@@ -21,6 +21,10 @@ inline constexpr int kFp8AttnInputLastSmallMmaT = 32;
                                                                   std::int32_t min_tokens,
                                                                   std::int32_t max_tokens);
 
+// A16ColumnInvariant: one sliced-K schedule (4 K-warps) for every T, so a column's arithmetic does
+// not depend on the call's other columns.
+void fp8_attn_input_invariant_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
+                                     Tensor& k, Tensor& v, cudaStream_t stream);
 void fp8_attn_input_a16_small_mma_launch(const Tensor& x, const Weight& weight, Tensor& q,
                                          Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream);
 void fp8_attn_input_a16_gemm_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,

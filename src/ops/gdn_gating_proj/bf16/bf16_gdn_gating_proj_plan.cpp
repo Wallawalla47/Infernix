@@ -439,13 +439,23 @@ void bf16_gdn_gating_dispatch(const Tensor& x, const Weight& a_weight, const Wei
 
 void bf16_gdn_norm_gating_dispatch(const Tensor& x, const Tensor& norm_weight, float eps, Tensor& h,
                                    const Weight& a_weight, const Weight& b_weight,
-                                   const Tensor& A_log, const Tensor& dt_bias, WorkspaceArena& ws,
-                                   Tensor& g, Tensor& beta, DeviceExecutionView execution) {
+                                   const Tensor& A_log, const Tensor& dt_bias,
+                                   bool column_invariant, WorkspaceArena& ws, Tensor& g,
+                                   Tensor& beta, DeviceExecutionView execution) {
     const Bf16GdnGatingProblem problem{g.ne[0], x.ne[0], x.ne[1]};
+    if (column_invariant) {
+        if (!is_27(problem)) {
+            throw std::invalid_argument(
+                "gdn_norm_gating_proj: no column-invariant schedule for this problem");
+        }
+        bf16_gdn_norm_gating_proj_27_launch(x, norm_weight, eps, h, a_weight, b_weight, A_log,
+                                            dt_bias, g, beta, true, execution.stream);
+        return;
+    }
     const Bf16GdnNormGatingPlan plan = bf16_gdn_norm_gating_resolve_plan(problem);
     if (plan.schedule == Bf16GdnNormGatingScheduleId::FusedSimt27) {
         bf16_gdn_norm_gating_proj_27_launch(x, norm_weight, eps, h, a_weight, b_weight, A_log,
-                                            dt_bias, g, beta, execution.stream);
+                                            dt_bias, g, beta, false, execution.stream);
         return;
     }
     if (plan.schedule == Bf16GdnNormGatingScheduleId::Composed) {

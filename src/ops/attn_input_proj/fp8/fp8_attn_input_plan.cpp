@@ -11,12 +11,14 @@ namespace infernix::ops::detail {
 namespace {
 
 enum class Fp8AttnInputRoute : std::uint8_t {
+    ColumnInvariantA16,
     A16,
     A8,
 };
 
 Fp8AttnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (tokens <= 0) { throw std::invalid_argument("fp8 attn_input_proj: T must be positive"); }
+    if (column_invariant(policy)) { return Fp8AttnInputRoute::ColumnInvariantA16; }
     if (policy == LinearPolicy::A16Only) { return Fp8AttnInputRoute::A16; }
     if (!allows_a8(policy)) {
         throw std::invalid_argument("fp8 attn_input_proj: unsupported policy");
@@ -51,7 +53,12 @@ std::size_t fp8_attn_input_workspace_capacity_bytes(LinearPolicy policy, std::in
 void fp8_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                              Tensor& k, Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,
                              cudaStream_t stream) {
-    if (resolve_route(policy, x.ne[1]) == Fp8AttnInputRoute::A16) {
+    const Fp8AttnInputRoute route = resolve_route(policy, x.ne[1]);
+    if (route == Fp8AttnInputRoute::ColumnInvariantA16) {
+        fp8_attn_input_invariant_launch(x, weight, q, gate, k, v, stream);
+        return;
+    }
+    if (route == Fp8AttnInputRoute::A16) {
         launch_a16(x, weight, q, gate, k, v, stream);
         return;
     }

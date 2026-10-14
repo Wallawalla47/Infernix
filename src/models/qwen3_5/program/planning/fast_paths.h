@@ -29,9 +29,28 @@ struct FastPathConfiguration {
 [[nodiscard]] FastPathConfiguration fast_path_configuration(const Model& model,
                                                             const EngineOptions& options);
 
-// Whether the path's kernels run in this configuration at all.
+// Whether the path's kernels run in this configuration at all. The request-coupling paths
+// (FastPath::BatchedDecode and after) apply only where the exact route can be request-invariant
+// (`invariant_capable`: every decode projection registers a column-invariant route,
+// execution::column_invariant_text_supported); elsewhere both routes couple requests.
 [[nodiscard]] bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration,
-                                     const EngineOptions& options);
+                                     const EngineOptions& options, bool invariant_capable);
+
+// A path that couples a request's arithmetic to the other requests of the Engine.
+[[nodiscard]] constexpr bool couples_requests(FastPath path) noexcept {
+    switch (path) {
+    case FastPath::PromptPv8:
+    case FastPath::DecodeSplit64: return false;
+    case FastPath::BatchedDecode:
+    case FastPath::BatchedA8Decode:
+    case FastPath::BatchedA4Decode:
+    case FastPath::BatchSplitAttention:
+    case FastPath::AdaptiveSpeculation:
+    case FastPath::FreeCacheResume:
+    case FastPath::Preemption: return true;
+    }
+    return false;
+}
 
 // Whether the path passed the acceptance gate in this configuration (the registry, section 6.7).
 [[nodiscard]] bool fast_path_qualified(FastPath path, const FastPathConfiguration& configuration);
@@ -40,12 +59,21 @@ struct FastPathSelection {
     FastPathConfiguration configuration;
     // In kFastPaths order.
     std::vector<FastPath> paths;
+    bool invariant_capable = false;
 
     [[nodiscard]] bool selected(FastPath path) const noexcept;
+    // Request invariance holds for `path`'s concern: the Model supports it and the path is not
+    // selected.
+    [[nodiscard]] bool invariant(FastPath path) const noexcept {
+        return invariant_capable && !selected(path);
+    }
+    // A request's outputs depend only on the request, the artifact, the options and the build.
+    [[nodiscard]] bool request_invariant() const noexcept;
 };
 
 // The qualified paths that apply when options.fast_paths is set, plus every
 // options.fast_path_candidates entry (qualification runs), which must apply.
-[[nodiscard]] FastPathSelection select_fast_paths(const Model& model, const EngineOptions& options);
+[[nodiscard]] FastPathSelection select_fast_paths(const Model& model, const EngineOptions& options,
+                                                  bool invariant_capable);
 
 } // namespace infernix::models::qwen3_5

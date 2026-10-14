@@ -70,11 +70,16 @@ bool overlaps(const Tensor& lhs, const Tensor& rhs) {
     return lhs_begin < rhs_begin + rhs.bytes() && rhs_begin < lhs_begin + lhs.bytes();
 }
 
-void validate_policy(LinearPolicy policy) {
+void validate_policy(LinearPolicy policy, QType qtype) {
+    if (column_invariant(policy) && qtype != QType::NVFP4 &&
+        qtype != QType::FP8_E4M3FN_ROW_BF16) {
+        throw std::invalid_argument("linear_add: the weight format registers no column-invariant route");
+    }
     switch (policy) {
     case LinearPolicy::A16Only:
     case LinearPolicy::AllowA8:
     case LinearPolicy::AllowA4:
+    case LinearPolicy::A16ColumnInvariant:
         return;
     }
     throw std::invalid_argument("linear_add: invalid compute policy");
@@ -92,7 +97,7 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
 std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output_rows,
                                                 std::int32_t input_rows, LinearPolicy policy,
                                                 std::int32_t min_tokens, std::int32_t max_tokens) {
-    validate_policy(policy);
+    validate_policy(policy, qtype);
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("linear_add workspace: invalid token interval");
     }
@@ -147,7 +152,7 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, Workspac
 
 void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPolicy policy,
                 WorkspaceArena& ws, cudaStream_t stream) {
-    validate_policy(policy);
+    validate_policy(policy, w.qtype);
     const std::int32_t t = x.ne[1];
     if (t <= 0) { throw std::invalid_argument("linear_add: T must be positive"); }
     require_tensor(x, DType::BF16, w.k, t, "x");

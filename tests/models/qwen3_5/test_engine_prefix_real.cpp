@@ -26,6 +26,9 @@ infernix::EngineOptions engine_options(const char* artifact) {
     options.max_concurrency                  = 1;
     options.max_pending_requests             = 1;
     options.context_cache.hybrid.device_snapshot_slots = 4;
+    // The cache resumes off the prefill chunk grid, from taps and endpoints, only under the
+    // free-cache-resume fast path; these cases test those resumes.
+    options.fast_path_candidates = {infernix::FastPath::FreeCacheResume};
     return options;
 }
 
@@ -44,6 +47,7 @@ infernix::EngineOptions anthropic_prefix_regression_engine_options(const char* a
     // This 27B workload has a fixed Host budget for four StateImages and 512 MiB of KV;
     // all contents compete within the same backing allocation.
     options.context_cache.host_capacity_bytes = 4ULL * 153954304 + (512ULL << 20);
+    options.fast_path_candidates = {infernix::FastPath::FreeCacheResume};
     return options;
 }
 
@@ -61,6 +65,7 @@ infernix::EngineOptions shared_rewrite_materialization_engine_options(const char
     options.max_pending_requests              = 1;
     options.context_cache.hybrid.device_snapshot_slots  = 2;
     options.context_cache.host_capacity_bytes = 0;
+    options.fast_path_candidates = {infernix::FastPath::FreeCacheResume};
     return options;
 }
 
@@ -75,6 +80,7 @@ infernix::EngineOptions explicit_anchor_engine_options(const char* artifact) {
     options.max_pending_requests              = 1;
     options.context_cache.hybrid.device_snapshot_slots  = 4;
     options.context_cache.host_capacity_bytes = 0;
+    options.fast_path_candidates = {infernix::FastPath::FreeCacheResume};
     return options;
 }
 
@@ -91,6 +97,7 @@ infernix::EngineOptions concurrent_engine_options(const char* artifact) {
     options.max_pending_requests              = 8;
     options.context_cache.hybrid.device_snapshot_slots  = 16;
     options.context_cache.host_capacity_bytes = 0;
+    options.fast_path_candidates = {infernix::FastPath::FreeCacheResume};
     return options;
 }
 
@@ -1704,6 +1711,7 @@ int exercise_attention_integration(const char* artifact) {
     options.speculative.backend              = backend;
     options.speculative.draft_tokens  = backend == infernix::SpeculativeBackend::None ? 0 : drafts;
     options.speculative.proposal_head = infernix::ProposalHead::Full;
+    options.fast_path_candidates = {infernix::FastPath::FreeCacheResume};
     infernix::Engine engine(options);
     if (engine.memory_summary().kv_cache != storage)
         throw std::runtime_error("attention integration selected the wrong KV dtype");

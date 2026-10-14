@@ -51,6 +51,17 @@ struct CausalAttentionExecutionEnvelope {
     // the workspace, so workspace planning and execution must use the same value. Other routes and
     // cache formats ignore it.
     bool decode_split64 = false;
+    // Size every row's key partition as if it were the launch's only row, so a row's splits and
+    // softmax merge order depend on its own visible keys alone, not on how many rows share the
+    // launch (the exact route's request invariance). It sizes the workspace, so workspace
+    // planning and execution must use the same value.
+    bool row_invariant_partition = false;
+    // A multi-column verification round computes each column as a one-column call, in column
+    // order, so a column's result equals that token decoded alone at the same position, whatever
+    // the round's width (the exact route's request invariance under speculative decoding, whose
+    // round boundaries depend on proposals). Applies to batched calls without tree masks; prefill
+    // chunks leave it unset. It sizes the workspace like row_invariant_partition.
+    bool column_invariant = false;
 };
 
 struct ContextAttentionExecutionEnvelope {

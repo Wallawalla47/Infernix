@@ -2153,6 +2153,8 @@ struct BatchAttentionCase {
     bool fast_prompt_kernel = false;
     bool fast_prompt_pv8    = false;
     bool decode_split64     = false;
+    bool row_invariant_partition = false;
+    bool column_invariant        = false;
     // Speculative verification-tree ancestor masks, [B][W] row-major (one per column of every
     // row); empty is the causal Op.
     std::vector<std::uint32_t> tree_masks;
@@ -2220,6 +2222,8 @@ int run_batch_case(DeviceExecutionView execution, const Geometry& geometry, KvCa
     envelope.fast_prompt_kernel = test_case.fast_prompt_kernel;
     envelope.fast_prompt_pv8    = test_case.fast_prompt_pv8;
     envelope.decode_split64     = test_case.decode_split64;
+    envelope.row_invariant_partition = test_case.row_invariant_partition;
+    envelope.column_invariant        = test_case.column_invariant;
     const std::size_t q_column_elements  = std::size_t(kHeadDim) * geometry.q_heads,
                       kv_column_elements = std::size_t(kHeadDim) * geometry.kv_heads;
     const std::size_t columns            = std::size_t(width) * batch;
@@ -2360,7 +2364,9 @@ int run_batch_case(DeviceExecutionView execution, const Geometry& geometry, KvCa
                                   geometry.name + " " + cache_name(storage) +
                                   " W=" + std::to_string(width) + " B=" + std::to_string(batch) +
                                   " phase=" + std::to_string(phase) +
-                                  (test_case.decode_split64 ? " decode-split64" : "");
+                                  (test_case.decode_split64 ? " decode-split64" : "") +
+                                  (test_case.row_invariant_partition ? " row-invariant" : "") +
+                                  (test_case.column_invariant ? " column-invariant" : "");
         const auto output = copy_from_guarded<std::uint16_t>(dout, q.size());
         failures += verify_attention(label, bf16_bits_to_double(output), reference,
                                      attention_criterion(storage, test_case.fast_prompt_pv8));
@@ -2601,8 +2607,47 @@ int run_tree_mask_cases(DeviceExecutionView execution, KvCacheStorage storage) {
     return failures;
 }
 
+// The exact route's row-invariant partition: every row splits its keys as if alone, so batched
+// rows long enough to saturate the batch's split target take more splits than the default
+// schedule gives them (and a larger workspace).
+int run_row_invariant_batch_cases(DeviceExecutionView execution, KvCacheStorage storage) {
+    int failures       = 0;
+    std::uint32_t seed = 3600u;
+    for (const Geometry& geometry : kGeometries) {
+        for (const std::vector<std::int32_t>& contexts :
+             {std::vector<std::int32_t>{0, 31, 1300, 2700, 5400, 9000, 17000, 30000},
+              std::vector<std::int32_t>{6000, 17}}) {
+            const auto batch = static_cast<std::int32_t>(contexts.size());
+            std::vector<std::int32_t> rows(contexts.size());
+            for (std::int32_t row = 0; row < batch; ++row) rows[row] = (row * 5 + 3) % batch;
+            for (const std::int32_t width : {1, 5}) {
+                BatchAttentionCase test_case{width,
+                                             contexts,
+                                             std::vector<std::int32_t>(contexts.size(), width),
+                                             rows,
+                                             MappingPattern::Fragmented,
+                                             seed++};
+                test_case.row_invariant_partition = true;
+                failures += run_batch_case(execution, geometry, storage, test_case);
+            }
+        }
+        // Column-invariant rounds: each column a one-column call in order, every row full or
+        // ending early (its later columns masked).
+        for (const std::int32_t width : {2, 5, 16}) {
+            const std::vector<std::int32_t> contexts{0, 700, 5400, 17000};
+            const std::vector<std::int32_t> valid{width, 1, width - 1, width / 2 + 1};
+            BatchAttentionCase test_case{width, contexts, valid, {2, 0, 3, 1},
+                                         MappingPattern::Fragmented, seed++};
+            test_case.row_invariant_partition = true;
+            test_case.column_invariant        = true;
+            failures += run_batch_case(execution, geometry, storage, test_case);
+        }
+    }
+    return failures;
+}
+
 int run_batch_cases(DeviceExecutionView execution, KvCacheStorage storage) {
-    int failures = 0;
+    int failures = run_row_invariant_batch_cases(execution, storage);
     failures += run_batch_case(execution, kGeometries[0], storage,
                                {16, {0}, {0}, {0}, MappingPattern::Fragmented, 1501u});
     failures += run_batch_case(execution, kGeometries[0], storage,

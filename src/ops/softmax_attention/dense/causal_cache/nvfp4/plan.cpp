@@ -24,7 +24,7 @@ Nvfp4KvCausalPlan make_nvfp4_kv_causal_plan(int heads, int width, int batch,
                                                                      : Nvfp4KvFamily::Tiled;
     const int tiles =
         family == Nvfp4KvFamily::ParallelGrouped ? (width + grouped_limit - 1) / grouped_limit : 1;
-    const int independent_tiles = batch * (heads == 24 ? 4 : 2) * tiles;
+    const int independent_tiles = (envelope.row_invariant_partition ? 1 : batch) * (heads == 24 ? 4 : 2) * tiles;
     const int query_tile        = family == Nvfp4KvFamily::ParallelGrouped && width <= 16
                                       ? (width + 1) / 2
                                       : std::min(width, grouped_limit);

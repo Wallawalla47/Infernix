@@ -4,6 +4,25 @@
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_output.cuh"
 
 namespace infernix::ops::detail {
+void nvfp4_gdn_input_invariant_launch(const Tensor& x, const Weight& weight, Tensor& qkv,
+                                      Tensor& z, cudaStream_t stream) {
+    // The tiles run 8 K-warps over the same K slices and reduce them in the same order, and the
+    // MMA's columns are independent; wider calls run as 64-column slices.
+    const auto p        = nvfp4_a16_operands(x, weight);
+    const auto output   = Nvfp4GdnInputOutput{static_cast<__nv_bfloat16*>(qkv.data),
+                                            static_cast<__nv_bfloat16*>(z.data)};
+    const auto epilogue = LinearIdentityEpilogue{};
+    if (x.ne[1] <= 8)
+        return launch_nvfp4_a16_sliced_k_mma<
+            Nvfp4ScheduleInstance<Nvfp4SlicedInstance<8, 8, 2>, 5120>>(p, output, epilogue, stream);
+    if (x.ne[1] <= 16)
+        return launch_nvfp4_a16_sliced_k_mma<
+            Nvfp4ScheduleInstance<Nvfp4SlicedInstance<16, 8, 2>, 5120>>(p, output, epilogue,
+                                                                        stream);
+    launch_nvfp4_a16_sliced_k_mma<Nvfp4ScheduleInstance<Nvfp4SlicedInstance<64, 8, 1>, 5120>>(
+        p, output, epilogue, stream);
+}
+
 void nvfp4_gdn_input_a16_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                 cudaStream_t stream) {
     const int tokens = x.ne[1];

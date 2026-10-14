@@ -219,6 +219,10 @@ struct RequestControl {
     std::uint32_t replay_target = 0;
     std::uint32_t replay_cursor = 0;
     Lifecycle resume_lifecycle  = Lifecycle::Empty;
+    // Without the preemption fast path, the KV extent the request holds from binding to release,
+    // so no unit of it waits for pages or pauses another resident (a replay recomputes generated
+    // tokens as prefill, which another request's arrival must not cause). Zero otherwise.
+    UnitDemand held_extent;
     // Constrained requests: the draws of the pending candidate (one per produced token, in
     // order) and the committed trace they move into.
     std::vector<ConstrainedDraw> constraint_round;
@@ -309,6 +313,10 @@ struct HybridLaneState {
     // restore if it may still be landing.
     std::uint64_t restore_ticket = 0;
     bool restore_layers_pending  = false;
+    // Without free cache resume, blocks publish only below this frontier: the last chunk-grid
+    // position prefill reached (state computed on the grid equals any other request's cold
+    // computation of the same prefix). Unbounded otherwise.
+    std::uint32_t publish_frontier = std::numeric_limits<std::uint32_t>::max();
 };
 
 class ProgramImpl {
@@ -392,7 +400,7 @@ public:
     const std::uint32_t max_concurrency;
     const ContextCacheOptions context_cache;
     const std::uint32_t prefill_chunk;
-    const AttentionSchedule attention_schedule;
+    const ExecutionSchedule execution_schedule;
     const std::uint32_t draft_window;
     const std::uint32_t neural_draft_window;
     // DFlash2 tree verification: the tree widths each batch size may verify and the most
@@ -534,6 +542,7 @@ public:
     std::vector<SpeculativeRoundFamily> round_families;
 
     [[nodiscard]] std::uint32_t initial_mtp_extent(const RequestBasePlanImpl&) const;
+    [[nodiscard]] UnitDemand held_extent(const RequestBasePlanImpl&) const;
     [[nodiscard]] UnitDemand prefill_unit(std::uint32_t prompt, std::uint32_t cursor,
                                           std::uint32_t mtp_extent) const;
     [[nodiscard]] UnitDemand next_unit(const SequenceState&, const RequestControl&,

@@ -18,8 +18,10 @@ using LinearParameters = ops::SingleProjectionWeight;
 
 [[nodiscard]] inline ops::LinearPolicy residual_projection_policy(const LinearParameters& p,
                                                                   bool wide_verification) {
-    // Keep the neural path's residual activation precision in wide copy verification.
-    return wide_verification && p.weight.qtype == QType::FP8_E4M3FN_ROW_BF16
+    // Keep the neural path's residual activation precision in wide copy verification. A
+    // column-invariant projection already runs 16-bit activations at every width.
+    return wide_verification && p.weight.qtype == QType::FP8_E4M3FN_ROW_BF16 &&
+                   !ops::column_invariant(p.policy)
                ? ops::LinearPolicy::A16Only
                : p.policy;
 }
@@ -142,6 +144,19 @@ struct ProposalParameters {
     std::uint32_t rows = 0;
 };
 
+// The exact route's request invariance runs decode and verification under
+// LinearPolicy::A16ColumnInvariant, which needs a column-invariant route for every Text
+// projection: single-parent NVFP4 or FP8 attention and GDN input projections, NVFP4 or FP8 output
+// and dense MLP projections, an FP8 or Q8 vocabulary head, and the 27B's BF16 GDN control parent.
+// Other artifacts run the exact route without request invariance.
+[[nodiscard]] bool column_invariant_text_supported(const TextParameters& text);
+// `text` with every projection's policy LinearPolicy::A16ColumnInvariant, the GDN control
+// included (its fused norm and gating keep one schedule at every width).
+[[nodiscard]] TextParameters column_invariant_text(const TextParameters& text);
+// `text` with each FP8 projection's policy LinearPolicy::A16Only unless `a8`, and each NVFP4
+// projection's unless `a4` (others and the GDN control keep their own).
+[[nodiscard]] TextParameters precision_decode_text(const TextParameters& text, bool a8, bool a4);
+
 // Cold native preparation for the fixed model implementation. This owner is stable before
 // startup sizing, execution, or Graph capture; all weight addresses borrow the source Model.
 // Shape-dependent kernel selection and scratch remain with the calling implementation and Op.
@@ -155,6 +170,27 @@ public:
 
     const Model& model;
     TextParameters text;
+    // `text` under LinearPolicy::A16ColumnInvariant, which the exact route's decode and
+    // verification run when the artifact supports it (column_invariant_text_supported).
+    std::optional<TextParameters> invariant_text;
+    // `text` for batched decode and verification with each projection class's low-precision
+    // activations permitted or not, indexed by precision_index (built with invariant_text): FP8
+    // projections keep their 8-bit permission only with a8, NVFP4 their 4-bit one only with a4.
+    std::array<std::optional<TextParameters>, 3> precision_text;
+
+    [[nodiscard]] static constexpr std::size_t precision_index(bool a8, bool a4) noexcept {
+        return (a8 ? 1U : 0U) + (a4 ? 2U : 0U);
+    }
+
+    // The parameters decode and verification run with: the column-invariant copy, else the copy
+    // with the selected low-precision permissions (`text` itself when both are).
+    [[nodiscard]] const TextParameters& decode_text(bool column_invariant, bool a8,
+                                                    bool a4) const noexcept {
+        if (column_invariant && invariant_text) { return *invariant_text; }
+        const std::size_t index = precision_index(a8, a4);
+        if (index < precision_text.size() && precision_text[index]) { return *precision_text[index]; }
+        return text;
+    }
     std::optional<MtpParameters> mtp;
     std::optional<VisionParameters> vision;
     std::optional<DraftParameters> draft;

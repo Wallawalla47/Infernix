@@ -17,6 +17,10 @@ namespace infernix::ops::detail {
                                                                    std::int32_t min_tokens,
                                                                    std::int32_t max_tokens);
 
+// A16ColumnInvariant: one sliced-K schedule family (8 K-warps) for every T, so a column's
+// arithmetic does not depend on the call's other columns.
+void nvfp4_gdn_input_invariant_launch(const Tensor& x, const Weight& weight, Tensor& qkv,
+                                      Tensor& z, cudaStream_t stream);
 void nvfp4_gdn_input_a16_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                 cudaStream_t stream);
 

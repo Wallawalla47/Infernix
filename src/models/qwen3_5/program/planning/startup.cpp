@@ -403,12 +403,14 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     // Every launch takes the schedule's fast-path permission, which sizes partials (see
     // execution/text.cpp).
     const ops::CausalAttentionExecutionEnvelope text_envelope =
-        plan.attention_schedule.apply({1, plan.capacity});
+        plan.execution_schedule.apply({1, plan.capacity});
     // Prefill chunks run the selected prompt kernel, which may split keys into workspace.
     const ops::CausalAttentionExecutionEnvelope prefill_envelope =
-        plan.attention_schedule.envelope(1, plan.capacity);
+        plan.execution_schedule.envelope(1, plan.capacity);
+    // Target verification only: the drafters' attention runs text_envelope, since proposals need
+    // no column invariance, and its workspace must be planned with the envelope it runs.
     const ops::CausalAttentionExecutionEnvelope verify_envelope =
-        plan.attention_schedule.apply({1, plan.capacity});
+        plan.execution_schedule.verify({1, plan.capacity});
 
     const auto matrix  = [](WorkspaceLayoutBuilder& layout, DType dtype, std::int32_t rows,
                            std::int32_t tokens) { (void)layout.alloc(dtype, {rows, tokens}); };
@@ -445,7 +447,13 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                  std::int32_t max_width,
                                  ops::CausalAttentionExecutionEnvelope envelope) {
         const bool wide_verification = wide_residual_verification(phase, min_width, max_width);
-        for (const auto& block : parameters.text.layers) {
+        const execution::TextParameters& text =
+            phase == TextPhase::Verify
+                ? parameters.decode_text(plan.execution_schedule.column_invariant_decode,
+                                         plan.execution_schedule.a8_decode,
+                                         plan.execution_schedule.a4_decode)
+                : parameters.text;
+        for (const auto& block : text.layers) {
             {
                 auto stage = layout.scope();
                 if (const auto* attention =
@@ -463,10 +471,14 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     add_scratch(layout, attention->output, first, last, wide_verification);
                 } else {
                     const auto& gdn = std::get<execution::GdnParameters>(block.mixer);
+                    const auto* control = std::get_if<execution::LinearParameters>(&gdn.control);
                     (void)workspace::gdn_control(layout, config, last);
                     scratch(layout, ops::gdn_norm_gating_proj_workspace_capacity_bytes(
                                         dimension(config.gdn->linear_num_value_heads),
-                                        dimension(config.hidden_size), first, last));
+                                        dimension(config.hidden_size),
+                                        control != nullptr ? control->policy
+                                                           : ops::LinearPolicy::A16Only,
+                                        first, last));
                     (void)workspace::gdn_projection(layout, config, last);
                     if (path == GdnWorkspacePath::Snapshot) {
                         scratch(layout, execution::gdn_snapshot_workspace_bytes(
@@ -498,9 +510,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                                             wide_verification),
                              execution::ffn_workspace_bytes(block.ffn, first, last, false, false)));
         }
-        if (!plan.causal_scoring) {
-            linear_scratch(layout, parameters.text.output_head, first, last);
-        }
+        if (!plan.causal_scoring) { linear_scratch(layout, text.output_head, first, last); }
     };
     const auto mtp_post_mixer = [&](WorkspaceLayoutBuilder& layout, int first, int last) {
         linear_scratch(layout, parameters.mtp->output, first, last);
@@ -637,7 +647,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         out.mtp_prefill = finish(mtp_prefill);
 
         WorkspaceLayoutBuilder mtp_batch;
-        mtp_full_call(mtp_batch, verify, verify_envelope, false);
+        mtp_full_call(mtp_batch, verify, text_envelope, false);
         WorkspaceLayoutBuilder mtp_ar;
         mtp_full_call(mtp_ar, 1, text_envelope, true);
         WorkspaceLayoutBuilder mtp_align;
@@ -669,7 +679,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                     {dimension(config.attention->head_dim),
                                      dimension(config.attention->num_attention_heads),
                                      dimension(config.attention->num_key_value_heads)},
-                                    plan.kv_storage, verify_envelope, batch, width, width,
+                                    plan.kv_storage, text_envelope, batch, width, width,
                                     device_execution));
                 (void)workspace::mtp_post_attention(layout, config, tokens);
                 mtp_post_mixer(layout, tokens, tokens);
@@ -1033,7 +1043,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         "resolved Paged KV capacity exceeds int32"));
     impl->max_concurrency      = inputs.max_concurrency;
     impl->prefill_chunk        = inputs.prefill_chunk;
-    impl->attention_schedule   = inputs.attention_schedule;
+    impl->execution_schedule   = inputs.execution_schedule;
     impl->draft_window         = inputs.draft_window;
     impl->neural_draft_window  = inputs.neural_draft_window;
     impl->round_shapes         = inputs.round_shapes;
@@ -1133,15 +1143,28 @@ static_assert(std::size_t{kDefaultPrefillSplitWorkspaceMiB} << 20 ==
 // INT8 and NVFP4 KV prefill with their fast prompt kernels unless the original was selected.
 // Prompt P*V runs in FP16 unless the prompt-pv8 fast path is selected, and single-column decode
 // keeps 128-key splits unless decode-split64 is (fast_paths.h).
-AttentionSchedule attention_schedule(const execution::Parameters& parameters,
+ExecutionSchedule execution_schedule(const execution::Parameters& parameters,
                                      const EngineOptions& options) {
-    const FastPathSelection fast_paths = select_fast_paths(parameters.model, options);
+    // Request invariance is possible where every Text projection registers a column-invariant
+    // route (docs/maintainer/model-quality.md, 6.1); each request-coupling fast
+    // path gives up one part of it.
+    const FastPathSelection fast_paths =
+        select_fast_paths(parameters.model, options, parameters.invariant_text.has_value());
     return {.fast = uses_fast_int8_prefill(options) ||
                     (options.kv_cache == KvCacheStorage::Nvfp4Group16 &&
                      !options.original_nvfp4_prefill_kernel),
-            .pv8                   = fast_paths.selected(FastPath::PromptPv8),
-            .split_workspace_bytes = std::size_t{options.prefill_split_workspace_mib} << 20,
-            .decode_split64        = fast_paths.selected(FastPath::DecodeSplit64)};
+            .pv8                     = fast_paths.selected(FastPath::PromptPv8),
+            .split_workspace_bytes   = std::size_t{options.prefill_split_workspace_mib} << 20,
+            .decode_split64          = fast_paths.selected(FastPath::DecodeSplit64),
+            .column_invariant_decode = fast_paths.invariant(FastPath::BatchedDecode),
+            .a8_decode =
+                !fast_paths.invariant_capable || fast_paths.selected(FastPath::BatchedA8Decode),
+            .a4_decode =
+                !fast_paths.invariant_capable || fast_paths.selected(FastPath::BatchedA4Decode),
+            .row_invariant_partition = fast_paths.invariant(FastPath::BatchSplitAttention),
+            .fixed_speculation       = fast_paths.invariant(FastPath::AdaptiveSpeculation),
+            .grid_cache              = fast_paths.invariant(FastPath::FreeCacheResume),
+            .held_extent             = fast_paths.invariant(FastPath::Preemption)};
 }
 // The fast INT8, NVFP4, VQ2 and K4V2 prompt kernels and the MXFP8 tiled kernel of FP8 and K8V4 KV
 // run one 128-row CTA of one query head per SM; BF16 KV and the original INT8 and NVFP4 kernels use
@@ -1202,7 +1225,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .capacity            = options.max_context,
         .max_concurrency     = options.max_concurrency,
         .prefill_chunk       = effective_prefill_chunk(parameters, options),
-        .attention_schedule   = attention_schedule(parameters, options),
+        .execution_schedule   = execution_schedule(parameters, options),
         .draft_window         = draft_window,
         .speculative_backend  = options.speculative.backend,
         .kv_storage           = options.kv_cache,

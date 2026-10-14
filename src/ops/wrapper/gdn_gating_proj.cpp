@@ -94,8 +94,20 @@ std::size_t gdn_gating_proj_workspace_capacity_bytes(std::int32_t heads, std::in
 
 std::size_t gdn_norm_gating_proj_workspace_capacity_bytes(std::int32_t heads,
                                                           std::int32_t input_rows,
+                                                          LinearPolicy policy,
                                                           std::int32_t min_tokens,
                                                           std::int32_t max_tokens) {
+    if (!valid_linear_policy(policy)) {
+        throw std::invalid_argument("gdn_norm_gating_proj workspace: invalid compute policy");
+    }
+    if (column_invariant(policy)) {
+        // The fused 27B schedule runs at every T without workspace.
+        if (heads != 48 || input_rows != 5120 || min_tokens <= 0 || max_tokens < min_tokens) {
+            throw std::invalid_argument(
+                "gdn_norm_gating_proj workspace: no column-invariant schedule for this problem");
+        }
+        return 0;
+    }
     return detail::bf16_gdn_norm_gating_capacity_workspace_bytes(heads, input_rows, min_tokens,
                                                                  max_tokens);
 }
@@ -137,8 +149,8 @@ void gdn_gating_proj(const Tensor& x, const Weight& ab_weight, const Tensor& A_l
 
 void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
                           const Weight& a_weight, const Weight& b_weight, const Tensor& A_log,
-                          const Tensor& dt_bias, WorkspaceArena& ws, Tensor& h, Tensor& g,
-                          Tensor& beta, DeviceExecutionView execution) {
+                          const Tensor& dt_bias, LinearPolicy policy, WorkspaceArena& ws,
+                          Tensor& h, Tensor& g, Tensor& beta, DeviceExecutionView execution) {
     constexpr const char* op  = "gdn_norm_gating_proj";
     const std::int32_t tokens = x.ne[1];
     if (!(eps > 0.0F) || !std::isfinite(eps)) {
@@ -154,15 +166,19 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
     require_bf16_weight(a_weight, 48, 5120, "a_weight");
     require_bf16_weight(b_weight, 48, 5120, "b_weight");
     require_execution(execution, op);
+    if (!valid_linear_policy(policy)) {
+        throw std::invalid_argument("gdn_norm_gating_proj: invalid compute policy");
+    }
 
     detail::bf16_gdn_norm_gating_dispatch(x, norm_weight, eps, h, a_weight, b_weight, A_log,
-                                          dt_bias, ws, g, beta, execution);
+                                          dt_bias, column_invariant(policy), ws, g, beta,
+                                          execution);
 }
 
 void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
                           const Weight& ab_weight, const Tensor& A_log, const Tensor& dt_bias,
-                          WorkspaceArena& ws, Tensor& h, Tensor& g, Tensor& beta,
-                          DeviceExecutionView execution) {
+                          LinearPolicy policy, WorkspaceArena& ws, Tensor& h, Tensor& g,
+                          Tensor& beta, DeviceExecutionView execution) {
     constexpr const char* op  = "gdn_norm_gating_proj";
     const std::int32_t tokens = x.ne[1];
     if (!(eps > 0.0F) || !std::isfinite(eps)) {
@@ -178,10 +194,15 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
     require_sequence_tensor(beta, DType::FP32, geometry.heads, tokens, op, "beta");
     require_execution(execution, op);
 
+    if (!valid_linear_policy(policy)) {
+        throw std::invalid_argument("gdn_norm_gating_proj: invalid compute policy");
+    }
+
     const Weight a_weight = bf16_row_view(ab_weight, 0, geometry.heads);
     const Weight b_weight = bf16_row_view(ab_weight, geometry.heads, geometry.heads);
     detail::bf16_gdn_norm_gating_dispatch(x, norm_weight, eps, h, a_weight, b_weight, A_log,
-                                          dt_bias, ws, g, beta, execution);
+                                          dt_bias, column_invariant(policy), ws, g, beta,
+                                          execution);
 }
 
 } // namespace infernix::ops

@@ -128,6 +128,11 @@ infernix_add_op_test(infernix_attn_input_proj_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_attn_input_proj.cpp"
   LIBRARIES infernix_ops)
 
+# LinearPolicy::A16ColumnInvariant: a column's bits do not depend on the call's other columns.
+infernix_add_op_test(infernix_column_invariant_projections_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_column_invariant_projections.cpp"
+  LIBRARIES infernix_ops)
+
 infernix_add_op_test(infernix_attn_input_proj_fused_rmsnorm_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_attn_input_proj_fused_rmsnorm.cpp"
   LIBRARIES infernix_ops)

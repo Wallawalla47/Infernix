@@ -61,7 +61,7 @@ void configure_text_card(TextContext& card, const ExecutionCore& execution,
     card.set_linear_state_slots(state_source_slot, state_destination_slot);
     card.set_gdn_state_action(GdnStateAction::UpdateInPlace, nullptr);
     card.set_mtp_proposal_extent(mtp_proposal_extent);
-    card.set_attention_schedule(execution.attention_schedule);
+    card.set_execution_schedule(execution.execution_schedule);
     if (execution.proposal_head == ProposalHead::Full) {
         card.set_proposal_head(nullptr, nullptr, 0);
         return;
@@ -593,7 +593,8 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                    hybrid_lane->next_tap < hybrid_lane->taps.size();
         };
         const auto next_hybrid_split = [&]() -> std::optional<std::uint32_t> {
-            if (!hybrid_taps_left()) { return std::nullopt; }
+            // Without free cache resume prefill splits only on the chunk grid.
+            if (!hybrid_taps_left() || execution_schedule.grid_cache) { return std::nullopt; }
             for (std::size_t tap = hybrid_lane->next_tap; tap < hybrid_lane->taps.size(); ++tap) {
                 const runtime::prefix_cache::PlannedTap& planned = hybrid_lane->taps[tap];
                 if (planned.placement == runtime::prefix_cache::TapPlacement::Exact &&
@@ -612,7 +613,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
         execution::PrefillContext schedule_state{
             {device, parameters, work, *state_images,
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head, attention_schedule},
+             proposal_head, execution_schedule},
             text_kv_view(sequence),
             mtp_kv_view(sequence),
             decoder->text_kv,

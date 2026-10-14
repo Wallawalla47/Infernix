@@ -38,7 +38,7 @@ struct ExecutionCore {
     Tensor& prefill_hidden;
     std::uint32_t prefill_chunk;
     ProposalHead proposal_head;
-    qwen3_5::AttentionSchedule attention_schedule;
+    qwen3_5::ExecutionSchedule execution_schedule;
 };
 
 struct PrefillContext {

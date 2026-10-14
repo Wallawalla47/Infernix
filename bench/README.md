@@ -152,7 +152,8 @@ remains neural-only unless its cases explicitly request ngram.
 corpus prompt and forces the following corpus tokens through the production decode path, one
 constrained step per token, recording each token's log-probability from the round's full
 distribution (`ConstrainedDraw::mass`). Positions pair exactly between builds, which makes it the
-sensitive decode measure of the [acceptance policy](../docs/maintainer/model-quality.md#6-numerical-acceptance-policy-and-fast-paths):
+sensitive decode measure of the [acceptance policy](../docs/maintainer/model-quality.md#6-numerical-acceptance-policy-and-fast-paths)
+(`--kv-dtype` takes every KV format: `int8`, `bf16`, `fp8`, `nvfp4`, `k8v4`, `vq2`, `k4v2`):
 
 ```bat
 infernix_decode_quality_forced model.ninfer corpus.txt exact.json --segments 256 ^
@@ -177,7 +178,9 @@ bit. `--concurrency N` (1-8) submits the segments in groups of N that run togeth
 lengths differ, so prefills overlap decodes), `--prefill-chunk N` sets the prompt chunk (default
 4096, rounded down to the prompt-attention wave), and `--prefix-reuse` runs each segment's prompt
 alone first (with `--warm-tokens N`, only its first N tokens) and then the measured request from
-the prefix cache (the report's `reused_prompt_tokens` counts the restored tokens).
+the prefix cache (the report's `reused_prompt_tokens` counts the restored tokens). `--kv-tokens N`
+sizes the KV pool (default: every lane's whole context), so a short pool makes concurrent requests
+preempt; the report's `preemptions` and `replayed_tokens` count what happened.
 
 `infernix_decode_quality_gen` and `infernix_decode_quality_judge` measure what a build's decode path
 does to output quality, end to end, free-running. Perplexity scoring runs prefill only, so this is the check for
@@ -214,6 +217,9 @@ infernix_decode_quality_judge model.ninfer corpus.txt base.txt base-ngram.txt ot
 infernix_decode_quality_gen flash-next.infernix corpus.txt fn.txt 32 1536 384 mtp ngram-volume=v.ngram
 infernix_decode_quality_judge --ngram-volume v.ngram flash-next.infernix corpus.txt fn.txt
 ```
+
+The generator runs INT8 KV unless `kv=NAME` selects another format (`bf16`, `fp8`, `nvfp4`, `k8v4`,
+`vq2`, `k4v2`); the judge scores against the BF16-KV reference whatever the run used.
 
 Use the same artifact and corpus for every build. The generator uses only Engine API that NInfer
 also has, so for an Infernix-versus-NInfer comparison copy `decode_quality_gen.cpp` into an

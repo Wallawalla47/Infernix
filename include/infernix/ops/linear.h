@@ -22,11 +22,20 @@ enum class LinearPolicy : std::uint8_t {
     A16Only, ///< Admit only A16 compute profiles.
     AllowA8, ///< Admit either A16 or A8 compute profiles.
     AllowA4, ///< Admit A16, A8 or A4 compute profiles.
+    /// Admit only an A16 profile whose arithmetic for one column does not depend on how many
+    /// columns the call holds or on their values: column t's output bits are a function of column
+    /// t's input and the weight alone, for every T. A projection that does not register such a
+    /// route rejects this policy.
+    A16ColumnInvariant,
 };
 
 [[nodiscard]] constexpr bool valid_linear_policy(LinearPolicy policy) noexcept {
     return policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8 ||
-           policy == LinearPolicy::AllowA4;
+           policy == LinearPolicy::AllowA4 || policy == LinearPolicy::A16ColumnInvariant;
+}
+
+[[nodiscard]] constexpr bool column_invariant(LinearPolicy policy) noexcept {
+    return policy == LinearPolicy::A16ColumnInvariant;
 }
 
 [[nodiscard]] constexpr bool allows_a8(LinearPolicy policy) noexcept {
@@ -103,7 +112,10 @@ enum class LinearPolicy : std::uint8_t {
  * compute under every policy at every positive T. NVFP4 uses A16 for A16Only and
  * AllowA8; AllowA4 permits the private resolver to select either a qualified A16 route or
  * activation quantization to NVFP4 at every positive T. The selected route depends only on the
- * registered problem and T.
+ * registered problem and T. A16ColumnInvariant selects one A16 route per registered problem for
+ * every T, so each column's result is independent of the call's other columns. NVFP4 and FP8
+ * register it for their text problems and Q8 for the [248320, 5120] vocabulary head; the other
+ * formats and problems reject it.
  *
  * @par Workspace
  * `workspace` is caller-owned call-scoped transient storage sized by

@@ -8,6 +8,7 @@
 #include "ops/linear/fp8/fp8_a16_simt.cuh"
 #include "ops/linear/fp8/fp8_a16_sliced_k_mma.cuh"
 #include "ops/linear/fp8/fp8_a16_mma.cuh"
+#include "ops/linear/fp8/fp8_instances.cuh"
 
 namespace infernix::ops::detail {
 namespace {
@@ -38,6 +39,23 @@ void launch_gemm(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
 }
 
 } // namespace
+
+void fp8_gdn_input_invariant_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
+                                    cudaStream_t stream) {
+    // The tiles run 4 K-warps over the same K slices and reduce them in the same order, and the
+    // MMA's columns are independent; wider calls run as 64-column slices.
+    const Fp8GdnInputOutput output{static_cast<__nv_bfloat16*>(qkv.data),
+                                   static_cast<__nv_bfloat16*>(z.data)};
+    const auto launch = [&]<int T>() {
+        launch_fp8_a16_sliced_k_mma<
+            Fp8ScheduleInstance<Fp8SlicedInstance<T, 4, 1>, Geometry::kInputRows>>(
+            fp8_a16_operands(x, weight), output, LinearIdentityEpilogue{}, stream);
+    };
+    if (x.ne[1] <= 8) return launch.template operator()<8>();
+    if (x.ne[1] <= 16) return launch.template operator()<16>();
+    if (x.ne[1] <= 32) return launch.template operator()<32>();
+    launch.template operator()<64>();
+}
 
 void fp8_gdn_input_matrix_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                  cudaStream_t stream) {

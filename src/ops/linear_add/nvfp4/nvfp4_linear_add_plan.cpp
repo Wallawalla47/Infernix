@@ -11,6 +11,7 @@ namespace infernix::ops::detail {
 namespace {
 
 enum class Nvfp4LinearAddRoute : std::uint8_t {
+    ColumnInvariantA16,
     A16,
     A4,
 };
@@ -20,6 +21,7 @@ Nvfp4LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_r
     if (tokens <= 0 || output_rows != 5120 || (input_rows != 6144 && input_rows != 17408)) {
         throw std::invalid_argument("nvfp4 linear_add: unsupported shape");
     }
+    if (column_invariant(policy)) { return Nvfp4LinearAddRoute::ColumnInvariantA16; }
     if (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) {
         return Nvfp4LinearAddRoute::A16;
     }
@@ -49,7 +51,12 @@ std::size_t nvfp4_linear_add_workspace_capacity_bytes(std::int32_t output_rows,
 void nvfp4_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,
                                LinearPolicy policy, WorkspaceArena& workspace,
                                cudaStream_t stream) {
-    if (resolve_route(weight.n, weight.k, policy, x.ne[1]) == Nvfp4LinearAddRoute::A16) {
+    const Nvfp4LinearAddRoute route = resolve_route(weight.n, weight.k, policy, x.ne[1]);
+    if (route == Nvfp4LinearAddRoute::ColumnInvariantA16) {
+        nvfp4_linear_add_invariant_launch(x, weight, residual, stream);
+        return;
+    }
+    if (route == Nvfp4LinearAddRoute::A16) {
         nvfp4_linear_add_a16_launch(x, weight, residual, stream);
         return;
     }

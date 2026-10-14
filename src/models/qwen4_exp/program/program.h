@@ -359,6 +359,21 @@ struct ProgramOptions {
     // MTP drafts per round when the drafter is loaded (design section 11, at most 7). A longer
     // n-gram proposal, when enabled, replaces a round's MTP drafts.
     std::uint32_t mtp_draft_tokens = 0;
+    // The request-coupling fast paths (FastPath; docs/maintainer/model-quality.md section 6.7). Each
+    // is off unless selected, and with all three off a request's output does not depend on the other
+    // requests (concurrency, cache contents, KV pressure):
+    // - pair_speculation (adaptive-speculation): two-row rounds draft one length chosen from both
+    //   rows' acceptance; without it they decode plain, as rounds of three or more rows do;
+    // - free_cache_resume (free-cache-resume): prefill calls, taps and resumes at any position, sibling
+    //   coalescing, and endpoints and blocks holding decode-computed state; without it every call
+    //   boundary, tap and resume is a multiple of 16 tokens (the GDN prefill's sub-chunk) and only
+    //   prompt blocks and taps are published;
+    // - preemption (preemption): KV pages grow per unit and a short pool pauses residents (replay
+    //   recomputes generated tokens as prefill); without it a request holds its whole extent from
+    //   admission.
+    bool pair_speculation  = false;
+    bool free_cache_resume = false;
+    bool preemption        = false;
     // CPU-served misses (design section 10): host expert-engine workers (0 disables), the most
     // experts one layer call hands to them, and the share kept on the PCIe stage (misses / divisor;
     // 0 derives it from the measured link and CPU rates, design §19.3.12).

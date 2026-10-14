@@ -11,12 +11,14 @@ namespace infernix::ops::detail {
 namespace {
 
 enum class Nvfp4GdnInputRoute : std::uint8_t {
+    ColumnInvariantA16,
     A16,
     A4,
 };
 
 Nvfp4GdnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (tokens <= 0) { throw std::invalid_argument("nvfp4 gdn_input_proj: T must be positive"); }
+    if (column_invariant(policy)) { return Nvfp4GdnInputRoute::ColumnInvariantA16; }
     if (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) {
         return Nvfp4GdnInputRoute::A16;
     }
@@ -40,7 +42,12 @@ std::size_t nvfp4_gdn_input_workspace_capacity_bytes(LinearPolicy policy, std::i
 
 void nvfp4_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                               LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream) {
-    if (resolve_route(policy, x.ne[1]) == Nvfp4GdnInputRoute::A16) {
+    const Nvfp4GdnInputRoute route = resolve_route(policy, x.ne[1]);
+    if (route == Nvfp4GdnInputRoute::ColumnInvariantA16) {
+        nvfp4_gdn_input_invariant_launch(x, weight, qkv, z, stream);
+        return;
+    }
+    if (route == Nvfp4GdnInputRoute::A16) {
         nvfp4_gdn_input_a16_launch(x, weight, qkv, z, stream);
         return;
     }

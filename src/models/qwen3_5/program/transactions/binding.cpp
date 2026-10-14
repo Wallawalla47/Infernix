@@ -100,6 +100,13 @@ void ProgramImpl::plan_binding_units(ContextTransaction& tx, const RequestBasePl
     }
     tx.first_unit         = first;
     tx.reservation_demand = first;
+    if (!resume) {
+        request.held_extent = held_extent(*base.impl_);
+        tx.reservation_demand.main_frontier =
+            std::max(first.main_frontier, request.held_extent.main_frontier);
+        tx.reservation_demand.backend_frontier =
+            std::max(first.backend_frontier, request.held_extent.backend_frontier);
+    }
     if (resume) {
         const auto& resumed_sequence = resume->impl_->sequence;
         auto coverage =

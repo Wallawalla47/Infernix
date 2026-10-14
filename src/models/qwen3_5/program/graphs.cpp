@@ -341,7 +341,7 @@ void ProgramImpl::prepare_graphs() {
                                         prefill_hidden,
                                         prefill_chunk,
                                         proposal_head,
-                                        attention_schedule};
+                                        execution_schedule};
     };
 
     if (speculative_backend == SpeculativeBackend::None) {

@@ -98,10 +98,10 @@ public:
         prefill_split_frontier_ = position;
     }
 
-    // Causal-attention settings: prefill chunks' prompt kernels and every launch's fast-path
-    // permission. Unset, every launch runs the default schedule.
-    void set_attention_schedule(AttentionSchedule settings) noexcept {
-        attention_schedule_ = settings;
+    // Execution settings: prefill chunks' prompt kernels, every launch's fast-path permission and
+    // the exact route's request invariance. Unset, every launch runs the default schedule.
+    void set_execution_schedule(ExecutionSchedule settings) noexcept {
+        execution_schedule_ = settings;
     }
     void set_rewrite_checkpoint_hidden_output(Tensor* output) noexcept {
         rewrite_checkpoint_hidden_output_ = output;
@@ -206,6 +206,15 @@ private:
         return active_sequence_batch_ != 0 ? active_sequence_width_ : columns;
     }
     void run_layers(Tensor& x, Phase phase);
+    // The parameters a phase's projections run with (Parameters::decode_text for decode and
+    // verification).
+    [[nodiscard]] const TextParameters& phase_text(Phase phase) const noexcept {
+        return phase == Phase::Verify
+                   ? parameters_.decode_text(execution_schedule_.column_invariant_decode,
+                                             execution_schedule_.a8_decode,
+                                             execution_schedule_.a4_decode)
+                   : parameters_.text;
+    }
     template <class Tap>
     void run_layers(Tensor& x, Phase phase, Tap& tap);
     template <class Tap>
@@ -264,7 +273,7 @@ private:
     // Borrowed from Program; every measured chunk retires before this pair is reused.
     CudaEventTimer* prefill_gpu_timer_ = nullptr;
     std::uint32_t prefill_chunk_;
-    AttentionSchedule attention_schedule_;
+    ExecutionSchedule execution_schedule_;
     std::uint32_t text_kv_base_;
     const Tensor* active_cache_positions_                                          = nullptr;
     const Tensor* active_rope_positions_                                           = nullptr;

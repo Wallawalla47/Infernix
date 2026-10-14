@@ -70,12 +70,17 @@ int run_fp8_a16() {
         vocabulary_invocations.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only});
     for (int t : {7, 25, 41, 48, 56, 64, 65, 128})
         vocabulary_invocations.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true});
+    // The column-invariant route: the 8-column tile at every T, sliced beyond it.
+    for (int t : {1, 2, 5, 8, 9, 16, 17, 33, 40, 65, 129})
+        vocabulary_invocations.push_back(
+            {t, CallForm::Policy, ops::LinearPolicy::A16ColumnInvariant});
     failures += run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
                           {248320, 5120, 823U, Comparison::Sampled, true, vocabulary_invocations});
     constexpr std::array vocabulary_policies{
         ops::LinearPolicy::A16Only,
         ops::LinearPolicy::AllowA8,
         ops::LinearPolicy::AllowA4,
+        ops::LinearPolicy::A16ColumnInvariant,
     };
     for (const ops::LinearPolicy policy : vocabulary_policies) {
         try {

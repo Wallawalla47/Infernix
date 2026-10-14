@@ -19,11 +19,16 @@ bool aligned_to(const void* pointer, std::uintptr_t alignment) {
     return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) == 0;
 }
 
-void validate_policy(LinearPolicy policy) {
+void validate_policy(LinearPolicy policy, QType qtype) {
+    if (column_invariant(policy) && qtype != QType::NVFP4 &&
+        qtype != QType::FP8_E4M3FN_ROW_BF16) {
+        throw std::invalid_argument("linear_swiglu: the weight format registers no column-invariant route");
+    }
     switch (policy) {
     case LinearPolicy::A16Only:
     case LinearPolicy::AllowA8:
     case LinearPolicy::AllowA4:
+    case LinearPolicy::A16ColumnInvariant:
         return;
     }
     throw std::invalid_argument("linear_swiglu: invalid compute policy");
@@ -35,7 +40,7 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
                                                    std::int32_t input_rows, LinearPolicy policy,
                                                    std::int32_t min_tokens,
                                                    std::int32_t max_tokens) {
-    validate_policy(policy);
+    validate_policy(policy, qtype);
     if (min_tokens <= 0 || max_tokens < min_tokens || (gate_up_rows % 2) != 0) {
         throw std::invalid_argument("linear_swiglu workspace: invalid profile or token interval");
     }
@@ -75,7 +80,7 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
 
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, LinearPolicy policy,
                    WorkspaceArena& ws, cudaStream_t stream) {
-    validate_policy(policy);
+    validate_policy(policy, gate_up_weight.qtype);
     if (x.dtype != DType::BF16 || out.dtype != DType::BF16) {
         throw std::invalid_argument("linear_swiglu: x/out must be BF16");
     }

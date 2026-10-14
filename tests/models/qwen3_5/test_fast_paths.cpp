@@ -30,36 +30,114 @@ int main() {
 
     // decode-split64: INT8 KV with 24 query heads only.
     const FastPathConfiguration int8_24{24, ActivationClass::A4, KvCacheStorage::Int8Group64};
-    failures += check(q::fast_path_applies(FastPath::DecodeSplit64, int8_24, options),
+    failures += check(q::fast_path_applies(FastPath::DecodeSplit64, int8_24, options, true),
                       "decode-split64 must apply to 24 heads with INT8 KV");
     failures += check(!q::fast_path_applies(FastPath::DecodeSplit64,
-                                            {16, ActivationClass::A4, KvCacheStorage::Int8Group64}, options),
+                                            {16, ActivationClass::A4, KvCacheStorage::Int8Group64}, options, true),
                       "decode-split64 must not apply to 16 heads");
     for (const auto kv : {KvCacheStorage::BFloat16, KvCacheStorage::Fp8E4M3Row256, KvCacheStorage::Nvfp4Group16,
                           KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2, KvCacheStorage::Q4KeyVq2Value}) {
-        failures += check(!q::fast_path_applies(FastPath::DecodeSplit64, {24, ActivationClass::A4, kv}, options),
+        failures += check(!q::fast_path_applies(FastPath::DecodeSplit64, {24, ActivationClass::A4, kv}, options, true),
                           "decode-split64 must apply to INT8 KV only");
     }
 
     // prompt-pv8: the KV formats whose prompt kernel has an 8-bit P*V form.
     for (const auto kv : {KvCacheStorage::Int8Group64, KvCacheStorage::Nvfp4Group16,
                           KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2, KvCacheStorage::Q4KeyVq2Value}) {
-        failures += check(q::fast_path_applies(FastPath::PromptPv8, {24, ActivationClass::A4, kv}, options),
+        failures += check(q::fast_path_applies(FastPath::PromptPv8, {24, ActivationClass::A4, kv}, options, true),
                           "prompt-pv8 must apply where an 8-bit P*V form exists");
     }
     for (const auto kv : {KvCacheStorage::BFloat16, KvCacheStorage::Fp8E4M3Row256}) {
-        failures += check(!q::fast_path_applies(FastPath::PromptPv8, {24, ActivationClass::A4, kv}, options),
+        failures += check(!q::fast_path_applies(FastPath::PromptPv8, {24, ActivationClass::A4, kv}, options, true),
                           "prompt-pv8 must not apply to BF16 or FP8 KV");
     }
     infernix::EngineOptions original = options;
     original.original_int8_prefill_kernel = true;
-    failures += check(!q::fast_path_applies(FastPath::PromptPv8, int8_24, original),
+    failures += check(!q::fast_path_applies(FastPath::PromptPv8, int8_24, original, true),
                       "prompt-pv8 needs the fast INT8 prompt kernel");
     original                                = options;
     original.original_nvfp4_prefill_kernel  = true;
     failures += check(!q::fast_path_applies(FastPath::PromptPv8,
-                                            {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16}, original),
+                                            {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16}, original, true),
                       "prompt-pv8 needs the fast NVFP4 prompt kernel");
+
+    // The request-coupling paths apply only where the exact route can be request-invariant, and
+    // speculation and cache resume only where those run.
+    for (const FastPath path : infernix::kFastPaths) {
+        if (!q::couples_requests(path)) { continue; }
+        failures += check(!q::fast_path_applies(path, int8_24, options, false),
+                          std::string(infernix::fast_path_name(path)) +
+                              " must not apply where request invariance is impossible");
+    }
+    for (const FastPath path :
+         {FastPath::BatchedDecode, FastPath::BatchSplitAttention, FastPath::Preemption}) {
+        failures += check(q::fast_path_applies(path, int8_24, options, true),
+                          std::string(infernix::fast_path_name(path)) + " must apply when capable");
+    }
+    // Low-precision batched decode needs an artifact whose activations go below 16 bits.
+    for (const FastPath path : {FastPath::BatchedA8Decode, FastPath::BatchedA4Decode}) {
+        failures += check(!q::fast_path_applies(path,
+                                                {24, ActivationClass::A16, KvCacheStorage::Int8Group64},
+                                                options, true),
+                          std::string(infernix::fast_path_name(path)) +
+                              " must not apply at 16-bit activations");
+        failures += check(q::fast_path_applies(path, int8_24, options, true),
+                          std::string(infernix::fast_path_name(path)) +
+                              " must apply at 4-bit activations");
+    }
+    failures += check(!q::fast_path_applies(FastPath::BatchedA4Decode,
+                                            {24, ActivationClass::A8, KvCacheStorage::Int8Group64},
+                                            options, true),
+                      "batched-a4-decode must not apply at 8-bit activations");
+    infernix::EngineOptions plain = options;
+    plain.speculative             = {};
+    plain.context_cache.enabled   = false;
+    failures += check(!q::fast_path_applies(FastPath::AdaptiveSpeculation, int8_24, plain, true),
+                      "adaptive-speculation must not apply without speculation");
+    failures += check(!q::fast_path_applies(FastPath::FreeCacheResume, int8_24, plain, true),
+                      "free-cache-resume must not apply without the prefix cache");
+    infernix::EngineOptions coupled         = plain;
+    coupled.speculative.backend             = infernix::SpeculativeBackend::Mtp;
+    coupled.context_cache.enabled           = true;
+    failures += check(q::fast_path_applies(FastPath::AdaptiveSpeculation, int8_24, coupled, true),
+                      "adaptive-speculation must apply with speculation");
+    failures += check(q::fast_path_applies(FastPath::FreeCacheResume, int8_24, coupled, true),
+                      "free-cache-resume must apply with the prefix cache");
+    failures += check(!q::couples_requests(FastPath::PromptPv8) &&
+                          !q::couples_requests(FastPath::DecodeSplit64),
+                      "prompt-pv8 and decode-split64 do not couple requests");
+
+    // The request-coupling paths are qualified on the four measured KV formats (4-bit activations),
+    // except the low-precision path, which failed the decode gate.
+    for (const auto kv : {KvCacheStorage::Int8Group64, KvCacheStorage::Nvfp4Group16,
+                          KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Q4KeyVq2Value}) {
+        for (const FastPath path : {FastPath::BatchedDecode, FastPath::BatchSplitAttention,
+                                    FastPath::AdaptiveSpeculation, FastPath::FreeCacheResume,
+                                    FastPath::Preemption}) {
+            failures += check(q::fast_path_qualified(path, {24, ActivationClass::A4, kv}),
+                              std::string(infernix::fast_path_name(path)) + " is qualified");
+        }
+        failures += check(!q::fast_path_qualified(FastPath::BatchedA4Decode,
+                                                  {24, ActivationClass::A4, kv}),
+                          "batched-a4-decode is not qualified");
+    }
+    failures += check(!q::fast_path_qualified(FastPath::BatchedDecode,
+                                              {24, ActivationClass::A4, KvCacheStorage::Vq2}),
+                      "batched-decode is not qualified on the unmeasured VQ2 KV");
+
+    // Request invariance needs capability and no coupling path.
+    q::FastPathSelection selection{.configuration = int8_24, .paths = {}, .invariant_capable = true};
+    failures += check(selection.request_invariant(), "no coupling path selected is invariant");
+    selection.paths = {FastPath::PromptPv8, FastPath::DecodeSplit64};
+    failures += check(selection.request_invariant(), "prompt-pv8 and decode-split64 keep invariance");
+    selection.paths.push_back(FastPath::Preemption);
+    failures += check(!selection.request_invariant() && !selection.invariant(FastPath::Preemption) &&
+                          selection.invariant(FastPath::BatchedDecode),
+                      "a coupling path gives up its own part of invariance only");
+    selection.paths.clear();
+    selection.invariant_capable = false;
+    failures += check(!selection.request_invariant() && !selection.invariant(FastPath::BatchedDecode),
+                      "an incapable artifact is not invariant");
 
     // Qualification is per configuration: the measured one, not its neighbours.
     failures += check(q::fast_path_qualified(FastPath::DecodeSplit64, int8_24),
@@ -69,11 +147,8 @@ int main() {
                                                   {24, activations, KvCacheStorage::Int8Group64}),
                           "decode-split64 is not qualified at higher activation precision");
     }
-    // INT8 KV runs decode-split64 too, and that pair failed the decode gate.
-    failures += check(!q::fast_path_qualified(FastPath::PromptPv8, int8_24),
-                      "prompt-pv8 is not qualified beside decode-split64 on INT8 KV");
-    for (const auto kv : {KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2,
-                          KvCacheStorage::Q4KeyVq2Value}) {
+    for (const auto kv : {KvCacheStorage::Int8Group64, KvCacheStorage::Nvfp4Group16,
+                          KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2, KvCacheStorage::Q4KeyVq2Value}) {
         failures += check(q::fast_path_qualified(FastPath::PromptPv8, {24, ActivationClass::A4, kv}),
                           "prompt-pv8 is qualified for 24 heads and 4-bit activations on these KV formats");
         failures += check(!q::fast_path_qualified(FastPath::PromptPv8, {24, ActivationClass::A16, kv}),

@@ -101,7 +101,16 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t
 }
 
 bool uses_a8(std::int32_t, std::int32_t) { return false; }
+
+// A16ColumnInvariant: 16 K-warps over the same K slices, reduced in the same order, at every T:
+// the 8-column tile through 8 columns and 32-column slices beyond (the MMA's columns are
+// independent), so a column's arithmetic does not depend on the call's other columns.
+void launch_invariant(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+    if (x.ne[1] <= 8) return launch_tile<8, 16, 1>(x, weight, out, stream);
+    launch_tile<32, 16, 1>(x, weight, out, stream);
+}
 } // namespace
 
-const Fp8LinearShape kFp8N248320K5120{248320, 5120, launch_a16, nullptr, uses_a8};
+const Fp8LinearShape kFp8N248320K5120{248320, 5120, launch_a16, nullptr, uses_a8, nullptr,
+                                      launch_invariant};
 } // namespace infernix::ops::detail

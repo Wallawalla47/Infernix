@@ -28,7 +28,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     : parameters(parameters_in), device(device_in), capacity(plan.capacity),
       kv_capacity(plan.kv_capacity), max_concurrency(plan.max_concurrency),
       context_cache(plan.context_cache), prefill_chunk(plan.prefill_chunk),
-      attention_schedule(plan.attention_schedule), draft_window(plan.draft_window),
+      execution_schedule(plan.execution_schedule), draft_window(plan.draft_window),
       neural_draft_window(plan.neural_draft_window), tree_widths(plan.tree_widths),
       draft_tree_paths(plan.draft_tree_paths), ngram_draft_window(plan.ngram_draft_window),
       ngram_min_match(plan.ngram_min_match), speculative_backend(plan.speculative_backend),
@@ -398,7 +398,7 @@ ScoreResult ProgramImpl::causal_score(PreparedPromptData&& prompt, std::uint32_t
             const std::uint32_t nominal = std::min(prefill_chunk, predictor_count - cursor);
             execution::PrefillContext schedule_state{
                 {device, parameters, work, *state_images, nullptr, io, prefill_hidden,
-                 prefill_chunk, proposal_head, attention_schedule},
+                 prefill_chunk, proposal_head, execution_schedule},
                 decoder->text_kv.execution_view(text_kv_addresses->execution_row(*address)),
                 {},
                 decoder->text_kv,

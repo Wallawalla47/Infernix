@@ -35,6 +35,10 @@ infernix::EngineOptions dflash_engine_options(const char* artifact, infernix::Pr
     options.speculative.proposal_head = proposal;
     options.use_cuda_graph            = true;
     options.context_cache.hybrid.device_snapshot_slots = 2;
+    // Adaptive rounds and resumes from the committed frontier (the page-boundary case) are fast
+    // paths; the exact route verifies fixed chains and resumes on the chunk grid.
+    options.fast_path_candidates = {infernix::FastPath::AdaptiveSpeculation,
+                                    infernix::FastPath::FreeCacheResume};
     return options;
 }
 

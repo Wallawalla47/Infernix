@@ -13,12 +13,14 @@ namespace infernix::ops::detail {
 namespace {
 
 enum class Fp8LinearSwiGluRoute : std::uint8_t {
+    ColumnInvariantA16,
     A16,
     A8,
 };
 
 Fp8LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (tokens <= 0) { throw std::invalid_argument("fp8 linear_swiglu: T must be positive"); }
+    if (column_invariant(policy)) { return Fp8LinearSwiGluRoute::ColumnInvariantA16; }
     if (policy == LinearPolicy::A16Only) { return Fp8LinearSwiGluRoute::A16; }
     if (!allows_a8(policy)) {
         throw std::invalid_argument("fp8 linear_swiglu admits only A16 or A8");
@@ -51,7 +53,12 @@ std::size_t fp8_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy, std:
 void fp8_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& out,
                                 LinearPolicy policy, WorkspaceArena& workspace,
                                 cudaStream_t stream) {
-    if (resolve_route(policy, x.ne[1]) == Fp8LinearSwiGluRoute::A16) {
+    const Fp8LinearSwiGluRoute route = resolve_route(policy, x.ne[1]);
+    if (route == Fp8LinearSwiGluRoute::ColumnInvariantA16) {
+        fp8_linear_swiglu_invariant_launch(x, weight, out, stream);
+        return;
+    }
+    if (route == Fp8LinearSwiGluRoute::A16) {
         launch_a16(x, weight, out, stream);
         return;
     }

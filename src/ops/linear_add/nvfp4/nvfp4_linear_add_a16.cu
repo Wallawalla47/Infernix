@@ -2,6 +2,8 @@
 #include "ops/linear/nvfp4/nvfp4_template_launch.cuh"
 #include "ops/linear/nvfp4/nvfp4_instances.cuh"
 
+#include <stdexcept>
+
 namespace infernix::ops::detail {
 namespace {
 template <int K>
@@ -112,6 +114,49 @@ void launch_matrix(const Tensor& x, const Weight& weight, Tensor& residual, cuda
     }
 }
 } // namespace
+
+void nvfp4_linear_add_invariant_launch(const Tensor& x, const Weight& weight, Tensor& residual,
+                                       cudaStream_t stream) {
+    // Tiles of one K-warp count walk the same K slices and reduce them in the same order, and the
+    // MMA's columns are independent: the tile width only sets how many columns share a launch,
+    // and wider calls run as 64-column slices.
+    const int tokens  = x.ne[1];
+    const auto p      = nvfp4_a16_operands(x, weight);
+    const auto output = LinearBf16Output{static_cast<__nv_bfloat16*>(residual.data), weight.n};
+    const auto epilogue =
+        LinearResidualAddEpilogue{{static_cast<__nv_bfloat16*>(residual.data), weight.n}};
+    if (weight.k == 6144) {
+        if (tokens <= 8)
+            return launch_nvfp4_a16_sliced_k_mma<
+                Nvfp4ScheduleInstance<Nvfp4SlicedInstance<8, 8, 2>, 6144>>(p, output, epilogue,
+                                                                           stream);
+        if (tokens <= 16)
+            return launch_nvfp4_a16_sliced_k_mma<
+                Nvfp4ScheduleInstance<Nvfp4SlicedInstance<16, 8, 2>, 6144>>(p, output, epilogue,
+                                                                            stream);
+        return launch_nvfp4_a16_sliced_k_mma<
+            Nvfp4ScheduleInstance<Nvfp4SlicedInstance<64, 8, 1>, 6144>>(p, output, epilogue,
+                                                                        stream);
+    }
+    if (weight.k == 17408) {
+        if (tokens <= 8)
+            return launch_nvfp4_a16_sliced_k_mma<
+                Nvfp4ScheduleInstance<Nvfp4SlicedInstance<8, 4, 2>, 17408>>(p, output, epilogue,
+                                                                            stream);
+        if (tokens <= 16)
+            return launch_nvfp4_a16_sliced_k_mma<
+                Nvfp4ScheduleInstance<Nvfp4SlicedInstance<16, 4, 2>, 17408>>(p, output, epilogue,
+                                                                             stream);
+        if (tokens <= 32)
+            return launch_nvfp4_a16_sliced_k_mma<
+                Nvfp4ScheduleInstance<Nvfp4SlicedInstance<32, 4, 2>, 17408>>(p, output, epilogue,
+                                                                             stream);
+        return launch_nvfp4_a16_sliced_k_mma<
+            Nvfp4ScheduleInstance<Nvfp4SlicedInstance<64, 4, 2>, 17408>>(p, output, epilogue,
+                                                                         stream);
+    }
+    throw std::invalid_argument("nvfp4 linear_add: unsupported column-invariant problem");
+}
 
 void nvfp4_linear_add_a16_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                  cudaStream_t stream) {

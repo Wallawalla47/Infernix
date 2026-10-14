@@ -379,11 +379,13 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
     }
     summary.weight_formats.assign(formats.begin(), formats.end());
     {
-        const models::qwen3_5::FastPathSelection fast =
-            models::qwen3_5::select_fast_paths(*instance->model, options);
+        const models::qwen3_5::FastPathSelection fast = models::qwen3_5::select_fast_paths(
+            *instance->model, options, instance->parameters.invariant_text.has_value());
         summary.fast_path_configuration = models::qwen3_5::describe(fast.configuration);
         for (const FastPath path : fast.paths) { summary.fast_paths.emplace_back(fast_path_name(path)); }
         summary.fast_paths_disabled = !options.fast_paths;
+        summary.request_invariant   = fast.request_invariant();
+        summary.request_invariance_capable = fast.invariant_capable;
     }
     summary.load_seconds         = std::chrono::duration<double>(Clock::now() - start).count();
     summary.upload_seconds       = stats.upload_seconds;

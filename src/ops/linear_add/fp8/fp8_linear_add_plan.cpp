@@ -13,6 +13,7 @@ namespace infernix::ops::detail {
 namespace {
 
 enum class Fp8LinearAddRoute : std::uint8_t {
+    ColumnInvariantA16,
     A16,
     A8,
 };
@@ -23,6 +24,7 @@ Fp8LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_row
         (input_rows != Fp8N5120K6144::kInputRows && input_rows != Fp8N5120K17408::kInputRows)) {
         throw std::invalid_argument("fp8 linear_add: unsupported shape");
     }
+    if (column_invariant(policy)) { return Fp8LinearAddRoute::ColumnInvariantA16; }
     if (policy == LinearPolicy::A16Only) { return Fp8LinearAddRoute::A16; }
     if (!allows_a8(policy)) { throw std::invalid_argument("fp8 linear_add: unsupported policy"); }
     const std::int32_t first_a8 = input_rows == Fp8N5120K6144::kInputRows ? 17 : 20;
@@ -54,6 +56,10 @@ std::size_t fp8_linear_add_workspace_capacity_bytes(std::int32_t output_rows,
 void fp8_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,
                              LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream) {
     const Fp8LinearAddRoute route = resolve_route(weight.n, weight.k, policy, x.ne[1]);
+    if (route == Fp8LinearAddRoute::ColumnInvariantA16) {
+        fp8_linear_add_invariant_launch(x, weight, residual, stream);
+        return;
+    }
     if (route == Fp8LinearAddRoute::A16) {
         launch_a16(x, weight, residual, stream);
         return;

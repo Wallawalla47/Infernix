@@ -279,11 +279,16 @@ void require_q8_rowsplit(const Weight& weight, std::int32_t rows, const char* la
     }
 }
 
-void validate_policy(LinearPolicy policy) {
+void validate_policy(LinearPolicy policy, QType qtype) {
+    if (column_invariant(policy) && qtype != QType::NVFP4 &&
+        qtype != QType::FP8_E4M3FN_ROW_BF16) {
+        throw std::invalid_argument("gdn_input_proj: the weight format registers no column-invariant route");
+    }
     switch (policy) {
     case LinearPolicy::A16Only:
     case LinearPolicy::AllowA8:
     case LinearPolicy::AllowA4:
+    case LinearPolicy::A16ColumnInvariant:
         return;
     }
     throw std::invalid_argument("gdn_input_proj: invalid compute policy");
@@ -291,7 +296,7 @@ void validate_policy(LinearPolicy policy) {
 
 void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                             LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream) {
-    validate_policy(policy);
+    validate_policy(policy, weight.qtype);
     const std::int32_t cols = x.ne[1];
     if (cols <= 0) { throw std::invalid_argument("gdn_input_proj: T must be positive"); }
 
@@ -434,7 +439,7 @@ void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
                                      const Tensor& snapshot_base_slots, Tensor& query, Tensor& key,
                                      Tensor& value, Tensor& z, LinearPolicy policy,
                                      WorkspaceArena& workspace, cudaStream_t stream) {
-    validate_policy(policy);
+    validate_policy(policy, weight.qtype);
 
     if (weight.qtype == QType::NVFP4) {
         constexpr std::int32_t kHidden     = 5120;
@@ -462,7 +467,7 @@ void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
                             "gdn_input_proj_conv_snapshot", "z");
         const detail::Nvfp4GdnConvPlan plan =
             detail::nvfp4_gdn_conv_resolve_plan(policy, geometry.width, geometry.batch);
-        if (geometry.batch > 1) {
+        if (geometry.batch > 1 || column_invariant(policy)) {
             if (plan.schedule != detail::Nvfp4GdnConvScheduleId::Materialized) {
                 throw std::logic_error("batched NVFP4 GDN conv selected a fused schedule");
             }
@@ -580,7 +585,7 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
                                    Tensor& query, Tensor& key, Tensor& value, Tensor& z,
                                    LinearPolicy policy, WorkspaceArena& workspace,
                                    cudaStream_t stream, const Tensor* tree_rows = nullptr) {
-    validate_policy(policy);
+    validate_policy(policy, weight.qtype);
     if (tree_rows != nullptr) {
         if (x.ne[1] < 2 || x.ne[1] > kSpeculativeTreeMaxNodes) {
             throw std::invalid_argument(
@@ -628,7 +633,8 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
         }
         const detail::Nvfp4GdnConvPlan plan =
             detail::nvfp4_gdn_conv_resolve_plan(policy, geometry.width, geometry.batch);
-        if (plan.schedule == detail::Nvfp4GdnConvScheduleId::Materialized && geometry.batch > 1) {
+        if (plan.schedule == detail::Nvfp4GdnConvScheduleId::Materialized &&
+            (geometry.batch > 1 || column_invariant(policy))) {
             compose_record(x, conv_weight, conv_states, valid_columns, initial_state_slots,
                            conv_record, query, key, value, z, geometry, workspace, stream,
                            [&](const Tensor& x_flat, Tensor& record_flat, Tensor& z_flat) {
@@ -757,7 +763,7 @@ std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int
                                                     std::int32_t input_rows, LinearPolicy policy,
                                                     std::int32_t min_tokens,
                                                     std::int32_t max_tokens) {
-    validate_policy(policy);
+    validate_policy(policy, parent_qtype);
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("gdn_input_proj workspace: invalid token interval");
     }
@@ -844,7 +850,7 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
 std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     QType parent_qtype, std::int32_t parent_rows, std::int32_t input_rows, LinearPolicy policy,
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {
-    validate_policy(policy);
+    validate_policy(policy, parent_qtype);
     require_snapshot_capacity_domain(batch_size, min_width, max_width);
     if (parent_qtype == QType::FP8_E4M3FN_ROW_BF16 &&
         parent_rows == detail::Fp8N16384K5120::kOutputRows &&
@@ -857,7 +863,7 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
         throw std::invalid_argument(
             "gdn_input_proj_conv_snapshot workspace: unsupported single-parent profile");
     }
-    if (batch_size == 1) {
+    if (batch_size == 1 && !column_invariant(policy)) {
         return detail::nvfp4_gdn_snapshot_workspace_capacity_bytes(policy, min_width, max_width);
     }
 
@@ -893,7 +899,7 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
 std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     QType parent_qtype, std::int32_t parent_rows, std::int32_t input_rows, LinearPolicy policy,
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {
-    validate_policy(policy);
+    validate_policy(policy, parent_qtype);
     require_record_capacity_domain(batch_size, min_width, max_width);
     if (parent_qtype == QType::FP8_E4M3FN_ROW_BF16 &&
         parent_rows == detail::Fp8N16384K5120::kOutputRows &&

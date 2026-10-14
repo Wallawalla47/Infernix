@@ -48,6 +48,24 @@ constexpr auto kLaunchers = make_launchers(std::make_index_sequence<1>{});
 
 } // namespace
 
+void nvfp4_linear_swiglu_invariant_launch(const Tensor& x, const Weight& weight, Tensor& out,
+                                          cudaStream_t stream) {
+    // The tiles run 8 K-warps over the same K slices and reduce them in the same order, and the
+    // MMA's columns are independent, so the tile width changes only how many columns share a
+    // launch; wider calls run as 64-column slices.
+    const auto p = nvfp4_a16_operands(x, weight);
+    const LinearBf16Output output{static_cast<__nv_bfloat16*>(out.data), kIntermediate};
+    if (x.ne[1] <= 8)
+        launch_nvfp4_a16_sliced_k_mma<Nvfp4ScheduleInstance<Nvfp4SlicedInstance<8, 8, 2>, 5120>>(
+            p, output, Nvfp4SwiGluEpilogue{}, stream, Nvfp4SwiGluRows<8>{});
+    else if (x.ne[1] <= 16)
+        launch_nvfp4_a16_sliced_k_mma<Nvfp4ScheduleInstance<Nvfp4SlicedInstance<16, 8, 2>, 5120>>(
+            p, output, Nvfp4SwiGluEpilogue{}, stream, Nvfp4SwiGluRows<8>{});
+    else
+        launch_nvfp4_a16_sliced_k_mma<Nvfp4ScheduleInstance<Nvfp4SlicedInstance<64, 8, 1>, 5120>>(
+            p, output, Nvfp4SwiGluEpilogue{}, stream, Nvfp4SwiGluRows<8>{});
+}
+
 void nvfp4_linear_swiglu_small_t_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                         cudaStream_t stream) {
     const auto p = nvfp4_a16_operands(x, weight);

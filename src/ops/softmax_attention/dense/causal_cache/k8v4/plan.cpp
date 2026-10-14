@@ -35,7 +35,7 @@ K8V4KvCausalPlan make_k8v4_kv_causal_plan(int heads, int width, int batch,
     const int query_tile        = family == K8V4KvFamily::ParallelGrouped && width <= 16
                                       ? (width + 1) / 2
                                       : std::min(width, grouped_limit);
-    const int independent_tiles = batch * (heads == 24 ? 4 : 2) * tiles;
+    const int independent_tiles = (envelope.row_invariant_partition ? 1 : batch) * (heads == 24 ? 4 : 2) * tiles;
     // Decode budgets two CTAs per SM; wider queries start with one and double the
     // budget if complete query-tile groups would leave over 10% of the SMs idle.
     const std::int64_t sms = multiprocessor_count;

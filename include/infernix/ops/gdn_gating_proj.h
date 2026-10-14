@@ -4,6 +4,7 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/tensor.h"
+#include "infernix/ops/linear.h"
 
 #include <cuda_runtime.h>
 
@@ -23,6 +24,7 @@ namespace infernix::ops {
 // interval rules and does not make the optimized route part of the semantic API.
 [[nodiscard]] std::size_t gdn_norm_gating_proj_workspace_capacity_bytes(std::int32_t heads,
                                                                         std::int32_t input_rows,
+                                                                        LinearPolicy policy,
                                                                         std::int32_t min_tokens,
                                                                         std::int32_t max_tokens);
 
@@ -82,16 +84,21 @@ void gdn_gating_proj(const Tensor& x, const Weight& ab_weight, const Tensor& A_l
  * boundary. A contiguous [hidden,W,B] block is presented as the matrix with T=W*B; each
  * column has its own norm and controls. DFlash2 target verification uses W=2..16, B=1..8
  * (T<=128), without restricting the positive-T matrix contract.
+ *
+ * `policy` A16ColumnInvariant selects one schedule for every T, so a column's outputs are
+ * functions of that column alone whatever T is (LinearPolicy). The Qwen3.8-27B problem (48 heads,
+ * 5120 inputs) registers it; other problems reject it. Every other valid policy selects the
+ * default route.
  */
 void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
                           const Weight& a_weight, const Weight& b_weight, const Tensor& A_log,
-                          const Tensor& dt_bias, WorkspaceArena& ws, Tensor& h, Tensor& g,
-                          Tensor& beta, DeviceExecutionView execution);
+                          const Tensor& dt_bias, LinearPolicy policy, WorkspaceArena& ws,
+                          Tensor& h, Tensor& g, Tensor& beta, DeviceExecutionView execution);
 
 /** The Qwen3.8-27B and Qwen3.6-35B-A3B contiguous-parent storage forms described above. */
 void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
                           const Weight& ab_weight, const Tensor& A_log, const Tensor& dt_bias,
-                          WorkspaceArena& ws, Tensor& h, Tensor& g, Tensor& beta,
-                          DeviceExecutionView execution);
+                          LinearPolicy policy, WorkspaceArena& ws, Tensor& h, Tensor& g,
+                          Tensor& beta, DeviceExecutionView execution);
 
 } // namespace infernix::ops

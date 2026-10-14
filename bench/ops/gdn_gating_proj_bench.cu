@@ -157,16 +157,19 @@ void run(const Options& o, int t, DeviceExecutionView execution, bench::L2FlushB
                wb = weight(static_cast<const std::uint16_t*>(w.p) + std::size_t(heads) * hidden,
                            heads, hidden);
     const auto capacity =
-        o.norm ? ops::gdn_norm_gating_proj_workspace_capacity_bytes(heads, hidden, t, t)
+        o.norm ? ops::gdn_norm_gating_proj_workspace_capacity_bytes(heads, hidden,
+                                                                    ops::LinearPolicy::A16Only, t, t)
                : ops::gdn_gating_proj_workspace_capacity_bytes(heads, hidden, t, t);
     WorkspaceArena ws(std::max<std::size_t>(capacity, 256));
     auto launch = [&](cudaStream_t stream) {
         const DeviceExecutionView e{stream, execution.multiprocessor_count};
         if (o.norm) {
             if (o.parent)
-                ops::gdn_norm_gating_proj(tx, tn, 1.0e-6f, wp, ta, td, ws, th, tg, tb, e);
+                ops::gdn_norm_gating_proj(tx, tn, 1.0e-6f, wp, ta, td, ops::LinearPolicy::A16Only,
+                                          ws, th, tg, tb, e);
             else
-                ops::gdn_norm_gating_proj(tx, tn, 1.0e-6f, wa, wb, ta, td, ws, th, tg, tb, e);
+                ops::gdn_norm_gating_proj(tx, tn, 1.0e-6f, wa, wb, ta, td,
+                                          ops::LinearPolicy::A16Only, ws, th, tg, tb, e);
         } else {
             if (o.parent)
                 ops::gdn_gating_proj(tx, wp, ta, td, ws, tg, tb, e);

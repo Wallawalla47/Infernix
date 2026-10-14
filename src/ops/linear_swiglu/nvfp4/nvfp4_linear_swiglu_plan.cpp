@@ -14,6 +14,7 @@ namespace infernix::ops::detail {
 namespace {
 
 enum class Nvfp4LinearSwiGluRoute {
+    ColumnInvariantA16,
     DecodeFusedA16,
     SmallTFusedA16,
     FusedA4,
@@ -25,6 +26,7 @@ Nvfp4LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (!valid_linear_policy(policy)) {
         throw std::invalid_argument("nvfp4 linear_swiglu: invalid compute policy");
     }
+    if (column_invariant(policy)) { return Nvfp4LinearSwiGluRoute::ColumnInvariantA16; }
     if (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) {
         if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
         return Nvfp4LinearSwiGluRoute::SmallTFusedA16;
@@ -58,7 +60,8 @@ std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
     }
     (void)resolve_route(policy, min_tokens);
     (void)resolve_route(policy, max_tokens);
-    if ((policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) || max_tokens <= 4) {
+    if (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8 ||
+        column_invariant(policy) || max_tokens <= 4) {
         return 0;
     }
 
@@ -69,6 +72,9 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
                                   LinearPolicy policy, WorkspaceArena& workspace,
                                   cudaStream_t stream) {
     switch (resolve_route(policy, x.ne[1])) {
+    case Nvfp4LinearSwiGluRoute::ColumnInvariantA16:
+        nvfp4_linear_swiglu_invariant_launch(x, weight, out, stream);
+        return;
     case Nvfp4LinearSwiGluRoute::DecodeFusedA16:
         nvfp4_linear_swiglu_decode_launch(x, weight, out, stream);
         return;

@@ -13,6 +13,8 @@ enum class ActivationCompute : std::uint8_t {
     A16,
     A8,
     A4,
+    // A16 compute under LinearPolicy::A16ColumnInvariant: one schedule at every T.
+    A16ColumnInvariant,
 };
 
 struct Profile {

@@ -65,6 +65,9 @@ infernix::EngineOptions hybrid_options(const char* artifact, infernix::Speculati
     }
     options.context_cache.host_capacity_bytes          = host_bytes;
     options.context_cache.hybrid.device_snapshot_slots = device_slots;
+    // The cache resumes off the prefill chunk grid, from taps and endpoints, only under the
+    // free-cache-resume fast path; these cases test those resumes.
+    options.fast_path_candidates = {infernix::FastPath::FreeCacheResume};
     return options;
 }
 

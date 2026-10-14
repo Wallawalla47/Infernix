@@ -75,11 +75,16 @@ void require_bf16_contiguous(const Weight& weight, std::int32_t rows, std::int32
     }
 }
 
-void validate_policy(LinearPolicy policy) {
+void validate_policy(LinearPolicy policy, QType qtype) {
+    if (column_invariant(policy) && qtype != QType::NVFP4 &&
+        qtype != QType::FP8_E4M3FN_ROW_BF16) {
+        throw std::invalid_argument("attn_input_proj: the weight format registers no column-invariant route");
+    }
     switch (policy) {
     case LinearPolicy::A16Only:
     case LinearPolicy::AllowA8:
     case LinearPolicy::AllowA4:
+    case LinearPolicy::A16ColumnInvariant:
         return;
     }
     throw std::invalid_argument("attn_input_proj: invalid compute policy");
@@ -88,7 +93,7 @@ void validate_policy(LinearPolicy policy) {
 void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                             Tensor& k, Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,
                             cudaStream_t stream) {
-    validate_policy(policy);
+    validate_policy(policy, weight.qtype);
     if (weight.qtype == QType::BF16) {
         constexpr std::int32_t kHidden = 5120;
         constexpr std::int32_t kQRows  = 6144;
@@ -167,7 +172,7 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
                                                      std::int32_t input_rows, LinearPolicy policy,
                                                      std::int32_t min_tokens,
                                                      std::int32_t max_tokens) {
-    validate_policy(policy);
+    validate_policy(policy, parent_qtype);
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("attn_input_proj workspace: invalid token interval");
     }

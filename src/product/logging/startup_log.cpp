@@ -325,6 +325,10 @@ void StartupLogRenderer::engine_ready(const LoadSummary& load) {
         if (paths.empty()) {
             paths = load.fast_paths_disabled ? "disabled (exact route)" : "none qualified";
         }
+        paths += !load.request_invariance_capable
+                     ? " | not request-invariant (this artifact's formats)"
+                 : load.request_invariant ? " | request-invariant"
+                                          : " | request-coupled";
         impl_->logger->info("fast paths | {} | {}", paths, load.fast_path_configuration);
     }
     impl_->logger->debug("context cost | transfer {} | prefill {} | signature {}",

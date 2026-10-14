@@ -75,7 +75,7 @@ struct Measurement {
                  "error: %s\n"
                  "usage: infernix_attn_input_proj_bench "
                  "[--format q4q5|q8-qgkv|q8-qkv|q8-dflash2-qkv|bf16|nvfp4|fp8|all] "
-                 "[--nvfp4-policy a16|a4] [--fp8-policy a16|a8] "
+                 "[--nvfp4-policy a16|a4|invariant] [--fp8-policy a16|a8|invariant] "
                  "[--tokens T,...] [--cache cold|warm|both] [--execution eager|graph] "
                  "[--warmup N] [--repeat N] [--profile] [--csv-out PATH]\n",
                  message);
@@ -145,16 +145,20 @@ Options parse_options(int argc, char** argv) {
                 options.nvfp4_policy = ops::LinearPolicy::A16Only;
             else if (value == "a4")
                 options.nvfp4_policy = ops::LinearPolicy::AllowA4;
+            else if (value == "invariant")
+                options.nvfp4_policy = ops::LinearPolicy::A16ColumnInvariant;
             else
-                usage("--nvfp4-policy expects a16 or a4");
+                usage("--nvfp4-policy expects a16, a4 or invariant");
         } else if (argument == "--fp8-policy") {
             const std::string_view value(next("--fp8-policy requires a value"));
             if (value == "a16")
                 options.fp8_policy = ops::LinearPolicy::A16Only;
             else if (value == "a8")
                 options.fp8_policy = ops::LinearPolicy::AllowA8;
+            else if (value == "invariant")
+                options.fp8_policy = ops::LinearPolicy::A16ColumnInvariant;
             else
-                usage("--fp8-policy expects a16 or a8");
+                usage("--fp8-policy expects a16, a8 or invariant");
         } else if (argument == "--tokens") {
             options.tokens = parse_list(next("--tokens requires a value"), "--tokens");
         } else if (argument == "--cache") {
@@ -202,6 +206,8 @@ const char* policy_name(ops::LinearPolicy policy) {
         return "a8";
     case ops::LinearPolicy::AllowA4:
         return "a4";
+    case ops::LinearPolicy::A16ColumnInvariant:
+        return "invariant";
     }
     throw std::invalid_argument("unknown linear policy");
 }

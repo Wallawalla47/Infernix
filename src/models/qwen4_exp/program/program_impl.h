@@ -424,6 +424,11 @@ public:
         d.mtp           = config.mtp;
         d.head_rows     = config.proposal_rows != 0 ? dim(config.proposal_rows) : dim(c.vocab_size);
         d.chunk         = static_cast<std::int32_t>(std::min(o.prefill_chunk, o.max_context));
+        // Without free cache resume every prefill call starts on the GDN prefill's 16-token grid.
+        if (!o.free_cache_resume) {
+            constexpr auto grid = static_cast<std::int32_t>(kResumeGrid);
+            d.chunk             = std::max(grid, d.chunk / grid * grid);
+        }
         d.mtp_k         = d.mtp ? static_cast<std::int32_t>(o.mtp_draft_tokens) : 0;
         d.max_width     = 1 + std::max(static_cast<std::int32_t>(o.ngram_draft_tokens), d.mtp_k);
         d.columns       = std::max(d.chunk, d.lanes * d.max_width);
@@ -1061,7 +1066,13 @@ public:
     // The KV pages a binding of `base` whose prefill ends at `end` reserves: through one round past
     // it, within the request's extent.
     std::uint32_t binding_pages(const BasePlanImpl& base, std::uint32_t end) const noexcept {
-        const std::uint32_t positions = std::min(base.positions, end + round_positions());
+        std::uint32_t positions = std::min(base.positions, end + round_positions());
+        // Without preemption the request holds its whole extent from admission (less a page of the
+        // pool), so no unit of it grows and nothing pauses it.
+        if (!options_.preemption) {
+            const std::uint32_t pool = pool_->capacity_pages() > 1 ? pool_->capacity_pages() - 1U : 1U;
+            positions = std::max(positions, std::min(base.positions, pool * static_cast<std::uint32_t>(kPagedKVPageSize)));
+        }
         return (positions + kPagedKVPageSize - 1) / kPagedKVPageSize;
     }
 
@@ -1751,13 +1762,17 @@ public:
         // fewer than it may still emit, so every verified position lies in its reservation. A longer
         // n-gram copy proposal replaces a row's MTP drafts. By round size (design 11.3, 19.3.5):
         // - one row: its own draft length, maximizing its expected tokens per round time;
-        // - two rows: one draft length for both (choose_pair_draft_length), so no row is padded to the
-        //   other's; its at most 2 x 3 = 6 columns stay on the column-invariant dense routes, so greedy
-        //   output equals C = 1, and below the 7-column fork and CPU-job limits;
-        // - three or more rows decode plain (one draft each measured slower at four rows).
+        // - two rows, with the adaptive-speculation fast path: one draft length for both
+        //   (choose_pair_draft_length), so no row is padded to the other's; its at most 2 x 3 = 6
+        //   columns stay on the column-invariant dense routes, so greedy output equals C = 1, and
+        //   below the 7-column fork and CPU-job limits; the shared length couples the rows, and a
+        //   pair round's output differed from the rows alone in 1-4 of 96 segments (2026-10-14);
+        // - otherwise two or more rows decode plain (one draft each measured slower at four rows).
         // A plain round's W = 1 catch-up keeps each drafter current.
         const std::int32_t pair_k =
-            batch == 2 && mtp_ ? choose_pair_draft_length(lanes_[lanes[0]], lanes_[lanes[1]]) : 0;
+            batch == 2 && mtp_ && options_.pair_speculation
+                ? choose_pair_draft_length(lanes_[lanes[0]], lanes_[lanes[1]])
+                : 0;
         const bool speculate = batch == 1 || pair_k > 0;
         std::array<std::int32_t, kMaximumConcurrency> wanted{};
         std::int32_t steps = 0;
@@ -4499,6 +4514,9 @@ private:
     // (C = 2 decode on the 5090, AIME prompts sampled: K = 1 and 2 rounds took 1.44 and 1.95 plain
     // two-row rounds; K = 3, 8 columns, took 3.1 and lost to plain decode; design 19.3.5).
     static constexpr std::int32_t kPairMaxDrafts = 2;
+    // The GDN prefill's sub-chunk: prefill calls starting on multiples of it give every position the
+    // same bits whatever the call boundaries (request invariance's resume grid).
+    static constexpr std::uint32_t kResumeGrid = 16;
     static constexpr double kPairWidthCost       = 0.47;
     // A one-row round verifies its drafts up to the first whose draft-head probability is below 0.5
     // (Strata's --spec-min-p rule; C = 1 MTP, AIME prompts sampled on the 5090: 138.8 -> 147.2 tok/s,

@@ -22,6 +22,10 @@ namespace infernix::ops::detail {
 void nvfp4_linear_add_a16_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                  cudaStream_t stream);
 
+// A16ColumnInvariant: one K-warp count per K for every T (8 at K=6144, 4 at K=17408), so a
+// column's arithmetic does not depend on the call's other columns.
+void nvfp4_linear_add_invariant_launch(const Tensor& x, const Weight& weight, Tensor& residual,
+                                       cudaStream_t stream);
 void nvfp4_linear_add_decode_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                     cudaStream_t stream);
 

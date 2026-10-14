@@ -20,6 +20,10 @@ void nvfp4_linear_swiglu_decode_launch(const Tensor& x, const Weight& weight, Te
                                        cudaStream_t stream);
 void nvfp4_linear_swiglu_small_t_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                         cudaStream_t stream);
+// A16ColumnInvariant: one sliced-K schedule (8 K-warps) for every T, so a column's arithmetic does
+// not depend on the call's other columns.
+void nvfp4_linear_swiglu_invariant_launch(const Tensor& x, const Weight& weight, Tensor& out,
+                                          cudaStream_t stream);
 void nvfp4_linear_swiglu_a4_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                    WorkspaceArena& workspace, cudaStream_t stream);
 

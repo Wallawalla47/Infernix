@@ -329,8 +329,17 @@ different route may ship, what it is measured against, how much it may cost, and
 ### 6.1 The exact route and the fast paths
 
 - **The exact route** is what runs with `--disable-fast-paths` (`EngineOptions::fast_paths`
-  false). For a fixed artifact, Engine options, inputs and schedule (batch composition, chunking,
-  speculation), its output is bit-identical from run to run and **from release to release**. A
+  false). For a fixed artifact, Engine options (including the prefill chunk and the seed) and
+  request, its output is bit-identical from run to run and **from release to release**. Where the
+  artifact's formats support it (`LoadSummary::request_invariance_capable`: every decode
+  projection registers a column-invariant route, today NVFP4 and FP8 dense text decoders with an
+  FP8 or Q8 head, and every Qwen3.8-Flash-Next artifact) it is also **request-invariant**:
+  concurrency, the other requests, lane
+  assignment, prefix-cache
+  contents and resource pressure do not change a request's output. Elsewhere its output also
+  depends on the batch composition. Prompt and decode need not agree with each other. An option
+  whose effect depends on load (lossy Host-tier prefix state, whose use depends on eviction) is
+  refused with `--disable-fast-paths` at startup, never silently overridden. A
   change that alters any exact-route output bit is a *numerics change*. It is allowed only to fix
   a defect or to improve precision, and only when the gates of 6.5, with the previous exact route
   in the default role and the new one in the fast role, show the new route's estimated excess is
@@ -349,7 +358,8 @@ different route may ship, what it is measured against, how much it may cost, and
   `LoadSummary::fast_paths` reports it. A fast path stays deterministic for a fixed configuration
   and keeps every invariant the exact route guarantees: exact token constraints, sampling and
   speculative acceptance; Replay recovery and prefix-cache equivalence; masked-prefix and
-  live-length invariance of attention; and whatever invariance an Op contract states. Only
+  live-length invariance of attention; and whatever invariance an Op contract states. The
+  request-coupling paths (6.7) give up request invariance, and only that. Only
   approximate arithmetic changes: reduction order, split schedules, private precision. A fast path
   never changes an exact codec, a stored representation, or the artifact.
 
@@ -409,11 +419,12 @@ reach and the evidence are in [6.7](#67-fast-path-registry).
   (`TokenConstraint`). The segments lie back to back in the decode corpus `infernix-decode-v1`
   (`eval/corpora/decode-4m`: PG-19, WikiText-103 validation, Chinese Wikipedia and SGLang source,
   none of it in the prefill corpus), so no two share text. Every position has the same context in
-  both routes, so the measures pair position by position (65,536 per route). The reference at those positions is the same
-  16-bit-activation, BF16-KV route, scored in one pass (`--reference`), and each forced step also
+  both routes, so the measures pair position by position (65,536 per route). The reference at
+  those positions is the same 16-bit-activation, BF16-KV route, scored in one pass (`--reference`), and each forced step also
   reports the log-probabilities of the reference's 64 most probable tokens and its own largest one
-  (`TokenConstraint::observe`). Decode therefore has the prefill measures: KL from the reference over
-  its top 64 plus one bucket, top-1 disagreement, and the forced tokens' NLL. Its floor is the exact
+  (`TokenConstraint::observe`). Decode therefore has the prefill measures (KL from the reference
+  over its top 64 plus one bucket, top-1 disagreement, the forced tokens' NLL) and total variation
+  over the same coarsening, which carries its distribution criterion (6.3). Its floor is the exact
   route's own decode divergence from the reference, measured in the same run; decode at one row uses
   16-bit activations where prefill uses the artifact's, so the decode floor can be lower.
   Free-running greedy decoding, judged on each route's own prefixes
@@ -429,21 +440,26 @@ reach and the evidence are in [6.7](#67-fast-path-registry).
 | Prefill corpus NLL excess | the paired mean excess NLL of the corpus tokens (log of the perplexity ratio), a point estimate; its bound is reported | at most 25 % of the floor's KL (at least 1e-4) |
 | Prefill tail | 99.9th-percentile KL, mean over chunk sizes, fast / default | at most 1.25 |
 | Prefill context buckets | each context-length bucket with at least 20,000 positions: excess mean KL | at most 25 % of that bucket's default KL (at least 1e-4) |
-| Decode mean KL excess | one-sided 95 % upper bound of the paired per-segment excess KL at the teacher-forced positions | 10 % of the decode floor's KL, at least 1e-4 and at most 3e-3 nats |
+| Decode mean TV excess | one-sided 95 % upper bound of the paired per-segment excess total variation from the reference at the teacher-forced positions | 10 % of the decode floor's total variation, at least 1e-4 and at most 5e-3 |
 | Decode top-1 disagreement excess | the same bound for disagreement with the reference's top token | 10 % of the decode floor's top-1 disagreement, at least 0.05 and at most 0.5 points |
-| Decode NLL excess | the paired mean excess NLL of the forced tokens, a point estimate; its bound is reported | at most 25 % of the decode floor's KL (at least 1e-4) |
+| Decode KL and NLL excess | the paired mean excess KL and NLL of the forced positions, point estimates; their bounds are reported | each at most 25 % of the decode floor's KL (at least 1e-4) |
 | Decode tail | 99.9th-percentile KL over the forced positions, fast / default | at most 1.25 |
-| Decode prompt lengths | each prompt length's excess mean KL | at most 25 % of that prompt length's default KL (at least 1e-4) |
+| Decode prompt lengths | each prompt length's excess mean total variation | at most 25 % of that prompt length's default total variation (at least 1e-4) |
 | Free-running decode (optional) | the same bound for the rate of generated tokens that are not the reference's top token, and for mean regret | 10 % of the default's rate (0.05 to 0.5 points); 10 % of the default's regret |
 
 The bounded criteria carry the decision; the tail, bucket and prompt-length caps are point
 estimates, like an Op criterion's gross pointwise cap, so damage confined to rare positions or long
 contexts cannot hide in a mean. Decode has the prefill criteria at the forced positions, with its
-own floor. Until 2026-10-13 the decode gate bounded the forced tokens' NLL against the prefill
-floor's budget; NLL moves at first order under any perturbation of the logits (6.4), so that
-bound could not resolve its budget for a change that also alters the cached context (the INT8
-prompt-pv8 pair of 6.7 failed it with a bound eight times its budget). The budgets' lower limits
-sit at the measurement's resolution. The KL ceiling keeps any one fast path, on any artifact, below one step of the
+own floor, except that total variation, not KL, carries the bounded distribution criterion. KL is
+unbounded per position: the few positions whose most probable token flips under any rounding
+change contribute several nats each, and they set its standard error so that no feasible decode
+sample resolves a 10 % budget (6.4). Total variation counts each such position at most once and
+still measures how much probability a fast path moves, the quantity recent work recommends for
+estimating changed decisions (6.6); KL stays as a gross cap. Prefill keeps KL as its bounded
+criterion: with about 250 times as many positions it resolves its budget. The decode gate first
+bounded the forced tokens' NLL (until 2026-10-13), then their KL (2026-10-13); neither could resolve
+a change that also alters the cached context (6.4, 6.7). The budgets' lower limits sit at the
+measurement's resolution. The KL ceiling keeps any one fast path, on any artifact, below one step of the
 weight-quantization ladder (q8_0 to q6_K costs about 4e-3 on Llama 3 8B in llama.cpp's published
 measurements) and under half the 7e-3 that Fireworks calls a high-quality *whole* quantized
 deployment (6.6).
@@ -481,36 +497,66 @@ protocol of 6.2 at 896 and 3,584 tokens against INT8 KV's exact route, decided w
   +0.17 %), with a bound of 3.7e-3, larger than the KL budget. A perturbation of the logits changes
   the observed token's NLL at first order but the excess KL from the reference only at second
   order, so the same quantity measured on corpus tokens is about ten times noisier.
-**Decode validation** (2026-10-13, same artifact, INT8 KV, plain decode, 256 segments of 64 forced
-tokens, KL against the reference's top 64; decode floor KL 0.0167, top-1 disagreement 1.96 %,
-reference top mass 0.964; budgets: KL 1.67e-3, top-1 0.196 points, NLL cap 4.17e-3; decided with
-`evaluate-decode` and `compare-decode`):
+
+**Decode validation** (2026-10-13, same artifact, INT8 KV, plain decode, 64 forced tokens per
+segment against the reference's top 64, decided with `evaluate-decode` and `compare-decode`). The
+current protocol: 1,024 segments of the decode corpus (6.2), with these floors:
+
+- total variation 0.0243;
+- KL 0.0341 (512-token prompts 0.0055, 2,048 0.0119, 8,192 0.0852);
+- top-1 disagreement 2.27 %;
+- reference top mass 0.956.
+
+Budgets: TV 2.43e-3, top-1 0.227 points, KL and NLL caps 8.5e-3.
+
+| Candidate | TV excess (95 % bound) | Top-1 excess, points (bound) | KL excess (bound) | Decision |
+|---|---|---|---|---|
+| A/A: the exact route at concurrency 2 (batched 16-bit decode: rounding only) | 5.5e-5 (1.45e-4) | −0.012 (0.039) | 1.9e-4 (1.57e-3) | pass |
+| `decode-split64` with `prompt-pv8` | −1.8e-4 (3.01e-4) | −0.090 (0.017) | −4.6e-4 (3.27e-3) | pass |
+| Control: NVFP4 KV posing as a fast path over INT8 KV (a known loss) | **5.21e-3** (5.68e-3) | **0.49** (0.61) | 2.4e-3 (6.65e-3) | **fail** (also the 512-token bucket) |
+
+Statistics compared on the same runs (bound as a share of its budget; the control must fail):
+
+| Statistic | A/A | `decode-split64` + `prompt-pv8` | NVFP4-KV control |
+|---|---|---|---|
+| Mean KL (the 2026-10-13 criterion) | 52 % | 109 % | 222 % |
+| KL, 10 % trimmed per segment (Yuen) | 0 % | 3 % | **56 %, passes** |
+| Mean total variation (the criterion) | 6 % | 12 % | 234 % |
+| Mean Jensen-Shannon | 24 % | 50 % | 207 % |
+
+On the first protocol (below) total variation gives 2 %, 56 % and 287 %, and trimmed KL fails the
+control (115 %) only because that protocol's KL budget is smaller.
+
+- **The variance sits in a few chaotic long-context segments.** Five 8,192-token segments of the
+  Chinese Wikipedia and SGLang parts of the corpus carry about 90 % of the KL variance of every
+  comparison, the A/A's included. In them, the whole segment moves by up to 1.8 nats per position
+  between runs: the most probable token flips under any rounding change. The decode floor's
+  99.9th-percentile KL is 10.8 nats (prefill 0.9).
+- **More text alone did not help KL.** The four times larger sample did not narrow the KL
+  standard errors: 2.27e-3 against 2.62e-3 for the pair, 8.4e-4 against 8.0e-4 for the A/A. Its
+  long-context text is more chaotic than the prefill corpus's (twice the KL floor).
+- **Total variation fixes the resolution without dropping data.** It is bounded by 1 per position,
+  so a flipped position counts at most once; the mean stays a mean over every segment. Trimming
+  segments is too blunt: it discards the segments where a fast path's damage could sit, and here
+  it passed the control. Jensen-Shannon is bounded too, but it is dominated by the same flips.
+- **A change confined to decode kernels** was already resolved by KL (`decode-split64` alone,
+  first protocol: bound 6 % of the budget).
+
+The first protocol: 256 segments, cut evenly from the prefill corpus, judged on mean KL. Decode
+floor KL 0.0167, top-1 disagreement 1.96 %, reference top mass 0.964; budgets KL 1.67e-3, top-1
+0.196 points, NLL cap 4.17e-3:
 
 | Candidate | KL excess (95 % bound) | Top-1 excess, points (bound) | NLL excess | Decision |
 |---|---|---|---|---|
-| A/A: the exact route at concurrency 2 (batched 16-bit decode: rounding only) | −7e-6 (1.31e-3) | −0.04 (0.05) | −4.1e-4 | pass |
+| A/A: the exact route at concurrency 2 | −7e-6 (1.31e-3) | −0.04 (0.05) | −4.1e-4 | pass |
 | `decode-split64` alone | −5.6e-4 (9.6e-5) | −0.006 (0.089) | −3.7e-4 | pass |
 | `decode-split64` with `prompt-pv8` | −1.19e-3 (**3.12e-3**) | 0.22 (**0.42**) | 2.4e-3 | **fail** |
-| Control: NVFP4 KV posing as a fast path over INT8 KV (a known loss) | −4.2e-4 (3.23e-3) | **0.90** (1.13) | **8.0e-3** | **fail** |
+| Control: NVFP4 KV posing as a fast path over INT8 KV | −4.2e-4 (3.23e-3) | **0.90** (1.13) | **8.0e-3** | **fail** |
 
-- **Decode is far noisier than prefill per position.** The decode floor's 99.9th-percentile KL is
-  5.9 nats (prefill 0.9): a few knife-edge segments, whose most probable token flips under any
-  perturbation, move by nats between runs, and with 256 segments they dominate the variance.
-- **A change confined to decode kernels is resolved well** (`decode-split64`: bound 6 % of the
-  budget), but the A/A with batched decode, which re-rounds every forced position, uses 78 % of the
-  KL budget.
-- **A change that also alters the cached context is not resolved.** Both prompt-pv8 (a prompt
-  kernel) and NVFP4 KV perturb every forced position's context, and their KL bounds are about twice
-  the budget whatever the point estimate. NVFP4 KV's top-1 and NLL excesses fail outright, as its
-  prefill result does. The point estimate for prompt-pv8 favors the fast route on KL, but its top-1
-  excess is above budget, so the pair is undecided at this sample size, which the policy treats as
-  a fail.
-- **Before 2026-10-13 the decode gate bounded the forced tokens' NLL** (resolution about ±9e-4 for
-  a decode-only change). It could not resolve context-altering changes at all: NVFP4 KV's NLL bound
-  was 1.06e-2 and the INT8 pair's 1.19e-2, against a 1.55e-3 budget.
-- **More segments narrow every bound** with the square root of their number (`--segments`), but
-  the corpus bounds their independence: 256 segments already start about 3,900 tokens apart, under
-  the longest prompt.
+Its top-1 bound also fails the pair under the current criteria: 256 segments are too few for
+top-1. Before 2026-10-13 the decode gate bounded the forced tokens' NLL (resolution about ±9e-4
+for a decode-only change). NVFP4 KV's NLL bound was 1.06e-2 and the INT8 pair's 1.19e-2, against a
+1.55e-3 budget.
 
 ### 6.5 Testing compliance
 
@@ -536,15 +582,21 @@ always measured together with the paths it will run beside. Without a candidate 
 the configuration's current selection. `--mode` selects the decode route a fast path touches:
 `plain` (no speculation, single-column kernels), `dflash2` (DFlash2 with 7 drafts and the optimized
 proposal head), `ngram` (DFlash2 with n-gram drafting) or `mtp`; `--free-running` adds the greedy
-generations and the judge.
+generations and the judge. The request-coupling paths act only between requests, so the decode
+gate runs both routes under the same Engine conditions: `--concurrency N` (requests per round),
+`--kv-tokens N` (a short KV pool, so the fast run preempts) and `--prefix-reuse --warm-tokens N`
+(each segment resumes from a warm request's cache entry). A schedule path that widens prefill
+steps is qualified with prefill `--fast-chunk N`: every fast run prefills at that width against
+the default run at each `--chunk` (a separate `--out`).
 `evaluate-prefill DIR`, `evaluate-decode DEFAULT.json FAST.json --reference REFERENCE.json` and
 `evaluate-free-running judge.json` decide existing runs. `compare-prefill --base RUN... --candidate
 RUN...` decides any two sets of runs scored against one reference, paired in order, and
 `compare-decode --base A.json --candidate B.json --reference REFERENCE.json` two teacher-forced runs
 that observed one reference: a numerics change to the exact route (6.1), or a control. On
 Qwen3.8-27B on an RTX 5090 the prefill gate takes 27 minutes per KV format (eight runs) after a
-13-minute reference recorded once per artifact, and the decode gate 5 minutes per run after a
-6-minute reference.
+13-minute reference recorded once per artifact, and the decode gate 18 minutes per run after a
+22-minute reference (60 minutes for a first gate; a later candidate reuses the reference and,
+while the exact route is unchanged, its run).
 
 The exact route needs no budget: `identical` compares two builds' perplexity runs window by window
 (NLL, KL and top-1 agreement exactly), their teacher-forced decode runs position by position, or
@@ -558,7 +610,7 @@ experts' 4-bit activations cost; pass `--ngram-volume` to the gate when the volu
 `<artifact>.ngram`. Its Engine scoring is checked against the Forward's own teacher-forced logits
 (`infernix_qwen4_exp_score_real_test`): on 3,000 tokens the perplexity matches, top-1 agrees at
 every position, and the RAM and SSD expert tiers give the same output. No fast path is qualified
-for Qwen3.8-Flash-Next yet, and none of the current paths' kernels run there.
+for Qwen3.8-Flash-Next yet; only its request-coupling paths (6.7) apply there.
 
 ### 6.6 Calibration and comparison with other engines
 
@@ -600,6 +652,18 @@ comparing its KL against a reference path or the engine's run-to-run floor (KL a
 with no fixed bound: its two non-exact defaults moved first-token or teacher-forced KL by a mean of
 4e-3 and 5.8e-3 (top-1 agreement 97.7 %), and an experimental fast route at KL 6.3e-2 stayed opt-in.
 
+**Choice of measure.** Compression studies use KL and top-1 "flips" as distribution measures
+([Dutta et al. 2024](https://arxiv.org/abs/2407.09141)). More recent work finds that KL converts
+into changed decisions only through its square root, with a factor that varies across models and
+corpora, and recommends total variation for estimating how many decisions changed
+([2610.00694](https://arxiv.org/html/2610.00694)); KL's unboundedness lets low-probability
+mismatches dominate it ([2609.07664](https://arxiv.org/html/2609.07664v1)). llama.cpp reports
+mean KL and "same top p" with per-token Gaussian standard errors, which ignore the correlation
+within a sequence. Infernix's units are whole windows and segments. Robust estimators of a
+heavy-tailed mean exist (trimmed mean, median-of-means, Catoni;
+[Lugosi and Mendelson's survey](https://paperswithcode.com/paper/mean-estimation-and-regression-under-heavy)).
+For decode, a bounded measure keeps the estimand a plain mean and validated better (6.4).
+
 Infernix is stricter than each of these on what a change costs in fidelity to the reference. The
 ceiling alone (3e-3 excess KL, 0.5 points of top-1) is below the 5.8e-3 Strata adopted and
 Fireworks' 7e-3 for a whole deployment, the floor-relative budget is far below it on high-precision
@@ -619,12 +683,126 @@ model already loses to quantization sets the scale at which further error is vis
 Each entry records what the fast path changes, where its kernels run, the configurations it is
 qualified for, and the evidence that admitted it. The configurations are the ones
 `models/qwen3_5/program/planning/fast_paths.cpp` lists (`kQualified`); a configuration not listed
-runs the path's exact counterpart. Qwen3.8-Flash-Next runs no fast path (6.5, Coverage).
+runs the path's exact counterpart. Qwen3.8-Flash-Next has only three of the request-coupling paths
+below (`src/runtime/engine/qwen4_exp_instance.cpp` lists their configurations).
 
 | Fast path | Kernels run with | Qualified configurations |
 |---|---|---|
 | `decode-split64` | INT8 KV, 24 query heads | 24 heads, 4-bit activations, INT8 KV |
-| `prompt-pv8` | INT8 KV (fast prompt kernel), NVFP4 KV (fast kernel), K8V4, VQ2, K4V2 KV | 24 heads, 4-bit activations, with NVFP4, K8V4, VQ2 or K4V2 KV (not INT8: see below) |
+| `prompt-pv8` | INT8 KV (fast prompt kernel), NVFP4 KV (fast kernel), K8V4, VQ2, K4V2 KV | 24 heads, 4-bit activations, with INT8, NVFP4, K8V4, VQ2 or K4V2 KV |
+| `batched-decode`, `batch-split-attention` | request-invariance-capable artifacts | 24 heads, 4-bit activations, with INT8, NVFP4, K8V4 or K4V2 KV |
+| `batched-a8-decode`, `batched-a4-decode` | the same, with 8-bit (FP8) or 4-bit (NVFP4) activations | none (each fails, below) |
+| `adaptive-speculation` | the same, with speculative decoding | 24 heads, 4-bit activations, with INT8, NVFP4, K8V4 or K4V2 KV |
+| `free-cache-resume` | the same, with the prefix cache | 24 heads, 4-bit activations, with INT8, NVFP4, K8V4 or K4V2 KV |
+| `preemption` | request-invariance-capable artifacts | 24 heads, 4-bit activations, with INT8, NVFP4, K8V4 or K4V2 KV |
+| Qwen3.8-Flash-Next: `adaptive-speculation` (MTP), `free-cache-resume`, `preemption` | every Flash-Next artifact | INT8 KV |
+
+**The request-coupling paths.** These were the default behaviour until the exact route became
+request-invariant (2026-10-14). Each makes a request's arithmetic depend on the other requests of
+the Engine, and each acts only where the artifact can be request-invariant
+(`FastPath` documents each; `ExecutionSchedule` holds the flag each clears):
+- `batched-decode`: decode and verify projections pick a route by the round's width (single-column
+  GEMVs, small-T SIMT, MMA tiles) at 16-bit activations; the GDN input projection rounds to BF16
+  above one row.
+- `batched-a8-decode` and `batched-a4-decode`: with `batched-decode`, wide rounds take the
+  artifact's 8-bit activations in FP8 projections (from 5 columns, or 17 in wide verification) and
+  4-bit activations in NVFP4 projections (the MLP gate/up from 5, down from 8). Each **fails**
+  the decode gate on the official 27B NVFP4 with INT8 KV (2026-10-14; 1,024 segments, against the
+  2.43e-3 TV and 0.22-point top-1 budgets of a 2.43e-2 floor, jointly with the qualified paths
+  that act in the arm), so both stay off and wide rounds run 16-bit activations:
+
+  | Path, arm | TV excess (bound) | Top-1 excess, points (bound) | KL excess / cap | NLL excess |
+  |---|---|---|---|---|
+  | both, plain | 1.62e-2 (1.70e-2) | +1.84 (1.99) | 1.11e-2 / 8.6e-3 | -1.0e-3 |
+  | `batched-a4-decode`, plain | 1.57e-2 (1.64e-2) | +1.81 (1.96) | 1.08e-2 / 8.6e-3 | -1.4e-3 |
+  | `batched-a8-decode`, plain | 9.6e-4 (1.46e-3) | +0.04 (0.15) | -9.5e-4 / 8.6e-3 | -7.4e-3 |
+  | `batched-a8-decode`, spec | 3.85e-3 (4.38e-3) | +0.43 (0.55) | 1.2e-3 / 8.6e-3 | -5.9e-3 |
+
+  The plain arm (concurrency 8 with a four-lane pool) passes 8-bit activations because few of its
+  rounds are wide enough to take them; DFlash2 with n-gram copies at concurrency 4 verifies 32
+  columns, and fails. The 4-bit activations alone add two thirds of the floor at every prompt
+  length. Perplexity cannot see either: the NLL excess is negative in every arm.
+- `batch-split-attention`: decode attention sizes a row's key partition from the batch.
+- `adaptive-speculation`: DFlash2 tree tables and controller, and a round's longest n-gram copy,
+  set every row's verify width.
+- `free-cache-resume`: prefill splits at taps and sibling boundaries, and resumes from any tap or
+  endpoint (including decode-computed state).
+- `preemption`: KV grows per unit, and a short pool pauses residents, which replay their generated
+  tokens as prefill.
+
+Qwen3.8-Flash-Next decodes request-invariant at every batch already (its plain and single-row MTP
+output was identical across concurrency 1-8 and to plain decode, 2026-10-14), so only three apply
+(`ProgramOptions` holds them): `adaptive-speculation` is its two-row MTP rounds, which share one
+draft length chosen from both rows (without it two rows decode plain, as three or more do);
+`free-cache-resume` is prefill calls, taps and resumes off its 16-token GDN sub-chunk grid,
+sibling coalescing, and endpoints and blocks holding decode-computed state; `preemption` as above.
+
+**Evidence** (2026-10-14, RTX 5090, CUDA 13.4; official 27B NVFP4 and Qwen3.8-Flash-Next NVIDIA
+NVFP4 Dense8; 1,024 segments of the decode corpus, 65,536 forced positions per route). Each
+configuration was first shown request-invariant on 96 segments (the exact route bit-identical at
+concurrency 8 with a four-lane pool, under DFlash2 with n-gram copies at 4, or Flash-Next MTP at 2,
+and resuming from a warm request), so its one exact run is every arm's default. The arms ran
+jointly, each with every path that acts there: **plain**, concurrency 8 with a four-lane pool
+(`batched-decode`, `batch-split-attention`, and `preemption`, which acted only in its own arm
+below); **spec**,
+DFlash2 with 7 drafts and n-gram copies at concurrency 4 (adding `adaptive-speculation`;
+Flash-Next: MTP with 4 drafts at concurrency 2); **cache**, each segment resuming at 3,000 tokens
+from a warm request, its whole prompt for shorter ones, so off the chunk grid or from its endpoint
+(adding `free-cache-resume`; 1,023,000 prompt tokens reused per run). Bounds are one-sided 95 %:
+
+| Model, KV | Arm | TV excess (bound) / budget | Top-1 excess, points (bound) / budget | KL excess / cap |
+|---|---|---|---|---|
+| 27B, INT8 | plain | -1.7e-4 (3.3e-4) / 2.4e-3 | -0.06 (0.05) / 0.22 | -1.2e-3 / 8.6e-3 |
+| 27B, INT8 | spec | -2.1e-4 (3.3e-4) / 2.4e-3 | -0.10 (0.01) / 0.22 | -1.3e-3 / 8.6e-3 |
+| 27B, INT8 | cache | -2.0e-4 (3.6e-4) / 2.4e-3 | -0.10 (0.01) / 0.22 | -3.0e-3 / 8.6e-3 |
+| 27B, NVFP4 | plain | 2.5e-4 (5.8e-4) / 2.9e-3 | +0.09 (0.19) / 0.28 | 1.3e-3 / 8.8e-3 |
+| 27B, NVFP4 | spec | 2.3e-4 (5.5e-4) / 2.9e-3 | +0.13 (0.23) / 0.28 | 1.7e-3 / 8.8e-3 |
+| 27B, NVFP4 | cache | 6.5e-5 (5.4e-4) / 2.9e-3 | +0.01 (0.12) / 0.28 | 2.6e-4 / 8.8e-3 |
+| 27B, K8V4 | plain | 3.2e-4 (6.8e-4) / 2.7e-3 | -0.04 (0.07) / 0.26 | 3.7e-3 / 8.2e-3 |
+| 27B, K8V4 | spec | 2.5e-4 (6.3e-4) / 2.7e-3 | -0.05 (0.07) / 0.26 | 2.0e-3 / 8.2e-3 |
+| 27B, K8V4 | cache | 5.8e-4 (1.0e-3) / 2.7e-3 | -0.08 (0.04) / 0.26 | 4.0e-3 / 8.2e-3 |
+| 27B, K4V2 | plain | 3.1e-4 (6.9e-4) / 2.6e-3 | -0.09 (0.02) / 0.24 | -1.2e-3 / 8.9e-3 |
+| 27B, K4V2 | spec | 2.2e-4 (5.8e-4) / 2.6e-3 | -0.08 (0.02) / 0.24 | -1.5e-3 / 8.9e-3 |
+| 27B, K4V2 | cache | 1.1e-4 (4.2e-4) / 2.6e-3 | -0.00 (0.10) / 0.24 | -4.5e-3 / 8.9e-3 |
+| Flash-Next, INT8 | plain | 0 (identical: nothing preempted) / 5.0e-3 | 0 / 0.50 | 0 / 2.1e-2 |
+| Flash-Next, INT8 | spec | 6.0e-5 (1.1e-4) / 5.0e-3 | +0.01 (0.01) / 0.50 | 1.0e-4 / 2.1e-2 |
+| Flash-Next, INT8 | cache | 3.4e-4 (1.0e-3) / 5.0e-3 | +0.08 (0.20) / 0.50 | 1.5e-3 / 2.1e-2 |
+
+**Preemption** has its own arm, since the four-lane pool never ran short: concurrency 8 with a
+two-lane pool (16,640 tokens), jointly with `batched-decode` and `batch-split-attention`. On the 27B
+every fast run paused and replayed (342 preemptions; 1,115,648 tokens replayed on INT8), the exact
+route stayed bit-identical to its plain run under the same pool, and every criterion passes:
+
+| 27B, KV | TV excess (bound) / budget | Top-1 excess, points (bound) / budget | KL excess / cap | p99.9 KL ratio |
+|---|---|---|---|---|
+| INT8 | -1.3e-4 (3.9e-4) / 2.4e-3 | -0.07 (0.04) / 0.22 | -3.1e-3 / 8.6e-3 | 0.93 |
+| NVFP4 | 2.3e-5 (3.4e-4) / 2.9e-3 | +0.05 (0.16) / 0.28 | 2.5e-3 / 8.8e-3 | 1.19 |
+| K8V4 | -6.3e-5 (2.7e-4) / 2.7e-3 | -0.09 (0.01) / 0.26 | -4.3e-4 / 8.2e-3 | 1.07 |
+| K4V2 | 1.5e-4 (4.7e-4) / 2.6e-3 | -0.04 (0.06) / 0.24 | 1.2e-4 / 8.9e-3 | 1.08 |
+
+Flash-Next's run under the same pool never preempted: it binds a request's whole prompt plus one
+round, so only decode growth can run short, and 64 forced tokens rarely need a page. Its arm makes a
+shortage certain instead: every prompt 8,200 tokens (a binding takes 129 pages and decode crosses
+into a 130th), a 388-page pool (three bindings and one spare page) at concurrency 8, 256 segments
+(16,384 forced positions per route). The fast run paused 96 times and replayed 792,480 tokens; the
+exact run, holding whole extents, never paused. It passes: TV excess -8.7e-5 (bound 1.0e-4) against
+5.0e-3, top-1 -0.04 points (bound 0.05) against 0.50, KL excess 3.7e-5 against a 1.9e-2 cap, p99.9 KL
+ratio 0.93.
+
+Every prompt-length bucket and p99.9 KL ratio passes too (largest ratio 1.13, 27B K8V4 spec). The
+closest bound is 27B NVFP4 spec's top-1 at 82 % of its budget. Speed (official 27B, INT8 KV, 2,048
+prompt, 256 output tokens, three rounds; the qualified set against the exact route): plain decode
+81.83 vs 73.17 tok/s at one request (+11.8 %), +11.0 % at two, +6.9 % at four and +0.3 % at eight
+(the 4- and 8-bit activations the old route used there are not qualified); DFlash2 with n-gram
+copies 853 vs 523 tok/s at two requests (+63 %) and 583 vs 329 at four (+77 %). VQ2, BF16 and FP8
+KV were not measured, so they run request-invariant by default.
+
+**Qualification.** These act only above one request, so the decode gate runs them with
+`--concurrency`, `--kv-tokens` (a short pool), or `--prefix-reuse --warm-tokens` (an off-grid
+resume) on both routes. Where a path is not listed, the default route runs its request-invariant
+counterpart, which costs decode throughput (27B: 10 % at one request, 6-12 % at two to eight),
+prefix-cache reuse (no endpoints, so a conversation's next turn resumes from its last grid tap
+and recomputes the previous output) or admission (whole extents held without `preemption`).
 
 **`decode-split64`: INT8 KV decode attention, 64-key splits.** Measured on 2026-10-13 on an RTX
 5090 (CUDA 13.4, Windows).
@@ -700,11 +878,16 @@ runs the path's exact counterpart. Qwen3.8-Flash-Next runs no fast path (6.5, Co
   NVFP4, K8V4, VQ2 and K4V2 KV select no decode fast path, and prompt-pv8 changes only prompt
   kernels, so the prefill criteria decide them. INT8 KV also runs `decode-split64`, so the pair
   needs the decode criteria too, and it **fails** them. Under the first, NLL-based decode gate:
-  NLL excess 2.4e-3 with bound 1.19e-2 against a 1.55e-3 budget. Under the KL decode gate (6.4):
-  KL excess −1.19e-3 with bound 3.12e-3 against 1.67e-3, and top-1 excess 0.22 points with bound
-  0.42 against 0.196. The measurement does not resolve a change that perturbs every forced
-  position's context (6.4), so prompt-pv8 is not qualified for INT8 KV; qualifying it needs a
-  larger decode sample than the corpus supports independently.
+  NLL excess 2.4e-3 with bound 1.19e-2 against a 1.55e-3 budget. Under the KL decode gate (6.4),
+  first protocol: KL excess −1.19e-3 with bound 3.12e-3 against 1.67e-3, and top-1 excess 0.22
+  points with bound 0.42 against 0.196. Under the current protocol (1,024 segments of the decode
+  corpus): KL excess −4.6e-4 with bound 3.27e-3 against 3e-3 (109 %). Under the total-variation
+  decode criterion that replaced KL (6.3), on the same runs, every criterion passes: TV excess
+  −1.8e-4 with bound 3.0e-4 against 2.43e-3, top-1 excess −0.09 points with bound 0.017. The
+  criterion changed after this pair had failed; the A/A and NVFP4-KV controls of 6.4 validate it
+  on two protocols. prompt-pv8 was qualified for INT8 KV on 2026-10-14 on that evidence, by the
+  user's decision, which also weighed how far inside other engines' acceptance criteria the pair
+  sits (6.6): prefill KL excess 1.4 % of the floor (bound 2.8 %), decode TV bound 12 % of its budget.
 - **Speed** (`infernix_bench`, prefill chunk 4,096, three repetitions per run, two runs per route
   in exact / fast / fast / exact order; every fast run beats every exact run):
 

@@ -30,6 +30,23 @@ void fp8_linear_swiglu_small_t_launch(const Tensor& x, const Weight& weight, Ten
         stream, Rows{});
 }
 
+void fp8_linear_swiglu_invariant_launch(const Tensor& x, const Weight& weight, Tensor& out,
+                                        cudaStream_t stream) {
+    // The tiles run 4 K-warps over the same K slices and reduce them in the same order, and the
+    // MMA's columns are independent; wider calls run as 64-column slices.
+    const auto p = fp8_a16_operands(x, weight);
+    const LinearBf16Output output{static_cast<__nv_bfloat16*>(out.data), weight.n / 2};
+    const auto sliced = [&]<int T>() {
+        using S = Fp8ScheduleInstance<Fp8SlicedInstance<T, 4, 1>, 5120>;
+        launch_fp8_a16_sliced_k_mma<S>(p, output, Fp8SwiGluEpilogue{}, stream,
+                                       SwiGluRowMajorMmaRows<S>{});
+    };
+    if (x.ne[1] <= 8) return sliced.template operator()<8>();
+    if (x.ne[1] <= 16) return sliced.template operator()<16>();
+    if (x.ne[1] <= 32) return sliced.template operator()<32>();
+    sliced.template operator()<64>();
+}
+
 void fp8_linear_swiglu_matrix_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                      cudaStream_t stream) {
     const auto p = fp8_a16_operands(x, weight);

@@ -109,6 +109,10 @@ int main(int argc, char** argv) {
                 options.speculative.draft_tree_nodes[entry] =
                     options.speculative.draft_tree_nodes[entry - 1];
         }
+        // Adaptive rounds and resumes from the committed frontier (the page-boundary case) are
+        // fast paths; the exact route verifies fixed chains and resumes on the chunk grid.
+        options.fast_path_candidates = {infernix::FastPath::AdaptiveSpeculation,
+                                        infernix::FastPath::FreeCacheResume};
         infernix::Engine engine(options);
         require(engine.memory_summary().kv_cache == options.kv_cache,
                 "Engine did not select the requested KV dtype");

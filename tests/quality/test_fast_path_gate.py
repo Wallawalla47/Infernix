@@ -265,35 +265,40 @@ def make_decode(tmp_path: Path, *, count: int = 60, default_noise: float = 0.05,
 
 def test_the_divergence_matches_infernix_perplexity():
     reference = [math.log(0.6), math.log(0.3)]
-    kl, mass = gate.position_divergence(reference, reference)
+    kl, tv, mass = gate.position_divergence(reference, reference)
     assert kl == pytest.approx(0.0, abs=1e-15)
+    assert tv == pytest.approx(0.0, abs=1e-15)
     assert mass == pytest.approx(0.9)
     evaluated = [math.log(0.5), math.log(0.3)]
-    kl, _ = gate.position_divergence(reference, evaluated)
-    expected = 0.6 * math.log(0.6 / 0.5) + 0.1 * math.log(0.1 / 0.2)
-    assert kl == pytest.approx(expected)
+    kl, tv, _ = gate.position_divergence(reference, evaluated)
+    assert kl == pytest.approx(0.6 * math.log(0.6 / 0.5) + 0.1 * math.log(0.1 / 0.2))
+    # Total variation over the top tokens and the rest: (|0.6-0.5| + |0.3-0.3| + |0.1-0.2|) / 2.
+    assert tv == pytest.approx(0.1)
 
 
-def test_teacher_forced_decode_measures_kl_against_the_reference(tmp_path):
+def test_teacher_forced_decode_measures_the_distribution_against_the_reference(tmp_path):
     reference, default, fast = make_decode(tmp_path)
     verdict = gate.evaluate_forced(default, fast, reference)
     assert verdict.passed
     assert verdict.facts["fast_identical_to_default"]
     assert verdict.facts["reference_top_mass"] == pytest.approx(0.92)
-    floor = verdict.facts["floor_kl"]
-    assert floor > 0
-    kl = criterion(verdict, "decode mean KL excess")
-    assert kl.estimate == 0.0
-    assert kl.budget == pytest.approx(gate.kl_budget(floor, gate.POLICY))
+    floor_tv, floor_kl = verdict.facts["floor_tv"], verdict.facts["floor_kl"]
+    assert floor_tv > 0 and floor_kl > 0
+    tv = criterion(verdict, "decode mean TV excess")
+    assert tv.estimate == 0.0
+    assert tv.budget == pytest.approx(gate.clamp(0.1 * floor_tv, gate.POLICY.tv_budget_minimum,
+                                                 gate.POLICY.tv_budget_maximum))
+    # KL is a gross cap on its point estimate, like NLL.
+    assert criterion(verdict, "decode mean KL excess").budget == pytest.approx(0.25 * floor_kl)
     assert {c.name for c in verdict.criteria} >= {
         "decode top-1 disagreement excess", "decode NLL excess", "decode p99.9 KL ratio",
-        "prompt 512 decode KL excess", "prompt 8192 decode KL excess"}
+        "prompt 512 decode TV excess", "prompt 8192 decode TV excess"}
 
 
 def test_a_wider_decode_perturbation_fails(tmp_path):
     reference, default, fast = make_decode(tmp_path, fast_noise=0.15)
     verdict = gate.evaluate_forced(default, fast, reference)
-    assert not criterion(verdict, "decode mean KL excess").passed
+    assert not criterion(verdict, "decode mean TV excess").passed
     assert not verdict.passed
 
 
@@ -301,7 +306,28 @@ def test_an_equal_perturbation_from_other_rounding_passes(tmp_path):
     # A/A: the same noise level, independently drawn, like two equally precise orderings.
     reference, default, fast = make_decode(tmp_path, fast_seed=2)
     verdict = gate.evaluate_forced(default, fast, reference)
-    assert criterion(verdict, "decode mean KL excess").passed
+    assert criterion(verdict, "decode mean TV excess").passed
+
+
+def test_a_few_flipped_positions_cannot_dominate_the_distribution_criterion(tmp_path):
+    # Knife-edge positions: in the fast run, three positions move the reference's top token to
+    # almost nothing (KL of about 18 nats each). Total variation counts each at most once.
+    count = 60
+    reference = write_reference(tmp_path / "reference.json", count)
+    logprobs, _ = forced_segments(count, 0.0, random.Random(4))
+    observed = observations(count, 0.05, 1)
+    default = write_forced(tmp_path / "default.json", logprobs, fast=False, observed=observed)
+    flipped = [(list(values), list(best)) for values, best in observed]
+    for segment in (3, 17, 41):
+        values, best = flipped[segment]
+        values[0] = math.log(1e-8)
+        best[0] = max(values[1:4])
+    fast = write_forced(tmp_path / "fast.json", logprobs, fast=True, observed=flipped)
+    verdict = gate.evaluate_forced(default, fast, reference)
+    # Three positions of 3,840 move the mean KL by more than the KL budget's ceiling ...
+    assert verdict.facts["fast_mean_kl"] - verdict.facts["floor_kl"] > 2 * gate.POLICY.kl_budget_maximum
+    # ... but total variation by at most 3/3840.
+    assert criterion(verdict, "decode mean TV excess").passed
 
 
 def test_decode_top1_follows_the_run_maximum(tmp_path):

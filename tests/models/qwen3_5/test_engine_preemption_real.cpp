@@ -97,6 +97,9 @@ infernix::EngineOptions engine_options(const std::filesystem::path& artifact,
     options.prefill_chunk        = 128;
     options.max_concurrency      = 2;
     options.max_pending_requests = 2;
+    // Pausing a request for KV pages is the preemption fast path; the exact route would hold each
+    // request's whole extent instead, so the second would wait for the first to finish.
+    options.fast_path_candidates = {infernix::FastPath::Preemption};
     options.speculative.backend  = selected;
     if (selected != infernix::SpeculativeBackend::None) {
         options.speculative.draft_tokens  = 3;

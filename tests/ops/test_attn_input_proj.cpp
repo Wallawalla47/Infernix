@@ -84,8 +84,15 @@ int run_target_projection_case(DevicePackedWeight& parent, DevicePackedWeight* g
     const auto q_weight = rows(first, 0, qrows), k_weight = rows(first, qrows, kvrows);
     const auto g_weight = rows(dual ? second : first, dual ? 0 : 7168, qrows);
     const auto v_weight = rows(dual ? second : first, dual ? 6144 : 13312, kvrows);
-    const auto prepared = ops::prepare_attn_input_proj_weights(
-        {q_weight, policy}, {k_weight, policy}, {g_weight, policy}, {v_weight, policy});
+    // A column-invariant Use is an A16 preparation whose execution policy the Model sets.
+    const ops::LinearPolicy use =
+        ops::column_invariant(policy) ? ops::LinearPolicy::A16Only : policy;
+    auto prepared = ops::prepare_attn_input_proj_weights({q_weight, use}, {k_weight, use},
+                                                         {g_weight, use}, {v_weight, use});
+    if (auto* single = std::get_if<ops::SingleProjectionWeight>(&prepared);
+        single != nullptr && ops::column_invariant(policy)) {
+        single->policy = policy;
+    }
     const auto launch = [&] {
         if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&prepared)) {
             ops::attn_input_proj(x, pair->first, pair->second, q, g, k, v, device.stream);
@@ -376,10 +383,13 @@ int run_nvfp4_target_case(DevicePackedWeight& parent, std::int32_t tokens,
     const auto auxiliary    = [&](int index) -> std::optional<float> {
         return omit_divisors ? std::nullopt : std::optional(divisor + index * unused_step);
     };
-    const auto prepared =
-        std::get<ops::SingleProjectionWeight>(ops::prepare_attn_input_proj_weights(
-            {qw, policy, auxiliary(0)}, {kw, policy, auxiliary(1)}, {gw, policy, auxiliary(2)},
-            {vw, policy, auxiliary(3)}));
+    // A column-invariant Use is an A16 preparation whose execution policy the Model sets.
+    const ops::LinearPolicy use =
+        ops::column_invariant(policy) ? ops::LinearPolicy::A16Only : policy;
+    auto prepared = std::get<ops::SingleProjectionWeight>(ops::prepare_attn_input_proj_weights(
+        {qw, use, auxiliary(0)}, {kw, use, auxiliary(1)}, {gw, use, auxiliary(2)},
+        {vw, use, auxiliary(3)}));
+    if (ops::column_invariant(policy)) { prepared.policy = policy; }
     if (policy == ops::LinearPolicy::AllowA8) {
         const auto mixed =
             std::get<ops::SingleProjectionWeight>(ops::prepare_attn_input_proj_weights(
@@ -429,6 +439,11 @@ int run_nvfp4_target() {
     for (const std::int32_t tokens : {1, 2, 4, 8, 16, 20, 32, 33}) {
         failures += run_nvfp4_target_case(parent, tokens, ops::LinearPolicy::A16Only, tokens == 1);
     }
+    // The column-invariant route: one schedule at every T, sliced beyond its widest tile.
+    for (const std::int32_t tokens : {1, 2, 5, 8, 9, 16, 17, 33, 40, 65, 129}) {
+        failures +=
+            run_nvfp4_target_case(parent, tokens, ops::LinearPolicy::A16ColumnInvariant);
+    }
     failures += run_nvfp4_target_case(parent, 4, ops::LinearPolicy::AllowA8);
     failures += run_nvfp4_target_case(parent, 4, ops::LinearPolicy::AllowA8, true);
     failures += run_nvfp4_target_case(parent, 4, ops::LinearPolicy::AllowA4);
@@ -468,6 +483,16 @@ int run_fp8_target() {
         for (int t : {1,   4,   8,   16,  17,  32,  33,  64,  65,  96,  97,
                       128, 129, 192, 193, 288, 289, 385, 512, 513, 1025})
             failures += run_target_projection_case(parent, nullptr, t, policy, true);
+    }
+    // The column-invariant route: one schedule at every T, sliced beyond its widest tile.
+    for (int t : {1, 2, 5, 8, 9, 16, 17, 33, 40, 65, 129})
+        failures += run_target_projection_case(parent, nullptr, t,
+                                               ops::LinearPolicy::A16ColumnInvariant);
+    if (ops::attn_input_proj_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16, kRows, kHidden,
+                                                      ops::LinearPolicy::A16ColumnInvariant, 1,
+                                                      128) != 0) {
+        std::cerr << "FP8 column-invariant attention projection needs no workspace\n";
+        ++failures;
     }
     return failures;
 }

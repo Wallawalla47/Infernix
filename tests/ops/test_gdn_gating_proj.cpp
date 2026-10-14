@@ -319,7 +319,8 @@ int run_projection_case(const Geometry& geometry, std::int32_t tokens, std::uint
 }
 
 int run_norm_projection_case(const Geometry& geometry, std::int32_t tokens, std::uint32_t seed,
-                             DeviceExecutionView execution, bool replay = false, int mode = 0) {
+                             DeviceExecutionView execution, bool replay = false, int mode = 0,
+                             ops::LinearPolicy policy = ops::LinearPolicy::A16Only) {
     constexpr float kEps               = 1.0e-6f;
     const std::size_t h_elements       = std::size_t(geometry.hidden) * tokens;
     const std::size_t control_elements = std::size_t(geometry.heads) * tokens;
@@ -365,7 +366,7 @@ int run_norm_projection_case(const Geometry& geometry, std::int32_t tokens, std:
     Tensor ta(device_a_log.p, DType::FP32, {geometry.heads}),
         td(device_dt_bias.p, DType::FP32, {geometry.heads});
     const auto capacity = ops::gdn_norm_gating_proj_workspace_capacity_bytes(
-        geometry.heads, geometry.hidden, tokens, tokens);
+        geometry.heads, geometry.hidden, policy, tokens, tokens);
     GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 256));
     WorkspaceArena workspace(DeviceSpan{scratch.data(), std::max<std::size_t>(capacity, 256)});
     const auto wa = bf16_weight(device_weight.p, (geometry.parent_weight ? 2 : 1) * geometry.heads,
@@ -375,9 +376,10 @@ int run_norm_projection_case(const Geometry& geometry, std::int32_t tokens, std:
                         : bf16_weight(device_b_weight.p, geometry.heads, geometry.hidden);
     const auto launch = [&] {
         if (geometry.parent_weight)
-            ops::gdn_norm_gating_proj(tx, tn, kEps, wa, ta, td, workspace, th, tg, tb, execution);
+            ops::gdn_norm_gating_proj(tx, tn, kEps, wa, ta, td, policy, workspace, th, tg, tb,
+                                      execution);
         else
-            ops::gdn_norm_gating_proj(tx, tn, kEps, wa, wb, ta, td, workspace, th, tg, tb,
+            ops::gdn_norm_gating_proj(tx, tn, kEps, wa, wb, ta, td, policy, workspace, th, tg, tb,
                                       execution);
     };
     DecodeGraphDefinition definition;
@@ -471,9 +473,11 @@ int verify_workspace_capacity_contract(const Geometry& geometry,
         std::size_t witness = 0;
         for (int t = bounds.first; t <= bounds.second; ++t)
             witness = std::max(witness, ops::gdn_norm_gating_proj_workspace_capacity_bytes(
-                                            geometry.heads, geometry.hidden, t, t));
+                                            geometry.heads, geometry.hidden,
+                                            ops::LinearPolicy::A16Only, t, t));
         const auto capacity = ops::gdn_norm_gating_proj_workspace_capacity_bytes(
-            geometry.heads, geometry.hidden, bounds.first, bounds.second);
+            geometry.heads, geometry.hidden, ops::LinearPolicy::A16Only, bounds.first,
+            bounds.second);
         if (capacity != witness) {
             std::cerr << geometry.label << ": norm/control interval missed an extent\n";
             ++failures;
@@ -524,6 +528,11 @@ int main() {
     for (int mode : {1, 2, 3, 4})
         failures +=
             run_norm_projection_case(kQwen38Parent, 16, 0x5800u + mode, norm_execution, true, mode);
+    // The column-invariant schedule: one thread count at every width.
+    for (int tokens : {1, 2, 3, 14, 15, 29, 43, 64, 128})
+        failures += run_norm_projection_case(kQwen38Parent, tokens, 0x6800u + tokens,
+                                             norm_execution, false, 0,
+                                             ops::LinearPolicy::A16ColumnInvariant);
     failures += run_norm_projection_case(kQwen35, 1, 0x4001u, norm_execution);
     failures += run_norm_projection_case(kQwen35, 16, 0x4010u, norm_execution);
     failures += run_norm_projection_case(kQwen35, 17, 0x4011u, norm_execution);

@@ -97,7 +97,8 @@ __global__ __launch_bounds__(Threads) void gdn_norm_gating_27_simt(
 void bf16_gdn_norm_gating_proj_27_launch(const Tensor& x, const Tensor& norm_weight, float eps,
                                          Tensor& h, const Weight& a_weight, const Weight& b_weight,
                                          const Tensor& alog, const Tensor& bias, Tensor& g,
-                                         Tensor& beta, cudaStream_t stream) {
+                                         Tensor& beta, bool column_invariant,
+                                         cudaStream_t stream) {
     const auto launch = [&]<int T, int Threads>() {
         CUDA_CHECK(pdl::launch_consumer(
             {dim3(48, (x.ne[1] + T - 1) / T), dim3(Threads), 0, stream},
@@ -109,6 +110,18 @@ void bf16_gdn_norm_gating_proj_27_launch(const Tensor& x, const Tensor& norm_wei
             static_cast<float*>(g.data), static_cast<float*>(beta.data), x.ne[1], eps));
     };
     const int tokens = x.ne[1];
+    // A column's reduction order depends on the thread count, not the tile: column-invariant
+    // calls keep 512 threads at every T.
+    if (column_invariant) {
+        if (tokens <= 2)
+            launch.template operator()<1, 512>();
+        else if (tokens <= 14)
+            launch.template operator()<2, 512>();
+        else
+            launch.template operator()<4, 512>();
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     if (tokens <= 2)
         launch.template operator()<1, 512>();
     else if (tokens <= 14)

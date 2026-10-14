@@ -64,14 +64,54 @@ enum class FastPath : std::uint8_t {
     // INT8 KV with 24 query heads: single-column decode rows split their keys from 64 rather than
     // 128 (a different softmax merge order).
     DecodeSplit64,
+    // The paths below couple a request's arithmetic to the other requests of the Engine. Without
+    // them a request's outputs depend only on the request, the artifact, the options and the build
+    // (LoadSummary::request_invariant); they apply where the exact route is request-invariant.
+    //
+    // Decode and verify projections choose their route by the round's column count (single-column
+    // GEMVs, small-T SIMT, MMA tiles), all at 16-bit activations, and the GDN input projection
+    // rounds to BF16 at more than one row. Without it every width runs one column-invariant
+    // 16-bit-activation route per projection.
+    BatchedDecode,
+    // With batched-decode, wide decode and verify rounds of FP8 projections take the artifact's
+    // 8-bit activations (from 5 columns, or 17 in wide verification). Without it they stay at 16
+    // bits.
+    BatchedA8Decode,
+    // With batched-decode, wide decode and verify rounds of NVFP4 projections take the artifact's
+    // 4-bit activations (the MLP gate/up from 5 columns, down from 8). Without it they stay at 16 bits.
+    BatchedA4Decode,
+    // Decode attention sizes each row's key partition from the round's batch. Without it a row's
+    // partition depends only on its own keys.
+    BatchSplitAttention,
+    // Speculative rounds size their verify width and topology from all rows' proposals: DFlash2
+    // tree tables and controller, the round's longest n-gram copy. Without it each round verifies
+    // the configured chain at a fixed width.
+    AdaptiveSpeculation,
+    // The prefix cache resumes from any tap or endpoint and splits prefill at taps and sibling
+    // boundaries. Without it prefill splits and the cache publishes and resumes only on the
+    // prefill chunk grid, and decode-computed endpoints are not published.
+    FreeCacheResume,
+    // KV pages grow with each unit and a short pool pauses residents, which replay their generated
+    // tokens as prefill. Without it a request holds its whole KV extent from admission.
+    Preemption,
 };
 
-inline constexpr std::array<FastPath, 2> kFastPaths{FastPath::PromptPv8, FastPath::DecodeSplit64};
+inline constexpr std::array<FastPath, 9> kFastPaths{
+    FastPath::PromptPv8,           FastPath::DecodeSplit64,       FastPath::BatchedDecode,
+    FastPath::BatchedA8Decode,     FastPath::BatchedA4Decode,     FastPath::BatchSplitAttention,
+    FastPath::AdaptiveSpeculation, FastPath::FreeCacheResume,     FastPath::Preemption};
 
 [[nodiscard]] constexpr const char* fast_path_name(FastPath path) noexcept {
     switch (path) {
     case FastPath::PromptPv8: return "prompt-pv8";
     case FastPath::DecodeSplit64: return "decode-split64";
+    case FastPath::BatchedDecode: return "batched-decode";
+    case FastPath::BatchedA8Decode: return "batched-a8-decode";
+    case FastPath::BatchedA4Decode: return "batched-a4-decode";
+    case FastPath::BatchSplitAttention: return "batch-split-attention";
+    case FastPath::AdaptiveSpeculation: return "adaptive-speculation";
+    case FastPath::FreeCacheResume: return "free-cache-resume";
+    case FastPath::Preemption: return "preemption";
     }
     return "unknown";
 }
@@ -1552,6 +1592,11 @@ struct LoadSummary {
     std::string fast_path_configuration;
     std::vector<std::string> fast_paths;
     bool fast_paths_disabled = false;
+    // Whether a request's output depends only on the request, the artifact, the options and the
+    // build: the artifact supports it (every Text projection registers a column-invariant route)
+    // and no request-coupling fast path (FastPath::BatchedDecode and after) runs.
+    bool request_invariant          = false;
+    bool request_invariance_capable = false;
 
     // Hybrid prefix cache restored from its persistent file at startup.
     struct PrefixCacheRestore {

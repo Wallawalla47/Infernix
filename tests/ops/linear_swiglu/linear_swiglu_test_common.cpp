@@ -34,6 +34,7 @@ namespace {
 constexpr ReductionCriterion tolerance_for(ActivationCompute activation_compute) {
     switch (activation_compute) {
     case ActivationCompute::A16:
+    case ActivationCompute::A16ColumnInvariant:
         return {3.3e-3, 5.0e-3, 6.3e-3};
     case ActivationCompute::A8:
         // Both independently A8-quantized projections feed the nonlinear product, so this profile
@@ -236,10 +237,11 @@ void validate_profile(const Profile& profile) {
         profile.gate_up_rows != 2 * profile.output_rows) {
         throw std::invalid_argument("linear_swiglu test: profile is not registered");
     }
+    const bool invariant = profile.activation_compute == ActivationCompute::A16ColumnInvariant;
     if ((nvfp4 && profile.activation_compute != ActivationCompute::A16 &&
-         profile.activation_compute != ActivationCompute::A4) ||
+         profile.activation_compute != ActivationCompute::A4 && !invariant) ||
         (fp8 && profile.activation_compute != ActivationCompute::A16 &&
-         profile.activation_compute != ActivationCompute::A8) ||
+         profile.activation_compute != ActivationCompute::A8 && !invariant) ||
         (!nvfp4 && !fp8 && profile.activation_compute != ActivationCompute::A16)) {
         throw std::invalid_argument("linear_swiglu test: invalid activation-compute profile");
     }
@@ -298,11 +300,15 @@ int run_profile(std::string_view label, const Profile& profile,
     device_activation.copy_from_host(host_activation.data(),
                                      host_activation.size() * sizeof(std::uint16_t));
 
-    const ops::LinearPolicy policy =
-        profile.activation_compute == ActivationCompute::A4
-            ? ops::LinearPolicy::AllowA4
-            : (profile.activation_compute == ActivationCompute::A8 ? ops::LinearPolicy::AllowA8
-                                                                   : ops::LinearPolicy::A16Only);
+    const ops::LinearPolicy policy = [&] {
+        switch (profile.activation_compute) {
+        case ActivationCompute::A4: return ops::LinearPolicy::AllowA4;
+        case ActivationCompute::A8: return ops::LinearPolicy::AllowA8;
+        case ActivationCompute::A16ColumnInvariant: return ops::LinearPolicy::A16ColumnInvariant;
+        case ActivationCompute::A16: break;
+        }
+        return ops::LinearPolicy::A16Only;
+    }();
     const std::size_t workspace_bytes = ops::linear_swiglu_workspace_capacity_bytes(
         profile.qtype, profile.gate_up_rows, profile.input_rows, policy, 1, maximum_tokens);
     WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 256));

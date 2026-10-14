@@ -71,6 +71,10 @@ int main() {
             "LinearSwiGLU FP8_A16",
             {QType::FP8_E4M3FN_ROW_BF16, 34816, 5120, 17408, 1811U, ActivationCompute::A16},
             kA16Cases, std::array<std::int32_t, 1>{16});
+        failures += run_profile("LinearSwiGLU FP8_A16 column-invariant",
+                                {QType::FP8_E4M3FN_ROW_BF16, 34816, 5120, 17408, 1815U,
+                                 ActivationCompute::A16ColumnInvariant},
+                                std::array{1, 2, 5, 8, 9, 16, 17, 33, 40, 65, 129});
         failures += run_profile(
             "LinearSwiGLU FP8_A8",
             {QType::FP8_E4M3FN_ROW_BF16, 34816, 5120, 17408, 1813U, ActivationCompute::A8},

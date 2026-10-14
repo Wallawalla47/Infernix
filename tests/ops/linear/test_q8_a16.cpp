@@ -67,7 +67,14 @@ int q8_a16_conformance() {
         if (shape.n == 9216 && shape.k == 2048) {
             for (int t : {12, 13, 14}) calls.push_back({t});
         }
-        if (shape.n == 248320) calls.push_back({34});
+        if (shape.n == 248320) {
+            calls.push_back({34});
+            // The column-invariant route: one 8-K-warp family at every T, sliced beyond 32.
+            for (int t : {1, 2, 5, 8, 9, 16, 17, 33, 40, 65, 129}) {
+                calls.push_back(
+                    {t, CallForm::Policy, infernix::ops::LinearPolicy::A16ColumnInvariant});
+            }
+        }
         if (shape.n == 2048 && shape.k == 16384) {
             for (int t : {383,  384,  385,  479,  480,  481,  639,  640,  641,  703,
                           704,  705,  959,  960,  961,  1343, 1344, 1345, 1679, 1680,

@@ -24,6 +24,9 @@ namespace infernix::ops::detail {
 void fp8_linear_add_decode_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                   cudaStream_t stream);
 void fp8_linear_add_matrix_launch(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+// A16ColumnInvariant: one sliced-K schedule (8 K-warps) for every T, so a column's arithmetic does
+// not depend on the call's other columns.
+void fp8_linear_add_invariant_launch(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void fp8_linear_add_a8_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                               WorkspaceArena& workspace, cudaStream_t stream);
 

@@ -78,7 +78,8 @@ VqKvCausalPlan make_vq_kv_causal_plan(int heads, int width, int batch,
     out.parallel_tile   = envelope.max_visible_keys <= kVqWideTileMaxKeys ? kVqParallelTile : 8;
     const bool wide     = parallel && out.parallel_tile == kVqParallelTile;
     const int tiles       = parallel ? div_up(width, out.parallel_tile) : 1;
-    const int independent = batch * (heads == 24 ? 4 : 2) * tiles;
+    const int independent =
+        (envelope.row_invariant_partition ? 1 : batch) * (heads == 24 ? 4 : 2) * tiles;
     const int ctas =
         std::max(2, (wide ? 1 : 2) * fast_prompt_multiprocessors() / independent);
     out.window_splits     = std::clamp(ctas / 8, 1, kVqMaxWindowSplits);

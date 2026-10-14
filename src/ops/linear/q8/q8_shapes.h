@@ -53,6 +53,8 @@ using Q8N248320K5120 = Q8LinearGeometry<248320, 5120>;
 [[nodiscard]] Q8Launch select_q8_n17408_k5120(std::int32_t tokens);
 [[nodiscard]] Q8Launch select_q8_n34816_k5120(std::int32_t tokens);
 [[nodiscard]] Q8Launch select_q8_n248320_k5120(std::int32_t tokens);
+// A16ColumnInvariant for the output head: one 8-K-warp sliced-K family for every T.
+[[nodiscard]] Q8Launch select_q8_n248320_k5120_invariant(std::int32_t tokens);
 // Qwen3.8-Flash-Next's dense Q8 classes (register-streamed route up to 64 columns).
 [[nodiscard]] Q8Launch select_q8_n16384_k2560(std::int32_t tokens);
 [[nodiscard]] Q8Launch select_q8_n12800_k2560(std::int32_t tokens);

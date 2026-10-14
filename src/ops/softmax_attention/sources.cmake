@@ -1,5 +1,6 @@
 target_sources(infernix_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/causal_softmax_attention.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/column_invariant.cu"
   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/bf16/launch.cu"
   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/bf16/plan.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/fp8/launch.cu"

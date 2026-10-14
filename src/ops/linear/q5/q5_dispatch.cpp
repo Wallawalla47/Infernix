@@ -27,7 +27,8 @@ Q5Launch select_q5_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
 }
 
 Q5Launch select_q5_launch(std::int32_t n, std::int32_t k, std::int32_t t, LinearPolicy policy) {
-    if (!valid_linear_policy(policy)) throw std::invalid_argument("q5 linear: unsupported policy");
+    if (!valid_linear_policy(policy) || column_invariant(policy))
+        throw std::invalid_argument("q5 linear: unsupported policy");
     return select_q5_a16_launch(n, k, t);
 }
 

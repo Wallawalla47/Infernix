@@ -78,9 +78,11 @@ void bf16_gdn_gating_execute_candidate(Bf16GdnGatingScheduleId schedule, const T
 void bf16_gdn_gating_dispatch(const Tensor& x, const Weight& a_weight, const Weight& b_weight,
                               const Tensor& A_log, const Tensor& dt_bias, WorkspaceArena& ws,
                               Tensor& g, Tensor& beta, DeviceExecutionView execution);
+// column_invariant: the 27B fused schedule at one thread count for every T (the 27B problem only).
 void bf16_gdn_norm_gating_dispatch(const Tensor& x, const Tensor& norm_weight, float eps, Tensor& h,
                                    const Weight& a_weight, const Weight& b_weight,
-                                   const Tensor& A_log, const Tensor& dt_bias, WorkspaceArena& ws,
-                                   Tensor& g, Tensor& beta, DeviceExecutionView execution);
+                                   const Tensor& A_log, const Tensor& dt_bias,
+                                   bool column_invariant, WorkspaceArena& ws, Tensor& g,
+                                   Tensor& beta, DeviceExecutionView execution);
 
 } // namespace infernix::ops::detail

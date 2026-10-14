@@ -56,6 +56,10 @@ class Policy:
     # same budget: in expectation it is the same quantity measured on the corpus's own tokens.
     kl_budget_minimum: float = 1.0e-4
     kl_budget_maximum: float = 3.0e-3
+    # Decode's bounded criterion is total variation (bounded by 1 per position, so a position whose
+    # most probable token flips cannot dominate the mean as an unbounded KL does): budget bounds.
+    tv_budget_minimum: float = 1.0e-4
+    tv_budget_maximum: float = 5.0e-3
     # Top-1 disagreement budget bounds (fractions of positions or tokens).
     top1_budget_minimum: float = 5.0e-4
     top1_budget_maximum: float = 5.0e-3
@@ -76,7 +80,9 @@ class Policy:
 POLICY = Policy()
 
 # fast_path_name of every infernix::FastPath.
-FAST_PATHS = ("prompt-pv8", "decode-split64")
+FAST_PATHS = ("prompt-pv8", "decode-split64", "batched-decode", "batched-a8-decode",
+              "batched-a4-decode", "batch-split-attention", "adaptive-speculation",
+              "free-cache-resume", "preemption")
 
 
 class MeasurementError(RuntimeError):
@@ -361,27 +367,32 @@ def load_forced(path: Path) -> dict:
 
 
 # infernix_decode_quality_forced --kv-dtype names.
-KV_FORMATS = ("bf16", "fp8", "int8", "nvfp4")
+KV_FORMATS = ("bf16", "fp8", "int8", "nvfp4", "k8v4", "vq2", "k4v2")
 
 
-def position_divergence(reference: Sequence[float], evaluated: Sequence[float]) -> tuple[float, float]:
+def position_divergence(reference: Sequence[float],
+                        evaluated: Sequence[float]) -> tuple[float, float, float]:
     """KL(reference || evaluated) over the reference's top tokens plus one bucket for the rest (a
-    lower bound of the full divergence), and the reference's top mass; as infernix-perplexity."""
+    lower bound of the full divergence, as infernix-perplexity computes it), the total variation
+    distance over the same coarsening (also a lower bound), and the reference's top mass."""
     kl = 0.0
+    tv = 0.0
     reference_mass = 0.0
     evaluated_mass = 0.0
     for r, e in zip(reference, evaluated, strict=True):
         if not (math.isfinite(r) and math.isfinite(e)):
             raise MeasurementError("a divergence received a non-finite log-probability")
-        p = math.exp(r)
+        p, q = math.exp(r), math.exp(e)
         kl += p * (r - e)
+        tv += abs(p - q)
         reference_mass += p
-        evaluated_mass += math.exp(e)
+        evaluated_mass += q
     reference_rest = 1.0 - reference_mass
     if reference_rest > 0.0:
         evaluated_rest = max(1.0 - evaluated_mass, 1.0e-12)
         kl += reference_rest * (math.log(reference_rest) - math.log(evaluated_rest))
-    return kl, min(reference_mass, 1.0)
+    tv += abs(max(reference_rest, 0.0) - max(1.0 - evaluated_mass, 0.0))
+    return kl, 0.5 * tv, min(reference_mass, 1.0)
 
 
 @dataclass
@@ -390,6 +401,7 @@ class ForcedSegment:
 
     prompt_tokens: int
     kl: list[float]          # per forced position
+    tv: list[float]          # per forced position
     disagreement: list[int]  # 1 where the run's most probable token is not the reference's
     nll: float               # summed over the forced tokens
 
@@ -411,17 +423,19 @@ def forced_segments(run: dict, reference: dict) -> tuple[list[ForcedSegment], fl
         observed, best = segment.get("observed"), segment.get("top_logprobs")
         if observed is None or len(observed) != forced * top or len(best) != forced:
             raise MeasurementError(f"segment at {segment['offset']} lacks its observations")
-        kl, disagreement = [], []
+        kl, tv, disagreement = [], [], []
         for step in range(forced):
             window = slice(step * top, (step + 1) * top)
-            divergence, mass = position_divergence(ref["top_logprobs"][window], observed[window])
+            divergence, variation, mass = position_divergence(ref["top_logprobs"][window],
+                                                              observed[window])
             kl.append(divergence)
+            tv.append(variation)
             mass_total += mass
             positions += 1
             # Observed[0] is the reference's most probable token; the run agrees when that token
             # holds the run's largest log-probability.
             disagreement.append(0 if observed[step * top] == best[step] else 1)
-        out.append(ForcedSegment(segment["prompt_tokens"], kl, disagreement,
+        out.append(ForcedSegment(segment["prompt_tokens"], kl, tv, disagreement,
                                  -sum(segment["logprobs"])))
     return out, mass_total / positions
 
@@ -456,11 +470,13 @@ def evaluate_forced(default_path: Path, fast_path: Path, reference_path: Path,
             f"the reference's top tokens cover {coverage:.3f} of its distribution; the KL bound "
             f"needs at least {policy.coverage_minimum}")
     kl_units = [PairedUnit(len(d.kl), sum(d.kl), sum(f.kl)) for d, f in zip(a, b)]
+    tv_units = [PairedUnit(len(d.tv), sum(d.tv), sum(f.tv)) for d, f in zip(a, b)]
     top1_units = [PairedUnit(len(d.kl), sum(d.disagreement), sum(f.disagreement))
                   for d, f in zip(a, b)]
     nll_units = [PairedUnit(len(d.kl), d.nll, f.nll) for d, f in zip(a, b)]
     positions = sum(u.weight for u in kl_units)
     floor_kl = sum(u.default for u in kl_units) / positions
+    floor_tv = sum(u.default for u in tv_units) / positions
     floor_top1 = sum(u.default for u in top1_units) / positions
     verdict = Verdict(scope=f"teacher-forced decode {default['mode']} {fast_path.parent}")
     verdict.facts = {
@@ -470,8 +486,10 @@ def evaluate_forced(default_path: Path, fast_path: Path, reference_path: Path,
         "forced_positions_per_route": positions,
         "reference_top_mass": coverage,
         "floor_kl": floor_kl,
+        "floor_tv": floor_tv,
         "floor_top1_disagreement": floor_top1,
         "fast_mean_kl": sum(u.fast for u in kl_units) / positions,
+        "fast_mean_tv": sum(u.fast for u in tv_units) / positions,
         "fast_top1_disagreement": sum(u.fast for u in top1_units) / positions,
         "default_mean_nll": sum(u.default for u in nll_units) / positions,
         "fast_mean_nll": sum(u.fast for u in nll_units) / positions,
@@ -479,17 +497,25 @@ def evaluate_forced(default_path: Path, fast_path: Path, reference_path: Path,
         "fast_identical_to_default": all(
             d["logprobs"] == f["logprobs"] for d, f in zip(default["segments"], fast["segments"])),
     }
-    verdict.criteria.append(bounded("decode mean KL excess", kl_units, kl_budget(floor_kl, policy),
-                                    policy, f"floor {floor_kl:.6g}"))
+    # The bounded criteria. Total variation, not KL, carries the distribution criterion: KL is
+    # unbounded per position, so the few positions whose most probable token flips under any
+    # rounding change (a few nats each) set its standard error, and no feasible sample resolves a
+    # 10 % budget (section 6.4). Total variation counts each such position at most once.
+    verdict.criteria.append(bounded(
+        "decode mean TV excess", tv_units,
+        clamp(policy.relative_budget * floor_tv, policy.tv_budget_minimum,
+              policy.tv_budget_maximum), policy, f"floor {floor_tv:.6g}"))
     verdict.criteria.append(bounded(
         "decode top-1 disagreement excess", top1_units,
         clamp(policy.relative_budget * floor_top1, policy.top1_budget_minimum,
               policy.top1_budget_maximum), policy, f"floor {floor_top1:.6g}"))
-    # As in prefill: NLL moves at first order, so it is a gross cap on the point estimate.
-    nll_mean, nll_bound = paired_excess(nll_units, policy.z)
-    nll_cap = max(policy.bucket_relative * floor_kl, policy.kl_budget_minimum)
-    verdict.criteria.append(Criterion("decode NLL excess", nll_mean, nll_mean, nll_cap,
-                                      nll_mean <= nll_cap, f"95% bound {nll_bound:.4e}"))
+    # Gross caps on point estimates, their bounds reported: KL and NLL (NLL moves at first order,
+    # as in prefill), the far tail, and each prompt length.
+    cap = max(policy.bucket_relative * floor_kl, policy.kl_budget_minimum)
+    for name, units in (("decode mean KL excess", kl_units), ("decode NLL excess", nll_units)):
+        mean, bound = paired_excess(units, policy.z)
+        verdict.criteria.append(Criterion(name, mean, mean, cap, mean <= cap,
+                                          f"95% bound {bound:.4e}"))
     default_tail = quantile([k for s in a for k in s.kl], 0.999)
     fast_tail = quantile([k for s in b for k in s.kl], 0.999)
     tail_ratio = fast_tail / default_tail if default_tail > 0 else (0.0 if fast_tail == 0 else math.inf)
@@ -499,16 +525,16 @@ def evaluate_forced(default_path: Path, fast_path: Path, reference_path: Path,
     by_prompt: dict[int, list[float]] = {}
     for d, f in zip(a, b):
         totals = by_prompt.setdefault(d.prompt_tokens, [0.0, 0.0, 0.0])
-        totals[0] += len(d.kl)
-        totals[1] += sum(d.kl)
-        totals[2] += sum(f.kl)
+        totals[0] += len(d.tv)
+        totals[1] += sum(d.tv)
+        totals[2] += sum(f.tv)
     for prompt in sorted(by_prompt):
         n, d, f = by_prompt[prompt]
         excess = (f - d) / n
-        cap = max(policy.bucket_relative * d / n, policy.kl_budget_minimum)
+        bucket_cap = max(policy.bucket_relative * d / n, policy.tv_budget_minimum)
         verdict.criteria.append(
-            Criterion(f"prompt {prompt} decode KL excess", excess, excess, cap, excess <= cap,
-                      f"{int(n)} positions, default {d / n:.6g}"))
+            Criterion(f"prompt {prompt} decode TV excess", excess, excess, bucket_cap,
+                      excess <= bucket_cap, f"{int(n)} positions, default {d / n:.6g}"))
     return verdict
 
 
@@ -675,7 +701,10 @@ def run_prefill(args: argparse.Namespace) -> Path:
                 if (target / "report.json").is_file():
                     continue
                 target.parent.mkdir(parents=True, exist_ok=True)
-                run(common + ["--kv-dtype", kv, "--prefill-chunk", str(chunk), "--kl-reference",
+                # A schedule fast path's fast run may prefill at another width than the default
+                # run it pairs with (--fast-chunk); the pair keeps the default run's chunk name.
+                width = args.fast_chunk if route == "fast" and args.fast_chunk else chunk
+                run(common + ["--kv-dtype", kv, "--prefill-chunk", str(width), "--kl-reference",
                               str(reference), "--output", str(target)] + extra,
                     out / kv / f"{route}-c{chunk}.log")
     return out
@@ -707,6 +736,15 @@ def run_decode(args: argparse.Namespace) -> list[Verdict]:
     volume = ["--ngram-volume", args.ngram_volume] if args.ngram_volume else []
     segments = ["--segments", str(args.segments), "--prompts",
                 ",".join(str(p) for p in args.prompts)]
+    # The arm: both routes run the same Engine conditions, so the request-coupling paths act in
+    # the fast run (other requests in the round, a short KV pool, prefix-cache resumes).
+    arm = ["--concurrency", str(args.concurrency)]
+    if args.kv_tokens:
+        arm += ["--kv-tokens", str(args.kv_tokens)]
+    if args.prefix_reuse:
+        arm += ["--prefix-reuse"]
+    if args.warm_tokens:
+        arm += ["--warm-tokens", str(args.warm_tokens)]
     # The reference: the 16-bit-activation, BF16-KV scoring route at the same positions.
     reference = out / "reference.json"
     if not reference.is_file():
@@ -718,13 +756,13 @@ def run_decode(args: argparse.Namespace) -> list[Verdict]:
         if target.is_file():
             continue
         run([args.forced, args.artifact, text, str(target), "--observe", str(reference),
-             "--mode", args.mode, "--kv-dtype", args.kv] + segments + volume + extra,
+             "--mode", args.mode, "--kv-dtype", args.kv] + segments + arm + volume + extra,
             out / f"{route}-forced.log")
     verdicts = [evaluate_forced(out / "default-forced.json", out / "fast-forced.json", reference)]
     if args.free_running:
         modes = [] if args.mode == "dflash2" else [args.mode]
-        for route, extra in (("default", ["exact"]),
-                             ("fast", [f"path={p}" for p in args.fast_path])):
+        for route, extra in (("default", ["exact", f"kv={args.kv}"]),
+                             ("fast", [f"path={p}" for p in args.fast_path] + [f"kv={args.kv}"])):
             target = out / f"{route}.txt"
             if target.is_file():
                 continue
@@ -786,6 +824,10 @@ def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
     prefill.add_argument("--ngram-volume", help="Qwen3.8-Flash-Next n-gram volume")
     prefill.add_argument("--fast-path", action="append", default=[], choices=FAST_PATHS,
                          help="a candidate to qualify, run with the qualified paths")
+    prefill.add_argument("--fast-chunk", type=int, default=0,
+                         help="prefill chunk of every fast run, each paired with the default run "
+                              "at its --chunk (a schedule fast path that widens prefill steps); "
+                              "use a separate --out")
     prefill.add_argument("--out", required=True, help="run directory (reused runs are skipped)")
 
     decode = commands.add_parser("decode", help="run and decide the decode criteria")
@@ -798,6 +840,14 @@ def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
     decode.add_argument("--mode", choices=("plain", "dflash2", "mtp", "ngram"), default="plain")
     decode.add_argument("--kv", default="int8", choices=KV_FORMATS)
     decode.add_argument("--segments", type=int, default=1024)
+    decode.add_argument("--concurrency", type=int, default=1,
+                        help="requests per round in both runs (the batch-coupled paths act above 1)")
+    decode.add_argument("--kv-tokens", type=int, default=0,
+                        help="KV pool tokens (default: every lane's context); less preempts")
+    decode.add_argument("--prefix-reuse", action="store_true",
+                        help="resume each segment from a warm request's prefix-cache entry")
+    decode.add_argument("--warm-tokens", type=int, default=0,
+                        help="the warm request's prompt length (default: the whole prompt)")
     decode.add_argument("--prompts", type=int, nargs="+", default=[512, 2048, 8192],
                         help="prompt lengths the segments cycle through")
     decode.add_argument("--free-running", action="store_true",

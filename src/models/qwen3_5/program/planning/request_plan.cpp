@@ -1,6 +1,7 @@
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/execution_context.h"
+#include "core/paged_kv_cache.h"
 #include <algorithm>
 #include <cmath>
 #include <iterator>
@@ -214,6 +215,35 @@ std::uint32_t ProgramImpl::initial_mtp_extent(const RequestBasePlanImpl& base) c
                : 0U;
 }
 
+UnitDemand ProgramImpl::held_extent(const RequestBasePlanImpl& base) const {
+    if (!execution_schedule.held_extent) { return {}; }
+    // The prompt, the output budget and one verify window past it bound every unit's frontier
+    // (next_unit), capped at what one lane and the pool can hold, less a page for a binding's
+    // copied tail: a request beyond that grows its last pages per unit, as without the hold.
+    const std::uint64_t pool_pages = text_kv_pages->physical_pool().capacity_pages();
+    const std::uint64_t pool_tokens =
+        (pool_pages > 1 ? pool_pages - 1 : 0) * static_cast<std::uint64_t>(kPagedKVPageSize);
+    const auto limit = static_cast<std::uint32_t>(
+        std::min<std::uint64_t>(capacity, pool_tokens));
+    const std::uint64_t main = static_cast<std::uint64_t>(base.summary.prompt_tokens) +
+                               base.summary.effective_output_tokens + draft_window;
+    UnitDemand extent{.kind = ExecutionUnitKind::Decode};
+    extent.main_frontier = static_cast<std::uint32_t>(std::min<std::uint64_t>(main, limit));
+    if (backend_kv_cache()) {
+        std::uint64_t backend = extent.main_frontier;
+        if (speculative_backend == SpeculativeBackend::Mtp) { backend += draft_window; }
+        std::uint64_t backend_limit = capacity;
+        if (backend_kv_pages) {
+            const std::uint64_t pages = backend_kv_pages->physical_pool().capacity_pages();
+            backend_limit             = std::min<std::uint64_t>(
+                backend_limit,
+                (pages > 1 ? pages - 1 : 0) * static_cast<std::uint64_t>(kPagedKVPageSize));
+        }
+        extent.backend_frontier = static_cast<std::uint32_t>(std::min(backend, backend_limit));
+    }
+    return extent;
+}
+
 UnitDemand ProgramImpl::prefill_unit(std::uint32_t prompt, std::uint32_t cursor,
                                      std::uint32_t mtp_extent) const {
     UnitDemand demand{.kind = ExecutionUnitKind::Prefill};
@@ -262,8 +292,10 @@ UnitDemand ProgramImpl::next_unit(const SequenceState& sequence, const RequestCo
                                                 : draft_window});
         // A DFlash2 tree row verifies its whole tree whatever output budget it has left: a round
         // widens a row whose neural extent is full to the tree's width (decode.cpp row_extent),
-        // so the unit covers the widest tree that fits before the capacity.
-        if (is_masked_draft_backend(speculative_backend) && available >= neural_draft_window) {
+        // so the unit covers the widest tree that fits before the capacity. Fixed-width rounds
+        // verify no trees (decode.cpp).
+        if (is_masked_draft_backend(speculative_backend) && available >= neural_draft_window &&
+            !execution_schedule.fixed_speculation) {
             std::uint32_t tree_columns = 0;
             for (const std::uint32_t columns : tree_widths.automatic) {
                 tree_columns = std::max(tree_columns, columns);
@@ -316,6 +348,10 @@ runtime::ResourceReservation ProgramImpl::reserve_units(std::span<const Executio
         const auto& state = active_sequence(lane);
         demands[lane]     = next_unit(state, request, unit.kind, unit.tokens);
         coverage[lane]    = request.recovery ? request.recovery->coverage : demands[lane];
+        coverage[lane].main_frontier =
+            std::max(coverage[lane].main_frontier, request.held_extent.main_frontier);
+        coverage[lane].backend_frontier =
+            std::max(coverage[lane].backend_frontier, request.held_extent.backend_frontier);
         if (demands[lane].main_frontier > coverage[lane].main_frontier ||
             demands[lane].backend_frontier > coverage[lane].backend_frontier) {
             throw std::logic_error("execution exceeds the retained recovery capacity");
@@ -413,11 +449,13 @@ void ProgramImpl::settle_unit(std::uint32_t lane) noexcept {
         try {
             text_kv_addresses->settle_growth(
                 state.kv->text, state.text_kv_valid,
-                request.recovery ? request.recovery->coverage.main_frontier : 0);
+                std::max(request.recovery ? request.recovery->coverage.main_frontier : 0U,
+                         request.held_extent.main_frontier));
             if (state.kv->backend) {
                 backend_kv_addresses->settle_growth(
                     *state.kv->backend, backend_kv_valid(state),
-                    request.recovery ? request.recovery->coverage.backend_frontier : 0);
+                    std::max(request.recovery ? request.recovery->coverage.backend_frontier : 0U,
+                             request.held_extent.backend_frontier));
             }
         } catch (...) { std::terminate(); }
     }

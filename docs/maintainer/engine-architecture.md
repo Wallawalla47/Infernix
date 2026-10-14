@@ -211,6 +211,15 @@ At most one request is in this protected resume at a time; real new progress or 
 the permit, after which other resumes are attempted; other requests that hold permits can still
 execute.
 
+Replay recomputes generated tokens as prefill, whose bits differ from their decode, so a request
+that may not depend on the others (request invariance, the exact route's default) is never paused:
+without the `preemption` fast path the Program's binding reserves the request's whole KV extent
+(`RequestControl::held_extent`: prompt + output budget + one verify window, capped at the lane and
+the pool) and every unit settles back to it, so no unit needs new pages and the Engine's reclaim
+never chooses a victim. Admission waits for the extent instead. Without `free-cache-resume` the
+Program likewise splits prefill and publishes and resumes cached state only on the prefill chunk
+grid, and publishes no decode-computed endpoint ([numerical policy](model-quality.md#67-fast-path-registry)).
+
 ### 3.2 Outstanding capacity
 
 After a successful submit, a request with nonzero output takes one outstanding slot, and a pause does

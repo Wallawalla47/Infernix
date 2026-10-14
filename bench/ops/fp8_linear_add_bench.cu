@@ -84,8 +84,10 @@ Options parse_options(int argc, char** argv) {
                 options.policy = ops::LinearPolicy::A16Only;
             } else if (value == "a8") {
                 options.policy = ops::LinearPolicy::AllowA8;
+            } else if (value == "invariant") {
+                options.policy = ops::LinearPolicy::A16ColumnInvariant;
             } else {
-                throw std::invalid_argument("--policy must be a16 or a8");
+                throw std::invalid_argument("--policy must be a16, a8 or invariant");
             }
         } else if (argument == "--t-sweep") {
             options.t_sweep = parse_t_sweep(next("--t-sweep"));

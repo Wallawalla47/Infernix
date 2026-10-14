@@ -277,7 +277,7 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
                 execution::PrefillContext schedule_state{
                     {device, parameters, work, *state_images,
                      replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-                     proposal_head, attention_schedule},
+                     proposal_head, execution_schedule},
                     text_kv_view(sequence),
                     mtp_kv_view(sequence),
                     decoder->text_kv,

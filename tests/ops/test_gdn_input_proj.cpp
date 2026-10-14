@@ -369,6 +369,10 @@ int run_nvfp4() {
         quantized_weight::make_patterned_weight(QType::NVFP4, kRows, kHidden, 607U, options));
     int failures = 0;
     failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::A16Only);
+    // The column-invariant route: one schedule at every T, sliced beyond its widest tile.
+    for (const std::int32_t tokens : {1, 2, 5, 8, 9, 16, 17, 33, 40, 65, 129}) {
+        failures += run_nvfp4_case(parent, tokens, ops::LinearPolicy::A16ColumnInvariant);
+    }
     failures += run_nvfp4_case(parent, 4, ops::LinearPolicy::AllowA8);
     failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_case(parent, 2, ops::LinearPolicy::AllowA4);
@@ -478,6 +482,10 @@ int run_fp8() {
     int failures = 0;
     for (int columns : {5, 8, 16, 24, 32, 33, 64, 65, 96, 97, 128, 129}) {
         failures += run_fp8_case(parent, columns, ops::LinearPolicy::A16Only);
+    }
+    // The column-invariant route: one schedule at every T, sliced beyond its widest tile.
+    for (int columns : {1, 2, 5, 8, 9, 16, 17, 33, 40, 65, 129}) {
+        failures += run_fp8_case(parent, columns, ops::LinearPolicy::A16ColumnInvariant);
     }
     const std::size_t one = ops::gdn_input_proj_workspace_capacity_bytes(
         QType::FP8_E4M3FN_ROW_BF16, kRows, kHidden, ops::LinearPolicy::AllowA8, 1, 1);

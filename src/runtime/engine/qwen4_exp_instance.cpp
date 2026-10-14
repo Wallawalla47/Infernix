@@ -15,6 +15,7 @@
 #include "runtime/engine/model_instance.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdio>
 #include <stdexcept>
@@ -63,6 +64,52 @@ void report(const EngineOptions& options, DiagnosticLevel level, const std::stri
     }
 }
 
+// Whether `path` acts on Qwen3.8-Flash-Next under these options: its request-coupling behaviours
+// (two-row speculative rounds, free cache resume, preemption); its decode is already request-
+// invariant at every batch, so the batched-decode and attention paths have nothing to change.
+bool qwen4_exp_fast_path(FastPath path, const EngineOptions& options) {
+    switch (path) {
+    case FastPath::AdaptiveSpeculation:
+        return options.speculative.backend == SpeculativeBackend::Mtp;
+    case FastPath::FreeCacheResume: return options.context_cache.enabled;
+    case FastPath::Preemption: return true;
+    case FastPath::PromptPv8:
+    case FastPath::DecodeSplit64:
+    case FastPath::BatchedDecode:
+    case FastPath::BatchSplitAttention: return false;
+    }
+    return false;
+}
+
+// The KV formats each Qwen3.8-Flash-Next fast path passed the acceptance gate with
+// (docs/maintainer/model-quality.md section 6.7).
+struct Qwen4ExpQualification {
+    FastPath path;
+    KvCacheStorage kv;
+};
+constexpr std::array kQwen4ExpQualified{
+    // NVIDIA NVFP4 Dense8, INT8 KV: MTP at concurrency 2, and off-grid and endpoint cache resumes
+    // (2026-10-14).
+    Qwen4ExpQualification{FastPath::AdaptiveSpeculation, KvCacheStorage::Int8Group64},
+    Qwen4ExpQualification{FastPath::FreeCacheResume, KvCacheStorage::Int8Group64},
+    // Preemption with Replay under a 388-page pool that certainly runs short (2026-10-14).
+    Qwen4ExpQualification{FastPath::Preemption, KvCacheStorage::Int8Group64},
+};
+
+// A path runs when it is a candidate (a qualification run), or with fast paths enabled when it is
+// qualified for the KV format and acts under these options.
+bool selected_fast_path(const EngineOptions& options, FastPath path) {
+    if (std::find(options.fast_path_candidates.begin(), options.fast_path_candidates.end(), path) !=
+        options.fast_path_candidates.end()) {
+        return true;
+    }
+    return options.fast_paths && qwen4_exp_fast_path(path, options) &&
+           std::any_of(kQwen4ExpQualified.begin(), kQwen4ExpQualified.end(),
+                       [&](const Qwen4ExpQualification& entry) {
+                           return entry.path == path && entry.kv == options.kv_cache;
+                       });
+}
+
 void validate(const EngineOptions& options) {
     if (options.purpose != EnginePurpose::Generation && options.purpose != EnginePurpose::CausalScoring) {
         throw std::invalid_argument("Qwen3.8-Flash-Next serves generation and causal scoring");
@@ -83,9 +130,13 @@ void validate(const EngineOptions& options) {
         throw std::invalid_argument(
             "16-bit activations (the quality reference) run the exact route: disable fast paths");
     }
-    // No fast path applies to Qwen3.8-Flash-Next (docs/maintainer/model-quality.md section 6.7).
-    if (!options.fast_path_candidates.empty()) {
-        throw std::invalid_argument("no fast path applies to Qwen3.8-Flash-Next");
+    // Qwen3.8-Flash-Next's fast paths are its request-coupling behaviours, none qualified yet
+    // (docs/maintainer/model-quality.md section 6.7): they run only as candidates.
+    for (const FastPath path : options.fast_path_candidates) {
+        if (!qwen4_exp_fast_path(path, options)) {
+            throw std::invalid_argument(std::string("fast path ") + fast_path_name(path) +
+                                        " does not apply to Qwen3.8-Flash-Next");
+        }
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
@@ -185,6 +236,9 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.mtp_draft_tokens   = options.speculative.backend == SpeculativeBackend::Mtp
                                              ? options.speculative.draft_tokens
                                              : 0U;
+    program_options.pair_speculation  = selected_fast_path(options, FastPath::AdaptiveSpeculation);
+    program_options.free_cache_resume = selected_fast_path(options, FastPath::FreeCacheResume);
+    program_options.preemption        = selected_fast_path(options, FastPath::Preemption);
     if (!options.expert_state_path.empty()) {
         // The state belongs to the artifact: its experts and their records, not the build or KV format.
         std::error_code error;
@@ -373,6 +427,13 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     summary.prefix_cache         = std::move(restore);
     summary.fast_path_configuration = "Qwen3.8-Flash-Next";
     summary.fast_paths_disabled     = !options.fast_paths;
+    summary.request_invariance_capable = true;
+    summary.request_invariant          = true;
+    for (const FastPath path : kFastPaths) {
+        if (!selected_fast_path(options, path)) { continue; }
+        summary.fast_paths.emplace_back(fast_path_name(path));
+        summary.request_invariant = false;
+    }
 
     ModelMetadata metadata;
     metadata.model_id       = instance->model->info().name;

@@ -58,6 +58,30 @@ void launch_matrix(const Tensor& x, const Weight& weight, Tensor& residual, cuda
     tma.template operator()<Fp8A16TmaT64R128>();
 }
 
+void fp8_linear_add_invariant_launch(const Tensor& x, const Weight& weight, Tensor& residual,
+                                     cudaStream_t stream) {
+    // The tiles run 8 K-warps over the same K slices and reduce them in the same order, and the
+    // MMA's columns are independent; wider calls run as 64-column slices.
+    const auto operands = fp8_a16_operands(x, weight);
+    auto* data          = static_cast<__nv_bfloat16*>(residual.data);
+    const LinearBf16Output output{data, weight.n};
+    const LinearResidualAddEpilogue epilogue{{data, weight.n}};
+    const auto launch = [&]<int K>() {
+        if (x.ne[1] <= 8)
+            return launch_fp8_a16_sliced_k_mma<Fp8ScheduleInstance<Fp8SlicedInstance<8, 8, 2>, K>>(
+                operands, output, epilogue, stream);
+        if (x.ne[1] <= 16)
+            return launch_fp8_a16_sliced_k_mma<
+                Fp8ScheduleInstance<Fp8SlicedInstance<16, 8, 2>, K>>(operands, output, epilogue,
+                                                                    stream);
+        launch_fp8_a16_sliced_k_mma<Fp8ScheduleInstance<Fp8SlicedInstance<64, 8, 1>, K>>(
+            operands, output, epilogue, stream);
+    };
+    if (weight.k == 6144) return launch.template operator()<6144>();
+    if (weight.k == 17408) return launch.template operator()<17408>();
+    throw std::invalid_argument("fp8 linear_add: unsupported column-invariant problem");
+}
+
 void fp8_linear_add_matrix_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                   cudaStream_t stream) {
     if (weight.k == 6144)

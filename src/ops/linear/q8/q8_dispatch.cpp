@@ -72,6 +72,12 @@ Q8Launch select_q8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
 
 Q8Launch select_q8_launch(std::int32_t n, std::int32_t k, std::int32_t t, LinearPolicy policy) {
     if (!valid_linear_policy(policy)) throw std::invalid_argument("q8 linear: unsupported policy");
+    if (column_invariant(policy)) {
+        if (t <= 0) throw std::invalid_argument("q8 linear: T must be positive");
+        if (n == Q8N248320K5120::kOutputRows && k == Q8N248320K5120::kInputRows)
+            return select_q8_n248320_k5120_invariant(t);
+        throw std::invalid_argument("q8 linear: no column-invariant route for this problem");
+    }
     return select_q8_a16_launch(n, k, t);
 }
 

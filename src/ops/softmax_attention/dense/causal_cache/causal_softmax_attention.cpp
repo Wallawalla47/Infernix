@@ -15,6 +15,8 @@
 #include "ops/softmax_attention/dense/causal_cache/k8v4/plan.h"
 #include "ops/softmax_attention/dense/causal_cache/k8v4/launch.h"
 #include "ops/softmax_attention/dense/causal_cache/vq2/launch.h"
+#include "ops/softmax_attention/dense/causal_cache/column_invariant.h"
+#include "core/arena.h"
 
 #include <algorithm>
 #include <cmath>
@@ -264,6 +266,34 @@ void validate_batched_attention_tensors(const Tensor& q, const Tensor& positions
     }
 }
 
+// A column-invariant round staged column-major: q, k, v and out as [256, heads, 1, W * B] and
+// positions as [1, W * B], column j's B rows contiguous from row j * B, and every column's
+// validity as [W][B] (validity only for a masked round).
+struct StagedColumns {
+    Tensor q, k, v, out, positions, valid;
+};
+
+template <class Allocator>
+StagedColumns stage_columns(Allocator& allocator, AttentionHeadGeometry geometry,
+                            std::int32_t width, std::int32_t batch, bool masked) {
+    const std::int32_t rows = width * batch;
+    StagedColumns out;
+    out.q         = allocator.alloc(DType::BF16, {kHeadDim, geometry.query_heads, 1, rows});
+    out.k         = allocator.alloc(DType::BF16, {kHeadDim, geometry.kv_heads, 1, rows});
+    out.v         = allocator.alloc(DType::BF16, {kHeadDim, geometry.kv_heads, 1, rows});
+    out.out       = allocator.alloc(DType::BF16, {kHeadDim, geometry.query_heads, 1, rows});
+    out.positions = allocator.alloc(DType::I32, {1, rows});
+    if (masked) { out.valid = allocator.alloc(DType::I32, {batch, width}); }
+    return out;
+}
+
+// Column `column`'s B rows of a staged tensor whose rows are `row_bytes` long.
+void* column_rows(const Tensor& staged, std::int32_t column, std::int32_t batch,
+                  std::size_t row_bytes) {
+    return static_cast<unsigned char*>(staged.data) +
+           static_cast<std::size_t>(column) * batch * row_bytes;
+}
+
 } // namespace
 
 std::int32_t causal_softmax_attention_prompt_wave_tokens(AttentionHeadGeometry geometry) {
@@ -297,28 +327,33 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
             "causal_softmax_attention workspace: invalid profile or interval");
     }
 
-    if (cache_storage == KvCacheStorage::BFloat16)
-        return detail::bf16_kv_workspace_bytes(q_heads, batch_size, min_width, max_width, envelope,
-                                               execution.multiprocessor_count);
-
-    if (cache_storage == KvCacheStorage::Fp8E4M3Row256)
-        return detail::fp8_kv_workspace_bytes(q_heads, batch_size, min_width, max_width, envelope,
-                                              execution.multiprocessor_count);
-
-    if (cache_storage == KvCacheStorage::Int8Group64)
-        return detail::int8_kv_workspace_bytes(q_heads, batch_size, min_width, max_width, envelope,
-                                               execution.multiprocessor_count);
-
-    if (cache_storage == KvCacheStorage::Nvfp4Group16)
-        return detail::nvfp4_kv_workspace_bytes(q_heads, batch_size, min_width, max_width, envelope,
-                                                execution.multiprocessor_count);
-
-    if (kv_storage_has_exact_window(cache_storage))
-        return detail::vq_kv_workspace_bytes(q_heads, geometry.kv_heads, batch_size, min_width,
-                                             max_width, envelope);
-
-    return detail::k8v4_kv_workspace_bytes(q_heads, batch_size, min_width, max_width, envelope,
-                                           execution.multiprocessor_count);
+    const auto routes = [&](std::int32_t first, std::int32_t last,
+                            CausalAttentionExecutionEnvelope routed) -> std::size_t {
+        const int sms = execution.multiprocessor_count;
+        if (cache_storage == KvCacheStorage::BFloat16)
+            return detail::bf16_kv_workspace_bytes(q_heads, batch_size, first, last, routed, sms);
+        if (cache_storage == KvCacheStorage::Fp8E4M3Row256)
+            return detail::fp8_kv_workspace_bytes(q_heads, batch_size, first, last, routed, sms);
+        if (cache_storage == KvCacheStorage::Int8Group64)
+            return detail::int8_kv_workspace_bytes(q_heads, batch_size, first, last, routed, sms);
+        if (cache_storage == KvCacheStorage::Nvfp4Group16)
+            return detail::nvfp4_kv_workspace_bytes(q_heads, batch_size, first, last, routed, sms);
+        if (kv_storage_has_exact_window(cache_storage))
+            return detail::vq_kv_workspace_bytes(q_heads, geometry.kv_heads, batch_size, first,
+                                                 last, routed);
+        return detail::k8v4_kv_workspace_bytes(q_heads, batch_size, first, last, routed, sms);
+    };
+    if (!envelope.column_invariant || max_width == 1) {
+        return routes(min_width, max_width, envelope);
+    }
+    // Column by column: the staged column beside each one-column call's own workspace (a
+    // one-column call also serves width one).
+    CausalAttentionExecutionEnvelope column = envelope;
+    column.column_invariant                 = false;
+    WorkspaceLayoutBuilder layout;
+    (void)stage_columns(layout, geometry, max_width, batch_size, true);
+    if (const std::size_t one = routes(1, 1, column); one != 0) { (void)layout.alloc_bytes(one); }
+    return layout.peak_bytes(1);
 }
 
 void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
@@ -362,6 +397,57 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
         }
         require_shape(tree_masks, width, batch, 1, 1, op, "tree masks");
         require_contiguous_nonnull(tree_masks, op, "tree masks");
+    }
+
+    if (envelope.column_invariant && width > 1 && tree_masks.data == nullptr) {
+        // Column by column, in order: column j appends its K/V and attends as a one-column call,
+        // after columns 0..j-1 have appended theirs, so it computes what that token decoded alone
+        // computes. The round is staged column-major once, so each call reads its column in
+        // place, and the outputs return in one scatter.
+        auto scope            = workspace.scope();
+        const bool masked     = valid_columns.data != nullptr;
+        StagedColumns staged  = stage_columns(workspace, geometry, width, batch, masked);
+        cudaStream_t stream   = execution.stream;
+        const std::size_t qb  = static_cast<std::size_t>(kHeadDim) * geometry.query_heads * 2;
+        const std::size_t kb  = static_cast<std::size_t>(kHeadDim) * kv_heads * 2;
+        const std::size_t pb  = sizeof(std::int32_t);
+        const detail::CausalColumnPermutation inputs[] = {
+            {q.data, staged.q.data, static_cast<std::int32_t>(qb)},
+            {k.data, staged.k.data, static_cast<std::int32_t>(kb)},
+            {v.data, staged.v.data, static_cast<std::int32_t>(kb)},
+            {positions.data, staged.positions.data, static_cast<std::int32_t>(pb)},
+        };
+        detail::causal_columns_permute_launch(inputs, 4, width, batch, true, stream);
+        if (masked) {
+            detail::causal_column_valid_launch(valid_columns, staged.valid, width, batch, stream);
+        }
+        CausalAttentionExecutionEnvelope column_envelope = envelope;
+        column_envelope.column_invariant                 = false;
+        for (std::int32_t column = 0; column < width; ++column) {
+            const Tensor column_q(column_rows(staged.q, column, batch, qb), DType::BF16,
+                                  {kHeadDim, geometry.query_heads, 1, batch});
+            const Tensor column_k(column_rows(staged.k, column, batch, kb), DType::BF16,
+                                  {kHeadDim, kv_heads, 1, batch});
+            const Tensor column_v(column_rows(staged.v, column, batch, kb), DType::BF16,
+                                  {kHeadDim, kv_heads, 1, batch});
+            const Tensor column_positions(column_rows(staged.positions, column, batch, pb),
+                                          DType::I32, {1, batch});
+            Tensor column_out(column_rows(staged.out, column, batch, qb), DType::BF16,
+                              {kHeadDim, geometry.query_heads, 1, batch});
+            Tensor valid;
+            if (masked) {
+                valid = Tensor(static_cast<std::int32_t*>(staged.valid.data) +
+                                   static_cast<std::size_t>(column) * batch,
+                               DType::I32, {batch});
+            }
+            causal_softmax_attention(column_q, column_k, column_v, column_positions, valid,
+                                     kv_table_rows, Tensor{}, geometry, scale, cache,
+                                     column_envelope, workspace, column_out, execution);
+        }
+        const detail::CausalColumnPermutation output{staged.out.data, out.data,
+                                                     static_cast<std::int32_t>(qb)};
+        detail::causal_columns_permute_launch(&output, 1, width, batch, false, stream);
+        return;
     }
 
     if (cache.storage == KvCacheStorage::BFloat16) {

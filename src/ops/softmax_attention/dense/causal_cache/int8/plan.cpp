@@ -23,7 +23,7 @@ Int8KvCausalPlan make_int8_kv_causal_plan(int heads, int width, int batch,
                                                                      : Int8KvFamily::Tiled;
     const int tiles =
         family == Int8KvFamily::ParallelGrouped ? (width + grouped_limit - 1) / grouped_limit : 1;
-    const int independent_tiles = batch * (heads == 24 ? 4 : 2) * tiles;
+    const int independent_tiles = (envelope.row_invariant_partition ? 1 : batch) * (heads == 24 ? 4 : 2) * tiles;
     const std::int64_t sms      = multiprocessor_count;
     const auto budget =
         heads == 24 || width <= 4 ||

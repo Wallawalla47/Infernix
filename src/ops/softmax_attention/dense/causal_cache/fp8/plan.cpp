@@ -31,7 +31,7 @@ Fp8KvCausalPlan make_fp8_kv_causal_plan(int heads, int width, int batch,
                                       envelope.prompt_split_workspace_bytes)};
     const int tiles =
         family == Fp8KvFamily::ParallelGrouped ? (width + grouped_limit - 1) / grouped_limit : 1;
-    const int independent_tiles = batch * (heads == 24 ? 4 : 2) * tiles;
+    const int independent_tiles = (envelope.row_invariant_partition ? 1 : batch) * (heads == 24 ? 4 : 2) * tiles;
     // Decode budgets two CTAs per SM; wider queries start with one and double the
     // budget if complete query-tile groups would leave over 10% of the SMs idle.
     const std::int64_t sms = multiprocessor_count;

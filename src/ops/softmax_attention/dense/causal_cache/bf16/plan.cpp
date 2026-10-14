@@ -33,7 +33,7 @@ Bf16KvCausalPlan make_bf16_kv_causal_plan(int heads, int width, int batch,
                                                    : Bf16KvInstance::Grouped64;
     const auto description          = bf16_kv_instance_description(instance);
     const int tiles                 = ceil_div(rows, description.query_rows);
-    const int independent_tiles     = batch * kv_heads * tiles;
+    const int independent_tiles     = (envelope.row_invariant_partition ? 1 : batch) * kv_heads * tiles;
     const bool many_memory_tiles    = description.query_rows == 32 && independent_tiles >= 16;
     const bool multiple_query_tiles = tiles > 1;
     const std::int64_t sms          = multiprocessor_count;

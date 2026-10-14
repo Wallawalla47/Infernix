@@ -38,7 +38,7 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
                          {}, state.execution.state_images, state.execution.io,
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
                          &state.text_cache);
-        card.set_attention_schedule(state.execution.attention_schedule);
+        card.set_execution_schedule(state.execution.execution_schedule);
 
         Tensor tokens             = ordinary.tokens.slice(0, 0, batch_size);
         Tensor cache_positions    = ordinary.cache_positions.slice(0, 0, batch_size);
@@ -241,7 +241,7 @@ void ProgramImpl::enqueue_dflash_context_append(std::span<const std::uint32_t> l
     execution::DFlashAppendContext state{{device, parameters, work, *state_images,
                                           replay_records ? &*replay_records : nullptr, io,
                                           prefill_hidden, prefill_chunk, proposal_head,
-                                          attention_schedule},
+                                          execution_schedule},
                                          *dflash};
     mark_workspace_usage(workspace_plan.dflash_context);
     execution::dflash_append_context(state, features, positions, device_counts,
@@ -328,7 +328,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
         execution::OrdinaryBatchContext schedule_state{
             {device, parameters, work, *state_images,
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head, attention_schedule},
+             proposal_head, execution_schedule},
             decoder->text_kv,
             *io.ordinary,
             *ordinary_host_ingress,
@@ -505,10 +505,16 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
     // As for DFlash, a round with at least one copy proposal verifies at the narrowest n-gram
     // window that holds its longest copy and an all-neural round at the MTP window, each on the
     // frame viewed at that width. Every round proposes the next round's drafts at the configured
-    // MTP depth.
+    // MTP depth. Without adaptive speculation the width is the configuration's: every round verifies
+    // at the n-gram window when n-gram drafting is configured, else at the MTP window, so a row's
+    // verification does not depend on the other rows' proposals.
+    const bool fixed_width = execution_schedule.fixed_speculation;
     SpeculativeRoundFamily& family =
-        any_ngram ? round_family(SpeculativeRoundKind::Ngram, longest_copy)
-                  : round_family(SpeculativeRoundKind::Neural, neural_draft_window);
+        fixed_width ? (ngram_draft_window != 0
+                           ? round_family(SpeculativeRoundKind::Ngram, ngram_draft_window)
+                           : round_family(SpeculativeRoundKind::Neural, neural_draft_window))
+        : any_ngram ? round_family(SpeculativeRoundKind::Ngram, longest_copy)
+                    : round_family(SpeculativeRoundKind::Neural, neural_draft_window);
     const std::uint32_t verify_drafts = family.shape.verify_drafts;
     const std::uint32_t mtp_ar_depth  = neural_draft_window;
     const std::uint32_t width         = verify_drafts + 1;
@@ -605,7 +611,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
 
         execution::MtpBatchContext schedule_state{
             {device, parameters, work, *state_images, round_replay_records(verify_drafts),
-             io, prefill_hidden, prefill_chunk, proposal_head, attention_schedule},
+             io, prefill_hidden, prefill_chunk, proposal_head, execution_schedule},
             decoder->text_kv,
             *decoder->mtp_cache(),
             *io.mtp_decode,
@@ -780,8 +786,14 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
         constrained |= masks && masks->constrained(row);
     }
     const auto batch_rows    = static_cast<std::uint32_t>(lanes.size());
+    // Without adaptive speculation every round verifies the configuration's chain at a fixed width
+    // (the n-gram window when n-gram drafting is configured, else the drafter's), and the drafter
+    // runs for every row: no tree tables or controller, and nothing taken from the other rows.
+    const bool fixed_width   = execution_schedule.fixed_speculation;
     std::uint32_t tree_nodes = 0;
-    if (!any_ngram && !constrained && tree_controller) {
+    if (fixed_width) {
+        tree_nodes = 0;
+    } else if (!any_ngram && !constrained && tree_controller) {
         const std::uint32_t columns = tree_controller->choose(batch_rows, maximum_frontier);
         tree_nodes                  = columns == neural_draft_window + 1U ? 0U : columns;
     } else if (!any_ngram && !constrained) {
@@ -789,11 +801,14 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
     }
     const bool tree_round = tree_nodes != 0U;
     SpeculativeRoundFamily& family =
-        any_ngram    ? round_family(SpeculativeRoundKind::Ngram, longest_copy)
+        fixed_width  ? (ngram_draft_window != 0
+                            ? round_family(SpeculativeRoundKind::Ngram, ngram_draft_window)
+                            : round_family(SpeculativeRoundKind::Neural, neural_draft_window))
+        : any_ngram  ? round_family(SpeculativeRoundKind::Ngram, longest_copy)
         : tree_round ? round_family(SpeculativeRoundKind::Tree, tree_nodes - 1U)
                      : round_family(SpeculativeRoundKind::Neural, neural_draft_window);
     const std::uint32_t verify_drafts = family.shape.verify_drafts;
-    const bool drafter_runs           = !any_ngram || lanes.size() > 1;
+    const bool drafter_runs           = fixed_width || !any_ngram || lanes.size() > 1;
     const bool dflash2_backend        = speculative_backend == SpeculativeBackend::DFlash2;
     qwen3_5::DFlashDecodeState& frame = *io.dflash_decode;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -906,7 +921,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
         execution::DFlashBatchContext schedule_state{
             {device, parameters, work, *state_images,
              round_replay_records(verify_drafts), io, prefill_hidden, prefill_chunk,
-             proposal_head, attention_schedule},
+             proposal_head, execution_schedule},
             decoder->text_kv,
             *dflash,
             frame,

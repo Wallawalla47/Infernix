@@ -68,6 +68,8 @@ struct Options {
     std::vector<infernix::FastPath> candidates;
     std::uint32_t concurrency   = 1;
     std::uint32_t prefill_chunk = 4096;
+    // KV pool tokens; 0: every lane's whole context. Less makes concurrent requests preempt.
+    std::uint32_t kv_tokens     = 0;
     bool prefix_reuse           = false;
     std::uint32_t warm_tokens   = 0; // 0: the whole prompt
     bool reference              = false;
@@ -115,6 +117,8 @@ Options parse(int argc, char** argv) {
             out.concurrency = parse_u32(value(), "concurrency");
         } else if (option == "--prefill-chunk") {
             out.prefill_chunk = parse_u32(value(), "prefill chunk");
+        } else if (option == "--kv-tokens") {
+            out.kv_tokens = parse_u32(value(), "KV tokens");
         } else if (option == "--prefix-reuse") {
             out.prefix_reuse = true;
         } else if (option == "--warm-tokens") {
@@ -156,7 +160,10 @@ infernix::KvCacheStorage kv_storage(std::string_view name) {
     if (name == "bf16") { return infernix::KvCacheStorage::BFloat16; }
     if (name == "fp8") { return infernix::KvCacheStorage::Fp8E4M3Row256; }
     if (name == "nvfp4") { return infernix::KvCacheStorage::Nvfp4Group16; }
-    throw std::invalid_argument("--kv-dtype must be int8, bf16, fp8 or nvfp4");
+    if (name == "k8v4") { return infernix::KvCacheStorage::Fp8KeyNvfp4Value; }
+    if (name == "vq2") { return infernix::KvCacheStorage::Vq2; }
+    if (name == "k4v2") { return infernix::KvCacheStorage::Q4KeyVq2Value; }
+    throw std::invalid_argument("--kv-dtype must be int8, bf16, fp8, nvfp4, k8v4, vq2 or k4v2");
 }
 
 void write_string(std::ostream& out, const std::string& text) {
@@ -325,7 +332,8 @@ int main(int argc, char** argv) {
         engine_options.artifact_path   = options.artifact;
         engine_options.max_context     = (longest + options.forced + 64 + 127) / 128 * 128;
         engine_options.kv_capacity     = infernix::KvCapacityPolicy::explicit_capacity(
-            engine_options.max_context * options.concurrency);
+            options.kv_tokens != 0 ? options.kv_tokens
+                                   : engine_options.max_context * options.concurrency);
         engine_options.kv_cache        = kv_storage(options.kv);
         engine_options.max_concurrency = options.concurrency;
         engine_options.prefill_chunk   = options.prefill_chunk;
@@ -449,7 +457,10 @@ int main(int argc, char** argv) {
         }
         out << "], \"observed_reference\": ";
         write_string(out, options.observe);
-        out << ", \"underflows\": " << underflows << ", \"reused_prompt_tokens\": " << reused << "}\n";
+        const infernix::RuntimeStats stats = engine.runtime_stats();
+        out << ", \"underflows\": " << underflows << ", \"reused_prompt_tokens\": " << reused
+            << ", \"preemptions\": " << stats.preemptions
+            << ", \"replayed_tokens\": " << stats.replayed_tokens << "}\n";
         if (!out) { throw std::runtime_error("cannot write " + options.output); }
         const double seconds =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();

@@ -512,7 +512,9 @@ std::uint64_t ProgramImpl::hybrid_cache_epoch() const noexcept {
 }
 
 bool ProgramImpl::hybrid_await_sibling(const PreparedPromptData& prompt, std::uint32_t reuse) {
-    if (hybrid_coalesce_wait_seconds_ <= 0.0) { return false; }
+    if (hybrid_coalesce_wait_seconds_ <= 0.0 || execution_schedule.grid_cache) {
+        return false;
+    }
     const auto n = static_cast<std::uint32_t>(prompt.token_ids.size());
 
     struct Wait {
@@ -994,6 +996,7 @@ void ProgramImpl::complete_hybrid_binding(ContextTransaction& tx, ContextProgres
     lane_state.last_capture     = reuse;
     lane_state.restore_ticket   = ticket;
     lane_state.restore_layers_pending = ticket != 0;
+    if (execution_schedule.grid_cache) { lane_state.publish_frontier = reuse; }
 
     HybridCacheCounters& counters = hybrid_->counters();
     ++counters.admissions;
@@ -1028,6 +1031,7 @@ void ProgramImpl::hybrid_publish_blocks(SequenceState& sequence) {
     if (sequence.kv->backend) { frontier = std::min(frontier, backend_kv_valid(sequence)); }
     frontier =
         std::min<std::uint32_t>(frontier, static_cast<std::uint32_t>(sequence.ledger.size()));
+    frontier                 = std::min(frontier, lane.publish_frontier);
     const std::uint32_t full = frontier / kBlock;
     while (lane.path.size() < full) {
         const auto block = static_cast<std::uint32_t>(lane.path.size());
@@ -1203,6 +1207,15 @@ void ProgramImpl::hybrid_after_prefill_chunk(SequenceState& sequence, std::uint3
     if (!hybrid_ || sequence.lane >= max_concurrency) { return; }
     HybridLaneState& lane = hybrid_lanes_[sequence.lane];
     if (!lane.active || !lane.publish || cursor >= prompt_tokens) { return; }
+    // Without free cache resume prefill splits only on the chunk grid, every tap is realized at a
+    // grid boundary, and blocks publish up to the last one reached.
+    const bool invariant = execution_schedule.grid_cache;
+    const bool on_grid   = cursor % prefill_chunk == 0;
+    if (invariant) {
+        if (!on_grid) { return; }
+        lane.publish_frontier = cursor;
+        hybrid_publish_blocks(sequence);
+    }
     // The next chunk reaches the prompt end, so a flexible tap inside it is realized here.
     const bool final_chunk_next = prompt_tokens - cursor <= prefill_chunk;
     bool exact                  = false;
@@ -1210,7 +1223,7 @@ void ProgramImpl::hybrid_after_prefill_chunk(SequenceState& sequence, std::uint3
     bool boundary               = false;
     while (lane.next_tap < lane.taps.size()) {
         const pc::PlannedTap& tap = lane.taps[lane.next_tap];
-        if (tap.placement == pc::TapPlacement::Exact) {
+        if (tap.placement == pc::TapPlacement::Exact && !invariant) {
             if (tap.position > cursor) { break; }
             exact    = exact || tap.position == cursor;
             boundary = boundary || (tap.position == cursor && tap.boundary);
@@ -1316,7 +1329,8 @@ pc::SnapshotRef ProgramImpl::hybrid_publish_endpoint(SequenceState& sequence,
                 (!is_masked_draft_backend(speculative_backend) ||
                  sequence.dflash_context_frontier == frontier);
             const std::uint32_t anchor_blocks = frontier / kBlock;
-            if (endpoint && backend_caught_up && frontier != 0 &&
+            if (endpoint && !execution_schedule.grid_cache && backend_caught_up &&
+                frontier != 0 &&
                 frontier >= lane_state.deepest_snapshot + pc::kMinimumTapSeparation &&
                 frontier <= sequence.ledger.size() && lane_state.path.size() >= anchor_blocks &&
                 sequence.state.read == sequence.state.write &&

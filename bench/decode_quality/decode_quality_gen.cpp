@@ -31,7 +31,8 @@
 int main(int argc, char** argv) {
     if (argc < 7) {
         std::cerr << "usage: infernix_decode_quality_gen <artifact> <corpus.txt> <out.txt> <segments> "
-                     "<prompt_tokens> <new_tokens> [ngram] [mtp] [plain] [exact] [path=NAME]...\n";
+                     "<prompt_tokens> <new_tokens> [ngram] [mtp] [plain] [exact] [path=NAME]... "
+                     "[kv=bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2]\n";
         return 2;
     }
     try {
@@ -41,6 +42,7 @@ int main(int argc, char** argv) {
         bool ngram = false, mtp = false, plain = false, exact = false;
         std::vector<std::string> paths;
         std::string ngram_volume;
+        infernix::KvCacheStorage kv = infernix::KvCacheStorage::Int8Group64;
         for (int i = 7; i < argc; ++i) {
             const std::string flag = argv[i];
             if (flag == "ngram") {
@@ -55,9 +57,29 @@ int main(int argc, char** argv) {
                 ngram_volume = flag.substr(13);
             } else if (flag.starts_with("path=")) {
                 paths.push_back(flag.substr(5));
+            } else if (flag.starts_with("kv=")) {
+                const std::string name = flag.substr(3);
+                if (name == "bf16") {
+                    kv = infernix::KvCacheStorage::BFloat16;
+                } else if (name == "int8") {
+                    kv = infernix::KvCacheStorage::Int8Group64;
+                } else if (name == "fp8") {
+                    kv = infernix::KvCacheStorage::Fp8E4M3Row256;
+                } else if (name == "nvfp4") {
+                    kv = infernix::KvCacheStorage::Nvfp4Group16;
+                } else if (name == "k8v4") {
+                    kv = infernix::KvCacheStorage::Fp8KeyNvfp4Value;
+                } else if (name == "vq2") {
+                    kv = infernix::KvCacheStorage::Vq2;
+                } else if (name == "k4v2") {
+                    kv = infernix::KvCacheStorage::Q4KeyVq2Value;
+                } else {
+                    std::cerr << "unknown KV format " << name << '\n';
+                    return 2;
+                }
             } else {
                 std::cerr << "unknown option " << flag
-                          << " (ngram, mtp, plain, exact, path=NAME, ngram-volume=FILE)\n";
+                          << " (ngram, mtp, plain, exact, path=NAME, ngram-volume=FILE, kv=NAME)\n";
                 return 2;
             }
         }
@@ -73,7 +95,7 @@ int main(int argc, char** argv) {
         infernix::EngineOptions options;
         options.artifact_path = argv[1];
         options.max_context   = (prompt_tokens + new_tokens + 64 + 127) / 128 * 128;
-        options.kv_cache      = infernix::KvCacheStorage::Int8Group64;
+        options.kv_cache      = kv;
         options.max_concurrency                   = 1;
         options.prefill_chunk                     = 4096;
         options.speculative.backend               = infernix::SpeculativeBackend::DFlash2;

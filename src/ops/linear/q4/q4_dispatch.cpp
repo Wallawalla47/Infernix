@@ -33,7 +33,8 @@ Q4Launch select_q4_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
 }
 
 Q4Launch select_q4_launch(std::int32_t n, std::int32_t k, std::int32_t t, LinearPolicy policy) {
-    if (!valid_linear_policy(policy)) throw std::invalid_argument("q4 linear: unsupported policy");
+    if (!valid_linear_policy(policy) || column_invariant(policy))
+        throw std::invalid_argument("q4 linear: unsupported policy");
     return select_q4_a16_launch(n, k, t);
 }
 

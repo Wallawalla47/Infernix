@@ -240,6 +240,7 @@ const char* policy_name(LinearPolicy policy) {
     if (policy == LinearPolicy::A16Only) { return "A16"; }
     if (policy == LinearPolicy::AllowA8) { return "A8"; }
     if (policy == LinearPolicy::AllowA4) { return "A4"; }
+    if (policy == LinearPolicy::A16ColumnInvariant) { return "A16-invariant"; }
     throw std::invalid_argument("unsupported Linear benchmark policy");
 }
 
@@ -260,6 +261,7 @@ LinearPolicy parse_policy(std::string_view text) {
     if (value == "a16" || value == "a16only") { return LinearPolicy::A16Only; }
     if (value == "a8" || value == "allowa8") { return LinearPolicy::AllowA8; }
     if (value == "a4" || value == "allowa4") { return LinearPolicy::AllowA4; }
+    if (value == "invariant") { return LinearPolicy::A16ColumnInvariant; }
     throw std::invalid_argument("Linear benchmark policy must be a16, a8, or a4");
 }
 

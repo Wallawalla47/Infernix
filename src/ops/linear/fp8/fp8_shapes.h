@@ -9,6 +9,8 @@ struct Fp8LinearShape {
     void (*a8)(const Tensor&, const Weight&, Tensor&, Fp8A8Workspace, cudaStream_t);
     bool (*uses_a8)(std::int32_t min_tokens, std::int32_t max_tokens);
     std::size_t (*partial_capacity_bytes)(std::int32_t max_tokens) = nullptr;
+    // A16ColumnInvariant: one schedule for every T; null where the shape registers none.
+    Fp8Launch invariant = nullptr;
 };
 
 extern const Fp8LinearShape kFp8N14336K5120;

@@ -79,12 +79,13 @@ void gdn_norm_control(const Tensor& residual, const Tensor& norm, float epsilon,
                       WorkspaceArena& workspace, DeviceExecutionView execution) {
     if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.control)) {
         ops::gdn_norm_gating_proj(residual, norm, epsilon, pair->first, pair->second,
-                                  parameters.a_log, parameters.dt_bias, workspace, hidden, g, beta,
-                                  execution);
+                                  parameters.a_log, parameters.dt_bias, ops::LinearPolicy::A16Only,
+                                  workspace, hidden, g, beta, execution);
     } else {
         const auto& single = std::get<LinearParameters>(parameters.control);
         ops::gdn_norm_gating_proj(residual, norm, epsilon, single.weight, parameters.a_log,
-                                  parameters.dt_bias, workspace, hidden, g, beta, execution);
+                                  parameters.dt_bias, single.policy, workspace, hidden, g, beta,
+                                  execution);
     }
 }
 
