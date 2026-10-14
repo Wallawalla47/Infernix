@@ -230,9 +230,10 @@ tokens; KV blocks are shared across requests. `infernix` (one request) runs with
 ## SSD expert tier
 
 When the routed experts do not all fit in RAM, or `--expert-ram-mib N` caps them below the ~64.5 GiB
-they need, the experts stay in the artifact: startup pins N MiB (or what the ledger leaves) of
-expert slots and fills all but ~430 of them (kept free for reads and demotions) before the first
-request. RAM and VRAM hold different experts: the VRAM warm start takes the top of the saved
+they need, or Windows cannot page-lock all of them (see [Page-locking limit](#page-locking-limit)),
+the experts stay in the artifact: startup pins N MiB (or what the ledger leaves, up to the
+page-locking limit) of expert slots and fills all but ~430 of them (kept free for reads and
+demotions) before the first request; RAM past the limit holds unpinned records. RAM and VRAM hold different experts: the VRAM warm start takes the top of the saved
 ranking of `--expert-state`, and RAM the next ones, then the experts the last session used most,
 then the rest spread evenly across the layers (the same spread with no saved state). The tier's
 usage ranking starts from the saved counts, so the best-ranked RAM experts are not the first to

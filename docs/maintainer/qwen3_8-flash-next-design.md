@@ -6952,58 +6952,80 @@ measured results are under "Status" at the end of this section.
 
 #### Feature 2: the SSD expert tier
 
-- **Regimes** (§4.1), with H host slots, H_res = H − 176 (128 ring, 16 prefetch, 32 demotion
-  slots) and V_min the smallest runtime frame count: **full** (expert RAM ≥ 64,801 MiB + 1 GiB),
-  **tier without steady-state SSD** (V_min + H_res ≥ 24,576), **tier with SSD**, and **refuse**
-  below H_min = 1,024 slots (2.64 GiB).
+- **Regimes** (§4.1), with H pinned host slots, H_res = H − 176 (128 ring, 16 prefetch, 32 demotion
+  slots; with unpinned records also the bounce slots below), U unpinned records and V_min the
+  smallest runtime frame count: **full** (expert RAM ≥ 64,801 MiB + 1 GiB and the banks inside the
+  pin room), **tier without steady-state SSD** (V_min + H_res + U ≥ 24,576), **tier with SSD**, and
+  **refuse** below H_min = 1,024 pinned slots (2.64 GiB; plus the bounce slots when there are
+  unpinned records).
 - **RAM ledger** `models/qwen4_exp/memory_plan.{h,cpp}` (§4.2): a pure, unit-tested function over a
   Core host-memory snapshot (Windows `ullAvailPhys`, commit, `PrivateUsage`; Linux `MemAvailable`
-  under the cgroup limit). Planned: embedding 1.18 GiB, vision tower and media reserve, the prefix
-  Host tier, n-gram row cache 0.16 GiB, Program buffers, load staging 0.26 GiB, 1.0 GiB of process
-  growth until RM7 measures it, and 0.25 % lock overhead. `--expert-ram-mib N` caps the result (to
-  keep RAM for other programs or simulate a smaller machine). The commit limit is honoured, pinning
-  re-checks available RAM before each 1.32 GiB chunk, a failed full-mode pin falls back to tier mode
-  before any read, and a hard minimum working set keeps Infernix's own pageable pages resident.
-  Explicit and default sizes of the prefix tier and vision are honoured first (Q6).
-- **Page-locking limit and unpinned records** (2026-10-14, after a 64 GB user's start failed with
-  `SSD tier: cannot pin 1350 MiB of expert slots`). Windows WDDM page-locks for the device at most
-  the adapter's shared system memory (`DXGI_ADAPTER_DESC::SharedSystemMemory`; NON_LOCAL usage counts
-  every pinned byte; the NON_LOCAL budget is not the limit). Measured here (95.8 GiB, RTX 5090): shared
-  76.61 GiB, page-locking failed at 76.07 GiB in 64 MiB steps and at 75.15 GiB in 1.32 GiB chunks,
-  identical for `cudaHostAlloc` mapped and unmapped and for `VirtualAlloc` + `cudaHostRegister`, with
-  5-6 GiB of RAM still free. Many machines report half of RAM, which would also break full mode on a
-  96 GB machine. The ledger takes `pin room = shared − NON_LOCAL usage − 1 GiB` as a separate bound:
-  other pins first, the experts pin what is left (`--expert-pin-mib` lowers it), and full mode
-  needs the banks inside it. Expert RAM past the room is not given up: the tier keeps it as
-  **unpinned records** (`ResidentHostBuffer`: hard minimum working set raised by its size plus
-  `VirtualLock`; Linux `mlock`), a fixed set filled after the slots with the next keys of the fill
-  order that VRAM does not hold, and marked `HostTier::held` (never admitted to a slot, kept on VRAM
-  eviction, no promotion pins). They are absent from the device's record table, so the plan kernel
-  treats them as SSD-only: CPU jobs read them in place, a fetch copies them into a ring slot on the
-  copy threads (a third of the hardware threads, 2-8; never admitted), and promotions stage them
-  through 32 pinned bounce slots carved from the tier's own (two halves: the copy threads and the
-  engine thread fill one while the link drains the other). The prefill stream (§19.3.8 F2) takes a layer's unpinned records through more bounce slots in four
-  parts (`ExpertStream::Staging`: the host fills part l % 4 when it enqueues layer l's copies; that
-  part's last DMA, layer l - 4's, is long done, where two parts made the host wait for layer l - 2's),
-  each part sized to the layer's unpinned share of its 512 experts (64-256 records). 8K-token prefill,
-  MTP 4, RTX 5090 at x8: with 25.4 GiB of 63.3 unpinned, 1,553 tok/s fetching them inside each layer
-  call, 2,350 with 160 per part, 2,673 with 256 and 2,692 scaled (tier all pinned 3,222; full mode
-  3,297); with 18.4 GiB of 42.8 unpinned (the 64 GB report), 1,130, 1,144, 1,082 and 1,125, the
-  bounce coming out of a small pinned share (all 42.8 GiB pinned: 1,232; capped at the 24.4 GiB pin
-  room: 703); with 6 GiB pinned and 58.4 unpinned, 1,171 at 160 and 1,337 scaled. Decode moved
-  less: 191 full, 180-187 with unpinned records, 178 capped. Greedy outputs were identical in every
-  case. Pinning stays the primary route: it is what the GPU reads at the link rate. Measured (RTX 5090 at 5.0 x8, 2,048
-  records of 2.64 MiB): a pageable `cudaMemcpyBatchAsync` held the host for the whole copy at
-  13 GB/s in stream and any order (pinned: 0.9 ms of host, 23 GB/s); memcpy pageable to pinned ran
-  at 20 GB/s on one thread, 36 on four, 41 on eight; CPU reads of pageable and pinned records
-  matched (77 and 73 GB/s on six threads). A bounced record crosses DRAM three times (read, write,
-  DMA read), so unpinned promotions and fetches top out near a third of DRAM bandwidth however
-  wide the link; the fill therefore leaves the coldest RAM experts unpinned. A slot chunk the OS still refuses makes the tier give back
-  `prefix Host tier + 256 MiB + 1 GiB` and turn the refused slots into unpinned records. Strata
-  (pin per layer until refused, `VirtualLock` the rest, CPU computes unpinned experts, a pinned
-  bounce ring for prompts) and the SGLang Windows fork (pageable expert copies) handle the same
-  limit; vLLM and upstream SGLang pin everything and fail; llama.cpp and KTransformers never pin
-  expert weights.
+  under the cgroup limit) and the pin room below. Planned: embedding 1.18 GiB, vision tower and
+  media reserve, the prefix Host tier, n-gram row cache 0.16 GiB, Program buffers, load staging
+  0.26 GiB, 1.0 GiB of process growth until RM7 measures it, and 0.25 % lock overhead. The experts
+  take what is left of available RAM and of the commit limit; `--expert-ram-mib N` caps it (to keep
+  RAM for other programs or simulate a smaller machine). The ledger then splits the experts' RAM:
+  `expert_pinned = min(expert RAM, pin room − other pins)` (`--expert-pin-mib N` lowers it) and
+  `expert_pageable` = the rest. Full mode needs the whole banks inside the pinned part; otherwise the
+  SSD tier runs, with every expert in RAM when expert RAM covers the full need. A hard minimum
+  working set keeps Infernix's own pageable pages resident. Full mode registers the banks once at
+  load and a refused registration is a startup error (the pin room keeps full mode inside the
+  limit; there is no fallback to tier mode). Explicit and default sizes of the prefix tier and
+  vision are honoured first (Q6). The info line names the split; the debug ledger line every term.
+- **Pin room** (2026-10-14, after a 64 GB user's start failed with `SSD tier: cannot pin 1350 MiB of
+  expert slots`). Windows WDDM page-locks memory for the device only up to the adapter's shared
+  system memory (`DXGI_ADAPTER_DESC::SharedSystemMemory`, read by `core/vram_budget` with the
+  NON_LOCAL usage, which counts every pinned byte; the NON_LOCAL budget is not the limit). Measured
+  here (95.8 GiB, RTX 5090): shared 76.61 GiB; page-locking failed at 76.07 GiB in 64 MiB steps and
+  at 75.15 GiB in 1.32 GiB chunks, identical for `cudaHostAlloc` mapped and unmapped and for
+  `VirtualAlloc` + `cudaHostRegister`, with 5-6 GiB of RAM still free. Many machines report half of
+  RAM, which would break full mode on a 96 GB machine as well. `pin room = shared − NON_LOCAL usage −
+  1 GiB` (`kPinRoomMarginBytes`); without DXGI (Linux) there is no limit beyond RAM.
+- **Unpinned records** `program/host_expert_tier.{h,cpp}`. The experts' RAM past the pinned part is a
+  fixed set of records in pageable memory kept resident (`core::ResidentHostBuffer`: the hard minimum
+  working set raised by its size plus `VirtualLock`; Linux `mlock`; a refused lock only warns). The
+  startup fill gives them the next keys of the fill order after the slots' refill, skipping keys in
+  VRAM, so the coldest RAM experts are the unpinned ones; `HostTier::hold` marks them for good (never
+  admitted to a slot, kept on a VRAM eviction (T3), no promotion pins). They are absent from the
+  device's record table, so the plan kernel treats them as SSD-only, and every path reads them
+  without the device touching pageable memory:
+  - **CPU jobs** (decode, verification) are served in place: the `RecordProvider` ticket lands at
+    once with the unpinned record, no read.
+  - **Fetches** (calls past the CPU cap, prefill experts the stream did not take) copy them into a
+    ring slot on the tier's copy threads (a third of the hardware threads, 2-8); the landing is never
+    admitted, and the copies are not counted as reads.
+  - **The prefill stream** (§19.3.8 F2, `ExpertStream::Staging`) takes them like pinned records, two
+    layers ahead, through bounce slots in four parts: when it enqueues layer l's copies the host
+    (copy threads plus the engine thread, `HostExpertTier::copy_records`) fills part l % 4 and the
+    DMA reads it. That part's last DMA, layer l − 4's, is long done; two parts made the host wait for
+    layer l − 2's and so held it to the device's pace. Each part holds a layer's unpinned share of
+    its 512 experts, 64-256 records (`kStreamBounceMin/Max`).
+  - **Promotions** stage them through 32 bounce slots in two halves (the copy threads fill one while
+    the link drains the other); a pageable `cudaMemcpyBatchAsync` would hold the engine thread.
+  - The bounce slots are the tier's last pinned slots, outside the RAM policy, so they come out of
+    the pinned share and the experts' RAM is unchanged.
+  - **A refused slot chunk** (the OS limit reached earlier than planned, e.g. another program
+    pinned memory meanwhile) makes the tier release slots worth `prefix Host tier + 256 MiB + 1 GiB`
+    for the pins made after it and turn every refused slot into an unpinned record, with a warning;
+    below H_min plus the bounce it refuses to start with that cause.
+- **Unpinned costs, measured** (RTX 5090 at PCIe 5.0 x8). Copies of 2,048 records of 2.64 MiB: a
+  pageable `cudaMemcpyBatchAsync` held the host for the whole copy at 13 GB/s in stream and any
+  order (pinned: 0.9 ms of host, 23 GB/s); memcpy pageable to pinned ran at 20 GB/s on one thread,
+  36 on four, 41 on eight; CPU reads of pageable and pinned records matched (77 and 73 GB/s on six
+  threads). A bounced record crosses DRAM three times (read, write, DMA read), so bounced paths top
+  out near a third of DRAM bandwidth however wide the link: below a 5.0 x16 link's ~50 GB/s, which
+  is why pinning stays the primary route. End to end (NVFP4 Dense8, 8K-token prefill and 256-token
+  decode, MTP 4, 3 repetitions; prefill / decode tok/s): full mode 3,297 / 191; the tier all pinned
+  3,222 / 192; every expert in RAM with 25.4 GiB of 63.3 unpinned 2,692 / 181 (1,553 when the
+  stream left them to the fetch channel; 2,350 with 160 per part, 2,673 with 256); the 64 GB report
+  (42.8 GiB of expert RAM, 24.4 pinned) 1,125 / 177, against 703 / 178 capped at the pin room and
+  1,232 / 184 if all 42.8 could be pinned (a fixed 256 per part cost it 5 %: 1,082); 6 GiB pinned
+  and 58.4 unpinned 1,337 / 182. Greedy outputs (200 tokens of a 5,795-token prompt) were identical
+  in every configuration.
+- **Other engines** (read 2026-10-14). Strata pins its expert arena per layer until refused,
+  `VirtualLock`s the rest, computes unpinned experts on the CPU and stages prompt copies through a
+  pinned ring; the SGLang Windows fork copies experts from pageable memory; vLLM and upstream SGLang
+  pin everything and fail; llama.cpp and KTransformers never pin expert weights.
 - **Residency** (§4.3): exclusive with shadows (a VRAM resident keeps its RAM copy only as a shadow;
   shadows are the first RAM victims). Slots carry pins (`H2D`, `Queue`, `D2H`, `Use`, `Prefetch`)
   and load serials, so a slot is never rewritten while read and never publishes stale bytes; the
