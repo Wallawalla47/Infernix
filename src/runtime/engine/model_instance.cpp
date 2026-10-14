@@ -201,6 +201,12 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
             qwen4_exp ? kDefaultQwen4ExpHybridHostCacheBytes : kDefaultHybridHostCacheBytes);
         const bool host_tier             = *cache.host_capacity_bytes != 0;
         HybridPrefixCacheOptions& hybrid = cache.hybrid;
+        // Whether a turn resumes from lossy Host state depends on what eviction left, so the exact
+        // route's output would depend on load (model-quality 6.1).
+        if (!options.fast_paths && hybrid.host_state_precision != HybridHostStatePrecision::Fp32) {
+            throw std::invalid_argument(
+                "--cache-host-state fp24 and bf16 are lossy; --disable-fast-paths requires fp32");
+        }
         if (qwen4_exp) {
             // Qwen3.8-Flash-Next's snapshots are born in the Host tier (design §19.3.1): it needs
             // the tier and has no Device snapshot slots.

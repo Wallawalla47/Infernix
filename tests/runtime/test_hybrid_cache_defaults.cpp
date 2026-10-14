@@ -162,8 +162,25 @@ int main() {
         } catch (const std::invalid_argument&) { rejected = true; }
         failures += check(rejected == (variant != 1), "a tool-call hold was misjudged");
     }
-    // ... and refuses what its binding cannot serve: no Host tier, Device snapshot slots, a
-    // tool-call hold and a packed Host state.
+    // Lossy Host state makes a resume depend on eviction, so the exact route refuses it.
+    for (const auto precision :
+         {infernix::HybridHostStatePrecision::Fp32, infernix::HybridHostStatePrecision::Fp24,
+          infernix::HybridHostStatePrecision::Bf16}) {
+        for (const bool fast_paths : {true, false}) {
+            EngineOptions options;
+            options.context_cache.hybrid.host_state_precision = precision;
+            options.fast_paths                                = fast_paths;
+            bool rejected = false;
+            try {
+                (void)normalize_engine_options(options);
+            } catch (const std::invalid_argument&) { rejected = true; }
+            const bool lossy = precision != infernix::HybridHostStatePrecision::Fp32;
+            failures += check(rejected == (lossy && !fast_paths),
+                              "the exact route misjudged a Host state precision");
+        }
+    }
+    // Qwen3.8-Flash-Next refuses what its binding cannot serve: no Host tier, Device snapshot
+    // slots, a tool-call hold and a packed Host state.
     for (int variant = 0; variant < 4; ++variant) {
         EngineOptions options;
         if (variant == 0) { options.context_cache.host_capacity_bytes = 0; }
