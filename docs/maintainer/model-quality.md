@@ -382,6 +382,27 @@ Qualification evidence comes from a real artifact of the configuration; the qual
 `--fast-path NAME` options run a candidate before it is listed. The configurations, the kernels'
 reach and the evidence are in [6.7](#67-fast-path-registry).
 
+**Paths that leave attention and the KV cache alone** add the same excess whatever the KV format:
+their kernels neither read nor write the cache nor change attention arithmetic (activation
+precision, linear-layer tiles, GDN, the MLP). Two-term A4 residual activations added 2.2-2.5e-4
+decode TV excess on INT8, NVFP4, K8V4 and K4V2 KV alike (6.7). The gate is joint, though, and
+each format's other qualified paths already use a different share of its budgets, so the format
+with the tightest budgets is not always the one with the least room. Such a path is qualified per
+KV format in three steps:
+
+1. Gate it on INT8 KV, the format with the tightest budgets (the lowest floor), in every arm where
+   it acts. Its **increment** per criterion is that estimate minus the same arm's estimate with the
+   qualified paths alone.
+2. Gate it also on the qualified format with the least **headroom** on any criterion (its budget
+   minus the 95 % bound of its qualified joint arm; on the 27B in 2026-10, NVFP4 KV's spec top-1,
+   0.05 points).
+3. Register it for each remaining format whose qualified 95 % bounds plus the INT8 increments stay
+   within that format's budgets on every criterion; gate any other format as in step 1.
+
+A path that changes attention or KV arithmetic (`prompt-pv8`, `decode-split64`,
+`batch-split-attention`, adaptive speculation's verify kernels, `free-cache-resume`, Replay over
+quantized KV) is gated on every format.
+
 ### 6.2 What is measured
 
 - **The reference** for an artifact is the same artifact with 16-bit activations in every linear
