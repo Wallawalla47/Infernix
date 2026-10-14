@@ -614,6 +614,18 @@ int main() {
         } catch (const std::exception&) { rejected = true; }
         failures += check(rejected, "--expert-ram-mib must reject a zero or malformed size");
     }
+    failures += check(parse({"infernix-serve", "model.ninfer", "--expert-pin-mib", "24576"}).expert_pin_bytes == (24576ULL << 20) &&
+                          !parse({"infernix-serve", "model.ninfer", "--expert-pin-mib", "24576", "--expert-pin-mib", "auto"})
+                               .expert_pin_bytes &&
+                          !parse({"infernix-serve", "model.ninfer"}).expert_pin_bytes,
+                      "--expert-pin-mib must parse a MiB count and auto");
+    for (const auto* bad : {"0", "-1", "12x", ""}) {
+        bool rejected = false;
+        try {
+            (void)parse({"infernix-serve", "model.ninfer", "--expert-pin-mib", bad});
+        } catch (const std::exception&) { rejected = true; }
+        failures += check(rejected, "--expert-pin-mib must reject a zero or malformed size");
+    }
     const ServeOptions hybrid_explicit_kv =
         parse({"infernix-serve", "model.ninfer", "--max-context", "8192", "--kv-capacity", "16384",
                "--host-context-mib", "0"});

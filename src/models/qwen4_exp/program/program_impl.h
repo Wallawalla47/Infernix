@@ -787,14 +787,35 @@ public:
                                               static_cast<std::uint32_t>(ops::offloaded_moe::kMaxCpuJobs))
                     : 0U;
             HostExpertTier::Options tier;
-            tier.ring  = std::max<std::uint32_t>(128, cpu_cap + 2U * kStagingSlots);
-            tier.slots = static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                options_.expert_ram_bytes / record_stride, static_cast<std::uint64_t>(store->layers()) * store->experts()));
+            tier.ring                 = std::max<std::uint32_t>(128, cpu_cap + 2U * kStagingSlots);
             const std::uint32_t lists = tier.ring + tier.prefetch + tier.demotion;
-            if (tier.slots < std::max<std::uint32_t>(kMinTierSlots, lists + kMinTierSlots / 2)) {
-                throw std::runtime_error("Qwen3.8-Flash-Next: the SSD expert tier needs RAM for at least " +
-                                         std::to_string(std::max<std::uint32_t>(kMinTierSlots, lists + kMinTierSlots / 2)) +
-                                         " expert slots (" + std::to_string(tier.slots) + " fit in the RAM ledger's expert share)");
+            const std::uint64_t keys  = static_cast<std::uint64_t>(store->layers()) * store->experts();
+            // Pinned slots up to every key besides the lists; unpinned records for the keys they leave.
+            // With unpinned records, tier.bounce of the pinned slots stage their promotions and
+            // tier.stream_bounce the prefill stream's copies of them.
+            if (options_.prefill_stream && options_.expert_cache) {
+                // A wide chunk streams about a layer's unpinned share of its experts.
+                const double share = std::min(1.0, static_cast<double>(options_.expert_unpinned_bytes / record_stride) /
+                                                       static_cast<double>(keys));
+                const auto per_part = std::clamp<std::uint32_t>(
+                    (static_cast<std::uint32_t>(std::ceil(share * store->experts())) + 15U) / 16U * 16U,
+                    kStreamBounceMin, kStreamBounceMax);
+                tier.stream_bounce = execution::ExpertStream::kBounceParts * per_part;
+            }
+            tier.slots    = static_cast<std::uint32_t>(std::min<std::uint64_t>(options_.expert_ram_bytes / record_stride, keys + lists));
+            const std::uint32_t reserved =
+                options_.expert_unpinned_bytes >= record_stride ? lists + tier.bounce + tier.stream_bounce : lists;
+            tier.unpinned = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                options_.expert_unpinned_bytes / record_stride, keys - std::min<std::uint64_t>(keys, tier.slots - std::min(tier.slots, reserved))));
+            tier.min_slots    = std::max<std::uint32_t>(kMinTierSlots, lists + kMinTierSlots / 2);
+            tier.pin_reserve  = options_.later_pinned_bytes;
+            const std::uint32_t needed = tier.min_slots + (tier.unpinned > 0 ? tier.bounce + tier.stream_bounce : 0U);
+            if (tier.slots < needed) {
+                throw std::runtime_error(
+                    "Qwen3.8-Flash-Next: the SSD expert tier needs RAM for at least " + std::to_string(needed) +
+                    " pinned expert slots (" + std::to_string(tier.slots) +
+                    " fit in the RAM ledger's page-locked expert share; on Windows page-locked memory is limited to "
+                    "the GPU's shared memory, so lower --host-context-mib or close programs that use it)");
             }
             fetch_channel_ = std::make_unique<ops::offloaded_moe::FetchChannel>();
             tier.fetch     = fetch_channel_.get();
@@ -803,6 +824,18 @@ public:
             tier.layer_calls = store->layers() + kWalkMaxTokens / static_cast<std::uint32_t>(std::max(chunk_, 1)) + 1U;
             tier_          = std::make_unique<HostExpertTier>(*store, std::move(tier));
             residency_->attach_tier(tier_.get());
+            if (tier_->refused_slots() > 0) {
+                diagnostic("SSD expert tier: Windows refused to page-lock " + std::to_string(tier_->refused_slots()) +
+                               " of the planned expert slots (its limit is the GPU's shared memory); they are kept as "
+                               "unpinned records the CPU serves",
+                           DiagnosticLevel::Warning);
+            }
+            if (!tier_->unpinned_lock_failure().empty()) {
+                diagnostic("SSD expert tier: the OS would not lock the " + std::to_string(tier_->unpinned_records()) +
+                               " unpinned expert records in RAM (" + tier_->unpinned_lock_failure() +
+                               "); they still work, but under memory pressure the OS may page them out and responses slow down",
+                           DiagnosticLevel::Warning);
+            }
         }
         // After the tier (whose pinned slots are the probe's source when the banks stay in the
         // artifact), before the CPU service and the split take the measured rate.
@@ -833,6 +866,19 @@ public:
             }
             expert_stream_ = std::make_unique<execution::ExpertStream>(
                 c_.num_hidden_layers, c_.moe.experts, record_stride, std::move(record_of), !tier_, std::move(hold));
+            if (tier_ && tier_->stream_bounce_slots() > 0) {
+                // Unpinned records stream through the tier's bounce slots, still two layers ahead.
+                HostExpertTier* tier = tier_.get();
+                expert_stream_->set_staging(execution::ExpertStream::Staging{
+                    .unpinned = [tier](std::uint32_t layer, std::uint32_t expert) {
+                        return tier->unpinned_record(tier->key(layer, expert));
+                    },
+                    .slot     = [tier](std::uint32_t i) { return tier->stream_bounce_slot(i); },
+                    .copy     = [tier](std::span<const std::pair<std::uint8_t*, const std::uint8_t*>> copies) {
+                        tier->copy_records(copies);
+                    },
+                    .per_part = tier->stream_bounce_slots() / execution::ExpertStream::kBounceParts});
+            }
             experts.stream = expert_stream_.get();
         }
         // CPU-served misses for decode and verify calls, and for every call of at most
@@ -2061,6 +2107,11 @@ private:
     static constexpr std::int32_t kStagingSlots = 64;
     // The SSD tier's smallest RAM (design §19.3.7 H_min: 1,024 slots, 2.6 GiB).
     static constexpr std::uint32_t kMinTierSlots = 1024;
+    // Unpinned records a layer may stream through the bounce, per part: the layer's unpinned share
+    // of its experts, within these bounds (the bounce comes out of the pinned share). RTX 5090 at
+    // x8, 8K-token prefill: 25.4 GiB of 63.3 unpinned ran at 2,350 tok/s with 160 and 2,673 with 256;
+    // 18.4 of 42.8 GiB unpinned (24.4 pinned) at 1,144 with 160 and 1,082 with 256.
+    static constexpr std::uint32_t kStreamBounceMin = 64, kStreamBounceMax = 256;
     // Promotions follow the tokens a round advances (the longest row's), not rounds: a verification
     // round that advances four tokens promotes what four decode rounds would, so a speculative
     // round's cache warms per token as plain decode does.
@@ -2261,19 +2312,29 @@ private:
                 refilled = tier_->prefill(std::span<const std::uint32_t>(fill.order).subspan(fill.filled));
             }
         }
+        // The unpinned records take the next keys of the order that neither the slots nor the frames
+        // hold: they keep them for good, so a copy of a VRAM seed would be wasted.
+        const std::int32_t* in_vram = residency_->host_table();
+        const std::uint32_t unpinned =
+            tier_->fill_unpinned(fill.order, [in_vram](std::uint32_t key) { return in_vram != nullptr && in_vram[key] >= 0; });
         const double seconds =
             fill.seconds + std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
         const std::uint32_t keys = tier_->keys(), in_ram = fill.filled - released + refilled;
-        const std::uint32_t slots = tier_->controller().config().slots;
+        const std::uint32_t slots = tier_->pinned_slots();
         const double gib          = static_cast<double>(residency_->frame_stride()) / (1ULL << 30);
-        char line[400];
+        char split[160] = "";
+        if (tier_->unpinned_records() > 0) {
+            std::snprintf(split, sizeof(split), " and %u unpinned records (%.1f GiB, served by the CPU) hold %u more",
+                          tier_->unpinned_records(), gib * tier_->unpinned_records(), unpinned);
+        }
+        char line[560];
         std::snprintf(line, sizeof(line),
-                      "SSD expert tier: %u RAM slots (%.1f GiB) hold %u experts (%s)%s, read in %.1f s; %u of %u "
+                      "SSD expert tier: %u RAM slots (%.1f GiB) hold %u experts (%s)%s%s, read in %.1f s; %u of %u "
                       "experts are read from the artifact when used",
                       slots, gib * slots, in_ram,
                       fill.saved ? "the saved ranking, then the last session's use counts" : "spread across the layers",
                       released > 0 ? (", none of them among the " + std::to_string(released) + " in VRAM").c_str() : "",
-                      seconds, keys - in_ram - released, keys);
+                      split, seconds, keys - in_ram - released - unpinned, keys);
         diagnostic(line);
     }
 
@@ -2465,7 +2526,7 @@ private:
             const auto cpu      = cpu_service_ ? cpu_service_->served_experts() - lane.cpu_served_at_admission : 0;
             std::size_t free_vram = 0, total_vram = 0;
             if (cudaMemGetInfo(&free_vram, &total_vram) != cudaSuccess) { free_vram = 0; }
-            char text[384];
+            char text[512];
             std::snprintf(text, sizeof(text),
                           "expert cache: %u frames; request %.1f%% of %llu routed experts hit, %llu promotions, "
                           "%llu landed, %llu misses CPU-served; since start %.1f%%; VRAM free %zu MiB",
@@ -2483,15 +2544,19 @@ private:
                 const auto reads = t.demand_reads - a.demand_reads;
                 std::snprintf(text, sizeof(text),
                               "SSD expert tier: request %llu expert reads (%.2f GiB, mean %.2f ms), %llu failed; %llu "
-                              "fetched (%llu from RAM); %llu admitted to RAM, %llu demoted from VRAM",
+                              "fetched (%llu from RAM slots, %llu copied from unpinned records); %llu served in place "
+                              "from unpinned records; %llu admitted to RAM, %llu demoted from VRAM, %llu promoted from unpinned records",
                               static_cast<unsigned long long>(reads),
                               static_cast<double>(reads) * static_cast<double>(residency_->frame_stride()) / (1ULL << 30),
                               reads ? 1e-6 * static_cast<double>(t.read_ns - a.read_ns) / static_cast<double>(reads) : 0.0,
                               static_cast<unsigned long long>(t.demand_failures - a.demand_failures),
                               static_cast<unsigned long long>(t.fetch_records - a.fetch_records),
                               static_cast<unsigned long long>(t.fetch_from_ram - a.fetch_from_ram),
+                              static_cast<unsigned long long>(t.unpinned_copies - a.unpinned_copies),
+                              static_cast<unsigned long long>(t.unpinned_served - a.unpinned_served),
                               static_cast<unsigned long long>(t.admitted - a.admitted),
-                              static_cast<unsigned long long>(s.demotions - at_admission.demotions));
+                              static_cast<unsigned long long>(s.demotions - at_admission.demotions),
+                              static_cast<unsigned long long>(s.unpinned_promotions - at_admission.unpinned_promotions));
                 diagnostic(text, DiagnosticLevel::Debug);
             }
         } catch (...) {}

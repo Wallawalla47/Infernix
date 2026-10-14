@@ -42,7 +42,21 @@ struct HostMemoryDemand {
     // --expert-ram-mib: at most this much RAM for the experts (less than full mode needs selects the
     // SSD tier even when more is free). Empty: what the ledger leaves.
     std::optional<std::uint64_t> expert_cap;
+    // What this process may still page-lock for the device (pin_room()); empty: no limit beyond
+    // RAM. Every pinned allocation draws on it; experts past it are kept resident in pageable RAM
+    // for the CPU (the SSD tier's resident records).
+    std::optional<std::uint64_t> pin_room;
+    // --expert-pin-mib: at most this much of the experts' RAM page-locked (less than the banks
+    // selects the SSD tier, the rest resident). Empty: what the pin room leaves.
+    std::optional<std::uint64_t> expert_pin_cap;
 };
+
+// Page-locking fails just below the adapter's shared system memory (VramSnapshot::shared_system:
+// 0.5 GiB below it on an RTX 5090); the ledger keeps this much further below it.
+inline constexpr std::uint64_t kPinRoomMarginBytes = 1ULL << 30;
+// What this process may still page-lock: the adapter's shared system memory less what is in use and
+// the margin (Windows WDDM); empty where the snapshot does not know the shared size.
+[[nodiscard]] std::optional<std::uint64_t> pin_room(const VramSnapshot& snapshot);
 
 enum class ExpertPlacement : std::uint8_t {
     Full, // every expert bank pinned in RAM
@@ -55,11 +69,19 @@ struct HostMemoryLedger {
     // Everything but the experts: other and later pins with their lock overhead, pageable caches,
     // staging and growth.
     std::uint64_t planned = 0;
-    // What the experts may take (pinned bytes including their lock overhead), never more than
-    // full mode needs.
+    // What the experts may take (including the pinned part's lock overhead), never more than full
+    // mode needs.
     std::uint64_t expert_ram = 0;
     // Full mode's need: the banks with their lock overhead plus the margin.
     std::uint64_t full_need = 0;
+    // The SSD tier's split of expert_ram: page-locked slots the device reads (with their lock
+    // overhead), and resident pageable records only the CPU reads (beyond the pin room).
+    std::uint64_t expert_pinned   = 0;
+    std::uint64_t expert_pageable = 0;
+    // The pin room or --expert-pin-mib (pin_capped), not RAM, kept the experts from full mode:
+    // expert_pageable is the part that could not be pinned.
+    bool pin_limited = false;
+    bool pin_capped  = false;
     // The commit limit, not physical memory, bounded expert_ram (a small page file).
     bool commit_limited = false;
     // expert_cap bounded expert_ram; the cap asked for more than the ledger leaves (an error).

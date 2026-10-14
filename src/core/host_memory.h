@@ -62,4 +62,29 @@ private:
     std::byte* device_ = nullptr;
 };
 
+// Host memory kept in RAM for the CPU without page-locking it for the device: on Windows the
+// process's hard minimum working set grows by its size and its pages are VirtualLock'ed; on Linux
+// they are mlock'ed. The device cannot read it, so it does not count toward the limit Windows puts
+// on page-locked memory (the adapter's shared system memory, VramSnapshot::shared_system). Committed
+// at construction and page-aligned; locking touches (zeroes) every page. When the OS refuses the
+// lock, the memory still works but may be paged out under memory pressure: lock_failure() says why.
+class ResidentHostBuffer {
+public:
+    explicit ResidentHostBuffer(std::size_t bytes);
+    ~ResidentHostBuffer();
+    ResidentHostBuffer(const ResidentHostBuffer&)            = delete;
+    ResidentHostBuffer& operator=(const ResidentHostBuffer&) = delete;
+
+    [[nodiscard]] std::byte* data() const noexcept { return data_; }
+    [[nodiscard]] std::size_t size() const noexcept { return size_; }
+    // Empty when every page is locked in RAM; otherwise the OS's reason.
+    [[nodiscard]] const std::string& lock_failure() const noexcept { return lock_failure_; }
+
+private:
+    std::byte* data_  = nullptr;
+    std::size_t size_ = 0;
+    std::size_t raised_ = 0; // Windows: what the minimum working set grew by
+    std::string lock_failure_;
+};
+
 } // namespace infernix

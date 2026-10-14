@@ -387,6 +387,10 @@ struct EngineOptions {
     // Less than every expert needs selects the SSD tier: the experts not in RAM are read from the
     // artifact when used. Empty: what the RAM ledger leaves after the reserve and every other pin.
     std::optional<std::uint64_t> expert_ram_bytes;
+    // Qwen3.8-Flash-Next (--expert-pin-mib): at most this much of the experts' RAM page-locked for
+    // the GPU; the rest stays in RAM unpinned and the CPU serves it. Empty: what Windows lets the
+    // process page-lock (the GPU's shared memory) after every other pin; no limit elsewhere.
+    std::optional<std::uint64_t> expert_pin_bytes;
     // Zero selects a bounded worker count from the detected host concurrency.
     std::uint32_t media_preprocess_threads = 0;
     bool enable_vision                     = false;

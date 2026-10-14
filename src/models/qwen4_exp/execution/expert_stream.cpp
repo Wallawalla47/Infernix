@@ -37,11 +37,35 @@ ExpertStream::ExpertStream(std::uint32_t layers, std::uint32_t experts, std::uin
 
 ExpertStream::~ExpertStream() {
     if (stream_ != nullptr) { (void)cudaStreamSynchronize(stream_); }
+    for (auto event : bounced_) {
+        if (event != nullptr) { (void)cudaEventDestroy(event); }
+    }
     for (auto event : landed_) { (void)cudaEventDestroy(event); }
     for (auto event : consumed_) { (void)cudaEventDestroy(event); }
     if (uploaded_ != nullptr) { (void)cudaEventDestroy(uploaded_); }
     if (start_ != nullptr) { (void)cudaEventDestroy(start_); }
     if (stream_ != nullptr) { (void)cudaStreamDestroy(stream_); }
+}
+
+void ExpertStream::set_staging(Staging staging) {
+    if (active_) { throw std::logic_error("expert stream: staging changed during a chunk"); }
+    if (staging.per_part > 0 && (!staging.unpinned || !staging.slot || !staging.copy)) {
+        throw std::invalid_argument("expert stream: incomplete staging");
+    }
+    staging_ = std::move(staging);
+    for (auto& event : bounced_) {
+        if (event == nullptr && staging_.per_part > 0) { CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming)); }
+    }
+}
+
+bool ExpertStream::takes(std::uint32_t layer, std::uint32_t e, std::uint32_t taken, std::uint32_t& staged) const {
+    if (taken >= half_) { return false; }
+    if (record_of_(layer, e) != nullptr) { return true; }
+    if (staged < staging_.per_part && staging_.unpinned && staging_.unpinned(layer, e) != nullptr) {
+        ++staged;
+        return true;
+    }
+    return false;
 }
 
 std::uint32_t ExpertStream::slots_in(std::size_t bytes) const noexcept {
@@ -76,9 +100,9 @@ void ExpertStream::begin(DeviceSpan ring, const std::int32_t* residency, cudaStr
     for (std::uint32_t l = 0; l < layers_; ++l) {
         std::int32_t* row = tables + static_cast<std::size_t>(l) * experts_;
         const std::int32_t* frames = residency + static_cast<std::size_t>(l) * experts_;
-        std::uint32_t taken = 0;
+        std::uint32_t taken = 0, staged = 0;
         for (std::uint32_t e = 0; e < experts_; ++e) {
-            const bool stream = frames[e] < 0 && taken < half_ && record_of_(l, e) != nullptr;
+            const bool stream = frames[e] < 0 && takes(l, e, taken, staged);
             row[e]            = stream ? static_cast<std::int32_t>((l % 2) * half_ + taken++) : -1;
             if (stream && hold_) { hold_(l, e); }
         }
@@ -103,11 +127,10 @@ std::uint32_t ExpertStream::plan_layer(std::uint32_t layer, std::span<const std:
     }
     auto* row                  = static_cast<std::int32_t*>(tables_host_.data()) + static_cast<std::size_t>(layer) * experts_;
     const std::int32_t* frames = residency_ + static_cast<std::size_t>(layer) * experts_;
-    std::uint32_t taken        = 0;
+    std::uint32_t taken        = 0, staged = 0;
     for (std::uint32_t e = 0; e < experts_; ++e) {
         // An SSD-only expert has no host record to copy: the CPU or the fetch channel serves it.
-        const bool copy = columns[e] > 0 && frames[e] < 0 && cpu[e] == 0 && taken < half_ &&
-                          record_of_(layer, e) != nullptr;
+        const bool copy = columns[e] > 0 && frames[e] < 0 && cpu[e] == 0 && takes(layer, e, taken, staged);
         row[e]          = copy ? static_cast<std::int32_t>((layer % 2) * half_ + taken++) : -1;
         if (copy && hold_) { hold_(layer, e); }
     }
@@ -132,12 +155,18 @@ void ExpertStream::enqueue(std::uint32_t layer) {
     // copy per run (a copy may not span two pinned allocations, even adjacent ones), all enqueued as
     // one batch so the host does not wait on the copy queue.
     CopyBatch copies(stream_);
+    staged_.clear();
     for (std::uint32_t e = 0; e < experts_;) {
         if (row[e] < 0) {
             ++e;
             continue;
         }
         const std::uint8_t* source = record_of_(layer, e);
+        if (source == nullptr) { // an unpinned record: bounced below
+            staged_.emplace_back(records_ + static_cast<std::size_t>(row[e]) * stride_, staging_.unpinned(layer, e));
+            ++e;
+            continue;
+        }
         std::uint32_t end = e + 1;
         while (one_allocation_ && end < experts_ && row[end] == row[end - 1] + 1 &&
                record_of_(layer, end) == source + static_cast<std::size_t>(end - e) * stride_) {
@@ -149,7 +178,27 @@ void ExpertStream::enqueue(std::uint32_t layer) {
         ++stats_.copies;
         e = end;
     }
+    if (!staged_.empty()) {
+        // The layer's part of the bounce: free once its last DMA (layer - 4's, or an earlier
+        // chunk's) has read it; the host fills it, then the DMA reads it in stream order.
+        const std::uint32_t h = layer % kBounceParts;
+        if (bounce_used_[h]) { CUDA_CHECK(cudaEventSynchronize(bounced_[h])); }
+        fill_.clear();
+        for (std::size_t i = 0; i < staged_.size(); ++i) {
+            fill_.emplace_back(staging_.slot(h * staging_.per_part + static_cast<std::uint32_t>(i)), staged_[i].second);
+        }
+        staging_.copy(fill_);
+        for (std::size_t i = 0; i < staged_.size(); ++i) { copies.add(staged_[i].first, fill_[i].first, stride_); }
+        stats_.streamed += staged_.size();
+        stats_.staged += staged_.size();
+        stats_.copies += staged_.size();
+    }
     copies.flush();
+    if (!staged_.empty()) {
+        const std::uint32_t h = layer % kBounceParts;
+        CUDA_CHECK(cudaEventRecord(bounced_[h], stream_));
+        bounce_used_[h] = true;
+    }
     CUDA_CHECK(cudaEventRecord(landed_[layer], stream_));
 }
 

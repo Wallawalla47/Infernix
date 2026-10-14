@@ -21,6 +21,7 @@ struct Options {
     std::optional<std::filesystem::path> expert_state;
     std::uint64_t ram_headroom_bytes = kDefaultRamHeadroomBytes;
     std::optional<std::uint64_t> expert_ram_bytes; // --expert-ram-mib; empty: the RAM ledger's share
+    std::optional<std::uint64_t> expert_pin_bytes; // --expert-pin-mib; empty: what the OS lets it pin
     std::filesystem::path grammar_path;
     std::filesystem::path json_schema_path;
     std::optional<std::string> regex;

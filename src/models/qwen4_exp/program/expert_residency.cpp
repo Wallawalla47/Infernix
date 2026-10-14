@@ -91,6 +91,9 @@ ExpertResidency::~ExpertResidency() {
     }
     for (auto& batch : in_flight_) { (void)cudaEventDestroy(batch.done); }
     for (auto event : spare_events_) { (void)cudaEventDestroy(event); }
+    for (auto event : bounced_) {
+        if (event != nullptr) { (void)cudaEventDestroy(event); }
+    }
     if (table_ready_ != nullptr) { (void)cudaEventDestroy(table_ready_); }
     if (copy_stream_ != nullptr) { (void)cudaStreamDestroy(copy_stream_); }
 }
@@ -197,11 +200,14 @@ void ExpertResidency::attach_tier(HostExpertTier* tier) {
     queue_pinned_.assign(keys, 0);
     queue_mark_.assign(keys, 0);
     copies_in_flight_.assign(keys, 0);
-    admissible_ = [this](std::uint32_t key) { return tier_->record(key) != nullptr; };
+    admissible_ = [this](std::uint32_t key) { return tier_->host_record(key) != nullptr; };
     evictable_  = [this](std::uint32_t key) { return tier_->controller().allow_evict(key); };
     demoting_.assign(keys, 0);
     // The D2H stream: a demotion never waits behind the copy stream's promotion DMA.
     CUDA_CHECK(cudaStreamCreateWithFlags(&d2h_stream_, cudaStreamNonBlocking));
+    if (tier_->bounce_slots() > 0) {
+        for (auto& event : bounced_) { CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming)); }
+    }
 }
 
 void ExpertResidency::demote_or_drop(std::int32_t* table) {
@@ -641,6 +647,33 @@ void ExpertResidency::issue_loads(cudaStream_t compute) {
     // A prefill promotes thousands of records (~1.2 s of link at x8): batched copies keep the host
     // free, and an event per group publishes the group's experts as soon as it lands.
     CopyBatch copies(copy_stream_);
+    // Unpinned records (the SSD tier past the page-locking limit): copied from pageable memory the
+    // driver would stage synchronously at ~13 GB/s while holding this thread (RTX 5090, x8), so
+    // they go through the tier's pinned bounce slots instead: the copy threads fill one half while
+    // the link drains the other, and the DMA runs at the link rate (~50 GB/s at 5.0 x16).
+    std::vector<std::pair<std::uint8_t*, const std::uint8_t*>> bounced; // (frame, unpinned record)
+    std::vector<std::pair<std::uint8_t*, const std::uint8_t*>> fill;
+    const auto drain_bounced = [&] {
+        if (bounced.empty()) { return; }
+        copies.flush(); // stream order with the pending pinned copies
+        const std::uint32_t half = tier_->bounce_slots() / 2;
+        for (std::size_t at = 0; at < bounced.size(); at += half) {
+            const std::size_t n = std::min<std::size_t>(half, bounced.size() - at);
+            const std::uint32_t h = bounce_half_;
+            if (bounce_pending_[h]) { CUDA_CHECK(cudaEventSynchronize(bounced_[h])); } // its last DMA read it
+            fill.clear();
+            for (std::size_t i = 0; i < n; ++i) { fill.emplace_back(tier_->bounce_slot(h * half + static_cast<std::uint32_t>(i)), bounced[at + i].second); }
+            tier_->copy_records(fill);
+            CopyBatch from_bounce(copy_stream_);
+            for (std::size_t i = 0; i < n; ++i) { from_bounce.add(bounced[at + i].first, fill[i].first, stride_); }
+            from_bounce.flush();
+            CUDA_CHECK(cudaEventRecord(bounced_[h], copy_stream_));
+            bounce_pending_[h] = true;
+            bounce_half_       = h ^ 1U;
+        }
+        stats_.unpinned_promotions += bounced.size();
+        bounced.clear();
+    };
     for (std::size_t first = 0; first < loads.size(); first += kLoadsPerEvent) {
         Batch batch;
         batch.loads.assign(loads.begin() + static_cast<std::ptrdiff_t>(first),
@@ -651,9 +684,12 @@ void ExpertResidency::issue_loads(cudaStream_t compute) {
             const std::uint8_t* source = banks_[layer] + static_cast<std::size_t>(expert) * stride_;
             if (tier_ != nullptr) {
                 // T1: the RAM slot is pinned until the copy completes (admission required a host copy,
-                // and the Queue pin kept it since).
+                // and the Queue pin kept it since). An unpinned record never moves.
                 source = tier_->record(load.key);
-                if (source == nullptr) { throw std::logic_error("expert residency: a promotion lost its host copy"); }
+                if (source == nullptr) {
+                    source = tier_->unpinned_record(load.key);
+                    if (source == nullptr) { throw std::logic_error("expert residency: a promotion lost its host copy"); }
+                }
                 auto& host = tier_->controller();
                 if (copies_in_flight_[load.key]++ == 0) {
                     if (queue_pinned_[load.key] == 0) { host.queued(load.key); }
@@ -663,8 +699,21 @@ void ExpertResidency::issue_loads(cudaStream_t compute) {
                 }
                 queue_pinned_[load.key] = 0;
             }
-            copies.add(base + static_cast<std::size_t>(load.frame) * stride_, source, stride_);
+            auto* destination = base + static_cast<std::size_t>(load.frame) * stride_;
+            if (tier_ != nullptr && source == tier_->unpinned_record(load.key)) {
+                bounced.emplace_back(destination, source);
+                continue;
+            }
+            // A frame written by a pending bounced copy and then by this one keeps stream order.
+            for (const auto& b : bounced) {
+                if (b.first == destination) {
+                    drain_bounced();
+                    break;
+                }
+            }
+            copies.add(destination, source, stride_);
         }
+        drain_bounced();
         copies.flush();
         stats_.promotions += batch.loads.size();
         if (spare_events_.empty()) {

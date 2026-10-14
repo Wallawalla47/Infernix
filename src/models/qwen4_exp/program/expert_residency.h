@@ -61,6 +61,7 @@ public:
         std::uint64_t seeded         = 0; // experts loaded by the warm start
         std::uint64_t landed         = 0; // staged misses landed in reserved frames and adopted (S4)
         std::uint64_t demotions      = 0; // SSD tier: VRAM victims copied to RAM (T4)
+        std::uint64_t unpinned_promotions = 0; // SSD tier: promotions of unpinned records (bounced)
     };
     // Landing frames per layer and round (design §19.3.5 S4): free frames are reserved before a
     // decode or verification round, the round's forked MoE calls copy their first staged misses
@@ -278,6 +279,11 @@ private:
     };
     std::vector<Demotion> demotions_;
     std::vector<std::uint8_t> demoting_; // per key
+    // Promotions of unpinned records go through the tier's bounce slots, in two halves: the CPU
+    // fills one while the link drains the other (bounced_[h]: the half's last copies, recorded).
+    cudaEvent_t bounced_[2]  = {nullptr, nullptr};
+    bool bounce_pending_[2]  = {false, false};
+    std::uint32_t bounce_half_ = 0;
 };
 
 } // namespace infernix::models::qwen4_exp

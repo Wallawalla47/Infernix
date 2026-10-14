@@ -205,6 +205,10 @@ std::string serve_usage_text(const char* argv0) {
            "                             experts (auto: what --ram-headroom-mib and the other\n"
            "                             pins leave); less than all of them need reads the\n"
            "                             rest from the artifact (the SSD tier)\n"
+           "  --expert-pin-mib N|auto    Qwen3.8-Flash-Next: at most this much of the experts'\n"
+           "                             RAM page-locked for the GPU; the rest stays in RAM\n"
+           "                             and the CPU serves it (auto: what Windows allows,\n"
+           "                             the GPU's shared memory)\n"
            "\n"
            "KV CACHE\n"
            "  --kv-capacity N|auto       KV-cache capacity in tokens (default auto, or\n"
@@ -649,6 +653,17 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                     throw std::invalid_argument("--expert-ram-mib is out of range");
                 }
                 options.expert_ram_bytes = mib << 20;
+            }
+        } else if (arg == "--expert-pin-mib") {
+            const std::string text = require_value("--expert-pin-mib");
+            if (text == "auto") {
+                options.expert_pin_bytes.reset();
+            } else {
+                const std::uint64_t mib = parse_u64(text.c_str(), "expert-pin-mib");
+                if (mib == 0 || mib > (std::numeric_limits<std::uint64_t>::max() >> 20)) {
+                    throw std::invalid_argument("--expert-pin-mib is out of range");
+                }
+                options.expert_pin_bytes = mib << 20;
             }
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));

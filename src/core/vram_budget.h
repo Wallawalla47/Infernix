@@ -29,6 +29,14 @@ struct VramSnapshot {
     // A source opened past the budget: the bytes added to the OS budget (already included in
     // local_budget and device_free); 0 otherwise.
     std::uint64_t budget_allowance = 0;
+    // Windows WDDM: the adapter's shared system memory (DXGI_ADAPTER_DESC SharedSystemMemory) and
+    // this process's use of it (NON_LOCAL CurrentUsage), 0 unknown. Every byte page-locked for the
+    // device (cudaHostAlloc, cudaHostRegister) counts in the usage, and page-locking fails just
+    // below the shared size (RTX 5090, 95.8 GiB of RAM: shared 76.61 GiB, locking failed at 76.07
+    // GiB in 64 MiB steps, the same for mapped, unmapped and registered memory). Windows sets the
+    // size, often half of RAM (80 % on that machine); the NON_LOCAL budget is not the limit.
+    std::uint64_t shared_system  = 0;
+    std::uint64_t nonlocal_usage = 0;
 };
 
 // One device's source. query() may be called from any thread on which the device is current.

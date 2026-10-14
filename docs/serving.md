@@ -1186,6 +1186,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--device N` | CUDA device index | `0` |
 | `--ram-headroom-mib N` | physical Host RAM in MiB that pinned weights and caches leave free for the system; startup refuses a lock that would take it (Qwen3.8-Flash-Next plans every allocation against it in its RAM ledger) | `2048` |
 | `--expert-ram-mib N\|auto` | Qwen3.8-Flash-Next: Host RAM in MiB for the routed experts; less than all of them need (~64.5 GiB) keeps that many in RAM and reads the rest from the artifact ([SSD expert tier](qwen3_8-flash-next.md#ssd-expert-tier)); more than is free is an error | `auto` (what the ledger leaves) |
+| `--expert-pin-mib N\|auto` | Qwen3.8-Flash-Next: at most N MiB of the experts' RAM page-locked for the GPU; the rest stays in RAM unpinned and the CPU serves it ([Page-locking limit](qwen3_8-flash-next.md#page-locking-limit)) | `auto` (what Windows lets the GPU page-lock) |
 | `--context-cost-presets FILE` | optional runtime context-cost preset registry | generic + compiled defaults |
 | `--max-request-mib N` | body-size limit before JSON parsing | `384` |
 | `--media-cache-mib N` | LRU-retained prepared BF16 media payloads; `0` disables retention | `1024` |

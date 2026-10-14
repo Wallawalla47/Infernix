@@ -62,6 +62,7 @@ struct ServeOptions {
     std::size_t media_live_bytes           = kDefaultMediaLiveBytes;
     std::uint64_t ram_headroom_bytes       = kDefaultRamHeadroomBytes;
     std::optional<std::uint64_t> expert_ram_bytes; // --expert-ram-mib; empty: the RAM ledger's share
+    std::optional<std::uint64_t> expert_pin_bytes; // --expert-pin-mib; empty: what the OS lets it pin
     std::uint32_t media_preprocess_threads = 0;
     std::size_t response_store_max_records = kDefaultResponseStoreRecords;
     std::size_t response_store_max_bytes   = kDefaultResponseStoreBytes;

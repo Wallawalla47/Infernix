@@ -21,6 +21,13 @@
 // Gated chunks (design §19.3.12, a short prompt's CPU share) copy nothing ahead: once a layer's
 // routing is known, plan_layer copies only the experts the call routes that are neither resident
 // nor left to the CPU, and uploads the layer's slot table with them.
+//
+// Staging (set_staging; the SSD tier's unpinned records, which the copy engine cannot read without
+// the driver holding the host thread): up to per_part of a layer's streamed records may be unpinned.
+// When the layer's copies are enqueued, the host copies them into pinned bounce slots (part l % 4,
+// whose previous DMA, layer l - 4's, finished long before) and the DMA reads the bounce, still two
+// layers ahead. Four parts keep the host from waiting on layer l - 2's DMA, which would hold it to
+// the device's pace while it copies.
 
 #include "core/arena.h"
 
@@ -30,6 +37,7 @@
 #include <cstdint>
 #include <span>
 #include <functional>
+#include <utility>
 #include <vector>
 
 namespace infernix::models::qwen4_exp::execution {
@@ -50,6 +58,17 @@ public:
     ~ExpertStream();
     ExpertStream(const ExpertStream&)            = delete;
     ExpertStream& operator=(const ExpertStream&) = delete;
+
+    // Host-only records streamed through pinned bounce slots (see the file comment).
+    struct Staging {
+        RecordOf unpinned;                                // a non-resident expert's unpinned record, or null
+        std::function<std::uint8_t*(std::uint32_t)> slot; // bounce slot i of kBounceParts * per_part (pinned)
+        // Copies whole records (destination, source) and returns once they have landed.
+        std::function<void(std::span<const std::pair<std::uint8_t*, const std::uint8_t*>>)> copy;
+        std::uint32_t per_part = 0;
+    };
+    static constexpr std::uint32_t kBounceParts = 4;
+    void set_staging(Staging staging);
 
     // The stream that writes the ring (a writer for the lender to order after its promotions).
     [[nodiscard]] cudaStream_t stream() const noexcept { return stream_; }
@@ -84,11 +103,15 @@ public:
     struct Stats {
         std::uint64_t streamed = 0; // expert records copied
         std::uint64_t copies   = 0; // DMA calls (runs of consecutive experts)
+        std::uint64_t staged   = 0; // of the streamed records, unpinned ones bounced
     };
     [[nodiscard]] const Stats& stats() const noexcept { return stats_; }
 
 private:
     void enqueue(std::uint32_t layer);
+    // Whether expert e of layer l is streamed: not resident, room in the half, and a pinned record
+    // (or an unpinned one while the layer's staging has room, counted in `staged`).
+    bool takes(std::uint32_t layer, std::uint32_t e, std::uint32_t taken, std::uint32_t& staged) const;
 
     std::uint32_t experts_ = 0, layers_ = 0;
     std::uint64_t stride_  = 0;
@@ -108,6 +131,11 @@ private:
     bool uploading_ = false;
     bool gated_     = false;
     const std::int32_t* residency_ = nullptr; // host [layers][experts] of the active chunk
+    Staging staging_;
+    cudaEvent_t bounced_[kBounceParts] = {}; // each bounce part's last DMA
+    bool bounce_used_[kBounceParts]    = {};
+    std::vector<std::pair<std::uint8_t*, const std::uint8_t*>> staged_; // (ring slot, unpinned record)
+    std::vector<std::pair<std::uint8_t*, const std::uint8_t*>> fill_;
     Stats stats_;
 };
 

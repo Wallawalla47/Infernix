@@ -145,6 +145,69 @@ void test_expert_cap() {
             "a cap larger than the ledger leaves is flagged");
 }
 
+// The page-locking limit (Windows: the GPU's shared system memory): the other pins draw on it first,
+// the experts pin what is left, and the rest of their RAM stays unpinned; it never shrinks the RAM
+// the experts get. Without a known limit nothing changes.
+void test_pin_room() {
+    HostMemoryDemand d       = flash_next();
+    d.prefix_cache           = 4 * kGiB;
+    const std::uint64_t need = need_for_full(d);
+    const HostMemoryLedger unlimited = plan_host_memory(snapshot(need, 200 * kGiB), d);
+    require(unlimited.placement == ExpertPlacement::Full && !unlimited.pin_limited && unlimited.expert_pageable == 0,
+            "no pin limit: full mode as before");
+    // A 96 GB machine whose limit is half of RAM (47.9 GiB, 1 GiB margin): every expert fits in RAM
+    // but not in the pin room, so the SSD tier holds all of them, part unpinned.
+    const std::uint64_t pins = plan_host_memory(snapshot(need, 200 * kGiB), d).planned; // unchanged by the room
+    d.pin_room = 47 * kGiB;
+    const HostMemoryLedger half = plan_host_memory(snapshot(need, 200 * kGiB), d);
+    const std::uint64_t other =
+        d.other_pinned + d.later_pinned + d.prefix_cache +
+        ((d.other_pinned + d.later_pinned + d.prefix_cache) * 25 + 9'999) / 10'000;
+    require(half.placement == ExpertPlacement::Tier && half.pin_limited && !half.pin_capped &&
+                half.expert_ram == unlimited.expert_ram && half.expert_pinned == 47 * kGiB - other &&
+                half.expert_pinned + half.expert_pageable == half.expert_ram && half.planned == pins,
+            "a pin room below the banks splits the full need into pinned and unpinned RAM");
+    require(half.summary().find("every expert fits in RAM") != std::string::npos &&
+                half.summary().find("page-locked for the GPU") != std::string::npos,
+            "the summary names the split: " + half.summary());
+    require(half.describe().find("pin room 47.00") != std::string::npos &&
+                half.describe().find("limited by the pin room") != std::string::npos,
+            "the ledger line names the pin room: " + half.describe());
+    // The 64 GB machine of the report: 52.7 GiB available, a limit of half of RAM. The RAM the
+    // experts get does not change; the pinned part is what the room leaves.
+    HostMemoryDemand small = d;
+    small.pin_room         = 31 * kGiB;
+    HostMemoryDemand open  = small;
+    open.pin_room.reset();
+    const HostMemoryLedger report = plan_host_memory(snapshot(52 * kGiB + 700 * kMiB, 60 * kGiB), small);
+    const HostMemoryLedger before = plan_host_memory(snapshot(52 * kGiB + 700 * kMiB, 60 * kGiB), open);
+    require(report.placement == ExpertPlacement::Tier && report.expert_ram == before.expert_ram &&
+                report.expert_pinned == 31 * kGiB - other && report.expert_pageable == report.expert_ram - report.expert_pinned,
+            "a small pin room moves expert RAM from pinned to unpinned, never from RAM to the SSD");
+    // A room the other pins take whole leaves no pinned expert RAM (the tier then refuses to start).
+    small.pin_room = 2 * kGiB;
+    require(plan_host_memory(snapshot(52 * kGiB, 60 * kGiB), small).expert_pinned == 0,
+            "the other pins come first");
+    // A RAM-bound tier inside the room is not pin limited.
+    small.pin_room = 60 * kGiB;
+    const HostMemoryLedger ram_bound = plan_host_memory(snapshot(40 * kGiB, 60 * kGiB), small);
+    require(ram_bound.placement == ExpertPlacement::Tier && !ram_bound.pin_limited && ram_bound.expert_pageable == 0,
+            "a tier bounded by RAM pins all of its expert RAM");
+    // --expert-pin-mib caps the pinned part below the room, and says so.
+    HostMemoryDemand capped = flash_next();
+    capped.expert_pin_cap   = 20 * kGiB;
+    const HostMemoryLedger pin_cap = plan_host_memory(snapshot(need_for_full(capped), 200 * kGiB), capped);
+    require(pin_cap.placement == ExpertPlacement::Tier && pin_cap.pin_capped && pin_cap.expert_pinned == 20 * kGiB &&
+                pin_cap.summary().find("--expert-pin-mib") != std::string::npos,
+            "--expert-pin-mib caps the pinned part");
+    // The room from a VRAM snapshot: shared size less usage less the margin; unknown without DXGI.
+    VramSnapshot vram;
+    require(!pin_room(vram).has_value(), "no shared size: no pin limit");
+    vram.shared_system  = 48 * kGiB;
+    vram.nonlocal_usage = 3 * kGiB;
+    require(pin_room(vram) == 48 * kGiB - 3 * kGiB - kPinRoomMarginBytes, "pin room = shared - usage - margin");
+}
+
 // ---------------------------------------------------------------- RT7
 
 constexpr std::uint64_t kRecord = 2'764'800; // one nvfp4_expert_rg16_v1 record of this model
@@ -385,6 +448,7 @@ int main() {
         test_commit_limit();
         test_starved_and_describe();
         test_expert_cap();
+        test_pin_room();
         test_graph_bound();
         test_display_headroom();
         test_internal_reserve();

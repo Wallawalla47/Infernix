@@ -338,6 +338,8 @@ std::string usage_text(std::string_view program) {
         << (infernix::kDefaultRamHeadroomBytes >> 20) << ")\n"
         << "  --expert-ram-mib <N|auto>   Qwen3.8-Flash-Next: Host RAM for the routed experts (default auto);\n"
         << "                              less than all of them need reads the rest from the artifact\n"
+        << "  --expert-pin-mib <N|auto>   Qwen3.8-Flash-Next: at most this much of the experts' RAM page-locked;\n"
+        << "                              the rest stays in RAM for the CPU (default auto: what Windows allows)\n"
         << "  --vram-headroom-mib <N|auto> Qwen3.8-Flash-Next: VRAM the expert cache leaves free for the\n"
         << "                              display and other programs (default auto: 1024 with a display, else 256)\n"
         << "  --vram-past-budget          Qwen3.8-Flash-Next on Windows: also use the VRAM the OS budget withholds\n"
@@ -450,6 +452,22 @@ BenchOptions parse_args(int argc, char** argv) {
                     throw std::invalid_argument("--expert-ram-mib must be a MiB count or auto");
                 }
                 options.expert_ram_bytes = static_cast<std::uint64_t>(mib) << 20;
+            }
+        } else if (arg == "--expert-pin-mib") {
+            const std::string text = value("--expert-pin-mib");
+            if (text == "auto") {
+                options.expert_pin_bytes.reset();
+            } else {
+                std::size_t used       = 0;
+                unsigned long long mib = 0;
+                try {
+                    mib = std::stoull(text, &used);
+                } catch (const std::exception&) { used = 0; }
+                if (used != text.size() || text.empty() || text.front() == '-' || mib == 0 ||
+                    mib > (std::numeric_limits<std::uint64_t>::max() >> 20)) {
+                    throw std::invalid_argument("--expert-pin-mib must be a MiB count or auto");
+                }
+                options.expert_pin_bytes = static_cast<std::uint64_t>(mib) << 20;
             }
         } else if (arg == "--vram-headroom-mib") {
             const std::string text = value("--vram-headroom-mib");

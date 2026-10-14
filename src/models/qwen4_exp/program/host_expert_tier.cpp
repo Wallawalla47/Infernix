@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 
@@ -47,11 +48,12 @@ void relax() {
 #endif
 }
 
+// Null when the OS refuses: on Windows page-locking stops at the adapter's shared system memory.
 void* pinned_allocate(std::size_t bytes) {
     void* p = nullptr;
     if (cudaHostAlloc(&p, bytes, cudaHostAllocPortable | cudaHostAllocMapped) != cudaSuccess) {
         (void)cudaGetLastError();
-        throw std::runtime_error("SSD tier: cannot pin " + std::to_string(bytes >> 20) + " MiB of expert slots");
+        return nullptr;
     }
     return p;
 }
@@ -60,35 +62,101 @@ void pinned_release(void* p) { (void)cudaFreeHost(p); }
 
 } // namespace
 
+HostExpertTier::Pinned::Pinned(Pinned&& other) noexcept
+    : chunks(std::move(other.chunks)), slots(other.slots), refused(other.refused), release(std::move(other.release)) {
+    other.chunks.clear();
+}
+
+HostExpertTier::Pinned::~Pinned() {
+    for (auto* p : chunks) { release(p); }
+}
+
+HostExpertTier::Options HostExpertTier::normalized(Options options) {
+    if (!options.allocate) { options.allocate = pinned_allocate; }
+    if (!options.release) { options.release = pinned_release; }
+    if (options.slots_per_chunk == 0) { throw std::invalid_argument("SSD tier: slots per chunk must be positive"); }
+    if (options.min_slots == 0) { options.min_slots = options.ring + options.prefetch + options.demotion + 1; }
+    if (options.copy_threads == 0) {
+        options.copy_threads = std::clamp(std::thread::hardware_concurrency() / 3, 2U, 8U);
+    }
+    options.bounce        = options.bounce / 2 * 2; // two halves
+    options.stream_bounce = options.stream_bounce / 2 * 2;
+    return options;
+}
+
+HostExpertTier::Pinned HostExpertTier::pin_slots(const ExpertStore& store, const Options& options) {
+    if (store.record_bytes() % DirectReadQueue::kAlignment != 0) {
+        throw std::invalid_argument("SSD tier: expert records must be a multiple of 4 KiB");
+    }
+    Pinned out;
+    out.release = options.release;
+    std::vector<std::uint32_t> sizes;
+    bool refused = false;
+    for (std::uint32_t s = 0; s < options.slots; s += options.slots_per_chunk) {
+        const std::uint32_t here = std::min(options.slots_per_chunk, options.slots - s);
+        auto* p = static_cast<std::byte*>(options.allocate(static_cast<std::size_t>(here) * store.record_bytes()));
+        if (p == nullptr) {
+            refused = true;
+            break;
+        }
+        if (reinterpret_cast<std::uintptr_t>(p) % DirectReadQueue::kAlignment != 0) {
+            options.release(p);
+            throw std::runtime_error("SSD tier: expert slots must be 4 KiB-aligned");
+        }
+        out.chunks.push_back(p);
+        sizes.push_back(here);
+        out.slots += here;
+    }
+    if (refused) {
+        // Whatever is pinned after the tier (the prefix cache's Host tier, the Program's buffers)
+        // must still fit below the limit the OS just reached.
+        std::uint64_t freed = 0;
+        while (!out.chunks.empty() && freed < options.pin_reserve) {
+            options.release(out.chunks.back());
+            out.chunks.pop_back();
+            freed += static_cast<std::uint64_t>(sizes.back()) * store.record_bytes();
+            out.slots -= sizes.back();
+            sizes.pop_back();
+        }
+        out.refused = options.slots - out.slots;
+        // The refused slots become unpinned records, whose promotions need the bounce slots.
+        const std::uint32_t needed = options.min_slots + options.bounce + options.stream_bounce;
+        if (out.slots < needed) {
+            throw std::runtime_error("SSD tier: the OS let Infernix page-lock only " +
+                                     std::to_string((static_cast<std::uint64_t>(out.slots) * store.record_bytes()) >> 20) +
+                                     " MiB of expert slots once " + std::to_string(options.pin_reserve >> 20) +
+                                     " MiB are left for later pinned buffers; at least " +
+                                     std::to_string((static_cast<std::uint64_t>(needed) * store.record_bytes()) >> 20) +
+                                     " MiB are needed (Windows limits page-locked memory to the GPU's shared memory: "
+                                     "close programs that use it, or lower --host-context-mib)");
+        }
+    }
+    return out;
+}
+
 HostExpertTier::HostExpertTier(const ExpertStore& store, Options options)
-    : store_(store), options_(std::move(options)),
+    : store_(store), options_(normalized(std::move(options))), pinned_(pin_slots(store_, options_)),
+      bounce_(options_.unpinned > 0 || pinned_.refused > 0 ? options_.bounce : 0),
+      stream_bounce_(options_.unpinned > 0 || pinned_.refused > 0 ? options_.stream_bounce : 0),
       tier_(expert_cache::HostTier::Config{.num_keys  = store.layers() * store.experts(),
-                                           .slots     = options_.slots,
+                                           .slots     = pinned_.slots - bounce_ - stream_bounce_,
                                            .ring      = options_.ring,
                                            .prefetch  = options_.prefetch,
                                            .demotion  = options_.demotion,
                                            .half_life = options_.half_life}),
+      per_chunk_(options_.slots_per_chunk), unpinned_of_(static_cast<std::size_t>(store.layers()) * store.experts(), -1),
       round_ticket_of_key_(static_cast<std::size_t>(store.layers()) * store.experts(), 0) {
-    if (!options_.allocate) { options_.allocate = pinned_allocate; }
-    if (!options_.release) { options_.release = pinned_release; }
-    if (options_.slots_per_chunk == 0) { throw std::invalid_argument("SSD tier: slots per chunk must be positive"); }
-    per_chunk_ = options_.slots_per_chunk;
-    try {
-        for (std::uint32_t s = 0; s < options_.slots; s += per_chunk_) {
-            const std::uint32_t here = std::min(per_chunk_, options_.slots - s);
-            auto* p = static_cast<std::byte*>(options_.allocate(static_cast<std::size_t>(here) * store_.record_bytes()));
-            if (reinterpret_cast<std::uintptr_t>(p) % DirectReadQueue::kAlignment != 0) {
-                options_.release(p);
-                throw std::runtime_error("SSD tier: expert slots must be 4 KiB-aligned");
-            }
-            chunks_.push_back(p);
-        }
-        queue_ = std::make_unique<DirectReadQueue>(options_.io);
-        for (const auto& path : store_.files()) { files_.push_back(queue_->open(path)); }
-    } catch (...) {
-        for (auto* p : chunks_) { options_.release(p); }
-        throw;
+    // Unpinned records: those asked for and the slots the OS refused, at most the keys the
+    // resident slots leave.
+    const std::uint32_t lists     = options_.ring + options_.prefetch + options_.demotion;
+    const std::uint32_t resident  = pinned_.slots - bounce_ - stream_bounce_ - lists;
+    const std::uint32_t uncovered = keys() > resident ? keys() - resident : 0;
+    unpinned_count_ = std::min<std::uint32_t>(options_.unpinned + pinned_.refused, uncovered);
+    if (unpinned_count_ > 0) {
+        unpinned_ = std::make_unique<ResidentHostBuffer>(static_cast<std::size_t>(unpinned_count_) * store_.record_bytes());
     }
+    queue_ = std::make_unique<DirectReadQueue>(options_.io);
+    for (const auto& path : store_.files()) { files_.push_back(queue_->open(path)); }
     // A layer call reads each of its experts once, so a round demands at most its layer calls'
     // experts (every key once when a round calls each layer once).
     ticket_capacity_ = options_.layer_calls > 0 ? options_.layer_calls * store_.experts() : keys();
@@ -97,6 +165,11 @@ HostExpertTier::HostExpertTier(const ExpertStore& store, Options options)
         std::lock_guard<std::mutex> lock(mutex_);
         tier_.begin_round(0);
         for (const std::uint32_t s : tier_.ring()) { ring_.push_back({s, tier_.serial(s)}); }
+    }
+    if (unpinned_count_ > 0) {
+        for (std::uint32_t i = 0; i < std::max<std::uint32_t>(1, options_.copy_threads); ++i) {
+            copiers_.emplace_back([this] { copier_main(); });
+        }
     }
     agent_ = std::thread([this] { agent_main(); });
 }
@@ -108,12 +181,22 @@ HostExpertTier::~HostExpertTier() {
     }
     wake_.notify_all();
     if (agent_.joinable()) { agent_.join(); }
+    {
+        std::lock_guard<std::mutex> lock(copy_mutex_);
+        copy_stop_ = true;
+    }
+    copy_wake_.notify_all();
+    for (auto& copier : copiers_) { copier.join(); }
     queue_.reset(); // cancels and waits for any read still in flight
-    for (auto* p : chunks_) { options_.release(p); }
+}
+
+const std::string& HostExpertTier::unpinned_lock_failure() const noexcept {
+    static const std::string none;
+    return unpinned_ ? unpinned_->lock_failure() : none;
 }
 
 const std::uint8_t* HostExpertTier::slot_bytes(std::uint32_t slot) const noexcept {
-    return reinterpret_cast<const std::uint8_t*>(chunks_[slot / per_chunk_]) +
+    return reinterpret_cast<const std::uint8_t*>(pinned_.chunks[slot / per_chunk_]) +
            static_cast<std::size_t>(slot % per_chunk_) * store_.record_bytes();
 }
 
@@ -122,9 +205,8 @@ const std::uint8_t* HostExpertTier::record(std::uint32_t key) const noexcept {
     return slot >= 0 ? slot_bytes(static_cast<std::uint32_t>(slot)) : nullptr;
 }
 
-void HostExpertTier::submit(std::uint32_t key, std::uint32_t slot, std::uint64_t tag_base) {
+void HostExpertTier::submit(std::uint32_t key, std::uint8_t* destination, std::uint64_t tag_base) {
     const std::uint32_t layer = key / store_.experts(), expert = key % store_.experts();
-    auto* destination = const_cast<std::uint8_t*>(slot_bytes(slot));
     const auto segments = store_.segments(layer, expert);
     for (std::size_t i = 0; i < segments.size(); ++i) {
         const auto& s = segments[i];
@@ -139,15 +221,15 @@ bool HostExpertTier::follows(std::uint32_t before, std::uint32_t key) const {
     return a.size() == 1 && b.size() == 1 && a[0].file == b[0].file && a[0].offset + a[0].bytes == b[0].offset;
 }
 
-void HostExpertTier::submit_run(std::span<const std::pair<std::uint32_t, std::uint32_t>> run, std::uint64_t tag) {
+void HostExpertTier::submit_run(std::span<const std::pair<std::uint32_t, std::uint8_t*>> run, std::uint64_t tag) {
     DirectReadQueue::Read read;
     const auto first = store_.segments(run.front().first / store_.experts(), run.front().first % store_.experts())[0];
     read.file   = files_[first.file];
     read.offset = first.offset;
     read.tag    = tag;
-    for (const auto& [key, slot] : run) {
+    for (const auto& [key, destination] : run) {
         const auto s = store_.segments(key / store_.experts(), key % store_.experts())[0];
-        read.scatter.push_back({const_cast<std::uint8_t*>(slot_bytes(slot)) + s.at, s.bytes});
+        read.scatter.push_back({destination + s.at, s.bytes});
         read.bytes += s.bytes;
     }
     queue_->submit(read);
@@ -155,15 +237,7 @@ void HostExpertTier::submit_run(std::span<const std::pair<std::uint32_t, std::ui
     agent_run_records_.fetch_add(run.size(), std::memory_order_relaxed);
 }
 
-std::uint32_t HostExpertTier::prefill(std::span<const std::uint32_t> ranked) {
-    std::vector<std::pair<std::uint32_t, std::uint32_t>> jobs;
-    for (const std::uint32_t key : ranked) {
-        if (!tier_.has_free_resident()) { break; }
-        std::int32_t slot = -1;
-        if (!tier_.prefill(key, slot)) { continue; } // already has a host copy
-        jobs.emplace_back(key, static_cast<std::uint32_t>(slot));
-    }
-    if (jobs.empty()) { return 0; }
+void HostExpertTier::read_at_startup(const std::vector<std::pair<std::uint32_t, std::uint8_t*>>& jobs) {
     {
         std::unique_lock<std::mutex> lock(mutex_);
         if (!agent_failure_.empty()) { throw std::runtime_error("SSD tier: the read agent stopped: " + agent_failure_); }
@@ -179,6 +253,35 @@ std::uint32_t HostExpertTier::prefill(std::span<const std::uint32_t> ranked) {
     stats_.prefill_reads += jobs.size();
     stats_.run_reads   = agent_run_reads_.load(std::memory_order_relaxed);
     stats_.run_records = agent_run_records_.load(std::memory_order_relaxed);
+}
+
+std::uint32_t HostExpertTier::prefill(std::span<const std::uint32_t> ranked) {
+    std::vector<std::pair<std::uint32_t, std::uint8_t*>> jobs;
+    for (const std::uint32_t key : ranked) {
+        if (!tier_.has_free_resident()) { break; }
+        std::int32_t slot = -1;
+        if (!tier_.prefill(key, slot)) { continue; } // already has a host copy
+        jobs.emplace_back(key, const_cast<std::uint8_t*>(slot_bytes(static_cast<std::uint32_t>(slot))));
+    }
+    if (jobs.empty()) { return 0; }
+    read_at_startup(jobs);
+    return static_cast<std::uint32_t>(jobs.size());
+}
+
+std::uint32_t HostExpertTier::fill_unpinned(std::span<const std::uint32_t> ranked,
+                                            const std::function<bool(std::uint32_t)>& skip) {
+    std::vector<std::pair<std::uint32_t, std::uint8_t*>> jobs;
+    for (const std::uint32_t key : ranked) {
+        if (unpinned_filled_ == unpinned_count_) { break; }
+        if (tier_.host_copy(key) || tier_.held(key) || (skip && skip(key))) { continue; }
+        const std::uint32_t index = unpinned_filled_++;
+        unpinned_of_[key]         = static_cast<std::int32_t>(index);
+        (void)tier_.hold(key);
+        jobs.emplace_back(key, reinterpret_cast<std::uint8_t*>(unpinned_->data()) +
+                                   static_cast<std::size_t>(index) * store_.record_bytes());
+    }
+    if (jobs.empty()) { return 0; }
+    read_at_startup(jobs);
     return static_cast<std::uint32_t>(jobs.size());
 }
 
@@ -193,7 +296,9 @@ void HostExpertTier::begin_round(std::uint32_t allowance) {
     for (std::uint32_t t = 0; t < count; ++t) {
         Ticket& ticket = tickets_[t];
         round_ticket_of_key_[ticket.key] = 0;
-        if (ticket.state.load(std::memory_order_acquire) == 1 && !ticket.resident && !ticket.recycled) {
+        // A copied unpinned record is not admitted: its key keeps the unpinned record.
+        if (ticket.state.load(std::memory_order_acquire) == 1 && !ticket.resident && !ticket.recycled &&
+            ticket.copy_from == nullptr) {
             landings.push_back({ticket.slot, ticket.serial, ticket.key});
         }
     }
@@ -212,6 +317,8 @@ void HostExpertTier::begin_round(std::uint32_t allowance) {
     stats_.fetch_from_ram  = agent_fetch_from_ram_.load(std::memory_order_relaxed);
     stats_.run_reads       = agent_run_reads_.load(std::memory_order_relaxed);
     stats_.run_records     = agent_run_records_.load(std::memory_order_relaxed);
+    stats_.unpinned_served = unpinned_served_.load(std::memory_order_relaxed);
+    stats_.unpinned_copies = unpinned_copies_.load(std::memory_order_relaxed);
     tier_.begin_round(allowance);
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -234,18 +341,31 @@ std::uint32_t HostExpertTier::new_ticket(std::uint32_t key, std::int32_t fetch) 
     const std::uint32_t t = ticket_count_.fetch_add(1, std::memory_order_acq_rel);
     if (t >= ticket_capacity_) { return kNoTicket; }
     Ticket& ticket = tickets_[t];
-    ticket.key      = key;
-    ticket.resident = false;
-    ticket.recycled = false;
-    ticket.fetch    = fetch;
+    ticket.key       = key;
+    ticket.resident  = false;
+    ticket.recycled  = false;
+    ticket.fetch     = fetch;
+    ticket.copy_from = nullptr;
+    ticket.bytes     = nullptr;
     ticket.done.store(false, std::memory_order_relaxed);
     ticket.status.store(0, std::memory_order_relaxed);
     round_ticket_of_key_[key] = t + 1;
     if (const std::int32_t slot = tier_.slot_of(key); slot >= 0) { // already in RAM: nothing to read
         ticket.slot     = static_cast<std::uint32_t>(slot);
+        ticket.bytes    = slot_bytes(ticket.slot);
         ticket.resident = true;
         ticket.state.store(1, std::memory_order_release);
         return t;
+    }
+    if (const std::uint8_t* unpinned = unpinned_record(key); unpinned != nullptr) {
+        if (fetch < 0) { // the CPU reads it in place
+            ticket.bytes    = unpinned;
+            ticket.resident = true;
+            unpinned_served_.fetch_add(1, std::memory_order_relaxed);
+            ticket.state.store(1, std::memory_order_release);
+            return t;
+        }
+        ticket.copy_from = unpinned; // the device reads pinned memory only: a ring slot takes a copy
     }
     ticket.state.store(0, std::memory_order_relaxed);
     in_flight_.fetch_add(1, std::memory_order_acq_rel);
@@ -281,6 +401,54 @@ void HostExpertTier::fail_ticket(std::uint32_t t) noexcept {
 std::string HostExpertTier::failure() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return agent_failure_;
+}
+
+void HostExpertTier::finish_copy(const Copy& copy) {
+    std::memcpy(copy.destination, copy.source, store_.record_bytes());
+    std::lock_guard<std::mutex> lock(copy_mutex_);
+    if (copy.left == nullptr) {
+        copied_.push_back(copy.tag);
+    } else if (--*copy.left == 0) {
+        copy_done_.notify_all();
+    }
+}
+
+void HostExpertTier::copier_main() noexcept {
+    for (;;) {
+        Copy copy;
+        {
+            std::unique_lock<std::mutex> lock(copy_mutex_);
+            copy_wake_.wait(lock, [&] { return copy_stop_ || !copies_.empty(); });
+            if (copies_.empty()) { return; } // stopping
+            copy = copies_.front();
+            copies_.pop_front();
+        }
+        finish_copy(copy);
+    }
+}
+
+void HostExpertTier::copy_records(std::span<const std::pair<std::uint8_t*, const std::uint8_t*>> copies) {
+    if (copies.empty()) { return; }
+    std::uint32_t left = static_cast<std::uint32_t>(copies.size());
+    {
+        std::lock_guard<std::mutex> lock(copy_mutex_);
+        for (const auto& [destination, source] : copies) { copies_.push_back({destination, source, 0, &left}); }
+    }
+    copy_wake_.notify_all();
+    // This thread copies too, then waits for the copies the threads took.
+    for (;;) {
+        Copy copy;
+        {
+            std::unique_lock<std::mutex> lock(copy_mutex_);
+            if (copies_.empty()) {
+                copy_done_.wait(lock, [&] { return left == 0; });
+                return;
+            }
+            copy = copies_.front();
+            copies_.pop_front();
+        }
+        finish_copy(copy);
+    }
 }
 
 void HostExpertTier::agent_main() noexcept {
@@ -344,7 +512,7 @@ const std::uint8_t* HostExpertTier::wait(std::uint32_t t, std::uint32_t& status)
         const std::uint32_t state = ticket.state.load(std::memory_order_acquire);
         if (state == 1) {
             status = 0;
-            return slot_bytes(ticket.slot);
+            return ticket.bytes;
         }
         if (state == 2) {
             status = ticket.status.load(std::memory_order_relaxed);
@@ -368,17 +536,18 @@ void HostExpertTier::done(std::uint32_t t) noexcept {
 
 void HostExpertTier::agent_loop() {
     struct PrefillEntry {
-        std::uint32_t key, slot, remaining;
+        std::uint32_t key, remaining;
         bool failed;
     };
     std::vector<std::uint32_t> demands;
-    std::vector<std::pair<std::uint32_t, std::uint32_t>> prefills;
+    std::vector<std::pair<std::uint32_t, std::uint8_t*>> prefills;
     std::vector<PrefillEntry> prefill_entries;
     std::uint32_t prefill_left = 0;
     // The members of each scatter read in flight (tickets or prefill entries), by tag index.
     std::vector<std::vector<std::uint32_t>> runs;
     std::vector<DirectReadQueue::Completion> done;
-    std::size_t outstanding = 0;        // reads submitted and not completed
+    std::vector<std::uint64_t> copied;
+    std::size_t outstanding = 0;        // reads and copies submitted and not completed
     std::deque<std::uint32_t> waiting;  // tickets of this round waiting for a ring slot, in order
     // The current fetch request: its tickets by index, and how many of them the device has released.
     std::vector<std::uint32_t> fetch_ticket;
@@ -388,6 +557,7 @@ void HostExpertTier::agent_loop() {
     auto last_work             = Clock::now();
     auto* const fetch          = options_.fetch;
     const auto finish_ticket = [&](Ticket& ticket, std::uint32_t t, bool failed) {
+        if (!failed) { ticket.bytes = slot_bytes(ticket.slot); }
         ticket.state.store(failed ? 2 : 1, std::memory_order_release);
         in_flight_.fetch_sub(1, std::memory_order_acq_rel);
         if (fetch == nullptr || ticket.fetch < 0 || static_cast<std::size_t>(ticket.fetch) >= fetch_ticket.size() ||
@@ -445,7 +615,7 @@ void HostExpertTier::agent_loop() {
                     }
                     fetch_ticket[i] = t;
                     if (tickets_[t].resident) {
-                        fetch->land(static_cast<std::uint32_t>(i), slot_bytes(tickets_[t].slot));
+                        fetch->land(static_cast<std::uint32_t>(i), tickets_[t].bytes);
                         agent_fetch_from_ram_.fetch_add(1, std::memory_order_relaxed);
                     } else {
                         waiting.push_back(t);
@@ -474,6 +644,19 @@ void HostExpertTier::agent_loop() {
             if (!take_slot(t)) { break; } // a slot frees up once the device or the CPU is done with one
             waiting.pop_front();
             ticket.submitted_ns = now_ns();
+            if (ticket.copy_from != nullptr) { // an unpinned record: copied at memory speed
+                ticket.remaining = 1;
+                {
+                    std::lock_guard<std::mutex> lock(copy_mutex_);
+                    copies_.push_back({const_cast<std::uint8_t*>(slot_bytes(ticket.slot)), ticket.copy_from,
+                                       tag_of(kDemandTag, t, 0)});
+                }
+                copy_wake_.notify_one();
+                unpinned_copies_.fetch_add(1, std::memory_order_relaxed);
+                ++outstanding;
+                last_work = Clock::now();
+                continue;
+            }
             ticket.remaining    = static_cast<std::uint32_t>(
                 store_.segments(ticket.key / store_.experts(), ticket.key % store_.experts()).size());
             // The next waiting tickets of the same request whose records follow this one in the file
@@ -483,8 +666,8 @@ void HostExpertTier::agent_loop() {
             while (!waiting.empty() && ticket.remaining == 1 && ticket.fetch >= 0 && !fetch_failed &&
                    run.size() < DirectReadQueue::kMaxTargets && bytes + store_.record_bytes() <= kFetchRunBytes) {
                 const std::uint32_t next = waiting.front();
-                if (tickets_[next].fetch < 0 || !follows(tickets_[run.back()].key, tickets_[next].key) ||
-                    !take_slot(next)) {
+                if (tickets_[next].fetch < 0 || tickets_[next].copy_from != nullptr ||
+                    !follows(tickets_[run.back()].key, tickets_[next].key) || !take_slot(next)) {
                     break;
                 }
                 waiting.pop_front();
@@ -494,11 +677,13 @@ void HostExpertTier::agent_loop() {
                 bytes += store_.record_bytes();
             }
             if (run.size() == 1) {
-                submit(ticket.key, ticket.slot, tag_of(kDemandTag, t, 0));
+                submit(ticket.key, const_cast<std::uint8_t*>(slot_bytes(ticket.slot)), tag_of(kDemandTag, t, 0));
                 outstanding += ticket.remaining;
             } else {
-                std::vector<std::pair<std::uint32_t, std::uint32_t>> records;
-                for (const std::uint32_t member : run) { records.emplace_back(tickets_[member].key, tickets_[member].slot); }
+                std::vector<std::pair<std::uint32_t, std::uint8_t*>> records;
+                for (const std::uint32_t member : run) {
+                    records.emplace_back(tickets_[member].key, const_cast<std::uint8_t*>(slot_bytes(tickets_[member].slot)));
+                }
                 const auto index = static_cast<std::uint32_t>(runs.size());
                 runs.push_back(std::move(run));
                 submit_run(records, tag_of(kDemandRunTag, index, 0));
@@ -524,17 +709,17 @@ void HostExpertTier::agent_loop() {
                     ++end;
                 }
                 if (end - i == 1) {
-                    const auto [key, slot] = prefills[i];
-                    const auto index       = static_cast<std::uint32_t>(prefill_entries.size());
+                    const auto [key, destination] = prefills[i];
+                    const auto index              = static_cast<std::uint32_t>(prefill_entries.size());
                     const auto n = static_cast<std::uint32_t>(store_.segments(key / store_.experts(), key % store_.experts()).size());
-                    prefill_entries.push_back({key, slot, n, false});
-                    submit(key, slot, tag_of(kPrefillTag, index, 0));
+                    prefill_entries.push_back({key, n, false});
+                    submit(key, destination, tag_of(kPrefillTag, index, 0));
                     outstanding += n;
                 } else {
                     std::vector<std::uint32_t> members;
                     for (std::size_t k = i; k < end; ++k) {
                         members.push_back(static_cast<std::uint32_t>(prefill_entries.size()));
-                        prefill_entries.push_back({prefills[k].first, prefills[k].second, 1, false});
+                        prefill_entries.push_back({prefills[k].first, 1, false});
                     }
                     const auto index = static_cast<std::uint32_t>(runs.size());
                     runs.push_back(std::move(members));
@@ -549,6 +734,11 @@ void HostExpertTier::agent_loop() {
         done.clear();
         // While a round is open the agent spins (a fetch request must not wait for a timer).
         queue_->poll(done, outstanding != 0 && !open ? std::chrono::microseconds(200) : std::chrono::microseconds(0));
+        copied.clear();
+        if (!copiers_.empty()) {
+            std::lock_guard<std::mutex> lock(copy_mutex_);
+            copied.swap(copied_);
+        }
         const auto ticket_read = [&](std::uint32_t t, bool ok) {
             Ticket& ticket = tickets_[t];
             if (!ok) { ticket.status.store(EIO, std::memory_order_relaxed); }
@@ -592,15 +782,20 @@ void HostExpertTier::agent_loop() {
                 runs[index].clear();
             }
         }
+        for (const std::uint64_t tag : copied) { // not reads: the read statistics leave them out
+            --outstanding;
+            const auto t = static_cast<std::uint32_t>((tag >> 8U) & ((1ULL << 54U) - 1U));
+            finish_ticket(tickets_[t], t, false);
+        }
         if (outstanding == 0) { runs.clear(); } // no run is in flight: their indices start over
-        if (!done.empty()) { last_work = Clock::now(); }
-        if (open && done.empty()) {
+        if (!done.empty() || !copied.empty()) { last_work = Clock::now(); }
+        if (open && done.empty() && copied.empty()) {
             if (Clock::now() - last_work > kIdleSpin) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             } else {
                 relax();
             }
-        } else if (!open && done.empty() && outstanding == 0 && !waiting.empty()) {
+        } else if (!open && done.empty() && copied.empty() && outstanding == 0 && !waiting.empty()) {
             std::this_thread::yield(); // tickets of a closed round wait for a reader to finish
         }
     }

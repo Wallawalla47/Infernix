@@ -22,6 +22,9 @@ drafter (`--spec mtp`), n-gram copy proposals, images and video (`--vision`), an
   about 69.3 GiB must be available, and 73.3 GiB for `infernix-serve` with its prefix cache (see
   [Prefix cache](#prefix-cache)). With less, the [SSD expert tier](#ssd-expert-tier) keeps the
   experts that fit in RAM and reads the others from the artifact; the ledger line names every term.
+  Windows lets the GPU page-lock RAM only up to its *shared GPU memory* (Task Manager → Performance
+  → GPU; often half of RAM). Experts past that limit stay in RAM unpinned and the CPU serves them
+  (see [Page-locking limit](#page-locking-limit)), so the limit costs some speed, not RAM.
 - **VRAM.** All of it: the expert cache takes what the dense weights, the KV cache, the
   workspaces and a reserve for CUDA graphs leave, less a headroom for the display and other
   programs (see [VRAM](#vram)).
@@ -245,6 +248,39 @@ requests running in that round with an error and the server keeps serving; queue
 usual, and the prefix cache is emptied (the failed round may have published state it never
 computed). If the tier's read thread or the CPU expert service itself stops, every later round
 would fail too, so the server stops with that cause.
+
+### Page-locking limit
+
+The GPU reads RAM experts only from page-locked (pinned) memory, and Windows page-locks at most
+the adapter's shared system memory for it: on an RTX 5090 with 95.8 GiB of RAM page-locking stopped
+at 76.0 GiB of a reported 76.6 GiB (80 % of RAM there; many machines report half of RAM). The RAM
+ledger reads that size and its current use at startup and keeps 1 GiB below it. Every other pin
+comes first (the embedding, the prefix cache's Host tier, the Program's buffers); the experts pin
+what is left, and their RAM beyond it holds **unpinned records**:
+
+- The RAM the experts get does not change: a 96 GB machine with a half-of-RAM limit still holds
+  every expert in RAM (the SSD tier with nothing on disk), a 64 GB machine the same experts as
+  without the limit.
+- Unpinned records are ordinary memory kept resident (a raised minimum working set and
+  `VirtualLock`), filled at startup with the experts ranked after the slots' (none of them in VRAM)
+  and never replaced; the slots keep adapting.
+- Decode and verification hand an unpinned expert to the CPU expert engine, which reads it in
+  place (as fast as from pinned memory). A prefill streams it two layers ahead like a pinned one,
+  through pinned bounce slots that the CPU fills first (four parts, each a layer's unpinned share of its 512 experts, 64-256 records: 2.2 GiB with 40 % of the experts unpinned); past that
+  a layer's call copies it into a pinned ring slot instead of reading it from disk. A VRAM
+  promotion stages it through 32 more bounce slots. The bounce slots come out of the pinned
+  share. Each bounced copy crosses RAM three times, so these paths reach about a third of the RAM
+  bandwidth (~25-30 GB/s with two DDR5 channels), below a PCIe 5.0 x16 link: pinned experts stay
+  faster for prefill, which is why the coldest experts are the unpinned ones. Outputs are the same
+  bits.
+- If Windows refuses a slot chunk anyway (another program pinned memory meanwhile), the tier gives
+  back enough for the prefix cache and the Program's buffers, and the slots it lost become unpinned
+  records; a warning says so.
+- `--expert-pin-mib N` page-locks at most N MiB of the experts' RAM (the rest unpinned), for
+  example to leave shared GPU memory to other programs.
+
+The info line at startup names the split (`… page-locked for the GPU and … kept in RAM for the
+CPU`), and the tier's line counts the unpinned records.
 
 ## VRAM
 

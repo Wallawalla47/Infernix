@@ -31,6 +31,9 @@ public:
     void flush();
 
 private:
+    // Whether a pending copy writes any of [destination, destination + bytes).
+    [[nodiscard]] bool pending(const void* destination, std::size_t bytes) const;
+
     cudaStream_t stream_;
     std::vector<void*> destinations_;
     std::vector<const void*> sources_;

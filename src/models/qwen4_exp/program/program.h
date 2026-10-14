@@ -340,9 +340,14 @@ struct ProgramOptions {
     bool vram_past_budget = false; // EngineOptions::vram_past_budget
     bool expert_cache = true;
     // SSD expert tier (design §19.3.7): pinned RAM for expert slots when the model's banks are
-    // streamed from the artifact (LoadOptions::stream_experts; the RAM ledger's expert share).
-    // Ignored in full mode.
-    std::uint64_t expert_ram_bytes = 0;
+    // streamed from the artifact (LoadOptions::stream_experts; the RAM ledger's pinned expert
+    // share), and resident pageable RAM for unpinned records past the page-locking limit (its
+    // pageable share). Ignored in full mode.
+    std::uint64_t expert_ram_bytes      = 0;
+    std::uint64_t expert_unpinned_bytes = 0;
+    // Pinned allocations the Program makes after the tier (the prefix cache's Host tier and an
+    // allowance): when the OS refuses a slot chunk, the tier leaves this much below the limit.
+    std::uint64_t later_pinned_bytes = 0;
     // Speculative decoding with n-gram copy proposals (design section 11.3): at most this many
     // draft tokens per round (0 disables, at most 15), proposed only from a match of at least
     // ngram_min_match tokens (4..64) earlier in the request.

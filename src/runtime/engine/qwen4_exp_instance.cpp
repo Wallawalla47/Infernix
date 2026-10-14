@@ -129,7 +129,12 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     demand.pageable     = models::qwen4_exp::NgramVolume::cache_bytes(plan.config().text.ple.table);
     demand.load_staging = kLoadStagingBytes;
     demand.expert_cap   = options.expert_ram_bytes;
-    const auto ledger   = models::qwen4_exp::plan_host_memory(host_memory_snapshot(), demand);
+    // Windows page-locks memory for the GPU only up to the adapter's shared system memory; the
+    // experts past that stay in RAM unpinned (the SSD tier's unpinned records).
+    auto vram             = open_vram_budget_source(device.device, options.vram_past_budget);
+    demand.pin_room       = models::qwen4_exp::pin_room(vram->query());
+    demand.expert_pin_cap = options.expert_pin_bytes;
+    const auto ledger     = models::qwen4_exp::plan_host_memory(host_memory_snapshot(), demand);
     report(options, DiagnosticLevel::Info, ledger.summary());
     report(options, DiagnosticLevel::Debug, ledger.describe());
     if (ledger.cap_too_large) {
@@ -218,7 +223,9 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.vram_past_budget = options.vram_past_budget;
     if (tier) {
         program_options.expert_ram_bytes =
-            static_cast<std::uint64_t>(static_cast<double>(ledger.expert_ram) / (1.0 + demand.lock_overhead));
+            static_cast<std::uint64_t>(static_cast<double>(ledger.expert_pinned) / (1.0 + demand.lock_overhead));
+        program_options.expert_unpinned_bytes = ledger.expert_pageable;
+        program_options.later_pinned_bytes    = demand.prefix_cache + demand.later_pinned + models::qwen4_exp::kPinRoomMarginBytes;
     }
 
     // The VRAM check (design §19.3.7), before the weights are read: the dense weights, the
@@ -227,7 +234,6 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     const auto device_plan =
         models::qwen4_exp::Program::plan_device(program_options, plan.config(), plan.public_token_count());
     const std::uint64_t dense = plan.device_bytes();
-    auto vram                 = open_vram_budget_source(device.device, options.vram_past_budget);
     const VramSnapshot before = vram->query();
     models::qwen4_exp::VramDemand vram_demand;
     vram_demand.headroom    = options.vram_headroom_bytes;

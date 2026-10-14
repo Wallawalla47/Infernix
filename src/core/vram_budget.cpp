@@ -180,6 +180,10 @@ public:
                                           : 0;
                 }
             }
+            if (shared_ != 0 && SUCCEEDED(adapter_->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &info))) {
+                out.shared_system  = shared_;
+                out.nonlocal_usage = info.CurrentUsage;
+            }
             out.outputs = outputs_;
         }
 #endif
@@ -210,6 +214,8 @@ private:
         }
         factory_ = factory;
         adapter_ = adapter;
+        DXGI_ADAPTER_DESC desc{};
+        shared_ = SUCCEEDED(adapter_->GetDesc(&desc)) ? desc.SharedSystemMemory : 0;
         if (budget_event_ != nullptr &&
             FAILED(adapter_->RegisterVideoMemoryBudgetChangeNotificationEvent(budget_event_, &budget_cookie_))) {
             budget_cookie_ = 0;
@@ -239,11 +245,13 @@ private:
         if (factory_ != nullptr) { factory_->Release(); }
         adapter_ = nullptr;
         factory_ = nullptr;
+        shared_  = 0;
         outputs_ = -1;
     }
 
     IDXGIFactory4* factory_ = nullptr;
     IDXGIAdapter3* adapter_ = nullptr;
+    std::uint64_t shared_   = 0; // the adapter's shared system memory
     int outputs_            = -1;
     HANDLE budget_event_    = nullptr;
     DWORD budget_cookie_    = 0;

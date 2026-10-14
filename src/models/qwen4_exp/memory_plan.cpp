@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <stdexcept>
 
 namespace infernix::models::qwen4_exp {
@@ -42,40 +43,72 @@ HostMemoryLedger plan_host_memory(const HostMemorySnapshot& snapshot, const Host
             out.capped     = true;
         }
     }
-    out.placement = out.expert_ram >= out.full_need ? ExpertPlacement::Full : ExpertPlacement::Tier;
+    // Page-locking: the other pins come first; the experts pin what is left of the room, and the
+    // rest of their RAM stays pageable (resident records the CPU serves).
+    std::uint64_t pin_left =
+        demand.pin_room ? saturating_sub(*demand.pin_room, pinned_other) : std::numeric_limits<std::uint64_t>::max();
+    if (demand.expert_pin_cap && *demand.expert_pin_cap < pin_left) {
+        pin_left       = *demand.expert_pin_cap;
+        out.pin_capped = true;
+    }
+    const bool banks_pin = with_lock_overhead(demand.expert_banks, demand.lock_overhead) <= pin_left;
+    out.placement = out.expert_ram >= out.full_need && banks_pin ? ExpertPlacement::Full : ExpertPlacement::Tier;
+    out.expert_pinned   = std::min(out.expert_ram, pin_left);
+    out.expert_pageable = out.expert_ram - out.expert_pinned;
+    out.pin_limited     = out.placement == ExpertPlacement::Tier && out.expert_pageable > 0;
+    out.pin_capped      = out.pin_capped && out.pin_limited;
     if (out.placement == ExpertPlacement::Full || out.capped) { out.commit_limited = false; }
     return out;
 }
 
+std::optional<std::uint64_t> pin_room(const VramSnapshot& snapshot) {
+    if (snapshot.shared_system == 0) { return std::nullopt; }
+    return saturating_sub(snapshot.shared_system, snapshot.nonlocal_usage + kPinRoomMarginBytes);
+}
+
 std::string HostMemoryLedger::describe() const {
-    char line[640];
+    char pins[96] = "pin room unlimited";
+    if (demand.pin_room) { std::snprintf(pins, sizeof(pins), "pin room %.2f", gib(*demand.pin_room)); }
+    char line[768];
     std::snprintf(line, sizeof(line),
-                  "RAM ledger: available %.2f GiB of %.2f (commit %.2f); reserve %.2f; other pins %.2f; later pins "
-                  "%.2f; prefix cache %.2f; caches %.2f; staging %.2f; growth %.2f -> experts %.2f GiB of %.2f needed "
-                  "(banks %.2f + margin %.2f)%s%s; %s",
-                  gib(snapshot.available_physical), gib(snapshot.total_physical), gib(snapshot.available_commit),
+                  "RAM ledger: available %.2f GiB of %.2f (commit %.2f); %s; reserve %.2f; other pins %.2f; later "
+                  "pins %.2f; prefix cache %.2f; caches %.2f; staging %.2f; growth %.2f -> experts %.2f GiB of %.2f "
+                  "needed (banks %.2f + margin %.2f; pinned %.2f, resident %.2f)%s%s%s; %s",
+                  gib(snapshot.available_physical), gib(snapshot.total_physical), gib(snapshot.available_commit), pins,
                   gib(demand.reserve), gib(demand.other_pinned), gib(demand.later_pinned), gib(demand.prefix_cache),
-                  gib(demand.pageable),
-                  gib(demand.load_staging),
-                  gib(demand.process_growth), gib(expert_ram), gib(full_need), gib(demand.expert_banks),
-                  gib(demand.full_margin), commit_limited ? ", limited by the page file" : "",
+                  gib(demand.pageable), gib(demand.load_staging), gib(demand.process_growth), gib(expert_ram),
+                  gib(full_need), gib(demand.expert_banks), gib(demand.full_margin), gib(expert_pinned),
+                  gib(expert_pageable), commit_limited ? ", limited by the page file" : "",
                   capped ? ", capped by --expert-ram-mib" : "",
+                  pin_capped ? ", pinned share capped by --expert-pin-mib" : pin_limited ? ", pinned share limited by the pin room" : "",
                   placement == ExpertPlacement::Full ? "full mode (every expert in RAM)"
                                                      : "SSD tier (experts not in RAM are read from the artifact)");
     return line;
 }
 
 std::string HostMemoryLedger::summary() const {
-    char line[320];
+    char line[480];
     if (placement == ExpertPlacement::Full) {
         std::snprintf(line, sizeof(line), "RAM: %.1f of %.1f GiB free; every expert fits in RAM (%.1f GiB)",
                       gib(snapshot.available_physical), gib(snapshot.total_physical), gib(demand.expert_banks));
+        return line;
+    }
+    char split[200] = "";
+    if (pin_limited) {
+        std::snprintf(split, sizeof(split), "; %s, so %.1f GiB are page-locked for the GPU and %.1f GiB kept in RAM for the CPU",
+                      pin_capped ? "--expert-pin-mib limits page-locking"
+                                 : "Windows lets the GPU page-lock only part of RAM",
+                      gib(expert_pinned), gib(expert_pageable));
+    }
+    if (expert_ram >= full_need) {
+        std::snprintf(line, sizeof(line), "RAM: %.1f of %.1f GiB free; every expert fits in RAM (%.1f GiB)%s",
+                      gib(snapshot.available_physical), gib(snapshot.total_physical), gib(demand.expert_banks), split);
     } else {
         std::snprintf(line, sizeof(line),
-                      "RAM: %.1f of %.1f GiB free; %.1f of the experts' %.1f GiB fit in RAM%s, the rest are read "
+                      "RAM: %.1f of %.1f GiB free; %.1f of the experts' %.1f GiB fit in RAM%s%s, the rest are read "
                       "from the model files on demand (slower)",
                       gib(snapshot.available_physical), gib(snapshot.total_physical), gib(expert_ram),
-                      gib(demand.expert_banks), capped ? " (--expert-ram-mib)" : "");
+                      gib(demand.expert_banks), capped ? " (--expert-ram-mib)" : "", split);
     }
     return line;
 }

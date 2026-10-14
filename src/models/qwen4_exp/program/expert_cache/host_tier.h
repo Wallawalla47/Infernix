@@ -3,7 +3,8 @@
 // Host side of the SSD expert tier's RAM level (docs/maintainer/qwen3_8-flash-next-design.md
 // §19.3.7, plan local/workdirs/fn/plans/memory-tiers.md §4.3, §4.7, §4.8): the decayed-LFU ranking
 // of every expert key, the pinned host slots with their states, pins and load serials, the landing
-// lists (demand ring, prefetch list, demotion list), and the admission and demotion gates. Pure
+// lists (demand ring, prefetch list, demotion list), the admission and demotion gates, and the keys
+// held outside the slots (resident pageable records past the page-locking limit). Pure
 // host logic with no CUDA dependency, driven by the engine thread at round boundaries; the Program
 // turns its decisions into copies and host-pointer table uploads.
 
@@ -93,6 +94,10 @@ public:
     // The slot holding key's bytes (resident or shadow), or -1.
     [[nodiscard]] std::int32_t slot_of(std::uint32_t key) const { return slot_of_[key]; }
     [[nodiscard]] bool host_copy(std::uint32_t key) const { return slot_of_[key] >= 0; }
+    // A key held in RAM outside the slots for good (the SSD tier's resident pageable records): it is
+    // never admitted into a slot, a VRAM eviction keeps it (T3), and its promotions pin nothing.
+    [[nodiscard]] bool held(std::uint32_t key) const { return held_[key] != 0; }
+    [[nodiscard]] std::size_t held_count() const { return held_count_; }
     [[nodiscard]] SlotState state(std::uint32_t slot) const { return slots_[slot].state; }
     [[nodiscard]] std::uint32_t key(std::uint32_t slot) const { return slots_[slot].key; }
     [[nodiscard]] std::uint8_t pins(std::uint32_t slot) const { return slots_[slot].pins; }
@@ -113,6 +118,8 @@ public:
     // or the key already has a host copy. The caller writes the bytes before the first round.
     bool prefill(std::uint32_t key, std::int32_t& slot);
     [[nodiscard]] bool has_free_resident() const { return !free_resident_.empty(); }
+    // Marks `key` held outside the slots (see held); false when it has a slot copy or is held.
+    bool hold(std::uint32_t key);
     // Seeds the decayed LFU at the current time with a saved session's use counts, each capped at
     // `cap`, so the first admissions and demotions rank RAM residents by what that session used
     // instead of comparing all-zero scores (where the lowest slot, the best-ranked pre-fill, goes
@@ -212,6 +219,8 @@ private:
     DecayedLfu lfu_;
     std::vector<Slot> slots_;
     std::vector<std::int32_t> slot_of_;
+    std::vector<std::uint8_t> held_;
+    std::size_t held_count_ = 0;
     std::vector<std::uint32_t> free_resident_; // free slots of the resident partition
     std::vector<std::uint32_t> ring_, prefetch_, demotion_;
     std::vector<std::uint32_t> used_; // slots holding a Use pin

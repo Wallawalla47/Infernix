@@ -342,6 +342,7 @@ int main(int argc, char** argv) {
                                                                    : std::filesystem::path(cli.artifact_path.string() + ".expert-state");
         engine_options.ram_headroom_bytes       = cli.ram_headroom_bytes;
         engine_options.expert_ram_bytes         = cli.expert_ram_bytes;
+        engine_options.expert_pin_bytes         = cli.expert_pin_bytes;
         engine_options.device                   = cli.device;
         engine_options.max_context              = cli.max_context;
         engine_options.rope_yarn_factor         = cli.rope_yarn_factor;

@@ -167,4 +167,59 @@ void RegisteredHostBuffer::pin() {
     device_ = static_cast<std::byte*>(device);
 }
 
+ResidentHostBuffer::ResidentHostBuffer(std::size_t bytes) : size_(bytes) {
+    if (bytes == 0) { throw std::invalid_argument("ResidentHostBuffer size must be nonzero"); }
+#ifdef _WIN32
+    void* p = ::VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (p == nullptr) {
+        throw std::runtime_error("VirtualAlloc of " + std::to_string(bytes) + " bytes failed: Windows error " +
+                                 std::to_string(::GetLastError()));
+    }
+    data_ = static_cast<std::byte*>(p);
+    // VirtualLock holds pages in the working set, so the hard minimum must cover them (with the
+    // process's own pages above it); the maximum stays soft.
+    constexpr SIZE_T kSlack = SIZE_T{64} << 20;
+    SIZE_T minimum = 0, maximum = 0;
+    DWORD flags    = 0;
+    if (!::GetProcessWorkingSetSizeEx(::GetCurrentProcess(), &minimum, &maximum, &flags)) {
+        lock_failure_ = "Windows error " + std::to_string(::GetLastError()) + " reading the working set";
+        return;
+    }
+    const SIZE_T wanted = minimum + bytes + kSlack;
+    if (!::SetProcessWorkingSetSizeEx(::GetCurrentProcess(), wanted, std::max(maximum, wanted + kSlack),
+                                      QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE)) {
+        lock_failure_ = "Windows error " + std::to_string(::GetLastError()) + " raising the working set";
+        return;
+    }
+    raised_ = bytes + kSlack;
+    constexpr std::size_t kPiece = std::size_t{1} << 30;
+    for (std::size_t at = 0; at < bytes; at += kPiece) {
+        if (!::VirtualLock(data_ + at, std::min(kPiece, bytes - at))) {
+            lock_failure_ = "Windows error " + std::to_string(::GetLastError()) + " locking pages";
+            return;
+        }
+    }
+#else
+    void* p = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) { throw std::runtime_error("mmap of " + std::to_string(bytes) + " bytes failed"); }
+    data_ = static_cast<std::byte*>(p);
+    if (::mlock(data_, bytes) != 0) { lock_failure_ = "mlock failed (RLIMIT_MEMLOCK)"; }
+#endif
+}
+
+ResidentHostBuffer::~ResidentHostBuffer() {
+#ifdef _WIN32
+    (void)::VirtualFree(data_, 0, MEM_RELEASE); // releases the locks
+    if (raised_ != 0) {
+        SIZE_T minimum = 0, maximum = 0;
+        DWORD flags    = 0;
+        if (::GetProcessWorkingSetSizeEx(::GetCurrentProcess(), &minimum, &maximum, &flags) && minimum > raised_) {
+            (void)::SetProcessWorkingSetSizeEx(::GetCurrentProcess(), minimum - raised_, maximum, flags);
+        }
+    }
+#else
+    (void)::munmap(data_, size_);
+#endif
+}
+
 } // namespace infernix

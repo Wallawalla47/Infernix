@@ -41,7 +41,7 @@ double DecayedLfu::score(std::uint32_t key) const {
 
 HostTier::HostTier(const Config& config)
     : config_(config), lfu_(config.num_keys, config.half_life), slots_(config.slots),
-      slot_of_(config.num_keys, -1), dirty_mark_(config.num_keys, 0) {
+      slot_of_(config.num_keys, -1), held_(config.num_keys, 0), dirty_mark_(config.num_keys, 0) {
     const std::uint64_t lists = static_cast<std::uint64_t>(config.ring) + config.prefetch + config.demotion;
     if (config.num_keys == 0 || config.slots <= lists) {
         throw std::invalid_argument("HostTier: the slots must exceed the ring, prefetch and demotion lists");
@@ -159,11 +159,18 @@ void HostTier::replace_in_list(std::vector<std::uint32_t>& list, std::uint32_t o
 }
 
 bool HostTier::prefill(std::uint32_t key, std::int32_t& slot) {
-    if (host_copy(key) || free_resident_.empty()) { return false; }
+    if (host_copy(key) || held(key) || free_resident_.empty()) { return false; }
     const std::uint32_t s = free_resident_.back();
     free_resident_.pop_back();
     set_resident(s, key, SlotState::kResident);
     slot = static_cast<std::int32_t>(s);
+    return true;
+}
+
+bool HostTier::hold(std::uint32_t key) {
+    if (host_copy(key) || held(key)) { return false; }
+    held_[key] = 1;
+    ++held_count_;
     return true;
 }
 
@@ -236,7 +243,9 @@ std::size_t HostTier::admit(std::span<const Landing> landings, bool prefetch) {
     for (const Landing& l : landings) {
         if (l.slot >= slots_.size()) { throw std::logic_error("HostTier: landing slot out of range"); }
         Slot& s = slots_[l.slot];
-        if (s.list != tag || s.serial != l.serial || (s.pins & kPinPrefetch) || host_copy(l.key)) { continue; }
+        if (s.list != tag || s.serial != l.serial || (s.pins & kPinPrefetch) || host_copy(l.key) || held(l.key)) {
+            continue;
+        }
         std::uint32_t replacement;
         if (!free_resident_.empty()) {
             replacement = free_resident_.back();
@@ -286,6 +295,7 @@ void HostTier::replenish_demotion_list() {
 
 void HostTier::queued(std::uint32_t key) {
     const std::int32_t s = slot_of_[key];
+    if (s < 0 && held(key)) { return; } // its record never moves
     if (s < 0) { throw std::logic_error("HostTier: a key queued for VRAM has no host copy"); }
     slots_[static_cast<std::uint32_t>(s)].pins |= kPinQueue;
     push_victim(static_cast<std::uint32_t>(s));
@@ -300,6 +310,7 @@ void HostTier::unqueued(std::uint32_t key) {
 
 void HostTier::promotion_issued(std::uint32_t key) {
     const std::int32_t s = slot_of_[key];
+    if (s < 0 && held(key)) { return; }
     if (s < 0) { throw std::logic_error("HostTier: a promotion without a host copy"); }
     Slot& slot = slots_[static_cast<std::uint32_t>(s)];
     slot.pins  = static_cast<std::uint8_t>((slot.pins & ~kPinQueue) | kPinH2D);
@@ -308,6 +319,7 @@ void HostTier::promotion_issued(std::uint32_t key) {
 
 void HostTier::promotion_completed(std::uint32_t key, bool published) {
     const std::int32_t s = slot_of_[key];
+    if (s < 0 && held(key)) { return; }
     if (s < 0) { throw std::logic_error("HostTier: a completed promotion without a host copy"); }
     Slot& slot = slots_[static_cast<std::uint32_t>(s)];
     slot.pins &= static_cast<std::uint8_t>(~kPinH2D);
@@ -326,7 +338,7 @@ bool HostTier::demotion_worthy(std::uint32_t key) {
 }
 
 bool HostTier::allow_evict(std::uint32_t key) {
-    if (host_copy(key) || !demotion_worthy(key)) { return true; }
+    if (host_copy(key) || held(key) || !demotion_worthy(key)) { return true; }
     if (allowance_ == 0 || demotion_.empty()) { return false; } // T6: the admission waits
     if (allowance_ != std::numeric_limits<std::uint32_t>::max()) { --allowance_; }
     return true;
@@ -342,6 +354,7 @@ VramEviction HostTier::vram_evicted(std::uint32_t key, bool published, std::uint
         push_victim(static_cast<std::uint32_t>(s));
         return VramEviction::kKeptInRam;
     }
+    if (held(key)) { return VramEviction::kKeptInRam; } // T3
     if (!published || demotion_.empty() || !demotion_worthy(key)) { return VramEviction::kDropped; } // T5
     slot = demotion_.back(); // T4
     demotion_.pop_back();
@@ -419,10 +432,14 @@ void HostTier::check() const {
     for (const Slot& slot : slots_) { stream_pins += (slot.pins & kPinStream) ? 1 : 0; }
     if (stream_pins != streamed_.size()) { fail("stream pins"); }
     if (residents != resident_count_ || shadows != shadow_count_) { fail("counts"); }
+    std::size_t held_keys = 0;
     for (std::uint32_t k = 0; k < slot_of_.size(); ++k) {
         const std::int32_t s = slot_of_[k];
         if (s >= 0 && slots_[static_cast<std::uint32_t>(s)].key != k) { fail("key map"); }
+        if (held_[k] != 0 && s >= 0) { fail("a held key also has a slot"); }
+        held_keys += held_[k] != 0 ? 1 : 0;
     }
+    if (held_keys != held_count_) { fail("held count"); }
 }
 
 } // namespace infernix::models::qwen4_exp::expert_cache

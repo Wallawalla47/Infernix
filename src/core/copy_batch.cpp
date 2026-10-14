@@ -6,15 +6,19 @@
 
 namespace infernix {
 
-void CopyBatch::add(void* destination, const void* source, std::size_t bytes) {
-    if (bytes == 0) { return; }
+bool CopyBatch::pending(const void* destination, std::size_t bytes) const {
+    if (bytes == 0) { return false; }
     const auto begin = reinterpret_cast<std::uintptr_t>(destination), end = begin + bytes;
     // Overlap: the first pending range starting after `begin` starts before `end`, or the last one
     // starting at or before `begin` ends after it.
-    auto next = ranges_.upper_bound(begin);
-    const bool overlaps = (next != ranges_.end() && next->first < end) ||
-                          (next != ranges_.begin() && std::prev(next)->second > begin);
-    if (overlaps) { flush(); }
+    const auto next = ranges_.upper_bound(begin);
+    return (next != ranges_.end() && next->first < end) || (next != ranges_.begin() && std::prev(next)->second > begin);
+}
+
+void CopyBatch::add(void* destination, const void* source, std::size_t bytes) {
+    if (bytes == 0) { return; }
+    const auto begin = reinterpret_cast<std::uintptr_t>(destination), end = begin + bytes;
+    if (pending(destination, bytes)) { flush(); }
     destinations_.push_back(destination);
     sources_.push_back(source);
     sizes_.push_back(bytes);

@@ -3,8 +3,10 @@
 // closed-form byte oracle: the startup pre-fill, demand reads from another thread (the CPU
 // service's role) including a straddling record, a resident key served without a read, duplicate
 // demands sharing a ticket, admission of hot landings at the next boundary (the victims lose their
-// host copy, the dirty set names both), ring exhaustion reusing finished slots, a failed read, and
-// destruction with reads in flight. CPU and disk only, except with --fetch: the tier as the responder
+// host copy, the dirty set names both), ring exhaustion reusing finished slots, a failed read,
+// destruction with reads in flight, and unpinned records (a refused pin chunk becoming unpinned
+// records, their startup fill, CPU demands served in place and never admitted). CPU and disk only,
+// except with --fetch: the tier as the responder
 // of a fetch channel (mapped words, so a CUDA context), this thread playing the device's half of the
 // protocol (ops/offloaded_sparse_moe/cpu/fetch_request.h): records landed from RAM and read from disk,
 // more records than ring slots (slots reused as the "device" consumes them), the heartbeat, a request
@@ -245,6 +247,115 @@ void test_fetch(const ExpertStore& store) {
     tier.end_round();
 }
 
+// Pinning refused after three of four chunks (the Windows page-locking limit): the tier gives back a
+// chunk for later pins and keeps the slots it lost as unpinned records, beside those asked for.
+HostExpertTier::Options refusing_options(int& chunks) {
+    auto o            = options();
+    o.min_slots       = 20;
+    o.unpinned        = 14;
+    o.bounce          = 4;
+    o.pin_reserve     = 16 * kRecord;
+    o.copy_threads    = 2;
+    o.allocate        = [&chunks](std::size_t bytes) -> void* {
+        if (chunks++ == 3) { return nullptr; }
+        return ::operator new(bytes, std::align_val_t{4096});
+    };
+    return o;
+}
+
+void test_unpinned(const ExpertStore& store) {
+    int chunks = 0;
+    HostExpertTier tier(store, refusing_options(chunks));
+    check(tier.pinned_slots() == 32 && tier.refused_slots() == 32, "a refused chunk: one chunk given back, 32 slots kept");
+    check(tier.unpinned_records() == 46 && tier.bounce_slots() == 4, "the refused slots join the unpinned records asked for; 4 bounce slots");
+    std::cout << "unpinned: lock " << (tier.unpinned_lock_failure().empty() ? "ok" : tier.unpinned_lock_failure()) << '\n';
+    std::vector<std::uint32_t> ranked(kKeys);
+    for (std::uint32_t k = 0; k < kKeys; ++k) { ranked[k] = k; }
+    check(tier.prefill(ranked) == 14, "the 14 resident slots take the first keys");
+    // The unpinned records take the next keys the slots do not hold, skipping key 20 (in VRAM),
+    // including the record that straddles the files (key 60).
+    const std::uint32_t filled = tier.fill_unpinned(ranked, [](std::uint32_t key) { return key == 20; });
+    check(filled == 46, "the unpinned records fill up");
+    bool exact = true, device_free = true;
+    for (std::uint32_t k = 14; k <= kStraddle; ++k) { // 14..19 and 21..60: 46 records
+        if (k == 20) { continue; }
+        exact       = exact && matches(tier.unpinned_record(k), k) && matches(tier.host_record(k), k);
+        device_free = device_free && tier.record(k) == nullptr && tier.controller().held(k);
+    }
+    check(exact, "unpinned records (straddling one included) equal the file bytes");
+    check(device_free, "unpinned records are not in the device table, and their keys are held");
+    check(tier.unpinned_record(20) == nullptr && tier.unpinned_record(kStraddle + 1) == nullptr,
+          "skipped and later keys are not unpinned");
+    check(tier.fill_unpinned(ranked, {}) == 0, "a full set of unpinned records takes nothing more");
+    tier.controller().check();
+    // Promotions stage unpinned records through the bounce slots (copy threads plus the caller).
+    const std::vector<std::pair<std::uint8_t*, const std::uint8_t*>> bounce{
+        {tier.bounce_slot(0), tier.unpinned_record(30)}, {tier.bounce_slot(1), tier.unpinned_record(kStraddle)},
+        {tier.bounce_slot(2), tier.unpinned_record(15)}, {tier.bounce_slot(3), tier.unpinned_record(44)}};
+    tier.copy_records(bounce);
+    check(matches(tier.bounce_slot(0), 30) && matches(tier.bounce_slot(1), kStraddle) && matches(tier.bounce_slot(2), 15) &&
+              matches(tier.bounce_slot(3), 44),
+          "copy_records lands every record in its bounce slot");
+
+    // CPU demands: unpinned records in place, without a read; a slot key from its slot; key 20 from disk.
+    tier.begin_round(32);
+    std::vector<std::uint32_t> statuses;
+    std::vector<bool> valid;
+    const std::vector<std::uint32_t> keys{18, kStraddle, 20, 5};
+    const auto got = serve(tier, keys, statuses, valid);
+    check(valid[0] && valid[1] && valid[2] && valid[3], "CPU demands of unpinned, disk and slot keys hold their bytes");
+    check(got[0] == tier.unpinned_record(18) && got[1] == tier.unpinned_record(kStraddle),
+          "an unpinned record is served in place");
+    const std::vector<std::uint32_t> hot{18, kStraddle, 20};
+    tier.record_uses(1, hot, 50.0);
+    tier.begin_round(32);
+    check(tier.stats().unpinned_served == 2 && tier.stats().demand_reads == 1, "two served in place, one read");
+    check(tier.record(18) == nullptr && tier.record(kStraddle) == nullptr && matches(tier.record(20), 20),
+          "only the read landing is admitted into a slot");
+    tier.controller().check();
+    tier.end_round();
+}
+
+// The device's fetch of unpinned records: copied into ring slots (the device reads pinned memory
+// only) with their bytes, more records than ring slots, and never admitted.
+void test_fetch_unpinned(const ExpertStore& store) {
+    infernix::ops::offloaded_moe::FetchChannel channel;
+    int chunks = 0;
+    auto o     = refusing_options(chunks);
+    o.fetch    = &channel;
+    HostExpertTier tier(store, o);
+    std::vector<std::uint32_t> ranked(kKeys);
+    for (std::uint32_t k = 0; k < kKeys; ++k) { ranked[k] = k; }
+    (void)tier.prefill(ranked);
+    (void)tier.fill_unpinned(ranked, {});
+    DeviceSide device{channel.channel(0)};
+    tier.begin_round(32);
+    // Layer 0, experts 10..29: 10..13 in slots, 14..29 unpinned (16 copies through the 8-slot ring).
+    std::vector<std::int32_t> experts;
+    for (std::int32_t e = 10; e < 30; ++e) { experts.push_back(e); }
+    device.publish(0, experts);
+    bool all = true, copied = true;
+    for (std::uint32_t i = 0; i < experts.size(); ++i) {
+        std::uint32_t status = 0;
+        const std::uint8_t* record = device.wait(i, status);
+        const std::uint32_t key    = 10 + i;
+        all = all && status == 0 && matches(record, key);
+        if (key >= 14) { copied = copied && record != nullptr && record != tier.unpinned_record(key); }
+        device.consume(i + 1);
+    }
+    check(all, "fetch: slot keys and unpinned copies land with their bytes");
+    check(copied, "fetch: an unpinned record lands as a copy in a ring slot");
+    tier.end_round();
+    const std::vector<std::uint32_t> hot{18, 19, 20};
+    tier.record_uses(1, hot, 50.0);
+    tier.begin_round(32);
+    check(tier.stats().unpinned_copies == 16 && tier.stats().demand_reads == 0, "fetch: 16 copies, no reads");
+    check(tier.record(18) == nullptr && tier.controller().held(18) && tier.stats().admitted == 0,
+          "fetch: a copied unpinned record is not admitted");
+    tier.controller().check();
+    tier.end_round();
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -352,7 +463,11 @@ int main(int argc, char** argv) {
             check(tier.record(60) != nullptr, "the demoted record is in RAM");
             host.check();
         }
-        if (argc > 1 && std::string_view(argv[1]) == "--fetch") { test_fetch(store); }
+        test_unpinned(store);
+        if (argc > 1 && std::string_view(argv[1]) == "--fetch") {
+            test_fetch(store);
+            test_fetch_unpinned(store);
+        }
         {
             // Destruction with reads in flight.
             HostExpertTier tier(store, options());

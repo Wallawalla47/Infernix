@@ -455,6 +455,46 @@ void test_warm_fill() {
     check(threw, "seed counts of another key count are refused");
 }
 
+// ---- keys held outside the slots (unpinned records past the page-locking limit)
+void test_held() {
+    HostTier tier(small_config());
+    for (std::uint32_t k = 0; k < 8; ++k) {
+        std::int32_t slot = -1;
+        check(tier.prefill(k, slot), "prefill");
+    }
+    check(!tier.hold(3), "a key with a slot copy is not held");
+    check(tier.hold(60) && tier.hold(61) && !tier.hold(60) && tier.held(60) && tier.held_count() == 2,
+          "hold marks keys once");
+    check(!tier.host_copy(60) && tier.slot_of(60) < 0, "a held key has no slot");
+    std::int32_t slot = -1;
+    check(!tier.prefill(60, slot), "a held key is not pre-filled into a slot");
+    tier.check();
+    // A landing of a held key (a fetch copied its record into a ring slot) is never admitted, however
+    // hot: the key keeps its record outside the slots, and no resident loses its copy.
+    tier.begin_round(32);
+    {
+        const std::uint32_t used[] = {60};
+        tier.record_uses(1, used, 1000.0);
+    }
+    const Landing landing{tier.ring()[0], tier.serial(tier.ring()[0]), 60};
+    check(tier.admit({&landing, 1}, false) == 0 && tier.slot_of(60) < 0 && tier.resident_count() == 8,
+          "a held key's landing is not admitted");
+    // Promotions pin nothing and complete without a slot; a VRAM eviction keeps it (T3), consumes no
+    // demotion allowance and takes no demotion slot.
+    tier.queued(60);
+    tier.promotion_issued(60);
+    tier.promotion_completed(60, true);
+    tier.unqueued(61);
+    check(tier.shadow_count() == 0, "a held key never becomes a shadow");
+    tier.begin_round(0); // no demotion allowance
+    check(tier.allow_evict(60), "evicting a held key needs no allowance");
+    const std::size_t demotion_slots = tier.demotion_slots();
+    std::uint32_t target = 0;
+    check(tier.vram_evicted(60, true, target) == VramEviction::kKeptInRam && tier.demotion_slots() == demotion_slots,
+          "a VRAM eviction keeps a held key in RAM");
+    tier.check();
+}
+
 } // namespace
 
 int main() {
@@ -462,6 +502,7 @@ int main() {
         test_lfu();
         test_transitions();
         test_warm_fill();
+        test_held();
         test_stream_pins();
         test_random();
     } catch (const std::exception& e) {

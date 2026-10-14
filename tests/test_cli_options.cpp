@@ -283,6 +283,13 @@ int run_tests() {
                       "--expert-ram-mib must parse a MiB count and auto");
     failures += check(rejects([] { (void)parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--expert-ram-mib", "0"}); }),
                       "--expert-ram-mib must reject zero");
+    failures += check(help.find("--expert-pin-mib") != std::string::npos, "CLI help omits the expert pin control");
+    failures += check(parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--expert-pin-mib", "24576"}).expert_pin_bytes ==
+                              (24576ULL << 20) &&
+                          !parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--expert-pin-mib", "auto"}).expert_pin_bytes,
+                      "--expert-pin-mib must parse a MiB count and auto");
+    failures += check(rejects([] { (void)parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--expert-pin-mib", "0"}); }),
+                      "--expert-pin-mib must reject zero");
     const char* const cli_help_sections[] = {"CONTEXT", "KV CACHE", "SPECULATIVE DECODING",
                                              "SAMPLING", "VISION", "LOGGING"};
     for (const char* section : cli_help_sections) {
