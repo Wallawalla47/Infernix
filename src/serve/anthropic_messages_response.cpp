@@ -1,6 +1,7 @@
 #include "serve/anthropic_messages.h"
 #include "product/constraint_observation.h"
 
+#include "serve/completion_timings.h"
 #include "serve/generation_service.h"
 
 #include <nlohmann/json.hpp>
@@ -277,6 +278,7 @@ std::string make_anthropic_messages_response(const AnthropicResponseIdentity& id
                          {"usage", final_usage(outcome)}};
     if (outcome.constraint)
         response["constraint"] = product::constraint_observation_json(outcome.constraint);
+    response["timings"] = timings_json(outcome_timings(outcome));
     return response.dump();
 }
 
@@ -423,6 +425,7 @@ std::vector<std::string> AnthropicMessagesStream::finish(const GenerationOutcome
                   {"usage", final_usage(outcome)}};
     if (outcome.constraint)
         terminal["constraint"] = product::constraint_observation_json(outcome.constraint);
+    terminal["timings"] = timings_json(outcome_timings(outcome));
     events.push_back(event("message_delta", std::move(terminal)));
     events.push_back(event("message_stop", Json{{"type", "message_stop"}}));
     finished_ = true;
