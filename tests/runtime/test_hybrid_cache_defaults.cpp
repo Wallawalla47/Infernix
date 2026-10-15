@@ -205,6 +205,27 @@ int main() {
         failures += check(accepted, "Qwen3.8-Flash-Next refused a disabled context cache");
     }
 
+    // The same normalization owns the speculative draft-confidence gate (--spec-min-p): only
+    // Qwen3.8-Flash-Next's MTP rounds have it, so every other combination is refused, not ignored.
+    for (int variant = 0; variant < 5; ++variant) {
+        EngineOptions options;
+        options.speculative.backend      = infernix::SpeculativeBackend::Mtp;
+        options.speculative.draft_tokens = 3;
+        options.speculative.draft_min_p  = variant == 3 ? 1.5F : 0.25F;
+        auto architecture                = infernix::models::Architecture::Qwen4Exp;
+        if (variant == 1) { architecture = infernix::models::Architecture::Qwen3_5; }
+        if (variant == 2) { options.speculative.backend = infernix::SpeculativeBackend::DFlash; }
+        if (variant == 4) { options.speculative.draft_min_p = 0.0F; }
+        bool rejected = false;
+        try {
+            const EngineOptions out = normalize_engine_options(options, architecture);
+            failures += check(out.speculative.draft_min_p == options.speculative.draft_min_p,
+                              "normalization changed --spec-min-p");
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected == (variant == 1 || variant == 2 || variant == 3),
+                          "--spec-min-p was misjudged for its model, backend or range");
+    }
+
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

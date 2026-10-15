@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -29,6 +31,26 @@ namespace infernix::product {
         return "dflash2";
     }
     return "unknown";
+}
+
+// Parses --spec-min-p: a draft-head probability in [0, 1].
+[[nodiscard]] inline float parse_draft_min_p(std::string_view value) {
+    const std::string text(value);
+    char* end                = nullptr;
+    const double probability = std::strtod(text.c_str(), &end);
+    if (text.empty() || end != text.c_str() + text.size() || !(probability >= 0.0) ||
+        !(probability <= 1.0)) {
+        throw std::invalid_argument("--spec-min-p takes a probability in [0,1]: " + text);
+    }
+    return static_cast<float>(probability);
+}
+
+// "0.5"-style text of --spec-min-p, or "default" when unset.
+[[nodiscard]] inline std::string draft_min_p_text(const SpeculativeOptions& options) {
+    if (!options.draft_min_p) { return "default"; }
+    char text[32];
+    std::snprintf(text, sizeof(text), "%g", static_cast<double>(*options.draft_min_p));
+    return text;
 }
 
 // Parses --draft-tree-nodes: one to eight comma-separated column counts, entry c-1 applying to
@@ -124,6 +146,9 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
                     "--draft-tree-nodes entries must be 0 or in [draft tokens + 2, 32]");
             }
         }
+    }
+    if (options.draft_min_p && options.backend != SpeculativeBackend::Mtp) {
+        throw std::invalid_argument("--spec-min-p requires --spec mtp");
     }
     if (options.draft_tree_paths < 2 || options.draft_tree_paths > 8) {
         throw std::invalid_argument("--draft-tree-paths must be in [2,8]");

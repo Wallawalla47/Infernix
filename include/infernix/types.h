@@ -194,6 +194,10 @@ struct SpeculativeOptions {
     // Zero disables the proposer; enabled draft width is 1..63 and minimum match 4..64.
     std::uint32_t ngram_draft_tokens = 0;
     std::uint32_t ngram_min_match    = 12;
+    // Qwen3.8-Flash-Next MTP (--spec-min-p): a one-row round verifies its drafts up to the first
+    // whose draft-head probability is below this value; 0 verifies every draft. In [0, 1]; unset
+    // keeps the model's measured default (0.5). Other models refuse it.
+    std::optional<float> draft_min_p;
     // DFlash2 tree verification by batch size: entry c-1 is the column count (anchor included,
     // draft_tokens+2..32) a neural round of c rows verifies per row as a draft tree built from the
     // drafter's lattice; zero keeps that batch size on chain verification. All zero disables trees.

@@ -136,6 +136,7 @@ The benchmark disables context retention because every repetition is an independ
 Schema v16 records `speculative_backend`, `draft_tokens`, and the proposal head independently;
 JSON and CSV identify DFlash2 explicitly. MTP alone reserves its extra lookahead KV margin.
 Schema v20 adds `rope_yarn_factor`, `ngram_draft_tokens` and `ngram_min_match` to `config`.
+Schema v21 adds `spec_min_p` (`--spec-min-p`; `null` keeps the model's default, CSV empty).
 
 `--ngram-draft-tokens 1..63 --ngram-min-match 4..64` enables the single-request
 [ngram copy proposer](../docs/ngram.md) alongside the selected neural backend.

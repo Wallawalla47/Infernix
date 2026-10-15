@@ -569,6 +569,9 @@ std::string format_server_start_json(
              {"speculative_backend",
               product::speculative_backend_name(engine_options.speculative.backend)},
              {"speculative_draft_window", engine_options.speculative.draft_tokens},
+             {"spec_min_p", engine_options.speculative.draft_min_p
+                                ? Json(static_cast<double>(*engine_options.speculative.draft_min_p))
+                                : Json(nullptr)},
              {"draft_tree_nodes", engine_options.speculative.draft_tree_nodes},
              {"draft_tree_auto", engine_options.speculative.draft_tree_auto},
              {"draft_tree_paths", engine_options.speculative.draft_tree_paths},

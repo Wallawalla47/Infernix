@@ -54,11 +54,13 @@
 #include <atomic>
 #include <bit>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -662,6 +664,8 @@ public:
         span_          = dim(c_.ple.conv_span());
         di_            = dim(c_.qsa.index_head_dim);
         r_             = dim(c_.qsa.compress_ratio);
+        draft_min_logprob_ = options_.mtp_draft_min_p > 0.0 ? std::log(options_.mtp_draft_min_p)
+                                                            : -std::numeric_limits<double>::infinity();
 
         // Every fixed allocation below is checked against the plan and against device free memory
         // (an allocation the driver placed in system memory fails startup, design §19.3.7).
@@ -1827,9 +1831,9 @@ public:
                 }
             }
             // A one-row round verifies only its confident drafts: those before the first whose
-            // draft-head probability is below 0.5 (kDraftMinLogprob). Its width may still shrink, as
-            // the drafter staged only column 0's n-gram rows; a pair round's columns are staged at
-            // their offsets, so it keeps its length.
+            // draft-head probability is below --spec-min-p (draft_min_logprob_). Its width may
+            // still shrink, as the drafter staged only column 0's n-gram rows; a pair round's
+            // columns are staged at their offsets, so it keeps its length.
             if (batch == 1 && !from_ngram_[0] && extents[0] > 0) {
                 extents[0] = std::min(extents[0], mtp_confident_[0]);
                 drafts_[0].resize(static_cast<std::size_t>(extents[0]));
@@ -3816,11 +3820,11 @@ private:
             for (std::int32_t j = 0; j < steps; ++j) {
                 mtp_drafts_[b][static_cast<std::size_t>(j)] = mtp_host(mtp_io_.drafts)[j * batch + b];
             }
-            // The row's confident drafts: those before the first below kDraftMinLogprob.
+            // The row's confident drafts: those before the first below draft_min_logprob_.
             mtp_confident_[b] = steps;
             const auto* logprobs = reinterpret_cast<const float*>(mtp_host(mtp_io_.logprobs));
             for (std::int32_t j = 0; j < steps; ++j) {
-                if (logprobs[j * batch + b] < kDraftMinLogprob) {
+                if (logprobs[j * batch + b] < draft_min_logprob_) {
                     mtp_confident_[b] = j;
                     break;
                 }
@@ -4499,7 +4503,7 @@ private:
     PinnedHostBuffer mtp_host_{1};
     MtpIo mtp_io_;
     std::array<std::vector<std::int32_t>, kMaximumConcurrency> mtp_drafts_;
-    std::array<std::int32_t, kMaximumConcurrency> mtp_confident_{}; // per row: drafts above kDraftMinLogprob
+    std::array<std::int32_t, kMaximumConcurrency> mtp_confident_{}; // per row: drafts above draft_min_logprob_
     std::array<bool, kMaximumConcurrency> from_ngram_{};
     // Draft-length policy: acceptance prior and EWMA weight, and the cost of each draft column in
     // plain rounds (warm tg512 on the 5090: W = 3, 4, 5 rounds took 1.84, 2.13 and 2.54 plain
@@ -4518,10 +4522,11 @@ private:
     // same bits whatever the call boundaries (request invariance's resume grid).
     static constexpr std::uint32_t kResumeGrid = 16;
     static constexpr double kPairWidthCost       = 0.47;
-    // A one-row round verifies its drafts up to the first whose draft-head probability is below 0.5
-    // (Strata's --spec-min-p rule; C = 1 MTP, AIME prompts sampled on the 5090: 138.8 -> 147.2 tok/s,
+    // A one-row round verifies its drafts up to the first whose draft-head probability is below
+    // ProgramOptions::mtp_draft_min_p, held as its log (-inf at 0: every draft). The 0.5 default is
+    // Strata's --spec-min-p rule (C = 1 MTP, AIME prompts sampled on the 5090: 138.8 -> 147.2 tok/s,
     // acceptance 75.6 -> 81.8 %, repeatable to the decimal; 0.7 gave 142.6; design 19.3.5).
-    static constexpr double kDraftMinLogprob = -0.6931471805599453; // log(0.5)
+    double draft_min_logprob_ = 0.0;
     std::uint64_t pair_policy_rounds_            = 0;
     bool plain_round_ = false;
 

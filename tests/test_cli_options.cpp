@@ -49,6 +49,22 @@ int run_tests() {
                                        "a", "--json-object"});
                       }),
                       "regex and JSON were accepted together");
+    const auto gated = parse({"infernix", "model.ninfer", "--prompt", "hello", "--spec", "mtp",
+                              "--draft-tokens", "3", "--spec-min-p", "0.7"});
+    failures += check(gated.speculative.draft_min_p && *gated.speculative.draft_min_p == 0.7F,
+                      "--spec-min-p lost its probability");
+    failures += check(rejects([] {
+                          (void)parse({"infernix", "model.ninfer", "--prompt", "hello", "--spec",
+                                       "dflash", "--draft-tokens", "3", "--spec-min-p", "0.5"});
+                      }),
+                      "--spec-min-p was accepted without MTP");
+    failures += check(rejects([] {
+                          (void)parse({"infernix", "model.ninfer", "--prompt", "hello", "--spec", "mtp",
+                                       "--draft-tokens", "3", "--spec-min-p", "2"});
+                      }),
+                      "--spec-min-p accepted a value above 1");
+    failures += check(infernix::cli::usage_text("infernix").find("--spec-min-p") != std::string::npos,
+                      "CLI help omits --spec-min-p");
     failures += check(
         parse({"infernix", "model.ninfer", "--prompt", "hello", "--grammar-file", "answer.gbnf"})
                 .grammar_path == "answer.gbnf",

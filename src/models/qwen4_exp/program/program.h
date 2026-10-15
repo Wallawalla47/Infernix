@@ -359,6 +359,9 @@ struct ProgramOptions {
     // MTP drafts per round when the drafter is loaded (design section 11, at most 7). A longer
     // n-gram proposal, when enabled, replaces a round's MTP drafts.
     std::uint32_t mtp_draft_tokens = 0;
+    // A one-row MTP round verifies its drafts up to the first whose draft-head probability is below
+    // this value (design §19.3.5; --spec-min-p); 0 verifies every draft. 0.5 is the measured default.
+    double mtp_draft_min_p = 0.5;
     // The request-coupling fast paths (FastPath; docs/maintainer/model-quality.md section 6.7). Each
     // is off unless selected, and with all three off a request's output does not depend on the other
     // requests (concurrency, cache contents, KV pressure):

@@ -388,6 +388,8 @@ std::string usage_text(std::string_view program) {
         << "                              128-384 recommended, 0 = no splitting)\n"
         << "  --spec <mtp|dflash|dflash2> speculative backend (default: none)\n"
         << "  --draft-tokens <n>         MTP 1..5; DFlash/DFlash2 1..15\n"
+        << "  --spec-min-p <p>           Qwen3.8-Flash-Next MTP draft-confidence gate 0..1\n"
+        << "                             (default: the model's 0.5; 0 verifies every draft)\n"
         << "  --ngram-draft-tokens <n>   copy proposals 1..63; 0 disables (default: 0)\n"
         << "  --ngram-min-match <n>      copy admission 4..64 (default: 12)\n"
         << "  --draft-tree-nodes <auto|list>  DFlash2 tree verification (default: off): auto\n"
@@ -553,6 +555,8 @@ BenchOptions parse_args(int argc, char** argv) {
             options.speculative.backend = product::parse_speculative_backend(value("--spec"));
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = parse_u32(value("--draft-tokens"), "draft-tokens");
+        } else if (arg == "--spec-min-p") {
+            options.speculative.draft_min_p = product::parse_draft_min_p(value("--spec-min-p"));
         } else if (arg == "--ngram-draft-tokens") {
             options.speculative.ngram_draft_tokens =
                 parse_u32(value("--ngram-draft-tokens"), "ngram-draft-tokens", true);
@@ -837,6 +841,7 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << env.speculative.draft_tree_paths
         << " ngram_draft_tokens=" << env.speculative.ngram_draft_tokens
         << " ngram_min_match=" << env.speculative.ngram_min_match
+        << " spec_min_p=" << product::draft_min_p_text(env.speculative)
         << " proposal_head=" << proposal_head_name(env.speculative.proposal_head)
         << " decode_path=" << decode_path_name(env.use_cuda_graph, env.speculative)
         << " graph_prime="
@@ -976,6 +981,9 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "    \"draft_tokens\": " << env.speculative.draft_tokens << ",\n"
         << "    \"ngram_draft_tokens\": " << env.speculative.ngram_draft_tokens << ",\n"
         << "    \"ngram_min_match\": " << env.speculative.ngram_min_match << ",\n"
+        << "    \"spec_min_p\": "
+        << (env.speculative.draft_min_p ? product::draft_min_p_text(env.speculative) : "null")
+        << ",\n"
         << "    \"proposal_head\": \"" << proposal_head_name(env.speculative.proposal_head)
         << "\",\n"
         << "    \"use_cuda_graph\": " << (env.use_cuda_graph ? "true" : "false") << ",\n"
@@ -1074,7 +1082,7 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
            "context,prefill_chunk,concurrency,constraint_type,constraint_file,constraint_source,"
            "constraint_choices,mixed_constraints,rope_yarn_factor,"
            "speculative_"
-           "backend,draft_tokens,ngram_draft_tokens,ngram_min_match,"
+           "backend,draft_tokens,ngram_draft_tokens,ngram_min_match,spec_min_p,"
            "proposal_head,decode_path,kv_cache,kv_payload_bytes,load_host_to_device_bytes,"
            "weights_capacity_bytes,sequence_capacity_bytes,workspace_capacity_bytes,"
            "workspace_general_capacity_bytes,vision_handoff_capacity_bytes,"
@@ -1110,6 +1118,7 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
             << product::speculative_backend_name(env.speculative.backend) << ','
             << env.speculative.draft_tokens << ',' << env.speculative.ngram_draft_tokens << ','
             << env.speculative.ngram_min_match << ','
+            << (env.speculative.draft_min_p ? product::draft_min_p_text(env.speculative) : "") << ','
             << proposal_head_name(env.speculative.proposal_head) << ','
             << decode_path_name(env.use_cuda_graph, env.speculative) << ','
             << kv_cache_name(env.kv_cache) << ',' << env.memory.kv_payload_bytes << ','

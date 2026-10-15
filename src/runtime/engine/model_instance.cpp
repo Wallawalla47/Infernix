@@ -194,6 +194,17 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
     }
     const std::uint32_t concurrency = options.max_concurrency;
     const bool qwen4_exp            = architecture == models::Architecture::Qwen4Exp;
+    // The draft-confidence gate exists only on Qwen3.8-Flash-Next's one-row MTP rounds; another
+    // model refuses it rather than ignoring a tuning value.
+    if (const auto& p = options.speculative.draft_min_p) {
+        if (!(*p >= 0.0F && *p <= 1.0F)) {
+            throw std::invalid_argument("speculative draft_min_p (--spec-min-p) must be in [0,1]");
+        }
+        if (!qwen4_exp || options.speculative.backend != SpeculativeBackend::Mtp) {
+            throw std::invalid_argument(
+                "--spec-min-p applies to Qwen3.8-Flash-Next with --spec mtp only");
+        }
+    }
     if (cache.enabled) {
         // One pinned Host slab pool serves blocks and snapshots alike; its size is the only
         // capacity a deployment has to choose (docs/maintainer/hybrid-prefix-cache-spec.md §5.4).

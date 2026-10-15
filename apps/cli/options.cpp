@@ -88,7 +88,7 @@ std::string usage_text(const char* argv0) {
            "       [--device N]\n"
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2] [--spec mtp|dflash|dflash2 --draft-tokens "
            "N]\n"
-           "       [--lm-head-draft] [--draft-tree-nodes auto|N] [--draft-tree-paths N]\n"
+           "       [--lm-head-draft] [--spec-min-p P] [--draft-tree-nodes auto|N] [--draft-tree-paths N]\n"
            "       [--ngram-draft-tokens 1..63] [--ngram-min-match 4..64]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -170,6 +170,9 @@ std::string usage_text(const char* argv0) {
            "  --spec mtp|dflash|dflash2 speculative backend\n"
            "  --draft-tokens N         draft tokens per round (mtp 1-5; dflash 1-15)\n"
            "  --lm-head-draft          use the optimized proposal head\n"
+           "  --spec-min-p P           Qwen3.8-Flash-Next mtp: verify drafts until one is\n"
+           "                           below probability P, 0-1 (default 0.5; 0 verifies\n"
+           "                           every draft)\n"
            "  --draft-tree-nodes auto|N\n"
            "                           dflash2: verify a small tree of alternative drafts each\n"
            "                           round instead of a single draft, so more drafted tokens\n"
@@ -319,6 +322,8 @@ Options parse_options(int argc, char** argv) {
             options.speculative.backend = product::parse_speculative_backend(value(arg));
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = parse_u32(value(arg), "draft-tokens");
+        } else if (arg == "--spec-min-p") {
+            options.speculative.draft_min_p = product::parse_draft_min_p(value(arg));
         } else if (arg == "--ngram-draft-tokens") {
             options.speculative.ngram_draft_tokens =
                 parse_u32(value(arg), "ngram-draft-tokens", true);

@@ -849,6 +849,28 @@ int main() {
     failures +=
         check(serve_usage_text("infernix-serve").find("--route-trace") != std::string::npos,
               "serve help omits --route-trace");
+    // --spec-min-p: unset keeps the model's default; a probability in [0,1], MTP only.
+    failures += check(!defaults.speculative.draft_min_p, "--spec-min-p must default to the model's value");
+    const ServeOptions gated =
+        parse({"infernix-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "4", "--spec-min-p", "0"});
+    failures += check(gated.speculative.draft_min_p && *gated.speculative.draft_min_p == 0.0F,
+                      "--spec-min-p 0 did not survive parsing");
+    for (const auto& tail : std::vector<std::vector<std::string>>{
+             {"--spec", "mtp", "--draft-tokens", "4", "--spec-min-p", "1.01"},
+             {"--spec", "mtp", "--draft-tokens", "4", "--spec-min-p", "-1"},
+             {"--spec", "mtp", "--draft-tokens", "4", "--spec-min-p", ""},
+             {"--spec", "dflash2", "--draft-tokens", "7", "--spec-min-p", "0.5"},
+             {"--spec-min-p", "0.5"}}) {
+        std::vector<std::string> command{"infernix-serve", "model.ninfer"};
+        command.insert(command.end(), tail.begin(), tail.end());
+        bool rejected = false;
+        try {
+            (void)parse(command);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "an invalid --spec-min-p was accepted");
+    }
+    failures += check(serve_usage_text("infernix-serve").find("--spec-min-p") != std::string::npos,
+                      "serve help omits --spec-min-p");
     failures += check(logged.request_log_rotation.max_bytes == 0 &&
                           logged.request_log_rotation.keep == kDefaultRequestLogKeep,
                       "the request log must not rotate unless --request-log-max-mib is given");

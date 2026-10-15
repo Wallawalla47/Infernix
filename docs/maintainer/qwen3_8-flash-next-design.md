@@ -6544,7 +6544,9 @@ was ruled out first (`--lm-head-draft` on and off: 76.1 % and 76.1 %).
 
 The draft head now also writes each draft's log-probability (`ops::top_logprobs` over the head's
 rows, K = 1, beside the argmax), and a one-row round verifies its drafts only up to the first below
-probability 0.5 (`kDraftMinLogprob`). C = 1, AIME prompts sampled, MTP 4 with the proposal head:
+probability 0.5 (`ProgramOptions::mtp_draft_min_p`, exposed as `--spec-min-p` on 2026-10-14 so other
+workloads can be tuned without a rebuild; `0` restores "no cut"). C = 1, AIME prompts sampled, MTP 4
+with the proposal head:
 
 | Variant | tok/s | Acceptance |
 |---|---:|---:|

@@ -12,7 +12,7 @@ def test_schema_v20_report_is_flattened_for_matrix_summary(tmp_path, ngram_enabl
     report_path.write_text(
         json.dumps(
             {
-                "schema_version": 20,
+                "schema_version": 21,
                 "artifact_type": "infernix_bench_report",
                 "tool": "infernix_bench",
                 "artifact": {"path": "model.ninfer"},
@@ -128,7 +128,7 @@ def test_schema_v20_report_is_flattened_for_matrix_summary(tmp_path, ngram_enabl
     assert row["spec_accepted_per_position"] == "[1,1,1,1,1]"
 
 
-@pytest.mark.parametrize("version", [19, 21])
+@pytest.mark.parametrize("version", [20, 22])
 def test_matrix_rejects_different_report_schema(tmp_path, version) -> None:
     report_path = tmp_path / "report.json"
     report_path.write_text(json.dumps({"schema_version": version,

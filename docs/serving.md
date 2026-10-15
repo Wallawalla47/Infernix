@@ -1201,6 +1201,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--spec mtp\|dflash\|dflash2` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash/DFlash2 `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
+| `--spec-min-p P` | Qwen3.8-Flash-Next with `--spec mtp` only (other models refuse it at startup): a one-request round verifies its MTP drafts up to the first whose draft-head probability is below `P`, `0..1`; `0` verifies every draft. It changes how many drafts a round verifies, not what is generated: greedy output still equals plain decoding, and sampling keeps its distribution (only the realization of a seeded run may differ). The default was measured on sampled AIME prompts at one lane on an RTX 5090: 0.5 gave 147.2 tok/s against 138.8 with every draft and 142.6 at 0.7; other workloads may prefer another value | `0.5` |
 | `--draft-tree-nodes auto\|LIST` | DFlash2 tree verification, each row's tree built on the device from the drafter's candidate lattice; works with every `--kv-dtype`. `auto` (recommended) lets every all-neural round of up to four rows choose the chain or a tree of `draft tokens + 5` or `+ 9` columns from measured round time and acceptance at its batch size and context length; on an artifact whose GDN input projections cannot verify trees it keeps chain verification and logs a warning. A LIST fixes the column count by batch size: entry *c* (anchor included, `draft tokens + 2..32`) applies to rounds of *c* rows, the last entry repeats for larger batches and `0` keeps chain verification; see [tree verification](maintainer/tree-verification.md) | off |
 | `--draft-tree-paths N` | most root-to-leaf paths per tree row, `2..8` | `8` |
 | `--ngram-draft-tokens N` | verified n-gram copy proposals per round beside the `--spec` drafter (Qwen3.8-Flash-Next: also alone, `1..15`), `1..63`; `0` disables; see [ngram copy proposals](ngram.md) | `0` |
@@ -1376,7 +1377,7 @@ because another process holds `FILE` open without delete sharing on Windows, the
 warning, keeps appending to `FILE`, and tries again after another `N` MiB. Rotated names are also
 checked against the model artifact path.
 
-Every line is one `infernix_serve_request_log` schema-v26 JSON object. All events carry
+Every line is one `infernix_serve_request_log` schema-v28 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance. Successful request-start records include request-scoped acquisition,
 media-preprocessing wall/work, tokenizer, cache hit/miss/single-flight, and payload-size fields;
@@ -1468,7 +1469,8 @@ the first.
 `original_nvfp4_prefill_kernel` and `fast_paths` record `--use-original-int8-prefill-kernel`,
 `--prefill-split-workspace-mib`, `--use-original-nvfp4-prefill-kernel` and whether
 `--disable-fast-paths` was absent; `server_start.artifact.fast_paths` lists the fast paths that run
-and `fast_path_configuration` the configuration they were selected for. `draft_tree_nodes` (eight
+and `fast_path_configuration` the configuration they were selected for. `spec_min_p` records
+`--spec-min-p` (`null`: the model's default). `draft_tree_nodes` (eight
 entries, one per batch size, all zero for `auto`), `draft_tree_auto` and `draft_tree_paths`
 record `--draft-tree-nodes` and `--draft-tree-paths`; `draft_tree_auto` is the resolved value,
 false when the artifact cannot verify trees. `ngram_draft_window` and

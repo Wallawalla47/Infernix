@@ -239,6 +239,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.mtp_draft_tokens   = options.speculative.backend == SpeculativeBackend::Mtp
                                              ? options.speculative.draft_tokens
                                              : 0U;
+    if (options.speculative.draft_min_p) { program_options.mtp_draft_min_p = *options.speculative.draft_min_p; }
     program_options.pair_speculation  = selected_fast_path(options, FastPath::AdaptiveSpeculation);
     program_options.free_cache_resume = selected_fast_path(options, FastPath::FreeCacheResume);
     program_options.preemption        = selected_fast_path(options, FastPath::Preemption);
