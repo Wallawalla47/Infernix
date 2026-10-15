@@ -1402,6 +1402,12 @@ Further results:
    - The cache starts from the saved LFRU state of the previous run (counts and ranking).
    - Failing that, it starts from a shipped profile built from broad traces.
    - A static profile alone loses badly when the workload differs: +82% misses on B.
+   - Shipped: a pack can carry that profile as its `expert_profile` resource (container
+     spec §9.3); the loader seeds this warm start from it when the saved-state file holds nothing
+     usable, so a cold first run starts from the measured prior (the replay study's −19% placement
+     arm above). The runtime-learned state and `--expert-state off` keep priority; the converter
+     embeds a provided profile (`tools/convert --expert-profile`), whose frequencies come from
+     recorded sessions via `python -m tools.expert_cache_replay.profile`.
 5. **Policy telemetry and selection on the host, off the critical path.**
    - The route log (§8.2) carries every routed id (48 × 10 × T × 2 bytes per round) to the host.
    - A low-priority host thread replays them through shadow copies of LRU, LFRU with 2-3 half-life

@@ -36,6 +36,9 @@ target_sources(infernix_model_runtime PRIVATE
 add_library(infernix_qwen4_exp_expert_cache STATIC
   "${CMAKE_CURRENT_LIST_DIR}/program/expert_cache/expert_cache.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/expert_cache/expert_state.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/expert_cache/expert_profile.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/expert_cache/host_tier.cpp")
 infernix_internal_includes(infernix_qwen4_exp_expert_cache)
 target_link_libraries(infernix_model_runtime PUBLIC infernix_qwen4_exp_expert_cache)
+# The loader interprets the artifact's shipped expert routing profile (design §9.3 item 4).
+target_link_libraries(infernix_model_loading PUBLIC infernix_qwen4_exp_expert_cache)

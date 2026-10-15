@@ -119,20 +119,27 @@ If `entry_payload_start + payload_bytes <= limit`, the writer generates only the
 Above the limit, the entry first holds the first segment, and the remaining data goes into continuation
 volumes in order.
 
-For a given entry_payload_start, the current writer's shard capacities are:
+For a given entry_payload_start, the shard capacities follow the strongest placement alignment `A`
+of any object in the file (§5.3; `A` is at least 4096, and today only streamed routed-expert bank
+objects raise it to 2 MiB). The entry_payload_start is itself rounded up to `A`:
 
 ```text
-entry_capacity = floor((limit - entry_payload_start) / 4096) * 4096
-part_capacity  = floor((limit - 4096) / 4096) * 4096
+entry_capacity = floor((limit - entry_payload_start - 4096) / A) * A + 4096
+part_capacity  = floor((limit - 4096) / A) * A
 ```
+
+The 4096 residue is the continuation header size, so every volume's payload begins at file offset
+4096; for `A = 4096` both formulas reduce to the historical `floor(... / 4096) * 4096`.
 
 When sharding is needed, the writer first checks that the limit can hold the headers and that both
 capacities are positive; non-final segments are filled to capacity and the final segment holds the
 remaining bytes.
 The number of shards is determined by the data size and the capacities.
-This placement keeps the logical start of every segment 4096-byte aligned, which suits direct I/O; the
-reader's range mapping also accepts other positive-length segmentations that satisfy this
-specification.
+This placement keeps the logical start of every segment 4096-byte aligned and keeps the start of
+every object placed at an `A`-aligned logical offset `A`-aligned in the file space of the volume
+holding that start; a bank that straddles a volume boundary resumes at that volume's payload start,
+4096-byte aligned. Both suit direct I/O; the reader's range mapping also accepts other
+positive-length segmentations that satisfy this specification.
 
 ## 3. Binary framing
 
@@ -320,6 +327,8 @@ of a use site is bound separately; see section 8.
 
 How a resource is interpreted is determined by its use role. Content rules for JSON, UTF-8 templates or
 other resources belong to the corresponding Frontend; the resource object itself only provides raw bytes.
+A role-carrying resource documented with its consumer is the expert routing profile of section 9.3: a
+routed-expert model may ship one, and it is placed and aligned like any other raw resource.
 
 ### 5.3 Object ranges and sharing
 
@@ -330,7 +339,11 @@ Tensor bytes equal the encoded size of the corresponding `(format,layout,shape)`
 
 Gaps between objects and unreferenced logical payload bytes at the end have no load semantics. A regular
 writer only leaves space for alignment and truncates at the end of the last object. Padding inside a
-completely encoded object continues to follow its layout contract.
+completely encoded object continues to follow its layout contract. Writers may place objects more strongly
+than the section 6.2 minima: the converter starts streamed routed-expert bank objects on 2 MiB boundaries,
+along with the entry payload start and file segment capacities so the alignment holds in file space across
+parts, for huge-page mapping and wide O_DIRECT reads of the SSD expert tier; the section 6.2 values remain
+the minimum every reader must accept.
 
 When multiple logical uses share the same object they all reference the same ID; the materializer
 establishes the backing once on that basis.
@@ -567,6 +580,35 @@ Its parameters still live in the root bindings, using the defined names `proposa
 Full takes its row count from the Text vocab_size; indexed needs an explicit token ID mapping. The main
 output head is always provided by Text's own bindings. When proposal is omitted, the existing backends
 use the target's complete output representation according to their code.
+
+### 9.3 Expert routing profile
+
+A routed-expert model may ship an `expert_profile` resource (role `expert_profile` of the text
+component, object `resource/text/expert_profile`) that seeds the expert cache's warm start on the
+first cold run ([Qwen3.8-Flash-Next design](qwen3_8-flash-next-design.md) §9.3 item 4, §19.3.5 S4b).
+It is an ordinary raw resource: one object record as in section 5.2, alignment and
+placement like any other raw bytes. The bytes are little-endian:
+
+| Offset | Content |
+|---:|---|
+| 0 | Magic `NINFQ4EP`, 8 bytes |
+| 8 | `version` U32, `1` |
+| 12 | `keys` U32, the model's layers × experts |
+| 16 | `counts` U32[keys]: recorded live routing uses per key, key = layer × experts + expert |
+| 16+4·keys | `ranked` U32, `0..keys` |
+| 20+4·keys | ranked key ids, U32[ranked], hottest first, distinct and each `< keys` |
+
+The length must equal `20 + 4·keys + 4·ranked` exactly. The consumer checks the version, refuses an
+unknown one, and validates `keys` against the model geometry and the ranking against the bounds;
+a profile the model cannot use is refused with a reason, and the cache then starts as if none were
+shipped. The profile is a placement prior only: it provides the initial fill ranking and the seeded
+use counts (which the runtime caps like a saved state's) and never claims a hit rate — effectiveness
+is measured by running, not re-derived from these bytes. Precedence: a runtime-learned saved-state
+file wins while usable; the shipped profile seeds a run that has no usable saved state; the operator
+switching the warm start off (`--expert-state off`) applies neither. The converter embeds a provided
+profile file (`tools/convert --expert-profile`); its frequencies come from recorded sessions
+(`python -m tools.expert_cache_replay.profile`) or an engine-saved state, and the profile's source is
+recorded in `provenance`.
 
 ## 10. Instance information and provenance
 

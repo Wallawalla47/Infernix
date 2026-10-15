@@ -55,6 +55,9 @@ public:
     void require_streamed(ObjectHandle object);
     [[nodiscard]] std::span<const std::byte> host_object(ObjectHandle object);
     [[nodiscard]] ObjectHandle resource(std::string_view component, std::string_view role);
+    // A component's resource role that exists; nullopt when the component or the role is absent
+    // (optional resources, for example the shipped expert routing profile of artifact-container.md §9.3).
+    [[nodiscard]] std::optional<ObjectHandle> find_resource(std::string_view component, std::string_view role) const;
     [[nodiscard]] HostValues values(const Binding& binding, std::optional<QType> format = {});
     // evictable_alignment (a power of two, typically EvictableWeightPool::kChunkBytes)
     // chunk-aligns the first ranked object so the evictable suffix is chunk-aligned.

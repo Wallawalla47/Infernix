@@ -7,7 +7,7 @@ import json
 from math import prod
 from typing import ClassVar, Mapping, Sequence, TypeAlias
 
-from .layouts import align_up, encoded_size, get_layout
+from .layouts import align_up, encoded_size, get_layout, placement_alignment
 
 U64_MAX = (1 << 64) - 1
 RAW_BYTES_V1 = "raw_bytes_v1"
@@ -170,7 +170,7 @@ def plan_objects(specs: Sequence[ObjectSpec]) -> tuple[ArtifactObject, ...]:
         if isinstance(spec, TensorSpec):
             dims = shape(spec.shape, name)
             try:
-                start = align_up(offset, get_layout(spec.layout).alignment)
+                start = align_up(offset, placement_alignment(spec.layout))
                 size = encoded_size(spec.layout, spec.format, dims)
             except (TypeError, ValueError) as error:
                 raise ArtifactError(f"{name}: {error}") from error

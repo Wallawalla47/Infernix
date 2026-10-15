@@ -14,6 +14,7 @@ from types import MappingProxyType
 from typing import Sequence
 
 
+from .framing import EXPERT_STREAM_ALIGNMENT
 from .formats import (
     DirectFormat,
     Fp8RowFormat,
@@ -135,6 +136,15 @@ LAYOUTS = MappingProxyType(
         )
     }
 )
+
+
+def placement_alignment(layout_name: str) -> int:
+    """Writer placement alignment for a tensor layout: the §6.2 object-alignment minimum,
+    raised to ``EXPERT_STREAM_ALIGNMENT`` for streamed routed-expert bank objects."""
+    alignment = get_layout(layout_name).alignment
+    if layout_name == NVFP4_EXPERT_RG16_V1.name:
+        return max(alignment, EXPERT_STREAM_ALIGNMENT)
+    return alignment
 
 
 def align_up(value: int, alignment: int) -> int:

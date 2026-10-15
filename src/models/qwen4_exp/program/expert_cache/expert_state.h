@@ -17,6 +17,7 @@ namespace infernix::models::qwen4_exp::expert_cache {
 
 struct ExpertStateLoad {
     std::optional<SavedState> state;
+    bool shipped      = false; // the state came from the artifact's profile, not a saved session
     std::string message; // why nothing was loaded
 };
 

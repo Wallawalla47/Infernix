@@ -1,9 +1,12 @@
 #pragma once
 
 #include "models/qwen4_exp/model.h"
+#include "models/qwen4_exp/program/expert_cache/expert_cache.h"
 
 #include <filesystem>
 #include <memory>
+#include <optional>
+#include <string>
 
 namespace infernix::artifact {
 class Reader;
@@ -28,6 +31,10 @@ public:
     // Device bytes of the dense weights, and the tokenizer's public token count.
     [[nodiscard]] std::uint64_t device_bytes() const;
     [[nodiscard]] std::uint32_t public_token_count() const;
+    // The artifact's shipped expert routing profile (design §9.3 item 4), when it ships a usable one.
+    [[nodiscard]] const std::optional<expert_cache::SavedState>& expert_profile() const noexcept;
+    // Why a shipped profile was refused; empty when none was shipped or it parsed.
+    [[nodiscard]] const std::string& expert_profile_message() const noexcept;
     // The Host memory the pinned block must leave free at materialization, and the pins the
     // caller makes after it (both checked before anything is read).
     void set_host_reserve(std::uint64_t reserve_bytes, std::uint64_t later_pinned_bytes);

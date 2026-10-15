@@ -25,6 +25,7 @@
 #include "models/qwen4_exp/memory_plan.h"
 #include "models/qwen4_exp/program/expert_residency.h"
 #include "models/qwen4_exp/program/host_expert_tier.h"
+#include "models/qwen4_exp/program/expert_cache/expert_profile.h"
 #include "models/qwen4_exp/program/expert_cache/expert_state.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
 #include "models/qwen4_exp/program/prefix/call_plan.h"
@@ -2169,18 +2170,19 @@ public:
     }
 
     // ---- warm start (design §19.3.5 S4b) ----
-    // Fills the frames from the saved state, before the first request. With the SSD tier, RAM is
+    // Fills the frames from the saved state, or, with no saved state, from the artifact's shipped
+    // routing profile (§9.3 item 4), before the first request. With the SSD tier, RAM is
     // filled first (the frames load from it), then the seeds' RAM copies are released and their slots
     // refilled with the next keys of the fill order, so the two levels hold different experts.
     void warm_start_experts() {
         const auto keys = c_.num_hidden_layers * c_.moe.experts;
-        expert_cache::ExpertStateLoad load;
-        if (!options_.expert_state.empty() && options_.expert_cache) {
-            load = expert_cache::load_expert_state(options_.expert_state, options_.expert_state_identity, keys);
-        }
-        const expert_cache::SavedState* state = load.state ? &*load.state : nullptr;
+        // The runtime-learned sidecar wins; the shipped profile seeds only a cold first run
+        // (missing or refused file), and --expert-state off seeds neither.
+        const auto load = expert_cache::warm_start_load(options_.expert_state, options_.expert_cache,
+                                                        options_.expert_state_identity, keys,
+                                                        options_.expert_profile);
         TierFill fill;
-        if (tier_) { fill = prefill_tier(state); }
+        if (tier_) { fill = prefill_tier(load); }
         const std::uint32_t seeded = warm_start_frames(load);
         if (tier_) { finish_tier_fill(fill, seeded); }
     }
@@ -2192,6 +2194,7 @@ private:
         std::uint32_t filled = 0;
         double seconds       = 0;
         bool saved           = false;
+        bool shipped         = false; // the ranking came from the artifact's profile, not a saved session
     };
 
     // The SSD tier's RAM fill order (design §19.3.7 §4.9): the saved state's ranking (the last
@@ -2236,10 +2239,12 @@ private:
     }
 
     // The SSD tier's first RAM pass, before the frames' warm start reads from it.
-    TierFill prefill_tier(const expert_cache::SavedState* state) {
+    TierFill prefill_tier(const expert_cache::ExpertStateLoad& load) {
         const auto start = std::chrono::steady_clock::now();
+        const expert_cache::SavedState* state = load.state ? &*load.state : nullptr;
         TierFill fill;
-        fill.saved = state != nullptr;
+        fill.saved   = state != nullptr;
+        fill.shipped = load.shipped;
         fill.order = tier_fill_order(state);
         if (state != nullptr && state->counts.size() == tier_->keys()) {
             tier_->controller().seed_uses(state->counts, kSeedCountCap);
@@ -2271,13 +2276,16 @@ private:
                       "SSD expert tier: %u RAM slots (%.1f GiB) hold %u experts (%s)%s, read in %.1f s; %u of %u "
                       "experts are read from the artifact when used",
                       slots, gib * slots, in_ram,
-                      fill.saved ? "the saved ranking, then the last session's use counts" : "spread across the layers",
+                      fill.shipped
+                          ? "the shipped profile ranking, then its use counts"
+                          : fill.saved ? "the saved ranking, then the last session's use counts"
+                                       : "spread across the layers",
                       released > 0 ? (", none of them among the " + std::to_string(released) + " in VRAM").c_str() : "",
                       seconds, keys - in_ram - released, keys);
         diagnostic(line);
     }
 
-    // The frames' warm start from the saved state; returns how many experts it loaded.
+    // The frames' warm start from the saved state or the shipped profile; returns how many experts it loaded.
     std::uint32_t warm_start_frames(const expert_cache::ExpertStateLoad& load) {
         if (options_.expert_state.empty() || !options_.expert_cache) { return 0; }
         if (!load.state) {
@@ -2294,12 +2302,19 @@ private:
         const double loaded_gib =
             static_cast<double>(loaded) * static_cast<double>(residency_->frame_stride()) / (1ULL << 30);
         char line[256];
-        std::snprintf(line, sizeof(line),
-                      "expert cache: restored the %u most-used experts from the last session (%.1f GiB in %.2f s)",
-                      loaded, loaded_gib, seconds);
+        if (load.shipped) {
+            std::snprintf(line, sizeof(line),
+                          "expert cache: seeded %u experts from the artifact's shipped routing profile (%.1f GiB in %.2f s)",
+                          loaded, loaded_gib, seconds);
+        } else {
+            std::snprintf(line, sizeof(line),
+                          "expert cache: restored the %u most-used experts from the last session (%.1f GiB in %.2f s)",
+                          loaded, loaded_gib, seconds);
+        }
         diagnostic(line);
         std::snprintf(line, sizeof(line), "expert cache warm start: %u of %u frames from %s", loaded,
-                      residency_->frames(), options_.expert_state.string().c_str());
+                      residency_->frames(),
+                      load.shipped ? "the shipped profile" : options_.expert_state.string().c_str());
         diagnostic(line, DiagnosticLevel::Debug);
         expert_state_saved_  = std::chrono::steady_clock::now();
         expert_state_routed_ = residency_->stats().routed;

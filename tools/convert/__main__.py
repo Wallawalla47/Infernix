@@ -159,6 +159,12 @@ def main(argv=None):
         type=Path,
         help="Qwen4Exp: bind the artifact to this existing volume of the same checkpoint instead of writing one",
     )
+    parser.add_argument(
+        "--expert-profile",
+        type=Path,
+        help="Qwen4Exp: embed this routing profile (python -m tools.expert_cache_replay.profile) "
+        "as the pack's expert_profile resource, seeding the expert cache's warm start",
+    )
     args = parser.parse_args(argv)
     components = tuple(args.components.split(","))
     if len(components) != len(set(components)):
@@ -175,6 +181,8 @@ def main(argv=None):
             model = qwen4_exp.build_model(
                 base, components=components, resource_overrides=overrides
             )
+            if args.expert_profile is not None:
+                qwen4_exp.attach_expert_profile(model, args.expert_profile)
             # The volume id ties the separately placed n-gram volume to this artifact.
             if args.ngram_reuse is not None:
                 if args.ngram_out is not None:
@@ -190,6 +198,8 @@ def main(argv=None):
         else:
             if args.ngram_out is not None:
                 raise ValueError("--ngram-out applies only to Qwen4Exp sources")
+            if args.expert_profile is not None:
+                raise ValueError("--expert-profile applies only to Qwen4Exp sources")
             companions = {
                 key: sources[key] for key in ("dflash", "dflash2") if key in components
             }
@@ -224,6 +234,8 @@ def main(argv=None):
             provenance["override"] = args.override
         if args.proposal:
             provenance["ranking"] = str(args.ranking)
+        if args.expert_profile is not None:
+            provenance["expert_profile"] = str(args.expert_profile)
         report = convert(
             model,
             recipe,
