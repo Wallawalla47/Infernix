@@ -9567,6 +9567,113 @@ already qualified selection.
     [2560, 6144] and [2560, 640] from 513, [1280, 2560] from 1,025.
   - No recipe-C artifact was gated.
 
+### 19.3.23 Ideas from sergqwer/strata-nvfp4 (2026-10-14)
+
+[sergqwer/strata-nvfp4](https://github.com/sergqwer/strata-nvfp4) (a Strata fork that runs this model
+with NVFP4 experts; its record is `docs/NVFP4.md`) was read at `3fa66b4` (release 0.1.44.1-nvfp4.1).
+It reports 186-190 tok/s decode with MTP and a 32K prompt in ~3.9 s on an RTX 5090 with 128 GB and
+PCIe x16 (not comparable with this machine's x8 link and 96 GB). Of its techniques, three were new
+here; the rest are in Infernix or were measured before (the CPU/PCIe miss split: §19.3.16; the draft
+cut at 0.7: §19.3.5; verify/draft overlap: §19.3.9; chunked GDN, in-place expert reads, the n-gram
+readers). Measured on the RTX 5090 (PCIe 5.0 x8, i9-13900K, 96 GB), CUDA 13.4, Dense8, INT8 KV.
+
+**Profile (pp32768, chunk 4096, nsys, 3,031 ms of kernels).** Q8 dense GEMMs 1,208 ms (40 %), the
+wide expert GEMMs 457 ms (15 %), the QSA prompt kernel 207 ms (6.8 %), the hyper-connection mixers
+~480 ms in all (down 162, up and collapse 207, norm 61, inject 43; ~16 %), the chunked recurrence
+113 ms, the BF16 indexer GEMMs 125 ms.
+
+**Victim landing (Strata's `STRATA_ADAPT_FETCH=2`): rejected.** Once the frames are full, Strata
+writes a fetched miss into the slot of the layer's least-routed resident. Built here as: before a
+decode or verification round the lowest-score published residents (2 per layer) leave the device
+table for the round and their frames become the round's landing frames; a staged miss that lands
+there replaces its victim (no copy of its own), an unused frame's victim is put back. tg512 (warm
+cache, two runs per arm, interleaved; outputs are placement-invariant, so every arm decodes the same
+text):
+
+| Arm | MTP K = 4 tok/s (hits) | Plain tok/s (hits) |
+|---|---:|---:|
+| Baseline | 181.3 (90.1 %) | 129.8 (93.4 %) |
+| Victim landing | 181.8 (90.1 %) | 127.7 (92.7 %) |
+| + landings spend the promotion budget | 183.9 (89.8 %) | 128.7 (92.8 %) |
+| + only experts with a count of at least 1 land (a device mask) | 188.5 (89.8 %) | 129.7 (93.0 %) |
+
+(The last row is from a later set whose baseline read 183.9 / 130.8.) Landed one-off misses push out
+residents that still earn hits, so plain decode lost 0.4-0.7 points of hits and 0.8-1.6 % of speed;
+the MTP gain came only with fewer promotions. Promoting every 8 tokens instead of 4 without any
+landing gave more: 191.3 tok/s at 90.4 % hits against 184.3 and 90.1 % in the same set. Victim
+landing therefore loses to simply promoting less and is not kept.
+
+**The promotion interval: kept at 4.** On tg512 in one set (two runs each, all within 0.5 %):
+
+| Promote every | MTP K = 4 | Plain |
+|---|---:|---:|
+| 4 tokens (current) | 184.2 (90.1 %, 4,578 promotions) | 130.7 (93.4 %, 2,433) |
+| 8 tokens | 191.5 (90.4 %, 2,296) | 132.3 (94.0 %, 1,121) |
+| 16 tokens | 193.8 (91.1 %, 1,097) | 129.8 (93.9 %, 565) |
+
+Fewer promotions raise the hit rate, so the budgeted admissions churn. §19.2 chose 4 at 36 tok/s on a
+much older build. The GSQ-RCO IQ3_S artifact agrees (measured by the IQ3_S work, 2026-10-15:
+`infernix_bench` pp4096 + tg512 on a natural-text prompt, MTP K = 4, INT8 KV, five repetitions per
+run, two rotated rounds; acceptance 0.855 in every arm): interval 4 173.9 tok/s (173.5-174.3), 8
+179.6 (178.6-180.7, +3.3 %), 16 176.8 (176.0-177.6, +1.7 %, ±11 tok/s within runs). Both are single
+texts. On text that changes topic the gain disappears: `infernix_decode_quality_gen` over 32
+evenly spaced segments of a fiction + encyclopedia + code corpus (1,536-token prompts, 384 tokens
+each, MTP, identical tokens in every arm), after a warm-up run, ABBA: interval 4 135.65 / 135.64 s
+(83.0 % hits, 3,182 promotions), 8 136.22 / 136.25 s (+0.4 %, 81.8 %, 1,599). An earlier ABC CBA set
+without the warm-up ran 163.8 → 141.0 s with the order (drift dominated; its first run overlapped
+a build). Promotions adapt the cache when the text moves; fewer of them help only text the cache
+already fits. The interval stays 4; a rate that follows the hit rate is the open idea.
+
+**INT8 tensor cores for the QSA prompt scores (Strata's integer prompt attention): rejected.**
+Strata's previous kernel ran two FP16 MMAs per score (hi/lo splits), so its 1.34-1.46x did not
+transfer: this kernel runs one FP16 m16n8k16 per score tile, near the tensor-core bound (2.15 ms per
+4,096-column call against ~1.2 ms of MMA work at peak). A prototype took the FP16 query of each
+64-dimension group as 2 or 3 exact int8 limbs and scored with m16n8k32.s8, the limbs combined
+exactly in int64 (P x V unchanged); it passed `test_qsa` at both limb counts. Attention time
+(`infernix_qsa_attention_bench --storage int8`, cold L2): 8K/32K/128K contexts at 4,096 columns
+2,153 / 2,164 / 2,307 µs on FP16 against 2,422 / 2,446 / 2,597 (+12.5-13.1 %) with 2 limbs and
+2,590 / 2,620 / 2,796 (+20-21 %) with 3; at 512 columns +11-14 % and +18-23 %. Not kept.
+
+**Two-term A4 for W4A16 experts (fast path `expert-a4-residual`): built, failed the prefill gate,
+not merged.**
+Weight-only exports (recipe C, §16.2.1) run their wide expert calls on the exact limb route, two
+integer MMAs per 16-element block, which costs what a BF16 GEMM would. The fast path takes each x
+row (per token) and h row (per entry) as the A4 residual profile of two NVFP4 terms
+(`quantize_nvfp4_terms_k16`, the dense residual route's codec, re-paired into the wide plane's code
+order) with an FP32 row scale amax / (6 · 448), and runs both terms through the grouped
+mxf4nvf4 kernel into one accumulator (two stages, both terms' A tiles per stage; the epilogues
+multiply by the row scale). `test_offloaded_moe_wide` against the exact arithmetic: mean relative
+L2 0.31-0.41 % per case, worst entry 2.0 % (criteria 1.56 % / 6.25 %); placement-invariant; an Inf
+column gives NaN. `infernix_offloaded_moe_wide_bench`, whole expert call, frames: 256 / 1,024 /
+4,096 columns 3,415 / 4,254 / 5,365 µs exact against 3,105 / 2,760 / 2,029 (−9 / −35 / −62 %; the
+W4A4 route 2,324 / 2,275 / 1,564). End to end on the recipe C artifact (orcarouter Uncensored,
+converted 2026-10-14, verified), INT8 KV, chunk 4,096, ABBA: pp4096 1,631 → 1,637 tok/s (level),
+pp16384 6,175 → 6,380 (+3.3 %), pp32768 6,620 → 8,803 (+33 %), pp65536 6,730 → 9,067 (+35 %). Short
+prompts are bound by the walk's expert stream over the x8 link; from 32K the GEMMs are.
+
+The prefill gate (model-quality.md section 6; `fast_path_gate prefill --quick --kv int8`, chunks
+896 / 1,792 / 3,584 / 7,168, against the artifact's 16-bit-activation BF16-KV reference, 2026-10-15,
+on main 4f0bb18f) failed on mean KL: the exact route's floor is 6.107e-3, the fast route 6.902e-3,
+an excess of 7.95e-4 (95 % bound 8.92e-4) against a budget of 6.11e-4 (10 % of the floor). The
+other criteria passed: top-1 disagreement excess 1.89e-3 (budget 2.75e-3), corpus NLL excess
+−1.7e-4 (perplexity ratio 0.99983), p99.9 KL ratio 1.07 (budget 1.25), and every context band. The
+decode gate was not run. The path therefore stays off main; its implementation (kernels, workspace
+route, registry entry, op test and bench mode) is kept on the branch `expert-a4-residual-unqualified`.
+The untried remedy is a third activation term, which adds half again the FP4 MMA work of the
+two-term route.
+
+**The prefill hyper-connection up projection fused with its collapse: adopted (bit-exact).** For
+Q8_G32_FP16 W_up and more than 96 columns, one Q8 MMA tile computes 16 features x 4 streams of u
+(a row policy maps the tile's rows to W_up rows s·H + d) and collapses them in its epilogue, so u
+never reaches global memory. Every Q8 MMA tile accumulates over K in one order, and the epilogue
+rounds u to BF16 and evaluates the collapse with collapse_kernel's expressions, so the output is
+bit-identical: `infernix_hyper_connection_bench --codec q8 --layers 8` gave the same output hash as
+the separate steps at 13 widths (17-4096) and every tile. Per mixer call (fused, best tile, against
+separate): 97-128 columns −1 %, 192 −1.6 %, 256 +1 %, 512 −16 %, 1,024 +0.3 %, 2,048 −7 %, 4,096 −7 %
+(540 against 580 µs); up to 96 columns the fused form was no faster (+0.5-2 %), so those widths keep
+the separate steps. At a 4,096-token chunk that is ~4 ms of ~380 ms per chunk (estimate, not measured
+end to end; below the run-to-run spread of a prefill benchmark).
+
 ### 19.4 On the Gold-Star-Infer runtime contract (2026-10-05)
 
 The Flash-Next history (dev through `claude/fn-layer-prefill` 91af38dd0) was replayed onto
