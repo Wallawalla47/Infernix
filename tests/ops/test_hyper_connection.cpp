@@ -7,7 +7,9 @@
 //   inject = 2 sigmoid(z[rank:] / S); u = W_up m; x = (1/S) sum_s sigmoid(u[sH + d]) Rn[sH + d].
 //
 // Cases: Flash-Next's geometry (S = 4, H = 2560, rank 320) with and without injects at T = 1, 4, 5,
-// 8, 9, 16 (the fused route) and 17, 64 (the composed route); column invariance of the fused route
+// 8, 9, 16 (the fused route) and 17, 64, 96, 97, 129, 193 (the composed route; with Q8 weights and
+// more than 96 columns its up projection and collapse run as one kernel, whose tile changes at 129
+// columns and leaves partial token tiles at 97, 129 and 193); column invariance of the fused route
 // (each column of a 16-column call bit-identical to that column alone, and a 5-column call equal to
 // the 16-column call's first five); one graph-captured call bit-identical to the eager call; the
 // workspace capacity covers every T. Criteria: the fused route rounds only x to BF16 (FP32
@@ -335,10 +337,10 @@ int main() {
         for (const bool inject : {true, false}) {
             Problem p = make_problem(inject, codec);
             const std::size_t capacity = infernix::ops::hyper_connection_mix_workspace_capacity_bytes(
-                p.down_w, p.up_w, infernix::ops::LinearPolicy::A16Only, kS, kRank, 64);
+                p.down_w, p.up_w, infernix::ops::LinearPolicy::A16Only, kS, kRank, 193);
             infernix::WorkspaceArena ws(capacity);
             const std::string tag = std::string(codec == Codec::Q8 ? "q8 " : "bf16 ") + (inject ? "inject" : "no inject");
-            for (const int T : {1, 4, 5, 8, 9, 16, 17, 64}) {
+            for (const int T : {1, 4, 5, 8, 9, 16, 17, 64, 96, 97, 129, 193}) {
                 const auto r     = residual(T, 1000U + static_cast<std::uint32_t>(T));
                 const Result got = run(p, r, T, inject, ws, stream);
                 compare(got, oracle(r, p.norm, p.down_values, p.down_rows, p.up_values, T), T <= 16, inject,

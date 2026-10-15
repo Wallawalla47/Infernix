@@ -41,7 +41,9 @@ namespace infernix::ops {
 /// registered geometry (S = 4, H = 2560, rank a multiple of 8 up to 512) at T <= 16 run two fused
 /// kernels with every intermediate (Rn, z, m, u) in FP32, so a column's result does not depend on
 /// T within 1..16. Other weights and wider calls run the norm, linear (with `policy`), gates,
-/// linear and collapse steps with BF16 intermediates. `workspace` is caller-owned transient
+/// linear and collapse steps with BF16 intermediates; with a Q8_G32_FP16 RowSplit W_up and 4 streams,
+/// calls of more than 96 columns compute the up linear and the collapse in one kernel that keeps u
+/// on chip, with the same bits as the separate steps. `workspace` is caller-owned transient
 /// storage of hyper_connection_mix_workspace_capacity_bytes; it must not overlap any operand.
 void hyper_connection_mix(const Tensor& residual, const Tensor& norm_weight, const Weight& down,
                           const Weight& up, LinearPolicy policy, std::int32_t streams,

@@ -1,6 +1,7 @@
 #include "infernix/ops/hyper_connection.h"
 
 #include "ops/hyper_connection/hyper_connection_mix_fused.h"
+#include "ops/hyper_connection/hyper_connection_up_collapse.h"
 
 #include "core/pdl.cuh"
 
@@ -235,6 +236,11 @@ void hyper_connection_mix(const Tensor& residual, const Tensor& norm_weight, con
     linear(normalized, down, z, policy, workspace, stream);
     Tensor m = workspace.alloc(DType::BF16, {rank, T});
     hyper_connection_gates(z, rank, streams, m, inject, stream);
+    if (detail::hc_up_collapse_supported(up, hidden, streams, T)) {
+        // Q8 W_up beyond the fused decode route: u stays in the MMA tile (bit-identical, §19.3.23).
+        detail::hc_up_collapse(m, up, normalized, streams, x, stream);
+        return;
+    }
     Tensor u = workspace.alloc(DType::BF16, {up.n, T});
     linear(m, up, u, policy, workspace, stream);
     hyper_connection_collapse(u, normalized, streams, x, stream);
