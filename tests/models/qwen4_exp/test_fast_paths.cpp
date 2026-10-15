@@ -51,11 +51,20 @@ int main() {
     failures += check(!q::fast_path_applies(FastPath::QsaPrepareFused, {QType::Q8_G32_FP16, true, KvCacheStorage::Vq2}, options),
                       "qsa-prepare-fused has no VQ2 kernel");
 
-    // The kernel paths are qualified only where they passed the gate: Q8 dense, 4-bit experts, INT8 KV.
+    // The kernel paths are qualified with Q8 dense weights and 4-bit experts on every KV format their
+    // kernels serve: qsa-prepare-fused has none for VQ2 or K4V2.
+    for (const KvCacheStorage kv : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
+                                    KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2,
+                                    KvCacheStorage::Q4KeyVq2Value}) {
+        const FastPathConfiguration config{QType::Q8_G32_FP16, true, kv};
+        failures += check(q::fast_path_qualified(FastPath::Q8SlicedK, config) &&
+                              q::fast_path_qualified(FastPath::GdnConvFused, config),
+                          "the dense kernel paths are qualified on every KV format");
+        failures += check(q::fast_path_qualified(FastPath::QsaPrepareFused, config) ==
+                              q::fast_path_applies(FastPath::QsaPrepareFused, config, options),
+                          "qsa-prepare-fused is qualified exactly where its kernel runs");
+    }
     for (const FastPath path : {FastPath::Q8SlicedK, FastPath::GdnConvFused, FastPath::QsaPrepareFused}) {
-        failures += check(q::fast_path_qualified(path, dense8), "a kernel path is qualified on NVFP4 Dense8, INT8 KV");
-        failures += check(!q::fast_path_qualified(path, {QType::Q8_G32_FP16, true, KvCacheStorage::Nvfp4Group16}),
-                          "a kernel path stays unqualified on an ungated KV format");
         failures += check(!q::fast_path_qualified(path, {QType::Q8_G32_FP16, false, KvCacheStorage::Int8Group64}),
                           "a kernel path stays unqualified with 16-bit expert activations");
     }

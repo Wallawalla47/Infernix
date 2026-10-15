@@ -1973,6 +1973,16 @@ void test_prepare(KvCacheStorage storage, std::uint32_t seed) {
                name + ": a W=8 call equals eight W=1 calls bit for bit");
     }
     {
+        // ... at prefill widths too (one route serves every width, so a decode append is a prefill
+        // append's arithmetic): one W = 896 chunk against 896 W = 1 calls.
+        auto wide = harness(seed + 6), narrow = harness(seed + 6);
+        wide->call({3}, {126}, 896, true);
+        for (int j = 0; j < 896; ++j) { narrow->call({3}, {126 + j}, 1, true); }
+        wide->check(name + " W=896");
+        expect(wide->same_outputs(*narrow) && wide->same_state(*narrow, /*tails=*/false),
+               name + ": a W=896 call equals 896 W=1 calls bit for bit");
+    }
+    {
         // ... and not on the other rows of its call: B = 4 against four B = 1 calls.
         auto batched = harness(seed + 2), alone = harness(seed + 2);
         batched->call({0, 1, 2, 3}, first, 2, true);

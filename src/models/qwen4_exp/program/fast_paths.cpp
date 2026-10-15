@@ -32,6 +32,26 @@ constexpr std::array kQualified{
     Qualification{FastPath::Q8SlicedK, {QType::Q8_G32_FP16, true, KvCacheStorage::Int8Group64}},
     Qualification{FastPath::GdnConvFused, {QType::Q8_G32_FP16, true, KvCacheStorage::Int8Group64}},
     Qualification{FastPath::QsaPrepareFused, {QType::Q8_G32_FP16, true, KvCacheStorage::Int8Group64}},
+    // The same three on the other formats qsa_prepare serves: prefill (quick corpus, 896 and 7,168
+    // tokens) on each, decode plain on BF16 (the lowest floor) and NVFP4 (the lossiest KV) (2026-10-15).
+    Qualification{FastPath::Q8SlicedK, {QType::Q8_G32_FP16, true, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::Q8SlicedK, {QType::Q8_G32_FP16, true, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::Q8SlicedK, {QType::Q8_G32_FP16, true, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::Q8SlicedK, {QType::Q8_G32_FP16, true, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::GdnConvFused, {QType::Q8_G32_FP16, true, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::GdnConvFused, {QType::Q8_G32_FP16, true, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::GdnConvFused, {QType::Q8_G32_FP16, true, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::GdnConvFused, {QType::Q8_G32_FP16, true, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::QsaPrepareFused, {QType::Q8_G32_FP16, true, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::QsaPrepareFused, {QType::Q8_G32_FP16, true, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::QsaPrepareFused, {QType::Q8_G32_FP16, true, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::QsaPrepareFused, {QType::Q8_G32_FP16, true, KvCacheStorage::Fp8KeyNvfp4Value}},
+    // VQ2 and K4V2 keep the composed QSA prepare; the dense paths leave attention and the KV cache alone,
+    // so they are registered from the INT8 increments (model-quality.md 6.1, step 3).
+    Qualification{FastPath::Q8SlicedK, {QType::Q8_G32_FP16, true, KvCacheStorage::Vq2}},
+    Qualification{FastPath::Q8SlicedK, {QType::Q8_G32_FP16, true, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::GdnConvFused, {QType::Q8_G32_FP16, true, KvCacheStorage::Vq2}},
+    Qualification{FastPath::GdnConvFused, {QType::Q8_G32_FP16, true, KvCacheStorage::Q4KeyVq2Value}},
 };
 
 const char* dense_name(QType dense) {

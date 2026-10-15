@@ -9507,7 +9507,8 @@ as a fast path. NInfer dev and giveen/ninfer-ext routes rejected earlier for tha
 pp16384+tg128 and pp2048+tg256, two rounds of each arm. Each fast arm was measured on top of the
 already qualified selection.
 
-**Adopted as fast paths** (qualified for Q8 dense, 4-bit experts, INT8 KV; model-quality.md 6.7):
+**Adopted as fast paths** (qualified for Q8 dense and 4-bit experts with INT8 KV, and then on every
+KV format the same day; model-quality.md 6.7):
 - `q8-sliced-k`: NInfer's [16384, 2560] and [2560, 6144] Q8 tables (35e9b5c85, cd521ab7d).
   - Cold-L2 sweeps: [16384, 2560] 0.62-0.95 of the exact routes at most widths. [2560, 6144] 0.24-0.90 up
     to T = 128, but 1.0-1.45 beyond.

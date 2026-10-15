@@ -721,7 +721,7 @@ configurations).
 | `free-cache-resume` | the same, with the prefix cache | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
 | `preemption` | request-invariance-capable artifacts | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
 | Qwen3.8-Flash-Next: `adaptive-speculation` (MTP), `free-cache-resume`, `preemption` | every Flash-Next artifact | INT8 KV |
-| Qwen3.8-Flash-Next: `q8-sliced-k`, `gdn-conv-fused`, `qsa-prepare-fused` | Q8 dense weights (`qsa-prepare-fused`: BF16, INT8, FP8, NVFP4 or K8V4 KV) | Q8 dense, 4-bit experts, INT8 KV |
+| Qwen3.8-Flash-Next: `q8-sliced-k`, `gdn-conv-fused`, `qsa-prepare-fused` | Q8 dense weights (`qsa-prepare-fused`: BF16, INT8, FP8, NVFP4 or K8V4 KV) | Q8 dense, 4-bit experts, every KV format (`qsa-prepare-fused`: the five it serves) |
 | `fp8-a8-pair` | row-FP8 dense weights (recipe C) | none (op level only, below) |
 | `q4-w4a8` | groupwise Q4 MLP gate/up | none (fails, below) |
 | `idle-wide-prefill` | Qwen3.8-27B / Qwen3.6-35B-A3B generation engines | 24 heads, 4-bit activations, with INT8, NVFP4, K8V4 or K4V2 KV |
@@ -1146,11 +1146,37 @@ and recomputes the previous output) or admission (whole extents held without `pr
   | decode MTP, concurrency 2 | TV −8.6e-4 (9.4e-4) / 5.0e-3 | −0.18 (0.12) / 0.50 | KL −3.3e-3 / 2.1e-2, p99.9 ratio 1.02 |
 
   Every prompt-length and context bucket passes.
+- **The other KV formats** (2026-10-15, the same artifact, the three jointly). `qsa-prepare-fused`
+  prepares every K/V append, so it is gated on each format it serves. Two reductions, chosen by
+  the user to save GPU time:
+  - Prefill runs at the 896- and 7,168-token chunks only, not all four (INT8 KV's floor was
+    identical at 1,792 and 3,584, and none of the paths changes the chunk schedule).
+  - Decode runs on BF16 (the lowest floor) and NVFP4 (the lossiest KV it serves) only, at 256
+    segments with their own reference. FP8 and K8V4 rest on their prefill gates: a decode append
+    is a prefill append's arithmetic, since `infernix_qsa_test` shows `qsa_prepare`'s columns
+    bit-identical alone, batched and in a 896-token chunk on every format it serves.
+
+  | KV | Arm | KL or TV excess (bound) / budget | Top-1 excess, points (bound) / budget | Other |
+  |---|---|---|---|---|
+  | BF16 | prefill | KL −1.3e-4 (3.1e-4) / 3.0e-3 | +0.06 (0.12) / 0.50 | perplexity ratio 0.9998, p99.9 KL ratio 0.94 |
+  | FP8 | prefill | KL 2.7e-4 (7.1e-4) / 3.0e-3 | 0.00 (0.08) / 0.50 | perplexity ratio 0.9985, p99.9 KL ratio 1.00 |
+  | NVFP4 | prefill | KL −3.6e-4 (4.8e-4) / 3.0e-3 | −0.05 (0.04) / 0.50 | perplexity ratio 0.9992, p99.9 KL ratio 0.95 |
+  | K8V4 | prefill | KL 1.0e-4 (8.1e-4) / 3.0e-3 | −0.01 (0.08) / 0.50 | perplexity ratio 1.0009, p99.9 KL ratio 1.00 |
+  | BF16 | decode plain c8 | TV −1.8e-4 (6.0e-4) / 5.0e-3 | +0.10 (**0.46**) / 0.50 | KL −1.8e-5, p99.9 KL ratio 0.94 |
+  | NVFP4 | decode plain c8 | TV −3.3e-4 (5.4e-4) / 5.0e-3 | −0.21 (0.17) / 0.50 | KL −1.9e-4, p99.9 KL ratio **1.244** / 1.25 |
+
+  Every criterion and bucket passes. Two are close: BF16's top-1 bound (92 % of its budget; the
+  estimate is +0.10 points, the interval wide at 256 segments) and NVFP4's p99.9 KL ratio, which
+  at 16,384 positions per route rests on about 16 of them. The BF16 floor (prefill KL 0.0316,
+  decode TV 0.084) keeps its budgets at the ceilings, like INT8's. On VQ2 and K4V2 KV, where
+  `qsa-prepare-fused` has no kernel, `q8-sliced-k` and `gdn-conv-fused` are registered from the
+  INT8 increments (6.1, step 3): no other path is qualified there, and the increments' upper
+  bounds (prefill KL 1.1e-4 below zero; decode TV 8.0e-4 and 9.4e-4) fit any budget above INT8's.
+  Those formats' floors were not measured; their KV is lossier than INT8's, so they are taken to
+  be at least INT8's.
 - **Speed** (`infernix_bench`, two rounds): plain decode +1.4 %, MTP (four drafts) +3.4 to
   +4.2 %, prefill +0.3 to +1.0 % (qwen3_8-flash-next-design.md §19.3.22).
-- **Not yet qualified:** other KV formats (`qsa-prepare-fused` is KV-specific, and the other two
-  need the format with least headroom), 16-bit expert activations, and other dense formats (no
-  kernels).
+- **Not qualified:** 16-bit expert activations, and other dense formats (no kernels).
 
 **`fp8-a8-pair`: two E4M3 activation terms in recipe C's FP8 projections (op level only).**
 - **What changes:** prefill-width calls of Flash-Next's row-FP8 dense problems carry each 16-bit
