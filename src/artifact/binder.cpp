@@ -125,12 +125,20 @@ std::span<const std::byte> Binder::host_object(ObjectHandle object) {
 }
 
 ObjectHandle Binder::resource(std::string_view component, std::string_view role) {
-    const auto& resources = reader_.directory().component(component).resources;
-    const auto found      = resources.find(role);
-    if (found == resources.end()) {
+    const auto object = find_resource(component, role);
+    if (!object) {
         throw ArtifactError(std::string(component) + ": missing resource " + std::string(role));
     }
-    (void)host_object(found->second);
+    (void)host_object(*object);
+    return *object;
+}
+
+std::optional<ObjectHandle> Binder::find_resource(std::string_view component, std::string_view role) const {
+    const auto& components = reader_.directory().components;
+    const auto owner       = components.find(component);
+    if (owner == components.end()) { return std::nullopt; }
+    const auto found = owner->second.resources.find(role);
+    if (found == owner->second.resources.end()) { return std::nullopt; }
     return found->second;
 }
 

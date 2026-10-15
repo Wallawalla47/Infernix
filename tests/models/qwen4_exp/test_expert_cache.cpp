@@ -5,6 +5,7 @@
 // top and never names a frame above it.
 
 #include "models/qwen4_exp/program/expert_cache/expert_cache.h"
+#include "models/qwen4_exp/program/expert_cache/expert_profile.h"
 #include "models/qwen4_exp/program/expert_cache/expert_state.h"
 
 #include <algorithm>
@@ -632,6 +633,95 @@ void test_tier_gates() {
     }
 }
 
+// The shipped routing profile (design §9.3 item 4, artifact-container.md §9.3): parse accepts the
+// version-1 layout it documents and refuses a wrong version, an expert count that differs from the
+// model, a damaged body or a bad ranking; the sidecar keeps priority over it, and it seeds only a
+// load the sidecar refused (and only when the warm start is on, which the caller gates).
+void test_shipped_profile() {
+    const auto put = [](std::vector<std::byte>& out, std::uint32_t value) {
+        const auto* p = reinterpret_cast<const std::byte*>(&value);
+        out.insert(out.end(), p, p + sizeof(value));
+    };
+    const auto bytes = [&put](std::uint32_t version, const std::vector<std::uint32_t>& counts,
+                              const std::vector<std::uint32_t>& ranked, std::uint32_t declared_keys, bool damage = false) {
+        std::vector<std::byte> out;
+        const char magic[8] = {'N', 'I', 'N', 'F', 'Q', '4', 'E', 'P'};
+        const auto* mb = reinterpret_cast<const std::byte*>(magic);
+        out.insert(out.end(), mb, mb + 8);
+        put(out, version);
+        put(out, declared_keys);
+        for (const auto c : counts) { put(out, c); }
+        put(out, static_cast<std::uint32_t>(ranked.size()) + (damage ? 1U : 0U));
+        for (const auto k : ranked) { put(out, k); }
+        return out;
+    };
+    const std::vector<std::uint32_t> counts{8, 0, 3, 0, 7, 0, 1, 0}, ranked{4, 0, 2, 7};
+    const auto good = bytes(1, counts, ranked, 8);
+    const auto parsed = parse_expert_profile(good, 8);
+    check(parsed.profile && parsed.profile->counts == counts && parsed.profile->ranked == ranked &&
+              parsed.message.empty(),
+          "a shipped profile round-trips");
+    const std::vector<std::byte> empty_rank{bytes(1, counts, {}, 8)};
+    check(parse_expert_profile(empty_rank, 8).profile && parse_expert_profile(empty_rank, 8).profile->ranked.empty(),
+          "a counts-only profile parses");
+    check(!parse_expert_profile(bytes(2, counts, ranked, 8), 8).profile, "an unknown version is refused");
+    check(!parse_expert_profile(bytes(1, counts, ranked, 4), 8).profile, "another expert count is refused");
+    check(!parse_expert_profile(std::span<const std::byte>(good).first(good.size() - 4), 8).profile,
+          "a truncated profile is refused");
+    {
+        auto extra = good;
+        extra.insert(extra.end(), 4, std::byte{0});
+        check(!parse_expert_profile(extra, 8).profile, "trailing bytes are refused");
+    }
+    check(!parse_expert_profile(bytes(1, counts, {4, 9}, 8), 8).profile, "an out-of-range rank is refused");
+    check(!parse_expert_profile(bytes(1, counts, {4, 4, 0}, 8), 8).profile, "a repeated rank is refused");
+    check(!parse_expert_profile(bytes(1, counts, ranked, 8, true), 8).profile, "a bad ranking length is refused");
+
+    SavedState sidecar{{5, 0, 9, 1}, {2}};
+    SavedState prior{counts, ranked};
+    ExpertStateLoad loaded;
+    loaded.state = sidecar;
+    check(!apply_shipped_profile(loaded, prior) && loaded.state->counts == sidecar.counts && !loaded.shipped,
+          "the runtime-learned sidecar keeps priority over the shipped profile");
+    ExpertStateLoad cold;
+    cold.message = "no saved expert state at ... yet";
+    check(apply_shipped_profile(cold, prior) && cold.state->ranked == ranked && cold.shipped &&
+              cold.message.find("no saved expert state") != std::string::npos &&
+              cold.message.find("shipped expert profile") != std::string::npos,
+          "a refused sidecar load seeds from the shipped profile, keeping the refusal reason");
+    ExpertStateLoad none;
+    check(!apply_shipped_profile(none, std::nullopt) && !none.state && !none.shipped,
+          "without a shipped profile, a cold start stays cold");
+
+    // The Program's whole call-site branch (warm_start_experts defers to this one function): the
+    // gating, the sidecar precedence and the shipped fallback, driven over real files.
+    const auto dir     = std::filesystem::temp_directory_path();
+    const auto path    = dir / "infernix_expert_profile_seam.bin";
+    const auto missing = dir / "infernix_expert_profile_seam_missing.bin";
+    std::filesystem::remove(missing);
+    const SavedState warm{{5, 0, 9, 1, 7, 0, 1, 0}, {2, 0, 3, 1, 5, 4, 7, 6}};
+    check(save_expert_state(path, "artifact A", warm).empty(), "the seam fixture saves a sidecar");
+    const auto seeds = [&](const ExpertStateLoad& l) {
+        return l.state && l.state->counts == counts && l.state->ranked == ranked && l.shipped;
+    };
+    const auto by_sidecar = warm_start_load(path, true, "artifact A", 8, prior);
+    check(by_sidecar.state && by_sidecar.state->counts == warm.counts && !by_sidecar.shipped,
+          "the seam: the runtime-learned sidecar wins over the shipped profile");
+    const auto by_profile = warm_start_load(missing, true, "artifact A", 8, prior);
+    check(seeds(by_profile) && by_profile.message.find("shipped expert profile") != std::string::npos,
+          "the seam: a missing sidecar seeds the warm start from the shipped profile");
+    const auto by_identity = warm_start_load(path, true, "artifact B", 8, prior);
+    check(seeds(by_identity) && by_identity.message.find("saved expert state") != std::string::npos,
+          "the seam: a refused sidecar seeds from the profile and still says why it gave way");
+    check(!warm_start_load(path, false, "artifact A", 8, prior).state &&
+              !warm_start_load(std::filesystem::path{}, true, "artifact A", 8, prior).state,
+          "the seam: an off warm start takes neither source (--expert-cache off or --expert-state off)");
+    const auto no_profile = warm_start_load(missing, true, "artifact A", 8, std::nullopt);
+    check(!no_profile.state && !no_profile.shipped && !no_profile.message.empty(),
+          "the seam: with no profile shipped, a cold start stays cold");
+    std::filesystem::remove(path);
+}
+
 int main() {
     test_residency_entries();
     test_tier_gates();
@@ -646,6 +736,7 @@ int main() {
     test_seed();
     test_landing();
     test_state_file();
+    test_shipped_profile();
     if (g_failures) {
         std::fprintf(stderr, "%d check(s) failed\n", g_failures);
         return 1;

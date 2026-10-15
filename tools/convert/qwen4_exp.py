@@ -18,6 +18,7 @@ from typing import Mapping
 
 import torch
 
+from tools.artifact import expert_profile as shipped_profile
 from tools.artifact.codecs.nvfp4_expert import encode_nvfp4_expert_bank
 from tools.artifact.layouts import expert_bank_geometry
 from tools.flash_next.ngram import NgramConfig, head_tables, layer_multipliers
@@ -190,6 +191,27 @@ def ngram_config(config: dict) -> NgramConfig:
         make_ngram_vocab_size_divisible_by=config["make_ngram_vocab_size_divisible_by"],
         seed=config["seed"],
     )
+
+
+def attach_expert_profile(model: Model, path: str | Path) -> None:
+    """Embed a converter-shipped routing profile as the text component's
+    ``expert_profile`` resource (docs/maintainer/artifact-container.md §9.3).
+
+    The profile records routing frequency from measured sessions (the converter's calibration data
+    covers activations, not routing); the file comes from ``tools.expert_cache_replay.profile`` or
+    an equivalent producer, and its expert count must match this model. The bytes join the pack like
+    any resource object, aligned like one."""
+
+    data = Path(path).read_bytes()
+    config = model.config
+    shipped_profile.parse(
+        data, layers=config["num_hidden_layers"], experts=config["num_experts"]
+    )
+    resources = model.components["text"].setdefault("resources", {})
+    if shipped_profile.ROLE in resources:
+        raise ValueError("the text component already ships an expert_profile resource")
+    resources[shipped_profile.ROLE] = shipped_profile.OBJECT_ID
+    model.resources[shipped_profile.OBJECT_ID] = data
 
 
 # ---------------------------------------------------------------------------- routed expert banks

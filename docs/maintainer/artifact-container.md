@@ -327,6 +327,8 @@ of a use site is bound separately; see section 8.
 
 How a resource is interpreted is determined by its use role. Content rules for JSON, UTF-8 templates or
 other resources belong to the corresponding Frontend; the resource object itself only provides raw bytes.
+A role-carrying resource documented with its consumer is the expert routing profile of section 9.3: a
+routed-expert model may ship one, and it is placed and aligned like any other raw resource.
 
 ### 5.3 Object ranges and sharing
 
@@ -578,6 +580,35 @@ Its parameters still live in the root bindings, using the defined names `proposa
 Full takes its row count from the Text vocab_size; indexed needs an explicit token ID mapping. The main
 output head is always provided by Text's own bindings. When proposal is omitted, the existing backends
 use the target's complete output representation according to their code.
+
+### 9.3 Expert routing profile
+
+A routed-expert model may ship an `expert_profile` resource (role `expert_profile` of the text
+component, object `resource/text/expert_profile`) that seeds the expert cache's warm start on the
+first cold run ([Qwen3.8-Flash-Next design](qwen3_8-flash-next-design.md) §9.3 item 4, §19.3.5 S4b).
+It is an ordinary raw resource: one object record as in section 5.2, alignment and
+placement like any other raw bytes. The bytes are little-endian:
+
+| Offset | Content |
+|---:|---|
+| 0 | Magic `NINFQ4EP`, 8 bytes |
+| 8 | `version` U32, `1` |
+| 12 | `keys` U32, the model's layers × experts |
+| 16 | `counts` U32[keys]: recorded live routing uses per key, key = layer × experts + expert |
+| 16+4·keys | `ranked` U32, `0..keys` |
+| 20+4·keys | ranked key ids, U32[ranked], hottest first, distinct and each `< keys` |
+
+The length must equal `20 + 4·keys + 4·ranked` exactly. The consumer checks the version, refuses an
+unknown one, and validates `keys` against the model geometry and the ranking against the bounds;
+a profile the model cannot use is refused with a reason, and the cache then starts as if none were
+shipped. The profile is a placement prior only: it provides the initial fill ranking and the seeded
+use counts (which the runtime caps like a saved state's) and never claims a hit rate — effectiveness
+is measured by running, not re-derived from these bytes. Precedence: a runtime-learned saved-state
+file wins while usable; the shipped profile seeds a run that has no usable saved state; the operator
+switching the warm start off (`--expert-state off`) applies neither. The converter embeds a provided
+profile file (`tools/convert --expert-profile`); its frequencies come from recorded sessions
+(`python -m tools.expert_cache_replay.profile`) or an engine-saved state, and the profile's source is
+recorded in `provenance`.
 
 ## 10. Instance information and provenance
 

@@ -82,6 +82,11 @@ opens part 1. `--resource` stores the maintained Qwen3.8 template, as for Qwen3.
 - **Second artifact of the same checkpoint.** It can share an existing n-gram volume: pass
   `--ngram-reuse <volume>` instead of `--ngram-out`. The converter checks the volume's geometry and
   512 of its rows against the checkpoint, so a volume of another checkpoint is refused.
+- **Shipped routing profile.** `--expert-profile <file>` embeds an expert routing profile as the
+  artifact's `expert_profile` resource, so the first cold run starts where a warmed one would: the
+  engine seeds its warm-start ranking and initial use counts from it when no saved state is usable
+  yet (design §9.3 item 4). The converter does not measure routing; the file is built from recorded
+  sessions with `python -m tools.expert_cache_replay.profile` over route traces or a saved state.
 - **Duration.** A conversion takes ~11 minutes from a warm disk cache; the MTP experts' MSE
   scale search accounts for several of them.
 
@@ -169,7 +174,9 @@ infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8
   request (under a second), so the first few hundred tokens decode faster when the work resembles
   the last session's (measured +24 % plain and +30 % with MTP on a repeated coding prompt), and
   about as fast as a cold start when it does not; the other half stays free to fill quickly. `--expert-state FILE` moves the file; `--expert-state off` starts with an empty cache,
-  as cold benchmarks need. Output is the same either way: where an expert is computed never
+  as cold benchmarks need. A pack that ships a routing profile (container §9.3) seeds this warm start
+  when the file holds nothing usable yet, so the first run is not cold; the saved state keeps
+  priority, and `off` applies neither. Output is the same either way: where an expert is computed never
   changes a bit.
 - The `infernix-serve` statistics panel's `experts` column shows the expert cache's hit rate over
   the session and the last ten requests.

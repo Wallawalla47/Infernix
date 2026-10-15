@@ -16,6 +16,7 @@
 #include "models/qwen3_5/ngram.h"
 #include "models/qwen4_exp/config.h"
 #include "models/qwen4_exp/memory_plan.h"
+#include "models/qwen4_exp/program/expert_cache/expert_cache.h"
 #include "infernix/types.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/request.h"
@@ -331,6 +332,10 @@ struct ProgramOptions {
     // artifact the state belongs to.
     std::filesystem::path expert_state;
     std::string expert_state_identity;
+    // The artifact's shipped expert routing profile (design §9.3 item 4, artifact-container.md §9.3):
+    // seeds the warm start when the saved-state file holds nothing usable; the runtime-learned state
+    // and an off warm start (--expert-state off) keep priority over it.
+    std::optional<expert_cache::SavedState> expert_profile;
     // Device memory left free for the display and other programs once the fixed allocations and
     // the expert frames are made (design §19.3.7); empty selects it from the display state.
     std::optional<std::uint64_t> vram_headroom;

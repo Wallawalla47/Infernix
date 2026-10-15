@@ -179,6 +179,14 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                                                 ";size=" + std::to_string(error ? 0U : size) +
                                                 ";mtime=" + std::to_string(error ? 0 : time.time_since_epoch().count());
     }
+    // The artifact's shipped routing profile (design §9.3 item 4): a cold first run seeds from it
+    // when the saved-state sidecar holds nothing usable; an unusable one is reported and ignored.
+    program_options.expert_profile = plan.expert_profile();
+    if (const auto& refused = plan.expert_profile_message(); !refused.empty()) {
+        report(options, DiagnosticLevel::Warning,
+               "Qwen3.8-Flash-Next: the artifact ships an unusable expert profile: " + refused +
+                   "; the expert cache starts without that prior");
+    }
     program_options.ngram_volume = options.ngram_volume_path.empty()
                                        ? models::qwen4_exp::default_ngram_volume(options.artifact_path)
                                        : options.ngram_volume_path;
