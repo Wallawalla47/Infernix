@@ -119,20 +119,27 @@ If `entry_payload_start + payload_bytes <= limit`, the writer generates only the
 Above the limit, the entry first holds the first segment, and the remaining data goes into continuation
 volumes in order.
 
-For a given entry_payload_start, the current writer's shard capacities are:
+For a given entry_payload_start, the shard capacities follow the strongest placement alignment `A`
+of any object in the file (§5.3; `A` is at least 4096, and today only streamed routed-expert bank
+objects raise it to 2 MiB). The entry_payload_start is itself rounded up to `A`:
 
 ```text
-entry_capacity = floor((limit - entry_payload_start) / 4096) * 4096
-part_capacity  = floor((limit - 4096) / 4096) * 4096
+entry_capacity = floor((limit - entry_payload_start - 4096) / A) * A + 4096
+part_capacity  = floor((limit - 4096) / A) * A
 ```
+
+The 4096 residue is the continuation header size, so every volume's payload begins at file offset
+4096; for `A = 4096` both formulas reduce to the historical `floor(... / 4096) * 4096`.
 
 When sharding is needed, the writer first checks that the limit can hold the headers and that both
 capacities are positive; non-final segments are filled to capacity and the final segment holds the
 remaining bytes.
 The number of shards is determined by the data size and the capacities.
-This placement keeps the logical start of every segment 4096-byte aligned, which suits direct I/O; the
-reader's range mapping also accepts other positive-length segmentations that satisfy this
-specification.
+This placement keeps the logical start of every segment 4096-byte aligned and keeps the start of
+every object placed at an `A`-aligned logical offset `A`-aligned in the file space of the volume
+holding that start; a bank that straddles a volume boundary resumes at that volume's payload start,
+4096-byte aligned. Both suit direct I/O; the reader's range mapping also accepts other
+positive-length segmentations that satisfy this specification.
 
 ## 3. Binary framing
 
@@ -330,7 +337,11 @@ Tensor bytes equal the encoded size of the corresponding `(format,layout,shape)`
 
 Gaps between objects and unreferenced logical payload bytes at the end have no load semantics. A regular
 writer only leaves space for alignment and truncates at the end of the last object. Padding inside a
-completely encoded object continues to follow its layout contract.
+completely encoded object continues to follow its layout contract. Writers may place objects more strongly
+than the section 6.2 minima: the converter starts streamed routed-expert bank objects on 2 MiB boundaries,
+along with the entry payload start and file segment capacities so the alignment holds in file space across
+parts, for huge-page mapping and wide O_DIRECT reads of the SSD expert tier; the section 6.2 values remain
+the minimum every reader must accept.
 
 When multiple logical uses share the same object they all reference the same ID; the materializer
 establishes the backing once on that basis.

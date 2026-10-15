@@ -11,13 +11,14 @@ from typing import Iterable, Sequence
 from uuid import uuid4
 
 from .framing import HEADER, MAGIC, PART_MAGIC, PAYLOAD_ALIGNMENT
-from .layouts import align_up
+from .layouts import align_up, placement_alignment
 from .file_io import IO_CHUNK_BYTES, Writeback
 from .schema import (
     ArtifactError,
     ArtifactObject,
     Directory,
     ObjectSpec,
+    TensorObject,
     encode_directory,
     integer,
     parse_directory,
@@ -34,14 +35,29 @@ def layout_directory(
     payload_bytes: int,
     *,
     max_file_bytes: int = DEFAULT_MAX_FILE_BYTES,
+    segment_alignment: int = PAYLOAD_ALIGNMENT,
 ) -> tuple[Directory, bytes, int]:
-    """Resolve JSON reserve and file segments before any payload is generated."""
+    """Resolve JSON reserve and file segments before any payload is generated.
+
+    ``segment_alignment`` is the placement alignment the artifact's objects demand: the entry
+    payload start is rounded to it, the entry segment capacity is congruent to the part header
+    size modulo it and every following full capacity is a multiple of it, so the start of a
+    strongly aligned object maps to an aligned file offset in the volume holding that start; a
+    bank straddling a volume boundary resumes at that volume's payload start (4 KiB aligned).
+    With the default ``PAYLOAD_ALIGNMENT`` the layout is byte-identical to the historical 4 KiB
+    writer.
+    """
     integer(payload_bytes, "payload bytes", positive=True)
     integer(max_file_bytes, "maximum file bytes", positive=True)
+    integer(segment_alignment, "segment alignment", positive=True)
+    if segment_alignment % PAYLOAD_ALIGNMENT:
+        raise ArtifactError(
+            "segment alignment must be a multiple of the payload alignment"
+        )
     value = deepcopy(description)
     value["files"] = [{"path": None, "payload_bytes": payload_bytes}]
     reserve = (
-        align_up(HEADER.size + len(encode_directory(value)), PAYLOAD_ALIGNMENT)
+        align_up(HEADER.size + len(encode_directory(value)), segment_alignment)
         - HEADER.size
     )
     while True:
@@ -54,12 +70,17 @@ def layout_directory(
             files = [{"path": None, "payload_bytes": payload_bytes}]
         else:
             entry_capacity = (
-                (max_file_bytes - entry_start) // PAYLOAD_ALIGNMENT * PAYLOAD_ALIGNMENT
+                (
+                    max_file_bytes - entry_start - PAYLOAD_ALIGNMENT
+                )
+                // segment_alignment
+                * segment_alignment
+                + PAYLOAD_ALIGNMENT
             )
             part_capacity = (
                 (max_file_bytes - PAYLOAD_ALIGNMENT)
-                // PAYLOAD_ALIGNMENT
-                * PAYLOAD_ALIGNMENT
+                // segment_alignment
+                * segment_alignment
             )
             if min(entry_capacity, part_capacity) <= 0:
                 raise ArtifactError(
@@ -81,7 +102,7 @@ def layout_directory(
         if len(encoded) <= reserve:
             directory = parse_directory(value, entry_name=entry_name)
             return directory, encoded + b" " * (reserve - len(encoded)), entry_start
-        reserve = align_up(HEADER.size + len(encoded), PAYLOAD_ALIGNMENT) - HEADER.size
+        reserve = align_up(HEADER.size + len(encoded), segment_alignment) - HEADER.size
 
 
 class _Coverage:
@@ -124,6 +145,14 @@ class ArtifactWriter:
         self.path = Path(path)
         self.objects = plan_objects(specs)
         self.by_id = {obj.id: obj for obj in self.objects}
+        self.segment_alignment = max(
+            [
+                placement_alignment(obj.layout)
+                for obj in self.objects
+                if isinstance(obj, TensorObject)
+            ]
+            + [PAYLOAD_ALIGNMENT]
+        )
         description = {
             "components": components,
             "objects": [obj.to_json() for obj in self.objects],
@@ -137,6 +166,7 @@ class ArtifactWriter:
             description,
             self.objects[-1].offset + self.objects[-1].bytes,
             max_file_bytes=max_file_bytes,
+            segment_alignment=self.segment_alignment,
         )
         self.artifact_id = uuid4().bytes
         self._coverage = {obj.id: _Coverage() for obj in self.objects}
