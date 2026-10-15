@@ -126,7 +126,7 @@ Forward::~Forward() {
 }
 
 std::size_t Forward::workspace_bytes(const TextConfig& c, std::int32_t columns, std::int32_t max_context,
-                                     KvCacheStorage storage) {
+                                     KvCacheStorage storage, ops::offloaded_moe::WideA16 wide_a16) {
     const std::size_t t = static_cast<std::size_t>(columns);
     const std::size_t h = c.hidden_size, w = c.residual_width(), k = c.moe.top_k;
     const std::size_t bf = 2;
@@ -144,7 +144,7 @@ std::size_t Forward::workspace_bytes(const TextConfig& c, std::int32_t columns, 
     bytes += (c.moe.experts + 1) * t * 4 + k * t * 8 + t * 4;           // FP32 router logits, routing
     bytes += ops::moe_dispatch_bytes(dim(c.moe.experts), dim(k * t));
     bytes += h * k * t * bf + ops::moe_experts_workspace_bytes(dim(c.moe.experts), dim(k * t), std::max(columns, 1),
-                                                               expert_activation(c));
+                                                               expert_activation(c), wide_a16);
     bytes += 2 * std::size_t(c.moe.shared_intermediate) * t * bf * 3;
     // Linear and GDN scratch (chunked recurrence), plus alignment slack per allocation.
     bytes += ops::gated_delta_net_workspace_capacity_bytes(dim(c.gdn.key_heads), dim(c.gdn.value_heads), 1,
@@ -738,7 +738,10 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     }
     Tensor outputs = work_.alloc(DType::BF16, {H, K * T});
     const std::int32_t max_jobs = std::min(E, K * T);
-    const DeviceSpan expert_ws  = work_.alloc_bytes(ops::moe_experts_workspace_bytes(max_jobs, K * T, T, source.activation));
+    source.wide_a16             = fast_.expert_a4_residual ? ops::offloaded_moe::WideA16::kA4Residual
+                                                           : ops::offloaded_moe::WideA16::kExact;
+    const DeviceSpan expert_ws  = work_.alloc_bytes(ops::moe_experts_workspace_bytes(max_jobs, K * T, T, source.activation,
+                                                                                 source.wide_a16));
     const bool planned = route_plans && ops::moe_route_dispatch_plan(logits, K, routing, dispatch, route_log, x, source,
                                                                      max_jobs, expert_ws.data, outputs, s);
     // The shared expert runs while the host computes the CPU-served misses.

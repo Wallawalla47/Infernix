@@ -86,6 +86,29 @@ int main() {
     selection.paths = {FastPath::GdnConvFused, FastPath::QsaPrepareFused};
     failures += check(selection.request_invariant(), "the fused kernels keep a request invariant");
 
+    // expert-a4-residual acts only on W4A16 experts (recipe C), and routes an expert by its column
+    // count in the call, which batched rounds share between requests.
+    const FastPathConfiguration recipe_c{QType::FP8_E4M3FN_ROW_BF16, false, KvCacheStorage::Int8Group64};
+    failures += check(q::fast_path_applies(FastPath::ExpertA4Residual, recipe_c, options),
+                      "expert-a4-residual runs on W4A16 experts");
+    failures += check(!q::fast_path_applies(FastPath::ExpertA4Residual, dense8, options),
+                      "expert-a4-residual does not apply to W4A4 experts");
+    failures += check(!exact.expert_a4_residual, "the exact route keeps W4A16 experts exact");
+    selection.paths = {FastPath::ExpertA4Residual};
+    failures += check(selection.forward().expert_a4_residual, "expert-a4-residual sets its Forward flag");
+    failures += check(!selection.request_invariant(), "expert-a4-residual couples a request to its round");
+    for (const auto kv : {KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256, KvCacheStorage::Nvfp4Group16,
+                          KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2, KvCacheStorage::Q4KeyVq2Value}) {
+        failures += check(q::fast_path_qualified(FastPath::ExpertA4Residual, {QType::FP8_E4M3FN_ROW_BF16, false, kv}),
+                          "expert-a4-residual is qualified on recipe C with every quantized KV format");
+    }
+    failures += check(!q::fast_path_qualified(FastPath::ExpertA4Residual,
+                                              {QType::FP8_E4M3FN_ROW_BF16, false, KvCacheStorage::BFloat16}),
+                      "expert-a4-residual fails on BF16 KV, where recipe C's exact route is the reference");
+    failures += check(!q::fast_path_qualified(FastPath::ExpertA4Residual,
+                                              {QType::Q8_G32_FP16, false, KvCacheStorage::Int8Group64}),
+                      "expert-a4-residual is qualified only on the dense format it was gated with");
+
     std::cout << (failures == 0 ? "PASS" : "FAIL") << " Qwen3.8-Flash-Next fast-path selection\n";
     return failures == 0 ? 0 : 1;
 }

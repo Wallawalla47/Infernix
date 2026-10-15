@@ -111,6 +111,12 @@ enum class FastPath : std::uint8_t {
     // (ops::LinearPolicy::AllowA8Residual); output and down projections stay at 16 bits.
     // batched-a8-decode takes precedence. Without either they stay at 16 bits.
     BatchedA8ResidualDecode,
+    // Qwen3.8-Flash-Next W4A16 experts (weight-only exports): calls of more than eight columns per
+    // expert (prefill, wide verification) take each x and h row as the A4 residual profile of two
+    // NVFP4 terms with an FP32 row scale, on the FP4 Tensor Cores, instead of the exact integer limb
+    // route. A column's result then depends on its expert's column count in the call, which other
+    // requests' columns share in batched rounds. Without it W4A16 experts are exact on every route.
+    ExpertA4Residual,
     // Decode attention sizes each row's key partition from the round's batch. Without it a row's
     // partition depends only on its own keys.
     BatchSplitAttention,
@@ -134,16 +140,17 @@ enum class FastPath : std::uint8_t {
     IdleWidePrefill,
 };
 
-inline constexpr std::array<FastPath, 18> kFastPaths{
+inline constexpr std::array<FastPath, 19> kFastPaths{
     FastPath::PromptPv8,           FastPath::DecodeSplit64,
     FastPath::Q8SlicedK,           FastPath::GdnConvFused,
     FastPath::QsaPrepareFused,     FastPath::Fp8A8Pair,
     FastPath::Q4W4A8,              FastPath::BatchedDecode,
     FastPath::BatchedA8Decode,     FastPath::BatchedA4Decode,
     FastPath::BatchedA4ResidualDecode, FastPath::BatchedA8ResidualDecode,
-    FastPath::BatchSplitAttention, FastPath::AdaptiveSpeculation,
-    FastPath::AdaptiveMtp,         FastPath::FreeCacheResume,
-    FastPath::Preemption,          FastPath::IdleWidePrefill};
+    FastPath::ExpertA4Residual,    FastPath::BatchSplitAttention,
+    FastPath::AdaptiveSpeculation, FastPath::AdaptiveMtp,
+    FastPath::FreeCacheResume,     FastPath::Preemption,
+    FastPath::IdleWidePrefill};
 
 [[nodiscard]] constexpr const char* fast_path_name(FastPath path) noexcept {
     switch (path) {
@@ -154,6 +161,7 @@ inline constexpr std::array<FastPath, 18> kFastPaths{
     case FastPath::BatchedA4Decode: return "batched-a4-decode";
     case FastPath::BatchedA4ResidualDecode: return "batched-a4-residual-decode";
     case FastPath::BatchedA8ResidualDecode: return "batched-a8-residual-decode";
+    case FastPath::ExpertA4Residual: return "expert-a4-residual";
     case FastPath::BatchSplitAttention: return "batch-split-attention";
     case FastPath::AdaptiveSpeculation: return "adaptive-speculation";
     case FastPath::AdaptiveMtp: return "adaptive-mtp";

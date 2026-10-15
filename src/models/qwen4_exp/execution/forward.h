@@ -252,8 +252,9 @@ public:
     // scoring runs it in tiles over a prompt's saved residuals. Uses the workspace (no call open).
     void head_logits(const Tensor& residuals, Tensor& logits);
 
-    [[nodiscard]] static std::size_t workspace_bytes(const TextConfig& config, std::int32_t columns,
-                                                     std::int32_t max_context, KvCacheStorage storage);
+    [[nodiscard]] static std::size_t workspace_bytes(
+        const TextConfig& config, std::int32_t columns, std::int32_t max_context, KvCacheStorage storage,
+        ops::offloaded_moe::WideA16 wide_a16 = ops::offloaded_moe::WideA16::kExact);
     // Extra workspace of the MTP drafter: K/V-only calls over up to `kv_columns` columns (chunks
     // run them inside run()) and full steps over `draft_columns` sequences.
     [[nodiscard]] static std::size_t mtp_workspace_bytes(const TextConfig& config, std::int32_t kv_columns,

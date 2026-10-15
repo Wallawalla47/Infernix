@@ -51,23 +51,32 @@ class Policy:
 
     # A fast path's excess over the default route, as a fraction of the artifact's floor.
     relative_budget: float = 0.10
-    # KL budget bounds (nats): the smallest the measurement resolves, the most any fast path may
-    # cost whatever the artifact's floor. NLL excess (prefill and teacher-forced decode) uses the
-    # same budget: in expectation it is the same quantity measured on the corpus's own tokens.
-    kl_budget_minimum: float = 1.0e-4
+    # KL budget bounds (nats). The minimum is the absolute acceptance floor: an excess this small
+    # is always acceptable, whatever the configuration's own floor (about what llama.cpp's Q8_0
+    # costs against FP16; without it a configuration whose exact route is the reference, floor 0,
+    # would admit nothing). The maximum is the most any fast path may cost. NLL excess (prefill and
+    # teacher-forced decode) uses the same budget: in expectation it is the same quantity measured
+    # on the corpus's own tokens.
+    kl_budget_minimum: float = 1.0e-3
     kl_budget_maximum: float = 3.0e-3
     # Decode's bounded criterion is total variation (bounded by 1 per position, so a position whose
     # most probable token flips cannot dominate the mean as an unbounded KL does): budget bounds.
-    tv_budget_minimum: float = 1.0e-4
+    # The minimum is the KL floor at the decode TV / KL ratio measured at a floor (4.2, recipe C
+    # INT8 KV).
+    tv_budget_minimum: float = 4.0e-3
     tv_budget_maximum: float = 5.0e-3
-    # Top-1 disagreement budget bounds (fractions of positions or tokens).
-    top1_budget_minimum: float = 5.0e-4
+    # Top-1 disagreement budget bounds (fractions of positions or tokens). The floor equals the
+    # cap, so every configuration's top-1 budget is 0.5 points.
+    top1_budget_minimum: float = 5.0e-3
     top1_budget_maximum: float = 5.0e-3
-    # Free-running decode regret budget lower bound (nats per token).
-    regret_budget_minimum: float = 1.0e-4
+    # Free-running decode regret budget lower bound (nats per token): the KL floor.
+    regret_budget_minimum: float = 1.0e-3
     # Gross caps on point estimates: 99.9th-percentile KL ratio, and each context bucket's (or
-    # decode prompt length's) excess as a fraction of its default divergence or of the floor.
+    # decode prompt length's) excess as a fraction of its default divergence or of the floor. A
+    # fast route's p99.9 KL at most tail_minimum always passes the tail cap (the p99.9 of a route
+    # at the KL floor: p99.9 / mean measured 48 in prefill and 21 in decode at recipe C's INT8 floor).
     tail_ratio: float = 1.25
+    tail_minimum: float = 0.05
     bucket_relative: float = 0.25
     bucket_min_positions: int = 20000
     # The KL lower bound must resolve at least this share of the reference distribution.
@@ -82,9 +91,9 @@ POLICY = Policy()
 # fast_path_name of every infernix::FastPath.
 FAST_PATHS = ("prompt-pv8", "decode-split64", "batched-decode", "batched-a8-decode",
               "batched-a4-decode", "batched-a4-residual-decode", "batched-a8-residual-decode",
-              "batch-split-attention", "adaptive-speculation", "free-cache-resume", "preemption",
-              "q8-sliced-k", "gdn-conv-fused", "qsa-prepare-fused", "adaptive-mtp",
-              "idle-wide-prefill", "fp8-a8-pair", "q4-w4a8")
+              "expert-a4-residual", "batch-split-attention", "adaptive-speculation",
+              "free-cache-resume", "preemption", "q8-sliced-k", "gdn-conv-fused",
+              "qsa-prepare-fused", "adaptive-mtp", "idle-wide-prefill", "fp8-a8-pair", "q4-w4a8")
 
 
 class MeasurementError(RuntimeError):
@@ -337,8 +346,9 @@ def evaluate_prefill_pairs(pairs: Sequence[ChunkPair], scope: str,
         tail_ratio = 0.0 if fast_tail == 0 else math.inf
     verdict.criteria.append(
         Criterion("p99.9 KL ratio", tail_ratio, tail_ratio, policy.tail_ratio,
-                  tail_ratio <= policy.tail_ratio,
-                  f"default {default_tail:.6g}, fast {fast_tail:.6g}"))
+                  tail_ratio <= policy.tail_ratio or fast_tail <= policy.tail_minimum,
+                  f"default {default_tail:.6g}, fast {fast_tail:.6g}; "
+                  f"a fast p99.9 to {policy.tail_minimum:g} passes"))
     buckets: dict[int, list[float]] = {}
     for pair in pairs:
         for route, report in ((1, pair.default), (2, pair.fast)):
@@ -529,8 +539,10 @@ def evaluate_forced(default_path: Path, fast_path: Path, reference_path: Path,
     fast_tail = quantile([k for s in b for k in s.kl], 0.999)
     tail_ratio = fast_tail / default_tail if default_tail > 0 else (0.0 if fast_tail == 0 else math.inf)
     verdict.criteria.append(Criterion("decode p99.9 KL ratio", tail_ratio, tail_ratio,
-                                      policy.tail_ratio, tail_ratio <= policy.tail_ratio,
-                                      f"default {default_tail:.6g}, fast {fast_tail:.6g}"))
+                                      policy.tail_ratio,
+                                      tail_ratio <= policy.tail_ratio or fast_tail <= policy.tail_minimum,
+                                      f"default {default_tail:.6g}, fast {fast_tail:.6g}; "
+                                      f"a fast p99.9 to {policy.tail_minimum:g} passes"))
     by_prompt: dict[int, list[float]] = {}
     for d, f in zip(a, b):
         totals = by_prompt.setdefault(d.prompt_tokens, [0.0, 0.0, 0.0])

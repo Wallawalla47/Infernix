@@ -165,6 +165,9 @@ struct MoeExpertSource {
     // stored without activation scales (§16.2.1; scales then hold the multipliers in alpha_*). The
     // CPU channel's service must compute with the same arithmetic.
     offloaded_moe::ExpertActivation activation = offloaded_moe::ExpertActivation::kA4;
+    // W4A16 experts' wide route: exact (default) or the two-term A4 fast path (design §19.3.23); the
+    // workspace must be sized for the same choice. Narrow routes and W4A4 experts ignore it.
+    offloaded_moe::WideA16 wide_a16 = offloaded_moe::WideA16::kExact;
     std::uint8_t* staging_base  = nullptr;
     std::int32_t staging_slots  = 0;
     MoeCpuChannel cpu;
@@ -206,7 +209,8 @@ struct MoeExpertSource {
 /// Workspace of one moe_experts call of `columns` (T) columns and `entries` (k*T) routed entries
 /// with the layer's expert arithmetic.
 [[nodiscard]] std::size_t moe_experts_workspace_bytes(std::int32_t max_jobs, std::int32_t entries, std::int32_t columns,
-                                                      offloaded_moe::ExpertActivation activation);
+                                                      offloaded_moe::ExpertActivation activation,
+                                                      offloaded_moe::WideA16 wide_a16 = offloaded_moe::WideA16::kExact);
 
 /// x: BF16 [H, T]. outputs: BF16 [H, k*T], column t*k + slot receives expert ids[slot, t]'s
 /// output for column t. max_jobs bounds the job count the grid covers (min(E, k*T)).

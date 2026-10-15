@@ -9566,7 +9566,7 @@ KV format the same day; model-quality.md 6.7):
   - Error: 0.78 of the A16 criterion.
   - Admitted per shape where it is faster: [16384, 2560] from T = 17, [13312, 2560] from 97,
     [2560, 6144] and [2560, 640] from 513, [1280, 2560] from 1,025.
-  - No recipe-C artifact was gated.
+  - Gated on the recipe C artifact on 2026-10-15 (beside three-term `expert-a4-residual`, §19.3.23): prefill passes on every format but BF16, the INT8 decode gate fails its tail (p99.9 KL ratio 1.35 against 1.25); not qualified.
 
 ### 19.3.23 Ideas from sergqwer/strata-nvfp4 (2026-10-14)
 
@@ -9635,33 +9635,66 @@ exactly in int64 (P x V unchanged); it passed `test_qsa` at both limb counts. At
 2,153 / 2,164 / 2,307 µs on FP16 against 2,422 / 2,446 / 2,597 (+12.5-13.1 %) with 2 limbs and
 2,590 / 2,620 / 2,796 (+20-21 %) with 3; at 512 columns +11-14 % and +18-23 %. Not kept.
 
-**Two-term A4 for W4A16 experts (fast path `expert-a4-residual`): built, failed the prefill gate,
-not merged.**
+**Two-term A4 for W4A16 experts (fast path `expert-a4-residual`): adopted.**
 Weight-only exports (recipe C, §16.2.1) run their wide expert calls on the exact limb route, two
 integer MMAs per 16-element block, which costs what a BF16 GEMM would. The fast path takes each x
 row (per token) and h row (per entry) as the A4 residual profile of two NVFP4 terms
 (`quantize_nvfp4_terms_k16`, the dense residual route's codec, re-paired into the wide plane's code
-order) with an FP32 row scale amax / (6 · 448), and runs both terms through the grouped
-mxf4nvf4 kernel into one accumulator (two stages, both terms' A tiles per stage; the epilogues
-multiply by the row scale). `test_offloaded_moe_wide` against the exact arithmetic: mean relative
-L2 0.31-0.41 % per case, worst entry 2.0 % (criteria 1.56 % / 6.25 %); placement-invariant; an Inf
-column gives NaN. `infernix_offloaded_moe_wide_bench`, whole expert call, frames: 256 / 1,024 /
-4,096 columns 3,415 / 4,254 / 5,365 µs exact against 3,105 / 2,760 / 2,029 (−9 / −35 / −62 %; the
-W4A4 route 2,324 / 2,275 / 1,564). End to end on the recipe C artifact (orcarouter Uncensored,
-converted 2026-10-14, verified), INT8 KV, chunk 4,096, ABBA: pp4096 1,631 → 1,637 tok/s (level),
-pp16384 6,175 → 6,380 (+3.3 %), pp32768 6,620 → 8,803 (+33 %), pp65536 6,730 → 9,067 (+35 %). Short
-prompts are bound by the walk's expert stream over the x8 link; from 32K the GEMMs are.
+order) with an FP32 row scale amax / (6 · 448), and runs both terms through the grouped mxf4nvf4
+kernel into one accumulator (two stages of 39 KB holding both terms' A tiles, two CTAs per SM; the
+epilogues multiply by the row scale). Two terms failed the gate first, three passed, and two passed
+once the acceptance policy gained its absolute floor (model-quality.md 6.3); the record follows.
 
-The prefill gate (model-quality.md section 6; `fast_path_gate prefill --quick --kv int8`, chunks
-896 / 1,792 / 3,584 / 7,168, against the artifact's 16-bit-activation BF16-KV reference, 2026-10-15,
-on main 4f0bb18f) failed on mean KL: the exact route's floor is 6.107e-3, the fast route 6.902e-3,
-an excess of 7.95e-4 (95 % bound 8.92e-4) against a budget of 6.11e-4 (10 % of the floor). The
-other criteria passed: top-1 disagreement excess 1.89e-3 (budget 2.75e-3), corpus NLL excess
-−1.7e-4 (perplexity ratio 0.99983), p99.9 KL ratio 1.07 (budget 1.25), and every context band. The
-decode gate was not run. The path therefore stays off main; its implementation (kernels, workspace
-route, registry entry, op test and bench mode) is kept on the branch `expert-a4-residual-unqualified`.
-The untried remedy is a third activation term, which adds half again the FP4 MMA work of the
-two-term route.
+*Two terms first (2026-10-14/15).* `test_offloaded_moe_wide` against the exact arithmetic: mean
+relative L2 0.31-0.41 % per case, worst entry 2.0 %. End to end on the recipe C artifact
+(orcarouter Uncensored, converted 2026-10-14, verified), INT8 KV, chunk 4,096, ABBA: pp4096 1,631 →
+1,637 tok/s (level), pp16384 6,175 → 6,380 (+3.3 %), pp32768 6,620 → 8,803 (+33 %), pp65536 6,730 →
+9,067 (+35 %); short prompts are bound by the walk's expert stream over the x8 link, from 32K the
+GEMMs are. The prefill gate (`fast_path_gate prefill --quick --kv int8`, chunks 896 / 1,792 / 3,584 /
+7,168, on main 4f0bb18f) failed on mean KL only: floor 6.107e-3, excess 7.95e-4 (95 % bound 8.92e-4)
+against a budget of 6.11e-4; top-1, NLL (perplexity ratio 0.99983), p99.9 and every context band
+passed.
+
+*Term counts (2026-10-15, main 95a43dae).* Each side was screened at two and three terms (prefill
+gate at chunk 3,584 on INT8 KV, the reference and exact run shared; a choice rule fixed before the
+screens: the fastest variant whose KL bound is at most 0.7 of the budget, else the lowest ratio
+within budget). KL excess 95 % bound / budget and the whole expert call at 4,096 columns
+(`infernix_offloaded_moe_wide_bench`, frames; exact 5,370 µs):
+
+| x terms + h terms | KL bound / budget | Expert call |
+|---|---:|---:|
+| 2 + 2 | 1.47 | 2,035 µs (−62 %) |
+| 2 + 3 | 1.23 | 2,256 µs (−58 %) |
+| 3 + 2 | 1.04 | 2,434 µs (−55 %) |
+| 3 + 3 | 0.82 | 2,634 µs (−51 %) |
+
+The x terms carry more of the error than h's. Three terms on both sides was the only variant within
+budget (none within the 0.7 margin). Its op test: mean relative L2 0.09-0.10 % per case, worst entry
+0.98 % (the test's bounds 2^-9 and 2^-6 reject two terms' means). The third term cuts the error
+~4x rather than the ~6x a term could; probably (not measured) because the third term's block
+scales, for small blocks in rows with large outliers, fall into E4M3's subnormal range.
+
+*Three terms, gated (the user-approved reduced protocol: prefill at chunks 896 and 7,168, the MTP
+decode gate at concurrency 2 over 256 segments with its own reference).* INT8 KV: prefill PASS, KL
+excess 3.10e-4 (95 % bound 4.24e-4, 0.69 of the 6.11e-4 budget), top-1 excess 1.04e-3 (bound
+1.46e-3 of 2.75e-3), perplexity ratio 0.99942, p99.9 KL ratio 0.99; decode PASS, TV excess 4.7e-4
+(bound 8.6e-4 of 3.61e-3), top-1 excess 6.7e-4 (bound 2.95e-3 of 3.31e-3, the closest), every prompt
+length. End to end on INT8 KV, chunk 4,096, ABBA (A B B A, `infernix_bench -r 2`): pp32768 6,604 →
+8,302 tok/s (+25.7 %), pp65536 6,716 → 8,523 (+26.9 %); runs within 0.3 % of their pair; peak
+workspace 287 → 321 MiB. The other KV formats' prefill gates: FP8, K8V4, NVFP4, K4V2 and VQ2 pass
+and are registered with INT8's decode (model-quality.md 6.1, step 3); BF16 fails by construction,
+since recipe C's exact route with BF16 KV is the reference itself (floor 0, so the minimum budgets).
+
+*Two terms under the absolute floor (2026-10-15, the same protocol).* With BF16 KV's floor of 0 the
+policy gained absolute budget minimums (KL 1e-3, top-1 0.5 points, decode TV 4e-3); re-scored
+under them, every term-count screen passes (2 + 2 at 0.90 of its budget). Two terms were then
+gated on what they had never run: prefill on the seven formats, INT8 KL excess 7.82e-4 (bound
+9.07e-4 of 1.0e-3), FP8, K8V4, NVFP4, K4V2 and VQ2 passing, BF16 failing (KL 6.8e-3, the floor's
+budgets being the absolute minimum); INT8 decode TV bound 1.37e-3 of 4.0e-3, top-1 bound 4.41e-3 of
+5.0e-3, p99.9 KL ratio 1.09. Two terms replaced three: +33-35 % at 32K-64K against +26-27 %, with
+the larger error inside the policy. The gates ran with the screen build's term-count switch at two
+(x and h); the committed build fixes two terms (kResidualTerms) and its op bench output hashes
+match that build's.
 
 **The prefill hyper-connection up projection fused with its collapse: adopted (bit-exact).** For
 Q8_G32_FP16 W_up and more than 96 columns, one Q8 MMA tile computes 16 features x 4 streams of u

@@ -50,6 +50,7 @@ struct FastPathConfiguration {
     case FastPath::QsaPrepareFused:
     case FastPath::Fp8A8Pair:
     case FastPath::Q4W4A8: return false;
+    case FastPath::ExpertA4Residual:
     case FastPath::BatchedDecode:
     case FastPath::BatchedA8Decode:
     case FastPath::BatchedA4Decode:

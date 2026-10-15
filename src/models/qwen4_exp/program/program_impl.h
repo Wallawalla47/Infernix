@@ -608,6 +608,12 @@ public:
         return static_cast<std::size_t>(std::count(need.begin(), need.end(), std::uint8_t{1})) * kKvChunkBytes;
     }
 
+    // W4A16 experts' wide route under these options (the expert-a4-residual fast path).
+    static ops::offloaded_moe::WideA16 wide_a16(const ProgramOptions& o) noexcept {
+        return o.fast_paths.expert_a4_residual ? ops::offloaded_moe::WideA16::kA4Residual
+                                               : ops::offloaded_moe::WideA16::kExact;
+    }
+
     // The workspace arena of a Program with `lanes` lanes and the plan's widths: the forward at its
     // widest call (a prefill chunk or every lane's widest round), sampling, acceptance and the
     // drafter. The plan sizes the arena with the Program's lane count; the per-lane report compares
@@ -616,7 +622,8 @@ public:
                                        std::int32_t lanes, std::int32_t columns) {
         const std::int32_t W = d.max_width;
         std::size_t bytes =
-            execution::Forward::workspace_bytes(c, std::max(columns, lanes * W), dim(o.max_context), o.kv_cache) +
+            execution::Forward::workspace_bytes(c, std::max(columns, lanes * W), dim(o.max_context), o.kv_cache,
+                                                wide_a16(o)) +
             ops::sampling_workspace_capacity_bytes(d.token_domain, 1, lanes);
         if (W > 1) {
             bytes += ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(d.token_domain, 1, W - 1, 1, lanes);

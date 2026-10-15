@@ -1721,8 +1721,8 @@ void moe_route_dispatch(const Tensor& logits, std::int32_t top_k, MoeRouting& ro
 }
 
 std::size_t moe_experts_workspace_bytes(std::int32_t max_jobs, std::int32_t entries, std::int32_t columns,
-                                        moe::ExpertActivation activation) {
-    return moe::wide::experts_workspace_bytes(max_jobs, entries, columns, activation);
+                                        moe::ExpertActivation activation, moe::WideA16 wide_a16) {
+    return moe::wide::experts_workspace_bytes(max_jobs, entries, columns, activation, wide_a16);
 }
 
 namespace {
@@ -1734,7 +1734,7 @@ static_assert(kFetchCallOffset + sizeof(FetchCall) <= moe::wide::kCpuCallBytes,
 // The CPU bookkeeping of a call in its workspace.
 CpuCall* cpu_call_of(void* workspace, const Tensor& x, const MoeExpertSource& source, std::int32_t max_jobs,
                      std::int32_t entries, std::int32_t** flags) {
-    const auto layout = moe::wide::carve_experts_workspace(workspace, max_jobs, entries, x.ne[1], source.activation);
+    const auto layout = moe::wide::carve_experts_workspace(workspace, max_jobs, entries, x.ne[1], source.activation, source.wide_a16);
     if (flags != nullptr) { *flags = layout.cpu_flags; }
     return static_cast<CpuCall*>(layout.cpu_call);
 }
@@ -1742,7 +1742,7 @@ CpuCall* cpu_call_of(void* workspace, const Tensor& x, const MoeExpertSource& so
 // The fetch bookkeeping of a call in its workspace, after the CPU's.
 FetchCall* fetch_call_of(void* workspace, const Tensor& x, const MoeExpertSource& source, std::int32_t max_jobs,
                          std::int32_t entries) {
-    const auto layout = moe::wide::carve_experts_workspace(workspace, max_jobs, entries, x.ne[1], source.activation);
+    const auto layout = moe::wide::carve_experts_workspace(workspace, max_jobs, entries, x.ne[1], source.activation, source.wide_a16);
     return reinterpret_cast<FetchCall*>(static_cast<std::byte*>(layout.cpu_call) + kFetchCallOffset);
 }
 
@@ -1831,7 +1831,7 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
                 (source.landing_slots == 0 || (source.landing != nullptr && source.landed != nullptr)),
             "experts landing is incomplete");
     require(source.prefetched == nullptr || source.prefetch_base != nullptr, "experts prefetch table without its base");
-    const auto layout  = moe::wide::carve_experts_workspace(workspace, max_jobs, outputs.ne[1], x.ne[1], source.activation);
+    const auto layout  = moe::wide::carve_experts_workspace(workspace, max_jobs, outputs.ne[1], x.ne[1], source.activation, source.wide_a16);
     auto** job_records = layout.job_records;
     std::int32_t* cpu_flags = nullptr;
     CpuCall* cpu_call       = cpu_call_of(workspace, x, source, max_jobs, outputs.ne[1], &cpu_flags);

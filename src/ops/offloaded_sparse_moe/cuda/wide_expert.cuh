@@ -31,12 +31,21 @@
 
 namespace infernix::ops::offloaded_moe::wide {
 
-// The activation planes of one call: A4(x) for the gate/up GEMM and A4(h) for the down GEMM.
+// The activation planes of one call: A4(x) for the gate/up GEMM and A4(h) for the down GEMM, and with
+// two-term A4 (W4A16 fast path) the later terms' planes.
 struct alignas(128) Descriptors {
     CUtensorMap x_codes;
     CUtensorMap x_scales;
     CUtensorMap h_codes;
     CUtensorMap h_scales;
+    CUtensorMap x2_codes;
+    CUtensorMap x2_scales;
+    CUtensorMap h2_codes;
+    CUtensorMap h2_scales;
+    CUtensorMap x3_codes;
+    CUtensorMap x3_scales;
+    CUtensorMap h3_codes;
+    CUtensorMap h3_scales;
 };
 
 enum class Matrix { GateUp, Down };
@@ -64,6 +73,7 @@ struct MatrixShape<Matrix::Down> {
 // 256-token tiles (fixed by its tiled scale layout) would mostly compute padding. Eight consumer
 // warps tile it 2 (columns) x 4 (rows); a warp's 32 rows are one 16-intermediate block of h.
 struct Schedule {
+    static constexpr int kTerms            = 1;            // A4 activation terms per element
     static constexpr int kBlockTokens      = kTileColumns; // 64
     static constexpr int kBlockRows        = 128;
     static constexpr int kRowGroups        = kBlockRows / 16; // 8
@@ -91,10 +101,19 @@ struct Schedule {
     static_assert(kUnitRunBytes % 16 == 0, "bulk copies move multiples of 16 bytes");
 };
 
+// Two-term A4 (W4A16 fast path): each stage holds both terms' activation tiles beside one weight
+// tile, and two stages (39 KB) keep two CTAs per SM.
+struct ScheduleResidual : Schedule {
+    static constexpr int kTerms  = kResidualTerms;
+    static constexpr int kStages = 2;
+    static constexpr std::uint32_t kStageBytes =
+        kTerms * (kBlockTokens * kCodeRowBytes + kBlockTokens * kScaleWordsPerRow * 4) + kRowGroups * kUnitRunBytes;
+};
+
 template <class S>
 struct Storage {
-    alignas(1024) std::uint8_t a_codes[S::kStages][S::kBlockTokens * S::kCodeRowBytes];
-    alignas(128) std::uint32_t a_scales[S::kStages][S::kBlockTokens * S::kScaleWordsPerRow];
+    alignas(1024) std::uint8_t a_codes[S::kStages][S::kTerms][S::kBlockTokens * S::kCodeRowBytes];
+    alignas(128) std::uint32_t a_scales[S::kStages][S::kTerms][S::kBlockTokens * S::kScaleWordsPerRow];
     alignas(128) std::uint8_t b_units[S::kStages][S::kRowGroups * S::kUnitRunBytes];
     alignas(8) std::uint64_t full[S::kStages];
     alignas(8) std::uint64_t empty[S::kStages];
@@ -166,8 +185,8 @@ __device__ __forceinline__ void rg16_fragments(const std::uint8_t* units, int gr
     scale_hi = __byte_perm(__byte_perm(t0, t2, select), __byte_perm(t1, t3, select), 0x5410);
 }
 
-template <Matrix M, class Epilogue>
-__global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void grouped_kernel(
+template <Matrix M, class Epilogue, class S = Schedule>
+__global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void grouped_kernel(
 #ifdef _WIN32
     // As in nvfp4_a4_tma_kernel: MSVC cannot pass the over-aligned descriptors by value.
     const Descriptors* descriptors_pointer,
@@ -178,13 +197,16 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
 #ifdef _WIN32
     const Descriptors& descriptors = *descriptors_pointer;
 #endif
-    using S                    = Schedule;
     using Shape                = MatrixShape<M>;
     constexpr int kRowBlocks   = Shape::kRowGroups / S::kRowGroups;
     constexpr int kKTiles      = Shape::kBlocks / S::kUnitsPerKTile;
     static_assert(Shape::kRowGroups % S::kRowGroups == 0 && Shape::kBlocks % S::kUnitsPerKTile == 0);
-    const CUtensorMap* codes_map  = M == Matrix::GateUp ? &descriptors.x_codes : &descriptors.h_codes;
-    const CUtensorMap* scales_map = M == Matrix::GateUp ? &descriptors.x_scales : &descriptors.h_scales;
+    const CUtensorMap* codes_map[3]  = {M == Matrix::GateUp ? &descriptors.x_codes : &descriptors.h_codes,
+                                        M == Matrix::GateUp ? &descriptors.x2_codes : &descriptors.h2_codes,
+                                        M == Matrix::GateUp ? &descriptors.x3_codes : &descriptors.h3_codes};
+    const CUtensorMap* scales_map[3] = {M == Matrix::GateUp ? &descriptors.x_scales : &descriptors.h_scales,
+                                        M == Matrix::GateUp ? &descriptors.x2_scales : &descriptors.h2_scales,
+                                        M == Matrix::GateUp ? &descriptors.x3_scales : &descriptors.h3_scales};
 
     extern __shared__ __align__(1024) unsigned char shared_bytes[];
     auto& shared = *reinterpret_cast<Storage<S>*>(shared_bytes);
@@ -205,8 +227,11 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     if (threadIdx.x < S::kProducerThreads) {
         if (threadIdx.x == 0) {
 #ifdef _WIN32
-            acquire_staged_tensor_map(codes_map);
-            acquire_staged_tensor_map(scales_map);
+#pragma unroll
+            for (int term = 0; term < S::kTerms; ++term) {
+                acquire_staged_tensor_map(codes_map[term]);
+                acquire_staged_tensor_map(scales_map[term]);
+            }
 #endif
             int it = 0;
 #pragma unroll 1
@@ -222,11 +247,14 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
                     const int stage = it % S::kStages;
                     cta_mbarrier_wait(&shared.empty[stage], 1U ^ ((static_cast<unsigned>(it) / S::kStages) & 1U));
                     cta_mbarrier_arrive_expect_tx(&shared.full[stage], S::kStageBytes);
-                    detail::nvfp4_tma_load_2d(shared.a_codes[stage], codes_map, k_tile * S::kCodeRowBytes, row,
-                                              &shared.full[stage]);
-                    // A 16-byte scale box covers two K tiles; each tile loads its own copy.
-                    detail::nvfp4_tma_load_2d(shared.a_scales[stage], scales_map, (k_tile / 2) * 16, row,
-                                              &shared.full[stage]);
+#pragma unroll
+                    for (int term = 0; term < S::kTerms; ++term) {
+                        detail::nvfp4_tma_load_2d(shared.a_codes[stage][term], codes_map[term],
+                                                  k_tile * S::kCodeRowBytes, row, &shared.full[stage]);
+                        // A 16-byte scale box covers two K tiles; each tile loads its own copy.
+                        detail::nvfp4_tma_load_2d(shared.a_scales[stage][term], scales_map[term], (k_tile / 2) * 16,
+                                                  row, &shared.full[stage]);
+                    }
 #pragma unroll
                     for (int g = 0; g < S::kRowGroups; ++g) {
                         bulk_load(shared.b_units[stage] + g * S::kUnitRunBytes,
@@ -272,19 +300,22 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
             cta_mbarrier_wait(&shared.full[stage], (static_cast<unsigned>(it) / S::kStages) & 1U);
 #pragma unroll
             for (int local_k64 = 0; local_k64 < S::kK64PerStage; ++local_k64) {
-                unsigned a_fragments[S::kMmaTokens][4];
-                unsigned a_scales[S::kMmaTokens];
+                unsigned a_fragments[S::kTerms][S::kMmaTokens][4];
+                unsigned a_scales[S::kTerms][S::kMmaTokens];
 #pragma unroll
-                for (int mma_m = 0; mma_m < S::kMmaTokens; ++mma_m) {
-                    const int row          = ctx.warp_m * S::kWarpTokens + mma_m * 16 + a_row_offset;
-                    const int logical_byte = local_k64 * 32 + a_column_byte;
-                    const int physical_byte = ((logical_byte >> 4) ^ ((row >> 1) & 3)) * 16 + (logical_byte & 15);
-                    ldmatrix_x4(a_fragments[mma_m][0], a_fragments[mma_m][1], a_fragments[mma_m][2],
-                                a_fragments[mma_m][3],
-                                smem_addr(shared.a_codes[stage] + row * S::kCodeRowBytes + physical_byte));
-                    const int scale_row = ctx.warp_m * S::kWarpTokens + mma_m * 16 + sfa_row;
-                    a_scales[mma_m] = shared.a_scales[stage][scale_row * S::kScaleWordsPerRow + (k_tile & 1) * 2 +
-                                                             local_k64];
+                for (int term = 0; term < S::kTerms; ++term) {
+#pragma unroll
+                    for (int mma_m = 0; mma_m < S::kMmaTokens; ++mma_m) {
+                        const int row          = ctx.warp_m * S::kWarpTokens + mma_m * 16 + a_row_offset;
+                        const int logical_byte = local_k64 * 32 + a_column_byte;
+                        const int physical_byte = ((logical_byte >> 4) ^ ((row >> 1) & 3)) * 16 + (logical_byte & 15);
+                        ldmatrix_x4(a_fragments[term][mma_m][0], a_fragments[term][mma_m][1], a_fragments[term][mma_m][2],
+                                    a_fragments[term][mma_m][3],
+                                    smem_addr(shared.a_codes[stage][term] + row * S::kCodeRowBytes + physical_byte));
+                        const int scale_row = ctx.warp_m * S::kWarpTokens + mma_m * 16 + sfa_row;
+                        a_scales[term][mma_m] = shared.a_scales[stage][term][scale_row * S::kScaleWordsPerRow +
+                                                                             (k_tile & 1) * 2 + local_k64];
+                    }
                 }
                 unsigned b_fragments[S::kMmaRows][2];
                 unsigned b_scales[S::kMmaRows];
@@ -296,13 +327,16 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
                                    b_scales[2 * g], b_scales[2 * g + 1]);
                 }
 #pragma unroll
-                for (int mma_m = 0; mma_m < S::kMmaTokens; ++mma_m) {
+                for (int term = 0; term < S::kTerms; ++term) {
 #pragma unroll
-                    for (int r = 0; r < S::kMmaRows; ++r) {
-                        mma_nvfp4_e4m3(acc[mma_m][r][0], acc[mma_m][r][1], acc[mma_m][r][2], acc[mma_m][r][3],
-                                       a_fragments[mma_m][0], a_fragments[mma_m][1], a_fragments[mma_m][2],
-                                       a_fragments[mma_m][3], b_fragments[r][0], b_fragments[r][1],
-                                       a_scales[mma_m], b_scales[r]);
+                    for (int mma_m = 0; mma_m < S::kMmaTokens; ++mma_m) {
+#pragma unroll
+                        for (int r = 0; r < S::kMmaRows; ++r) {
+                            mma_nvfp4_e4m3(acc[mma_m][r][0], acc[mma_m][r][1], acc[mma_m][r][2], acc[mma_m][r][3],
+                                           a_fragments[term][mma_m][0], a_fragments[term][mma_m][1],
+                                           a_fragments[term][mma_m][2], a_fragments[term][mma_m][3], b_fragments[r][0],
+                                           b_fragments[r][1], a_scales[term][mma_m], b_scales[r]);
+                        }
                     }
                 }
             }
@@ -402,16 +436,81 @@ struct DownEpilogue {
     }
 };
 
+// Two-term A4 (W4A16 fast path): the accumulators are in units of the row scale, so the gate/up
+// outputs are bf16_rn(acc * row_scale(token) * alpha), h = swiglu_bf16(gate, up) is written as the
+// entry's BF16 h row (the A16 h_rows layout), and its terms are formed by a separate pass.
+struct GateUpEpilogueResidual {
+    const ExpertScales* scales;
+    const std::int32_t* entries;
+    const float* x_row_scale; // per token
+    std::uint8_t* h_rows;
+    int top_k;
+
+    __device__ __forceinline__ void operator()(Accumulators& acc, const TileContext& ctx) const {
+        using S               = Schedule;
+        const ExpertScales sc = scales[ctx.expert];
+#pragma unroll
+        for (int m = 0; m < S::kMmaTokens; ++m) {
+#pragma unroll
+            for (int half = 0; half < 2; ++half) {
+                const int column = ctx.warp_m * S::kWarpTokens + m * 16 + ctx.group + 8 * half;
+                if (column >= ctx.columns) { continue; }
+                const int entry = ctx.first + column;
+                const float rs  = x_row_scale[entries[entry] / top_k];
+                auto* h = reinterpret_cast<std::uint16_t*>(h_rows + static_cast<std::size_t>(entry) * kA16HRowBytes);
+#pragma unroll
+                for (int r = 0; r < S::kMmaRows; ++r) {
+                    const std::uint16_t gate =
+                        canon::f32_to_bf16_rn(canon::mul_rn(canon::mul_rn(acc[m][r][2 * half], rs), sc.alpha_gate));
+                    const std::uint16_t up =
+                        canon::f32_to_bf16_rn(canon::mul_rn(canon::mul_rn(acc[m][r][2 * half + 1], rs), sc.alpha_up));
+                    h[(ctx.row_block * S::kBlockRows + tile_row(ctx.warp_n, r, ctx.tig)) / 2] = canon::swiglu_bf16(gate, up);
+                }
+            }
+        }
+    }
+};
+
+// y = bf16_rn(acc * row_scale(entry's h) * alpha_down) into the entry's output column.
+struct DownEpilogueResidual {
+    const ExpertScales* scales;
+    const std::int32_t* entries;
+    const float* h_row_scale; // per entry
+    std::uint16_t* outputs;
+
+    __device__ __forceinline__ void operator()(Accumulators& acc, const TileContext& ctx) const {
+        using S           = Schedule;
+        const float alpha = scales[ctx.expert].alpha_down;
+#pragma unroll
+        for (int m = 0; m < S::kMmaTokens; ++m) {
+#pragma unroll
+            for (int half = 0; half < 2; ++half) {
+                const int column = ctx.warp_m * S::kWarpTokens + m * 16 + ctx.group + 8 * half;
+                if (column >= ctx.columns) { continue; }
+                const float rs     = h_row_scale[ctx.first + column];
+                std::uint16_t* out = outputs + static_cast<std::size_t>(entries[ctx.first + column]) * kHidden +
+                                     ctx.row_block * S::kBlockRows;
+#pragma unroll
+                for (int r = 0; r < S::kMmaRows; ++r) {
+                    const std::uint32_t y0 = canon::f32_to_bf16_rn(canon::mul_rn(canon::mul_rn(acc[m][r][2 * half], rs), alpha));
+                    const std::uint32_t y1 =
+                        canon::f32_to_bf16_rn(canon::mul_rn(canon::mul_rn(acc[m][r][2 * half + 1], rs), alpha));
+                    *reinterpret_cast<std::uint32_t*>(out + tile_row(ctx.warp_n, r, ctx.tig)) = y0 | (y1 << 16);
+                }
+            }
+        }
+    }
+};
+
 // ------------------------------------------------------------------------------------ launching
 
 [[nodiscard]] int persistent_ctas();
 
-template <Matrix M, class Epilogue>
+template <Matrix M, class S = Schedule, class Epilogue>
 void launch(const Call& call, std::int32_t pass, const Epilogue& epilogue, cudaStream_t stream) {
-    using S             = Schedule;
     constexpr int bytes = static_cast<int>(sizeof(Storage<S>));
     // Static: MSVC 2022 rejects the lambda's use of an automatic constexpr local (C2326).
-    static constexpr auto kernel = grouped_kernel<M, Epilogue>;
+    static constexpr auto kernel = grouped_kernel<M, Epilogue, S>;
     static const bool configured = [] {
         CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
                                         cudaSharedmemCarveoutMaxShared));

@@ -44,7 +44,8 @@ def make_prefill(root: Path, *, windows: int, floor: float, excess: float, noise
                  top1_floor: float = 0.04, top1_excess: float = 0.0,
                  nll_excess: float | None = None, chunks: tuple[int, ...] = (896, 3584),
                  tail_ratio: float = 1.0, alternating: float = 0.0, coverage: float = 0.95,
-                 fast_flag: bool = True, fast_chunk: int = 0, seed: int = 1) -> Path:
+                 fast_flag: bool = True, fast_chunk: int = 0, seed: int = 1,
+                 default_p999: float = 1.0) -> Path:
     """Synthetic default and fast runs: the fast route's KL and NLL move by excess per position
     (NLL by nll_excess when given), plus per-window noise."""
     rng = random.Random(seed)
@@ -61,7 +62,7 @@ def make_prefill(root: Path, *, windows: int, floor: float, excess: float, noise
             fast.append(window(7168, base + excess + shift, 1.0 - top1_floor - top1_excess,
                                nll + 7168 * (nll_excess + shift)))
         write_report(root / f"default-c{chunk}", chunk=chunk, fast=False, windows=default,
-                     p999=1.0, coverage=coverage)
+                     p999=default_p999, coverage=coverage)
         write_report(root / f"fast-c{chunk}", chunk=fast_chunk or chunk, fast=fast_flag, windows=fast,
                      p999=tail_ratio, coverage=coverage)
     return root
@@ -115,13 +116,30 @@ def test_the_kl_budget_is_a_tenth_of_the_default_floor(tmp_path):
 
 
 def test_the_budget_scales_with_the_artifacts_floor(tmp_path):
-    # The same absolute excess passes a 4-bit-like floor and fails an 8-bit-like one.
+    # The same absolute excess, above the absolute floor, passes a 4-bit-like floor and fails an
+    # 8-bit-like one.
     low_bit = gate.evaluate_prefill(
-        make_prefill(tmp_path / "a", windows=60, floor=0.03, excess=0.001, noise=1e-5))
+        make_prefill(tmp_path / "a", windows=60, floor=0.03, excess=0.002, noise=1e-5))
     high_bit = gate.evaluate_prefill(
-        make_prefill(tmp_path / "b", windows=60, floor=0.002, excess=0.001, noise=1e-5))
+        make_prefill(tmp_path / "b", windows=60, floor=0.015, excess=0.002, noise=1e-5))
     assert criterion(low_bit, "mean KL excess").passed
     assert not criterion(high_bit, "mean KL excess").passed
+
+
+def test_an_excess_below_the_absolute_floor_always_passes(tmp_path):
+    # A configuration whose exact route is the reference (floor 0): a tenth of nothing would admit
+    # nothing, so the absolute floor sets every budget.
+    small = gate.evaluate_prefill(
+        make_prefill(tmp_path / "a", windows=40, floor=0.0, excess=5e-4, noise=0.0, top1_floor=0.0,
+                     top1_excess=0.004, default_p999=0.0, tail_ratio=0.03))
+    assert small.passed
+    assert criterion(small, "mean KL excess").budget == gate.POLICY.kl_budget_minimum
+    assert criterion(small, "p99.9 KL ratio").estimate == math.inf
+    large = gate.evaluate_prefill(
+        make_prefill(tmp_path / "b", windows=40, floor=0.0, excess=2e-3, noise=0.0, top1_floor=0.0,
+                     default_p999=0.0, tail_ratio=0.2))
+    assert not criterion(large, "mean KL excess").passed
+    assert not criterion(large, "p99.9 KL ratio").passed
 
 
 def test_budgets_are_clamped(tmp_path):
@@ -300,7 +318,8 @@ def test_teacher_forced_decode_measures_the_distribution_against_the_reference(t
     assert tv.budget == pytest.approx(gate.clamp(0.1 * floor_tv, gate.POLICY.tv_budget_minimum,
                                                  gate.POLICY.tv_budget_maximum))
     # KL is a gross cap on its point estimate, like NLL.
-    assert criterion(verdict, "decode mean KL excess").budget == pytest.approx(0.25 * floor_kl)
+    assert criterion(verdict, "decode mean KL excess").budget == pytest.approx(
+        max(0.25 * floor_kl, gate.POLICY.kl_budget_minimum))
     assert {c.name for c in verdict.criteria} >= {
         "decode top-1 disagreement excess", "decode NLL excess", "decode p99.9 KL ratio",
         "prompt 512 decode TV excess", "prompt 8192 decode TV excess"}

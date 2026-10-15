@@ -485,7 +485,8 @@ void test_layer(const char* name, int experts, int columns, int top_k, const std
                                             .scales        = d_scales,
                                             .staging_base  = d_staging,
                                             .staging_slots = 64};
-        const auto layout = wide::carve_experts_workspace(d_workspace, max_jobs, entries, columns, moe::ExpertActivation::kA4);
+        const auto layout = wide::carve_experts_workspace(d_workspace, max_jobs, entries, columns, moe::ExpertActivation::kA4,
+                                                          moe::WideA16::kExact);
         Tensor tx(d_x, DType::BF16, {moe::kHidden, columns});
         Tensor out(d_out, DType::BF16, {moe::kHidden, entries});
         const wide::Call call = wide::prepare(tx, dispatch, source, top_k, max_jobs, max_jobs, layout, out, nullptr);
@@ -629,9 +630,17 @@ void test_layer(const char* name, int experts, int columns, int top_k, const std
 //       `nonfinite` set holds an Inf, so its outputs are the canonical NaN on every route.
 //   A2  Placement invariance: outputs bit-identical for every staging layout, the fork stream,
 //       zero-copy records and a rerun.
+// With `a4_residual` the wide experts take the two-term A4 fast path (design §19.3.23):
+//   X1  Narrow entries as A1. Each wide entry against the exact canonical arithmetic (the CPU engine):
+//       relative L2 error <= 2^-5, and the mean over the wide entries <= 2^-7. Two terms measured
+//       means of 0.31-0.41 % and a worst entry of 2.0 %; one 4-bit term misses by several percent
+//       and a layout or scale error by ~100 %, which both bounds reject. A non-finite column's
+//       outputs are the canonical NaN.
+//   A2  as above (the route depends on the data and the column count only).
 void test_layer_a16(const char* name, int experts, int columns, int top_k, const std::vector<double>& weight,
-                    std::uint32_t seed, bool nonfinite = false) {
-    std::printf("== W4A16 %s: E=%d T=%d k=%d\n", name, experts, columns, top_k);
+                    std::uint32_t seed, bool nonfinite = false, bool a4_residual = false) {
+    std::printf("== W4A16%s %s: E=%d T=%d k=%d\n", a4_residual ? " two-term" : "", name, experts, columns, top_k);
+    const moe::WideA16 route = a4_residual ? moe::WideA16::kA4Residual : moe::WideA16::kExact;
     std::mt19937 rng(seed);
     const std::size_t stride = moe::kRecordBytes;
     std::vector<fixtures::Expert> bank;
@@ -693,7 +702,9 @@ void test_layer_a16(const char* name, int experts, int columns, int top_k, const
     std::uint8_t* d_staging = nullptr;
     cuda_check(cudaMalloc(&d_staging, stride * 64), "cudaMalloc");
     void* d_workspace = nullptr;
-    cuda_check(cudaMalloc(&d_workspace, infernix::ops::moe_experts_workspace_bytes(max_jobs, entries, columns, moe::ExpertActivation::kA16)), "cudaMalloc");
+    cuda_check(cudaMalloc(&d_workspace, infernix::ops::moe_experts_workspace_bytes(max_jobs, entries, columns,
+                                                                                 moe::ExpertActivation::kA16, route)),
+               "cudaMalloc");
     std::uint16_t* d_out = nullptr;
     const std::size_t out_elements = static_cast<std::size_t>(moe::kHidden) * entries;
     cuda_check(cudaMalloc(&d_out, out_elements * sizeof(std::uint16_t)), "cudaMalloc");
@@ -720,6 +731,7 @@ void test_layer_a16(const char* name, int experts, int columns, int top_k, const
                                             .record_stride = stride,
                                             .scales        = d_scales,
                                             .activation    = moe::ExpertActivation::kA16,
+                                            .wide_a16      = route,
                                             .staging_base  = config.slots > 0 ? d_staging : nullptr,
                                             .staging_slots = config.slots};
         if (config.overlap) {
@@ -746,9 +758,11 @@ void test_layer_a16(const char* name, int experts, int columns, int top_k, const
         }
     }
 
-    // A1: per entry, the CPU engine.
+    // A1 (X1): per entry, the CPU engine.
     std::vector<long> mismatch(2, 0), checked(2, 0); // [narrow, wide]
     long nan_columns = 0;
+    double worst = 0.0, sum = 0.0;
+    long measured = 0;
     for (int entry = 0; entry < entries; ++entry) {
         const int e = ids[static_cast<std::size_t>(entry)];
         const fixtures::Expert& expert = bank[static_cast<std::size_t>(e)];
@@ -760,14 +774,36 @@ void test_layer_a16(const char* name, int experts, int columns, int top_k, const
             moe::expert_forward_a16(moe::best_cpu_isa(), expert.record.data(), expert.scales, 1, xp, yp);
         }
         const std::uint16_t* got = &first_outputs[static_cast<std::size_t>(entry) * moe::kHidden];
-        const int route = moe::wide_route(counts[static_cast<std::size_t>(e)], scales[static_cast<std::size_t>(e)]) ? 1 : 0;
-        mismatch[static_cast<std::size_t>(route)] += std::memcmp(got, cpu.data(), moe::kHidden * 2) != 0;
-        ++checked[static_cast<std::size_t>(route)];
-        nan_columns += entry / top_k == 0 && cpu[0] == 0x7FC0U;
+        const int wide = moe::wide_route(counts[static_cast<std::size_t>(e)], scales[static_cast<std::size_t>(e)]) ? 1 : 0;
+        mismatch[static_cast<std::size_t>(wide)] += std::memcmp(got, cpu.data(), moe::kHidden * 2) != 0;
+        ++checked[static_cast<std::size_t>(wide)];
+        nan_columns += entry / top_k == 0 && got[0] == 0x7FC0U;
+        if (a4_residual && wide == 1 && !(nonfinite && entry / top_k == 0)) {
+            double err = 0.0, ref = 0.0;
+            for (int i = 0; i < moe::kHidden; ++i) {
+                const double r = canon::bf16_to_f32(cpu[static_cast<std::size_t>(i)]);
+                const double d = canon::bf16_to_f32(got[i]) - r;
+                err += d * d;
+                ref += r * r;
+            }
+            const double rel = ref > 0.0 ? std::sqrt(err / ref) : std::sqrt(err);
+            worst = std::max(worst, rel);
+            sum += rel;
+            ++measured;
+        }
     }
     std::printf("   A1 entries differing from the CPU engine: narrow %ld of %ld, wide %ld of %ld\n", mismatch[0],
                 checked[0], mismatch[1], checked[1]);
-    check(mismatch[0] == 0 && mismatch[1] == 0, "A1: every W4A16 entry equals the CPU engine bit for bit");
+    if (a4_residual) {
+        const double mean = measured > 0 ? sum / static_cast<double>(measured) : 0.0;
+        std::printf("   X1 wide entries' relative L2 against the exact arithmetic: mean %.5f, worst %.5f (%ld entries)\n",
+                    mean, worst, measured);
+        check(mismatch[0] == 0, "X1: every narrow W4A16 entry equals the CPU engine bit for bit");
+        check(worst <= std::ldexp(1.0, -5), "X1: every wide entry within 2^-5 relative L2 of the exact arithmetic");
+        check(mean <= std::ldexp(1.0, -7), "X1: the wide entries' mean relative L2 within 2^-7");
+    } else {
+        check(mismatch[0] == 0 && mismatch[1] == 0, "A1: every W4A16 entry equals the CPU engine bit for bit");
+    }
     if (nonfinite) { check(nan_columns == top_k, "A1: the non-finite column's outputs are the canonical NaN"); }
     for (auto event : events) { cudaEventDestroy(event); }
     cudaStreamDestroy(side);
@@ -815,6 +851,11 @@ int main() {
         test_layer_a16("n = 9", 4, 9, 4, std::vector<double>(4, 1.0), 43);
         test_layer_a16("n = 65", 2, 65, 2, std::vector<double>(2, 1.0), 47, true);
         test_layer_a16("T = 10", 12, 10, 10, std::vector<double>(12, 1.0), 53);
+        // The two-term A4 fast path of the W4A16 wide route (§19.3.23): the same cases.
+        test_layer_a16("prefill mix", 20, 300, 4, popularity, 41, false, true);
+        test_layer_a16("n = 9", 4, 9, 4, std::vector<double>(4, 1.0), 43, false, true);
+        test_layer_a16("n = 65", 2, 65, 2, std::vector<double>(2, 1.0), 47, true, true);
+        test_layer_a16("T = 10", 12, 10, 10, std::vector<double>(12, 1.0), 53, false, true);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL: %s\n", e.what());
         return 1;

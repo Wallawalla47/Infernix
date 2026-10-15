@@ -14,6 +14,9 @@ struct ForwardFastPaths {
     bool gdn_conv_fused = false;
     // qsa-prepare-fused: one QSA prepare kernel (norms, rotations, K/V and index-key appends).
     bool qsa_prepare_fused = false;
+    // expert-a4-residual: W4A16 experts' wide calls take the two-term A4 route
+    // (ops::offloaded_moe::WideA16::kA4Residual, design §19.3.23); no effect on W4A4 experts.
+    bool expert_a4_residual = false;
 };
 
 } // namespace infernix::models::qwen4_exp::execution

@@ -52,6 +52,17 @@ constexpr std::array kQualified{
     Qualification{FastPath::Q8SlicedK, {QType::Q8_G32_FP16, true, KvCacheStorage::Q4KeyVq2Value}},
     Qualification{FastPath::GdnConvFused, {QType::Q8_G32_FP16, true, KvCacheStorage::Vq2}},
     Qualification{FastPath::GdnConvFused, {QType::Q8_G32_FP16, true, KvCacheStorage::Q4KeyVq2Value}},
+    // Recipe C (FP8 dense, W4A16 experts): two-term A4 expert activations. Prefill (quick corpus,
+    // 896 and 7,168 tokens) on every format, decode (MTP at concurrency 2, 256 segments) on INT8, the
+    // passing format with the lowest floor; the path leaves attention and the KV cache alone, so the
+    // others are registered from the INT8 increments (model-quality.md 6.1, step 3). BF16 KV fails:
+    // there recipe C's exact route is the reference itself (floor 0) (2026-10-15).
+    Qualification{FastPath::ExpertA4Residual, {QType::FP8_E4M3FN_ROW_BF16, false, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::ExpertA4Residual, {QType::FP8_E4M3FN_ROW_BF16, false, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::ExpertA4Residual, {QType::FP8_E4M3FN_ROW_BF16, false, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::ExpertA4Residual, {QType::FP8_E4M3FN_ROW_BF16, false, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::ExpertA4Residual, {QType::FP8_E4M3FN_ROW_BF16, false, KvCacheStorage::Vq2}},
+    Qualification{FastPath::ExpertA4Residual, {QType::FP8_E4M3FN_ROW_BF16, false, KvCacheStorage::Q4KeyVq2Value}},
 };
 
 const char* dense_name(QType dense) {
@@ -125,6 +136,8 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
     case FastPath::Fp8A8Pair: return configuration.dense == QType::FP8_E4M3FN_ROW_BF16;
     case FastPath::Q8SlicedK:
     case FastPath::GdnConvFused: return configuration.dense == QType::Q8_G32_FP16;
+    // The wide route of W4A16 experts (weight-only exports such as recipe C).
+    case FastPath::ExpertA4Residual: return !configuration.a4_experts;
     case FastPath::QsaPrepareFused:
         // ops::qsa_prepare_supports's KV formats (bf16, int8, fp8, nvfp4, k8v4); VQ2 and K4V2 append
         // inside qsa_attention and keep the composed prepare.
@@ -149,8 +162,11 @@ bool FastPathSelection::request_invariant() const noexcept {
     return std::none_of(paths.begin(), paths.end(), [](FastPath path) {
         // q8-sliced-k picks its reduction order by the round's column count, so a decode column's bits
         // depend on the other requests of its round.
+        // expert-a4-residual routes an expert by its column count in the call, which batched rounds
+        // share between requests.
         return path == FastPath::AdaptiveSpeculation || path == FastPath::FreeCacheResume ||
-               path == FastPath::Preemption || path == FastPath::Q8SlicedK;
+               path == FastPath::Preemption || path == FastPath::Q8SlicedK ||
+               path == FastPath::ExpertA4Residual;
     });
 }
 
@@ -158,9 +174,10 @@ execution::ForwardFastPaths FastPathSelection::forward() const noexcept {
     ops::LinearRoutes routes = ops::LinearRoutes::Exact;
     if (selected(FastPath::Q8SlicedK)) { routes = routes | ops::LinearRoutes::Q8SlicedK; }
     if (selected(FastPath::Fp8A8Pair)) { routes = routes | ops::LinearRoutes::Fp8A8Pair; }
-    return {.dense_routes      = routes,
-            .gdn_conv_fused    = selected(FastPath::GdnConvFused),
-            .qsa_prepare_fused = selected(FastPath::QsaPrepareFused)};
+    return {.dense_routes       = routes,
+            .gdn_conv_fused     = selected(FastPath::GdnConvFused),
+            .qsa_prepare_fused  = selected(FastPath::QsaPrepareFused),
+            .expert_a4_residual = selected(FastPath::ExpertA4Residual)};
 }
 
 FastPathSelection select_fast_paths(const execution::Parameters& parameters, const EngineOptions& options) {

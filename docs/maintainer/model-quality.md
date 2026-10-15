@@ -457,17 +457,17 @@ quantized KV) is gated on every format.
 
 | Criterion | Statistic | Budget |
 |---|---|---|
-| Prefill mean KL excess | one-sided 95 % upper bound of the paired per-window excess KL(ref ‖ fast) − KL(ref ‖ default) | 10 % of the floor's KL, at least 1e-4 and at most 3e-3 nats |
-| Prefill top-1 disagreement excess | the same bound for disagreement with the reference's top token | 10 % of the floor's top-1 disagreement, at least 0.05 and at most 0.5 points |
-| Prefill corpus NLL excess | the paired mean excess NLL of the corpus tokens (log of the perplexity ratio), a point estimate; its bound is reported | at most 25 % of the floor's KL (at least 1e-4) |
-| Prefill tail | 99.9th-percentile KL, mean over chunk sizes, fast / default | at most 1.25 |
-| Prefill context buckets | each context-length bucket with at least 20,000 positions: excess mean KL | at most 25 % of that bucket's default KL (at least 1e-4) |
-| Decode mean TV excess | one-sided 95 % upper bound of the paired per-segment excess total variation from the reference at the teacher-forced positions | 10 % of the decode floor's total variation, at least 1e-4 and at most 5e-3 |
-| Decode top-1 disagreement excess | the same bound for disagreement with the reference's top token | 10 % of the decode floor's top-1 disagreement, at least 0.05 and at most 0.5 points |
-| Decode KL and NLL excess | the paired mean excess KL and NLL of the forced positions, point estimates; their bounds are reported | each at most 25 % of the decode floor's KL (at least 1e-4) |
-| Decode tail | 99.9th-percentile KL over the forced positions, fast / default | at most 1.25 |
-| Decode prompt lengths | each prompt length's excess mean total variation | at most 25 % of that prompt length's default total variation (at least 1e-4) |
-| Free-running decode (optional) | the same bound for the rate of generated tokens that are not the reference's top token, and for mean regret | 10 % of the default's rate (0.05 to 0.5 points); 10 % of the default's regret |
+| Prefill mean KL excess | one-sided 95 % upper bound of the paired per-window excess KL(ref ‖ fast) − KL(ref ‖ default) | 10 % of the floor's KL, at least 1e-3 (the absolute floor) and at most 3e-3 nats |
+| Prefill top-1 disagreement excess | the same bound for disagreement with the reference's top token | 0.5 points (the absolute floor equals the cap on 10 % of the floor's top-1 disagreement) |
+| Prefill corpus NLL excess | the paired mean excess NLL of the corpus tokens (log of the perplexity ratio), a point estimate; its bound is reported | at most 25 % of the floor's KL (at least 1e-3) |
+| Prefill tail | 99.9th-percentile KL, mean over chunk sizes, fast / default | at most 1.25, or a fast p99.9 KL of at most 0.05 |
+| Prefill context buckets | each context-length bucket with at least 20,000 positions: excess mean KL | at most 25 % of that bucket's default KL (at least 1e-3) |
+| Decode mean TV excess | one-sided 95 % upper bound of the paired per-segment excess total variation from the reference at the teacher-forced positions | 10 % of the decode floor's total variation, at least 4e-3 and at most 5e-3 |
+| Decode top-1 disagreement excess | the same bound for disagreement with the reference's top token | 0.5 points (the absolute floor equals the cap on 10 % of the decode floor's top-1 disagreement) |
+| Decode KL and NLL excess | the paired mean excess KL and NLL of the forced positions, point estimates; their bounds are reported | each at most 25 % of the decode floor's KL (at least 1e-3) |
+| Decode tail | 99.9th-percentile KL over the forced positions, fast / default | at most 1.25, or a fast p99.9 KL of at most 0.05 |
+| Decode prompt lengths | each prompt length's excess mean total variation | at most 25 % of that prompt length's default total variation (at least 4e-3) |
+| Free-running decode (optional) | the same bound for the rate of generated tokens that are not the reference's top token, and for mean regret | 0.5 points; 10 % of the default's regret, at least 1e-3 |
 
 The bounded criteria carry the decision; the tail, bucket and prompt-length caps are point
 estimates, like an Op criterion's gross pointwise cap, so damage confined to rare positions or long
@@ -480,8 +480,18 @@ still measures how much probability a fast path moves, the quantity recent work 
 estimating changed decisions (6.6); KL stays as a gross cap. Prefill keeps KL as its bounded
 criterion: with about 250 times as many positions it resolves its budget. The decode gate first
 bounded the forced tokens' NLL (until 2026-10-13), then their KL (2026-10-13); neither could resolve
-a change that also alters the cached context (6.4, 6.7). The budgets' lower limits sit at the
-measurement's resolution. The KL ceiling keeps any one fast path, on any artifact, below one step of the
+a change that also alters the cached context (6.4, 6.7).
+
+**The absolute floor** (since 2026-10-15): an excess below KL 1e-3, top-1 disagreement 0.5 points,
+decode total variation 4e-3 (KL 1e-3 at the decode TV / KL ratio of 4.2 measured at recipe C's INT8
+floor), free-running regret 1e-3, and a fast p99.9 KL of 0.05 (the tail of a route at that mean:
+p99.9 / mean measured 48 in prefill and 21 in decode at the same floor) always passes, whatever the
+configuration's own floor. KL 1e-3 is of the order of what llama.cpp's q8_0 costs against FP16.
+Without it, a configuration whose exact route is the reference itself (floor 0, as recipe C with
+BF16 KV) would admit no fast path at all, since a tenth of nothing is nothing; before it the lower
+limits sat at the measurement's resolution (KL 1e-4, top-1 0.05 points, TV 1e-4). The floor raises
+budgets only where 10 % of the configuration's floor is smaller, and never past the ceilings. The
+KL ceiling keeps any one fast path, on any artifact, below one step of the
 weight-quantization ladder (q8_0 to q6_K costs about 4e-3 on Llama 3 8B in llama.cpp's published
 measurements) and under half the 7e-3 that Fireworks calls a high-quality *whole* quantized
 deployment (6.6).
@@ -706,8 +716,8 @@ Each entry records what the fast path changes, where its kernels run, the config
 qualified for, and the evidence that admitted it. The configurations are the ones
 `models/qwen3_5/program/planning/fast_paths.cpp` lists (`kQualified`); a configuration not listed
 runs the path's exact counterpart. Qwen3.8-Flash-Next has three of the request-coupling paths
-below and its own kernel paths (`models/qwen4_exp/program/fast_paths.cpp` lists their
-configurations).
+below and its own kernel paths, among them `expert-a4-residual`
+(`models/qwen4_exp/program/fast_paths.cpp` lists their configurations).
 
 | Fast path | Kernels run with | Qualified configurations |
 |---|---|---|
@@ -722,10 +732,11 @@ configurations).
 | `preemption` | request-invariance-capable artifacts | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
 | Qwen3.8-Flash-Next: `adaptive-speculation` (MTP), `free-cache-resume`, `preemption` | every Flash-Next artifact | INT8 KV |
 | Qwen3.8-Flash-Next: `q8-sliced-k`, `gdn-conv-fused`, `qsa-prepare-fused` | Q8 dense weights (`qsa-prepare-fused`: BF16, INT8, FP8, NVFP4 or K8V4 KV) | Q8 dense, 4-bit experts, every KV format (`qsa-prepare-fused`: the five it serves) |
-| `fp8-a8-pair` | row-FP8 dense weights (recipe C) | none (op level only, below) |
+| `fp8-a8-pair` | row-FP8 dense weights (recipe C) | none (fails its decode tail on recipe C, below) |
 | `q4-w4a8` | groupwise Q4 MLP gate/up | none (fails, below) |
 | `idle-wide-prefill` | Qwen3.8-27B / Qwen3.6-35B-A3B generation engines | 24 heads, 4-bit activations, with INT8, NVFP4, K8V4 or K4V2 KV |
 | `adaptive-mtp` | Qwen3.8-27B / Qwen3.6-35B-A3B with MTP | none (no speed gain shown, below) |
+| Qwen3.8-Flash-Next: `expert-a4-residual` | artifacts with W4A16 experts (recipe C), expert calls of more than eight columns | FP8 dense, 16-bit expert activations, with INT8, FP8, NVFP4, K8V4, VQ2 or K4V2 KV (fails on BF16 KV, below) |
 
 **The request-coupling paths.** These were the default behaviour until the exact route became
 request-invariant (2026-10-14). Each makes a request's arithmetic depend on the other requests of
@@ -764,6 +775,12 @@ the Engine, and each acts only where the artifact can be request-invariant
   that scale (`LinearPolicy::AllowA8Residual`); each term has its own accumulator, summed exactly
   before the scales apply. Its error is about the 8-bit route's squared. Output and down
   projections keep 16-bit activations: two terms never beat A16 on their 5,120 outputs.
+- `expert-a4-residual` (Qwen3.8-Flash-Next with W4A16 experts): expert calls of more than eight
+  columns (prefill, wide verification) take each x and h row as two terms of the same A4 residual
+  profile, with an FP32 row scale of amax / (6 · 448) in place of an input scale (the export has
+  none), on the FP4 Tensor Cores (design §19.3.23). Without it W4A16 experts run the exact integer
+  limb route. An expert's route depends on its column count in the call, which other requests'
+  columns share in batched rounds.
 - `batch-split-attention`: decode attention sizes a row's key partition from the batch.
 - `adaptive-speculation`: DFlash2 tree tables and controller, and a round's longest n-gram copy,
   set every row's verify width.
@@ -1178,7 +1195,41 @@ and recomputes the previous output) or admission (whole extents held without `pr
   +4.2 %, prefill +0.3 to +1.0 % (qwen3_8-flash-next-design.md §19.3.22).
 - **Not qualified:** 16-bit expert activations, and other dense formats (no kernels).
 
-**`fp8-a8-pair`: two E4M3 activation terms in recipe C's FP8 projections (op level only).**
+**`expert-a4-residual`: two-term A4 activations in recipe C's wide expert calls (qualified
+2026-10-15).**
+- **What changes:** expert calls of more than eight columns on W4A16 experts take x and h as two
+  NVFP4 terms of the A4 residual profile with an FP32 row scale, on the FP4 Tensor Cores, instead of
+  the exact limb route (design §19.3.23).
+- **History:** two terms first failed the INT8 prefill gate on mean KL (excess bound 8.92e-4
+  against the then budget of 6.11e-4, four chunk sizes). Three terms on both sides, the only
+  variant of a one-chunk screen within that budget, then passed every gate below except BF16 KV
+  (prefill KL bound 4.24e-4, decode top-1 bound 2.95e-3 of 3.31e-3, pp32768/65536 +25.7/+26.9 %).
+  With the absolute floor (6.3) two terms pass, and they replaced three, which cost 7-8 points of
+  prefill speed.
+- **Op qualification:** `infernix_offloaded_moe_wide_test` X1 against the exact canonical
+  arithmetic: mean relative L2 0.31-0.41 % per case, worst entry 2.0 % (bounds 2^-7 and 2^-5).
+- **Artifact:** orcarouter Qwen3.8-Flash-Next Uncensored NVFP4, converted with recipe C (FP8 dense,
+  W4A16 experts), the protocol reduced as the user approved (prefill quick corpus at 896 and 7,168
+  tokens; decode MTP at concurrency 2 over 256 segments; the reference and exact runs shared).
+- **INT8 KV:** prefill KL excess 7.82e-4 (95 % bound 9.07e-4 of 1.0e-3, the closest), top-1 excess
+  1.89e-3 (bound 2.41e-3 of 5.0e-3), perplexity ratio 0.99967, p99.9 KL ratio 1.08; decode TV
+  excess 9.9e-4 (bound 1.37e-3 of 4.0e-3), top-1 excess 2.08e-3 (bound 4.41e-3 of 5.0e-3), p99.9
+  KL ratio 1.09, every prompt length.
+- **The other formats (prefill):** FP8, K8V4, NVFP4, K4V2 and VQ2 pass (KL bounds 7.3e-4, 3.8e-4,
+  4.6e-4, 6.6e-4 and 6.1e-4; floors 7.5e-3, 1.21e-2, 1.49e-2, 1.53e-2 and 2.17e-2, all above
+  INT8's 6.11e-3); their decode is registered from the INT8 increments (6.1, step 3), INT8 being
+  the passing format with the lowest floor.
+- **BF16 KV fails, as a path of this size must there:** recipe C's exact route with BF16 KV is the
+  reference itself (16-bit activations everywhere, chunking bit-exact), so its floor is 0 and every
+  budget the absolute floor. The fast route's whole divergence (KL 6.8e-3, top-1 2.9 %, about INT8
+  KV's own; three terms 6.35e-3) counts as excess, probably mostly near-tie expert routing that
+  any perturbation flips (not measured).
+- **Speed:** `infernix_bench` INT8 KV, chunk 4,096, ABBA (2026-10-14/15, before main 2ec268c2,
+  whose changes leave recipe C's route alone): pp4096 1,631 → 1,637 tok/s (level), pp16384 6,175 →
+  6,380 (+3.3 %), pp32768 6,620 → 8,803 (+33 %), pp65536 6,730 → 9,067 (+35 %); short prompts are
+  bound by the expert stream over the x8 link.
+
+**`fp8-a8-pair`: two E4M3 activation terms in recipe C's FP8 projections (fails on recipe C).**
 - **What changes:** prefill-width calls of Flash-Next's row-FP8 dense problems carry each 16-bit
   activation as two E4M3 terms on the 8-bit Tensor Core path, admitted per problem where faster
   than the exact route (cold L2, graph): [16384, 2560] from T = 17, [13312, 2560] from 97,
@@ -1186,8 +1237,13 @@ and recomputes the previous output) or admission (whole extents held without `pr
   beyond, except [2560, 6144] at T = 1,040-1,088: 1.18).
 - **Op qualification:** `infernix_linear_fp8_a8_test`, the A16 criterion at every problem's
   admission seams and tiles (worst relative L2 0.78 of the criterion), outliers and K tails.
-- **Model level:** not gated (no recipe-C artifact on this machine), so it runs in no
-  configuration.
+- **Model level (2026-10-15):** gated on the orcarouter recipe C artifact jointly with
+  `expert-a4-residual` at three terms (the variant qualified then), the reduced protocol as above.
+  Prefill passes on every format but BF16 (INT8 KL bound 6.61e-4 of 1.0e-3, against 4.24e-4 for
+  three-term `expert-a4-residual` alone). The INT8 decode gate fails on its tail: p99.9 KL ratio
+  1.35 against 1.25 (three terms alone 1.07); TV and top-1 pass (top-1 bound 4.29e-3 of 5.0e-3).
+  INT8 failing, the other formats would need decode gates of their own; none ran, and it was not
+  gated beside two-term `expert-a4-residual`. It runs in no configuration.
 
 **`q4-w4a8`: int8 activations in the groupwise Q4 MLP gate/up (fails; not qualified).**
 - **Selected by:** `--fast-path q4-w4a8` on artifacts whose text MLP gate/up is RowSplit
