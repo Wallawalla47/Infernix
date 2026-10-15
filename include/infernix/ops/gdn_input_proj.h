@@ -78,10 +78,12 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
                     LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream);
 
 /**
- * Applies the A16-only single-parent GDN projection without transient workspace.
+ * Applies the A16-only single-parent GDN projection without transient workspace. With
+ * LinearRoutes::Q8SlicedK, the Q8 [16384,2560] parent runs the q8-sliced-k fast routes linear selects
+ * for that problem (include/infernix/ops/linear.h); every other parent runs its exact route.
  */
 void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Tensor& qkv, Tensor& z,
-                    cudaStream_t stream);
+                    cudaStream_t stream, LinearRoutes routes = LinearRoutes::Exact);
 
 /**
  * Returns the transient capacity required by the registered two-parent Q4/Q5 or single-parent Q8
@@ -172,6 +174,33 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
                                   const Tensor& valid_columns, const Tensor& initial_state_slots,
                                   const Tensor& snapshot_base_slots, Tensor& query, Tensor& key,
                                   Tensor& value, Tensor& z, WorkspaceArena& ws,
+                                  cudaStream_t stream);
+
+/**
+ * Routes form of the single-parent snapshot Op for the Q8_G32_FP16 [16384,2560] parent
+ * (Qwen3.8-Flash-Next) in q/k/value/z row order, stored row counts [2048,2048,6144,6144], at W=1:
+ * x [2560,1,B], conv_weight [10240,4], conv_states [10240,3,Slots], query/key [2048,1,B],
+ * value/z [6144,1,B] and I32 [B] selectors, B=1..8. With one column per row there is no
+ * valid-column selector. The Math, Effects and state rules are gdn_input_proj_conv_snapshot's;
+ * no transient workspace is used.
+ *
+ * Numeric: the oracle is the snapshot Op's (exact-decode projection, convolution, SiLU and
+ * snapshot in FP64 from the represented inputs). `routes` selects the projection's route set as
+ * linear does for this problem (LinearRoutes::Q8SlicedK admits the q8-sliced-k routes). The projection
+ * is evaluated on those routes, so z and the newest published history value are exactly the bits
+ * of the corresponding rows of linear's [16384,B] result under the same routes; the two older
+ * published history values are the initial window's BF16 values. The convolution consumes the
+ * route's FP32 projected value as its current tap. It therefore differs from the composed
+ * gdn_input_proj + causal_conv1d_silu_snapshot_split route, which convolves bf16(projection),
+ * only in that one input of query/key/value: this form is the gdn-conv-fused fast path, and the
+ * composed route stays the exact one. Operands and the parent are mutually non-overlapping except
+ * that the read-only selectors may alias; initial_state_slots[b] may equal snapshot_base_slots[b].
+ */
+void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value_z_weight,
+                                  const Tensor& conv_weight, Tensor& conv_states,
+                                  const Tensor& initial_state_slots,
+                                  const Tensor& snapshot_base_slots, Tensor& query, Tensor& key,
+                                  Tensor& value, Tensor& z, LinearRoutes routes,
                                   cudaStream_t stream);
 
 /**

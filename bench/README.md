@@ -901,12 +901,17 @@ cmake --build build -j --target infernix_q8_linear_swiglu_bench
 ## Q4 LinearSwiGLU Op benchmark
 
 `infernix_q4_linear_swiglu_bench` measures the public Q4 `[34816,5120] -> [17408,T]` profile and
-queries workspace capacity for the requested aggregate interval.
+queries workspace capacity for the requested aggregate interval. `--routes fast` passes
+`LinearRoutes::Q4W4A8`, the q4-w4a8 fast path (int8 per-token activations, from T = 256, its
+quantization included in each sample); alternating `--routes exact` and `--routes fast` runs over
+the prefill widths are the sweep that sets the route's column threshold.
 
 ```bash
 cmake --build build --parallel --target infernix_q4_linear_swiglu_bench
 ./build/bench/infernix_q4_linear_swiglu_bench \
   --t-sweep 1,2,4,8,16,24,32,40,48 --warmup 10 --repeat 50
+./build/bench/infernix_q4_linear_swiglu_bench \
+  --routes fast --t-sweep 128,192,255,256,320,384,512,1024,2048,4096,8192 --warmup 10 --repeat 50
 ```
 
 ## NVFP4 LinearSwiGLU Op benchmark
@@ -1301,8 +1306,9 @@ preparation/mask/matcher seconds, evaluated positions and mask upload bytes; `nu
 - `constraint_draft_wait_exposed_seconds`: the sample's exposure to draft-ready wait; shared batch
 exposure must not be summed across requests, and CPU constraint work must not be added to wall time;
 - each request sample's `speculative`: window, rounds, drafted/accepted tokens, fallbacks, separate
-  ngram rounds/drafted/accepted tokens, and per-position
-acceptance.
+  ngram rounds/drafted/accepted tokens, per-position
+acceptance, and (MTP on Qwen3.5-family models) `rounds_by_draft_length`, the all-neural rounds per
+draft length, which `--fast-path adaptive-mtp` spreads over 1..`--draft-tokens`.
 
 Each test reports `workspace_peak_bytes` from the planned phase markers, including CUDA Graph
 replay, and `workspace_allocator_peak_bytes` from host-side arena allocation activity. These are

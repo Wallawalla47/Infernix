@@ -35,6 +35,7 @@ struct Options {
     bool profile = false;
     bool graph   = false;
     std::string csv_out;
+    ops::LinearRoutes routes = ops::LinearRoutes::Exact;
 };
 
 struct Result {
@@ -94,15 +95,23 @@ Options parse_options(int argc, char** argv) {
             options.graph = mode == "graph";
         } else if (argument == "--csv-out") {
             options.csv_out = std::string(next("--csv-out value"));
+        } else if (argument == "--routes") {
+            const std::string_view routes = next("--routes value");
+            if (routes != "exact" && routes != "fast") {
+                throw std::invalid_argument("--routes must be exact or fast");
+            }
+            options.routes = routes == "fast" ? ops::LinearRoutes::Q4W4A8 : ops::LinearRoutes::Exact;
         } else if (argument == "--profile") {
             options.profile = true;
         } else if (argument == "--help" || argument == "-h") {
             std::printf(
                 "Usage: %s [--t-sweep 1,2,...] [--warmup N] [--repeat N] [--execution "
                 "eager|graph]\n"
-                "          [--csv-out PATH] [--profile]\n"
+                "          [--routes exact|fast] [--csv-out PATH] [--profile]\n"
                 "  --execution graph captures ONE complete public ops::linear_swiglu call per\n"
                 "  graph; the reported graph_nodes is the captured count, not an assumption.\n"
+                "  --routes fast passes LinearRoutes::Q4W4A8 (the q4-w4a8 fast path, which serves\n"
+                "  T >= 256, int8 activation quantization included); exact (default) passes none.\n"
                 "  --profile runs a single eager or single graph launch for external profilers.\n",
                 argv[0]);
             std::exit(0);
@@ -159,14 +168,17 @@ int main(int argc, char** argv) {
         bench::PackedQuantizedWeight packed =
             bench::make_row_split_weight(QType::Q4_G64_FP16, kGateUpRows, kHidden, kHidden, 501U);
         const std::size_t workspace_capacity = ops::linear_swiglu_workspace_capacity_bytes(
-            QType::Q4_G64_FP16, kGateUpRows, kHidden, min_t, max_t);
+            QType::Q4_G64_FP16, kGateUpRows, kHidden, ops::LinearPolicy::A16Only, min_t, max_t,
+            options.routes);
         WorkspaceArena workspace(std::max<std::size_t>(workspace_capacity, 256));
 
         const auto launch = [&](std::int32_t tokens, cudaStream_t launch_stream) {
             Tensor x(input.p, DType::BF16, {kHidden, tokens});
             Tensor out(output.p, DType::BF16, {kOutputRows, tokens});
-            ops::linear_swiglu(x, packed.weight, out, workspace, launch_stream);
+            ops::linear_swiglu(x, packed.weight, out, ops::LinearPolicy::A16Only, workspace,
+                               launch_stream, options.routes);
         };
+        const char* routes_name = options.routes == ops::LinearRoutes::Exact ? "exact" : "fast";
 
         if (options.profile) {
             bench::TimedGraph graph;
@@ -179,18 +191,18 @@ int main(int argc, char** argv) {
                 launch(options.tokens.front(), stream);
             }
             CUDA_CHECK(cudaStreamSynchronize(stream));
-            std::printf("PROFILE linear_swiglu Q4 T=%d execution=%s graph_nodes=%zu "
+            std::printf("PROFILE linear_swiglu Q4 T=%d execution=%s routes=%s graph_nodes=%zu "
                         "workspace_sweep=%zu\n",
-                        options.tokens.front(), options.graph ? "graph" : "eager", graph.nodes(),
-                        workspace_capacity);
+                        options.tokens.front(), options.graph ? "graph" : "eager", routes_name,
+                        graph.nodes(), workspace_capacity);
             CUDA_CHECK(cudaStreamDestroy(stream));
             return 0;
         }
 
-        std::printf("# execution=%s warmup=%d repeat=%d flush_bytes=%zu "
+        std::printf("# execution=%s routes=%s warmup=%d repeat=%d flush_bytes=%zu "
                     "workspace_sweep_bytes=%zu\n",
-                    options.graph ? "graph" : "eager", options.warmup, options.repeat, kFlushBytes,
-                    workspace_capacity);
+                    options.graph ? "graph" : "eager", routes_name, options.warmup, options.repeat,
+                    kFlushBytes, workspace_capacity);
         std::vector<Result> results;
         results.reserve(options.tokens.size());
         for (const std::int32_t tokens : options.tokens) {
@@ -211,7 +223,8 @@ int main(int argc, char** argv) {
             const double bytes   = static_cast<double>(packed.model_weight_bytes()) +
                                  2.0 * static_cast<double>(kHidden + kOutputRows) * tokens;
             const std::size_t workspace_exact = ops::linear_swiglu_workspace_capacity_bytes(
-                QType::Q4_G64_FP16, kGateUpRows, kHidden, tokens, tokens);
+                QType::Q4_G64_FP16, kGateUpRows, kHidden, ops::LinearPolicy::A16Only, tokens,
+                tokens, options.routes);
             std::printf("T=%-4d median=%9.3f us min=%9.3f p95=%9.3f %7.1f GB/s %7.2f TFLOP/s "
                         "workspace_sweep=%zu workspace_exact=%zu nodes=%zu\n",
                         tokens, timing.median_us, timing.min_us, timing.p95_us,

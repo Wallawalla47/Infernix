@@ -31,8 +31,10 @@ inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 15;
 // configured chain at a fixed width;
 // grid_cache splits prefill, publishes and resumes only on the prefill chunk grid; held_extent
 // holds each request's whole KV extent from admission, so nothing preempts it. With all of them a
-// request's output does not depend on the other requests of the Engine. Workspace planning and
-// every launch use the same settings.
+// request's output does not depend on the other requests of the Engine. linear_routes carries
+// the LinearRoutes flags of every Text-layer MLP gate/up projection (q4-w4a8); under
+// column_invariant_decode the decode and verification projections ignore them. Workspace
+// planning and every launch use the same settings.
 struct ExecutionSchedule {
     bool fast                         = false;
     bool pv8                          = false;
@@ -47,6 +49,9 @@ struct ExecutionSchedule {
     bool fixed_speculation            = false;
     bool grid_cache                   = false;
     bool held_extent                  = false;
+    // adaptive-mtp: MTP rounds choose their draft length (only where speculation is adaptive).
+    bool adaptive_mtp                 = false;
+    ops::LinearRoutes linear_routes   = ops::LinearRoutes::Exact;
 
     // A prefill chunk's envelope.
     [[nodiscard]] ops::CausalAttentionExecutionEnvelope

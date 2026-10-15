@@ -2445,9 +2445,7 @@ int32_t JSONSchemaConverter::GenerateString(const StringSpec& spec, const std::s
   if (spec.min_length != 0 || spec.max_length != -1) {
     XGRAMMAR_CHECK(excludes_.empty())
         << "string exclusions combined with length constraints are unsupported";
-    return Sequence({ByteString("\""),
-                     AddSubGrammar(JSONStringLength(spec.min_length, spec.max_length)),
-                     ByteString("\"")});
+    return AddSubGrammar(JSONStringLength(spec.min_length, spec.max_length));
   }
   // Default string
   return Sequence({ByteString("\""), RuleRef(kBasicStringSub)});

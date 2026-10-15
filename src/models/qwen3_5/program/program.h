@@ -61,6 +61,10 @@ public:
     [[nodiscard]] std::size_t host_capacity_bytes() const noexcept;
     // Whether automatic DFlash2 tree widths are active: requested and verifiable by the target.
     [[nodiscard]] bool draft_tree_auto() const noexcept;
+    // The effective prefill chunk, and the width a prefill step takes while no other lane waits
+    // to decode (idle-wide-prefill; the chunk when that fast path is off).
+    [[nodiscard]] std::uint32_t prefill_chunk() const noexcept;
+    [[nodiscard]] std::uint32_t idle_prefill_width() const noexcept;
 
 private:
     explicit SequencePlan(std::unique_ptr<detail::SequencePlanImpl> impl) noexcept;
@@ -90,6 +94,8 @@ private:
 
     friend SequencePlanner make_sequence_planner(const execution::Parameters&, DeviceContext&,
                                                  const EngineOptions&);
+    friend SequencePlanner make_sequence_planner(const execution::Parameters&, DeviceContext&,
+                                                 const EngineOptions&, std::uint32_t);
 };
 
 class RequestBasePlan {
@@ -458,6 +464,16 @@ private:
 
 [[nodiscard]] SequencePlanner make_sequence_planner(const execution::Parameters&, DeviceContext&,
                                                     const EngineOptions&);
+// Plans prefill steps up to `idle_prefill_width` tokens while no other lane waits to decode: one
+// of idle_prefill_widths(parameters, options).
+[[nodiscard]] SequencePlanner make_sequence_planner(const execution::Parameters&, DeviceContext&,
+                                                    const EngineOptions&,
+                                                    std::uint32_t idle_prefill_width);
+// The idle-wide-prefill widths to try, widest first: startup plans the widest whose runtime
+// reservation keeps the KV capacity (runtime/engine/model_instance.cpp). Empty unless the fast
+// path is selected and some width is wider than the effective chunk.
+[[nodiscard]] std::vector<std::uint32_t> idle_prefill_widths(const execution::Parameters&,
+                                                             const EngineOptions&);
 [[nodiscard]] std::unique_ptr<Program> create_program(const execution::Parameters&, SequencePlan&&,
                                                       DeviceContext&, const StartupObserver&);
 } // namespace infernix::models::qwen3_5

@@ -140,7 +140,11 @@ permits row by row, resumes first and original ticket order first, keeps the run
 uses the remaining headroom to try fresh admission.
 It executes the permitted compact Control/Decode set and one Prefill/Replay chunk; rows committed by
 Control reacquire Decode permits in the next cycle. Graphs use the actual member count and execution
-profile.
+profile. With the `idle-wide-prefill` fast path a Prefill permit reserved while no other lane is
+generating covers the startup-planned idle width (a multiple of the chunk) instead of one chunk,
+when its extra KV pages are free or evictable cache; a held permit keeps its width until its step
+runs. Bindings, Replay and recovering requests keep one chunk
+([model quality §6.7](model-quality.md#67-fast-path-registry)).
 
 The fresh queue keeps FIFO tickets, and each blocked request can be successfully bypassed by at most C
 younger requests. Each scan checks the queue head and at most C following candidates; failed checks do

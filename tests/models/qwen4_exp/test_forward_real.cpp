@@ -231,7 +231,8 @@ struct Harness {
         kv_view       = kv;
         experts_view  = experts;
         forward = std::make_unique<q4::execution::Forward>(parameters, device, *work, std::move(state), std::move(kv),
-                                                           std::move(experts), context);
+                                                           std::move(experts), context,
+                                                           q4::execution::ForwardFastPaths{});
     }
 
     // Another Forward over the same state, KV and workspace, with other expert sources.
@@ -239,7 +240,8 @@ struct Harness {
     forward_with(const q4::execution::Parameters& parameters, DeviceContext& device,
                  q4::execution::ForwardExperts sources, std::int32_t context) const {
         return std::make_unique<q4::execution::Forward>(parameters, device, *work, state_view,
-                                                        kv_view, std::move(sources), context);
+                                                        kv_view, std::move(sources), context,
+                                                        q4::execution::ForwardFastPaths{});
     }
 
     const q4::TextConfig& config;

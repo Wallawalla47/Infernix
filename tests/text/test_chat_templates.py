@@ -188,6 +188,19 @@ class ChatTemplates(unittest.TestCase):
                         enable_thinking=False,
                     ).endswith("<|im_start|>assistant\nprefix </think> text")
                 )
+                # A continued prefix keeps its whitespace (code indentation, a trailing newline);
+                # the same message is trimmed when it is not the continued one.
+                code = [message("user", "question"), message("assistant", "  def f():\n    ")]
+                self.assertTrue(
+                    self.render(
+                        version, code, continue_final_message=True, enable_thinking=False
+                    ).endswith("<|im_start|>assistant\n  def f():\n    ")
+                )
+                closed = self.render(
+                    version, code + [message("user", "next")], enable_thinking=False
+                )
+                self.assertIn("def f():<|im_end|>", closed)
+                self.assertNotIn("  def f()", closed)
 
     def test_cpp_matches_independent_renderer(self):
         contexts = [
@@ -231,6 +244,12 @@ class ChatTemplates(unittest.TestCase):
             ),
             dict(
                 messages=[message("user", "first"), message("assistant", "prefix")],
+                add_generation_prompt=False,
+                continue_final_message=True,
+                enable_thinking=False,
+            ),
+            dict(
+                messages=[message("user", "first"), message("assistant", "  def f():\n    ")],
                 add_generation_prompt=False,
                 continue_final_message=True,
                 enable_thinking=False,

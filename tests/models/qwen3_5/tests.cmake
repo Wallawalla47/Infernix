@@ -10,9 +10,18 @@ infernix_add_test(infernix_qwen3_5_fast_paths_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_fast_paths.cpp"
   LIBRARIES infernix_engine infernix::json)
 
+# idle-wide-prefill planning rules: the idle width ladder and the flexible-tap step limit.
+infernix_add_test(infernix_qwen3_5_idle_prefill_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_idle_prefill.cpp")
+
 infernix_add_test(infernix_qwen3_5_tree_width_controller_test SOURCES
   "${CMAKE_CURRENT_LIST_DIR}/test_tree_width_controller.cpp"
   "${PROJECT_SOURCE_DIR}/src/models/qwen3_5/program/speculative/tree_width_controller.cpp")
+
+# adaptive-mtp draft-length policy (host logic only).
+infernix_add_test(infernix_qwen3_5_mtp_draft_policy_test SOURCES
+  "${CMAKE_CURRENT_LIST_DIR}/test_mtp_draft_policy.cpp"
+  "${PROJECT_SOURCE_DIR}/src/models/qwen3_5/program/speculative/mtp_draft_policy.cpp")
 
 infernix_add_test(infernix_ngram_graph_planning_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ngram_graph_planning.cpp"

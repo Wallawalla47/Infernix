@@ -346,6 +346,7 @@ Json speculative_json(const GenerationMetrics& metrics) {
                 {"accepted_tokens", metrics.speculative_accepted_tokens},
                 {"fallback_steps", metrics.speculative_fallback_steps},
                 {"accepted_per_position", metrics.speculative_accepted_per_position},
+                {"rounds_by_draft_length", metrics.speculative_rounds_by_draft_length},
                 {"ngram_rounds", metrics.ngram_rounds},
                 {"ngram_drafted_tokens", metrics.ngram_drafted_tokens},
                 {"ngram_accepted_tokens", metrics.ngram_accepted_tokens},

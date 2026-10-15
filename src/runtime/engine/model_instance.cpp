@@ -337,9 +337,32 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
             .prefill_signature = signature},
         options.context_cost.preset_path);
     auto planner    = models::qwen3_5::make_sequence_planner(instance->parameters, device, options);
-    auto resolution = resolve_kv_capacity(
-        options.kv_capacity, planner.capacity_curve(), current_free_device_bytes(),
-        options.vram_headroom_bytes.value_or(kDefaultKvCapacityHeadroomBytes));
+    const std::size_t free_bytes = current_free_device_bytes();
+    const std::size_t headroom =
+        options.vram_headroom_bytes.value_or(kDefaultKvCapacityHeadroomBytes);
+    auto resolution =
+        resolve_kv_capacity(options.kv_capacity, planner.capacity_curve(), free_bytes, headroom);
+    // idle-wide-prefill: plan the widest idle width (4096, 2048, then 1024 tokens, as the chunk is
+    // rounded) whose larger prefill buffers and workspace keep the KV capacity: an explicit one
+    // whole, an automatic one down to every lane's full context. None fitting keeps chunk-wide steps.
+    {
+        const std::uint64_t page_tokens = planner.capacity_curve().main_page_tokens;
+        const std::uint64_t lane_page_groups =
+            static_cast<std::uint64_t>(options.max_concurrency) *
+            ((static_cast<std::uint64_t>(options.max_context) + page_tokens - 1U) / page_tokens);
+        for (const std::uint32_t width :
+             models::qwen3_5::idle_prefill_widths(instance->parameters, options)) {
+            auto wide = models::qwen3_5::make_sequence_planner(instance->parameters, device,
+                                                               options, width);
+            if (const auto fitted =
+                    resolve_kv_capacity_beside(options.kv_capacity, wide.capacity_curve(),
+                                               free_bytes, headroom, resolution, lane_page_groups)) {
+                planner    = std::move(wide);
+                resolution = *fitted;
+                break;
+            }
+        }
+    }
     auto sequence   = std::move(planner).finalize(resolution.main_page_groups);
     if (sequence.device_reservation_bytes() != resolution.runtime_reservation_bytes ||
         sequence.kv_capacity() != resolution.resolved_tokens) {
@@ -349,6 +372,8 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
     // Automatic tree widths on a target that cannot verify trees resolve to chain verification.
     options.speculative.draft_tree_auto = sequence.draft_tree_auto();
     instance->kv_capacity_resolution    = resolution;
+    const std::uint32_t planned_prefill_chunk = sequence.prefill_chunk();
+    const std::uint32_t planned_idle_width    = sequence.idle_prefill_width();
     planning.complete();
     StartupPhaseScope program(options.startup_observer, StartupPhase::ProgramInitialize);
     instance->program = models::qwen3_5::create_program(instance->parameters, std::move(sequence),
@@ -403,6 +428,8 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
         summary.fast_paths_disabled = !options.fast_paths;
         summary.request_invariant   = fast.request_invariant();
         summary.request_invariance_capable = fast.invariant_capable;
+        summary.prefill_chunk       = planned_prefill_chunk;
+        if (fast.selected(FastPath::IdleWidePrefill)) { summary.idle_prefill_width = planned_idle_width; }
     }
     summary.load_seconds         = std::chrono::duration<double>(Clock::now() - start).count();
     summary.upload_seconds       = stats.upload_seconds;

@@ -394,17 +394,21 @@ void ProgramImpl::prepare_graphs() {
         // Every planned round family captures a Forward/Finish pair at its own width for every
         // batch size, on the one frame viewed at that width, and records ReplaySSM transitions
         // through the record view of the same width. Every MTP round proposes the next round's
-        // drafts at the configured neural depth; a batch>1 DFlash ngram round also runs the
+        // drafts at its neural family's draft length (copy rounds at the configured neural
+        // depth); a batch>1 DFlash ngram round also runs the
         // drafter so rows without a copy keep their neural proposal. A DFlash2 tree family serves
-        // only the batch sizes that may verify its width. Chain families serve every batch size:
+        // only the batch sizes that may verify its width, and an adaptive-mtp single-row family
+        // only one row. Chain families serve every batch size:
         // a round with a constrained row verifies the chain whatever the tree table selects.
-        const std::uint32_t ar_depth = neural_draft_window;
         for (SpeculativeRoundFamily& round : round_families) {
             const bool ngram                  = round.shape.kind == SpeculativeRoundKind::Ngram;
             const bool tree                   = round.shape.kind == SpeculativeRoundKind::Tree;
             const std::uint32_t verify_drafts = round.shape.verify_drafts;
-            const auto serves                 = [&](std::uint32_t batch) {
-                return !tree || tree_widths.tree(batch, verify_drafts + 1U);
+            const std::uint32_t ar_depth = mtp_proposal_drafts(round.shape, neural_draft_window);
+            const bool single_row        = round.shape.single_row;
+            const auto serves            = [&](std::uint32_t batch) {
+                return (!tree || tree_widths.tree(batch, verify_drafts + 1U)) &&
+                       (!single_row || batch == 1U);
             };
             bool used = false;
             for (std::uint32_t batch = 1; batch <= max_concurrency; ++batch) {

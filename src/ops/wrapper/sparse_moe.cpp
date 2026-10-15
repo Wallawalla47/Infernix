@@ -186,7 +186,8 @@ std::size_t sparse_moe_workspace_capacity_bytes(QType routed_gate_up, QType rout
 
     const std::int32_t prefill_interval_first = std::max(min_tokens, prefill_first);
     if (prefill_interval_first <= max_tokens) {
-        required = std::max(required, detail::sparse_moe_prefill_workspace_bytes(max_tokens));
+        required =
+            std::max(required, detail::sparse_moe_prefill_workspace_bytes(max_tokens, q8_profile));
     }
     return required;
 }
@@ -250,7 +251,8 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
         const detail::SparseMoePrefillPlan plan = detail::resolve_sparse_moe_prefill_plan(
             tokens, weights.routed_gate_up.qtype, weights.routed_down.qtype);
         const detail::SparseMoePrefillWorkspace views =
-            detail::allocate_sparse_moe_prefill_workspace(workspace, plan.slice_tokens);
+            detail::allocate_sparse_moe_prefill_workspace(
+                workspace, plan.slice_tokens, weights.routed_gate_up.qtype == QType::Q8_G32_FP16);
         detail::sparse_moe_prefill_launch(x, weights, destination, plan, views, execution);
         return;
     }

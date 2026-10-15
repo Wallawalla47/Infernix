@@ -16,6 +16,7 @@
 #include "models/qwen3_5/ngram.h"
 #include "models/qwen4_exp/config.h"
 #include "models/qwen4_exp/memory_plan.h"
+#include "models/qwen4_exp/execution/fast_path_flags.h"
 #include "infernix/types.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/request.h"
@@ -331,6 +332,8 @@ struct ProgramOptions {
     // Main KV capacity in tokens, shared by every lane.
     std::uint32_t kv_capacity_tokens = 0;
     KvCacheStorage kv_cache          = KvCacheStorage::Int8Group64;
+    // The fast paths the Forward runs (fast_paths.h); all off on the exact route.
+    execution::ForwardFastPaths fast_paths;
     std::filesystem::path ngram_volume;
     // The expert cache's saved state (design §19.3.5 S4b): read at startup to fill the frames, written
     // at stop and every 10 minutes between requests. Empty: no warm start. The identity names the

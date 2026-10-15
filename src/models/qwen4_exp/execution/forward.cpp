@@ -41,8 +41,11 @@ ops::offloaded_moe::ExpertActivation expert_activation(const TextConfig& c) {
     return c.moe.a16_experts ? ops::offloaded_moe::ExpertActivation::kA16 : ops::offloaded_moe::ExpertActivation::kA4;
 }
 
-void project(const Tensor& x, const LinearParameters& p, Tensor& out, WorkspaceArena& work, cudaStream_t s) {
-    ops::linear(x, p.weight, out, p.policy, work, s);
+// `routes` carries the selected fast paths' linear route flags (ForwardFastPaths::dense_routes) to the
+// projections they serve; a problem without a route for a flag runs its exact route.
+void project(const Tensor& x, const LinearParameters& p, Tensor& out, WorkspaceArena& work, cudaStream_t s,
+             ops::LinearRoutes routes = ops::LinearRoutes::Exact) {
+    ops::linear(x, p.weight, out, p.policy, work, s, routes);
 }
 
 // FP32 logits of the text head (BF16 or Q8) for the columns of x.
@@ -58,7 +61,7 @@ void text_head_logits(const Parameters& parameters, const Tensor& x, Tensor& log
 // The shared expert's SiLU(gate) * up: one fused call for Q8 weights (gate and up stay FP32); BF16
 // weights (recipe A) project, split and multiply.
 void shared_swiglu(const Tensor& x, const LinearParameters& gate_up, Tensor& out, WorkspaceArena& work,
-                   cudaStream_t s) {
+                   cudaStream_t s, ops::LinearRoutes routes = ops::LinearRoutes::Exact) {
     // Q8 (Dense8) at every width; BF16 (the bit-exact artifact) on its register-streamed route at decode
     // and verification widths, the tuned GEMM then SwiGLU beyond.
     if (gate_up.weight.qtype == QType::Q8_G32_FP16 ||
@@ -69,7 +72,7 @@ void shared_swiglu(const Tensor& x, const LinearParameters& gate_up, Tensor& out
     auto scope = work.scope();
     const std::int32_t I = out.ne[0], T = out.ne[1];
     Tensor projected = work.alloc(DType::BF16, {2 * I, T});
-    project(x, gate_up, projected, work, s);
+    project(x, gate_up, projected, work, s, routes);
     Tensor gate = work.alloc(DType::BF16, {I, T});
     Tensor up   = work.alloc(DType::BF16, {I, T});
     {
@@ -97,9 +100,11 @@ ops::QsaGeometry qsa_geometry(const TextConfig& c) {
 }
 
 Forward::Forward(const Parameters& parameters, DeviceContext& device, WorkspaceArena& work,
-                 ForwardState state, ForwardKV kv, ForwardExperts experts, std::int32_t max_context)
+                 ForwardState state, ForwardKV kv, ForwardExperts experts, std::int32_t max_context,
+                 ForwardFastPaths fast_paths)
     : parameters_(parameters), config_(parameters.model.config().text), device_(device), work_(work),
       state_(std::move(state)), kv_(std::move(kv)), experts_(std::move(experts)), max_context_(max_context),
+      fast_(fast_paths),
       rope_(ops::prepare_rope(dim(config_.rope.rotary_dim), config_.rope.theta,
                               {config_.rope.yarn_factor, config_.max_position_embeddings})) {
     if (state_.gdn == nullptr || state_.gdn->layer_count() != config_.gdn_layers ||
@@ -386,14 +391,30 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
     // A verification call projects its convolution inputs straight into the replay records.
     GdnReplayRecordLayer records;
     if (batch.verify != nullptr) { records = batch.verify->gdn.layer(static_cast<std::int32_t>(index), batch.batch); }
-    Tensor qkv = batch.verify != nullptr ? records.conv.view({C, T}) : work_.alloc(DType::BF16, {C, T});
-    Tensor z   = work_.alloc(DType::BF16, {VW, T});
-    if (p.projection.weight.qtype == QType::Q8_G32_FP16) {
+    // gdn-conv-fused: a decode call's Q8 projection runs the causal convolution in its epilogue, from
+    // the FP32 projection rather than its BF16 rounding. Verification and prefill stay composed.
+    const bool decode     = batch.verify == nullptr && batch.width <= 1;
+    const bool fused_conv = fast_.gdn_conv_fused && decode && p.projection.weight.qtype == QType::Q8_G32_FP16;
+    Tensor qkv;
+    if (!fused_conv) { qkv = batch.verify != nullptr ? records.conv.view({C, T}) : work_.alloc(DType::BF16, {C, T}); }
+    Tensor z = work_.alloc(DType::BF16, {VW, T});
+    Tensor q, k, v;
+    if (fused_conv) {
+        q = work_.alloc(DType::BF16, {KW, T});
+        k = work_.alloc(DType::BF16, {KW, T});
+        v = work_.alloc(DType::BF16, {VW, T});
+        auto layer          = state_.gdn->layer_view(index);
+        const Tensor x_rows = x.view({H, 1, T});
+        Tensor q_rows = q.view({KW, 1, T}), k_rows = k.view({KW, 1, T}), v_rows = v.view({VW, 1, T}),
+               z_rows = z.view({VW, 1, T});
+        ops::gdn_input_proj_conv_snapshot(x_rows, p.projection.weight, p.convolution, layer.conv, batch.slots,
+                                          batch.slots, q_rows, k_rows, v_rows, z_rows, fast_.dense_routes, s);
+    } else if (p.projection.weight.qtype == QType::Q8_G32_FP16) {
         // Q8 (Dense8): the projection writes q/k/v and z to their destinations itself.
-        ops::gdn_input_proj(x, p.projection.weight, qkv, z, s);
+        ops::gdn_input_proj(x, p.projection.weight, qkv, z, s, fast_.dense_routes);
     } else {
         Tensor projected = work_.alloc(DType::BF16, {C + VW, T});
-        project(x, p.projection, projected, work_, s);
+        project(x, p.projection, projected, work_, s, fast_.dense_routes);
         Tensor* parts[] = {&qkv, &z};
         ops::split_rows(projected, parts, s);
     }
@@ -408,9 +429,11 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
         ops::gdn_gating(ab.slice(0, 0, NV), ab.slice(0, NV, NV), p.a_log, p.dt_bias, gate, beta, s);
     }
 
-    Tensor q = work_.alloc(DType::BF16, {KW, T});
-    Tensor k = work_.alloc(DType::BF16, {KW, T});
-    Tensor v = work_.alloc(DType::BF16, {VW, T});
+    if (!fused_conv) {
+        q = work_.alloc(DType::BF16, {KW, T});
+        k = work_.alloc(DType::BF16, {KW, T});
+        v = work_.alloc(DType::BF16, {VW, T});
+    }
     Tensor o = work_.alloc(DType::BF16, {DV, NV, T});
     const float scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(DK)));
     if (batch.verify != nullptr) {
@@ -438,8 +461,10 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
     } else {
         // One position per sequence (decode): the recurrent update with device-chosen slots.
         auto layer = state_.gdn->layer_view(index);
-        ops::causal_conv1d_silu_snapshot_split(qkv.view({C, 1, T}), p.convolution, layer.conv, Tensor{},
-                                               batch.slots, batch.slots, q, k, v, s);
+        if (!fused_conv) {
+            ops::causal_conv1d_silu_snapshot_split(qkv.view({C, 1, T}), p.convolution, layer.conv, Tensor{},
+                                                   batch.slots, batch.slots, q, k, v, s);
+        }
         Tensor o_batch = o.view({DV, NV, 1, T});
         // The gates are evaluated inside the update from the control projection (no gdn_gating kernel).
         ops::gated_delta_net_batch_update_gating(q.view({DK, NK, 1, T}), k.view({DK, NK, 1, T}), v.view({DV, NV, 1, T}),
@@ -454,7 +479,7 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
                        g.output_gate == GateActivation::Sigmoid ? ops::RmsGate::Sigmoid : ops::RmsGate::Silu,
                        config_.rms_norm_eps, normed, device_.execution_view().on_stream(s));
     Tensor y = work_.alloc(DType::BF16, {H, T});
-    project(normed.view({VW, T}), p.output, y, work_, s);
+    project(normed.view({VW, T}), p.output, y, work_, s, fast_.dense_routes);
     return y;
 }
 
@@ -466,7 +491,7 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const A
     const std::int32_t IH = dim(config_.qsa.index_heads), ID = dim(config_.qsa.index_head_dim);
     const std::int32_t index_rows = IH * ID + ID;
     Tensor projected = work_.alloc(DType::BF16, {2 * QW + 2 * KW + (p.index_projection ? 0 : index_rows), T});
-    project(x, p.projection, projected, work_, s);
+    project(x, p.projection, projected, work_, s, fast_.dense_routes);
     Tensor q = work_.alloc(DType::BF16, {D, dim(a.heads), T});
     Tensor gate = work_.alloc(DType::BF16, {QW, T});
     Tensor k = work_.alloc(DType::BF16, {D, dim(a.kv_heads), T});
@@ -487,39 +512,11 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const A
             ops::split_rows(projected, parts, s);
         }
     }
-    Tensor qn = work_.alloc(DType::BF16, {D, dim(a.heads), T});
-    Tensor kn = work_.alloc(DType::BF16, {D, dim(a.kv_heads), T});
-    {
-        Tensor qn_rows = qn.view({D, dim(a.heads) * T});
-        Tensor kn_rows = kn.view({D, dim(a.kv_heads) * T});
-        ops::rmsnorm(q.view({D, dim(a.heads) * T}), p.query_norm, config_.rms_norm_eps, true, qn_rows, s);
-        ops::rmsnorm(k.view({D, dim(a.kv_heads) * T}), p.key_norm, config_.rms_norm_eps, true, kn_rows, s);
-    }
-    ops::rope(call.rope_positions, rope_, qn, kn, device_.execution_view().on_stream(s));
-
-    // Append K/V of every sequence through its device-chosen table row, then the pooled index keys.
-    // The vector-quantized storages' exact window is addressed by the sequences' state slots, and
-    // qsa_attention appends their K/V itself (a wide call stages its window rows); a K/V-only call
-    // appends here.
+    // The vector-quantized storages' exact window is addressed by the sequences' state slots.
     ops::QsaKVLayer layer = call.layer;
     if (layer.kv.window.present()) { layer.kv.window.slots = call.slots; }
     const bool vq = layer.kv.storage == KvCacheStorage::Vq2 || layer.kv.storage == KvCacheStorage::Q4KeyVq2Value;
     const std::int32_t KVH = dim(a.kv_heads);
-    const ops::QsaAppend append{.k = kn.view({D, KVH, call.width, call.batch}),
-                                .v = v.view({D, KVH, call.width, call.batch})};
-    if (!vq || call.kv_only) {
-        const PagedKVBatchLayerView view{.k_pages       = layer.kv.k_pages,
-                                         .v_pages       = layer.kv.v_pages,
-                                         .k_scale_pages = layer.kv.k_scale_pages,
-                                         .v_scale_pages = layer.kv.v_scale_pages,
-                                         .block_tables  = kv_.block_tables,
-                                         .head_dim      = layer.kv.head_dim,
-                                         .num_kv_heads  = layer.kv.num_kv_heads,
-                                         .storage       = layer.kv.storage,
-                                         .window        = layer.kv.window};
-        ops::kv_cache_append_batch(append.k, append.v, call.positions.view({call.width, call.batch}),
-                                   call.table_rows, view, s);
-    }
     const ops::QsaGeometry geometry = qsa_geometry(config_);
     const ops::QsaBatch qsa_batch{.block_tables     = kv_.block_tables,
                                   .table_rows       = call.table_rows,
@@ -530,9 +527,56 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const A
                                   .batch            = call.batch,
                                   .width            = call.width,
                                   .update_tails     = call.update_tails};
-    ops::qsa_pool_keys(ik, p.index_key_norm, call.tails, layer, qsa_batch, geometry, s);
-    if (call.kv_only) { return Tensor{}; }
-    ops::qsa_index_query(iq, p.index_query_norm, call.rope_positions, geometry, s);
+    // qsa-prepare-fused: every call (decode, verification, prefill and MTP chunks alike, so a position's
+    // stored K and pooled keys do not depend on which route wrote them, as Replay and prefix-cache
+    // equivalence require) normalizes and rotates Q, K, the index query and the pooled keys and appends
+    // K/V and the tails in one kernel, FP32 from the projection rows into the cache codec. Q and the
+    // index query are prepared in place.
+    Tensor qn = q;
+    ops::QsaAppend append{};
+    if (fast_.qsa_prepare_fused && ops::qsa_prepare_supports(layer.kv.storage)) {
+        const ops::QsaPrepareInputs inputs{.q = q, .k = k, .v = v, .index_q = iq, .index_k = ik};
+        const ops::QsaPrepareNorms norms{.query       = p.query_norm,
+                                         .key         = p.key_norm,
+                                         .index_query = p.index_query_norm,
+                                         .index_key   = p.index_key_norm};
+        Tensor q_out  = call.kv_only ? Tensor{} : q;
+        Tensor iq_out = call.kv_only ? Tensor{} : iq;
+        ops::qsa_prepare(inputs, norms, call.tails, layer, qsa_batch, geometry, q_out, iq_out, s);
+        if (call.kv_only) { return Tensor{}; }
+    } else {
+        qn        = work_.alloc(DType::BF16, {D, dim(a.heads), T});
+        Tensor kn = work_.alloc(DType::BF16, {D, dim(a.kv_heads), T});
+        {
+            Tensor qn_rows = qn.view({D, dim(a.heads) * T});
+            Tensor kn_rows = kn.view({D, dim(a.kv_heads) * T});
+            ops::rmsnorm(q.view({D, dim(a.heads) * T}), p.query_norm, config_.rms_norm_eps, true, qn_rows, s);
+            ops::rmsnorm(k.view({D, dim(a.kv_heads) * T}), p.key_norm, config_.rms_norm_eps, true, kn_rows, s);
+        }
+        ops::rope(call.rope_positions, rope_, qn, kn, device_.execution_view().on_stream(s));
+
+        // Append K/V of every sequence through its device-chosen table row, then the pooled index
+        // keys. qsa_attention appends the vector-quantized storages' K/V itself (a wide call stages
+        // its window rows); a K/V-only call appends here.
+        append = ops::QsaAppend{.k = kn.view({D, KVH, call.width, call.batch}),
+                                .v = v.view({D, KVH, call.width, call.batch})};
+        if (!vq || call.kv_only) {
+            const PagedKVBatchLayerView view{.k_pages       = layer.kv.k_pages,
+                                             .v_pages       = layer.kv.v_pages,
+                                             .k_scale_pages = layer.kv.k_scale_pages,
+                                             .v_scale_pages = layer.kv.v_scale_pages,
+                                             .block_tables  = kv_.block_tables,
+                                             .head_dim      = layer.kv.head_dim,
+                                             .num_kv_heads  = layer.kv.num_kv_heads,
+                                             .storage       = layer.kv.storage,
+                                             .window        = layer.kv.window};
+            ops::kv_cache_append_batch(append.k, append.v, call.positions.view({call.width, call.batch}),
+                                       call.table_rows, view, s);
+        }
+        ops::qsa_pool_keys(ik, p.index_key_norm, call.tails, layer, qsa_batch, geometry, s);
+        if (call.kv_only) { return Tensor{}; }
+        ops::qsa_index_query(iq, p.index_query_norm, call.rope_positions, geometry, s);
+    }
 
     Tensor out = work_.alloc(DType::BF16, {D, dim(a.heads), T});
     const std::size_t scratch = ops::qsa_attention_workspace_bytes(geometry, T, max_context_, layer.kv.storage);
@@ -544,7 +588,7 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const A
     Tensor gated = out.view({QW, T});
     ops::sigmoid_mul(gate, gated, s);
     Tensor y = work_.alloc(DType::BF16, {H, T});
-    project(gated, p.output, y, work_, s);
+    project(gated, p.output, y, work_, s, fast_.dense_routes);
     return y;
 }
 
@@ -703,9 +747,9 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
 
     const std::int32_t I = dim(m.shared_intermediate);
     Tensor product = work_.alloc(DType::BF16, {I, T});
-    shared_swiglu(x, p.shared_gate_up, product, work_, s);
+    shared_swiglu(x, p.shared_gate_up, product, work_, s, fast_.dense_routes);
     Tensor shared = work_.alloc(DType::BF16, {H, T});
-    project(product, p.shared_down, shared, work_, s);
+    project(product, p.shared_down, shared, work_, s, fast_.dense_routes);
     ops::moe_experts_cpu_wait(x, dispatch, source, max_jobs, expert_ws.data, outputs, s);
     if (inject != nullptr) {
         ops::moe_combine_inject(outputs, routing, shared, *inject, *residual, s);

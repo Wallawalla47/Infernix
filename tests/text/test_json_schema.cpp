@@ -1,5 +1,6 @@
 #include "text/grammar.h"
 #include <nlohmann/json.hpp>
+#include <algorithm>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -35,6 +36,69 @@ bool accepts(infernix::text::GrammarCompiler& compiler, const Constraint& constr
 
 void check(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
+}
+
+void length_boundaries(infernix::text::GrammarCompiler& compiler) {
+    for (int upper : {0, 1, 127, 128, 129, 200}) {
+        for (int lower : {0, upper}) {
+            auto schema = Json{{"type", "string"}, {"minLength", lower}, {"maxLength", upper}};
+            const auto constraint = Constraint::json_schema(schema.dump());
+            for (int count : {std::max(0, upper - 1), upper, upper + 1}) {
+                const bool expected = lower <= count && count <= upper;
+                check(accepts(compiler, constraint, Json(std::string(count, 'a')).dump()) ==
+                          expected,
+                      "bounded JSON string accepted the wrong length");
+            }
+            if (upper == 0) continue;
+            for (const auto& last :
+                 std::vector<std::string>{"你", "😀", "\n", "\"", "\\", std::string(1, '\0')}) {
+                const std::string prefix(upper - 1, 'a');
+                check(accepts(compiler, constraint, Json(prefix + last).dump()),
+                      "last JSON scalar did not fit its length budget");
+                check(!accepts(compiler, constraint, Json(prefix + last + "a").dump()),
+                      "JSON escape or UTF-8 exceeded its length budget");
+            }
+        }
+    }
+    const auto minimum = Constraint::json_schema(R"({"type":"string","minLength":129})");
+    check(!accepts(compiler, minimum, Json(std::string(128, 'a')).dump()) &&
+              accepts(compiler, minimum, Json(std::string(200, 'a')).dump()),
+          "unbounded JSON length lost its minimum");
+
+    const auto shared = Constraint::json_schema(R"({"type":"object","properties":{
+        "a":{"type":"string","minLength":1,"maxLength":2},
+        "b":{"type":"string","minLength":3,"maxLength":4}},
+        "required":["a","b"],"additionalProperties":false})");
+    check(accepts(compiler, shared, R"({"a":"你","b":"a\nb"})") &&
+              !accepts(compiler, shared, R"({"a":"abc","b":"abc"})") &&
+              !accepts(compiler, shared, R"({"a":"a","b":"ab"})"),
+          "shared JSON scalar rules confused field length bounds");
+}
+
+void dense_length_masks() {
+    std::vector<std::string> vocabulary{"\"", "a\"", "aa\"", "aaaa\"", "\"a"};
+    for (char a = 'a'; a <= 'z'; ++a)
+        for (char b = 'a'; b <= 'z'; ++b)
+            for (char c = 'a'; c <= 'z'; ++c) vocabulary.push_back(std::string{a, b, c});
+    const int eos = static_cast<int>(vocabulary.size());
+    vocabulary.emplace_back();
+    infernix::text::GrammarCompiler compiler(vocabulary, {eos}, 8 * 1024 * 1024);
+    const auto constraint =
+        Constraint::json_schema(R"({"type":"string","minLength":127,"maxLength":129})");
+    for (int consumed : {0, 126, 127, 128, 129}) {
+        auto session = compiler.compile(constraint, {}, "\"" + std::string(consumed, 'a'));
+        std::vector<std::uint32_t> words(session->mask_words());
+        check(session->masks({}, words) == 0, "length mask reached a dead end");
+        for (int token = 0; token <= eos; ++token) {
+            bool expected = token >= 5 && token < eos && consumed + 3 <= 129;
+            if (token < 4) {
+                const int length = consumed + static_cast<int>(vocabulary[token].size()) - 1;
+                expected         = length >= 127 && length <= 129;
+            }
+            check(bool(words[token / 32] & (1u << (token % 32))) == expected,
+                  "dense JSON mask differs from independent length bounds");
+        }
+    }
 }
 
 void contracts(infernix::text::GrammarCompiler& compiler) {
@@ -103,6 +167,8 @@ int main(int argc, char** argv) {
             }
         } else {
             contracts(compiler);
+            length_boundaries(compiler);
+            dense_length_masks();
             std::cout << "JSON/schema CPU contracts passed\n";
         }
         return 0;

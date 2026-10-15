@@ -146,4 +146,24 @@ KvCapacityResolution resolve_kv_capacity(const KvCapacityPolicy& policy,
     };
 }
 
+std::optional<KvCapacityResolution>
+resolve_kv_capacity_beside(const KvCapacityPolicy& policy, const SequenceCapacityCurve& curve,
+                           std::size_t available_runtime_bytes,
+                           std::size_t automatic_headroom_bytes,
+                           const KvCapacityResolution& ordinary, std::uint64_t lane_page_groups) {
+    KvCapacityResolution grown;
+    try {
+        grown = resolve_kv_capacity(policy, curve, available_runtime_bytes,
+                                    automatic_headroom_bytes);
+    } catch (const std::invalid_argument&) {
+        return std::nullopt;
+    }
+    const std::uint64_t required =
+        policy.mode == KvCapacityMode::Automatic
+            ? std::min<std::uint64_t>(ordinary.main_page_groups, lane_page_groups)
+            : ordinary.main_page_groups;
+    if (grown.main_page_groups < required) { return std::nullopt; }
+    return grown;
+}
+
 } // namespace infernix::runtime

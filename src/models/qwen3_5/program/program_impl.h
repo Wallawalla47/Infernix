@@ -10,6 +10,7 @@
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 
 #include "models/qwen3_5/program/planning/startup.h"
+#include "models/qwen3_5/program/speculative/mtp_draft_policy.h"
 #include "models/qwen3_5/program/speculative/tree_width_controller.h"
 #include "models/qwen3_5/program/storage/draft_context.h"
 #include "models/qwen3_5/program/storage/kv_address_space.h"
@@ -197,6 +198,9 @@ struct SequenceState {
     std::uint32_t dflash_context_frontier = 0;
     std::array<TokenId, qwen3_5::kMtpDecodeMaximumDrafts> mtp_drafts{};
     std::uint32_t mtp_draft_count = 0;
+    // adaptive-mtp: the request's learned draft acceptance and draft-length memory. It moves with
+    // the sequence into a paused request's ResumeState and back at its resume binding.
+    MtpLaneDraftState mtp_draft;
     bool tail_hidden_valid        = false;
     bool endpoint_valid           = false;
 };
@@ -400,6 +404,11 @@ public:
     const std::uint32_t max_concurrency;
     const ContextCacheOptions context_cache;
     const std::uint32_t prefill_chunk;
+    // The width a staged prefill step may take while no other lane waits to decode
+    // (FastPath::IdleWidePrefill): a multiple of prefill_chunk, and prefill_chunk itself when the
+    // fast path is off or no wider step fit the memory plan. prefill_hidden, the DFlash prefill
+    // features and the prefill workspace are planned at this width.
+    const std::uint32_t idle_prefill_width;
     const ExecutionSchedule execution_schedule;
     const std::uint32_t draft_window;
     const std::uint32_t neural_draft_window;
@@ -409,6 +418,9 @@ public:
     const TreeWidthPlan tree_widths;
     const std::uint32_t draft_tree_paths;
     std::optional<TreeWidthController> tree_controller;
+    // The adaptive-mtp draft-length policy (FastPath::AdaptiveMtp): present when the plan captures
+    // a neural MTP family per draft length; each all-neural MTP round then runs the length it picks.
+    std::optional<MtpDraftPolicy> mtp_draft_policy;
     const std::uint32_t ngram_draft_window;
     const std::uint32_t ngram_min_match;
     const SpeculativeBackend speculative_backend;
@@ -543,8 +555,17 @@ public:
 
     [[nodiscard]] std::uint32_t initial_mtp_extent(const RequestBasePlanImpl&) const;
     [[nodiscard]] UnitDemand held_extent(const RequestBasePlanImpl&) const;
+    // The KV coverage of a staged prefill step of up to `step_tokens` prompt tokens from `cursor`.
     [[nodiscard]] UnitDemand prefill_unit(std::uint32_t prompt, std::uint32_t cursor,
-                                          std::uint32_t mtp_extent) const;
+                                          std::uint32_t mtp_extent,
+                                          std::uint32_t step_tokens) const;
+    // The tokens the lane's next staged prefill step is reserved for: prefill_chunk, or the idle
+    // width when idle-wide-prefill is selected and no other lane waits to decode (request_plan.cpp).
+    [[nodiscard]] std::uint32_t prefill_step_tokens(const SequenceState&,
+                                                    const RequestControl&) const;
+    // Whether a lane other than `lane` is generating (Active or Pending): its next decode or
+    // control round waits behind any prefill step.
+    [[nodiscard]] bool other_lane_generating(std::uint32_t lane) const noexcept;
     [[nodiscard]] UnitDemand next_unit(const SequenceState&, const RequestControl&,
                                        ExecutionUnitKind, std::uint32_t tokens) const;
     void require_unit(std::uint32_t lane, ExecutionUnitKind, std::uint32_t tokens = 0) const;
@@ -733,6 +754,12 @@ public:
     // Realizes the planned taps a completed prefill chunk reached.
     void hybrid_after_prefill_chunk(SequenceState& sequence, std::uint32_t cursor,
                                     std::uint32_t prompt_tokens);
+    // The tokens a prefill step wider than prefill_chunk may take from `cursor` (at most
+    // `tokens`): it ends no later than the chunk boundary where a chunk-wide prefill would
+    // realize the lane's next flexible tap, so idle-wide-prefill snapshots where it does.
+    [[nodiscard]] std::uint32_t hybrid_wide_step_limit(std::uint32_t lane, std::uint32_t cursor,
+                                                       std::uint32_t prompt_tokens,
+                                                       std::uint32_t tokens) const;
     // Publishes pending taps whose blocks are committed; a finishing lane hands its own last
     // pages to the remaining ones or drops them.
     void hybrid_publish_pending(SequenceState& sequence, bool finishing);

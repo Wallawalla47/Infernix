@@ -12,6 +12,7 @@
 #include "core/tensor.h"
 #include "models/qwen4_exp/execution/expert_stream.h"
 #include "models/qwen4_exp/execution/parameters.h"
+#include "models/qwen4_exp/execution/fast_path_flags.h"
 #include "infernix/ops/offloaded_sparse_moe.h"
 #include "infernix/ops/qsa.h"
 #include "infernix/ops/rope.h"
@@ -222,7 +223,8 @@ struct ForwardTap {
 class Forward {
 public:
     Forward(const Parameters& parameters, DeviceContext& device, WorkspaceArena& work,
-            ForwardState state, ForwardKV kv, ForwardExperts experts, std::int32_t max_context);
+            ForwardState state, ForwardKV kv, ForwardExperts experts, std::int32_t max_context,
+            ForwardFastPaths fast_paths);
     ~Forward();
     Forward(const Forward&)            = delete;
     Forward& operator=(const Forward&) = delete;
@@ -294,6 +296,8 @@ private:
     ForwardKV kv_;
     ForwardExperts experts_;
     std::int32_t max_context_;
+    // The selected fast paths (program/fast_paths.h); all off on the exact route.
+    ForwardFastPaths fast_;
     ops::PreparedRope rope_; // the text rotation (YaRN-scaled when the factor is above 1)
     bool eager_chunk_ = false;
     // A gated call's layer routing on the host: the dispatch offsets (pinned I32 [E + 1]), the

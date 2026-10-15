@@ -352,7 +352,8 @@ different route may ship, what it is measured against, how much it may cost, and
 - **The fast paths** (`infernix::FastPath`) are routes whose arithmetic differs from the exact
   route's. By default (no `--disable-fast-paths`) the Engine runs every fast path qualified for the
   loaded **configuration**: the attention geometry, the activation class (the narrowest activation
-  precision any text-decoder linear permits: 4, 8 or 16 bits) and the KV format. A path runs only
+  precision any text-decoder linear permits: 4, 8 or 16 bits) and the KV format (on Qwen3.5, also
+  whether the text MLP gate/up is groupwise Q4, the format q4-w4a8 runs on). A path runs only
   in the configurations the registry (6.7) lists, so each configuration gets the fast paths that
   meet its own budget and no others; startup logs the selection (`fast paths | ...`) and
   `LoadSummary::fast_paths` reports it. A fast path stays deterministic for a fixed configuration
@@ -630,8 +631,8 @@ placement-invariant W4A16 arithmetic of its design §16.2.1), so its floor inclu
 experts' 4-bit activations cost; pass `--ngram-volume` to the gate when the volume is not
 `<artifact>.ngram`. Its Engine scoring is checked against the Forward's own teacher-forced logits
 (`infernix_qwen4_exp_score_real_test`): on 3,000 tokens the perplexity matches, top-1 agrees at
-every position, and the RAM and SSD expert tiers give the same output. No fast path is qualified
-for Qwen3.8-Flash-Next yet; only its request-coupling paths (6.7) apply there.
+every position, and the RAM and SSD expert tiers give the same output. Its qualified paths are
+three request-coupling paths and the three Q8 dense-kernel paths (6.7).
 
 ### 6.6 Calibration and comparison with other engines
 
@@ -704,8 +705,9 @@ model already loses to quantization sets the scale at which further error is vis
 Each entry records what the fast path changes, where its kernels run, the configurations it is
 qualified for, and the evidence that admitted it. The configurations are the ones
 `models/qwen3_5/program/planning/fast_paths.cpp` lists (`kQualified`); a configuration not listed
-runs the path's exact counterpart. Qwen3.8-Flash-Next has only three of the request-coupling paths
-below (`src/runtime/engine/qwen4_exp_instance.cpp` lists their configurations).
+runs the path's exact counterpart. Qwen3.8-Flash-Next has three of the request-coupling paths
+below and its own kernel paths (`models/qwen4_exp/program/fast_paths.cpp` lists their
+configurations).
 
 | Fast path | Kernels run with | Qualified configurations |
 |---|---|---|
@@ -719,6 +721,11 @@ below (`src/runtime/engine/qwen4_exp_instance.cpp` lists their configurations).
 | `free-cache-resume` | the same, with the prefix cache | 24 heads, 4-bit activations, with INT8, NVFP4, K8V4 or K4V2 KV |
 | `preemption` | request-invariance-capable artifacts | 24 heads, 4-bit activations, with INT8, NVFP4, K8V4 or K4V2 KV |
 | Qwen3.8-Flash-Next: `adaptive-speculation` (MTP), `free-cache-resume`, `preemption` | every Flash-Next artifact | INT8 KV |
+| Qwen3.8-Flash-Next: `q8-sliced-k`, `gdn-conv-fused`, `qsa-prepare-fused` | Q8 dense weights (`qsa-prepare-fused`: BF16, INT8, FP8, NVFP4 or K8V4 KV) | Q8 dense, 4-bit experts, INT8 KV |
+| `fp8-a8-pair` | row-FP8 dense weights (recipe C) | none (op level only, below) |
+| `q4-w4a8` | groupwise Q4 MLP gate/up | none (fails, below) |
+| `idle-wide-prefill` | Qwen3.8-27B / Qwen3.6-35B-A3B generation engines | 24 heads, 4-bit activations, with INT8, NVFP4, K8V4 or K4V2 KV |
+| `adaptive-mtp` | Qwen3.8-27B / Qwen3.6-35B-A3B with MTP | none (no speed gain shown, below) |
 
 **The request-coupling paths.** These were the default behaviour until the exact route became
 request-invariant (2026-10-14). Each makes a request's arithmetic depend on the other requests of
@@ -771,6 +778,7 @@ output was identical across concurrency 1-8 and to plain decode, 2026-10-14), so
 draft length chosen from both rows (without it two rows decode plain, as three or more do);
 `free-cache-resume` is prefill calls, taps and resumes off its 16-token GDN sub-chunk grid,
 sibling coalescing, and endpoints and blocks holding decode-computed state; `preemption` as above.
+Its kernel path `q8-sliced-k` (below) couples requests too: its routes depend on the round's width.
 
 **Evidence** (2026-10-14, RTX 5090, CUDA 13.4; official 27B NVFP4 and Qwen3.8-Flash-Next NVIDIA
 NVFP4 Dense8; 1,024 segments of the decode corpus, 65,536 forced positions per route). Each
@@ -996,3 +1004,138 @@ and recomputes the previous output) or admission (whole extents held without `pr
   The path acts only in the prompt (tiled) attention kernels; decode throughput was not measured.
 - **Not yet qualified:** 24-head artifacts with 8- or 16-bit activations (smaller budgets), and
   other attention geometries; none exists on this machine.
+
+**`adaptive-mtp`: MTP draft length chosen per round (candidate, not qualified).**
+- **Selected by:** `--fast-path adaptive-mtp` with `--spec mtp` on Qwen3.8-27B / Qwen3.6-35B-A3B;
+  the policy is `models/qwen3_5/program/speculative/mtp_draft_policy.h`.
+- **What changes:** `--draft-tokens N` becomes a ceiling. Each all-neural round of one row runs a
+  draft length K in 1..N, and a round of several rows one common K among 1, 2, 3 and N, whichever
+  maximizes the rows' expected committed tokens per unit of round time. Expected tokens come from
+  each request's decayed per-position acceptance (carried through preemption and Replay with the
+  request); a round of K drafts costs the fixed model 1 + 0.2 K plain rounds (calibrated on the
+  captured graphs), so the choices repeat run to run.
+  Every 16 choices the next longer K runs for two rounds so its acceptance stays measured. A choice
+  reads only earlier rounds: drafts, acceptance and sampling are unchanged, but the verification
+  width, and with it the target's linear routes, varies by round. Copy (n-gram) rounds keep their
+  widths and propose at N.
+- **Cost:** one Forward/Finish graph pair per extra (K, batch size): K < N for one row, K in 1..3
+  for every batch size (about +4 MiB of graph allowance each).
+- **Speed** (2026-10-15, RTX 5090, INT8 KV, `infernix_bench` pp2048+tg256 on the bench corpus,
+  `--draft-tokens 5`): slower than a fixed five drafts everywhere measured. Official 27B NVFP4: 312.6
+  against 326.1 tok/s at one request (−4.1 %), 311.8 against 314.9 at two (−1.0 %), 273.6 against
+  276.9 at four (−1.2 %); 35B-A3B: 892.7 against 928.4 at one (−3.9 %). The corpus accepts almost
+  every draft (mean accepted length 5.9 of 6), so the policy keeps K = 5 and loses only its probe
+  rounds; text with low acceptance, where shorter drafts pay, was not measured. Not gated: no
+  speed gain is shown.
+
+**`idle-wide-prefill`: wider prefill steps while no request waits to decode (qualified
+2026-10-15).**
+- **Selected by:** `--fast-path idle-wide-prefill` on Qwen3.8-27B / Qwen3.6-35B-A3B generation
+  engines; the rules are `models/qwen3_5/program/planning/idle_prefill.h`.
+- **What changes:** a staged prefill step whose permit is reserved while no other lane is
+  generating (Active or Pending) takes the idle width instead of one chunk. Startup plans 4096,
+  2048 and 1024 tokens, each clamped and rounded to whole prompt-attention waves as the chunk is
+  (3584 and 1792 on the RTX 5090 with 24 heads), then down to a multiple of the chunk, and keeps
+  the widest whose larger prefill buffers and workspace keep the KV capacity (an explicit one
+  whole, an automatic one down to every lane's full context); the `fast paths |` startup line
+  reports it. Beside a lane that waits to decode the step stays one chunk, so that lane's stall
+  is unchanged. Only the pass boundaries move, and every boundary stays on the chunk grid from the
+  step's start: a wide step ends where a chunk-wide prefill would realize the lane's next flexible
+  prefix-cache tap, and exact taps split it where they split a chunk, so snapshots land at the same
+  positions. A Vision prompt, a binding's first step, a recovering request and Replay keep the
+  chunk, as does a step whose extra KV pages are neither free nor evictable cache.
+- **Cost:** prefill buffers and workspace at the idle width (with automatic KV capacity, fewer
+  cached KV pages); a request admitted during a wide step waits up to one wide step.
+- **Speed** (2026-10-15, RTX 5090, official Qwen3.8-27B NVFP4, INT8 KV, `infernix_bench`, one
+  24,576-token prompt alone): 10,547.6 → 11,533.4 tok/s (+9.3 %). The upstream measurement (NInfer
+  5bcef9e2c): 35B-A3B 1.41 → 1.26 s, 27B NVFP4 3.28 → 3.06 s, with the decode stall behind a
+  13.8k-token prompt unchanged.
+- **Evidence** (2026-10-15, RTX 5090, official Qwen3.8-27B NVFP4, quick corpus, its own a16
+  reference). Scoring engines plan no idle width, so the gate runs the step the path takes: every
+  fast run prefills at the idle width (`--fast-chunk 3584`, jointly with the qualified paths)
+  against the exact route at the 896- and 1,792-token chunks below it (36 windows, 0.52 million
+  positions per route). Every criterion passes:
+
+  | KV | KL excess (bound) / budget | Top-1 excess, points (bound) / budget | NLL excess | p99.9 KL ratio |
+  |---|---|---|---|---|
+  | INT8 | 4.0e-4 (7.3e-4) / 1.2e-3 | +0.03 (0.09) / 0.41 | 5.1e-4 | 1.05 |
+  | NVFP4 | 3.3e-4 (6.7e-4) / 1.4e-3 | +0.02 (0.09) / 0.45 | −3.4e-4 | 1.01 |
+  | K8V4 | 2.8e-4 (9.4e-4) / 1.3e-3 | +0.05 (0.12) / 0.43 | −1.5e-3 | 1.04 |
+  | K4V2 | −3.1e-4 (1.9e-4) / 1.4e-3 | −0.02 (0.04) / 0.44 | 1.3e-3 | 1.02 |
+
+  A first run with `--fast-path idle-wide-prefill` at each chunk was void: the scoring engine
+  never widened a step, so its fast runs measured only the qualified paths. The evaluation then
+  needed `evaluate-prefill --fast-chunk` (fixed the same day: the pair check had required equal
+  chunks).
+- **Qualified:** 24 heads, 4-bit activations, with INT8, NVFP4, K8V4 or K4V2 KV.
+
+**`q8-sliced-k`, `gdn-conv-fused`, `qsa-prepare-fused`: Qwen3.8-Flash-Next dense kernels (qualified 2026-10-15).**
+- **What changes:** `q8-sliced-k` runs NInfer's GEMV, sliced-K and grouped sliced-K tables for the
+  Q8 [16384, 2560] GDN projection and the [2560, 6144] GDN and QSA output projections, where they
+  are faster than the exact routes (above T = 128, and at T = 321-384 and 449-511 on [16384,
+  2560], they keep the exact routes). Their reduction order depends on the call's width, so it
+  couples a request's decode to the other requests of its round (`request_invariant` is false).
+  `gdn-conv-fused` feeds plain decode's GDN convolution the projection's FP32 q/k/v; and
+  `qsa-prepare-fused` keeps FP32 between the QSA layer's norm, rotation and append steps. With them
+  MTP output no longer equals plain decode.
+- **Evidence** (RTX 5090, CUDA 13.4, Qwen3.8-Flash-Next NVIDIA NVFP4 Dense8, INT8 KV, the three
+  jointly with the qualified paths; the exact route was bit-identical to the 2026-10-14 controls,
+  so their exact run is the decode default):
+
+  | Arm | KL or TV excess (bound) / budget | Top-1 excess, points (bound) / budget | Other |
+  |---|---|---|---|
+  | prefill, quick corpus, chunks 896-7,168 | KL −4.2e-4 (−1.1e-4) / 3.0e-3 | −0.06 (0.02) / 0.50 | NLL −2.2e-3, p99.9 KL ratio 0.96 |
+  | decode plain, concurrency 8, four-lane pool | TV −1.0e-3 (8.0e-4) / 5.0e-3 | −0.13 (0.16) / 0.50 | KL −2.2e-3 / 2.1e-2, p99.9 ratio 1.01 |
+  | decode MTP, concurrency 2 | TV −8.6e-4 (9.4e-4) / 5.0e-3 | −0.18 (0.12) / 0.50 | KL −3.3e-3 / 2.1e-2, p99.9 ratio 1.02 |
+
+  Every prompt-length and context bucket passes.
+- **Speed** (`infernix_bench`, two rounds): plain decode +1.4 %, MTP (four drafts) +3.4 to
+  +4.2 %, prefill +0.3 to +1.0 % (qwen3_8-flash-next-design.md §19.3.22).
+- **Not yet qualified:** other KV formats (`qsa-prepare-fused` is KV-specific, and the other two
+  need the format with least headroom), 16-bit expert activations, and other dense formats (no
+  kernels).
+
+**`fp8-a8-pair`: two E4M3 activation terms in recipe C's FP8 projections (op level only).**
+- **What changes:** prefill-width calls of Flash-Next's row-FP8 dense problems carry each 16-bit
+  activation as two E4M3 terms on the 8-bit Tensor Core path, admitted per problem where faster
+  than the exact route (cold L2, graph): [16384, 2560] from T = 17, [13312, 2560] from 97,
+  [2560, 6144] and [2560, 640] from 513, [1280, 2560] from 1,025 (0.65-0.93 of the exact route
+  beyond, except [2560, 6144] at T = 1,040-1,088: 1.18).
+- **Op qualification:** `infernix_linear_fp8_a8_test`, the A16 criterion at every problem's
+  admission seams and tiles (worst relative L2 0.78 of the criterion), outliers and K tails.
+- **Model level:** not gated (no recipe-C artifact on this machine), so it runs in no
+  configuration.
+
+**`q4-w4a8`: int8 activations in the groupwise Q4 MLP gate/up (fails; not qualified).**
+- **Selected by:** `--fast-path q4-w4a8` on artifacts whose text MLP gate/up is RowSplit
+  `Q4_G64_FP16` (the official Qwen3.8-27B groupwise recipe; `FastPathConfiguration::q4_gate_up`),
+  through `ExecutionSchedule::linear_routes` to `ops::linear_swiglu` with `LinearRoutes::Q4W4A8`.
+- **What changes:** calls of at least 256 columns (prefill chunks; decode and verification stay
+  narrower and keep their bits) quantize each token's activation to int8 against its own absmax and
+  run an `mma.s8` kernel over the sign-extended Q4 codes: each 64-element group's dot product is
+  exact in integers, its FP16 weight scale is folded in FP32, and the token scale applies at the
+  end. The artifact's gate/up permits only 16-bit activations; the path overrides that permission
+  for its calls, which is what the gate must show to be cheap. Within the route a column's bits do
+  not depend on T or its place in the call.
+- **Op qualification:** `infernix_linear_swiglu_q4_w4a8_test`, the int8 per-token criterion
+  (relative L2 4e-2; its derivation is in the suite), at T 1-4,096, graph replay, exact bits below
+  the threshold, and the A16 criterion on inputs int8 represents exactly. Passes (2026-10-15).
+- **Cost:** 5,124 bytes of workspace per column of a gate/up call (37 MB at a 7,168-token chunk),
+  below the exact route's 44.6 MB materialized-projection reservation up to about 8,700 columns.
+- **Speed** (2026-10-15, RTX 5090, official Qwen3.8-27B groupwise artifact, INT8 KV,
+  `infernix_bench`): prefill 3,349.7 → 3,741.8 tok/s at 4,096 tokens (+11.7 %) and 3,250.8 →
+  3,624.5 at 16,384 (+11.5 %); decode 91.00 → 90.97 tok/s (unchanged: its calls are narrower than
+  the threshold). Op level (cold L2, graph), the gate/up call at 0.71-0.80 of the exact route from
+  T = 256. The upstream measurement (giveen/ninfer-ext b8a4ec826): 202 → 313 TFLOP/s at T = 1,024
+  and 183 → 331 at 4,096.
+- **Model-level acceptance: fails** (2026-10-15, quick corpus, the artifact's own a16 reference,
+  four chunk sizes, 36 windows, 1.04 million positions per route). The artifact runs 16-bit
+  activations, so its floor is small, and int8 per-token activations add several times it:
+
+  | KV | Floor KL / top-1 | KL excess (bound) / budget | Top-1 excess, points (bound) / budget | NLL excess (perplexity ratio) |
+  |---|---|---|---|---|
+  | INT8 | 7.6e-4 / 0.93 % | 4.2e-3 (4.7e-3) / 1.0e-4 | +2.02 (2.24) / 0.09 | 2.5e-3 (1.0025) |
+  | NVFP4 | 3.5e-3 / 2.24 % | 3.7e-3 (4.0e-3) / 3.5e-4 | +1.25 (1.38) / 0.22 | 1.3e-3 (1.0013) |
+
+  Every criterion fails in both formats (p99.9 KL ratio 11.9 and 2.1), so the path runs in no
+  configuration.

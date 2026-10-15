@@ -12,6 +12,7 @@
 #include "models/qwen3_5/program/vision_control.h"
 #include "models/qwen3_5/program/vision_prefill.h"
 #include "models/qwen3_5/program/prefix/block_keys.h"
+#include "models/qwen3_5/program/planning/idle_prefill.h"
 #include "core/device.h"
 #include "core/startup.h"
 #include "runtime/prefix_cache/block_hash.h"
@@ -1241,6 +1242,23 @@ void ProgramImpl::hybrid_after_prefill_chunk(SequenceState& sequence, std::uint3
         return;
     }
     hybrid_capture_tap(sequence, cursor, boundary);
+}
+
+std::uint32_t ProgramImpl::hybrid_wide_step_limit(std::uint32_t lane, std::uint32_t cursor,
+                                                  std::uint32_t prompt_tokens,
+                                                  std::uint32_t tokens) const {
+    if (tokens <= prefill_chunk || !hybrid_ || lane >= max_concurrency) { return tokens; }
+    const HybridLaneState& state = hybrid_lanes_[lane];
+    if (!state.active || !state.publish) { return tokens; }
+    for (std::size_t tap = state.next_tap; tap < state.taps.size(); ++tap) {
+        const pc::PlannedTap& planned = state.taps[tap];
+        // An exact tap splits a wide step where it splits a chunk-wide one.
+        if (planned.placement == pc::TapPlacement::Exact) { continue; }
+        // Later flexible taps are realized at this tap's boundary or after it.
+        return flexible_tap_step_limit(cursor, prompt_tokens, prefill_chunk, planned.position,
+                                       tokens);
+    }
+    return tokens;
 }
 
 void ProgramImpl::hybrid_supersede_resume(HybridLaneState& lane, std::uint32_t frontier,

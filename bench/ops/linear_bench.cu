@@ -115,6 +115,7 @@ struct Options {
     int graph_calls     = 1;
     QType qtype         = QType::Q4_G64_FP16;
     LinearPolicy policy = LinearPolicy::A16Only;
+    infernix::ops::LinearRoutes routes = infernix::ops::LinearRoutes::Exact;
     std::int32_t n      = 0;
     std::int32_t k      = 0;
     std::int32_t t      = 0;
@@ -134,6 +135,7 @@ struct BenchPoint {
     std::int32_t t;
     std::vector<std::string> labels;
     bool sweep_point = false;
+    infernix::ops::LinearRoutes routes = infernix::ops::LinearRoutes::Exact;
 };
 
 struct PointGroup {
@@ -142,6 +144,7 @@ struct PointGroup {
     std::int32_t n;
     std::int32_t k;
     std::vector<BenchPoint> points;
+    infernix::ops::LinearRoutes routes = infernix::ops::LinearRoutes::Exact;
 };
 
 struct Result {
@@ -326,6 +329,7 @@ void usage(const char* argv0) {
                  "  %s --suite qwen3_6_27b|qwen3_6_35b_a3b|all [options]\n\n"
                  "Options:\n"
                  "  --policy a16|a8|a4 Activation-compute policy (default a16).\n"
+                 "  --routes exact|fast Route set (default exact; fast admits fast-path routes).\n"
                  "  --execution MODE   eager (default) or graph; time the complete Op.\n"
                  "  --graph-calls N    Calls per timed graph (1..64, default 1); report per call.\n"
                  "  --profile          Capture exactly one post-warmup public Linear call.\n"
@@ -350,6 +354,14 @@ Options parse_args(int argc, char** argv) {
             opt.have_qtype = true;
         } else if (arg == "--policy") {
             opt.policy = parse_policy(next("policy"));
+        } else if (arg == "--routes") {
+            const std::string_view routes = next("routes");
+            if (routes != "exact" && routes != "fast") {
+                throw std::invalid_argument("Linear benchmark routes must be exact or fast");
+            }
+            opt.routes = routes == "fast" ? infernix::ops::LinearRoutes::Q8SlicedK | infernix::ops::LinearRoutes::Fp8A8Pair |
+                                                infernix::ops::LinearRoutes::Q4W4A8
+                                          : infernix::ops::LinearRoutes::Exact;
         } else if (arg == "--n") {
             opt.n      = parse_i32(next("N"), "N");
             opt.have_n = true;
@@ -474,12 +486,14 @@ std::vector<BenchPoint> expand_points(const Options& opt) {
         return points;
     }
     if (opt.have_t) {
-        points.push_back({opt.qtype, opt.policy, opt.n, opt.k, opt.t, {"explicit"}, false});
+        points.push_back({opt.qtype, opt.policy, opt.n, opt.k, opt.t,
+                          {opt.routes != infernix::ops::LinearRoutes::Exact ? "explicit,fast" : "explicit"}, false, opt.routes});
         return points;
     }
     for (std::int64_t t = opt.sweep.begin; t <= opt.sweep.end; t += opt.sweep.step) {
         points.push_back(
-            {opt.qtype, opt.policy, opt.n, opt.k, static_cast<std::int32_t>(t), {"sweep"}, true});
+            {opt.qtype, opt.policy, opt.n, opt.k, static_cast<std::int32_t>(t),
+             {opt.routes != infernix::ops::LinearRoutes::Exact ? "sweep,fast" : "sweep"}, true, opt.routes});
         if (t > static_cast<std::int64_t>(opt.sweep.end) - opt.sweep.step) { break; }
     }
     return points;
@@ -490,10 +504,10 @@ std::vector<PointGroup> group_points(const std::vector<BenchPoint>& points) {
     for (const BenchPoint& point : points) {
         auto it = std::find_if(groups.begin(), groups.end(), [&](const PointGroup& group) {
             return group.qtype == point.qtype && group.policy == point.policy &&
-                   group.n == point.n && group.k == point.k;
+                   group.n == point.n && group.k == point.k && group.routes == point.routes;
         });
         if (it == groups.end()) {
-            groups.push_back({point.qtype, point.policy, point.n, point.k, {point}});
+            groups.push_back({point.qtype, point.policy, point.n, point.k, {point}, point.routes});
         } else {
             it->points.push_back(point);
         }
@@ -698,7 +712,8 @@ std::vector<Result> run_group(const PointGroup& group, const Options& opt,
         Tensor activation(x.p, DType::BF16, {group.k, point.t});
         Tensor output(out.p, DType::BF16, {group.n, point.t});
         const auto launch = [&](cudaStream_t launch_stream) {
-            ops::linear(activation, weight.weight, output, group.policy, workspace, launch_stream);
+            ops::linear(activation, weight.weight, output, group.policy, workspace, launch_stream,
+                        group.routes);
         };
         bench::TimedGraph graph;
         if (opt.graph)
@@ -748,7 +763,8 @@ void run_profile(const BenchPoint& point, const Options& opt, bench::L2FlushBuff
     Tensor activation(x.p, DType::BF16, {point.k, point.t});
     Tensor output(out.p, DType::BF16, {point.n, point.t});
     const auto body = [&](cudaStream_t launch_stream) {
-        ops::linear(activation, weight.weight, output, point.policy, workspace, launch_stream);
+        ops::linear(activation, weight.weight, output, point.policy, workspace, launch_stream,
+                    point.routes);
     };
     bench::TimedGraph graph;
     if (opt.graph) graph.capture(stream, body);

@@ -13,6 +13,8 @@ struct ShapeEntry {
     std::int32_t n;
     std::int32_t k;
     ShapeSelector select;
+    // The shape's fast-path routes (LinearRoutes::Q8SlicedK), or null where it has none.
+    ShapeSelector fast = nullptr;
 };
 
 template <class Geometry>
@@ -31,12 +33,12 @@ constexpr std::array kShapes{
     shape<Q8N14336K5120>(select_q8_n14336_k5120),   shape<Q8N17408K5120>(select_q8_n17408_k5120),
     shape<Q8N34816K5120>(select_q8_n34816_k5120),   shape<Q8N248320K5120>(select_q8_n248320_k5120),
     // Qwen3.8-Flash-Next (N 324 and 320 are not 16-row multiples, so they bypass the geometry type).
-    ShapeEntry{16384, 2560, select_q8_n16384_k2560},
+    ShapeEntry{16384, 2560, select_q8_n16384_k2560, select_q8_n16384_k2560_fast},
     ShapeEntry{12800, 2560, select_q8_n12800_k2560},
     ShapeEntry{13952, 2560, select_q8_n13952_k2560},
     ShapeEntry{2560, 2560, select_q8_n2560_k2560},
     ShapeEntry{1280, 2560, select_q8_n1280_k2560},
-    ShapeEntry{2560, 6144, select_q8_n2560_k6144},
+    ShapeEntry{2560, 6144, select_q8_n2560_k6144, select_q8_n2560_k6144_fast},
     ShapeEntry{324, 10240, select_q8_n324_k10240},
     ShapeEntry{320, 10240, select_q8_n320_k10240},
     ShapeEntry{10240, 320, select_q8_n10240_k320},
@@ -61,16 +63,19 @@ Q8Launch select_q8_generic(std::int32_t n, std::int32_t k, std::int32_t t) {
 }
 } // namespace
 
-Q8Launch select_q8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
+Q8Launch select_q8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t, LinearRoutes routes) {
     if (t <= 0) throw std::invalid_argument("q8 linear: T must be positive");
     if (n <= 0 || k <= 0) throw std::invalid_argument("q8 linear: unsupported shape");
     for (const auto& entry : kShapes) {
-        if (entry.n == n && entry.k == k) return entry.select(t);
+        if (entry.n != n || entry.k != k) continue;
+        if (has_route(routes, LinearRoutes::Q8SlicedK) && entry.fast != nullptr) return entry.fast(t);
+        return entry.select(t);
     }
     return select_q8_generic(n, k, t);
 }
 
-Q8Launch select_q8_launch(std::int32_t n, std::int32_t k, std::int32_t t, LinearPolicy policy) {
+Q8Launch select_q8_launch(std::int32_t n, std::int32_t k, std::int32_t t, LinearPolicy policy,
+                          LinearRoutes routes) {
     if (!valid_linear_policy(policy)) throw std::invalid_argument("q8 linear: unsupported policy");
     if (column_invariant(policy)) {
         if (t <= 0) throw std::invalid_argument("q8 linear: T must be positive");
@@ -78,12 +83,12 @@ Q8Launch select_q8_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
             return select_q8_n248320_k5120_invariant(t);
         throw std::invalid_argument("q8 linear: no column-invariant route for this problem");
     }
-    return select_q8_a16_launch(n, k, t);
+    return select_q8_a16_launch(n, k, t, routes);
 }
 
 void q8_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
-                 cudaStream_t stream) {
-    select_q8_launch(w.n, w.k, x.ne[1], policy)(x, w, out, stream);
+                 LinearRoutes routes, cudaStream_t stream) {
+    select_q8_launch(w.n, w.k, x.ne[1], policy, routes)(x, w, out, stream);
 }
 
 } // namespace infernix::ops::detail

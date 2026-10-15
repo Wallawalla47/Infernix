@@ -15,11 +15,11 @@ int32_t AddScalarStringFSM(GrammarBuilder& builder, const FSMWithStartEnd& fsm,
 Grammar StringConstraints(const std::vector<std::string>& patterns, int minimum, int maximum,
                           const std::vector<std::string>& excluded, bool json_encoding);
 
-// Build the JSON-encoded body of a string whose decoded value matches a schema pattern or
-// codepoint length. Quotes are supplied by the caller.
+// JSON-encoded string body matching a schema pattern; the caller supplies quotes.
 Grammar JSONStringPattern(const std::string& pattern);
 // Search semantics and ECMAScript character classes, before JSON string encoding.
 std::string SchemaStringPattern(const std::string& pattern);
+// Complete JSON string, including quotes, bounded by decoded Unicode scalar count.
 Grammar JSONStringLength(int minimum, int maximum);
 Grammar JSONStringExcept(const std::vector<std::string>& excluded);
 }  // namespace xgrammar

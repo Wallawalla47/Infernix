@@ -65,11 +65,16 @@ struct SparseMoePrefillWorkspace {
     Tensor grouped_io;
     Tensor routed_storage;
     Tensor routed_sum;
+    // The low BF16 parts of the Q8 SiLU(gate) * up activations (the shared expert's, and the routed
+    // experts' when they are Q8): value = high + low, read by the Q8 down kernel.
+    Tensor shared_activation_low;
+    Tensor routed_activation_low;
 };
 
 template <class Arena>
 SparseMoePrefillWorkspace allocate_sparse_moe_prefill_workspace(Arena& arena,
-                                                                std::int32_t capacity_tokens) {
+                                                                std::int32_t capacity_tokens,
+                                                                bool routed_q8) {
     SparseMoePrefillWorkspace out;
     const std::int32_t assignments = 8 * capacity_tokens;
     const std::int32_t route_tiles =
@@ -104,12 +109,16 @@ SparseMoePrefillWorkspace allocate_sparse_moe_prefill_workspace(Arena& arena,
 
     out.routed_storage = arena.alloc(DType::BF16, {512, assignments}, 256);
     out.routed_sum     = Tensor(out.routed_storage.data, DType::FP32, {2048, capacity_tokens});
+
+    out.shared_activation_low = arena.alloc(DType::BF16, {512, capacity_tokens}, 256);
+    if (routed_q8) { out.routed_activation_low = arena.alloc(DType::BF16, {512, assignments}, 256); }
     return out;
 }
 
 [[nodiscard]] bool sparse_moe_uses_prefill(std::int32_t tokens, QType routed_gate_up,
                                            QType routed_down) noexcept;
-[[nodiscard]] std::size_t sparse_moe_prefill_workspace_bytes(std::int32_t max_tokens);
+// routed_q8: the routed experts' gate/up and down are Q8 (their activations take a low plane).
+[[nodiscard]] std::size_t sparse_moe_prefill_workspace_bytes(std::int32_t max_tokens, bool routed_q8);
 [[nodiscard]] SparseMoePrefillPlan
 resolve_sparse_moe_prefill_plan(std::int32_t tokens, QType routed_gate_up, QType routed_down);
 

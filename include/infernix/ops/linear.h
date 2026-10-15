@@ -39,6 +39,33 @@ enum class LinearPolicy : std::uint8_t {
     AllowA8Residual,
 };
 
+/**
+ * @brief The fast-path routes a projection may select (a set of flags).
+ *
+ * Exact (no flag) keeps each registered problem's output bits fixed from release to release. Each
+ * flag admits one fast path's routes for the problems that register them, whose arithmetic differs;
+ * a Model sets a flag only where its fast path is qualified (docs/maintainer/model-quality.md
+ * section 6.7). A problem with no route for a set flag runs its exact route.
+ */
+enum class LinearRoutes : std::uint8_t {
+    Exact     = 0,
+    Q8SlicedK = 1, ///< q8-sliced-k: NInfer's Q8 GEMV/sliced-K routes (Flash-Next [16384,2560], [2560,6144]).
+    Fp8A8Pair = 2, ///< fp8-a8-pair: FP8 weights with the activation as two E4M3 terms.
+    Q4W4A8    = 4, ///< q4-w4a8: groupwise Q4 weights with int8 activations.
+};
+
+[[nodiscard]] constexpr LinearRoutes operator|(LinearRoutes a, LinearRoutes b) noexcept {
+    return static_cast<LinearRoutes>(static_cast<std::uint8_t>(a) | static_cast<std::uint8_t>(b));
+}
+
+[[nodiscard]] constexpr bool has_route(LinearRoutes routes, LinearRoutes flag) noexcept {
+    return (static_cast<std::uint8_t>(routes) & static_cast<std::uint8_t>(flag)) != 0;
+}
+
+[[nodiscard]] constexpr bool valid_linear_routes(LinearRoutes routes) noexcept {
+    return (static_cast<std::uint8_t>(routes) & ~std::uint8_t{7}) == 0;
+}
+
 [[nodiscard]] constexpr bool valid_linear_policy(LinearPolicy policy) noexcept {
     return policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8 ||
            policy == LinearPolicy::AllowA4 || policy == LinearPolicy::A16ColumnInvariant ||
@@ -136,10 +163,21 @@ enum class LinearPolicy : std::uint8_t {
  * compute under every policy at every positive T. NVFP4 uses A16 for A16Only and
  * AllowA8; AllowA4 permits the private resolver to select either a qualified A16 route or
  * activation quantization to NVFP4 at every positive T. The selected route depends only on the
- * registered problem and T. A16ColumnInvariant selects one A16 route per registered problem for
+ * registered problem, T and `routes`. A16ColumnInvariant selects one A16 route per registered problem for
  * every T, so each column's result is independent of the call's other columns. NVFP4 and FP8
  * register it for their text problems and Q8 for the [248320, 5120] vocabulary head; the other
  * formats and problems reject it.
+ *
+ * @par Routes
+ * Under LinearRoutes::Q8SlicedK, Q8 `[16384,2560]` and `[2560,6144]` (Qwen3.8-Flash-Next's GDN q/k/v/z
+ * and GDN/QSA output projections) select from NInfer's GEMV, sliced-K and grouped sliced-K routes,
+ * which accumulate in a different order from the exact routes; a column's bits then depend on the
+ * call's T. Under LinearRoutes::Fp8A8Pair, FP8 [16384,2560], [13312,2560], [2560,6144], [1280,2560]
+ * and [2560,640] at T >= 17, unless a single-term A8 route is selected, carry each activation column
+ * as two E4M3 terms with their own scales on the 8-bit Tensor Core path. Every other problem runs its
+ * exact route under a flag it does not register. Under A16ColumnInvariant every flag is ignored:
+ * the column-invariant route is the exact route's. Every route meets the A16 criterion; the
+ * workspace query covers the two-term route's scratch.
  *
  * @par Workspace
  * `workspace` is caller-owned call-scoped transient storage sized by
@@ -153,9 +191,11 @@ enum class LinearPolicy : std::uint8_t {
  * @param[in] policy Permitted private activation-compute profiles.
  * @param[in,out] workspace Caller-owned transient arena.
  * @param[in] stream CUDA stream on which execution is enqueued.
+ * @param[in] routes The fast-path route flags (Exact: none).
  */
 void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
-            WorkspaceArena& workspace, cudaStream_t stream);
+            WorkspaceArena& workspace, cudaStream_t stream,
+            LinearRoutes routes = LinearRoutes::Exact);
 
 /**
  * @brief Applies the A16-only form of the bias-free matrix projection.

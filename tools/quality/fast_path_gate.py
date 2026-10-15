@@ -82,7 +82,9 @@ POLICY = Policy()
 # fast_path_name of every infernix::FastPath.
 FAST_PATHS = ("prompt-pv8", "decode-split64", "batched-decode", "batched-a8-decode",
               "batched-a4-decode", "batched-a4-residual-decode", "batched-a8-residual-decode",
-              "batch-split-attention", "adaptive-speculation", "free-cache-resume", "preemption")
+              "batch-split-attention", "adaptive-speculation", "free-cache-resume", "preemption",
+              "q8-sliced-k", "gdn-conv-fused", "qsa-prepare-fused", "adaptive-mtp",
+              "idle-wide-prefill", "fp8-a8-pair", "q4-w4a8")
 
 
 class MeasurementError(RuntimeError):
@@ -208,7 +210,9 @@ class ChunkPair:
     fast: dict
 
 
-def check_pair(pair: ChunkPair, *, fast_route: bool) -> None:
+def check_pair(pair: ChunkPair, *, fast_route: bool, fast_chunk: int = 0) -> None:
+    """fast_chunk: the fast run prefills at this width instead of its default run's chunk
+    (prefill --fast-chunk, a schedule fast path that widens prefill steps)."""
     a, b = pair.default, pair.fast
     for key in ("context_tokens", "stride_tokens"):
         if a["execution"][key] != b["execution"][key]:
@@ -216,15 +220,19 @@ def check_pair(pair: ChunkPair, *, fast_route: bool) -> None:
     if a["kl_divergence"]["reference"] != b["kl_divergence"]["reference"]:
         raise MeasurementError(f"{pair.label}: the runs used different references")
     if fast_route:
-        for key in ("kv_dtype", "prefill_chunk_tokens"):
-            if a["execution"][key] != b["execution"][key]:
-                raise MeasurementError(f"{pair.label}: default and fast differ in {key}")
+        if a["execution"]["kv_dtype"] != b["execution"]["kv_dtype"]:
+            raise MeasurementError(f"{pair.label}: default and fast differ in kv_dtype")
+        expected = fast_chunk or a["execution"]["prefill_chunk_tokens"]
+        if b["execution"]["prefill_chunk_tokens"] != expected:
+            raise MeasurementError(
+                f"{pair.label}: the fast run prefills at {b['execution']['prefill_chunk_tokens']}"
+                f" tokens, expected {expected}")
         if a["execution"].get("fast_paths") or not b["execution"].get("fast_paths"):
             raise MeasurementError(
                 f"{pair.label}: expected an exact-route run and a run with fast paths active")
 
 
-def prefill_pairs(directory: Path) -> list[ChunkPair]:
+def prefill_pairs(directory: Path, fast_chunk: int = 0) -> list[ChunkPair]:
     pairs = []
     for default_dir in sorted(d for d in directory.glob("default-c*") if d.is_dir()):
         chunk = default_dir.name.removeprefix("default-c")
@@ -233,7 +241,7 @@ def prefill_pairs(directory: Path) -> list[ChunkPair]:
     if not pairs:
         raise MeasurementError(f"no default-c<chunk> runs in {directory}")
     for pair in pairs:
-        check_pair(pair, fast_route=True)
+        check_pair(pair, fast_route=True, fast_chunk=fast_chunk)
     return pairs
 
 
@@ -352,8 +360,9 @@ def evaluate_prefill_pairs(pairs: Sequence[ChunkPair], scope: str,
     return verdict
 
 
-def evaluate_prefill(directory: Path, policy: Policy = POLICY) -> Verdict:
-    return evaluate_prefill_pairs(prefill_pairs(directory), f"prefill {directory}", policy)
+def evaluate_prefill(directory: Path, policy: Policy = POLICY, fast_chunk: int = 0) -> Verdict:
+    return evaluate_prefill_pairs(prefill_pairs(directory, fast_chunk), f"prefill {directory}",
+                                  policy)
 
 
 # --- decode --------------------------------------------------------------------------------------
@@ -864,6 +873,8 @@ def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
     evaluate = commands.add_parser("evaluate-prefill", help="decide an existing prefill run")
     evaluate.add_argument("directory",
                           help="a prefill run directory, or one KV format's subdirectory")
+    evaluate.add_argument("--fast-chunk", type=int, default=0,
+                          help="the width the fast runs prefilled at (prefill --fast-chunk)")
 
     compare = commands.add_parser("compare-prefill",
                                   help="decide two sets of runs of one reference, paired in order")
@@ -894,25 +905,25 @@ def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def prefill_verdicts(directory: Path) -> list[Verdict]:
+def prefill_verdicts(directory: Path, fast_chunk: int = 0) -> list[Verdict]:
     if any(d.is_dir() for d in directory.glob("default-c*")):
-        return [evaluate_prefill(directory)]
+        return [evaluate_prefill(directory, fast_chunk=fast_chunk)]
     kv_dirs = sorted(d for d in directory.iterdir()
                      if d.is_dir() and any(c.is_dir() for c in d.glob("default-c*")))
     if not kv_dirs:
         raise MeasurementError(f"no prefill runs under {directory}")
-    return [evaluate_prefill(d) for d in kv_dirs]
+    return [evaluate_prefill(d, fast_chunk=fast_chunk) for d in kv_dirs]
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_arguments(sys.argv[1:] if argv is None else argv)
     try:
         if args.command == "prefill":
-            return finish(prefill_verdicts(run_prefill(args)), args.json)
+            return finish(prefill_verdicts(run_prefill(args), args.fast_chunk), args.json)
         if args.command == "decode":
             return finish(run_decode(args), args.json)
         if args.command == "evaluate-prefill":
-            return finish(prefill_verdicts(Path(args.directory)), args.json)
+            return finish(prefill_verdicts(Path(args.directory), args.fast_chunk), args.json)
         if args.command == "compare-prefill":
             pairs = compared_pairs(args.base, args.candidate)
             return finish([evaluate_prefill_pairs(pairs, "compare-prefill")], args.json)

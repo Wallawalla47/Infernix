@@ -321,6 +321,14 @@ void StartupLogRenderer::engine_ready(const LoadSummary& load) {
         std::string paths;
         for (const std::string& path : load.fast_paths) {
             paths += (paths.empty() ? "" : ", ") + path;
+            // The idle width startup planned, against the chunk taken beside decode work.
+            if (path == fast_path_name(FastPath::IdleWidePrefill) && load.idle_prefill_width != 0) {
+                paths += load.idle_prefill_width > load.prefill_chunk
+                             ? " (" + std::to_string(load.idle_prefill_width) + " idle, " +
+                                   std::to_string(load.prefill_chunk) + " beside decode)"
+                             : std::string(" (inactive: no step wider than ") +
+                                   std::to_string(load.prefill_chunk) + " fits)";
+            }
         }
         if (paths.empty()) {
             paths = load.fast_paths_disabled ? "disabled (exact route)" : "none qualified";

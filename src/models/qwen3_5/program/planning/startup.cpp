@@ -4,9 +4,11 @@
 #include "models/qwen3_5/execution/mtp.h"
 #include "models/qwen3_5/program/planning/fast_paths.h"
 #include "models/qwen3_5/program/planning/graph_profiles.h"
+#include "models/qwen3_5/program/planning/idle_prefill.h"
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/program/prefix/hybrid_host_layout.h"
+#include "models/qwen3_5/program/speculative/mtp_draft_policy.h"
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/execution/workspace.h"
 #include "core/device.h"
@@ -108,13 +110,22 @@ bool plan_has_tree(const SequencePlanImpl& plan) {
 }
 
 // The speculative round families an engine captures. Neural rounds verify at the drafter's window
-// and n-gram copy rounds at the n-gram window, for every backend.
+// and n-gram copy rounds at the n-gram window, for every backend. With adaptive-mtp every shorter
+// MTP draft length has its own neural family; lengths outside the batch lengths serve one row.
 std::vector<SpeculativeRoundShape> speculative_round_shapes(const EngineOptions& options,
-                                                            const TreeWidthPlan& tree_widths) {
+                                                            const TreeWidthPlan& tree_widths,
+                                                            bool adaptive_mtp) {
     const SpeculativeOptions& spec = options.speculative;
     std::vector<SpeculativeRoundShape> shapes;
     if (spec.backend == SpeculativeBackend::None) { return shapes; }
     shapes.push_back({SpeculativeRoundKind::Neural, spec.draft_tokens});
+    if (adaptive_mtp && spec.backend == SpeculativeBackend::Mtp) {
+        for (std::uint32_t k = 1; k < spec.draft_tokens; ++k) {
+            shapes.push_back({SpeculativeRoundKind::Neural, k,
+                              options.max_concurrency > 1 &&
+                                  !mtp_batch_draft_length(k, spec.draft_tokens)});
+        }
+    }
     if (spec.ngram_draft_tokens != 0) {
         // Copy rounds take the narrowest n-gram family that holds their longest copy, so short
         // copies do not pay for the whole window. Narrower families lie strictly between the
@@ -201,8 +212,9 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         static_cast<std::uint64_t>(plan.max_concurrency) +
             *plan.context_cache.hybrid.device_snapshot_slots,
         "Qwen3.5 StateImage slot count exceeds int32");
+    // Prefill buffers hold the widest step: the idle-wide-prefill width, else the chunk.
     const auto effective_prefill_chunk =
-        static_cast<std::int32_t>(std::min(plan.prefill_chunk, plan.capacity));
+        static_cast<std::int32_t>(std::min(plan.idle_prefill_width, plan.capacity));
     const std::uint32_t logical_pages  = page_count(plan.capacity);
     const std::uint32_t physical_pages = plan.main_page_groups;
     const std::uint64_t mtp_extra_pages =
@@ -391,7 +403,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto& parameters = *plan.parameters;
     const auto& config     = parameters.model.config().text;
 
-    const std::uint32_t chunk_u32 = std::min(plan.prefill_chunk, plan.capacity);
+    // Prefill passes are as wide as the widest step: the idle-wide-prefill width, else the chunk.
+    const std::uint32_t chunk_u32 = std::min(plan.idle_prefill_width, plan.capacity);
     if (chunk_u32 == 0 ||
         chunk_u32 > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
         plan.draft_window >= static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
@@ -507,10 +520,12 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             }
             auto stage = layout.scope();
             (void)workspace::post_mixer_hidden(layout, config, last);
+            const ops::LinearRoutes ffn_routes = plan.execution_schedule.linear_routes;
             scratch(layout,
                     std::max(execution::ffn_workspace_bytes(block.ffn, first, last, false,
-                                                            wide_verification),
-                             execution::ffn_workspace_bytes(block.ffn, first, last, false, false)));
+                                                            wide_verification, ffn_routes),
+                             execution::ffn_workspace_bytes(block.ffn, first, last, false, false,
+                                                            ffn_routes)));
         }
         if (!plan.causal_scoring) { linear_scratch(layout, text.output_head, first, last); }
     };
@@ -1045,6 +1060,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         "resolved Paged KV capacity exceeds int32"));
     impl->max_concurrency      = inputs.max_concurrency;
     impl->prefill_chunk        = inputs.prefill_chunk;
+    impl->idle_prefill_width   = inputs.idle_prefill_width;
     impl->execution_schedule   = inputs.execution_schedule;
     impl->draft_window         = inputs.draft_window;
     impl->neural_draft_window  = inputs.neural_draft_window;
@@ -1099,21 +1115,23 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             // Each speculative round family's profiles are captured at the family's own width for
             // every batch size, on the one frame viewed at that width, as a Forward/Finish pair.
             // MTP Finish keeps the Forward profiles; DFlash Finish has one executable per exact B.
-            // Every MTP round proposes the next round's drafts at the configured neural depth.
-            const bool mtp               = impl->speculative_backend == SpeculativeBackend::Mtp;
-            const std::uint32_t ar_depth = impl->neural_draft_window;
+            // Every MTP round proposes the next round's drafts at its neural family's draft length
+            // (copy rounds at the configured neural depth).
+            const bool mtp = impl->speculative_backend == SpeculativeBackend::Mtp;
             for (const SpeculativeRoundShape& shape : impl->round_shapes) {
+                const std::uint32_t ar_depth = mtp_proposal_drafts(shape, impl->neural_draft_window);
                 const auto profiles =
                     mtp ? mtp_graph_profiles(impl->capacity, shape.verify_drafts, ar_depth)
                         : dflash_graph_profiles(impl->speculative_backend, impl->capacity,
                                                 shape.verify_drafts);
                 // A tree family serves only the batch sizes that may verify its width. Chain
                 // families serve every batch size: a round with a constrained row verifies the
-                // chain whatever the tree table selects.
+                // chain whatever the tree table selects. A single-row family serves one row.
                 std::uint32_t batch_sizes = 0;
                 for (std::uint32_t b = 1; b <= impl->max_concurrency; ++b) {
-                    batch_sizes += shape.kind != SpeculativeRoundKind::Tree ||
-                                   impl->tree_widths.tree(b, shape.verify_drafts + 1U);
+                    batch_sizes += (shape.kind != SpeculativeRoundKind::Tree ||
+                                    impl->tree_widths.tree(b, shape.verify_drafts + 1U)) &&
+                                   (!shape.single_row || b == 1U);
                 }
                 const std::uint64_t forward = graph_topology_classes(profiles);
                 executables += (forward + (mtp ? forward : 1U)) * batch_sizes;
@@ -1144,7 +1162,8 @@ static_assert(std::size_t{kDefaultPrefillSplitWorkspaceMiB} << 20 ==
 
 // INT8 and NVFP4 KV prefill with their fast prompt kernels unless the original was selected.
 // Prompt P*V runs in FP16 unless the prompt-pv8 fast path is selected, and single-column decode
-// keeps 128-key splits unless decode-split64 is (fast_paths.h).
+// keeps 128-key splits unless decode-split64 is (fast_paths.h). The MLP gate/up takes the q4-w4a8
+// route at prefill widths when that path is selected.
 ExecutionSchedule execution_schedule(const execution::Parameters& parameters,
                                      const EngineOptions& options) {
     // Request invariance is possible where every Text projection registers a column-invariant
@@ -1168,7 +1187,11 @@ ExecutionSchedule execution_schedule(const execution::Parameters& parameters,
             .row_invariant_partition = fast_paths.invariant(FastPath::BatchSplitAttention),
             .fixed_speculation       = fast_paths.invariant(FastPath::AdaptiveSpeculation),
             .grid_cache              = fast_paths.invariant(FastPath::FreeCacheResume),
-            .held_extent             = fast_paths.invariant(FastPath::Preemption)};
+            .held_extent             = fast_paths.invariant(FastPath::Preemption),
+            .adaptive_mtp            = fast_paths.selected(FastPath::AdaptiveMtp) &&
+                                       !fast_paths.invariant(FastPath::AdaptiveSpeculation),
+            .linear_routes           = fast_paths.selected(FastPath::Q4W4A8) ? ops::LinearRoutes::Q4W4A8
+                                                                             : ops::LinearRoutes::Exact};
 }
 // The fast INT8, NVFP4, VQ2 and K4V2 prompt kernels and the MXFP8 tiled kernel of FP8 and K8V4 KV
 // run one 128-row CTA of one query head per SM; BF16 KV and the original INT8 and NVFP4 kernels use
@@ -1207,13 +1230,36 @@ std::uint32_t effective_prefill_chunk(const execution::Parameters& parameters,
     return prefill_step_width(parameters, options, options.prefill_chunk);
 }
 
+std::vector<std::uint32_t> idle_prefill_widths_impl(const execution::Parameters& parameters,
+                                                    const EngineOptions& options) {
+    if (options.purpose != EnginePurpose::Generation ||
+        !select_fast_paths(parameters.model, options, parameters.invariant_text.has_value())
+             .selected(FastPath::IdleWidePrefill)) {
+        return {};
+    }
+    // Each width is taken as the chunk is (prefill_step_width), then kept on the chunk's grid.
+    std::array<std::uint32_t, kIdlePrefillRequestedWidths.size()> steps{};
+    for (std::size_t i = 0; i < steps.size(); ++i) {
+        steps[i] = prefill_step_width(parameters, options, kIdlePrefillRequestedWidths[i]);
+    }
+    return idle_prefill_width_ladder(effective_prefill_chunk(parameters, options), steps);
+}
+
 std::unique_ptr<qwen3_5::detail::SequencePlannerImpl>
 make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContext& device,
-                           const EngineOptions& options) {
+                           const EngineOptions& options, std::uint32_t idle_prefill_width) {
     validate_target_options(parameters, device, options);
+    if (idle_prefill_width != 0) {
+        const std::vector<std::uint32_t> widths = idle_prefill_widths_impl(parameters, options);
+        if (std::find(widths.begin(), widths.end(), idle_prefill_width) == widths.end()) {
+            throw std::invalid_argument("idle prefill width is not an idle-wide-prefill width of "
+                                        "these options");
+        }
+    }
     TreeWidthPlan tree_widths = resolve_tree_widths(parameters, options);
-    const std::vector<SpeculativeRoundShape> round_shapes =
-        speculative_round_shapes(options, tree_widths);
+    const std::vector<SpeculativeRoundShape> round_shapes = speculative_round_shapes(
+        options, tree_widths,
+        execution_schedule(parameters, options).adaptive_mtp);
     std::uint32_t draft_window = 0;
     for (const SpeculativeRoundShape& shape : round_shapes) {
         draft_window = std::max(draft_window, shape.verify_drafts);
@@ -1229,6 +1275,8 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .capacity            = options.max_context,
         .max_concurrency     = options.max_concurrency,
         .prefill_chunk       = effective_prefill_chunk(parameters, options),
+        .idle_prefill_width  = idle_prefill_width != 0 ? idle_prefill_width
+                                                       : effective_prefill_chunk(parameters, options),
         .execution_schedule   = execution_schedule(parameters, options),
         .draft_window         = draft_window,
         .speculative_backend  = options.speculative.backend,

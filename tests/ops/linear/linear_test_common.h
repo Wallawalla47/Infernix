@@ -31,6 +31,7 @@ struct Invocation {
     CallForm call_form       = CallForm::Policy;
     ops::LinearPolicy policy = ops::LinearPolicy::A16Only;
     bool graph_replay        = false;
+    ops::LinearRoutes routes = ops::LinearRoutes::Exact;
 };
 
 enum class ActivationPattern : std::uint8_t { Dense, KTail, Cancellation };

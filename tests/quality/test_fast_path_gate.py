@@ -44,7 +44,7 @@ def make_prefill(root: Path, *, windows: int, floor: float, excess: float, noise
                  top1_floor: float = 0.04, top1_excess: float = 0.0,
                  nll_excess: float | None = None, chunks: tuple[int, ...] = (896, 3584),
                  tail_ratio: float = 1.0, alternating: float = 0.0, coverage: float = 0.95,
-                 fast_flag: bool = True, seed: int = 1) -> Path:
+                 fast_flag: bool = True, fast_chunk: int = 0, seed: int = 1) -> Path:
     """Synthetic default and fast runs: the fast route's KL and NLL move by excess per position
     (NLL by nll_excess when given), plus per-window noise."""
     rng = random.Random(seed)
@@ -62,9 +62,20 @@ def make_prefill(root: Path, *, windows: int, floor: float, excess: float, noise
                                nll + 7168 * (nll_excess + shift)))
         write_report(root / f"default-c{chunk}", chunk=chunk, fast=False, windows=default,
                      p999=1.0, coverage=coverage)
-        write_report(root / f"fast-c{chunk}", chunk=chunk, fast=fast_flag, windows=fast,
+        write_report(root / f"fast-c{chunk}", chunk=fast_chunk or chunk, fast=fast_flag, windows=fast,
                      p999=tail_ratio, coverage=coverage)
     return root
+
+
+def test_a_widened_fast_run_pairs_only_under_its_fast_chunk(tmp_path):
+    # prefill --fast-chunk: the fast runs prefill at one width, each paired with a default chunk.
+    root = make_prefill(tmp_path, windows=40, floor=0.02, excess=0.0, noise=1e-4, fast_chunk=3584,
+                        chunks=(896, 1792))
+    assert gate.evaluate_prefill(root, fast_chunk=3584).passed
+    with pytest.raises(gate.MeasurementError, match="prefills at 3584"):
+        gate.evaluate_prefill(root)
+    with pytest.raises(gate.MeasurementError, match="expected 7168"):
+        gate.evaluate_prefill(root, fast_chunk=7168)
 
 
 def criterion(verdict: gate.Verdict, name: str) -> gate.Criterion:

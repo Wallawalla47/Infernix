@@ -9,6 +9,7 @@
 #include <array>
 #include <stdexcept>
 #include <string_view>
+#include <variant>
 
 namespace infernix::models::qwen3_5 {
 namespace {
@@ -68,6 +69,12 @@ constexpr std::array kQualified{
                   {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value}},
     Qualification{FastPath::BatchedA8ResidualDecode,
                   {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value}},
+    // Wider prefill steps while no lane waits to decode: the idle width (3,584) against 896- and
+    // 1,792-token chunks, prefill gate, quick corpus (2026-10-15).
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A4, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value}},
     // Preemption with Replay under a two-lane pool at concurrency 8 (2026-10-14).
     Qualification{FastPath::Preemption, {24, ActivationClass::A4, KvCacheStorage::Int8Group64}},
     Qualification{FastPath::Preemption, {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16}},
@@ -102,7 +109,7 @@ const char* activation_name(ActivationClass activations) {
 std::string describe(const FastPathConfiguration& configuration) {
     return std::to_string(configuration.query_heads) + " heads, " +
            activation_name(configuration.activations) + " activations, " +
-           kv_name(configuration.kv) + " KV";
+           kv_name(configuration.kv) + " KV" + (configuration.q4_gate_up ? ", Q4 gate/up" : "");
 }
 
 FastPathConfiguration fast_path_configuration(const Model& model, const EngineOptions& options) {
@@ -119,10 +126,27 @@ FastPathConfiguration fast_path_configuration(const Model& model, const EngineOp
             }
         }
     }
+    // A text layer whose dense MLP gate and up are both RowSplit Q4_G64_FP16 (the groupwise recipes).
+    const auto groupwise_q4 = [&](WeightId id) {
+        const WeightView& view = model.weight(id).view;
+        return !view.parts.empty() &&
+               std::all_of(view.parts.begin(), view.parts.end(), [](const WeightRegion& part) {
+                   return part.parent != nullptr &&
+                          part.parent->geometry.format == QType::Q4_G64_FP16 &&
+                          part.parent->geometry.layout == QuantLayout::RowSplit;
+               });
+    };
+    bool q4_gate_up = false;
+    for (const BlockWeights& layer : model.weights().text.layers) {
+        if (const auto* dense = std::get_if<DenseWeights>(&layer.ffn)) {
+            q4_gate_up = q4_gate_up || (groupwise_q4(dense->gate) && groupwise_q4(dense->up));
+        }
+    }
     const auto& attention = model.config().text.attention;
     return {.query_heads = attention ? static_cast<std::uint32_t>(attention->num_attention_heads) : 0U,
             .activations = activations,
-            .kv          = options.kv_cache};
+            .kv          = options.kv_cache,
+            .q4_gate_up  = q4_gate_up};
 }
 
 bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration,
@@ -153,6 +177,19 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
         return false;
     case FastPath::DecodeSplit64:
         return configuration.kv == KvCacheStorage::Int8Group64 && configuration.query_heads == 24;
+    case FastPath::Q8SlicedK:
+    case FastPath::GdnConvFused:
+    case FastPath::QsaPrepareFused: return false; // Qwen3.8-Flash-Next kernels only
+    // It runs only where speculation is adaptive (adaptive-speculation selected, or an artifact the
+    // exact route cannot make request-invariant), see ExecutionSchedule::adaptive_mtp.
+    case FastPath::AdaptiveMtp: return options.speculative.backend == SpeculativeBackend::Mtp;
+    // Causal scoring has no idle steps (each window's chunks are the caller's); the path is a no-op
+    // there, which lets the gate name it while its fast run prefills at --fast-chunk.
+    case FastPath::IdleWidePrefill: return true;
+    // The FP8 sites of the Qwen3.8-27B recipes already permit single-term A8 at prefill widths.
+    case FastPath::Fp8A8Pair: return false;
+    // The W4A8 gate/up kernel runs only on groupwise Q4 weights (the text MLP's linear_swiglu).
+    case FastPath::Q4W4A8: return configuration.q4_gate_up;
     }
     return false;
 }

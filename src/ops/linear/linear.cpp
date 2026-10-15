@@ -77,7 +77,7 @@ void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& o
     validate_linear_policy(policy);
 }
 
-void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
+void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy, LinearRoutes routes,
                      WorkspaceArena* workspace, cudaStream_t stream) {
     switch (w.qtype) {
     case QType::Q4_G64_FP16:
@@ -90,7 +90,7 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
         detail::q6_dispatch(x, w, out, policy, stream);
         return;
     case QType::Q8_G32_FP16:
-        detail::q8_dispatch(x, w, out, policy, stream);
+        detail::q8_dispatch(x, w, out, policy, routes, stream);
         return;
     case QType::BF16:
         detail::bf16_dispatch(x, w, out, policy, stream);
@@ -99,7 +99,7 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
         detail::nvfp4_dispatch(x, w, out, policy, workspace, stream);
         return;
     case QType::FP8_E4M3FN_ROW_BF16:
-        detail::fp8_dispatch(x, w, out, policy, workspace, stream);
+        detail::fp8_dispatch(x, w, out, policy, routes, workspace, stream);
         return;
     case QType::FP32:
     case QType::INT32:
@@ -132,8 +132,8 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
         (void)detail::select_q6_launch(output_rows, input_rows, max_tokens, policy);
         return 0;
     case QType::Q8_G32_FP16:
-        (void)detail::select_q8_launch(output_rows, input_rows, min_tokens, policy);
-        (void)detail::select_q8_launch(output_rows, input_rows, max_tokens, policy);
+        (void)detail::select_q8_launch(output_rows, input_rows, min_tokens, policy, LinearRoutes::Exact);
+        (void)detail::select_q8_launch(output_rows, input_rows, max_tokens, policy, LinearRoutes::Exact);
         return 0;
     case QType::BF16:
         (void)detail::select_bf16_launch(output_rows, input_rows, min_tokens, policy);
@@ -153,14 +153,17 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
 }
 
 void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
-            WorkspaceArena& workspace, cudaStream_t stream) {
+            WorkspaceArena& workspace, cudaStream_t stream, LinearRoutes routes) {
     validate_linear_semantics(x, w, out, policy);
-    dispatch_linear(x, w, out, policy, &workspace, stream);
+    if (!valid_linear_routes(routes)) {
+        throw std::invalid_argument("linear: unsupported route set");
+    }
+    dispatch_linear(x, w, out, policy, routes, &workspace, stream);
 }
 
 void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     validate_linear_semantics(x, w, out, LinearPolicy::A16Only);
-    dispatch_linear(x, w, out, LinearPolicy::A16Only, nullptr, stream);
+    dispatch_linear(x, w, out, LinearPolicy::A16Only, LinearRoutes::Exact, nullptr, stream);
 }
 
 } // namespace infernix::ops

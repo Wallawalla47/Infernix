@@ -100,6 +100,9 @@ void ProgramImpl::install_sampling(SequenceState& sequence, RequestControl& requ
         .enabled               = speculative_backend != SpeculativeBackend::None,
         .draft_window          = draft_window,
         .accepted_per_position = std::vector<std::uint64_t>(draft_window, 0),
+        .rounds_by_draft_length =
+            std::vector<std::uint64_t>(
+                speculative_backend == SpeculativeBackend::Mtp ? neural_draft_window : 0U, 0),
     };
     const bool penalties = request.sampling_host.presence_penalty != 0.0F ||
                            request.sampling_host.frequency_penalty != 0.0F;
@@ -504,19 +507,35 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
     }
     // As for DFlash, a round with at least one copy proposal verifies at the narrowest n-gram
     // window that holds its longest copy and an all-neural round at the MTP window, each on the
-    // frame viewed at that width. Every round proposes the next round's drafts at the configured
-    // MTP depth. Without adaptive speculation the width is the configuration's: every round verifies
-    // at the n-gram window when n-gram drafting is configured, else at the MTP window, so a row's
-    // verification does not depend on the other rows' proposals.
-    const bool fixed_width = execution_schedule.fixed_speculation;
+    // frame viewed at that width. Without adaptive speculation the width is the configuration's:
+    // every round verifies at the n-gram window when n-gram drafting is configured, else at the MTP
+    // window, so a row's verification does not depend on the other rows' proposals. With
+    // adaptive-mtp (only where speculation is adaptive) an all-neural round runs the draft length
+    // the policy picks from the rows' learned acceptance (one common length for several rows). A
+    // neural round proposes the next round's drafts at its own length, a copy round at the
+    // configured MTP depth.
+    const bool fixed_width        = execution_schedule.fixed_speculation;
+    std::uint32_t neural_drafts   = neural_draft_window;
+    if (!fixed_width && execution_schedule.adaptive_mtp && mtp_draft_policy && !any_ngram) {
+        if (lanes.size() == 1) {
+            neural_drafts = mtp_draft_policy->choose(active_sequence(lanes.front()).mtp_draft);
+        } else {
+            std::array<const MtpAcceptanceEstimate*, kMaximumConcurrency> acceptance{};
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                acceptance[row] = &active_sequence(lanes[row]).mtp_draft.acceptance;
+            }
+            neural_drafts = mtp_draft_policy->choose_batch(
+                std::span<const MtpAcceptanceEstimate* const>(acceptance.data(), lanes.size()));
+        }
+    }
     SpeculativeRoundFamily& family =
         fixed_width ? (ngram_draft_window != 0
                            ? round_family(SpeculativeRoundKind::Ngram, ngram_draft_window)
                            : round_family(SpeculativeRoundKind::Neural, neural_draft_window))
         : any_ngram ? round_family(SpeculativeRoundKind::Ngram, longest_copy)
-                    : round_family(SpeculativeRoundKind::Neural, neural_draft_window);
+                    : round_family(SpeculativeRoundKind::Neural, neural_drafts);
     const std::uint32_t verify_drafts = family.shape.verify_drafts;
-    const std::uint32_t mtp_ar_depth  = neural_draft_window;
+    const std::uint32_t mtp_ar_depth  = mtp_proposal_drafts(family.shape, neural_draft_window);
     const std::uint32_t width         = verify_drafts + 1;
     std::uint32_t maximum_frontier    = 0;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -537,7 +556,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
             sequence.ledger_frontier != sequence.execution_frontier + 1 ||
             sequence.ledger.size() != sequence.ledger_frontier ||
             sequence.ledger_splits.size() != sequence.ledger_frontier ||
-            sequence.mtp_draft_count > mtp_ar_depth) {
+            sequence.mtp_draft_count > neural_draft_window) {
             throw std::logic_error("MTP batch row is not decode-ready");
         }
         maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
@@ -678,6 +697,17 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
                 for (std::int32_t i = 0; i < accepted_i; ++i) {
                     request.speculative_stats.accepted_per_position[static_cast<std::size_t>(i)] +=
                         1;
+                }
+                std::vector<std::uint64_t>& by_length =
+                    request.speculative_stats.rounds_by_draft_length;
+                if (family.shape.kind == SpeculativeRoundKind::Neural &&
+                    verify_drafts <= by_length.size()) {
+                    by_length[verify_drafts - 1U] += 1;
+                }
+                // The row verified MTP drafts (its own, also in a copy round): learn from them.
+                if (mtp_draft_policy && matches[row].tokens.empty()) {
+                    sequence.mtp_draft.acceptance.observe(pcur,
+                                                          static_cast<std::uint32_t>(accepted_i));
                 }
             }
             if (!matches[row].tokens.empty()) {

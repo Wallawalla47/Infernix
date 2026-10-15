@@ -541,11 +541,107 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_q4_gat
     }
 }
 
+// The exact Q8 arithmetic of both Q8 expert kernels. A tile's codes enter the MMA as BF16 integers
+// (every int8 is exact in BF16); the scale of each 32-wide K group multiplies that group's FP32
+// partial sum. Sr caches 8 scales per row, so it holds the scales of four 64-wide K tiles.
+__device__ __forceinline__ void q8_expert_decode_codes(const std::uint8_t* Cr, __nv_bfloat16* As,
+                                                       int tid) {
+    for (int item = tid; item < kExpertBM * kExpertBK / 2; item += kExpertThreads) {
+        const int row = item / (kExpertBK / 2);
+        const int col = (item % (kExpertBK / 2)) * 2;
+        const auto packed = *reinterpret_cast<const std::uint16_t*>(&Cr[row * kExpertBK + col]);
+        store_vec(&As[row * kExpertBK + gemm_swz64(row, col)],
+                  __floats2bfloat162_rn(static_cast<float>(static_cast<std::int8_t>(packed & 0xffu)),
+                                        static_cast<float>(static_cast<std::int8_t>(packed >> 8))));
+    }
+}
+
+// Tile kt's two group scales (one 32-bit word) for the fragment rows mi * 16 + gid and + 8.
+__device__ __forceinline__ void q8_expert_tile_scales(const std::uint8_t* Sr, int kt, int gid,
+                                                      unsigned (&scales)[4][2]) {
+    static_assert(kExpertBK == 64, "two 32-wide scale groups per K tile");
+    const int offset = (kt % 4) * 4;
+#pragma unroll
+    for (int mi = 0; mi < 4; ++mi) {
+        const int row  = mi * 16 + gid;
+        scales[mi][0]  = *reinterpret_cast<const unsigned*>(&Sr[row * 16 + offset]);
+        scales[mi][1]  = *reinterpret_cast<const unsigned*>(&Sr[(row + 8) * 16 + offset]);
+    }
+}
+
+// One warp's eight columns of a K tile: per group, sum the MMAs over each activation plane (the
+// high and, for the down kernel, low BF16 parts), then add the partial times the group scale.
+template <int Planes>
+__device__ __forceinline__ void q8_expert_tile_mma(const __nv_bfloat16* As,
+                                                   const __nv_bfloat16* const (&planes)[Planes],
+                                                   int warp, int lane, const unsigned (&scales)[4][2],
+                                                   float (&acc)[4][4]) {
+    const int a_mat    = lane >> 3;
+    const int a_rowoff = (lane & 7) + ((a_mat & 1) << 3);
+    const int a_coloff = (a_mat >> 1) << 3;
+    const int b_rin    = lane & 7;
+    const int b_koff   = ((lane >> 3) & 1) << 3;
+#pragma unroll
+    for (int group = 0; group < 2; ++group) {
+        float partial[4][4] = {};
+#pragma unroll
+        for (int k = 0; k < 2; ++k) {
+            const int ki   = group * 2 + k;
+            const int brow = warp * 8 + b_rin;
+            const int bcol = ki * 16 + b_koff;
+            unsigned bf[Planes][2];
+#pragma unroll
+            for (int plane = 0; plane < Planes; ++plane) {
+                ldmatrix_x2(bf[plane][0], bf[plane][1],
+                            smem_addr(&planes[plane][brow * kExpertBK + gemm_swz64(brow, bcol)]));
+            }
+#pragma unroll
+            for (int mi = 0; mi < 4; ++mi) {
+                const int row = mi * 16 + a_rowoff;
+                const int col = ki * 16 + a_coloff;
+                unsigned af0, af1, af2, af3;
+                ldmatrix_x4(af0, af1, af2, af3,
+                            smem_addr(&As[row * kExpertBK + gemm_swz64(row, col)]));
+#pragma unroll
+                for (int plane = 0; plane < Planes; ++plane) {
+                    mma_bf16(partial[mi][0], partial[mi][1], partial[mi][2], partial[mi][3], af0, af1,
+                             af2, af3, bf[plane][0], bf[plane][1]);
+                }
+            }
+        }
+#pragma unroll
+        for (int mi = 0; mi < 4; ++mi) {
+            const float s0 = __half2float(
+                __ushort_as_half(static_cast<unsigned short>(scales[mi][0] >> (group * 16))));
+            const float s1 = __half2float(
+                __ushort_as_half(static_cast<unsigned short>(scales[mi][1] >> (group * 16))));
+            acc[mi][0] = fmaf(partial[mi][0], s0, acc[mi][0]);
+            acc[mi][1] = fmaf(partial[mi][1], s0, acc[mi][1]);
+            acc[mi][2] = fmaf(partial[mi][2], s1, acc[mi][2]);
+            acc[mi][3] = fmaf(partial[mi][3], s1, acc[mi][3]);
+        }
+    }
+}
+
+// SiLU(gate) * up as its BF16 high part and the BF16 rounding of the remainder.
+__device__ __forceinline__ void store_split_activation(__nv_bfloat16* high, __nv_bfloat16* low,
+                                                       std::int64_t index, float value) {
+    const __nv_bfloat16 rounded = __float2bfloat16_rn(value);
+    high[index]                 = rounded;
+    low[index]                  = __float2bfloat16_rn(value - __bfloat162float(rounded));
+}
+
+// Q8 gate/up: the codes enter the MMA exactly as BF16 integers, each 32-wide group's partial sum is
+// scaled by its FP16 scale in FP32, and SiLU(gate) * up leaves as a BF16 high/low pair (value =
+// high + low to about 16 significant bits) that the Q8 down kernel consumes with two MMAs. Rounding
+// code * scale to BF16 before the MMA, or the activation to one BF16, cost about 2^-9 relative per
+// element; the decode route computes both in FP32 (NInfer 610f79e9d).
 template <bool Routed, bool Adaptive = false>
 __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_q8_gate_up_kernel(
     const __nv_bfloat16* __restrict__ input, const int* __restrict__ expert_offsets,
     const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ scales,
-    __nv_bfloat16* __restrict__ activation, int tokens, const int* __restrict__ route_job_count) {
+    __nv_bfloat16* __restrict__ activation, __nv_bfloat16* __restrict__ activation_low, int tokens,
+    const int* __restrict__ route_job_count) {
     __shared__ __align__(16) __nv_bfloat16 As[kExpertBM * kExpertBK];
     __shared__ __align__(16) __nv_bfloat16 Bs[kExpertStages][kExpertBN * kExpertBK];
     __shared__ __align__(16) std::uint8_t Cr[kExpertBM * kExpertBK];
@@ -564,12 +660,6 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_q8_gate_
                                 : (tokens - begin < kExpertBN ? tokens - begin : kExpertBN);
     if (count <= 0) { return; }
 
-    const int a_mat              = lane >> 3;
-    const int a_rin              = lane & 7;
-    const int a_rowoff           = a_rin + ((a_mat & 1) << 3);
-    const int a_coloff           = (a_mat >> 1) << 3;
-    const int b_rin              = lane & 7;
-    const int b_koff             = ((lane >> 3) & 1) << 3;
     const int gid                = lane >> 2;
     const int lid                = lane & 3;
     constexpr int groups_per_row = kHidden / 32;
@@ -621,35 +711,6 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_q8_gate_
             }
         };
 
-        auto decode_weight = [&](int kt) {
-            constexpr int groups_per_tile   = kExpertBK / 32;
-            constexpr int scale_cache_tiles = 8 / groups_per_tile;
-            const int scale_offset          = (kt % scale_cache_tiles) * groups_per_tile * 2;
-            const int half                  = lane >> 4;
-            const int half_lane             = lane & 15;
-            for (int row_pair = warp * 2; row_pair < kExpertBM; row_pair += kExpertWarps * 2) {
-                const int row = row_pair + half;
-                unsigned scale_pair =
-                    half_lane == 0
-                        ? *reinterpret_cast<const std::uint32_t*>(&Sr[row * 16 + scale_offset])
-                        : 0;
-                scale_pair = __shfl_sync(0xffffffffu, scale_pair, half * 16);
-#pragma unroll
-                for (int group = 0; group < groups_per_tile; ++group) {
-                    const float scale = __half2float(__ushort_as_half(
-                        static_cast<std::uint16_t>((scale_pair >> (group * 16)) & 0xffffu)));
-                    const int col     = group * 32 + half_lane * 2;
-                    const std::uint16_t packed =
-                        *reinterpret_cast<const std::uint16_t*>(&Cr[row * kExpertBK + col]);
-                    const int q0 = static_cast<int>(static_cast<std::int8_t>(packed & 0xffu));
-                    const int q1 = static_cast<int>(static_cast<std::int8_t>(packed >> 8));
-                    const __nv_bfloat162 value = __floats2bfloat162_rn(
-                        static_cast<float>(q0) * scale, static_cast<float>(q1) * scale);
-                    store_vec(&As[row * kExpertBK + gemm_swz64(row, col)], value);
-                }
-            }
-        };
-
         stage_x(0, 0);
         stage_weight(0);
         cp_commit();
@@ -659,7 +720,10 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_q8_gate_
             const int stage = kt & 1;
             cp_wait<0>();
             __syncthreads();
-            decode_weight(kt);
+            q8_expert_decode_codes(Cr, As, tid);
+            // The next stage may refill Sr, so this tile's scales are read first.
+            unsigned row_scales[4][2];
+            q8_expert_tile_scales(Sr, kt, gid, row_scales);
             __syncthreads();
 
             const int next = kt + 1;
@@ -670,34 +734,8 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_q8_gate_
             }
 
             if (warp * 8 < cols) {
-                unsigned af[2][4][4];
-                unsigned bf[2][2];
-                auto load_fragments = [&](int slot, int ki) {
-#pragma unroll
-                    for (int mi = 0; mi < 4; ++mi) {
-                        const int row = mi * 16 + a_rowoff;
-                        const int col = ki * 16 + a_coloff;
-                        ldmatrix_x4(af[slot][mi][0], af[slot][mi][1], af[slot][mi][2],
-                                    af[slot][mi][3],
-                                    smem_addr(&As[row * kExpertBK + gemm_swz64(row, col)]));
-                    }
-                    const int brow = warp * 8 + b_rin;
-                    const int bcol = ki * 16 + b_koff;
-                    ldmatrix_x2(bf[slot][0], bf[slot][1],
-                                smem_addr(&Bs[stage][brow * kExpertBK + gemm_swz64(brow, bcol)]));
-                };
-                load_fragments(0, 0);
-#pragma unroll
-                for (int ki = 0; ki < kExpertBK / 16; ++ki) {
-                    const int slot = ki & 1;
-                    if (ki + 1 < kExpertBK / 16) { load_fragments(slot ^ 1, ki + 1); }
-#pragma unroll
-                    for (int mi = 0; mi < 4; ++mi) {
-                        mma_bf16(acc[mi][0], acc[mi][1], acc[mi][2], acc[mi][3], af[slot][mi][0],
-                                 af[slot][mi][1], af[slot][mi][2], af[slot][mi][3], bf[slot][0],
-                                 bf[slot][1]);
-                    }
-                }
+                const __nv_bfloat16* const planes[1] = {Bs[stage]};
+                q8_expert_tile_mma<1>(As, planes, warp, lane, row_scales, acc);
             }
         }
         cp_wait<0>();
@@ -713,16 +751,20 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_q8_gate_
                 const int local_col0 = warp * 8 + 2 * lid;
                 const int local_col1 = local_col0 + 1;
                 if (local_col0 < cols) {
-                    activation[static_cast<std::int64_t>(col0) * kIntermediate + row0] =
-                        __float2bfloat16_rn(silu(acc[mi][0]) * acc[mi + 2][0]);
-                    activation[static_cast<std::int64_t>(col0) * kIntermediate + row1] =
-                        __float2bfloat16_rn(silu(acc[mi][2]) * acc[mi + 2][2]);
+                    store_split_activation(activation, activation_low,
+                                           static_cast<std::int64_t>(col0) * kIntermediate + row0,
+                                           silu(acc[mi][0]) * acc[mi + 2][0]);
+                    store_split_activation(activation, activation_low,
+                                           static_cast<std::int64_t>(col0) * kIntermediate + row1,
+                                           silu(acc[mi][2]) * acc[mi + 2][2]);
                 }
                 if (local_col1 < cols) {
-                    activation[static_cast<std::int64_t>(col1) * kIntermediate + row0] =
-                        __float2bfloat16_rn(silu(acc[mi][1]) * acc[mi + 2][1]);
-                    activation[static_cast<std::int64_t>(col1) * kIntermediate + row1] =
-                        __float2bfloat16_rn(silu(acc[mi][3]) * acc[mi + 2][3]);
+                    store_split_activation(activation, activation_low,
+                                           static_cast<std::int64_t>(col1) * kIntermediate + row0,
+                                           silu(acc[mi][1]) * acc[mi + 2][1]);
+                    store_split_activation(activation, activation_low,
+                                           static_cast<std::int64_t>(col1) * kIntermediate + row1,
+                                           silu(acc[mi][3]) * acc[mi + 2][3]);
                 }
             }
         }
@@ -930,15 +972,19 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_qx_dow
     }
 }
 
+// Q8 down: the gate/up kernel's activation high and low planes, each through the exact Q8
+// arithmetic (q8_expert_tile_mma).
 template <bool Routed, bool Adaptive = false>
 __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_q8_down_kernel(
-    const __nv_bfloat16* __restrict__ input, const int* __restrict__ expert_offsets,
+    const __nv_bfloat16* __restrict__ input, const __nv_bfloat16* __restrict__ input_low,
+    const int* __restrict__ expert_offsets,
     const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ scales,
     __nv_bfloat16* __restrict__ grouped_output, const float* __restrict__ routed_sum,
     const float* __restrict__ shared_scale, __nv_bfloat16* __restrict__ destination, int tokens,
     const int* __restrict__ route_job_count) {
     __shared__ __align__(16) __nv_bfloat16 As[kExpertBM * kExpertBK];
     __shared__ __align__(16) __nv_bfloat16 Bs[kExpertStages][kExpertBN * kExpertBK];
+    __shared__ __align__(16) __nv_bfloat16 Bl[kExpertStages][kExpertBN * kExpertBK];
     __shared__ __align__(16) std::uint8_t Cr[kExpertBM * kExpertBK];
     __shared__ __align__(16) std::uint8_t Sr[kExpertBM * 16];
 
@@ -955,12 +1001,6 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_q8_down_
                               : (tokens - begin < kExpertBN ? tokens - begin : kExpertBN);
     if (count <= 0) { return; }
 
-    const int a_mat              = lane >> 3;
-    const int a_rin              = lane & 7;
-    const int a_rowoff           = a_rin + ((a_mat & 1) << 3);
-    const int a_coloff           = (a_mat >> 1) << 3;
-    const int b_rin              = lane & 7;
-    const int b_koff             = ((lane >> 3) & 1) << 3;
     const int gid                = lane >> 2;
     const int lid                = lane & 3;
     constexpr int groups_per_row = kIntermediate / 32;
@@ -977,12 +1017,14 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_q8_down_
                 const int col        = item / (kExpertBK / 8);
                 const int k8         = item - col * (kExpertBK / 8);
                 const int source_col = begin + column_base + col;
-                auto* dst            = &Bs[stage][col * kExpertBK + gemm_swz64(col, k8 * 8)];
-                const auto* src =
-                    input +
+                const int swizzled   = col * kExpertBK + gemm_swz64(col, k8 * 8);
+                const std::int64_t offset =
                     static_cast<std::int64_t>(col < cols ? source_col : begin) * kIntermediate +
                     k0 + k8 * 8;
-                cp_async_zfill<16, Cache::cg>(dst, src, col < cols ? 16 : 0);
+                cp_async_zfill<16, Cache::cg>(&Bs[stage][swizzled], input + offset,
+                                              col < cols ? 16 : 0);
+                cp_async_zfill<16, Cache::cg>(&Bl[stage][swizzled], input_low + offset,
+                                              col < cols ? 16 : 0);
             }
         };
 
@@ -1009,35 +1051,6 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_q8_down_
             }
         };
 
-        auto decode_weight = [&](int kt) {
-            constexpr int groups_per_tile   = kExpertBK / 32;
-            constexpr int scale_cache_tiles = 8 / groups_per_tile;
-            const int scale_offset          = (kt % scale_cache_tiles) * groups_per_tile * 2;
-            const int half                  = lane >> 4;
-            const int half_lane             = lane & 15;
-            for (int row_pair = warp * 2; row_pair < kExpertBM; row_pair += kExpertWarps * 2) {
-                const int row = row_pair + half;
-                unsigned scale_pair =
-                    half_lane == 0
-                        ? *reinterpret_cast<const std::uint32_t*>(&Sr[row * 16 + scale_offset])
-                        : 0;
-                scale_pair = __shfl_sync(0xffffffffu, scale_pair, half * 16);
-#pragma unroll
-                for (int group = 0; group < groups_per_tile; ++group) {
-                    const float scale = __half2float(__ushort_as_half(
-                        static_cast<std::uint16_t>((scale_pair >> (group * 16)) & 0xffffu)));
-                    const int col     = group * 32 + half_lane * 2;
-                    const std::uint16_t packed =
-                        *reinterpret_cast<const std::uint16_t*>(&Cr[row * kExpertBK + col]);
-                    const int q0 = static_cast<int>(static_cast<std::int8_t>(packed & 0xffu));
-                    const int q1 = static_cast<int>(static_cast<std::int8_t>(packed >> 8));
-                    const __nv_bfloat162 value = __floats2bfloat162_rn(
-                        static_cast<float>(q0) * scale, static_cast<float>(q1) * scale);
-                    store_vec(&As[row * kExpertBK + gemm_swz64(row, col)], value);
-                }
-            }
-        };
-
         stage_x(0, 0);
         stage_weight(0);
         cp_commit();
@@ -1047,7 +1060,9 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_q8_down_
             const int stage = kt & 1;
             cp_wait<0>();
             __syncthreads();
-            decode_weight(kt);
+            q8_expert_decode_codes(Cr, As, tid);
+            unsigned row_scales[4][2];
+            q8_expert_tile_scales(Sr, kt, gid, row_scales);
             __syncthreads();
 
             const int next = kt + 1;
@@ -1058,34 +1073,8 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_q8_down_
             }
 
             if (warp * 8 < cols) {
-                unsigned af[2][4][4];
-                unsigned bf[2][2];
-                auto load_fragments = [&](int slot, int ki) {
-#pragma unroll
-                    for (int mi = 0; mi < 4; ++mi) {
-                        const int row = mi * 16 + a_rowoff;
-                        const int col = ki * 16 + a_coloff;
-                        ldmatrix_x4(af[slot][mi][0], af[slot][mi][1], af[slot][mi][2],
-                                    af[slot][mi][3],
-                                    smem_addr(&As[row * kExpertBK + gemm_swz64(row, col)]));
-                    }
-                    const int brow = warp * 8 + b_rin;
-                    const int bcol = ki * 16 + b_koff;
-                    ldmatrix_x2(bf[slot][0], bf[slot][1],
-                                smem_addr(&Bs[stage][brow * kExpertBK + gemm_swz64(brow, bcol)]));
-                };
-                load_fragments(0, 0);
-#pragma unroll
-                for (int ki = 0; ki < kExpertBK / 16; ++ki) {
-                    const int slot = ki & 1;
-                    if (ki + 1 < kExpertBK / 16) { load_fragments(slot ^ 1, ki + 1); }
-#pragma unroll
-                    for (int mi = 0; mi < 4; ++mi) {
-                        mma_bf16(acc[mi][0], acc[mi][1], acc[mi][2], acc[mi][3], af[slot][mi][0],
-                                 af[slot][mi][1], af[slot][mi][2], af[slot][mi][3], bf[slot][0],
-                                 bf[slot][1]);
-                    }
-                }
+                const __nv_bfloat16* const planes[2] = {Bs[stage], Bl[stage]};
+                q8_expert_tile_mma<2>(As, planes, warp, lane, row_scales, acc);
             }
         }
         cp_wait<0>();
@@ -1214,6 +1203,8 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
     auto* packed_token      = static_cast<int*>(workspace.packed_token.data);
     auto* routed_activation = static_cast<__nv_bfloat16*>(workspace.routed_storage.data);
     auto* routed_sum        = static_cast<float*>(workspace.routed_sum.data);
+    auto* shared_activation_low = static_cast<__nv_bfloat16*>(workspace.shared_activation_low.data);
+    auto* routed_activation_low = static_cast<__nv_bfloat16*>(workspace.routed_activation_low.data);
 
     for (std::int32_t token0 = 0; token0 < plan.tokens; token0 += plan.slice_tokens) {
         const std::int32_t tokens =
@@ -1307,7 +1298,7 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
             sparse_moe_prefill_q8_gate_up_kernel<true>
                 <<<routed_gate_grid, kExpertThreads, 0, stream>>>(
                     grouped_io, offsets, routed_gate_codes, routed_gate_scales, routed_activation,
-                    tokens, nullptr);
+                    routed_activation_low, tokens, nullptr);
         } else {
             throw std::invalid_argument("sparse_moe prefill: unsupported gate/up codec");
         }
@@ -1319,12 +1310,12 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
             sparse_moe_prefill_q8_gate_up_kernel<false, true>
                 <<<shared_gate_grid, kExpertThreads, 0, stream>>>(
                     input, nullptr, shared_gate_codes, shared_gate_scales, shared_activation,
-                    tokens, route_job_count);
+                    shared_activation_low, tokens, route_job_count);
         } else {
             sparse_moe_prefill_q8_gate_up_kernel<false, false>
                 <<<shared_gate_grid, kExpertThreads, 0, stream>>>(
                     input, nullptr, shared_gate_codes, shared_gate_scales, shared_activation,
-                    tokens, nullptr);
+                    shared_activation_low, tokens, nullptr);
         }
         CUDA_CHECK(cudaGetLastError());
 
@@ -1363,8 +1354,8 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         case QType::Q8_G32_FP16:
             sparse_moe_prefill_q8_down_kernel<true>
                 <<<routed_down_grid, kExpertThreads, 0, stream>>>(
-                    routed_activation, offsets, routed_down_codes, routed_down_scales, grouped_io,
-                    nullptr, nullptr, nullptr, tokens, nullptr);
+                    routed_activation, routed_activation_low, offsets, routed_down_codes,
+                    routed_down_scales, grouped_io, nullptr, nullptr, nullptr, tokens, nullptr);
             break;
         default:
             throw std::invalid_argument("sparse_moe prefill: unsupported down codec");
@@ -1384,13 +1375,14 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         if (adaptive) {
             sparse_moe_prefill_q8_down_kernel<false, true>
                 <<<shared_down_grid, kExpertThreads, 0, stream>>>(
-                    shared_activation, nullptr, shared_down_codes, shared_down_scales, nullptr,
-                    routed_sum, shared_scale, output, tokens, route_job_count);
+                    shared_activation, shared_activation_low, nullptr, shared_down_codes,
+                    shared_down_scales, nullptr, routed_sum, shared_scale, output, tokens,
+                    route_job_count);
         } else {
             sparse_moe_prefill_q8_down_kernel<false, false>
                 <<<shared_down_grid, kExpertThreads, 0, stream>>>(
-                    shared_activation, nullptr, shared_down_codes, shared_down_scales, nullptr,
-                    routed_sum, shared_scale, output, tokens, nullptr);
+                    shared_activation, shared_activation_low, nullptr, shared_down_codes,
+                    shared_down_scales, nullptr, routed_sum, shared_scale, output, tokens, nullptr);
         }
         CUDA_CHECK(cudaGetLastError());
     }

@@ -91,8 +91,10 @@ void ProgramImpl::plan_binding_units(ContextTransaction& tx, const RequestBasePl
     initialize_prefill(lane, tx.reuse_frontier);
     UnitDemand first;
     if (!resume) {
+        // A binding's first step is one chunk: admission and source choice size it so
+        // (hybrid_program.cpp), whatever the other lanes do.
         first = prefill_unit(base.summary().prompt_tokens, tx.reuse_frontier,
-                             initial_mtp_extent(*base.impl_));
+                             initial_mtp_extent(*base.impl_), prefill_chunk);
     } else {
         first = {.kind          = ExecutionUnitKind::Replay,
                  .main_frontier = std::min(tx.reuse_frontier + prefill_chunk, resume->frontier())};

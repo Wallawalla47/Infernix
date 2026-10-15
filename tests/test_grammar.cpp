@@ -101,6 +101,71 @@ void check_compiled_grammar_lifetime() {
     require(allows(mask(*session), 2), "evicted grammar did not complete");
 }
 
+void check_counted_units() {
+    const std::vector<std::string> units{"a", "b", "你", "😀", "\\n", "\\u0000", "\\\"", "\\\\"};
+    std::vector<std::string> vocabulary{
+        "a",        "b",        "ab",   "aaa",  "\"",    "\"!",  "a\"!",     "ab\"!",
+        "!",        "你",       "😀",   "\xe4", "\xbd",  "\xa0", "\xe4\xbd", "\xbd\xa0",
+        "\xf0\x9f", "\x98\x80", "a你",  "\\",   "n",     "u",    "0",        "\\n",
+        "\\u00",    "00",       "\\\"", "\\\\", "\xf0",  "\x9f", "\x98",     "\x80",
+        "A",        "B",        "\"A",  "\"B",  "ab\"A", "a\"B"};
+    const int eos = static_cast<int>(vocabulary.size());
+    vocabulary.emplace_back();
+    vocabulary.emplace_back();
+    infernix::text::GrammarCompiler compiler(vocabulary, {eos}, 4 * 1024 * 1024);
+
+    struct Bound {
+        int minimum, maximum;
+        std::string suffix;
+    };
+
+    const std::vector<std::vector<Bound>> cases{
+        {{0, 2, "!"}}, {{1, 2, "!"}}, {{2, 2, "!"}}, {{0, 1, "A"}, {2, 2, "B"}}};
+    for (const auto& branches : cases) {
+        std::string source = "root ::= ";
+        std::set<std::string> language, prefixes;
+        for (const auto& bound : branches) {
+            if (source != "root ::= ") source += " | ";
+            source += "\"\\\"\" unit{" + std::to_string(bound.minimum) + "," +
+                      std::to_string(bound.maximum) + "} \"\\\"" + bound.suffix + "\"";
+            const std::string end = "\"" + bound.suffix;
+            if (bound.minimum == 0) language.insert("\"" + end);
+            for (const auto& first : units) {
+                if (bound.minimum <= 1) language.insert("\"" + first + end);
+                if (bound.maximum == 2)
+                    for (const auto& second : units) language.insert("\"" + first + second + end);
+            }
+        }
+        source += R"(
+unit ::= "a" | "b" | "你" | "😀" | "\\n" | "\\u0000" | "\\\"" | "\\\\"
+)";
+        for (const auto& word : language)
+            for (std::size_t n = 0; n <= word.size(); ++n) prefixes.insert(word.substr(0, n));
+        for (const auto& prefix : prefixes) {
+            auto session      = compile(compiler, source, {}, prefix);
+            const auto before = mask(*session);
+            for (int token = 0; token < static_cast<int>(before.size() * 32); ++token) {
+                const bool expected = token == eos
+                                          ? language.contains(prefix)
+                                          : token < static_cast<int>(vocabulary.size()) &&
+                                                !vocabulary[token].empty() &&
+                                                prefixes.contains(prefix + vocabulary[token]);
+                require(allows(before, token) == expected,
+                        "counted unit mask differs from enumerated language");
+                if (!expected) continue;
+                session->accept(token);
+                session->discard();
+                require(mask(*session) == before, "counted unit rollback changed the mask");
+                const std::array<std::int32_t, 1> draft{token};
+                std::vector<std::uint32_t> draft_masks(2 * session->mask_words());
+                require(session->masks(draft, draft_masks) == 0,
+                        "counted unit rejected a legal speculative token");
+                require(mask(*session) == before, "counted unit speculation changed the mask");
+            }
+        }
+    }
+}
+
 void check_draft_lookahead() {
     // IDs: a=0, b=1, c=2, EOS=3, forbidden special=4.
     infernix::text::GrammarCompiler compiler({"a", "b", "c", "", ""}, {3}, 1024 * 1024);
@@ -139,6 +204,7 @@ void check_draft_lookahead() {
 int main() {
     try {
         check_finite_language_masks();
+        check_counted_units();
         check_compiled_grammar_lifetime();
         check_draft_lookahead();
         std::vector<std::string> vocab;

@@ -12,7 +12,8 @@
 namespace infernix::models::qwen3_5::execution {
 
 std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t first,
-                                std::int32_t last, bool mtp, bool wide_verification) {
+                                std::int32_t last, bool mtp, bool wide_verification,
+                                ops::LinearRoutes gate_up_routes) {
     if (first <= 0 || last < first) { throw std::invalid_argument("FFN: invalid column interval"); }
     if (const auto* moe = std::get_if<ops::SparseMoeWeights>(&parameters)) {
         return ops::sparse_moe_workspace_capacity_bytes(moe->routed_gate_up.qtype,
@@ -44,7 +45,7 @@ std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t fi
         {
             auto scope = layout.scope();
             (void)layout.alloc_bytes(ops::linear_swiglu_workspace_capacity_bytes(
-                gu.qtype, gu.n, gu.k, p.gate_up.policy, first, last));
+                gu.qtype, gu.n, gu.k, p.gate_up.policy, first, last, gate_up_routes));
         }
         {
             auto scope = layout.scope();
@@ -58,7 +59,7 @@ std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t fi
 
 void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual,
          const ops::SparseMoeHints& hints, WorkspaceArena& workspace, DeviceExecutionView execution,
-         bool mtp, bool wide_verification) {
+         bool mtp, bool wide_verification, ops::LinearRoutes gate_up_routes) {
     const auto stream  = execution.stream;
     auto scope         = workspace.scope();
     const auto columns = hidden.ne[1];
@@ -94,7 +95,8 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
     Tensor activation = workspace.alloc(DType::BF16, {gu.n / 2, columns});
     {
         auto call = workspace.scope();
-        ops::linear_swiglu(hidden, gu, activation, p.gate_up.policy, workspace, stream);
+        ops::linear_swiglu(hidden, gu, activation, p.gate_up.policy, workspace, stream,
+                           gate_up_routes);
     }
     ops::linear_add(activation, down, residual,
                     residual_projection_policy(p.down, wide_verification), workspace, stream);

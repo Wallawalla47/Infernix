@@ -8,6 +8,10 @@ infernix_add_op_test(infernix_linear_swiglu_q4_a16_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_q4_a16.cpp"
   LIBRARIES infernix_linear_swiglu_test_support)
 
+infernix_add_op_test(infernix_linear_swiglu_q4_w4a8_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_q4_w4a8.cpp"
+  LIBRARIES infernix_linear_swiglu_test_support)
+
 infernix_add_op_test(infernix_linear_swiglu_q8_a16_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_q8_a16.cpp"
   LIBRARIES infernix_linear_swiglu_test_support)

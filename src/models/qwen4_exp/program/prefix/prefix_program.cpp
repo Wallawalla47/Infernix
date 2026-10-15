@@ -894,6 +894,10 @@ std::optional<pc::SnapshotRef> ProgramImpl::prefix_resident(const Lane& lane) co
 void ProgramImpl::prefix_release(Lane& lane) noexcept {
     if (!prefix_) { return; }
     try {
+        // A lane released before its first call (cancelled, failed or aborted after binding) may still
+        // have its restore landing in its private page and state slot: whatever reuses them next runs
+        // on the compute stream, so that stream waits for the restore (free once it has landed).
+        if (lane.prefix.restore) { prefix_->order_after_restore(*lane.prefix.restore, device_.stream); }
         if (!lane.prefix.path.empty()) { prefix_->index().release_path(lane.prefix.path); }
         prefix_->poll();
     } catch (...) {}

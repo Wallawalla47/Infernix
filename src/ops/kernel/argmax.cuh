@@ -18,7 +18,7 @@ namespace infernix::ops {
 // execution dispatches registered vocab profiles to a smaller block so the much
 // larger 2-D grid exposes enough resident CTAs without oversized reductions.
 inline constexpr int kArgmaxBlock          = 512;
-inline constexpr int kArgmaxItemsPerThread = 1;
+inline constexpr int kArgmaxItemsPerThread = 16; // rows per thread: two 8-row vector loads
 
 __device__ __forceinline__ bool argmax_better(float value, std::int32_t index, float best_value,
                                               std::int32_t best_index) {
@@ -104,15 +104,37 @@ __launch_bounds__(kArgmaxBlock) __global__
 
     float best_value        = -CUDART_INF_F;
     std::int32_t best_index = INT32_MAX;
+    const auto consider     = [&](std::int32_t row, float value) {
+        if (argmax_better(value, row, best_value, best_index)) {
+            best_value = value;
+            best_index = row;
+        }
+    };
+    // Each thread reads 8 contiguous rows per 16-byte load when every column starts 16-byte aligned
+    // (giveen/ninfer-ext 98a5904cb); the winner is the same value/lower-id maximum either way.
+    constexpr int kVectorRows = 8;
+    if (physical_rows % kVectorRows == 0 && (reinterpret_cast<std::uintptr_t>(logits) & 15U) == 0) {
 #pragma unroll
-    for (int item = 0; item < kArgmaxItemsPerThread; ++item) {
-        const std::int32_t v = tile_start + threadIdx.x + item * blockDim.x;
-        if (v < valid_rows) {
-            const float value = __bfloat162float(logits[base + v]);
-            if (argmax_better(value, v, best_value, best_index)) {
-                best_value = value;
-                best_index = v;
+        for (int group = 0; group < kArgmaxItemsPerThread / kVectorRows; ++group) {
+            const std::int32_t v =
+                tile_start + (static_cast<std::int32_t>(threadIdx.x) + group * static_cast<std::int32_t>(blockDim.x)) *
+                                 kVectorRows;
+            if (v + kVectorRows <= valid_rows) {
+                const uint4 packed = __ldg(reinterpret_cast<const uint4*>(logits + base + v));
+                const auto* rows   = reinterpret_cast<const __nv_bfloat16*>(&packed);
+#pragma unroll
+                for (int k = 0; k < kVectorRows; ++k) { consider(v + k, __bfloat162float(rows[k])); }
+            } else {
+                for (std::int32_t row = v; row < valid_rows; ++row) {
+                    consider(row, __bfloat162float(logits[base + row]));
+                }
             }
+        }
+    } else {
+#pragma unroll
+        for (int item = 0; item < kArgmaxItemsPerThread; ++item) {
+            const std::int32_t v = tile_start + threadIdx.x + item * blockDim.x;
+            if (v < valid_rows) { consider(v, __bfloat162float(logits[base + v])); }
         }
     }
 

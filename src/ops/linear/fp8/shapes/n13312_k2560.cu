@@ -4,6 +4,7 @@
 // chain, so a column has the same bits at every width (design §11.3).
 #include "ops/linear/fp8/fp8_shapes.h"
 #include "ops/linear/fp8/fp8_launch.cuh"
+#include "ops/linear/fp8/fp8_a8_pair_tma_mma.cuh"
 
 namespace infernix::ops::detail {
 namespace {
@@ -32,9 +33,14 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t
     fp8_linear_a16_tma<Geometry, TmaT128R128>(x, weight, out, stream);
 }
 
-// A16 only: the checkpoint is weight-only, served with BF16 activations.
+// No single-term A8 route: the checkpoint is weight-only, served with BF16 activations. The
+// fp8-a8-pair fast path carries them as two E4M3 terms from T = 97.
 bool uses_a8(std::int32_t, std::int32_t) { return false; }
+// The pair route's admission (2026-10-15 sweep, RTX 5090): slower than the exact route at T=32, 80
+// and 96 (1.06-1.08), faster from 112 (0.65-0.89).
+constexpr std::int32_t kPairMinTokens = 97;
 } // namespace
 
-const Fp8LinearShape kFp8N13312K2560{13312, 2560, launch_a16, nullptr, uses_a8, nullptr};
+const Fp8LinearShape kFp8N13312K2560{13312,   2560, launch_a16, nullptr, uses_a8, nullptr,
+                                     /*invariant*/ nullptr, launch_fp8_a8_pair<Geometry>, kPairMinTokens};
 } // namespace infernix::ops::detail

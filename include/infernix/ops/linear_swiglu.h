@@ -30,12 +30,13 @@ namespace infernix::ops {
  * A16Only/AllowA8 and accepts every positive T under every policy. Row-scaled FP8 accepts all
  * policies, with A8 permitted by AllowA8/AllowA4.
  * A permissive policy covers whichever qualified route the private resolver selects across the
- * requested interval.
+ * requested interval. `routes` must be the flags the calls pass (linear_swiglu's Routes).
  */
 [[nodiscard]] std::size_t
 linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
                                        std::int32_t input_rows, LinearPolicy policy,
-                                       std::int32_t min_tokens, std::int32_t max_tokens);
+                                       std::int32_t min_tokens, std::int32_t max_tokens,
+                                       LinearRoutes routes = LinearRoutes::Exact);
 
 /**
  * Op: linear_swiglu
@@ -66,17 +67,27 @@ linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
  *   AllowA8/AllowA4 permit FP8 activation quantization; route thresholds are implementation
  * choices.
  *
+ * Routes:
+ *   `routes` admits fast-path routes (LinearRoutes); without a flag every profile runs its exact
+ *   route. Under LinearRoutes::Q4W4A8 the Q4 profile serves prefill widths (a private column
+ *   threshold) on the q4-w4a8 route, whatever `policy`: each token's activation is quantized to
+ *   int8 against its own absmax (scale max|x|/127), the dot product of every 64-element weight group
+ *   is exact in integers, and the group's FP16 scale and the token scale are applied in FP32. It meets
+ *   the int8 per-token activation criterion; narrower calls keep the exact route's bits. A token with
+ *   a non-finite element yields non-finite outputs. Other profiles ignore that flag.
+ *
  * Effects:
  *   Writes the full output; x/weight and output must not alias.
  *
  * Workspace:
  *   Caller-owned transient storage reported by linear_swiglu_workspace_capacity_bytes(),
- *   scoped to the call. Q8, NVFP4 A16, and row-scaled FP8 A16 require zero bytes; A4/A8 routes use
- *   caller-owned activation storage and may use private projection storage. There is no persistent
- *   state side effect.
+ *   scoped to the call. Q8, NVFP4 A16, and row-scaled FP8 A16 require zero bytes; A4/A8 routes and
+ *   the q4-w4a8 route use caller-owned activation storage and may use private projection storage.
+ *   There is no persistent state side effect.
  */
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, LinearPolicy policy,
-                   WorkspaceArena& ws, cudaStream_t stream);
+                   WorkspaceArena& ws, cudaStream_t stream,
+                   LinearRoutes routes = LinearRoutes::Exact);
 
 /**
  * A16-only convenience form. Q4/Q8, NVFP4 and row-scaled FP8 retain their complete positive-T

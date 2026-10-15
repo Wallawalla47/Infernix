@@ -341,6 +341,16 @@ backslashes in JSON strings must be escaped legally. Finite const/enum candidate
 and recursive definitions with no generating branch are unsatisfiable at compilation or the initial
 mask check, rather than having the constraint dropped.
 
+Pure string length constraints use a counted repetition of JSON scalars, with the closing quote in the
+same rule as the repeated body. The compiler normalizes repeated bodies with determinable unit
+boundaries into a byte DFA and precomputes, per repetition budget a token needs, a dense bitmap or a
+sparse set, including partial UTF-8 and escape states; the dynamic count stays in the parser history
+and takes part in the same rollback. Different upper bounds share the repeated body, so the rule count
+and bitmap buckets do not grow with the bound. The same lowering covers other terminal repetitions
+followed by a byte that cannot start their unit, such as the bounded whitespace runs. Tokens that
+leave the string and consume the following grammar keep exact matching. Combinations of pattern,
+length and tool-delimiter exclusion still use the constraint-intersection automaton.
+
 JSON uses the declared field order and admits insignificant whitespace between tokens in runs of at most
 32 characters. A compact-only grammar forces a model that prefers pretty-printed output off its layout:
 Qwen3.8 without thinking then closed the first key empty (`{"":"ok"}`, NInfer #392). String length and pattern grammars

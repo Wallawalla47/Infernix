@@ -1202,10 +1202,8 @@ CompiledGrammar GrammarCompilerSub::CompileImpl(Grammar grammar_unoptimized) {
     thread_pool->Join();
   }
 
-  PopulateRepeatInteriorBitsets(
-      compiled_grammar_impl->grammar,
-      tokenizer_info_,
-      &compiled_grammar_impl->adaptive_token_mask_cache
+  PopulateRepeatMasks(
+      compiled_grammar_impl->grammar, tokenizer_info_, &compiled_grammar_impl->adaptive_token_mask_cache
   );
 
   return CompiledGrammar(compiled_grammar_impl);

@@ -9245,8 +9245,8 @@ BF16 and FP8 projections keep the packed write and its split. End to end (dense8
 every B run above every A run), MTP K = 4 170.32 → 172.13 (+1.1 %, identical acceptance 0.8049 and
 573/72 rounds in all eight runs); pp4096 1630.6 → 1628.9 (−0.1 %, within the ±0.9 spread).
 
-**NInfer 81c8ce09's Q8 routes for [16384, 2560] and [2560, 6144], re-measured; not adopted (§19.3.20
-stands).** Cold-L2 graph sweep: [16384, 2560] −6 to −33 % at T = 1-8 on its 8-column sliced-K tile
+**NInfer 81c8ce09's Q8 routes for [16384, 2560] and [2560, 6144], re-measured; not adopted on the
+exact route (§19.3.20 stands; since 2026-10-15 they run as the `q8-sliced-k` fast path, §19.3.22).** Cold-L2 graph sweep: [16384, 2560] −6 to −33 % at T = 1-8 on its 8-column sliced-K tile
 (one route over 1-8, column-invariant), −14 to −37 % at 9-48, neutral at 49-64, −17 % at 65-96, −5 %
 at 2048/4096 (worst +4.1 % at 384); [2560, 6144] −26 to −75 % at 9-128 but +37-56 % at 129-256. In
 the decode graph (nsys, per call): [16384, 2560] 26.6 → 23.4 µs at T = 1, 27.8 → 22.2 µs at MTP
@@ -9498,6 +9498,74 @@ Host time between decode rounds, re-measured without a profiler (a temporary pro
 132 tok/s): 82-89 µs per round (`settle_round` 42-49, the decode prologue 26.6, the engine ~13), ~1.1 %
 of a round; nsys had shown 226-360 µs. Pipelined decode (§19.3.9 step 2) is therefore worth at most
 ~1.1 % (launch-ahead) or ~0.6 % (deferred settle) and is not pursued.
+
+### 19.3.22 Upstream routes re-measured as fast paths (2026-10-15)
+
+The numerical acceptance policy (model-quality.md section 6) lets a route that is not bit-exact ship
+as a fast path. NInfer dev and giveen/ninfer-ext routes rejected earlier for that reason (§19.3.20,
+§19.3.20a) were re-measured against it on the RTX 5090: Dense8, INT8 KV, `infernix_bench`
+pp16384+tg128 and pp2048+tg256, two rounds of each arm. Each fast arm was measured on top of the
+already qualified selection.
+
+**Adopted as fast paths** (qualified for Q8 dense, 4-bit experts, INT8 KV; model-quality.md 6.7):
+- `q8-sliced-k`: NInfer's [16384, 2560] and [2560, 6144] Q8 tables (35e9b5c85, cd521ab7d).
+  - Cold-L2 sweeps: [16384, 2560] 0.62-0.95 of the exact routes at most widths. [2560, 6144] 0.24-0.90 up
+    to T = 128, but 1.0-1.45 beyond.
+  - Those widths keep the exact routes: [2560, 6144] above T = 128, and [16384, 2560] at T = 321-384
+    (1.05-1.10) and 449-511 (1.02-1.04).
+  - The table's reduction order depends on the round's width, so the path couples a request to its
+    round.
+- `gdn-conv-fused`: plain decode's Q8 GDN projection runs the causal convolution in its epilogue,
+  from FP32 instead of BF16.
+- `qsa-prepare-fused`: one kernel per QSA layer (NInfer 30b489f62, fc4e3331a).
+- **Speed, jointly:**
+  - Plain decode 117.5 / 118.1 → 119.35 / 119.34 tok/s (16k prompt) and 111.3 / 110.9 → 112.8 / 112.7
+    (2k): +1.4 %.
+  - MTP K = 4: 204.9 / 206.0 → 213.5 / 214.7 (+4.2 %, the same acceptance length 4.267) and 178.2 /
+    178.1 → 183.7 / 184.3 (+3.4 %, acceptance 4.34 → 4.41 from the changed bits).
+  - Prefill +0.3 % (plain runs) and +1.0 % (MTP runs) at 16k.
+- With them, MTP output no longer equals plain decode: the fused convolution runs only in plain
+  rounds, and the Q8 table picks routes by width. The exact route still does both.
+
+**Not adopted:**
+- **Expert refill after a frame loan** (NInfer c7c36e88f): the experts a prefill loan evicted
+  reloaded, highest score first, when it returned.
+  - It acted (390 experts on the first return), and the decode hit rate rose by 0.7 points.
+  - Plain decode was unchanged (117.8 / 117.8 against 117.5 / 118.1).
+  - MTP decode fell 5.3 % (193.7 / 195.1 against 204.9 / 206.0) and 5.5 % (168.1 / 168.6 against
+    178.2 / 178.1).
+- **N-gram copy gate** (giveen 4d39be1d4): a one-row round takes a copy only when its expected tokens
+  per round time beat the MTP drafts'.
+  - MTP with 15-token copies: −6.1 % at 16k (187.1 / 187.9 against 199.8 / 200.0), +1.2 % at 2k.
+  - Copies themselves were slower than MTP alone on this corpus (199.9 against 205.5; 169.3 against
+    178.2).
+- **Tensor-core QSA decode** (NInfer 47cdc08ab, fbcd8504e): the kernel takes 23.1 µs against 14.3 µs of
+  attention at one query column on one row (8k and 128k context). It wins only from about 8 columns
+  per row (MTP verification or batch 8: 1.35-1.5×). It is not ported for that.
+- **Fused PLE gate** (NInfer 1b50c72d2):
+  - Op speed: 3.6× faster cold and 1.7× warm at T = 1.
+  - Saving: the gate runs once per forward (one PLE layer), so about 5 µs per round in a graph.
+  - Numerics: it normalizes the BF16 rounding of its gated output, so 26.6 % of the normalized bits
+    differ, with 1.4× the error of the ideal.
+- **10,240-wide offset RMSNorm** (NInfer 569861a3a):
+  - Op speed: 1.5-2.3× faster.
+  - Saving: only the MTP hidden norm has that width, so 2-2.6 µs per draft step.
+  - Numerics: not bit-exact past 16 rows.
+- **NInfer's NVFP4 expert kernels** (GPU 69c098bf0, CPU 7e691b0bd):
+  - Upstream faster: GPU 25 against 34 µs at T = 1, and up to 4.5× when 8 columns share 10 experts.
+  - Upstream slower: GPU 156 against 140 µs at T = 8 with independent routing; CPU 2× slower than
+    Infernix's AVX-VNNI path.
+  - Numerics: about 10× Infernix's error against the A4 contract (relative L2 2.3e-2 against 2.3e-3).
+  - Placement invariance: CPU and GPU give different sums.
+  - Determinism: nondeterministic at T = 4,096 (FP32 atomics).
+  - Open: Infernix's narrow expert kernel takes time proportional to the columns per expert (144 µs
+    for 8 columns on 10 experts). A multi-column narrow kernel that keeps each column's order would
+    stay exact and could speed up MTP verification.
+- **Recipe C `fp8-a8-pair`** (two E4M3 activation terms): qualified at op level only.
+  - Error: 0.78 of the A16 criterion.
+  - Admitted per shape where it is faster: [16384, 2560] from T = 17, [13312, 2560] from 97,
+    [2560, 6144] and [2560, 640] from 513, [1280, 2560] from 1,025.
+  - No recipe-C artifact was gated.
 
 ### 19.4 On the Gold-Star-Infer runtime contract (2026-10-05)
 

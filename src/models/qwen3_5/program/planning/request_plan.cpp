@@ -245,15 +245,64 @@ UnitDemand ProgramImpl::held_extent(const RequestBasePlanImpl& base) const {
 }
 
 UnitDemand ProgramImpl::prefill_unit(std::uint32_t prompt, std::uint32_t cursor,
-                                     std::uint32_t mtp_extent) const {
+                                     std::uint32_t mtp_extent, std::uint32_t step_tokens) const {
     UnitDemand demand{.kind = ExecutionUnitKind::Prefill};
-    demand.main_frontier    = std::min(prompt, cursor + prefill_chunk);
+    demand.main_frontier    = std::min(prompt, cursor + step_tokens);
     demand.backend_frontier = backend_kv_cache() ? demand.main_frontier : 0;
     if (speculative_backend == SpeculativeBackend::Mtp && demand.main_frontier == prompt &&
         mtp_extent != 0) {
         demand.backend_frontier = std::min(capacity, prompt + mtp_extent - 1U);
     }
     return demand;
+}
+
+bool ProgramImpl::other_lane_generating(std::uint32_t lane) const noexcept {
+    for (std::uint32_t other = 0; other < max_concurrency; ++other) {
+        const Lifecycle lifecycle = requests[other].lifecycle;
+        if (other != lane && (lifecycle == Lifecycle::Active || lifecycle == Lifecycle::Pending)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::uint32_t ProgramImpl::prefill_step_tokens(const SequenceState& sequence,
+                                               const RequestControl& request) const {
+    // idle-wide-prefill: a step beside a lane that waits to decode stays one chunk, which bounds
+    // that lane's stall; with none waiting it may take the idle width. A Vision prompt keeps the
+    // chunk (its media is staged per chunk), and so does a recovering request, whose resume
+    // coverage was planned in chunks.
+    if (idle_prefill_width <= prefill_chunk || !request.prefill || request.prefill->vision ||
+        request.recovery || !sequence.kv || other_lane_generating(sequence.lane)) {
+        return prefill_chunk;
+    }
+    const RequestControl::Prefill& staged = *request.prefill;
+    const std::uint32_t tokens =
+        hybrid_wide_step_limit(sequence.lane, staged.cursor, staged.prompt_tokens,
+                               idle_prefill_width);
+    if (tokens <= prefill_chunk || staged.prompt_tokens - staged.cursor <= prefill_chunk) {
+        return prefill_chunk;
+    }
+    // The wider step takes only KV pages that are free or that the prefix cache can give up, so
+    // a request that could advance by a chunk is never paused or failed for the width.
+    const UnitDemand wide =
+        prefill_unit(staged.prompt_tokens, staged.cursor, staged.initial_mtp_extent, tokens);
+    const std::uint64_t evictable = hybrid_ ? hybrid_->index().device_evictable_blocks() : 0U;
+    const auto fits = [evictable](const KVAddressSpaceStore& addresses,
+                                  const LogicalKVPageStore& pages, KVAddressSpaceHandle handle,
+                                  std::uint32_t frontier) {
+        const std::uint32_t needed = addresses.growth_pages_for_tokens(handle, frontier);
+        const std::uint32_t held   = addresses.reserved_growth_pages(handle);
+        return needed <= held ||
+               static_cast<std::uint64_t>(needed - held) <=
+                   pages.physical_pool().available_pages() + evictable;
+    };
+    if (!fits(*text_kv_addresses, *text_kv_pages, sequence.kv->text, wide.main_frontier) ||
+        (sequence.kv->backend && !fits(*backend_kv_addresses, *backend_kv_pages,
+                                       *sequence.kv->backend, wide.backend_frontier))) {
+        return prefill_chunk;
+    }
+    return tokens;
 }
 
 UnitDemand ProgramImpl::next_unit(const SequenceState& sequence, const RequestControl& request,
@@ -266,7 +315,14 @@ UnitDemand ProgramImpl::next_unit(const SequenceState& sequence, const RequestCo
             throw std::logic_error("prefill demand requires a prefill cursor");
         }
         const auto& staged = *request.prefill;
-        return prefill_unit(staged.prompt_tokens, staged.cursor, staged.initial_mtp_extent);
+        // idle-wide-prefill: a held permit keeps the width it was reserved with until its step
+        // runs, since whether another lane waits to decode can change in between.
+        if (idle_prefill_width > prefill_chunk && request.permit &&
+            request.permit->kind == ExecutionUnitKind::Prefill) {
+            return *request.permit;
+        }
+        return prefill_unit(staged.prompt_tokens, staged.cursor, staged.initial_mtp_extent,
+                            prefill_step_tokens(sequence, request));
     }
     case ExecutionUnitKind::Replay:
         if (request.lifecycle != Lifecycle::Replaying) {

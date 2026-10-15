@@ -17,6 +17,14 @@ JSON adaptations preserve literal data in cache keys, reject unsupported unions,
 JSON Pointers and carry typed errors with schema locations. String grammars constrain decoded
 Unicode values before JSON encoding; property-name exclusion also covers escaped spellings.
 String intersections combine patterns, Unicode length and tool-delimiter exclusion in one automaton.
+Pure JSON length bounds use counted repetitions of JSON-encoded Unicode scalars, with both quotes in
+the string rule (NInfer `0a8530d44`). Any terminal repetition body whose byte DFA has prefix-free
+unit boundaries, and whose following byte cannot start a unit, is lowered to one counted repeat edge
+over a body rule shared across bounds; this includes the bounded insignificant-whitespace runs of
+Infernix's JSON adapter. Its token masks are count-independent, including partial UTF-8 and escape
+states, stored as cumulative dense buckets or sparse (count, token) pairs; tokens crossing into a
+parent's continuation retain exact parser matching. Derived repeat masks are rebuilt on
+deserialization (serialization version `v18`) and charged to the compiled grammar's cache budget.
 General schema conjunction reduction and source diagnostics belong to Infernix's text adapter.
 Positional arrays preserve optional prefix positions and impossible-position length caps.
 Bounded numbers use decimal interval compilation and the product JSON serializer's binary64

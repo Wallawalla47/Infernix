@@ -279,6 +279,17 @@ void require_q8_rowsplit(const Weight& weight, std::int32_t rows, const char* la
     }
 }
 
+// Qwen3.8-Flash-Next's Q8_G32_FP16 [16384,2560] query/key/value/z parent.
+void require_q8_flash_next_parent(const Weight& weight, const char* operation) {
+    if (weight.qtype != QType::Q8_G32_FP16 || weight.n != 16384 || weight.k != 2560 ||
+        weight.scale_dtype != DType::FP16 || weight.group_size != 32 || weight.ndim != 2 ||
+        weight.padded_shape[1] != 2560 || weight.qhigh != nullptr ||
+        !aligned_to(weight.qdata, 16) || !aligned_to(weight.scales, 16)) {
+        throw std::invalid_argument(std::string(operation) +
+                                    ": invalid query/key/value/z weight");
+    }
+}
+
 void validate_policy(LinearPolicy policy, QType qtype) {
     if (column_invariant(policy) && qtype != QType::NVFP4 &&
         qtype != QType::FP8_E4M3FN_ROW_BF16) {
@@ -297,7 +308,8 @@ void validate_policy(LinearPolicy policy, QType qtype) {
 }
 
 void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
-                            LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream) {
+                            LinearPolicy policy, LinearRoutes routes, WorkspaceArena* workspace,
+                            cudaStream_t stream) {
     validate_policy(policy, weight.qtype);
     const std::int32_t cols = x.ne[1];
     if (cols <= 0) { throw std::invalid_argument("gdn_input_proj: T must be positive"); }
@@ -346,12 +358,8 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
         require_matrix(qkv, kQkvRows, cols, "qkv");
         require_matrix(z, kZRows, cols, "z");
         require_single_parent_nonoverlap(x, qkv, z);
-        if (weight.n != kQkvRows + kZRows || weight.scale_dtype != DType::FP16 || weight.group_size != 32 ||
-            weight.ndim != 2 || weight.padded_shape[1] != kHidden || weight.qhigh != nullptr ||
-            !aligned_to(weight.qdata, 16) || !aligned_to(weight.scales, 16)) {
-            throw std::invalid_argument("gdn_input_proj: invalid query/key/value/z weight");
-        }
-        detail::launch_q8_n16384_k2560_split(x, weight, qkv, z, stream);
+        require_q8_flash_next_parent(weight, "gdn_input_proj");
+        detail::launch_q8_n16384_k2560_split(x, weight, qkv, z, routes, stream);
         return;
     }
 
@@ -799,12 +807,16 @@ std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int
 
 void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Tensor& qkv, Tensor& z,
                     LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream) {
-    dispatch_single_parent(x, query_key_value_z_weight, qkv, z, policy, &workspace, stream);
+    dispatch_single_parent(x, query_key_value_z_weight, qkv, z, policy, LinearRoutes::Exact, &workspace,
+                           stream);
 }
 
 void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Tensor& qkv, Tensor& z,
-                    cudaStream_t stream) {
-    dispatch_single_parent(x, query_key_value_z_weight, qkv, z, LinearPolicy::A16Only, nullptr,
+                    cudaStream_t stream, LinearRoutes routes) {
+    if (!valid_linear_routes(routes)) {
+        throw std::invalid_argument("gdn_input_proj: unsupported route set");
+    }
+    dispatch_single_parent(x, query_key_value_z_weight, qkv, z, LinearPolicy::A16Only, routes, nullptr,
                            stream);
 }
 
@@ -1052,6 +1064,66 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
     dispatch_single_parent_snapshot(x, query_key_value_z_weight, conv_weight, conv_states,
                                     valid_columns, initial_state_slots, snapshot_base_slots, query,
                                     key, value, z, LinearPolicy::A16Only, ws, stream);
+}
+
+void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value_z_weight,
+                                  const Tensor& conv_weight, Tensor& conv_states,
+                                  const Tensor& initial_state_slots,
+                                  const Tensor& snapshot_base_slots, Tensor& query, Tensor& key,
+                                  Tensor& value, Tensor& z, LinearRoutes routes,
+                                  cudaStream_t stream) {
+    static constexpr char kOperation[] = "gdn_input_proj_conv_snapshot";
+    constexpr std::int32_t kHidden     = 2560;
+    constexpr std::int32_t kQueryRows  = 2048;
+    constexpr std::int32_t kKeyRows    = 2048;
+    constexpr std::int32_t kValueRows  = 6144;
+    constexpr std::int32_t kZRows      = 6144;
+    constexpr std::int32_t kChannels   = kQueryRows + kKeyRows + kValueRows;
+    constexpr std::int32_t kMaxBatch   = 8;
+    if (!valid_linear_routes(routes)) {
+        throw std::invalid_argument("gdn_input_proj_conv_snapshot: unsupported route set");
+    }
+    require_q8_flash_next_parent(query_key_value_z_weight, kOperation);
+    const std::int32_t batch = x.ne[2];
+    if (x.ne[1] != 1 || batch <= 0 || batch > kMaxBatch) {
+        throw std::invalid_argument(
+            "gdn_input_proj_conv_snapshot: the routes form takes W=1 and B=1..8");
+    }
+    require_conv_tensor(x, kHidden, 1, batch, kOperation, "x");
+    const ConvGeometry geometry{1, batch, batch};
+    require_snapshot_operands(conv_weight, conv_states, Tensor{}, initial_state_slots,
+                              snapshot_base_slots, kChannels, geometry);
+    require_conv_tensor(query, kQueryRows, 1, batch, kOperation, "query");
+    require_conv_tensor(key, kKeyRows, 1, batch, kOperation, "key");
+    require_conv_tensor(value, kValueRows, 1, batch, kOperation, "value");
+    require_conv_tensor(z, kZRows, 1, batch, kOperation, "z");
+
+    // Every operand and the parent are mutually disjoint, except that the two read-only selectors
+    // may be the same tensor (decode publishes each window over its own initial slot).
+    const std::array<const Tensor*, 9> tensors{&x,     &conv_weight, &conv_states,
+                                               &initial_state_slots, &snapshot_base_slots,
+                                               &query, &key,         &value, &z};
+    const Weight& parent = query_key_value_z_weight;
+    for (std::size_t lhs = 0; lhs < tensors.size(); ++lhs) {
+        for (std::size_t rhs = lhs + 1; rhs < tensors.size(); ++rhs) {
+            const bool shared_state_selectors =
+                tensors[lhs] == &initial_state_slots && tensors[rhs] == &snapshot_base_slots;
+            if (!shared_state_selectors && overlaps(*tensors[lhs], *tensors[rhs])) {
+                throw std::invalid_argument(
+                    "gdn_input_proj_conv_snapshot: tensor operands must not overlap");
+            }
+        }
+        if (overlaps_range(*tensors[lhs], parent.payload,
+                           static_cast<std::size_t>(parent.payload_bytes))) {
+            throw std::invalid_argument(
+                "gdn_input_proj_conv_snapshot: tensor operand overlaps parent weight");
+        }
+    }
+
+    const Tensor x_columns(x.data, x.dtype, {kHidden, batch});
+    detail::launch_q8_n16384_k2560_conv_snapshot(x_columns, parent, conv_weight, conv_states,
+                                                 initial_state_slots, snapshot_base_slots, query,
+                                                 key, value, z, routes, stream);
 }
 
 void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z_weight,

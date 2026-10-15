@@ -359,7 +359,8 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
     for (const Invocation& invocation : shape.invocations) {
         const std::string case_label = std::string(label) + " [" + std::to_string(shape.n) + "," +
                                        std::to_string(shape.k) +
-                                       "] T=" + std::to_string(invocation.t);
+                                       "] T=" + std::to_string(invocation.t) +
+                                       (invocation.routes != ops::LinearRoutes::Exact ? " fast" : "");
         GuardedOutput output(checked_elements(shape.n, invocation.t, "guarded output"));
         Tensor input(device_activation.p, DType::BF16, {shape.k, invocation.t});
         Tensor destination(output.data(), DType::BF16, {shape.n, invocation.t});
@@ -375,7 +376,8 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
             if (invocation.call_form == CallForm::A16Convenience) {
                 ops::linear(input, weight, destination, stream);
             } else {
-                ops::linear(input, weight, destination, invocation.policy, workspace, stream);
+                ops::linear(input, weight, destination, invocation.policy, workspace, stream,
+                            invocation.routes);
             }
         };
         try {

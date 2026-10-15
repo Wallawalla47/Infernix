@@ -264,6 +264,14 @@ void print_generation_summary(const infernix::GenerationResult& result,
             }
             print_metric(backend + " accepted by pos", positions.str());
         }
+        if (!speculative.rounds_by_draft_length.empty()) {
+            std::ostringstream lengths;
+            for (std::size_t i = 0; i < speculative.rounds_by_draft_length.size(); ++i) {
+                if (i != 0) { lengths << ','; }
+                lengths << speculative.rounds_by_draft_length[i];
+            }
+            print_metric(backend + " rounds by length", lengths.str());
+        }
         if (speculative.tree_rounds != 0) {
             print_metric(backend + " tree rounds", std::to_string(speculative.tree_rounds));
             print_metric(backend + " tree side rounds",

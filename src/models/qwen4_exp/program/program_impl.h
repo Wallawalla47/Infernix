@@ -1010,7 +1010,7 @@ public:
                                 .prefill_chunk      = static_cast<std::uint32_t>(chunk_)});
         }
         forward_ = std::make_unique<execution::Forward>(parameters_, device_, *work_, std::move(state), std::move(kv),
-                                                        std::move(experts), dim(options_.max_context));
+                                                        std::move(experts), dim(options_.max_context), options_.fast_paths);
         device_.synchronize();
         report_lane_cost(lanes, record_stride);
     }

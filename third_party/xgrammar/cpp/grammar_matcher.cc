@@ -1949,15 +1949,12 @@ void GrammarMatcher::Impl::FillBitmaskForStates(
         tmp_accepted_bitset_.Set(sorted_decoded_vocab[idx].first, true);
       }
     }
-    // In the body state of a counted repetition of a character class, most tokens are legal
-    // exactly when the budget left in the repetition state that predicted this body state covers
-    // the repetitions they consume, and a token that leaves the repetition also needs them to
-    // complete its lower bound (see PopulateRepeatInteriorBitsets). The compiled mask is shared by
-    // every repeat count, so the count is read from the parse history here and the matching bitset
-    // is accepted in one operation instead of replaying every such token.
+    // The compiled unit masks are count-independent. Resolve their budget against the
+    // active repetition parents, preserving each parent's bounds for exit tokens.
     if (!adaptive_token_mask.repeat_interior_bitsets.empty() ||
+        !adaptive_token_mask.repeat_interior_tokens.empty() ||
         !adaptive_token_mask.repeat_exit_tokens.empty()) {
-      // PopulateRepeatInteriorBitsets only fills the bitsets of body rules that are entered
+      // PopulateRepeatMasks only classifies tokens of body rules that are entered
       // through repeat edges alone, and none when character budgets are enforced. The mask lists
       // none of these tokens as accepted, so without a repetition parent this state would
       // silently reject all of them.
@@ -1992,11 +1989,15 @@ void GrammarMatcher::Impl::FillBitmaskForStates(
       }
       // The tokens that do not fit are rejected by this state without further work.
       XGRAMMAR_CHECK(on_repeat) << "A counted-repetition body state has no repetition parent";
-      const auto& char_counts = adaptive_token_mask.repeat_interior_char_counts;
-      const auto it = std::upper_bound(char_counts.begin(), char_counts.end(), remaining);
-      if (it != char_counts.begin()) {
-        const size_t index = static_cast<size_t>(it - char_counts.begin()) - 1;
+      const auto& counts = adaptive_token_mask.repeat_interior_counts;
+      const auto it = std::upper_bound(counts.begin(), counts.end(), remaining);
+      if (it != counts.begin()) {
+        const size_t index = static_cast<size_t>(it - counts.begin()) - 1;
         tmp_accepted_bitset_ |= adaptive_token_mask.repeat_interior_bitsets[index];
+      }
+      for (const auto& [count, token_id] : adaptive_token_mask.repeat_interior_tokens) {
+        if (count > remaining) break;
+        tmp_accepted_bitset_.Set(token_id, true);
       }
     }
   }

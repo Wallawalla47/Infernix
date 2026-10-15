@@ -34,7 +34,18 @@ enum class SpeculativeRoundKind : std::uint8_t { Neural, Ngram, Tree };
 struct SpeculativeRoundShape {
     SpeculativeRoundKind kind   = SpeculativeRoundKind::Neural;
     std::uint32_t verify_drafts = 0;
+    // The family serves only rounds of one row (adaptive-mtp draft lengths outside the batch
+    // lengths, mtp_draft_policy.h).
+    bool single_row = false;
 };
+
+// The drafts an MTP round of `shape` proposes for the next round. A neural round proposes at its
+// own draft length (the configured window, or with adaptive-mtp each length's own family); a copy
+// round proposes at the configured window.
+[[nodiscard]] inline std::uint32_t mtp_proposal_drafts(const SpeculativeRoundShape& shape,
+                                                       std::uint32_t neural_draft_window) noexcept {
+    return shape.kind == SpeculativeRoundKind::Neural ? shape.verify_drafts : neural_draft_window;
+}
 
 // The DFlash2 tree widths (columns per row, anchor included) each batch size's all-neural rounds
 // may verify. A fixed table gives a batch size one tree width or the chain; automatic mode lets
@@ -137,6 +148,9 @@ struct SequencePlanningInputs {
     std::uint32_t capacity                  = 0;
     std::uint32_t max_concurrency           = 1;
     std::uint32_t prefill_chunk             = 0;
+    // Widest staged prefill step (idle-wide-prefill), a multiple of prefill_chunk; prefill_chunk
+    // when the fast path is off. Prefill buffers and the prefill workspace are planned at it.
+    std::uint32_t idle_prefill_width        = 0;
     ExecutionSchedule execution_schedule;
     std::uint32_t draft_window              = 0;
     SpeculativeBackend speculative_backend  = SpeculativeBackend::None;
@@ -165,6 +179,7 @@ struct SequencePlanImpl {
     std::uint32_t main_page_groups          = 0;
     std::uint32_t max_concurrency           = 1;
     std::uint32_t prefill_chunk             = 0;
+    std::uint32_t idle_prefill_width        = 0;
     ExecutionSchedule execution_schedule;
     std::uint32_t draft_window              = 0;
     SpeculativeBackend speculative_backend  = SpeculativeBackend::None;
@@ -188,9 +203,15 @@ struct SequencePlannerImpl {
     std::unique_ptr<SequencePlanImpl> minimum;
 };
 
+// `idle_prefill_width` plans an idle-wide-prefill width (one of idle_prefill_widths_impl); zero
+// plans prefill steps of the chunk only.
 [[nodiscard]] std::unique_ptr<qwen3_5::detail::SequencePlannerImpl>
 make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContext& device,
-                           const EngineOptions& options);
+                           const EngineOptions& options, std::uint32_t idle_prefill_width = 0);
+// The idle-wide-prefill widths a plan may take, widest first (planning/idle_prefill.h); empty
+// unless the fast path is selected and some width is wider than the chunk.
+[[nodiscard]] std::vector<std::uint32_t>
+idle_prefill_widths_impl(const execution::Parameters& parameters, const EngineOptions& options);
 [[nodiscard]] std::unique_ptr<SequencePlanImpl>
 finalize_sequence_plan_impl(std::unique_ptr<qwen3_5::detail::SequencePlannerImpl> planner,
                             std::uint32_t main_page_groups);

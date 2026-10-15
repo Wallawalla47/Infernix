@@ -44,9 +44,9 @@ void argmax_launch(const Tensor& logits, Tensor& out, std::int32_t valid_rows,
     const std::int32_t t_count       = logits.ne[1];
     if (t_count == 0) { return; }
 
-    constexpr int kTileElems = kArgmaxBlock * kArgmaxItemsPerThread;
-    const int tiled_blocks   = div_up(valid_rows, kTileElems);
-    if (tiled_blocks < 2) {
+    // One CTA per column up to one block of rows; the tiled kernel beyond (each CTA covers
+    // kArgmaxItemsPerThread rows per thread).
+    if (div_up(valid_rows, kArgmaxBlock) < 2) {
         argmax_kernel<<<static_cast<unsigned int>(t_count), kArgmaxBlock, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(logits.data), static_cast<std::int32_t*>(out.data),
             valid_rows, physical_rows);

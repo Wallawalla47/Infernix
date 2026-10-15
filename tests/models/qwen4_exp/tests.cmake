@@ -115,3 +115,8 @@ infernix_add_test(infernix_qwen4_exp_decide_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_decide_real.cpp"
   LIBRARIES infernix_engine)
 set_tests_properties(infernix_qwen4_exp_decide_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
+
+# Fast-path selection rules: where each path applies and which configurations qualify it.
+infernix_add_test(infernix_qwen4_exp_fast_paths_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_fast_paths.cpp"
+  LIBRARIES infernix_model_runtime)

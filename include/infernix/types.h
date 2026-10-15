@@ -64,6 +64,25 @@ enum class FastPath : std::uint8_t {
     // INT8 KV with 24 query heads: single-column decode rows split their keys from 64 rather than
     // 128 (a different softmax merge order).
     DecodeSplit64,
+    // Qwen3.8-Flash-Next with Q8 dense weights: the GDN q/k/v/z [16384,2560] and the GDN and QSA
+    // output [2560,6144] projections run NInfer's GEMV, sliced-K and grouped sliced-K routes
+    // (ops::LinearRoutes::Q8SlicedK), which accumulate in a different order, so a column's bits depend on
+    // how many columns share the call: it couples a request's decode to the other requests of its
+    // round (LoadSummary::request_invariant is false with it).
+    Q8SlicedK,
+    // Qwen3.8-Flash-Next with Q8 dense weights: the GDN projection feeds its causal convolution the
+    // current token's FP32 q/k/v instead of their BF16 rounding (one fused kernel; the convolution
+    // history stays the BF16 state).
+    GdnConvFused,
+    // Qwen3.8-Flash-Next: one kernel per QSA layer normalizes and rotates Q, K and the index query,
+    // appends K/V and the index keys, keeping FP32 between those steps instead of BF16.
+    QsaPrepareFused,
+    // FP8 weights whose permission is 16-bit activations: prefill-width projections carry the
+    // activation as two E4M3 terms on the 8-bit Tensor Core path (ops::LinearRoutes::Fp8A8Pair).
+    Fp8A8Pair,
+    // Groupwise Q4 gate/up weights: prefill-width projections quantize activations to int8 per token
+    // and fold each group's weight scale into its accumulator (ops::LinearRoutes::Q4W4A8).
+    Q4W4A8,
     // The paths below couple a request's arithmetic to the other requests of the Engine. Without
     // them a request's outputs depend only on the request, the artifact, the options and the build
     // (LoadSummary::request_invariant); they apply where the exact route is request-invariant.
@@ -99,6 +118,10 @@ enum class FastPath : std::uint8_t {
     // tree tables and controller, the round's longest n-gram copy. Without it each round verifies
     // the configured chain at a fixed width.
     AdaptiveSpeculation,
+    // With adaptive-speculation, Qwen3.8-27B / 35B MTP rounds choose their draft length from the
+    // rows' learned acceptance and the round costs (one common length for several rows). Without it
+    // they draft the configured length.
+    AdaptiveMtp,
     // The prefix cache resumes from any tap or endpoint and splits prefill at taps and sibling
     // boundaries. Without it prefill splits and the cache publishes and resumes only on the
     // prefill chunk grid, and decode-computed endpoints are not published.
@@ -106,15 +129,21 @@ enum class FastPath : std::uint8_t {
     // KV pages grow with each unit and a short pool pauses residents, which replay their generated
     // tokens as prefill. Without it a request holds its whole KV extent from admission.
     Preemption,
+    // Prefill steps take a wider chunk while no request is waiting to decode (the chunk boundaries,
+    // and with them the prefill arithmetic, depend on load).
+    IdleWidePrefill,
 };
 
-inline constexpr std::array<FastPath, 11> kFastPaths{
+inline constexpr std::array<FastPath, 18> kFastPaths{
     FastPath::PromptPv8,           FastPath::DecodeSplit64,
-    FastPath::BatchedDecode,       FastPath::BatchedA8Decode,
-    FastPath::BatchedA4Decode,     FastPath::BatchedA4ResidualDecode,
-    FastPath::BatchedA8ResidualDecode, FastPath::BatchSplitAttention,
-    FastPath::AdaptiveSpeculation, FastPath::FreeCacheResume,
-    FastPath::Preemption};
+    FastPath::Q8SlicedK,           FastPath::GdnConvFused,
+    FastPath::QsaPrepareFused,     FastPath::Fp8A8Pair,
+    FastPath::Q4W4A8,              FastPath::BatchedDecode,
+    FastPath::BatchedA8Decode,     FastPath::BatchedA4Decode,
+    FastPath::BatchedA4ResidualDecode, FastPath::BatchedA8ResidualDecode,
+    FastPath::BatchSplitAttention, FastPath::AdaptiveSpeculation,
+    FastPath::AdaptiveMtp,         FastPath::FreeCacheResume,
+    FastPath::Preemption,          FastPath::IdleWidePrefill};
 
 [[nodiscard]] constexpr const char* fast_path_name(FastPath path) noexcept {
     switch (path) {
@@ -127,8 +156,15 @@ inline constexpr std::array<FastPath, 11> kFastPaths{
     case FastPath::BatchedA8ResidualDecode: return "batched-a8-residual-decode";
     case FastPath::BatchSplitAttention: return "batch-split-attention";
     case FastPath::AdaptiveSpeculation: return "adaptive-speculation";
+    case FastPath::AdaptiveMtp: return "adaptive-mtp";
     case FastPath::FreeCacheResume: return "free-cache-resume";
     case FastPath::Preemption: return "preemption";
+    case FastPath::Q8SlicedK: return "q8-sliced-k";
+    case FastPath::GdnConvFused: return "gdn-conv-fused";
+    case FastPath::QsaPrepareFused: return "qsa-prepare-fused";
+    case FastPath::IdleWidePrefill: return "idle-wide-prefill";
+    case FastPath::Fp8A8Pair: return "fp8-a8-pair";
+    case FastPath::Q4W4A8: return "q4-w4a8";
     }
     return "unknown";
 }
@@ -1235,6 +1271,10 @@ struct SpeculativeStats {
     std::uint64_t accepted_tokens = 0;
     std::uint64_t fallback_steps  = 0;
     std::vector<std::uint64_t> accepted_per_position;
+    // Qwen3.5-family MTP: entry k-1 counts the all-neural rounds (fallback steps excluded) that ran
+    // draft length k. Every one runs the configured window unless adaptive-mtp chooses the length
+    // per round. Empty for other backends.
+    std::vector<std::uint64_t> rounds_by_draft_length;
     std::uint64_t ngram_rounds                  = 0;
     std::uint64_t ngram_drafted_tokens          = 0;
     std::uint64_t ngram_accepted_tokens         = 0;
@@ -1618,6 +1658,11 @@ struct LoadSummary {
     // and no request-coupling fast path (FastPath::BatchedDecode and after) runs.
     bool request_invariant          = false;
     bool request_invariance_capable = false;
+    // Effective prefill chunk (tokens), and the width a prefill step takes while no request waits
+    // to decode when idle-wide-prefill runs: the widest that fit the memory plan, or the chunk when
+    // none wider fit. Zero when idle-wide-prefill is not selected (Qwen3.5 family only).
+    std::uint32_t prefill_chunk      = 0;
+    std::uint32_t idle_prefill_width = 0;
 
     // Hybrid prefix cache restored from its persistent file at startup.
     struct PrefixCacheRestore {

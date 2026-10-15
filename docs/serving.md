@@ -1417,7 +1417,10 @@ rejection/error records rather than successful constraint outcomes.
 
 `request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `prefill`, `decode`, and `total`
 as full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,
-`drafted_tokens`, `accepted_tokens`, `fallback_steps`, and `accepted_per_position`. Rates can be
+`drafted_tokens`, `accepted_tokens`, `fallback_steps`, `accepted_per_position`, and
+`rounds_by_draft_length`: with MTP on Qwen3.5-family models, entry k-1 counts the all-neural rounds
+that ran draft length k (all at `--draft-tokens` unless the `adaptive-mtp` fast path chooses the
+length per round); empty for other backends. Rates can be
 derived downstream from raw token counts and seconds instead of rounded stderr strings.
 `generation.scheduling` records preemptions, snapshot/replay restores, replayed tokens and paused
 time. Replay rebuilds committed state without adding new output usage.

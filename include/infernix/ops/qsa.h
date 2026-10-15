@@ -92,7 +92,7 @@ struct QsaBatch {
     Tensor table_rows;    // I32 [batch]
     Tensor positions;     // I32 [batch * width]: absolute (KV) position of each column
     Tensor tail_slots;    // I32 [batch]: raw-key tail state slot of each sequence
-    // Read by qsa_pool_keys only. rope_positions: I32 [batch * width, 3] axis-major, the RoPE
+    // Read by qsa_pool_keys and qsa_prepare only. rope_positions: I32 [batch * width, 3] axis-major, the RoPE
     // position of each column (axis a of column t at word a * batch * width + t). block_start_rope:
     // I32 [batch, 3] axis-major, the RoPE position of token R * floor(start / R) of each sequence
     // (start = its first column's position), read when that token precedes the call.
@@ -131,6 +131,92 @@ void qsa_pool_keys(const Tensor& raw_keys, const Tensor& norm_weight, Tensor& ta
 void qsa_commit_tails(const Tensor& raw_keys, const Tensor& positions, const Tensor& commit_columns,
                       Tensor& tails, const Tensor& tail_slots, const QsaGeometry& geometry,
                       cudaStream_t stream);
+
+/// The QSA projection rows of a call's T = batch * width columns, un-normalized and un-rotated:
+/// q BF16 [head_dim, heads, T]; k and v BF16 [head_dim, kv_heads, T]; index_q BF16
+/// [Di, index_heads, T]; index_k BF16 [Di, T] (the raw index keys).
+struct QsaPrepareInputs {
+    Tensor q;
+    Tensor k;
+    Tensor v;
+    Tensor index_q;
+    Tensor index_k;
+};
+
+/// Unit-offset RMSNorm weights: query and key BF16 [head_dim], index_query and index_key BF16 [Di].
+struct QsaPrepareNorms {
+    Tensor query;
+    Tensor key;
+    Tensor index_query;
+    Tensor index_key;
+};
+
+/**
+ * Op: QSA prepare (the qsa-prepare-fused fast path of Qwen3.8-Flash-Next): the attention layer's
+ * query/key normalization and rotation, its K/V append, its index query and its pooled index keys
+ * and raw-key tails in one call.
+ *
+ * Math / indexing:
+ *   norm_w(x)  = x * rsqrt(mean(x^2) + eps) * (1 + w), evaluated over the whole head.
+ *   RoPE(x, r) = the half-split rotation of the first rotary_dim dimensions at three-axis RoPE
+ *                position r, pair i on axis i % 3 with inverse frequency theta^(-2i/rotary_dim),
+ *                or under YaRN (yarn_factor > 1) prepare_rope(rotary_dim, theta, {yarn_factor,
+ *                original_positions})'s inverse frequency with cosine and sine scaled by its
+ *                attention scale (ops/rope.h). Both the attention and the index rotation are this
+ *                rotation.
+ *   For column c = b * width + t (sequence b; positions consecutive in a sequence), p =
+ *   positions[c], r(c) = rope_positions[c]:
+ *     q_out[:, h, c]       = BF16(RoPE(norm_{query}(q[:, h, c]), r(c)))
+ *     index_q_out[:, h, c] = BF16(RoPE(norm_{index_query}(index_q[:, h, c]), r(c)))
+ *     key_h(c)             = RoPE(norm_{key}(k[:, h, c]), r(c)), an FP32 vector
+ *     K/V row (p, h)       = kv_cache_append_batch's encoding of key_h(c) and v[:, h, c] in the
+ *                            layer's storage at position p through table row table_rows[b]
+ *                            (codec input key_h(c) itself; BF16 storage keeps BF16(key_h(c))).
+ *   Pooled keys and tails are qsa_pool_keys's for the call's raw keys index_k, except that the
+ *   pooled key of every block the call completes is BF16(RoPE(norm_{index_key}(bf16(mean)),
+ *   r(first token))) without a BF16 rounding of the normalized key; the tails change only when
+ *   batch.update_tails, exactly as qsa_pool_keys changes them.
+ *
+ * Logical shapes:
+ *   T = batch.batch * batch.width > 0; QsaPrepareInputs and QsaPrepareNorms as documented there;
+ *   q_out like inputs.q and index_q_out like inputs.index_q, or both empty (data null): a K/V-only
+ *   call, which leaves the queries unwritten. tails BF16 [Di, R - 1, slots]. batch as for
+ *   qsa_pool_keys (rope_positions [T, 3], block_start_rope [batch, 3]).
+ *
+ * Supported domain:
+ *   head_dim 256, Di 128, rotary_dim 64, kv_heads 2 or 4, heads a multiple of kv_heads,
+ *   1 <= index_heads <= 4, R > 1 dividing Di; KV storages for which qsa_prepare_supports() holds:
+ *   bf16, int8-g64, fp8-row, nvfp4 and k8v4 (the vector-quantized storages are appended by
+ *   qsa_attention and are rejected).
+ *
+ * Numeric:
+ *   Normalization, rotation, the Hadamard preparation and the codec run in FP32 with no
+ *   intermediate rounding; q_out, index_q_out and pooled keys round once to BF16 (the composed
+ *   rmsnorm -> rope -> kv_cache_append_batch / qsa_index_query / qsa_pool_keys route rounds the
+ *   normalized vector to BF16 too, and the key once more before its codec). bf16(mean) of a pooled
+ *   key stays a semantic boundary. Values and raw-key tails take exactly qsa_pool_keys's and
+ *   kv_cache_append_batch's encoding. A column's outputs and stored bytes depend only on that
+ *   column's inputs and its sequence's state, never on T, width, batch or other sequences.
+ *
+ * Effects:
+ *   Writes q_out, index_q_out, the K/V rows of the call's positions (pool pages: every K/V id the
+ *   call's positions resolve to is below layer.spaces.device_pages), the pooled keys of completed
+ *   blocks (page spaces translated as by qsa_pool_keys) and, with update_tails, the tails; nothing
+ *   else. q_out and index_q_out may be identical to inputs.q and inputs.index_q (in place) and
+ *   otherwise must not overlap any input; inputs other than those are unchanged.
+ *
+ * Workspace:
+ *   none.
+ *
+ * Execution:
+ *   stream-ordered, without host synchronization; every row, position and block decision is read
+ *   on the device, so a captured call serves any device values of the same T, batch and width.
+ */
+[[nodiscard]] bool qsa_prepare_supports(KvCacheStorage storage) noexcept;
+
+void qsa_prepare(const QsaPrepareInputs& inputs, const QsaPrepareNorms& norms, Tensor& tails,
+                 const QsaKVLayer& layer, const QsaBatch& batch, const QsaGeometry& geometry,
+                 Tensor& q_out, Tensor& index_q_out, cudaStream_t stream);
 
 /// Workspace of qsa_attention for `columns` columns of the given KV storage (the vector-quantized
 /// storages add the staging of a wide call's exact window rows).

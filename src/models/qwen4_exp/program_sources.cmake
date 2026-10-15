@@ -15,6 +15,7 @@ target_sources(infernix_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/execution/expert_stream.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/ngram_volume.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/program.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/fast_paths.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/expert_residency.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/rope_positions.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/vision_program.cpp"

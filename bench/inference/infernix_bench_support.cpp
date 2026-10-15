@@ -217,6 +217,12 @@ SpeculativeStats aggregate_speculative(const TestResult& result) {
         for (std::size_t i = 0; i < in.accepted_per_position.size(); ++i) {
             out.accepted_per_position[i] += in.accepted_per_position[i];
         }
+        if (out.rounds_by_draft_length.size() < in.rounds_by_draft_length.size()) {
+            out.rounds_by_draft_length.resize(in.rounds_by_draft_length.size());
+        }
+        for (std::size_t i = 0; i < in.rounds_by_draft_length.size(); ++i) {
+            out.rounds_by_draft_length[i] += in.rounds_by_draft_length[i];
+        }
     }
     return out;
 }
@@ -295,6 +301,11 @@ void append_speculative_json(std::ostringstream& out, const SpeculativeStats& st
     for (std::size_t i = 0; i < stats.accepted_per_position.size(); ++i) {
         if (i != 0) { out << ", "; }
         out << stats.accepted_per_position[i];
+    }
+    out << "],\n" << indent << "  \"rounds_by_draft_length\": [";
+    for (std::size_t i = 0; i < stats.rounds_by_draft_length.size(); ++i) {
+        if (i != 0) { out << ", "; }
+        out << stats.rounds_by_draft_length[i];
     }
     out << "]\n" << indent << '}';
 }

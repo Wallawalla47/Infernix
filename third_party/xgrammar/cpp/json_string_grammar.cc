@@ -287,11 +287,15 @@ Grammar JSONStringPattern(const std::string& pattern) {
 }
 
 Grammar JSONStringLength(int minimum, int maximum) {
-  std::string count = "{" + std::to_string(minimum) + ",";
-  if (maximum >= 0) count += std::to_string(maximum);
-  count += "}";
-  return GrammarNormalizer::Apply(JSONEncoder().Apply(Grammar::FromEBNF("root ::= [^]" + count)));
+  auto scalar = JSONEncoder().Apply(Grammar::FromEBNF("root ::= [^]"));
+  GrammarBuilder builder;
+  const int32_t unit = SubGrammarAdder::Apply(&builder, scalar);
+  const int32_t body =
+      builder.AddSequence({builder.AddByteString("\""), builder.AddRepeat(unit, minimum, maximum),
+                           builder.AddByteString("\"")});
+  return GrammarNormalizer::Apply(builder.Get(builder.AddRuleWithHint("string", body)));
 }
+
 Grammar JSONStringExcept(const std::vector<std::string>& excluded) {
   struct Node {
     bool terminal = false;

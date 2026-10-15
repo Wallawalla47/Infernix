@@ -610,9 +610,11 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             rewrite_capture_hidden = state_images->continuation_hidden_slot(selectors.destination);
             rewrite_capture_hidden_ptr = &rewrite_capture_hidden;
         }
+        // A pass may be as wide as the step (idle_prefill_width is prefill_chunk unless
+        // idle-wide-prefill planned a wider one); the step's nominal width bounds each pass.
         execution::PrefillContext schedule_state{
             {device, parameters, work, *state_images,
-             replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
+             replay_records ? &*replay_records : nullptr, io, prefill_hidden, idle_prefill_width,
              proposal_head, execution_schedule},
             text_kv_view(sequence),
             mtp_kv_view(sequence),
@@ -667,8 +669,20 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
         }
 
         if (staged.cursor < staged.prompt_tokens) {
-            const std::uint32_t nominal =
-                std::min(prefill_chunk, staged.prompt_tokens - staged.cursor);
+            // idle-wide-prefill: the step takes the width its permit reserved (request_plan.cpp
+            // prefill_step_tokens), ending where a chunk-wide prefill would take the lane's next
+            // flexible prefix-cache tap; a lane that began generating since the reservation keeps
+            // it to one chunk. Without the fast path the step is one chunk.
+            std::uint32_t width = prefill_chunk;
+            if (idle_prefill_width > prefill_chunk && request.permit &&
+                request.permit->kind == ExecutionUnitKind::Prefill &&
+                request.permit->main_frontier > staged.cursor + prefill_chunk &&
+                !other_lane_generating(sequence.lane)) {
+                width = hybrid_wide_step_limit(
+                    sequence.lane, staged.cursor, staged.prompt_tokens,
+                    std::min(request.permit->main_frontier - staged.cursor, idle_prefill_width));
+            }
+            const std::uint32_t nominal = std::min(width, staged.prompt_tokens - staged.cursor);
             mark_workspace_usage(staged.prepare_mtp ? workspace_plan.mtp_prefill
                                                     : workspace_plan.text_prefill);
             if (is_masked_draft_backend(speculative_backend)) {

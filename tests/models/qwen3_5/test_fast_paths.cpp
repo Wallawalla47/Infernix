@@ -63,8 +63,12 @@ int main() {
 
     // The request-coupling paths apply only where the exact route can be request-invariant, and
     // speculation and cache resume only where those run.
+    // adaptive-mtp and idle-wide-prefill couple requests too, but no exact route runs their
+    // behaviour, so they remain selectable fast paths where invariance is impossible (below).
     for (const FastPath path : infernix::kFastPaths) {
-        if (!q::couples_requests(path)) { continue; }
+        if (!q::couples_requests(path) || path == FastPath::AdaptiveMtp || path == FastPath::IdleWidePrefill) {
+            continue;
+        }
         failures += check(!q::fast_path_applies(path, int8_24, options, false),
                           std::string(infernix::fast_path_name(path)) +
                               " must not apply where request invariance is impossible");
@@ -162,6 +166,34 @@ int main() {
     }
     failures += check(q::describe(int8_24) == "24 heads, 4-bit activations, int8 KV",
                       "configuration description changed");
+
+    failures += check(q::fast_path_applies(FastPath::IdleWidePrefill, int8_24, options, false),
+                      "idle-wide-prefill applies where request invariance is impossible");
+    for (const KvCacheStorage kv : {KvCacheStorage::Int8Group64, KvCacheStorage::Nvfp4Group16,
+                                    KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Q4KeyVq2Value}) {
+        failures += check(q::fast_path_qualified(FastPath::IdleWidePrefill, {24, ActivationClass::A4, kv}),
+                          "idle-wide-prefill is qualified where it passed its gate");
+    }
+    failures += check(!q::fast_path_qualified(FastPath::IdleWidePrefill,
+                                              {24, ActivationClass::A16, KvCacheStorage::Int8Group64}),
+                      "idle-wide-prefill is not qualified at 16-bit activations");
+    auto mtp                 = options;
+    mtp.speculative.backend  = infernix::SpeculativeBackend::Mtp;
+    failures += check(q::fast_path_applies(FastPath::AdaptiveMtp, int8_24, mtp, false),
+                      "adaptive-mtp applies to MTP where request invariance is impossible");
+    failures += check(!q::fast_path_applies(FastPath::AdaptiveMtp, int8_24, options, true),
+                      "adaptive-mtp needs the MTP backend");
+
+    // q4-w4a8: only where the text MLP gate/up is groupwise Q4; it fails its gate, so nowhere qualified.
+    const FastPathConfiguration groupwise{24, ActivationClass::A16, KvCacheStorage::Int8Group64, true};
+    failures += check(q::fast_path_applies(FastPath::Q4W4A8, groupwise, options, false),
+                      "q4-w4a8 must apply to a groupwise Q4 gate/up");
+    failures += check(!q::fast_path_applies(FastPath::Q4W4A8, int8_24, options, true),
+                      "q4-w4a8 must not apply without a Q4 gate/up");
+    failures += check(!q::fast_path_qualified(FastPath::Q4W4A8, groupwise),
+                      "q4-w4a8 failed its gate");
+    failures += check(q::describe(groupwise) == "24 heads, 16-bit activations, int8 KV, Q4 gate/up",
+                      "groupwise configuration description changed");
 
     std::cout << (failures == 0 ? "PASS" : "FAIL") << " fast-path selection\n";
     return failures == 0 ? 0 : 1;

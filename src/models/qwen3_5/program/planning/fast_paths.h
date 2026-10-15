@@ -13,26 +13,30 @@ namespace infernix::models::qwen3_5 {
 enum class ActivationClass : std::uint8_t { A4, A8, A16 };
 
 // What a fast path is qualified by: the precision that sets the default route's noise floor
-// (activations and KV format) and the attention geometry the kernels run in
+// (activations and KV format), the attention geometry the kernels run in, and whether the text MLP
+// gate/up weights are groupwise Q4, the format the q4-w4a8 kernels run on
 // (docs/maintainer/model-quality.md section 6).
 struct FastPathConfiguration {
     std::uint32_t query_heads   = 0;
     ActivationClass activations = ActivationClass::A16;
     KvCacheStorage kv           = KvCacheStorage::BFloat16;
+    bool q4_gate_up             = false;
 
     bool operator==(const FastPathConfiguration&) const = default;
 };
 
-// For example "24 heads, 4-bit activations, int8 KV".
+// For example "24 heads, 4-bit activations, int8 KV" (", Q4 gate/up" appended when set).
 [[nodiscard]] std::string describe(const FastPathConfiguration& configuration);
 
 [[nodiscard]] FastPathConfiguration fast_path_configuration(const Model& model,
                                                             const EngineOptions& options);
 
-// Whether the path's kernels run in this configuration at all. The request-coupling paths
-// (FastPath::BatchedDecode and after) apply only where the exact route can be request-invariant
-// (`invariant_capable`: every decode projection registers a column-invariant route,
-// execution::column_invariant_text_supported); elsewhere both routes couple requests.
+// Whether the path's kernels run in this configuration at all. The request-coupling paths that give
+// up a part of the exact route's invariance (batched-decode through preemption) apply only where the
+// exact route can be request-invariant (`invariant_capable`: every decode projection registers a
+// column-invariant route, execution::column_invariant_text_supported); elsewhere their behaviour is
+// the exact route's. adaptive-mtp and idle-wide-prefill couple requests with behaviour no exact
+// route runs, so they apply either way.
 [[nodiscard]] bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration,
                                      const EngineOptions& options, bool invariant_capable);
 
@@ -40,7 +44,12 @@ struct FastPathConfiguration {
 [[nodiscard]] constexpr bool couples_requests(FastPath path) noexcept {
     switch (path) {
     case FastPath::PromptPv8:
-    case FastPath::DecodeSplit64: return false;
+    case FastPath::DecodeSplit64:
+    case FastPath::Q8SlicedK:
+    case FastPath::GdnConvFused:
+    case FastPath::QsaPrepareFused:
+    case FastPath::Fp8A8Pair:
+    case FastPath::Q4W4A8: return false;
     case FastPath::BatchedDecode:
     case FastPath::BatchedA8Decode:
     case FastPath::BatchedA4Decode:
@@ -49,7 +58,9 @@ struct FastPathConfiguration {
     case FastPath::BatchSplitAttention:
     case FastPath::AdaptiveSpeculation:
     case FastPath::FreeCacheResume:
-    case FastPath::Preemption: return true;
+    case FastPath::Preemption:
+    case FastPath::AdaptiveMtp:
+    case FastPath::IdleWidePrefill: return true;
     }
     return false;
 }

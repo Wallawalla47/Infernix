@@ -27,10 +27,17 @@
 //     exact recent-key window: slots with matching and stale tags, and a staged wide call), at
 //     decode, verification and prefill
 //     widths, across the dense/selected boundary and page boundaries.
+//   - qsa_prepare (the qsa-prepare-fused fast path): Q, the index query, the stored keys (decoded
+//     exactly from their codes and scales) and the pooled keys against the FP64 chain norm -> RoPE
+//     (-> Hadamard) under named one-rounding / codec criteria; values against kv_cache_append_batch's
+//     bytes; the tails exactly; every other cache byte untouched; and bit for bit: W = 8 against
+//     eight W = 1 calls, B = 4 against four B = 1 calls, K/V-only and in-place calls, page spaces and
+//     CUDA Graph replay over new device rows and positions.
 #include "core/arena.h"
 #include "core/paged_kv_cache.h"
 #include "core/paged_kv_storage.h"
 #include "infernix/ops/attention_geometry.h"
+#include "infernix/ops/kv_cache_append.h"
 #include "infernix/ops/qsa.h"
 #include "ops/host_parallel.h"
 #include "ops/op_tester.h"
@@ -48,9 +55,14 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <map>
+#include <memory>
 #include <numeric>
 #include <random>
+#include <set>
 #include <string>
+#include <tuple>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -1366,6 +1378,647 @@ void test_attention(KvCacheStorage storage, const AttentionCase& c, std::uint32_
     g_failures += t::verify_reduction(tag, got, ref, kAttentionCriterion);
 }
 
+// ----------------------------------------------------------------------------------- prepare
+
+// Q, the index query, BF16-stored keys and pooled keys: one BF16 rounding of an FP32 result (the
+// fused prepare keeps FP32 through norm and rotation). An RNE rounding errs by at most 2^-8 of the
+// element (3.9e-3 of the largest), and uniform rounding errors give a relative L2 of at most
+// 2^-8 / sqrt(3) = 2.3e-3; FP32 normalization adds ~1e-6, and FP32 angles at positions below 2^13 err
+// by at most ~3e-4 rad (one ulp of position x frequency), at most ~1e-3 of the largest element.
+constexpr t::ReductionCriterion kPrepareCriterion{
+    /*relative_l2*/ 3.0e-3,
+    /*gross_absolute*/ 1.0e-3,
+    /*gross_relative_to_max_reference*/ 5.5e-3,
+};
+
+// Quantized stored keys, decoded exactly and compared in the codec's (Hadamard-rotated) domain with
+// the FP64 key, add the codec's rounding to that FP32 noise (1e-3 of the largest element):
+// - INT8-G64: |error| <= s / 2 with s = FP16(group max / 127), at most 3.95e-3 of the largest
+//   element; uniform errors s / sqrt(12) against groups whose max is at most 3.5 RMS give a relative
+//   L2 of at most 3.5 / (127 sqrt(12)) = 8.0e-3.
+// - FP8 E4M3 rows (fp8, k8v4 keys): three fraction bits, |error| <= 2^-4 |x| (6.25e-2 of the largest);
+//   uniform errors within a binade give a relative L2 of at most 2^-3 / sqrt(12) = 3.6e-2.
+// - NVFP4-G16: E2M1 levels times the group scale (max / target, target 4..6, E4M3-rounded): half the
+//   level spacing is at most a quarter of the element's magnitude or of the scale, so |error| <=
+//   max / 4 (1 + 2^-4) and uniform errors give a relative L2 of at most 1 / (4 sqrt(3)) = 0.144.
+constexpr t::ReductionCriterion kStoredInt8Criterion{8.5e-3, 1.0e-3, 5.0e-3};
+constexpr t::ReductionCriterion kStoredFp8Criterion{3.7e-2, 1.0e-3, 6.4e-2};
+constexpr t::ReductionCriterion kStoredNvfp4Criterion{1.45e-1, 1.0e-3, 2.7e-1};
+
+const t::ReductionCriterion& stored_key_criterion(KvCacheStorage storage) {
+    switch (storage) {
+    case KvCacheStorage::Int8Group64: return kStoredInt8Criterion;
+    case KvCacheStorage::Fp8E4M3Row256:
+    case KvCacheStorage::Fp8KeyNvfp4Value: return kStoredFp8Criterion;
+    case KvCacheStorage::Nvfp4Group16: return kStoredNvfp4Criterion;
+    default: return kPrepareCriterion;
+    }
+}
+
+// Element d of a stored key row (row: its code bytes, scales: its scale bytes), decoded exactly.
+double stored_key(KvCacheStorage storage, const std::uint8_t* row, const std::uint8_t* scales, int d) {
+    std::uint16_t bits = 0;
+    switch (storage) {
+    case KvCacheStorage::BFloat16: std::memcpy(&bits, row + 2 * d, 2); return from_bf16(bits);
+    case KvCacheStorage::Int8Group64:
+        std::memcpy(&bits, scales + 2 * (d / 64), 2);
+        return static_cast<std::int8_t>(row[d]) * from_fp16(bits);
+    case KvCacheStorage::Fp8E4M3Row256:
+    case KvCacheStorage::Fp8KeyNvfp4Value: std::memcpy(&bits, scales, 2); return from_e4m3(row[d]) * from_fp16(bits);
+    default: return from_e2m1((row[d / 2] >> (4 * (d % 2))) & 0xFU) * from_e4m3(scales[d / 16]);
+    }
+}
+
+// The projection rows of one (sequence, position), deterministic in the seed: harnesses built from
+// one seed see the same inputs whatever calls they split them into.
+enum class Rows : std::uint32_t { Query, Key, Value, IndexQuery, IndexKey };
+
+std::vector<std::uint16_t> projection_rows(std::uint32_t seed, Rows kind, int sequence, int position) {
+    static constexpr std::size_t kCount[] = {std::size_t{kD} * kHeads, std::size_t{kD} * kKvHeads,
+                                             std::size_t{kD} * kKvHeads, std::size_t{kDi} * kIndexHeads,
+                                             std::size_t{kDi}};
+    static constexpr double kScale[] = {2.0, 2.0, 1.0, 2.0, 1.0};
+    const auto k = static_cast<std::uint32_t>(kind);
+    std::seed_seq words{seed, k, static_cast<std::uint32_t>(sequence), static_cast<std::uint32_t>(position)};
+    std::mt19937 rng(words);
+    return random_bf16(rng, kCount[k], kScale[k]);
+}
+
+// Position q's RoPE position in a sequence with one image (rope_map's assignment).
+Rope rope_at(int q, const Image& image) {
+    const int end = image.start + image.rows * image.cols;
+    if (image.rows == 0 || q < image.start) { return {q, q, q}; }
+    if (q < end) {
+        const int k = q - image.start;
+        return {image.start, image.start + k / image.cols, image.start + k % image.cols};
+    }
+    const int v = image.start + std::max(image.rows, image.cols) + (q - end);
+    return {v, v, v};
+}
+
+// RMSNorm with the unit-offset weight over the whole row, in FP64.
+std::vector<double> normalize_row(const std::vector<double>& x, const std::vector<std::uint16_t>& weight) {
+    double squares = 0.0;
+    for (const double v : x) { squares += v * v; }
+    const double inv = 1.0 / std::sqrt(squares / static_cast<double>(x.size()) + static_cast<double>(kGeometry.eps));
+    std::vector<double> out(x.size());
+    for (std::size_t d = 0; d < x.size(); ++d) { out[d] = x[d] * inv * (1.0 + from_bf16(weight[d])); }
+    return out;
+}
+
+// RoPE(norm(row)) of one head of `dim` BF16 values.
+std::vector<double> head_oracle(const std::uint16_t* row, int dim, const std::vector<std::uint16_t>& weight,
+                                const Rope& rope) {
+    std::vector<double> x(dim);
+    for (int d = 0; d < dim; ++d) { x[d] = from_bf16(row[d]); }
+    auto out = normalize_row(x, weight);
+    rotate(out, rope);
+    return out;
+}
+
+std::vector<std::uint8_t> bytes_of(const DeviceBuffer& buffer) {
+    return buffer.p == nullptr ? std::vector<std::uint8_t>{} : download<std::uint8_t>(buffer, buffer.bytes);
+}
+
+template <class T>
+void put(DeviceBuffer& buffer, const std::vector<T>& host) {
+    if (buffer.p == nullptr) {
+        buffer = upload(host);
+    } else {
+        buffer.copy_from_host(host.data(), host.size() * sizeof(T));
+    }
+}
+
+enum class Launch { Eager, InPlace, KvOnly, Graph };
+
+// The device inputs and outputs of one call; a Graph call keeps them and its graph, so a later call
+// of the same batch and width uploads new rows, positions and table rows and replays it.
+struct PrepareCall {
+    DeviceBuffer q, k, v, iq, ik, positions, rows, slots, rope, block_rope, q_out, iq_out;
+    cudaStream_t stream  = nullptr;
+    cudaGraphExec_t exec = nullptr;
+
+    PrepareCall() = default;
+    PrepareCall(const PrepareCall&)            = delete;
+    PrepareCall& operator=(const PrepareCall&) = delete;
+    ~PrepareCall() {
+        if (exec != nullptr) { (void)cudaGraphExecDestroy(exec); }
+        if (stream != nullptr) { (void)cudaStreamDestroy(stream); }
+    }
+};
+
+// The KV planes, pooled keys and tails of `first.size()` sequences and the qsa_prepare calls over
+// them. Sequence r's positions before first[r] are in the state (its latest block's raw keys in the
+// tails); its RoPE positions hold one image. Two harnesses of one seed start from the same bytes.
+// With `spaces`, every page wholly before a sequence's first position moves to a host or lent space
+// (alternately); the call's pages stay in the pool.
+class PrepareHarness {
+public:
+    PrepareHarness(KvCacheStorage storage, std::vector<int> first, std::vector<Image> images, int extent,
+                   std::uint32_t seed, bool spaces = false)
+        : storage_(storage), layout_(infernix::paged_kv_storage_layout(storage, kD)), first_(std::move(first)),
+          images_(std::move(images)), seed_(seed), rows_(static_cast<int>(first_.size())) {
+        std::mt19937 rng(seed);
+        pages_per_row_ = (extent + kPage - 1) / kPage;
+        pages_         = rows_ * pages_per_row_;
+        tables_host_.resize(static_cast<std::size_t>(pages_));
+        std::iota(tables_host_.begin(), tables_host_.end(), 0);
+        std::shuffle(tables_host_.begin(), tables_host_.end(), rng);
+        wq_  = random_bf16(rng, kD, 0.3);
+        wk_  = random_bf16(rng, kD, 0.3);
+        wiq_ = random_bf16(rng, kDi, 0.3);
+        wik_ = random_bf16(rng, kDi, 0.3);
+        dwq_  = upload(wq_);
+        dwk_  = upload(wk_);
+        dwiq_ = upload(wiq_);
+        dwik_ = upload(wik_);
+        // Random bytes in every plane, so an unwritten row's bytes are recognizable.
+        std::uniform_int_distribution<int> byte(0, 255);
+        const auto random_plane = [&](int row_bytes) {
+            std::vector<std::uint8_t> v(static_cast<std::size_t>(row_bytes) * kPage * kKvHeads * pages_);
+            for (auto& x : v) { x = static_cast<std::uint8_t>(byte(rng)); }
+            return v;
+        };
+        k0_  = random_plane(key_bytes());
+        v0_  = random_plane(value_bytes());
+        ks0_ = random_plane(key_scale_bytes());
+        vs0_ = random_plane(value_scale_bytes());
+        for (auto [device, reference, host] : {std::tuple{&dk_, &rk_, &k0_}, std::tuple{&dv_, &rv_, &v0_},
+                                               std::tuple{&dks_, &rks_, &ks0_}, std::tuple{&dvs_, &rvs_, &vs0_}}) {
+            if (!host->empty()) {
+                *device    = upload(*host);
+                *reference = upload(*host);
+            }
+        }
+        dpooled_ = upload(std::vector<std::uint16_t>(static_cast<std::size_t>(kSlotWidth) * kPage * pages_, kCanary));
+        // Tails: random, except each sequence's latest block before its first position.
+        tails_host_ = random_bf16(rng, static_cast<std::size_t>(kDi) * (kR - 1) * rows_, 1.0);
+        tail_last_.assign(rows_, -1);
+        for (int r = 0; r < rows_; ++r) {
+            if (first_[r] == 0) { continue; }
+            const int last = first_[r] - 1, base = last - last % kR;
+            for (int q = base; q <= std::min(last, base + kR - 2); ++q) {
+                const auto raw = projection_rows(seed_, Rows::IndexKey, r, q);
+                std::copy(raw.begin(), raw.end(), tails_host_.begin() + tail_index(slot_of(r), q % kR));
+            }
+            tail_last_[r] = last;
+        }
+        dtails_ = upload(tails_host_);
+        if (spaces) { move_to_spaces(); }
+        dtables_ = upload(tables_host_);
+    }
+
+    PrepareHarness(const PrepareHarness&)            = delete;
+    PrepareHarness& operator=(const PrepareHarness&) = delete;
+    ~PrepareHarness() {
+        for (void* p : host_planes_) { (void)cudaFreeHost(p); }
+    }
+
+    // One qsa_prepare call: `width` columns of each listed sequence from starts[i].
+    void call(const std::vector<int>& rows, const std::vector<int>& starts, int width, bool update_tails,
+              Launch mode = Launch::Eager, PrepareCall* persistent = nullptr) {
+        PrepareCall local;
+        PrepareCall& b    = persistent != nullptr ? *persistent : local;
+        const int batch   = static_cast<int>(rows.size());
+        const int columns = batch * width;
+        std::vector<std::uint16_t> q, k, v, iq, ik;
+        std::vector<std::int32_t> positions(columns), table_rows(batch), slots(batch), rope(3 * std::size_t(columns)),
+            block_rope(3 * std::size_t(batch));
+        const auto append = [](std::vector<std::uint16_t>& to, const std::vector<std::uint16_t>& from) {
+            to.insert(to.end(), from.begin(), from.end());
+        };
+        for (int i = 0; i < batch; ++i) {
+            const int r   = rows[i];
+            table_rows[i] = r;
+            slots[i]      = slot_of(r);
+            const Rope block_start = rope_at(starts[i] / kR * kR, images_[r]);
+            for (int a = 0; a < 3; ++a) { block_rope[static_cast<std::size_t>(a) * batch + i] = block_start[a]; }
+            for (int j = 0; j < width; ++j) {
+                const int column = i * width + j, p = starts[i] + j;
+                positions[column] = p;
+                const Rope at     = rope_at(p, images_[r]);
+                for (int a = 0; a < 3; ++a) { rope[static_cast<std::size_t>(a) * columns + column] = at[a]; }
+                append(q, projection_rows(seed_, Rows::Query, r, p));
+                append(k, projection_rows(seed_, Rows::Key, r, p));
+                append(v, projection_rows(seed_, Rows::Value, r, p));
+                append(iq, projection_rows(seed_, Rows::IndexQuery, r, p));
+                append(ik, projection_rows(seed_, Rows::IndexKey, r, p));
+            }
+        }
+        put(b.q, q);
+        put(b.k, k);
+        put(b.v, v);
+        put(b.iq, iq);
+        put(b.ik, ik);
+        put(b.positions, positions);
+        put(b.rows, table_rows);
+        put(b.slots, slots);
+        put(b.rope, rope);
+        put(b.block_rope, block_rope);
+        if (b.q_out.p == nullptr) {
+            b.q_out  = DeviceBuffer(q.size() * 2);
+            b.iq_out = DeviceBuffer(iq.size() * 2);
+        }
+        Tensor tq(b.q.p, DType::BF16, {kD, kHeads, columns});
+        Tensor tiq(b.iq.p, DType::BF16, {kDi, kIndexHeads, columns});
+        const ops::QsaPrepareInputs inputs{.q       = tq,
+                                           .k       = Tensor(b.k.p, DType::BF16, {kD, kKvHeads, columns}),
+                                           .v       = Tensor(b.v.p, DType::BF16, {kD, kKvHeads, columns}),
+                                           .index_q = tiq,
+                                           .index_k = Tensor(b.ik.p, DType::BF16, {kDi, columns})};
+        const ops::QsaPrepareNorms norms{.query       = Tensor(dwq_.p, DType::BF16, {kD}),
+                                         .key         = Tensor(dwk_.p, DType::BF16, {kD}),
+                                         .index_query = Tensor(dwiq_.p, DType::BF16, {kDi}),
+                                         .index_key   = Tensor(dwik_.p, DType::BF16, {kDi})};
+        Tensor tails(dtails_.p, DType::BF16, {kDi, kR - 1, rows_});
+        const ops::QsaBatch qsa_batch{.block_tables     = Tensor(dtables_.p, DType::I32, {pages_per_row_, rows_}),
+                                      .table_rows       = Tensor(b.rows.p, DType::I32, {batch}),
+                                      .positions        = Tensor(b.positions.p, DType::I32, {columns}),
+                                      .tail_slots       = Tensor(b.slots.p, DType::I32, {batch}),
+                                      .rope_positions   = Tensor(b.rope.p, DType::I32, {columns, 3}),
+                                      .block_start_rope = Tensor(b.block_rope.p, DType::I32, {batch, 3}),
+                                      .batch            = batch,
+                                      .width            = width,
+                                      .update_tails     = update_tails};
+        Tensor q_out  = mode == Launch::KvOnly    ? Tensor{}
+                        : mode == Launch::InPlace ? tq
+                                                  : Tensor(b.q_out.p, DType::BF16, {kD, kHeads, columns});
+        Tensor iq_out = mode == Launch::KvOnly    ? Tensor{}
+                        : mode == Launch::InPlace ? tiq
+                                                  : Tensor(b.iq_out.p, DType::BF16, {kDi, kIndexHeads, columns});
+        const ops::QsaKVLayer kv_layer = layer();
+        if (mode == Launch::Graph) {
+            if (b.exec == nullptr) {
+                t::cuda_check(cudaStreamCreateWithFlags(&b.stream, cudaStreamNonBlocking), "prepare stream");
+                cudaGraph_t graph = nullptr;
+                t::cuda_check(cudaStreamBeginCapture(b.stream, cudaStreamCaptureModeThreadLocal), "prepare capture");
+                ops::qsa_prepare(inputs, norms, tails, kv_layer, qsa_batch, g_index_geometry, q_out, iq_out, b.stream);
+                t::cuda_check(cudaStreamEndCapture(b.stream, &graph), "prepare end capture");
+                t::cuda_check(cudaGraphInstantiate(&b.exec, graph, 0), "prepare graph instantiate");
+                t::cuda_check(cudaGraphDestroy(graph), "prepare graph destroy");
+            }
+            t::cuda_check(cudaGraphLaunch(b.exec, b.stream), "prepare graph launch");
+            t::cuda_check(cudaStreamSynchronize(b.stream), "prepare graph replay");
+        } else {
+            ops::qsa_prepare(inputs, norms, tails, kv_layer, qsa_batch, g_index_geometry, q_out, iq_out, nullptr);
+        }
+        synchronize("prepare");
+        if (mode != Launch::KvOnly) {
+            const auto qs  = download<std::uint16_t>(mode == Launch::InPlace ? b.q : b.q_out, q.size());
+            const auto iqs = download<std::uint16_t>(mode == Launch::InPlace ? b.iq : b.iq_out, iq.size());
+            for (int i = 0; i < batch; ++i) {
+                for (int j = 0; j < width; ++j) {
+                    const std::size_t column = static_cast<std::size_t>(i) * width + j;
+                    const auto key           = std::pair{rows[i], starts[i] + j};
+                    q_[key].assign(qs.begin() + column * kHeads * kD, qs.begin() + (column + 1) * kHeads * kD);
+                    iq_[key].assign(iqs.begin() + column * kIndexHeads * kDi,
+                                    iqs.begin() + (column + 1) * kIndexHeads * kDi);
+                }
+            }
+        }
+        // The same K/V through kv_cache_append_batch into the reference planes (the values must match).
+        infernix::PagedKVBatchLayerView reference;
+        reference.k_pages      = plane_tensor(rk_, layout_.key, false);
+        reference.v_pages      = plane_tensor(rv_, layout_.value, false);
+        reference.k_scale_pages = plane_tensor(rks_, layout_.key, true);
+        reference.v_scale_pages = plane_tensor(rvs_, layout_.value, true);
+        reference.block_tables = Tensor(dtables_.p, DType::I32, {pages_per_row_, rows_});
+        reference.head_dim     = kD;
+        reference.num_kv_heads = kKvHeads;
+        reference.storage      = storage_;
+        ops::kv_cache_append_batch(Tensor(b.k.p, DType::BF16, {kD, kKvHeads, width, batch}),
+                                   Tensor(b.v.p, DType::BF16, {kD, kKvHeads, width, batch}),
+                                   Tensor(b.positions.p, DType::I32, {width, batch}), Tensor(b.rows.p, DType::I32, {batch}),
+                                   reference, nullptr);
+        synchronize("reference append");
+        for (int i = 0; i < batch; ++i) {
+            for (int j = 0; j < width; ++j) { written_.insert({rows[i], starts[i] + j}); }
+            if (update_tails) { tail_last_[rows[i]] = starts[i] + width - 1; }
+        }
+    }
+
+    // Every recorded column and stored row against the oracles, and every other byte untouched.
+    void check(const std::string& tag) const {
+        // Queries and index queries.
+        std::vector<double> got, ref, got_index, ref_index;
+        for (const auto& [key, rows] : q_) {
+            const auto [r, p] = key;
+            const Rope at     = rope_at(p, images_[r]);
+            const auto in     = projection_rows(seed_, Rows::Query, r, p);
+            for (int h = 0; h < kHeads; ++h) {
+                const auto oracle = head_oracle(in.data() + static_cast<std::size_t>(h) * kD, kD, wq_, at);
+                ref.insert(ref.end(), oracle.begin(), oracle.end());
+                for (int d = 0; d < kD; ++d) { got.push_back(from_bf16(rows[static_cast<std::size_t>(h) * kD + d])); }
+            }
+            const auto index_in = projection_rows(seed_, Rows::IndexQuery, r, p);
+            const auto& index   = iq_.at(key);
+            for (int h = 0; h < kIndexHeads; ++h) {
+                const auto oracle = head_oracle(index_in.data() + static_cast<std::size_t>(h) * kDi, kDi, wiq_, at);
+                ref_index.insert(ref_index.end(), oracle.begin(), oracle.end());
+                for (int d = 0; d < kDi; ++d) {
+                    got_index.push_back(from_bf16(index[static_cast<std::size_t>(h) * kDi + d]));
+                }
+            }
+        }
+        if (!got.empty()) {
+            g_failures += t::verify_reduction(tag + " q", got, ref, kPrepareCriterion);
+            g_failures += t::verify_reduction(tag + " index q", got_index, ref_index, kPrepareCriterion);
+        }
+        // Stored keys (decoded) against the FP64 key, in the codec's domain; unwritten rows untouched.
+        const auto kd = bytes_of(dk_), ks = bytes_of(dks_), vd = bytes_of(dv_), vs = bytes_of(dvs_);
+        const int kb = key_bytes(), ksb = key_scale_bytes();
+        std::vector<char> written_row(static_cast<std::size_t>(kPage) * kKvHeads * pages_, 0);
+        std::vector<double> got_key, ref_key;
+        for (const auto& [r, p] : written_) {
+            const int page  = page_of(r, p);
+            const auto in   = projection_rows(seed_, Rows::Key, r, p);
+            const Rope at   = rope_at(p, images_[r]);
+            for (int h = 0; h < kKvHeads; ++h) {
+                const std::size_t row = (static_cast<std::size_t>(page) * kKvHeads + h) * kPage + p % kPage;
+                written_row[row]      = 1;
+                auto oracle           = head_oracle(in.data() + static_cast<std::size_t>(h) * kD, kD, wk_, at);
+                if (storage_ != KvCacheStorage::BFloat16) { hadamard(oracle); }
+                ref_key.insert(ref_key.end(), oracle.begin(), oracle.end());
+                for (int d = 0; d < kD; ++d) {
+                    got_key.push_back(stored_key(storage_, kd.data() + row * kb,
+                                                 ksb > 0 ? ks.data() + row * ksb : nullptr, d));
+                }
+            }
+        }
+        if (!got_key.empty()) {
+            g_failures += t::verify_reduction(tag + " stored keys", got_key, ref_key, stored_key_criterion(storage_));
+        }
+        bool untouched = true;
+        for (std::size_t row = 0; row < written_row.size(); ++row) {
+            if (written_row[row] != 0) { continue; }
+            untouched &= std::memcmp(kd.data() + row * kb, k0_.data() + row * kb, kb) == 0;
+            if (ksb > 0) { untouched &= std::memcmp(ks.data() + row * ksb, ks0_.data() + row * ksb, ksb) == 0; }
+        }
+        expect(untouched, tag + ": key rows of no call's position are untouched");
+        expect(vd == bytes_of(rv_) && vs == bytes_of(rvs_),
+               tag + ": values (and every unwritten value byte) equal kv_cache_append_batch's");
+        // Pooled keys: every block a call completed against the oracle, every other slot untouched.
+        const auto pooled = download<std::uint16_t>(dpooled_, static_cast<std::size_t>(kSlotWidth) * kPage * pages_);
+        std::vector<double> got_pooled, ref_pooled;
+        bool canaries = true;
+        for (int r = 0; r < rows_; ++r) {
+            for (int block = 0; block < pages_per_row_ * kPage / kR; ++block) {
+                const int page = page_of(r, kR * block);
+                if (page >= pages_) { continue; } // a moved page: never written
+                std::vector<std::uint16_t> key(kDi);
+                for (int d = 0; d < kDi; ++d) {
+                    const int token = kR * block + d / kSlotWidth;
+                    key[d] = pooled[(static_cast<std::size_t>(page) * kPage + token % kPage) * kSlotWidth + d % kSlotWidth];
+                }
+                if (written_.count({r, kR * block + kR - 1}) != 0) {
+                    const auto oracle = pooled_at(r, block);
+                    ref_pooled.insert(ref_pooled.end(), oracle.begin(), oracle.end());
+                    for (const auto bits : key) { got_pooled.push_back(from_bf16(bits)); }
+                } else {
+                    canaries &= std::all_of(key.begin(), key.end(), [](std::uint16_t x) { return x == kCanary; });
+                }
+            }
+        }
+        if (!got_pooled.empty()) {
+            g_failures += t::verify_reduction(tag + " pooled keys", got_pooled, ref_pooled, kPrepareCriterion);
+        }
+        expect(canaries, tag + ": pooled slots of blocks no call completed are untouched");
+        // Tails: the raw keys of the latest block up to each sequence's last tail-updating position.
+        const auto tails = download<std::uint16_t>(dtails_, tails_host_.size());
+        for (int r = 0; r < rows_; ++r) {
+            if (tail_last_[r] < 0) { continue; }
+            const int last = tail_last_[r], base = last - last % kR;
+            bool ok = true;
+            for (int q = base; q <= std::min(last, base + kR - 2); ++q) {
+                const auto raw = projection_rows(seed_, Rows::IndexKey, r, q);
+                ok &= std::memcmp(&tails[tail_index(slot_of(r), q % kR)], raw.data(), kDi * 2) == 0;
+            }
+            expect(ok, tag + " row " + std::to_string(r) + ": tails hold the raw keys of the latest block");
+        }
+        // Page spaces: nothing outside the pool is written.
+        if (!host_planes_.empty()) {
+            bool clean = true;
+            for (std::size_t i = 0; i < host_planes_.size(); ++i) {
+                const auto* p = static_cast<const std::uint8_t*>(host_planes_[i]);
+                clean &= std::all_of(p, p + host_bytes_[i], [](std::uint8_t x) { return x == kSpaceByte; });
+            }
+            for (const DeviceBuffer* d : {&lent_k_, &lent_v_, &lent_ks_, &lent_vs_, &spaces_pooled_}) {
+                const auto bytes = bytes_of(*d);
+                clean &= std::all_of(bytes.begin(), bytes.end(), [](std::uint8_t x) { return x == kSpaceByte; });
+            }
+            expect(clean, tag + ": host and lent pages are not written");
+        }
+    }
+
+    // Outputs of the same columns, bit for bit (both harnesses recorded them).
+    bool same_outputs(const PrepareHarness& other) const { return q_ == other.q_ && iq_ == other.iq_; }
+
+    // Every pool-plane and pooled-key byte, bit for bit, and every tail byte with `tails` (calls that
+    // end at different positions leave different stale slots; check() checks the defined ones).
+    bool same_state(const PrepareHarness& other, bool tails = true) const {
+        return bytes_of(dk_) == bytes_of(other.dk_) && bytes_of(dv_) == bytes_of(other.dv_) &&
+               bytes_of(dks_) == bytes_of(other.dks_) && bytes_of(dvs_) == bytes_of(other.dvs_) &&
+               bytes_of(dpooled_) == bytes_of(other.dpooled_) &&
+               (!tails || bytes_of(dtails_) == bytes_of(other.dtails_));
+    }
+
+private:
+    static constexpr std::uint8_t kSpaceByte = 0x5A;
+
+    int key_bytes() const { return row_bytes(layout_.key, false); }
+    int value_bytes() const { return row_bytes(layout_.value, false); }
+    int key_scale_bytes() const { return row_bytes(layout_.key, true); }
+    int value_scale_bytes() const { return row_bytes(layout_.value, true); }
+    static int row_bytes(const infernix::PagedKVVectorLayout& v, bool scale) {
+        return scale ? v.scale_leading_extent * static_cast<int>(infernix::dtype_size(v.scale_dtype))
+                     : v.data_leading_extent * static_cast<int>(infernix::dtype_size(v.data_dtype));
+    }
+
+    Tensor plane_tensor(const DeviceBuffer& buffer, const infernix::PagedKVVectorLayout& v, bool scale) const {
+        if (buffer.p == nullptr) { return Tensor{}; }
+        return Tensor(buffer.p, scale ? v.scale_dtype : v.data_dtype,
+                      {scale ? v.scale_leading_extent : v.data_leading_extent, kPage, kKvHeads, pages_});
+    }
+
+    ops::QsaKVLayer layer() const {
+        ops::QsaKVLayer out;
+        out.kv.storage       = storage_;
+        out.kv.head_dim      = kD;
+        out.kv.num_kv_heads  = kKvHeads;
+        out.kv.k_pages       = plane_tensor(dk_, layout_.key, false);
+        out.kv.v_pages       = plane_tensor(dv_, layout_.value, false);
+        out.kv.k_scale_pages = plane_tensor(dks_, layout_.key, true);
+        out.kv.v_scale_pages = plane_tensor(dvs_, layout_.value, true);
+        out.pooled_pages     = Tensor(dpooled_.p, DType::BF16, {kSlotWidth, kPage, 1, pages_});
+        out.spaces           = spaces_;
+        return out;
+    }
+
+    int slot_of(int r) const { return rows_ - 1 - r; } // not the identity
+    int page_of(int r, int position) const {
+        return tables_host_[static_cast<std::size_t>(r) * pages_per_row_ + position / kPage];
+    }
+    std::size_t tail_index(int slot, int j) const { return (static_cast<std::size_t>(slot) * (kR - 1) + j) * kDi; }
+
+    // FP64 RoPE(norm(bf16(mean))) of sequence r's block, at its first token's RoPE position.
+    std::vector<double> pooled_at(int r, int block) const {
+        std::vector<double> mean(kDi, 0.0);
+        for (int j = 0; j < kR; ++j) {
+            const auto raw = projection_rows(seed_, Rows::IndexKey, r, kR * block + j);
+            for (int d = 0; d < kDi; ++d) { mean[d] += from_bf16(raw[d]); }
+        }
+        for (auto& m : mean) { m = from_bf16(to_bf16(m / kR)); }
+        auto out = normalize_row(mean, wik_);
+        rotate(out, rope_at(kR * block, images_[r]));
+        return out;
+    }
+
+    void move_to_spaces() {
+        std::vector<std::pair<std::size_t, bool>> moves; // (table entry, to the host space)
+        for (int r = 0; r < rows_; ++r) {
+            for (int lp = 0; (lp + 1) * kPage <= first_[r]; ++lp) {
+                moves.emplace_back(static_cast<std::size_t>(r) * pages_per_row_ + lp, moves.size() % 2 == 0);
+            }
+        }
+        int host_pages = 0, lent_pages = 0;
+        for (const auto& move : moves) { (move.second ? host_pages : lent_pages) += 1; }
+        int h = 0, l = 0;
+        for (const auto& [entry, to_host] : moves) {
+            tables_host_[entry] = to_host ? pages_ + h++ : pages_ + host_pages + l++;
+        }
+        const auto page_bytes = [](int row_bytes) { return static_cast<std::size_t>(row_bytes) * kPage * kKvHeads; };
+        const int row_sizes[] = {key_bytes(), value_bytes(), key_scale_bytes(), value_scale_bytes()};
+        void* host[4]         = {nullptr, nullptr, nullptr, nullptr};
+        DeviceBuffer* lent[4] = {&lent_k_, &lent_v_, &lent_ks_, &lent_vs_};
+        for (int i = 0; i < 4; ++i) {
+            if (row_sizes[i] == 0) { continue; }
+            const std::size_t bytes = page_bytes(row_sizes[i]) * std::max(host_pages, 1);
+            t::cuda_check(cudaHostAlloc(&host[i], bytes, cudaHostAllocMapped), "host plane");
+            std::memset(host[i], kSpaceByte, bytes);
+            host_planes_.push_back(host[i]);
+            host_bytes_.push_back(bytes);
+            *lent[i] = DeviceBuffer(page_bytes(row_sizes[i]) * std::max(lent_pages, 1));
+            lent[i]->fill(kSpaceByte);
+        }
+        spaces_pooled_ = DeviceBuffer(static_cast<std::size_t>(kSlotWidth) * kPage * 2 *
+                                      std::max(host_pages + lent_pages, 1));
+        spaces_pooled_.fill(kSpaceByte);
+        spaces_ = ops::QsaPageSpaces{.device_pages = pages_,
+                                     .host_pages   = host_pages,
+                                     .host_k       = host[0],
+                                     .host_v       = host[1],
+                                     .host_k_scale = host[2],
+                                     .host_v_scale = host[3],
+                                     .lent_k       = lent_k_.p,
+                                     .lent_v       = lent_v_.p,
+                                     .lent_k_scale = lent_ks_.p,
+                                     .lent_v_scale = lent_vs_.p,
+                                     .pooled       = spaces_pooled_.p};
+    }
+
+    KvCacheStorage storage_;
+    infernix::PagedKVStorageLayout layout_;
+    std::vector<int> first_;
+    std::vector<Image> images_;
+    std::uint32_t seed_;
+    int rows_ = 0, pages_per_row_ = 0, pages_ = 0;
+    std::vector<std::int32_t> tables_host_;
+    std::vector<std::uint16_t> wq_, wk_, wiq_, wik_, tails_host_;
+    std::vector<std::uint8_t> k0_, v0_, ks0_, vs0_;
+    DeviceBuffer dwq_, dwk_, dwiq_, dwik_, dtables_, dk_, dv_, dks_, dvs_, rk_, rv_, rks_, rvs_, dpooled_, dtails_;
+    ops::QsaPageSpaces spaces_{};
+    std::vector<void*> host_planes_;
+    std::vector<std::size_t> host_bytes_;
+    DeviceBuffer lent_k_, lent_v_, lent_ks_, lent_vs_, spaces_pooled_;
+    std::vector<int> tail_last_;
+    std::set<std::pair<int, int>> written_;                               // (sequence, position)
+    std::map<std::pair<int, int>, std::vector<std::uint16_t>> q_, iq_; // the latest outputs of a column
+};
+
+void test_prepare(KvCacheStorage storage, std::uint32_t seed) {
+    const std::string name = std::string("qsa_prepare ") + storage_name(storage) +
+                             (g_index_geometry.yarn_factor > 1.0F ? " yarn" : "");
+    // Four sequences whose first positions fall on every residue mod 4 (a block carried into the
+    // call from the tails, or none), one at a page's end; images give the blocks distinct axes.
+    const std::vector<int> first        = {2049, 3006, 4093, 126};
+    const std::vector<Image> images     = {{2040, 4, 8}, {3000, 8, 4}, {4090, 2, 8}, {0, 0, 0}};
+    constexpr int kExtent               = 4160;
+    const auto harness = [&](std::uint32_t s, bool spaces = false) {
+        return std::make_unique<PrepareHarness>(storage, first, images, kExtent, s, spaces);
+    };
+    {
+        // Decode of four rows; a verification of two (tails unchanged); its commit as a narrower
+        // call over the same positions; a call across a page boundary; two rows completing their
+        // carried blocks at their first column.
+        auto h = harness(seed);
+        h->call({0, 1, 2, 3}, {2049, 3006, 4093, 126}, 1, true);
+        h->check(name + " decode W=1 B=4");
+        h->call({0, 1}, {2050, 3007}, 5, false);
+        h->check(name + " verify W=5 B=2");
+        h->call({0, 1}, {2050, 3007}, 3, true);
+        h->check(name + " commit W=3 B=2");
+        h->call({2}, {4094}, 8, true);
+        h->check(name + " W=8 B=1 across a page");
+        h->call({3, 0}, {127, 2053}, 4, true);
+        h->check(name + " W=4 B=2");
+    }
+    {
+        // A column's bits do not depend on its call: one W = 8 call against eight W = 1 calls.
+        auto wide = harness(seed + 1), narrow = harness(seed + 1);
+        wide->call({2}, {4093}, 8, true);
+        for (int j = 0; j < 8; ++j) { narrow->call({2}, {4093 + j}, 1, true); }
+        wide->check(name + " W=8");
+        narrow->check(name + " eight W=1");
+        expect(wide->same_outputs(*narrow) && wide->same_state(*narrow, /*tails=*/false),
+               name + ": a W=8 call equals eight W=1 calls bit for bit");
+    }
+    {
+        // ... and not on the other rows of its call: B = 4 against four B = 1 calls.
+        auto batched = harness(seed + 2), alone = harness(seed + 2);
+        batched->call({0, 1, 2, 3}, first, 2, true);
+        for (int r = 0; r < 4; ++r) { alone->call({r}, {first[r]}, 2, true); }
+        batched->check(name + " W=2 B=4");
+        expect(batched->same_outputs(*alone) && batched->same_state(*alone),
+               name + ": a B=4 call equals four B=1 calls bit for bit");
+    }
+    {
+        // In place and K/V only (the MTP drafter's chunks) give the eager call's bits.
+        auto eager = harness(seed + 3), in_place = harness(seed + 3), kv_only = harness(seed + 3);
+        eager->call({0, 3}, {2049, 126}, 3, true);
+        in_place->call({0, 3}, {2049, 126}, 3, true, Launch::InPlace);
+        kv_only->call({0, 3}, {2049, 126}, 3, true, Launch::KvOnly);
+        expect(in_place->same_outputs(*eager) && in_place->same_state(*eager),
+               name + ": in-place queries give the separate outputs' bits");
+        expect(kv_only->same_state(*eager), name + ": a K/V-only call writes the same state");
+        kv_only->check(name + " K/V only");
+    }
+    {
+        // Page spaces: pages before the calls live in host and lent spaces; the calls write only the
+        // pool and give the bits of the all-pool layout.
+        auto pool = harness(seed + 4), spaced = harness(seed + 4, true);
+        for (auto* h : {pool.get(), spaced.get()}) {
+            h->call({0, 1, 2, 3}, first, 1, true);
+            h->call({1, 2}, {3007, 4094}, 6, false);
+        }
+        spaced->check(name + " page spaces");
+        expect(spaced->same_outputs(*pool) && spaced->same_state(*pool),
+               name + ": pages in host and lent spaces give the pool layout's bits");
+    }
+    {
+        // CUDA Graph: captured once, replayed with new rows, positions and table rows (swapped
+        // sequences) uploaded into the same buffers.
+        auto graph = harness(seed + 5), eager = harness(seed + 5);
+        PrepareCall captured;
+        graph->call({0, 1}, {2049, 3006}, 4, true, Launch::Graph, &captured);
+        graph->call({1, 0}, {3010, 2053}, 4, true, Launch::Graph, &captured);
+        eager->call({0, 1}, {2049, 3006}, 4, true);
+        eager->call({1, 0}, {3010, 2053}, 4, true);
+        graph->check(name + " graph replay");
+        expect(graph->same_outputs(*eager) && graph->same_state(*eager),
+               name + ": graph replays give the eager calls' bits");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -1428,6 +2081,21 @@ int main() {
             std::uint32_t seed = 71;
             for (const auto& c : vq_cases) { test_vq_attention(storage, c, seed++); }
         }
+        // The fused prepare (qsa-prepare-fused) for every storage it supports, and under YaRN.
+        std::uint32_t prepare_seed = 501;
+        for (const auto storage : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
+                                   KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
+            expect(ops::qsa_prepare_supports(storage), std::string("qsa_prepare supports ") + storage_name(storage));
+            test_prepare(storage, prepare_seed);
+            prepare_seed += 10;
+        }
+        expect(!ops::qsa_prepare_supports(KvCacheStorage::Vq2) &&
+                   !ops::qsa_prepare_supports(KvCacheStorage::Q4KeyVq2Value),
+               "qsa_prepare: the vector-quantized storages keep the composed prepare");
+        g_index_geometry.yarn_factor        = 4.0F;
+        g_index_geometry.original_positions = 4096;
+        test_prepare(KvCacheStorage::Int8Group64, 601);
+        g_index_geometry = kGeometry;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL: %s\n", e.what());
         return 1;

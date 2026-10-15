@@ -40,6 +40,22 @@ constexpr ReductionCriterion tolerance_for(ActivationCompute activation_compute)
         // Both independently A8-quantized projections feed the nonlinear product, so this profile
         // allows twice Linear's relative-L2 quantization allowance plus a bounded gross tail.
         return {8.0e-2, 1.0e-2, 1.2e-1};
+    case ActivationCompute::A8Int:
+        // Int8 activations with one absmax scale per token. Token t's step is
+        // D_t = max|x_t| / 127; rounding to nearest moves each represented element by at most D_t/2
+        // (zeros stay exact, nothing clips), about uniformly, so one projection's relative RMS error
+        // is (D_t / sqrt(12)) / rms(x_t) = c_t / (127 sqrt(12)) = 2.27e-3 c_t, with c_t the token's
+        // crest factor (largest magnitude over the RMS of its nonzero elements). The group integer
+        // sums are exact and their 80 FP32 folds add about 1e-6. Allowing c_t <= 8 gives 1.8e-2 per
+        // projection; doubled for the two projections that feed the product, as the A8 profile
+        // does (the product's relative error is the up error plus at most 1.28 times the gate error
+        // where gate > 0), 3.6e-2; plus the A16 profile's 3.3e-3 for accumulation and BF16 output
+        // storage: 4.0e-2. The gross cap is Linear's A8 form, 1.5 times that allowance of the
+        // largest reference, on the A16 profile's absolute term. Against the FP8 profile above: E4M3
+        // bounds each element's relative error by 2^-4 (RMS 3.6e-2) whatever the crest factor; int8
+        // per token is finer for elements above max/16 and coarser below, and at c_t = 8 its RMS is
+        // half E4M3's, hence half the allowance. The suite's inputs have c_t <= 2.
+        return {4.0e-2, 5.0e-3, 6.0e-2};
     case ActivationCompute::A4:
         return {1.6e-1, 1.0e-2, 1.6e-1};
     case ActivationCompute::A4Residual:
@@ -50,6 +66,14 @@ constexpr ReductionCriterion tolerance_for(ActivationCompute activation_compute)
         return {1.0e-2, 5.0e-3, 2.0e-2};
     }
     throw std::invalid_argument("linear_swiglu test: unknown activation compute profile");
+}
+
+// Int8-representable inputs make the int8 per-token quantization exact, so the int8 route must
+// then meet the A16 profile: what remains is its accumulation and BF16 output storage.
+ReductionCriterion criterion_for(const Profile& profile) {
+    return profile.pattern == ActivationPattern::Int8Representable
+               ? tolerance_for(ActivationCompute::A16)
+               : tolerance_for(profile.activation_compute);
 }
 
 bool cuda_available() { return !test::cuda_unavailable(); }
@@ -73,7 +97,49 @@ std::uint64_t mix64(std::uint64_t value) {
     return value ^ (value >> 31);
 }
 
+// Every value is n * 2^-e with |n| <= 127 and one element per token at |n| = 127, so a token's
+// absmax scale is exactly its power-of-two step and int8 represents every element. Token zero is
+// dense at step 2^-14; later tokens hold eight nonzeros at step 2^-10, the 127 written last.
+std::vector<std::uint16_t> make_int8_representable_activation(const Profile& profile,
+                                                              std::int32_t tokens) {
+    std::vector<std::uint16_t> activation(
+        checked_elements(profile.input_rows, tokens, "activation size"), 0);
+    const auto value_bits = [](int numerator, float step) {
+        return test::f32_to_bf16(static_cast<float>(numerator) * step);
+    };
+    constexpr float kDenseStep  = 1.0F / 16384.0F;
+    constexpr float kSparseStep = 1.0F / 1024.0F;
+    for (std::int32_t column = 0; column < profile.input_rows; ++column) {
+        const std::uint64_t mixed = mix64((static_cast<std::uint64_t>(profile.seed) << 32) |
+                                          static_cast<std::uint32_t>(column));
+        activation[static_cast<std::size_t>(column)] =
+            value_bits(static_cast<int>((mixed >> 48) % 255U) - 127, kDenseStep);
+    }
+    activation[static_cast<std::size_t>(profile.seed % static_cast<std::uint32_t>(
+                   profile.input_rows))] = value_bits(127, kDenseStep);
+
+    constexpr std::int32_t kNonzerosPerToken = 8;
+    for (std::int32_t token = 1; token < tokens; ++token) {
+        for (std::int32_t lane = kNonzerosPerToken - 1; lane >= 0; --lane) {
+            const std::uint64_t mixed =
+                mix64((static_cast<std::uint64_t>(profile.seed + 1U) << 32) |
+                      static_cast<std::uint32_t>(token * kNonzerosPerToken + lane));
+            const std::int32_t column =
+                static_cast<std::int32_t>(mixed % static_cast<std::uint64_t>(profile.input_rows));
+            int numerator = static_cast<int>((mixed >> 48) % 255U) - 127;
+            if (numerator == 0) { numerator = 1; }
+            if (lane == 0) { numerator = (mixed & 1U) != 0 ? 127 : -127; }
+            activation[static_cast<std::size_t>(token) * profile.input_rows + column] =
+                value_bits(numerator, kSparseStep);
+        }
+    }
+    return activation;
+}
+
 std::vector<std::uint16_t> make_activation(const Profile& profile, std::int32_t tokens) {
+    if (profile.pattern == ActivationPattern::Int8Representable) {
+        return make_int8_representable_activation(profile, tokens);
+    }
     std::vector<std::uint16_t> activation(
         checked_elements(profile.input_rows, tokens, "activation size"), 0);
 
@@ -202,14 +268,14 @@ std::vector<double> read_bf16_output(const test::GuardedDeviceBuffer& output,
 }
 
 int compare_output(std::string_view label, const std::vector<double>& actual,
-                   const double* reference, ActivationCompute activation_compute) {
+                   const double* reference, const ReductionCriterion& criterion) {
     if (actual.empty() || reference == nullptr) {
         std::cerr << label << ": invalid numerical comparison\n";
         return 1;
     }
 
     return verify_reduction(label, actual, std::span<const double>(reference, actual.size()),
-                            tolerance_for(activation_compute));
+                            criterion);
 }
 
 int verify_unchanged(std::string_view label, const test::GuardedDeviceBuffer& device,
@@ -244,13 +310,18 @@ void validate_profile(const Profile& profile) {
         throw std::invalid_argument("linear_swiglu test: profile is not registered");
     }
     const bool invariant = profile.activation_compute == ActivationCompute::A16ColumnInvariant;
+    // The q4-w4a8 route is the only int8-activation route: Q4 with LinearRoutes::Q4W4A8.
+    const bool q4_w4a8 = q4 && ops::has_route(profile.routes, ops::LinearRoutes::Q4W4A8);
     if ((nvfp4 && profile.activation_compute != ActivationCompute::A16 &&
          profile.activation_compute != ActivationCompute::A4 &&
          profile.activation_compute != ActivationCompute::A4Residual && !invariant) ||
         (fp8 && profile.activation_compute != ActivationCompute::A16 &&
          profile.activation_compute != ActivationCompute::A8 &&
          profile.activation_compute != ActivationCompute::A8Residual && !invariant) ||
-        (!nvfp4 && !fp8 && profile.activation_compute != ActivationCompute::A16)) {
+        (q4_w4a8 && profile.activation_compute != ActivationCompute::A8Int) ||
+        (!nvfp4 && !fp8 && !q4_w4a8 && profile.activation_compute != ActivationCompute::A16) ||
+        (profile.pattern == ActivationPattern::Int8Representable &&
+         profile.activation_compute != ActivationCompute::A8Int)) {
         throw std::invalid_argument("linear_swiglu test: invalid activation-compute profile");
     }
 }
@@ -259,7 +330,8 @@ void validate_profile(const Profile& profile) {
 
 int run_profile(std::string_view label, const Profile& profile,
                 std::span<const std::int32_t> token_cases,
-                std::span<const std::int32_t> graph_cases) {
+                std::span<const std::int32_t> graph_cases,
+                std::span<const std::int32_t> exact_route_cases) {
     validate_profile(profile);
     if (token_cases.empty()) { throw std::invalid_argument("linear_swiglu test: no token cases"); }
     if (!cuda_available()) {
@@ -278,6 +350,9 @@ int run_profile(std::string_view label, const Profile& profile,
     for (int tokens : graph_cases)
         if (tokens <= 0 || tokens > maximum_tokens)
             throw std::invalid_argument("graph case outside oracle extent");
+    for (int tokens : exact_route_cases)
+        if (tokens <= 0 || tokens > maximum_tokens)
+            throw std::invalid_argument("exact-route case outside the activation extent");
 
     quantized_weight::PatternedWeightOptions weight_options;
     if (profile.qtype == QType::NVFP4) {
@@ -319,8 +394,16 @@ int run_profile(std::string_view label, const Profile& profile,
         }
         return ops::LinearPolicy::A16Only;
     }();
-    const std::size_t workspace_bytes = ops::linear_swiglu_workspace_capacity_bytes(
-        profile.qtype, profile.gate_up_rows, profile.input_rows, policy, 1, maximum_tokens);
+    // The exact-route comparison also runs the exact route over the same interval.
+    const std::size_t workspace_bytes = std::max(
+        ops::linear_swiglu_workspace_capacity_bytes(profile.qtype, profile.gate_up_rows,
+                                                    profile.input_rows, policy, 1, maximum_tokens,
+                                                    profile.routes),
+        exact_route_cases.empty()
+            ? std::size_t{0}
+            : ops::linear_swiglu_workspace_capacity_bytes(profile.qtype, profile.gate_up_rows,
+                                                          profile.input_rows, policy, 1,
+                                                          maximum_tokens));
     WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 256));
 
     int failures        = 0;
@@ -333,7 +416,7 @@ int run_profile(std::string_view label, const Profile& profile,
         workspace.reset_peak();
         const cudaStream_t stream = replay ? graph_context->stream : nullptr;
         const auto launch         = [&] {
-            ops::linear_swiglu(x, weight, destination, policy, workspace, stream);
+            ops::linear_swiglu(x, weight, destination, policy, workspace, stream, profile.routes);
         };
         const std::string label_case =
             std::string(label) + " T=" + std::to_string(tokens) + (replay ? " graph" : " eager");
@@ -360,7 +443,7 @@ int run_profile(std::string_view label, const Profile& profile,
                 test::cuda_check(cudaStreamSynchronize(stream), "synchronize LinearSwiGLU");
                 const auto exact = ops::linear_swiglu_workspace_capacity_bytes(
                     profile.qtype, profile.gate_up_rows, profile.input_rows, policy, tokens,
-                    tokens);
+                    tokens, profile.routes);
                 if (workspace.used() != 0 || workspace.peak_used() != exact) {
                     std::cerr << label_case << ": exact workspace query/execution mismatch\n";
                     ++failures;
@@ -368,7 +451,7 @@ int run_profile(std::string_view label, const Profile& profile,
                 failures += output.verify_guards(label_case);
                 const auto actual = read_bf16_output(output, elements);
                 failures +=
-                    compare_output(label_case, actual, expected.data(), profile.activation_compute);
+                    compare_output(label_case, actual, expected.data(), criterion_for(profile));
                 if (replay)
                     failures += verify_unchanged(label_case + " input", device_activation,
                                                  input_bits.data(),
@@ -380,6 +463,37 @@ int run_profile(std::string_view label, const Profile& profile,
         }
     };
     for (int tokens : token_cases) run_case(tokens, false);
+    for (int tokens : exact_route_cases) {
+        const auto elements = checked_elements(profile.output_rows, tokens, "output size");
+        const std::size_t bytes = elements * sizeof(std::uint16_t);
+        const std::string label_case =
+            std::string(label) + " T=" + std::to_string(tokens) + " against the exact route";
+        try {
+            Tensor x(device_activation.data(), DType::BF16, {profile.input_rows, tokens});
+            const auto run = [&](test::GuardedDeviceBuffer& output, ops::LinearRoutes routes) {
+                Tensor destination(output.data(), DType::BF16, {profile.output_rows, tokens});
+                output.fill(0xff);
+                workspace.reset();
+                ops::linear_swiglu(x, weight, destination, policy, workspace, nullptr, routes);
+                test::cuda_check(cudaStreamSynchronize(nullptr), "synchronize LinearSwiGLU");
+                std::vector<std::uint8_t> bits(bytes);
+                output.copy_to_host(bits.data(), bits.size());
+                failures += output.verify_guards(label_case);
+                return bits;
+            };
+            test::GuardedDeviceBuffer routed_output(bytes);
+            test::GuardedDeviceBuffer exact_output(bytes);
+            const std::vector<std::uint8_t> routed = run(routed_output, profile.routes);
+            const std::vector<std::uint8_t> exact  = run(exact_output, ops::LinearRoutes::Exact);
+            if (routed != exact) {
+                std::cerr << label_case << ": output bits differ from the exact route's\n";
+                ++failures;
+            }
+        } catch (const std::exception& error) {
+            std::cerr << label_case << ": unexpected exception: " << error.what() << '\n';
+            ++failures;
+        }
+    }
     if (!graph_cases.empty()) {
         // Check eager inputs before graph fixtures overwrite them with the next represented input.
         failures += verify_unchanged(std::string(label) + " eager input", device_activation,

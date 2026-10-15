@@ -28,6 +28,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     : parameters(parameters_in), device(device_in), capacity(plan.capacity),
       kv_capacity(plan.kv_capacity), max_concurrency(plan.max_concurrency),
       context_cache(plan.context_cache), prefill_chunk(plan.prefill_chunk),
+      idle_prefill_width(plan.idle_prefill_width),
       execution_schedule(plan.execution_schedule), draft_window(plan.draft_window),
       neural_draft_window(plan.neural_draft_window), tree_widths(plan.tree_widths),
       draft_tree_paths(plan.draft_tree_paths), ngram_draft_window(plan.ngram_draft_window),
@@ -82,6 +83,27 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             }
         }
         tree_controller.emplace(neural_draft_window + 1U, trees);
+    }
+    if (speculative_backend == SpeculativeBackend::Mtp &&
+        std::count_if(plan.round_shapes.begin(), plan.round_shapes.end(),
+                      [](const SpeculativeRoundShape& shape) {
+                          return shape.kind == SpeculativeRoundKind::Neural;
+                      }) > 1) {
+        // adaptive-mtp: one neural family per draft length, serving the batch sizes the policy
+        // may run it at.
+        mtp_draft_policy.emplace(neural_draft_window, max_concurrency);
+        for (std::uint32_t k = 1; k <= neural_draft_window; ++k) {
+            const bool planned = std::any_of(
+                plan.round_shapes.begin(), plan.round_shapes.end(),
+                [&](const SpeculativeRoundShape& shape) {
+                    return shape.kind == SpeculativeRoundKind::Neural && shape.verify_drafts == k &&
+                           shape.single_row == (max_concurrency > 1 &&
+                                                !mtp_draft_policy->serves(k, max_concurrency));
+                });
+            if (!planned) {
+                throw std::logic_error("adaptive MTP draft lengths do not match the planned families");
+            }
+        }
     }
     const DeviceSpan backing = persistent.alloc_bytes(plan.persistent.bytes, 256);
     decoder      = std::make_unique<qwen3_5::DecoderState>(backing, plan.persistent.decoder);

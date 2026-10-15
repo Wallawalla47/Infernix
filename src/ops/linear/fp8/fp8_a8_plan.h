@@ -61,5 +61,44 @@ inline std::size_t fp8_a8_workspace_capacity_bytes(std::int32_t tokens, std::int
 void launch_fp8_a8_quantize(const Tensor& x, const Weight& weight, Fp8A8Workspace workspace,
                             cudaStream_t stream);
 
+// fp8-a8-pair (LinearRoutes::Fp8A8Pair): each activation column as two E4M3 terms with their own
+// per-column scales, x ~ scales_hi * codes_hi + scales_lo * codes_lo. The high term is the
+// single-term A8 quantization (scale = max|x| / 448); the low term quantizes the high term's exact
+// residual x - scales_hi * codes_hi the same way.
+struct Fp8A8PairWorkspace {
+    std::uint8_t* codes_hi = nullptr;
+    float* scales_hi       = nullptr;
+    std::uint8_t* codes_lo = nullptr;
+    float* scales_lo       = nullptr;
+};
+
+template <class Arena>
+Fp8A8PairWorkspace allocate_fp8_a8_pair_workspace(Arena& arena, std::int32_t tokens,
+                                                  std::int32_t input_rows) {
+    if (input_rows <= 0 || (input_rows % 32) != 0) {
+        throw std::invalid_argument("fp8 A8 pair workspace: invalid K");
+    }
+    const std::size_t code_bytes =
+        fp8_a8_checked_bytes(tokens, static_cast<std::size_t>(input_rows));
+    const std::size_t scale_bytes = fp8_a8_checked_bytes(tokens, sizeof(float));
+    const DeviceSpan codes_hi     = arena.alloc_bytes(code_bytes, 256);
+    const DeviceSpan scales_hi    = arena.alloc_bytes(scale_bytes, 256);
+    const DeviceSpan codes_lo     = arena.alloc_bytes(code_bytes, 256);
+    const DeviceSpan scales_lo    = arena.alloc_bytes(scale_bytes, 256);
+    return {static_cast<std::uint8_t*>(codes_hi.data), static_cast<float*>(scales_hi.data),
+            static_cast<std::uint8_t*>(codes_lo.data), static_cast<float*>(scales_lo.data)};
+}
+
+inline std::size_t fp8_a8_pair_workspace_capacity_bytes(std::int32_t tokens,
+                                                        std::int32_t input_rows) {
+    WorkspaceLayoutBuilder layout;
+    (void)allocate_fp8_a8_pair_workspace(layout, tokens, input_rows);
+    return layout.peak_bytes(1);
+}
+
+// Writes both terms of every column of x (K = weight.k) in one pass.
+void launch_fp8_a8_pair_quantize(const Tensor& x, const Weight& weight,
+                                 Fp8A8PairWorkspace workspace, cudaStream_t stream);
+
 
 } // namespace infernix::ops::detail
