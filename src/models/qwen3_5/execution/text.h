@@ -211,9 +211,10 @@ private:
     [[nodiscard]] const TextParameters& phase_text(Phase phase) const noexcept {
         return phase == Phase::Verify
                    ? parameters_.decode_text(execution_schedule_.column_invariant_decode,
-                                             execution_schedule_.a8_decode,
-                                             execution_schedule_.a4_decode,
-                                             execution_schedule_.a4_residual_decode)
+                                             {execution_schedule_.a8_decode,
+                                              execution_schedule_.a4_decode,
+                                              execution_schedule_.a8_residual_decode,
+                                              execution_schedule_.a4_residual_decode})
                    : parameters_.text;
     }
     template <class Tap>

@@ -24,6 +24,8 @@ namespace {
 constexpr ReductionCriterion kGdnInputProjA16Tolerance{3.0e-3, 4.0e-3, 3.5e-3};
 constexpr ReductionCriterion kFp8GdnInputProjA16Tolerance{1.0 / 256.0, 1.0 / 256.0, 2.0 / 256.0};
 constexpr ReductionCriterion kFp8GdnInputProjA8Tolerance{0.04, 1.0 / 256.0, 0.06};
+// Two E4M3 terms put the A8 residual profile near A16; one term (A8's error) fails it.
+constexpr ReductionCriterion kFp8GdnInputProjA8ResidualTolerance{1.0e-2, 1.0 / 256.0, 2.0e-2};
 constexpr ReductionCriterion kGdnInputProjA4Tolerance{0.16, 4.0e-3, 0.16};
 constexpr std::int32_t kA8SampleRows = 31;
 
@@ -441,11 +443,14 @@ int run_fp8_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearPol
         const bool a8 =
             (policy == ops::LinearPolicy::AllowA8 || policy == ops::LinearPolicy::AllowA4) &&
             tokens >= 17;
-        const ReductionCriterion& criterion =
-            a8 ? kFp8GdnInputProjA8Tolerance : kFp8GdnInputProjA16Tolerance;
-        const std::int32_t sample_count = a8 ? kA8SampleRows : 7;
-        const std::string suffix =
-            std::string(" FP8 ") + (a8 ? "A8" : "A16") + " T=" + std::to_string(tokens);
+        const bool a8_residual = ops::allows_a8_residual(policy) && tokens >= 17;
+        const ReductionCriterion& criterion = a8            ? kFp8GdnInputProjA8Tolerance
+                                              : a8_residual ? kFp8GdnInputProjA8ResidualTolerance
+                                                            : kFp8GdnInputProjA16Tolerance;
+        const std::int32_t sample_count = (a8 || a8_residual) ? kA8SampleRows : 7;
+        const std::string suffix = std::string(" FP8 ") +
+                                   (a8 ? "A8" : (a8_residual ? "A8 residual" : "A16")) +
+                                   " T=" + std::to_string(tokens);
         failures += qkv.verify_guards("gdn qkv" + suffix);
         failures += z.verify_guards("gdn z" + suffix);
         failures += qkv.verify_fully_written("gdn qkv" + suffix);
@@ -517,6 +522,13 @@ int run_fp8() {
     }
     for (int tokens : {4, 17, 128, 385, 512, 1025})
         failures += run_fp8_case(parent, tokens, ops::LinearPolicy::AllowA8, false, true);
+    // The A8 residual route: A16 below 17 columns, then its 32- and 64-token tiles and their edges.
+    for (const std::int32_t tokens :
+         {16, 17, 32, 33, 48, 64, 65, 96, 97, 128, 129, 192, 256, 257}) {
+        failures += run_fp8_case(parent, tokens, ops::LinearPolicy::AllowA8Residual);
+    }
+    for (int tokens : {17, 65, 97})
+        failures += run_fp8_case(parent, tokens, ops::LinearPolicy::AllowA8Residual, false, true);
     return failures;
 }
 

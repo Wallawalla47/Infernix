@@ -44,9 +44,11 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     constexpr int BK        = Schedule::kBlockK;
     constexpr int S         = Schedule::kStages;
     constexpr int THREADS   = Schedule::kThreads;
+    constexpr int TERMS     = Schedule::kTerms;
     auto* shared_raw        = fp8_shared_storage<fp8_mma_shared_bytes<Schedule, Epilogue>>();
+    // Each stage holds TERMS activation planes of BM x BK, then the weights.
     auto* activation_shared = reinterpret_cast<std::uint8_t*>(shared_raw);
-    auto* weight_shared     = activation_shared + S * BM * BK;
+    auto* weight_shared     = activation_shared + S * TERMS * BM * BK;
 
     const int tid  = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;
@@ -63,29 +65,33 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     const int token_begin        = token_offset + token_tile * BM;
 
     auto stage_inputs = [&](int stage, int k_tile) {
-        const int k_begin      = k_tile * BK;
-        auto* activation_stage = activation_shared + stage * BM * BK;
-        auto* weight_stage     = weight_shared + stage * BN * BK;
+        const int k_begin  = k_tile * BK;
+        auto* weight_stage = weight_shared + stage * BN * BK;
 
+#pragma unroll
+        for (int term = 0; term < TERMS; ++term) {
+            auto* activation_stage = activation_shared + (stage * TERMS + term) * BM * BK;
+            const auto* plane      = term == 0 ? activation_codes : operands.x_residual;
 #pragma unroll 1
-        for (int task = tid; task < BM * Schedule::kSegmentsPerRow; task += THREADS) {
-            const int row             = task / Schedule::kSegmentsPerRow;
-            const int logical_segment = task - row * Schedule::kSegmentsPerRow;
-            const int logical_byte    = logical_segment * 16;
-            const int physical_byte   = fp8_mma_shared_byte<Schedule>(row, logical_byte);
-            auto* destination         = activation_stage + row * BK + physical_byte;
-            const int token           = token_begin + row;
-            if constexpr (FullTokens) {
-                cp_async<16, Schedule::kActivationCache>(
-                    destination, activation_codes + static_cast<std::int64_t>(token) * K + k_begin +
-                                     logical_byte);
-            } else {
-                const bool valid = token < tokens;
-                cp_async_zfill<16, Schedule::kActivationCache>(
-                    destination,
-                    activation_codes + static_cast<std::int64_t>(valid ? token : 0) * K + k_begin +
-                        logical_byte,
-                    valid ? 16 : 0);
+            for (int task = tid; task < BM * Schedule::kSegmentsPerRow; task += THREADS) {
+                const int row             = task / Schedule::kSegmentsPerRow;
+                const int logical_segment = task - row * Schedule::kSegmentsPerRow;
+                const int logical_byte    = logical_segment * 16;
+                const int physical_byte   = fp8_mma_shared_byte<Schedule>(row, logical_byte);
+                auto* destination         = activation_stage + row * BK + physical_byte;
+                const int token           = token_begin + row;
+                if constexpr (FullTokens) {
+                    cp_async<16, Schedule::kActivationCache>(
+                        destination,
+                        plane + static_cast<std::int64_t>(token) * K + k_begin + logical_byte);
+                } else {
+                    const bool valid = token < tokens;
+                    cp_async_zfill<16, Schedule::kActivationCache>(
+                        destination,
+                        plane + static_cast<std::int64_t>(valid ? token : 0) * K + k_begin +
+                            logical_byte,
+                        valid ? 16 : 0);
+                }
             }
         }
 
@@ -109,6 +115,9 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     }
 
     float accumulators[Schedule::kMmaTokens][Schedule::kMmaRows][4] = {};
+    // The residual plane's own accumulator: its codes are in units of scale / 16.
+    float residual_accumulators[TERMS > 1 ? Schedule::kMmaTokens : 1]
+                               [TERMS > 1 ? Schedule::kMmaRows : 1][4] = {};
 #pragma unroll 1
     for (int k_tile = 0; k_tile < TILES_K; ++k_tile) {
         const int stage = k_tile % S;
@@ -119,8 +128,13 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
         }
         __syncthreads();
 
-        fp8_mma_compute_stage<Schedule>(activation_shared + stage * BM * BK,
+        fp8_mma_compute_stage<Schedule>(activation_shared + stage * TERMS * BM * BK,
                                         weight_shared + stage * BN * BK, accumulators, warp, lane);
+        if constexpr (TERMS > 1) {
+            fp8_mma_compute_stage<Schedule>(activation_shared + (stage * TERMS + 1) * BM * BK,
+                                            weight_shared + stage * BN * BK, residual_accumulators,
+                                            warp, lane);
+        }
 
         __syncthreads();
         const int next_k_tile = k_tile + S;
@@ -130,6 +144,18 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
         }
     }
     pdl::trigger_dependents();
+
+    if constexpr (TERMS > 1) {
+        // Scaling by 1/16 is exact, so each sum rounds once.
+#pragma unroll
+        for (int mt = 0; mt < Schedule::kMmaTokens; ++mt)
+#pragma unroll
+            for (int mr = 0; mr < Schedule::kMmaRows; ++mr)
+#pragma unroll
+                for (int v = 0; v < 4; ++v)
+                    accumulators[mt][mr][v] = __fadd_rn(
+                        accumulators[mt][mr][v], __fmul_rn(residual_accumulators[mt][mr][v], 0.0625F));
+    }
 
     fp8_finish_mma_tile<Schedule, FullTokens>(
         output, epilogue, row_policy, shared_raw, accumulators, activation_scales, weight_scales,

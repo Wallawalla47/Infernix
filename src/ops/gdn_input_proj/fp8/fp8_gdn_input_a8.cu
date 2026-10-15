@@ -16,6 +16,21 @@ std::size_t fp8_gdn_input_partial_capacity_bytes(std::int32_t max_tokens) {
     return max_tokens > 256 ? Bulk::kPartialBytes : 0;
 }
 
+void fp8_gdn_input_a8_residual_launch(const Tensor& x, const Weight& weight, Tensor& qkv,
+                                      Tensor& z, Fp8A8Workspace workspace, cudaStream_t stream) {
+    launch_fp8_a8_quantize(x, weight, workspace, stream);
+    const Fp8GdnInputOutput output{static_cast<__nv_bfloat16*>(qkv.data),
+                                   static_cast<__nv_bfloat16*>(z.data)};
+    const auto launch = [&]<class Schedule>() {
+        launch_fp8_a8_mma<Fp8ScheduleInstance<Schedule, 5120>>(
+            fp8_a8_operands(weight, workspace, x.ne[1]), output, LinearIdentityEpilogue{}, stream);
+    };
+    const std::int32_t tokens = x.ne[1];
+    if (tokens <= 32) return launch.template operator()<Fp8A8ResidualT32R64>();
+    if (tokens <= 96) return launch.template operator()<Fp8A8ResidualT64R64>();
+    launch.template operator()<Fp8A8ResidualT64R128>();
+}
+
 void fp8_gdn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                              Fp8A8Workspace workspace, cudaStream_t stream) {
     launch_fp8_a8_quantize(x, weight, workspace, stream);

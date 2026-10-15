@@ -714,6 +714,7 @@ below (`src/runtime/engine/qwen4_exp_instance.cpp` lists their configurations).
 | `batched-decode`, `batch-split-attention` | request-invariance-capable artifacts | 24 heads, 4-bit activations, with INT8, NVFP4, K8V4 or K4V2 KV |
 | `batched-a8-decode`, `batched-a4-decode` | the same, with 8-bit (FP8) or 4-bit (NVFP4) activations | none (each fails, below) |
 | `batched-a4-residual-decode` | the same, with 4-bit (NVFP4) MLP activations | 24 heads, 4-bit activations, with INT8, NVFP4, K8V4 or K4V2 KV |
+| `batched-a8-residual-decode` | the same, with 8-bit (FP8) input-projection activations | 24 heads, 4-bit activations, with INT8, NVFP4, K8V4 or K4V2 KV |
 | `adaptive-speculation` | the same, with speculative decoding | 24 heads, 4-bit activations, with INT8, NVFP4, K8V4 or K4V2 KV |
 | `free-cache-resume` | the same, with the prefix cache | 24 heads, 4-bit activations, with INT8, NVFP4, K8V4 or K4V2 KV |
 | `preemption` | request-invariance-capable artifacts | 24 heads, 4-bit activations, with INT8, NVFP4, K8V4 or K4V2 KV |
@@ -750,6 +751,12 @@ the Engine, and each acts only where the artifact can be request-invariant
   earlier ones left (`LinearPolicy::AllowA4Residual`), and multiply every term by the same weight
   tile into one accumulator. Weight traffic is the 4-bit route's; the activation error is roughly
   the 4-bit route's raised to the term count.
+- `batched-a8-residual-decode`: with `batched-decode`, wide rounds of the FP8 attention and GDN
+  input projections and MLP gate/up (from 17 columns) quantize each column into two E4M3 terms,
+  the first the 8-bit encoding at the column's scale and the second what it left at a sixteenth of
+  that scale (`LinearPolicy::AllowA8Residual`); each term has its own accumulator, summed exactly
+  before the scales apply. Its error is about the 8-bit route's squared. Output and down
+  projections keep 16-bit activations: two terms never beat A16 on their 5,120 outputs.
 - `batch-split-attention`: decode attention sizes a row's key partition from the batch.
 - `adaptive-speculation`: DFlash2 tree tables and controller, and a round's longest n-gram copy,
   set every row's verify width.
@@ -850,6 +857,39 @@ budget). Speed (INT8 KV, as above, the qualified set with and without it; the ol
 the down tile, 72.6 on the old route); DFlash2 with n-gram copies 1,787 vs 1,280 tok/s at one request
 (+40 %), 1,217 vs 852 at two (+43 %) and 887 vs 604 at four (+47 %), against the old route's 1,995,
 1,650 and 1,286. Three terms ran 1,696, 1,074 and 783 and were not needed.
+
+**`batched-a8-residual-decode`** (2026-10-15, the same artifact, corpus and arms): two E4M3 terms
+per column in the FP8 attention and GDN input projections from 17 columns (the official 27B's MLP
+is NVFP4, and its output projections keep 16-bit activations). Its op error is 0.14-0.22 % relative
+L2 against the FP64 oracle (one-term A8 2.5-2.8 %). It passed under the KV-independent rule
+(6.1), jointly with every path above: on INT8 the plain arm never reaches 17 columns (its verdict
+is the qualified arm's to the bit), and the spec arm adds 2.2e-5 TV and 6.2e-5 KL excess; NVFP4
+KV, the format with least headroom, passes its spec arm with the closest margin of any registered
+path; K8V4 and K4V2 are registered by their qualified bounds plus the INT8 increment (closest: K8V4
+spec top-1, 1.28e-3 of 2.65e-3):
+
+| 27B, KV | Arm | TV excess (bound) / budget | Top-1 excess, points (bound) / budget | KL excess / cap |
+|---|---|---|---|---|
+| INT8 | plain | -2.2e-4 (3.1e-4) / 2.4e-3 | -0.10 (0.01) / 0.22 | -9.1e-4 / 8.6e-3 |
+| INT8 | spec | 6.4e-5 (5.6e-4) / 2.4e-3 | -0.07 (0.04) / 0.22 | -7.7e-4 / 8.6e-3 |
+| NVFP4 | spec | 4.4e-4 (7.5e-4) / 2.9e-3 | +0.14 (0.24) / 0.28 | 2.3e-3 / 8.8e-3 |
+
+The same change retiled the two-term NVFP4 kernels above 32 columns without changing their
+arithmetic (each output's K order is the tile's; op error identical at every width): gate/up
+takes one token tile per round to 128 columns (64x128 to 64, 96x128 to 96, single-stage 128x128
+to 128; 74, 95-101 and 134-138 us against 85, 138-142 and 144 us), and the [5120, 17408] down
+projection keeps 32-token tiles to 64 columns (44-46 against 59-63 us). Speed (INT8 KV, 2,048
+prompt, 256 output tokens, three rounds; DFlash2 with n-gram copies at one, two and four requests,
+and plain decode at eight): the retiled qualified set ran 1,788, 1,288 and 922 tok/s and 70.4
+(1,787, 1,217, 887 and 70.3 before); with two-term A8 1,915, 1,548 and 1,034 and 70.4, against the
+old route's 1,995, 1,650, 1,286 and 72.6 (-4.0, -6.2, -19.6 and -3.0 %).
+
+**Rejected** (2026-10-15): one-term A4 gate/up beside two-term down, with "four over six" block
+scales (each 16-value block keeps the better of its max-to-6 and max-to-4 encodings). The scale
+choice halves one-term op error (gate/up 9.8 to 5.0 %, down 7-9 to 5-7 % relative L2), and the mix
+ran 1,944, 1,575 and 1,109 tok/s with two-term A8 (+1.5, +1.7 and +7.2 %), but it fails the INT8
+spec arm: TV excess 1.14e-2 (bound 1.20e-2) against 2.4e-3 and top-1 +1.17 points against 0.22,
+about two thirds of what one-term A4 in the whole MLP adds.
 
 **Qualification.** These act only above one request, so the decode gate runs them with
 `--concurrency`, `--kv-tokens` (a short pool), or `--prefix-reuse --warm-tokens` (an off-grid

@@ -70,12 +70,14 @@ Options parse_options(int argc, char** argv) {
             const std::string_view value = next("--policy value");
             if (value == "a16") {
                 options.policy = ops::LinearPolicy::A16Only;
+            } else if (value == "a8r") {
+                options.policy = ops::LinearPolicy::AllowA8Residual;
             } else if (value == "a8") {
                 options.policy = ops::LinearPolicy::AllowA8;
             } else if (value == "invariant") {
                 options.policy = ops::LinearPolicy::A16ColumnInvariant;
             } else {
-                throw std::invalid_argument("--policy must be a16, a8 or invariant");
+                throw std::invalid_argument("--policy must be a16, a8, a8r or invariant");
             }
         } else if (argument == "--t-sweep") {
             options.tokens = parse_tokens(next("--t-sweep value"));
@@ -104,6 +106,7 @@ Options parse_options(int argc, char** argv) {
 }
 
 const char* policy_name(ops::LinearPolicy policy) {
+    if (policy == ops::LinearPolicy::AllowA8Residual) { return "A8R"; }
     return policy == ops::LinearPolicy::AllowA8 ? "A8" : "A16";
 }
 

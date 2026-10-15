@@ -16,6 +16,26 @@ std::size_t fp8_attn_input_partial_capacity_bytes(std::int32_t max_tokens) {
     return max_tokens > 384 ? Bulk::kPartialBytes : 0;
 }
 
+void fp8_attn_input_a8_residual_launch(const Tensor& x, const Weight& weight, Tensor& q,
+                                       Tensor& gate, Tensor& key, Tensor& value,
+                                       Fp8A8Workspace workspace, cudaStream_t stream) {
+    launch_fp8_a8_quantize(x, weight, workspace, stream);
+    const Fp8AttentionInputOutput output{
+        static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(key.data),
+        static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(value.data)};
+    const auto launch = [&]<class Schedule>() {
+        launch_fp8_a8_mma<Fp8ScheduleInstance<Schedule, 5120>>(
+            fp8_a8_operands(weight, workspace, x.ne[1]), output, LinearIdentityEpilogue{}, stream,
+            {}, pdl::Dependency::Programmatic);
+    };
+    // 32-token tiles to 32 columns and at 65-96 (80.5 against 95-101 us for 64-token tiles).
+    const std::int32_t tokens = x.ne[1];
+    if (tokens <= 32 || (tokens > 64 && tokens <= 96)) {
+        return launch.template operator()<Fp8A8ResidualT32R64>();
+    }
+    launch.template operator()<Fp8A8ResidualT64R128>();
+}
+
 void fp8_attn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                               Tensor& key, Tensor& value, Fp8A8Workspace workspace,
                               cudaStream_t stream) {

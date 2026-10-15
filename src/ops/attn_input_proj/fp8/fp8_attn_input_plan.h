@@ -35,6 +35,10 @@ void fp8_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor&
 
 void fp8_attn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                               Tensor& k, Tensor& v, Fp8A8Workspace workspace, cudaStream_t stream);
+// AllowA8Residual: the workspace's two E4M3 planes into two accumulators (MMA tiles).
+void fp8_attn_input_a8_residual_launch(const Tensor& x, const Weight& weight, Tensor& q,
+                                       Tensor& gate, Tensor& k, Tensor& v,
+                                       Fp8A8Workspace workspace, cudaStream_t stream);
 
 void fp8_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                              Tensor& k, Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,

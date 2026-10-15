@@ -32,16 +32,30 @@ enum class LinearPolicy : std::uint8_t {
     /// term count. Never one-term A4 or A8. A projection that does not register a residual route
     /// runs A16; one that does needs the A4 activation divisor (as AllowA4 does).
     AllowA4Residual,
+    /// Admit A16 or an A8 residual profile: FP8 activations as two E4M3 terms per token, the
+    /// second encoding what the first left at a sixteenth of its scale. Never one-term A8 or A4.
+    /// A projection that does not register a residual route runs A16 (the FP8 input projections
+    /// and gate/up register one; the output and down projections do not).
+    AllowA8Residual,
 };
 
 [[nodiscard]] constexpr bool valid_linear_policy(LinearPolicy policy) noexcept {
     return policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8 ||
            policy == LinearPolicy::AllowA4 || policy == LinearPolicy::A16ColumnInvariant ||
-           policy == LinearPolicy::AllowA4Residual;
+           policy == LinearPolicy::AllowA4Residual || policy == LinearPolicy::AllowA8Residual;
 }
 
 [[nodiscard]] constexpr bool allows_a4_residual(LinearPolicy policy) noexcept {
     return policy == LinearPolicy::AllowA4Residual;
+}
+
+[[nodiscard]] constexpr bool allows_a8_residual(LinearPolicy policy) noexcept {
+    return policy == LinearPolicy::AllowA8Residual;
+}
+
+// Either residual profile: a projection without that profile's route runs A16.
+[[nodiscard]] constexpr bool allows_residual(LinearPolicy policy) noexcept {
+    return allows_a4_residual(policy) || allows_a8_residual(policy);
 }
 
 [[nodiscard]] constexpr bool column_invariant(LinearPolicy policy) noexcept {

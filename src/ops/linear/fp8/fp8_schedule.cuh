@@ -126,7 +126,8 @@ struct Fp8A16MmaSchedule {
 
 template <int BlockTokens, int BlockRows, int BlockK, int WarpsTokens, int WarpsRows, int Stages,
           int MinBlocksPerSm, Cache WeightCache, Cache ActivationCache,
-          Fp8MmaFragmentPipeline FragmentPipeline, Fp8MmaRaster Raster, int RasterGroupRows = 1>
+          Fp8MmaFragmentPipeline FragmentPipeline, Fp8MmaRaster Raster, int RasterGroupRows = 1,
+          int Terms = 1>
 struct Fp8A8MmaSchedule {
     static constexpr bool kTmaSwizzle                         = false;
     static constexpr int kStaticK                             = 0;
@@ -142,6 +143,9 @@ struct Fp8A8MmaSchedule {
     static constexpr Fp8MmaFragmentPipeline kFragmentPipeline = FragmentPipeline;
     static constexpr Fp8MmaRaster kRaster                     = Raster;
     static constexpr int kRasterGroupRows                     = RasterGroupRows;
+    // Terms > 1 is the A8 residual profile: the activation tile holds that many E4M3 planes,
+    // each into its own accumulator (fp8_a8_mma_kernel).
+    static constexpr int kTerms                               = Terms;
 
     static constexpr int kWarps          = kWarpsTokens * kWarpsRows;
     static constexpr int kThreads        = kWarps * 32;
@@ -152,10 +156,12 @@ struct Fp8A8MmaSchedule {
     static constexpr int kMmaK           = kBlockK / 32;
     static constexpr int kSegmentsPerRow = kBlockK / 16;
     static constexpr int kSharedBytes =
-        (kStages * (kBlockTokens + kBlockRows) * kBlockK > kBlockTokens * (kBlockRows + 8) * 2
-             ? kStages * (kBlockTokens + kBlockRows) * kBlockK
+        (kStages * (kTerms * kBlockTokens + kBlockRows) * kBlockK >
+                 kBlockTokens * (kBlockRows + 8) * 2
+             ? kStages * (kTerms * kBlockTokens + kBlockRows) * kBlockK
              : kBlockTokens * (kBlockRows + 8) * 2);
 
+    static_assert(Terms == 1 || Terms == 2);
     static_assert(kBlockTokens > 0 && kBlockRows > 0 && kBlockK > 0);
     static_assert((kBlockTokens % kWarpsTokens) == 0 && (kBlockRows % kWarpsRows) == 0);
     static_assert((kWarpTokens % 16) == 0 && (kWarpRows % 8) == 0);

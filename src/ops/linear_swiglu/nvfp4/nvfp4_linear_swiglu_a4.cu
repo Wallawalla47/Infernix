@@ -59,6 +59,12 @@ template <int Terms>
 using ResidualM32N64 = Nvfp4A4MmaSchedule<32, 64, 256, 2, 4, 3, 2, Cache::cg, Cache::cg, Terms>;
 template <int Terms>
 using ResidualM64N64 = Nvfp4A4MmaSchedule<64, 64, 256, 4, 2, 2, 2, Cache::cg, Cache::cg, Terms>;
+template <int Terms>
+using ResidualM64N128 = Nvfp4A4MmaSchedule<64, 128, 256, 4, 2, 2, 1, Cache::cg, Cache::cg, Terms>;
+template <int Terms>
+using ResidualM96N128 = Nvfp4A4MmaSchedule<96, 128, 256, 3, 4, 2, 1, Cache::cg, Cache::cg, Terms>;
+template <int Terms>
+using ResidualM128N128 = Nvfp4A4MmaSchedule<128, 128, 256, 4, 4, 1, 1, Cache::cg, Cache::cg, Terms>;
 
 template <int Terms>
 void launch_residual(const Tensor& x, const Weight& weight, Tensor& out, WorkspaceArena& workspace,
@@ -67,12 +73,20 @@ void launch_residual(const Tensor& x, const Weight& weight, Tensor& out, Workspa
     const Nvfp4A4Workspace scratch =
         allocate_nvfp4_a4_workspace(workspace, x.ne[1], Geometry::kInputRows, Terms);
     launch_nvfp4_a4_quantize(x, weight, scratch, Nvfp4ScaleLayout::RowMajor, stream);
-    if (x.ne[1] <= 16) {
-        launch_gemm<ResidualM16N64<Terms>>(weight, out, scratch, x.ne[1], stream);
-    } else if (x.ne[1] <= 32) {
-        launch_gemm<ResidualM32N64<Terms>>(weight, out, scratch, x.ne[1], stream);
+    // Above 32 columns one token tile per round streams each weight tile once: 64x128 runs
+    // 74 against 85 us for 64x64 at 48-64 columns, 96x128 95-101 against 138-142 at 80-96, and
+    // the single-stage 128x128 134-138 against 144 at 112-128 (RTX 5090).
+    const std::int32_t tokens = x.ne[1];
+    if (tokens <= 16) {
+        launch_gemm<ResidualM16N64<Terms>>(weight, out, scratch, tokens, stream);
+    } else if (tokens <= 32) {
+        launch_gemm<ResidualM32N64<Terms>>(weight, out, scratch, tokens, stream);
+    } else if (tokens <= 64 || tokens > 128) {
+        launch_gemm<ResidualM64N128<Terms>>(weight, out, scratch, tokens, stream);
+    } else if (tokens <= 96) {
+        launch_gemm<ResidualM96N128<Terms>>(weight, out, scratch, tokens, stream);
     } else {
-        launch_gemm<ResidualM64N64<Terms>>(weight, out, scratch, x.ne[1], stream);
+        launch_gemm<ResidualM128N128<Terms>>(weight, out, scratch, tokens, stream);
     }
 }
 

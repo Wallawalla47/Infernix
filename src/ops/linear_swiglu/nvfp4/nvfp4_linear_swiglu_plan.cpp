@@ -28,7 +28,8 @@ Nvfp4LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
         throw std::invalid_argument("nvfp4 linear_swiglu: invalid compute policy");
     }
     if (column_invariant(policy)) { return Nvfp4LinearSwiGluRoute::ColumnInvariantA16; }
-    if (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) {
+    if (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8 ||
+        allows_a8_residual(policy)) {
         if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
         return Nvfp4LinearSwiGluRoute::SmallTFusedA16;
     }
@@ -69,6 +70,7 @@ std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
     (void)resolve_route(policy, min_tokens);
     (void)resolve_route(policy, max_tokens);
     if (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8 ||
+        allows_a8_residual(policy) ||
         column_invariant(policy) || max_tokens <= 4) {
         return 0;
     }

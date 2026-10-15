@@ -484,7 +484,8 @@ int run_fp8() {
     DevicePackedWeight parent(
         quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16, kRows, kHidden, 1701U));
     int failures = 0;
-    for (auto policy : {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA8}) {
+    for (auto policy : {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA8,
+                        ops::LinearPolicy::AllowA8Residual}) {
         for (int width = 2; width <= 16; ++width) {
             failures += run_fp8_case(parent, width, 1, {}, policy, 1700U + width);
             failures += run_fp8_case(parent, width, 8, ragged(width, 8), policy, 1750U + width);

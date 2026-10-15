@@ -154,10 +154,12 @@ parameters; when a complete FP8/NVFP4 parent stores Q/K/gate/V, a single weight 
 A View keeps the parent's geometry, planes and element ranges; shared objects are resident once and
 every use site keeps its own Use.
 Activation permissions are `A16Only={A16}`, `AllowA8={A16,A8}` and `AllowA4={A16,A8,A4}`; a fused call
-takes the intersection of the relevant permissions. Two runtime policies narrow a permission and are
-never stored: `A16ColumnInvariant` (one A16 schedule at every width, the exact route's decode) and
+takes the intersection of the relevant permissions. Three runtime policies narrow a permission and
+are never stored: `A16ColumnInvariant` (one A16 schedule at every width, the exact route's decode),
 `AllowA4Residual` (A16, or NVFP4 activations as a sum of residual NVFP4 terms, which a projection
-permitted A4 may take under the `batched-a4-residual-decode` fast path).
+permitted A4 may take under the `batched-a4-residual-decode` fast path) and `AllowA8Residual` (A16,
+or FP8 activations as two E4M3 terms, which an FP8 input projection or gate/up permitted A8 may
+take under `batched-a8-residual-decode`; output and down projections stay A16).
 
 The reader, binder, native parameter preparation, capacity queries, warmup and execution each check
 the contracts they consume. The executable scope is determined by the actual consumers. The

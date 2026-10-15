@@ -25,6 +25,20 @@ using Fp8A8T64R64K128S2 =
 using Fp8A8T64R128K256 =
     Fp8A8MmaSchedule<64, 128, 256, 2, 4, 2, 1, Cache::cg, Cache::cg,
                      Fp8MmaFragmentPipeline::PingPong, Fp8MmaRaster::TokenFast>;
+// The A8 residual profile's tiles: two activation planes per stage.
+using Fp8A8ResidualT32R64 =
+    Fp8A8MmaSchedule<32, 64, 128, 1, 2, 3, 2, Cache::cg, Cache::cg,
+                     Fp8MmaFragmentPipeline::PingPong, Fp8MmaRaster::TokenFast, 1, 2>;
+using Fp8A8ResidualT32R128 =
+    Fp8A8MmaSchedule<32, 128, 128, 2, 4, 2, 2, Cache::cg, Cache::cg,
+                     Fp8MmaFragmentPipeline::PingPong, Fp8MmaRaster::TokenFast, 1, 2>;
+using Fp8A8ResidualT64R64 =
+    Fp8A8MmaSchedule<64, 64, 128, 2, 2, 2, 2, Cache::cg, Cache::cg,
+                     Fp8MmaFragmentPipeline::PingPong, Fp8MmaRaster::TokenFast, 1, 2>;
+using Fp8A8ResidualT64R128 =
+    Fp8A8MmaSchedule<64, 128, 128, 2, 4, 2, 1, Cache::cg, Cache::cg,
+                     Fp8MmaFragmentPipeline::PingPong, Fp8MmaRaster::TokenFast, 1, 2>;
+
 using Fp8A16TmaT32R64   = Fp8A16TmaMmaSchedule<32, 64, 1, 4, 6, 1>;
 using Fp8A16TmaT32R64S3 = Fp8A16TmaMmaSchedule<32, 64, 1, 4, 3, 2>;
 using Fp8A16TmaT32R128  = Fp8A16TmaMmaSchedule<32, 128, 1, 8, 4, 1>;

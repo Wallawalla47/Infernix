@@ -26,6 +26,9 @@ constexpr ReductionCriterion kGdnInputProjConvSnapshotA4Tolerance{0.16, 4.0e-3, 
 constexpr ReductionCriterion kFp8GdnInputProjConvSnapshotA16Tolerance{1.0 / 256.0, 1.0 / 256.0,
                                                                       2.0 / 256.0};
 constexpr ReductionCriterion kFp8GdnInputProjConvSnapshotA8Tolerance{0.04, 1.0 / 256.0, 0.06};
+// Two E4M3 terms put the A8 residual profile near A16; one term (A8's error) fails it.
+constexpr ReductionCriterion kFp8GdnInputProjConvSnapshotA8ResidualTolerance{1.0e-2, 1.0 / 256.0,
+                                                                             2.0e-2};
 
 constexpr std::int32_t kQueryRows = 2048;
 constexpr std::int32_t kKeyRows   = 2048;
@@ -1085,12 +1088,16 @@ int run_fp8_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearPol
                 parent.host, row, activation.data() + static_cast<std::size_t>(token) * kHidden,
                 kHidden);
         });
-    const bool uses_a8                  = policy == ops::LinearPolicy::AllowA8 && tokens >= 17;
-    const ReductionCriterion& criterion = uses_a8 ? kFp8GdnInputProjConvSnapshotA8Tolerance
-                                                  : kFp8GdnInputProjConvSnapshotA16Tolerance;
+    const bool uses_a8          = policy == ops::LinearPolicy::AllowA8 && tokens >= 17;
+    const bool uses_a8_residual = ops::allows_a8_residual(policy) && tokens >= 17;
+    const ReductionCriterion& criterion =
+        uses_a8            ? kFp8GdnInputProjConvSnapshotA8Tolerance
+        : uses_a8_residual ? kFp8GdnInputProjConvSnapshotA8ResidualTolerance
+                           : kFp8GdnInputProjConvSnapshotA16Tolerance;
     const std::string suffix =
-        std::string(" FP8 ") + (uses_a8 ? "A8" : "A16") + " T=" + std::to_string(tokens) +
-        " initial=" + std::to_string(initial_slot) + " base=" + std::to_string(snapshot_base_slot);
+        std::string(" FP8 ") + (uses_a8 ? "A8" : (uses_a8_residual ? "A8 residual" : "A16")) +
+        " T=" + std::to_string(tokens) + " initial=" + std::to_string(initial_slot) +
+        " base=" + std::to_string(snapshot_base_slot);
     const std::vector<std::uint16_t> state_after = state.bits();
     int failures =
         verify_snapshot_outputs(suffix, query, key, value, kValueRows, tokens, oracle, criterion);
@@ -1147,6 +1154,11 @@ int run_fp8() {
     failures += run_fp8_case(parent, 257, ops::LinearPolicy::AllowA8, 258);
     failures += run_fp8_case(parent, 512, ops::LinearPolicy::AllowA8, 513);
     failures += run_fp8_case(parent, 1025, ops::LinearPolicy::AllowA8, 1026);
+    // The A8 residual route: A16 below 17 columns, then its 32- and 64-token tiles.
+    failures += run_fp8_case(parent, 16, ops::LinearPolicy::AllowA8Residual, 17);
+    failures += run_fp8_case(parent, 17, ops::LinearPolicy::AllowA8Residual, 1);
+    failures += run_fp8_case(parent, 65, ops::LinearPolicy::AllowA8Residual, 66);
+    failures += run_fp8_case(parent, 97, ops::LinearPolicy::AllowA8Residual, 98);
 
     const auto run_batched = [&](std::int32_t width, std::int32_t batch,
                                  std::vector<std::int32_t> valid_columns, std::uint32_t seed) {

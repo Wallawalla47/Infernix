@@ -79,6 +79,7 @@ bool qwen4_exp_fast_path(FastPath path, const EngineOptions& options) {
     case FastPath::BatchedA8Decode:
     case FastPath::BatchedA4Decode:
     case FastPath::BatchedA4ResidualDecode:
+    case FastPath::BatchedA8ResidualDecode:
     case FastPath::BatchSplitAttention: return false;
     }
     return false;

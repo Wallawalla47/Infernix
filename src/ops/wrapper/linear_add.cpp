@@ -81,6 +81,7 @@ void validate_policy(LinearPolicy policy, QType qtype) {
     case LinearPolicy::AllowA4:
     case LinearPolicy::A16ColumnInvariant:
     case LinearPolicy::AllowA4Residual:
+    case LinearPolicy::AllowA8Residual:
         return;
     }
     throw std::invalid_argument("linear_add: invalid compute policy");

@@ -86,6 +86,12 @@ enum class FastPath : std::uint8_t {
     // (ops::LinearPolicy::AllowA4Residual). batched-a4-decode takes precedence. Without either they
     // stay at 16 bits.
     BatchedA4ResidualDecode,
+    // With batched-decode, wide decode and verify rounds (17+ columns) of the FP8 attention and GDN
+    // input projections and gate/up take the A8 residual profile where the artifact permits 8-bit
+    // activations: each token as two E4M3 terms, the second encoding what the first left
+    // (ops::LinearPolicy::AllowA8Residual); output and down projections stay at 16 bits.
+    // batched-a8-decode takes precedence. Without either they stay at 16 bits.
+    BatchedA8ResidualDecode,
     // Decode attention sizes each row's key partition from the round's batch. Without it a row's
     // partition depends only on its own keys.
     BatchSplitAttention,
@@ -102,12 +108,13 @@ enum class FastPath : std::uint8_t {
     Preemption,
 };
 
-inline constexpr std::array<FastPath, 10> kFastPaths{
+inline constexpr std::array<FastPath, 11> kFastPaths{
     FastPath::PromptPv8,           FastPath::DecodeSplit64,
     FastPath::BatchedDecode,       FastPath::BatchedA8Decode,
     FastPath::BatchedA4Decode,     FastPath::BatchedA4ResidualDecode,
-    FastPath::BatchSplitAttention, FastPath::AdaptiveSpeculation,
-    FastPath::FreeCacheResume,     FastPath::Preemption};
+    FastPath::BatchedA8ResidualDecode, FastPath::BatchSplitAttention,
+    FastPath::AdaptiveSpeculation, FastPath::FreeCacheResume,
+    FastPath::Preemption};
 
 [[nodiscard]] constexpr const char* fast_path_name(FastPath path) noexcept {
     switch (path) {
@@ -117,6 +124,7 @@ inline constexpr std::array<FastPath, 10> kFastPaths{
     case FastPath::BatchedA8Decode: return "batched-a8-decode";
     case FastPath::BatchedA4Decode: return "batched-a4-decode";
     case FastPath::BatchedA4ResidualDecode: return "batched-a4-residual-decode";
+    case FastPath::BatchedA8ResidualDecode: return "batched-a8-residual-decode";
     case FastPath::BatchSplitAttention: return "batch-split-attention";
     case FastPath::AdaptiveSpeculation: return "adaptive-speculation";
     case FastPath::FreeCacheResume: return "free-cache-resume";

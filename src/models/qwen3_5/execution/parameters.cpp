@@ -316,11 +316,12 @@ Parameters::Parameters(const Model& source) : model(source) {
     }
     if (column_invariant_text_supported(text)) {
         invariant_text = column_invariant_text(text);
-        for (const bool a8 : {false, true}) {
-            for (const auto [a4, a4_residual] : {std::pair{false, false}, std::pair{true, false},
-                                                 std::pair{false, true}}) {
-                precision_text[precision_index(a8, a4, a4_residual)] =
-                    precision_decode_text(text, a8, a4, a4_residual);
+        constexpr std::pair<bool, bool> kModes[] = {{false, false}, {true, false}, {false, true}};
+        for (const auto [a8, a8_residual] : kModes) {
+            for (const auto [a4, a4_residual] : kModes) {
+                const DecodePrecision precision{a8, a4, a8_residual, a4_residual};
+                precision_text[precision_index(precision)] =
+                    precision_decode_text(text, precision);
             }
         }
     }
@@ -344,20 +345,25 @@ bool invariant_head(const LinearParameters& p) {
 
 void make_invariant(LinearParameters& p) { p.policy = ops::LinearPolicy::A16ColumnInvariant; }
 
-// Keeps the projection's low-precision permission only where its format's class is permitted; an
-// NVFP4 projection permitted 4-bit activations takes the A4 residual profile with `a4_residual`.
-void limit_precision(LinearParameters& p, bool a8, bool a4, bool a4_residual = false) {
-    const bool keep = (p.weight.qtype == QType::FP8_E4M3FN_ROW_BF16 && a8) ||
-                      (p.weight.qtype == QType::NVFP4 && a4);
-    if (keep) { return; }
-    p.policy = p.weight.qtype == QType::NVFP4 && a4_residual && ops::allows_a4(p.policy)
-                   ? ops::LinearPolicy::AllowA4Residual
-                   : ops::LinearPolicy::A16Only;
+// Keeps the projection's low-precision permission only where its format's class is permitted; a
+// projection permitted its class's one-term activations may take its residual profile instead
+// (the NVFP4 one, `a4_residual_here`, is registered for the MLP only).
+void limit_precision(LinearParameters& p, DecodePrecision precision, bool a4_residual_here) {
+    const bool fp8   = p.weight.qtype == QType::FP8_E4M3FN_ROW_BF16;
+    const bool nvfp4 = p.weight.qtype == QType::NVFP4;
+    if ((fp8 && precision.a8) || (nvfp4 && precision.a4)) { return; }
+    if (fp8 && precision.a8_residual && ops::allows_a8(p.policy)) {
+        p.policy = ops::LinearPolicy::AllowA8Residual;
+    } else if (nvfp4 && a4_residual_here && precision.a4_residual && ops::allows_a4(p.policy)) {
+        p.policy = ops::LinearPolicy::AllowA4Residual;
+    } else {
+        p.policy = ops::LinearPolicy::A16Only;
+    }
 }
 
-void limit_precision(ops::ProjectionWeights& projection, bool a8, bool a4) {
+void limit_precision(ops::ProjectionWeights& projection, DecodePrecision precision) {
     if (auto* single = std::get_if<ops::SingleProjectionWeight>(&projection)) {
-        limit_precision(*single, a8, a4);
+        limit_precision(*single, precision, false);
     }
 }
 
@@ -418,21 +424,21 @@ TextParameters column_invariant_text(const TextParameters& text) {
     return out;
 }
 
-TextParameters precision_decode_text(const TextParameters& text, bool a8, bool a4,
-                                     bool a4_residual) {
+TextParameters precision_decode_text(const TextParameters& text, DecodePrecision precision) {
     TextParameters out = text;
-    limit_precision(out.output_head, a8, a4);
+    // The vocabulary head keeps 16-bit activations unless its class's one-term profile is on.
+    limit_precision(out.output_head, {precision.a8, precision.a4, false, false}, false);
     for (BlockParameters& block : out.layers) {
         auto& dense = std::get<DenseParameters>(block.ffn);
-        limit_precision(dense.gate_up, a8, a4, a4_residual);
-        limit_precision(dense.down, a8, a4, a4_residual);
+        limit_precision(dense.gate_up, precision, true);
+        limit_precision(dense.down, precision, true);
         if (auto* attention = std::get_if<AttentionParameters>(&block.mixer)) {
-            limit_precision(attention->projection, a8, a4);
-            limit_precision(attention->output, a8, a4);
+            limit_precision(attention->projection, precision);
+            limit_precision(attention->output, precision, false);
         } else {
             auto& gdn = std::get<GdnParameters>(block.mixer);
-            limit_precision(gdn.projection, a8, a4);
-            limit_precision(gdn.output, a8, a4);
+            limit_precision(gdn.projection, precision);
+            limit_precision(gdn.output, precision, false);
         }
     }
     return out;

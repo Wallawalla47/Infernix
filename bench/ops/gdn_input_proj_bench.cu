@@ -143,6 +143,8 @@ Options parse_options(int argc, char** argv) {
             const std::string_view value(next("--fp8-policy requires a value"));
             if (value == "a16")
                 options.fp8_policy = ops::LinearPolicy::A16Only;
+            else if (value == "a8r")
+                options.fp8_policy = ops::LinearPolicy::AllowA8Residual;
             else if (value == "a8")
                 options.fp8_policy = ops::LinearPolicy::AllowA8;
             else if (value == "invariant")
@@ -198,6 +200,10 @@ const char* policy_name(ops::LinearPolicy policy) {
         return "a8";
     case ops::LinearPolicy::AllowA4:
         return "a4";
+    case ops::LinearPolicy::AllowA4Residual:
+        return "a4r";
+    case ops::LinearPolicy::AllowA8Residual:
+        return "a8r";
     case ops::LinearPolicy::A16ColumnInvariant:
         return "invariant";
     }

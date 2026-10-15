@@ -118,6 +118,9 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
     // The column-invariant route: one schedule at every T, sliced beyond its widest tile.
     for (int columns : {1, 2, 5, 8, 9, 16, 17, 33, 40, 65, 129})
         invocations.push_back({columns, ops::LinearPolicy::A16ColumnInvariant});
+    // The A8 residual profile registers no route here: A16 at every width.
+    for (int columns : {first_a8 - 1, first_a8, 32, 33, 64, 65, 129})
+        invocations.push_back({columns, ops::LinearPolicy::AllowA8Residual});
     // Every wide A16 route and its boundaries, including the 257..384 return to 32-column tiles.
     for (int columns : {31,  32,  33,  63,  64,  65,  127, 128, 129, 191,
                         192, 193, 255, 256, 257, 383, 384, 385, 512, 1024})

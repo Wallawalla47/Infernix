@@ -28,6 +28,9 @@ void fp8_linear_swiglu_matrix_launch(const Tensor&, const Weight&, Tensor&, cuda
 void fp8_linear_swiglu_invariant_launch(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void fp8_linear_swiglu_a8_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                  WorkspaceArena& workspace, cudaStream_t stream);
+// AllowA8Residual: two E4M3 activation planes into two accumulators (MMA tiles).
+void fp8_linear_swiglu_a8_residual_launch(const Tensor& x, const Weight& weight, Tensor& out,
+                                          WorkspaceArena& workspace, cudaStream_t stream);
 
 void fp8_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& out,
                                 LinearPolicy policy, WorkspaceArena& workspace,

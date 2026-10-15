@@ -72,7 +72,13 @@ template <int Terms>
 using ResidualM32N64 = Nvfp4A4MmaSchedule<32, 64, 256, 2, 4, 3, 2, Cache::cg, Cache::cg, Terms>;
 template <int Terms>
 using ResidualM64N64 = Nvfp4A4MmaSchedule<64, 64, 256, 4, 2, 2, 2, Cache::cg, Cache::cg, Terms>;
+template <int Terms>
+using ResidualM64N128 = Nvfp4A4MmaSchedule<64, 128, 256, 4, 2, 2, 1, Cache::cg, Cache::cg, Terms>;
 
+// The 5,120 outputs give 64-row tiles only 80 CTAs per token tile: 32-token tiles keep 160 CTAs
+// to 64 columns (44-46 against 59-63 us at 40-64 for 64-token tiles), 64x64 tiles to 128 (67-71
+// against 94-120 us for 64x128 or 128x64), and 64x128 above (98-108 against 128-141 us at 160-256;
+// K=17408, RTX 5090).
 template <class Geometry, int Terms>
 void launch_residual_problem(const Weight& weight, Tensor& residual, Nvfp4A4Workspace workspace,
                              std::int32_t tokens, cudaStream_t stream) {
@@ -84,10 +90,12 @@ void launch_residual_problem(const Weight& weight, Tensor& residual, Nvfp4A4Work
             launch_gemm<Geometry, ResidualM16N64<Terms>>(weight, residual, workspace, tokens,
                                                          stream);
         }
-    } else if (tokens <= 32) {
+    } else if (tokens <= 64) {
         launch_gemm<Geometry, ResidualM32N64<Terms>>(weight, residual, workspace, tokens, stream);
-    } else {
+    } else if (tokens <= 128) {
         launch_gemm<Geometry, ResidualM64N64<Terms>>(weight, residual, workspace, tokens, stream);
+    } else {
+        launch_gemm<Geometry, ResidualM64N128<Terms>>(weight, residual, workspace, tokens, stream);
     }
 }
 

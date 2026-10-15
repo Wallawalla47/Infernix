@@ -32,6 +32,8 @@ constexpr ReductionCriterion kAttnInputProjA16Tolerance{2.9e-3, 4.0e-3, 4.5e-3};
 // attention-input implementations' reduction profile.
 constexpr ReductionCriterion kFp8AttnInputProjA16Tolerance{1.0 / 256.0, 1.0 / 256.0, 2.0 / 256.0};
 constexpr ReductionCriterion kAttnInputProjA8Tolerance{0.04, 1.0 / 256.0, 0.06};
+// Two E4M3 terms put the A8 residual profile near A16; one term (A8's error) fails it.
+constexpr ReductionCriterion kAttnInputProjA8ResidualTolerance{1.0e-2, 1.0 / 256.0, 2.0e-2};
 
 int verify_output(std::string_view label, const GuardedBf16Tensor& output,
                   const quantized_weight::PackedWeight& weight, std::int32_t weight_row_offset,
@@ -84,13 +86,15 @@ int run_target_projection_case(DevicePackedWeight& parent, DevicePackedWeight* g
     const auto q_weight = rows(first, 0, qrows), k_weight = rows(first, qrows, kvrows);
     const auto g_weight = rows(dual ? second : first, dual ? 0 : 7168, qrows);
     const auto v_weight = rows(dual ? second : first, dual ? 6144 : 13312, kvrows);
-    // A column-invariant Use is an A16 preparation whose execution policy the Model sets.
-    const ops::LinearPolicy use =
-        ops::column_invariant(policy) ? ops::LinearPolicy::A16Only : policy;
+    // A column-invariant or A8 residual Use is an A16 or A8 preparation whose execution policy
+    // the Model sets.
+    const ops::LinearPolicy use = ops::column_invariant(policy)       ? ops::LinearPolicy::A16Only
+                                  : ops::allows_a8_residual(policy) ? ops::LinearPolicy::AllowA8
+                                                                    : policy;
     auto prepared = ops::prepare_attn_input_proj_weights({q_weight, use}, {k_weight, use},
                                                          {g_weight, use}, {v_weight, use});
     if (auto* single = std::get_if<ops::SingleProjectionWeight>(&prepared);
-        single != nullptr && ops::column_invariant(policy)) {
+        single != nullptr && use != policy) {
         single->policy = policy;
     }
     const auto launch = [&] {
@@ -128,12 +132,15 @@ int run_target_projection_case(DevicePackedWeight& parent, DevicePackedWeight* g
         cuda_synchronize(device.stream);
         const bool a8 =
             policy == ops::LinearPolicy::AllowA8 || policy == ops::LinearPolicy::AllowA4;
-        const auto criterion     = dual ? kAttnInputProjA16Tolerance
-                                   : a8 ? kAttnInputProjA8Tolerance
-                                        : kFp8AttnInputProjA16Tolerance;
-        const int sample_count   = (a8 || replay) ? 31 : 7;
+        const bool a8_residual = ops::allows_a8_residual(policy) && tokens >= 17;
+        const auto criterion     = dual          ? kAttnInputProjA16Tolerance
+                                   : a8          ? kAttnInputProjA8Tolerance
+                                   : a8_residual ? kAttnInputProjA8ResidualTolerance
+                                                 : kFp8AttnInputProjA16Tolerance;
+        const int sample_count   = (a8 || a8_residual || replay) ? 31 : 7;
         const std::string suffix = std::string(dual ? " Q4/Q5" : " FP8") +
-                                   (a8 ? " allow-a8" : " a16") + " T=" + std::to_string(tokens) +
+                                   (a8 ? " allow-a8" : (a8_residual ? " a8-residual" : " a16")) +
+                                   " T=" + std::to_string(tokens) +
                                    " phase=" + std::to_string(phase);
         failures += verify_output("attn q" + suffix, query, parent.host, 0, qrows, activation,
                                   hidden, tokens, criterion, sample_count);
@@ -483,6 +490,23 @@ int run_fp8_target() {
         for (int t : {1,   4,   8,   16,  17,  32,  33,  64,  65,  96,  97,
                       128, 129, 192, 193, 288, 289, 385, 512, 513, 1025})
             failures += run_target_projection_case(parent, nullptr, t, policy, true);
+    }
+    // The A8 residual route: A16 below 17 columns, then its 32- and 64-token tiles and their edges.
+    {
+        constexpr auto kResidual = ops::LinearPolicy::AllowA8Residual;
+        std::size_t peak         = 0;
+        for (int t : {16, 17, 32, 33, 48, 64, 65, 96, 97, 128, 129, 192, 256, 257}) {
+            peak = std::max(peak, ops::attn_input_proj_workspace_capacity_bytes(
+                                      QType::FP8_E4M3FN_ROW_BF16, kRows, kHidden, kResidual, t, t));
+            failures += run_target_projection_case(parent, nullptr, t, kResidual);
+        }
+        if (ops::attn_input_proj_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16, kRows,
+                                                          kHidden, kResidual, 1, 257) != peak) {
+            std::cerr << "FP8 A8 residual attention projection workspace interval mismatch\n";
+            ++failures;
+        }
+        for (int t : {17, 65, 97})
+            failures += run_target_projection_case(parent, nullptr, t, kResidual, true);
     }
     // The column-invariant route: one schedule at every T, sliced beyond its widest tile.
     for (int t : {1, 2, 5, 8, 9, 16, 17, 33, 40, 65, 129})

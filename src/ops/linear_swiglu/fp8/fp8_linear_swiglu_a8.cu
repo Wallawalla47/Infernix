@@ -14,6 +14,25 @@ std::size_t fp8_linear_swiglu_partial_capacity_bytes(std::int32_t max_tokens) {
     return max_tokens > 256 ? Bulk::kPartialBytes : 0;
 }
 
+void fp8_linear_swiglu_a8_residual_launch(const Tensor& x, const Weight& weight, Tensor& out,
+                                          WorkspaceArena& workspace, cudaStream_t stream) {
+    auto scope         = workspace.scope();
+    const auto scratch = allocate_fp8_a8_workspace(workspace, x.ne[1], weight.k, 0, true);
+    launch_fp8_a8_quantize(x, weight, scratch, stream);
+    const auto launch = [&]<class Schedule>() {
+        using S = Fp8ScheduleInstance<Schedule, 5120>;
+        launch_fp8_a8_mma<S>(fp8_a8_operands(weight, scratch, x.ne[1]),
+                             LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), weight.n / 2},
+                             SwiGluTokenMajorMmaEpilogue{}, stream, SwiGluTokenMajorMmaRows<S>{});
+    };
+    // 32-token tiles to 32 columns and at 65-96 (four waves of 816 CTAs beat three of 544).
+    const std::int32_t tokens = x.ne[1];
+    if (tokens <= 32 || (tokens > 64 && tokens <= 96)) {
+        return launch.template operator()<Fp8A8ResidualT32R128>();
+    }
+    launch.template operator()<Fp8A8ResidualT64R128>();
+}
+
 void fp8_linear_swiglu_a8_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                  WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope         = workspace.scope();

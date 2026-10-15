@@ -14,6 +14,7 @@ enum class Fp8AttnInputRoute : std::uint8_t {
     ColumnInvariantA16,
     A16,
     A8,
+    A8Residual,
 };
 
 Fp8AttnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
@@ -21,6 +22,9 @@ Fp8AttnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (column_invariant(policy)) { return Fp8AttnInputRoute::ColumnInvariantA16; }
     if (policy == LinearPolicy::A16Only || allows_a4_residual(policy)) {
         return Fp8AttnInputRoute::A16;
+    }
+    if (allows_a8_residual(policy)) {
+        return tokens >= 17 ? Fp8AttnInputRoute::A8Residual : Fp8AttnInputRoute::A16;
     }
     if (!allows_a8(policy)) {
         throw std::invalid_argument("fp8 attn_input_proj: unsupported policy");
@@ -46,10 +50,17 @@ std::size_t fp8_attn_input_workspace_capacity_bytes(LinearPolicy policy, std::in
         throw std::invalid_argument("fp8 attn_input_proj workspace: invalid token interval");
     }
     (void)resolve_route(policy, min_tokens);
-    return resolve_route(policy, max_tokens) == Fp8AttnInputRoute::A8
-               ? fp8_a8_workspace_capacity_bytes(max_tokens, Fp8N14336K5120::kInputRows,
-                                                 fp8_attn_input_partial_capacity_bytes(max_tokens))
-               : 0;
+    switch (resolve_route(policy, max_tokens)) {
+    case Fp8AttnInputRoute::A8:
+        return fp8_a8_workspace_capacity_bytes(max_tokens, Fp8N14336K5120::kInputRows,
+                                               fp8_attn_input_partial_capacity_bytes(max_tokens));
+    case Fp8AttnInputRoute::A8Residual:
+        return fp8_a8_workspace_capacity_bytes(max_tokens, Fp8N14336K5120::kInputRows, 0, true);
+    case Fp8AttnInputRoute::ColumnInvariantA16:
+    case Fp8AttnInputRoute::A16:
+        break;
+    }
+    return 0;
 }
 
 void fp8_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
@@ -67,7 +78,13 @@ void fp8_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, T
     if (workspace == nullptr) {
         throw std::invalid_argument("fp8 A8 attn_input_proj requires caller workspace");
     }
-    auto scope                   = workspace->scope();
+    auto scope = workspace->scope();
+    if (route == Fp8AttnInputRoute::A8Residual) {
+        fp8_attn_input_a8_residual_launch(
+            x, weight, q, gate, k, v,
+            allocate_fp8_a8_workspace(*workspace, x.ne[1], weight.k, 0, true), stream);
+        return;
+    }
     const Fp8A8Workspace scratch = allocate_fp8_a8_workspace(
         *workspace, x.ne[1], weight.k, fp8_attn_input_partial_capacity_bytes(x.ne[1]));
     fp8_attn_input_a8_launch(x, weight, q, gate, k, v, scratch, stream);

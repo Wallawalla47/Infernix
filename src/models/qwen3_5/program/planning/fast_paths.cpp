@@ -57,6 +57,17 @@ constexpr std::array kQualified{
                   {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value}},
     Qualification{FastPath::BatchedA4ResidualDecode,
                   {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value}},
+    // Two-term A8 residual activations in the FP8 input projections' wide rounds: gated on INT8
+    // and NVFP4 KV (the least headroom), K8V4 and K4V2 by their bounds plus INT8's increment
+    // (2026-10-15).
+    Qualification{FastPath::BatchedA8ResidualDecode,
+                  {24, ActivationClass::A4, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::BatchedA8ResidualDecode,
+                  {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::BatchedA8ResidualDecode,
+                  {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::BatchedA8ResidualDecode,
+                  {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value}},
     // Preemption with Replay under a two-lane pool at concurrency 8 (2026-10-14).
     Qualification{FastPath::Preemption, {24, ActivationClass::A4, KvCacheStorage::Int8Group64}},
     Qualification{FastPath::Preemption, {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16}},
@@ -121,6 +132,7 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
     case FastPath::BatchSplitAttention:
     case FastPath::Preemption: return invariant_capable;
     case FastPath::BatchedA8Decode:
+    case FastPath::BatchedA8ResidualDecode:
         return invariant_capable && configuration.activations != ActivationClass::A16;
     case FastPath::BatchedA4Decode:
     case FastPath::BatchedA4ResidualDecode:

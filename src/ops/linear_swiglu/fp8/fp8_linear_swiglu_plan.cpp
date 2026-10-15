@@ -16,6 +16,7 @@ enum class Fp8LinearSwiGluRoute : std::uint8_t {
     ColumnInvariantA16,
     A16,
     A8,
+    A8Residual,
 };
 
 Fp8LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
@@ -23,6 +24,11 @@ Fp8LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (column_invariant(policy)) { return Fp8LinearSwiGluRoute::ColumnInvariantA16; }
     if (policy == LinearPolicy::A16Only || allows_a4_residual(policy)) {
         return Fp8LinearSwiGluRoute::A16;
+    }
+    if (allows_a8_residual(policy)) {
+        // Two E4M3 terms stream the same bytes as A16 below 17 columns and run slower there
+        // (111 against 107 us at 16, RTX 5090).
+        return tokens >= 17 ? Fp8LinearSwiGluRoute::A8Residual : Fp8LinearSwiGluRoute::A16;
     }
     if (!allows_a8(policy)) {
         throw std::invalid_argument("fp8 linear_swiglu admits only A16 or A8");
@@ -44,7 +50,9 @@ std::size_t fp8_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy, std:
         throw std::invalid_argument("fp8 linear_swiglu workspace: invalid token interval");
     }
     (void)resolve_route(policy, min_tokens);
-    (void)resolve_route(policy, max_tokens);
+    if (resolve_route(policy, max_tokens) == Fp8LinearSwiGluRoute::A8Residual) {
+        return fp8_a8_workspace_capacity_bytes(max_tokens, Fp8N34816K5120::kInputRows, 0, true);
+    }
     const bool interval_uses_a8 = allows_a8(policy) && max_tokens >= 5;
     return interval_uses_a8 ? fp8_a8_workspace_capacity_bytes(
                                   max_tokens, Fp8N34816K5120::kInputRows,
@@ -62,6 +70,10 @@ void fp8_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& o
     }
     if (route == Fp8LinearSwiGluRoute::A16) {
         launch_a16(x, weight, out, stream);
+        return;
+    }
+    if (route == Fp8LinearSwiGluRoute::A8Residual) {
+        fp8_linear_swiglu_a8_residual_launch(x, weight, out, workspace, stream);
         return;
     }
     fp8_linear_swiglu_a8_launch(x, weight, out, workspace, stream);

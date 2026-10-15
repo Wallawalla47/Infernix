@@ -290,6 +290,7 @@ void validate_policy(LinearPolicy policy, QType qtype) {
     case LinearPolicy::AllowA4:
     case LinearPolicy::A16ColumnInvariant:
     case LinearPolicy::AllowA4Residual:
+    case LinearPolicy::AllowA8Residual:
         return;
     }
     throw std::invalid_argument("gdn_input_proj: invalid compute policy");

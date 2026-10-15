@@ -76,7 +76,7 @@ int main() {
     }
     // Low-precision batched decode needs an artifact whose activations go below 16 bits.
     for (const FastPath path : {FastPath::BatchedA8Decode, FastPath::BatchedA4Decode,
-                                FastPath::BatchedA4ResidualDecode}) {
+                                FastPath::BatchedA4ResidualDecode, FastPath::BatchedA8ResidualDecode}) {
         failures += check(!q::fast_path_applies(path,
                                                 {24, ActivationClass::A16, KvCacheStorage::Int8Group64},
                                                 options, true),
@@ -111,19 +111,21 @@ int main() {
                           !q::couples_requests(FastPath::DecodeSplit64),
                       "prompt-pv8 and decode-split64 do not couple requests");
 
-    // The request-coupling paths and the A4 residual route are qualified on the four measured KV
-    // formats (4-bit activations); the one-term 4-bit path failed the decode gate.
+    // The request-coupling paths and both residual routes are qualified on the four measured KV
+    // formats (4-bit activations); the one-term 4- and 8-bit paths failed the decode gate.
     for (const auto kv : {KvCacheStorage::Int8Group64, KvCacheStorage::Nvfp4Group16,
                           KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Q4KeyVq2Value}) {
-        for (const FastPath path : {FastPath::BatchedDecode, FastPath::BatchedA4ResidualDecode,
-                                    FastPath::BatchSplitAttention, FastPath::AdaptiveSpeculation,
-                                    FastPath::FreeCacheResume, FastPath::Preemption}) {
+        for (const FastPath path :
+             {FastPath::BatchedDecode, FastPath::BatchedA4ResidualDecode,
+              FastPath::BatchedA8ResidualDecode, FastPath::BatchSplitAttention,
+              FastPath::AdaptiveSpeculation, FastPath::FreeCacheResume, FastPath::Preemption}) {
             failures += check(q::fast_path_qualified(path, {24, ActivationClass::A4, kv}),
                               std::string(infernix::fast_path_name(path)) + " is qualified");
         }
-        failures += check(!q::fast_path_qualified(FastPath::BatchedA4Decode,
-                                                  {24, ActivationClass::A4, kv}),
-                          "batched-a4-decode is not qualified");
+        for (const FastPath path : {FastPath::BatchedA4Decode, FastPath::BatchedA8Decode}) {
+            failures += check(!q::fast_path_qualified(path, {24, ActivationClass::A4, kv}),
+                              std::string(infernix::fast_path_name(path)) + " is not qualified");
+        }
     }
     failures += check(!q::fast_path_qualified(FastPath::BatchedDecode,
                                               {24, ActivationClass::A4, KvCacheStorage::Vq2}),
