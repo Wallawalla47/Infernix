@@ -713,13 +713,13 @@ configurations).
 |---|---|---|
 | `decode-split64` | INT8 KV, 24 query heads | 24 heads, 4-bit activations, INT8 KV |
 | `prompt-pv8` | INT8 KV (fast prompt kernel), NVFP4 KV (fast kernel), K8V4, VQ2, K4V2 KV | 24 heads, 4-bit activations, with INT8, NVFP4, K8V4, VQ2 or K4V2 KV |
-| `batched-decode`, `batch-split-attention` | request-invariance-capable artifacts | 24 heads, 4-bit activations, with INT8, NVFP4, K8V4 or K4V2 KV |
+| `batched-decode`, `batch-split-attention` | request-invariance-capable artifacts | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
 | `batched-a8-decode`, `batched-a4-decode` | the same, with 8-bit (FP8) or 4-bit (NVFP4) activations | none (each fails, below) |
-| `batched-a4-residual-decode` | the same, with 4-bit (NVFP4) MLP activations | 24 heads, 4-bit activations, with INT8, NVFP4, K8V4 or K4V2 KV |
-| `batched-a8-residual-decode` | the same, with 8-bit (FP8) input-projection activations | 24 heads, 4-bit activations, with INT8, NVFP4, K8V4 or K4V2 KV |
-| `adaptive-speculation` | the same, with speculative decoding | 24 heads, 4-bit activations, with INT8, NVFP4, K8V4 or K4V2 KV |
-| `free-cache-resume` | the same, with the prefix cache | 24 heads, 4-bit activations, with INT8, NVFP4, K8V4 or K4V2 KV |
-| `preemption` | request-invariance-capable artifacts | 24 heads, 4-bit activations, with INT8, NVFP4, K8V4 or K4V2 KV |
+| `batched-a4-residual-decode` | the same, with 4-bit (NVFP4) MLP activations | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
+| `batched-a8-residual-decode` | the same, with 8-bit (FP8) input-projection activations | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
+| `adaptive-speculation` | the same, with speculative decoding | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
+| `free-cache-resume` | the same, with the prefix cache | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
+| `preemption` | request-invariance-capable artifacts | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
 | Qwen3.8-Flash-Next: `adaptive-speculation` (MTP), `free-cache-resume`, `preemption` | every Flash-Next artifact | INT8 KV |
 | Qwen3.8-Flash-Next: `q8-sliced-k`, `gdn-conv-fused`, `qsa-prepare-fused` | Q8 dense weights (`qsa-prepare-fused`: BF16, INT8, FP8, NVFP4 or K8V4 KV) | Q8 dense, 4-bit experts, INT8 KV |
 | `fp8-a8-pair` | row-FP8 dense weights (recipe C) | none (op level only, below) |
@@ -837,8 +837,8 @@ closest bound is 27B NVFP4 spec's top-1 at 82 % of its budget. Speed (official 2
 prompt, 256 output tokens, three rounds; the qualified set against the exact route): plain decode
 81.83 vs 73.17 tok/s at one request (+11.8 %), +11.0 % at two, +6.9 % at four and +0.3 % at eight
 (the 4- and 8-bit activations the old route used there are not qualified); DFlash2 with n-gram
-copies 853 vs 523 tok/s at two requests (+63 %) and 583 vs 329 at four (+77 %). VQ2, BF16 and FP8
-KV were not measured, so they run request-invariant by default.
+copies 853 vs 523 tok/s at two requests (+63 %) and 583 vs 329 at four (+77 %). VQ2, BF16 and
+FP8 KV were qualified later (below).
 
 **`batched-a4-residual-decode`** (2026-10-14, the same artifact, corpus and arms): two NVFP4 terms
 per column, from 9 columns in the MLP. Its op error against the 16-bit oracle is 0.9 % relative L2
@@ -898,6 +898,63 @@ choice halves one-term op error (gate/up 9.8 to 5.0 %, down 7-9 to 5-7 % relativ
 ran 1,944, 1,575 and 1,109 tok/s with two-term A8 (+1.5, +1.7 and +7.2 %), but it fails the INT8
 spec arm: TV excess 1.14e-2 (bound 1.20e-2) against 2.4e-3 and top-1 +1.17 points against 0.22,
 about two thirds of what one-term A4 in the whole MLP adds.
+
+**What else was tried for wide rounds** (2026-10-15, the same artifact):
+- Two-term NVFP4 MMA tiles at 65-128 columns with 32x64 warp tiles (one weight fragment feeding
+  both terms of two token fragments), with 128-wide K stages three deep, or with both: none beat
+  the tiles above by more than 2 % (gate/up 129.6-136.4 against 131.7-135.8 us at 97-128 columns,
+  slower at 65-96; down no faster).
+- The warp-specialized TMA route with two activation planes (three 128-K stages over one
+  128-token tile, which the MMA tile's shared memory held one of) takes gate/up at 97-128
+  columns: 101-103 against 128-138 us, with identical op error at every width (the same K order
+  per output). DFlash2 with n-gram copies ran 1,051 against 1,025 tok/s at four requests (+2.5 %,
+  within one run-to-run standard deviation of 28-30) and 1,534 against 1,538 at two.
+- Two-term FP8 input projections take 32x128 tiles at 65-104 columns (attention: 58-62 against
+  78-83 us at 65-96, 89-91 against 105 at 97-104) and at 65-96 (GDN: 87-91 against 91-99), with
+  identical op error at every width. End to end nothing measurable changed at two and four
+  requests (1,551 and 1,037 against 1,548 and 1,034 tok/s; their rounds are rarely that wide).
+- A per-token activation scale for one-term A4 (no clipping, the widest E4M3 range). On real
+  activations (DFlash2 with n-gram copies, four requests) the artifact's static scale leaves no
+  block subnormal and clips 0.046 % of gate/up blocks (all but five by at most 2x) and 0.001 % of
+  down blocks. Removing the clipping with a 4x or 16x wider static range moves one-term A4's INT8
+  spec TV excess from 1.73e-2 to 1.72e-2 and 1.68e-2 and its top-1 excess from +2.02 to +1.92 and
+  +1.86 points, against 2.4e-3 and 0.22: one-term's failure is the 4-bit grid itself, so the
+  per-token scale was not built.
+
+**VQ2 KV** (2026-10-15, the same artifact, corpus and arms; 1,024 segments): the exact route is
+request-invariant there (96 segments bit-identical at concurrency 8, under DFlash2 with n-gram
+copies at 4, resuming from a warm request, and under the two-lane pool), and every path that acts
+passes jointly in each arm (the fast run paused and replayed 342 times in the preemption arm).
+Its NLL excess is the largest of any format (2.8-7.4e-3, the cache arm's at 76 % of its budget):
+
+| 27B, VQ2 | TV excess (bound) / budget | Top-1 excess, points (bound) / budget | KL excess / cap | NLL excess / budget |
+|---|---|---|---|---|
+| plain | 1.6e-4 (5.7e-4) / 3.0e-3 | -0.00 (0.11) / 0.28 | 2.6e-3 / 9.7e-3 | 5.1e-3 / 9.7e-3 |
+| spec | 4.7e-4 (9.0e-4) / 3.0e-3 | +0.02 (0.14) / 0.28 | 3.7e-3 / 9.7e-3 | 4.5e-3 / 9.7e-3 |
+| cache | 1.1e-4 (4.9e-4) / 3.0e-3 | -0.05 (0.06) / 0.28 | -1.2e-4 / 9.7e-3 | 7.4e-3 / 9.7e-3 |
+| preemption | 2.6e-4 (6.8e-4) / 3.0e-3 | -0.04 (0.07) / 0.28 | 1.8e-3 / 9.7e-3 | 2.8e-3 / 9.7e-3 |
+
+**BF16 and FP8 KV** (2026-10-15, the same artifact, corpus and paths), shortened at the user's
+request: 512 segments (the first 512 of the same reference; bounds about 1.4 times wider than at
+1,024) and no separate plain arm (the preemption arm runs eight requests per round as well). The
+exact route is request-invariant on both (96 segments bit-identical under DFlash2 with n-gram
+copies at 4, resuming from a warm request, and under the two-lane pool). Every arm passes, but
+these formats' low floors make the KL and NLL budgets tight (2.4-2.5e-3), and the cache arm sits
+close to them on point estimates whose 95 % bounds exceed the budget (BF16 KL 2.34e-3 of 2.47e-3,
+FP8 NLL 2.345e-3 of 2.359e-3) while its TV excess is nil: a 1,024-segment cache arm would settle
+whether `free-cache-resume` keeps that margin.
+
+| 27B, KV | Arm | TV excess (bound) / budget | Top-1 excess, points (bound) / budget | KL excess / cap | NLL excess / budget |
+|---|---|---|---|---|---|
+| BF16 | spec | 1.8e-4 (2.9e-4) / 2.3e-3 | +0.03 (0.11) / 0.21 | 6.0e-5 / 2.5e-3 | 1.0e-3 / 2.5e-3 |
+| BF16 | cache | -0.9e-5 (1.8e-4) / 2.3e-3 | +0.03 (0.12) / 0.21 | 2.3e-3 / 2.5e-3 | 2.1e-3 / 2.5e-3 |
+| BF16 | preemption | -1.1e-4 (4.4e-5) / 2.3e-3 | -0.04 (0.03) / 0.21 | 3.8e-6 / 2.5e-3 | 3.1e-5 / 2.5e-3 |
+| FP8 | spec | 3.0e-4 (4.2e-4) / 2.4e-3 | -0.09 (-0.00) / 0.22 | 2.0e-3 / 2.4e-3 | -7.7e-5 / 2.4e-3 |
+| FP8 | cache | -0.0e-5 (1.6e-4) / 2.4e-3 | -0.04 (0.06) / 0.22 | 1.2e-3 / 2.4e-3 | 2.3e-3 / 2.4e-3 |
+| FP8 | preemption | -2.2e-5 (9.7e-5) / 2.4e-3 | +0.01 (0.09) / 0.22 | 1.8e-3 / 2.4e-3 | -1.1e-3 / 2.4e-3 |
+
+The preemption arms paused and replayed 85 (BF16) and 170 (FP8) times. With BF16 the default KV
+of the CLI and server, the default route now runs the qualified fast paths.
 
 **Qualification.** These act only above one request, so the decode gate runs them with
 `--concurrency`, `--kv-tokens` (a short pool), or `--prefix-reuse --warm-tokens` (an off-grid

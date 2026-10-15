@@ -65,25 +65,65 @@ nvfp4_make_tma_2d(void* address, CUtensorMapDataType data_type, std::uint64_t co
     return map;
 }
 
+// A stack of 2D planes [planes][rows][columns] at a byte stride between planes, one plane per box.
+inline CUtensorMap nvfp4_make_tma_planes(void* address, std::uint64_t columns, std::uint64_t rows,
+                                         std::uint64_t row_stride_bytes, std::uint64_t planes,
+                                         std::uint64_t plane_stride_bytes,
+                                         std::uint32_t box_columns, std::uint32_t box_rows,
+                                         CUtensorMapSwizzle swizzle, const char* operation) {
+    CUtensorMap map{};
+    const std::uint64_t global_dim[]     = {columns, rows, planes};
+    const std::uint64_t global_stride[]  = {row_stride_bytes, plane_stride_bytes};
+    const std::uint32_t box_dim[]        = {box_columns, box_rows, 1};
+    const std::uint32_t element_stride[] = {1, 1, 1};
+    nvfp4_check_driver(cuTensorMapEncodeTiled(&map, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3, address,
+                                              global_dim, global_stride, box_dim, element_stride,
+                                              CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle,
+                                              CU_TENSOR_MAP_L2_PROMOTION_NONE,
+                                              CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE),
+                       operation);
+    return map;
+}
+
 template <class Schedule, class Rows>
 Nvfp4A4TmaDescriptors make_nvfp4_a4_tma_descriptors(const Nvfp4A4Operands& p) {
     constexpr int tile      = Schedule::kBlockTokens;
     constexpr int code_rows = Rows::kPaired ? Schedule::kBlockRows / 2 : Schedule::kBlockRows;
+    const std::uint64_t scale_rows =
+        static_cast<std::uint64_t>(nvfp4_a4_padded_tokens(p.tokens, Schedule::kScaleLayout) /
+                                   tile) *
+        (p.k / 256) * 16;
     Nvfp4A4TmaDescriptors d{};
-    d.a_codes = nvfp4_make_tma_2d(const_cast<std::uint8_t*>(p.x), CU_TENSOR_MAP_DATA_TYPE_UINT8,
-                                  p.k / 2, p.tokens, p.k / 2, 64, tile, CU_TENSOR_MAP_SWIZZLE_64B,
-                                  "encode activation codes TMA");
+    if constexpr (Schedule::kTerms > 1) {
+        // The residual planes: a token past the call reads zeroes, as in one plane.
+        if (p.terms != Schedule::kTerms ||
+            p.code_plane < static_cast<std::int64_t>(p.tokens) * (p.k / 2) ||
+            p.scale_plane < static_cast<std::int64_t>(scale_rows) * tile) {
+            throw std::invalid_argument("NVFP4 TMA residual planes do not match the call");
+        }
+        d.a_codes  = nvfp4_make_tma_planes(const_cast<std::uint8_t*>(p.x), p.k / 2, p.tokens,
+                                           p.k / 2, Schedule::kTerms, p.code_plane, 64, tile,
+                                           CU_TENSOR_MAP_SWIZZLE_64B,
+                                           "encode residual activation codes TMA");
+        d.a_scales = nvfp4_make_tma_planes(const_cast<std::uint8_t*>(p.x_scales), tile, scale_rows,
+                                           tile, Schedule::kTerms, p.scale_plane, tile, 16,
+                                           CU_TENSOR_MAP_SWIZZLE_NONE,
+                                           "encode residual activation scales TMA");
+    } else {
+        d.a_codes = nvfp4_make_tma_2d(const_cast<std::uint8_t*>(p.x),
+                                      CU_TENSOR_MAP_DATA_TYPE_UINT8, p.k / 2, p.tokens, p.k / 2,
+                                      64, tile, CU_TENSOR_MAP_SWIZZLE_64B,
+                                      "encode activation codes TMA");
+        // The quantizer and descriptor agree on both token and group tile dimensions.
+        d.a_scales = nvfp4_make_tma_2d(const_cast<std::uint8_t*>(p.x_scales),
+                                       CU_TENSOR_MAP_DATA_TYPE_UINT8, tile, scale_rows, tile, tile,
+                                       16, CU_TENSOR_MAP_SWIZZLE_NONE,
+                                       "encode activation scales TMA");
+    }
     d.b_codes =
         nvfp4_make_tma_2d(const_cast<std::uint8_t*>(p.codes), CU_TENSOR_MAP_DATA_TYPE_UINT8,
                           p.k / 2, p.rows, p.k / 2, 64, code_rows, CU_TENSOR_MAP_SWIZZLE_64B,
                           "encode weight codes TMA", Schedule::kWeightCodePromotion);
-    // The quantizer and descriptor agree on both token and group tile dimensions.
-    d.a_scales = nvfp4_make_tma_2d(
-        const_cast<std::uint8_t*>(p.x_scales), CU_TENSOR_MAP_DATA_TYPE_UINT8, tile,
-        static_cast<std::uint64_t>(nvfp4_a4_padded_tokens(p.tokens, Schedule::kScaleLayout) /
-                                   tile) *
-            (p.k / 256) * 16,
-        tile, tile, 16, CU_TENSOR_MAP_SWIZZLE_NONE, "encode activation scales TMA");
     d.b_scales =
         nvfp4_make_tma_2d(const_cast<std::uint8_t*>(p.scales), CU_TENSOR_MAP_DATA_TYPE_UINT8, 16,
                           static_cast<std::uint64_t>(p.rows) * p.k / 256, 16, 16, 64,
@@ -91,14 +131,16 @@ Nvfp4A4TmaDescriptors make_nvfp4_a4_tma_descriptors(const Nvfp4A4Operands& p) {
     return d;
 }
 
+// The activation buffers hold kTerms planes of kBlockTokens rows each, plane after plane.
 template <class Schedule, class Rows>
 struct Nvfp4A4TmaTensorStorage {
+    static constexpr int kActivationRows = Schedule::kTerms * Schedule::kBlockTokens;
     alignas(128)
-        std::uint8_t a_codes[Schedule::kStages][Schedule::kBlockTokens * Schedule::kCodeRowBytes];
+        std::uint8_t a_codes[Schedule::kStages][kActivationRows * Schedule::kCodeRowBytes];
     alignas(128)
         std::uint8_t b_codes[Schedule::kStages][Schedule::kBlockRows * Schedule::kCodeRowBytes];
     alignas(16) std::uint32_t
-        a_scale4[Schedule::kScaleSlots][Schedule::kBlockTokens * Schedule::kScaleWordsPerRow];
+        a_scale4[Schedule::kScaleSlots][kActivationRows * Schedule::kScaleWordsPerRow];
     alignas(16) std::uint8_t b_scales[Schedule::kStages][Rows::kPaired ? 2 : 1]
                                      [Schedule::kBlockRows * Schedule::kK64PerStage * 4];
 };
@@ -148,6 +190,32 @@ __device__ __forceinline__ void nvfp4_tma_load_2d(void* destination, const CUten
                  : "r"(smem_addr(destination)), "l"(descriptor), "r"(coordinate0), "r"(coordinate1),
                    "r"(smem_addr(barrier))
                  : "memory");
+}
+
+__device__ __forceinline__ void nvfp4_tma_load_3d(void* destination, const CUtensorMap* descriptor,
+                                                  std::int32_t coordinate0,
+                                                  std::int32_t coordinate1,
+                                                  std::int32_t coordinate2,
+                                                  std::uint64_t* barrier) {
+    asm volatile("cp.async.bulk.tensor.3d.shared::cta.global.tile.mbarrier::complete_tx::bytes "
+                 "[%0], [%1, {%2, %3, %4}], [%5];"
+                 :
+                 : "r"(smem_addr(destination)), "l"(descriptor), "r"(coordinate0), "r"(coordinate1),
+                   "r"(coordinate2), "r"(smem_addr(barrier))
+                 : "memory");
+}
+
+// One activation box of plane `term` (a 2D map when the schedule has one plane).
+template <class Schedule>
+__device__ __forceinline__ void nvfp4_tma_load_activation(void* destination,
+                                                          const CUtensorMap* descriptor,
+                                                          std::int32_t column, std::int32_t row,
+                                                          int term, std::uint64_t* barrier) {
+    if constexpr (Schedule::kTerms > 1) {
+        nvfp4_tma_load_3d(destination, descriptor, column, row, term, barrier);
+    } else {
+        nvfp4_tma_load_2d(destination, descriptor, column, row, barrier);
+    }
 }
 
 template <class Schedule, class Epilogue, class OutputPolicy, class Rows>
@@ -213,9 +281,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_t
                 const std::uint32_t empty_phase = 1U ^ ((k_tile / Schedule::kStages) & 1U);
                 cta_mbarrier_wait(&shared.empty[stage], empty_phase);
                 constexpr std::uint32_t kScaleBytes =
-                    Schedule::kBlockTokens * Schedule::kScaleWordsPerRow * 4;
+                    Schedule::kTerms * Schedule::kBlockTokens * Schedule::kScaleWordsPerRow * 4;
                 constexpr std::uint32_t kTransactionBytes =
-                    Schedule::kBlockTokens * Schedule::kCodeRowBytes +
+                    Schedule::kTerms * Schedule::kBlockTokens * Schedule::kCodeRowBytes +
                     Schedule::kBlockRows * Schedule::kCodeRowBytes + kScaleBytes +
                     branches * Schedule::kBlockRows * Schedule::kK64PerStage * 4;
                 // A scale tile covers kNvfp4ScaleTileGroups groups, which is two K tiles, so the
@@ -227,9 +295,13 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_t
                                                           : kTransactionBytes - kScaleBytes);
 
                 auto& tensors = shared.scratch.tensors;
-                nvfp4_tma_load_2d(tensors.a_codes[stage], &descriptors.a_codes,
-                                  k_tile * Schedule::kCodeRowBytes, token_begin,
-                                  &shared.full[stage]);
+#pragma unroll
+                for (int term = 0; term < Schedule::kTerms; ++term)
+                    nvfp4_tma_load_activation<Schedule>(
+                        tensors.a_codes[stage] +
+                            term * Schedule::kBlockTokens * Schedule::kCodeRowBytes,
+                        &descriptors.a_codes, k_tile * Schedule::kCodeRowBytes, token_begin, term,
+                        &shared.full[stage]);
 #pragma unroll
                 for (int branch = 0; branch < branches; ++branch)
                     nvfp4_tma_load_2d(tensors.b_codes[stage] +
@@ -242,9 +314,12 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_t
                     const int kScaleTilesPerPlane = K / 256;
                     const int scale_tile =
                         (token_begin / Schedule::kBlockTokens) * kScaleTilesPerPlane + k_tile / 2;
-                    nvfp4_tma_load_2d(tensors.a_scale4[(k_tile / 2) % Schedule::kScaleSlots],
-                                      &descriptors.a_scales, 0, scale_tile * 16,
-                                      &shared.full[stage]);
+#pragma unroll
+                    for (int term = 0; term < Schedule::kTerms; ++term)
+                        nvfp4_tma_load_activation<Schedule>(
+                            tensors.a_scale4[(k_tile / 2) % Schedule::kScaleSlots] +
+                                term * Schedule::kBlockTokens * Schedule::kScaleWordsPerRow,
+                            &descriptors.a_scales, 0, scale_tile * 16, term, &shared.full[stage]);
                 }
 #pragma unroll
                 for (int branch = 0; branch < branches; ++branch) {
@@ -287,26 +362,34 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_t
 
 #pragma unroll
         for (int local_k64 = 0; local_k64 < Schedule::kK64PerStage; ++local_k64) {
-            unsigned a_fragments[Schedule::kMmaTokens][4];
+            unsigned a_fragments[Schedule::kTerms][Schedule::kMmaTokens][4];
             unsigned b_fragments[Schedule::kMmaRows][2];
-            unsigned a_scales[Schedule::kMmaTokens];
+            unsigned a_scales[Schedule::kTerms][Schedule::kMmaTokens];
             unsigned b_scales[Schedule::kMmaRows];
 
 #pragma unroll
-            for (int mma_m = 0; mma_m < Schedule::kMmaTokens; ++mma_m) {
-                const int row          = warp_m * Schedule::kWarpTokens + mma_m * 16 + a_row_offset;
-                const int logical_byte = local_k64 * 32 + a_column_byte;
-                const int physical_byte =
-                    ((logical_byte >> 4) ^ ((row >> 1) & 3)) * 16 + (logical_byte & 15);
-                const auto* address =
-                    tensors.a_codes[stage] + row * Schedule::kCodeRowBytes + physical_byte;
-                ldmatrix_x4(a_fragments[mma_m][0], a_fragments[mma_m][1], a_fragments[mma_m][2],
-                            a_fragments[mma_m][3], smem_addr(address));
-                const int scale_row = warp_m * Schedule::kWarpTokens + mma_m * 16 + sfa_row;
-                a_scales[mma_m] =
-                    tensors.a_scale4[(k_tile / 2) % Schedule::kScaleSlots]
-                                    [scale_row * Schedule::kScaleWordsPerRow +
-                                     (k_tile & 1) * Schedule::kK64PerStage + local_k64];
+            for (int term = 0; term < Schedule::kTerms; ++term) {
+#pragma unroll
+                for (int mma_m = 0; mma_m < Schedule::kMmaTokens; ++mma_m) {
+                    // Each plane is its own box at a multiple of the swizzle period, so the row
+                    // across planes keeps the box's swizzle phase.
+                    const int plane_row = term * Schedule::kBlockTokens +
+                                          warp_m * Schedule::kWarpTokens + mma_m * 16;
+                    const int row          = plane_row + a_row_offset;
+                    const int logical_byte = local_k64 * 32 + a_column_byte;
+                    const int physical_byte =
+                        ((logical_byte >> 4) ^ ((row >> 1) & 3)) * 16 + (logical_byte & 15);
+                    const auto* address =
+                        tensors.a_codes[stage] + row * Schedule::kCodeRowBytes + physical_byte;
+                    ldmatrix_x4(a_fragments[term][mma_m][0], a_fragments[term][mma_m][1],
+                                a_fragments[term][mma_m][2], a_fragments[term][mma_m][3],
+                                smem_addr(address));
+                    const int scale_row = plane_row + sfa_row;
+                    a_scales[term][mma_m] =
+                        tensors.a_scale4[(k_tile / 2) % Schedule::kScaleSlots]
+                                        [scale_row * Schedule::kScaleWordsPerRow +
+                                         (k_tile & 1) * Schedule::kK64PerStage + local_k64];
+                }
             }
 
 #pragma unroll
@@ -331,12 +414,16 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_t
             for (int mma_m = 0; mma_m < Schedule::kMmaTokens; ++mma_m) {
 #pragma unroll
                 for (int mma_n = 0; mma_n < Schedule::kMmaRows; ++mma_n) {
-                    mma_nvfp4_e4m3(accumulators[mma_m][mma_n][0], accumulators[mma_m][mma_n][1],
-                                   accumulators[mma_m][mma_n][2], accumulators[mma_m][mma_n][3],
-                                   a_fragments[mma_m][0], a_fragments[mma_m][1],
-                                   a_fragments[mma_m][2], a_fragments[mma_m][3],
-                                   b_fragments[mma_n][0], b_fragments[mma_n][1], a_scales[mma_m],
-                                   b_scales[mma_n]);
+#pragma unroll
+                    for (int term = 0; term < Schedule::kTerms; ++term) {
+                        const unsigned(&a)[4] = a_fragments[term][mma_m];
+                        mma_nvfp4_e4m3(accumulators[mma_m][mma_n][0],
+                                       accumulators[mma_m][mma_n][1],
+                                       accumulators[mma_m][mma_n][2],
+                                       accumulators[mma_m][mma_n][3], a[0], a[1], a[2], a[3],
+                                       b_fragments[mma_n][0], b_fragments[mma_n][1],
+                                       a_scales[term][mma_m], b_scales[mma_n]);
+                    }
                 }
             }
         }

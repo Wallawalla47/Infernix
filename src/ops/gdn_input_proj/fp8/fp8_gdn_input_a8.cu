@@ -25,9 +25,11 @@ void fp8_gdn_input_a8_residual_launch(const Tensor& x, const Weight& weight, Ten
         launch_fp8_a8_mma<Fp8ScheduleInstance<Schedule, 5120>>(
             fp8_a8_operands(weight, workspace, x.ne[1]), output, LinearIdentityEpilogue{}, stream);
     };
+    // 32x128 tiles at 65-96 run 87-91 against 91-99 us for 64x64 (RTX 5090).
     const std::int32_t tokens = x.ne[1];
     if (tokens <= 32) return launch.template operator()<Fp8A8ResidualT32R64>();
-    if (tokens <= 96) return launch.template operator()<Fp8A8ResidualT64R64>();
+    if (tokens <= 64) return launch.template operator()<Fp8A8ResidualT64R64>();
+    if (tokens <= 96) return launch.template operator()<Fp8A8ResidualT32R128>();
     launch.template operator()<Fp8A8ResidualT64R128>();
 }
 

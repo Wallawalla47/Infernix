@@ -80,6 +80,37 @@ constexpr std::array kQualified{
     Qualification{FastPath::Preemption, {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16}},
     Qualification{FastPath::Preemption, {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value}},
     Qualification{FastPath::Preemption, {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value}},
+    // VQ2 KV: every request-coupling path and both residual profiles, jointly in the plain, spec,
+    // cache and preemption arms (2026-10-15).
+    Qualification{FastPath::BatchedDecode, {24, ActivationClass::A4, KvCacheStorage::Vq2}},
+    Qualification{FastPath::BatchSplitAttention, {24, ActivationClass::A4, KvCacheStorage::Vq2}},
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A4, KvCacheStorage::Vq2}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A4, KvCacheStorage::Vq2}},
+    Qualification{FastPath::BatchedA4ResidualDecode, {24, ActivationClass::A4, KvCacheStorage::Vq2}},
+    Qualification{FastPath::BatchedA8ResidualDecode, {24, ActivationClass::A4, KvCacheStorage::Vq2}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A4, KvCacheStorage::Vq2}},
+    // BF16 and FP8 KV: the same paths, jointly in the spec, cache and preemption arms at 512
+    // segments (the preemption arm also covers eight requests per round; 2026-10-15).
+    Qualification{FastPath::BatchedDecode, {24, ActivationClass::A4, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::BatchSplitAttention, {24, ActivationClass::A4, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A4, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A4, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::BatchedA4ResidualDecode,
+                  {24, ActivationClass::A4, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::BatchedA8ResidualDecode,
+                  {24, ActivationClass::A4, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A4, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::BatchedDecode, {24, ActivationClass::A4, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::BatchSplitAttention,
+                  {24, ActivationClass::A4, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::AdaptiveSpeculation,
+                  {24, ActivationClass::A4, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A4, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::BatchedA4ResidualDecode,
+                  {24, ActivationClass::A4, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::BatchedA8ResidualDecode,
+                  {24, ActivationClass::A4, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A4, KvCacheStorage::Fp8E4M3Row256}},
 };
 
 const char* kv_name(KvCacheStorage kv) {

@@ -28,11 +28,11 @@ void fp8_attn_input_a8_residual_launch(const Tensor& x, const Weight& weight, Te
             fp8_a8_operands(weight, workspace, x.ne[1]), output, LinearIdentityEpilogue{}, stream,
             {}, pdl::Dependency::Programmatic);
     };
-    // 32-token tiles to 32 columns and at 65-96 (80.5 against 95-101 us for 64-token tiles).
+    // 32-token tiles to 32 columns, 32x128 tiles at 65-104 (58-62 against 78-83 us for 32x64 at
+    // 65-96, 89-91 against 105 for 64x128 at 97-104), and 64x128 tiles otherwise (RTX 5090).
     const std::int32_t tokens = x.ne[1];
-    if (tokens <= 32 || (tokens > 64 && tokens <= 96)) {
-        return launch.template operator()<Fp8A8ResidualT32R64>();
-    }
+    if (tokens <= 32) return launch.template operator()<Fp8A8ResidualT32R64>();
+    if (tokens > 64 && tokens <= 104) return launch.template operator()<Fp8A8ResidualT32R128>();
     launch.template operator()<Fp8A8ResidualT64R128>();
 }
 

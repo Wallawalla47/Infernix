@@ -10,6 +10,7 @@
 #include "ops/linear/nvfp4/nvfp4_template_launch.cuh"
 #include "ops/linear_swiglu/token_major_mma_epilogue.cuh"
 #include "ops/linear/nvfp4/nvfp4_a4_plan.h"
+#include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_a4_tma_launch.h"
 
 #include <cuda_bf16.h>
 
@@ -63,8 +64,6 @@ template <int Terms>
 using ResidualM64N128 = Nvfp4A4MmaSchedule<64, 128, 256, 4, 2, 2, 1, Cache::cg, Cache::cg, Terms>;
 template <int Terms>
 using ResidualM96N128 = Nvfp4A4MmaSchedule<96, 128, 256, 3, 4, 2, 1, Cache::cg, Cache::cg, Terms>;
-template <int Terms>
-using ResidualM128N128 = Nvfp4A4MmaSchedule<128, 128, 256, 4, 4, 1, 1, Cache::cg, Cache::cg, Terms>;
 
 template <int Terms>
 void launch_residual(const Tensor& x, const Weight& weight, Tensor& out, WorkspaceArena& workspace,
@@ -72,10 +71,20 @@ void launch_residual(const Tensor& x, const Weight& weight, Tensor& out, Workspa
     auto scope = workspace.scope();
     const Nvfp4A4Workspace scratch =
         allocate_nvfp4_a4_workspace(workspace, x.ne[1], Geometry::kInputRows, Terms);
+    // 97-128 columns take the warp-specialized TMA route over one 128-token tile: three 128-K
+    // stages fit where the MMA tile holds one, 101-103 against 128-138 us (RTX 5090), with the
+    // same K order per output.
+    if (Terms == kNvfp4A4ResidualTerms && x.ne[1] > 96 && x.ne[1] <= 128) {
+        launch_nvfp4_a4_quantize(x, weight, scratch, Nvfp4ScaleLayout::Tiled128, stream);
+        launch_nvfp4_linear_swiglu_a4_residual_tma(
+            nvfp4_a4_operands(weight, scratch, x.ne[1], Nvfp4ScaleLayout::Tiled128),
+            static_cast<__nv_bfloat16*>(out.data), stream);
+        return;
+    }
     launch_nvfp4_a4_quantize(x, weight, scratch, Nvfp4ScaleLayout::RowMajor, stream);
     // Above 32 columns one token tile per round streams each weight tile once: 64x128 runs
-    // 74 against 85 us for 64x64 at 48-64 columns, 96x128 95-101 against 138-142 at 80-96, and
-    // the single-stage 128x128 134-138 against 144 at 112-128 (RTX 5090).
+    // 74 against 85 us for 64x64 at 48-64 columns and 96x128 95-101 against 138-142 at 80-96
+    // (RTX 5090).
     const std::int32_t tokens = x.ne[1];
     if (tokens <= 16) {
         launch_gemm<ResidualM16N64<Terms>>(weight, out, scratch, tokens, stream);
@@ -83,10 +92,8 @@ void launch_residual(const Tensor& x, const Weight& weight, Tensor& out, Workspa
         launch_gemm<ResidualM32N64<Terms>>(weight, out, scratch, tokens, stream);
     } else if (tokens <= 64 || tokens > 128) {
         launch_gemm<ResidualM64N128<Terms>>(weight, out, scratch, tokens, stream);
-    } else if (tokens <= 96) {
-        launch_gemm<ResidualM96N128<Terms>>(weight, out, scratch, tokens, stream);
     } else {
-        launch_gemm<ResidualM128N128<Terms>>(weight, out, scratch, tokens, stream);
+        launch_gemm<ResidualM96N128<Terms>>(weight, out, scratch, tokens, stream);
     }
 }
 

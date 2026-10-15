@@ -115,10 +115,12 @@ int main() {
                           !q::couples_requests(FastPath::DecodeSplit64),
                       "prompt-pv8 and decode-split64 do not couple requests");
 
-    // The request-coupling paths and both residual routes are qualified on the four measured KV
-    // formats (4-bit activations); the one-term 4- and 8-bit paths failed the decode gate.
-    for (const auto kv : {KvCacheStorage::Int8Group64, KvCacheStorage::Nvfp4Group16,
-                          KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Q4KeyVq2Value}) {
+    // The request-coupling paths and both residual routes are qualified on every KV format
+    // (4-bit activations); the one-term 4- and 8-bit paths failed the decode gate.
+    for (const auto kv : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64,
+                          KvCacheStorage::Fp8E4M3Row256, KvCacheStorage::Nvfp4Group16,
+                          KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Q4KeyVq2Value,
+                          KvCacheStorage::Vq2}) {
         for (const FastPath path :
              {FastPath::BatchedDecode, FastPath::BatchedA4ResidualDecode,
               FastPath::BatchedA8ResidualDecode, FastPath::BatchSplitAttention,
@@ -132,8 +134,8 @@ int main() {
         }
     }
     failures += check(!q::fast_path_qualified(FastPath::BatchedDecode,
-                                              {24, ActivationClass::A4, KvCacheStorage::Vq2}),
-                      "batched-decode is not qualified on the unmeasured VQ2 KV");
+                                              {16, ActivationClass::A4, KvCacheStorage::Int8Group64}),
+                      "batched-decode is not qualified for an unmeasured head count");
 
     // Request invariance needs capability and no coupling path.
     q::FastPathSelection selection{.configuration = int8_24, .paths = {}, .invariant_capable = true};

@@ -56,10 +56,11 @@ Nvfp4A4Workspace allocate_nvfp4_a4_workspace(Arena& arena, std::int32_t tokens,
     const std::size_t code_bytes =
         nvfp4_a4_checked_bytes(tokens, static_cast<std::size_t>(input_rows) / 2);
     if (terms > 1) {
-        // Residual planes are row-major only (the MMA routes), so they need no tile padding. Each
-        // plane's extent is a multiple of 16 bytes for every K that is a multiple of 256.
-        const std::size_t scale_plane =
-            nvfp4_a4_checked_bytes(tokens, static_cast<std::size_t>(input_rows) / 16);
+        // Residual scale planes are allocated over whole tiles like the one-term plane, so either
+        // the row-major (MMA) or the 128-token tiled (TMA) layout fits. Each plane's extent is a
+        // multiple of 16 bytes for every K that is a multiple of 256.
+        const std::size_t scale_plane = nvfp4_a4_checked_bytes(
+            nvfp4_a4_padded_tokens(tokens), static_cast<std::size_t>(input_rows) / 16);
         const DeviceSpan codes  = arena.alloc_bytes(code_bytes * terms, 256);
         const DeviceSpan scales = arena.alloc_bytes(scale_plane * terms, 256);
         return {static_cast<std::uint8_t*>(codes.data), static_cast<std::uint8_t*>(scales.data),

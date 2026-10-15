@@ -133,9 +133,14 @@ struct Nvfp4A4MmaSchedule {
 };
 
 template <int BlockTokens, int Stages, int MinBlocksPerSm,
-          CUtensorMapL2promotion WeightCodePromotion = CU_TENSOR_MAP_L2_PROMOTION_NONE>
+          CUtensorMapL2promotion WeightCodePromotion = CU_TENSOR_MAP_L2_PROMOTION_NONE,
+          int Terms = 1>
 struct Nvfp4A4TmaMmaSchedule {
     static constexpr int kStaticK = 0;
+    // Terms > 1 is the A4 residual profile: each stage holds that many activation planes, each
+    // multiplied by the same weight tile into one accumulator.
+    static constexpr int kTerms = Terms;
+    static_assert(Terms == 1 || Terms == 2);
     // Each scale tile serves two consecutive K stages. Before a slot is reused,
     // the producer must have waited for the second consumer of the old pair.
     static constexpr int kScaleSlots = (Stages + 2) / 2;

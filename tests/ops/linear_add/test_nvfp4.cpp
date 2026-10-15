@@ -149,6 +149,7 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
         Invocation{64, ops::LinearPolicy::AllowA4Residual},
         Invocation{65, ops::LinearPolicy::AllowA4Residual},
         Invocation{128, ops::LinearPolicy::AllowA4Residual},
+        Invocation{129, ops::LinearPolicy::AllowA4Residual},
     };
     // The invocation list is what drives the host buffers, so take the bound from it rather than
     // from a literal that silently caps it.
