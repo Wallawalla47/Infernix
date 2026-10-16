@@ -917,7 +917,25 @@ default role (6.1). Bounds are one-sided 95 %:
 Every prompt-length bucket passes. `adaptive-speculation` and `free-cache-resume` are therefore
 qualified on BF16, NVFP4, VQ2 and K4V2 and not on FP8 or K8V4; `preemption` (which acts only in its
 own arm) on all six. Which path carries the FP8 and K8V4 excess is not resolved: the joint fast run
-also holds the format's kernel paths, whose decode was gated on BF16 and NVFP4 only. Before the increment rule, the BF16 forced-preemption arm against the exact route failed
+also holds the format's kernel paths, whose decode was gated on BF16 and NVFP4 only. Attribution
+(2026-10-16, the joint arm's conditions, 256 segments; top-1 in points, bound in parentheses):
+
+| KV | Run | TV excess (bound) | Top-1 excess (bound) / 0.50 | p99.9 KL ratio / 1.25 | Verdict |
+|---|---|---|---|---|---|
+| FP8 | kernel paths alone vs exact | -4.5e-5 (7.7e-4) | +0.26 (**0.69**) | 1.08 | fails |
+| FP8 | `qsa-prepare-fused` alone vs exact | -2.7e-4 (4.9e-4) | +0.12 (**0.56**) | 0.94 | fails |
+| FP8 | coupling paths over the kernel paths | -2.4e-5 (7.8e-4) | +0.18 (**0.55**) | 1.00 | fails |
+| K8V4 | kernel paths alone vs exact | -1.3e-4 (6.9e-4) | -0.09 (0.32) | **1.36** | fails |
+| K8V4 | `qsa-prepare-fused` alone vs exact | 8.9e-4 (1.8e-3) | +0.34 (**0.75**) | **1.36** | fails |
+| K8V4 | coupling paths over the kernel paths | 5.1e-4 (1.2e-3) | +0.18 (**0.54**) | 0.98 | fails |
+
+KL and NLL pass everywhere. The kernel paths, registered on FP8 and K8V4 from prefill and from
+decode on BF16 and NVFP4 only, fail their first decode measurement on these formats, through
+`qsa-prepare-fused`, which has its own kernel per KV format; the coupling paths' increment fails
+top-1 narrowly on both. At 256 segments the top-1 bound sits 0.35-0.44 points above its estimate on
+every format, so these are small positive estimates (+0.12 to +0.34) that the sample cannot clear.
+The exact run is plain at concurrency 8 and the fast runs MTP; their exact routes were shown
+identical on INT8 only. Before the increment rule, the BF16 forced-preemption arm against the exact route failed
 (TV bound 4.57e-3, KL excess 1.23e-2, p99.9 ratio 1.63), and the kernel paths alone failed it the same
 way; its exact route was bit-identical with and without the short pool and across reruns (6.1).
 
@@ -1328,7 +1346,17 @@ and recomputes the previous output) or admission (whole extents held without `pr
   5.0e-3, forced-token NLL excess 1.23e-2 against the 1.0e-2 cap, p99.9 KL ratio 1.261 against
   1.25; TV excess bound 3.36e-3 of 4.0e-3, KL excess 2.8e-3 of 1.0e-2 and every prompt length pass
   (floor: KL 2.11e-2, TV 3.91e-2, top-1 3.67 points). The fuller sample confirmed the tail and
-  moved top-1 and NLL past their limits, so it is not a small-sample artifact. Speed beside two-term
+  moved top-1 and NLL past their limits, so it is not a small-sample artifact. Attribution over
+  the same segments (2026-10-16): two-term `expert-a4-residual` alone passes (TV bound 2.38e-3,
+  top-1 bound 4.41e-3, NLL excess 1.2e-3, p99.9 ratio 1.18), and `fp8-a8-pair`'s increment over it
+  passes every criterion but NLL (1.11e-2 against the 1.0e-2 cap, bound 2.0e-2; TV bound 1.98e-3,
+  top-1 bound 2.57e-3, p99.9 ratio 1.07). The joint failure is `fp8-a8-pair`'s NLL shift on top of
+  the top-1 and tail budget `expert-a4-residual` already uses. Two E4M3 terms carry about 2^-8
+  relative error per value, one bit coarser than BF16; per-block scales would not change that. A
+  bit-exact alternative cannot recover its speed: the exact route's BF16 MMAs run at 227-243 TFLOP/s
+  at 2,048-16,384 columns, the Tensor Core pipe 91.7 % busy (ncu, [16384, 2560] at 4,096), level
+  with the BF16 GEMM of the same shape, so the gain is the FP8 Tensor Core rate (0.69-0.78 of the
+  exact route's time at 4,096 columns). Speed beside two-term
   `expert-a4-residual` (`infernix_bench`, INT8 KV, chunk 4,096, ABBA): pp32768 8,732 → 9,277 tok/s
   (+6.2 %), pp65536 9,022 → 9,619 (+6.6 %). The other formats were not gated. It runs in no
   configuration.
