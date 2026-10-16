@@ -934,8 +934,12 @@ decode on BF16 and NVFP4 only, fail their first decode measurement on these form
 `qsa-prepare-fused`, which has its own kernel per KV format; the coupling paths' increment fails
 top-1 narrowly on both. At 256 segments the top-1 bound sits 0.35-0.44 points above its estimate on
 every format, so these are small positive estimates (+0.12 to +0.34) that the sample cannot clear.
-The exact run is plain at concurrency 8 and the fast runs MTP; their exact routes were shown
-identical on INT8 only. Before the increment rule, the BF16 forced-preemption arm against the exact route failed
+`qsa-prepare-fused`'s own decode gate at 1,024 segments (plain at concurrency 8, the shared INT8
+coupling reference) settles it: it passes on FP8 (TV bound -2.5e-5, top-1 bound -0.002 points, KL
+excess -5.3e-3, NLL -1.8e-2, p99.9 ratio 0.94) and K8V4 (TV bound 6.2e-5, top-1 bound 0.14 points,
+KL -2.7e-3, NLL -9.4e-3, p99.9 ratio 1.10), so its registrations stand. The exact route gives the
+same bits under MTP at concurrency 2 as plain at concurrency 8 on FP8 and K8V4 too (96 segments).
+The coupling paths' narrow FP8 and K8V4 failures were not repeated at 1,024 segments. Before the increment rule, the BF16 forced-preemption arm against the exact route failed
 (TV bound 4.57e-3, KL excess 1.23e-2, p99.9 ratio 1.63), and the kernel paths alone failed it the same
 way; its exact route was bit-identical with and without the short pool and across reruns (6.1).
 
