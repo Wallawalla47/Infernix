@@ -97,8 +97,7 @@ opens part 1. `--resource` stores the maintained Qwen3.8 template, as for Qwen3.
 ```text
 infernix <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8 --max-context 16384 \
   --prompt "..."
-infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8 --max-context 16384 \
-  --prefill-chunk 4096
+infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8 --max-context 16384
 ```
 
 - `--kv-dtype` accepts every Infernix KV format: `int8` (recommended), `bf16`, `fp8`, `nvfp4`,
@@ -125,8 +124,11 @@ infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8
   factor 2 and at 4. At 970K tokens and factor 4, the middle one came from a neighbouring record,
   while the engine's block selection and rotations matched their oracles at that length
   (GitHub #22).
-- `--prefill-chunk 2048` or `4096` speeds up long prompts by 1.4-1.6×. Each costs ~2-5 % of
-  decode speed, because the larger prefill workspace takes expert frames.
+- The prefill chunk defaults to 16,384 tokens. The exact route's output measured identical at
+  chunks of 1,024, 4,096 and 12,288, and wide chunks prefill long prompts faster at no decode cost
+  (Dense8, INT8 KV, RTX 5090, 2026-10-16: 32K prompts 5,570 / 9,640 / 11,210 tok/s at chunks
+  1,024 / 4,096 / 16,384, 64K prompts 5,700 / 9,890 / 11,270; tg512 unchanged; 26 fewer expert
+  frames of ~8,560). A smaller `--prefill-chunk` only shrinks the prefill workspace.
 - `--spec mtp --draft-tokens 4 --lm-head-draft` drafts with the model's MTP layer.
   - `--draft-tokens` sets the maximum. Each round drafts the number of tokens the recent
     acceptance makes worthwhile, down to none on text it predicts poorly.
@@ -364,7 +366,7 @@ later at 8K, level from 128K (the bit-exact
 | Single CLI request, cold cache, plain: code rewrite / prose story | ~66 / ~65 |
 | Single CLI request, cold cache, MTP: code rewrite / prose story | ~84 / ~67 |
 | Prompt, 4,096 tokens, `--prefill-chunk 4096` | ~670-690 |
-| Prompt, 4,096 tokens, default chunk 1024 | ~410 |
+| Prompt, 4,096 tokens, `--prefill-chunk 1024` (the default then) | ~410 |
 
 tg512 generates its own greedy text, so it moves with any change in rounding. Its current text
 has a lower expert hit rate (88 % against 93 %) than before the last kernel change, which is

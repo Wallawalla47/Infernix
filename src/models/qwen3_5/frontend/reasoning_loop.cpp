@@ -72,29 +72,42 @@ bool word_codepoint(std::int32_t value) {
 // The bytes accumulated at a word boundary are one word to the byte rule above; Strata's split can
 // make several of them. A run of word characters is one word, every other non-space character is a
 // word of its own, and whitespace separates.
+// Words are lowercased as Strata's `str.lower()` does: ASCII on arrival (append_words), every other
+// complete character by its simple lowercase mapping here.
 void flush_word(std::string& partial, std::vector<std::uint64_t>& words) {
     const std::string_view text = partial;
-    std::size_t begin           = 0;
+    std::string word;
+    const auto emit_word = [&] {
+        if (!word.empty()) {
+            words.push_back(fnv1a(word));
+            word.clear();
+        }
+    };
     for (std::size_t at = 0; at < text.size();) {
         const Codepoint point = codepoint_at(text, at);
         if (!point.complete) { // cut by the last token: the bytes stand as a word of their own
-            if (at > begin) { words.push_back(fnv1a(text.substr(begin, at - begin))); }
+            emit_word();
             words.push_back(fnv1a(text.substr(at)));
             partial.clear();
             return;
         }
         if (word_codepoint(point.value)) {
+            if (point.length == 1) {
+                word.push_back(text[at]);
+            } else {
+                word += text::unicode_internal::codepoint_to_utf8(
+                    text::unicode_internal::simple_lowercase(point.value));
+            }
             at += point.length;
             continue;
         }
-        if (at > begin) { words.push_back(fnv1a(text.substr(begin, at - begin))); }
+        emit_word();
         if (!space_codepoint(point.value)) {
             words.push_back(fnv1a(text.substr(at, point.length)));
         }
         at += point.length;
-        begin = at;
     }
-    if (text.size() > begin) { words.push_back(fnv1a(text.substr(begin))); }
+    emit_word();
     partial.clear();
 }
 

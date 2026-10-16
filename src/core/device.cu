@@ -257,6 +257,13 @@ float CudaEventTimer::elapsed_ms() const {
     return ms;
 }
 
+std::optional<float> CudaEventTimer::try_elapsed_ms() const {
+    const cudaError_t status = cudaEventQuery(stop_);
+    if (status == cudaErrorNotReady) { return std::nullopt; }
+    CUDA_CHECK(status);
+    return elapsed_ms();
+}
+
 float CudaEventTimer::stop_ms() {
     record_stop();
     CUDA_CHECK(cudaEventSynchronize(stop_));

@@ -137,7 +137,7 @@ std::string serve_usage_text(const char* argv0) {
            "  --max-context N            max context tokens per request (default 8192)\n"
            "  --max-concurrency N        max concurrent sequences, 1-8 (default 1)\n"
            "  --prefill-chunk N          prefill chunk size in tokens, multiple of 128\n"
-           "                             (default 1024)\n"
+           "                             (default 16384 for Qwen3.8-Flash-Next, 1024 otherwise)\n"
            "  --use-original-int8-prefill-kernel\n"
            "                             prefill INT8 KV with the original prompt kernel at\n"
            "                             the requested chunk (default: the fast kernel, chunk\n"
@@ -472,6 +472,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--prefill-chunk"), "prefill-chunk"));
+            if (options.prefill_chunk == 0) {
+                throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
+            }
         } else if (arg == "--use-original-int8-prefill-kernel") {
             options.original_int8_prefill_kernel = true;
         } else if (arg == "--prefill-split-workspace-mib") {
@@ -845,7 +848,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.max_request_bytes == 0) {
         throw std::invalid_argument("--max-request-mib must be positive");
     }
-    if (options.prefill_chunk == 0 || options.prefill_chunk % 128 != 0) {
+    // 0: the model's default (EngineOptions::prefill_chunk).
+    if (options.prefill_chunk % 128 != 0) {
         throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
     }
     if (options.prefill_split_workspace_mib > kMaximumPrefillSplitWorkspaceMiB) {

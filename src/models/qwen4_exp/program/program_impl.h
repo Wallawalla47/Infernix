@@ -366,6 +366,9 @@ public:
         LaneRope rope;                    // RoPE positions of the lane's tokens (design §19.3.2)
         std::unique_ptr<LaneVision> vision; // the encode window and handoff of a media prompt
         double vision_seconds = 0;          // the tower's GPU time
+        // The tower's timer when its stop had not completed at release: read later
+        // (vision_seconds_of), never waited for.
+        std::optional<CudaEventTimer> vision_timer;
         ops::SamplingConfig sampling;
         // /v1/decide: the tokens the prompt's readout names, the constraint, the draws of the pending
         // round's tokens (one per licensed token) and the committed trace they move into.
@@ -1181,6 +1184,7 @@ public:
         // Reset before activation: a resume's activation sets the lane's frontier and state.
         lane.state_tokens   = 0;
         lane.vision_seconds = 0;
+        lane.vision_timer.reset();
         lane.speculative    = {};
         lane.mtp_cells      = 0;
         lane.mtp_live       = mtp_;
@@ -1292,7 +1296,7 @@ public:
         r.prefill_ns              = lane.prefill_ns;
         r.decode_ns               = lane.decode_ns;
         r.decode_share_ns         = lane.decode_share_ns;
-        r.vision_seconds          = lane.vision_seconds;
+        r.vision_seconds          = vision_seconds_of(lane);
         r.speculative             = lane.speculative;
         r.mtp_accept              = lane.mtp_accept;
         r.mtp_policy_rounds       = lane.mtp_policy_rounds;
@@ -1362,6 +1366,7 @@ public:
         }
         lane.state_tokens   = 0;
         lane.vision_seconds = 0;
+        lane.vision_timer.reset();
         lane.speculative    = {};
         lane.mtp_cells      = 0;
         lane.mtp_live       = mtp_;
@@ -1607,17 +1612,41 @@ public:
         return walk_.active && walk_.lane != index && index < lanes_.size() && lanes_[index].phase == Phase::Prefill;
     }
 
-    // The Engine's reclaim for a binding shortage: evict cached Device blocks until it is covered.
+    // The Engine's reclaim for a binding shortage: evict cached Device blocks until it is covered,
+    // then grow the elastic pool, taking back a prefill's loans first if only they block growth.
     bool hybrid_reclaim(runtime::ContextResourceUsage shortage) {
-        if (!prefix_ || shortage.main_kv_pages == 0) { return false; }
+        if (shortage.main_kv_pages == 0) { return false; }
         const std::uint32_t before = pool_->available_pages();
-        pc_make_room(before + shortage.main_kv_pages);
-        if (pool_->available_pages() == before && prefix_->transfers_pending()) {
-            // Blocks pinned only by in-flight Host writes become evictable once those land.
-            prefix_->drain();
-            pc_make_room(before + shortage.main_kv_pages);
+        const std::uint32_t target = before + shortage.main_kv_pages;
+        if (prefix_) {
+            pc_make_room(target);
+            if (pool_->available_pages() == before && prefix_->transfers_pending()) {
+                // Blocks pinned only by in-flight Host writes become evictable once those land.
+                prefix_->drain();
+                pc_make_room(target);
+            }
+        }
+        // A long prompt's stream ring and wide arena stay lent until its last call, and growth is
+        // refused while frames are lent, so a request queued behind it waited out its prefill (issue
+        // #24). Between calls they can go back: the prompt's next streamed call lends again from
+        // the smaller cache, or stages its experts (the same bytes either way, design §19.3.8 F3).
+        if (pool_->available_pages() < target && leases_returnable()) {
+            return_stream_lease();
+            return_wide_work();
+            (void)grow_kv(target);
         }
         return pool_->available_pages() > before;
+    }
+
+    // Whether every lent frame is held by a lease a round boundary can return (the prefill stream
+    // ring and the wide arena; not a layer walk's area or a vision window), so growth needs only
+    // their return (hybrid_reclaim).
+    [[nodiscard]] bool leases_returnable() const noexcept {
+        if (!kv_vmm_ || !residency_ || walk_.active || wide_active_) { return false; }
+        const std::uint64_t lent = residency_->stats().lent_frames;
+        const std::uint64_t returnable = (stream_lease_.valid() ? stream_lease_.count : 0U) +
+                                         (work_lease_.valid() ? work_lease_.count : 0U);
+        return lent != 0 && lent == returnable;
     }
 
     // ---------------------------------------------------------------- execution
@@ -2749,12 +2778,19 @@ private:
         return lane;
     }
 
+    static double vision_seconds_of(const Lane& lane) {
+        if (lane.vision_timer) {
+            if (const auto ms = lane.vision_timer->try_elapsed_ms()) { return *ms * 1e-3; }
+        }
+        return lane.vision_seconds;
+    }
+
     GenerationTimings timings(const Lane& lane) const {
         GenerationTimings out;
         out.prefill_seconds      = static_cast<double>(lane.prefill_ns) * 1e-9;
         out.decode_seconds       = static_cast<double>(lane.decode_ns) * 1e-9;
         out.decode_share_seconds = static_cast<double>(lane.decode_share_ns) * 1e-9;
-        out.vision_seconds       = lane.vision_seconds;
+        out.vision_seconds       = vision_seconds_of(lane);
         return out;
     }
 
@@ -2797,10 +2833,11 @@ private:
     }
 
     // The pages one growth could add at most: grow_kv takes up to every frame, and none while frames
-    // are lent (an estimate; grow_kv decides).
+    // are lent, unless only leases hybrid_reclaim can return hold them (an estimate; grow_kv
+    // decides).
     std::uint32_t kv_grow_pages() const noexcept {
         if (!kv_vmm_ || !residency_ || !residency_->elastic() || residency_->frames() == 0 ||
-            residency_->stats().lent_frames != 0) {
+            (residency_->stats().lent_frames != 0 && !leases_returnable())) {
             return 0;
         }
         const std::uint32_t room = pool_->capacity_pages() - pool_->backed_pages();

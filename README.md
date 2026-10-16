@@ -194,13 +194,13 @@ The server is `build-windows\apps\Release\infernix-serve.exe`, with the FFmpeg, 
 next to it. Qwen3.8-Flash-Next (see the [guide](docs/qwen3_8-flash-next.md#run)):
 
 ```bat
-infernix-serve.exe Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix-00001-of-00003.infernix --ngram-volume Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram --kv-dtype int8 --max-context 262144 --prefill-chunk 4096 --spec mtp --draft-tokens 4 --lm-head-draft --max-concurrency 2
+infernix-serve.exe Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix-00001-of-00003.infernix --ngram-volume Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram --kv-dtype int8 --max-context 262144 --spec mtp --draft-tokens 4 --lm-head-draft --max-concurrency 2
 ```
 
 The uncensored Flash-Next takes the same options and the same n-gram volume:
 
 ```bat
-infernix-serve.exe Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix-00001-of-00003.infernix --ngram-volume Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram --kv-dtype int8 --max-context 262144 --prefill-chunk 4096 --spec mtp --draft-tokens 4 --lm-head-draft --max-concurrency 2
+infernix-serve.exe Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix-00001-of-00003.infernix --ngram-volume Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram --kv-dtype int8 --max-context 262144 --spec mtp --draft-tokens 4 --lm-head-draft --max-concurrency 2
 ```
 
 Qwen3.8-27B on a 32 GB RTX 5090:

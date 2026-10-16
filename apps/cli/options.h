@@ -36,7 +36,7 @@ struct Options {
     KvCapacityPolicy kv_capacity = KvCapacityPolicy::explicit_capacity(2048);
     std::optional<std::size_t> vram_headroom_bytes; // empty: the model's automatic headroom
     bool vram_past_budget = false;
-    std::uint32_t prefill_chunk  = 1024;
+    std::uint32_t prefill_chunk  = 0; // 0: the model's default (EngineOptions)
     int device                   = 0;
 
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;

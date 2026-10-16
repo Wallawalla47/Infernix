@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 
 namespace infernix {
 
@@ -91,6 +92,8 @@ public:
     void start();
     void record_stop();
     [[nodiscard]] float elapsed_ms() const;
+    // Empty while the recorded stop has not completed on the device (never waits).
+    [[nodiscard]] std::optional<float> try_elapsed_ms() const;
     float stop_ms();
 
 private:

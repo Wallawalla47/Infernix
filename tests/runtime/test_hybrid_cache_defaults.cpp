@@ -136,6 +136,18 @@ int main() {
         failures += check(qwen35.host_capacity_bytes == infernix::kDefaultHybridHostCacheBytes &&
                               qwen35.hybrid.device_snapshot_slots == 3U,
                           "Qwen3.5 prefix cache defaults changed");
+        // The prefill chunk defaults per model: 16,384 for Qwen3.8-Flash-Next, whose ladder keeps
+        // the 4,096-token chunk's spacing (max(4096, 2 * 4096) and max(1024, 4096)), and 1,024
+        // for Qwen3.5 (ladder max(4096, 2 * 1024), gap max(1024, 1024)).
+        const EngineOptions qwen4_options =
+            normalize_engine_options(options, infernix::models::Architecture::Qwen4Exp);
+        failures += check(qwen4_options.prefill_chunk == 16384U && qwen4.hybrid.tap_ladder_tokens == 8192U &&
+                              qwen4.hybrid.tap_min_gap_tokens == 4096U,
+                          "Qwen3.8-Flash-Next prefill chunk or ladder defaults are wrong");
+        failures += check(normalize_engine_options(options).prefill_chunk == 1024U &&
+                              qwen35.hybrid.tap_ladder_tokens == 4096U &&
+                              qwen35.hybrid.tap_min_gap_tokens == 1024U,
+                          "Qwen3.5 prefill chunk or ladder defaults changed");
         // Tool-call holds: on by default for Qwen3.5, absent for Qwen3.8-Flash-Next, explicit
         // values (zero turns them off) kept, and a disabled cache has none.
         failures += check(qwen35.hybrid.tool_call_hold == infernix::kDefaultToolCallHold &&

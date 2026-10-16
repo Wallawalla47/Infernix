@@ -383,7 +383,7 @@ std::string usage_text(std::string_view program) {
            "only\n"
         << "  --max-ctx <tokens>          override auto-sized context capacity\n"
         << "  --prefill-chunk <tokens>    multiple of " << kPrefillChunkAlignment
-        << " (default: " << kDefaultPrefillChunk << ")\n"
+        << " (default: 16384 for Qwen3.8-Flash-Next, 1024 otherwise)\n"
         << "  --kv-dtype <bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2>  KV cache storage (default: bf16)\n"
         << "  --use-original-int8-prefill-kernel  original INT8-KV prompt kernel at the\n"
         << "                              requested chunk (default: fast kernel, wave-aligned\n"
@@ -546,6 +546,9 @@ BenchOptions parse_args(int argc, char** argv) {
             options.max_context = parse_u32(value("--max-ctx"), "max-ctx");
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = parse_u32(value("--prefill-chunk"), "prefill-chunk");
+            if (options.prefill_chunk == 0) {
+                throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
+            }
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_cache(value("--kv-dtype"));
         } else if (arg == "--use-original-int8-prefill-kernel") {

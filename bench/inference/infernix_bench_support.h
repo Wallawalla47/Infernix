@@ -23,7 +23,7 @@ inline constexpr int kDefaultNPrompt                  = 512;
 inline constexpr int kDefaultNGen                     = 128;
 inline constexpr int kDefaultRepetitions              = 5;
 inline constexpr int kDefaultWarmup                   = 1;
-inline constexpr std::uint32_t kDefaultPrefillChunk   = 1024;
+inline constexpr std::uint32_t kDefaultPrefillChunk   = 0; // the model's default
 inline constexpr std::uint32_t kPrefillChunkAlignment = 128;
 
 enum class TestKind { Prefill, Decode, PrefillDecode };

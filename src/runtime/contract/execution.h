@@ -16,6 +16,14 @@ public:
     using std::runtime_error::runtime_error;
 };
 
+// One request's own output cannot continue (its grammar refused a committed token). A commit
+// releases that row like a cancellation and fails only its request; anywhere else it is handled as
+// a RecoverableExecutionError.
+class RequestOutputError : public RecoverableExecutionError {
+public:
+    using RecoverableExecutionError::RecoverableExecutionError;
+};
+
 // Borrowed for one synchronous Program call. Engine maps compact rows to request-owned matchers.
 class TokenMaskProvider {
 public:

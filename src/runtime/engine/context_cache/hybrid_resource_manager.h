@@ -74,6 +74,16 @@ public:
         out.hybrid_taps_created            = hybrid.taps_created;
         out.hybrid_taps_skipped            = hybrid.taps_skipped;
         out.hybrid_endpoints_created       = hybrid.endpoints_created;
+        // Publication refusals (Qwen3.5's Device snapshot slots; other caches have none).
+        if constexpr (requires { hybrid.device_slot_refusals; }) {
+            out.hybrid_taps_skipped_no_slot       = hybrid.taps_skipped_no_slot;
+            out.hybrid_endpoints_skipped          = hybrid.endpoints_skipped;
+            out.hybrid_host_image_write_refusals  = hybrid.host_image_write_refusals;
+            out.hybrid_host_block_write_refusals  = hybrid.host_block_write_refusals;
+            out.hybrid_device_slot_evictions      = hybrid.device_slot_evictions;
+            out.hybrid_device_slot_refusals       = hybrid.device_slot_refusals;
+            out.hybrid_free_device_snapshot_slots = hybrid.free_device_snapshot_slots;
+        }
         out.hybrid_host_image_writes       = hybrid.host_image_writes;
         out.hybrid_host_block_writes       = hybrid.host_block_writes;
         out.hybrid_host_image_restores     = hybrid.host_image_restores;

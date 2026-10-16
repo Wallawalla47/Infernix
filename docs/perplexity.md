@@ -20,7 +20,8 @@ English reference text, English long-form text, Chinese reference text, and Infe
 
 The default evaluation uses a 4,096-token context and a 2,048-token stride. Use `--context` and
 `--stride` to change that protocol, or score one UTF-8 file with `--text FILE`. Each window is
-prefilled in passes of `--prefill-chunk` tokens (a multiple of 128, default 1024), recorded in
+prefilled in passes of `--prefill-chunk` tokens (a multiple of 128, default 16384 for
+Qwen3.8-Flash-Next and 1024 otherwise), recorded in
 `report.json` as `prefill_chunk_tokens`; INT8, NVFP4, FP8 and K8V4 KV round it down to whole
 prompt-attention waves (896 tokens on Qwen3.8-27B). The pass size changes only the order of
 rounding, but on artifacts with 4-bit activations that order matters more than it seems: on the

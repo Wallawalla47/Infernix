@@ -142,6 +142,9 @@ int main() {
         // and the walk's calls publish fetch requests for them.
         options.expert_ram_bytes      = 24ULL << 30;
         options.context_cache.enabled = false; // every prompt prefills in full, the walk included
+        // Solo equality is the exact route's contract (model-quality.md §6.1): the default route's
+        // q8-sliced-k and gdn-conv-fused fast paths couple a request to its round.
+        options.fast_paths = false;
         options.diagnostic_observer.callback = [&](const infernix::Diagnostic& d) {
             const std::lock_guard<std::mutex> lock(diagnostics_mutex);
             diagnostics.push_back(d.message);

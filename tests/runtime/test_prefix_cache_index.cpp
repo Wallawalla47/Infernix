@@ -728,12 +728,60 @@ void test_unbacked_slot_values() {
     const SnapshotRef other_end =
         index.publish_snapshot(other_path[1], 128, {}, std::nullopt, *slot, SnapshotKind::Endpoint)
             .snapshot;
-    require(!index.acquire_device_slot(0.0).has_value() && index.valid(long_end) &&
-                index.valid(other_end),
-            "a snapshot worth less than every owner must not displace one");
+    // Device-only owners hold at most D - 1 slots: with both slots theirs, even a snapshot worth
+    // less than every owner takes the least valuable one's slot, and the long one keeps its own.
+    const auto rotated = index.acquire_device_slot(0.0);
+    require(rotated.has_value() && index.valid(long_end) && !index.valid(other_end),
+            "Device-only owners must not hold every slot for good");
+    index.release_device_slot(*rotated);
     index.release_path(long_path);
     index.release_path(short_path);
     index.release_path(other_path);
+    index.check_invariants();
+}
+
+// A Host-backed owner and a Device-only one: below the Device-only owner's value, a new snapshot
+// takes the backed owner's Device copy, never the Device-only one (its last copy).
+void test_unbacked_slot_kept_beside_backed_owner() {
+    RecordingBackend backend;
+    PrefixCacheIndex index(small_config(64, 2), backend);
+    const auto long_tokens = make_tokens(64 * 20, 60);
+    const auto long_path   = insert_sequence(index, backend, long_tokens);
+    const SnapshotRef long_end =
+        publish_at(index, backend, long_path, long_tokens, 64 * 20, SnapshotKind::Endpoint);
+    const auto short_tokens = make_tokens(64 * 2, 61);
+    const auto short_path   = insert_sequence(index, backend, short_tokens);
+    const SnapshotRef backed =
+        publish_at(index, backend, short_path, short_tokens, 64 * 2, SnapshotKind::Endpoint);
+    backup_snapshot(index, backed);
+    const auto slot = index.acquire_device_slot(0.0);
+    require(slot.has_value() && index.valid(long_end) && index.valid(backed) &&
+                index.snapshot(backed).device_slot == kNoId &&
+                index.snapshot(long_end).device_slot != kNoId,
+            "a backed owner gives up its Device copy before a Device-only owner its last copy");
+    index.release_device_slot(*slot);
+    index.release_path(long_path);
+    index.release_path(short_path);
+    index.check_invariants();
+}
+
+// A supersession undone (the deeper snapshot never came) leaves the snapshot retained: it is no
+// longer the first Host victim, and its retained ancestors are valued as before.
+void test_unsupersede_restores_retention() {
+    RecordingBackend backend;
+    PrefixCacheIndex index(small_config(8, 2), backend);
+    const auto tokens       = make_tokens(64 * 4, 62);
+    const auto path         = insert_sequence(index, backend, tokens);
+    const SnapshotRef first = publish_at(index, backend, path, tokens, 64 * 2, SnapshotKind::Tap);
+    const SnapshotRef second = publish_at(index, backend, path, tokens, 64 * 4, SnapshotKind::Tap);
+    require(index.supersede(first), "a retained tap must report its supersession");
+    require(!index.supersede(first), "a superseded tap must not report a second supersession");
+    require(index.snapshot(first).superseded, "supersede did not mark the tap");
+    index.check_invariants();
+    index.unsupersede(first);
+    require(!index.snapshot(first).superseded && index.valid(second),
+            "unsupersede must retain the tap again");
+    index.release_path(path);
     index.check_invariants();
 }
 
@@ -1592,6 +1640,8 @@ int main() {
         test_supersession();
         test_lineage_under_pressure();
         test_unbacked_slot_values();
+        test_unbacked_slot_kept_beside_backed_owner();
+        test_unsupersede_restores_retention();
         test_host_write_admission();
         test_unshared_boundary();
         test_passed_endpoints();

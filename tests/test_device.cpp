@@ -254,5 +254,23 @@ int main(int argc, char** argv) {
         std::cerr << "timer elapsed time was negative\n";
     }
 
+    // try_elapsed_ms never waits: empty while the stop is queued behind host work, a value after.
+    infernix::CudaEventTimer pending(moved);
+    pending.start();
+    CUDA_CHECK(cudaLaunchHostFunc(
+        moved.stream,
+        [](void*) { std::this_thread::sleep_for(std::chrono::milliseconds(200)); }, nullptr));
+    pending.record_stop();
+    if (pending.try_elapsed_ms()) {
+        ++failures;
+        std::cerr << "try_elapsed_ms returned a time before the stop completed\n";
+    }
+    moved.synchronize();
+    const auto settled = pending.try_elapsed_ms();
+    if (!settled || *settled < 100.0f) {
+        ++failures;
+        std::cerr << "try_elapsed_ms did not report the completed stop\n";
+    }
+
     return failures == 0 ? 0 : fail("device test failed");
 }

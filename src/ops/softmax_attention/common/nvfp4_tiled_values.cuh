@@ -88,7 +88,6 @@ struct Nvfp4G16TiledValues {
     __device__ __forceinline__ static int4 expand(const std::uint8_t* codes, Scale scale,
                                                   __half mul) {
         const std::uint32_t packed = load_vec<std::uint32_t>(codes);
-        const std::uint8_t* bytes  = reinterpret_cast<const std::uint8_t*>(&packed);
         __nv_fp8_e4m3 encoded_scale;
         encoded_scale.__x    = scale;
         const __half value   = __hmul(static_cast<__half>(encoded_scale), mul);
@@ -97,7 +96,7 @@ struct Nvfp4G16TiledValues {
 #pragma unroll
         for (int pair = 0; pair < 4; ++pair) {
             __nv_fp4x2_e2m1 encoded;
-            encoded.__x     = bytes[pair];
+            encoded.__x     = static_cast<std::uint8_t>(packed >> (8 * pair));
             const __half2 v = __hmul2(static_cast<__half2>(encoded), scale2);
             half_bits[pair] = *reinterpret_cast<const unsigned*>(&v);
         }

@@ -937,21 +937,31 @@ Two lists are kept, *backed* and *unbacked*, and backed entries are always consu
 
 Slots hold at most `D` images. A sequence about to snapshot past its previous snapshot (the one
 it resumed from, or its previous tap in the same prompt) supersedes it first (§9.3), so the slot
-comes from its own lineage when it can. A tap or endpoint takes a slot in this order:
+comes from its own lineage when it can. If the new snapshot is then not published (no slot, no
+StateImage, a dropped tap, a full snapshot table, a failure while publishing), the supersession is
+undone: the previous snapshot stays the lineage's resume point, unless the sequence has published
+a deeper snapshot since. Left superseded, it was the first Host victim, and the conversation's
+next turn resumed from nothing. A tap or endpoint takes a slot in this order:
 
 1. a free slot;
 2. a slot owned by a superseded snapshot, oldest supersession first; the snapshot keeps its Host
    copy or, without one, is deleted;
 3. a slot owned by a Device-only snapshot (no Host copy: the Host tier is full, disabled or
-   evicted it): the one with the lowest GDSF priority (§9.3), and only when the new snapshot's
-   estimated priority (no hits, and the blocks since the sequence's previous snapshot its own) is
-   at least as high. The snapshot is lost, and `L` rises to its priority;
+   evicted it): the one with the lowest GDSF priority (§9.3), when the new snapshot's estimated
+   priority (no hits, and the blocks since the sequence's previous snapshot its own) is at least
+   as high, or when Device-only snapshots own every one of two or more slots. The snapshot is
+   lost, and `L` rises to its priority;
 4. the least recently hit Host-backed snapshot's slot, which loses only its Device copy.
 
-Otherwise the tap or endpoint is skipped. A Device-only owner's slot is its last copy, so value
+Otherwise the tap or endpoint is skipped and counted (`device_slot_refusals`,
+`taps_skipped_no_slot`, `endpoints_skipped`). A Device-only owner's slot is its last copy, so value
 decides there rather than recency: least-recently-hit eviction let a short request's snapshots
 push out the snapshot a long conversation resumes from, and taking Host-backed slots first left
-owners that Host eviction had made Device-only in their slots for good (§16.5).
+owners that Host eviction had made Device-only in their slots for good (§16.5). With `D ≥ 2`,
+Device-only owners hold at most `D − 1` slots, though: `L` rises only on an eviction, so owners worth more than every
+new claim (a long prompt's hot snapshots after Host write-back stripped their Host copies) kept all
+`D` slots for the rest of the session, and no new conversation could publish a snapshot (issue
+#29). The most valuable keep their slots; the last one rotates.
 
 ### 9.3 Host (superseded snapshots first, then GDSF; dead-KV first)
 

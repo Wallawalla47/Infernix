@@ -49,7 +49,14 @@ struct HybridCacheCounters {
     std::uint64_t blocks_duplicate    = 0;
     std::uint64_t taps_created        = 0;
     std::uint64_t taps_skipped        = 0;
+    std::uint64_t taps_skipped_no_slot = 0; // of taps_skipped: no Device snapshot slot
     std::uint64_t endpoints_created   = 0;
+    // Endpoints that passed their gates but were not published (no Device snapshot slot, a full
+    // snapshot table, or a failure while publishing).
+    std::uint64_t endpoints_skipped   = 0;
+    // Snapshot images and blocks refused Host slabs (they stay Device-only).
+    std::uint64_t host_image_write_refusals = 0;
+    std::uint64_t host_block_write_refusals = 0;
     std::uint64_t host_image_writes   = 0;
     std::uint64_t host_block_writes   = 0;
     std::uint64_t host_image_restores = 0;

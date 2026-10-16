@@ -389,7 +389,11 @@ bool admits_value(TypeSet types, JsonValueKind kind) {
     return false;
 }
 
-std::string encode_json_string(std::string_view value) { return Json(std::string(value)).dump(); }
+// Model bytes need not be valid UTF-8 (a recovered call can end inside a sequence): invalid
+// sequences encode as U+FFFD instead of throwing.
+std::string encode_json_string(std::string_view value) {
+    return Json(std::string(value)).dump(-1, ' ', false, Json::error_handler_t::replace);
+}
 
 NormalizedParameter normalize_declared_parameter(std::string_view encoded_value, TypeSet types) {
     const std::string_view framed = remove_parameter_framing_newlines(encoded_value);

@@ -50,7 +50,7 @@ struct ServeOptions {
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
-    std::uint32_t prefill_chunk        = 1024;
+    std::uint32_t prefill_chunk        = 0; // 0: the model's default (EngineOptions)
     bool original_int8_prefill_kernel  = false;
     std::uint32_t prefill_split_workspace_mib = kDefaultPrefillSplitWorkspaceMiB;
     bool original_nvfp4_prefill_kernel = false;

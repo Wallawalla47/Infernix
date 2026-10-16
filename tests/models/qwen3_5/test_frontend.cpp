@@ -7,6 +7,7 @@
 #include "models/qwen3_5/frontend/processor.h"
 #include "models/qwen3_5/frontend/test_access.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
+#include "runtime/contract/execution.h"
 #include "runtime/prefix_cache/block_hash.h"
 #include "text/unicode.h"
 
@@ -31,6 +32,12 @@
 #include <thread>
 #include <utility>
 #include <vector>
+
+// The Windows SDK's minwindef.h (through runtime/contract/execution.h) defines `near` as an empty
+// legacy compatibility macro; drop it so the local helper below keeps its name.
+#ifdef _WIN32
+#undef near
+#endif
 
 namespace {
 
@@ -2278,6 +2285,36 @@ int test_constrained_thinking_control(const Frontend& frontend) {
     return failures;
 }
 
+// A token the grammar refuses fails only its request: the Engine releases that row and keeps
+// serving, so the refusal must surface as a request-scoped runtime::RequestOutputError.
+int test_grammar_refusal_is_request_scoped(const Frontend& frontend) {
+    auto prompt           = thinking_prompt(frontend);
+    const auto bare_close = frontend.tokenize_text("</think>");
+    auto session          = frontend.make_output_session(
+        prompt, {}, {}, {.budget = static_cast<std::uint32_t>(bare_close.size())},
+        infernix::OutputConstraint::grammar("root ::= \" yes\""));
+    (void)session.preview_model(bare_close, 512, infernix::FinishReason::OutputLimit);
+    (void)session.commit_preview();
+    (void)session.preview_control(session.pending_control_tokens(), 512);
+    (void)session.commit_preview();
+    int failures = 0;
+    bool request_scoped = false;
+    try {
+        (void)session.preview_model(frontend.tokenize_text(" no"), 512,
+                                    infernix::FinishReason::OutputLimit);
+    } catch (const infernix::runtime::RequestOutputError&) {
+        request_scoped = true;
+    } catch (...) {}
+    failures += check(request_scoped, "a refused grammar token did not fail only its request");
+    session.discard_preview();
+    (void)session.preview_model(frontend.tokenize_text(" yes"), 512,
+                                infernix::FinishReason::OutputLimit);
+    failures +=
+        check(channel_text(session.commit_preview(), infernix::OutputChannel::Content) == " yes",
+              "a refused token left tentative grammar state behind");
+    return failures;
+}
+
 int test_reasoning_close_requires_boundary(const Frontend& frontend) {
     auto prompt  = thinking_prompt(frontend);
     auto session = frontend.make_output_session(prompt, {});
@@ -3302,6 +3339,7 @@ int main() {
     failures += test_thinking_budget_control(frontend);
     failures += test_reasoning_loop_guard(frontend);
     failures += test_constrained_thinking_control(frontend);
+    failures += test_grammar_refusal_is_request_scoped(frontend);
     failures += test_thinking_budget_message();
     failures += test_thinking_budget_ignores_quoted_close(frontend);
     failures += test_utf8_and_hidden_eos(frontend);

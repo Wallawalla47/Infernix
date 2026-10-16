@@ -1054,6 +1054,8 @@ private:
         std::array<std::size_t, kMaximumConcurrency> generated_sizes{};
         std::array<bool, kMaximumConcurrency> cancelled{};
         std::array<bool, kMaximumConcurrency> failed{};
+        // A row whose output refused its tokens: released like a cancelled row, failed alone.
+        std::array<std::exception_ptr, kMaximumConcurrency> refused{};
         bool generated_staged = false;
         std::array<std::shared_ptr<Request>, kMaximumConcurrency> terminal_requests{};
         std::array<std::uint32_t, kMaximumConcurrency> terminal_lanes{};
@@ -1104,8 +1106,21 @@ private:
                     finish_reasons[row] = FinishReason::Cancelled;
                     continue;
                 }
-                const OutputDecision decision = request->output.preview_model(
-                    row_tokens, request->budget->remaining(), request->budget->limit_reason());
+                OutputDecision decision;
+                try {
+                    decision = request->output.preview_model(
+                        row_tokens, request->budget->remaining(), request->budget->limit_reason());
+                } catch (const RequestOutputError&) {
+                    refused[row]   = std::current_exception();
+                    cancelled[row] = true;
+                    request->output.discard_preview();
+                    decisions[row] = CommitDecision{
+                        .accepted_tokens = 0,
+                        .terminal        = true,
+                        .cancelled       = true,
+                    };
+                    continue;
+                }
                 if (decision.accepted_tokens == 0 || decision.accepted_tokens > count ||
                     (!decision.finished() && decision.accepted_tokens != count) ||
                     (decision.finished() && decision.continuation != ContinuationAction::Decode) ||
@@ -1222,6 +1237,18 @@ private:
                     remove_completed_slot(lane);
                     continue;
                 }
+                if (refused[row]) {
+                    std::string what = "unknown error";
+                    try {
+                        std::rethrow_exception(refused[row]);
+                    } catch (const std::exception& e) { what = e.what(); } catch (...) {}
+                    publish_diagnostic(diagnostics_, DiagnosticLevel::Error,
+                                       "%s: failed 1 request; the Engine keeps serving",
+                                       what.c_str());
+                    complete_error(request, refused[row]);
+                    remove_completed_slot(lane);
+                    continue;
+                }
                 if (!cancelled[row]) { request->budget->commit(accepted); }
                 update_recovery(request, cancelled[row]);
                 auto published = request->output.commit_preview();
@@ -1298,6 +1325,9 @@ private:
         phase.finish();
         commit_pending(std::move(*progress.pending), lanes, false, cancelled_at_unit_start);
         progress.pending.reset();
+        // A completed prompt returns what its prefill held (Qwen4Exp lends expert frames to a long
+        // prompt), which a request waiting for KV growth may need.
+        request_admission_check();
     }
 
     void run_prefill_step(std::uint32_t lane,

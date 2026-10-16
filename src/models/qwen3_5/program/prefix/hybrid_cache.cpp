@@ -352,7 +352,9 @@ bool HybridPrefixCache::start_snapshot_host_write(SnapshotRef snapshot, cudaStre
     }
     index_->pin_snapshot(snapshot);
     if (!index_->begin_snapshot_host_fill(snapshot)) {
+        // It stays Device-only: its slot is then its last copy (spec §9.2).
         index_->unpin_snapshot(snapshot);
+        ++counters_.host_image_write_refusals;
         return false;
     }
     try {
@@ -415,6 +417,7 @@ void HybridPrefixCache::start_block_host_writes(std::span<const NodeRef> nodes,
             if (!slab_id) {
                 // Everything left on the Host tier is pinned or filling; retry at a later release.
                 index_->unpin_node(node);
+                ++counters_.host_block_write_refusals;
                 break;
             }
             write.nodes.push_back(node);

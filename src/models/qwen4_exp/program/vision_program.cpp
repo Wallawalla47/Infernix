@@ -161,7 +161,15 @@ void ProgramImpl::vision_release(Lane& lane) noexcept {
         const cudaStream_t s = device_.stream;
         // Compute is ordered after every upload into the window before its memory goes back.
         if (v.stream) { v.stream->finish(s); }
-        if (v.encoded && v.timer) { lane.vision_seconds = v.timer->elapsed_ms() * 1e-3; }
+        // Release follows the last prefill call's enqueue, so the tower's stop may still be in
+        // flight: its time is read once it has completed (vision_seconds_of), never waited for.
+        if (v.encoded && v.timer) {
+            if (const auto ms = v.timer->try_elapsed_ms()) {
+                lane.vision_seconds = *ms * 1e-3;
+            } else {
+                lane.vision_timer = std::move(v.timer);
+            }
+        }
         v.pass.reset();
         v.layout.reset();
         v.weights.reset();

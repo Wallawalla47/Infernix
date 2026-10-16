@@ -80,6 +80,13 @@ std::string codepoint_to_utf8(std::int32_t codepoint) {
     return {reinterpret_cast<const char*>(buffer), static_cast<std::size_t>(length)};
 }
 
+std::int32_t simple_lowercase(std::int32_t codepoint) noexcept {
+    if (static_cast<std::uint32_t>(codepoint) < 0x80U) {
+        return codepoint >= 'A' && codepoint <= 'Z' ? codepoint - 'A' + 'a' : codepoint;
+    }
+    return utf8proc_tolower(codepoint);
+}
+
 bool is_letter(std::int32_t codepoint) noexcept {
     if (static_cast<std::uint32_t>(codepoint) < 0x80U) {
         return (codepoint >= 'A' && codepoint <= 'Z') || (codepoint >= 'a' && codepoint <= 'z');

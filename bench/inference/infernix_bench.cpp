@@ -251,6 +251,7 @@ int main(int argc, char** argv) {
                   << " (max_context=" << max_context
                   << ", kv_cache=" << infernix::bench::kv_cache_name(options.kv_cache) << ")\n";
         infernix::Engine engine(std::move(engine_options));
+        env.prefill_chunk = engine.options().prefill_chunk; // the model's default when unset
         fill_cuda_environment(env, options.device);
         env.load   = engine.load_summary();
         env.memory = engine.memory_summary();

@@ -113,6 +113,7 @@ std::string usage_text(const char* argv0) {
            "  --rope-yarn-factor F     startup-fixed YaRN, finite [1,4] (default 1);\n"
            "                           extends allowed ceiling only, not --max-context\n"
            "  --prefill-chunk N        prefill chunk size in tokens, multiple of 128\n"
+           "                           (default 16384 for Qwen3.8-Flash-Next, 1024 otherwise)\n"
            "  --max-new N              cap on generated tokens\n"
            "  --device N               CUDA device ordinal (default 0)\n"
            "  --ram-headroom-mib N     physical Host RAM in MiB that pinned weights and\n"
@@ -286,6 +287,9 @@ Options parse_options(int argc, char** argv) {
             }
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = parse_u32(value(arg), "prefill-chunk");
+            if (options.prefill_chunk == 0) {
+                throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
+            }
         } else if (arg == "--device") {
             options.device = parse_device(value(arg));
         } else if (arg == "--ram-headroom-mib") {

@@ -194,6 +194,15 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
     }
     const std::uint32_t concurrency = options.max_concurrency;
     const bool qwen4_exp            = architecture == models::Architecture::Qwen4Exp;
+    // The model's default prefill chunk. Qwen3.8-Flash-Next's exact route split at 1,024, 4,096
+    // and 12,288 tokens gave identical bits (36 perplexity windows of 14,336 tokens; its calls
+    // split on the 16-token GDN grid and its routes are column-invariant), and wide chunks prefill
+    // faster with no decode cost: Dense8, INT8 KV, RTX 5090,
+    // pp32768 9,639 -> 11,211 tok/s from 4,096 to 16,384 (pp65536 9,887 -> 11,268; 26 fewer expert
+    // frames of ~8,560). The Qwen3.5 family keeps 1,024: its prefill bits follow the chunk grid,
+    // and idle-wide-prefill already widens its idle steps (16,384 measured 3.5 % slower at
+    // pp16384 and pp32768 on the 27B).
+    if (options.prefill_chunk == 0) { options.prefill_chunk = qwen4_exp ? 16384U : 1024U; }
     // The draft-confidence gate exists only on Qwen3.8-Flash-Next's one-row MTP rounds; another
     // model refuses it rather than ignoring a tuning value.
     if (const auto& p = options.speculative.draft_min_p) {
@@ -256,7 +265,11 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
         hybrid.max_new_taps = hybrid.max_new_taps.value_or(host_tier ? 8U : 2U);
         // Ladder taps are realized on prefill chunk boundaries, so the ladder never refines below
         // the chunk: coarser ladders only waste snapshots on taps that share one boundary.
-        const std::uint32_t chunk = std::max<std::uint32_t>(options.prefill_chunk, 64U);
+        // Qwen3.8-Flash-Next splits its prefill calls at taps instead (free-cache-resume), so its
+        // ladder keeps the 4,096-token chunk's spacing whatever wider chunk it prefills with.
+        const std::uint32_t chunk = std::max<std::uint32_t>(
+            qwen4_exp ? std::min<std::uint32_t>(options.prefill_chunk, 4096U) : options.prefill_chunk,
+            64U);
         hybrid.tap_ladder_tokens =
             hybrid.tap_ladder_tokens.value_or(std::max<std::uint32_t>(4096U, 2U * chunk));
         hybrid.tap_min_gap_tokens =

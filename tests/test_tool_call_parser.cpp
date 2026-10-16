@@ -1112,6 +1112,31 @@ int test_duplicate_parameter_keeps_last_value() {
     return failures;
 }
 
+// Model bytes need not be valid UTF-8: a value cut inside a sequence (or a stray byte) must encode
+// as U+FFFD rather than throw out of the parser.
+int test_invalid_utf8_parameter_value() {
+    const auto contract = contract_for("configure", Json{{"value", Json{{"type", "string"}}}});
+    int failures        = 0;
+    for (const std::string value : {std::string("ab\xC3"), std::string("a\xFF" "b"),
+                                    std::string("\xE2\x82")}) {
+        try {
+            const auto parsed =
+                fi::parse_qwen_tool_call_output(tool_call("configure", {{"value", value}}), 64,
+                                                contract, true);
+            failures += check(parsed.tool_calls.size() == 1,
+                              "a call with invalid UTF-8 in its value was not parsed");
+            if (parsed.tool_calls.size() != 1) { continue; }
+            const Json args = Json::parse(parsed.tool_calls.front().arguments_json);
+            failures += check(args.at("value").get<std::string>().find("\xEF\xBF\xBD") !=
+                                  std::string::npos,
+                              "invalid UTF-8 was not replaced by U+FFFD");
+        } catch (const std::exception&) {
+            failures += check(false, "invalid UTF-8 in a tool-call value threw");
+        }
+    }
+    return failures;
+}
+
 int test_tolerant_recovery() {
     using Reason = infernix::ToolCallParseFallbackReason;
     int failures = 0;
@@ -1479,6 +1504,7 @@ int main() {
     int failures = 0;
     failures += test_free_tool_continuation();
     failures += test_untyped_parameters();
+    failures += test_invalid_utf8_parameter_value();
     failures += test_duplicate_parameter_keeps_last_value();
     failures += test_multiple_calls();
     failures += test_declared_strings_preserve_text();

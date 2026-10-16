@@ -77,6 +77,13 @@ int main() {
         append_words(" ", pb, b);
         expect(a == b && a.size() == 3, "unseparated symbol splits per character");
     }
+    // Non-ASCII letters fold as `str.lower()` does: "ПРИВЕТ Ünïcode" and "привет ünïCODE" are the
+    // same words, also when a token boundary cuts a character.
+    {
+        expect(words_of("\xd0\x9f\xd0\xa0\xd0\x98\xd0\x92\xd0\x95\xd0\xa2 \xc3\x9cn\xc3\xaf" "code", 1) ==
+                   words_of("\xd0\xbf\xd1\x80\xd0\xb8\xd0\xb2\xd0\xb5\xd1\x82 \xc3\xbcn\xc3\xaf" "CODE"),
+               "non-ascii case fold");
+    }
     // A run of CJK letters is one word, as `\w+` reads it.
     {
         std::vector<std::uint64_t> words;

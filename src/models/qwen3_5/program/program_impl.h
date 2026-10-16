@@ -271,11 +271,26 @@ struct HybridQuoteImpl {
 // A prefill tap whose StateImage is captured but whose snapshot waits for the blocks it anchors
 // on: a frontier inside a block needs that block complete, and an MTP backend trails the text
 // frontier by one token, so even a page-aligned frontier waits for its last block's backend page.
+// A snapshot a lane superseded on the way to a deeper one (its resume snapshot, or its previous
+// tap), so that the deeper one's slot could come from the lineage. If the deeper snapshot is not
+// published after all, the supersession is undone (hybrid_undo_supersession).
+struct HybridSuperseded {
+    runtime::prefix_cache::SnapshotRef snapshot; // invalid: nothing was superseded
+    std::uint32_t frontier = 0;
+    bool index_changed     = false; // the index marked it superseded (not already, not shared)
+};
+
+struct HybridSupersession {
+    HybridSuperseded resume;
+    HybridSuperseded tap;
+};
+
 struct HybridPendingTap {
     std::uint32_t frontier = 0;
     StateImageHandle image;
     std::uint32_t slot = 0; // staging device snapshot slot
     bool boundary      = false;
+    HybridSupersession superseded; // undone if this tap is dropped
 };
 
 // Per-lane hybrid bookkeeping for the active sequence.
@@ -778,9 +793,14 @@ public:
     // Drops the lane's index pins and pending taps. Safe on any lane state.
     void hybrid_release_lane(std::uint32_t lane) noexcept;
     // Supersedes the snapshot the sequence resumed from once it snapshots past it at
-    // `frontier`, before the new snapshot takes a slot or slabs (spec §9.2, §9.3).
-    void hybrid_supersede_resume(HybridLaneState& lane, std::uint32_t frontier,
-                                 std::span<const TokenId> ledger);
-    void hybrid_supersede_tap(HybridLaneState& lane, std::uint32_t frontier);
+    // `frontier`, before the new snapshot takes a slot or slabs (spec §9.2, §9.3). Each returns
+    // what it superseded, for hybrid_undo_supersession.
+    HybridSuperseded hybrid_supersede_resume(HybridLaneState& lane, std::uint32_t frontier,
+                                             std::span<const TokenId> ledger);
+    HybridSuperseded hybrid_supersede_tap(HybridLaneState& lane, std::uint32_t frontier);
+    // The deeper snapshot was not published (no slot, no image, a dropped tap, a failed
+    // publication): what it superseded is the lineage's resume point again, unless the lane has
+    // published a deeper snapshot since.
+    void hybrid_undo_supersession(HybridLaneState& lane, const HybridSupersession& superseded);
 };
 } // namespace infernix::models::qwen3_5::detail

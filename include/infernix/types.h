@@ -468,7 +468,10 @@ struct EngineOptions {
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
-    std::uint32_t prefill_chunk        = 1024;
+    // Prompt tokens per prefill call, a multiple of 128; 0 takes the model's default: 16,384 for
+    // Qwen3.8-Flash-Next (its exact-route prefill measured identical across chunks), 1,024
+    // otherwise.
+    std::uint32_t prefill_chunk        = 0;
     // INT8 KV prefills with the fast prompt-attention kernel and rounds prefill_chunk down to whole
     // prompt-attention waves. True selects the original INT8 prompt kernel at the requested chunk;
     // it requires the INT8 KV cache.
@@ -1575,6 +1578,17 @@ struct RuntimeStats {
     std::uint64_t hybrid_taps_created            = 0;
     std::uint64_t hybrid_taps_skipped            = 0;
     std::uint64_t hybrid_endpoints_created       = 0;
+    // Publication refusals: taps skipped for want of a Device snapshot slot (of taps_skipped),
+    // endpoints that passed their gates but were not published, snapshot images and blocks
+    // refused Host slabs (they stay Device-only), Device snapshot slots taken from an owner, slot
+    // requests refused, and the slots free now.
+    std::uint64_t hybrid_taps_skipped_no_slot      = 0;
+    std::uint64_t hybrid_endpoints_skipped         = 0;
+    std::uint64_t hybrid_host_image_write_refusals = 0;
+    std::uint64_t hybrid_host_block_write_refusals = 0;
+    std::uint64_t hybrid_device_slot_evictions     = 0;
+    std::uint64_t hybrid_device_slot_refusals      = 0;
+    std::uint32_t hybrid_free_device_snapshot_slots = 0;
     std::uint64_t hybrid_host_image_writes       = 0;
     std::uint64_t hybrid_host_block_writes       = 0;
     std::uint64_t hybrid_host_image_restores     = 0;

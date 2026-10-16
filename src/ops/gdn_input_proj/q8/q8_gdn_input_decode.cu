@@ -57,7 +57,10 @@ void q8_gdn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& q
     constexpr int kRowsPerCta = 8;
     static_assert((8192 % kRowsPerCta) == 0 && (4096 % kRowsPerCta) == 0);
     const Output output{static_cast<__nv_bfloat16*>(qkv.data), static_cast<__nv_bfloat16*>(z.data)};
-    launch_q8_a16_gemv<Q8A16GemvSchedule<kRowsPerCta, 1, 2, 2048>>(
+    // Four blocks per SM fit 64 registers per thread (from 80): the same instructions and order,
+    // so the same bits; Qwen3.6-35B-A3B plain decode 397.4 -> 398.6 tok/s (giveen/ninfer-ext
+    // 310d3bf18; RTX 5090, ABAB x2, every 4-block run ahead).
+    launch_q8_a16_gemv<Q8A16GemvSchedule<kRowsPerCta, 1, 4, 2048>>(
         q8_linear_operands(x, weight), output, LinearIdentityEpilogue{}, stream);
     CUDA_CHECK(cudaGetLastError());
 }
@@ -75,7 +78,7 @@ void q8_gdn_input_decode_conv_snapshot_launch(
                            snapshot_base_slot, query, key, value),
         static_cast<__nv_bfloat16*>(z.data),
     };
-    launch_q8_a16_gemv<Q8A16GemvSchedule<kRowsPerCta, 1, 2, 2048>>(
+    launch_q8_a16_gemv<Q8A16GemvSchedule<kRowsPerCta, 1, 4, 2048>>(
         q8_linear_operands(x, weight), ignored_output, epilogue, stream);
     CUDA_CHECK(cudaGetLastError());
 }

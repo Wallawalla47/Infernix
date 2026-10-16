@@ -180,7 +180,13 @@ struct HybridPrefixCacheStats {
     std::uint64_t blocks_duplicate           = 0;
     std::uint64_t taps_created               = 0;
     std::uint64_t taps_skipped               = 0;
+    std::uint64_t taps_skipped_no_slot       = 0;
     std::uint64_t endpoints_created          = 0;
+    std::uint64_t endpoints_skipped          = 0;
+    std::uint64_t host_image_write_refusals  = 0;
+    std::uint64_t host_block_write_refusals  = 0;
+    std::uint64_t device_slot_evictions      = 0;
+    std::uint64_t device_slot_refusals       = 0;
     std::uint64_t host_image_writes          = 0;
     std::uint64_t host_block_writes          = 0;
     std::uint64_t host_image_restores        = 0;

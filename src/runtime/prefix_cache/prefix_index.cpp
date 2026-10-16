@@ -321,7 +321,7 @@ bool PrefixCacheIndex::leaves_path(const Snapshot& snapshot, std::uint32_t from,
     return false;
 }
 
-void PrefixCacheIndex::supersede(SnapshotRef snapshot, std::span<const TokenId> continuation) {
+bool PrefixCacheIndex::supersede(SnapshotRef snapshot, std::span<const TokenId> continuation) {
     // Below a Boundary the endpoints may be other conversations': one conversation passing them
     // says nothing about theirs.
     if (!continuation.empty() && require(snapshot).kind != SnapshotKind::Boundary) {
@@ -335,13 +335,13 @@ void PrefixCacheIndex::supersede(SnapshotRef snapshot, std::span<const TokenId> 
             }
         }
         // Before `snapshot`, so they are evicted first.
-        for (const std::uint32_t endpoint : passed) { supersede(ref_of_snapshot(endpoint)); }
+        for (const std::uint32_t endpoint : passed) { (void)supersede(ref_of_snapshot(endpoint)); }
     }
     Snapshot& entry = require(snapshot);
     // A boundary serves the conversations that share it, so it is superseded only while the tree
     // shows no other conversation below it: until then it is just this lineage's snapshot.
     if (entry.superseded || (entry.kind == SnapshotKind::Boundary && shared_below(entry))) {
-        return;
+        return false;
     }
     std::vector<std::uint32_t> dependents;
     collect_retained_dependents(snapshot.index, dependents);
@@ -349,6 +349,18 @@ void PrefixCacheIndex::supersede(SnapshotRef snapshot, std::span<const TokenId> 
     entry.superseded_tick = ++tick_;
     adjust_retained(entry.anchor, -1);
     // Its retained dependents now value what lies between them and the retained ancestor above.
+    revalue_around(snapshot.index, dependents);
+    return true;
+}
+
+void PrefixCacheIndex::unsupersede(SnapshotRef snapshot) {
+    Snapshot& entry = require(snapshot);
+    if (!entry.superseded) { return; }
+    entry.superseded      = false;
+    entry.superseded_tick = 0;
+    adjust_retained(entry.anchor, +1);
+    std::vector<std::uint32_t> dependents;
+    collect_retained_dependents(snapshot.index, dependents);
     revalue_around(snapshot.index, dependents);
 }
 
@@ -936,9 +948,12 @@ std::optional<std::uint32_t> PrefixCacheIndex::acquire_device_slot(double claim)
     std::uint32_t superseded = kNoId;
     std::uint32_t unbacked   = kNoId;
     std::uint32_t backed     = kNoId;
+    // Owned slots whose (retained) owner has no Host copy, evictable or not.
+    std::uint32_t device_only_slots = 0;
     for (std::uint32_t slot = 0; slot < slot_state_.size(); ++slot) {
         if (slot_state_[slot] != SlotState::Owned) { continue; }
         const Snapshot& owner = snapshots_[slot_owner_[slot]];
+        if (!owner.superseded && owner.host != CopyState::Resident) { ++device_only_slots; }
         if (owner.pins != 0) { continue; }
         // A held owner without a Host copy would be lost with its slot.
         if (owner.hold != kNoHold && owner.host != CopyState::Resident) { continue; }
@@ -970,13 +985,21 @@ std::optional<std::uint32_t> PrefixCacheIndex::acquire_device_slot(double claim)
     // at least as much. Host eviction leaves such owners behind, and without this they hold their
     // slots for good; a short request's snapshots must not push out the one a long conversation
     // resumes from.
-    if (unbacked != kNoId && snapshots_[slot_owner_[unbacked]].priority <= claim) {
+    // Device-only owners hold at most D - 1 slots, though: GDSF time advances only on an eviction,
+    // so owners worth more than every new claim would otherwise keep all D slots for the rest of
+    // the session and no new conversation could publish a snapshot (issue #29). The least
+    // valuable yields; the most valuable keeps its slot. A single slot keeps value's rule alone.
+    const bool every_slot_device_only =
+        slot_state_.size() >= 2 && device_only_slots == slot_state_.size();
+    if (unbacked != kNoId &&
+        (snapshots_[slot_owner_[unbacked]].priority <= claim || every_slot_device_only)) {
         inflation_ = std::max(inflation_, snapshots_[slot_owner_[unbacked]].priority);
         remove_snapshot(slot_owner_[unbacked]);
         return take(unbacked);
     }
     // A backed owner keeps its Host copy: the least recently hit gives up its Device copy.
     if (backed != kNoId) { return drop_device_copy(backed); }
+    if (!slot_state_.empty()) { ++counters_.device_slot_refusals; }
     return std::nullopt;
 }
 

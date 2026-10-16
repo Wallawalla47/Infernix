@@ -10,6 +10,7 @@
 #include <spdlog/logger.h>
 
 #include <chrono>
+#include <cstdio>
 #include <exception>
 #include <mutex>
 #include <stdexcept>
@@ -305,6 +306,15 @@ void HttpServer::run_stats_reporter() {
     Clock::time_point previous_time = Clock::now();
     const auto interval             = std::chrono::milliseconds(options_.log_stats_interval_ms);
     Clock::time_point next_deadline = previous_time + interval;
+    // An exception leaving this thread would terminate the server: a failed report is noted on
+    // stderr (once; the log writers may be what failed) and the next interval reports again.
+    bool failure_noted       = false;
+    const auto note_failure = [&failure_noted](const char* what) noexcept {
+        if (failure_noted) { return; }
+        failure_noted = true;
+        std::fprintf(stderr, "[infernix-serve] throughput report failed: %s; reporting continues\n",
+                     what);
+    };
 
     for (;;) {
         {
@@ -314,27 +324,39 @@ void HttpServer::run_stats_reporter() {
             }
         }
 
-        const infernix::RuntimeStats current = service_->runtime_stats();
-        const Clock::time_point now        = Clock::now();
-        const ThroughputReport report      = make_throughput_report(
-            previous, current, std::chrono::duration<double>(now - previous_time).count());
-        if (report_has_activity(report)) { record_throughput(report); }
-        if (console_stats_) { console_stats_->runtime(current); }
-        previous      = current;
-        previous_time = now;
+        try {
+            const infernix::RuntimeStats current = service_->runtime_stats();
+            const Clock::time_point now        = Clock::now();
+            const ThroughputReport report      = make_throughput_report(
+                previous, current, std::chrono::duration<double>(now - previous_time).count());
+            previous      = current;
+            previous_time = now;
+            if (report_has_activity(report)) { record_throughput(report); }
+            if (console_stats_) { console_stats_->runtime(current); }
+        } catch (const std::exception& error) {
+            note_failure(error.what());
+        } catch (...) {
+            note_failure("unknown error");
+        }
         next_deadline += interval;
         const Clock::time_point after_write = Clock::now();
         if (next_deadline <= after_write) { next_deadline = after_write + interval; }
     }
 
-    const infernix::RuntimeStats current = service_->runtime_stats();
-    const Clock::time_point now        = Clock::now();
-    ThroughputReport tail              = make_throughput_report(
-        previous, current, std::chrono::duration<double>(now - previous_time).count());
-    // The exact partial interval remains useful to measurement consumers. Pretty throughput is a
-    // fixed-cadence operational record and deliberately has no irregular shutdown tail.
-    tail.final_interval = true;
-    request_jsonl_.write_throughput(tail);
+    try {
+        const infernix::RuntimeStats current = service_->runtime_stats();
+        const Clock::time_point now        = Clock::now();
+        ThroughputReport tail              = make_throughput_report(
+            previous, current, std::chrono::duration<double>(now - previous_time).count());
+        // The exact partial interval remains useful to measurement consumers. Pretty throughput is
+        // a fixed-cadence operational record and deliberately has no irregular shutdown tail.
+        tail.final_interval = true;
+        request_jsonl_.write_throughput(tail);
+    } catch (const std::exception& error) {
+        note_failure(error.what());
+    } catch (...) {
+        note_failure("unknown error");
+    }
 }
 
 void HttpServer::stop_stats_reporter() {

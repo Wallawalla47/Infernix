@@ -8282,6 +8282,12 @@ elastic pool does the same job with no kernel change:
       unmapped), as many as the growth needs: a fixed pool at the capacity takes them all.
     - Growth is refused while frames are lent. The quote and the prefix selection count what one
       growth could add.
+    - When only a prefill's stream ring and wide arena are lent (no layer walk, no vision window),
+      the Engine's reclaim for a short binding returns them between calls and grows (the prompt's
+      next streamed call lends again from the smaller cache, or stages: the same bytes), and the
+      quote counts that growth. A completed prompt also re-runs admission, since its loans return
+      then. Before 2026-10-15 a long prompt held its loans for its whole prefill, and a request
+      queued behind it could expire in the queue (GitHub #24).
     - Until 2026-10-11 one growth took at most a quarter of the frames. After the idle shrink this
       rejected a ~480K resume with HTTP 503 ("more than an idle Engine has"), although resuming a
       350K request first and then the same 480K request grew the pool to the same size (GitHub
@@ -9707,6 +9713,51 @@ separate): 97-128 columns −1 %, 192 −1.6 %, 256 +1 %, 512 −16 %, 1,024 +0.
 (540 against 580 µs); up to 96 columns the fused form was no faster (+0.5-2 %), so those widths keep
 the separate steps. At a 4,096-token chunk that is ~4 ms of ~380 ms per chunk (estimate, not measured
 end to end; below the run-to-run spread of a prefill benchmark).
+
+### 19.3.24 Six-source adoption review (2026-10-15/16)
+
+NInfer dev (to 439e1075e), kido5217/Infernix (to 86479527), giveen/ninfer-ext (to f7ae74760),
+sergqwer/strata-nvfp4 (to 257727d5, upstream Strata 296b59d2), jpezzulli/sglang-rtxpro6000 (fa9c2673,
+with its kernel donor aiueo52/flash-next-rtxpro6000 e0fa9fa9) and this repository's issues were
+reviewed for speed ideas. Measured on the RTX 5090 (PCIe 5.0 x8), CUDA 13.4, single runs unless
+stated.
+
+**The prefill chunk: Flash-Next now defaults to 16,384 (adopted).** The exact route split at 1,024,
+4,096 and 12,288 tokens gave identical bits (36 perplexity windows of 14,336 tokens, Dense8, INT8
+KV): calls split on the 16-token GDN grid and the routes are column-invariant. `infernix_bench`,
+MTP 4, proposal head, chunks 1,024 / 4,096 / 8,192 / 12,288 / 16,384: pp16384 5,207 / 6,648 / 6,673 /
+6,702 / 6,768 tok/s, pp32768 5,567 / 9,639 / 10,557 / 10,907 / 11,211, pp65536 5,701 / 9,887 / 10,770 /
+11,136 / 11,268, pp4096 ~1,720 at every chunk, tg512 143.7-144.0 at every chunk; expert frames
+8,561 → 8,535. With the SSD tier (`--expert-ram-mib 30000`) a 49K-token prompt ran at 16,384. kido5217
+measured the same direction on recipe C (#76). `--prefill auto` (kido #73) is therefore not needed for
+speed. The tap ladder keeps the 4,096-token chunk's spacing. The Qwen3.5 family keeps 1,024: on the
+27B (INT8 KV) 1,024 / 4,096 / 8,192 / 16,384 gave pp16384 12,009 / 12,154 / 12,062 / 11,580 and pp32768
+10,869 / 10,897 / 10,881 / 10,499 tok/s (idle-wide-prefill already widens idle steps), and its exact
+route's bits follow the chunk grid (perplexity 4.1436 / 4.1440 / 4.1288 / 4.1441 at 896 / 3,584 /
+8,064 / 16,128).
+
+**Measured and not adopted:**
+- MTP draft length from measured per-width round times instead of `kWidthCost` (Strata's DraftPolicy
+  idea; ABBA, pg4096+256 and pg32768+256): decode 140.5 → 133.8 tok/s and 170.9 → 161.0 (151-171);
+  accepted drafts per round 2.10 → 1.29. Round times carry the expert misses, which priced drafts
+  higher than the slope.
+- The 27B chunked GDN value tile 16 instead of the heuristic's 64 at 48 value heads (giveen's survey):
+  op 96.9 against 105.1 µs at 1,024 tokens and 386 against 392 at 4,096, bit-identical, but pp16384
+  12,100 against 12,217 tok/s (−0.9 %, two ABBA rounds).
+
+**Adopted elsewhere:** the 35B Q8 GDN decode GEMV at four blocks per SM (giveen 310d3bf18):
+bit-identical greedy output, plain decode 397.4 → 398.6 tok/s (every four-block run ahead).
+
+**Sized and not built** (each at most ~0.4 % of a round, below what end-to-end runs resolve):
+- QSA selection shared across chained MTP draft steps (SGLang `QSAMTPSharedSparseIndices`): select
+  15 / 17 / 25 µs per call at 4K / 32K / 128K (`infernix_qsa_attention_bench`, width 1), so 40-80 µs of
+  a ~21 ms MTP 4 round; a block completing between steps would also need an attention-kernel change.
+- The MTP catch-up folded into the first draft step (Strata 3fd0460ba2): the catch-up is already a
+  K/V-only pass.
+- The gated RMSNorm folded into the out_proj GEMV prologue at verify widths (SGLang/donor): ~36 µs per
+  round, a loss at width 1.
+- Strata's v4 hyper-connection read scheduling: this engine's BF16 mixer is already 10.6 / 18.5 /
+  20.8 µs at T = 1 / 5 / 8 against Strata v4's 11.8 / 18.1 / 26.3 µs.
 
 ### 19.4 On the Gold-Star-Infer runtime contract (2026-10-05)
 

@@ -197,6 +197,7 @@ struct PrefixIndexStats {
     std::uint64_t host_snapshot_evictions = 0;
     std::uint64_t superseded_evictions    = 0; // of host_snapshot_evictions
     std::uint64_t device_slot_evictions   = 0;
+    std::uint64_t device_slot_refusals    = 0; // acquire_device_slot found no slot
     std::uint64_t snapshot_hits           = 0;
     double gdsf_inflation                 = 0.0;
     // Queue holds (§9.6): held snapshots now, held entries whose Device copy was evicted, held
@@ -246,7 +247,13 @@ public:
     // send one (a client re-rendering the reply, a retry, or a branch). Left retained, such
     // endpoints held Device-only slots for good while the lineage's own resume point gave up its
     // slot.
-    void supersede(SnapshotRef snapshot, std::span<const TokenId> continuation = {});
+    // Returns whether `snapshot` itself became superseded (not already superseded, not a shared
+    // Boundary).
+    bool supersede(SnapshotRef snapshot, std::span<const TokenId> continuation = {});
+    // Undoes a supersede() that returned true when the deeper snapshot was not published after
+    // all (no Device slot, or the publication failed): `snapshot` is its lineage's resume point
+    // again. Endpoints that supersede() superseded as passed stay superseded.
+    void unsupersede(SnapshotRef snapshot);
 
     // ---- queue holds (§9.6) --------------------------------------------------------------------
     // The snapshots queued requests will resume from, in admission order (rank 0 is admitted
@@ -325,8 +332,10 @@ public:
     // ------------------------------------------------------- Returns a device snapshot slot for a
     // tap/endpoint destination (staging): a free one, else a superseded owner's, else the least
     // valuable Device-only owner's when the new snapshot's `claim` priority is at least its GDSF
-    // priority (that snapshot is lost), else the least recently hit Host-backed owner's (which
-    // keeps its Host copy). Absent with no Device slots configured.
+    // priority, or when Device-only owners hold every one of two or more slots (that snapshot is
+    // lost), else the least
+    // recently hit Host-backed owner's (which keeps its Host copy). Absent with no Device slots
+    // configured, or when every owner is pinned, held or worth more (counted as a refusal).
     [[nodiscard]] std::optional<std::uint32_t>
     acquire_device_slot(double claim = std::numeric_limits<double>::infinity());
     // GDSF priority of a new snapshot at `frontier` whose nearest retained snapshot on its path
