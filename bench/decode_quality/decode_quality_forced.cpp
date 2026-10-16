@@ -25,7 +25,8 @@
 // so `fast_path_gate identical` compares two runs bit for bit. --concurrency N submits the segments
 // in groups of N that run together (their prompt lengths differ, so prefills overlap decodes),
 // --prefill-chunk N sets the prompt chunk, and --prefix-reuse first runs each segment's prompt (or
-// with --warm-tokens N its first N tokens) alone and then the measured request from the prefix cache.
+// with --warm-tokens N its first N tokens) alone and then the group's measured requests together
+// from the prefix cache.
 //
 // Usage: infernix_decode_quality_forced <artifact> <corpus.txt> <out.json> [--segments N]
 //          [--prompts L1,L2,...] [--forced N] [--reference | --observe REFERENCE.json]
@@ -143,9 +144,6 @@ Options parse(int argc, char** argv) {
         throw std::invalid_argument("--forced exceeds the constraint step limit");
     }
     if (out.concurrency > 8) { throw std::invalid_argument("--concurrency must be 1..8"); }
-    if (out.prefix_reuse && out.concurrency != 1) {
-        throw std::invalid_argument("--prefix-reuse runs one request at a time");
-    }
     if (out.warm_tokens != 0 && !out.prefix_reuse) {
         throw std::invalid_argument("--warm-tokens needs --prefix-reuse");
     }
@@ -395,10 +393,10 @@ int main(int argc, char** argv) {
         };
         for (std::uint32_t group = 0; group < options.segments; group += options.concurrency) {
             const std::uint32_t end = std::min(options.segments, group + options.concurrency);
-            if (options.prefix_reuse) {
-                // The warm request publishes the prompt's prefix (its first --warm-tokens tokens when
-                // set); the measured one resumes from it.
-                std::vector<infernix::TokenId> warm = segments.prompt(group);
+            // Each warm request publishes its segment's prompt prefix (its first --warm-tokens tokens
+            // when set) before the round; the measured requests then resume from them together.
+            for (std::uint32_t segment = group; options.prefix_reuse && segment < end; ++segment) {
+                std::vector<infernix::TokenId> warm = segments.prompt(segment);
                 if (options.warm_tokens != 0 && options.warm_tokens < warm.size()) {
                     warm.resize(options.warm_tokens);
                     infernix::RequestOptions request;
@@ -408,7 +406,7 @@ int main(int argc, char** argv) {
                     request.stop.include_model_defaults       = false;
                     (void)engine.generate(engine.prepare_tokens(std::move(warm), true), std::move(request));
                 } else {
-                    (void)engine.generate(engine.prepare_tokens(std::move(warm), true), request_of(group, 1));
+                    (void)engine.generate(engine.prepare_tokens(std::move(warm), true), request_of(segment, 1));
                 }
             }
             std::vector<infernix::GenerationHandle> handles;

@@ -178,8 +178,8 @@ The log-probabilities are printed exactly, so the same segments also measure req
 bit. `--concurrency N` (1-8) submits the segments in groups of N that run together (their prompt
 lengths differ, so prefills overlap decodes), `--prefill-chunk N` sets the prompt chunk (default
 4096, rounded down to the prompt-attention wave), and `--prefix-reuse` runs each segment's prompt
-alone first (with `--warm-tokens N`, only its first N tokens) and then the measured request from
-the prefix cache (the report's `reused_prompt_tokens` counts the restored tokens). `--kv-tokens N`
+alone first (with `--warm-tokens N`, only its first N tokens) and then the group's measured
+requests together from the prefix cache (the report's `reused_prompt_tokens` counts the restored tokens). `--kv-tokens N`
 sizes the KV pool (default: every lane's whole context), so a short pool makes concurrent requests
 preempt; the report's `preemptions` and `replayed_tokens` count what happened.
 
