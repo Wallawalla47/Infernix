@@ -770,8 +770,8 @@ tokens. The recipe C gates (`expert-a4-residual`, `fp8-a8-pair`) are re-scored i
 | `adaptive-speculation` | the same, with speculative decoding | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
 | `free-cache-resume` | the same, with the prefix cache | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
 | `preemption` | request-invariance-capable artifacts | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
-| Qwen3.8-Flash-Next: `adaptive-speculation` (MTP), `free-cache-resume` | every Flash-Next artifact | Q8 dense, 4-bit experts, with BF16, INT8, NVFP4 or VQ2 KV (FP8 and K8V4 fail, K4V2 not gated; below) |
-| Qwen3.8-Flash-Next: `preemption` | every Flash-Next artifact | Q8 dense, 4-bit experts, with BF16, INT8, FP8, NVFP4, K8V4 or VQ2 KV (K4V2 not gated) |
+| Qwen3.8-Flash-Next: `adaptive-speculation` (MTP), `free-cache-resume` | every Flash-Next artifact | Q8 dense, 4-bit experts, with BF16, INT8, NVFP4, VQ2 or K4V2 KV (FP8 and K8V4 fail, below) |
+| Qwen3.8-Flash-Next: `preemption` | every Flash-Next artifact | Q8 dense, 4-bit experts, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
 | Qwen3.8-Flash-Next: `q8-sliced-k`, `gdn-conv-fused`, `qsa-prepare-fused` | Q8 dense weights (`qsa-prepare-fused`: BF16, INT8, FP8, NVFP4 or K8V4 KV) | Q8 dense, 4-bit experts, every KV format (`qsa-prepare-fused`: the five it serves) |
 | `fp8-a8-pair` | row-FP8 dense weights (recipe C) | none (fails its decode gate on recipe C, below) |
 | `q4-w4a8` | groupwise Q4 MLP gate/up | none (fails, below) |
@@ -911,12 +911,13 @@ default role (6.1). Bounds are one-sided 95 %:
 | K8V4 | preemption increment | 4.3e-4 (9.4e-4) | -0.08 (0.16) | 1.7e-5 | 3.0e-3 | 0.98 | pass |
 | VQ2 | joint | 1.4e-4 (8.3e-4) | -0.02 (0.36) | 5.3e-4 | 7.0e-4 | 1.23 | pass |
 | VQ2 | preemption increment | -3.7e-5 (4.8e-4) | -0.01 (0.22) | 1.2e-3 | 9.9e-5 | 1.07 | pass |
+| K4V2 | joint | -1.8e-4 (5.7e-4) | +0.10 (0.46) | 5.0e-5 | -2.7e-3 | 1.02 | pass |
+| K4V2 | preemption increment | 3.6e-4 (8.2e-4) | -0.08 (0.13) | 1.1e-3 | 4.4e-4 | 1.03 | pass |
 
 Every prompt-length bucket passes. `adaptive-speculation` and `free-cache-resume` are therefore
-qualified on BF16, NVFP4 and VQ2 and not on FP8 or K8V4; `preemption` (which acts only in its own
-arm) on all five. Which path carries the FP8 and K8V4 excess is not resolved: the joint fast run
-also holds the format's kernel paths, whose decode was gated on BF16 and NVFP4 only. K4V2 is not
-gated yet. Before the increment rule, the BF16 forced-preemption arm against the exact route failed
+qualified on BF16, NVFP4, VQ2 and K4V2 and not on FP8 or K8V4; `preemption` (which acts only in its
+own arm) on all six. Which path carries the FP8 and K8V4 excess is not resolved: the joint fast run
+also holds the format's kernel paths, whose decode was gated on BF16 and NVFP4 only. Before the increment rule, the BF16 forced-preemption arm against the exact route failed
 (TV bound 4.57e-3, KL excess 1.23e-2, p99.9 ratio 1.63), and the kernel paths alone failed it the same
 way; its exact route was bit-identical with and without the short pool and across reruns (6.1).
 

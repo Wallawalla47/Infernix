@@ -72,8 +72,7 @@ int main() {
                       "fp8-a8-pair is qualified at op level only, not on any artifact");
 
     // The request-coupling paths, per KV format: speculation and cache resume passed their joint arm
-    // on these formats (FP8's and K8V4's failed), preemption its increment arm on these; K4V2 is not
-    // gated yet.
+    // on these formats (FP8's and K8V4's failed), preemption its increment arm on all of them.
     struct Coupling {
         KvCacheStorage kv;
         bool spec_and_cache;
@@ -84,7 +83,7 @@ int main() {
                               Coupling{KvCacheStorage::Nvfp4Group16, true, true},
                               Coupling{KvCacheStorage::Fp8KeyNvfp4Value, false, true},
                               Coupling{KvCacheStorage::Vq2, true, true},
-                              Coupling{KvCacheStorage::Q4KeyVq2Value, false, false}}) {
+                              Coupling{KvCacheStorage::Q4KeyVq2Value, true, true}}) {
         const FastPathConfiguration config{QType::Q8_G32_FP16, true, c.kv};
         failures += check(q::fast_path_qualified(FastPath::AdaptiveSpeculation, config) == c.spec_and_cache &&
                               q::fast_path_qualified(FastPath::FreeCacheResume, config) == c.spec_and_cache,

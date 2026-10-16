@@ -30,7 +30,7 @@ constexpr std::array kQualified{
     // The other formats (2026-10-16, 256 segments): MTP at concurrency 2 with every request resuming
     // from a warm 3,000-token entry, against the exact route; preemption by its increment over the
     // qualified paths under the same short pool (model-quality.md 6.1). The joint arm fails top-1 on
-    // FP8 and K8V4 (K8V4 also its tail). K4V2 is not gated yet.
+    // FP8 and K8V4 (K8V4 also its tail).
     Qualification{FastPath::AdaptiveSpeculation, {QType::Q8_G32_FP16, true, KvCacheStorage::BFloat16}},
     Qualification{FastPath::FreeCacheResume, {QType::Q8_G32_FP16, true, KvCacheStorage::BFloat16}},
     Qualification{FastPath::Preemption, {QType::Q8_G32_FP16, true, KvCacheStorage::BFloat16}},
@@ -42,6 +42,9 @@ constexpr std::array kQualified{
     Qualification{FastPath::AdaptiveSpeculation, {QType::Q8_G32_FP16, true, KvCacheStorage::Vq2}},
     Qualification{FastPath::FreeCacheResume, {QType::Q8_G32_FP16, true, KvCacheStorage::Vq2}},
     Qualification{FastPath::Preemption, {QType::Q8_G32_FP16, true, KvCacheStorage::Vq2}},
+    Qualification{FastPath::AdaptiveSpeculation, {QType::Q8_G32_FP16, true, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::FreeCacheResume, {QType::Q8_G32_FP16, true, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::Preemption, {QType::Q8_G32_FP16, true, KvCacheStorage::Q4KeyVq2Value}},
     // NInfer's Q8 dense tables, fused GDN convolution and fused QSA prepare, jointly: prefill (quick
     // corpus, four chunk sizes) and decode (plain at concurrency 8, MTP at 2) (2026-10-15).
     Qualification{FastPath::Q8SlicedK, {QType::Q8_G32_FP16, true, KvCacheStorage::Int8Group64}},
