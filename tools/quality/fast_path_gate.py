@@ -4,11 +4,10 @@ Decides whether an artifact's fast paths keep it within Infernix's numerical acc
 (docs/maintainer/model-quality.md, section 6). The policy compares two Engine routes against one
 fixed reference distribution: the exact route (--disable-fast-paths), in the default role, and the
 fast-path route (every path qualified for the configuration plus any --fast-path candidates, so a
-new path is always measured together with the paths it will run beside). A fast path may move
-the output away from the reference by at most a fixed fraction of what the artifact already loses
-(its floor: the default route's own divergence from the reference, which its activation and KV
-quantization and rounding set), so the budget is small where the arithmetic is precise and larger
-with 4-bit activations or KV.
+new path is always measured together with the paths it will run beside). The fast paths of a
+configuration together may move the output away from the reference by at most one fixed budget per
+measure, the same for every artifact and KV format (about what llama.cpp's q8_0 costs against
+FP16); the floor (the default route's own divergence from the reference) is reported, not used.
 Every decision is a one-sided 95 % upper confidence bound over independent units (scoring windows
 or decode segments), so noise makes a fast path harder to pass, never easier: a noisier comparison
 needs more data.
@@ -49,35 +48,31 @@ from typing import Iterable, Sequence
 class Policy:
     """The acceptance policy's constants (docs/maintainer/model-quality.md, section 6.3)."""
 
-    # A fast path's excess over the default route, as a fraction of the artifact's floor.
-    relative_budget: float = 0.10
-    # KL budget bounds (nats). The minimum is the absolute acceptance floor: an excess this small
-    # is always acceptable, whatever the configuration's own floor (about what llama.cpp's Q8_0
-    # costs against FP16; without it a configuration whose exact route is the reference, floor 0,
-    # would admit nothing). The maximum is the most any fast path may cost. NLL excess (prefill and
-    # teacher-forced decode) uses the same budget: in expectation it is the same quantity measured
-    # on the corpus's own tokens.
-    kl_budget_minimum: float = 1.0e-3
-    kl_budget_maximum: float = 3.0e-3
+    # One budget per measure for every configuration (since 2026-10-16), for the excess of all its
+    # fast paths together over the exact route. Mean KL excess (nats): 1.5e-3, about what
+    # llama.cpp's q8_0 costs against FP16 on Llama 3 8B (1.36e-3) and below Strata's adopted
+    # defaults (4e-3, 5.8e-3) and the "distribution-lossless" band (2e-3 to 4e-3).
+    kl_budget: float = 1.5e-3
     # Decode's bounded criterion is total variation (bounded by 1 per position, so a position whose
-    # most probable token flips cannot dominate the mean as an unbounded KL does): budget bounds.
-    # The minimum is the KL floor at the decode TV / KL ratio measured at a floor (4.2, recipe C
-    # INT8 KV).
-    tv_budget_minimum: float = 4.0e-3
-    tv_budget_maximum: float = 5.0e-3
-    # Top-1 disagreement budget bounds (fractions of positions or tokens). The floor equals the
-    # cap, so every configuration's top-1 budget is 0.5 points.
-    top1_budget_minimum: float = 5.0e-3
-    top1_budget_maximum: float = 5.0e-3
-    # Free-running decode regret budget lower bound (nats per token): the KL floor.
-    regret_budget_minimum: float = 1.0e-3
-    # Gross caps on point estimates: 99.9th-percentile KL ratio, and each context bucket's (or
-    # decode prompt length's) excess as a fraction of its default divergence or of the floor. A
-    # fast route's p99.9 KL at most tail_minimum always passes the tail cap (the p99.9 of a route
-    # at the KL floor: p99.9 / mean measured 48 in prefill and 21 in decode at recipe C's INT8 floor).
+    # most probable token flips cannot dominate the mean as an unbounded KL does): the KL budget at
+    # the decode excess TV / KL ratio measured on recipe C (about 2.3), rounded up.
+    tv_budget: float = 4.0e-3
+    # Top-1 disagreement excess (fractions of positions or tokens): 0.5 points.
+    top1_budget: float = 5.0e-3
+    # Free-running decode regret (nats per token): the KL budget.
+    regret_budget: float = 1.5e-3
+    # Gross caps on point estimates: the corpus NLL excess and each prefill context bucket at twice
+    # the KL budget; each decode prompt length's TV excess at twice the TV budget; the decode KL
+    # and forced-token NLL excess at decode_kl_cap, since their standard error is about 2-4e-3 even
+    # over 1,024 segments (knife-edge positions; total variation carries decode's decision), so a
+    # cap must sit about three standard errors above zero; the 99.9th-percentile KL at most 1.25
+    # times the default's, or a fast p99.9 of at most tail_minimum (the tail of a route at the KL
+    # budget: p99.9 / mean measured 48 in prefill and 21 in decode on recipe C), so a default whose
+    # tail is 0 does not fail every path.
+    point_cap_factor: float = 2.0
+    decode_kl_cap: float = 1.0e-2
     tail_ratio: float = 1.25
     tail_minimum: float = 0.05
-    bucket_relative: float = 0.25
     bucket_min_positions: int = 20000
     # The KL lower bound must resolve at least this share of the reference distribution.
     coverage_minimum: float = 0.90
@@ -137,15 +132,6 @@ class Verdict:
             "facts": self.facts,
             "criteria": [c.to_json() for c in self.criteria],
         }
-
-
-def clamp(value: float, low: float, high: float) -> float:
-    return min(max(value, low), high)
-
-
-def kl_budget(floor_kl: float, policy: Policy) -> float:
-    return clamp(policy.relative_budget * floor_kl, policy.kl_budget_minimum,
-                 policy.kl_budget_maximum)
 
 
 @dataclass(frozen=True)
@@ -317,22 +303,19 @@ def evaluate_prefill_pairs(pairs: Sequence[ChunkPair], scope: str,
             t[1] == t[2] and t[3] == t[4] and t[5] == t[6] for t in units.values()),
     }
 
-    budget = kl_budget(floor_kl, policy)
     verdict.criteria.append(bounded(
-        "mean KL excess", [PairedUnit(t[0], t[1], t[2]) for t in units.values()], budget, policy,
-        f"floor {floor_kl:.6g}"))
-    top1_budget = clamp(policy.relative_budget * floor_top1, policy.top1_budget_minimum,
-                        policy.top1_budget_maximum)
+        "mean KL excess", [PairedUnit(t[0], t[1], t[2]) for t in units.values()], policy.kl_budget,
+        policy, f"floor {floor_kl:.6g}"))
     verdict.criteria.append(bounded(
         "top-1 disagreement excess", [PairedUnit(t[0], t[3], t[4]) for t in units.values()],
-        top1_budget, policy, f"floor {floor_top1:.6g}"))
+        policy.top1_budget, policy, f"floor {floor_top1:.6g}"))
     # Corpus NLL moves at first order under any perturbation of the logits, where the KL excess
     # moves at second order: a pure reordering shifted it by 1.7e-3 on the 27B NVFP4 artifact
     # (section 6.4). It is therefore a gross cap on the point estimate, for what truncated KL cannot
     # see (probability moved within the unsaved tail); its bound is reported.
     nll_mean, nll_bound = paired_excess(
         [PairedUnit(t[0], t[5], t[6]) for t in units.values()], policy.z)
-    nll_cap = max(policy.bucket_relative * floor_kl, policy.kl_budget_minimum)
+    nll_cap = policy.point_cap_factor * policy.kl_budget
     verdict.criteria.append(
         Criterion("corpus NLL excess", nll_mean, nll_mean, nll_cap, nll_mean <= nll_cap,
                   f"95% bound {nll_bound:.4e}; perplexity ratio {math.exp(nll_mean):.5f}"))
@@ -363,7 +346,7 @@ def evaluate_prefill_pairs(pairs: Sequence[ChunkPair], scope: str,
         if n < policy.bucket_min_positions:
             continue
         excess = (f - d) / n
-        bucket_budget = max(policy.bucket_relative * d / n, policy.kl_budget_minimum)
+        bucket_budget = policy.point_cap_factor * policy.kl_budget
         verdict.criteria.append(
             Criterion(f"context [{begin},{end}) KL excess", excess, excess, bucket_budget,
                       excess <= bucket_budget, f"{int(n)} positions, default {d / n:.6g}"))
@@ -519,18 +502,15 @@ def evaluate_forced(default_path: Path, fast_path: Path, reference_path: Path,
     # The bounded criteria. Total variation, not KL, carries the distribution criterion: KL is
     # unbounded per position, so the few positions whose most probable token flips under any
     # rounding change (a few nats each) set its standard error, and no feasible sample resolves a
-    # 10 % budget (section 6.4). Total variation counts each such position at most once.
+    # KL budget (section 6.4). Total variation counts each such position at most once.
     verdict.criteria.append(bounded(
-        "decode mean TV excess", tv_units,
-        clamp(policy.relative_budget * floor_tv, policy.tv_budget_minimum,
-              policy.tv_budget_maximum), policy, f"floor {floor_tv:.6g}"))
+        "decode mean TV excess", tv_units, policy.tv_budget, policy, f"floor {floor_tv:.6g}"))
     verdict.criteria.append(bounded(
-        "decode top-1 disagreement excess", top1_units,
-        clamp(policy.relative_budget * floor_top1, policy.top1_budget_minimum,
-              policy.top1_budget_maximum), policy, f"floor {floor_top1:.6g}"))
+        "decode top-1 disagreement excess", top1_units, policy.top1_budget, policy,
+        f"floor {floor_top1:.6g}"))
     # Gross caps on point estimates, their bounds reported: KL and NLL (NLL moves at first order,
     # as in prefill), the far tail, and each prompt length.
-    cap = max(policy.bucket_relative * floor_kl, policy.kl_budget_minimum)
+    cap = policy.decode_kl_cap
     for name, units in (("decode mean KL excess", kl_units), ("decode NLL excess", nll_units)):
         mean, bound = paired_excess(units, policy.z)
         verdict.criteria.append(Criterion(name, mean, mean, cap, mean <= cap,
@@ -552,7 +532,7 @@ def evaluate_forced(default_path: Path, fast_path: Path, reference_path: Path,
     for prompt in sorted(by_prompt):
         n, d, f = by_prompt[prompt]
         excess = (f - d) / n
-        bucket_cap = max(policy.bucket_relative * d / n, policy.tv_budget_minimum)
+        bucket_cap = policy.point_cap_factor * policy.tv_budget
         verdict.criteria.append(
             Criterion(f"prompt {prompt} decode TV excess", excess, excess, bucket_cap,
                       excess <= bucket_cap, f"{int(n)} positions, default {d / n:.6g}"))
@@ -605,12 +585,9 @@ def evaluate_free_running(report_path: Path, policy: Policy = POLICY) -> Verdict
         "default_regret": floor_regret,
         "fast_regret": sum(u.fast for u in regret) / tokens,
     }
-    budget = clamp(policy.relative_budget * floor_disagreement, policy.top1_budget_minimum,
-                   policy.top1_budget_maximum)
-    verdict.criteria.append(bounded("reference-top disagreement excess", disagreement, budget,
-                                    policy, f"floor {floor_disagreement:.6g}"))
-    budget = max(policy.relative_budget * floor_regret, policy.regret_budget_minimum)
-    verdict.criteria.append(bounded("mean regret excess", regret, budget, policy,
+    verdict.criteria.append(bounded("reference-top disagreement excess", disagreement,
+                                    policy.top1_budget, policy, f"floor {floor_disagreement:.6g}"))
+    verdict.criteria.append(bounded("mean regret excess", regret, policy.regret_budget, policy,
                                     f"floor {floor_regret:.6g} nats"))
     return verdict
 

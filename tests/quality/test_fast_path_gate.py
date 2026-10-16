@@ -103,52 +103,35 @@ def test_a_fast_path_identical_to_the_default_passes(tmp_path):
     assert criterion(verdict, "corpus NLL excess").bound == 0.0
 
 
-def test_the_kl_budget_is_a_tenth_of_the_default_floor(tmp_path):
-    passing = gate.evaluate_prefill(
-        make_prefill(tmp_path / "a", windows=60, floor=0.02, excess=0.0015, noise=1e-4))
-    failing = gate.evaluate_prefill(
-        make_prefill(tmp_path / "b", windows=60, floor=0.02, excess=0.0025, noise=1e-4))
-    kl = criterion(passing, "mean KL excess")
-    assert kl.budget == pytest.approx(0.10 * passing.facts["floor_kl"])
-    assert kl.passed
-    assert not criterion(failing, "mean KL excess").passed
-    assert not failing.passed
+def test_one_kl_budget_for_every_configuration(tmp_path):
+    # The same excess gets the same verdict whatever the configuration's floor: a 4-bit-like, an
+    # 8-bit-like and an exact route that is the reference itself (floor 0).
+    for floor in (0.03, 0.003, 0.0):
+        passing = gate.evaluate_prefill(
+            make_prefill(tmp_path / f"pass-{floor}", windows=60, floor=floor, excess=0.0012,
+                         noise=1e-5))
+        failing = gate.evaluate_prefill(
+            make_prefill(tmp_path / f"fail-{floor}", windows=60, floor=floor, excess=0.0018,
+                         noise=1e-5))
+        kl = criterion(passing, "mean KL excess")
+        assert kl.budget == gate.POLICY.kl_budget
+        assert kl.passed
+        assert not criterion(failing, "mean KL excess").passed
 
 
-def test_the_budget_scales_with_the_artifacts_floor(tmp_path):
-    # The same absolute excess, above the absolute floor, passes a 4-bit-like floor and fails an
-    # 8-bit-like one.
-    low_bit = gate.evaluate_prefill(
-        make_prefill(tmp_path / "a", windows=60, floor=0.03, excess=0.002, noise=1e-5))
-    high_bit = gate.evaluate_prefill(
-        make_prefill(tmp_path / "b", windows=60, floor=0.015, excess=0.002, noise=1e-5))
-    assert criterion(low_bit, "mean KL excess").passed
-    assert not criterion(high_bit, "mean KL excess").passed
-
-
-def test_an_excess_below_the_absolute_floor_always_passes(tmp_path):
-    # A configuration whose exact route is the reference (floor 0): a tenth of nothing would admit
-    # nothing, so the absolute floor sets every budget.
+def test_a_zero_floor_configuration_can_pass(tmp_path):
+    # Floor 0 (the exact route is the reference): the default's tail is 0, so the tail cap admits
+    # a fast p99.9 up to tail_minimum.
     small = gate.evaluate_prefill(
         make_prefill(tmp_path / "a", windows=40, floor=0.0, excess=5e-4, noise=0.0, top1_floor=0.0,
                      top1_excess=0.004, default_p999=0.0, tail_ratio=0.03))
     assert small.passed
-    assert criterion(small, "mean KL excess").budget == gate.POLICY.kl_budget_minimum
     assert criterion(small, "p99.9 KL ratio").estimate == math.inf
     large = gate.evaluate_prefill(
         make_prefill(tmp_path / "b", windows=40, floor=0.0, excess=2e-3, noise=0.0, top1_floor=0.0,
                      default_p999=0.0, tail_ratio=0.2))
     assert not criterion(large, "mean KL excess").passed
     assert not criterion(large, "p99.9 KL ratio").passed
-
-
-def test_budgets_are_clamped(tmp_path):
-    tiny = gate.evaluate_prefill(
-        make_prefill(tmp_path / "a", windows=40, floor=1e-5, excess=0.0, noise=0.0))
-    huge = gate.evaluate_prefill(
-        make_prefill(tmp_path / "b", windows=40, floor=0.5, excess=0.0, noise=0.0))
-    assert criterion(tiny, "mean KL excess").budget == gate.POLICY.kl_budget_minimum
-    assert criterion(huge, "mean KL excess").budget == gate.POLICY.kl_budget_maximum
 
 
 def test_noise_widens_the_bound_instead_of_the_budget(tmp_path):
@@ -172,13 +155,13 @@ def test_top1_and_tail_criteria(tmp_path):
 
 def test_a_corpus_nll_loss_fails_even_with_kl_inside_budget(tmp_path):
     # A change the truncated KL cannot see (mass moved within the unsaved tail) still raises the
-    # corpus tokens' NLL; the cap is a quarter of the floor, on the point estimate.
+    # corpus tokens' NLL; the cap is twice the KL budget, on the point estimate.
     verdict = gate.evaluate_prefill(
         make_prefill(tmp_path, windows=40, floor=0.02, excess=0.0, noise=0.0, nll_excess=0.006))
     assert criterion(verdict, "mean KL excess").passed
     nll = criterion(verdict, "corpus NLL excess")
     assert nll.estimate == pytest.approx(0.006)
-    assert nll.budget == pytest.approx(0.25 * verdict.facts["floor_kl"])
+    assert nll.budget == pytest.approx(gate.POLICY.point_cap_factor * gate.POLICY.kl_budget)
     assert not nll.passed
     noisy = gate.evaluate_prefill(
         make_prefill(tmp_path / "noisy", windows=40, floor=0.02, excess=0.0, noise=0.0,
@@ -315,11 +298,9 @@ def test_teacher_forced_decode_measures_the_distribution_against_the_reference(t
     assert floor_tv > 0 and floor_kl > 0
     tv = criterion(verdict, "decode mean TV excess")
     assert tv.estimate == 0.0
-    assert tv.budget == pytest.approx(gate.clamp(0.1 * floor_tv, gate.POLICY.tv_budget_minimum,
-                                                 gate.POLICY.tv_budget_maximum))
+    assert tv.budget == gate.POLICY.tv_budget
     # KL is a gross cap on its point estimate, like NLL.
-    assert criterion(verdict, "decode mean KL excess").budget == pytest.approx(
-        max(0.25 * floor_kl, gate.POLICY.kl_budget_minimum))
+    assert criterion(verdict, "decode mean KL excess").budget == gate.POLICY.decode_kl_cap
     assert {c.name for c in verdict.criteria} >= {
         "decode top-1 disagreement excess", "decode NLL excess", "decode p99.9 KL ratio",
         "prompt 512 decode TV excess", "prompt 8192 decode TV excess"}
@@ -354,8 +335,8 @@ def test_a_few_flipped_positions_cannot_dominate_the_distribution_criterion(tmp_
         best[0] = max(values[1:4])
     fast = write_forced(tmp_path / "fast.json", logprobs, fast=True, observed=flipped)
     verdict = gate.evaluate_forced(default, fast, reference)
-    # Three positions of 3,840 move the mean KL by more than the KL budget's ceiling ...
-    assert verdict.facts["fast_mean_kl"] - verdict.facts["floor_kl"] > 2 * gate.POLICY.kl_budget_maximum
+    # Three positions of 3,840 move the mean KL by several times the KL budget ...
+    assert verdict.facts["fast_mean_kl"] - verdict.facts["floor_kl"] > 4 * gate.POLICY.kl_budget
     # ... but total variation by at most 3/3840.
     assert criterion(verdict, "decode mean TV excess").passed
 

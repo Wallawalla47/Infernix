@@ -383,26 +383,21 @@ Qualification evidence comes from a real artifact of the configuration; the qual
 `--fast-path NAME` options run a candidate before it is listed. The configurations, the kernels'
 reach and the evidence are in [6.7](#67-fast-path-registry).
 
-**Paths that leave attention and the KV cache alone** add the same excess whatever the KV format:
-their kernels neither read nor write the cache nor change attention arithmetic (activation
-precision, linear-layer tiles, GDN, the MLP). Two-term A4 residual activations added 2.2-2.5e-4
-decode TV excess on INT8, NVFP4, K8V4 and K4V2 KV alike (6.7). The gate is joint, though, and
-each format's other qualified paths already use a different share of its budgets, so the format
-with the tightest budgets is not always the one with the least room. Such a path is qualified per
-KV format in three steps:
+**Every KV format is gated** (since 2026-10-15): a path is registered only for formats it passed a
+gate on, never for INT8 alone by inference. The minimum per format is the reduced protocol (prefill
+on the quick corpus at two chunk sizes; decode over 256 segments, the references and exact runs
+shared across candidates). A path that changes attention or KV arithmetic (`prompt-pv8`,
+`decode-split64`, `batch-split-attention`, adaptive speculation's verify kernels,
+`free-cache-resume`, Replay over quantized KV) runs every gate on every format.
 
-1. Gate it on INT8 KV, the format with the tightest budgets (the lowest floor), in every arm where
-   it acts. Its **increment** per criterion is that estimate minus the same arm's estimate with the
-   qualified paths alone.
-2. Gate it also on the qualified format with the least **headroom** on any criterion (its budget
-   minus the 95 % bound of its qualified joint arm; on the 27B in 2026-10, NVFP4 KV's spec top-1,
-   0.05 points).
-3. Register it for each remaining format whose qualified 95 % bounds plus the INT8 increments stay
-   within that format's budgets on every criterion; gate any other format as in step 1.
-
-A path that changes attention or KV arithmetic (`prompt-pv8`, `decode-split64`,
-`batch-split-attention`, adaptive speculation's verify kernels, `free-cache-resume`, Replay over
-quantized KV) is gated on every format.
+**Paths that leave attention and the KV cache alone** (activation precision, linear-layer tiles,
+GDN, the MLP) run the prefill gate on every format and the decode gate on INT8 and on the passing
+format with the lowest floor, where the format's own noise hides the least of the path's excess.
+The budgets are the same on every format, so a format whose joint prefill gate passed and whose
+floor is higher takes the decode verdict of those two. The excess of one path is not the same on
+every format, though: noise the format already carries absorbs part of it (two-term
+`expert-a4-residual` showed KL 6.8e-3 against recipe C's exact route on BF16 KV, floor 0, and
+7.8e-4 on INT8 KV), which is why its decode is measured where the floor is lowest.
 
 ### 6.2 What is measured
 
@@ -419,9 +414,11 @@ quantized KV) is gated on every format.
   already carries: **activation quantization** (4-bit activations raise it most), **KV-cache
   quantization** (the reference keeps BF16 KV, so INT8, FP8 or NVFP4 KV each raise it) and
   rounding. A fast path's errors are computation errors of the same kind, so where activations or
-  KV are already rounded coarsely at every layer, a slightly different kernel rounding is lost in
-  that noise. Budgets are fractions of the floor: a fast path may cost little where the arithmetic
-  is precise and more with 4-bit activations or KV (6.6), and never more than a fixed ceiling.
+  KV are already rounded coarsely at every layer, part of a slightly different kernel rounding is
+  lost in that noise, and its measured excess is smaller there. The floor is reported, not used:
+  since 2026-10-16 the budgets are the same for every configuration (6.3). Until then they were 10 %
+  of the floor, which admitted nothing where the floor is 0 and judged one kernel differently per
+  KV format.
 - **Weight quantization is not part of the floor.** The reference keeps the artifact's own
   weights, so weight error is in neither route. It is a fixed change to the function the model
   computes, not noise in the computation: a model with 4-bit weights but 16-bit activations
@@ -457,17 +454,20 @@ quantized KV) is gated on every format.
 
 | Criterion | Statistic | Budget |
 |---|---|---|
-| Prefill mean KL excess | one-sided 95 % upper bound of the paired per-window excess KL(ref ‖ fast) − KL(ref ‖ default) | 10 % of the floor's KL, at least 1e-3 (the absolute floor) and at most 3e-3 nats |
-| Prefill top-1 disagreement excess | the same bound for disagreement with the reference's top token | 0.5 points (the absolute floor equals the cap on 10 % of the floor's top-1 disagreement) |
-| Prefill corpus NLL excess | the paired mean excess NLL of the corpus tokens (log of the perplexity ratio), a point estimate; its bound is reported | at most 25 % of the floor's KL (at least 1e-3) |
+| Prefill mean KL excess | one-sided 95 % upper bound of the paired per-window excess KL(ref ‖ fast) − KL(ref ‖ default) | 1.5e-3 nats |
+| Prefill top-1 disagreement excess | the same bound for disagreement with the reference's top token | 0.5 points |
+| Prefill corpus NLL excess | the paired mean excess NLL of the corpus tokens (log of the perplexity ratio), a point estimate; its bound is reported | 3e-3 (twice the KL budget; +0.3 % perplexity) |
 | Prefill tail | 99.9th-percentile KL, mean over chunk sizes, fast / default | at most 1.25, or a fast p99.9 KL of at most 0.05 |
-| Prefill context buckets | each context-length bucket with at least 20,000 positions: excess mean KL | at most 25 % of that bucket's default KL (at least 1e-3) |
-| Decode mean TV excess | one-sided 95 % upper bound of the paired per-segment excess total variation from the reference at the teacher-forced positions | 10 % of the decode floor's total variation, at least 4e-3 and at most 5e-3 |
-| Decode top-1 disagreement excess | the same bound for disagreement with the reference's top token | 0.5 points (the absolute floor equals the cap on 10 % of the decode floor's top-1 disagreement) |
-| Decode KL and NLL excess | the paired mean excess KL and NLL of the forced positions, point estimates; their bounds are reported | each at most 25 % of the decode floor's KL (at least 1e-3) |
+| Prefill context buckets | each context-length bucket with at least 20,000 positions: excess mean KL | 3e-3 |
+| Decode mean TV excess | one-sided 95 % upper bound of the paired per-segment excess total variation from the reference at the teacher-forced positions | 4e-3 |
+| Decode top-1 disagreement excess | the same bound for disagreement with the reference's top token | 0.5 points |
+| Decode KL and NLL excess | the paired mean excess KL and NLL of the forced positions, point estimates; their bounds are reported | each 1e-2 (their standard error is 2-4e-3 even over 1,024 segments) |
 | Decode tail | 99.9th-percentile KL over the forced positions, fast / default | at most 1.25, or a fast p99.9 KL of at most 0.05 |
-| Decode prompt lengths | each prompt length's excess mean total variation | at most 25 % of that prompt length's default total variation (at least 4e-3) |
-| Free-running decode (optional) | the same bound for the rate of generated tokens that are not the reference's top token, and for mean regret | 0.5 points; 10 % of the default's regret, at least 1e-3 |
+| Decode prompt lengths | each prompt length's excess mean total variation | 8e-3 (twice the TV budget) |
+| Free-running decode (optional) | the same bound for the rate of generated tokens that are not the reference's top token, and for mean regret | 0.5 points; 1.5e-3 nats per token |
+
+Each budget covers the excess of every fast path a configuration selects together (the gate is
+joint, 6.1), and is the same for every artifact, activation class and KV format.
 
 The bounded criteria carry the decision; the tail, bucket and prompt-length caps are point
 estimates, like an Op criterion's gross pointwise cap, so damage confined to rare positions or long
@@ -475,26 +475,36 @@ contexts cannot hide in a mean. Decode has the prefill criteria at the forced po
 own floor, except that total variation, not KL, carries the bounded distribution criterion. KL is
 unbounded per position: the few positions whose most probable token flips under any rounding
 change contribute several nats each, and they set its standard error so that no feasible decode
-sample resolves a 10 % budget (6.4). Total variation counts each such position at most once and
+sample resolves a KL budget (6.4). Total variation counts each such position at most once and
 still measures how much probability a fast path moves, the quantity recent work recommends for
 estimating changed decisions (6.6); KL stays as a gross cap. Prefill keeps KL as its bounded
 criterion: with about 250 times as many positions it resolves its budget. The decode gate first
 bounded the forced tokens' NLL (until 2026-10-13), then their KL (2026-10-13); neither could resolve
 a change that also alters the cached context (6.4, 6.7).
 
-**The absolute floor** (since 2026-10-15): an excess below KL 1e-3, top-1 disagreement 0.5 points,
-decode total variation 4e-3 (KL 1e-3 at the decode TV / KL ratio of 4.2 measured at recipe C's INT8
-floor), free-running regret 1e-3, and a fast p99.9 KL of 0.05 (the tail of a route at that mean:
-p99.9 / mean measured 48 in prefill and 21 in decode at the same floor) always passes, whatever the
-configuration's own floor. KL 1e-3 is of the order of what llama.cpp's q8_0 costs against FP16.
-Without it, a configuration whose exact route is the reference itself (floor 0, as recipe C with
-BF16 KV) would admit no fast path at all, since a tenth of nothing is nothing; before it the lower
-limits sat at the measurement's resolution (KL 1e-4, top-1 0.05 points, TV 1e-4). The floor raises
-budgets only where 10 % of the configuration's floor is smaller, and never past the ceilings. The
-KL ceiling keeps any one fast path, on any artifact, below one step of the
-weight-quantization ladder (q8_0 to q6_K costs about 4e-3 on Llama 3 8B in llama.cpp's published
-measurements) and under half the 7e-3 that Fireworks calls a high-quality *whole* quantized
-deployment (6.6).
+**Where the budgets come from** (adopted 2026-10-16). KL 1.5e-3 is about what llama.cpp's q8_0
+costs against FP16 on Llama 3 8B (1.36e-3; 3.7e-4 on Llama 2 7B), a quarter of q6_K's (5.5e-3),
+below the 2e-3 to 4e-3 that Helcig et al. call distribution-lossless, under the 4e-3 and 5.8e-3
+Strata adopted for its non-exact defaults, and about a fifth of Fireworks' 7e-3 for a whole
+high-quality quantized deployment (6.6); here it bounds all of a configuration's speed-ups together.
+Top-1 0.5 points is a quarter of what q8_0 changes (2.3 % of tokens on Llama 3 8B). Decode total
+variation 4e-3 is the KL budget at the decode excess ratio measured on recipe C (TV about 2.3 times
+KL), rounded up. The prefill point caps are twice the bounded budgets. The decode KL and NLL caps
+are 1e-2: their estimates' standard error is 2-4e-3 even over 1,024 segments (knife-edge
+positions), and a gross cap must sit well above its own noise; at twice the KL budget, 3e-3, they
+failed 27B K8V4 and VQ2 request-coupling arms whose total variation and top-1 bounds were at 0.25-0.28
+of their budgets, so they were set to 1e-2 the same day, near the earlier caps (25 % of those decode
+floors, 8-10e-3). As a gross cap, 1e-2 is about llama.cpp's q5_K_M cost against FP16 (1.08e-2 on
+Llama 3 8B); decode's decision stays with the bounded TV and top-1 budgets, and no engine surveyed
+in 6.6 bounds decode distribution change more tightly (SGLang's CI allows 0.05-0.08 absolute
+log-probability error on top-5 tokens; vLLM and llama.cpp set no distribution bound). The tail passes at a fast p99.9 KL of
+0.05 (a route at the KL budget: p99.9 / mean measured 48 in prefill and 21 in decode on recipe C),
+so a configuration whose default tail is 0 (its exact route the reference itself) can pass.
+
+The budgets replaced, on 2026-10-16, budgets of 10 % of each configuration's floor clamped to KL
+1e-3 to 3e-3 (a day earlier 1e-4 to 3e-3), top-1 0.5 points (earlier 0.05 to 0.5), and decode TV
+4e-3 to 5e-3 (earlier 1e-4 to 5e-3), with the point caps at 25 % of the floor. Every registered path
+was re-scored from its saved runs (6.7); the change and its effect are listed there.
 
 ### 6.4 Statistical method
 
@@ -647,16 +657,18 @@ three request-coupling paths and the three Q8 dense-kernel paths (6.7).
 ### 6.6 Calibration and comparison with other engines
 
 **Floors measured on this machine** (RTX 5090, CUDA 13.4, 2026-10-12, full corpus and windows as
-in 6.2, budgets from 6.3):
+in 6.2; until 2026-10-16 the budgets were 10 % of these, they are now 1.5e-3 KL and 0.5 points of
+top-1 for every configuration, 6.3):
 
-| Configuration | Floor: KL / top-1 disagreement | KL budget | Top-1 budget |
-|---|---|---|---|
-| Qwen3.8-27B NVFP4 (official artifact: 4-bit MLP, 8-bit projection activations), INT8 KV | 0.0155 / 4.30 % (0.0151-0.0159 across the four chunk sizes) | 1.55e-3 | 0.43 points |
-| The same, BF16 KV | 0.0153 / 4.29 % | 1.53e-3 | 0.43 points |
-| The same, FP8 KV (896 and 3,584 tokens only) | 0.0155 / 4.34 % | 1.55e-3 | 0.43 points |
-| The same, NVFP4 KV (896 and 3,584 tokens only) | 0.0178 / 4.67 % | 1.78e-3 | 0.47 points |
-| Qwen3.8-Flash-Next NVFP4 (NVIDIA's checkpoint: W4A4 experts), INT8 KV, quick corpus (2026-10-13; 1,792 and 3,584 tokens gave identical windows) | 0.0320 / 6.30 % | 3e-3 (ceiling) | 0.5 points (ceiling) |
-| Qwen3.8-27B Q6 (16-bit activations), BF16 KV, 256-token chunks against one pass (section 1, an earlier corpus) | about 0.002 / 0.9 % | about 2e-4 | 0.09 points |
+| Configuration | Floor: KL / top-1 disagreement |
+|---|---|
+| Qwen3.8-27B NVFP4 (official artifact: 4-bit MLP, 8-bit projection activations), INT8 KV | 0.0155 / 4.30 % (0.0151-0.0159 across the four chunk sizes) |
+| The same, BF16 KV | 0.0153 / 4.29 % |
+| The same, FP8 KV (896 and 3,584 tokens only) | 0.0155 / 4.34 % |
+| The same, NVFP4 KV (896 and 3,584 tokens only) | 0.0178 / 4.67 % |
+| Qwen3.8-Flash-Next NVFP4 (NVIDIA's checkpoint: W4A4 experts), INT8 KV, quick corpus (2026-10-13; 1,792 and 3,584 tokens gave identical windows) | 0.0320 / 6.30 % |
+| Qwen3.8-Flash-Next recipe C (FP8 dense, W4A16 experts), quick corpus (2026-10-15): BF16 KV / INT8 KV | 0 / 0 % (the exact route is the reference) / 0.0061 / 2.75 % |
+| Qwen3.8-27B Q6 (16-bit activations), BF16 KV, 256-token chunks against one pass (section 1, an earlier corpus) | about 0.002 / 0.9 % |
 
 The floor is set mostly by activation precision: 16-bit activations give about an eighth of the
 4-bit-activation artifact's. KV quantization adds to it: INT8 and FP8 KV add about 1 % to BF16
@@ -696,19 +708,23 @@ heavy-tailed mean exist (trimmed mean, median-of-means, Catoni;
 [Lugosi and Mendelson's survey](https://paperswithcode.com/paper/mean-estimation-and-regression-under-heavy)).
 For decode, a bounded measure keeps the estimand a plain mean and validated better (6.4).
 
-Infernix is stricter than each of these on what a change costs in fidelity to the reference. The
-ceiling alone (3e-3 excess KL, 0.5 points of top-1) is below the 5.8e-3 Strata adopted and
-Fireworks' 7e-3 for a whole deployment, the floor-relative budget is far below it on high-precision
-artifacts, and the decision uses a 95 % confidence bound rather than a point estimate. The measures
+Infernix is stricter than each of these on what a change costs in fidelity to the reference: its
+budget (1.5e-3 excess KL, 0.5 points of top-1, for all of a configuration's fast paths together)
+is about what llama.cpp's q8_0 costs over FP16, a quarter to a third of the 4e-3 and 5.8e-3 Strata
+adopted and a fifth of Fireworks' 7e-3 for a whole deployment, and the decision uses a 95 %
+confidence bound rather than a point estimate. The measures
 differ in one respect: Strata compares the two routes directly, and that direct divergence also
 contains rounding noise both routes carry, while Infernix charges only the excess distance from a
 fixed reference. A fast path that merely reorders arithmetic on a 4-bit artifact can therefore
 differ from the exact route by as much as two chunk sizes do (KL 0.025-0.033 on the 27B NVFP4
 artifact, section 1) while costing no measurable fidelity; Infernix accepts that, because the
 exact route itself carries the same scatter. No engine surveyed publishes a
-per-change KL budget for kernel optimizations; scaling the budget with the artifact's own floor
-follows the observation (llama.cpp's quantization ladder, Unsloth, Helcig et al.) that what a
-model already loses to quantization sets the scale at which further error is visible.
+per-change KL budget for kernel optimizations. Infernix first scaled its budget with each
+configuration's floor (what a model already loses to quantization sets the scale at which further
+error is visible: llama.cpp's quantization ladder, Unsloth, Helcig et al.); since 2026-10-16 it
+uses one budget, because the floor-relative rule admitted nothing where the exact route is the
+reference itself and judged one kernel differently per KV format, while the measured excess is
+already smaller where a format's own noise absorbs part of it.
 
 ### 6.7 Fast-path registry
 
@@ -718,6 +734,18 @@ qualified for, and the evidence that admitted it. The configurations are the one
 runs the path's exact counterpart. Qwen3.8-Flash-Next has three of the request-coupling paths
 below and its own kernel paths, among them `expert-a4-residual`
 (`models/qwen4_exp/program/fast_paths.cpp` lists their configurations).
+
+**Re-scored under the single budgets (2026-10-16).** Every saved gate run in `profiles/quality`
+was decided again by `fast_path_gate.py` with the budgets of 6.3. Every registered configuration
+still passes, and no failed candidate passes: the bounded criteria of every registered path stay
+within budget (the closest, Flash-Next Dense8's kernel paths with BF16 KV, decode top-1 at 0.92;
+27B prompt-pv8 with decode-split64, decode top-1 0.84), and the failed `batched-a4-decode`,
+`batched-a8-decode` (spec top-1 at 1.11), `q4-w4a8` and the rejected two-term A8 mixes still fail.
+At decode KL and NLL caps of twice the KL budget (3e-3), the 27B request-coupling arms on K8V4
+(plain, cache) and VQ2 (plain, cache, spec) failed on those point estimates alone, inside their
+standard error, which set the caps at 1e-2 (6.3). Spec arms were scored against the exact run of
+their configuration in plain decode, which the request-invariant exact route makes the same
+tokens. The recipe C gates (`expert-a4-residual`, `fp8-a8-pair`) are re-scored in their entries.
 
 | Fast path | Kernels run with | Qualified configurations |
 |---|---|---|
@@ -1209,26 +1237,26 @@ and recomputes the previous output) or admission (whole extents held without `pr
   against the then budget of 6.11e-4, four chunk sizes). Three terms on both sides, the only
   variant of a one-chunk screen within that budget, then passed every gate below except BF16 KV
   (prefill KL bound 4.24e-4, decode top-1 bound 2.95e-3 of 3.31e-3, pp32768/65536 +25.7/+26.9 %).
-  With the absolute floor (6.3) two terms pass, and they replaced three, which cost 7-8 points of
+  With the absolute floor, and the single budgets that replaced it (6.3), two terms pass, and they replaced three, which cost 7-8 points of
   prefill speed.
 - **Op qualification:** `infernix_offloaded_moe_wide_test` X1 against the exact canonical
   arithmetic: mean relative L2 0.31-0.41 % per case, worst entry 2.0 % (bounds 2^-7 and 2^-5).
 - **Artifact:** orcarouter Qwen3.8-Flash-Next Uncensored NVFP4, converted with recipe C (FP8 dense,
   W4A16 experts), the protocol reduced as the user approved (prefill quick corpus at 896 and 7,168
   tokens; decode MTP at concurrency 2 over 256 segments; the reference and exact runs shared).
-- **INT8 KV:** prefill KL excess 7.82e-4 (95 % bound 9.07e-4 of 1.0e-3, the closest), top-1 excess
-  1.89e-3 (bound 2.41e-3 of 5.0e-3), perplexity ratio 0.99967, p99.9 KL ratio 1.08; decode TV
-  excess 9.9e-4 (bound 1.37e-3 of 4.0e-3), top-1 excess 2.08e-3 (bound 4.41e-3 of 5.0e-3), p99.9
-  KL ratio 1.09, every prompt length.
+- **INT8 KV:** prefill KL excess 7.82e-4 (95 % bound 9.07e-4; budget 1.0e-3 when gated, 1.5e-3
+  since 2026-10-16), top-1 excess 1.89e-3 (bound 2.41e-3 of 5.0e-3), perplexity ratio 0.99967,
+  p99.9 KL ratio 1.08; decode TV excess 9.9e-4 (bound 1.37e-3 of 4.0e-3), top-1 excess 2.08e-3
+  (bound 4.41e-3 of 5.0e-3, the closest), p99.9 KL ratio 1.09, every prompt length.
 - **The other formats (prefill):** FP8, K8V4, NVFP4, K4V2 and VQ2 pass (KL bounds 7.3e-4, 3.8e-4,
   4.6e-4, 6.6e-4 and 6.1e-4; floors 7.5e-3, 1.21e-2, 1.49e-2, 1.53e-2 and 2.17e-2, all above
-  INT8's 6.11e-3); their decode is registered from the INT8 increments (6.1, step 3), INT8 being
-  the passing format with the lowest floor.
+  INT8's 6.11e-3); they take INT8's decode verdict (6.1), INT8 being the passing format with the
+  lowest floor.
 - **BF16 KV fails, as a path of this size must there:** recipe C's exact route with BF16 KV is the
-  reference itself (16-bit activations everywhere, chunking bit-exact), so its floor is 0 and every
-  budget the absolute floor. The fast route's whole divergence (KL 6.8e-3, top-1 2.9 %, about INT8
-  KV's own; three terms 6.35e-3) counts as excess, probably mostly near-tie expert routing that
-  any perturbation flips (not measured).
+  reference itself (16-bit activations everywhere, chunking bit-exact), so its floor is 0 and no
+  format noise absorbs any of the path's error. The fast route's whole divergence (KL 6.8e-3, top-1
+  2.9 %, about INT8 KV's own; three terms 6.35e-3) counts as excess, 4.5 times the 1.5e-3 budget,
+  probably mostly near-tie expert routing that any perturbation flips (not measured).
 - **Speed:** `infernix_bench` INT8 KV, chunk 4,096, ABBA (2026-10-14/15, before main 2ec268c2,
   whose changes leave recipe C's route alone): pp4096 1,631 → 1,637 tok/s (level), pp16384 6,175 →
   6,380 (+3.3 %), pp32768 6,620 → 8,803 (+33 %), pp65536 6,730 → 9,067 (+35 %); short prompts are
@@ -1247,10 +1275,11 @@ and recomputes the previous output) or admission (whole extents held without `pr
   Prefill passes on every format but BF16 (INT8 KL bound 6.61e-4 of 1.0e-3, against 4.24e-4 for
   three-term `expert-a4-residual` alone). The INT8 decode gate fails on its tail: p99.9 KL ratio
   1.35 against 1.25 (three terms alone 1.07); TV and top-1 pass (top-1 bound 4.29e-3 of 5.0e-3).
-  Beside two-term `expert-a4-residual` (2026-10-16, INT8 KV): prefill fails on mean KL (excess
-  1.006e-3, bound 1.14e-3 of 1.0e-3; the two-term path alone uses 0.91 of that budget), every
-  other criterion passing; decode fails its tail again (p99.9 KL ratio 1.266 against 1.25), TV and
-  top-1 passing. Both reduced-protocol misses are narrow. Speed beside two-term
+  Beside two-term `expert-a4-residual` (2026-10-16, INT8 KV): prefill KL excess 1.006e-3 (bound
+  1.14e-3), which failed the 1.0e-3 budget it was gated under and passes the single 1.5e-3 budget,
+  every other criterion passing; decode fails its tail again (p99.9 KL ratio 1.266 against 1.25),
+  TV and top-1 passing. The p99.9 of 256 segments rests on about 16 positions, so a decode gate over
+  1,024 segments, whose verdict alone counts, is queued. Speed beside two-term
   `expert-a4-residual` (`infernix_bench`, INT8 KV, chunk 4,096, ABBA): pp32768 8,732 → 9,277 tok/s
   (+6.2 %), pp65536 9,022 → 9,619 (+6.6 %). The other formats were not gated. It runs in no
   configuration.

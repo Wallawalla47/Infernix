@@ -86,7 +86,7 @@ INFERNIX_WIDE_HD constexpr int plane_block(int b) { return (b & ~3) | ((b & 1) <
 
 // Two-term A4 planes of W4A16 experts (WideA16::kA4Residual): a row holds its first term's A4 row
 // (the W4A4 plane layout above), then its second term's, both scaled by one FP32 row scale. Two terms
-// per side passed the acceptance gate under its absolute floor; three cost 7-8 points of prefill
+// per side passed the acceptance gate under its single budgets; three cost 7-8 points of prefill
 // speed (design §19.3.23).
 inline constexpr int kResidualTerms  = 2;
 inline constexpr int kXTermsRowBytes = kResidualTerms * kXRowBytes;

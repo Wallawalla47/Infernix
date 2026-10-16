@@ -9649,7 +9649,7 @@ row (per token) and h row (per entry) as the A4 residual profile of two NVFP4 te
 order) with an FP32 row scale amax / (6 · 448), and runs both terms through the grouped mxf4nvf4
 kernel into one accumulator (two stages of 39 KB holding both terms' A tiles, two CTAs per SM; the
 epilogues multiply by the row scale). Two terms failed the gate first, three passed, and two passed
-once the acceptance policy gained its absolute floor (model-quality.md 6.3); the record follows.
+once the acceptance policy gained an absolute floor, kept under its single budgets (model-quality.md 6.3); the record follows.
 
 *Two terms first (2026-10-14/15).* `test_offloaded_moe_wide` against the exact arithmetic: mean
 relative L2 0.31-0.41 % per case, worst entry 2.0 %. End to end on the recipe C artifact
@@ -9700,7 +9700,9 @@ budgets being the absolute minimum); INT8 decode TV bound 1.37e-3 of 4.0e-3, top
 5.0e-3, p99.9 KL ratio 1.09. Two terms replaced three: +33-35 % at 32K-64K against +26-27 %, with
 the larger error inside the policy. The gates ran with the screen build's term-count switch at two
 (x and h); the committed build fixes two terms (kResidualTerms) and its op bench output hashes
-match that build's.
+match that build's. On 2026-10-16 the policy replaced its floor-relative budgets with single ones
+(KL 1.5e-3, top-1 0.5 points, decode TV 4e-3); re-scored, two terms pass on the same six formats
+(INT8 KL bound 0.60 of the budget) and BF16 still fails (4.5 times it).
 
 **The prefill hyper-connection up projection fused with its collapse: adopted (bit-exact).** For
 Q8_G32_FP16 W_up and more than 96 columns, one Q8 MMA tile computes 16 features x 4 streams of u
