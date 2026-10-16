@@ -96,6 +96,14 @@ ApiError request_error_to_api_error(const infernix::RequestError& exception,
     case infernix::RequestErrorKind::ContextLengthExceeded:
         error.status = 400;
         error.code   = "context_length_exceeded";
+        if (const auto& details = exception.context_length()) {
+            // OpenAI's wording, which agent clients match to compact and retry.
+            error.context_length = details;
+            error.message        = "This model's maximum context length is " + std::to_string(details->max_context) +
+                            " tokens. However, your messages resulted in " + (details->exact ? "" : "more than ") +
+                            std::to_string(details->prompt_tokens) +
+                            " tokens. Please reduce the length of the messages.";
+        }
         break;
     case infernix::RequestErrorKind::ThinkingBudgetCapacityInsufficient:
         error.param.clear();

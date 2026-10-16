@@ -1081,10 +1081,13 @@ int test_common_objects() {
         .parameters     = 27000000000ULL,
         .weight_bytes   = 17000000000ULL,
     };
-    const Json models = Json::parse(make_models_list("qwen", 7, 240000, metadata));
+    const Json models = Json::parse(
+        make_models_list("qwen", 7, 240000, metadata, ChatTemplateCaps{.supports_tools = true}));
     failures +=
         check(models["data"][0]["id"] == "qwen" && models["data"][0]["max_model_len"] == 240000,
               "models list advertises the configured context limit");
+    failures += check(models["data"][0]["chat_template_caps"] == Json{{"supports_tools", true}},
+                      "models list lost the llama.cpp-compatible chat_template_caps");
     // n_ctx is the running instance's configured ceiling (max_model_len); n_ctx_train is the
     // model's native context. The two must not be conflated.
     const Json list_meta = models["data"][0]["meta"];
@@ -1094,17 +1097,57 @@ int test_common_objects() {
                           list_meta["n_params"] == 27000000000ULL &&
                           list_meta["size"] == 17000000000ULL && list_meta["ftype"] == "nvfp4",
                       "models list exposes the llama.cpp-compatible model meta");
-    const Json model = Json::parse(make_model_object("qwen", 7, 240000, metadata));
+    const Json model =
+        Json::parse(make_model_object("qwen", 7, 240000, metadata, ChatTemplateCaps{}));
     failures += check(model["max_model_len"] == 240000,
                       "model lookup advertises the configured context limit");
     failures += check(model["meta"]["n_ctx"] == 240000 && model["meta"]["n_ctx_train"] == 262144 &&
                           model["meta"]["n_embd"] == 5120 && model["meta"]["ftype"] == "nvfp4",
                       "model lookup exposes the llama.cpp-compatible model meta");
+    failures += check(model["chat_template_caps"]["supports_tools"] == false,
+                      "model lookup did not report a template without tool support");
     const Json empty = Json::parse(
-        make_models_list("qwen", 7, 240000, infernix::ModelMetadata{}));
+        make_models_list("qwen", 7, 240000, infernix::ModelMetadata{}, ChatTemplateCaps{}));
     failures += check(empty["data"][0]["meta"]["n_ctx"] == 240000 &&
                           empty["data"][0]["meta"]["n_ctx_train"] == 0,
                       "empty model metadata still renders the configured context");
+
+    // supports_tools: a declared tool's name must reach the counted prompt. The fake counters stand
+    // for templates: 10 tokens of conversation, plus what each renders for the declared tool.
+    const auto template_counting = [](int tool_preamble, bool renders_name,
+                                      std::string refusal_code = {}) {
+        return [=](const GenerationRequest& request) -> int {
+            if (request.tools.empty()) { return 10; }
+            if (!refusal_code.empty()) {
+                throw ApiException(ApiError{.status = 400, .code = refusal_code});
+            }
+            const int name = renders_name ? static_cast<int>(request.tools.front().name.size()) : 0;
+            return 10 + tool_preamble + name;
+        };
+    };
+    failures += check(probe_chat_template_caps(template_counting(40, true)).supports_tools,
+                      "a template rendering tool declarations was reported without tools");
+    failures += check(!probe_chat_template_caps(template_counting(0, false)).supports_tools,
+                      "a template ignoring tools was reported with tools");
+    failures += check(!probe_chat_template_caps(template_counting(40, false)).supports_tools,
+                      "a fixed tool preamble without the declaration counted as tool support");
+    failures += check(
+        !probe_chat_template_caps(template_counting(0, false, "invalid_prompt")).supports_tools,
+        "a template refusing declared tools was reported with tools");
+    failures += check(probe_chat_template_caps(template_counting(0, false, "context_length_exceeded"))
+                          .supports_tools,
+                      "a declaration overflowing the context was not counted as rendered");
+    bool internal_error_propagated = false;
+    try {
+        (void)probe_chat_template_caps([](const GenerationRequest& request) -> int {
+            if (!request.tools.empty()) {
+                throw ApiException(ApiError{.status = 500, .type = "internal_error"});
+            }
+            return 10;
+        });
+    } catch (const ApiException&) { internal_error_propagated = true; }
+    failures += check(internal_error_propagated,
+                      "a server failure during the template probe was reported as no tool support");
     const Json error = Json::parse(make_error_body(
         ApiError{.status = 400, .message = "bad", .param = "messages", .code = "invalid"}));
     failures += check(error["error"]["param"] == "messages" && error["error"]["code"] == "invalid",

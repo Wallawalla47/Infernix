@@ -3,9 +3,13 @@
 
 #include <array>
 #include <cstdint>
+#include <exception>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
+#include <set>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -27,12 +31,35 @@ ServeOptions parse(std::vector<std::string> arguments) {
     return parse_serve_options(static_cast<int>(argv.size()), argv.data());
 }
 
+// The message of the exception parsing `arguments` raises, or empty when it parses.
+std::string parse_error(std::vector<std::string> arguments) {
+    try {
+        (void)parse(std::move(arguments));
+    } catch (const std::exception& error) { return error.what(); }
+    return {};
+}
+
+// Replaces the scratch --config file's contents and returns its path.
+std::string write_config(const std::string& text) {
+    const std::filesystem::path path =
+        std::filesystem::temp_directory_path() / "infernix-serve-options-config.json";
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    file << text;
+    return path.string();
+}
+
 } // namespace
 
 int main() {
     int failures       = 0;
     failures += check(parse({"infernix-serve", "model.ninfer"}).rope_yarn_factor == 1.0F,
                       "serving YaRN must default off");
+    for (const auto* host : {"127.0.0.1", "127.1.2.3", "localhost", "::1", "[::1]"}) {
+        failures += check(is_loopback_host(host), "a loopback --host warned of external reach");
+    }
+    for (const auto* host : {"0.0.0.0", "::", "192.168.1.20", "myhost", "128.0.0.1", ""}) {
+        failures += check(!is_loopback_host(host), "a --host reachable beyond this machine passed as loopback");
+    }
     for (const auto* factor : {"1", "2.5", "4"}) {
         const auto yarn = parse({"infernix-serve", "model.ninfer", "--rope-yarn-factor", factor});
         failures += check(yarn.rope_yarn_factor == std::stof(factor) && yarn.max_context == 8192 &&
@@ -962,6 +989,133 @@ int main() {
     const auto state_file = parse({"infernix-serve", "model.ninfer", "--expert-state", "cache.state"});
     failures += check(state_file.expert_state && *state_file.expert_state == "cache.state",
                       "serve --expert-state FILE must name the file");
+
+    // --claude-code-prompt as-sent|local: Claude Code's System prompt is used as sent by default.
+    failures += check(defaults.claude_code_prompt == ClaudeCodePrompt::AsSent,
+                      "Claude Code's System prompt must be used as sent by default");
+    failures += check(parse({"infernix-serve", "model.ninfer", "--claude-code-prompt", "local"})
+                                  .claude_code_prompt == ClaudeCodePrompt::Local &&
+                          parse({"infernix-serve", "model.ninfer", "--claude-code-prompt", "local",
+                                 "--claude-code-prompt", "as-sent"})
+                                  .claude_code_prompt == ClaudeCodePrompt::AsSent,
+                      "--claude-code-prompt did not select the Claude Code System rewrite");
+    for (const auto* value : {"Local", "as_sent", "on", ""}) {
+        failures += check(!parse_error({"infernix-serve", "model.ninfer", "--claude-code-prompt",
+                                        value})
+                               .empty(),
+                          "--claude-code-prompt accepted a value other than as-sent or local");
+    }
+    failures += check(serve_usage_text("infernix-serve").find("--claude-code-prompt") !=
+                          std::string::npos,
+                      "serve help omits --claude-code-prompt");
+
+    // --config FILE: options from a JSON object keyed by their long names. The command line
+    // overrides the file wherever --config appears, and the file overrides the defaults.
+    {
+        const std::string config = write_config(
+            R"({"port": 9000, "max-context": 4096, "kv-dtype": "int8", "temperature": 0.7,)"
+            R"( "greedy": true, "no-thinking": true, "preserve-thinking": false,)"
+            R"( "claude-code-prompt": "local"})");
+        const ServeOptions from_file = parse({"infernix-serve", "model.ninfer", "--config", config});
+        failures += check(from_file.port == 9000 && from_file.max_context == 4096 &&
+                              from_file.kv_cache == infernix::KvCacheStorage::Int8Group64 &&
+                              from_file.sampling_overrides.temperature == 0.7F &&
+                              from_file.greedy && from_file.enable_thinking == false &&
+                              !from_file.preserve_thinking.has_value() &&
+                              from_file.claude_code_prompt == ClaudeCodePrompt::Local,
+                          "--config values did not reach serving options");
+        failures += check(from_file.host == "127.0.0.1" && from_file.max_concurrency == 1 &&
+                              from_file.prefill_chunk == 0,
+                          "options absent from --config lost their defaults");
+        for (const std::vector<std::string>& command : std::vector<std::vector<std::string>>{
+                 {"infernix-serve", "model.ninfer", "--port", "9100", "--claude-code-prompt",
+                  "as-sent", "--config", config},
+                 {"infernix-serve", "model.ninfer", "--config", config, "--port", "9100",
+                  "--claude-code-prompt", "as-sent"}}) {
+            const ServeOptions overridden = parse(command);
+            failures += check(overridden.port == 9100 &&
+                                  overridden.claude_code_prompt == ClaudeCodePrompt::AsSent &&
+                                  overridden.max_context == 4096 && overridden.greedy,
+                              "the command line did not override --config");
+        }
+        failures += check(parse({"infernix-serve", "model.ninfer", "--config",
+                                 write_config(R"({"api-key": "from-file"})")})
+                                  .api_key == "from-file",
+                          "--config did not set a secret-bearing option");
+
+        // Each rejection names the offending key, so a bad file is never applied in part silently.
+        for (const auto& [text, expected] : std::vector<std::pair<std::string, std::string>>{
+                 {R"({"prefil-chunk": 4096})", "unknown option 'prefil-chunk'"},
+                 {R"({"--port": 9000})", "unknown option '--port'"},
+                 {R"({"help": true})", "unknown option 'help'"},
+                 {R"({"port": true})", "'port' takes a string or a number"},
+                 {R"({"port": [8080, 8081]})", "'port' takes a string or a number"},
+                 {R"({"port": null})", "'port' takes a string or a number"},
+                 {R"({"max-context": {"tokens": 4096}})", "'max-context' takes a string or a number"},
+                 {R"({"greedy": "yes"})", "'greedy' is a flag"},
+                 {R"({"greedy": 1})", "'greedy' is a flag"},
+                 {R"({"port": 9000, "port": 9100})", "repeats the key 'port'"},
+                 {R"({"config": "other.json"})", "cannot name another"},
+                 {R"([{"port": 9000}])", "must be a JSON object"},
+                 {R"({"port": 9000,)", "invalid JSON"},
+                 {R"({"prefill-chunk": 100})", "--prefill-chunk must be a positive multiple of 128"},
+                 {R"({"port": "http"})", "invalid port: http"}}) {
+            const std::string error =
+                parse_error({"infernix-serve", "model.ninfer", "--config", write_config(text)});
+            failures += check(error.find(expected) != std::string::npos,
+                              ("--config did not reject " + text + " with: " + expected).c_str());
+        }
+        for (const auto& [command, expected] :
+             std::vector<std::pair<std::vector<std::string>, std::string>>{
+                 {{"infernix-serve", "model.ninfer", "--config", config, "--config", config},
+                  "--config may be given only once"},
+                 {{"infernix-serve", "model.ninfer", "--config"}, "--config needs a value"},
+                 {{"infernix-serve", "model.ninfer", "--config",
+                   (std::filesystem::temp_directory_path() / "infernix-missing-directory-for-test" /
+                    "serve.json")
+                       .string()},
+                  "cannot be read"}}) {
+            failures += check(parse_error(command).find(expected) != std::string::npos,
+                              ("--config was not rejected with: " + expected).c_str());
+        }
+        // An option's value is never read as --config.
+        failures += check(parse({"infernix-serve", "model.ninfer", "--model-id", "--config"})
+                                  .model_id_override == "--config",
+                          "an option value spelled --config was read as a config file");
+
+        // Every option the help lists is a --config key with the command line's arity.
+        const std::string help = serve_usage_text("infernix-serve");
+        std::set<std::string> listed;
+        for (std::size_t at = help.find("--"); at != std::string::npos; at = help.find("--", at + 2)) {
+            std::size_t end = at + 2;
+            while (end < help.size() &&
+                   ((help[end] >= 'a' && help[end] <= 'z') || (help[end] >= '0' && help[end] <= '9') ||
+                    help[end] == '-')) {
+                ++end;
+            }
+            listed.insert(help.substr(at, end - at));
+        }
+        listed.erase("--help");
+        listed.erase("--config");
+        failures += check(listed.contains("--port") && listed.contains("--greedy") &&
+                              listed.contains("--claude-code-prompt"),
+                          "the help lists no options to compare with --config");
+        for (const std::string& option : listed) {
+            const bool takes_value = parse_error({"infernix-serve", "model.ninfer", option})
+                                         .ends_with(option + " needs a value");
+            const std::string key   = option.substr(2);
+            const std::string error = parse_error(
+                {"infernix-serve", "model.ninfer", "--config",
+                 write_config(takes_value ? "{\"" + key + "\": \"1\"}" : "{\"" + key + "\": true}")});
+            failures += check(error.find("unknown option") == std::string::npos &&
+                                  error.find("is a flag") == std::string::npos &&
+                                  error.find("takes a string") == std::string::npos &&
+                                  error.find("has no parser") == std::string::npos,
+                              ("--config does not accept the serve option " + option).c_str());
+        }
+        std::error_code ignored;
+        std::filesystem::remove(config, ignored);
+    }
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

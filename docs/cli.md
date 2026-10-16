@@ -312,6 +312,8 @@ and rendered prompt mode. The current official models use:
 | Qwen3.8-27B | non-thinking | `0.7` | `0.80` | `20` | `0` | `1.5` |
 | Qwen3.6-35B-A3B | thinking | `1.0` | `0.95` | `20` | `0` | `1.5` |
 | Qwen3.6-35B-A3B | non-thinking | `0.7` | `0.80` | `20` | `0` | `1.5` |
+| Qwen3.8-Flash-Next | thinking | `1.0` | `0.95` | `20` | `0` | `0` |
+| Qwen3.8-Flash-Next | non-thinking | `0.7` | `0.80` | `20` | `0` | `1.5` |
 
 Frequency penalty is `0` in every registered preset. Task-specific profiles such as Qwen's
 precise-coding profile use explicit sampling overrides.

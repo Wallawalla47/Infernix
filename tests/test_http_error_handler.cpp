@@ -41,6 +41,18 @@ int main() {
                   context_limit.message.find("200 tokens") != std::string::npos &&
                   context_limit.message.find("128") != std::string::npos,
               "context rejection lost its HTTP classification or capacity details");
+    const infernix::serve::ApiError counted = infernix::serve::request_error_to_api_error(
+        infernix::RequestError(infernix::ContextLengthDetails{.prompt_tokens = 200, .max_context = 128}));
+    failures += check(counted.status == 400 && counted.code == "context_length_exceeded" &&
+                          counted.param == "messages" && counted.context_length &&
+                          counted.message ==
+                              "This model's maximum context length is 128 tokens. However, your messages "
+                              "resulted in 200 tokens. Please reduce the length of the messages.",
+                      "context overflow lost OpenAI's wording, which agent clients match to compact");
+    const infernix::serve::ApiError bounded = infernix::serve::request_error_to_api_error(infernix::RequestError(
+        infernix::ContextLengthDetails{.prompt_tokens = 512, .max_context = 128, .exact = false}));
+    failures += check(bounded.message.find("resulted in more than 512 tokens.") != std::string::npos,
+                      "a bounded recount claimed an exact prompt length");
     const infernix::serve::ApiError thinking_capacity = infernix::serve::request_error_to_api_error(
         infernix::RequestError(infernix::RequestErrorKind::ThinkingBudgetCapacityInsufficient,
                              "thinking control suffix does not fit"));

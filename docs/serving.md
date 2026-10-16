@@ -75,8 +75,8 @@ tier must be saved. Before the server is ready, one Ctrl+C ends startup at once.
 |---|---|
 | `GET /health` | Engine readiness |
 | `GET /metrics` | Prometheus counters, gauges and latency histograms |
-| `GET /v1/models` | configured OpenAI model alias, effective `max_model_len`, and a llama.cpp-compatible `meta` object |
-| `GET /v1/models/{id}` | lookup of the configured alias, `max_model_len`, and `meta` object |
+| `GET /v1/models` | configured OpenAI model alias, effective `max_model_len`, and llama.cpp-compatible `meta` and `chat_template_caps` objects |
+| `GET /v1/models/{id}` | lookup of the configured alias, `max_model_len`, `meta` and `chat_template_caps` |
 | `POST /v1/chat/completions` | OpenAI-style chat generation |
 | `POST /v1/responses` | OpenAI Responses Core generation, state, typed Items, and SSE |
 | `POST /v1/responses/input_tokens` | Responses prompt-token count without generation |
@@ -142,6 +142,23 @@ the model behind the alias and the running instance:
 `n_ctx` is a property of the running `infernix-serve` instance, so it reflects the `--max-context`
 that this server was started with, not the model's native context. `n_ctx_train` reports the model's
 own trained context separately.
+
+Each model object also carries `chat_template_caps`, the chat-template capability object `llama.cpp`
+reports, with one field:
+
+| Field | Meaning |
+|---|---|
+| `supports_tools` | the loaded chat template (the artifact's, or `--chat-template FILE`) renders tool declarations into the prompt |
+
+The server measures it once at startup, after warmup, through the same prompt path requests take: it
+counts a one-message conversation that declares a probe tool, under a short name and under a longer
+one, and the template supports tools when the longer name lengthens the prompt. A template that
+ignores tools, or adds a fixed text whenever tools are present without the declaration itself,
+counts both alike and reports `false`, as does a template that refuses a declared tool. A request
+may still declare tools then, but the model never sees them. Generated tool calls are always read by
+the model family's own tool-call parser, so the probe does not test a template that teaches the
+model another call format. The Qwen templates, including those in `tools/chat_templates`, write each
+declared tool as JSON into the System turn, so they report `true`.
 
 `GET /v1/models/{id}` returns the same object for the single configured alias and a `404` for any
 other id.
@@ -581,8 +598,13 @@ not invalidate a request reference, and live bytes are returned only when the fi
 released. A request-level preparation gate derived from the live limit prevents concurrent partial
 builds from deadlocking the memory account.
 
-An expanded prompt beyond `--max-context` returns HTTP 400 `context_length_exceeded`, including
-the prepared token count and configured context ceiling. A media preprocessing resource rejection
+An expanded prompt beyond `--max-context` returns HTTP 400 `context_length_exceeded` with OpenAI's
+wording, which agent clients match to compact the conversation and retry: "This model's maximum
+context length is N tokens. However, your messages resulted in M tokens. Please reduce the length
+of the messages." The Anthropic route returns `invalid_request_error` with the Anthropic API's
+"prompt is too long: M tokens > N maximum", which Claude Code matches the same way. M is exact up
+to four times the limit; a longer prompt is not tokenized further and reads "more than M tokens".
+A media preprocessing resource rejection
 returns HTTP 400 `media_budget_exceeded`. HTTP 413 `request_too_large` is reserved for a raw request
 body that exceeds `--max-request-mib` before JSON parsing; it is not used for model-context or media
 resource errors.
@@ -958,6 +980,30 @@ positional: a string-form System value, a later array block, or an inline System
 same text remains ordinary prompt content. A `cache_control` marker attached to the consumed block
 is consumed with it rather than moved to adjacent content.
 
+`--claude-code-prompt local` rewrites Claude Code's own System prompt for a local model; the default,
+`as-sent`, uses the client's System text unchanged. The rewrite applies only when the consumed first
+block is that attribution block and the next block opens with Claude Code's identity line (`You are
+Claude Code` or `You are a Claude agent`); every other System value is used as sent. The rules,
+taken from strata-nvfp4's `claude_code_prompt: "local"`, each match a marker of Claude Code's prompt:
+
+- the identity line is replaced by a short local-agent preamble: call only the declared tools, by
+  their exact names and with arguments that match their schemas; never write a tool call as text;
+  run dependent calls in turn and read each result before acting on it;
+- paragraphs opening with `You are an agent working with the user toward their goals`,
+  `IMPORTANT: Assist with authorized security testing` (Anthropic's security policy) or `When you
+  use a pronoun for someone` are dropped;
+- bullets opening with `The most recent Claude models`, `Claude Code is available as` or `Fast
+  mode for Claude Code` (Claude Code's Environment section) are dropped, and the `# Environment`
+  heading with them when nothing else remains under it;
+- a `# Memory` section that names its directory (``memory at `PATH` ``) becomes one paragraph that
+  keeps the path; it ends at the next `# ` heading outside a code fence;
+- runs of blank lines collapse to one. Every other section passes unchanged.
+
+The rewrite depends on the text alone, so every turn of a conversation renders the same System
+prefix and the prefix cache keeps hitting; Count Tokens counts the rewritten prompt. Each System
+block keeps its `cache_control` breakpoint, and a block the rewrite leaves empty hands its
+breakpoint to the end of the previous block.
+
 `max_tokens` is optional for local clients and otherwise uses `--default-max-tokens`; a positive
 value is the complete output budget. `max_tokens:0` is rejected because Infernix does not expose a
 completed zero-output cache-prewarm lifecycle. `temperature`, `top_p`, `top_k`, and
@@ -1014,6 +1060,12 @@ verified reused tokens in `cache_read_input_tokens` and leaves cache creation un
 emits `message_start` after Engine admission commits the prefix selection and before
 transfer/prefill output, so its uncached/cache-read split is already exact; terminal cumulative
 usage matches the aggregate response.
+
+Every successful Messages response also carries the llama.cpp-compatible top-level `timings`
+object described for [Chat Completions](#llamacpp-compatible-request-observations), with the same
+fields and semantics (`cache_n` equals `cache_read_input_tokens`). It is not an Anthropic field. A
+stream attaches it only to the terminal `message_delta` event; `timings_per_token` and
+`return_progress` are Chat Completions options and have no Messages equivalent.
 
 Documents, Search Results, Files, Structured Outputs, server-tool results, container uploads, and
 other execution-dependent blocks are rejected with the missing capability identified. Metadata,
@@ -1144,7 +1196,9 @@ curl http://127.0.0.1:8080/v1/decide -H 'Content-Type: application/json' -d '{
 ## Authentication and CORS
 
 Pass `--api-key VALUE` to require the same value as an OpenAI bearer token or Anthropic
-`x-api-key` header. `GET /health` and CORS preflight requests remain unauthenticated.
+`x-api-key` header. `GET /health` and CORS preflight requests remain unauthenticated. A server
+started without `--api-key` on a `--host` other than loopback (`127.0.0.0/8`, `::1`, `localhost`),
+such as `0.0.0.0`, logs a warning that anyone who can reach the port can use the model.
 
 ```bash
 curl http://127.0.0.1:8080/v1/models \
@@ -1159,11 +1213,13 @@ The table lists executable defaults. The startup example selects a long-context 
 
 | Option | Meaning | Default |
 |---|---|---:|
+| `--config FILE` | read options from a JSON file ([Configuration file](#configuration-file)); command-line options override it | unset |
 | `--host H` | listen address | `127.0.0.1` |
 | `--port N` | listen port | `8080` |
 | `--api-key KEY` | required bearer or `x-api-key` value | unset |
 | `--model-id ID` | override the public OpenAI model alias | artifact `metadata.name`, or architecture name |
 | `--chat-template FILE` | replace the artifact's chat template at startup; it must be one the target accepts | artifact template |
+| `--claude-code-prompt as-sent\|local` | Anthropic Messages from Claude Code: use its System prompt as sent, or replace its Claude-specific parts with a short local-agent preamble ([Anthropic Messages](#anthropic-messages)) | `as-sent` |
 | `--rope-yarn-factor F` | startup-fixed runtime YaRN factor, finite `[1,4]`; extends allowed ceiling only | `1` |
 | `--max-context N` | logical context ceiling of each sequence | `8192` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `auto` with the prefix cache and `--max-context` with `--no-prefix-reuse` | `auto` |
@@ -1313,6 +1369,39 @@ tool marker is returned to text because its structure or tool identity cannot be
 Serve emits one warning with the failure classification and the returned markup's first 240
 bytes from `<tool_call>` on (tabs and line breaks shown as spaces, `...` when cut), so a malformed
 call can be diagnosed from the console. The request JSONL records only the classification.
+
+### Configuration file
+
+`--config FILE` reads options from a JSON object whose keys are the long option names without the
+leading dashes. The artifact path stays the first command-line argument:
+
+```json
+{
+  "max-context": 240000,
+  "max-concurrency": 2,
+  "kv-dtype": "int8",
+  "spec": "dflash2",
+  "draft-tokens": 7,
+  "lm-head-draft": true,
+  "prefix-cache-file": "qwen3_8_27b.cache",
+  "api-key": "local-secret"
+}
+```
+
+```bash
+./build/apps/infernix-serve models/qwen3_8_27b_nvfp4.ninfer --config serve.json --port 8081
+```
+
+A flag takes `true` or `false` (`false` leaves it unset); every other option takes a string or a
+number, which reaches the option exactly as its command-line text would (`"auto"`, `4096`, `0.7`).
+Each value is validated as on the command line, and relative paths resolve against the launch
+directory, not the file's. Options on the command line override the file wherever `--config`
+appears, and the file overrides the defaults; a flag the file sets cannot be turned off from the
+command line, since flags have no negative form. Startup refuses a file that is not a JSON object,
+names an unknown option (including a dashed name or `config`), repeats a key, or gives a value of
+another type, naming the key. `--config` may be given once. The `server_start` record's `argv` shows
+the `--config FILE` argument, not the file's contents, so keep the file with the log when its
+values matter.
 
 ## Live metrics
 
@@ -1466,7 +1555,9 @@ be added to `workspace.capacity_bytes`. The field is `null` when Vision is disab
 `cuda_graph_allowance_bytes` is the CUDA Graph memory
 the KV sizing reserved, and `cuda_graph_measured_bytes` the Device memory graph preparation
 actually took at startup (`0` without CUDA Graphs); the startup log warns when the second exceeds
-the first.
+the first. When the graphs find no Device memory at all, a Qwen3.5-family engine with
+`--kv-capacity auto` warns and starts once more with 1 GiB more headroom (a smaller KV capacity);
+an explicit `--kv-capacity` fails startup instead.
 
 `server_start.engine.original_int8_prefill_kernel`, `prefill_split_workspace_mib`,
 `original_nvfp4_prefill_kernel` and `fast_paths` record `--use-original-int8-prefill-kernel`,
@@ -1552,7 +1643,9 @@ blocks refused Host slabs, which then stay Device-only), `device_slot_evictions`
 slots taken from another snapshot) and `device_slot_refusals` (slot requests refused);
 `free_device_snapshot_slots` is an end-of-interval gauge. `host_image_writes`, `host_block_writes`,
 `host_image_restores`, `host_block_restores`, `host_write_bytes`, and `host_restore_bytes` count
-Host-tier write-through and restores; `prefetched_blocks` counts the restored blocks copied for a
+Host-tier write-through and restores, and `host_write_copies` and `host_restore_copies` the copy
+calls that moved those bytes (many small copies queue behind other work on the copy engine; the
+Qwen3.8-Flash-Next prefix cache reports 0); `prefetched_blocks` counts the restored blocks copied for a
 waiting FIFO head before its admission. `evicted_blocks` counts Device block evictions,
 `host_snapshot_evictions` snapshots evicted from the Host tier, `host_dead_reclaims` Host slabs
 reclaimed from KV that no snapshot can reach, and `unbacked_node_losses` Device evictions of blocks

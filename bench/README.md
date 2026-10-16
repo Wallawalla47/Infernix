@@ -1260,9 +1260,10 @@ cmake --build build --parallel --target \
 ./build/bench/infernix_add_bias_bench [--d D --columns C] [--control]
 ```
 
-Aligned registered shapes use 16-byte BF16 packs in the cache-sized regime. GELU and AddBias
-select their BF16x2 streaming routes for larger Vision items; odd or unaligned repository-internal
-test shapes exercise the scalar fallbacks.
+Aligned registered shapes use 16-byte BF16 packs: GELU in the cache-sized regime, selecting its
+BF16x2 streaming route for larger Vision items; AddBias as one stream of packs over the whole tensor
+at every size (its control mirrors that). Odd or unaligned repository-internal test shapes exercise
+the scalar fallbacks.
 
 ## Causal conv1d SiLU Op benchmark
 

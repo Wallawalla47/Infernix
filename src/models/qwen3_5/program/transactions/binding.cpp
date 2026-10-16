@@ -92,9 +92,33 @@ void ProgramImpl::plan_binding_units(ContextTransaction& tx, const RequestBasePl
     UnitDemand first;
     if (!resume) {
         // A binding's first step is one chunk: admission and source choice size it so
-        // (hybrid_program.cpp), whatever the other lanes do.
-        first = prefill_unit(base.summary().prompt_tokens, tx.reuse_frontier,
-                             initial_mtp_extent(*base.impl_), prefill_chunk);
+        // (hybrid_program.cpp), whatever the other lanes do. Under idle-wide-prefill it takes the
+        // idle width instead when no other lane is generating, the prompt has no media, and the free
+        // KV pages alone hold the whole wide extent (so a request that could start with one chunk is
+        // never paused or failed for the width): RTX 5090, 27B NVFP4, INT8 KV, C = 1, 2026-10-16:
+        // pp1024 +19.3 %, pp2048 +11.5 %, pp3072 +5.2 %, pp4096 +0.5 %, pp8192 +1.8 % (ABBA).
+        std::uint32_t step = prefill_chunk;
+        const std::uint32_t prompt = base.summary().prompt_tokens;
+        if (idle_prefill_width > prefill_chunk && !request.prefill->vision_plan &&
+            prompt - tx.reuse_frontier > prefill_chunk && !other_lane_generating(lane)) {
+            const std::uint32_t tokens =
+                hybrid_wide_step_limit(lane, tx.reuse_frontier, prompt, idle_prefill_width);
+            const UnitDemand wide = prefill_unit(prompt, tx.reuse_frontier, initial_mtp_extent(*base.impl_), tokens);
+            // Free pages only (no eviction), for the wide growth, the private tail page, and every
+            // reused block as if it had to be restored from the Host tier (an upper bound: the
+            // binding's restore count is decided after this plan, hybrid_program.cpp).
+            const auto fits = [&](const LogicalKVPageStore& pages, std::uint32_t from, std::uint32_t to) {
+                const std::uint32_t restored = tx.hybrid ? kv_pages_for_frontier(from) : 0U;
+                return static_cast<std::uint64_t>(kv_pages_for_frontier(std::max(from, to))) -
+                           kv_pages_for_frontier(from) + restored + 2U <=
+                       pages.physical_pool().available_pages();
+            };
+            if (tokens > prefill_chunk && fits(*text_kv_pages, tx.reuse_frontier, wide.main_frontier) &&
+                (!backend_kv_pages || fits(*backend_kv_pages, tx.backend_frontier, wide.backend_frontier))) {
+                step = tokens;
+            }
+        }
+        first = prefill_unit(prompt, tx.reuse_frontier, initial_mtp_extent(*base.impl_), step);
     } else {
         first = {.kind          = ExecutionUnitKind::Replay,
                  .main_frontier = std::min(tx.reuse_frontier + prefill_chunk, resume->frontier())};

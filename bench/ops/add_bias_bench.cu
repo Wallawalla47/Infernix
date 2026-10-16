@@ -16,40 +16,18 @@ using namespace infernix::bench;
 
 namespace {
 
-template <int RowsPerBlock>
-__global__ void add_bias_payload_control(const uint4* bias, uint4* x, std::int32_t packs,
-                                         std::int32_t rows) {
-    const int pack = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (pack >= packs) { return; }
-    const uint4 b       = bias[pack];
-    const int first_row = static_cast<int>(blockIdx.y) * RowsPerBlock;
-#pragma unroll
-    for (int item = 0; item < RowsPerBlock; ++item) {
-        const int row = first_row + item;
-        if (row >= rows) { return; }
-        uint4 value = x[static_cast<std::int64_t>(row) * packs + pack];
-        value.x ^= b.x;
-        value.y ^= b.y;
-        value.z ^= b.z;
-        value.w ^= b.w;
-        x[static_cast<std::int64_t>(row) * packs + pack] = value;
-    }
-}
-
-template <int Block>
-__global__ void add_bias_pair_payload_control(const unsigned int* bias, unsigned int* x,
-                                              std::int32_t pairs, std::int32_t rows) {
-    constexpr int pairsPerThread = 4;
-    const int first =
-        (static_cast<int>(blockIdx.x) * Block + static_cast<int>(threadIdx.x)) * pairsPerThread;
-    for (int row = static_cast<int>(blockIdx.y); row < rows; row += static_cast<int>(gridDim.y)) {
-        const std::int64_t base = static_cast<std::int64_t>(row) * pairs;
-#pragma unroll
-        for (int item = 0; item < pairsPerThread; ++item) {
-            const int pair = first + item;
-            if (pair < pairs) { x[base + pair] ^= bias[pair]; }
-        }
-    }
+// The production route's traffic: one 16-byte pack per thread over the whole tensor.
+__global__ void add_bias_payload_control(const uint4* bias, uint4* x, std::uint32_t packs,
+                                         std::uint32_t total) {
+    const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= total) { return; }
+    const uint4 b = bias[index % packs];
+    uint4 value   = x[index];
+    value.x ^= b.x;
+    value.y ^= b.y;
+    value.z ^= b.z;
+    value.w ^= b.w;
+    x[index] = value;
 }
 
 void run(int d, int columns, bool control) {
@@ -65,33 +43,11 @@ void run(int d, int columns, bool control) {
         restore,
         [&](cudaStream_t stream) {
             if (control) {
-                constexpr int block   = 256;
-                const int packs       = d / 8;
-                const unsigned grid_x = static_cast<unsigned>((packs + block - 1) / block);
-                if (static_cast<std::int64_t>(n) <= ops::kBf16x8CacheSizedMaxElements &&
-                    columns >= 1024) {
-                    constexpr int rowsPerBlock = 4;
-                    const unsigned grid_y =
-                        static_cast<unsigned>((columns + rowsPerBlock - 1) / rowsPerBlock);
-                    add_bias_payload_control<rowsPerBlock>
-                        <<<dim3(grid_x, grid_y), block, 0, stream>>>(
-                            static_cast<const uint4*>(bias.p), static_cast<uint4*>(x.p), packs,
-                            columns);
-                } else if (static_cast<std::int64_t>(n) <= ops::kBf16x8CacheSizedMaxElements) {
-                    add_bias_payload_control<1><<<dim3(grid_x, columns), block, 0, stream>>>(
-                        static_cast<const uint4*>(bias.p), static_cast<uint4*>(x.p), packs,
-                        columns);
-                } else {
-                    constexpr int pairsPerThread = 4;
-                    const int pairs              = d / 2;
-                    const unsigned pair_grid_x   = static_cast<unsigned>(
-                        (pairs + block * pairsPerThread - 1) / (block * pairsPerThread));
-                    const unsigned pair_grid_y = static_cast<unsigned>(std::min(columns, 65535));
-                    add_bias_pair_payload_control<block>
-                        <<<dim3(pair_grid_x, pair_grid_y), block, 0, stream>>>(
-                            static_cast<const unsigned int*>(bias.p),
-                            static_cast<unsigned int*>(x.p), pairs, columns);
-                }
+                constexpr unsigned block   = 256;
+                const auto total           = static_cast<std::uint32_t>(n / 8);
+                add_bias_payload_control<<<(total + block - 1) / block, block, 0, stream>>>(
+                    static_cast<const uint4*>(bias.p), static_cast<uint4*>(x.p),
+                    static_cast<std::uint32_t>(d / 8), total);
             } else {
                 ops::add_bias(tb, tx, stream);
             }

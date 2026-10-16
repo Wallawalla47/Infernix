@@ -30,6 +30,8 @@ struct ApiError {
     std::string message;
     std::string param; // optional
     std::string code;  // optional
+    // A context overflow's counts, so each protocol can word it as its clients detect it.
+    std::optional<ContextLengthDetails> context_length;
 };
 
 class ApiException : public std::runtime_error {
@@ -43,9 +45,16 @@ private:
     ApiError error_;
 };
 
+// --claude-code-prompt: what Anthropic Messages lowering does with Claude Code's system prompt.
+enum class ClaudeCodePrompt : std::uint8_t {
+    AsSent, // the client's System text, unchanged
+    Local,  // Claude-specific sections replaced by a short local-agent preamble
+};
+
 // Server-side context needed while parsing/validating a request.
 struct RequestLimits {
-    int default_max_tokens = 8192;
+    int default_max_tokens              = 8192;
+    ClaudeCodePrompt claude_code_prompt = ClaudeCodePrompt::AsSent; // Anthropic Messages only
 };
 
 enum class ContentKind {

@@ -17,8 +17,8 @@ namespace infernix::serve {
 void HttpServer::handle_count_tokens(const httplib::Request& req, httplib::Response& res) {
     const std::string request_id = res.get_header_value("request-id");
     try {
-        const AnthropicCountTokensRequest request =
-            parse_anthropic_count_tokens_request(parse_json_body(req));
+        const AnthropicCountTokensRequest request = parse_anthropic_count_tokens_request(
+            parse_json_body(req), {.claude_code_prompt = options_.claude_code_prompt});
         const int input_tokens = service_->count_prompt_tokens(
             request.generation, [&req] { return client_disconnected(req); });
         res.set_content(make_anthropic_count_tokens_response(input_tokens), "application/json");
@@ -42,6 +42,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     try {
         RequestLimits limits;
         limits.default_max_tokens        = options_.default_max_tokens;
+        limits.claude_code_prompt        = options_.claude_code_prompt;
         const auto body                  = parse_json_body(req);
         request                          = parse_anthropic_messages_request(body, limits);
         request.generation.ngram_session = resolve_ngram_session(req, body, options_);

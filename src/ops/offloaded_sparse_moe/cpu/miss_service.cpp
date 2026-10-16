@@ -1,5 +1,7 @@
 #include "ops/offloaded_sparse_moe/cpu/miss_service.h"
 
+#include "core/nvtx.h"
+
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -189,6 +191,10 @@ void CpuMissService::serve() {
             const MissRequest& r = *request_;
             const Layer& layer   = layers_.at(static_cast<std::size_t>(r.layer));
             const int count      = r.jobs;
+            // One request's experts (payload: layer << 32 | job count).
+            const nvtx::ScopedRange compute_range(
+                nvtx::Name::MoeCpuCompute, nvtx::Category::Moe,
+                (static_cast<std::uint64_t>(static_cast<std::uint32_t>(r.layer)) << 32) | static_cast<std::uint32_t>(count));
             std::uint32_t status = 0;
             ready.clear();
             read_jobs.clear();

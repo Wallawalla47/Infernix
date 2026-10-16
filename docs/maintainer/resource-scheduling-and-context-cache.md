@@ -143,7 +143,8 @@ Control reacquire Decode permits in the next cycle. Graphs use the actual member
 profile. With the `idle-wide-prefill` fast path a Prefill permit reserved while no other lane is
 generating covers the startup-planned idle width (a multiple of the chunk) instead of one chunk,
 when its extra KV pages are free or evictable cache; a held permit keeps its width until its step
-runs. Bindings, Replay and recovering requests keep one chunk
+runs. A binding's first step takes it only when the free pages alone hold it (and every reused
+block, counted as restored); Replay and recovering requests keep one chunk
 ([model quality §6.7](model-quality.md#67-fast-path-registry)).
 
 The fresh queue keeps FIFO tickets, and each blocked request can be successfully bypassed by at most C

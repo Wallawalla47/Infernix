@@ -115,6 +115,10 @@ void DecodeGraphExecutable::instantiate(const DecodeGraphDefinition& definition)
     const cudaError_t err = cudaGraphInstantiate(&exec, definition.graph_, 0);
     if (err != cudaSuccess) {
         destroy_graph_exec(exec);
+        if (err == cudaErrorMemoryAllocation) {
+            (void)cudaGetLastError();
+            throw GraphMemoryExhausted("CUDA Graph instantiation: out of device memory");
+        }
         CUDA_CHECK(err);
     }
     exec_ = exec;
@@ -138,7 +142,12 @@ void DecodeGraphExecutable::update(const DecodeGraphDefinition& definition) {
 void DecodeGraphExecutable::upload(cudaStream_t stream) {
     nvtx::ScopedRange upload_range(nvtx::Name::CudaGraphUpload, nvtx::Category::Graph);
     if (!ready()) { throw std::logic_error("cannot upload an empty CUDA Graph executable"); }
-    CUDA_CHECK(cudaGraphUpload(exec_, stream));
+    const cudaError_t err = cudaGraphUpload(exec_, stream);
+    if (err == cudaErrorMemoryAllocation) {
+        (void)cudaGetLastError();
+        throw GraphMemoryExhausted("CUDA Graph upload: out of device memory");
+    }
+    CUDA_CHECK(err);
 }
 
 void DecodeGraphExecutable::launch(cudaStream_t stream) {

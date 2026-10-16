@@ -222,6 +222,10 @@ struct PrefillProgress {
     runtime::BeginSummary summary;
     std::uint32_t processed_prompt_tokens = 0;
     bool complete                         = false;
+    // The expert frames lent to this prompt's calls are returnable now (between calls, and after
+    // each layer-walk span), so a request waiting for KV growth may be admitted: the Engine re-runs
+    // admission (GitHub #24).
+    bool capacity_released = false;
     runtime::ExecutionTiming timing;
     std::optional<PendingBatch> pending;
     std::optional<PromptReadout> readout;

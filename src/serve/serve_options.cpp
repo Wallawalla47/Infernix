@@ -1,18 +1,215 @@
 #include "serve/serve_options.h"
 #include "product/speculative_options.h"
 
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <unordered_set>
+#include <utility>
+#include <vector>
 
 namespace infernix::serve {
 namespace {
+
+// Every option parse_serve_options accepts after the artifact path, and whether it takes a value.
+// The argument loop accepts nothing outside this table, and --config maps its keys through it, so
+// a config file accepts exactly the command line's options with the same arity.
+struct ServeOptionArity {
+    std::string_view name;
+    bool takes_value = true;
+};
+
+constexpr std::array kServeOptionArities{
+    ServeOptionArity{"--host"},
+    ServeOptionArity{"--port"},
+    ServeOptionArity{"--api-key"},
+    ServeOptionArity{"--model-id"},
+    ServeOptionArity{"--ngram-volume"},
+    ServeOptionArity{"--expert-state"},
+    ServeOptionArity{"--chat-template"},
+    ServeOptionArity{"--claude-code-prompt"},
+    ServeOptionArity{"--rope-yarn-factor"},
+    ServeOptionArity{"--max-context"},
+    ServeOptionArity{"--kv-capacity"},
+    ServeOptionArity{"--vram-headroom-mib"},
+    ServeOptionArity{"--vram-past-budget", false},
+    ServeOptionArity{"--max-concurrency"},
+    ServeOptionArity{"--max-pending-requests"},
+    ServeOptionArity{"--pending-timeout-ms"},
+    ServeOptionArity{"--prefill-chunk"},
+    ServeOptionArity{"--use-original-int8-prefill-kernel", false},
+    ServeOptionArity{"--prefill-split-workspace-mib"},
+    ServeOptionArity{"--use-original-nvfp4-prefill-kernel", false},
+    ServeOptionArity{"--disable-fast-paths", false},
+    ServeOptionArity{"--context-cost-presets"},
+    ServeOptionArity{"--log-stats-interval-ms"},
+    ServeOptionArity{"--log-colours"},
+    ServeOptionArity{"--log-stats-panel"},
+    ServeOptionArity{"--max-request-mib"},
+    ServeOptionArity{"--media-cache-mib"},
+    ServeOptionArity{"--media-live-mib"},
+    ServeOptionArity{"--media-preprocess-threads"},
+    ServeOptionArity{"--device-snapshot-slots"},
+    ServeOptionArity{"--cache-taps-per-request"},
+    ServeOptionArity{"--cache-tap-ladder"},
+    ServeOptionArity{"--prefix-cache-file"},
+    ServeOptionArity{"--prefix-cache-save-mins"},
+    ServeOptionArity{"--no-queue-holds", false},
+    ServeOptionArity{"--cache-tool-hold-secs"},
+    ServeOptionArity{"--cache-host-state"},
+    ServeOptionArity{"--cache-tap-min-gap"},
+    ServeOptionArity{"--host-context-mib"},
+    ServeOptionArity{"--request-log-jsonl"},
+    ServeOptionArity{"--request-log-max-mib"},
+    ServeOptionArity{"--request-log-keep"},
+    ServeOptionArity{"--route-trace"},
+    ServeOptionArity{"--response-store-max-records"},
+    ServeOptionArity{"--response-store-max-mib"},
+    ServeOptionArity{"--device"},
+    ServeOptionArity{"--ram-headroom-mib"},
+    ServeOptionArity{"--expert-ram-mib"},
+    ServeOptionArity{"--expert-pin-mib"},
+    ServeOptionArity{"--kv-dtype"},
+    ServeOptionArity{"--spec"},
+    ServeOptionArity{"--draft-tokens"},
+    ServeOptionArity{"--spec-min-p"},
+    ServeOptionArity{"--draft-tree-nodes"},
+    ServeOptionArity{"--draft-tree-paths"},
+    ServeOptionArity{"--ngram-draft-tokens"},
+    ServeOptionArity{"--ngram-min-match"},
+    ServeOptionArity{"--ngram-archive-mib"},
+    ServeOptionArity{"--ngram-session-mib"},
+    ServeOptionArity{"--ngram-native-sessions", false},
+    ServeOptionArity{"--default-max-tokens"},
+    ServeOptionArity{"--default-thinking-budget"},
+    ServeOptionArity{"--thinking-budget-message"},
+    ServeOptionArity{"--reasoning-loop"},
+    ServeOptionArity{"--vision", false},
+    ServeOptionArity{"--vision-offload"},
+    ServeOptionArity{"--vision-max-merged"},
+    ServeOptionArity{"--no-cuda-graph", false},
+    ServeOptionArity{"--no-prefix-reuse", false},
+    ServeOptionArity{"--lm-head-draft", false},
+    ServeOptionArity{"--no-thinking", false},
+    ServeOptionArity{"--preserve-thinking", false},
+    ServeOptionArity{"--tolerant-tool-calls", false},
+    ServeOptionArity{"--cors", false},
+    ServeOptionArity{"--usage-chunk-choice", false},
+    ServeOptionArity{"--temperature"},
+    ServeOptionArity{"--top-p"},
+    ServeOptionArity{"--top-k"},
+    ServeOptionArity{"--min-p"},
+    ServeOptionArity{"--presence-penalty"},
+    ServeOptionArity{"--frequency-penalty"},
+    ServeOptionArity{"--seed"},
+    ServeOptionArity{"--greedy", false},
+    ServeOptionArity{"--log-level"},
+};
+
+const ServeOptionArity* find_option(std::string_view name) noexcept {
+    const auto found =
+        std::find_if(kServeOptionArities.begin(), kServeOptionArities.end(),
+                     [&](const ServeOptionArity& option) { return option.name == name; });
+    return found == kServeOptionArities.end() ? nullptr : &*found;
+}
+
+// The options of a --config file as command-line arguments, in the file's order. Keys are long
+// option names without the dashes; a flag takes true or false (false leaves it unset), any other
+// option a string or a number, which reaches the option's parser as its JSON text. Unknown and
+// repeated keys and other value types are rejected by name.
+std::vector<std::string> read_config_arguments(const std::string& path) {
+    using ConfigJson          = nlohmann::ordered_json;
+    const std::string context = "--config " + path + ": ";
+    std::ifstream file(std::filesystem::path(path), std::ios::binary);
+    if (!file) { throw std::invalid_argument(context + "cannot be read"); }
+    const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    if (file.bad()) { throw std::invalid_argument(context + "cannot be read"); }
+
+    std::unordered_set<std::string> keys;
+    const ConfigJson::parser_callback_t reject_repeated_keys =
+        [&](int depth, ConfigJson::parse_event_t event, ConfigJson& parsed) {
+            if (event == ConfigJson::parse_event_t::key && depth == 1 &&
+                !keys.insert(parsed.get<std::string>()).second) {
+                throw std::invalid_argument(context + "repeats the key '" +
+                                            parsed.get<std::string>() + "'");
+            }
+            return true;
+        };
+    ConfigJson config;
+    try {
+        config = ConfigJson::parse(text, reject_repeated_keys);
+    } catch (const ConfigJson::exception& error) {
+        throw std::invalid_argument(context + "invalid JSON: " + error.what());
+    }
+    if (!config.is_object()) {
+        throw std::invalid_argument(context + "must be a JSON object of option names and values");
+    }
+
+    std::vector<std::string> arguments;
+    for (const auto& item : config.items()) {
+        const std::string& key  = item.key();
+        const ConfigJson& value = item.value();
+        if (key == "config") {
+            throw std::invalid_argument(context + "a config file cannot name another one");
+        }
+        const std::string option      = "--" + key;
+        const ServeOptionArity* arity = find_option(option);
+        if (arity == nullptr) { throw std::invalid_argument(context + "unknown option '" + key + "'"); }
+        if (!arity->takes_value) {
+            if (!value.is_boolean()) {
+                throw std::invalid_argument(context + "'" + key +
+                                            "' is a flag and takes true or false");
+            }
+            if (value.get<bool>()) { arguments.push_back(option); }
+        } else if (value.is_string() || value.is_number()) {
+            arguments.push_back(option);
+            arguments.push_back(value.is_string() ? value.get<std::string>() : value.dump());
+        } else {
+            throw std::invalid_argument(context + "'" + key + "' takes a string or a number");
+        }
+    }
+    return arguments;
+}
+
+// The options after the artifact path, with those of `--config FILE` ahead of the command line's:
+// a later option overrides an earlier one, so the command line takes precedence over the file.
+std::vector<std::string> collect_arguments(int argc, char** argv) {
+    std::vector<std::string> command_line;
+    std::optional<std::string> config_path;
+    for (int i = 2; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--config") {
+            if (++i >= argc) { throw std::invalid_argument("--config needs a value"); }
+            if (config_path) { throw std::invalid_argument("--config may be given only once"); }
+            config_path = argv[i];
+            continue;
+        }
+        const ServeOptionArity* arity = find_option(arg);
+        command_line.push_back(std::move(arg));
+        // An option's value is never read as an option: `--model-id --config` names a model id.
+        if (arity != nullptr && arity->takes_value && i + 1 < argc) {
+            command_line.emplace_back(argv[++i]);
+        }
+    }
+    if (!config_path) { return command_line; }
+    std::vector<std::string> arguments = read_config_arguments(*config_path);
+    arguments.insert(arguments.end(), std::make_move_iterator(command_line.begin()),
+                     std::make_move_iterator(command_line.end()));
+    return arguments;
+}
 
 int parse_nonnegative_int(const char* text, const char* label) {
     char* end        = nullptr;
@@ -132,6 +329,11 @@ std::string serve_usage_text(const char* argv0) {
            "\n"
            "Serves the OpenAI Responses/Chat Completions and Anthropic Messages APIs.\n"
            "  --help, -h                 show this help and exit\n"
+           "  --config FILE              read options from a JSON object keyed by the long\n"
+           "                             option names without the dashes, e.g.\n"
+           "                             {\"port\": 8080, \"kv-dtype\": \"int8\", \"greedy\": true}\n"
+           "                             (a flag takes true or false); options on the command\n"
+           "                             line override the file\n"
            "\n"
            "MODEL & CONTEXT\n"
            "  --max-context N            max context tokens per request (default 8192)\n"
@@ -180,6 +382,10 @@ std::string serve_usage_text(const char* argv0) {
            "                             the server\n"
            "  --chat-template FILE       replace the artifact frontend chat template at\n"
            "                             startup; must match a template the target accepts\n"
+           "  --claude-code-prompt as-sent|local\n"
+           "                             Anthropic Messages from Claude Code: keep its system\n"
+           "                             prompt (as-sent, default) or replace its Claude-\n"
+           "                             specific parts with a short local-agent preamble\n"
            "  --ngram-volume FILE        Qwen3.8-Flash-Next n-gram embedding volume\n"
            "                             (default: the artifact path + .ngram)\n"
            "  --expert-state FILE|off    Qwen3.8-Flash-Next expert-cache state: read at\n"
@@ -394,6 +600,11 @@ const char* reasoning_loop_name(infernix::ReasoningLoopAction action) noexcept {
     return "off";
 }
 
+bool is_loopback_host(std::string_view host) noexcept {
+    if (host.size() >= 2 && host.front() == '[' && host.back() == ']') { host = host.substr(1, host.size() - 2); }
+    return host == "localhost" || host == "::1" || host.starts_with("127.");
+}
+
 ServeOptions parse_serve_options(int argc, char** argv) {
     ServeOptions options;
     options.startup_argv.reserve(static_cast<std::size_t>(argc));
@@ -418,13 +629,17 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         return options;
     }
     if (argc < 2) { throw std::invalid_argument("artifact path is required"); }
-    options.artifact_path = argv[1];
-    for (int i = 2; i < argc; ++i) {
-        const std::string arg    = argv[i];
+    options.artifact_path                    = argv[1];
+    const std::vector<std::string> arguments = collect_arguments(argc, argv);
+    for (std::size_t i = 0; i < arguments.size(); ++i) {
+        const std::string arg    = arguments[i];
         const auto require_value = [&](const char* flag) -> const char* {
-            if (++i >= argc) { throw std::invalid_argument(std::string(flag) + " needs a value"); }
-            return argv[i];
+            if (++i >= arguments.size()) {
+                throw std::invalid_argument(std::string(flag) + " needs a value");
+            }
+            return arguments[i].c_str();
         };
+        if (find_option(arg) == nullptr) { throw std::invalid_argument("unknown argument: " + arg); }
         if (arg == "--host") {
             options.host = require_value("--host");
         } else if (arg == "--port") {
@@ -445,6 +660,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.chat_template_path = require_value("--chat-template");
             if (options.chat_template_path.empty()) {
                 throw std::invalid_argument("--chat-template must not be empty");
+            }
+        } else if (arg == "--claude-code-prompt") {
+            const std::string_view value = require_value("--claude-code-prompt");
+            if (value == "as-sent") {
+                options.claude_code_prompt = ClaudeCodePrompt::AsSent;
+            } else if (value == "local") {
+                options.claude_code_prompt = ClaudeCodePrompt::Local;
+            } else {
+                throw std::invalid_argument("--claude-code-prompt accepts as-sent or local");
             }
         } else if (arg == "--rope-yarn-factor") {
             options.rope_yarn_factor =
@@ -785,7 +1009,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--log-level") {
             options.log_level = product::parse_log_level(require_value("--log-level"));
         } else {
-            throw std::invalid_argument("unknown argument: " + arg);
+            throw std::logic_error("serve option " + arg + " has no parser");
         }
     }
     if (!kv_capacity_explicit) {

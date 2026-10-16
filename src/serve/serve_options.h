@@ -2,6 +2,7 @@
 
 #include "infernix/types.h"
 #include "product/logging/logging.h"
+#include "serve/request.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -80,6 +81,9 @@ struct ServeOptions {
     std::optional<bool> preserve_thinking;
     // Recover complete Qwen calls with malformed wrapper/suffix output (opt-in; strict by default).
     bool tolerant_tool_calls = false;
+    // --claude-code-prompt as-sent|local: Anthropic Messages from Claude Code keep its System prompt,
+    // or have its Claude-specific parts replaced by a short local-agent preamble.
+    ClaudeCodePrompt claude_code_prompt = ClaudeCodePrompt::AsSent;
     std::optional<std::uint32_t> default_thinking_budget;
     // End-of-thinking message fed to the model when it hits the thinking budget; empty
     // preserves the model's built-in control suffix.
@@ -107,11 +111,16 @@ struct ServeOptions {
     std::vector<std::string> startup_argv;
 };
 
+// argv[1] is the artifact path and the rest are options. `--config FILE` reads further options from
+// a JSON object keyed by their long names without the dashes; options on the command line override
+// the file, and the file overrides the defaults.
 ServeOptions parse_serve_options(int argc, char** argv);
 // "off", "stop" or "conclude".
 const char* reasoning_loop_name(infernix::ReasoningLoopAction action) noexcept;
 std::string resolve_public_model_id(const ServeOptions& options,
                                     std::string_view artifact_model_name);
 std::string serve_usage_text(const char* argv0);
+// Whether a --host value accepts connections from this machine only (127.0.0.0/8, ::1, localhost).
+bool is_loopback_host(std::string_view host) noexcept;
 
 } // namespace infernix::serve

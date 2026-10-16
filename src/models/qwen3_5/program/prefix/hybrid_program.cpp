@@ -1542,6 +1542,8 @@ HybridPrefixCacheStats ProgramImpl::hybrid_stats() const noexcept {
     out.host_tail_restores              = counters.host_tail_restores;
     out.host_write_bytes                = counters.host_write_bytes;
     out.host_restore_bytes              = counters.host_restore_bytes;
+    out.host_write_copies               = counters.host_write_copies;
+    out.host_restore_copies             = counters.host_restore_copies;
     out.evicted_blocks                  = counters.evicted_blocks;
     out.host_snapshot_evictions         = index.host_snapshot_evictions;
     out.host_dead_reclaims              = index.host_dead_reclaims;

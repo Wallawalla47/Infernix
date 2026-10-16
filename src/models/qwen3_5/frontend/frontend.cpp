@@ -241,6 +241,7 @@ fi::CompiledChatTemplate compile_chat_template(const FrontendResources& resource
     case fi::ProcessorErrorKind::BudgetExceeded:
         throw RequestError(RequestErrorKind::MediaBudgetExceeded, error.what());
     case fi::ProcessorErrorKind::ContextLengthExceeded:
+        if (error.context_length()) { throw RequestError(*error.context_length()); }
         throw RequestError(RequestErrorKind::ContextLengthExceeded, error.what());
     case fi::ProcessorErrorKind::InvalidMedia:
         throw RequestError(RequestErrorKind::InvalidMedia, error.what());
@@ -248,9 +249,8 @@ fi::CompiledChatTemplate compile_chat_template(const FrontendResources& resource
     throw std::logic_error("unknown Qwen3.5 processor error kind");
 }
 
-[[noreturn]] void throw_context_length_exceeded(std::uint32_t max_context) {
-    throw RequestError(RequestErrorKind::ContextLengthExceeded,
-                       "prepared prompt exceeds Engine max_context " + std::to_string(max_context));
+[[noreturn]] void throw_context_length_exceeded(std::size_t counted, std::uint32_t max_context) {
+    throw RequestError(fi::context_length_details(counted, max_context));
 }
 
 std::vector<fi::ChatMessage> convert_messages(std::vector<ChatMessage> messages) {
@@ -875,7 +875,10 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
             std::chrono::duration<double>(Clock::now() - tokenize_started).count();
         fi::check_preparation_control(control, "tokenization");
         if (encoded.input_ids.size() > impl_->max_context) {
-            throw_context_length_exceeded(impl_->max_context);
+            throw_context_length_exceeded(
+                fi::encode_rendered_chat(*impl_->tokenizer, rendered, fi::context_recount_limit(impl_->max_context))
+                    .input_ids.size(),
+                impl_->max_context);
         }
         result.token_ids                   = std::move(encoded.input_ids);
         result.identity.rewrite_checkpoint = encoded.rewrite_checkpoint;
@@ -1004,7 +1007,7 @@ PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids,
                                         bool allow_prefix_identity) const {
     const auto start = Clock::now();
     if (token_ids.size() > impl_->max_context) {
-        throw_context_length_exceeded(impl_->max_context);
+        throw RequestError(ContextLengthDetails{.prompt_tokens = token_ids.size(), .max_context = impl_->max_context});
     }
     (void)checked_token_count(token_ids.size());
     for (const TokenId token : token_ids) {

@@ -143,6 +143,13 @@ AnthropicResponseIdentity make_anthropic_response_identity(std::string request_i
 
 ApiError normalize_anthropic_error(ApiError error) {
     if (error.param == "reasoning_effort") { error.param = "output_config.effort"; }
+    if (const auto& details = error.context_length) {
+        // The Anthropic API's wording, which Claude Code matches to compact the conversation.
+        error.param   = {};
+        error.message = "prompt is too long: " + std::string(details->exact ? "" : "more than ") +
+                        std::to_string(details->prompt_tokens) + " tokens > " + std::to_string(details->max_context) +
+                        " maximum";
+    }
     if (error.code == "server_overloaded" || error.status == 429) {
         error.status = 529;
         error.type   = "overloaded_error";

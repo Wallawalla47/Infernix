@@ -75,6 +75,9 @@ int main() {
     failures += run_case("add_bias [1152,1]", 1152, 1, 101u);
     failures += run_case("add_bias [3456,64]", 3456, 64, 201u);
     failures += run_case("add_bias [4304,257]", 4304, 257, 301u);
+    // The BF16x2 route (an even width that is not a multiple of 8) and the scalar route (odd).
+    failures += run_case("add_bias [1154,33]", 1154, 33, 401u);
+    failures += run_case("add_bias [1151,7]", 1151, 7, 501u);
     std::cout << (failures ? "FAIL" : "OK") << " add_bias\n";
     return failures ? 1 : 0;
 }

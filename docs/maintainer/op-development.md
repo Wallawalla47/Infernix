@@ -615,7 +615,10 @@ rewritten:
 7. qualify every affected public entry and reachable production profile directly against the
    independent oracle;
 8. measure the Op when performance changes; measure a product route only for an explicitly scoped
-   end-to-end claim;
+   end-to-end claim; a kernel whose per-thread stack or local memory grows (a register spill or a
+   local array) fails `infernix_cuda_stack_check`, which compares `cuobjdump`'s resource usage of
+   `infernix-serve` with `tools/cuda_stack/cuda_stack_allowlist.json`; fix the spill, or after review
+   record it with `python tools/cuda_stack/check_cuda_stack.py update BINARY`;
 9. integrate models only through semantic contract headers and explicit operands;
 10. give every source and symbol one clear build and link owner.
 

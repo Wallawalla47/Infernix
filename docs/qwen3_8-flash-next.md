@@ -128,7 +128,11 @@ infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8
   chunks of 1,024, 4,096 and 12,288, and wide chunks prefill long prompts faster at no decode cost
   (Dense8, INT8 KV, RTX 5090, 2026-10-16: 32K prompts 5,570 / 9,640 / 11,210 tok/s at chunks
   1,024 / 4,096 / 16,384, 64K prompts 5,700 / 9,890 / 11,270; tg512 unchanged; 26 fewer expert
-  frames of ~8,560). A smaller `--prefill-chunk` only shrinks the prefill workspace.
+  frames of ~8,560). A smaller `--prefill-chunk` only shrinks the prefill workspace. A long
+  prompt's prefill workspace is lent from the expert cache; a chunk whose workspace the cache could
+  never lend (more than three quarters of its frames, e.g. 65,536 tokens under the SSD tier, ~27
+  GiB) is halved at startup until it can, with a warning, since the output does not depend on the
+  chunk.
 - `--spec mtp --draft-tokens 4 --lm-head-draft` drafts with the model's MTP layer.
   - `--draft-tokens` sets the maximum. Each round drafts the number of tokens the recent
     acceptance makes worthwhile, down to none on text it predicts poorly.
@@ -255,6 +259,11 @@ requests running in that round with an error and the server keeps serving; queue
 usual, and the prefix cache is emptied (the failed round may have published state it never
 computed). If the tier's read thread or the CPU expert service itself stops, every later round
 would fail too, so the server stops with that cause.
+
+The tier and the n-gram volume read with unbuffered, 4 KiB-aligned I/O. On ZFS (NInfer #404) a
+dataset's `recordsize` (128 KiB by default) is the unit the filesystem reads, so each small read
+can cost a whole record; keeping the artifact and the `.ngram` volume on a dataset with
+`recordsize=16K` or less avoids that (not measured here; Windows NTFS is unaffected).
 
 ### Page-locking limit
 

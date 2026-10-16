@@ -181,12 +181,14 @@ void apply_openai_prompt_cache_policy(GenerationRequest& request, OpenAIPromptCa
 
 namespace {
 
-// OpenAI model object carrying the llama.cpp-compatible `meta` field. `id` is the public OpenAI
-// alias; the facts describe the loaded model. n_ctx is this instance's configured per-request
-// context ceiling (equal to max_model_len), not the model's native context; n_ctx_train is the
-// model's native training context. ftype is the loaded weights profile (the quantization name).
+// OpenAI model object carrying the llama.cpp-compatible `meta` and `chat_template_caps` fields.
+// `id` is the public OpenAI alias; the facts describe the loaded model. n_ctx is this instance's
+// configured per-request context ceiling (equal to max_model_len), not the model's native context;
+// n_ctx_train is the model's native training context. ftype is the loaded weights profile (the
+// quantization name).
 Json make_model_object_json(const std::string& model_id, std::int64_t created,
-                            std::uint32_t max_model_len, const ModelMetadata& metadata) {
+                            std::uint32_t max_model_len, const ModelMetadata& metadata,
+                            const ChatTemplateCaps& caps) {
     return Json{{"id", model_id},
                 {"object", "model"},
                 {"created", created},
@@ -199,24 +201,68 @@ Json make_model_object_json(const std::string& model_id, std::int64_t created,
                       {"n_embd", metadata.embedding_size},
                       {"n_params", metadata.parameters},
                       {"size", metadata.weight_bytes},
-                      {"ftype", metadata.weights_id}}}};
+                      {"ftype", metadata.weights_id}}},
+                {"chat_template_caps", Json{{"supports_tools", caps.supports_tools}}}};
+}
+
+// A one-message conversation, declaring one tool named `tool_name` unless it is empty.
+GenerationRequest template_probe_request(std::string tool_name) {
+    GenerationRequest request;
+    ChatTurn turn;
+    turn.role = ChatRole::User;
+    ContentPart content;
+    content.kind     = ContentKind::Text;
+    content.text     = "hi";
+    content.type_raw = "text";
+    turn.content.push_back(std::move(content));
+    request.messages.push_back(std::move(turn));
+    request.max_tokens = 1;
+    if (!tool_name.empty()) {
+        ToolDefinition tool;
+        tool.name              = std::move(tool_name);
+        tool.description       = "Probe tool.";
+        tool.input_schema_json = R"({"type":"object","properties":{}})";
+        tool.schema_param      = "tools/0/input_schema";
+        request.tools.push_back(std::move(tool));
+    }
+    return request;
 }
 
 } // namespace
 
+ChatTemplateCaps
+probe_chat_template_caps(const std::function<int(const GenerationRequest&)>& count_prompt_tokens) {
+    // The tool-free prompt renders and fits; any error here is not about tools.
+    (void)count_prompt_tokens(template_probe_request({}));
+    try {
+        const int short_name = count_prompt_tokens(template_probe_request("probe"));
+        const int long_name  = count_prompt_tokens(
+            template_probe_request("probe_tool_declaration_reaches_the_rendered_prompt"));
+        return ChatTemplateCaps{.supports_tools = long_name > short_name};
+    } catch (const ApiException& exception) {
+        if (exception.error().code == "context_length_exceeded") {
+            return ChatTemplateCaps{.supports_tools = true};
+        }
+        if (exception.error().status != 400) { throw; }
+        return ChatTemplateCaps{};
+    }
+}
+
 std::string make_models_list(const std::string& model_id, std::int64_t created,
-                             std::uint32_t max_model_len, const ModelMetadata& metadata) {
+                             std::uint32_t max_model_len, const ModelMetadata& metadata,
+                             const ChatTemplateCaps& caps) {
     // vLLM/llama.cpp-compatible discovery metadata for the configured per-request context limit.
     const Json payload = {
         {"object", "list"},
-        {"data",
-         Json::array({make_model_object_json(model_id, created, max_model_len, metadata)})}};
+        {"data", Json::array({make_model_object_json(model_id, created, max_model_len, metadata,
+                                                     caps)})}};
     return payload.dump();
 }
 
 std::string make_model_object(const std::string& model_id, std::int64_t created,
-                              std::uint32_t max_model_len, const ModelMetadata& metadata) {
-    return make_model_object_json(model_id, created, max_model_len, metadata).dump();
+                              std::uint32_t max_model_len, const ModelMetadata& metadata,
+                              const ChatTemplateCaps& caps) {
+    return make_model_object_json(model_id, created, max_model_len, metadata, caps).dump();
 }
 
 std::string make_error_body(const ApiError& error) {

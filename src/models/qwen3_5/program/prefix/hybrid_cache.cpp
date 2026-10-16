@@ -287,29 +287,33 @@ void HybridPrefixCache::add_copies(PageCopies& copies, const HybridBlockPages& p
     }
 }
 
-void HybridPrefixCache::enqueue_to_host(const PageCopies& copies, cudaStream_t stream) const {
+std::uint32_t HybridPrefixCache::enqueue_to_host(const PageCopies& copies, cudaStream_t stream) const {
+    std::uint32_t issued = 0;
     if (!copies.text_pages.empty()) {
-        text_pages_->physical_pool().copy_to_host_records(
+        issued += text_pages_->physical_pool().copy_to_host_records(
             copies.text_pages, copies.text_records, copies.text_groups, host_layout_.text, stream);
     }
     if (!copies.backend_pages.empty()) {
-        backend_pages_->physical_pool().copy_to_host_records(
+        issued += backend_pages_->physical_pool().copy_to_host_records(
             copies.backend_pages, copies.backend_records, copies.backend_groups,
             *host_layout_.backend, stream);
     }
+    return issued;
 }
 
-void HybridPrefixCache::enqueue_from_host(const PageCopies& copies, cudaStream_t stream) const {
+std::uint32_t HybridPrefixCache::enqueue_from_host(const PageCopies& copies, cudaStream_t stream) const {
+    std::uint32_t issued = 0;
     if (!copies.text_pages.empty()) {
-        text_pages_->physical_pool().copy_from_host_records(const_records(copies.text_records),
-                                                            copies.text_groups, copies.text_pages,
-                                                            host_layout_.text, stream);
+        issued += text_pages_->physical_pool().copy_from_host_records(const_records(copies.text_records),
+                                                                      copies.text_groups, copies.text_pages,
+                                                                      host_layout_.text, stream);
     }
     if (!copies.backend_pages.empty()) {
-        backend_pages_->physical_pool().copy_from_host_records(
+        issued += backend_pages_->physical_pool().copy_from_host_records(
             const_records(copies.backend_records), copies.backend_groups, copies.backend_pages,
             *host_layout_.backend, stream);
     }
+    return issued;
 }
 
 cudaEvent_t HybridPrefixCache::take_event() {
@@ -365,16 +369,17 @@ bool HybridPrefixCache::start_snapshot_host_write(SnapshotRef snapshot, cudaStre
             segments.push_back(slab(view.host_slabs[i]));
         }
         order_after(producer, transfer);
-        state_pool_->copy_to_host_segments(states_->physical_slot(images_[snapshot.index]),
-                                           segments, host_layout_.slab_bytes, transfer);
+        std::uint32_t copies = state_pool_->copy_to_host_segments(states_->physical_slot(images_[snapshot.index]),
+                                                                  segments, host_layout_.slab_bytes, transfer);
         std::uint64_t bytes = host_layout_.image_bytes;
         if (view.tail_len != 0) {
             write_scratch_.clear();
             add_copies(write_scratch_, block(view.tail_device),
                        view.host_slabs[host_layout_.image_slabs]);
-            enqueue_to_host(write_scratch_, transfer);
+            copies += enqueue_to_host(write_scratch_, transfer);
             bytes += host_layout_.block_payload_bytes;
         }
+        counters_.host_write_copies += copies;
         PendingWrite write;
         write.snapshot = snapshot;
         write.done     = take_event();
@@ -430,7 +435,7 @@ void HybridPrefixCache::start_block_host_writes(std::span<const NodeRef> nodes,
     if (write.nodes.empty()) { return; }
     try {
         order_after(producer, transfer);
-        enqueue_to_host(write_scratch_, transfer);
+        counters_.host_write_copies += enqueue_to_host(write_scratch_, transfer);
         write.done = take_event();
         CUDA_CHECK(cudaEventRecord(write.done, transfer));
     } catch (...) {
@@ -581,14 +586,14 @@ void HybridPrefixCache::submit_restore() {
     // Prelude: what activation reads (the snapshot tail), what a pass reads outside the layer
     // stack (backend KV, the continuation hidden, DFlash local state) and the StateImage's VQ KV
     // window (the rest of the image, landed whole before the pass starts).
-    enqueue_from_host(restore_.tail_copies, restore_stream_);
+    std::uint64_t copies = enqueue_from_host(restore_.tail_copies, restore_stream_);
     if (!restore_.copies.backend_pages.empty()) {
-        backend_pages_->physical_pool().copy_from_host_records(
+        copies += backend_pages_->physical_pool().copy_from_host_records(
             const_records(restore_.copies.backend_records), restore_.copies.backend_groups,
             restore_.copies.backend_pages, *host_layout_.backend, restore_stream_);
     }
     if (restore_.image) {
-        state_pool_->copy_from_host_segments(
+        copies += state_pool_->copy_from_host_segments(
             segments, host_layout_.slab_bytes, restore_.image_slot,
             qwen3_5::StateImagePart{.kind = qwen3_5::StateImagePart::Kind::Rest}, restore_stream_);
     }
@@ -600,13 +605,13 @@ void HybridPrefixCache::submit_restore() {
         if (layer.attention) {
             if (!restore_.copies.text_pages.empty()) {
                 const std::size_t begin = layer.index * planes_per_attention_layer_;
-                text_pages_->physical_pool().copy_from_host_records(
+                copies += text_pages_->physical_pool().copy_from_host_records(
                     const_records(restore_.copies.text_records), restore_.copies.text_groups,
                     restore_.copies.text_pages, host_layout_.text, begin,
                     begin + planes_per_attention_layer_, restore_stream_);
             }
         } else if (restore_.image) {
-            state_pool_->copy_from_host_segments(
+            copies += state_pool_->copy_from_host_segments(
                 segments, host_layout_.slab_bytes, restore_.image_slot,
                 qwen3_5::StateImagePart{.kind  = qwen3_5::StateImagePart::Kind::LinearLayer,
                                         .layer = layer.index},
@@ -616,6 +621,7 @@ void HybridPrefixCache::submit_restore() {
     }
     restore_.submitted = true;
     restore_.ticket    = next_ticket_++;
+    counters_.host_restore_copies += copies;
     counters_.host_block_restores += restore_.nodes.size();
     counters_.host_tail_restores += restore_.tail ? 1U : 0U;
     counters_.host_image_restores += restore_.image ? 1U : 0U;

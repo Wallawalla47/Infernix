@@ -323,6 +323,8 @@ void ProgramImpl::walk_commit_taps(Lane& lane) {
 void ProgramImpl::walk_enqueue(std::uint32_t to_layer) {
     require_tier_round();
     for (std::uint32_t l = walk_.next_layer; l < to_layer; ++l) {
+        // Host enqueue of one layer over the span's chunks (payload: the layer).
+        const nvtx::ScopedRange layer_range(nvtx::Name::TextLayer, nvtx::Category::Prefill, l);
         for (std::size_t c = 0; c < walk_.widths.size(); ++c) { walk_pass(c, l); }
     }
     walk_.next_layer = std::max(walk_.next_layer, to_layer);

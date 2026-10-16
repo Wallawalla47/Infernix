@@ -90,6 +90,16 @@ infernix_add_test(infernix_jinja_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../text/test_jinja.cpp"
   LIBRARIES infernix_jinja infernix::json)
 
+add_test(NAME infernix_cuda_stack_tool_test
+  COMMAND ${Python3_EXECUTABLE} -B ${PROJECT_SOURCE_DIR}/tests/cuda_stack/test_check_cuda_stack.py)
+# Register spills and local arrays: no kernel of the server may use more per-thread stack or local
+# memory than tools/cuda_stack/cuda_stack_allowlist.json records.
+if(TARGET infernix-serve)
+  add_test(NAME infernix_cuda_stack_check
+    COMMAND ${Python3_EXECUTABLE} -B ${PROJECT_SOURCE_DIR}/tools/cuda_stack/check_cuda_stack.py check
+            $<TARGET_FILE:infernix-serve> --cuobjdump "${CUDAToolkit_BIN_DIR}/cuobjdump${CMAKE_EXECUTABLE_SUFFIX}")
+endif()
+
 add_test(NAME infernix_chat_templates_test
   COMMAND ${Python3_EXECUTABLE} -B ${PROJECT_SOURCE_DIR}/tests/text/test_chat_templates.py
           $<TARGET_FILE:infernix_jinja_test>)

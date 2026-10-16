@@ -533,7 +533,7 @@ void HttpServer::register_routes() {
 
 void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) const {
     res.set_content(make_models_list(public_model_id_, unix_time_now(), options_.max_context,
-                                     model_metadata_),
+                                     model_metadata_, chat_template_caps_),
                     "application/json");
 }
 
@@ -549,7 +549,7 @@ void HttpServer::handle_model(const httplib::Request& req, httplib::Response& re
         return;
     }
     res.set_content(make_model_object(public_model_id_, unix_time_now(), options_.max_context,
-                                      model_metadata_),
+                                      model_metadata_, chat_template_caps_),
                     "application/json");
 }
 
@@ -565,6 +565,9 @@ void HttpServer::attach(GenerationService& service) {
     const infernix::RuntimeStats baseline = service.runtime_stats();
     public_model_id_                    = resolve_public_model_id(options_, load.model_name);
     model_metadata_                     = service.model_metadata();
+    chat_template_caps_ = probe_chat_template_caps([&service](const GenerationRequest& request) {
+        return service.count_prompt_tokens(request);
+    });
     decide_labels_                      = build_decide_alphabet(
         [&service](std::string_view text) { return service.tokenize_text(text); });
     service_                            = &service;

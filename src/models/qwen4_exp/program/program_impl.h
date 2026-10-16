@@ -815,6 +815,13 @@ public:
         for (auto& event : overlap_.events) { CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming)); }
         experts.overlap_stream = overlap_.stream;
         experts.overlap_events = overlap_.events;
+        // The prefill chunk the expert cache can lend a wide workspace for, from the frames the
+        // cache will start with (sized below with the same demand); before the SSD tier, whose
+        // tickets are sized by the chunk.
+        if (options_.expert_cache) {
+            fit_wide_work_to_cache(size_expert_frames(vram_->query(), expert_frame_demand(record_stride)).frames,
+                                   record_stride);
+        }
         // The SSD expert tier (design §19.3.7): the banks were not pinned; RAM slots hold the
         // records the tier keeps and the rest are read from the artifact when a round needs them.
         if (const auto& store = parameters_.model.expert_store(); store.has_value()) {
@@ -970,13 +977,8 @@ public:
         // elastic allocation: a chunk the driver places in system memory (another program took
         // memory since the reading) is given back and the cache stops growing there.
         if (options_.expert_cache) {
-            VramDemand demand;
-            demand.headroom    = options_.vram_headroom;
-            demand.elastic     = residency_->elastic() && options_.vram_monitor;
-            demand.graphs      = plan_.bytes.graph_bound;
-            demand.frame_bytes = record_stride;
-            demand.max_frames  = residency_->frame_limit();
-            sizing_            = size_expert_frames(vram_->query(), demand);
+            const VramDemand demand = expert_frame_demand(record_stride);
+            sizing_                 = size_expert_frames(vram_->query(), demand);
             const auto grown   = residency_->resize(sizing_.frames, device_.stream, *vram_);
             if (grown.spilled != 0) {
                 diagnostic(std::to_string(grown.spilled >> 20) + " MiB of the expert frames were placed in system memory "
@@ -1630,7 +1632,12 @@ public:
         // refused while frames are lent, so a request queued behind it waited out its prefill (issue
         // #24). Between calls they can go back: the prompt's next streamed call lends again from
         // the smaller cache, or stages its experts (the same bytes either way, design §19.3.8 F3).
-        if (pool_->available_pages() < target && leases_returnable()) {
+        // Only when the pool's capacity leaves room for the growth: a return that cannot grow the pool
+        // only makes the prompt's next walk span lend again (a full --max-context returned 4,221
+        // frames for nothing, 2026-10-16).
+        const bool room = pool_->capacity_pages() - pool_->backed_pages() >=
+                          target - std::min(target, pool_->available_pages());
+        if (pool_->available_pages() < target && room && leases_returnable()) {
             return_stream_lease();
             return_wide_work();
             (void)grow_kv(target);
@@ -1731,6 +1738,7 @@ public:
         out.summary                 = prefill_summary(lane);
         out.processed_prompt_tokens = tokens;
         out.complete                = last;
+        out.capacity_released       = !last && leases_returnable();
         if (last && lane.replay) {
             // A replay ends at its paused frontier, whose next input the ledger already holds: the
             // lane decodes from there (design §19.3.13).
@@ -2938,6 +2946,7 @@ private:
 
     // As read_ngram, into `out` (count * heads rows).
     void read_ngram_to(Lane& lane, std::int32_t count, std::byte* out) {
+        const nvtx::ScopedRange rows_range(nvtx::Name::PleRows, nvtx::Category::Control, static_cast<std::uint64_t>(count));
         const std::size_t heads = hash_.heads();
         row_ids_.resize(static_cast<std::size_t>(count) * heads);
         hash_.row_ids(window_, static_cast<std::size_t>(count), row_ids_.data());
@@ -3153,6 +3162,45 @@ private:
         bool active_ = false;
     };
 
+    // The expert cache's VRAM demand: what the fixed allocations, the graph executables' reserve and
+    // the display headroom leave becomes frames of `frame_bytes`.
+    VramDemand expert_frame_demand(std::uint64_t frame_bytes) const {
+        VramDemand demand;
+        demand.headroom    = options_.vram_headroom;
+        demand.elastic     = residency_->elastic() && options_.vram_monitor;
+        demand.graphs      = plan_.bytes.graph_bound;
+        demand.frame_bytes = frame_bytes;
+        demand.max_frames  = residency_->frame_limit();
+        return demand;
+    }
+
+    // A prefill chunk whose wide workspace the expert cache could never lend (more than the three
+    // quarters of its frames serving may give up) would allocate it for every long prompt, which
+    // fails on a full card after admission (a 65,536-token chunk on the SSD tier wanted 27 GiB).
+    // Prefill then runs at the widest halving of the chunk that can be lent (or the static arena's
+    // width): its exact route is chunk-invariant, so only speed changes. The buffers planned for the
+    // wider chunk stay as they are.
+    void fit_wide_work_to_cache(std::uint64_t frames, std::uint64_t stride) {
+        if (wide_work_ == 0 || frames == 0 || stride == 0) { return; }
+        const std::uint64_t lendable = frames - frames / 4;
+        const auto frames_for        = [&](std::size_t bytes) { return (bytes + stride - 1) / stride; };
+        if (frames_for(wide_work_) < lendable) { return; }
+        const std::int32_t requested = chunk_;
+        const std::size_t needed     = wide_work_;
+        std::int32_t chunk           = chunk_ / 2;
+        while (chunk > plan_.static_columns &&
+               frames_for(workspace_bytes(c_, options_, plan_, plan_.lanes, chunk)) >= lendable) {
+            chunk /= 2;
+        }
+        chunk_     = std::max(chunk, plan_.static_columns);
+        wide_work_ = chunk_ > plan_.static_columns ? workspace_bytes(c_, options_, plan_, plan_.lanes, chunk_) : 0;
+        diagnostic("prefill chunk " + std::to_string(requested) + " needs " + std::to_string(needed >> 20) +
+                       " MiB of workspace, more than the expert cache can lend (" +
+                       std::to_string((lendable * stride) >> 20) + " MiB); prefilling at " + std::to_string(chunk_) +
+                       " tokens (the output is the same)",
+                   DiagnosticLevel::Warning);
+    }
+
     void enter_wide() {
         DeviceSpan span{};
         if (stream_lease_.valid() && stream_wide_bytes_ >= wide_work_) {
@@ -3168,7 +3216,16 @@ private:
                     diagnostic("the prefill workspace could not be lent from the expert cache; " +
                                    std::to_string(wide_work_ >> 20) + " MiB are allocated for the prompt",
                                DiagnosticLevel::Warning);
-                    wide_fallback_ = DeviceBuffer(wide_work_);
+                    // The cache shrank under VRAM pressure: a failed allocation fails this prompt's
+                    // requests, not the Engine.
+                    try {
+                        wide_fallback_ = DeviceBuffer(wide_work_);
+                    } catch (const std::exception& error) {
+                        throw runtime::RecoverableExecutionError(
+                            "the prefill workspace (" + std::to_string(wide_work_ >> 20) +
+                            " MiB) could neither be lent from the expert cache nor allocated (" + error.what() +
+                            "); a smaller --prefill-chunk needs less");
+                    }
                 }
             }
             span = work_lease_.valid() ? DeviceSpan{work_lease_.memory.data, wide_work_}

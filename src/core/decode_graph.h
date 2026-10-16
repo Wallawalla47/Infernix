@@ -3,8 +3,17 @@
 #include <cuda_runtime.h>
 
 #include <functional>
+#include <stdexcept>
 
 namespace infernix {
+
+// A CUDA Graph executable found no device memory to instantiate or upload into. The device stays
+// usable (the error is not sticky), so a caller may free memory and retry; every other CUDA error
+// of these calls aborts as CUDA_CHECK does.
+class GraphMemoryExhausted : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
 
 class DecodeGraphDefinition {
 public:

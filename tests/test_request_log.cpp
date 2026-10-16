@@ -243,6 +243,8 @@ int main() {
         "resolved context-cache configuration missing");
     failures += check(server.at("server").at("default_preserve_thinking") == true,
                       "server preserve-thinking default missing");
+    failures += check(server.at("server").at("claude_code_prompt") == "as-sent",
+                      "server Claude Code prompt setting missing");
     failures +=
         check(server.at("sampling_defaults").at("thinking").at("temperature") == 1.0 &&
                   server.at("sampling_defaults").at("non_thinking").at("presence_penalty") == 1.5,

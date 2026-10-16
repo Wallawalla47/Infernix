@@ -178,17 +178,17 @@ public:
     // segments[o / segment_bytes] + o % segment_bytes (fixed-size slabs of a shared pinned pool).
     // A packed recurrent Host form is packed and unpacked through the Device staging buffers:
     // every copy to the Host runs on one stream and every copy from it on another. The unsegmented
-    // copies above support only the exact form.
-    void copy_to_host_segments(std::int32_t source, std::span<std::byte* const> segments,
-                               std::size_t segment_bytes, cudaStream_t stream = nullptr) const;
-    void copy_from_host_segments(std::span<const std::byte* const> segments,
-                                 std::size_t segment_bytes, std::int32_t destination,
-                                 cudaStream_t stream = nullptr);
+    // copies above support only the exact form. Each returns the copy calls it issued.
+    std::uint32_t copy_to_host_segments(std::int32_t source, std::span<std::byte* const> segments,
+                                        std::size_t segment_bytes, cudaStream_t stream = nullptr) const;
+    std::uint32_t copy_from_host_segments(std::span<const std::byte* const> segments,
+                                          std::size_t segment_bytes, std::int32_t destination,
+                                          cudaStream_t stream = nullptr);
     // One part of the image, so a restore can land the state a forward pass reads first ahead of
     // the rest.
-    void copy_from_host_segments(std::span<const std::byte* const> segments,
-                                 std::size_t segment_bytes, std::int32_t destination,
-                                 StateImagePart part, cudaStream_t stream);
+    std::uint32_t copy_from_host_segments(std::span<const std::byte* const> segments,
+                                          std::size_t segment_bytes, std::int32_t destination,
+                                          StateImagePart part, cudaStream_t stream);
 
 private:
     void validate_host_layout(const StateImageHostLayout* layout, const std::byte* data) const;

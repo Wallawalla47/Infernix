@@ -990,6 +990,14 @@ enum class RequestErrorKind : std::uint8_t {
 
 enum class RequestErrorSource : std::uint8_t { OutputConstraint, Tools };
 
+// A prompt longer than the Engine's max_context. Counting stops at a bound past the limit, so
+// prompt_tokens is exact only when `exact`; otherwise the prompt has more than prompt_tokens.
+struct ContextLengthDetails {
+    std::uint64_t prompt_tokens = 0;
+    std::uint32_t max_context   = 0;
+    bool exact                  = true;
+};
+
 class RequestError final : public std::invalid_argument {
 public:
     RequestError(RequestErrorKind kind, std::string message, std::string pointer = {},
@@ -997,16 +1005,29 @@ public:
         : std::invalid_argument(std::move(message)), kind_(kind), pointer_(std::move(pointer)),
           source_(source) {}
 
+    // RequestErrorKind::ContextLengthExceeded with its counts.
+    explicit RequestError(ContextLengthDetails details)
+        : std::invalid_argument("prepared prompt has " + std::string(details.exact ? "" : "more than ") +
+                                std::to_string(details.prompt_tokens) + " tokens, exceeding Engine max_context " +
+                                std::to_string(details.max_context)),
+          kind_(RequestErrorKind::ContextLengthExceeded), source_(RequestErrorSource::OutputConstraint),
+          context_length_(details) {}
+
     [[nodiscard]] RequestErrorKind kind() const noexcept { return kind_; }
 
     [[nodiscard]] RequestErrorSource source() const noexcept { return source_; }
 
     [[nodiscard]] const std::string& pointer() const noexcept { return pointer_; }
 
+    [[nodiscard]] const std::optional<ContextLengthDetails>& context_length() const noexcept {
+        return context_length_;
+    }
+
 private:
     RequestErrorKind kind_;
     std::string pointer_;
     RequestErrorSource source_;
+    std::optional<ContextLengthDetails> context_length_;
 };
 
 // A submitted image's or video's display size in pixels, before any Vision resizing.
@@ -1597,6 +1618,9 @@ struct RuntimeStats {
     std::uint64_t hybrid_prefetched_blocks       = 0;
     std::uint64_t hybrid_host_write_bytes        = 0;
     std::uint64_t hybrid_host_restore_bytes      = 0;
+    // The copy calls behind those bytes (Qwen3.5's Host tier; zero for other caches).
+    std::uint64_t hybrid_host_write_copies       = 0;
+    std::uint64_t hybrid_host_restore_copies     = 0;
     std::uint64_t hybrid_evicted_blocks          = 0;
     std::uint64_t hybrid_host_snapshot_evictions = 0;
     std::uint64_t hybrid_host_dead_reclaims      = 0;

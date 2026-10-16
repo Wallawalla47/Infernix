@@ -1,9 +1,10 @@
 #pragma once
 
 // Implements: include/infernix/ops/add_bias.h
-// Match: contiguous BF16 [D,C]. Aligned cache-sized registered domains use
-// 16-byte channel packs with bias reuse across columns; large domains retain a
-// BF16x2 stream, and scalar indexing covers odd/unaligned storage.
+// Match: contiguous BF16 [D,C]. A row width that is a multiple of 8 with 16-byte aligned storage
+// streams the whole tensor as 16-byte packs, one per thread, so a width that is not a multiple of
+// the block (vision fc1's 4304 = 538 packs) leaves no mostly-idle tail block per row; other even
+// widths use a BF16x2 stream, and scalar indexing covers odd or unaligned storage.
 
 #include "ops/common/bf16_vector.cuh"
 #include "ops/common/memory.cuh"
@@ -21,26 +22,18 @@ __device__ __forceinline__ __nv_bfloat162 add_bias_pair(__nv_bfloat162 value, __
                                  __high2float(value) + __high2float(bias));
 }
 
-template <int Block, int RowsPerBlock>
+// total = D * C / 8 packs, fewer than 2^32; packs = D / 8 per row.
+template <int Block>
 __launch_bounds__(Block) __global__
-    void add_bias_bf16x8_kernel(const Bf16x8Pack* bias, Bf16x8Pack* x, std::int32_t packs,
-                                std::int32_t rows) {
-    const int pack = static_cast<int>(blockIdx.x) * Block + static_cast<int>(threadIdx.x);
-    if (pack >= packs) { return; }
-    const Bf16x8Pack bv = load_vec<Bf16x8Pack>(bias + pack);
-    const int first_row = static_cast<int>(blockIdx.y) * RowsPerBlock;
+    void add_bias_bf16x8_stream_kernel(const Bf16x8Pack* bias, Bf16x8Pack* x, std::uint32_t packs,
+                                       std::uint32_t total) {
+    const std::uint32_t index = blockIdx.x * static_cast<std::uint32_t>(Block) + threadIdx.x;
+    if (index >= total) { return; }
+    const Bf16x8Pack bv = load_vec<Bf16x8Pack>(bias + index % packs);
+    Bf16x8Pack value    = load_vec<Bf16x8Pack>(x + index);
 #pragma unroll
-    for (int item = 0; item < RowsPerBlock; ++item) {
-        const int row = first_row + item;
-        if (row >= rows) { return; }
-        const std::int64_t offset = static_cast<std::int64_t>(row) * packs + pack;
-        Bf16x8Pack value          = load_vec<Bf16x8Pack>(x + offset);
-#pragma unroll
-        for (int pair = 0; pair < 4; ++pair) {
-            value.pair[pair] = add_bias_pair(value.pair[pair], bv.pair[pair]);
-        }
-        store_vec(x + offset, value);
-    }
+    for (int pair = 0; pair < 4; ++pair) { value.pair[pair] = add_bias_pair(value.pair[pair], bv.pair[pair]); }
+    store_vec(x + index, value);
 }
 
 template <int Block>

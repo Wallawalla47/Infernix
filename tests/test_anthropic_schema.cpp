@@ -254,6 +254,157 @@ int test_attribution_system_block() {
     return failures;
 }
 
+// A System array shaped like Claude Code's: its attribution block (unless `attribution` is false),
+// then the given blocks, each with a cache_control breakpoint.
+Json claude_code_request(std::vector<std::string> blocks, bool attribution = true) {
+    Json body        = base_request();
+    body["thinking"] = Json{{"type", "disabled"}};
+    Json system      = Json::array();
+    if (attribution) {
+        system.push_back(Json{{"type", "text"},
+                              {"text", "x-anthropic-billing-header: cc_version=2.1.296.55c; "
+                                       "cc_entrypoint=cli; cch=0a1b2;"}});
+    }
+    for (std::string& text : blocks) {
+        system.push_back(Json{{"type", "text"},
+                              {"text", std::move(text)},
+                              {"cache_control", Json{{"type", "ephemeral"}}}});
+    }
+    body["system"] = std::move(system);
+    return body;
+}
+
+AnthropicMessagesRequest parse_with(const Json& body, ClaudeCodePrompt claude_code_prompt) {
+    RequestLimits value      = limits();
+    value.claude_code_prompt = claude_code_prompt;
+    return parse_anthropic_messages_request(body, value);
+}
+
+// The leading System turn's text as the template receives it (its blocks joined as they are).
+std::string system_text(const GenerationRequest& request) {
+    std::string text;
+    if (request.messages.empty() || request.messages.front().role != infernix::ChatRole::System) {
+        return text;
+    }
+    for (const ContentPart& part : request.messages.front().content) { text += part.text; }
+    return text;
+}
+
+// --claude-code-prompt: the default lowers Claude Code's System prompt as sent; local rewrites one
+// that carries Claude Code's attribution block and identity line, identically on every turn, and
+// leaves every other System value as sent.
+int test_claude_code_prompt() {
+    const std::string identity = "You are Claude Code, Anthropic's official CLI for Claude.";
+    // A short synthetic body with one section of each kind the rewrite handles, in Claude Code's
+    // order; the heading inside the memory example's code fence does not end the Memory section.
+    const std::string body_text =
+        "\nYou are an agent working with the user toward their goals in this repository.\n\n"
+        "IMPORTANT: Assist with authorized security testing only; refuse destructive techniques.\n\n"
+        "# Harness\n"
+        " - Text you output outside of tool use is displayed to the user.\n\n"
+        "When you use a pronoun for someone, use they/them.\n\n"
+        "# Memory\n"
+        "You have a persistent file-based memory at `C:\\mem\\dir\\`. This directory already "
+        "exists.\n\n"
+        "## Types\n"
+        "```markdown\n"
+        "# Example memory title\n"
+        "```\n"
+        "`user`: who the user is.\n\n"
+        "# Environment\n"
+        " - The most recent Claude models are the Claude 5 family.\n"
+        " - Claude Code is available as a CLI in the terminal.\n"
+        " - Fast mode for Claude Code uses Claude Opus with faster output.\n\n"
+        "# Context management\n"
+        "When the conversation grows long, some of it is summarized.";
+    const Json body = claude_code_request({identity, body_text});
+
+    const GenerationRequest as_sent = parse(body).generation;
+    int failures = check(as_sent.messages.front().role == infernix::ChatRole::System &&
+                             as_sent.messages.front().content.size() == 2 &&
+                             as_sent.messages.front().content[0].text == identity &&
+                             as_sent.messages.front().content[1].text == body_text,
+                         "the default did not lower Claude Code's System prompt as sent");
+
+    const GenerationRequest local         = parse_with(body, ClaudeCodePrompt::Local).generation;
+    const std::vector<ContentPart>& parts = local.messages.front().content;
+    if (local.messages.front().role != infernix::ChatRole::System || parts.size() != 2) {
+        return failures + check(false, "the local rewrite changed the System block count");
+    }
+    failures += check(parts[0].cache_boundary_after && parts[1].cache_boundary_after,
+                      "the local rewrite lost a System block's cache boundary");
+    const std::string opening = "You are a coding agent running on a local open-weights model";
+    failures += check(parts[0].text.starts_with(opening) &&
+                          parts[0].text.find("Claude") == std::string::npos,
+                      "the identity block did not become the local-agent preamble");
+    // The other sections pass through, and the memory how-to becomes one paragraph keeping its path.
+    const std::string kept_head =
+        "\n\n# Harness\n - Text you output outside of tool use is displayed to the user.\n\n"
+        "# Memory\nPersistent memory lives in `C:\\mem\\dir\\`";
+    const std::string kept_tail =
+        "\n\n# Context management\nWhen the conversation grows long, some of it is summarized.";
+    const std::string& rewritten = parts[1].text;
+    failures += check(rewritten.starts_with(kept_head) && rewritten.ends_with(kept_tail) &&
+                          rewritten.size() > kept_head.size() + kept_tail.size() &&
+                          rewritten
+                                  .substr(kept_head.size(),
+                                          rewritten.size() - kept_head.size() - kept_tail.size())
+                                  .find('\n') == std::string::npos,
+                      "the local rewrite did not produce the expected compact System body");
+    const std::string whole = system_text(local);
+    for (const char* removed :
+         {"billing-header", "Claude Code", "Claude 5", "security testing", "pronoun", "Fast mode",
+          "# Environment", "You are an agent working", "## Types", "```", "Example memory title"}) {
+        failures += check(whole.find(removed) == std::string::npos,
+                          std::string("the local rewrite kept Claude-only text: ") + removed);
+    }
+    // Every turn renders the same System prefix, and Count Tokens counts the prompt Messages runs.
+    const GenerationRequest again = parse_with(body, ClaudeCodePrompt::Local).generation;
+    const GenerationRequest counted =
+        parse_anthropic_count_tokens_request(body, {.claude_code_prompt = ClaudeCodePrompt::Local})
+            .generation;
+    failures += check(system_text(again) == whole && system_text(counted) == whole &&
+                          prompt(again).context_cache.markers == prompt(local).context_cache.markers,
+                      "the local rewrite is not deterministic or Count Tokens counted another prompt");
+
+    // Interactive shape, identity and body in one block: Environment keeps its other lines, and a
+    // section the rewrite does not know passes unchanged.
+    const GenerationRequest interactive =
+        parse_with(claude_code_request({identity +
+                                        "\n\n# Environment\nPrimary working directory: D:\\x\n"
+                                        " - The most recent Claude models are the Claude 5 family."
+                                        "\n\n# Plan mode\nPlan before you edit."}),
+                   ClaudeCodePrompt::Local)
+            .generation;
+    const std::string interactive_text = system_text(interactive);
+    failures += check(interactive.messages.front().content.size() == 1 &&
+                          interactive_text.starts_with(opening) &&
+                          interactive_text.ends_with("\n\n# Environment\nPrimary working directory: "
+                                                     "D:\\x\n\n# Plan mode\nPlan before you edit.") &&
+                          interactive_text.find("Claude") == std::string::npos,
+                      "the interactive Claude Code prompt was not rewritten section by section");
+
+    // Anything without both the attribution block and the identity line stays as sent.
+    const auto unchanged = [&](const Json& request_body, const std::string& message) {
+        const std::string sent = system_text(parse(request_body).generation);
+        return check(!sent.empty() &&
+                         system_text(parse_with(request_body, ClaudeCodePrompt::Local).generation) ==
+                             sent,
+                     message);
+    };
+    Json string_system        = base_request();
+    string_system["thinking"] = Json{{"type", "disabled"}};
+    string_system["system"]   = "You are a helpful assistant.";
+    failures += unchanged(string_system, "an ordinary string System prompt was rewritten");
+    failures += unchanged(claude_code_request({"You are a helpful assistant."}),
+                          "a prompt with Claude Code's attribution but another identity was rewritten");
+    failures += unchanged(claude_code_request({identity, body_text}, false),
+                          "Claude Code's identity without its attribution block was rewritten");
+    failures += unchanged(claude_code_request({"You are Claude Codex, another agent.", body_text}),
+                          "an identity that only begins like Claude Code's was rewritten");
+    return failures;
+}
+
 Json tool_use(std::string id, std::string name = "lookup") {
     return Json{{"type", "tool_use"},
                 {"id", std::move(id)},
@@ -685,6 +836,59 @@ int test_aggregate_and_errors() {
     failures += check(schema_response["error"]["message"] ==
                           schema_error.param + ": " + schema_error.message,
                       "Anthropic schema error lost its request field location");
+    ApiError overflow;
+    overflow.code           = "context_length_exceeded";
+    overflow.param          = "messages";
+    overflow.message        = "This model's maximum context length is 128 tokens.";
+    overflow.context_length = infernix::ContextLengthDetails{.prompt_tokens = 200, .max_context = 128};
+    const Json overflow_response = Json::parse(make_anthropic_error_body(overflow, "req_error"));
+    failures += check(overflow_response["error"]["type"] == "invalid_request_error" &&
+                          overflow_response["error"]["message"] == "prompt is too long: 200 tokens > 128 maximum",
+                      "Anthropic context overflow lost the wording Claude Code matches to compact");
+    return failures;
+}
+
+// llama.cpp-compatible `timings` (the Chat Completions semantics): prompt counts net of the cache
+// hit and N-1 generation intervals, on the aggregate body and only the terminal message_delta.
+int test_timings() {
+    const AnthropicResponseIdentity identity =
+        make_anthropic_response_identity("req_timings", "claude-local");
+    GenerationOutcome outcome                   = sample_outcome();
+    outcome.metrics.prompt_wall_seconds         = 0.0625;
+    outcome.metrics.generation_wall_seconds     = 0.125;
+    outcome.metrics.speculative_draft_tokens    = 9;
+    outcome.metrics.speculative_accepted_tokens = 6;
+    const Json timings = Json::parse(make_anthropic_messages_response(identity, outcome))["timings"];
+    int failures       = check(
+        timings["cache_n"] == 60 && timings["prompt_n"] == 40 && timings["prompt_ms"] == 62.5 &&
+            timings["prompt_per_second"] == 640.0 && timings["predicted_n"] == 12 &&
+            timings["predicted_ms"] == 125.0 && timings["predicted_per_second"] == 88.0 &&
+            timings["draft_n"] == 9 && timings["draft_n_accepted"] == 6,
+        "aggregate Anthropic timings use the exact cache split and N-1 generation intervals");
+
+    AnthropicMessagesStream stream(identity, 100);
+    std::vector<std::string> events{stream.start()};
+    // Braced lists evaluate in order: reasoning, then text, then the terminal events.
+    for (std::vector<std::string> values :
+         {stream.reasoning_delta("thought"), stream.content_delta("answer"), stream.finish(outcome)}) {
+        events.insert(events.end(), std::make_move_iterator(values.begin()),
+                      std::make_move_iterator(values.end()));
+    }
+    int timed = 0;
+    for (const std::string& wire : events) {
+        const Json event = parse_event(wire);
+        if (!event.contains("timings")) { continue; }
+        ++timed;
+        failures += check(event["type"] == "message_delta" && event["timings"]["predicted_n"] == 12,
+                          "Anthropic stream timings belong to the terminal message_delta");
+    }
+    failures += check(timed == 1, "an Anthropic stream carries exactly one timings object");
+
+    outcome = {};
+    const Json empty = Json::parse(make_anthropic_messages_response(identity, outcome))["timings"];
+    failures += check(empty["prompt_per_second"] == 0.0 && empty["predicted_per_second"] == 0.0 &&
+                          !empty.contains("draft_n"),
+                      "zero-token Anthropic timings report finite zero rates without draft counts");
     return failures;
 }
 
@@ -990,6 +1194,7 @@ int main() {
     failures += test_envelope_and_field_policy();
     failures += test_message_normalization();
     failures += test_attribution_system_block();
+    failures += test_claude_code_prompt();
     failures += test_tool_history();
     failures += test_tools();
     failures += test_prompt_object_order();
@@ -997,6 +1202,7 @@ int main() {
     failures += test_thinking_history_transport_metadata();
     failures += test_content_and_cache_hints();
     failures += test_aggregate_and_errors();
+    failures += test_timings();
     failures += test_tool_call_presentation();
     failures += test_stream();
     failures += test_hidden_reasoning_signature();

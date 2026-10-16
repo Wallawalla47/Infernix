@@ -83,6 +83,8 @@ public:
             out.hybrid_device_slot_evictions      = hybrid.device_slot_evictions;
             out.hybrid_device_slot_refusals       = hybrid.device_slot_refusals;
             out.hybrid_free_device_snapshot_slots = hybrid.free_device_snapshot_slots;
+            out.hybrid_host_write_copies          = hybrid.host_write_copies;
+            out.hybrid_host_restore_copies        = hybrid.host_restore_copies;
         }
         out.hybrid_host_image_writes       = hybrid.host_image_writes;
         out.hybrid_host_block_writes       = hybrid.host_block_writes;

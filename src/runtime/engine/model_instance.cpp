@@ -1,10 +1,12 @@
 #include "runtime/engine/model_instance.h"
 #include "artifact/reader.h"
 #include "artifact/formats.h"
+#include "core/decode_graph.h"
 #include "core/startup.h"
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/measurement.h"
 #include "models/qwen3_5/program/planning/fast_paths.h"
+#include "runtime/engine/diagnostics.h"
 
 #include <algorithm>
 #include <system_error>
@@ -12,6 +14,7 @@
 #include <filesystem>
 #include <chrono>
 #include <map>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <utility>
@@ -19,6 +22,11 @@
 namespace infernix::runtime {
 namespace {
 using Clock = std::chrono::steady_clock;
+
+// The extra VRAM headroom of the one startup retry after the CUDA Graphs found no device memory
+// (NInfer 193675826's calibration retry, adapted): their allowance is measured at 2.2-4.1 MiB per
+// executable, and 1 GiB covers the largest graph set (~274 MiB) several times.
+constexpr std::size_t kGraphRetryHeadroomBytes = std::size_t{1} << 30;
 } // namespace
 
 void validate_engine_options(const EngineOptions& options, models::Architecture architecture) {
@@ -342,55 +350,78 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
     StartupPhaseScope frontend(options.startup_observer, StartupPhase::FrontendInitialize);
     auto instance = std::make_unique<ModelInstance>(std::move(model), options);
     frontend.complete();
-    StartupPhaseScope planning(options.startup_observer, StartupPhase::TargetFinalize);
+    std::optional<StartupPhaseScope> planning;
+    planning.emplace(options.startup_observer, StartupPhase::TargetFinalize);
     const auto signature = models::qwen3_5::prefill_signature(*instance->model);
     auto context_cost    = resolve_context_machine_cost(
         {.hardware_class =
                 context_cost_hardware_class(device.props.name, device.props.major, device.props.minor),
             .prefill_signature = signature},
         options.context_cost.preset_path);
-    auto planner    = models::qwen3_5::make_sequence_planner(instance->parameters, device, options);
-    const std::size_t free_bytes = current_free_device_bytes();
-    const std::size_t headroom =
-        options.vram_headroom_bytes.value_or(kDefaultKvCapacityHeadroomBytes);
-    auto resolution =
-        resolve_kv_capacity(options.kv_capacity, planner.capacity_curve(), free_bytes, headroom);
-    // idle-wide-prefill: plan the widest idle width (4096, 2048, then 1024 tokens, as the chunk is
-    // rounded) whose larger prefill buffers and workspace keep the KV capacity: an explicit one
-    // whole, an automatic one down to every lane's full context. None fitting keeps chunk-wide steps.
-    {
-        const std::uint64_t page_tokens = planner.capacity_curve().main_page_tokens;
-        const std::uint64_t lane_page_groups =
-            static_cast<std::uint64_t>(options.max_concurrency) *
-            ((static_cast<std::uint64_t>(options.max_context) + page_tokens - 1U) / page_tokens);
-        for (const std::uint32_t width :
-             models::qwen3_5::idle_prefill_widths(instance->parameters, options)) {
-            auto wide = models::qwen3_5::make_sequence_planner(instance->parameters, device,
-                                                               options, width);
-            if (const auto fitted =
-                    resolve_kv_capacity_beside(options.kv_capacity, wide.capacity_curve(),
-                                               free_bytes, headroom, resolution, lane_page_groups)) {
-                planner    = std::move(wide);
-                resolution = *fitted;
-                break;
+    const std::size_t base_headroom = options.vram_headroom_bytes.value_or(kDefaultKvCapacityHeadroomBytes);
+    std::size_t retry_headroom      = 0;
+    std::uint32_t planned_prefill_chunk = 0, planned_idle_width = 0;
+    std::optional<StartupPhaseScope> program;
+    for (int attempt = 0;; ++attempt) {
+        if (!planning) { planning.emplace(options.startup_observer, StartupPhase::TargetFinalize); }
+        auto planner    = models::qwen3_5::make_sequence_planner(instance->parameters, device, options);
+        const std::size_t free_bytes = current_free_device_bytes();
+        const std::size_t headroom   = base_headroom + retry_headroom;
+        auto resolution =
+            resolve_kv_capacity(options.kv_capacity, planner.capacity_curve(), free_bytes, headroom);
+        // idle-wide-prefill: plan the widest idle width (4096, 2048, then 1024 tokens, as the chunk is
+        // rounded) whose larger prefill buffers and workspace keep the KV capacity: an explicit one
+        // whole, an automatic one down to every lane's full context. None fitting keeps chunk-wide steps.
+        {
+            const std::uint64_t page_tokens = planner.capacity_curve().main_page_tokens;
+            const std::uint64_t lane_page_groups =
+                static_cast<std::uint64_t>(options.max_concurrency) *
+                ((static_cast<std::uint64_t>(options.max_context) + page_tokens - 1U) / page_tokens);
+            for (const std::uint32_t width :
+                 models::qwen3_5::idle_prefill_widths(instance->parameters, options)) {
+                auto wide = models::qwen3_5::make_sequence_planner(instance->parameters, device,
+                                                                   options, width);
+                if (const auto fitted =
+                        resolve_kv_capacity_beside(options.kv_capacity, wide.capacity_curve(),
+                                                   free_bytes, headroom, resolution, lane_page_groups)) {
+                    planner    = std::move(wide);
+                    resolution = *fitted;
+                    break;
+                }
             }
         }
+        auto sequence   = std::move(planner).finalize(resolution.main_page_groups);
+        if (sequence.device_reservation_bytes() != resolution.runtime_reservation_bytes ||
+            sequence.kv_capacity() != resolution.resolved_tokens) {
+            throw std::logic_error("resolved KV capacity does not match the finalized Program plan");
+        }
+        options.context_cache.host_capacity_bytes = sequence.host_capacity_bytes();
+        // Automatic tree widths on a target that cannot verify trees resolve to chain verification.
+        options.speculative.draft_tree_auto = sequence.draft_tree_auto();
+        instance->kv_capacity_resolution    = resolution;
+        planned_prefill_chunk = sequence.prefill_chunk();
+        planned_idle_width    = sequence.idle_prefill_width();
+        planning->complete();
+        planning.reset();
+        program.emplace(options.startup_observer, StartupPhase::ProgramInitialize);
+        try {
+            instance->program = models::qwen3_5::create_program(instance->parameters, std::move(sequence),
+                                                                device, options.startup_observer);
+        } catch (const GraphMemoryExhausted& error) {
+            // The CUDA Graphs needed more device memory than their allowance left (the driver's
+            // per-executable cost varies): an automatic KV capacity retries once with
+            // kGraphRetryHeadroomBytes more headroom, so fewer KV pages; an explicit one cannot shrink.
+            if (attempt > 0 || options.kv_capacity.mode != KvCapacityMode::Automatic) { throw; }
+            retry_headroom = kGraphRetryHeadroomBytes;
+            program.reset();
+            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
+                               "%s at startup; retrying with %zu MiB more VRAM headroom (a smaller automatic KV "
+                               "capacity)",
+                               error.what(), kGraphRetryHeadroomBytes >> 20);
+            continue;
+        }
+        break;
     }
-    auto sequence   = std::move(planner).finalize(resolution.main_page_groups);
-    if (sequence.device_reservation_bytes() != resolution.runtime_reservation_bytes ||
-        sequence.kv_capacity() != resolution.resolved_tokens) {
-        throw std::logic_error("resolved KV capacity does not match the finalized Program plan");
-    }
-    options.context_cache.host_capacity_bytes = sequence.host_capacity_bytes();
-    // Automatic tree widths on a target that cannot verify trees resolve to chain verification.
-    options.speculative.draft_tree_auto = sequence.draft_tree_auto();
-    instance->kv_capacity_resolution    = resolution;
-    const std::uint32_t planned_prefill_chunk = sequence.prefill_chunk();
-    const std::uint32_t planned_idle_width    = sequence.idle_prefill_width();
-    planning.complete();
-    StartupPhaseScope program(options.startup_observer, StartupPhase::ProgramInitialize);
-    instance->program = models::qwen3_5::create_program(instance->parameters, std::move(sequence),
-                                                        device, options.startup_observer);
     LoadSummary::PrefixCacheRestore restore;
     if (options.context_cache.enabled) {
         instance->program->set_hybrid_cost(hybrid_cache_cost(context_cost.model));
@@ -419,7 +450,7 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
         }
     }
     device.synchronize();
-    program.complete();
+    program->complete();
     instance->kv_capacity_resolution.available_after_startup_bytes = current_free_device_bytes();
     const auto& stats = instance->model->storage_stats();
     LoadSummary summary;

@@ -21,6 +21,7 @@ Python tools are independent of CMake; there is no `INFERNIX_BUILD_TOOLS` option
 | Measure external Serve TTFT | [`bench/ttft/`](bench/ttft/README.md) |
 | Exercise a resident HTTP server | [`smoke/serve_contract.py`](smoke/serve_contract.py) |
 | Exercise thinking preservation through a managed server | [`smoke/serve_thinking_preservation.py`](smoke/serve_thinking_preservation.py) |
+| Check that no CUDA kernel's per-thread stack or local memory (register spills, local arrays) grew past the recorded allow-list; record a reviewed change | `python tools/cuda_stack/check_cuda_stack.py check\|update BINARY`; [`cuda_stack/`](cuda_stack/check_cuda_stack.py); CTest `infernix_cuda_stack_check` |
 | Measure the physical HBM read/copy ceiling | [`hbm_bandwidth_probe.cu`](hbm_bandwidth_probe.cu); [build command](#standalone-hbm-probe) |
 | Replay Qwen3.8-Flash-Next routing traces through VRAM expert-cache policies (needs numpy) | `python -m tools.expert_cache_replay.replay TRACE_DIR`; [`expert_cache_replay/`](expert_cache_replay/replay.py) |
 | Replay engine-captured route traces through the VRAM / RAM / SSD expert tiers: RAM policies, modes, priors, demotion allowance, prefill reserve (needs numpy) | `python tools/expert_cache_replay/host_tier.py TRACE [--validate]`; [`expert_cache_replay/host_tier.py`](expert_cache_replay/host_tier.py); traces from `infernix_qwen4_exp_route_trace_real_test` or `infernix-serve --route-trace FILE` |

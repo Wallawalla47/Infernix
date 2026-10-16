@@ -7482,7 +7482,10 @@ this section records the design decisions of F0 and F1. Results are recorded by 
   chunk) and `prefill.residency` (`after_round`: host LFRU policy and promotion issue). They are
   chunk-granular, cost nothing without a tool attached, and stay outside the files other tracks own
   (`ngram_volume.cpp`, `expert_residency.cpp`). An earlier ad-hoc patch with formatted range names in
-  those files was replaced.
+  those files was replaced. Three more ranges followed NInfer's 4f31ad4a0 (2026-10-16): `text.layer`
+  (a layer walk's host enqueue of one layer over its span; payload: the layer), `ple.rows` (every host
+  n-gram row read, decode and verification included; payload: positions) and `moe.cpu.compute` (the
+  CPU miss service's work on one request, on its own thread; payload: layer << 32 | experts).
 - **Rig.** nsys (`--trace=cuda,nvtx`) of `infernix_bench -p 16384 --prefill-chunk 4096 -r 2
   --warmup 0`: four cold chunks in a fresh process (empty expert cache, cold n-gram rows), then the
   same prompt warm; once per arm of the F1 toggle, plus profiler-free runs of the same workload.
@@ -9750,16 +9753,51 @@ route's bits follow the chunk grid (perplexity 4.1436 / 4.1440 / 4.1288 / 4.1441
 **Adopted elsewhere:** the 35B Q8 GDN decode GEMV at four blocks per SM (giveen 310d3bf18):
 bit-identical greedy output, plain decode 397.4 → 398.6 tok/s (every four-block run ahead).
 
-**Sized and not built** (each at most ~0.4 % of a round, below what end-to-end runs resolve):
-- QSA selection shared across chained MTP draft steps (SGLang `QSAMTPSharedSparseIndices`): select
-  15 / 17 / 25 µs per call at 4K / 32K / 128K (`infernix_qsa_attention_bench`, width 1), so 40-80 µs of
-  a ~21 ms MTP 4 round; a block completing between steps would also need an attention-kernel change.
-- The MTP catch-up folded into the first draft step (Strata 3fd0460ba2): the catch-up is already a
-  K/V-only pass.
-- The gated RMSNorm folded into the out_proj GEMV prologue at verify widths (SGLang/donor): ~36 µs per
-  round, a loss at width 1.
-- Strata's v4 hyper-connection read scheduling: this engine's BF16 mixer is already 10.6 / 18.5 /
-  20.8 µs at T = 1 / 5 / 8 against Strata v4's 11.8 / 18.1 / 26.3 µs.
+**Adopted, 2026-10-16 (second round, Dense8, INT8 KV, MTP 4 with the proposal head unless stated):**
+- Strata's v4 hyper-connection read scheduling for mixer calls of two or more columns (strata-nvfp4
+  `fused_gr.cu` `gr_down_v4_kernel` / `gr_up_v4_kernel`): K1a stages Rn once in two conflict-free
+  planes, K1b runs 8 rows per warp with one transposed butterfly per token. Bit-identical (56 op-test
+  hashes and every bench hash). Q8 mixer per call (48 distinct layers): T 2 10.4 → 9.7 µs, T 5
+  15.9 → 13.1, T 8 19.4 → 16.0; T 1 8.5 → 8.7 µs, so one column keeps K1a/K1b. Decode ABBA, pg4096:
+  MTP 4 149.2 → 150.5 tok/s (+0.9 %, runs 149.1 / 149.2 against 150.3 / 150.8), plain 94.7 → 95.2.
+  v4's two rows per warp in K1a spilled 120-160 bytes of stack and was slower; not adopted.
+- A prefill chunk whose wide workspace the expert cache could never lend is halved at startup (a
+  warning; exact route chunk-invariant): a 65,536-token chunk on the SSD tier had wanted 27 GiB,
+  failed `cudaMalloc` after admission and took the Engine down (GitHub #5 comment); now it prefills at
+  32,768 and served a 49K-token prompt. A failed fallback allocation fails the prompt's requests, not
+  the Engine.
+- GitHub #24 through the layer walk: after each walk span the Program reports that its lent frames are
+  returnable and the Engine re-runs admission, so a request waiting for KV growth is admitted after
+  the span instead of after the whole prompt. Scenario (exact route, C = 2, `--max-context 190000`):
+  A 144,624 tokens, B 34,020 tokens 3 s later with a 7 s queue timeout. Without the re-check B expired
+  (HTTP 503 after 8.3 s); with it B was admitted after A's first 65,536-token span (3.6 s in the
+  queue), finished before A, and its output equals its solo run; A took 19.2 s instead of 15.4 s. The
+  reclaim returns the leases only when the pool's capacity has room for the growth (at a full
+  `--max-context 150000` it had returned 4,221 frames for nothing).
+
+**Built, measured and not adopted (2026-10-16):**
+- A 32,768-token prefill chunk: pp32768 11,173 → 11,596 tok/s (+3.8 %), pp65536 11,274 → 10,627
+  (−5.7 %); the exact route is identical at both. 16,384 stays.
+- Equal-width calls (⌈n / chunk⌉ calls of equal width on the 16-token grid, or only a short tail merged
+  with the call before it): bit-identical on the exact route (28 windows of 18,000 tokens) but
+  pp18000 7,353 → 7,308 and pp20000 8,132 → 8,085 tok/s (−0.6 %, both forms).
+- QSA selection shared across chained MTP draft steps (the checkpoint's
+  `index_share_for_mtp_iteration`; the selecting step stored its blocks and a later step attended to
+  them and the grown tail): greedy text identical, acceptance identical, decode 4K 127.9 → 128.6
+  (within the spread), 32K 157.9 → 158.0 tok/s.
+- The gated RMSNorm folded into the GDN out_proj GEMV's activation prologue (27B FP8 sliced-K and
+  Flash-Next Q8 sliced-K routes at verification widths): bit-identical, but 2-4x slower per call
+  (Q8 T 5 15.0 → 51.8 µs): every CTA normalizing the whole activation costs far more than the
+  launch it saves.
+- NInfer's BF16 hyper-connection kernels (5989682a4, 70a11f127), op bench on BF16 weights: 1.11x
+  faster at T 1, 1.41x at T 4, 1.55x at T 5, but their output fails the mixer's criterion at decode
+  widths (normwise 2.45e-3 against this route's 1.70e-3); they would be a gated fast path for the
+  FP8 F-A artifact only, whose decode is CPU-bound.
+
+**Measured first, not built:** the MTP catch-up costs 104 µs of device time per call against a
+10.1 ms MTP 4 round (pg4096), so folding it into the first draft step (Strata 3fd0460ba2) could save
+at most ~0.5-0.9 %; draft-column n-gram reads during drafting (the parked S4a, NInfer 439e1075e):
+at C = 2 on first-time text the GPU waited at the n-gram gate in none of 210 gated rounds.
 
 ### 19.4 On the Gold-Star-Infer runtime contract (2026-10-05)
 

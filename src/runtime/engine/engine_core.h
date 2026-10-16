@@ -1311,6 +1311,10 @@ private:
             throw std::logic_error("completed prefill did not reach the admitted prompt frontier");
         }
         if (progress.processed_prompt_tokens != 0) { publish_prompt_progress(request); }
+        // Between a long prompt's calls (Qwen4Exp: after each layer-walk span) the frames it borrows
+        // can be returned, so a request waiting for KV growth need not wait for the whole prompt
+        // (GitHub #24: admitted after the first 65,536-token span instead of expiring in the queue).
+        if (progress.capacity_released) { request_admission_check(); }
         if (!progress.complete) { return; }
         if (!request->lane || !progress.pending) {
             throw std::logic_error("completed prefill has no lane or pending token");

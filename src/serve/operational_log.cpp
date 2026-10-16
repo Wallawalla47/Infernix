@@ -624,6 +624,11 @@ void OperationalLog::server_ready(std::string_view host, int port, std::string_v
     logger_->info("listening on http://{}:{} | model {} | auth {}",
                   product::format_pretty_text(host), port, product::format_pretty_text(model_id),
                   auth_enabled ? "bearer" : "disabled");
+    if (!auth_enabled && !is_loopback_host(host)) {
+        logger_->warn("{} is reachable beyond this machine without --api-key: anyone who can reach port {} "
+                      "can use the model",
+                      product::format_pretty_text(host), port);
+    }
 }
 
 void OperationalLog::server_stopped() const { logger_->info("server stopped"); }

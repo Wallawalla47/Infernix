@@ -614,14 +614,15 @@ void validate_segments(std::size_t segment_count, std::size_t segment_bytes,
 
 } // namespace
 
-void StateImageDevicePool::copy_to_host_segments(std::int32_t source,
-                                                 std::span<std::byte* const> segments,
-                                                 std::size_t segment_bytes,
-                                                 cudaStream_t stream) const {
+std::uint32_t StateImageDevicePool::copy_to_host_segments(std::int32_t source,
+                                                          std::span<std::byte* const> segments,
+                                                          std::size_t segment_bytes,
+                                                          cudaStream_t stream) const {
     validate_slot(source, slot_count(), "StateImage segmented D2H source is out of range");
     validate_segments(segments.size(), segment_bytes, host_layout_.image_bytes);
     const std::optional<ops::PackedStateFormat> packed =
         packed_format(host_layout_.spec.recurrent_host);
+    std::uint32_t copies = 0;
     for_each_host_component(
         source, [&](void* device, std::size_t offset, std::size_t bytes, bool recurrent) {
             const std::byte* from = static_cast<const std::byte*>(device);
@@ -639,31 +640,35 @@ void StateImageDevicePool::copy_to_host_segments(std::int32_t source,
                 [&](std::size_t segment, std::size_t within, std::size_t done, std::size_t count) {
                     CUDA_CHECK(cudaMemcpyAsync(segments[segment] + within, from + done, count,
                                                cudaMemcpyDeviceToHost, stream));
+                    ++copies;
                 });
         });
+    return copies;
 }
 
-void StateImageDevicePool::copy_from_host_segments(std::span<const std::byte* const> segments,
-                                                   std::size_t segment_bytes,
-                                                   std::int32_t destination, cudaStream_t stream) {
+std::uint32_t StateImageDevicePool::copy_from_host_segments(std::span<const std::byte* const> segments,
+                                                            std::size_t segment_bytes,
+                                                            std::int32_t destination, cudaStream_t stream) {
+    std::uint32_t copies = 0;
     for (std::uint32_t layer = 0; layer < linear_.layer_count(); ++layer) {
-        copy_from_host_segments(
+        copies += copy_from_host_segments(
             segments, segment_bytes, destination,
             StateImagePart{.kind = StateImagePart::Kind::LinearLayer, .layer = layer}, stream);
     }
-    copy_from_host_segments(segments, segment_bytes, destination,
-                            StateImagePart{.kind = StateImagePart::Kind::Rest}, stream);
+    return copies + copy_from_host_segments(segments, segment_bytes, destination,
+                                            StateImagePart{.kind = StateImagePart::Kind::Rest}, stream);
 }
 
-void StateImageDevicePool::copy_from_host_segments(std::span<const std::byte* const> segments,
-                                                   std::size_t segment_bytes,
-                                                   std::int32_t destination, StateImagePart part,
-                                                   cudaStream_t stream) {
+std::uint32_t StateImageDevicePool::copy_from_host_segments(std::span<const std::byte* const> segments,
+                                                            std::size_t segment_bytes,
+                                                            std::int32_t destination, StateImagePart part,
+                                                            cudaStream_t stream) {
     validate_slot(destination, slot_count(),
                   "StateImage segmented H2D destination is out of range");
     validate_segments(segments.size(), segment_bytes, host_layout_.image_bytes);
     const std::optional<ops::PackedStateFormat> packed =
         packed_format(host_layout_.spec.recurrent_host);
+    std::uint32_t copies = 0;
     for_each_host_component(
         destination, part,
         [&](void* device, std::size_t offset, std::size_t bytes, bool recurrent) {
@@ -679,12 +684,14 @@ void StateImageDevicePool::copy_from_host_segments(std::span<const std::byte* co
                 [&](std::size_t segment, std::size_t within, std::size_t done, std::size_t count) {
                     CUDA_CHECK(cudaMemcpyAsync(to + done, segments[segment] + within, count,
                                                cudaMemcpyHostToDevice, stream));
+                    ++copies;
                 });
             if (staged) {
                 Tensor state(device, DType::FP32, {static_cast<std::int32_t>(bytes / 4U)});
                 ops::unpack_fp32_state(to, state, *packed, stream);
             }
         });
+    return copies;
 }
 
 } // namespace infernix::models::qwen3_5

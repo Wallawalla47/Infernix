@@ -1210,14 +1210,20 @@ and recomputes the previous output) or admission (whole extents held without `pr
   is unchanged. Only the pass boundaries move, and every boundary stays on the chunk grid from the
   step's start: a wide step ends where a chunk-wide prefill would realize the lane's next flexible
   prefix-cache tap, and exact taps split it where they split a chunk, so snapshots land at the same
-  positions. A Vision prompt, a binding's first step, a recovering request and Replay keep the
-  chunk, as does a step whose extra KV pages are neither free nor evictable cache.
+  positions. A binding's first step takes the idle width too when no other lane is generating and
+  the free KV pages alone (no eviction) hold its wide extent plus every reused block as if restored
+  from the Host tier (2026-10-16; before, it kept one chunk). A Vision prompt, a recovering request
+  and Replay keep the chunk, as does a step whose extra KV pages are neither free nor evictable
+  cache.
 - **Cost:** prefill buffers and workspace at the idle width (with automatic KV capacity, fewer
   cached KV pages); a request admitted during a wide step waits up to one wide step.
 - **Speed** (2026-10-15, RTX 5090, official Qwen3.8-27B NVFP4, INT8 KV, `infernix_bench`, one
   24,576-token prompt alone): 10,547.6 → 11,533.4 tok/s (+9.3 %). The upstream measurement (NInfer
   5bcef9e2c): 35B-A3B 1.41 → 1.26 s, 27B NVFP4 3.28 → 3.06 s, with the decode stall behind a
-  13.8k-token prompt unchanged.
+  13.8k-token prompt unchanged. The wide first step (2026-10-16, same machine and artifact,
+  `infernix_bench` ABBA, two runs per arm, spread under 0.6 %): pp1024 11,744 → 14,013 tok/s
+  (+19.3 %), pp2048 +11.5 %, pp3072 +5.2 %, pp4096 +0.5 %, pp8192 +1.8 %. Its steps are the
+  idle-width steps the evidence below already gated.
 - **Evidence** (2026-10-15, RTX 5090, official Qwen3.8-27B NVFP4, quick corpus, its own a16
   reference). Scoring engines plan no idle width, so the gate runs the step the path takes: every
   fast run prefills at the idle width (`--fast-chunk 3584`, jointly with the qualified paths)

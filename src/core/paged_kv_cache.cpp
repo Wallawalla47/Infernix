@@ -700,11 +700,12 @@ TransferWork DeviceKVPagePool::copy_page(DeviceKVPageHandle source, DeviceKVPage
     return device_copy_work(1);
 }
 
-void DeviceKVPagePool::copy_host_run(cudaMemcpyKind kind, std::size_t plane_begin,
-                                     std::size_t plane_end, std::int32_t first, std::size_t count,
-                                     std::byte* host_base, std::size_t host_pitch,
-                                     const HostKVPageLayout& host, cudaStream_t stream) const {
+std::uint32_t DeviceKVPagePool::copy_host_run(cudaMemcpyKind kind, std::size_t plane_begin,
+                                              std::size_t plane_end, std::int32_t first, std::size_t count,
+                                              std::byte* host_base, std::size_t host_pitch,
+                                              const HostKVPageLayout& host, cudaStream_t stream) const {
     const bool to_host = kind == cudaMemcpyDeviceToHost;
+    std::uint32_t copies = 0;
     for (std::size_t plane_index = plane_begin; plane_index < plane_end; ++plane_index) {
         const Tensor& plane                 = planes_[plane_index];
         const HostKVPlaneLayout& host_plane = host.planes[plane_index];
@@ -712,6 +713,7 @@ void DeviceKVPagePool::copy_host_run(cudaMemcpyKind kind, std::size_t plane_begi
         auto* device_base                   = static_cast<unsigned char*>(plane.data);
         const auto copy                     = [&](std::byte* host_ptr, unsigned char* device_ptr,
                                                   std::size_t device_pitch, std::size_t width) {
+            ++copies;
             if (to_host) {
                 CUDA_CHECK(cudaMemcpy2DAsync(host_ptr, host_pitch, device_ptr, device_pitch, width,
                                              count, cudaMemcpyDeviceToHost, stream));
@@ -733,6 +735,7 @@ void DeviceKVPagePool::copy_host_run(cudaMemcpyKind kind, std::size_t plane_begi
             }
         }
     }
+    return copies;
 }
 
 template <bool ToHost>
@@ -895,20 +898,20 @@ void validate_record_groups(std::span<const std::uint32_t> groups, std::size_t r
 
 } // namespace
 
-void DeviceKVPagePool::copy_to_host_records(std::span<const DeviceKVPageHandle> source,
-                                            std::span<std::byte* const> records,
-                                            std::span<const std::uint32_t> record_groups,
-                                            const HostKVPageLayout& layout,
-                                            cudaStream_t stream) const {
-    copy_to_host_records(source, records, record_groups, layout, 0, planes_.size(), stream);
+std::uint32_t DeviceKVPagePool::copy_to_host_records(std::span<const DeviceKVPageHandle> source,
+                                                     std::span<std::byte* const> records,
+                                                     std::span<const std::uint32_t> record_groups,
+                                                     const HostKVPageLayout& layout,
+                                                     cudaStream_t stream) const {
+    return copy_to_host_records(source, records, record_groups, layout, 0, planes_.size(), stream);
 }
 
-void DeviceKVPagePool::copy_to_host_records(std::span<const DeviceKVPageHandle> source,
-                                            std::span<std::byte* const> records,
-                                            std::span<const std::uint32_t> record_groups,
-                                            const HostKVPageLayout& layout,
-                                            std::size_t plane_begin, std::size_t plane_end,
-                                            cudaStream_t stream) const {
+std::uint32_t DeviceKVPagePool::copy_to_host_records(std::span<const DeviceKVPageHandle> source,
+                                                     std::span<std::byte* const> records,
+                                                     std::span<const std::uint32_t> record_groups,
+                                                     const HostKVPageLayout& layout,
+                                                     std::size_t plane_begin, std::size_t plane_end,
+                                                     cudaStream_t stream) const {
     if (records.size() != source.size() || layout.geometry != geometry()) {
         throw std::invalid_argument("Paged KV D2H record geometry or extent is inconsistent");
     }
@@ -925,31 +928,33 @@ void DeviceKVPagePool::copy_to_host_records(std::span<const DeviceKVPageHandle> 
     }
     const std::span<const std::byte* const> addresses(
         reinterpret_cast<const std::byte* const*>(records.data()), records.size());
-    std::size_t begin = 0;
+    std::size_t begin    = 0;
+    std::uint32_t copies = 0;
     while (begin < source.size()) {
         std::size_t pitch     = 0;
         const std::size_t end = host_record_run_end(source, addresses, record_groups, begin,
                                                     layout.page_stride, max_pitch, pitch);
-        copy_host_run(cudaMemcpyDeviceToHost, plane_begin, plane_end, source[begin].index_,
-                      end - begin, records[begin], pitch, layout, stream);
+        copies += copy_host_run(cudaMemcpyDeviceToHost, plane_begin, plane_end, source[begin].index_,
+                                end - begin, records[begin], pitch, layout, stream);
         begin = end;
     }
+    return copies;
 }
 
-void DeviceKVPagePool::copy_from_host_records(std::span<const std::byte* const> records,
-                                              std::span<const std::uint32_t> record_groups,
-                                              std::span<const DeviceKVPageHandle> destination,
-                                              const HostKVPageLayout& layout,
-                                              cudaStream_t stream) const {
-    copy_from_host_records(records, record_groups, destination, layout, 0, planes_.size(), stream);
+std::uint32_t DeviceKVPagePool::copy_from_host_records(std::span<const std::byte* const> records,
+                                                       std::span<const std::uint32_t> record_groups,
+                                                       std::span<const DeviceKVPageHandle> destination,
+                                                       const HostKVPageLayout& layout,
+                                                       cudaStream_t stream) const {
+    return copy_from_host_records(records, record_groups, destination, layout, 0, planes_.size(), stream);
 }
 
-void DeviceKVPagePool::copy_from_host_records(std::span<const std::byte* const> records,
-                                              std::span<const std::uint32_t> record_groups,
-                                              std::span<const DeviceKVPageHandle> destination,
-                                              const HostKVPageLayout& layout,
-                                              std::size_t plane_begin, std::size_t plane_end,
-                                              cudaStream_t stream) const {
+std::uint32_t DeviceKVPagePool::copy_from_host_records(std::span<const std::byte* const> records,
+                                                       std::span<const std::uint32_t> record_groups,
+                                                       std::span<const DeviceKVPageHandle> destination,
+                                                       const HostKVPageLayout& layout,
+                                                       std::size_t plane_begin, std::size_t plane_end,
+                                                       cudaStream_t stream) const {
     if (records.size() != destination.size() || layout.geometry != geometry()) {
         throw std::invalid_argument("Paged KV H2D record geometry or extent is inconsistent");
     }
@@ -963,15 +968,17 @@ void DeviceKVPagePool::copy_from_host_records(std::span<const std::byte* const> 
     }
     const std::size_t max_pitch = device_max_copy_pitch();
     std::size_t begin           = 0;
+    std::uint32_t copies        = 0;
     while (begin < destination.size()) {
         std::size_t pitch     = 0;
         const std::size_t end = host_record_run_end(destination, records, record_groups, begin,
                                                     layout.page_stride, max_pitch, pitch);
         // The H2D direction only reads the host run.
-        copy_host_run(cudaMemcpyHostToDevice, plane_begin, plane_end, destination[begin].index_,
-                      end - begin, const_cast<std::byte*>(records[begin]), pitch, layout, stream);
+        copies += copy_host_run(cudaMemcpyHostToDevice, plane_begin, plane_end, destination[begin].index_,
+                                end - begin, const_cast<std::byte*>(records[begin]), pitch, layout, stream);
         begin = end;
     }
+    return copies;
 }
 
 std::vector<DeviceKVPageReservation>

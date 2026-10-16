@@ -88,6 +88,9 @@ enum class Name : std::size_t {
     DecodeDFlashTarget,
     PrefillPleRows,
     PrefillResidency,
+    TextLayer,
+    PleRows,
+    MoeCpuCompute,
     Count,
 };
 
@@ -209,6 +212,9 @@ enum class Name : std::size_t {
         "decode.dflash.target",
         "prefill.ple_rows",
         "prefill.residency",
+        "text.layer",
+        "ple.rows",
+        "moe.cpu.compute",
     });
     static_assert(names.size() == static_cast<std::size_t>(Name::Count));
     static const auto handles = [] {

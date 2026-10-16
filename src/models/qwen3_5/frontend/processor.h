@@ -5,6 +5,8 @@
 
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 
+#include "infernix/types.h"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -32,11 +34,38 @@ public:
     ProcessorError(ProcessorErrorKind kind, std::string message)
         : std::runtime_error(std::move(message)), kind_(kind) {}
 
+    // ProcessorErrorKind::ContextLengthExceeded with its counts.
+    explicit ProcessorError(ContextLengthDetails details)
+        : std::runtime_error(RequestError(details).what()), kind_(ProcessorErrorKind::ContextLengthExceeded),
+          context_length_(details) {}
+
     [[nodiscard]] ProcessorErrorKind kind() const noexcept { return kind_; }
+
+    [[nodiscard]] const std::optional<ContextLengthDetails>& context_length() const noexcept {
+        return context_length_;
+    }
 
 private:
     ProcessorErrorKind kind_;
+    std::optional<ContextLengthDetails> context_length_;
 };
+
+// The bound on recounting an overlong prompt for its error: four times the limit, so a prompt that
+// overflows by up to 4x reports its exact length without unbounded tokenization work.
+[[nodiscard]] inline std::size_t context_recount_limit(std::size_t maximum_prompt_tokens) noexcept {
+    return maximum_prompt_tokens > (std::numeric_limits<std::size_t>::max() - 1U) / 4U
+               ? std::numeric_limits<std::size_t>::max()
+               : 4U * maximum_prompt_tokens + 1U;
+}
+
+// The details for a prompt counted with context_recount_limit(maximum_prompt_tokens).
+[[nodiscard]] inline ContextLengthDetails context_length_details(std::size_t counted,
+                                                                 std::size_t maximum_prompt_tokens) {
+    const std::size_t limit = context_recount_limit(maximum_prompt_tokens);
+    return {.prompt_tokens = counted >= limit ? limit - 1U : counted,
+            .max_context   = static_cast<std::uint32_t>(maximum_prompt_tokens),
+            .exact         = counted < limit};
+}
 
 struct VisionGrid {
     int t = 0;

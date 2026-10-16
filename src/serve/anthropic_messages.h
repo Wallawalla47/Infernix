@@ -40,9 +40,14 @@ struct AnthropicCountTokensRequest {
     GenerationRequest generation;
 };
 
+// limits.claude_code_prompt selects the Claude Code System rewrite (--claude-code-prompt): with
+// Local, a System array whose consumed first block is Claude Code's attribution header and whose
+// next block opens with its identity line is rewritten for a local model; anything else is lowered
+// as sent. Count Tokens takes the same setting, so it counts the prompt Messages would run.
 AnthropicMessagesRequest parse_anthropic_messages_request(const RequestJson& body,
                                                           const RequestLimits& limits);
-AnthropicCountTokensRequest parse_anthropic_count_tokens_request(const RequestJson& body);
+AnthropicCountTokensRequest parse_anthropic_count_tokens_request(const RequestJson& body,
+                                                                 const RequestLimits& limits = {});
 
 struct AnthropicResponseIdentity {
     std::string request_id;

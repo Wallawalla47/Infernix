@@ -526,7 +526,9 @@ std::string format_server_start_json(
              {"default_thinking_budget", std::move(default_thinking_budget)},
              {"reasoning_loop", reasoning_loop_name(options.reasoning_loop)},
              {"default_preserve_thinking",
-              options.preserve_thinking ? Json(*options.preserve_thinking) : Json(nullptr)}};
+              options.preserve_thinking ? Json(*options.preserve_thinking) : Json(nullptr)},
+             {"claude_code_prompt",
+              options.claude_code_prompt == ClaudeCodePrompt::Local ? "local" : "as-sent"}};
     record["artifact"]                             = Json{{"path", options.artifact_path},
                                                           {"size_bytes", std::move(artifact_size)},
                                                           {"architecture", load.architecture},
@@ -850,6 +852,8 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                  {"prefetched_blocks", delta(&RuntimeStats::hybrid_prefetched_blocks)},
                  {"host_write_bytes", delta(&RuntimeStats::hybrid_host_write_bytes)},
                  {"host_restore_bytes", delta(&RuntimeStats::hybrid_host_restore_bytes)},
+                 {"host_write_copies", delta(&RuntimeStats::hybrid_host_write_copies)},
+                 {"host_restore_copies", delta(&RuntimeStats::hybrid_host_restore_copies)},
                  {"evicted_blocks", delta(&RuntimeStats::hybrid_evicted_blocks)},
                  {"host_snapshot_evictions", delta(&RuntimeStats::hybrid_host_snapshot_evictions)},
                  {"host_dead_reclaims", delta(&RuntimeStats::hybrid_host_dead_reclaims)},

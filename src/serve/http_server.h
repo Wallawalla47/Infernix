@@ -4,6 +4,7 @@
 #include "serve/decide.h"
 #include "serve/generation_service.h"
 #include "serve/metrics.h"
+#include "serve/openai_common.h"
 #include "serve/operational_log.h"
 #include "serve/openai_responses_store.h"
 #include "serve/request_log.h"
@@ -121,6 +122,8 @@ private:
     ServeOptions options_;
     std::string public_model_id_;
     infernix::ModelMetadata model_metadata_;
+    // Probed once through the attached service's prompt path (/v1/models chat_template_caps).
+    ChatTemplateCaps chat_template_caps_;
     // /v1/decide answer labels, computed from the loaded tokenizer when the service attaches.
     std::vector<DecideLabel> decide_labels_;
     OpenAIResponsesStore openai_responses_store_;

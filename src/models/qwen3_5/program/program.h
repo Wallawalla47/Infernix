@@ -195,6 +195,8 @@ struct HybridPrefixCacheStats {
     std::uint64_t host_tail_restores         = 0;
     std::uint64_t host_write_bytes           = 0;
     std::uint64_t host_restore_bytes         = 0;
+    std::uint64_t host_write_copies          = 0;
+    std::uint64_t host_restore_copies        = 0;
     std::uint64_t evicted_blocks             = 0;
     std::uint64_t host_snapshot_evictions    = 0;
     std::uint64_t host_dead_reclaims         = 0;
@@ -283,6 +285,9 @@ struct PrefillProgress {
     runtime::BeginSummary summary;
     std::uint32_t processed_prompt_tokens = 0;
     bool complete                         = false;
+    // Qwen3.5 lends nothing to a prefill, so no capacity comes back between its calls (the Engine
+    // re-runs admission when a Qwen4Exp prompt returns lent frames, GitHub #24).
+    bool capacity_released = false;
     runtime::ExecutionTiming timing;
     std::optional<PendingBatch> pending;
     std::optional<PromptReadout> readout;

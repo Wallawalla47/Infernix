@@ -448,6 +448,21 @@ bool throws_context_length(Callable&& callable) {
     return false;
 }
 
+// The counts a context overflow reports: {prompt_tokens, max_context, exact}.
+template <class Callable>
+bool throws_context_length(Callable&& callable, std::uint64_t prompt_tokens, std::uint32_t max_context,
+                           bool exact) {
+    try {
+        callable();
+    } catch (const infernix::RequestError& error) {
+        const auto& details = error.context_length();
+        return error.kind() == infernix::RequestErrorKind::ContextLengthExceeded && details &&
+               details->prompt_tokens == prompt_tokens && details->max_context == max_context &&
+               details->exact == exact;
+    }
+    return false;
+}
+
 int test_declared_frontend_semantics() {
     auto source                = resources();
     auto tokenizer             = nlohmann::json::parse(source.tokenizer_json);
@@ -765,16 +780,17 @@ int test_context_capacity_guard() {
     const Frontend short_frontend = make_frontend(resources(), short_options);
     failures += check(short_frontend.count_tokens(input) == exact_count,
                       "exact token counting was incorrectly bounded by max_context");
-    failures += check(throws_context_length([&] { (void)short_frontend.prepare(input); }),
-                      "Frontend accepted a text prompt at max_context + 1");
+    failures += check(throws_context_length([&] { (void)short_frontend.prepare(input); }, exact_count,
+                                            exact_count - 1U, true),
+                      "Frontend accepted a text prompt at max_context + 1, or lost its counts");
 
     std::vector<infernix::TokenId> exact_tokens(exact_count, 0);
     failures += check(exact.prepare_tokens(exact_tokens).summary().prompt_tokens == exact_count,
                       "prepare_tokens rejected an exact-capacity token vector");
     exact_tokens.push_back(0);
-    failures +=
-        check(throws_context_length([&] { (void)exact.prepare_tokens(std::move(exact_tokens)); }),
-              "prepare_tokens accepted a token vector at max_context + 1");
+    failures += check(throws_context_length([&] { (void)exact.prepare_tokens(std::move(exact_tokens)); },
+                                            exact_count + 1U, exact_count, true),
+                      "prepare_tokens accepted a token vector at max_context + 1, or lost its counts");
 
     infernix::models::qwen3_5::FrontendOptions media_options = short_options;
     media_options.vision_enabled                           = true;
@@ -3269,8 +3285,9 @@ int test_ngram_proposal_only_sources() {
         oversized += std::to_string(i) + ": value = 123456789\n";
     }
     input.messages.back().parts[0].text = std::move(oversized);
-    failures += check(throws_context_length([&] { (void)bounded.prepare(input); }),
-                      "proposal sources bypassed the target context limit");
+    // Far past four times the limit, counting stops: "more than 512 tokens".
+    failures += check(throws_context_length([&] { (void)bounded.prepare(input); }, 512U, 128U, false),
+                      "proposal sources bypassed the target context limit, or its recount was unbounded");
     std::atomic<unsigned> checks{0};
     infernix::PreparationControl control{
         .deadline     = {},

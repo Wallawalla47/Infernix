@@ -96,6 +96,88 @@ struct Observed {
     infernix::RuntimeStats stats;
 };
 
+// GitHub #29: after a ladder of long prompts with repeats on a small Host tier, the cache stopped
+// reusing for the rest of the session (identical repeats and continued turns prefilled from zero,
+// endpoints_created frozen). A tap or endpoint superseded the lineage's previous snapshot before it
+// had a Device slot and never undid that when refused, and long snapshots that lost their Host copy
+// held every Device slot. The serve scenario that reproduced it (automatic KV capacity, a 512 MiB
+// Host tier, two Device snapshot slots), at the Engine: the ladder, then a short prompt and its
+// repeat, then a two-turn conversation. A repeat resumes from the snapshot at its last chunk's
+// start, and a repeat's endpoint supersedes that snapshot (spec §9.2), so of two repeats one may
+// prefill again; the defect is reuse that never returns: every prompt must reuse in at least one
+// repeat, both later requests must reuse, and the ladder must keep publishing endpoints. The
+// prompts are raw tokens without the chat template's structural taps, so the short one spans two
+// chunks.
+int exercise_issue29(const char* artifact) {
+    infernix::EngineOptions options = hybrid_options(artifact, infernix::SpeculativeBackend::None, 65536,
+                                                     512ULL << 20, 2);
+    options.kv_capacity   = infernix::KvCapacityPolicy::automatic();
+    options.max_context   = 65536;
+    options.prefill_chunk = 4096;
+    infernix::Engine engine(std::move(options));
+    int failures = 0;
+    const std::array<std::pair<std::size_t, std::uint32_t>, 3> ladder{{{37000, 11}, {15000, 12}, {25000, 13}}};
+    for (const auto& [tokens, seed] : ladder) {
+        const std::vector<infernix::TokenId> prompt = synthetic_tokens(tokens, seed);
+        const std::uint64_t endpoints_before        = engine.runtime_stats().hybrid_endpoints_created;
+        std::uint32_t reused = 0;
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            const infernix::GenerationResult result = engine.generate(engine.prepare_tokens(prompt), greedy(16));
+            std::cout << "issue29: " << tokens << "-token prompt, run " << attempt << ": reused "
+                      << result.reused_prompt_tokens << '\n';
+            if (attempt > 0) { reused = std::max(reused, result.reused_prompt_tokens); }
+        }
+        if (reused == 0) {
+            std::cerr << "issue29: neither repeat of the " << tokens << "-token prompt reused anything\n";
+            ++failures;
+        }
+        if (engine.runtime_stats().hybrid_endpoints_created == endpoints_before) {
+            std::cerr << "issue29: the " << tokens << "-token prompt published no endpoint\n";
+            ++failures;
+        }
+    }
+    const std::vector<infernix::TokenId> short_prompt = synthetic_tokens(6000, 14);
+    const infernix::RuntimeStats before_short = engine.runtime_stats();
+    (void)engine.generate(engine.prepare_tokens(short_prompt), greedy(16));
+    const infernix::RuntimeStats after_short = engine.runtime_stats();
+    // As in the ladder, one of two repeats may find its tail snapshot superseded by the previous run's
+    // endpoint (raw tokens carry no structural tap before the answer, as a chat prompt does).
+    std::uint32_t short_reuse = 0;
+    for (int attempt = 1; attempt < 3; ++attempt) {
+        const std::uint32_t reused = engine.generate(engine.prepare_tokens(short_prompt), greedy(16)).reused_prompt_tokens;
+        std::cout << "issue29: short prompt, run " << attempt << ": reused " << reused << '\n';
+        short_reuse = std::max(short_reuse, reused);
+    }
+    // What the short prompt's first run published, for a repeat that reuses nothing.
+    const auto delta = [&](std::uint64_t infernix::RuntimeStats::* field) { return after_short.*field - before_short.*field; };
+    std::cout << "issue29: short prompt run: taps created " << delta(&infernix::RuntimeStats::hybrid_taps_created)
+              << ", skipped " << delta(&infernix::RuntimeStats::hybrid_taps_skipped) << " (no slot "
+              << delta(&infernix::RuntimeStats::hybrid_taps_skipped_no_slot) << "), endpoints "
+              << delta(&infernix::RuntimeStats::hybrid_endpoints_created) << ", Host image refusals "
+              << delta(&infernix::RuntimeStats::hybrid_host_image_write_refusals) << ", block refusals "
+              << delta(&infernix::RuntimeStats::hybrid_host_block_write_refusals) << ", slot evictions "
+              << delta(&infernix::RuntimeStats::hybrid_device_slot_evictions) << ", evicted blocks "
+              << delta(&infernix::RuntimeStats::hybrid_evicted_blocks) << ", snapshots now " << after_short.hybrid_snapshots
+              << ", free slots " << after_short.hybrid_free_device_snapshot_slots << '\n';
+    std::vector<infernix::TokenId> turn = synthetic_tokens(2500, 15);
+    const infernix::GenerationResult first_turn = engine.generate(engine.prepare_tokens(turn), greedy(32));
+    turn.insert(turn.end(), first_turn.generated_token_ids.begin(), first_turn.generated_token_ids.end());
+    const std::vector<infernix::TokenId> follow = synthetic_tokens(200, 16);
+    turn.insert(turn.end(), follow.begin(), follow.end());
+    const std::uint32_t turn_reuse = engine.generate(engine.prepare_tokens(turn), greedy(16)).reused_prompt_tokens;
+    const infernix::RuntimeStats stats = engine.runtime_stats();
+    if (short_reuse == 0 || turn_reuse == 0) {
+        std::cerr << "issue29: after the ladder the short prompt's repeats reused at most " << short_reuse
+                  << " tokens and the second turn " << turn_reuse << " (both must reuse)\n";
+        ++failures;
+    }
+    std::cout << "issue29: short prompt reused " << short_reuse << ", second turn " << turn_reuse
+              << "; endpoints " << stats.hybrid_endpoints_created << ", skipped "
+              << stats.hybrid_endpoints_skipped << ", taps skipped for a slot " << stats.hybrid_taps_skipped_no_slot
+              << ", slot refusals " << stats.hybrid_device_slot_refusals << '\n';
+    return failures;
+}
+
 // A later request restores a flexible prompt-tail snapshot the first request captured at its last
 // prefill chunk boundary. The Device-resident engine restores it with Device copies; the
 // constrained engine is first forced to evict the snapshot image and most of its blocks, so the
@@ -140,6 +222,14 @@ int exercise_restore_exact(const char* artifact, infernix::SpeculativeBackend ba
         std::cerr << "restore-exact: the constrained engine did not restore through Host slabs"
                   << " (images=" << host.stats.hybrid_host_image_restores
                   << " blocks=" << host.stats.hybrid_host_block_restores << ")\n";
+        ++failures;
+    }
+    // Copy calls accompany the bytes: at least one per restore and per write, never with no bytes.
+    if (host.stats.hybrid_host_restore_copies < host.stats.hybrid_host_image_restores ||
+        host.stats.hybrid_host_write_copies == 0 || device.stats.hybrid_host_restore_copies != 0) {
+        std::cerr << "restore-exact: copy counts disagree with the transfers (restore copies="
+                  << host.stats.hybrid_host_restore_copies << " write copies=" << host.stats.hybrid_host_write_copies
+                  << " device-resident restore copies=" << device.stats.hybrid_host_restore_copies << ")\n";
         ++failures;
     }
     if (device.tokens.size() != 24 || device.tokens != host.tokens) {
@@ -478,7 +568,9 @@ private:
 // saw the cancellation, and a request extending the cancelled prompt must resume from that prefix
 // and generate what an uncached run generates.
 int exercise_cancel_prefill(const char* artifact, infernix::SpeculativeBackend backend) {
-    const std::vector<infernix::TokenId> prompt = synthetic_tokens(6 * kPrefillChunk + 100, 11);
+    // Longer than idle-wide-prefill's widest first step (4,096 tokens), so the request is still
+    // prefilling when the cancellation arrives after its first step.
+    const std::vector<infernix::TokenId> prompt = synthetic_tokens(12 * kPrefillChunk + 100, 11);
     std::vector<infernix::TokenId> extended     = prompt;
     const std::vector<infernix::TokenId> suffix = synthetic_tokens(60, 12);
     extended.insert(extended.end(), suffix.begin(), suffix.end());
@@ -787,7 +879,8 @@ int main() {
     }
     const char* selected            = std::getenv("INFERNIX_HYBRID_REAL_SCENARIO");
     const std::string_view scenario = selected != nullptr && *selected != '\0' ? selected : "all";
-    constexpr std::array<std::string_view, 15> kScenarios{"all",
+    constexpr std::array<std::string_view, 16> kScenarios{"all",
+                                                          "issue29",
                                                           "restore-exact",
                                                           "restore-exact-mtp",
                                                           "restore-exact-dflash2",
@@ -808,6 +901,7 @@ int main() {
     int failures = 0;
     try {
         const bool all = scenario == "all";
+        if (all || scenario == "issue29") { failures += exercise_issue29(artifact); }
         if (all || scenario == "restore-exact") {
             failures += exercise_restore_exact(artifact, infernix::SpeculativeBackend::None);
         }
