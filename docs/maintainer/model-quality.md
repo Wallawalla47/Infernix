@@ -734,7 +734,7 @@ below and its own kernel paths, among them `expert-a4-residual`
 | Qwen3.8-Flash-Next: `q8-sliced-k`, `gdn-conv-fused`, `qsa-prepare-fused` | Q8 dense weights (`qsa-prepare-fused`: BF16, INT8, FP8, NVFP4 or K8V4 KV) | Q8 dense, 4-bit experts, every KV format (`qsa-prepare-fused`: the five it serves) |
 | `fp8-a8-pair` | row-FP8 dense weights (recipe C) | none (fails its decode tail on recipe C, below) |
 | `q4-w4a8` | groupwise Q4 MLP gate/up | none (fails, below) |
-| `idle-wide-prefill` | Qwen3.8-27B / Qwen3.6-35B-A3B generation engines | 24 heads, 4-bit activations, with INT8, NVFP4, K8V4 or K4V2 KV |
+| `idle-wide-prefill` | Qwen3.8-27B / Qwen3.6-35B-A3B generation engines | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
 | `adaptive-mtp` | Qwen3.8-27B / Qwen3.6-35B-A3B with MTP | none (no speed gain shown, below) |
 | Qwen3.8-Flash-Next: `expert-a4-residual` | artifacts with W4A16 experts (recipe C), expert calls of more than eight columns | FP8 dense, 16-bit expert activations, with INT8, FP8, NVFP4, K8V4, VQ2 or K4V2 KV (fails on BF16 KV, below) |
 
@@ -1136,12 +1136,17 @@ and recomputes the previous output) or admission (whole extents held without `pr
   | NVFP4 | 3.3e-4 (6.7e-4) / 1.4e-3 | +0.02 (0.09) / 0.45 | −3.4e-4 | 1.01 |
   | K8V4 | 2.8e-4 (9.4e-4) / 1.3e-3 | +0.05 (0.12) / 0.43 | −1.5e-3 | 1.04 |
   | K4V2 | −3.1e-4 (1.9e-4) / 1.4e-3 | −0.02 (0.04) / 0.44 | 1.3e-3 | 1.02 |
+  | BF16 (2026-10-16) | −1.0e-3 (1.2e-4) / 1.3e-3 | −0.02 (0.07) / 0.50 | 1.6e-3 | 0.86 |
+  | FP8 (2026-10-16) | −3.6e-4 (2.2e-4) / 1.3e-3 | +0.03 (0.11) / 0.50 | 9.8e-5 | 0.89 |
+  | VQ2 (2026-10-16) | −1.1e-4 (1.6e-4) / 1.6e-3 | +0.04 (0.09) / 0.50 | −9.7e-4 | 1.05 |
 
+  BF16, FP8 and VQ2 ran the same protocol a day later (the same reference; the top-1 budget is the
+  absolute floor's 0.5 points by then, though each bound is within the old 10 % budget too).
   A first run with `--fast-path idle-wide-prefill` at each chunk was void: the scoring engine
   never widened a step, so its fast runs measured only the qualified paths. The evaluation then
   needed `evaluate-prefill --fast-chunk` (fixed the same day: the pair check had required equal
   chunks).
-- **Qualified:** 24 heads, 4-bit activations, with INT8, NVFP4, K8V4 or K4V2 KV.
+- **Qualified:** 24 heads, 4-bit activations, with every KV format.
 
 **`q8-sliced-k`, `gdn-conv-fused`, `qsa-prepare-fused`: Qwen3.8-Flash-Next dense kernels (qualified 2026-10-15).**
 - **What changes:** `q8-sliced-k` runs NInfer's GEMV, sliced-K and grouped sliced-K tables for the
@@ -1242,8 +1247,13 @@ and recomputes the previous output) or admission (whole extents held without `pr
   Prefill passes on every format but BF16 (INT8 KL bound 6.61e-4 of 1.0e-3, against 4.24e-4 for
   three-term `expert-a4-residual` alone). The INT8 decode gate fails on its tail: p99.9 KL ratio
   1.35 against 1.25 (three terms alone 1.07); TV and top-1 pass (top-1 bound 4.29e-3 of 5.0e-3).
-  INT8 failing, the other formats would need decode gates of their own; none ran, and it was not
-  gated beside two-term `expert-a4-residual`. It runs in no configuration.
+  Beside two-term `expert-a4-residual` (2026-10-16, INT8 KV): prefill fails on mean KL (excess
+  1.006e-3, bound 1.14e-3 of 1.0e-3; the two-term path alone uses 0.91 of that budget), every
+  other criterion passing; decode fails its tail again (p99.9 KL ratio 1.266 against 1.25), TV and
+  top-1 passing. Both reduced-protocol misses are narrow. Speed beside two-term
+  `expert-a4-residual` (`infernix_bench`, INT8 KV, chunk 4,096, ABBA): pp32768 8,732 → 9,277 tok/s
+  (+6.2 %), pp65536 9,022 → 9,619 (+6.6 %). The other formats were not gated. It runs in no
+  configuration.
 
 **`q4-w4a8`: int8 activations in the groupwise Q4 MLP gate/up (fails; not qualified).**
 - **Selected by:** `--fast-path q4-w4a8` on artifacts whose text MLP gate/up is RowSplit

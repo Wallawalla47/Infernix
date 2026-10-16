@@ -171,8 +171,10 @@ int main() {
 
     failures += check(q::fast_path_applies(FastPath::IdleWidePrefill, int8_24, options, false),
                       "idle-wide-prefill applies where request invariance is impossible");
-    for (const KvCacheStorage kv : {KvCacheStorage::Int8Group64, KvCacheStorage::Nvfp4Group16,
-                                    KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Q4KeyVq2Value}) {
+    for (const KvCacheStorage kv : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64,
+                                    KvCacheStorage::Fp8E4M3Row256, KvCacheStorage::Nvfp4Group16,
+                                    KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2,
+                                    KvCacheStorage::Q4KeyVq2Value}) {
         failures += check(q::fast_path_qualified(FastPath::IdleWidePrefill, {24, ActivationClass::A4, kv}),
                           "idle-wide-prefill is qualified where it passed its gate");
     }

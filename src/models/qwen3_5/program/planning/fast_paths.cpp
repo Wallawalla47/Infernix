@@ -70,10 +70,13 @@ constexpr std::array kQualified{
     Qualification{FastPath::BatchedA8ResidualDecode,
                   {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value}},
     // Wider prefill steps while no lane waits to decode: the idle width (3,584) against 896- and
-    // 1,792-token chunks, prefill gate, quick corpus (2026-10-15).
+    // 1,792-token chunks, prefill gate, quick corpus (2026-10-15; BF16, FP8 and VQ2 2026-10-16).
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A4, KvCacheStorage::BFloat16}},
     Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A4, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A4, KvCacheStorage::Fp8E4M3Row256}},
     Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16}},
     Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A4, KvCacheStorage::Vq2}},
     Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value}},
     // Preemption with Replay under a two-lane pool at concurrency 8 (2026-10-14).
     Qualification{FastPath::Preemption, {24, ActivationClass::A4, KvCacheStorage::Int8Group64}},
