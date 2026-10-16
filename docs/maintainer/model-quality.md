@@ -399,6 +399,18 @@ every format, though: noise the format already carries absorbs part of it (two-t
 `expert-a4-residual` showed KL 6.8e-3 against recipe C's exact route on BF16 KV, floor 0, and
 7.8e-4 on INT8 KV), which is why its decode is measured where the floor is lowest.
 
+**Flash-Next's forced-preemption arm judges `preemption` by its increment** (since 2026-10-16): the
+default role is a fast run with the configuration's qualified paths alone, the fast role the same
+run with `preemption` added, under the same conditions and budgets. Its workload (256 contiguous
+segments of 8,200-token prompts, 6.7) cannot resolve a joint excess over the exact route: about 16
+segments sit on near-ties that any arithmetic change moves by up to 0.25 TV, so the NLL point
+estimate's standard error (about 1.6e-2) exceeds its 1.0e-2 cap. Two exact routes that differ only
+in KV format (INT8 against BF16) fail it on NLL (1.19e-2), and the dense kernel paths qualified on
+BF16 by their own protocol fail it alone (KL 1.31e-2, p99.9 ratio 1.76), while `preemption` on top
+of them passes with room (TV bound 1.9e-4, p99.9 ratio 0.93). The corpus holds at most about 480
+such segments, so a longer arm would mostly sample other text. The qualified paths keep their own
+joint gates; this arm decides only what preemption adds.
+
 ### 6.2 What is measured
 
 - **The reference** for an artifact is the same artifact with 16-bit activations in every linear
@@ -758,9 +770,10 @@ tokens. The recipe C gates (`expert-a4-residual`, `fp8-a8-pair`) are re-scored i
 | `adaptive-speculation` | the same, with speculative decoding | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
 | `free-cache-resume` | the same, with the prefix cache | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
 | `preemption` | request-invariance-capable artifacts | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
-| Qwen3.8-Flash-Next: `adaptive-speculation` (MTP), `free-cache-resume`, `preemption` | every Flash-Next artifact | INT8 KV |
+| Qwen3.8-Flash-Next: `adaptive-speculation` (MTP), `free-cache-resume` | every Flash-Next artifact | Q8 dense, 4-bit experts, with BF16, INT8, NVFP4 or VQ2 KV (FP8 and K8V4 fail, K4V2 not gated; below) |
+| Qwen3.8-Flash-Next: `preemption` | every Flash-Next artifact | Q8 dense, 4-bit experts, with BF16, INT8, FP8, NVFP4, K8V4 or VQ2 KV (K4V2 not gated) |
 | Qwen3.8-Flash-Next: `q8-sliced-k`, `gdn-conv-fused`, `qsa-prepare-fused` | Q8 dense weights (`qsa-prepare-fused`: BF16, INT8, FP8, NVFP4 or K8V4 KV) | Q8 dense, 4-bit experts, every KV format (`qsa-prepare-fused`: the five it serves) |
-| `fp8-a8-pair` | row-FP8 dense weights (recipe C) | none (fails its decode tail on recipe C, below) |
+| `fp8-a8-pair` | row-FP8 dense weights (recipe C) | none (fails its decode gate on recipe C, below) |
 | `q4-w4a8` | groupwise Q4 MLP gate/up | none (fails, below) |
 | `idle-wide-prefill` | Qwen3.8-27B / Qwen3.6-35B-A3B generation engines | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
 | `adaptive-mtp` | Qwen3.8-27B / Qwen3.6-35B-A3B with MTP | none (no speed gain shown, below) |
@@ -876,6 +889,36 @@ into a 130th), a 388-page pool (three bindings and one spare page) at concurrenc
 exact run, holding whole extents, never paused. It passes: TV excess -8.7e-5 (bound 1.0e-4) against
 5.0e-3, top-1 -0.04 points (bound 0.05) against 0.50, KL excess 3.7e-5 against a 1.9e-2 cap, p99.9 KL
 ratio 0.93.
+
+**Flash-Next on the other KV formats** (2026-10-16, RTX 5090, CUDA 13.4, NVIDIA NVFP4 Dense8, 256
+segments, the single budgets of 6.3). Two arms per format, each fast run with the format's qualified
+kernel paths. **Joint**: MTP with 4 drafts at concurrency 2, every segment resuming at 3,000 tokens
+(its whole prompt for shorter ones) from a warm request (`adaptive-speculation`,
+`free-cache-resume`, `preemption`; 255,000 prompt tokens reused per run), against one plain exact
+run at concurrency 8, the format's default for every arm (the exact route is request-invariant).
+**Preemption increment**: the forced-preemption arm above, with the qualified paths alone in the
+default role (6.1). Bounds are one-sided 95 %:
+
+| KV | Arm | TV excess (bound) / 4.0e-3 | Top-1 excess, points (bound) / 0.50 | KL excess / 1.0e-2 | NLL excess / 1.0e-2 | p99.9 KL ratio / 1.25 | Verdict |
+|---|---|---|---|---|---|---|---|
+| BF16 | joint | -2.3e-4 (6.1e-4) | -0.17 (0.18) | -1.2e-4 | -2.2e-3 | 0.97 | pass |
+| BF16 | preemption increment | -2.9e-4 (1.9e-4) | -0.16 (0.07) | -8.0e-4 | 2.0e-3 | 0.93 | pass |
+| FP8 | joint | -6.9e-5 (7.2e-4) | +0.45 (**0.83**) | -1.4e-4 | -4.3e-3 | 1.08 | **fails** |
+| FP8 | preemption increment | -3.7e-4 (1.9e-4) | -0.12 (0.13) | -8.1e-4 | -1.6e-3 | 0.95 | pass |
+| NVFP4 | joint | 6.4e-4 (1.5e-3) | +0.01 (0.39) | 6.9e-4 | -1.2e-3 | 1.03 | pass |
+| NVFP4 | preemption increment | 1.9e-4 (7.7e-4) | +0.04 (0.28) | -5.6e-4 | -4.9e-4 | 0.96 | pass |
+| K8V4 | joint | 3.8e-4 (1.2e-3) | +0.09 (**0.51**) | 1.1e-3 | 1.7e-4 | **1.33** | **fails** |
+| K8V4 | preemption increment | 4.3e-4 (9.4e-4) | -0.08 (0.16) | 1.7e-5 | 3.0e-3 | 0.98 | pass |
+| VQ2 | joint | 1.4e-4 (8.3e-4) | -0.02 (0.36) | 5.3e-4 | 7.0e-4 | 1.23 | pass |
+| VQ2 | preemption increment | -3.7e-5 (4.8e-4) | -0.01 (0.22) | 1.2e-3 | 9.9e-5 | 1.07 | pass |
+
+Every prompt-length bucket passes. `adaptive-speculation` and `free-cache-resume` are therefore
+qualified on BF16, NVFP4 and VQ2 and not on FP8 or K8V4; `preemption` (which acts only in its own
+arm) on all five. Which path carries the FP8 and K8V4 excess is not resolved: the joint fast run
+also holds the format's kernel paths, whose decode was gated on BF16 and NVFP4 only. K4V2 is not
+gated yet. Before the increment rule, the BF16 forced-preemption arm against the exact route failed
+(TV bound 4.57e-3, KL excess 1.23e-2, p99.9 ratio 1.63), and the kernel paths alone failed it the same
+way; its exact route was bit-identical with and without the short pool and across reruns (6.1).
 
 Every prompt-length bucket and p99.9 KL ratio passes too (largest ratio 1.13, 27B K8V4 spec). The
 closest bound is 27B NVFP4 spec's top-1 at 82 % of its budget. Speed (official 27B, INT8 KV, 2,048
@@ -1278,8 +1321,13 @@ and recomputes the previous output) or admission (whole extents held without `pr
   Beside two-term `expert-a4-residual` (2026-10-16, INT8 KV): prefill KL excess 1.006e-3 (bound
   1.14e-3), which failed the 1.0e-3 budget it was gated under and passes the single 1.5e-3 budget,
   every other criterion passing; decode fails its tail again (p99.9 KL ratio 1.266 against 1.25),
-  TV and top-1 passing. The p99.9 of 256 segments rests on about 16 positions, so a decode gate over
-  1,024 segments, whose verdict alone counts, is queued. Speed beside two-term
+  TV and top-1 passing. The p99.9 of 256 segments rests on about 16 positions, so the INT8 decode
+  gate was repeated over 1,024 segments (65,536 forced positions per route), its verdict alone
+  counting: it fails three criteria (2026-10-16). Top-1 disagreement excess bound 5.31e-3 against
+  5.0e-3, forced-token NLL excess 1.23e-2 against the 1.0e-2 cap, p99.9 KL ratio 1.261 against
+  1.25; TV excess bound 3.36e-3 of 4.0e-3, KL excess 2.8e-3 of 1.0e-2 and every prompt length pass
+  (floor: KL 2.11e-2, TV 3.91e-2, top-1 3.67 points). The fuller sample confirmed the tail and
+  moved top-1 and NLL past their limits, so it is not a small-sample artifact. Speed beside two-term
   `expert-a4-residual` (`infernix_bench`, INT8 KV, chunk 4,096, ABBA): pp32768 8,732 → 9,277 tok/s
   (+6.2 %), pp65536 9,022 → 9,619 (+6.6 %). The other formats were not gated. It runs in no
   configuration.

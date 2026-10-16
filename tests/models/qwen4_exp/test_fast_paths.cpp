@@ -71,6 +71,28 @@ int main() {
     failures += check(!q::fast_path_qualified(FastPath::Fp8A8Pair, {QType::FP8_E4M3FN_ROW_BF16, true, KvCacheStorage::Int8Group64}),
                       "fp8-a8-pair is qualified at op level only, not on any artifact");
 
+    // The request-coupling paths, per KV format: speculation and cache resume passed their joint arm
+    // on these formats (FP8's and K8V4's failed), preemption its increment arm on these; K4V2 is not
+    // gated yet.
+    struct Coupling {
+        KvCacheStorage kv;
+        bool spec_and_cache;
+        bool preemption;
+    };
+    for (const Coupling& c : {Coupling{KvCacheStorage::BFloat16, true, true}, Coupling{KvCacheStorage::Int8Group64, true, true},
+                              Coupling{KvCacheStorage::Fp8E4M3Row256, false, true},
+                              Coupling{KvCacheStorage::Nvfp4Group16, true, true},
+                              Coupling{KvCacheStorage::Fp8KeyNvfp4Value, false, true},
+                              Coupling{KvCacheStorage::Vq2, true, true},
+                              Coupling{KvCacheStorage::Q4KeyVq2Value, false, false}}) {
+        const FastPathConfiguration config{QType::Q8_G32_FP16, true, c.kv};
+        failures += check(q::fast_path_qualified(FastPath::AdaptiveSpeculation, config) == c.spec_and_cache &&
+                              q::fast_path_qualified(FastPath::FreeCacheResume, config) == c.spec_and_cache,
+                          "adaptive-speculation and free-cache-resume follow their joint arm per KV format");
+        failures += check(q::fast_path_qualified(FastPath::Preemption, config) == c.preemption,
+                          "preemption follows its increment arm per KV format");
+    }
+
     q::FastPathSelection selection{.configuration = dense8, .paths = {}};
     const auto exact = selection.forward();
     failures += check(exact.dense_routes == infernix::ops::LinearRoutes::Exact && !exact.gdn_conv_fused &&

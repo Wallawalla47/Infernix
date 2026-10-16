@@ -9572,7 +9572,7 @@ KV format the same day; model-quality.md 6.7):
   - Error: 0.78 of the A16 criterion.
   - Admitted per shape where it is faster: [16384, 2560] from T = 17, [13312, 2560] from 97,
     [2560, 6144] and [2560, 640] from 513, [1280, 2560] from 1,025.
-  - Gated on the recipe C artifact on 2026-10-15 (beside three-term `expert-a4-residual`, §19.3.23): prefill passes on every format but BF16, the INT8 decode gate fails its tail (p99.9 KL ratio 1.35 against 1.25); beside two-term `expert-a4-residual` (2026-10-16) INT8 fails prefill KL narrowly (bound 1.14e-3 of 1.0e-3) and the decode tail (1.266 against 1.25) for +6.2-6.6 % prefill; not qualified (model-quality.md 6.7).
+  - Gated on the recipe C artifact on 2026-10-15 (beside three-term `expert-a4-residual`, §19.3.23): prefill passes on every format but BF16, the INT8 decode gate fails its tail (p99.9 KL ratio 1.35 against 1.25); beside two-term `expert-a4-residual` (2026-10-16) INT8 fails prefill KL narrowly (bound 1.14e-3 of 1.0e-3; it passes the later single 1.5e-3 budget) and the decode tail (1.266 against 1.25) for +6.2-6.6 % prefill. The INT8 decode gate over 1,024 segments (2026-10-16) fails top-1 (bound 5.31e-3 of 5.0e-3), the NLL cap (1.23e-2 of 1.0e-2) and the tail (1.261); not qualified (model-quality.md 6.7).
 
 ### 19.3.23 Ideas from sergqwer/strata-nvfp4 (2026-10-14)
 
