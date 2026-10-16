@@ -2,6 +2,7 @@
 
 #include "models/qwen3_5/execution/parameters.h"
 #include "models/qwen3_5/program/program.h"
+#include "infernix/ops/gated_delta_net.h"
 #include "infernix/ops/softmax_attention.h"
 
 #include <cstddef>
@@ -52,6 +53,8 @@ struct ExecutionSchedule {
     // adaptive-mtp: MTP rounds choose their draft length (only where speculation is adaptive).
     bool adaptive_mtp                 = false;
     ops::LinearRoutes linear_routes   = ops::LinearRoutes::Exact;
+    // gdn-f16-accumulate: the chunked GDN calls' arithmetic.
+    ops::GdnChunkArithmetic gdn_arithmetic = ops::GdnChunkArithmetic::Exact;
 
     // A prefill chunk's envelope.
     [[nodiscard]] ops::CausalAttentionExecutionEnvelope

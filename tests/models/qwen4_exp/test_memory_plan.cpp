@@ -235,6 +235,7 @@ void test_graph_bound() {
     require(graph_bound(1, 8, 3) == 1 + 8 + 8 + 3, "C = 1, W = 8 with MTP 3");
     require(graph_bound(2, 16, 0) == 2 + 32, "n-gram only: decode and verification graphs");
     require(graph_bound(8, 16, 7) == 320, "C = 8 with MTP 7 and n-gram 15");
+    require(graph_bound(8, 16, 7, true) == 320 + 56, "sampled drafts: a second draft graph per batch size and step");
 }
 
 void test_display_headroom() {

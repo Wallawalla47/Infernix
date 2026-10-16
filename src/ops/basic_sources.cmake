@@ -12,6 +12,7 @@ target_sources(infernix_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/launcher/mtp_pack.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/mtp_round.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/speculative_round.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/launcher/speculative_sample_drafts.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/state_codec.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/position.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/prepare_ragged_prefix.cu"

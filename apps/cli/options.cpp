@@ -166,6 +166,8 @@ std::string usage_text(const char* argv0) {
            "                           for this model's activation precision and KV type\n"
            "                           runs (within Infernix's numerical quality policy;\n"
            "                           startup lists them; docs/cli.md)\n"
+           "  --fast-path NAME         also run this fast path, qualified or not\n"
+           "                           (qualification runs; repeatable)\n"
            "\n"
            "SPECULATIVE DECODING (off by default)\n"
            "  --spec mtp|dflash|dflash2 speculative backend\n"
@@ -399,6 +401,11 @@ Options parse_options(int argc, char** argv) {
             options.original_nvfp4_prefill_kernel = true;
         } else if (arg == "--disable-fast-paths") {
             options.fast_paths = false;
+        } else if (arg == "--fast-path") {
+            const std::string name(value(arg));
+            const std::optional<FastPath> path = parse_fast_path(name);
+            if (!path) { throw std::invalid_argument("unknown fast path: " + name); }
+            options.fast_path_candidates.push_back(*path);
         } else if (arg == "--stop-token-id") {
             const std::uint32_t token = parse_u32(value(arg), "stop-token-id", true);
             if (token > static_cast<std::uint32_t>(std::numeric_limits<TokenId>::max())) {

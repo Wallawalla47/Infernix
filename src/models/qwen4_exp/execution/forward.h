@@ -16,6 +16,7 @@
 #include "infernix/ops/offloaded_sparse_moe.h"
 #include "infernix/ops/qsa.h"
 #include "infernix/ops/rope.h"
+#include "infernix/ops/sampling.h"
 
 #include <array>
 #include <cstdint>
@@ -201,6 +202,16 @@ struct MtpCall {
     // Optional: each draft's log-probability under the draft head (FP32 [1, T]), the confidence
     // a draft-length cut reads.
     Tensor draft_logprobs;
+    // Sampled drafts (the sampled-mtp-drafts fast path): with sample_configs (device, one per
+    // column), each draft is drawn from the draft head's top sample_rows.ne[0] rows under its
+    // column's sampler, keyed by `positions` and the round's draft step (positions clamp at the
+    // lane's last mapped cell, so steps may share one; ops::speculative_sample_sparse_drafts; a
+    // greedy column keeps the argmax). sample_rows / sample_logprobs (I32 / FP32 [n, T]) are the
+    // top-n scratch; draft_candidates / draft_q (I32 / FP32 [16, T]) receive the proposal the sparse
+    // acceptance verifies, and draft_logprobs the top row's log-probability.
+    const ops::SamplingConfig* sample_configs = nullptr;
+    std::uint32_t draft_step                  = 0;
+    Tensor sample_rows, sample_logprobs, draft_candidates, draft_q;
     // Cells whose next token is an image token take its visual embedding (prompt cells only).
     const VisionInput* vision = nullptr;
 };

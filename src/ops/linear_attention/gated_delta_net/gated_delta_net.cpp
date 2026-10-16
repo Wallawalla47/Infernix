@@ -214,9 +214,10 @@ std::size_t gated_delta_net_workspace_capacity_bytes(std::int32_t qk_heads,
 
 void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                      const Tensor& beta, float scale, bool normalize_qk, WorkspaceArena& ws,
-                     Tensor& ssm_state, Tensor& out, DeviceExecutionView execution) {
+                     Tensor& ssm_state, Tensor& out, DeviceExecutionView execution,
+                     GdnChunkArithmetic arithmetic) {
     gated_delta_net(q, k, v, g, beta, scale, normalize_qk, ws, ssm_state, ssm_state, out,
-                    execution);
+                    execution, arithmetic);
 }
 
 void gated_delta_net_batch_update(const Tensor& q, const Tensor& k, const Tensor& v,
@@ -249,10 +250,14 @@ void gated_delta_net_batch_update_gating(const Tensor& q, const Tensor& k, const
 void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                      const Tensor& beta, float scale, bool normalize_qk, WorkspaceArena& ws,
                      const Tensor& ssm_state_in, Tensor& ssm_state_out, Tensor& out,
-                     DeviceExecutionView execution) {
+                     DeviceExecutionView execution, GdnChunkArithmetic arithmetic) {
     validate_chunked(q, k, v, g, beta, scale, ssm_state_in, ssm_state_out, out);
     if (execution.multiprocessor_count <= 0) {
         throw std::invalid_argument("gated_delta_net: invalid SM count");
+    }
+    const bool fp16 = arithmetic == GdnChunkArithmetic::Fp16Accumulate;
+    if (fp16 && !normalize_qk) {
+        throw std::invalid_argument("gated_delta_net: FP16 accumulation requires normalize_qk");
     }
     namespace chunked = detail::gated_delta_net::chunked;
     if (q.ne[2] < chunked::kMinTokens) {
@@ -278,8 +283,8 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
                                   v.ne[1],
                                   q.ne[2],
                                   scale};
-    chunked::launch_prepare(args, qk, control, normalize_qk, execution.stream);
-    chunked::launch_recurrence(args, qk, control, execution);
+    chunked::launch_prepare(args, qk, control, normalize_qk, execution.stream, fp16);
+    chunked::launch_recurrence(args, qk, control, execution, fp16);
 }
 
 } // namespace infernix::ops

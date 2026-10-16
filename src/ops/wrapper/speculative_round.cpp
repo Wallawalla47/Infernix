@@ -181,6 +181,32 @@ void speculative_overlay_copy_proposals(const Tensor& copy_rows, const Tensor& c
                                                       stream);
 }
 
+void speculative_sample_sparse_drafts(const Tensor& rows, const Tensor& logprobs, const std::int32_t* token_ids,
+                                      const SamplingConfig* configs, const Tensor& positions, std::uint32_t draw,
+                                      Tensor& drafts,
+                                      Tensor& candidate_ids, Tensor& proposal_q, Tensor& confidence,
+                                      cudaStream_t stream) {
+    constexpr const char* op = "speculative_sample_sparse_drafts";
+    const std::int32_t count   = rows.ne[0];
+    const std::int32_t columns = rows.ne[1];
+    if (count < 1 || count > kSparseCandidates) {
+        throw std::invalid_argument("speculative_sample_sparse_drafts: rows must hold 1..16 ranks");
+    }
+    if (columns < 1 || columns > kSparseMaxBatch) {
+        throw std::invalid_argument("speculative_sample_sparse_drafts: T must be 1..8");
+    }
+    if (configs == nullptr) { throw std::invalid_argument("speculative_sample_sparse_drafts: configs must be non-null"); }
+    require_matrix(rows, DType::I32, count, columns, op, "rows");
+    require_matrix(logprobs, DType::FP32, count, columns, op, "logprobs");
+    require_vector(positions, DType::I32, columns, op, "positions");
+    require_vector(drafts, DType::I32, columns, op, "drafts");
+    require_matrix(candidate_ids, DType::I32, kSparseCandidates, columns, op, "candidate_ids");
+    require_matrix(proposal_q, DType::FP32, kSparseCandidates, columns, op, "proposal_q");
+    if (confidence.data != nullptr) { require_vector(confidence, DType::FP32, columns, op, "confidence"); }
+    detail::speculative_sample_sparse_drafts_launch(rows, logprobs, token_ids, configs, positions, draw, drafts,
+                                                    candidate_ids, proposal_q, confidence, stream);
+}
+
 void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor& logits,
                                       const Tensor& drafts, const Tensor& current_extents,
                                       Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens,

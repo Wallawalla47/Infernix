@@ -3,6 +3,8 @@
 #include "ops/common/mma.cuh"
 #include "ops/common/warp.cuh"
 
+#include <stdexcept>
+
 namespace infernix::ops::detail::gated_delta_net::chunked {
 namespace {
 
@@ -14,7 +16,8 @@ struct PrepareShared {
     float lower[kChunkSize * kChunkSize];
 };
 
-template <bool Normalize>
+// Fp16Packet (GdnChunkArithmetic::Fp16Accumulate): the packet's 16-bit elements hold FP16.
+template <bool Normalize, bool Fp16Packet = false>
 __global__
 __launch_bounds__(256, 2) void prepare_kernel(Arguments args, QkChunk* __restrict__ qk_workspace,
                                               ControlChunk* __restrict__ control_workspace) {
@@ -56,8 +59,15 @@ __launch_bounds__(256, 2) void prepare_kernel(Arguments args, QkChunk* __restric
     }
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
-        sm.qk.q[vector_index(row, col + i)] = __float2bfloat16_rn(q[i]);
-        sm.qk.k[vector_index(row, col + i)] = __float2bfloat16_rn(k[i]);
+        if constexpr (Fp16Packet) {
+            sm.qk.q[vector_index(row, col + i)] =
+                __ushort_as_bfloat16(__half_as_ushort(__float2half_rn(q[i])));
+            sm.qk.k[vector_index(row, col + i)] =
+                __ushort_as_bfloat16(__half_as_ushort(__float2half_rn(k[i])));
+        } else {
+            sm.qk.q[vector_index(row, col + i)] = __float2bfloat16_rn(q[i]);
+            sm.qk.k[vector_index(row, col + i)] = __float2bfloat16_rn(k[i]);
+        }
     }
     if (tid < 32) sm.control.padding[tid] = 0;
     if (tid < kChunkSize) {
@@ -92,8 +102,12 @@ __launch_bounds__(256, 2) void prepare_kernel(Arguments args, QkChunk* __restric
                 ldmatrix_x2(bf[0], bf[1],
                             smem_addr(sm.qk.k + vector_index(n * 8 + (lane & 7),
                                                              offset + ((lane >> 3) & 1) * 8)));
-                mma_bf16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], af[0], af[1], af[2], af[3],
-                         bf[0], bf[1]);
+                if constexpr (Fp16Packet)
+                    mma_f16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], af[0], af[1], af[2], af[3],
+                            bf[0], bf[1]);
+                else
+                    mma_bf16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], af[0], af[1], af[2],
+                             af[3], bf[0], bf[1]);
             }
         }
 #pragma unroll
@@ -148,10 +162,15 @@ __launch_bounds__(256, 2) void prepare_kernel(Arguments args, QkChunk* __restric
 } // namespace
 
 void launch_prepare(const Arguments& args, QkChunk* qk, ControlChunk* control, bool normalize_qk,
-                    cudaStream_t stream) {
+                    cudaStream_t stream, bool fp16) {
     const unsigned blocks = static_cast<unsigned>(static_cast<std::int64_t>(args.value_heads) *
                                                   chunk_count(args.tokens));
-    if (normalize_qk)
+    if (fp16) {
+        if (!normalize_qk) {
+            throw std::invalid_argument("gated_delta_net: FP16 Q/K packets require normalize_qk");
+        }
+        prepare_kernel<true, true><<<blocks, 256, 0, stream>>>(args, qk, control);
+    } else if (normalize_qk)
         prepare_kernel<true><<<blocks, 256, 0, stream>>>(args, qk, control);
     else
         prepare_kernel<false><<<blocks, 256, 0, stream>>>(args, qk, control);

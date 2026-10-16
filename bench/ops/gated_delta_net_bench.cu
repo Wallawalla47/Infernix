@@ -576,11 +576,11 @@ std::vector<BenchRow> run_prefill(const Options& options, std::int32_t tokens,
                                                          prep_io.intermediate + rec_io.intermediate}
                                           : TrafficBytes{running_logical_bytes(problem), 0};
     auto prepare                = [&](cudaStream_t stream) {
-        chunked_detail::launch_prepare(args, qk, control, normalize, stream);
+        chunked_detail::launch_prepare(args, qk, control, normalize, stream, /*fp16=*/false);
     };
     auto recurrence = [&](cudaStream_t stream) {
         chunked_detail::launch_recurrence(args, qk, control,
-                                          {stream, execution.multiprocessor_count});
+                                          {stream, execution.multiprocessor_count}, /*fp16=*/false);
     };
     auto pipeline = [&](cudaStream_t stream) {
         if (force_chunked) {

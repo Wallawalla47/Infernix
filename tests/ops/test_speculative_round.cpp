@@ -1684,6 +1684,188 @@ int onehot_distribution_case(int k, bool graph, bool mtp_onehot = false, int for
     return failures;
 }
 
+// sampling_uniform's host oracle (SparseAcceptSuite::oracle_uniform with a sub-key).
+float draft_uniform(std::uint64_t seed, int position, int purpose, std::uint32_t sub) {
+    const auto mix = [](std::uint64_t value) {
+        value += 0x9E3779B97F4A7C15ull;
+        value = (value ^ (value >> 30)) * 0xBF58476D1CE4E5B9ull;
+        value = (value ^ (value >> 27)) * 0x94D049BB133111EBull;
+        return value ^ (value >> 31);
+    };
+    std::uint64_t key = mix(seed ^ (static_cast<std::uint64_t>(static_cast<std::uint32_t>(position)) *
+                                    0xD1B54A32D192ED03ull));
+    key = mix(key ^ (static_cast<std::uint64_t>(static_cast<std::uint32_t>(purpose)) << 21) ^
+              (static_cast<std::uint64_t>(sub) * 0x2545F4914F6CDD1Dull));
+    return static_cast<float>(static_cast<std::uint32_t>(key >> 40)) * (1.0f / 16777216.0f);
+}
+
+// speculative_sample_sparse_drafts against an FP64 oracle of its contract: candidates and fillers
+// exactly, q within 2e-6, and each draft the oracle's rank for the same uniform (a draw within 1e-5
+// of a cumulative boundary may round either way). Then 20,000 draws of one column against q.
+int sample_sparse_drafts_case() {
+    constexpr int S            = ops::kSparseSpeculativeCandidates;
+    constexpr std::uint32_t kDraw = 3; // a chained draft step's sub-key
+    int failures    = 0;
+    DeviceContext context;
+    struct Column {
+        float temperature;
+        std::int32_t top_k;
+        float top_p, min_p;
+    };
+    const std::vector<Column> columns{{0.0F, 20, 1.0F, 0.0F}, {1.0F, 20, 0.95F, 0.0F}, {0.7F, 2, 1.0F, 0.3F},
+                                      {1.3F, 0, 0.5F, 0.0F},  {1.0F, 0, 1.0F, 0.2F},   {0.6F, 3, 0.9F, 0.0F},
+                                      {2.0F, 0, 1.0F, 0.0F},  {1.0F, 1, 1.0F, 0.0F}};
+    const auto oracle_q = [](const Column& c, const float* lp, int n, std::vector<double>& q) {
+        q.assign(S, 0.0);
+        if (!(c.temperature > 0.0F)) {
+            q[0] = 1.0;
+            return 1;
+        }
+        const int ranks = c.top_k > 0 && c.top_k < n ? c.top_k : n;
+        std::vector<double> w(ranks);
+        double total = 0;
+        for (int j = 0; j < ranks; ++j) {
+            w[j] = std::exp((static_cast<double>(lp[j]) - lp[0]) / c.temperature);
+            total += w[j];
+        }
+        double mass = 0;
+        int support = 0;
+        for (int j = 0; j < ranks; ++j) {
+            if (c.min_p > 0.0F && w[j] < c.min_p * w[0]) { break; }
+            mass += w[j];
+            support = j + 1;
+            if (c.top_p < 1.0F && mass >= c.top_p * total) { break; }
+        }
+        if (support == 0) {
+            support = 1;
+            mass    = w[0];
+        }
+        for (int j = 0; j < support; ++j) { q[j] = w[j] / mass; }
+        return support;
+    };
+    for (const int n : {4, 16}) {
+        const int T = static_cast<int>(columns.size());
+        std::vector<std::int32_t> rows(n * T), positions(T), map(64);
+        std::vector<float> lp(n * T);
+        std::vector<ops::SamplingConfig> configs(T);
+        for (int i = 0; i < 64; ++i) { map[i] = 1000 + 37 * i; }
+        for (int t = 0; t < T; ++t) {
+            float value = -0.3F - 0.05F * t;
+            for (int j = 0; j < n; ++j) {
+                rows[t * n + j] = (7 * j + 3 * t) % 64;
+                lp[t * n + j]   = value;
+                value -= 0.15F + 0.11F * static_cast<float>((j * 5 + t) % 7);
+            }
+            positions[t]             = 4096 + 17 * t;
+            configs[t].temperature   = columns[t].temperature;
+            configs[t].top_k         = columns[t].top_k;
+            configs[t].top_p         = columns[t].top_p;
+            configs[t].min_p         = columns[t].min_p;
+            configs[t].seed          = 911 + t;
+        }
+        const bool mapped = n == 4;
+        DeviceBuffer d_rows = to_device(rows), d_lp = to_device(lp), d_positions = to_device(positions),
+                     d_configs = to_device(configs), d_map = to_device(map);
+        GuardedDeviceBuffer d_drafts(4ULL * T), d_candidates(4ULL * S * T), d_q(4ULL * S * T), d_confidence(4ULL * T);
+        Tensor r(d_rows.p, DType::I32, {n, T}), l(d_lp.p, DType::FP32, {n, T}), p(d_positions.p, DType::I32, {T});
+        Tensor drafts(d_drafts.data(), DType::I32, {T}), candidates(d_candidates.data(), DType::I32, {S, T});
+        Tensor q(d_q.data(), DType::FP32, {S, T}), confidence(d_confidence.data(), DType::FP32, {T});
+        ops::speculative_sample_sparse_drafts(r, l, mapped ? static_cast<const std::int32_t*>(d_map.p) : nullptr,
+                                              static_cast<const ops::SamplingConfig*>(d_configs.p), p, kDraw,
+                                              drafts, candidates, q, confidence, context.stream);
+        context.synchronize();
+        const auto got_drafts     = read<std::int32_t>(d_drafts, T);
+        const auto got_candidates = read<std::int32_t>(d_candidates, S * T);
+        const auto got_q          = read<float>(d_q, S * T);
+        const auto got_confidence = read<float>(d_confidence, T);
+        std::vector<double> want_q;
+        for (int t = 0; t < T; ++t) {
+            std::vector<std::int32_t> ids(S);
+            for (int j = 0; j < n; ++j) { ids[j] = mapped ? map[rows[t * n + j]] : rows[t * n + j]; }
+            for (int j = n, next = 0; j < S; ++j) {
+                while (std::find(ids.begin(), ids.begin() + j, next) != ids.begin() + j) { ++next; }
+                ids[j] = next++;
+            }
+            const int support = oracle_q(columns[t], &lp[t * n], n, want_q);
+            bool ok           = got_confidence[t] == lp[t * n];
+            for (int s = 0; s < S; ++s) {
+                ok = ok && got_candidates[t * S + s] == ids[s] && std::abs(got_q[t * S + s] - want_q[s]) <= 2e-6;
+            }
+            const double u = draft_uniform(configs[t].seed, positions[t], ops::kSamplePurposeDFlash2Proposal, kDraw);
+            int pick = support - 1;
+            double cumulative = 0, nearest = 1;
+            for (int j = 0; j < support; ++j) {
+                cumulative += want_q[j];
+                nearest = std::min(nearest, std::abs(u - cumulative));
+                if (u < cumulative) {
+                    pick = j;
+                    break;
+                }
+            }
+            const bool draft_ok = !(columns[t].temperature > 0.0F) ? got_drafts[t] == ids[0]
+                                                                   : got_drafts[t] == ids[pick] || nearest < 1e-5;
+            if (!ok || !draft_ok) {
+                ++failures;
+                std::cerr << "sample_sparse_drafts n=" << n << " column " << t << " mismatch (draft "
+                          << got_drafts[t] << ", oracle " << ids[pick] << ")\n";
+            }
+        }
+        failures += d_drafts.verify_guards("sample_sparse_drafts drafts");
+        failures += d_candidates.verify_guards("sample_sparse_drafts candidates");
+        failures += d_q.verify_guards("sample_sparse_drafts q");
+        failures += d_confidence.verify_guards("sample_sparse_drafts confidence");
+    }
+    // Frequencies: 8 identical columns at consecutive positions, 2,500 launches.
+    {
+        constexpr int T = 8, n = 6, launches = 2500;
+        const Column column{0.8F, 0, 0.97F, 0.0F};
+        std::vector<std::int32_t> rows(n * T), positions(T);
+        std::vector<float> lp(n * T);
+        std::vector<ops::SamplingConfig> configs(T);
+        const float base[n] = {-0.4F, -1.2F, -1.5F, -2.3F, -3.0F, -4.5F};
+        for (int t = 0; t < T; ++t) {
+            for (int j = 0; j < n; ++j) {
+                rows[t * n + j] = j;
+                lp[t * n + j]   = base[j];
+            }
+            configs[t].temperature = column.temperature;
+            configs[t].top_p       = column.top_p;
+            configs[t].top_k       = 0;
+            configs[t].seed        = 77;
+        }
+        std::vector<double> q;
+        oracle_q(column, base, n, q);
+        DeviceBuffer d_rows = to_device(rows), d_lp = to_device(lp), d_configs = to_device(configs);
+        DeviceBuffer d_positions(4ULL * T), d_drafts(4ULL * T), d_candidates(4ULL * S * T), d_q(4ULL * S * T);
+        Tensor r(d_rows.p, DType::I32, {n, T}), l(d_lp.p, DType::FP32, {n, T}), p(d_positions.p, DType::I32, {T});
+        Tensor drafts(d_drafts.p, DType::I32, {T}), candidates(d_candidates.p, DType::I32, {S, T});
+        Tensor proposal(d_q.p, DType::FP32, {S, T}), none;
+        std::vector<std::uint64_t> counts(S, 0);
+        std::vector<std::int32_t> got(T);
+        for (int launch = 0; launch < launches; ++launch) {
+            for (int t = 0; t < T; ++t) { positions[t] = launch * T + t; }
+            CUDA_CHECK(cudaMemcpyAsync(d_positions.p, positions.data(), 4ULL * T, cudaMemcpyHostToDevice, context.stream));
+            ops::speculative_sample_sparse_drafts(r, l, nullptr, static_cast<const ops::SamplingConfig*>(d_configs.p), p,
+                                                  0, drafts, candidates, proposal, none, context.stream);
+            CUDA_CHECK(cudaMemcpyAsync(got.data(), d_drafts.p, 4ULL * T, cudaMemcpyDeviceToHost, context.stream));
+            context.synchronize();
+            for (const std::int32_t id : got) { ++counts[id >= 0 && id < S ? id : S - 1]; }
+        }
+        const double draws = static_cast<double>(launches) * T;
+        for (int j = 0; j < S; ++j) {
+            const double expected = draws * q[j];
+            const double bound    = 6 * std::sqrt(draws * q[j] * (1 - q[j])) + 2;
+            if (std::abs(static_cast<double>(counts[j]) - expected) > bound) {
+                ++failures;
+                std::cerr << "sample_sparse_drafts frequency of rank " << j << ": " << counts[j] << " for "
+                          << expected << " expected\n";
+            }
+        }
+    }
+    std::cout << "sample_sparse_drafts failures=" << failures << '\n';
+    return failures;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -1854,6 +2036,7 @@ int main(int argc, char** argv) {
     failures += greedy_penalty_case(257);
     failures += deterministic_sampling_case();
     failures += batched_sampling_workspace_stride_case();
+    failures += sample_sparse_drafts_case();
     std::size_t sparse_peak = 0;
     for (int k = 1; k <= 31; ++k) {
         for (int batch = 1; batch <= 8; ++batch) {

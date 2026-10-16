@@ -9774,6 +9774,18 @@ bit-identical greedy output, plain decode 397.4 → 398.6 tok/s (every four-bloc
   queue), finished before A, and its output equals its solo run; A took 19.2 s instead of 15.4 s. The
   reclaim returns the leases only when the pool's capacity has room for the growth (at a full
   `--max-context 150000` it had returned 4,221 frames for nothing).
+- A built-in calibrated expert order seeds the warm start (S4b) when no saved state exists: NInfer's
+  `kFlashNextExpertPriority` (f8a774f73; 48 layers × 512 experts ranked over 128 tasks in nine
+  domains), copied into `expert_cache/calibrated_order.cpp` and applied to every model of its shape
+  (NInfer's guard: hidden 2,560, 48 layers, 512 experts, top-10, intermediate 640). Counts are the
+  ranks reversed (capped at the seed cap like any saved count) and the ranking interleaves the layers.
+  Measured as a state file against an empty cache (fresh process, first request, 256 greedy tokens,
+  MTP 4, two runs each): decode on a code prompt 147.6 → 161.3 tok/s (+9 %), on an AIME problem
+  129.8 → 149.4 (+15 %), with the SSD tier (30 GB of RAM slots) 53.8 → 83.9 (+56 %, prefill 29 → 46
+  tok/s). This machine's own saved state gave −4 % on the code prompt and +28 % on AIME, so the seed
+  is the calibrated order, not a single session's state.
+  It replaces shipping a profile in the artifact (kido5217 PR #28): every existing artifact gets it.
+  A saved state still wins, and `--expert-state off` (and `infernix_bench`) still starts empty.
 
 **Built, measured and not adopted (2026-10-16):**
 - A 32,768-token prefill chunk: pp32768 11,173 → 11,596 tok/s (+3.8 %), pp65536 11,274 → 10,627

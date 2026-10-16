@@ -25,6 +25,7 @@
 #include "models/qwen4_exp/memory_plan.h"
 #include "models/qwen4_exp/program/expert_residency.h"
 #include "models/qwen4_exp/program/host_expert_tier.h"
+#include "models/qwen4_exp/program/expert_cache/calibrated_order.h"
 #include "models/qwen4_exp/program/expert_cache/expert_state.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
 #include "models/qwen4_exp/program/prefix/call_plan.h"
@@ -65,6 +66,7 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <utility>
 
 namespace infernix::models::qwen4_exp {
 namespace detail {
@@ -248,11 +250,19 @@ struct SpecLayout {
 
 // I32 MTP drafter io: chain ids [B], cells [K, B], per draft step the cells' RoPE positions and
 // pooled-block starts [K][3][B] (axis-major per step), drafts [K, B], catch-up ids [W, B], gather
-// columns [B], catch-up cells [W, B]. Everything before `drafts` is uploaded per draft round.
+// columns [B], catch-up cells [W, B], the drafts' FP32 log-probabilities [K, B]. Everything before
+// `drafts` is uploaded per draft round. Sampled drafts add, per draft step, the head's top ranks
+// and their FP32 log-probabilities [kSampledDraftRanks, B] and the proposal's candidates and FP32 q
+// [16, B] (step j at j * rows * B), then the verify layout of candidates and q [16, W - 1, B].
 struct MtpIo {
     std::size_t ids = 0, cells = 0, rope_cells = 0, block_rope_cells = 0, drafts = 0, up_ids = 0, gather = 0,
-                up_cells = 0, logprobs = 0, words = 0;
+                up_cells = 0, logprobs = 0, sample_rows = 0, sample_logprobs = 0, draft_candidates = 0, draft_q = 0,
+                verify_candidates = 0, verify_q = 0, words = 0;
 };
+
+// Sampled MTP drafts (sampled-mtp-drafts) draw from the draft head's four most probable tokens:
+// measured against 8 and 16 at T 1.0 / top-p 0.95 / top-k 20 (design §19.3.24).
+inline constexpr std::int32_t kSampledDraftRanks = 4;
 
 // Every fixed device allocation of a Program and the layouts in it (design §19.3.7). One function
 // (ProgramImpl::plan_device) computes it from the options and the configuration alone: before the
@@ -564,7 +574,17 @@ public:
             d.mtp_io.gather    = d.mtp_io.up_ids + static_cast<std::size_t>(lanes) * W;
             d.mtp_io.up_cells  = d.mtp_io.gather + lanes;
             d.mtp_io.logprobs  = d.mtp_io.up_cells + static_cast<std::size_t>(lanes) * W;
-            d.mtp_io.words     = d.mtp_io.logprobs + lanes * k;
+            // Sampled drafts (sampled-mtp-drafts; planned whether or not it runs, a few KiB).
+            const auto ranks      = static_cast<std::size_t>(kSampledDraftRanks);
+            const auto candidates = static_cast<std::size_t>(ops::kSparseSpeculativeCandidates);
+            const auto verified   = static_cast<std::size_t>(lanes) * static_cast<std::size_t>(W - 1);
+            d.mtp_io.sample_rows       = d.mtp_io.logprobs + lanes * k;
+            d.mtp_io.sample_logprobs   = d.mtp_io.sample_rows + ranks * lanes * k;
+            d.mtp_io.draft_candidates  = d.mtp_io.sample_logprobs + ranks * lanes * k;
+            d.mtp_io.draft_q           = d.mtp_io.draft_candidates + candidates * lanes * k;
+            d.mtp_io.verify_candidates = d.mtp_io.draft_q + candidates * lanes * k;
+            d.mtp_io.verify_q          = d.mtp_io.verify_candidates + candidates * verified;
+            d.mtp_io.words             = d.mtp_io.verify_q + candidates * verified;
         }
 
         // Staging slots for each layer call's misses (design 8.6), one expert record each.
@@ -588,7 +608,7 @@ public:
         b.expert_record_stride = d.record_stride;
         b.max_frames           = ExpertResidency::max_frames(c);
         b.graph_bound          = graph_bound(o.max_concurrency, static_cast<std::uint32_t>(W),
-                                             static_cast<std::uint32_t>(d.mtp_k));
+                                             static_cast<std::uint32_t>(d.mtp_k), o.sampled_mtp_drafts && d.mtp);
         return d;
     }
 
@@ -629,13 +649,32 @@ public:
                                                 wide_a16(o)) +
             ops::sampling_workspace_capacity_bytes(d.token_domain, 1, lanes);
         if (W > 1) {
-            bytes += ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(d.token_domain, 1, W - 1, 1, lanes);
+            std::size_t accept =
+                ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(d.token_domain, 1, W - 1, 1, lanes);
+            if (o.sampled_mtp_drafts && d.mtp && sparse_acceptance(d.token_domain, W, lanes)) {
+                accept = std::max(accept, ops::speculative_accept_sparse_drafts_workspace_capacity_bytes(
+                                              d.token_domain, ops::SpeculativeAcceptExecutionEnvelope{}, 1, W - 1, 1,
+                                              lanes));
+            }
+            bytes += accept;
         }
         if (d.mtp) {
             bytes += execution::Forward::mtp_workspace_bytes(c, std::max(lanes * W, std::min(d.chunk, 512)), lanes,
                                                              d.head_rows, dim(o.max_context), o.kv_cache);
         }
         return bytes;
+    }
+
+    // Whether the sparse acceptance Op (sampled drafts' verifier) serves this token domain and these
+    // verify widths and row counts.
+    static bool sparse_acceptance(std::int32_t token_domain, std::int32_t W, std::int32_t lanes) {
+        try {
+            (void)ops::speculative_accept_sparse_drafts_workspace_capacity_bytes(
+                token_domain, ops::SpeculativeAcceptExecutionEnvelope{}, 1, W - 1, 1, lanes);
+            return true;
+        } catch (const std::invalid_argument&) {
+            return false;
+        }
     }
 
     static void allocate(DeviceBuffer& buffer, std::size_t bytes, std::uint64_t& tally) {
@@ -676,6 +715,12 @@ public:
         r_             = dim(c_.qsa.compress_ratio);
         draft_min_logprob_ = options_.mtp_draft_min_p > 0.0 ? std::log(options_.mtp_draft_min_p)
                                                             : -std::numeric_limits<double>::infinity();
+        sampled_drafts_ = options_.sampled_mtp_drafts && plan_.mtp && max_width_ > 1 &&
+                          sparse_acceptance(plan_.token_domain, max_width_, plan_.lanes);
+        if (options_.sampled_mtp_drafts && plan_.mtp && !sampled_drafts_) {
+            diagnostic("sampled MTP drafts need the sparse acceptance's token domain; drafts stay one-hot",
+                       DiagnosticLevel::Warning);
+        }
 
         // Every fixed allocation below is checked against the plan and against device free memory
         // (an allocation the driver placed in system memory fails startup, design §19.3.7).
@@ -2307,29 +2352,50 @@ public:
     }
 
     // ---- warm start (design §19.3.5 S4b) ----
-    // Fills the frames from the saved state, before the first request. With the SSD tier, RAM is
-    // filled first (the frames load from it), then the seeds' RAM copies are released and their slots
-    // refilled with the next keys of the fill order, so the two levels hold different experts.
+    // Fills the frames from the saved state, before the first request; without one (a first start,
+    // or a state of another artifact), from the calibrated expert order when the model has its shape.
+    // With the SSD tier, RAM is filled first (the frames load from it), then the seeds' RAM copies
+    // are released and their slots refilled with the next keys of the fill order, so the two levels
+    // hold different experts.
     void warm_start_experts() {
         const auto keys = c_.num_hidden_layers * c_.moe.experts;
         expert_cache::ExpertStateLoad load;
+        SeedSource source = SeedSource::None;
         if (!options_.expert_state.empty() && options_.expert_cache) {
             load = expert_cache::load_expert_state(options_.expert_state, options_.expert_state_identity, keys);
+            if (load.state) {
+                source = SeedSource::Saved;
+            } else if (has_calibrated_order()) {
+                diagnostic("expert cache: no saved state used: " + load.message, DiagnosticLevel::Debug);
+                load.state = expert_cache::calibrated_expert_order();
+                source     = SeedSource::Calibrated;
+            }
         }
         const expert_cache::SavedState* state = load.state ? &*load.state : nullptr;
         TierFill fill;
-        if (tier_) { fill = prefill_tier(state); }
-        const std::uint32_t seeded = warm_start_frames(load);
+        if (tier_) { fill = prefill_tier(state, source); }
+        const std::uint32_t seeded = warm_start_frames(load, source);
         if (tier_) { finish_tier_fill(fill, seeded); }
     }
 
 private:
+    // Where the warm start's ranking and counts came from.
+    enum class SeedSource { None, Saved, Calibrated };
+
+    // The calibrated order (expert_cache/calibrated_order.h) ranks Qwen3.8-Flash-Next's experts: it
+    // applies to every model of that shape (NInfer's guard), whatever the artifact's formats.
+    [[nodiscard]] bool has_calibrated_order() const noexcept {
+        return c_.hidden_size == 2560 && c_.num_hidden_layers == expert_cache::kCalibratedLayers &&
+               c_.moe.experts == expert_cache::kCalibratedExperts && c_.moe.top_k == 10 &&
+               c_.moe.intermediate == 640 && c_.moe.shared_intermediate == 640;
+    }
+
     // The SSD tier's startup fill: its key order, how many keys the first pass read, and its time.
     struct TierFill {
         std::vector<std::uint32_t> order;
         std::uint32_t filled = 0;
         double seconds       = 0;
-        bool saved           = false;
+        SeedSource source    = SeedSource::None;
     };
 
     // The SSD tier's RAM fill order (design §19.3.7 §4.9): the saved state's ranking (the last
@@ -2374,10 +2440,10 @@ private:
     }
 
     // The SSD tier's first RAM pass, before the frames' warm start reads from it.
-    TierFill prefill_tier(const expert_cache::SavedState* state) {
+    TierFill prefill_tier(const expert_cache::SavedState* state, SeedSource source) {
         const auto start = std::chrono::steady_clock::now();
         TierFill fill;
-        fill.saved = state != nullptr;
+        fill.source = source;
         fill.order = tier_fill_order(state);
         if (state != nullptr && state->counts.size() == tier_->keys()) {
             tier_->controller().seed_uses(state->counts, kSeedCountCap);
@@ -2419,16 +2485,19 @@ private:
                       "SSD expert tier: %u RAM slots (%.1f GiB) hold %u experts (%s)%s%s, read in %.1f s; %u of %u "
                       "experts are read from the artifact when used",
                       slots, gib * slots, in_ram,
-                      fill.saved ? "the saved ranking, then the last session's use counts" : "spread across the layers",
+                      fill.source == SeedSource::Saved        ? "the saved ranking, then the last session's use counts"
+                      : fill.source == SeedSource::Calibrated ? "the calibrated expert order"
+                                                              : "spread across the layers",
                       released > 0 ? (", none of them among the " + std::to_string(released) + " in VRAM").c_str() : "",
                       split, seconds, keys - in_ram - released - unpinned, keys);
         diagnostic(line);
     }
 
-    // The frames' warm start from the saved state; returns how many experts it loaded.
-    std::uint32_t warm_start_frames(const expert_cache::ExpertStateLoad& load) {
+    // The frames' warm start from the saved state or the calibrated order; returns how many experts
+    // it loaded.
+    std::uint32_t warm_start_frames(const expert_cache::ExpertStateLoad& load, SeedSource source) {
         if (options_.expert_state.empty() || !options_.expert_cache) { return 0; }
-        if (!load.state) {
+        if (source == SeedSource::None) {
             diagnostic("expert cache: no saved state yet, so it starts empty and fills as requests arrive");
             diagnostic("expert cache starts empty: " + load.message, DiagnosticLevel::Debug);
             expert_state_saved_ = std::chrono::steady_clock::now();
@@ -2442,12 +2511,20 @@ private:
         const double loaded_gib =
             static_cast<double>(loaded) * static_cast<double>(residency_->frame_stride()) / (1ULL << 30);
         char line[256];
-        std::snprintf(line, sizeof(line),
-                      "expert cache: restored the %u most-used experts from the last session (%.1f GiB in %.2f s)",
-                      loaded, loaded_gib, seconds);
+        if (source == SeedSource::Saved) {
+            std::snprintf(line, sizeof(line),
+                          "expert cache: restored the %u most-used experts from the last session (%.1f GiB in %.2f s)",
+                          loaded, loaded_gib, seconds);
+        } else {
+            std::snprintf(line, sizeof(line),
+                          "expert cache: no saved state yet, so it starts with the %u highest-ranked experts of "
+                          "the calibrated order (%.1f GiB in %.2f s)",
+                          loaded, loaded_gib, seconds);
+        }
         diagnostic(line);
         std::snprintf(line, sizeof(line), "expert cache warm start: %u of %u frames from %s", loaded,
-                      residency_->frames(), options_.expert_state.string().c_str());
+                      residency_->frames(),
+                      source == SeedSource::Saved ? options_.expert_state.string().c_str() : "the calibrated order");
         diagnostic(line, DiagnosticLevel::Debug);
         expert_state_saved_  = std::chrono::steady_clock::now();
         expert_state_routed_ = residency_->stats().routed;
@@ -3346,7 +3423,8 @@ private:
         if (at < 0 && (at = route_trace_index(verify_graphs_, &graph)) >= 0) {
             family = RouteTraceGraph::Verify;
             stride = max_width_;
-        } else if (at < 0 && (at = route_trace_index(mtp_draft_graphs_, &graph)) >= 0) {
+        } else if (at < 0 && ((at = route_trace_index(mtp_draft_graphs_, &graph)) >= 0 ||
+                              (at = route_trace_index(mtp_sampled_graphs_, &graph)) >= 0)) {
             family = RouteTraceGraph::MtpDraft;
             stride = mtp_k_;
         } else if (at < 0 && (at = route_trace_index(mtp_catch_graphs_, &graph)) >= 0) {
@@ -3532,7 +3610,45 @@ private:
         Tensor licensed(spec_device(spec_layout_.licensed), DType::I32, {W, batch});
         Tensor counts(spec_device(spec_layout_.counts), DType::I32, {batch});
         Tensor accepted(spec_device(spec_layout_.accepted), DType::I32, {batch});
-        {
+        const bool sampled = std::exchange(mtp_sampled_round_, false);
+        if (sampled) {
+            // Sampled drafts: each row's 16 candidates and q per verified position, [16, K, batch]: an
+            // MTP row's from its draft steps, an n-gram row's one-hot at its copied token.
+            constexpr std::int32_t C = ops::kSparseSpeculativeCandidates;
+            std::int32_t* host_candidates = mtp_host(mtp_io_.verify_candidates);
+            auto* host_q                  = reinterpret_cast<float*>(mtp_host(mtp_io_.verify_q));
+            for (std::int32_t b = 0; b < batch; ++b) {
+                const auto n = static_cast<std::int32_t>(drafts_[b].size());
+                if (n == 0) { continue; }
+                const std::size_t row = static_cast<std::size_t>(b) * K * C;
+                if (from_ngram_[b]) {
+                    for (std::int32_t j = 0; j < n; ++j) {
+                        const std::int32_t token = drafts_[b][static_cast<std::size_t>(j)];
+                        for (std::int32_t c = 0; c < C; ++c) {
+                            host_candidates[row + j * C + c] = (token + c) % token_domain_;
+                            host_q[row + j * C + c]          = c == 0 ? 1.0F : 0.0F;
+                        }
+                    }
+                    upload_pinned(mtp_device(mtp_io_.verify_candidates + row), host_candidates + row, 4ULL * C * n, s);
+                    upload_pinned(mtp_device(mtp_io_.verify_q + row), host_q + row, 4ULL * C * n, s);
+                    continue;
+                }
+                // Draft step j's plane of row b is at (j * batch + b) * C.
+                for (const auto [from, to] : {std::pair{mtp_io_.draft_candidates, mtp_io_.verify_candidates},
+                                              std::pair{mtp_io_.draft_q, mtp_io_.verify_q}}) {
+                    CUDA_CHECK(cudaMemcpy2DAsync(mtp_device(to + row), 4ULL * C,
+                                                 mtp_device(from + static_cast<std::size_t>(C) * b), 4ULL * C * batch,
+                                                 4ULL * C, static_cast<std::size_t>(n), cudaMemcpyDeviceToDevice, s));
+                }
+            }
+            Tensor candidates(mtp_device(mtp_io_.verify_candidates), DType::I32, {C, K, batch});
+            Tensor q(mtp_device(mtp_io_.verify_q), DType::FP32, {C, K, batch});
+            auto scope = work_->scope();
+            ops::speculative_accept_sparse_drafts(target.view({W, batch}), narrow.view({vocab_, W, batch}), drafts,
+                                                  candidates, q, extents, lengths, anchors, licensed, counts, accepted,
+                                                  token_domain_, static_cast<const ops::SamplingConfig*>(configs_.p),
+                                                  ops::SpeculativeAcceptExecutionEnvelope{}, *work_, s);
+        } else {
             auto scope = work_->scope();
             ops::speculative_accept_greedy_drafts(target.view({W, batch}), narrow.view({vocab_, W, batch}), drafts,
                                                   extents, lengths, anchors, licensed, counts, accepted,
@@ -3560,6 +3676,13 @@ private:
                 live_[static_cast<std::size_t>(b * W + j)]           = j <= A ? 1 : 0;
             }
             pending_counts_[b] = L;
+            if (sampled && lane.sampling.token_counts != nullptr) {
+                // The sparse acceptance leaves token counts to the caller (the greedy-draft Op counts
+                // each licensed token itself): count them before the next round's penalties.
+                Tensor ids(spec_device(spec_layout_.licensed) + static_cast<std::size_t>(b) * W, DType::I32, {L});
+                Tensor token_counts(lane.sampling.token_counts, DType::I32, {token_domain_});
+                ops::increment_token_counts(ids, token_counts, s);
+            }
             if (constrained) {
                 take_constraint_draws(lane, static_cast<std::size_t>(b * W),
                                       std::span<const std::int32_t>(&pending_tokens_[static_cast<std::size_t>(b * W)],
@@ -3701,6 +3824,7 @@ private:
         for (auto& d : mtp_drafts_) { d.assign(static_cast<std::size_t>(mtp_k_), 0); }
         mtp_catch_graphs_.resize(static_cast<std::size_t>(lanes) * max_width_);
         mtp_draft_graphs_.resize(static_cast<std::size_t>(lanes) * mtp_k_);
+        if (sampled_drafts_) { mtp_sampled_graphs_.resize(static_cast<std::size_t>(lanes) * mtp_k_); }
     }
 
     std::int32_t* mtp_host(std::size_t offset) const { return static_cast<std::int32_t*>(mtp_host_.data()) + offset; }
@@ -3820,6 +3944,7 @@ private:
         const cudaStream_t s = device_.stream;
         const auto batch     = static_cast<std::int32_t>(lanes.size());
         const std::size_t column = 2ULL * width_;
+        mtp_sampled_round_       = false;
         bool any = false, unwritten = false;
         for (std::int32_t b = 0; b < batch; ++b) {
             any |= lanes_[lanes[b]].mtp_live;
@@ -3882,10 +4007,33 @@ private:
             }
             return;
         }
-        replay(mtp_draft_graphs_[static_cast<std::size_t>(batch - 1) * mtp_k_ + (steps - 1)], [&] {
+        // Sampled drafts when a row samples (greedy rows draft the argmax either way).
+        const bool sampled = sampled_drafts_ && std::any_of(lanes.begin(), lanes.end(), [&](std::uint32_t lane) {
+                                 return lanes_[lane].sampling.temperature > 0.0F;
+                             });
+        mtp_sampled_round_ = sampled;
+        if (sampled) {
+            // The rows' samplers for the draws inside the draft graph (verify uploads them again,
+            // with grammar masks, after this round's synchronize).
+            auto* configs = static_cast<ops::SamplingConfig*>(host_configs_.data());
+            for (std::int32_t b = 0; b < batch; ++b) {
+                configs[b]      = lanes_[lanes[b]].sampling;
+                configs[b].mask = {};
+            }
+            upload_pinned(configs_.p, configs, sizeof(ops::SamplingConfig) * batch, s);
+        }
+        auto& draft_graphs = sampled ? mtp_sampled_graphs_ : mtp_draft_graphs_;
+        replay(draft_graphs[static_cast<std::size_t>(batch - 1) * mtp_k_ + (steps - 1)], [&] {
         for (std::int32_t j = 0; j < steps; ++j) {
             Tensor drafts(mtp_device(mtp_io_.drafts + static_cast<std::size_t>(j) * batch), DType::I32, {batch});
             const std::size_t step = 3ULL * static_cast<std::size_t>(batch) * j;
+            // Sampled drafts: step j's top-rank scratch and proposal planes.
+            const auto plane = [&](std::size_t offset, std::int32_t rows, DType type) {
+                return sampled
+                           ? Tensor(mtp_device(offset + static_cast<std::size_t>(rows) * batch * j), type, {rows, batch})
+                           : Tensor{};
+            };
+            constexpr std::int32_t C = ops::kSparseSpeculativeCandidates;
             forward_->run_mtp({.residuals    = chain,
                                .ids          = j == 0 ? anchors
                                                       : Tensor(mtp_device(mtp_io_.drafts + static_cast<std::size_t>(j - 1) * batch),
@@ -3903,7 +4051,14 @@ private:
                                .drafts       = drafts,
                                .draft_logprobs =
                                    Tensor(mtp_device(mtp_io_.logprobs + static_cast<std::size_t>(j) * batch), DType::FP32,
-                                          {1, batch})});
+                                          {1, batch}),
+                               .sample_configs =
+                                   sampled ? static_cast<const ops::SamplingConfig*>(configs_.p) : nullptr,
+                               .draft_step       = static_cast<std::uint32_t>(j),
+                               .sample_rows      = plane(mtp_io_.sample_rows, kSampledDraftRanks, DType::I32),
+                               .sample_logprobs  = plane(mtp_io_.sample_logprobs, kSampledDraftRanks, DType::FP32),
+                               .draft_candidates = plane(mtp_io_.draft_candidates, C, DType::I32),
+                               .draft_q          = plane(mtp_io_.draft_q, C, DType::FP32)});
         }
         });
         CUDA_CHECK(cudaMemcpyAsync(mtp_host(mtp_io_.drafts), mtp_device(mtp_io_.drafts), 4ULL * steps * batch,
@@ -3921,8 +4076,11 @@ private:
             for (std::int32_t j = 0; j < steps; ++j) {
                 mtp_drafts_[b][static_cast<std::size_t>(j)] = mtp_host(mtp_io_.drafts)[j * batch + b];
             }
-            // The row's confident drafts: those before the first below draft_min_logprob_.
+            // The row's confident drafts: those before the first below draft_min_logprob_ (every
+            // sampled draft with sampled-mtp-drafts: a sampled proposal's acceptance does not follow
+            // the head's top probability, and its rounds were measured faster without the cut).
             mtp_confident_[b] = steps;
+            if (sampled && lane.sampling.temperature > 0.0F) { continue; }
             const auto* logprobs = reinterpret_cast<const float*>(mtp_host(mtp_io_.logprobs));
             for (std::int32_t j = 0; j < steps; ++j) {
                 if (logprobs[j * batch + b] < draft_min_logprob_) {
@@ -4588,6 +4746,10 @@ private:
     std::unique_ptr<execution::Forward> forward_;
     std::array<DecodeGraph, kMaximumConcurrency> graphs_;
     std::vector<DecodeGraph> mtp_draft_graphs_; // (batch - 1) * mtp_k_ + steps - 1
+    // With sampled drafts, the same for rounds with a sampled row (greedy rounds keep the argmax).
+    std::vector<DecodeGraph> mtp_sampled_graphs_;
+    // Whether this round's MTP drafts were sampled (their proposals wait in the drafter's io).
+    bool mtp_sampled_round_ = false;
     std::vector<DecodeGraph> mtp_catch_graphs_; // (batch - 1) * max_width_ + width - 1
     std::vector<DecodeGraph> verify_graphs_; // (batch - 1) * max_width_ + width - 1
 
@@ -4628,6 +4790,9 @@ private:
     // Strata's --spec-min-p rule (C = 1 MTP, AIME prompts sampled on the 5090: 138.8 -> 147.2 tok/s,
     // acceptance 75.6 -> 81.8 %, repeatable to the decimal; 0.7 gave 142.6; design 19.3.5).
     double draft_min_logprob_ = 0.0;
+    // sampled-mtp-drafts (ProgramOptions::sampled_mtp_drafts) on a token domain the sparse
+    // acceptance serves: sampled rows draw their drafts and skip the confidence cut.
+    bool sampled_drafts_ = false;
     std::uint64_t pair_policy_rounds_            = 0;
     bool plain_round_ = false;
 

@@ -36,6 +36,7 @@ target_sources(infernix_model_runtime PRIVATE
 
 # The host expert cache (design §9) is a host-only library its conformance test links directly.
 add_library(infernix_qwen4_exp_expert_cache STATIC
+  "${CMAKE_CURRENT_LIST_DIR}/program/expert_cache/calibrated_order.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/expert_cache/expert_cache.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/expert_cache/expert_state.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/expert_cache/host_tier.cpp")

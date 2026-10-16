@@ -83,6 +83,18 @@ enum class FastPath : std::uint8_t {
     // Groupwise Q4 gate/up weights: prefill-width projections quantize activations to int8 per token
     // and fold each group's weight scale into its accumulator (ops::LinearRoutes::Q4W4A8).
     Q4W4A8,
+    // Qwen3.8-Flash-Next MTP: a sampled request's drafts are drawn from the draft head's four most
+    // probable tokens under the request's sampler and verified by speculative rejection sampling
+    // against that proposal (ops::speculative_sample_sparse_drafts), and its rounds verify every
+    // draft (no --spec-min-p cut). The output distribution stays the sampler's; a seeded sampled
+    // request's text changes, greedy requests are unchanged. Without it the drafts are the head's
+    // argmax (one-hot proposals).
+    SampledMtpDrafts,
+    // Chunked Gated DeltaNet calls (prefill and other calls of 16 or more tokens) store the
+    // normalized Q/K in FP16 and run the state products with FP16 operands, accumulating each pair
+    // of k16 products in FP16 before the FP32 carry (ops::GdnChunkArithmetic::Fp16Accumulate).
+    // Without it they keep BF16/TF32 operands with FP32 accumulators.
+    GdnF16Accumulate,
     // The paths below couple a request's arithmetic to the other requests of the Engine. Without
     // them a request's outputs depend only on the request, the artifact, the options and the build
     // (LoadSummary::request_invariant); they apply where the exact route is request-invariant.
@@ -140,17 +152,18 @@ enum class FastPath : std::uint8_t {
     IdleWidePrefill,
 };
 
-inline constexpr std::array<FastPath, 19> kFastPaths{
+inline constexpr std::array<FastPath, 21> kFastPaths{
     FastPath::PromptPv8,           FastPath::DecodeSplit64,
     FastPath::Q8SlicedK,           FastPath::GdnConvFused,
     FastPath::QsaPrepareFused,     FastPath::Fp8A8Pair,
-    FastPath::Q4W4A8,              FastPath::BatchedDecode,
-    FastPath::BatchedA8Decode,     FastPath::BatchedA4Decode,
-    FastPath::BatchedA4ResidualDecode, FastPath::BatchedA8ResidualDecode,
-    FastPath::ExpertA4Residual,    FastPath::BatchSplitAttention,
-    FastPath::AdaptiveSpeculation, FastPath::AdaptiveMtp,
-    FastPath::FreeCacheResume,     FastPath::Preemption,
-    FastPath::IdleWidePrefill};
+    FastPath::Q4W4A8,              FastPath::SampledMtpDrafts,
+    FastPath::GdnF16Accumulate,
+    FastPath::BatchedDecode,       FastPath::BatchedA8Decode,
+    FastPath::BatchedA4Decode,     FastPath::BatchedA4ResidualDecode,
+    FastPath::BatchedA8ResidualDecode, FastPath::ExpertA4Residual,
+    FastPath::BatchSplitAttention, FastPath::AdaptiveSpeculation,
+    FastPath::AdaptiveMtp,         FastPath::FreeCacheResume,
+    FastPath::Preemption,          FastPath::IdleWidePrefill};
 
 [[nodiscard]] constexpr const char* fast_path_name(FastPath path) noexcept {
     switch (path) {
@@ -173,6 +186,8 @@ inline constexpr std::array<FastPath, 19> kFastPaths{
     case FastPath::IdleWidePrefill: return "idle-wide-prefill";
     case FastPath::Fp8A8Pair: return "fp8-a8-pair";
     case FastPath::Q4W4A8: return "q4-w4a8";
+    case FastPath::SampledMtpDrafts: return "sampled-mtp-drafts";
+    case FastPath::GdnF16Accumulate: return "gdn-f16-accumulate";
     }
     return "unknown";
 }

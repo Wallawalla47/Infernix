@@ -325,6 +325,17 @@ int run_tests() {
     const auto state_file = parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--expert-state", "cache.state"});
     failures += check(state_file.expert_state && *state_file.expert_state == "cache.state",
                       "CLI --expert-state FILE must name the file");
+    // --fast-path NAME: a qualification candidate, repeatable; unknown names are refused.
+    const auto candidate = parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--fast-path", "sampled-mtp-drafts",
+                                  "--fast-path", "preemption"});
+    failures += check(candidate.fast_path_candidates ==
+                          std::vector<infernix::FastPath>{infernix::FastPath::SampledMtpDrafts,
+                                                          infernix::FastPath::Preemption},
+                      "CLI --fast-path must collect each named candidate");
+    failures += check(rejects([] {
+                          (void)parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--fast-path", "no-such-path"});
+                      }),
+                      "CLI accepted an unknown fast path");
     return failures == 0 ? 0 : 1;
 }
 

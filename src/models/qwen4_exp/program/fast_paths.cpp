@@ -150,6 +150,10 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
     case FastPath::AdaptiveMtp:
     case FastPath::IdleWidePrefill:
     case FastPath::Q4W4A8: return false;
+    // The drafter's sampled proposals (the program checks the sparse acceptance's token domain).
+    case FastPath::SampledMtpDrafts: return options.speculative.backend == SpeculativeBackend::Mtp;
+    // The GDN layers normalize Q/K; their chunked calls serve prefill.
+    case FastPath::GdnF16Accumulate: return true;
     // Recipe C's row-FP8 dense projections run 16-bit activations (A16Only).
     case FastPath::Fp8A8Pair: return configuration.dense == QType::FP8_E4M3FN_ROW_BF16;
     case FastPath::Q8SlicedK:
@@ -195,7 +199,9 @@ execution::ForwardFastPaths FastPathSelection::forward() const noexcept {
     return {.dense_routes       = routes,
             .gdn_conv_fused     = selected(FastPath::GdnConvFused),
             .qsa_prepare_fused  = selected(FastPath::QsaPrepareFused),
-            .expert_a4_residual = selected(FastPath::ExpertA4Residual)};
+            .expert_a4_residual = selected(FastPath::ExpertA4Residual),
+            .gdn_arithmetic     = selected(FastPath::GdnF16Accumulate) ? ops::GdnChunkArithmetic::Fp16Accumulate
+                                                                       : ops::GdnChunkArithmetic::Exact};
 }
 
 FastPathSelection select_fast_paths(const execution::Parameters& parameters, const EngineOptions& options) {

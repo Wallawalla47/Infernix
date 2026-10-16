@@ -130,6 +130,21 @@ int main() {
                                               {QType::Q8_G32_FP16, false, KvCacheStorage::Int8Group64}),
                       "expert-a4-residual is qualified only on the dense format it was gated with");
 
+    // sampled-mtp-drafts acts on the MTP drafter only; gdn-f16-accumulate on every artifact's GDN
+    // prefill, per call, so it keeps a request invariant.
+    infernix::EngineOptions mtp = options;
+    mtp.speculative.backend     = infernix::SpeculativeBackend::Mtp;
+    failures += check(q::fast_path_applies(FastPath::SampledMtpDrafts, dense8, mtp) &&
+                          !q::fast_path_applies(FastPath::SampledMtpDrafts, dense8, options),
+                      "sampled-mtp-drafts applies with the MTP drafter only");
+    failures += check(exact.gdn_arithmetic == infernix::ops::GdnChunkArithmetic::Exact,
+                      "the exact route keeps the GDN prefill exact");
+    selection.paths = {FastPath::GdnF16Accumulate};
+    failures += check(q::fast_path_applies(FastPath::GdnF16Accumulate, recipe_c, options) &&
+                          selection.forward().gdn_arithmetic == infernix::ops::GdnChunkArithmetic::Fp16Accumulate,
+                      "gdn-f16-accumulate applies to every artifact and sets its Forward flag");
+    failures += check(selection.request_invariant(), "gdn-f16-accumulate keeps a request invariant");
+
     std::cout << (failures == 0 ? "PASS" : "FAIL") << " Qwen3.8-Flash-Next fast-path selection\n";
     return failures == 0 ? 0 : 1;
 }

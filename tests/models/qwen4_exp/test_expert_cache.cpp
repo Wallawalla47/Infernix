@@ -4,6 +4,7 @@
 // §19.3.7, RT8) evicts the lowest-score experts wherever they sit, moves the survivors below the new
 // top and never names a frame above it.
 
+#include "models/qwen4_exp/program/expert_cache/calibrated_order.h"
 #include "models/qwen4_exp/program/expert_cache/expert_cache.h"
 #include "models/qwen4_exp/program/expert_cache/expert_state.h"
 
@@ -552,6 +553,37 @@ void test_state_file() {
     check(!std::filesystem::exists(path.string() + ".tmp"), "no temporary file is left behind");
 }
 
+// The calibrated order, the seed of a start without a saved state: every layer ranks each of its
+// experts once, counts reverse the ranks, and the ranked list interleaves the layers by rank (layer
+// 0's first experts as NInfer f8a774f73 lists them: 90, 109, 93).
+void test_calibrated_order() {
+    const SavedState order = calibrated_expert_order();
+    constexpr std::uint32_t kKeys = kCalibratedLayers * kCalibratedExperts;
+    check(order.counts.size() == kKeys && order.ranked.size() == kKeys, "the order covers every key once");
+    bool counts_ok = true;
+    for (std::uint32_t layer = 0; layer < kCalibratedLayers; ++layer) {
+        std::vector<std::uint32_t> counts(order.counts.begin() + layer * kCalibratedExperts,
+                                          order.counts.begin() + (layer + 1) * kCalibratedExperts);
+        std::sort(counts.begin(), counts.end());
+        for (std::uint32_t i = 0; i < kCalibratedExperts; ++i) { counts_ok = counts_ok && counts[i] == i + 1; }
+    }
+    check(counts_ok, "each layer's counts are its ranks reversed, 1 to 512");
+    std::vector<std::uint32_t> ranked = order.ranked;
+    std::sort(ranked.begin(), ranked.end());
+    bool ranked_ok = true;
+    for (std::uint32_t key = 0; key < kKeys && ranked_ok; ++key) { ranked_ok = ranked[key] == key; }
+    check(ranked_ok, "the ranked list is a permutation of the keys");
+    bool interleaved = true;
+    for (std::uint32_t i = 0; i < kKeys; ++i) {
+        const std::uint32_t key = order.ranked[i], layer = key / kCalibratedExperts;
+        interleaved = interleaved && layer == i % kCalibratedLayers &&
+                      order.counts[key] == kCalibratedExperts - i / kCalibratedLayers;
+    }
+    check(interleaved, "the ranked list takes every layer's next-ranked expert in turn");
+    check(order.ranked[0] == 90 && order.ranked[kCalibratedLayers] == 109 && order.ranked[2 * kCalibratedLayers] == 93,
+          "layer 0's first experts are NInfer's");
+}
+
 // Fill-phase landing (design §19.3.5 S4): reserve_free pops free frames only while the policy has
 // room; adopt makes a landed key READY and resident in its frame, drops its queued load (no second
 // copy), refuses a key loading elsewhere, and release returns unused frames.
@@ -646,6 +678,7 @@ int main() {
     test_seed();
     test_landing();
     test_state_file();
+    test_calibrated_order();
     if (g_failures) {
         std::fprintf(stderr, "%d check(s) failed\n", g_failures);
         return 1;

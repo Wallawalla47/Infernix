@@ -88,7 +88,8 @@ FAST_PATHS = ("prompt-pv8", "decode-split64", "batched-decode", "batched-a8-deco
               "batched-a4-decode", "batched-a4-residual-decode", "batched-a8-residual-decode",
               "expert-a4-residual", "batch-split-attention", "adaptive-speculation",
               "free-cache-resume", "preemption", "q8-sliced-k", "gdn-conv-fused",
-              "qsa-prepare-fused", "adaptive-mtp", "idle-wide-prefill", "fp8-a8-pair", "q4-w4a8")
+              "qsa-prepare-fused", "adaptive-mtp", "idle-wide-prefill", "fp8-a8-pair", "q4-w4a8",
+              "sampled-mtp-drafts", "gdn-f16-accumulate")
 
 
 class MeasurementError(RuntimeError):

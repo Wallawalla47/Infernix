@@ -1191,7 +1191,10 @@ ExecutionSchedule execution_schedule(const execution::Parameters& parameters,
             .adaptive_mtp            = fast_paths.selected(FastPath::AdaptiveMtp) &&
                                        !fast_paths.invariant(FastPath::AdaptiveSpeculation),
             .linear_routes           = fast_paths.selected(FastPath::Q4W4A8) ? ops::LinearRoutes::Q4W4A8
-                                                                             : ops::LinearRoutes::Exact};
+                                                                             : ops::LinearRoutes::Exact,
+            .gdn_arithmetic          = fast_paths.selected(FastPath::GdnF16Accumulate)
+                                           ? ops::GdnChunkArithmetic::Fp16Accumulate
+                                           : ops::GdnChunkArithmetic::Exact};
 }
 // The fast INT8, NVFP4, VQ2 and K4V2 prompt kernels and the MXFP8 tiled kernel of FP8 and K8V4 KV
 // run one 128-row CTA of one query head per SM; BF16 KV and the original INT8 and NVFP4 kernels use

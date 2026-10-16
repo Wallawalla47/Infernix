@@ -48,6 +48,52 @@ __device__ __forceinline__ void load_bf16_b(const float* p, int k, int n, int la
         pack_bf16x2(p[value_index<DV>(k + 2 * t + 8, col)], p[value_index<DV>(k + 2 * t + 9, col)]);
 }
 
+// GdnChunkArithmetic::Fp16Accumulate's helpers. Its packet holds FP16 Q/K; the 16-bit ldmatrix
+// loads above are type-agnostic.
+
+template <int DV>
+__device__ __forceinline__ void load_f16_b(const float* p, int k, int n, int lane, unsigned& b0,
+                                           unsigned& b1) {
+    const int t = lane & 3, col = n * 8 + lane / 4;
+    b0 = pack_f16x2(p[value_index<DV>(k + 2 * t, col)], p[value_index<DV>(k + 2 * t + 1, col)]);
+    b1 =
+        pack_f16x2(p[value_index<DV>(k + 2 * t + 8, col)], p[value_index<DV>(k + 2 * t + 9, col)]);
+}
+
+// D = A B in FP16 from a zero accumulator (mma_f16_f16acc accumulates into D).
+__device__ __forceinline__ void mma_f16_f16acc_zero(unsigned& d0, unsigned& d1, unsigned a0,
+                                                    unsigned a1, unsigned a2, unsigned a3,
+                                                    unsigned b0, unsigned b1) {
+    asm("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
+        "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%8,%8};\n"
+        : "=r"(d0), "=r"(d1)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(0));
+}
+
+// The k16 products an FP16 partial sum spans before its FP32 carry (measured 2026-10-16 against
+// one: 1.205x the exact route's op time at the 27B's shapes for both, and the more accurate state).
+inline constexpr int kFp16Carry = 2;
+
+// One k16 step of an FP16 partial sum; every kFp16Carry steps the partial (row g's columns
+// {2t, 2t+1} in part[0], row g+8's in part[1]) is added to the FP32 accumulator in its C-fragment
+// order, and the next step starts from zero. The FP16 rounding spans at most 16 * kFp16Carry
+// products.
+__device__ __forceinline__ void mma_f16_partial(float (&acc)[4], unsigned (&part)[2], int step,
+                                                const unsigned (&a)[4], unsigned b0, unsigned b1) {
+    if (step % kFp16Carry == 0)
+        mma_f16_f16acc_zero(part[0], part[1], a[0], a[1], a[2], a[3], b0, b1);
+    else
+        mma_f16_f16acc(part[0], part[1], a[0], a[1], a[2], a[3], b0, b1);
+    if (step % kFp16Carry == kFp16Carry - 1) {
+        const float2 low  = __half22float2(half2_from_bits(part[0]));
+        const float2 high = __half22float2(half2_from_bits(part[1]));
+        acc[0] += low.x;
+        acc[1] += low.y;
+        acc[2] += high.x;
+        acc[3] += high.y;
+    }
+}
+
 template <int DV>
 struct RecurrenceShared {
     struct alignas(256) Stage {
@@ -138,7 +184,8 @@ __device__ __forceinline__ void store_output(const Arguments& args, float (&acc)
     }
 }
 
-template <int DV>
+// Fp16 selects GdnChunkArithmetic::Fp16Accumulate (launch.h); without it the exact arithmetic.
+template <int DV, bool Fp16 = false>
 __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurrence_kernel(
     Arguments args, const QkChunk* __restrict__ qk_workspace,
     const ControlChunk* __restrict__ control_workspace) {
@@ -204,27 +251,50 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
 
         if constexpr (NT >= kWarps) {
             float prediction[NPW][4]{};
+            if constexpr (!Fp16) {
 #pragma unroll
-            for (int k = 0; k < kStateDim; k += 16) {
-                unsigned ka0[4], ka1[4], qa[4];
-                load_vector_tf32_a(qk.k, k, lane, ka0);
-                load_vector_tf32_a(qk.k, k + 8, lane, ka1);
-                load_vector_bf16_a(qk.q, k, lane, qa);
+                for (int k = 0; k < kStateDim; k += 16) {
+                    unsigned ka0[4], ka1[4], qa[4];
+                    load_vector_tf32_a(qk.k, k, lane, ka0);
+                    load_vector_tf32_a(qk.k, k + 8, lane, ka1);
+                    load_vector_bf16_a(qk.q, k, lane, qa);
 #pragma unroll
-                for (int ni = 0; ni < NPW; ++ni) {
-                    const int n    = warp + ni * kWarps;
-                    const float b0 = sm.snapshot[value_index<DV>(k + 2 * t, n * 8 + g)];
-                    const float b1 = sm.snapshot[value_index<DV>(k + 2 * t + 1, n * 8 + g)];
-                    const float b2 = sm.snapshot[value_index<DV>(k + 2 * t + 8, n * 8 + g)];
-                    const float b3 = sm.snapshot[value_index<DV>(k + 2 * t + 9, n * 8 + g)];
-                    mma_tf32_bits(prediction[ni][0], prediction[ni][1], prediction[ni][2],
-                                  prediction[ni][3], ka0[0], ka0[1], ka0[2], ka0[3],
-                                  __float_as_uint(b0), __float_as_uint(b1));
-                    mma_tf32_bits(prediction[ni][0], prediction[ni][1], prediction[ni][2],
-                                  prediction[ni][3], ka1[0], ka1[1], ka1[2], ka1[3],
-                                  __float_as_uint(b2), __float_as_uint(b3));
-                    mma_bf16(history[ni][0], history[ni][1], history[ni][2], history[ni][3], qa[0],
-                             qa[1], qa[2], qa[3], pack_bf16x2(b0, b1), pack_bf16x2(b2, b3));
+                    for (int ni = 0; ni < NPW; ++ni) {
+                        const int n    = warp + ni * kWarps;
+                        const float b0 = sm.snapshot[value_index<DV>(k + 2 * t, n * 8 + g)];
+                        const float b1 = sm.snapshot[value_index<DV>(k + 2 * t + 1, n * 8 + g)];
+                        const float b2 = sm.snapshot[value_index<DV>(k + 2 * t + 8, n * 8 + g)];
+                        const float b3 = sm.snapshot[value_index<DV>(k + 2 * t + 9, n * 8 + g)];
+                        mma_tf32_bits(prediction[ni][0], prediction[ni][1], prediction[ni][2],
+                                      prediction[ni][3], ka0[0], ka0[1], ka0[2], ka0[3],
+                                      __float_as_uint(b0), __float_as_uint(b1));
+                        mma_tf32_bits(prediction[ni][0], prediction[ni][1], prediction[ni][2],
+                                      prediction[ni][3], ka1[0], ka1[1], ka1[2], ka1[3],
+                                      __float_as_uint(b2), __float_as_uint(b3));
+                        mma_bf16(history[ni][0], history[ni][1], history[ni][2], history[ni][3],
+                                 qa[0], qa[1], qa[2], qa[3], pack_bf16x2(b0, b1),
+                                 pack_bf16x2(b2, b3));
+                    }
+                }
+            } else {
+                // S is rounded to FP16 once per element for both products.
+                unsigned prediction_part[NPW][2]{}, history_part[NPW][2]{};
+#pragma unroll
+                for (int k = 0; k < kStateDim; k += 16) {
+                    unsigned ka[4], qa[4];
+                    load_vector_bf16_a(qk.k, k, lane, ka);
+                    load_vector_bf16_a(qk.q, k, lane, qa);
+#pragma unroll
+                    for (int ni = 0; ni < NPW; ++ni) {
+                        const int n    = warp + ni * kWarps;
+                        const float b0 = sm.snapshot[value_index<DV>(k + 2 * t, n * 8 + g)];
+                        const float b1 = sm.snapshot[value_index<DV>(k + 2 * t + 1, n * 8 + g)];
+                        const float b2 = sm.snapshot[value_index<DV>(k + 2 * t + 8, n * 8 + g)];
+                        const float b3 = sm.snapshot[value_index<DV>(k + 2 * t + 9, n * 8 + g)];
+                        const unsigned s0 = pack_f16x2(b0, b1), s1 = pack_f16x2(b2, b3);
+                        mma_f16_partial(prediction[ni], prediction_part[ni], k / 16, ka, s0, s1);
+                        mma_f16_partial(history[ni], history_part[ni], k / 16, qa, s0, s1);
+                    }
                 }
             }
 #pragma unroll
@@ -237,25 +307,47 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
                 const bool query = warp >= NT;
                 const int n      = warp % NT;
                 if (query) {
+                    if constexpr (!Fp16) {
 #pragma unroll
-                    for (int k = 0; k < kStateDim; k += 16) {
-                        unsigned af[4], b0, b1;
-                        load_vector_bf16_a(qk.q, k, lane, af);
-                        load_bf16_b<DV>(sm.snapshot, k, n, lane, b0, b1);
-                        mma_bf16(history[0][0], history[0][1], history[0][2], history[0][3], af[0],
-                                 af[1], af[2], af[3], b0, b1);
+                        for (int k = 0; k < kStateDim; k += 16) {
+                            unsigned af[4], b0, b1;
+                            load_vector_bf16_a(qk.q, k, lane, af);
+                            load_bf16_b<DV>(sm.snapshot, k, n, lane, b0, b1);
+                            mma_bf16(history[0][0], history[0][1], history[0][2], history[0][3],
+                                     af[0], af[1], af[2], af[3], b0, b1);
+                        }
+                    } else {
+                        unsigned part[2]{};
+#pragma unroll
+                        for (int k = 0; k < kStateDim; k += 16) {
+                            unsigned af[4], b0, b1;
+                            load_vector_bf16_a(qk.q, k, lane, af);
+                            load_f16_b<DV>(sm.snapshot, k, n, lane, b0, b1);
+                            mma_f16_partial(history[0], part, k / 16, af, b0, b1);
+                        }
                     }
                 } else {
+                    if constexpr (Fp16) {
+                        unsigned part[2]{};
 #pragma unroll
-                    for (int k = 0; k < kStateDim; k += 8) {
-                        unsigned af[4];
-                        load_vector_tf32_a(qk.k, k, lane, af);
-                        mma_tf32_bits(
-                            history[0][0], history[0][1], history[0][2], history[0][3], af[0],
-                            af[1], af[2], af[3],
-                            __float_as_uint(sm.snapshot[value_index<DV>(k + 2 * t, n * 8 + g)]),
-                            __float_as_uint(
-                                sm.snapshot[value_index<DV>(k + 2 * t + 1, n * 8 + g)]));
+                        for (int k = 0; k < kStateDim; k += 16) {
+                            unsigned af[4], b0, b1;
+                            load_vector_bf16_a(qk.k, k, lane, af);
+                            load_f16_b<DV>(sm.snapshot, k, n, lane, b0, b1);
+                            mma_f16_partial(history[0], part, k / 16, af, b0, b1);
+                        }
+                    } else {
+#pragma unroll
+                        for (int k = 0; k < kStateDim; k += 8) {
+                            unsigned af[4];
+                            load_vector_tf32_a(qk.k, k, lane, af);
+                            mma_tf32_bits(
+                                history[0][0], history[0][1], history[0][2], history[0][3], af[0],
+                                af[1], af[2], af[3],
+                                __float_as_uint(sm.snapshot[value_index<DV>(k + 2 * t, n * 8 + g)]),
+                                __float_as_uint(
+                                    sm.snapshot[value_index<DV>(k + 2 * t + 1, n * 8 + g)]));
+                        }
                     }
                     store_residual<DV>(sm.delta, stage.value, history[0], p.prefix, n, lane);
                 }
@@ -296,37 +388,73 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
             store_output(args, history[0], chunk, head, value_start, n, lane);
         }
 
-        // S^T = gamma S^T + K^T diag(suffix) Delta. The master state stays FP32.
-        // Convert Delta only for this MMA and reuse its fragment across all key tiles.
-        // The output branch above consumes the original FP32 Delta through TF32 MMA.
-        unsigned delta_b[NPW][2];
-#pragma unroll
-        for (int ni = 0; ni < NPW; ++ni) {
-            const int col = (n_start + ni * kWarps) * 8 + g;
-            delta_b[ni][0] =
-                pack_bf16x2(p.suffix[2 * t] * sm.delta[value_index<DV>(2 * t, col)],
-                            p.suffix[2 * t + 1] * sm.delta[value_index<DV>(2 * t + 1, col)]);
-            delta_b[ni][1] =
-                pack_bf16x2(p.suffix[2 * t + 8] * sm.delta[value_index<DV>(2 * t + 8, col)],
-                            p.suffix[2 * t + 9] * sm.delta[value_index<DV>(2 * t + 9, col)]);
-        }
-#pragma unroll
-        for (int mi = 0; mi < MPW; ++mi) {
-            const int key     = (m_start + mi * MW) * 16 + g;
-            const float decay = p.prefix[kChunkSize - 1];
+        if constexpr (!Fp16) {
+            // S^T = gamma S^T + K^T diag(suffix) Delta. The master state stays FP32.
+            // Convert Delta only for this MMA and reuse its fragment across all key tiles.
+            // The output branch above consumes the original FP32 Delta through TF32 MMA.
+            unsigned delta_b[NPW][2];
 #pragma unroll
             for (int ni = 0; ni < NPW; ++ni) {
-                state[ni][mi][0] *= decay;
-                state[ni][mi][1] *= decay;
-                state[ni][mi][2] *= decay;
-                state[ni][mi][3] *= decay;
+                const int col = (n_start + ni * kWarps) * 8 + g;
+                delta_b[ni][0] =
+                    pack_bf16x2(p.suffix[2 * t] * sm.delta[value_index<DV>(2 * t, col)],
+                                p.suffix[2 * t + 1] * sm.delta[value_index<DV>(2 * t + 1, col)]);
+                delta_b[ni][1] =
+                    pack_bf16x2(p.suffix[2 * t + 8] * sm.delta[value_index<DV>(2 * t + 8, col)],
+                                p.suffix[2 * t + 9] * sm.delta[value_index<DV>(2 * t + 9, col)]);
             }
-            unsigned af[4];
-            load_transposed_bf16_a(qk.k, key - g, lane, af);
+#pragma unroll
+            for (int mi = 0; mi < MPW; ++mi) {
+                const int key     = (m_start + mi * MW) * 16 + g;
+                const float decay = p.prefix[kChunkSize - 1];
+#pragma unroll
+                for (int ni = 0; ni < NPW; ++ni) {
+                    state[ni][mi][0] *= decay;
+                    state[ni][mi][1] *= decay;
+                    state[ni][mi][2] *= decay;
+                    state[ni][mi][3] *= decay;
+                }
+                unsigned af[4];
+                load_transposed_bf16_a(qk.k, key - g, lane, af);
+#pragma unroll
+                for (int ni = 0; ni < NPW; ++ni) {
+                    mma_bf16(state[ni][mi][0], state[ni][mi][1], state[ni][mi][2],
+                             state[ni][mi][3], af[0], af[1], af[2], af[3], delta_b[ni][0],
+                             delta_b[ni][1]);
+                }
+            }
+        } else {
+            // The same update with FP16 operands. Each tile's 16-token product is rounded to FP16
+            // once, from zero, and carried into the FP32 state together with the decay.
+            unsigned delta_b[NPW][2];
 #pragma unroll
             for (int ni = 0; ni < NPW; ++ni) {
-                mma_bf16(state[ni][mi][0], state[ni][mi][1], state[ni][mi][2], state[ni][mi][3],
-                         af[0], af[1], af[2], af[3], delta_b[ni][0], delta_b[ni][1]);
+                const int col = (n_start + ni * kWarps) * 8 + g;
+                delta_b[ni][0] =
+                    pack_f16x2(p.suffix[2 * t] * sm.delta[value_index<DV>(2 * t, col)],
+                               p.suffix[2 * t + 1] * sm.delta[value_index<DV>(2 * t + 1, col)]);
+                delta_b[ni][1] =
+                    pack_f16x2(p.suffix[2 * t + 8] * sm.delta[value_index<DV>(2 * t + 8, col)],
+                               p.suffix[2 * t + 9] * sm.delta[value_index<DV>(2 * t + 9, col)]);
+            }
+#pragma unroll
+            for (int mi = 0; mi < MPW; ++mi) {
+                const int key     = (m_start + mi * MW) * 16 + g;
+                const float decay = p.prefix[kChunkSize - 1];
+                unsigned af[4];
+                load_transposed_bf16_a(qk.k, key - g, lane, af);
+#pragma unroll
+                for (int ni = 0; ni < NPW; ++ni) {
+                    unsigned part[2];
+                    mma_f16_f16acc_zero(part[0], part[1], af[0], af[1], af[2], af[3],
+                                        delta_b[ni][0], delta_b[ni][1]);
+                    const float2 low  = __half22float2(half2_from_bits(part[0]));
+                    const float2 high = __half22float2(half2_from_bits(part[1]));
+                    state[ni][mi][0]  = fmaf(state[ni][mi][0], decay, low.x);
+                    state[ni][mi][1]  = fmaf(state[ni][mi][1], decay, low.y);
+                    state[ni][mi][2]  = fmaf(state[ni][mi][2], decay, high.x);
+                    state[ni][mi][3]  = fmaf(state[ni][mi][3], decay, high.y);
+                }
             }
         }
         __syncthreads();
@@ -350,16 +478,23 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
     }
 }
 
-template <int DV>
+template <int DV, bool Fp16>
 void launch(const Arguments& args, const QkChunk* qk, const ControlChunk* control,
             cudaStream_t stream) {
     constexpr int shared_bytes = sizeof(RecurrenceShared<DV>);
-    CUDA_CHECK(cudaFuncSetAttribute(chunk_recurrence_kernel<DV>,
+    CUDA_CHECK(cudaFuncSetAttribute(chunk_recurrence_kernel<DV, Fp16>,
                                     cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes));
-    chunk_recurrence_kernel<DV>
+    chunk_recurrence_kernel<DV, Fp16>
         <<<args.value_heads*(kStateDim / DV), kThreads<DV>, shared_bytes, stream>>>(args, qk,
                                                                                     control);
     CUDA_CHECK(cudaGetLastError());
+}
+
+template <int DV>
+void dispatch(const Arguments& args, const QkChunk* qk, const ControlChunk* control,
+              cudaStream_t stream, bool fp16) {
+    if (fp16) return launch<DV, true>(args, qk, control, stream);
+    return launch<DV, false>(args, qk, control, stream);
 }
 
 } // namespace
@@ -389,16 +524,16 @@ int value_tile(int value_heads, int multiprocessor_count) {
 }
 
 void launch_recurrence(const Arguments& args, const QkChunk* qk, const ControlChunk* control,
-                       DeviceExecutionView execution) {
+                       DeviceExecutionView execution, bool fp16) {
     switch (value_tile(args.value_heads, execution.multiprocessor_count)) {
     case 64:
-        return launch<64>(args, qk, control, execution.stream);
+        return dispatch<64>(args, qk, control, execution.stream, fp16);
     case 32:
-        return launch<32>(args, qk, control, execution.stream);
+        return dispatch<32>(args, qk, control, execution.stream, fp16);
     case 16:
-        return launch<16>(args, qk, control, execution.stream);
+        return dispatch<16>(args, qk, control, execution.stream, fp16);
     default:
-        return launch<8>(args, qk, control, execution.stream);
+        return dispatch<8>(args, qk, control, execution.stream, fp16);
     }
 }
 

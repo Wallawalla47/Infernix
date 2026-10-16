@@ -23,6 +23,7 @@
 #include "infernix/ops/scatter.h"
 #include "infernix/ops/sigmoid_mul.h"
 #include "infernix/ops/silu_mul.h"
+#include "infernix/ops/speculative_round.h"
 
 #include <algorithm>
 #include <array>
@@ -457,7 +458,8 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
         ops::causal_conv1d_silu_split(qkv, p.convolution, conv_state, conv_state, q, k, v, s);
         Tensor state = state_.gdn->recurrent_slot(index, slot);
         ops::gated_delta_net(q.view({DK, NK, T}), k.view({DK, NK, T}), v.view({DV, NV, T}), gate, beta, scale,
-                             /*normalize_qk=*/true, work_, state, state, o, device_.execution_view());
+                             /*normalize_qk=*/true, work_, state, state, o, device_.execution_view(),
+                             fast_.gdn_arithmetic);
     } else {
         // One position per sequence (decode): the recurrent update with device-chosen slots.
         auto layer = state_.gdn->layer_view(index);
@@ -862,12 +864,27 @@ void Forward::mtp_block(const MtpCall& call, Tensor& rows) {
         Tensor narrow = work_.alloc(DType::BF16, {rows_out, T});
         ops::cast_fp32_to_bf16(head_logits, narrow, s);
         Tensor drafts = call.drafts;
-        if (head.rows) {
+        if (call.sample_configs != nullptr) {
+            // Sampled drafts: the head's top rows, one draw each under the column's sampler; the top
+            // row's log-probability is also the --spec-min-p confidence.
+            const std::int32_t valid = head.rows ? rows_out : dim(parameters_.model.resources().public_token_count);
+            Tensor sample_rows     = call.sample_rows;
+            Tensor sample_logprobs = call.sample_logprobs;
+            ops::top_logprobs(narrow, valid, sample_rows, sample_logprobs, s);
+            Tensor candidates = call.draft_candidates;
+            Tensor q          = call.draft_q;
+            Tensor confidence = call.draft_logprobs.data != nullptr
+                                    ? Tensor(call.draft_logprobs.data, DType::FP32, {T})
+                                    : Tensor{};
+            ops::speculative_sample_sparse_drafts(
+                sample_rows, sample_logprobs, head.rows ? static_cast<const std::int32_t*>(head.token_ids.data) : nullptr,
+                call.sample_configs, call.positions, call.draft_step, drafts, candidates, q, confidence, s);
+        } else if (head.rows) {
             ops::argmax(narrow, head.token_ids, drafts, rows_out, s);
         } else {
             ops::argmax(narrow, drafts, dim(parameters_.model.resources().public_token_count), s);
         }
-        if (call.draft_logprobs.data != nullptr) {
+        if (call.draft_logprobs.data != nullptr && call.sample_configs == nullptr) {
             // The top row's log-probability over the head's rows: the draft's own (same rows, same
             // tie order as the argmax above).
             const std::int32_t valid = head.rows ? rows_out : dim(parameters_.model.resources().public_token_count);

@@ -181,9 +181,14 @@ infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8
   next start loads the highest-ranked experts into half of the expert cache before the first
   request (under a second), so the first few hundred tokens decode faster when the work resembles
   the last session's (measured +24 % plain and +30 % with MTP on a repeated coding prompt), and
-  about as fast as a cold start when it does not; the other half stays free to fill quickly. `--expert-state FILE` moves the file; `--expert-state off` starts with an empty cache,
-  as cold benchmarks need. Output is the same either way: where an expert is computed never
-  changes a bit.
+  about as fast as a cold start when it does not; the other half stays free to fill quickly. With
+  no saved state yet (a first start, or a file of another artifact), the engine seeds the same way
+  from a built-in calibrated expert order (NInfer's, ranked over 128 tasks in nine domains), which
+  every Qwen3.8-Flash-Next artifact uses (measured against an empty cache on the first request, MTP
+  decode: +9 % on a coding prompt, +15 % on a math problem, +56 % with the SSD tier). `--expert-state
+  FILE` moves the file; `--expert-state off` starts with an empty cache and no seed, as cold
+  benchmarks need (`infernix_bench` always starts that way). Output is the same either way: where an
+  expert is computed never changes a bit.
 - The `infernix-serve` statistics panel's `experts` column shows the expert cache's hit rate over
   the session and the last ten requests.
 - After each request the engine logs two Debug lines (`--log-level debug`): the expert cache's
@@ -245,7 +250,8 @@ the experts stay in the artifact: startup pins N MiB (or what the ledger leaves,
 page-locking limit) of expert slots and fills all but ~430 of them (kept free for reads and
 demotions) before the first request; RAM past the limit holds unpinned records. RAM and VRAM hold different experts: the VRAM warm start takes the top of the saved
 ranking of `--expert-state`, and RAM the next ones, then the experts the last session used most,
-then the rest spread evenly across the layers (the same spread with no saved state). The tier's
+then the rest spread evenly across the layers. With no saved state, both take the calibrated
+order instead (with `--expert-state off`, RAM takes the even spread). The tier's
 usage ranking starts from the saved counts, so the best-ranked RAM experts are not the first to
 be replaced. A VRAM eviction of an expert worth keeping copies it back into RAM.
 A round that routes an expert in neither VRAM nor RAM reads it from the artifact while the layer's

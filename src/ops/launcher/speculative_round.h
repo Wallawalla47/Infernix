@@ -20,6 +20,13 @@ void speculative_overlay_copy_proposals_launch(const Tensor& copy_rows, const Te
                                                Tensor& drafts, Tensor& candidates,
                                                Tensor& proposal_q, cudaStream_t stream);
 
+void speculative_sample_sparse_drafts_launch(const Tensor& rows, const Tensor& logprobs,
+                                             const std::int32_t* token_ids,
+                                             const SamplingConfig* configs, const Tensor& positions,
+                                             std::uint32_t draw, Tensor& drafts,
+                                             Tensor& candidate_ids, Tensor& proposal_q,
+                                             Tensor& confidence, cudaStream_t stream);
+
 void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const Tensor& logits,
                                              const Tensor& drafts, const Tensor& current_extents,
                                              Tensor& lengths, Tensor& anchors,

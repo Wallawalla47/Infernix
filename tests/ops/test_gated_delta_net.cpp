@@ -35,7 +35,7 @@ DeviceExecutionView execution(cudaStream_t stream = nullptr) {
 
 constexpr int kStateDim = 128;
 
-enum class PrecisionProfile { Recurrent, ChunkedNormalized, ChunkedRaw };
+enum class PrecisionProfile { Recurrent, ChunkedNormalized, ChunkedRaw, ChunkedFp16Accumulate };
 
 struct Criteria {
     const char* name;
@@ -49,10 +49,21 @@ struct Criteria {
 // Output has an additional final BF16 conversion. These profile-wide regression limits retain
 // margin around the qualified error envelope and apply uniformly across head counts, sequence
 // lengths and gate values. The unchanged recurrent profile retains its limits.
-constexpr std::array<Criteria, 3> kCriteria{{
+//
+// chunked-fp16acc is GdnChunkArithmetic::Fp16Accumulate (normalized Q/K only). Every operand it
+// rounds to FP16 (Q/K, S, the scaled Delta: unit roundoff 2^-11) the chunked-normalized route
+// rounds to BF16 (2^-9) or truncates to TF32 (2^-10), and each FP16 partial sum spans 32 products
+// (two k16 MMAs before the FP32 carry) and is rounded once, so a 128-term readout or prediction
+// carries four such roundings in FP32 and the 16-token state update one per chunk. Unit Q/K rows
+// keep every packet value inside FP16's range; S and Delta follow V's magnitude, which the inputs
+// keep far below 65504. It keeps the chunked-normalized limits (measured 2026-10-16 at the 27B's
+// shapes: output relative RMS 2.08e-3 against the exact route's 3.60e-3, state 8.6e-4 against
+// 2.6e-3).
+constexpr std::array<Criteria, 4> kCriteria{{
     {"recurrent", {4.1e-3, 5.0e-6, 5.5e-3}, {2.7e-3, 1.0e-5, 3.9e-3}},
     {"chunked-normalized", {6.0e-3, 5.0e-6, 8.0e-3}, {4.5e-3, 1.0e-5, 9.0e-3}},
     {"chunked-raw", {4.5e-3, 5.0e-6, 7.0e-3}, {3.0e-3, 1.0e-5, 4.0e-3}},
+    {"chunked-fp16acc", {6.0e-3, 5.0e-6, 8.0e-3}, {4.5e-3, 1.0e-5, 9.0e-3}},
 }};
 
 PrecisionProfile prefill_profile(int tokens, bool normalize_qk) {
@@ -503,6 +514,57 @@ int run_case(const Case& test_case, std::uint32_t seed,
     return failures;
 }
 
+// GdnChunkArithmetic::Fp16Accumulate through the public Op (distinct states), against the same
+// FP64 oracle as run_case, with the exact-zero and identity properties of the special inputs.
+int fp16_accumulate_case(const Case& test_case, std::uint32_t seed, InputPattern pattern = InputPattern::Ordinary) {
+    const gdn_ref::Inputs in = make_inputs(test_case, seed, pattern);
+    const float scale        = 1.0F / std::sqrt(static_cast<float>(kStateDim));
+    const auto ref           = gdn_ref::evaluate(in, scale, true);
+    DeviceInputs device(in);
+    DeviceBuffer state_in = to_device_f32(in.state);
+    GuardedDeviceBuffer state_out(in.state.size() * sizeof(float));
+    GuardedDeviceBuffer out(in.v.size() * sizeof(std::uint16_t));
+    state_out.fill(0xff);
+    out.fill(0xff);
+    Tensor q(device.q.p, DType::BF16, {kStateDim, test_case.qk_heads, test_case.tokens});
+    Tensor k(device.k.p, DType::BF16, {kStateDim, test_case.qk_heads, test_case.tokens});
+    Tensor v(device.v.p, DType::BF16, {kStateDim, test_case.value_heads, test_case.tokens});
+    Tensor g(device.g.p, DType::FP32, {test_case.value_heads, test_case.tokens});
+    Tensor beta(device.beta.p, DType::FP32, {test_case.value_heads, test_case.tokens});
+    Tensor output(out.data(), DType::BF16, {kStateDim, test_case.value_heads, test_case.tokens});
+    Tensor input_state(state_in.p, DType::FP32, {kStateDim, kStateDim, test_case.value_heads});
+    Tensor output_state(state_out.data(), DType::FP32, {kStateDim, kStateDim, test_case.value_heads});
+    const auto workspace_bytes = ops::gated_delta_net_workspace_capacity_bytes(
+        test_case.qk_heads, test_case.value_heads, test_case.tokens, test_case.tokens);
+    GuardedDeviceBuffer scratch(std::max<std::size_t>(workspace_bytes, 256));
+    WorkspaceArena workspace(DeviceSpan{scratch.data(), scratch.bytes()});
+    const std::string label = std::string(test_case.name) + " fp16acc H=" + std::to_string(test_case.qk_heads) + "/" +
+                              std::to_string(test_case.value_heads) + " T=" + std::to_string(test_case.tokens);
+    std::cout << "GDN_CASE " << label << std::endl;
+    ops::gated_delta_net(q, k, v, g, beta, scale, true, workspace, input_state, output_state, output, execution(),
+                         ops::GdnChunkArithmetic::Fp16Accumulate);
+    cuda_synchronize();
+    const auto profile    = test_case.tokens < 16 ? PrecisionProfile::Recurrent : PrecisionProfile::ChunkedFp16Accumulate;
+    const auto got_output = from_device_bf16(out.data(), in.v.size());
+    const auto got_state  = read_f32(state_out.data(), in.state.size());
+    int failures          = 0;
+    failures += verify_heads(label + " out", got_output, ref.out, test_case.value_heads, test_case.tokens, profile, false);
+    failures += verify_heads(label + " state", got_state, ref.final_state, test_case.value_heads, 1, profile, true);
+    if (pattern == InputPattern::ZeroQuery || pattern == InputPattern::ZeroSignal) {
+        failures += verify_exact(label + " exact zero output", got_output, std::vector<double>(got_output.size(), 0.0));
+    }
+    if (pattern == InputPattern::ZeroSignal) {
+        failures += verify_exact(label + " exact zero state", got_state, std::vector<double>(got_state.size(), 0.0));
+    }
+    if (pattern == InputPattern::ZeroBeta) { failures += verify_exact(label + " identity state", got_state, doubles(in.state)); }
+    failures += state_out.verify_guards(label + " state");
+    failures += out.verify_guards(label + " out");
+    failures += scratch.verify_guards(label + " workspace");
+    failures += verify_exact(label + " source state unchanged", from_device<float>(state_in, in.state.size()), in.state);
+    failures += verify_common_inputs_unchanged(label, in, device.q, device.k, device.v, device.g, device.beta);
+    return failures;
+}
+
 int batch_update_case(const Case& test_case, const std::vector<int>& source_slots,
                       const std::vector<int>& destination_slots, int slots, std::uint32_t seed) {
     if (test_case.tokens != 1) { throw std::logic_error("batch_update_case requires W=1"); }
@@ -842,6 +904,31 @@ int main() {
                                   {8, 9, 10, 11, 12, 13, 14, 15}, 16, 13001u);
     failures += batch_update_case({"35b mixed fork destinations", 16, 32, 1, true}, {0, 2, 4, 6},
                                   {1, 3, 5, 7}, 8, 13101u);
+
+    // FP16 accumulation (gdn-f16-accumulate) on every value tile (64, 32, 16 and 8 columns on 170
+    // SMs), at the chunked route's boundaries and on the stress inputs.
+    for (const auto geometry :
+         {Geometry{"qwen-27b", 16, 48, 1025}, Geometry{"qwen-35b-a3b", 16, 32, 1025},
+          Geometry{"generic-grouped-map", 5, 15, 65}, Geometry{"shared-qk", 1, 3, 65}}) {
+        failures += fp16_accumulate_case({geometry.name, geometry.qk_heads, geometry.value_heads, geometry.tokens, true},
+                                         16180U + geometry.value_heads);
+    }
+    for (int tokens : {15, 16, 17, 33, 4096}) {
+        failures += fp16_accumulate_case({"fp16acc prefill boundary", 1, 3, tokens, true}, 90000U + tokens);
+    }
+    for (const auto stress : {Stress{"weak decay", InputPattern::WeakDecay, 16385, 332211U},
+                              Stress{"zero decay", InputPattern::ZeroDecay, 16385, 332212U},
+                              Stress{"small beta", InputPattern::SmallBeta, 16385, 332213U},
+                              Stress{"strong decay", InputPattern::StrongDecay, 16385, 332214U},
+                              Stress{"near collinear", InputPattern::NearCollinear, 4097, 332215U}}) {
+        failures += fp16_accumulate_case({stress.name, 1, 3, stress.tokens, true}, stress.seed, stress.pattern);
+    }
+    failures += fp16_accumulate_case({"27b weak decay", 16, 48, 2049, true}, 16048U, InputPattern::WeakDecay);
+    failures += fp16_accumulate_case({"near-zero normalization", 1, 3, 17, true, true}, 14017U);
+    failures += fp16_accumulate_case({"zero query", 1, 3, 17, true}, 14317U, InputPattern::ZeroQuery);
+    failures += fp16_accumulate_case({"zero signal", 1, 3, 17, true}, 14417U, InputPattern::ZeroSignal);
+    failures += fp16_accumulate_case({"zero beta", 1, 3, 17, true}, 14517U, InputPattern::ZeroBeta);
+    failures += fp16_accumulate_case({"unit beta", 1, 3, 257, true}, 14657U, InputPattern::UnitBeta);
 
     print_summaries();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gated_delta_net correctness\n";

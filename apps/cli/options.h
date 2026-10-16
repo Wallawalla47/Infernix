@@ -46,6 +46,9 @@ struct Options {
     bool original_nvfp4_prefill_kernel = false;
     // Off with --disable-fast-paths (EngineOptions::fast_paths).
     bool fast_paths = true;
+    // --fast-path NAME (repeatable): also run these, qualified or not (qualification runs;
+    // EngineOptions::fast_path_candidates).
+    std::vector<FastPath> fast_path_candidates;
     SpeculativeOptions speculative;
     bool enable_vision                     = false;
     VisionOffload vision_offload                    = VisionOffload::Auto;

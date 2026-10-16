@@ -243,7 +243,12 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
 
     // The VRAM check (design §19.3.7), before the weights are read: the dense weights, the
     // Program's fixed allocations, the reserve for graph executables and the display headroom
-    // must leave room for the expert cache.
+    // must leave room for the expert cache. Fast paths are selected once the weights are bound, so
+    // the check counts sampled-mtp-drafts' draft graphs whenever it could be selected.
+    program_options.sampled_mtp_drafts =
+        options.speculative.backend == SpeculativeBackend::Mtp &&
+        (options.fast_paths || std::find(options.fast_path_candidates.begin(), options.fast_path_candidates.end(),
+                                         FastPath::SampledMtpDrafts) != options.fast_path_candidates.end());
     const auto device_plan =
         models::qwen4_exp::Program::plan_device(program_options, plan.config(), plan.public_token_count());
     const std::uint64_t dense = plan.device_bytes();
@@ -292,6 +297,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.pair_speculation  = fast.selected(FastPath::AdaptiveSpeculation);
     program_options.free_cache_resume = fast.selected(FastPath::FreeCacheResume);
     program_options.preemption        = fast.selected(FastPath::Preemption);
+    program_options.sampled_mtp_drafts = fast.selected(FastPath::SampledMtpDrafts);
 
     StartupPhaseScope program(options.startup_observer, StartupPhase::ProgramInitialize);
     instance->program =

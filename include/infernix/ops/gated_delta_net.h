@@ -23,6 +23,16 @@ namespace infernix::ops {
                                                                    std::int32_t min_tokens,
                                                                    std::int32_t max_tokens);
 
+// The chunked route's arithmetic (T at or above its minimum; shorter calls run the recurrent route
+// either way). Exact is the documented route below. Fp16Accumulate (the gdn-f16-accumulate fast
+// path) requires normalize_qk: the private Q/K packet holds FP16 instead of BF16, and the chunk
+// products of the state (the prediction K S^T, the readout Q S^T and the update K^T diag(suffix)
+// Delta) take FP16 operands (S and the scaled Delta rounded to FP16) and accumulate each pair of
+// k16 products (32 terms) in FP16 before adding it to an FP32 accumulator; the update's product is
+// rounded once and added to the decayed FP32 state. The control products and the master state stay
+// FP32. It runs the state products at the FP16-accumulate tensor rate.
+enum class GdnChunkArithmetic : std::uint8_t { Exact, Fp16Accumulate };
+
 /**
  * Applies the Gated DeltaNet recurrence independently for each value head h. Let
  * G=value_heads/qk_heads; its Q/K head is qh=floor(h/G). Starting from S_h, for t in increasing
@@ -53,7 +63,8 @@ namespace infernix::ops {
  */
 void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                      const Tensor& beta, float scale, bool normalize_qk, WorkspaceArena& ws,
-                     Tensor& ssm_state, Tensor& out, DeviceExecutionView execution);
+                     Tensor& ssm_state, Tensor& out, DeviceExecutionView execution,
+                     GdnChunkArithmetic arithmetic = GdnChunkArithmetic::Exact);
 
 /**
  * Distinct-state form of the same recurrence. `ssm_state_out` receives the final state;
@@ -63,7 +74,8 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
 void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                      const Tensor& beta, float scale, bool normalize_qk, WorkspaceArena& ws,
                      const Tensor& ssm_state_in, Tensor& ssm_state_out, Tensor& out,
-                     DeviceExecutionView execution);
+                     DeviceExecutionView execution,
+                     GdnChunkArithmetic arithmetic = GdnChunkArithmetic::Exact);
 
 /**
  * One-token update for B independent state-pool slots. q/k are contiguous BF16 [128,Hqk,1,B],

@@ -384,6 +384,10 @@ struct ProgramOptions {
     bool pair_speculation  = false;
     bool free_cache_resume = false;
     bool preemption        = false;
+    // sampled-mtp-drafts (FastPath::SampledMtpDrafts): a sampled row's MTP drafts are drawn from the
+    // draft head's top tokens under its sampler and verified by sparse rejection sampling, and its
+    // one-row rounds verify every draft (no mtp_draft_min_p cut). Greedy rows are unchanged.
+    bool sampled_mtp_drafts = false;
     // CPU-served misses (design section 10): host expert-engine workers (0 disables), the most
     // experts one layer call hands to them, and the share kept on the PCIe stage (misses / divisor;
     // 0 derives it from the measured link and CPU rates, design §19.3.12).
