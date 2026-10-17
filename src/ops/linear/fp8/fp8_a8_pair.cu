@@ -1,6 +1,6 @@
-// fp8-a8-pair (LinearRoutes::Fp8A8Pair): the two-term E4M3 activation quantizer. One CTA per
-// column writes both terms, so the residual is formed from the high term's exact decoded value in
-// registers without a second pass over the activation.
+// fp8-a8-pair (LinearRoutes::Fp8A8Pair): the two-term E4M3 activation quantizer with power-of-two
+// column scales. One CTA per column writes both terms, so the residual is formed from the high
+// term's exact decoded value in registers without a second pass over the activation.
 #include "core/weight.h"
 #include "ops/linear/fp8/fp8_a8_plan.h"
 
@@ -26,6 +26,20 @@ __device__ __forceinline__ float fp8_e4m3_value(unsigned code) {
         exponent == 0U ? static_cast<float>(mantissa) * 0.001953125F // 2^-9: subnormal
                        : __uint_as_float(((exponent + 120U) << 23) | (mantissa << 20));
     return (code & 0x80U) != 0U ? -magnitude : magnitude;
+}
+
+// A term's scale: the least power of two 2^s with maximum * 2^-s <= 448 (E4M3's largest finite
+// value), s within [-126, 126] so that 2^s and 2^-s are normal FP32 values; 0 for a zero term.
+// Power-of-two scales keep x * 2^-s exact, so the high term keeps a BF16 value's top four
+// significant bits and the residual its remaining four exactly.
+__device__ __forceinline__ float pair_scale(float maximum) {
+    if (maximum == 0.0F) return 0.0F;
+    const unsigned bits = __float_as_uint(maximum);
+    const int exponent  = static_cast<int>((bits >> 23) & 0xFFU) - 127;
+    // maximum = 1.f * 2^exponent; 1.f * 2^8 <= 448 exactly when 1.f <= 1.75.
+    int s = exponent - 8 + ((bits & 0x7FFFFFU) > 0x600000U ? 1 : 0);
+    s     = s < -126 ? -126 : (s > 126 ? 126 : s);
+    return __uint_as_float(static_cast<unsigned>(s + 127) << 23);
 }
 
 // The maximum of every thread's value; each call needs its own `result` slot.
@@ -73,8 +87,8 @@ __global__ __launch_bounds__(Threads) void fp8_a8_pair_quantize_kernel(
         maximum      = fmaxf(maximum, fmaxf(fabsf(values[item].x), fabsf(values[item].y)));
     }
     maximum                = block_max<Threads>(maximum, warp_maxima, &maxima[0]);
-    const float scale_hi   = maximum > 0.0F ? maximum / 448.0F : 0.0F;
-    const float inverse_hi = scale_hi > 0.0F ? 1.0F / scale_hi : 0.0F;
+    const float scale_hi   = pair_scale(maximum);
+    const float inverse_hi = scale_hi > 0.0F ? 1.0F / scale_hi : 0.0F; // exact: a power of two
 
     // The high term, and the residual its decoded value leaves (in place of the activation).
     float residual_maximum = 0.0F;
@@ -92,7 +106,7 @@ __global__ __launch_bounds__(Threads) void fp8_a8_pair_quantize_kernel(
             fmaxf(residual_maximum, fmaxf(fabsf(values[item].x), fabsf(values[item].y)));
     }
     residual_maximum       = block_max<Threads>(residual_maximum, warp_maxima, &maxima[1]);
-    const float scale_lo   = residual_maximum > 0.0F ? residual_maximum / 448.0F : 0.0F;
+    const float scale_lo   = pair_scale(residual_maximum);
     const float inverse_lo = scale_lo > 0.0F ? 1.0F / scale_lo : 0.0F;
 #pragma unroll
     for (int item = 0; item < pairs_per_thread; ++item) {

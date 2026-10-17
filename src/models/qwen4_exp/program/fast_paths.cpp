@@ -27,17 +27,21 @@ constexpr std::array kQualified{
     Qualification{FastPath::FreeCacheResume, {QType::Q8_G32_FP16, true, KvCacheStorage::Int8Group64}},
     // Preemption with Replay under a 388-page pool that certainly runs short (2026-10-14).
     Qualification{FastPath::Preemption, {QType::Q8_G32_FP16, true, KvCacheStorage::Int8Group64}},
-    // The other formats (2026-10-16, 256 segments): MTP at concurrency 2 with every request resuming
+    // The other formats (2026-10-16/17, 256 segments): MTP at concurrency 2 with every request resuming
     // from a warm 3,000-token entry, against the exact route; preemption by its increment over the
-    // qualified paths under the same short pool (model-quality.md 6.1). The joint arm fails top-1 on
-    // FP8 and K8V4 (K8V4 also its tail).
+    // qualified paths under the same short pool (model-quality.md 6.1). FP8 and K8V4 failed the
+    // joint arm narrowly at 256 segments and passed it at 1,024 (2026-10-17).
     Qualification{FastPath::AdaptiveSpeculation, {QType::Q8_G32_FP16, true, KvCacheStorage::BFloat16}},
     Qualification{FastPath::FreeCacheResume, {QType::Q8_G32_FP16, true, KvCacheStorage::BFloat16}},
     Qualification{FastPath::Preemption, {QType::Q8_G32_FP16, true, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::AdaptiveSpeculation, {QType::Q8_G32_FP16, true, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::FreeCacheResume, {QType::Q8_G32_FP16, true, KvCacheStorage::Fp8E4M3Row256}},
     Qualification{FastPath::Preemption, {QType::Q8_G32_FP16, true, KvCacheStorage::Fp8E4M3Row256}},
     Qualification{FastPath::AdaptiveSpeculation, {QType::Q8_G32_FP16, true, KvCacheStorage::Nvfp4Group16}},
     Qualification{FastPath::FreeCacheResume, {QType::Q8_G32_FP16, true, KvCacheStorage::Nvfp4Group16}},
     Qualification{FastPath::Preemption, {QType::Q8_G32_FP16, true, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::AdaptiveSpeculation, {QType::Q8_G32_FP16, true, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::FreeCacheResume, {QType::Q8_G32_FP16, true, KvCacheStorage::Fp8KeyNvfp4Value}},
     Qualification{FastPath::Preemption, {QType::Q8_G32_FP16, true, KvCacheStorage::Fp8KeyNvfp4Value}},
     Qualification{FastPath::AdaptiveSpeculation, {QType::Q8_G32_FP16, true, KvCacheStorage::Vq2}},
     Qualification{FastPath::FreeCacheResume, {QType::Q8_G32_FP16, true, KvCacheStorage::Vq2}},

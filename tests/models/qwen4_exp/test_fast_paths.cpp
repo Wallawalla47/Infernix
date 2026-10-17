@@ -71,25 +71,18 @@ int main() {
     failures += check(!q::fast_path_qualified(FastPath::Fp8A8Pair, {QType::FP8_E4M3FN_ROW_BF16, true, KvCacheStorage::Int8Group64}),
                       "fp8-a8-pair is qualified at op level only, not on any artifact");
 
-    // The request-coupling paths, per KV format: speculation and cache resume passed their joint arm
-    // on these formats (FP8's and K8V4's failed), preemption its increment arm on all of them.
-    struct Coupling {
-        KvCacheStorage kv;
-        bool spec_and_cache;
-        bool preemption;
-    };
-    for (const Coupling& c : {Coupling{KvCacheStorage::BFloat16, true, true}, Coupling{KvCacheStorage::Int8Group64, true, true},
-                              Coupling{KvCacheStorage::Fp8E4M3Row256, false, true},
-                              Coupling{KvCacheStorage::Nvfp4Group16, true, true},
-                              Coupling{KvCacheStorage::Fp8KeyNvfp4Value, false, true},
-                              Coupling{KvCacheStorage::Vq2, true, true},
-                              Coupling{KvCacheStorage::Q4KeyVq2Value, true, true}}) {
-        const FastPathConfiguration config{QType::Q8_G32_FP16, true, c.kv};
-        failures += check(q::fast_path_qualified(FastPath::AdaptiveSpeculation, config) == c.spec_and_cache &&
-                              q::fast_path_qualified(FastPath::FreeCacheResume, config) == c.spec_and_cache,
-                          "adaptive-speculation and free-cache-resume follow their joint arm per KV format");
-        failures += check(q::fast_path_qualified(FastPath::Preemption, config) == c.preemption,
-                          "preemption follows its increment arm per KV format");
+    // The request-coupling paths are qualified with Q8 dense weights and 4-bit experts on every KV
+    // format: speculation and cache resume by their joint arm, preemption by its increment arm.
+    for (const KvCacheStorage kv : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
+                                    KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2,
+                                    KvCacheStorage::Q4KeyVq2Value}) {
+        const FastPathConfiguration config{QType::Q8_G32_FP16, true, kv};
+        for (const FastPath path : {FastPath::AdaptiveSpeculation, FastPath::FreeCacheResume, FastPath::Preemption}) {
+            failures += check(q::fast_path_qualified(path, config),
+                              "the request-coupling paths are qualified on every KV format");
+            failures += check(!q::fast_path_qualified(path, {QType::FP8_E4M3FN_ROW_BF16, false, kv}),
+                              "the request-coupling paths are not qualified on recipe C");
+        }
     }
 
     q::FastPathSelection selection{.configuration = dense8, .paths = {}};

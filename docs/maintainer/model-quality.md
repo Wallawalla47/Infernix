@@ -770,10 +770,10 @@ tokens. The recipe C gates (`expert-a4-residual`, `fp8-a8-pair`) are re-scored i
 | `adaptive-speculation` | the same, with speculative decoding | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
 | `free-cache-resume` | the same, with the prefix cache | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
 | `preemption` | request-invariance-capable artifacts | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
-| Qwen3.8-Flash-Next: `adaptive-speculation` (MTP), `free-cache-resume` | every Flash-Next artifact | Q8 dense, 4-bit experts, with BF16, INT8, NVFP4, VQ2 or K4V2 KV (FP8 and K8V4 fail, below) |
+| Qwen3.8-Flash-Next: `adaptive-speculation` (MTP), `free-cache-resume` | every Flash-Next artifact | Q8 dense, 4-bit experts, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
 | Qwen3.8-Flash-Next: `preemption` | every Flash-Next artifact | Q8 dense, 4-bit experts, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
 | Qwen3.8-Flash-Next: `q8-sliced-k`, `gdn-conv-fused`, `qsa-prepare-fused` | Q8 dense weights (`qsa-prepare-fused`: BF16, INT8, FP8, NVFP4 or K8V4 KV) | Q8 dense, 4-bit experts, every KV format (`qsa-prepare-fused`: the five it serves) |
-| `fp8-a8-pair` | row-FP8 dense weights (recipe C) | none (fails its decode gate on recipe C, below) |
+| `fp8-a8-pair` | row-FP8 dense weights (recipe C) | none (fails its INT8 decode tail on recipe C, below) |
 | `q4-w4a8` | groupwise Q4 MLP gate/up | none (fails, below) |
 | `idle-wide-prefill` | Qwen3.8-27B / Qwen3.6-35B-A3B generation engines | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
 | `adaptive-mtp` | Qwen3.8-27B / Qwen3.6-35B-A3B with MTP | none (no speed gain shown, below) |
@@ -942,10 +942,10 @@ default role (6.1). Bounds are one-sided 95 %:
 | K4V2 | joint | -1.8e-4 (5.7e-4) | +0.10 (0.46) | 5.0e-5 | -2.7e-3 | 1.02 | pass |
 | K4V2 | preemption increment | 3.6e-4 (8.2e-4) | -0.08 (0.13) | 1.1e-3 | 4.4e-4 | 1.03 | pass |
 
-Every prompt-length bucket passes. `adaptive-speculation` and `free-cache-resume` are therefore
-qualified on BF16, NVFP4, VQ2 and K4V2 and not on FP8 or K8V4; `preemption` (which acts only in its
-own arm) on all six. Which path carries the FP8 and K8V4 excess is not resolved: the joint fast run
-also holds the format's kernel paths, whose decode was gated on BF16 and NVFP4 only. Attribution
+Every prompt-length bucket passes. At 256 segments `adaptive-speculation` and `free-cache-resume`
+pass on BF16, NVFP4, VQ2 and K4V2 and fail narrowly on FP8 and K8V4; `preemption` (which acts only
+in its own arm) passes on all six. The joint fast run also holds the format's kernel paths, whose
+decode was gated on BF16 and NVFP4 only. Attribution
 (2026-10-16, the joint arm's conditions, 256 segments; top-1 in points, bound in parentheses):
 
 | KV | Run | TV excess (bound) | Top-1 excess (bound) / 0.50 | p99.9 KL ratio / 1.25 | Verdict |
@@ -967,7 +967,11 @@ coupling reference) settles it: it passes on FP8 (TV bound -2.5e-5, top-1 bound 
 excess -5.3e-3, NLL -1.8e-2, p99.9 ratio 0.94) and K8V4 (TV bound 6.2e-5, top-1 bound 0.14 points,
 KL -2.7e-3, NLL -9.4e-3, p99.9 ratio 1.10), so its registrations stand. The exact route gives the
 same bits under MTP at concurrency 2 as plain at concurrency 8 on FP8 and K8V4 too (96 segments).
-The coupling paths' narrow FP8 and K8V4 failures were not repeated at 1,024 segments. Before the increment rule, the BF16 forced-preemption arm against the exact route failed
+The joint arm at 1,024 segments (2026-10-17, against those exact runs; 1,023,000 prompt tokens
+reused per run) passes on both formats, every excess estimate negative: FP8 TV bound 8.9e-4, top-1
+bound 0.075 points, p99.9 ratio 1.04; K8V4 TV bound -3.6e-4, top-1 bound 0.10 points, p99.9 ratio
+1.05. `adaptive-speculation` and `free-cache-resume` are qualified on FP8 and K8V4 by this
+verdict, which replaces the 256-segment one. Before the increment rule, the BF16 forced-preemption arm against the exact route failed
 (TV bound 4.57e-3, KL excess 1.23e-2, p99.9 ratio 1.63), and the kernel paths alone failed it the same
 way; its exact route was bit-identical with and without the short pool and across reruns (6.1).
 
@@ -1368,9 +1372,32 @@ and recomputes the previous output) or admission (whole extents held without `pr
   than the exact route (cold L2, graph): [16384, 2560] from T = 17, [13312, 2560] from 97,
   [2560, 6144] and [2560, 640] from 513, [1280, 2560] from 1,025 (0.65-0.93 of the exact route
   beyond, except [2560, 6144] at T = 1,040-1,088: 1.18).
-- **Op qualification:** `infernix_linear_fp8_a8_test`, the A16 criterion at every problem's
-  admission seams and tiles (worst relative L2 0.78 of the criterion), outliers and K tails.
-- **Model level (2026-10-15):** gated on the orcarouter recipe C artifact jointly with
+- **Arithmetic (since 2026-10-17):** both terms' per-column scales are powers of two (the least
+  2^s with max * 2^-s <= 448), so x * 2^-s is exact, the high term keeps a BF16 value's top four
+  significant bits and the low term the remaining four: the pair represents every value within
+  2^14 of its column maximum exactly (smaller ones to 2^-20 of the maximum). The earlier
+  max/448 scales were not powers of two and left about 2^-8 relative error per value. The GEMM is
+  unchanged; op speed is within 0-1.6 % of the earlier pair (0.70-0.79 of the exact route at
+  4,096 columns). A variant with a power-of-two scale per 32 values of K, applied by the
+  block-scaled MMA, was nondeterministic on [2560, 6144] (about one 128 x 128 tile in a hundred
+  differed between identical calls, cause not found) and was dropped.
+- **Op qualification:** `infernix_linear_fp8_a8_test`: the quantizer against the exact oracle
+  (bit-exact decoding wherever a value is within 2^14 of its column maximum, on every problem and
+  the outlier activations), determinism across repeated calls in both tile widths, and the A16
+  criterion at every problem's admission seams and tiles, outliers and K tails.
+- **Model level with power-of-two scales (2026-10-17, beside two-term `expert-a4-residual`):**
+  prefill (quick corpus, 896 and 7,168 tokens) passes on every format but BF16 (INT8 KL excess
+  8.7e-4, bound 9.8e-4, against 8.0e-4 for `expert-a4-residual` alone; FP8 bound 8.2e-4, NVFP4
+  6.7e-4, K8V4 3.9e-4, VQ2 9.5e-4, K4V2 9.1e-4). BF16 fails by construction, as
+  `expert-a4-residual` does (the exact route is the reference; KL excess 6.4e-3: any change of
+  bits moves near-tie expert routing). The INT8 decode gate over 1,024 segments fails on its tail
+  alone: p99.9 KL ratio 1.270 against 1.25; TV bound 2.0e-3, top-1 bound 4.50e-3 of 5.0e-3, NLL
+  excess 9.8e-3 under the 1.0e-2 cap. Its increment over `expert-a4-residual` alone passes every
+  criterion (TV bound 5.7e-4, top-1 bound 1.6e-3, NLL 8.5e-3, p99.9 ratio 1.08); the joint tail
+  fails on the 1.18 that `expert-a4-residual` already uses. Speed beside it (ABBA, as below):
+  pp32768 8,752 → 9,221 tok/s (+5.4 %), pp65536 9,011 → 9,556 (+6.0 %). It runs in no
+  configuration.
+- **Model level with max/448 scales (2026-10-15/16):** gated on the orcarouter recipe C artifact jointly with
   `expert-a4-residual` at three terms (the variant qualified then), the reduced protocol as above.
   Prefill passes on every format but BF16 (INT8 KL bound 6.61e-4 of 1.0e-3, against 4.24e-4 for
   three-term `expert-a4-residual` alone). The INT8 decode gate fails on its tail: p99.9 KL ratio
@@ -1389,15 +1416,13 @@ and recomputes the previous output) or admission (whole extents held without `pr
   top-1 bound 4.41e-3, NLL excess 1.2e-3, p99.9 ratio 1.18), and `fp8-a8-pair`'s increment over it
   passes every criterion but NLL (1.11e-2 against the 1.0e-2 cap, bound 2.0e-2; TV bound 1.98e-3,
   top-1 bound 2.57e-3, p99.9 ratio 1.07). The joint failure is `fp8-a8-pair`'s NLL shift on top of
-  the top-1 and tail budget `expert-a4-residual` already uses. Two E4M3 terms carry about 2^-8
-  relative error per value, one bit coarser than BF16; per-block scales would not change that. A
-  bit-exact alternative cannot recover its speed: the exact route's BF16 MMAs run at 227-243 TFLOP/s
+  the top-1 and tail budget `expert-a4-residual` already uses. A bit-exact alternative cannot
+  recover its speed: the exact route's BF16 MMAs run at 227-243 TFLOP/s
   at 2,048-16,384 columns, the Tensor Core pipe 91.7 % busy (ncu, [16384, 2560] at 4,096), level
   with the BF16 GEMM of the same shape, so the gain is the FP8 Tensor Core rate (0.69-0.78 of the
   exact route's time at 4,096 columns). Speed beside two-term
   `expert-a4-residual` (`infernix_bench`, INT8 KV, chunk 4,096, ABBA): pp32768 8,732 → 9,277 tok/s
-  (+6.2 %), pp65536 9,022 → 9,619 (+6.6 %). The other formats were not gated. It runs in no
-  configuration.
+  (+6.2 %), pp65536 9,022 → 9,619 (+6.6 %). The other formats were not gated with these scales.
 
 **`q4-w4a8`: int8 activations in the groupwise Q4 MLP gate/up (fails; not qualified).**
 - **Selected by:** `--fast-path q4-w4a8` on artifacts whose text MLP gate/up is RowSplit

@@ -62,9 +62,10 @@ void launch_fp8_a8_quantize(const Tensor& x, const Weight& weight, Fp8A8Workspac
                             cudaStream_t stream);
 
 // fp8-a8-pair (LinearRoutes::Fp8A8Pair): each activation column as two E4M3 terms with their own
-// per-column scales, x ~ scales_hi * codes_hi + scales_lo * codes_lo. The high term is the
-// single-term A8 quantization (scale = max|x| / 448); the low term quantizes the high term's exact
-// residual x - scales_hi * codes_hi the same way.
+// power-of-two per-column scales, x = scales_hi * codes_hi + scales_lo * codes_lo. The high term
+// scales the column's maximum to at most 448 by a power of two; the low term quantizes the high
+// term's exact residual x - scales_hi * codes_hi the same way. A BF16 value has eight significant
+// bits, four in each term, so the pair is exact for every value within 2^14 of its column maximum.
 struct Fp8A8PairWorkspace {
     std::uint8_t* codes_hi = nullptr;
     float* scales_hi       = nullptr;

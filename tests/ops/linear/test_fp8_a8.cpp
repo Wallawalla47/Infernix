@@ -1,6 +1,7 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "core/weight.h"
+#include "ops/linear/fp8/fp8_a8_plan.h"
 #include "ops/linear/linear_test_common.h"
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
@@ -236,20 +237,16 @@ int run_fp8_a8() {
 // Named criterion: the route carries the activation as two E4M3 terms and meets the A16 criterion
 // (linear_test_common.cpp: relative L2 <= 2^-8, |error| <= 2^-8 + 2^-7 max|reference|), so the
 // suite checks it with ActivationCompute::A16. Derivation. A column x is represented as
-// s1*q1 + s2*q2 with s1 = max|x|/448, q1 = e4m3(x/s1), r = x - s1*q1 (formed from the decoded code,
-// to one FP32 rounding), s2 = max|r|/448, q2 = e4m3(r/s2). Round-to-nearest E4M3 keeps three
-// fraction bits: a normal code is within 2^-4 of its argument relatively, a subnormal one within
-// 2^-10 (half its 2^-9 spacing) absolutely, so
-//   |r_k| <= 2^-4 |x_k| + 2^-10 s1,   |e_k| = |r_k - s2*q2_k| <= 2^-4 |r_k| + 2^-10 s2,
-//   |e_k| <= 2^-8 |x_k| + 2^-13 max|x| / 448        (2^-13/448 = 2.7e-7).
-// Two independent round-to-nearest errors, each uniform over at most its worst-case spacing, give
-// an activation error of RMS at most 2^-8/3 = 1.3e-3 relative to x, which reaches W x at the same
-// relative size when the errors are uncorrelated with the weights. The FP32 MMA sums and the A8
-// epilogue's single BF16 rounding of the FP32 sum of both terms (at most 2^-9 relative, RMS about
-// 1.1e-3) are the A16 route's own error. Together: about sqrt(1.3^2 + 1.1^2) e-3 = 1.7e-3 against the
-// 3.9e-3 budget. Pointwise, the activation term at an output is a sum of K such errors, about
-// 1.3e-3 times that output's root-sum-square of w_k x_k, well under the 2^-7 max|reference| cap
-// (giveen/ninfer-ext measured 1.98e-3 relative L2 for the same arithmetic on [14336,5120]).
+// 2^s1*q1 + 2^s2*q2 with power-of-two scales: s1 the least exponent with max|x| * 2^-s1 <= 448,
+// q1 = e4m3(x * 2^-s1), r = x - 2^s1*q1 (exact in FP32), s2 likewise for max|r|,
+// q2 = e4m3(r * 2^-s2). A BF16 value has eight significant bits: q1 keeps the top four (rounded)
+// and r the remaining four, which E4M3's four significant bits hold exactly while r stays in its
+// normal or subnormal grid, that is for every value within 2^14 of the column maximum
+// (pair_quantizer_exact checks this against the exact oracle). Smaller values contribute at most
+// 2^-20 of the column maximum each. The MMAs multiply exact E4M3 products and sum them in FP32;
+// the epilogue's single BF16 rounding of the FP32 sum of both terms (at most 2^-9 relative, RMS
+// about 1.1e-3) is the A16 route's own error, so the route sits at the A16 route's error against
+// the 3.9e-3 budget, not above it.
 // Each problem's pair admission (its ops/linear/fp8/shapes kPairMinTokens: the width from which
 // the pair route is faster than the exact route).
 struct PairProblem {
@@ -339,6 +336,23 @@ std::vector<std::uint16_t> run_linear(const Weight& weight, const DeviceBuffer& 
 // each column's maximum, column magnitudes vary over nine binades, and every 37th column is zero.
 // Most values then sit far below their column's maximum, where the first E4M3 term alone is coarse
 // or subnormal and the second term must carry them; a zero column has two zero scales.
+std::vector<std::uint16_t> outlier_activations(std::int32_t k, std::int32_t t, std::uint32_t seed) {
+    std::vector<std::uint16_t> bits(static_cast<std::size_t>(k) * t);
+    std::uint32_t state = seed * 2654435761U + static_cast<std::uint32_t>(t);
+    for (std::int32_t token = 0; token < t; ++token) {
+        for (std::int32_t channel = 0; channel < k; ++channel) {
+            state            = state * 1664525U + 1013904223U;
+            const float unit = static_cast<float>(static_cast<std::int32_t>(state >> 9) - (1 << 22)) /
+                               static_cast<float>(1 << 22);
+            float value = std::ldexp(unit, token % 9 - 4);
+            if (channel % 61 == 7) value *= 256.0F;
+            if (token % 37 == 5) value = 0.0F;
+            bits[static_cast<std::size_t>(token) * k + channel] = test::f32_to_bf16(value);
+        }
+    }
+    return bits;
+}
+
 int run_flash_next_pair_outliers() {
     constexpr test::ReductionCriterion kA16Criterion{1.0 / 256.0, 1.0 / 256.0, 2.0 / 256.0};
     int failures       = 0;
@@ -352,23 +366,10 @@ int run_flash_next_pair_outliers() {
             test::quantized_weight::materialize_rows_fp32(problem.host, rows);
         // The problem's admission and a width in the 128-column tiles.
         for (const std::int32_t t : {min_tokens, std::max(min_tokens, kPairNarrowTokens) + 44}) {
-            std::vector<std::uint16_t> bits(static_cast<std::size_t>(k) * t);
+            const std::vector<std::uint16_t> bits = outlier_activations(k, t, seed);
             std::vector<float> values(bits.size());
-            std::uint32_t state = seed * 2654435761U + static_cast<std::uint32_t>(t);
-            for (std::int32_t token = 0; token < t; ++token) {
-                for (std::int32_t channel = 0; channel < k; ++channel) {
-                    state            = state * 1664525U + 1013904223U;
-                    const float unit = static_cast<float>(static_cast<std::int32_t>(state >> 9) -
-                                                          (1 << 22)) /
-                                       static_cast<float>(1 << 22);
-                    float value = std::ldexp(unit, token % 9 - 4);
-                    if (channel % 61 == 7) value *= 256.0F;
-                    if (token % 37 == 5) value = 0.0F;
-                    const std::size_t index = static_cast<std::size_t>(token) * k + channel;
-                    bits[index]             = test::f32_to_bf16(value);
-                    values[index]           = test::bf16_to_f32(bits[index]);
-                }
-            }
+            for (std::size_t index = 0; index < bits.size(); ++index)
+                values[index] = test::bf16_to_f32(bits[index]);
             DeviceBuffer x(bits.size() * sizeof(std::uint16_t));
             x.copy_from_host(bits.data(), bits.size() * sizeof(std::uint16_t));
             const auto output =
@@ -385,6 +386,148 @@ int run_flash_next_pair_outliers() {
             const std::string label = "FP8_A8Pair outliers [" + std::to_string(n) + "," +
                                       std::to_string(k) + "] T=" + std::to_string(t);
             failures += test::verify_reduction(label, actual, reference, kA16Criterion);
+        }
+    }
+    return failures;
+}
+
+// The exact value of an E4M3 code.
+double e4m3_value(std::uint8_t code) {
+    const int exponent = (code >> 3) & 0xF;
+    const int mantissa = code & 0x7;
+    const double magnitude = exponent == 0 ? std::ldexp(mantissa, -9)
+                                           : std::ldexp(8 + mantissa, exponent - 10);
+    return (code & 0x80) != 0 ? -magnitude : magnitude;
+}
+
+// The pair quantizer against the exact oracle: decoded with its column scales, the two terms equal
+// the BF16 activation exactly wherever a value lies within 2^14 of its column's maximum (the high
+// term keeps the top four significant bits, the low term the remaining four), and stay within
+// 2^-20 of the column maximum below that.
+int check_pair_quantizer(std::int32_t n, std::int32_t k, std::int32_t tokens,
+                         const std::vector<std::uint16_t>& bits) {
+    {
+        DeviceBuffer x(bits.size() * sizeof(std::uint16_t));
+        x.copy_from_host(bits.data(), bits.size() * sizeof(std::uint16_t));
+        const std::size_t capacity = ops::detail::fp8_a8_pair_workspace_capacity_bytes(tokens, k);
+        DeviceArena arena(capacity);
+        const auto workspace = ops::detail::allocate_fp8_a8_pair_workspace(arena, tokens, k);
+        Weight weight{};
+        weight.k = k;
+        weight.n = n;
+        ops::detail::launch_fp8_a8_pair_quantize(Tensor(x.p, DType::BF16, {k, tokens}), weight,
+                                                 workspace, nullptr);
+        test::cuda_check(cudaDeviceSynchronize(), "pair quantize");
+        const auto host = [&](const std::uint8_t* device, std::size_t size) {
+            std::vector<std::uint8_t> out(size);
+            test::cuda_check(cudaMemcpy(out.data(), device, size, cudaMemcpyDeviceToHost),
+                             "pair quantize copy");
+            return out;
+        };
+        const std::size_t codes = static_cast<std::size_t>(k) * tokens;
+        const auto hi = host(workspace.codes_hi, codes), lo = host(workspace.codes_lo, codes);
+        std::vector<float> s_hi(tokens), s_lo(tokens);
+        test::cuda_check(cudaMemcpy(s_hi.data(), workspace.scales_hi, tokens * sizeof(float),
+                                    cudaMemcpyDeviceToHost),
+                         "pair quantize copy");
+        test::cuda_check(cudaMemcpy(s_lo.data(), workspace.scales_lo, tokens * sizeof(float),
+                                    cudaMemcpyDeviceToHost),
+                         "pair quantize copy");
+        int mismatches = 0;
+        for (std::int32_t token = 0; token < tokens; ++token) {
+            double maximum = 0.0;
+            for (std::int32_t channel = 0; channel < k; ++channel)
+                maximum = std::max(maximum, std::fabs(static_cast<double>(test::bf16_to_f32(
+                                                bits[static_cast<std::size_t>(token) * k + channel]))));
+            for (const float scale : {s_hi[static_cast<std::size_t>(token)],
+                                      s_lo[static_cast<std::size_t>(token)]}) {
+                int exponent = 0;
+                if (scale != 0.0F && std::frexp(scale, &exponent) != 0.5F && mismatches++ < 3)
+                    std::cerr << "FP8 A8 pair quantizer K=" << k << " token " << token
+                              << ": scale " << scale << " is not a power of two\n";
+            }
+            for (std::int32_t channel = 0; channel < k; ++channel) {
+                const std::size_t at = static_cast<std::size_t>(token) * k + channel;
+                const double value   = test::bf16_to_f32(bits[at]);
+                const double decoded = e4m3_value(hi[at]) * s_hi[static_cast<std::size_t>(token)] +
+                                       e4m3_value(lo[at]) * s_lo[static_cast<std::size_t>(token)];
+                const bool in_range  = std::fabs(value) >= std::ldexp(maximum, -14);
+                const bool ok        = in_range ? decoded == value
+                                                : std::fabs(decoded - value) <= std::ldexp(maximum, -20);
+                if (!ok && mismatches++ < 3) {
+                    std::cerr << "FP8 A8 pair quantizer K=" << k << " T=" << tokens << " token "
+                              << token << " channel " << channel << ": " << value << " decodes to "
+                              << decoded << '\n';
+                }
+            }
+        }
+        return mismatches != 0 ? 1 : 0;
+    }
+}
+
+// Columns: random values over nine binades with an outlier channel every 61st (2^8 larger), a zero
+// column, a column at the BF16 extremes, and one whose every 32nd value lies 2^20 below the rest;
+// then the outlier test's own activations.
+int pair_quantizer_exact() {
+    int failures = 0;
+    std::uint32_t seed = 972U; // run_flash_next_pair_outliers' activation seeds
+    for (const auto& [n, k, min_tokens] : kFlashNextProblems) {
+        constexpr std::int32_t tokens = 40;
+        std::vector<std::uint16_t> bits(static_cast<std::size_t>(k) * tokens);
+        std::uint32_t state = 1009U * static_cast<std::uint32_t>(k);
+        for (std::int32_t token = 0; token < tokens; ++token) {
+            for (std::int32_t channel = 0; channel < k; ++channel) {
+                state = state * 1664525U + 1013904223U;
+                const float unit =
+                    static_cast<float>(static_cast<std::int32_t>(state >> 9) - (1 << 22)) /
+                    static_cast<float>(1 << 22);
+                float value = std::ldexp(unit, token % 9 - 4);
+                if (channel % 61 == 7) value *= 256.0F;
+                if (token == 5) value = 0.0F;
+                if (token == 6) value = std::ldexp(unit, channel % 2 ? 120 : -120);
+                if (token == 7 && channel % 32 == 3) value = std::ldexp(unit, -20 - 4);
+                bits[static_cast<std::size_t>(token) * k + channel] = test::f32_to_bf16(value);
+            }
+        }
+        failures += check_pair_quantizer(n, k, tokens, bits);
+        // The outlier test's own activations at both of its widths.
+        for (const std::int32_t t : {min_tokens, std::max(min_tokens, kPairNarrowTokens) + 44})
+            failures += check_pair_quantizer(n, k, t, outlier_activations(k, t, seed));
+        ++seed;
+    }
+    return failures;
+}
+
+// The pair route is deterministic: repeated calls on one input give the same bits, in both tile
+// widths of every problem.
+int pair_deterministic() {
+    int failures       = 0;
+    std::uint32_t seed = 991U;
+    for (const auto& [n, k, min_tokens] : kFlashNextProblems) {
+        DeviceProblem problem(n, k, seed++);
+        for (const std::int32_t t : {std::max(min_tokens, 200), std::max(min_tokens, 1024)}) {
+            const std::vector<std::uint16_t> bits = outlier_activations(k, t, seed);
+            DeviceBuffer x(bits.size() * sizeof(std::uint16_t));
+            x.copy_from_host(bits.data(), bits.size() * sizeof(std::uint16_t));
+            const auto first = run_linear(problem.view, x, t, ops::LinearPolicy::A16Only, kPair);
+            for (int repeat = 0; repeat < 4; ++repeat) {
+                const auto again = run_linear(problem.view, x, t, ops::LinearPolicy::A16Only, kPair);
+                int differing    = 0;
+                for (std::size_t i = 0; i < first.size(); ++i) {
+                    if (first[i] == again[i]) continue;
+                    if (differing++ < 4) {
+                        std::cerr << "FP8_A8Pair [" << n << "," << k << "] T=" << t << " repeat "
+                                  << repeat << ": token " << i / n << " row " << i % n
+                                  << " changed\n";
+                    }
+                }
+                if (differing != 0) {
+                    std::cerr << "FP8_A8Pair [" << n << "," << k << "] T=" << t << ": " << differing
+                              << " of " << first.size() << " outputs differ between calls\n";
+                    ++failures;
+                    break;
+                }
+            }
         }
     }
     return failures;
@@ -445,8 +588,9 @@ int main() {
         return 77;
     }
     try {
-        const int failures = run_fp8_a8() + run_flash_next_fp8_a8_pair() +
-                             run_flash_next_pair_outliers() + pair_admission_seams();
+        const int failures = run_fp8_a8() + run_flash_next_fp8_a8_pair() + pair_quantizer_exact() +
+                             pair_deterministic() + run_flash_next_pair_outliers() +
+                             pair_admission_seams();
         std::cout << (failures == 0 ? "OK" : "FAIL") << " FP8 A8 Linear\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
