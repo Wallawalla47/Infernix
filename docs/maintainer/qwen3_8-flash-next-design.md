@@ -2008,10 +2008,10 @@ format from the volume header's row size (`resolve_ngram_volume`, `config.h`):
   from it; the ledger (§19.3.7) counts it as a later pin, and startup stops if it does not fit.
   `auto` takes RAM only while every routed expert stays pinned beside the table: the GGUF import
   (46.9 + 27.1 GiB) on a 96 GB machine, never recipes A-B (64.5 + 48.8 GiB) or a BF16 table. The
-  gate machinery stays; with the table in RAM it never waits on I/O. Open: device-side PLE (the hash
-  and the row reads on the GPU over UVA), gated on ≥ 0.1 ms of after-draft GPU idle per verification
-  round that it would remove (not measured with the RAM mode); a cold 16K prompt with and without
-  RAM residency (not measured).
+  gate machinery stays; with the table in RAM it never waits on I/O. Device-side PLE (the hash and
+  the row reads on the GPU over UVA) is not built: after-draft GPU idle is 21-37 µs per verification
+  round, no gated round waited on the volume, and a cold 16K prompt ran no faster with the table in
+  RAM (§19.3.26).
 
 ---
 
@@ -9787,7 +9787,8 @@ each, MTP, identical tokens in every arm), after a warm-up run, ABBA: interval 4
 (83.0 % hits, 3,182 promotions), 8 136.22 / 136.25 s (+0.4 %, 81.8 %, 1,599). An earlier ABC CBA set
 without the warm-up ran 163.8 → 141.0 s with the order (drift dominated; its first run overlapped
 a build). Promotions adapt the cache when the text moves; fewer of them help only text the cache
-already fits. The interval stays 4; a rate that follows the hit rate is the open idea.
+already fits. The interval stays 4. A rate that follows the miss rate, and a longer interval for
+verification rounds only, were measured on 2026-10-17 and not kept (§19.3.26).
 
 **INT8 tensor cores for the QSA prompt scores (Strata's integer prompt attention): rejected.**
 Strata's previous kernel ran two FP16 MMAs per score (hi/lo splits), so its 1.34-1.46x did not
@@ -10287,12 +10288,87 @@ resident experts (TV 2.93e-2, top-1 3.8 pt).
   excluded); dequantizing to FP32 and re-quantizing (a second quantization).
 
 **Deferred or not applicable.** A persistent Stream-K expert schedule (the expert tiles are bound by
-their decode, not by its alternation with the MMAs); an FP8 A8 prefill permission through
+their decode, not by its alternation with the MMAs; 96-column tiles that decode less often gained
+nothing end to end, §19.3.26); an FP8 A8 prefill permission through
 block-scaled MMAs (inexact; prefill is I/O-bound); exact FP8 MTP experts; a trained pre-router for
 SSD lookahead. Not applicable: int4 `mma` (IQ3_S codes reach ±15, IQ4_NL ±127), FP8/FP6/FP4 and
 block-scaled `mma` (floating-point accumulation), `ldmatrix .b4x16_p64` (an FP4 container, no
 codebook), LUT-GEMM activation tables (13-bit grid indices: 32 KiB per group and column), fewer
 activation limbs (X needs 21 bits).
+
+### 19.3.26 Launch overhead, promotion schedules, HC prefetch, wide expert tiles, device PLE (2026-10-17)
+
+Five candidates, each built behind a temporary switch and measured on the RTX 5090 (PCIe 5.0 x8):
+nsys profiles of main (`infernix_bench`, IQ3_S and NVFP4 Dense8, INT8 KV), op benches, and
+`infernix_bench` pp4096 + tg512 (MTP 4 + n-gram 7) or pp4096 + tg256 (plain) on the natural-text
+prompt, two repetitions per run, three rotated rounds. In every arm the greedy text was identical
+(IQ3_S over eight arms, Dense8 over four), and the GGUF experts, dense GGUF projections, FP8 experts
+and hyper-connection mix were bit-equal to their oracles. None was kept.
+
+**Launch overhead (rejected).** In graph-level traces of main the GPU is idle 3.8 % (IQ3_S MTP +
+n-gram) and 4.1 % (Dense8 MTP) of the decode window. A verification graph's `cudaGraphLaunch` holds
+the host 315-400 µs, but its first kernel starts 60-80 µs into the call, so launches account for
+6.7 / 9.3 µs of idle per token; host work outside CUDA calls is 46 / 64 and syncs 12 / 63. Splitting
+the decode and verification graphs after 4 or 8 layers (head submitted and flushed, the gated n-gram
+rows read, then the tail) measured IQ3_S MTP −0.5 % (after 4) / −2.2 % (after 8), Dense8 MTP
+−1.2 %, IQ3_S plain +0.2 % (one valid run) / 0.0 %, Dense8 plain +0.1 %. Skipping draft steps that
+a copy proposal replaces: IQ3_S +0.2 %, Dense8 −0.4 %.
+
+**Device-assembled verification and device-side PLE (not built).** Between a draft graph's end and
+the verification graph's start the GPU idles 20.7 µs per round (IQ3_S) and 36.9 µs (Dense8) in
+steady state, below the 0.15 ms per round that S3 needs (§19.3.4); the only longer gaps (5-12.6 ms,
+one per verification width) are the first-use graph captures. With the table on its volume no gated
+round made the GPU wait (0 of 105; 129 NVMe reads, 2.3 ms in all, behind the gate). A cold 16K prompt
+(one 16,384-token call) ran 3,010 / 3,014 tok/s from the volume (262,144 rows, 49.6 % host-cache
+hits, 17,815 NVMe reads, 27-29 ms of reads overlapped) and 2,988 / 2,978 with the table in RAM; MTP +
+n-gram decode 211.1 from the volume and 215.2 in RAM, one run each and within the base arm's
+210.4-215.5 (`auto`, which holds this table in RAM). No row-read time is left for the GPU to take
+over.
+
+**Hyper-connection weights prefetched into L2 by the down partials (rejected).** Each K1a CTA issued
+`cp.async.bulk.prefetch.L2` for its share of K1b's `W_up` after its own weight loads. Op bench (48
+layers, output hashes identical): BF16 T = 1 10.65 → 10.95 µs, T = 5 15.48 → 16.15; Q8 T = 1 8.52 →
+9.33; end to end −0.3 to −0.7 % in all four workloads. As with the GEMV self-prefetch (§19.3.20c),
+the bulk requests compete with the kernels' own streams, and K1b already fetches its weights during
+K1a (§19.3.20d).
+
+**Promotion schedules (rejected).** Each layer's interval counter offset by l × interval / layers
+(the same promotions in smaller bursts): −0.1 % / −1.7 % MTP (IQ3_S / Dense8), −0.1 % / +0.2 %
+plain. Interval 8, or an interval that doubles while the decode miss rate is not rising, on the
+single text: MTP +1.9 % / +4.6 % and +1.7 % / +6.8 % (Dense8's adaptive arm 166.3-169.4 against
+153.5-159.8), but plain −0.5 % / −3.1 % and −0.5 % / −3.3 %. Verification rounds alone at twice the
+interval (plain rounds unchanged), on text that changes topic as in §19.3.24
+(`infernix_decode_quality_gen`, 32 segments of a fiction + encyclopedia + code corpus from
+decode-4m, 1,536-token prompts, 384 tokens each, MTP 4, cold cache, ABBA): IQ3_S 99.96 / 104.28 s
+against 98.64 / 102.96 (+1.3 %, identical tokens in every run); Dense8 134.42 / 134.71 s against
+134.68 / 112.18 (its text differed between runs of the same arm, so these compare different texts).
+Fewer promotions again help only text the cache already fits; the interval stays 4.
+
+**96-column gate/up tiles for the GGUF experts (rejected).** A 64 × 96 tile (sixteen warps of
+16 × 24, int64 per output since kLimbs would need 72 registers more) decodes an expert's weights
+once for up to 96 entries. Layer expert call (512 experts, top-10, all resident;
+`infernix_offloaded_moe_ggml_test --bench`, gate/up / down formats, two runs each): at 4,096 tokens
+IQ2_S / IQ4_NL 11.96-11.99 → 10.74-10.76 ms (−10 %), IQ3_XXS / IQ4_NL 11.71-11.73 → 9.38-9.39
+(−20 %), IQ3_S / IQ4_NL 11.53-11.99 → 9.25-9.57 (−17 to −21 %), IQ3_S / Q2_0 11.23 → 8.98 (−20 %);
+at 16,384 tokens IQ2_S 28.97-28.98 → 32.67-32.71 (+13 %), IQ3_XXS 25.87-25.90 → 26.37-26.39
+(+2 %), IQ3_S 26.77-27.37 → 26.60-26.71, IQ3_S / Q2_0 26.67 → 26.05. The wide tile spills (72-112
+bytes of stack against 40-48; IQ2_S the most). At 6,144 tokens it is 22-31 % slower (IQ2_S 12.60 →
+16.48-16.51 ms, IQ3_XXS 11.37-11.38 → 14.16-14.25, IQ3_S 11.61-12.16 → 14.56-14.71), at 8,192 mixed
+(IQ2_S +4.5 %, IQ3_XXS −4.6 %, IQ3_S −6 to −9 %), at 12,288 +9.5 % / +1.5 % / ±0: it saves a decode
+only where it cuts an expert's tile count (65-96 entries take one tile instead of two, 97-128 two
+either way), so the gain follows the call's column distribution, not its size. End to end it gains
+nothing: IQ3_S pp4096 (one call, cold, bound by the expert stream over the link) 2,216-2,220 against
+2,216-2,217 tok/s, pp8192 3,844-3,855 against 3,905-3,917 (−1.5 %), pp32768 (16K calls) 3,516-3,538
+against 3,541. Not kept.
+
+**The startup link probe (open).** About one IQ3_S startup in seven (10 of 69 in these runs, none
+of the Dense8 ones; 16 of the 750-odd probes logged since 2026-10-16, all but one IQ3_S) measured
+the link at 3.0 GB/s (once 12.0) instead of ~27.5. The session then promotes every 8 tokens, keeps
+1/12 of decode misses on the link and lets the CPU split prefill calls up to 4,096 columns: IQ3_S
+pp4096 3,454 → ~2,183 tok/s in a warm pg run, 2,216 → 1,496 cold. The probe
+(`measure_h2d_bytes_per_second`) takes the best of three copies after one warm-up, so the link
+stayed slow for the whole probe (cause not established: an idle link state, or the probe
+overlapping the bank fill). The runs above that measured it were excluded or rerun.
 
 ---
 

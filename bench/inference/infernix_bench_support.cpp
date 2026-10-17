@@ -355,6 +355,8 @@ std::string usage_text(std::string_view program) {
         << "  --corpus <path>             token-id corpus (default: " << kDefaultCorpusPath << ")\n"
         << "  --ngram-volume <path>       Qwen3.8-Flash-Next n-gram volume, or a BF16 one in place of the\n"
         << "                              artifact's quantized table (default: <weights>.ngram)\n"
+        << "  --ngram-residency <mode>    Qwen3.8-Flash-Next n-gram table: auto, ram (all of it in pinned\n"
+        << "                              RAM) or volume (rows read on demand) (default: auto)\n"
         << "  --expert-stripe <path>      Qwen3.8-Flash-Next expert stripe: the SSD tier reads each record's\n"
         << "                              tail from it (a second drive) beside its head in the artifact\n"
         << "  --ram-headroom-mib <N>      physical Host RAM pinned weights and caches leave free (default "
@@ -447,6 +449,8 @@ BenchOptions parse_args(int argc, char** argv) {
             options.corpus_path = value("--corpus");
         } else if (arg == "--ngram-volume") {
             options.ngram_volume_path = value("--ngram-volume");
+        } else if (arg == "--ngram-residency") {
+            options.ngram_residency = infernix::parse_ngram_residency(value("--ngram-residency"));
         } else if (arg == "--expert-stripe") {
             options.expert_stripe_path = value("--expert-stripe");
         } else if (arg == "--ram-headroom-mib") {

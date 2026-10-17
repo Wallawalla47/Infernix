@@ -171,6 +171,18 @@ int test_cli_contract() {
     failures += expect(parse_for_test({"infernix_bench", "--weights", "model.ninfer"})
                                .speculative.ngram_draft_tokens == 0,
                        "ngram is disabled by default");
+    // --ngram-residency: the Engine's residency, auto unless set.
+    failures += expect(parse_for_test({"infernix_bench", "--weights", "model.ninfer"}).ngram_residency ==
+                           infernix::NgramResidency::Auto,
+                       "n-gram residency defaults to auto");
+    failures += expect(parse_for_test({"infernix_bench", "--weights", "model.ninfer", "--ngram-residency", "ram"})
+                                   .ngram_residency == infernix::NgramResidency::Ram &&
+                           parse_for_test({"infernix_bench", "--weights", "model.ninfer", "--ngram-residency", "volume"})
+                                   .ngram_residency == infernix::NgramResidency::Volume,
+                       "--ngram-residency ram and volume");
+    failures += expect_throws<std::invalid_argument>(
+        [] { (void)parse_for_test({"infernix_bench", "--weights", "model.ninfer", "--ngram-residency", "disk"}); },
+        "--ngram-residency rejects other values");
     for (const std::string backend : {"mtp", "dflash", "dflash2"}) {
         for (unsigned width = 0; width <= 63; ++width) {
             for (const unsigned minimum : {4U, 12U, 64U}) {

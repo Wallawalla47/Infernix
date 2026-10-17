@@ -203,6 +203,7 @@ int main(int argc, char** argv) {
         engine_options.fast_path_candidates              = options.fast_path_candidates;
         engine_options.prefill_split_workspace_mib       = options.prefill_split_workspace_mib;
         engine_options.ngram_volume_path = options.ngram_volume_path;
+        engine_options.ngram_residency   = options.ngram_residency;
         engine_options.expert_stripe_path = options.expert_stripe_path;
         engine_options.ram_headroom_bytes = options.ram_headroom_bytes;
         engine_options.expert_ram_bytes   = options.expert_ram_bytes;

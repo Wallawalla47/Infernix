@@ -54,6 +54,7 @@ enum class OutputFormat { Table, Json, Csv };
 struct BenchOptions {
     std::string artifact_path;
     std::string ngram_volume_path;
+    infernix::NgramResidency ngram_residency = infernix::NgramResidency::Auto;
     std::string expert_stripe_path;
     std::uint64_t ram_headroom_bytes = infernix::kDefaultRamHeadroomBytes;
     std::optional<std::uint64_t> expert_ram_bytes; // --expert-ram-mib; empty: the RAM ledger's share
