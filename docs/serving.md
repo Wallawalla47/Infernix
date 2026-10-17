@@ -444,6 +444,15 @@ because requests can explicitly enable thinking. Anthropic
 Add `--default-thinking-budget 512` to the startup command to cap model-origin thinking at 512
 tokens for every thinking-enabled request.
 
+`max_tokens` counts the thinking, so a request that thinks for its whole output limit ends with
+no answer (a harness that sends `max_completion_tokens: 8192` on every request hits this on hard
+tasks). A thinking request with no budget of its own and no `--default-thinking-budget` therefore
+gets one when `max_tokens` is at least 1,024: thinking closes early enough to leave the answer a
+quarter of `max_tokens` (at least 256 tokens, at most half), through the same early close as any
+budget. 8,192 leaves 2,048 for the answer, 1,024 leaves 256. Below 1,024 nothing changes, and
+`--no-thinking-answer-room` lets thinking use all of `max_tokens` again. The request log's
+`thinking_budget` shows the budget a request ran with.
+
 At the cap boundary, Engine first honors a natural `</think>`, stop condition, cancellation, or
 total output/context limit. If thinking remains open, it commits Qwen's canonical early-close
 guidance and close marker to the same model sequence without sampling, streams the guidance as a
@@ -1269,6 +1278,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--ngram-native-sessions` | also recognize Kilo, Codex and Claude session metadata as conversation identities; requires `--ngram-archive-mib` | off |
 | `--default-max-tokens N` | output limit when omitted by a request | `8192` |
 | `--default-thinking-budget N` | positive thinking cap inherited by thinking-enabled requests | unset |
+| `--no-thinking-answer-room` | without a budget, thinking may use all of `max_tokens` (by default, from `max_tokens` 1,024, it closes early enough to leave a quarter for the answer) | answer room on |
 | `--thinking-budget-message S` | text committed when a thinking budget ends thinking, replacing Qwen's early-close guidance; the close marker is appended when `S` lacks it | Qwen guidance |
 | `--reasoning-loop MODE` | `off`, `stop` or `conclude`: reasoning-loop guard for thinking requests without a token constraint (details under [OpenAI Chat Completions](#openai-chat-completions)) | `off` |
 | `--vision` | enable media input and load Vision GPU allocations | off |

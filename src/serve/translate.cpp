@@ -3,6 +3,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -315,6 +316,13 @@ infernix::RequestOptions to_request_options(const GenerationRequest& request,
     if (semantics.enable_thinking != false) {
         options.execution.thinking.budget =
             request.thinking_budget ? request.thinking_budget : server.default_thinking_budget;
+        // max_tokens counts the thinking: without a budget, leave the answer its room.
+        if (!options.execution.thinking.budget && server.thinking_answer_room &&
+            request.max_tokens >= kThinkingAnswerRoomMinTokens) {
+            const int reserve =
+                std::min(std::max(kThinkingAnswerRoomMinReserve, request.max_tokens / 4), request.max_tokens / 2);
+            options.execution.thinking.budget = static_cast<std::uint32_t>(request.max_tokens - reserve);
+        }
         // A token constraint owns every output step, so the guard's injected close has no room.
         if (request.token_constraint.empty()) { options.execution.thinking.loop = server.reasoning_loop; }
     }

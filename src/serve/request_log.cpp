@@ -524,6 +524,7 @@ std::string format_server_start_json(
              {"default_thinking",
               options.enable_thinking ? Json(*options.enable_thinking) : Json(nullptr)},
              {"default_thinking_budget", std::move(default_thinking_budget)},
+             {"thinking_answer_room", options.thinking_answer_room},
              {"reasoning_loop", reasoning_loop_name(options.reasoning_loop)},
              {"default_preserve_thinking",
               options.preserve_thinking ? Json(*options.preserve_thinking) : Json(nullptr)},

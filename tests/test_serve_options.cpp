@@ -789,6 +789,34 @@ int main() {
         to_request_options(request, thinking_budget, semantics, thinking_budget.allow_prefix_reuse)
                 .execution.thinking.budget == 37,
         "thinking-enabled request did not inherit the server budget");
+    // Without a budget, thinking leaves the answer a quarter of max_tokens (at least 256, at most
+    // half) from max_tokens 1024; below that, or with --no-thinking-answer-room, it may use all.
+    {
+        GenerationRequest capped;
+        capped.max_tokens            = 8192;
+        const auto capped_semantics  = resolve_prompt_semantics(capped, defaults);
+        failures += check(to_request_options(capped, defaults, capped_semantics, true).execution.thinking.budget == 6144U,
+                          "a thinking request without a budget did not leave a quarter of max_tokens to answer");
+        capped.max_tokens = 1024;
+        failures += check(to_request_options(capped, defaults, capped_semantics, true).execution.thinking.budget == 768U,
+                          "the answer room did not keep its 256-token minimum");
+        capped.max_tokens = 1023;
+        failures += check(!to_request_options(capped, defaults, capped_semantics, true).execution.thinking.budget,
+                          "the answer room applied below max_tokens 1024");
+        capped.max_tokens          = 8192;
+        capped.thinking_budget     = 7000;
+        failures += check(to_request_options(capped, defaults, capped_semantics, true).execution.thinking.budget == 7000U,
+                          "the answer room overrode the request's own budget");
+        capped.thinking_budget.reset();
+        const auto no_room = parse({"infernix-serve", "model.ninfer", "--no-thinking-answer-room"});
+        failures += check(!no_room.thinking_answer_room &&
+                              !to_request_options(capped, no_room, capped_semantics, true).execution.thinking.budget,
+                          "--no-thinking-answer-room did not let thinking use all of max_tokens");
+        capped.enable_thinking     = false;
+        const auto off_semantics   = resolve_prompt_semantics(capped, defaults);
+        failures += check(!to_request_options(capped, defaults, off_semantics, true).execution.thinking.budget,
+                          "a non-thinking request got an answer-room budget");
+    }
     request.enable_thinking = false;
     const auto non_thinking = resolve_prompt_semantics(request, thinking_budget);
     failures += check(!non_thinking.reasoning_effort,

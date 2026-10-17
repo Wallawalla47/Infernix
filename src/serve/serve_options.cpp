@@ -98,6 +98,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--default-max-tokens"},
     ServeOptionArity{"--default-thinking-budget"},
     ServeOptionArity{"--thinking-budget-message"},
+    ServeOptionArity{"--no-thinking-answer-room", false},
     ServeOptionArity{"--reasoning-loop"},
     ServeOptionArity{"--vision", false},
     ServeOptionArity{"--vision-offload"},
@@ -369,6 +370,9 @@ std::string serve_usage_text(const char* argv0) {
            "  --default-thinking-budget N  cap model-origin thinking for enabled\n"
            "                             requests; control tokens count toward the\n"
            "                             request output limit\n"
+           "  --no-thinking-answer-room  without a budget, thinking may use all of\n"
+           "                             max_tokens (default: from max_tokens 1024, thinking\n"
+           "                             closes early enough to leave a quarter for the answer)\n"
            "  --thinking-budget-message S  message fed to the model when it hits its thinking\n"
            "                             budget, replacing the built-in end-of-thinking notice\n"
            "                             (wrap the message in double quotes, e.g.\n"
@@ -947,6 +951,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 throw std::invalid_argument("--default-thinking-budget is out of range");
             }
             options.default_thinking_budget = static_cast<std::uint32_t>(budget);
+        } else if (arg == "--no-thinking-answer-room") {
+            options.thinking_answer_room = false;
         } else if (arg == "--thinking-budget-message") {
             options.thinking_budget_message = require_value("--thinking-budget-message");
             if (options.thinking_budget_message.empty()) {
