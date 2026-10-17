@@ -2839,12 +2839,16 @@ private:
                 const auto reads = t.demand_reads - a.demand_reads;
                 std::snprintf(text, sizeof(text),
                               "SSD expert tier: request %llu expert reads (%.2f GiB, mean %.2f ms), %llu failed; %llu "
+                              "read for the prefill stream (%.2f GiB); %llu "
                               "fetched (%llu from RAM slots, %llu copied from unpinned records); %llu served in place "
                               "from unpinned records; %llu admitted to RAM, %llu demoted from VRAM, %llu promoted from unpinned records",
                               static_cast<unsigned long long>(reads),
                               static_cast<double>(reads) * static_cast<double>(residency_->frame_bytes()) / (1ULL << 30),
                               reads ? 1e-6 * static_cast<double>(t.read_ns - a.read_ns) / static_cast<double>(reads) : 0.0,
                               static_cast<unsigned long long>(t.demand_failures - a.demand_failures),
+                              static_cast<unsigned long long>(t.stream_reads - a.stream_reads),
+                              static_cast<double>(t.stream_reads - a.stream_reads) *
+                                  static_cast<double>(residency_->frame_bytes()) / (1ULL << 30),
                               static_cast<unsigned long long>(t.fetch_records - a.fetch_records),
                               static_cast<unsigned long long>(t.fetch_from_ram - a.fetch_from_ram),
                               static_cast<unsigned long long>(t.unpinned_copies - a.unpinned_copies),
@@ -4484,9 +4488,15 @@ public:
     [[nodiscard]] HybridPrefixCacheStats prefix_stats() const noexcept;
 
 private:
-    // The prompt's prefill calls from `frontier`, and with `taps` the prefix taps they realize.
+    // The prompt's prefill calls from `frontier`, and with `taps` the prefix taps they realize. A
+    // nonzero `branch` (past the frontier) adds an exact boundary tap there: where the prompt leaves
+    // a cached path (prefix_select).
     [[nodiscard]] prefix::CallPlan plan_prefill(const qwen3_5::PreparedPromptData& prompt, std::uint32_t frontier,
-                                                std::span<const std::uint32_t> existing, bool taps) const;
+                                                std::span<const std::uint32_t> existing, bool taps,
+                                                std::uint32_t branch = 0) const;
+    // A branch tap (prefix_select) needs the prompt to share at least this many cached tokens past
+    // its resume frontier: what a later prompt diverging further along re-prefills without it.
+    static constexpr std::uint32_t kBranchTapMinTokens = 1024;
     DeviceBuffer state_backing_, ple_backing_, tails_backing_, kv_backing_, staging_;
     // The vq2/k4v2 exact window (design §19.3.15), every KV layer and lane.
     DeviceBuffer window_backing_;

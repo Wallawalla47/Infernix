@@ -784,8 +784,10 @@ ExpertResidency::FrameLease ExpertResidency::lend(std::uint64_t bytes, cudaStrea
     const std::uint32_t moved = apply_moves(pool, compute);
     stats_.lend_relocations += moved;
     if (table_dirty_) { upload_table(compute); }
-    // The run's new user writes it only after the moves have read it.
-    if (moved != 0 && !writers.empty()) {
+    // The run's new user writes it only after the moves have read it, and after every round already
+    // on `compute` that reads its evicted experts (a run of victims and free frames moves nothing,
+    // so the fence does not depend on the moves).
+    if (!writers.empty()) {
         CUDA_CHECK(cudaEventRecord(table_ready_, compute));
         for (const cudaStream_t writer : writers) { CUDA_CHECK(cudaStreamWaitEvent(writer, table_ready_, 0)); }
     }

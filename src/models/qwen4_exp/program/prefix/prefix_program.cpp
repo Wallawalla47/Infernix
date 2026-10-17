@@ -184,7 +184,13 @@ std::optional<PrefixSelection> ProgramImpl::prefix_select(const qwen3_5::Prepare
     };
     std::uint32_t cached_tokens = 0; // the prompt prefix held as cached blocks
     const auto planned = [&](PrefixSelection s) {
-        s.plan          = plan_prefill(prompt, s.frontier, s.existing, base.reuse);
+        // Where the prompt leaves a cached path well past its resume frontier (a client re-sending a
+        // long transcript with new content inserted before its end, Strata PR #2843): a boundary
+        // snapshot there lets the next such prompt resume at the branch instead of re-prefilling
+        // the shared tokens after the frontier again.
+        const std::uint32_t branch =
+            cached_tokens < n && cached_tokens >= s.frontier + kBranchTapMinTokens ? cached_tokens : 0;
+        s.plan          = plan_prefill(prompt, s.frontier, s.existing, base.reuse, branch);
         s.cached_tokens = cached_tokens;
         return s;
     };
@@ -607,12 +613,24 @@ void ProgramImpl::prefix_activate(Lane& lane, std::uint32_t index, const PrefixS
 // The prompt's prefill calls from `frontier` (design §19.3.1, "Prefill integration"): with `taps`, the
 // prefix taps beyond the frontier (no tap inside a Vision item), exact ones admitted by their cost.
 prefix::CallPlan ProgramImpl::plan_prefill(const qwen3_5::PreparedPromptData& prompt, std::uint32_t frontier,
-                                           std::span<const std::uint32_t> existing, bool taps) const {
+                                           std::span<const std::uint32_t> existing, bool taps,
+                                           std::uint32_t branch) const {
     const auto n = static_cast<std::uint32_t>(prompt.token_ids.size());
     std::vector<pc::PlannedTap> planned;
     if (taps && prefix_) {
         const std::vector<pc::TapExclusion> spans = prefix_exclusions(prompt);
         planned = pc::plan_taps(n, frontier, prompt.tap_hints.hints, existing, spans, prefix_->taps());
+        if (branch > frontier && branch < n && !prefix::inside_exclusion(branch, spans)) {
+            const auto at = std::lower_bound(planned.begin(), planned.end(), branch,
+                                             [](const pc::PlannedTap& tap, std::uint32_t p) { return tap.position < p; });
+            if (at != planned.end() && at->position == branch) {
+                at->placement = pc::TapPlacement::Exact;
+                at->boundary  = true;
+            } else {
+                planned.insert(at, pc::PlannedTap{.position = branch, .placement = pc::TapPlacement::Exact,
+                                                  .boundary = true});
+            }
+        }
         if (!options_.free_cache_resume) {
             // Each tap moves to the grid position at or before it, so it cuts a call on the grid.
             for (pc::PlannedTap& tap : planned) { tap.position = tap.position / kResumeGrid * kResumeGrid; }

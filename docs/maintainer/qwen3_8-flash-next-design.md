@@ -9972,6 +9972,25 @@ bit-identical greedy output, plain decode 397.4 → 398.6 tok/s (every four-bloc
 at most ~0.5-0.9 %; draft-column n-gram reads during drafting (the parked S4a, NInfer 439e1075e):
 at C = 2 on first-time text the GPU waited at the n-gram gate in none of 210 gated rounds.
 
+**Third look, Strata v0.1.45 (296b59d2..477ac13cb, 2026-10-17; Dense8, INT8 KV):**
+- Adopted: a branch tap where a prompt leaves its cached path (Strata PR #2843's checkpoint for clients
+  that rewrite the end of their history; hybrid-prefix-cache-spec §17). A 40K-token transcript
+  re-sent with new actions before its end: 0.6-1.1 s to the first token against 2.1-2.2 s; the
+  agentic replay keeps its cache hits.
+- Measured and deferred (to investigate later):
+  - Strata's multi-column narrow expert kernel (f7eaf2d): in MTP 4 verify rounds (route trace, 438
+    rounds) the mean columns per expert call is 1.19 / 1.30 / 1.38 / 1.50 at width 2-5, and 32-54 %
+    of column-expert pairs share an expert. The narrow kernel stages each expert's weights once per
+    call already, so sharing saves only the per-column code and scale conversion (est. +0.5-1 %).
+  - Two cells per step and empty-chunk merge skipping in decode attention (731528b): the QSA decode
+    op takes 29 µs at one column and 44-48 µs at five (attention 14 and 27-29 µs) at 4K-32K
+    context, a few % of a round, so the ceiling is below 1 %.
+- Checked, no change: a 32K prompt on the SSD tier (`--expert-ram-mib 30000`) reads 20.8 GiB of
+  records for the prefill stream at chunk 16,384 against 35.3 GiB at 4,096, at the same speed
+  (4,273 against 4,248 tok/s), so Strata's re-read problem (#2824) does not apply; lending cannot
+  hand a frame to a new user while planned work still reads it (lend now fences its writers even
+  when nothing moved); the streaming tool-call parser is linear per token.
+
 ### 19.4 On the Gold-Star-Infer runtime contract (2026-10-05)
 
 The Flash-Next history (dev through `claude/fn-layer-prefill` 91af38dd0) was replayed onto
