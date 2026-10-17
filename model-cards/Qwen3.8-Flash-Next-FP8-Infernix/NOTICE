@@ -1,0 +1,22 @@
+Qwen3.8-Flash-Next-FP8-Infernix
+A conversion of Qwen/Qwen3.8-Flash-Next-FP8 for Infernix, by Wallawalla47.
+
+The model is Qwen3.8-Flash-Next-FP8 (https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8, revision
+236dfdf285828023ca3bcd3f37366c58a3469b13), Copyright 2026 Qwen, licensed under the Qwen Community
+License 1.0 (see LICENSE). The BF16 n-gram table is that of Qwen3.8-Flash-Next
+(https://huggingface.co/Qwen/Qwen3.8-Flash-Next), under the same license.
+
+------------------------------------------------------------------------------
+Changes made in this conversion:
+
+  - The checkpoint was converted into the Infernix v3 artifact Qwen3.8-Flash-Next-FP8-Infernix
+    (five numbered files) with the qwen3_8_flash_next_fp8 recipe of Infernix's tools.convert.
+  - The routed experts keep their E4M3FN codes and BF16 128 x 128 tile scales unchanged,
+    regrouped into one record per expert. Every other tensor keeps its BF16 or FP32 values.
+  - The PLE n-gram table is stored as Qwen's BF16 table in a separate n-gram volume
+    (Qwen3.8-Flash-Next-BF16.ngram); the checkpoint's FP8 table is its quantization.
+  - The MTP drafter is re-quantized: projections to q8_g32_fp16, routed experts to q2_g64_fp16;
+    and a proposal head is added (q4_g64_fp16 copies of 131,072 lm_head rows).
+  - Tokenizer, chat template, generation and processor configs: stored unchanged as artifact
+    resources.
+  - README.md, config.json (metadata only) and the conversion report added.

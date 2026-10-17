@@ -1,0 +1,14 @@
+{
+  "_comment": "Infernix does not read this file. It lets the Hugging Face Hub count downloads of this repository, which it does through requests for config.json. Give infernix-serve the first part.",
+  "format": "infernix-v3",
+  "engine": "https://github.com/Wallawalla47/Infernix",
+  "artifact": "Qwen3.8-Flash-Next-FP8-Infernix-00001-of-00005.infernix",
+  "parts": [
+    "Qwen3.8-Flash-Next-FP8-Infernix-00001-of-00005.infernix",
+    "Qwen3.8-Flash-Next-FP8-Infernix-00002-of-00005.infernix",
+    "Qwen3.8-Flash-Next-FP8-Infernix-00003-of-00005.infernix",
+    "Qwen3.8-Flash-Next-FP8-Infernix-00004-of-00005.infernix",
+    "Qwen3.8-Flash-Next-FP8-Infernix-00005-of-00005.infernix"
+  ],
+  "ngram_volume": "Qwen3.8-Flash-Next-BF16.ngram"
+}

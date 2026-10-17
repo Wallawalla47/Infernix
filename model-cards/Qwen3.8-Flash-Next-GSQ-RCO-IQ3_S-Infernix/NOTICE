@@ -1,0 +1,35 @@
+Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix
+A conversion of ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF (IQ3_S) for Infernix, by Wallawalla47.
+
+The GGUF quantization is by ISTA-DASLab
+(https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF, revision
+ed59f92082b1e93c0e96d60a8b11aab089b52f09), published under the Apache License,
+Version 2.0 (see LICENSE-APACHE-2.0): GSQ quantization with RCO's per-tensor bit
+allocation and an importance matrix.
+
+The model is a quantization of Qwen3.8-Flash-Next (https://huggingface.co/Qwen/Qwen3.8-Flash-Next),
+Copyright 2026 Qwen, licensed under the Qwen Community License 1.0 (see LICENSE). The MTP drafter
+is built from Qwen/Qwen3.8-Flash-Next-FP8 (revision 236dfdf285828023ca3bcd3f37366c58a3469b13),
+under the same license.
+
+------------------------------------------------------------------------------
+Changes made in this conversion (Apache License 2.0, Section 4(b)):
+
+  - Both IQ3_S GGUF shards and the BF16 mmproj were converted into the Infernix v3
+    artifact Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix (two numbered files) with the
+    qwen3_8_flash_next_gsq_rco_iq3s recipe of Infernix's tools.convert.
+  - Every quantized GGUF tensor is stored as its own GGUF blocks, byte for byte. Dense
+    matrices in Q4_K, Q5_K, Q6_K and IQ4_XS keep the same blocks in tiles of 16 rows
+    (reordered, not re-encoded); the routed experts are regrouped into one record per
+    expert; the one Q8_0 tensor is stored as identical q8_g32_fp16 words.
+  - BF16 and FP32 tensors keep their values; llama.cpp's export transforms (norms stored
+    as 1 + g, the GDN value-head order, ssm_a = -exp(A_log), concatenated indexer
+    projections) are undone exactly.
+  - The PLE n-gram table's IQ4_NL rows are stored byte for byte in a separate n-gram
+    volume.
+  - Added an MTP drafter (not in the GGUF) from Qwen/Qwen3.8-Flash-Next-FP8: projections
+    re-quantized to q8_g32_fp16, routed experts to q2_g64_fp16; and a proposal head
+    (q4_g64_fp16 copies of 131,072 lm_head rows).
+  - Tokenizer, chat template, generation and processor configs: stored unchanged as
+    artifact resources.
+  - README.md, config.json (metadata only) and the conversion report added.
