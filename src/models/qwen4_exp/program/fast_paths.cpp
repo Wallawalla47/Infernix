@@ -86,11 +86,14 @@ constexpr std::array kQualified{
     Qualification{FastPath::ExpertA4Residual, {QType::FP8_E4M3FN_ROW_BF16, false, KvCacheStorage::Vq2}},
     Qualification{FastPath::ExpertA4Residual, {QType::FP8_E4M3FN_ROW_BF16, false, KvCacheStorage::Q4KeyVq2Value}},
     // Recipe C: fp8-a8-pair (power-of-two column scales) beside two-term expert-a4-residual,
-    // decode gated on each format directly (MTP at concurrency 2, 256 segments, 2026-10-17), since
-    // INT8, the lowest floor, fails its tail. Prefill passes on every format but BF16; FP8, NVFP4
-    // and K4V2 await their 1,024-segment decode gates (model-quality.md 6.7).
+    // decode gated on each format directly (MTP at concurrency 2, 2026-10-17), since INT8, the
+    // lowest floor, fails its tail. Prefill passes on every format but BF16; FP8, NVFP4 and K4V2 by
+    // their 1,024-segment decode gates, K8V4 and VQ2 by 256 (model-quality.md 6.7).
+    Qualification{FastPath::Fp8A8Pair, {QType::FP8_E4M3FN_ROW_BF16, false, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::Fp8A8Pair, {QType::FP8_E4M3FN_ROW_BF16, false, KvCacheStorage::Nvfp4Group16}},
     Qualification{FastPath::Fp8A8Pair, {QType::FP8_E4M3FN_ROW_BF16, false, KvCacheStorage::Fp8KeyNvfp4Value}},
     Qualification{FastPath::Fp8A8Pair, {QType::FP8_E4M3FN_ROW_BF16, false, KvCacheStorage::Vq2}},
+    Qualification{FastPath::Fp8A8Pair, {QType::FP8_E4M3FN_ROW_BF16, false, KvCacheStorage::Q4KeyVq2Value}},
     // NVIDIA NVFP4 Dense8: sampled MTP drafts (2026-10-17). They change no logit, so the gate is the
     // sampler's distribution (2,000 seeded requests per arm, chi-square per position against plain
     // decoding, INT8 KV) and greedy identity (INT8, NVFP4), which no KV format affects; speed on

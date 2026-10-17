@@ -70,9 +70,11 @@ int main() {
     }
     // fp8-a8-pair runs on recipe C (FP8 dense, 16-bit expert activations) where its own decode gate
     // passed; INT8 fails its tail and BF16 its prefill gate.
-    for (const KvCacheStorage kv : {KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2})
+    for (const KvCacheStorage kv : {KvCacheStorage::Fp8E4M3Row256, KvCacheStorage::Nvfp4Group16,
+                                    KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2,
+                                    KvCacheStorage::Q4KeyVq2Value})
         failures += check(q::fast_path_qualified(FastPath::Fp8A8Pair, {QType::FP8_E4M3FN_ROW_BF16, false, kv}),
-                          "fp8-a8-pair is qualified on recipe C with K8V4 and VQ2 KV");
+                          "fp8-a8-pair is qualified on recipe C with every KV format but INT8 and BF16");
     for (const KvCacheStorage kv : {KvCacheStorage::Int8Group64, KvCacheStorage::BFloat16})
         failures += check(!q::fast_path_qualified(FastPath::Fp8A8Pair, {QType::FP8_E4M3FN_ROW_BF16, false, kv}),
                           "fp8-a8-pair stays unqualified on recipe C with INT8 or BF16 KV");

@@ -773,7 +773,7 @@ tokens. The recipe C gates (`expert-a4-residual`, `fp8-a8-pair`) are re-scored i
 | Qwen3.8-Flash-Next: `adaptive-speculation` (MTP), `free-cache-resume` | every Flash-Next artifact | Q8 dense, 4-bit experts, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
 | Qwen3.8-Flash-Next: `preemption` | every Flash-Next artifact | Q8 dense, 4-bit experts, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
 | Qwen3.8-Flash-Next: `q8-sliced-k`, `gdn-conv-fused`, `qsa-prepare-fused` | Q8 dense weights (`qsa-prepare-fused`: BF16, INT8, FP8, NVFP4 or K8V4 KV) | Q8 dense, 4-bit experts, every KV format (`qsa-prepare-fused`: the five it serves) |
-| `fp8-a8-pair` | row-FP8 dense weights (recipe C) | FP8 dense, 16-bit experts, with K8V4 or VQ2 KV (INT8 fails its decode tail, BF16 its prefill; FP8, NVFP4 and K4V2 await 1,024-segment decode gates; below) |
+| `fp8-a8-pair` | row-FP8 dense weights (recipe C) | FP8 dense, 16-bit experts, with FP8, NVFP4, K8V4, VQ2 or K4V2 KV (INT8 fails its decode tail, BF16 its prefill; below) |
 | `q4-w4a8` | groupwise Q4 MLP gate/up | none (fails, below) |
 | `idle-wide-prefill` | Qwen3.8-27B / Qwen3.6-35B-A3B generation engines | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
 | `adaptive-mtp` | Qwen3.8-27B / Qwen3.6-35B-A3B with MTP | none (no speed gain shown, below) |
@@ -1385,7 +1385,7 @@ and recomputes the previous output) or admission (whole extents held without `pr
   6,380 (+3.3 %), pp32768 6,620 → 8,803 (+33 %), pp65536 6,730 → 9,067 (+35 %); short prompts are
   bound by the expert stream over the x8 link.
 
-**`fp8-a8-pair`: two E4M3 activation terms in recipe C's FP8 projections (fails on recipe C).**
+**`fp8-a8-pair`: two E4M3 activation terms in recipe C's FP8 projections (recipe C with FP8, NVFP4, K8V4, VQ2 or K4V2 KV).**
 - **What changes:** prefill-width calls of Flash-Next's row-FP8 dense problems carry each 16-bit
   activation as two E4M3 terms on the 8-bit Tensor Core path, admitted per problem where faster
   than the exact route (cold L2, graph): [16384, 2560] from T = 17, [13312, 2560] from 97,
@@ -1428,10 +1428,20 @@ and recomputes the previous output) or admission (whole extents held without `pr
   | VQ2 | 1.7e-4 (6.6e-4) | -4.9e-4 (2.3e-3) | 9.4e-4 | 1.04 | passes |
   | K4V2 | 9.6e-5 (5.3e-4) | -7.3e-4 (1.7e-3) | -5.2e-4 | **1.18** | passes, close |
 
-  `fp8-a8-pair` is registered on K8V4 and VQ2. FP8's tail rests on about 16 positions with a small
-  default p99.9 (0.247 against 0.326), and NVFP4's top-1 and K4V2's tail are within 11 % of their
-  limits, so those three await the 1,024-segment gate. It is request-coupling: a dense call takes
-  the pair route from its problem's admission width, which batched rounds share.
+  FP8's tail rests on about 16 positions with a small default p99.9 (0.247 against 0.326), and
+  NVFP4's top-1 and K4V2's tail are within 11 % of their limits, so those three ran the decode gate
+  over 1,024 segments (the shared 1,024-segment reference), whose verdicts replace these:
+
+  | KV | TV excess (bound) / 4.0e-3 | Top-1 excess (bound) / 5.0e-3 | NLL excess / 1.0e-2 | p99.9 KL ratio / 1.25 | Verdict |
+  |---|---|---|---|---|---|
+  | FP8 | 2.4e-3 (3.84e-3) | 1.7e-3 (3.9e-3) | 6.7e-4 | 1.12 | passes |
+  | NVFP4 | 3.7e-4 (2.3e-3) | 5.3e-4 (3.2e-3) | -5.1e-3 | 1.15 | passes |
+  | K4V2 | 1.8e-3 (3.3e-3) | 2.0e-3 (4.3e-3) | 7.1e-3 | 0.93 | passes |
+
+  `fp8-a8-pair` is registered on FP8, NVFP4, K8V4, VQ2 and K4V2 (FP8's TV bound, 0.96 of its
+  budget, is the closest margin). Speed beside `expert-a4-residual` was measured on INT8 KV (+5.4 /
+  +6.0 % at 32K / 64K above); the other formats were not timed. It is request-coupling: a dense
+  call takes the pair route from its problem's admission width, which batched rounds share.
 - **A third h term for `expert-a4-residual` (2 + 3, tried 2026-10-17, not kept).** Recipe C, INT8
   KV, ABBA: two terms alone 8,736 / 8,997 tok/s (pp32768 / pp65536), 2 + 3 alone 8,548 / 8,801
   (-2.2 %), 2 + 3 with `fp8-a8-pair` 9,016 / 9,334 (+3.2 % / +3.7 % over two terms alone). Its
