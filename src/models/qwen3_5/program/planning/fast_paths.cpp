@@ -114,6 +114,15 @@ constexpr std::array kQualified{
     Qualification{FastPath::BatchedA8ResidualDecode,
                   {24, ActivationClass::A4, KvCacheStorage::Fp8E4M3Row256}},
     Qualification{FastPath::Preemption, {24, ActivationClass::A4, KvCacheStorage::Fp8E4M3Row256}},
+    // FP16-accumulate chunked GDN, jointly with the paths above: prefill gate (quick corpus, 896
+    // and 1,792) on every KV format, decode (plain, 256 segments) on INT8 and BF16 (2026-10-17).
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A4, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A4, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A4, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A4, KvCacheStorage::Vq2}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value}},
 };
 
 const char* kv_name(KvCacheStorage kv) {

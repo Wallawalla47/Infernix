@@ -177,7 +177,12 @@ int main() {
                                     KvCacheStorage::Q4KeyVq2Value}) {
         failures += check(q::fast_path_qualified(FastPath::IdleWidePrefill, {24, ActivationClass::A4, kv}),
                           "idle-wide-prefill is qualified where it passed its gate");
+        failures += check(q::fast_path_qualified(FastPath::GdnF16Accumulate, {24, ActivationClass::A4, kv}),
+                          "gdn-f16-accumulate is qualified where it passed its gate");
     }
+    failures += check(q::fast_path_applies(FastPath::GdnF16Accumulate, int8_24, options, false) &&
+                          !q::couples_requests(FastPath::GdnF16Accumulate),
+                      "gdn-f16-accumulate applies everywhere and keeps a request invariant");
     failures += check(!q::fast_path_qualified(FastPath::IdleWidePrefill,
                                               {24, ActivationClass::A16, KvCacheStorage::Int8Group64}),
                       "idle-wide-prefill is not qualified at 16-bit activations");

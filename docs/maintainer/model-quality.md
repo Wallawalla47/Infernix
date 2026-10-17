@@ -779,7 +779,7 @@ tokens. The recipe C gates (`expert-a4-residual`, `fp8-a8-pair`) are re-scored i
 | `adaptive-mtp` | Qwen3.8-27B / Qwen3.6-35B-A3B with MTP | none (no speed gain shown, below) |
 | Qwen3.8-Flash-Next: `expert-a4-residual` | artifacts with W4A16 experts (recipe C), expert calls of more than eight columns | FP8 dense, 16-bit expert activations, with INT8, FP8, NVFP4, K8V4, VQ2 or K4V2 KV (fails on BF16 KV, below) |
 | Qwen3.8-Flash-Next: `sampled-mtp-drafts` | MTP rounds with a sampled request | Q8 dense, 4-bit experts, with every KV format (distribution and greedy identity, below; no logit changes) |
-| `gdn-f16-accumulate` | chunked GDN calls (16+ tokens) of every Qwen3.5-family and Flash-Next artifact | none yet (prefill gain measured, gates pending, below) |
+| `gdn-f16-accumulate` | chunked GDN calls (16+ tokens) of every Qwen3.5-family and Flash-Next artifact | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2); not Flash-Next (no consistent prefill gain, below) |
 
 **`sampled-mtp-drafts`: drafts drawn from the draft head's top four tokens (Flash-Next, qualified
 2026-10-17).** It changes no logit: a sampled request's drafts are drawn from the head's four most
@@ -800,12 +800,31 @@ geomean +2.7 %, 5 of 6 cells faster, worst -0.9 % (each arm decodes its own text
 prototype measured +9.1 % (6 of 6) on a warm cache; greedy MTP decode is unchanged (150.3 against
 150.3 tok/s). Not measured on FP8 or recipe C dense, which stay unregistered.
 
-**`gdn-f16-accumulate`: FP16-accumulate chunked GDN (not qualified yet).** See
+**`gdn-f16-accumulate`: FP16-accumulate chunked GDN (qualified on the 27B, 2026-10-17).** See
 `ops::GdnChunkArithmetic::Fp16Accumulate`. Op: 1.20x at the 27B's shapes, and closer to the FP64
 oracle than the exact route (output relative RMS 2.08e-3 against 3.60e-3, state 8.6e-4 against
 2.6e-3). Prefill (INT8 KV, default route against default + the path, ABBA): 27B pp4096 12,956 ->
 12,986 and pp16384 11,965 -> 11,994 tok/s (+0.24 %, both runs of each arm ahead); Flash-Next
-pp16384 6,574 -> 6,564 (-0.15 %, ranges overlap), pp65536 11,186 -> 11,214 (+0.26 %).
+pp16384 6,574 -> 6,564 (-0.15 %, ranges overlap), pp65536 11,186 -> 11,214 (+0.26 %), so it is
+not registered there. Gates on the official 27B NVFP4, jointly with the qualified paths (the path
+touches no attention or KV: reduced prefill gate on every format, decode on INT8 and on BF16, the
+lowest floor):
+
+| 27B, KV | Prefill KL excess (bound) / 1.5e-3 | Prefill top-1 excess, points (bound) | Corpus NLL excess / 3e-3 |
+|---|---|---|---|
+| BF16 | -5.0e-4 (3.8e-5) | +0.01 (0.07) | 9.1e-4 |
+| INT8 | 7.6e-5 (3.8e-4) | +0.05 (0.10) | -3.9e-4 |
+| FP8 | -1.6e-4 (2.9e-4) | +0.08 (0.14) | -3.6e-4 |
+| NVFP4 | 5.8e-4 (1.0e-3) | +0.04 (0.11) | -9.5e-4 |
+| K8V4 | 3.8e-4 (9.0e-4) | +0.05 (0.09) | 5.9e-4 |
+| VQ2 | 9.1e-5 (3.0e-4) | +0.00 (0.05) | -6.9e-4 |
+| K4V2 | -1.1e-4 (3.9e-4) | -0.02 (0.04) | 1.6e-3 |
+
+Decode, plain, 256 segments: INT8 TV excess 2.6e-4 (bound 5.2e-4) / 4e-3, top-1 +0.05 points
+(0.23) / 0.5, KL 6.3e-5; BF16 TV -2.8e-4 (2.6e-5), top-1 -0.12 points (0.07), KL -1.4e-4. Every
+tail and context criterion passes. These are joint excesses over the exact route, so they do not
+isolate the path's own effect; BF16 KV, where the qualified paths add least, shows every estimate
+below zero.
 
 **The request-coupling paths.** These were the default behaviour until the exact route became
 request-invariant (2026-10-14). Each makes a request's arithmetic depend on the other requests of
