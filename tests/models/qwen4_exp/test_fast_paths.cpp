@@ -68,8 +68,16 @@ int main() {
         failures += check(!q::fast_path_qualified(path, {QType::Q8_G32_FP16, false, KvCacheStorage::Int8Group64}),
                           "a kernel path stays unqualified with 16-bit expert activations");
     }
+    // fp8-a8-pair runs on recipe C (FP8 dense, 16-bit expert activations) where its own decode gate
+    // passed; INT8 fails its tail and BF16 its prefill gate.
+    for (const KvCacheStorage kv : {KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2})
+        failures += check(q::fast_path_qualified(FastPath::Fp8A8Pair, {QType::FP8_E4M3FN_ROW_BF16, false, kv}),
+                          "fp8-a8-pair is qualified on recipe C with K8V4 and VQ2 KV");
+    for (const KvCacheStorage kv : {KvCacheStorage::Int8Group64, KvCacheStorage::BFloat16})
+        failures += check(!q::fast_path_qualified(FastPath::Fp8A8Pair, {QType::FP8_E4M3FN_ROW_BF16, false, kv}),
+                          "fp8-a8-pair stays unqualified on recipe C with INT8 or BF16 KV");
     failures += check(!q::fast_path_qualified(FastPath::Fp8A8Pair, {QType::FP8_E4M3FN_ROW_BF16, true, KvCacheStorage::Int8Group64}),
-                      "fp8-a8-pair is qualified at op level only, not on any artifact");
+                      "fp8-a8-pair is not qualified with 4-bit expert activations");
 
     // The request-coupling paths are qualified with Q8 dense weights and 4-bit experts on every KV
     // format: speculation and cache resume by their joint arm, preemption by its increment arm.
@@ -111,6 +119,10 @@ int main() {
     selection.paths = {FastPath::ExpertA4Residual};
     failures += check(selection.forward().expert_a4_residual, "expert-a4-residual sets its Forward flag");
     failures += check(!selection.request_invariant(), "expert-a4-residual couples a request to its round");
+    // fp8-a8-pair admits a dense call by its width, which batched rounds share.
+    selection.paths = {FastPath::Fp8A8Pair};
+    failures += check(!selection.request_invariant(), "fp8-a8-pair couples a request to its round");
+    selection.paths = {FastPath::ExpertA4Residual};
     for (const auto kv : {KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256, KvCacheStorage::Nvfp4Group16,
                           KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2, KvCacheStorage::Q4KeyVq2Value}) {
         failures += check(q::fast_path_qualified(FastPath::ExpertA4Residual, {QType::FP8_E4M3FN_ROW_BF16, false, kv}),
