@@ -1,9 +1,11 @@
 #include "models/qwen4_exp/program/ngram_volume.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstring>
 #include <exception>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -24,9 +26,12 @@ T read_le(const std::byte* p) {
 
 } // namespace
 
-NgramVolume::NgramVolume(const std::filesystem::path& path, const NgramTableConfig& table)
-    : file_(path, FileMapping::None), table_(table), tags_(std::size_t{1} << kCacheBits, 0xFFFFFFFFU),
-      cache_((std::size_t{1} << kCacheBits) * table.row_bytes) {
+NgramVolume::NgramVolume(const std::filesystem::path& path, const NgramTableConfig& table, bool resident)
+    : file_(path, FileMapping::None), table_(table) {
+    if (!resident) {
+        tags_.assign(std::size_t{1} << kCacheBits, 0xFFFFFFFFU);
+        cache_.assign((std::size_t{1} << kCacheBits) * table.row_bytes, std::byte{0});
+    }
     if (table.block_bytes < 4096 || table.block_bytes % 4096 != 0 || table.header_bytes % 4096 != 0) {
         throw std::runtime_error(path.string() + ": n-gram blocks and header must be whole 4 KiB pages");
     }
@@ -50,6 +55,23 @@ NgramVolume::NgramVolume(const std::filesystem::path& path, const NgramTableConf
         throw std::runtime_error(path.string() + ": n-gram volume does not belong to this artifact");
     }
     static_assert(kHeaderSize == 60);
+    if (resident) {
+        // The whole table in RAM: 1 GiB unbuffered reads (each keeps 16 reads of 8 MiB in flight on
+        // Windows) straight into the block, which is then page-locked and mapped in one call.
+        const auto start = std::chrono::steady_clock::now();
+        resident_ = std::make_unique<RegisteredHostBuffer>(resident_bytes(table));
+        constexpr std::size_t kPiece = std::size_t{1} << 30;
+        for (std::size_t at = 0; at < resident_->size(); at += kPiece) {
+            const std::size_t bytes = std::min(kPiece, resident_->size() - at);
+            if (file_.read_direct(table.header_bytes + at, std::span<std::byte>(resident_->data() + at, bytes)) != bytes) {
+                throw std::runtime_error(path.string() + ": short n-gram volume read");
+            }
+        }
+        resident_->pin();
+        counters_.reads   = table.blocks;
+        counters_.read_ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+    }
 }
 
 void NgramVolume::read_rows(std::span<const std::uint32_t> rows, std::span<std::byte> out) const {
@@ -57,6 +79,18 @@ void NgramVolume::read_rows(std::span<const std::uint32_t> rows, std::span<std::
         throw std::invalid_argument("n-gram rows: output size differs from the row count");
     }
     const std::size_t row_bytes = table_.row_bytes;
+    if (resident_) {
+        const std::byte* blocks = resident_->data();
+        for (std::size_t i = 0; i < rows.size(); ++i) {
+            if (rows[i] >= table_.rows) { throw std::out_of_range("n-gram row id outside the table"); }
+            const std::uint64_t at = static_cast<std::uint64_t>(rows[i] / table_.rows_per_block) * table_.block_bytes +
+                                     static_cast<std::uint64_t>(rows[i] % table_.rows_per_block) * row_bytes;
+            std::memcpy(out.data() + i * row_bytes, blocks + at, row_bytes);
+        }
+        counters_.rows += rows.size();
+        counters_.hits += rows.size();
+        return;
+    }
     misses_.clear();
     for (std::size_t i = 0; i < rows.size(); ++i) {
         if (rows[i] >= table_.rows) { throw std::out_of_range("n-gram row id outside the table"); }
@@ -147,6 +181,12 @@ void NgramVolume::read_rows(std::span<const std::uint32_t> rows, std::span<std::
 }
 
 bool NgramVolume::cached(std::span<const std::uint32_t> rows) const noexcept {
+    if (resident_) {
+        for (const std::uint32_t row : rows) {
+            if (row >= table_.rows) { return false; }
+        }
+        return true;
+    }
     for (const std::uint32_t row : rows) {
         if (row >= table_.rows || tags_[slot_of(row)] != row) { return false; }
     }
@@ -155,6 +195,57 @@ bool NgramVolume::cached(std::span<const std::uint32_t> rows) const noexcept {
 
 std::filesystem::path default_ngram_volume(const std::filesystem::path& artifact) {
     return std::filesystem::path(artifact.string() + ".ngram");
+}
+
+NgramTableConfig resolve_ngram_volume(const std::filesystem::path& path, const PleConfig& ple) {
+    const auto fail = [&](const std::string& why) { throw std::runtime_error(path.string() + ": " + why); };
+    std::array<std::byte, kHeaderSize> header{};
+    {
+        std::ifstream file(path, std::ios::binary);
+        if (!file) { fail("cannot open the n-gram volume"); }
+        if (!file.read(reinterpret_cast<char*>(header.data()), static_cast<std::streamsize>(header.size()))) {
+            fail("short n-gram volume header");
+        }
+    }
+    const std::byte* p = header.data();
+    if (std::memcmp(p, kMagic, 8) != 0 || read_le<std::uint32_t>(p + 8) != kVersion) {
+        fail("not an n-gram volume (v1)");
+    }
+    NgramTableConfig out;
+    out.header_bytes   = read_le<std::uint32_t>(p + 12);
+    out.rows           = read_le<std::uint64_t>(p + 16);
+    out.row_bytes      = read_le<std::uint32_t>(p + 24);
+    out.rows_per_block = read_le<std::uint32_t>(p + 28);
+    out.block_bytes    = read_le<std::uint32_t>(p + 32);
+    out.blocks         = read_le<std::uint64_t>(p + 36);
+    std::memcpy(out.volume_id.data(), p + 44, 16);
+    // The row format follows from the row size: head_width FP8 codes, IQ4_NL blocks of 32 (18 bytes
+    // each) or head_width BF16 values.
+    const std::uint32_t width = ple.head_width();
+    if (out.row_bytes == 2 * width) {
+        out.format = NgramRowFormat::Bf16;
+    } else if (out.row_bytes == width) {
+        out.format = NgramRowFormat::Fp8E4m3;
+    } else if (width % 32 == 0 && out.row_bytes == width / 32 * 18) {
+        out.format = NgramRowFormat::Iq4Nl;
+    } else {
+        fail("n-gram rows of " + std::to_string(out.row_bytes) + " bytes fit no table of this model");
+    }
+    if (out.format == ple.table.format) { return ple.table; } // its own volume: NgramVolume checks the id
+    if (ple.table.format == NgramRowFormat::Bf16) {
+        fail("this artifact's n-gram table is BF16; a quantized volume cannot replace it (use its BF16 volume)");
+    }
+    if (out.format != NgramRowFormat::Bf16) {
+        fail("an n-gram volume of another quantized format than the artifact's cannot replace its table; "
+             "use the artifact's volume or a BF16 volume (tools/flash_next/ngram_bf16.py)");
+    }
+    out.file_bytes = static_cast<std::uint64_t>(out.header_bytes) + out.blocks * out.block_bytes;
+    if (out.rows != ple.table.rows || out.block_bytes != 4096 || out.header_bytes != 4096 ||
+        out.rows_per_block != out.block_bytes / out.row_bytes ||
+        out.blocks != (out.rows + out.rows_per_block - 1) / out.rows_per_block) {
+        fail("the BF16 n-gram volume's geometry differs from this model's table");
+    }
+    return out;
 }
 
 } // namespace infernix::models::qwen4_exp

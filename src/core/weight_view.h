@@ -47,7 +47,7 @@ struct WeightGeometry {
     std::uint64_t scale_offset        = 0;
     std::uint64_t scale_bytes         = 0;
     std::uint64_t divisor_offset      = 0;
-    // ExpertRg16 only: one expert's unit bytes and its 4 KiB-aligned pitch.
+    // Expert-bank layouts only: one expert's record bytes and its 4 KiB-aligned pitch.
     std::uint64_t record_bytes  = 0;
     std::uint64_t record_stride = 0;
 };
@@ -106,18 +106,26 @@ struct WeightRowPlanes {
 // address (WeightParent::device).
 [[nodiscard]] Weight device_native_weight(const WeightView& view, float input_divisor = 0.0F);
 
-// A routed-expert bank in nvfp4_expert_rg16_v1 (Qwen3.8-Flash-Next design §6.2). Pointers are in
-// the parent's memory space; nothing is dereferenced.
+// A routed-expert bank: nvfp4_expert_rg16_v1 (Qwen3.8-Flash-Next design §6.2), a ggml expert
+// layout (ggml_expert_*_v1) or fp8_expert_b128_v1 (whose tile scales follow the down rows, at
+// record_bytes - 3 * (hidden / 128) * (intermediate / 128) * 2). Pointers are in the parent's
+// memory space; nothing is dereferenced.
 struct ExpertBankPlanes {
     const std::byte* records     = nullptr; // expert e at records + e * record_stride
     const std::byte* device_records = nullptr; // records where device code reads them (WeightParent::device)
-    const float* multipliers     = nullptr; // [experts][3]: gate, up, down weight_scale_2
+    const float* multipliers     = nullptr; // [experts][3]: gate, up, down weight_scale_2 (NVFP4 only)
     std::uint64_t record_bytes   = 0;
     std::uint64_t record_stride  = 0;
     std::uint64_t gate_up_bytes  = 0; // the down matrix starts here inside a record
     std::uint32_t experts        = 0;
     std::uint32_t hidden         = 0;
     std::uint32_t intermediate   = 0;
+    // ggml and block-FP8 banks: the gate/up and down formats (NVFP4_MUL for nvfp4_expert_rg16_v1)
+    // and their row bytes; the up rows start at intermediate * gate_row_bytes.
+    QType gate_up_format         = QType::NVFP4_MUL;
+    QType down_format            = QType::NVFP4_MUL;
+    std::uint64_t gate_row_bytes = 0;
+    std::uint64_t down_row_bytes = 0;
 };
 [[nodiscard]] ExpertBankPlanes expert_bank_planes(const WeightParent& parent);
 // The layout of a bank whose records are not resident (read in place by the SSD tier): records is

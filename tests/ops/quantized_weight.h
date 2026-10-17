@@ -151,6 +151,8 @@ struct QuantSpec {
 
 inline QuantSpec quant_spec(QType qtype) {
     switch (qtype) {
+    case QType::Q2_G64_FP16:
+        return {2, 64, 1, -2};
     case QType::Q4_G64_FP16:
         return {4, 64, 7, -8};
     case QType::Q5_G64_FP16:
@@ -165,7 +167,7 @@ inline QuantSpec quant_spec(QType qtype) {
 }
 
 inline int nibble_bytes_per_group(const QuantSpec& spec) {
-    return spec.bits == 8 ? spec.group_size : spec.group_size / 2;
+    return spec.bits == 8 ? spec.group_size : spec.bits == 2 ? spec.group_size / 4 : spec.group_size / 2;
 }
 
 inline int high_bytes_per_group(const QuantSpec& spec) {
@@ -182,6 +184,12 @@ inline void pack_lowbit_group(const std::int8_t* codes, const QuantSpec& spec,
     if (spec.bits == 8) {
         for (int i = 0; i < spec.group_size; ++i) {
             nibble_out[i] = static_cast<std::uint8_t>(codes[i]);
+        }
+        return;
+    }
+    if (spec.bits == 2) { // four codes per byte: element i in byte i / 4, bits 2 (i % 4)
+        for (int i = 0; i < spec.group_size; ++i) {
+            nibble_out[i >> 2] |= static_cast<std::uint8_t>((static_cast<std::uint32_t>(codes[i]) & 3u) << (2 * (i & 3)));
         }
         return;
     }
@@ -209,6 +217,10 @@ inline void pack_lowbit_group(const std::int8_t* codes, const QuantSpec& spec,
 inline int unpack_lowbit_code(const std::uint8_t* nibble, const std::uint8_t* high,
                               const QuantSpec& spec, int index) {
     if (spec.bits == 8) { return static_cast<std::int8_t>(nibble[index]); }
+    if (spec.bits == 2) {
+        const int u = (nibble[index >> 2] >> (2 * (index & 3))) & 3;
+        return u >= 2 ? u - 4 : u;
+    }
     const std::uint8_t low_byte = nibble[index >> 1];
     const std::uint32_t low     = (index & 1) ? (low_byte >> 4) : (low_byte & 0x0fu);
     std::uint32_t hi            = 0;

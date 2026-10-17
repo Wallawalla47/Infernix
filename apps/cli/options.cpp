@@ -93,7 +93,8 @@ std::string usage_text(const char* argv0) {
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
-           "       [--chat-template FILE] [--ngram-volume FILE] [--expert-state FILE|off]\n"
+           "       [--chat-template FILE] [--ngram-volume FILE] [--ngram-residency auto|ram|volume]\n"
+           "       [--expert-state FILE|off] [--expert-stripe FILE]\n"
            "       [--ram-headroom-mib N] [--expert-ram-mib N|auto] [--expert-pin-mib N|auto]\n"
            "       [--grammar-file FILE | --json-object | --json-schema-file FILE |\n"
            "        --regex PATTERN | --choice TEXT ...]\n"
@@ -250,9 +251,13 @@ Options parse_options(int argc, char** argv) {
             options.chat_template_path = value(arg);
         } else if (arg == "--ngram-volume") {
             options.ngram_volume_path = value(arg);
+        } else if (arg == "--ngram-residency") {
+            options.ngram_residency = parse_ngram_residency(value(arg));
         } else if (arg == "--expert-state") {
             const std::string path = value(arg);
             options.expert_state   = path == "off" ? std::filesystem::path{} : std::filesystem::path(path);
+        } else if (arg == "--expert-stripe") {
+            options.expert_stripe_path = value(arg);
         } else if (arg == "--grammar-file") {
             options.grammar_path = value(arg);
         } else if (arg == "--json-object") {

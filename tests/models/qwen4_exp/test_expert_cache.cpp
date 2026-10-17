@@ -489,6 +489,11 @@ void test_lending() {
     cache.give_back(first, 3, cmds);
     apply();
     check(cache.loaned_frames() == 0 && cache.policy().capacity() == capacity, "give_back restores the capacity");
+    bool reloaded = true;
+    for (std::uint32_t k = 0; k < 3; ++k) {
+        reloaded &= cache.entry(k).state == ResidencyState::kReady && frame_of[k] != ~0U && cache.policy().resident(k);
+    }
+    check(reloaded, "give_back reloads the experts the loan evicted");
     route_k();
     check(frame_of[K] != ~0U, "K is resident again after the give-back");
     check(!cache.complete_load(K, K_frame, s1), "K's copy from before the loan (ABA) does not publish");

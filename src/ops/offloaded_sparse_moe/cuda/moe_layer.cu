@@ -15,6 +15,10 @@
 #include "core/pdl.cuh"
 
 #include "ops/common/canonical_math.h"
+#include "ops/ggml/ggml_dp4a.cuh"
+#include "ops/ggml/ggml_exact.h"
+#include "ops/ggml/ggml_tile.cuh"
+#include "ops/fp8_block/fp8_exact.h"
 #include "ops/offloaded_sparse_moe/cuda/wide_expert.h"
 
 #include <cuda_bf16.h>
@@ -79,6 +83,21 @@ __device__ __forceinline__ void stage_async(const std::uint8_t* src, std::uint8_
 
 __device__ __forceinline__ void stage_wait() { asm volatile("cp.async.wait_group 0;\n" ::: "memory"); }
 
+// The pitch of frames, staging slots and landings (MoeExpertSource::frame_stride; prefetch slots
+// take prefetch_stride when it is set).
+__host__ __device__ __forceinline__ std::uint64_t frame_pitch(const MoeExpertSource& source) {
+    return source.frame_stride != 0 ? source.frame_stride : source.record_stride;
+}
+
+// Bytes a stage copies: a ggml bank's record, else the NVFP4 record.
+__device__ __forceinline__ int record_copy_bytes(const MoeExpertSource& source) {
+    return source.ggml.record_bytes != 0 ? static_cast<int>(source.ggml.record_bytes) : static_cast<int>(moe::kRecordBytes);
+}
+
+__host__ __device__ __forceinline__ bool ggml_bank(const MoeExpertSource& source) {
+    return source.ggml.gate_up_format != QType::NVFP4_MUL;
+}
+
 // A non-resident expert's host record (MoeExpertSource::host_table, else the pinned bank).
 __device__ __forceinline__ const std::uint8_t* host_record(const MoeExpertSource& source, int expert) {
     return source.host_table != nullptr ? source.host_table[expert]
@@ -103,7 +122,7 @@ __device__ __forceinline__ const std::uint8_t* pass_record(PassPhase phase, cons
     if (phase == PassPhase::All) { return job_records[job]; }
     const bool resident = source.frames[expert] >= 0;
     if (resident != (phase == PassPhase::Resident)) { return nullptr; }
-    return resident ? source.frame_base + static_cast<std::uint64_t>(source.frames[expert]) * source.record_stride
+    return resident ? source.frame_base + static_cast<std::uint64_t>(source.frames[expert]) * frame_pitch(source)
                     : job_records[job];
 }
 
@@ -151,7 +170,7 @@ __device__ __forceinline__ int fetch_index(const FetchCall* call, int job) {
 
 // One poll of the host's answer by the CTA holding the poller token: mirrors `landed` into the
 // device word the other CTAs read in L2 (keeping PCIe reads to one poller), and fails the request
-// on a host status or when the heartbeat has not changed for kHeartbeatTimeoutNs.
+// on a host status or when the heartbeat has not changed for source.heartbeat_timeout_ns.
 __device__ void poll_fetch(const MoeExpertSource& source, FetchCall* call) {
     volatile FetchCall* v = call;
     const auto* response  = reinterpret_cast<const volatile offloaded_moe::FetchResponse*>(source.fetch.response);
@@ -174,8 +193,8 @@ __device__ void poll_fetch(const MoeExpertSource& source, FetchCall* call) {
     if (beat != v->beat) {
         v->beat    = beat;
         v->beat_ns = now;
-    } else if (now - v->beat_ns > offloaded_moe::kHeartbeatTimeoutNs) {
-        report_error(source, offloaded_moe::kErrorHostSilent);
+    } else if (now - v->beat_ns > source.heartbeat_timeout_ns) {
+        report_error(source, offloaded_moe::kErrorFetchSilent);
         v->failed = 1;
     }
 }
@@ -329,9 +348,10 @@ __global__ void __launch_bounds__(kThreads)
             const int frame = source.frames[expert];
             const int slot  = source.prefetched != nullptr ? source.prefetched[expert] : -1;
             if (frame >= 0) {
-                record = source.frame_base + static_cast<std::uint64_t>(frame) * source.record_stride;
+                record = source.frame_base + static_cast<std::uint64_t>(frame) * frame_pitch(source);
             } else if (slot >= 0) { // streamed by the caller (F2)
-                record = source.prefetch_base + static_cast<std::uint64_t>(slot) * source.record_stride;
+                record = source.prefetch_base + static_cast<std::uint64_t>(slot) *
+                                                    (source.prefetch_stride != 0 ? source.prefetch_stride : frame_pitch(source));
             } else if (source.staging_slots > 0) {
                 miss = true;
             } else {
@@ -350,11 +370,11 @@ __global__ void __launch_bounds__(kThreads)
             if (n < landing_slots && source.landing[n] >= 0) {
                 // The frames are the caller's writable pool; frame_base is const for the read routes.
                 destination = const_cast<std::uint8_t*>(source.frame_base) +
-                              static_cast<std::uint64_t>(source.landing[n]) * source.record_stride;
+                              static_cast<std::uint64_t>(source.landing[n]) * frame_pitch(source);
                 if (blockIdx.x == 0) { source.landed[n] = expert; }
             } else {
                 const int slot = n - landed_before[min(n, landing_slots)];
-                destination    = source.staging_base + static_cast<std::uint64_t>(slot) * source.record_stride;
+                destination    = source.staging_base + static_cast<std::uint64_t>(slot) * frame_pitch(source);
             }
             miss_jobs[n] = job_base + j;
             miss_dst[n]  = destination;
@@ -367,7 +387,8 @@ __global__ void __launch_bounds__(kThreads)
         }
         __syncthreads();
     }
-    constexpr int kChunks = (static_cast<int>(moe::kRecordBytes) + kStageChunk - 1) / kStageChunk;
+    const int record_bytes = record_copy_bytes(source);
+    const int kChunks      = (record_bytes + kStageChunk - 1) / kStageChunk;
     constexpr int kVec    = kStageChunk / 16;
     const int total       = misses * kChunks;
     // Tier records live in host slots the host rewrites (RAM slots, the fetch ring): .cv loads
@@ -376,7 +397,7 @@ __global__ void __launch_bounds__(kThreads)
     __shared__ const std::uint8_t* fetched;
     for (int c = blockIdx.x; c < total; c += gridDim.x) {
         const int m = c / kChunks, offset = (c % kChunks) * kStageChunk;
-        const int bytes = min(kStageChunk, static_cast<int>(moe::kRecordBytes) - offset);
+        const int bytes = min(kStageChunk, record_bytes - offset);
         const int expert = dispatch.jobs[miss_jobs[m]];
         const int f      = fetch_index(fetch, miss_jobs[m]);
         const std::uint8_t* record;
@@ -1231,13 +1252,29 @@ void launch_expert_pass_a16(const bf16* x, const MoeDispatch& dispatch, const Mo
                                     phase));
 }
 
+#include "ops/offloaded_sparse_moe/cuda/ggml_expert.cuh"
+#include "ops/offloaded_sparse_moe/cuda/fp8_expert.cuh"
+
 // One pass of the narrow kernels in the source's arithmetic, for a call of `columns` columns. W4A4
 // jobs of any width take the one-column kernels (one pass per column over the staged weights); W4A16
-// jobs take them in calls of at most kA16OneColumnCalls columns, else the multi-column kernels.
+// jobs take them in calls of at most kA16OneColumnCalls columns, else the multi-column kernels. A GGUF
+// import's or block-FP8 bank runs its own exact kernels.
 void launch_pass(int columns, const bf16* x, const MoeDispatch& dispatch, const MoeExpertSource& source, int top_k,
                  const std::uint8_t* const* job_records, const std::int32_t* flags, int base, int jobs,
                  const moe::wide::ExpertsWorkspace& layout, int columns_out, bf16* outputs, cudaStream_t stream,
                  PassPhase phase = PassPhase::All) {
+    // Wide calls (more than kMaxColumns columns) were planned by moe_experts.
+    const bool wide = columns_out / top_k > moe::kMaxColumns;
+    if (source.ggml.gate_up_format == QType::FP8_E4M3FN_B128) {
+        launch_expert_pass_fp8(dispatch, source, top_k, job_records, flags, base, jobs, layout, outputs, stream, phase,
+                               wide ? columns_out : 0);
+        return;
+    }
+    if (ggml_bank(source)) {
+        launch_pass_ggml(dispatch, source, top_k, job_records, flags, base, jobs, layout, outputs, stream, phase,
+                         wide ? columns_out : 0);
+        return;
+    }
     if (source.activation == moe::ExpertActivation::kA16) {
         auto* h_plane = reinterpret_cast<std::uint16_t*>(layout.h_rows);
         if (columns <= kA16OneColumnCalls) {
@@ -1259,10 +1296,11 @@ void launch_pass(int columns, const bf16* x, const MoeDispatch& dispatch, const 
 // reads of several jobs are in flight at once.
 constexpr int kWaitCtas = offloaded_moe::kMaxCpuJobs < 8 ? offloaded_moe::kMaxCpuJobs : 8;
 
-// One CTA picks the CPU jobs: of the call's M misses, want = min(cap, M - M / pcie_divisor) of
+// One CTA picks the CPU jobs: of the call's M misses, want = min(cap, M - M / d) of
 // those with at most max_job_columns columns, the fewest-column ones first and, within a width, in
 // job order; cap is max_jobs, or wide_jobs for calls of at least wide_from columns (prefill
-// assist). Each thread ranks its jobs among their width with warp ballots, so no thread walks the
+// assist); d is pcie_divisor, or one_column_divisor (when set) in a one-column call (none for d = 0).
+// Each thread ranks its jobs among their width with warp ballots, so no thread walks the
 // job list. The chosen jobs are marked in cpu_flags and listed in that order in call->job and the
 // request. The x columns they read are published compacted, in column order (the request names
 // them by compact index), then the request's sequence after a system-scope fence.
@@ -1330,7 +1368,10 @@ __device__ __forceinline__ void cpu_plan_body(const MoeDispatch& dispatch, const
             take[w]       = min(width_misses[w], cap - n);
             n += take[w];
         }
-        const int want = min(cap - n, channel.pcie_divisor > 0 ? misses - misses / channel.pcie_divisor : misses);
+        const int one     = channel.one_column_divisor_device != nullptr && columns == 1 ? *channel.one_column_divisor_device
+                                                                                         : channel.one_column_divisor;
+        const int divisor = columns == 1 && one > 0 ? one : channel.pcie_divisor;
+        const int want    = min(cap - n, divisor > 0 ? misses - misses / divisor : misses);
         int m = 0;
         for (int w = 1; w <= kWidths; ++w) {
             first_slot[kWidths + w] = n + m;
@@ -1527,7 +1568,7 @@ __global__ void __launch_bounds__(kThreads)
         const auto* beat  = reinterpret_cast<const volatile std::uint32_t*>(source.cpu.heartbeat);
         std::uint32_t seen = beat != nullptr ? *beat : 0;
         std::uint64_t since = global_ns();
-        const std::uint64_t limit = beat != nullptr ? offloaded_moe::kHeartbeatTimeoutNs : 2000000000ULL;
+        const std::uint64_t limit = beat != nullptr ? source.heartbeat_timeout_ns : 2000000000ULL;
         silent = false;
         while (*done != sequence) {
             const std::uint64_t now = global_ns();
@@ -1821,12 +1862,17 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
     require(contiguous(x, DType::BF16) && contiguous(outputs, DType::BF16), "experts need BF16 x and outputs");
     require(x.ne[0] == moe::kHidden && outputs.ne[0] == moe::kHidden && outputs.ne[1] == x.ne[1] * top_k,
             "experts geometry differs from the nvfp4_expert_rg16_v1 record");
-    require(max_jobs > 0 && max_jobs <= 65535 && source.scales != nullptr && source.frames != nullptr &&
+    const bool ggml = ggml_bank(source);
+    const std::uint64_t record_bytes = ggml ? source.ggml.record_bytes : moe::kRecordBytes;
+    require(max_jobs > 0 && max_jobs <= 65535 && (ggml || source.scales != nullptr) && source.frames != nullptr &&
                 (source.host_records != nullptr || source.host_table != nullptr) &&
-                source.record_stride >= moe::kRecordBytes &&
-                source.record_stride % 16 == 0 && source.staging_slots >= 0 &&
+                source.record_stride >= record_bytes && frame_pitch(source) >= record_bytes &&
+                source.record_stride % 16 == 0 && frame_pitch(source) % 16 == 0 && source.staging_slots >= 0 &&
                 (source.staging_slots == 0 || source.staging_base != nullptr),
             "experts source is incomplete");
+    require(!ggml || (source.activation == moe::ExpertActivation::kA16 && source.ggml.record_bytes % 16 == 0 &&
+                      source.ggml.gate_row_bytes > 0 && source.ggml.down_row_bytes > 0),
+            "a ggml bank takes the A16 workspace");
     require(source.landing_slots >= 0 && source.landing_slots <= offloaded_moe::kMaxLandingSlots &&
                 (source.landing_slots == 0 || (source.landing != nullptr && source.landed != nullptr)),
             "experts landing is incomplete");
@@ -1856,12 +1902,17 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
         check_launch("fetch plan");
     }
     const std::int32_t* flags = cpu ? cpu_flags : nullptr;
+    // A ggml bank's gate/up kernels read every token's x limbs, encoded once here, before any fork.
+    if (ggml) {
+        launch_encode_x_ggml(x, layout, stream);
+        if (x.ne[1] > moe::kMaxColumns) { launch_plan_ggml(dispatch, max_jobs, layout, stream); }
+    }
     // Passes of at most staging_slots jobs (one pass covering every job without staging).
     const int pass_jobs = source.staging_slots > 0 ? std::min(source.staging_slots, kMaxPassJobs) : max_jobs;
     const int half      = source.staging_slots / 2;
     // In a call of more than eight columns, experts with more than eight take the wide route, pass
     // by pass once each pass's records are resolved; it is planned and x quantized before the passes.
-    const bool use_wide = x.ne[1] > moe::kMaxColumns && !forked(source, max_jobs, x.ne[1]);
+    const bool use_wide = !ggml && x.ne[1] > moe::kMaxColumns && !forked(source, max_jobs, x.ne[1]);
     // The staging overlap is not combined with the wide route: in the Program, overlapped calls with
     // wide experts gave run-to-run differences (prefix-cache exactness failures, varying greedy ids;
     // design §19.3.8, "F1 nondeterminism") that serial passes do not; the cause is not identified.
@@ -1879,7 +1930,7 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
             const int jobs = std::min(half, max_jobs - base);
             const int b    = pass % 2;
             MoeExpertSource buffer = source;
-            buffer.staging_base    = source.staging_base + static_cast<std::uint64_t>(b) * half * source.record_stride;
+            buffer.staging_base    = source.staging_base + static_cast<std::uint64_t>(b) * half * frame_pitch(source);
             buffer.staging_slots   = half;
             buffer.landing         = nullptr; // landing is for forked calls only
             buffer.landing_slots   = 0;

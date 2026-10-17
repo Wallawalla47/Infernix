@@ -4,6 +4,7 @@
 // call hits the host cache, two rows of one cache slot both return their own bytes, a row past the
 // table throws, and a volume of the wrong size is refused at open. A call of thousands of distinct
 // blocks (a prefill chunk) takes the multi-threaded route: the same oracle, counters and cache.
+// resolve_ngram_volume accepts a BF16 volume in place of a quantized table and refuses mismatches.
 
 #include "models/qwen4_exp/program/ngram_volume.h"
 
@@ -97,6 +98,83 @@ std::uint64_t distinct_blocks(const std::vector<std::uint32_t>& rows) {
     return blocks.size();
 }
 
+// A volume header alone (resolve_ngram_volume reads nothing else): rows of `row_bytes`, as the
+// converter lays them out, with `id`.
+void write_header(const std::filesystem::path& path, std::uint64_t rows, std::uint32_t row_bytes, std::uint8_t id) {
+    std::vector<std::byte> header(4096);
+    const std::uint32_t per_block = kBlockBytes / row_bytes;
+    std::memcpy(header.data(), "NINFERNG", 8);
+    put<std::uint32_t>(header, 8, 1);
+    put<std::uint32_t>(header, 12, 4096);
+    put<std::uint64_t>(header, 16, rows);
+    put<std::uint32_t>(header, 24, row_bytes);
+    put<std::uint32_t>(header, 28, per_block);
+    put<std::uint32_t>(header, 32, kBlockBytes);
+    put<std::uint64_t>(header, 36, (rows + per_block - 1) / per_block);
+    std::memset(header.data() + 44, id, 16);
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    out.write(reinterpret_cast<const char*>(header.data()), static_cast<std::streamsize>(header.size()));
+}
+
+// resolve_ngram_volume: the artifact's own volume keeps the artifact's table; a BF16 volume (rows of
+// 2 x head width) replaces an FP8 or an IQ4_NL table; a volume of the other quantized format, of
+// another row count or of no known row size is refused.
+void test_resolve(const std::filesystem::path& path) {
+    constexpr std::uint64_t rows = 100'003;
+    q4::PleConfig ple;
+    ple.embed_dim             = 2560;
+    ple.ngram.ngram_size      = 3;
+    ple.ngram.heads_per_ngram = 8; // 16 heads of 160
+    ple.table.format          = q4::NgramRowFormat::Fp8E4m3;
+    ple.table.rows            = rows;
+    ple.table.row_bytes       = 160;
+    ple.table.volume_id.fill(0xAA);
+    const auto refused = [&] {
+        try {
+            (void)q4::resolve_ngram_volume(path, ple);
+        } catch (const std::runtime_error&) { return true; }
+        return false;
+    };
+
+    write_header(path, rows, 160, 0xAA);
+    const q4::NgramTableConfig own = q4::resolve_ngram_volume(path, ple);
+    check(own.format == q4::NgramRowFormat::Fp8E4m3 && own.volume_id == ple.table.volume_id,
+          "the artifact's own volume keeps its table");
+    write_header(path, rows, 320, 0x55);
+    const q4::NgramTableConfig bf16 = q4::resolve_ngram_volume(path, ple);
+    check(bf16.format == q4::NgramRowFormat::Bf16 && bf16.row_bytes == 320 && bf16.rows_per_block == 12 &&
+              bf16.blocks == (rows + 11) / 12 && bf16.file_bytes == 4096 + bf16.blocks * 4096 &&
+              bf16.volume_id[0] == 0x55,
+          "a BF16 volume replaces an FP8 table, with its own geometry and id");
+    write_header(path, rows + 1, 320, 0x55);
+    check(refused(), "a BF16 volume of another row count is refused");
+    write_header(path, rows, 90, 0x55);
+    check(refused(), "an IQ4_NL volume cannot replace an FP8 table");
+    write_header(path, rows, 200, 0x55);
+    check(refused(), "a row size of no known format is refused");
+
+    ple.table.format    = q4::NgramRowFormat::Iq4Nl;
+    ple.table.row_bytes = 90;
+    write_header(path, rows, 320, 0x55);
+    check(q4::resolve_ngram_volume(path, ple).format == q4::NgramRowFormat::Bf16,
+          "a BF16 volume replaces an IQ4_NL table");
+    write_header(path, rows, 160, 0x55);
+    check(refused(), "an FP8 volume cannot replace an IQ4_NL table");
+
+    // An exact conversion bound to a BF16 volume: that volume is its own (the id is checked when it
+    // opens); a quantized volume cannot stand in for its BF16 table.
+    ple.table.format    = q4::NgramRowFormat::Bf16;
+    ple.table.row_bytes = 320;
+    write_header(path, rows, 320, 0xAA);
+    const q4::NgramTableConfig bf16_own = q4::resolve_ngram_volume(path, ple);
+    check(bf16_own.format == q4::NgramRowFormat::Bf16 && bf16_own.volume_id == ple.table.volume_id,
+          "a BF16 artifact's own volume keeps its table");
+    write_header(path, rows, 160, 0x55);
+    check(refused(), "an FP8 volume cannot replace a BF16 table");
+    write_header(path, rows, 90, 0x55);
+    check(refused(), "an IQ4_NL volume cannot replace a BF16 table");
+}
+
 } // namespace
 
 int main() {
@@ -187,6 +265,10 @@ int main() {
             const q4::NgramVolume bad(path, wrong);
         } catch (const std::runtime_error&) { threw = true; }
         check(threw, "a volume of the wrong size is refused at open");
+        const auto headers = std::filesystem::temp_directory_path() / "infernix_ngram_resolve_test.ngram";
+        test_resolve(headers); // its own file: the volume above holds `path` without write sharing
+        std::error_code removed;
+        std::filesystem::remove(headers, removed);
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         ++failures;

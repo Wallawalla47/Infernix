@@ -254,7 +254,7 @@ draft_tree_auto_widths(std::uint32_t draft_tokens) noexcept {
 
 struct SpeculativeOptions {
     SpeculativeBackend backend = SpeculativeBackend::None;
-    // Startup-fixed K: MTP 1..5; DFlash and DFlash2 1..15 (query width K+1).
+    // Startup-fixed K: MTP 1..7 (Qwen3.5/3.6 1..5); DFlash and DFlash2 1..15 (query width K+1).
     std::uint32_t draft_tokens = 0;
     ProposalHead proposal_head = ProposalHead::Full;
     // Optional target-verified copy proposals with MTP, DFlash or DFlash2, C1 only.
@@ -446,15 +446,35 @@ struct ContextCostOptions {
     std::filesystem::path preset_path;
 };
 
+// Where Qwen3.8-Flash-Next's n-gram table lives while serving.
+enum class NgramResidency : std::uint8_t {
+    Auto,   // the whole table in RAM when the RAM ledger still keeps every expert resident, else Volume
+    Ram,    // the whole table read into pinned RAM at startup
+    Volume, // rows read from the volume on demand through a small row cache
+};
+
+// The CLI spelling: auto, ram or volume.
+inline NgramResidency parse_ngram_residency(std::string_view value) {
+    if (value == "auto") { return NgramResidency::Auto; }
+    if (value == "ram") { return NgramResidency::Ram; }
+    if (value == "volume") { return NgramResidency::Volume; }
+    throw std::invalid_argument("--ngram-residency must be auto, ram or volume");
+}
+
 struct EngineOptions {
     std::filesystem::path artifact_path;
     std::filesystem::path chat_template_path;
     // Qwen3.8-Flash-Next's per-layer n-gram embedding volume. Empty uses `<artifact>.ngram`.
     std::filesystem::path ngram_volume_path;
+    NgramResidency ngram_residency = NgramResidency::Auto;
     // Qwen3.8-Flash-Next's saved expert-cache state: read at startup to fill the VRAM expert cache
     // before the first request (warm start), written at stop and every 10 minutes between requests.
     // Empty: no warm start (the cache starts empty and nothing is saved).
     std::filesystem::path expert_state_path;
+    // Qwen3.8-Flash-Next's expert stripe (tools/flash_next/expert_stripe.py): the tail of every routed
+    // expert record on a second drive, read beside each record's head in the artifact when the SSD
+    // expert tier serves the experts. Empty: whole records from the artifact.
+    std::filesystem::path expert_stripe_path;
     // Qwen3.8-Flash-Next: writes the internal per-round route trace (route_trace.h) to this file,
     // truncating it at startup. Empty (default): no trace is written and the run is numerically
     // unchanged. Other architectures ignore it.
@@ -1415,6 +1435,9 @@ struct PromptReadout {
 struct ExpertCacheStats {
     std::uint64_t routed = 0;
     std::uint64_t hits   = 0;
+    // Of those, the lookups of decode and verification rounds.
+    std::uint64_t decode_routed = 0;
+    std::uint64_t decode_hits   = 0;
 };
 
 struct GenerationResult {

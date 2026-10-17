@@ -51,6 +51,7 @@ struct Options {
     std::optional<std::filesystem::path> output;
     std::optional<std::filesystem::path> save_top_tokens;
     std::optional<std::filesystem::path> kl_reference;
+    std::filesystem::path expert_stripe; // Qwen3.8-Flash-Next's record tails on a second drive
     float rope_yarn_factor              = 1.0F;
     std::uint32_t context               = 4096;
     std::uint32_t stride                = 2048;
@@ -90,6 +91,8 @@ std::string usage_text() {
            "       [--save-top-tokens <file>] (record each position's 64 most probable tokens)\n"
            "       [--kl-reference <file>] (KL divergence from a --save-top-tokens run of the\n"
            "        same corpus, context and stride, by context length)\n"
+           "       [--expert-stripe <file>] (Qwen3.8-Flash-Next's expert record tails on a second\n"
+           "        drive, read beside the artifact by the SSD expert tier)\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n";
 }
 
@@ -178,6 +181,8 @@ Options parse_options(int argc, char** argv) {
             out.save_top_tokens = std::filesystem::path(value("--save-top-tokens"));
         } else if (option == "--kl-reference") {
             out.kl_reference = std::filesystem::path(value("--kl-reference"));
+        } else if (option == "--expert-stripe") {
+            out.expert_stripe = std::filesystem::path(value("--expert-stripe"));
         } else if (option == "--log-level") {
             out.log_level = infernix::product::parse_log_level(value("--log-level"));
         } else {
@@ -292,6 +297,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.fast_paths           = options.fast_paths && !options.a16_activations;
     engine_options.fast_path_candidates = options.fast_path_candidates;
     if (options.ngram_volume) { engine_options.ngram_volume_path = *options.ngram_volume; }
+    engine_options.expert_stripe_path   = options.expert_stripe;
     engine_options.startup_observer = startup_log.observer();
     engine_options.diagnostic_observer = infernix::product::engine_diagnostic_observer(logger);
     infernix::Engine engine(std::move(engine_options));

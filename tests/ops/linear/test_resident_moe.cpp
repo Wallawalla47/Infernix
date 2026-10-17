@@ -1,5 +1,5 @@
 // resident_moe_experts (the MTP drafter's device-resident experts) against the FP64 formula over
-// the exactly decoded Q4_G64_FP16 and Q8_G32_FP16 banks, at the Qwen4Exp drafter's shapes
+// the exactly decoded Q2_G64_FP16, Q4_G64_FP16 and Q8_G32_FP16 banks, at the Qwen4Exp drafter's shapes
 // (H = 2560, I = 640, top-10). Criterion: the BF16 output rounding plus the FP32 accumulation of
 // both projections (h is FP32), sum |D h| * (I + H) * 2^-23 for the accumulation part.
 #include "infernix/ops/resident_moe.h"
@@ -69,6 +69,10 @@ struct Decoder {
         int code = 0;
         if (qtype == QType::Q8_G32_FP16) {
             code = static_cast<std::int8_t>(packed.payload[static_cast<std::size_t>(r) * padded + i]);
+        } else if (qtype == QType::Q2_G64_FP16) {
+            const std::uint8_t byte = packed.payload[static_cast<std::size_t>(r) * (padded / 4) + i / 4];
+            const int u             = (byte >> (2 * (i % 4))) & 3;
+            code                    = u >= 2 ? u - 4 : u;
         } else {
             const std::uint8_t byte = packed.payload[static_cast<std::size_t>(r) * (padded / 2) + i / 2];
             const int u             = (i & 1) ? (byte >> 4) : (byte & 0xF);
@@ -150,8 +154,8 @@ void run_case(QType qtype, std::int32_t experts, std::int32_t columns, std::uint
             }
         }
     }
-    const std::string tag = std::string(qtype == QType::Q8_G32_FP16 ? "q8" : "q4") + " E=" + std::to_string(experts) +
-                            " T=" + std::to_string(columns);
+    const std::string tag = std::string(qtype == QType::Q8_G32_FP16 ? "q8" : qtype == QType::Q2_G64_FP16 ? "q2" : "q4") +
+                            " E=" + std::to_string(experts) + " T=" + std::to_string(columns);
     std::cout << tag << ": worst error " << worst << " of the bound, " << bad << " outside\n";
     check(bad == 0, tag + " within the bound");
     cudaFree(gu_payload);
@@ -173,6 +177,8 @@ int main() {
         run_case(QType::Q4_G64_FP16, 12, 1, 5);
         run_case(QType::Q4_G64_FP16, 12, 3, 7);
         run_case(QType::Q8_G32_FP16, 11, 2, 9);
+        run_case(QType::Q2_G64_FP16, 12, 1, 11);
+        run_case(QType::Q2_G64_FP16, 10, 3, 13);
     } catch (const std::exception& e) {
         std::cerr << "FAIL: " << e.what() << "\n";
         return 1;

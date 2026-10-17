@@ -11,6 +11,7 @@ constexpr std::array kFormats = {
     std::pair{QType::BF16, std::string_view{"bf16"}},
     std::pair{QType::FP32, std::string_view{"fp32"}},
     std::pair{QType::INT32, std::string_view{"int32"}},
+    std::pair{QType::Q2_G64_FP16, std::string_view{"q2_g64_fp16"}},
     std::pair{QType::Q4_G64_FP16, std::string_view{"q4_g64_fp16"}},
     std::pair{QType::Q5_G64_FP16, std::string_view{"q5_g64_fp16"}},
     std::pair{QType::Q6_G64_FP16, std::string_view{"q6_g64_fp16"}},
@@ -18,6 +19,16 @@ constexpr std::array kFormats = {
     std::pair{QType::NVFP4, std::string_view{"nvfp4"}},
     std::pair{QType::FP8_E4M3FN_ROW_BF16, std::string_view{"fp8_e4m3fn_row_bf16"}},
     std::pair{QType::NVFP4_MUL, std::string_view{"nvfp4_mul"}},
+    std::pair{QType::GGML_Q2_0, std::string_view{"ggml_q2_0"}},
+    std::pair{QType::GGML_Q4_K, std::string_view{"ggml_q4_k"}},
+    std::pair{QType::GGML_Q5_K, std::string_view{"ggml_q5_k"}},
+    std::pair{QType::GGML_Q6_K, std::string_view{"ggml_q6_k"}},
+    std::pair{QType::GGML_IQ2_S, std::string_view{"ggml_iq2_s"}},
+    std::pair{QType::GGML_IQ3_XXS, std::string_view{"ggml_iq3_xxs"}},
+    std::pair{QType::GGML_IQ3_S, std::string_view{"ggml_iq3_s"}},
+    std::pair{QType::GGML_IQ4_XS, std::string_view{"ggml_iq4_xs"}},
+    std::pair{QType::GGML_IQ4_NL, std::string_view{"ggml_iq4_nl"}},
+    std::pair{QType::FP8_E4M3FN_B128, std::string_view{"fp8_e4m3fn_b128"}},
 };
 constexpr std::array kLayouts = {
     std::pair{QuantLayout::Contiguous, std::string_view{"contiguous_le_v1"}},
@@ -25,6 +36,11 @@ constexpr std::array kLayouts = {
     std::pair{QuantLayout::RowScale, std::string_view{"row_scale_v1"}},
     std::pair{QuantLayout::BlockScaleK16M128x4, std::string_view{"block_scale_k16_m128x4_v1"}},
     std::pair{QuantLayout::ExpertRg16, std::string_view{"nvfp4_expert_rg16_v1"}},
+    std::pair{QuantLayout::GgmlRows, std::string_view{"ggml_rows_v1"}},
+    std::pair{QuantLayout::GgmlExpertIq4Nl, std::string_view{"ggml_expert_iq4_nl_v1"}},
+    std::pair{QuantLayout::GgmlExpertQ2_0, std::string_view{"ggml_expert_q2_0_v1"}},
+    std::pair{QuantLayout::Fp8ExpertB128, std::string_view{"fp8_expert_b128_v1"}},
+    std::pair{QuantLayout::GgmlTiles16, std::string_view{"ggml_tiles16_v1"}},
 };
 
 } // namespace

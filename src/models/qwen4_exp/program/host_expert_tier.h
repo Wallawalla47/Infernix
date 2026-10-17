@@ -20,9 +20,11 @@
 // admitted (the key keeps its unpinned record). Promotions read them through host_record().
 //
 // Threads: the engine thread calls every method except the RecordProvider ones, and only while no
-// round is in flight (begin_round, end_round, record_uses, prefill, the controller); the CPU service
-// thread calls demand / wait / done during a round. The agent is internal: it spins while a round is
-// open (begin_round to end_round), so a request waits for no timer, and sleeps otherwise.
+// round is in flight (begin_round, end_round, record_uses, prefill, the controller), except the
+// stream slots' (stream_read, stream_wait, stream_release: the prefill stream's reads of SSD-only
+// records, at any time); the CPU service thread calls demand / wait / done during a round. The
+// agent is internal: it spins while a round is open (begin_round to end_round), so a request waits
+// for no timer, and sleeps otherwise.
 
 #include "core/direct_read_queue.h"
 #include "core/host_memory.h"
@@ -86,6 +88,16 @@ public:
         // experts once, so a round holds this many layers' worth of tickets; a layer walk's step
         // calls its layers once per chunk of the span.
         std::uint32_t layer_calls = 0;
+        // Read-ahead: a fetch request of at least `ahead_min` records (a wide prefill call, which
+        // routes nearly every expert) also queues, behind its own reads, up to `ahead` of the next
+        // layer's records without a host copy; the next request adopts those it names, the others
+        // give their ring slots back. 0 disables it.
+        std::uint32_t ahead_min = 64;
+        std::uint32_t ahead     = 32;
+        // The most resident slots lend_stream lends to the prefill expert stream for a layer walk's
+        // span: SSD-only records it reads ahead (stream_read) and copies to the device once per span.
+        // 0 disables it.
+        std::uint32_t stream = 0;
     };
 
     struct Stats {
@@ -94,6 +106,7 @@ public:
         std::uint64_t read_ns = 0; // demand reads, submit to landing, summed
         // Scatter reads of records that follow each other in a file, and the records they read.
         std::uint64_t run_reads = 0, run_records = 0;
+        std::uint64_t stream_reads = 0; // records read into stream slots
         // Unpinned records served: in place to the CPU, and copied into ring slots for fetches.
         std::uint64_t unpinned_served = 0, unpinned_copies = 0;
     };
@@ -173,6 +186,25 @@ public:
     void release_stream_pins() { tier_.release_stream_pins(); }
     // Keys whose host pointer changed since the last call (the device table's dirty set).
     void take_dirty(std::vector<std::uint32_t>& keys) { tier_.take_dirty(keys); }
+    // ---- stream slots (Options::stream)
+    // Engine thread, no round in flight: lends up to min(n, Options::stream) resident slots to the
+    // stream (the lowest-ranked RAM residents leave RAM; HostTier::lend) and returns how many; and
+    // takes them back as free resident slots (every stream slot released), which admissions refill.
+    std::uint32_t lend_stream(std::uint32_t n);
+    void return_stream();
+    // The engine thread, during a round or between rounds: queues a read of `key`'s record into a
+    // free stream slot and returns the slot, or -1 when none is free (or the agent has stopped);
+    // the record is the artifact's whatever the key's RAM state.
+    std::int32_t stream_read(std::uint32_t key);
+    // The record of stream slot `slot` once its read has landed (waits), or null when it failed.
+    const std::uint8_t* stream_wait(std::int32_t slot) noexcept;
+    // Gives a stream slot back: its read has landed and nothing reads the slot any more.
+    void stream_release(std::int32_t slot);
+    // Stream slots lent now.
+    [[nodiscard]] std::uint32_t stream_slots() const noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return static_cast<std::uint32_t>(stream_slot_.size());
+    }
     [[nodiscard]] expert_cache::HostTier& controller() noexcept { return tier_; }
     [[nodiscard]] const Stats& stats() const noexcept { return stats_; }
     [[nodiscard]] const std::uint8_t* slot_bytes(std::uint32_t slot) const noexcept;
@@ -295,6 +327,14 @@ private:
     std::condition_variable prefill_done_;
     std::atomic<std::uint32_t> in_flight_{0}; // demands and prefill reads not yet completed
     std::vector<std::uint32_t> round_ticket_of_key_; // ticket + 1 of a key demanded this round, 0 none
+    // Stream slots: the lent tier slots (stream slot s is slot stream_slot_[s]), queued reads
+    // (key, stream slot), the free stream slots (all guarded by mutex_), and each stream slot's
+    // state (0 pending, 1 landed, 2 failed).
+    std::vector<std::uint32_t> stream_slot_;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> stream_jobs_;
+    std::vector<std::uint32_t> stream_free_;
+    std::unique_ptr<std::atomic<std::uint32_t>[]> stream_state_;
+    std::atomic<std::uint64_t> agent_stream_reads_{0};
 
     // Tickets of the current round (stable addresses; reset at each boundary).
     std::unique_ptr<Ticket[]> tickets_;

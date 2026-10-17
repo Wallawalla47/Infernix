@@ -161,8 +161,10 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
         }
         return;
     case SpeculativeBackend::Mtp:
-        if (options.draft_tokens == 0 || options.draft_tokens > 5) {
-            throw std::invalid_argument("--spec mtp requires --draft-tokens in [1,5]");
+        // Qwen3.8-Flash-Next verifies up to 8 columns with column-invariant kernels (1..7); the
+        // Qwen3.5/3.6 MTP planner accepts 1..5 itself.
+        if (options.draft_tokens == 0 || options.draft_tokens > 7) {
+            throw std::invalid_argument("--spec mtp requires --draft-tokens in [1,7]");
         }
         return;
     case SpeculativeBackend::DFlash:

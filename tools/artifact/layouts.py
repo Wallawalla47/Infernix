@@ -15,8 +15,11 @@ from typing import Sequence
 
 
 from .formats import (
+    GGML_FORMATS,
     DirectFormat,
+    Fp8BlockFormat,
     Fp8RowFormat,
+    GgmlFormat,
     Nvfp4Format,
     Nvfp4MulFormat,
     NumericFormat,
@@ -97,6 +100,56 @@ class ExpertBankGeometry:
     payload_bytes: int
 
 
+@dataclass(frozen=True, slots=True)
+class GgmlRowsGeometry:
+    """``ggml_rows_v1``: [n, k] as n rows of whole GGUF blocks, verbatim and contiguous."""
+
+    n: int
+    k: int
+    blocks_per_row: int
+    row_bytes: int
+    payload_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class GgmlExpertGeometry:
+    """``ggml_expert_*_v1``: one 4 KiB-aligned record per expert of [experts, hidden, intermediate]:
+    the gate rows, the up rows ([intermediate, hidden] each, in the bank's format), then the down
+    rows ([hidden, intermediate], in the layout's down format), every row verbatim GGUF blocks."""
+
+    experts: int
+    hidden: int
+    intermediate: int
+    gate_up_format: str
+    down_format: str
+    gate_row_bytes: int
+    down_row_bytes: int
+    gate_bytes: int     # one of gate, up; up starts at gate_bytes
+    down_offset: int    # 2 * gate_bytes
+    record_bytes: int
+    record_stride: int
+    payload_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class Fp8ExpertGeometry:
+    """``fp8_expert_b128_v1``: one 4 KiB-aligned record per expert of [experts, hidden, intermediate]:
+    the gate rows, the up rows ([intermediate, hidden] each), the down rows ([hidden, intermediate]),
+    one E4M3FN byte per weight, then the scale plane: each matrix's BF16 128 x 128 tile scales,
+    row-major [n/128][k/128], gate, up, down (tools/artifact/codecs/fp8_b128.py)."""
+
+    experts: int
+    hidden: int
+    intermediate: int
+    gate_bytes: int     # one of gate, up; up starts at gate_bytes
+    down_offset: int    # 2 * gate_bytes
+    scale_offset: int   # 2 * gate_bytes + down bytes
+    tiles: int          # scale words per matrix
+    record_bytes: int
+    record_stride: int
+    payload_bytes: int
+
+
 EXPERT_UNIT_BYTES = 144
 EXPERT_RECORD_ALIGNMENT = 4096
 
@@ -104,7 +157,7 @@ CONTIGUOUS_LE_V1 = Layout("contiguous_le_v1", 256, frozenset(("bf16", "fp32", "i
 ROW_SPLIT_K128_V1 = Layout(
     "row_split_k128_v1",
     256,
-    frozenset(("q4_g64_fp16", "q5_g64_fp16", "q6_g64_fp16", "q8_g32_fp16")),
+    frozenset(("q2_g64_fp16", "q4_g64_fp16", "q5_g64_fp16", "q6_g64_fp16", "q8_g32_fp16")),
 )
 BLOCK_SCALE_K16_M128X4_V1 = Layout(
     "block_scale_k16_m128x4_v1",
@@ -123,6 +176,23 @@ NVFP4_EXPERT_RG16_V1 = Layout(
     frozenset(("nvfp4_mul",)),
 )
 
+GGML_ROWS_V1 = Layout("ggml_rows_v1", 256, frozenset(GGML_FORMATS))
+
+# The dense formats the tiled narrow kernels decode (ops/ggml/ggml_linear.cu, 256-element blocks).
+GGML_TILES16_FORMATS = frozenset(("ggml_q4_k", "ggml_q5_k", "ggml_q6_k", "ggml_iq4_xs"))
+GGML_TILES16_V1 = Layout("ggml_tiles16_v1", 256, GGML_TILES16_FORMATS)
+
+# Expert banks of GGUF formats: the layout names the down matrices' format; the bank's own format
+# is the gate/up format.
+_GGML_EXPERT_GATE_UP = frozenset(("ggml_iq2_s", "ggml_iq3_xxs", "ggml_iq3_s", "ggml_iq4_xs"))
+GGML_EXPERT_IQ4_NL_V1 = Layout("ggml_expert_iq4_nl_v1", EXPERT_RECORD_ALIGNMENT, _GGML_EXPERT_GATE_UP)
+GGML_EXPERT_Q2_0_V1 = Layout("ggml_expert_q2_0_v1", EXPERT_RECORD_ALIGNMENT, _GGML_EXPERT_GATE_UP)
+GGML_EXPERT_DOWN_FORMATS = MappingProxyType(
+    {GGML_EXPERT_IQ4_NL_V1.name: "ggml_iq4_nl", GGML_EXPERT_Q2_0_V1.name: "ggml_q2_0"}
+)
+
+FP8_EXPERT_B128_V1 = Layout("fp8_expert_b128_v1", EXPERT_RECORD_ALIGNMENT, frozenset(("fp8_e4m3fn_b128",)))
+
 LAYOUTS = MappingProxyType(
     {
         layout.name: layout
@@ -132,6 +202,11 @@ LAYOUTS = MappingProxyType(
             BLOCK_SCALE_K16_M128X4_V1,
             ROW_SCALE_V1,
             NVFP4_EXPERT_RG16_V1,
+            GGML_ROWS_V1,
+            GGML_TILES16_V1,
+            GGML_EXPERT_IQ4_NL_V1,
+            GGML_EXPERT_Q2_0_V1,
+            FP8_EXPERT_B128_V1,
         )
     }
 )
@@ -195,9 +270,12 @@ def row_split_geometry(
     n, k = _shape(shape, rank=2)
     k_pad = align_up(k, K_ALIGNMENT)
     groups_per_row = k_pad // spec.group_size
-    base_bytes_per_group = spec.group_size if spec.bits == 8 else spec.group_size // 2
+    # The base plane: whole bytes (8), low nibbles (4-6), or the 2-bit codes four to a byte (2).
+    base_bytes_per_group = (
+        spec.group_size if spec.bits == 8 else spec.group_size // 4 if spec.bits == 2 else spec.group_size // 2
+    )
     high_bytes_per_group = (
-        0 if spec.bits in (4, 8) else spec.group_size * (spec.bits - 4) // 8
+        0 if spec.bits in (2, 4, 8) else spec.group_size * (spec.bits - 4) // 8
     )
     base_row_bytes = groups_per_row * base_bytes_per_group
     high_row_bytes = groups_per_row * high_bytes_per_group
@@ -318,6 +396,69 @@ def expert_bank_geometry(
     )
 
 
+def ggml_rows_geometry(format: str | GgmlFormat, shape: Sequence[int]) -> GgmlRowsGeometry:
+    spec = _format(format)
+    if not isinstance(spec, GgmlFormat):
+        raise ValueError("ggml_rows_v1 requires a ggml block format")
+    n, k = _shape(shape, rank=2)
+    if k % spec.block_elems:
+        raise ValueError(f"ggml_rows_v1: K={k} is not a multiple of {spec.name}'s {spec.block_elems}")
+    blocks = k // spec.block_elems
+    row_bytes = blocks * spec.block_bytes
+    return GgmlRowsGeometry(n, k, blocks, row_bytes, n * row_bytes)
+
+
+def ggml_tiles16_geometry(format: str | GgmlFormat, shape: Sequence[int]) -> GgmlRowsGeometry:
+    """``ggml_tiles16_v1``: ``ggml_rows_v1``'s rows in tiles of 16 (tile i at 16 i row_bytes; block b
+    of the tile's row r at (16 b + r) block_bytes), the last tile padded with zero blocks."""
+    spec = _format(format)
+    if not isinstance(spec, GgmlFormat) or spec.name not in GGML_TILES16_FORMATS:
+        raise ValueError(f"ggml_tiles16_v1 holds {sorted(GGML_TILES16_FORMATS)} only")
+    rows = ggml_rows_geometry(spec, shape)
+    return GgmlRowsGeometry(rows.n, rows.k, rows.blocks_per_row, rows.row_bytes, (rows.n + 15) // 16 * 16 * rows.row_bytes)
+
+
+def ggml_expert_geometry(
+    layout: str | Layout, format: str | GgmlFormat, shape: Sequence[int]
+) -> GgmlExpertGeometry:
+    layout_spec = _layout(layout)
+    spec = _format(format)
+    if layout_spec.name not in GGML_EXPERT_DOWN_FORMATS or spec.name not in layout_spec.formats:
+        raise ValueError(f"{layout_spec.name} does not accept {spec.name}")
+    down = _format(GGML_EXPERT_DOWN_FORMATS[layout_spec.name])
+    experts, hidden, intermediate = _shape(shape, rank=3)
+    if hidden % spec.block_elems or intermediate % down.block_elems:
+        raise ValueError("ggml expert rows must be whole blocks")
+    gate_row = hidden // spec.block_elems * spec.block_bytes
+    down_row = intermediate // down.block_elems * down.block_bytes
+    gate_bytes = intermediate * gate_row
+    record = 2 * gate_bytes + hidden * down_row
+    stride = align_up(record, EXPERT_RECORD_ALIGNMENT)
+    return GgmlExpertGeometry(
+        experts=experts, hidden=hidden, intermediate=intermediate, gate_up_format=spec.name,
+        down_format=down.name, gate_row_bytes=gate_row, down_row_bytes=down_row, gate_bytes=gate_bytes,
+        down_offset=2 * gate_bytes, record_bytes=record, record_stride=stride, payload_bytes=experts * stride,
+    )
+
+
+def fp8_expert_geometry(format: str | Fp8BlockFormat, shape: Sequence[int]) -> Fp8ExpertGeometry:
+    spec = _format(format)
+    if not isinstance(spec, Fp8BlockFormat):
+        raise ValueError("fp8_expert_b128_v1 requires a block-scaled FP8 format")
+    experts, hidden, intermediate = _shape(shape, rank=3)
+    if hidden % spec.block or intermediate % spec.block:
+        raise ValueError(f"fp8_expert_b128_v1 needs whole {spec.block} x {spec.block} tiles")
+    gate_bytes = intermediate * hidden
+    scale_offset = 2 * gate_bytes + hidden * intermediate
+    tiles = (intermediate // spec.block) * (hidden // spec.block)
+    record = scale_offset + 3 * tiles * 2
+    stride = align_up(record, EXPERT_RECORD_ALIGNMENT)
+    return Fp8ExpertGeometry(
+        experts=experts, hidden=hidden, intermediate=intermediate, gate_bytes=gate_bytes, down_offset=2 * gate_bytes,
+        scale_offset=scale_offset, tiles=tiles, record_bytes=record, record_stride=stride, payload_bytes=experts * stride,
+    )
+
+
 def encoded_size(
     layout: str | Layout,
     format: str | NumericFormat,
@@ -350,4 +491,12 @@ def encoded_size(
         return row_scale_geometry(numeric_spec, shape).payload_bytes
     if layout_spec is NVFP4_EXPERT_RG16_V1:
         return expert_bank_geometry(numeric_spec, shape).payload_bytes
+    if layout_spec is GGML_ROWS_V1:
+        return ggml_rows_geometry(numeric_spec, shape).payload_bytes
+    if layout_spec is GGML_TILES16_V1:
+        return ggml_tiles16_geometry(numeric_spec, shape).payload_bytes
+    if layout_spec.name in GGML_EXPERT_DOWN_FORMATS:
+        return ggml_expert_geometry(layout_spec, numeric_spec, shape).payload_bytes
+    if layout_spec is FP8_EXPERT_B128_V1:
+        return fp8_expert_geometry(numeric_spec, shape).payload_bytes
     raise ValueError(f"unsupported tensor layout: {layout_spec.name!r}")

@@ -361,6 +361,7 @@ the fixed group size, scale type and decoding rules are defined directly by that
 | bf16 | Raw Bfloat16 word |
 | fp32 | Raw IEEE binary32 word |
 | int32 | Signed 32-bit integer |
+| q2_g64_fp16 | Signed 2-bit codes, G64, signed FP16 multiplier |
 | q4_g64_fp16 | Signed 4-bit codes, G64, FP16 multiplier |
 | q5_g64_fp16 | Signed 5-bit codes, G64, FP16 multiplier |
 | q6_g64_fp16 | Signed 6-bit codes, G64, FP16 multiplier |
@@ -383,7 +384,7 @@ the same, and the generation method is recorded in the recipe/provenance.
 | Name | Currently allowed format / shape | Object alignment |
 |---|---|---:|
 | contiguous_le_v1 | bf16/fp32/int32, rank 0..16 | 256 |
-| row_split_k128_v1 | q4_g64_fp16, q5_g64_fp16, q6_g64_fp16, q8_g32_fp16, positive rank-2 `[N,K]` | 256 |
+| row_split_k128_v1 | q2_g64_fp16, q4_g64_fp16, q5_g64_fp16, q6_g64_fp16, q8_g32_fp16, positive rank-2 `[N,K]` | 256 |
 | block_scale_k16_m128x4_v1 | nvfp4, `N%128=0`, `K%64=0` | 256 |
 | row_scale_v1 | fp8_e4m3fn_row_bf16, positive rank-2 `[N,K]` | 256 |
 | raw_bytes_v1 | Resource, non-empty byte string | 1 |

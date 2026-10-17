@@ -8,7 +8,9 @@
 // The span keeps the prompt's call grid: chunk c of layer l reads exactly what the chunk-major
 // call c reads at layer l (its own residual columns, and the layer's KV, GDN, PLE and QSA state
 // after chunks 0..c-1), so every output bit equals the chunk-major prefill's. Only placement
-// differs (resident, streamed or staged experts), which the MoE's arithmetic does not see.
+// differs (resident, streamed or staged experts), which the MoE's arithmetic does not see. A
+// layer's MoE runs once per group of consecutive chunks (walk_.groups, up to kWalkMoeColumns
+// columns): every MoE step acts column by column, so grouping changes no bit either.
 //
 // The span's residual stream (BF16 [S*H, tokens]) and every chunk's staged io image live in the
 // stream lease after the ring. Each advance_prefill call enqueues about one call's work (a few
@@ -41,7 +43,11 @@ std::size_t walk_align(std::size_t bytes) { return (bytes + kWalkAlign - 1) / kW
 } // namespace
 
 std::size_t ProgramImpl::walk_bytes(std::uint32_t tokens, std::size_t chunks) const noexcept {
-    return walk_align(2ULL * static_cast<std::size_t>(width_) * tokens) + chunks * walk_align(io_layout_.bytes);
+    // The residual stream, every chunk's io image, and an MoE group's input (xm BF16 [H, columns],
+    // inject FP32 [S, columns]).
+    const std::size_t moe = static_cast<std::size_t>(kWalkMoeColumns) * (2ULL * c_.hidden_size + 4ULL * c_.hc.streams);
+    return walk_align(2ULL * static_cast<std::size_t>(width_) * tokens) + chunks * walk_align(io_layout_.bytes) +
+           walk_align(moe);
 }
 
 // The exclusive end of the span that starts at lane.next_call; lane.next_call when the call runs
@@ -101,6 +107,22 @@ void ProgramImpl::walk_begin(Lane& lane, std::uint32_t index, std::size_t end) {
     }
     walk_.io_stride      = walk_align(io_layout_.bytes);
     walk_.residual_bytes = walk_align(2ULL * static_cast<std::size_t>(width_) * static_cast<std::size_t>(offset));
+    walk_.moe_offset     = walk_.residual_bytes + n * walk_.io_stride;
+    // MoE groups: consecutive chunks while their columns fit kWalkMoeColumns and the arena the calls
+    // run in (WideWork of the span's widest chunk: the wide arena when it exceeds the static one's).
+    const std::int32_t widest = *std::max_element(walk_.widths.begin(), walk_.widths.end());
+    const std::size_t arena   = widest > plan_.static_columns && wide_work_ > 0 ? wide_work_ : plan_.work;
+    for (std::size_t c = 0; c < n;) {
+        std::size_t e       = c + 1;
+        std::int32_t columns = walk_.widths[c];
+        while (e < n && columns + walk_.widths[e] <= kWalkMoeColumns &&
+               execution::Forward::moe_workspace_bytes(c_, columns + walk_.widths[e]) <= arena) {
+            columns += walk_.widths[e];
+            ++e;
+        }
+        walk_.groups.emplace_back(c, e);
+        c = e;
+    }
     walk_.layers_per_step =
         static_cast<std::uint32_t>((c_.num_hidden_layers + n - 1) / n); // about one call's work per step
     walk_.mtp.assign(n, std::nullopt);
@@ -127,8 +149,8 @@ void ProgramImpl::walk_begin(Lane& lane, std::uint32_t index, std::size_t end) {
         return t;
     };
     if (cpu_service_) { cpu_service_->wake(); }
-    residency_->before_round(s);
-    expert_stream_->begin(ring_span(), residency_->host_table(), s);
+    residency_->before_round(s, /*landing=*/false, /*walking=*/false, kStreamReadSlots);
+    expert_stream_->begin(ring_span(), residency_->host_table(), s, /*gated=*/false, /*ssd=*/true);
     for (std::size_t c = 0; c < n; ++c) {
         const std::int32_t b = walk_.begins[c], w = walk_.widths[c];
         // Rows the previous span prefetched already stand at this chunk's slot.
@@ -143,7 +165,7 @@ void ProgramImpl::walk_begin(Lane& lane, std::uint32_t index, std::size_t end) {
         std::byte* host_slot = host_area + c * walk_.io_stride;
         std::byte* slot      = area + walk_.residual_bytes + c * walk_.io_stride;
         if (prefetched) {
-            const std::size_t rows = static_cast<std::size_t>(w) * hash_.heads() * c_.ple.table.row_bytes;
+            const std::size_t rows = static_cast<std::size_t>(w) * hash_.heads() * ngram_table().row_bytes;
             const std::size_t tail = io_layout_.ngram + rows;
             std::memcpy(host_slot, io_host_.data(), io_layout_.ngram);
             std::memcpy(host_slot + tail, static_cast<const std::byte*>(io_host_.data()) + tail, io_layout_.bytes - tail);
@@ -170,9 +192,13 @@ void ProgramImpl::walk_begin(Lane& lane, std::uint32_t index, std::size_t end) {
         if (vision != nullptr) {
             walk_.vision[c] = execution::VisionInput{vision->embeddings, rebase_tensor(vision->columns, slot)};
         }
-        // The chunk's embedding and first layer run while the host stages the next chunk.
-        const WideWork wide(*this, w);
-        walk_pass(c, 0);
+        // The chunk's embedding and first layer run while the host stages the next chunk (its MoE
+        // once its group's last chunk is staged).
+        const WideWork wide(*this, widest);
+        walk_mixer(c, 0);
+        for (std::size_t g = 0; g < walk_.groups.size(); ++g) {
+            if (walk_.groups[g].second == c + 1) { walk_moe(g, 0); }
+        }
     }
     walk_.next_layer = 1;
     walk_prefetch_   = WalkPrefetch{}; // consumed; the slots now hold this span's chunks
@@ -238,15 +264,10 @@ void ProgramImpl::walk_prefetch_rows(Lane& lane, std::uint32_t index, std::size_
     }
 }
 
-// Layer l of chunk c (with the embedding before layer 0, and the MTP cells and, for the prompt's
-// last chunk, the logits after the last layer).
-void ProgramImpl::walk_pass(std::size_t c, std::uint32_t l) {
-    const std::size_t n   = walk_.widths.size();
-    const std::uint32_t L = c_.num_hidden_layers;
-    const bool prompt_end = walk_.end_call == lanes_[walk_.lane].calls.size();
-    auto* area            = walk_area();
-    std::byte* slot       = area + walk_.residual_bytes + c * walk_.io_stride;
-    const std::int32_t w  = walk_.widths[c];
+// Chunk c's call as the Forward reads it.
+execution::ForwardBatch ProgramImpl::walk_batch(std::size_t c) {
+    std::byte* slot      = walk_area() + walk_.residual_bytes + c * walk_.io_stride;
+    const std::int32_t w = walk_.widths[c];
     execution::ForwardBatch fb = io_batch(slot, 1, w, 1);
     fb.host_slots      = std::span<const std::int32_t>(&walk_.host_slot, 1);
     fb.host_table_rows = fb.host_slots;
@@ -262,25 +283,76 @@ void ProgramImpl::walk_pass(std::size_t c, std::uint32_t l) {
         fb.layer_waits[1] = prefix_->staged_events(walk_.taps[c - 1].staged);
     }
     fb.stream         = true;
-    fb.release_stream = c + 1 == n;
-    // A scored prompt keeps each chunk's final residuals at its positions (causal_score).
-    if (scoring_) { fb.residual_out = score_residuals(walk_.begins[c], w); }
-    Tensor residual(area + 2ULL * static_cast<std::size_t>(width_) * static_cast<std::size_t>(walk_.offsets[c]),
-                    DType::BF16, {width_, w});
-    const bool logits_here = l + 1 == L && prompt_end && c + 1 == n;
-    Tensor logits(logits32_.p, DType::FP32, {vocab_, 1});
-    forward_->begin_call(fb, logits_here ? &logits : nullptr);
+    fb.release_stream = c + 1 == walk_.widths.size();
+    if (scoring_) { fb.residual_out = score_residuals(walk_.begins[c], w); } // a scored prompt's (causal_score)
+    return fb;
+}
+
+// The residual columns of chunks [first, end) (consecutive in the area).
+Tensor ProgramImpl::walk_residual(std::size_t first, std::size_t end) {
+    const std::int32_t columns = walk_.offsets[end - 1] + walk_.widths[end - 1] - walk_.offsets[first];
+    return Tensor(walk_area() + 2ULL * static_cast<std::size_t>(width_) * static_cast<std::size_t>(walk_.offsets[first]),
+                  DType::BF16, {width_, columns});
+}
+
+// Layer l of chunk c up to its MoE (with the embedding before layer 0): the MoE input and inject
+// weights go to its columns of the group's area.
+void ProgramImpl::walk_mixer(std::size_t c, std::uint32_t l) {
+    std::size_t g = 0;
+    while (walk_.groups[g].second <= c) { ++g; }
+    const auto first        = static_cast<std::size_t>(walk_.offsets[c] - walk_.offsets[walk_.groups[g].first]);
+    const std::int32_t w    = walk_.widths[c];
+    const std::int32_t H    = static_cast<std::int32_t>(c_.hidden_size), S = static_cast<std::int32_t>(c_.hc.streams);
+    std::byte* moe          = walk_area() + walk_.moe_offset;
+    std::byte* inject_base  = moe + walk_align(static_cast<std::size_t>(kWalkMoeColumns) * 2ULL * H);
+    Tensor xm(moe + first * 2ULL * H, DType::BF16, {H, w});
+    Tensor inject(inject_base + first * 4ULL * S, DType::FP32, {S, w});
+    execution::ForwardBatch fb = walk_batch(c);
+    Tensor residual            = walk_residual(c, c + 1);
+    forward_->begin_call(fb, nullptr);
     if (l == 0) { forward_->embed(fb, residual); }
-    forward_->layer(l, fb, residual);
-    if (l + 1 == L) { forward_->finish(fb, residual, logits_here ? &logits : nullptr); }
-    if (const LayerWalk::Tap& tap = walk_.taps[c]; tap.staged != 0) {
-        // The chunk's end in this layer (and after the last layer, in the MTP block): copy it out.
-        const Lane& lane = lanes_[walk_.lane];
-        std::optional<DeviceKVPageHandle> tail_page;
-        if (tap.frontier % kBlock != 0) { tail_page = lane.pages.at(tap.frontier / kBlock - lane.prefix.page_base).handle(); }
-        prefix_->capture_group(tap.staged, l, walk_.lane, tail_page, device_.stream);
-        if (l + 1 == L) { prefix_->capture_group(tap.staged, L, walk_.lane, tail_page, device_.stream); }
+    forward_->layer_mixer(l, fb, residual, xm, inject);
+    walk_capture(c, l); // the layer's state (the MoE writes none) at the chunk's end
+}
+
+// Layer l's MoE over group g's chunks, then (the last layer) each chunk's MTP cells and, for the
+// prompt's last chunk, the logits.
+void ProgramImpl::walk_moe(std::size_t g, std::uint32_t l) {
+    const auto [first, end]    = walk_.groups[g];
+    const std::uint32_t L      = c_.num_hidden_layers;
+    const std::int32_t H       = static_cast<std::int32_t>(c_.hidden_size), S = static_cast<std::int32_t>(c_.hc.streams);
+    Tensor residual            = walk_residual(first, end);
+    const std::int32_t columns = residual.ne[1];
+    std::byte* moe             = walk_area() + walk_.moe_offset;
+    Tensor xm(moe, DType::BF16, {H, columns});
+    Tensor inject(moe + walk_align(static_cast<std::size_t>(kWalkMoeColumns) * 2ULL * H), DType::FP32, {S, columns});
+    // The group's last chunk's call opens it (its release_stream ends the span's last layer copies);
+    // the route log keeps that chunk's columns, the span's last as walk_step downloads them.
+    const execution::ForwardBatch fb = walk_batch(end - 1);
+    forward_->begin_call(fb, nullptr);
+    forward_->layer_moe(l, fb, xm, inject, residual, walk_.widths[end - 1]);
+    if (l + 1 < L) { return; }
+    const bool prompt_end = walk_.end_call == lanes_[walk_.lane].calls.size();
+    for (std::size_t c = first; c < end; ++c) {
+        const bool logits_here = prompt_end && c + 1 == walk_.widths.size();
+        Tensor logits(logits32_.p, DType::FP32, {vocab_, 1});
+        execution::ForwardBatch chunk = walk_batch(c);
+        Tensor chunk_residual         = walk_residual(c, c + 1);
+        forward_->begin_call(chunk, logits_here ? &logits : nullptr);
+        forward_->finish(chunk, chunk_residual, logits_here ? &logits : nullptr);
+        walk_capture(c, L); // the chunk's end in the MTP block
     }
+}
+
+// A prefix tap due at chunk c's end (walk_plan_taps): copies its state of layer `layer` (L: the MTP
+// block) once the walk has enqueued that layer of the chunk, before the next chunk overwrites it.
+void ProgramImpl::walk_capture(std::size_t c, std::uint32_t layer) {
+    const LayerWalk::Tap& tap = walk_.taps[c];
+    if (tap.staged == 0) { return; }
+    const Lane& lane = lanes_[walk_.lane];
+    std::optional<DeviceKVPageHandle> tail_page;
+    if (tap.frontier % kBlock != 0) { tail_page = lane.pages.at(tap.frontier / kBlock - lane.prefix.page_base).handle(); }
+    prefix_->capture_group(tap.staged, layer, walk_.lane, tail_page, device_.stream);
 }
 
 void ProgramImpl::walk_plan_taps(Lane& lane) {
@@ -325,7 +397,10 @@ void ProgramImpl::walk_enqueue(std::uint32_t to_layer) {
     for (std::uint32_t l = walk_.next_layer; l < to_layer; ++l) {
         // Host enqueue of one layer over the span's chunks (payload: the layer).
         const nvtx::ScopedRange layer_range(nvtx::Name::TextLayer, nvtx::Category::Prefill, l);
-        for (std::size_t c = 0; c < walk_.widths.size(); ++c) { walk_pass(c, l); }
+        for (std::size_t g = 0; g < walk_.groups.size(); ++g) {
+            for (std::size_t c = walk_.groups[g].first; c < walk_.groups[g].second; ++c) { walk_mixer(c, l); }
+            walk_moe(g, l);
+        }
     }
     walk_.next_layer = std::max(walk_.next_layer, to_layer);
 }

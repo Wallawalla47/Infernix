@@ -47,6 +47,9 @@ namespace {
 
 int g_failures = 0;
 
+// The silent-host cases wait this long each (production waits kHeartbeatTimeoutNs, 10 s).
+constexpr std::uint64_t kTestHeartbeatTimeoutNs = 1000000000ULL;
+
 void check(bool ok, const char* what) {
     if (!ok) {
         std::fprintf(stderr, "FAIL: %s\n", what);
@@ -286,6 +289,9 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
                                              .pcie_divisor = 0, .cpus = {}, .activation = activation});
     moe::CpuMissService service_narrow(layers, {.workers = 6, .max_jobs = 24, .max_columns = 64, .pcie_divisor = 2,
                                                 .max_job_columns = 2, .cpus = {}, .activation = activation});
+    // A GGUF import's decode split: one-column calls keep every miss on the link (d = 1), wider calls d = 2.
+    moe::CpuMissService service_one(layers, {.workers = 6, .max_jobs = 16, .max_columns = 64, .pcie_divisor = 2,
+                                             .one_column_divisor = 1, .cpus = {}, .activation = activation});
     // Prefill CPU assist (P7): calls of at least 9 columns take up to 256 CPU-served misses.
     moe::CpuMissService service_assist(layers, {.workers = 6, .max_jobs = 8, .max_columns = 255, .pcie_divisor = 4,
                                                 .wide_from = 9, .wide_jobs = moe::kMaxCpuJobs, .cpus = {}, .activation = activation});
@@ -303,7 +309,11 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
     moe::CpuMissService service_ssd8(layers, {.workers = 4, .max_jobs = 8, .max_columns = 64, .cpus = {}, .activation = activation,
                                               .records = &copied});
     // The CPU's share of the misses (design §19.3.5 S3): want = min(cap, M - M / divisor) of the misses
-    // with at most max_job_columns columns, so the number served is min(want, eligible misses).
+    // with at most max_job_columns columns, so the number served is min(want, eligible misses). The
+    // divisor is one_column_divisor (when set) in a one-column call.
+    const auto divisor_of = [&](const auto& channel) {
+        return columns == 1 && channel.one_column_divisor > 0 ? channel.one_column_divisor : channel.pcie_divisor;
+    };
     std::vector<int> expert_columns(experts, 0);
     for (const std::int32_t id : ids) { ++expert_columns[id]; }
     // SSD-only experts have no host record in the table. Narrow set: every third non-resident
@@ -351,7 +361,8 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
         }
         const int cap  = channel.wide_from > 0 && columns >= channel.wide_from ? channel.wide_jobs : channel.max_jobs;
         const int take = std::min(cap, ssd_misses);
-        const int want = std::min(cap - take, channel.pcie_divisor > 0 ? misses - misses / channel.pcie_divisor : misses);
+        const int d    = divisor_of(channel);
+        const int want = std::min(cap - take, d > 0 ? misses - misses / d : misses);
         return take + std::min(want, eligible);
     };
     // Narrow SSD-only experts no CPU job takes (no service, a call wider than its columns, or past
@@ -388,7 +399,8 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
         int misses = 0;
         for (const std::int32_t e : jobs) { misses += miss(e) ? 1 : 0; }
         const int cap  = channel.wide_from > 0 && columns >= channel.wide_from ? channel.wide_jobs : channel.max_jobs;
-        const int want = std::min(cap, channel.pcie_divisor > 0 ? misses - misses / channel.pcie_divisor : misses);
+        const int d    = divisor_of(channel);
+        const int want = std::min(cap, d > 0 ? misses - misses / d : misses);
         int n = 0;
         for (int width = 1; width <= channel.max_job_columns && n < want; ++width) {
             for (const std::int32_t e : jobs) {
@@ -418,7 +430,8 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
                                 Config{3, &service_two}, Config{64, &service_eight}, Config{0, &service_eight},
                                 Config{64, nullptr, true}, Config{64, &service_two, true}, Config{3, nullptr, true},
                                 Config{3, &service_all}, Config{64, &service_all, true}, Config{64, &service_narrow},
-                                Config{64, &service_narrow, true}, Config{64, nullptr, true, true},
+                                Config{64, &service_narrow, true}, Config{64, &service_one}, Config{64, &service_one, true},
+                                Config{64, nullptr, true, true},
                                 Config{64, &service_narrow, true, true}, Config{3, nullptr, false, true},
                                 Config{64, &service_assist}, Config{3, &service_assist}, Config{0, &service_assist},
                                 Config{64, &service_assist, true}, Config{0, nullptr, false, false, true},
@@ -473,7 +486,8 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
                                             .staging_slots = slots,
                                             .cpu = config.service != nullptr ? config.service->channel(0)
                                                                              : infernix::ops::MoeCpuChannel{}};
-        source.activation = activation;
+        source.activation           = activation;
+        source.heartbeat_timeout_ns = kTestHeartbeatTimeoutNs;
         if (config.service != nullptr) {
             // The CPU wait warms these into L2 while the host works; no output may change.
             source.l2_warm.ptr[0]   = d_frame_base;
@@ -585,7 +599,7 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
             const std::uint32_t count = published ? responder.count() : 0;
             if (config.fetch != Responder::Mode::kAnswer) {
                 // The wait ends without a trap; the word names the layer and the host's errno or the silence.
-                const std::uint32_t want = config.fetch == Responder::Mode::kFail ? EIO : moe::kErrorHostSilent;
+                const std::uint32_t want = config.fetch == Responder::Mode::kFail ? EIO : moe::kErrorFetchSilent;
                 std::printf("E=%d T=%d k=%d staging slots %2d (fetch, %s): %u records requested, error word %#x\n",
                             experts, columns, top_k, slots, config.fetch == Responder::Mode::kFail ? "failing host" : "silent host",
                             count, error);
@@ -665,7 +679,7 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
     }
     if (experts == 12) {
         // A CPU channel whose host never answers and whose heartbeat stands still: the wait gives up
-        // after kHeartbeatTimeoutNs and reports it in the error word instead of trapping, and the
+        // after heartbeat_timeout_ns and reports it in the error word instead of trapping, and the
         // device stays usable.
         const auto mapped = [](std::size_t bytes) {
             void* p = nullptr;
@@ -687,7 +701,8 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
                                             .scales        = d_scales,
                                             .staging_base  = d_staging,
                                             .staging_slots = 3};
-        source.activation = activation;
+        source.activation           = activation;
+        source.heartbeat_timeout_ns = kTestHeartbeatTimeoutNs;
         source.cpu = {.request = request, .x = cx, .y = cy, .done = words, .status = words + 1, .heartbeat = words + 2,
                       .sequence = sequence, .layer = 7, .max_jobs = 8, .max_columns = 64};
         *reinterpret_cast<volatile std::uint32_t*>(error_host) = 0;

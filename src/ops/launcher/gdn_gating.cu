@@ -11,7 +11,7 @@
 namespace infernix::ops::detail {
 
 void gdn_gating_launch(const Tensor& a, const Tensor& b, const Tensor& A_log, const Tensor& dt_bias,
-                       Tensor& g, Tensor& beta, cudaStream_t stream) {
+                       Tensor& g, Tensor& beta, bool a_direct, cudaStream_t stream) {
     const std::int64_t n = g.numel();
     constexpr int kBlock = 256;
     const int grid =
@@ -21,7 +21,8 @@ void gdn_gating_launch(const Tensor& a, const Tensor& b, const Tensor& A_log, co
     const auto column_stride = [](const Tensor& t) {
         return t.ne[1] == 1 ? std::int64_t{48} : t.nb[1] / static_cast<std::int64_t>(sizeof(__nv_bfloat16));
     };
-    CUDA_CHECK(pdl::launch_consumer({dim3(grid), dim3(kBlock), 0, stream}, gdn_gating_kernel,
+    CUDA_CHECK(pdl::launch_consumer({dim3(grid), dim3(kBlock), 0, stream},
+                                    a_direct ? gdn_gating_kernel<true> : gdn_gating_kernel<false>,
                                     static_cast<const __nv_bfloat16*>(a.data),
                                     static_cast<const __nv_bfloat16*>(b.data), column_stride(a),
                                     column_stride(b), static_cast<const float*>(A_log.data),

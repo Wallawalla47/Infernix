@@ -1,4 +1,4 @@
-"""Q4/Q5/Q6/Q8 bit planes and exact row_split_k128_v1 layout transforms."""
+"""Q2/Q4/Q5/Q6/Q8 bit planes and exact row_split_k128_v1 layout transforms."""
 
 from __future__ import annotations
 
@@ -38,6 +38,21 @@ def _pack_low_nibbles(codes: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def _pack_quarters(codes: torch.Tensor) -> torch.Tensor:
+    """2-bit codes four to a byte: element i in byte i // 4, bits 2 * (i % 4)."""
+
+    groups, group_size = codes.shape
+    out = torch.empty((groups, group_size // 4), dtype=torch.uint8, device=codes.device)
+    chunk = max(1, _PACK_TEMP_BYTES // max(1, group_size * 2))
+    for begin in range(0, groups, chunk):
+        end = min(groups, begin + chunk)
+        unsigned = codes[begin:end].to(torch.int16) & 0x03
+        out[begin:end] = (
+            unsigned[:, 0::4] | (unsigned[:, 1::4] << 2) | (unsigned[:, 2::4] << 4) | (unsigned[:, 3::4] << 6)
+        ).to(torch.uint8)
+    return out
+
+
 def _pack_high_bits(codes: torch.Tensor, bits: int) -> torch.Tensor:
     groups, group_size = codes.shape
     high_bits = bits - 4
@@ -68,6 +83,11 @@ def _pack_codes(
     if spec.bits == 8:
         return (
             codes.contiguous().view(torch.uint8),
+            torch.empty((codes.shape[0], 0), dtype=torch.uint8, device=codes.device),
+        )
+    if spec.bits == 2:
+        return (
+            _pack_quarters(codes),
             torch.empty((codes.shape[0], 0), dtype=torch.uint8, device=codes.device),
         )
     base = _pack_low_nibbles(codes)
@@ -352,7 +372,7 @@ def _high_indices(
         if device_index is None
         else torch.device(device_type, device_index)
     )
-    if bits in (4, 8):
+    if bits in (2, 4, 8):
         empty = torch.empty(0, dtype=torch.long, device=device)
         return empty, empty
     bit_positions = torch.arange(group_size, device=device, dtype=torch.long) * (
@@ -379,6 +399,10 @@ def _unpack_codes(
         )
         return scales, codes
     packed = planes.base.reshape(groups, geometry.base_bytes_per_group).to(torch.int16)
+    if spec.bits == 2:
+        unsigned = torch.stack([(packed >> (2 * q)) & 0x03 for q in range(4)], dim=-1).reshape(groups, spec.group_size)
+        codes = torch.where((unsigned & 2) != 0, unsigned - 4, unsigned)
+        return scales, codes.to(torch.int8).reshape(geometry.n, geometry.groups_per_row, spec.group_size)
     low = torch.empty(
         (groups, spec.group_size), dtype=torch.int16, device=packed.device
     )
@@ -437,6 +461,17 @@ def _low_g64(base: torch.Tensor, groups: int) -> torch.Tensor:
     )
 
 
+def _dequant2(base, _high, scale, _byte_indices, _shifts):
+    scales = _scales(scale)
+    groups = scales.numel()
+    packed = base.reshape(groups, 16).to(torch.int16)
+    unsigned = torch.stack(
+        ((packed & 3), (packed >> 2) & 3, (packed >> 4) & 3, (packed >> 6) & 3), dim=-1
+    ).reshape(groups, 64)
+    codes = torch.where((unsigned & 2) != 0, unsigned - 4, unsigned).float()
+    return (codes * scales).to(torch.bfloat16)
+
+
 def _dequant4(base, _high, scale, _byte_indices, _shifts):
     scales = _scales(scale)
     unsigned = _low_g64(base, scales.numel())
@@ -473,6 +508,7 @@ def _dequant8(base, _high, scale, _byte_indices, _shifts):
 
 
 _EAGER_DEQUANTIZERS = {
+    2: _dequant2,
     4: _dequant4,
     5: _dequant5,
     6: _dequant6,

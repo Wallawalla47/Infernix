@@ -13,6 +13,7 @@
 // The calling thread is worker 0 and starts computing at once. Idle workers spin for a bounded
 // time, then park on a futex (std::atomic::wait).
 
+#include "ops/offloaded_sparse_moe/cpu/ggml_expert.h"
 #include "ops/offloaded_sparse_moe/cpu/w4a16_expert.h"
 #include "ops/offloaded_sparse_moe/cpu/w4a4_expert.h"
 
@@ -28,6 +29,7 @@ namespace infernix::ops::offloaded_moe {
 struct CpuExpertJob {
     const std::uint8_t* record = nullptr;
     ExpertScales scales{};
+    GgmlExpertFormat ggml{};                // a GGUF bank's record (ggml_expert.h); scales unused
     int ncols = 0;                          // 1..kMaxColumns
     const std::uint16_t* x[kMaxColumns]{};  // BF16 [kHidden] per column
     std::uint16_t* y[kMaxColumns]{};        // BF16 [kHidden] per column
@@ -51,6 +53,7 @@ public:
         int spin_iterations = 1 << 16; // pause-loop iterations before parking
         int prefetch_bytes  = kDefaultPrefetchBytes; // calibrated on the target (§14.2)
         ExpertActivation activation = ExpertActivation::kA4; // of every job's expert
+        bool ggml = false; // jobs may be GGUF records (ggml_expert.h; activation kA16)
         std::vector<int> cpus;         // optional: CPU of worker i (worker 0 is the caller, not pinned)
     };
 
@@ -73,6 +76,7 @@ private:
     void worker_main(int w);
     void work(int w);
     void work_a16(int w);
+    void work_ggml(int w);
     void barrier();
     // Worker 0's beat after an item.
     void beat(int w) const {
@@ -91,7 +95,9 @@ private:
     std::vector<canon::A16Block> h16_; // A16 jobs: [job][col][kHBlocks]
     std::vector<std::uint16_t> hv_;    // A16 jobs: BF16 h [job][col][kIntermediate]
     std::vector<int> x_exp_, h_exp_;   // A16 jobs: column exponents [job][col]
+    std::vector<CpuLimbSlice> xg_, hg_; // ggml jobs: [job][col][kGgmlXSlices], [job][col][kGgmlHSlices]
     ExpertActivation activation_;
+    bool ggml_ = false;
     std::span<const CpuExpertJob> jobs_;
     CpuExpertHeartbeat heartbeat_;
 

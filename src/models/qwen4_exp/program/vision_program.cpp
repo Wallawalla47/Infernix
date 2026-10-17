@@ -37,7 +37,7 @@ std::shared_ptr<const VisionAdmission> ProgramImpl::plan_vision(const qwen3_5::P
     const std::size_t pass_bytes = patches.empty() ? 0 : vx::plan_vision_pass(config, *parameters_.vision, patches).bytes;
     const auto& overlay          = parameters_.model.overlay_vision();
     const std::size_t staging    = overlay ? vx::vision_staging_align(overlay->layout.staging_bytes) : 0;
-    out->window = plan_vision_window(items, reused, pass_bytes, staging, work_capacity_, residency_->frame_stride(),
+    out->window = plan_vision_window(items, reused, pass_bytes, staging, work_capacity_, residency_->lend_pitch(),
                                      static_cast<std::uint32_t>(parameters_.vision->merger_fc2.weight.n),
                                      config.hidden_size, config.depth);
     return out;
@@ -85,7 +85,7 @@ void ProgramImpl::vision_step(Lane& lane) {
         // waited for by compute and the weight stream's transfer stream.
         const cudaStream_t writers[] = {device_.transfer_stream};
         return_stream_lease(); // a prefill ring is lent again by the next streamed chunk
-        v.lease   = residency_->lend(window.frames, s, writers);
+        v.lease   = residency_->lend(window.lease_bytes, s, writers);
         v.handoff = Tensor(v.lease.memory.data, DType::BF16, {out, static_cast<std::int32_t>(window.encoded_tokens)});
         DeviceSpan memory;
         if (window.lease) {
@@ -139,13 +139,8 @@ void ProgramImpl::vision_step(Lane& lane) {
     v.timer->record_stop();
     if (window.lease) {
         // Only the handoff stays lent; the window's frames go back once compute reaches here.
-        const auto handoff_frames = static_cast<std::uint32_t>(
-            (align(window.handoff_bytes) + residency_->frame_stride() - 1) / residency_->frame_stride());
-        if (handoff_frames < v.lease.count) {
-            ExpertResidency::FrameLease tail{.first = v.lease.first + handoff_frames, .count = v.lease.count - handoff_frames};
-            residency_->give_back(tail, s);
-            v.lease.count = handoff_frames;
-        }
+        auto tail = residency_->split(v.lease, align(window.handoff_bytes));
+        residency_->give_back(tail, s);
     }
     v.pass.reset();
     v.layout.reset();

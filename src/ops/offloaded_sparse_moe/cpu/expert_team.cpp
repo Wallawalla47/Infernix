@@ -55,10 +55,17 @@ std::size_t h_index(int job, int col) {
 CpuExpertTeam::CpuExpertTeam(Options options)
     : workers_(options.workers), isa_(options.isa), max_jobs_(options.max_jobs),
       spin_iterations_(options.spin_iterations), prefetch_bytes_(options.prefetch_bytes),
-      activation_(options.activation) {
+      activation_(options.activation), ggml_(options.ggml) {
     if (workers_ < 1 || workers_ > kHBlocks) { throw std::invalid_argument("CpuExpertTeam: workers must be in [1, 40]"); }
     if (max_jobs_ < 1) { throw std::invalid_argument("CpuExpertTeam: max_jobs must be positive"); }
     if (!cpu_isa_supported(isa_)) { throw std::invalid_argument("CpuExpertTeam: unsupported CPU ISA"); }
+    if (ggml_ && activation_ != ExpertActivation::kA16) {
+        throw std::invalid_argument("CpuExpertTeam: GGUF experts take the A16 activation");
+    }
+    if (ggml_) {
+        xg_.resize(static_cast<std::size_t>(max_jobs_) * kMaxColumns * kGgmlXSlices);
+        hg_.resize(static_cast<std::size_t>(max_jobs_) * kMaxColumns * kGgmlHSlices);
+    }
     if (activation_ == ExpertActivation::kA16) {
         x16_.resize(xs_index(max_jobs_, 0));
         h16_.resize(h_index(max_jobs_, 0));
@@ -162,8 +169,65 @@ void CpuExpertTeam::work_a16(int w) {
     }
 }
 
+// A round of GGUF records (ggml_expert.h): x encoded per column, the gate/up 16-intermediate
+// units with SwiGLU (h in BF16), h encoded per column (its exponent spans all 640), then the down
+// rows in groups of 64. Every output is an exact sum rounded once, so the item split changes no bit.
+void CpuExpertTeam::work_ggml(int w) {
+    const int n_jobs = static_cast<int>(jobs_.size());
+    constexpr int kUnitSize = 16, kUnits = kIntermediate / kUnitSize, kRowsPerItem = 64,
+                  kRowItems = kHidden / kRowsPerItem;
+    const auto column = [](int job, int col) { return static_cast<std::size_t>(job) * kMaxColumns + col; };
+    const int column_items = n_jobs * kMaxColumns;
+    for (int i = next_quantize_.fetch_add(1, std::memory_order_relaxed); i < column_items;
+         i = next_quantize_.fetch_add(1, std::memory_order_relaxed)) {
+        const int j = i / kMaxColumns, c = i % kMaxColumns;
+        const CpuExpertJob& job = jobs_[static_cast<std::size_t>(j)];
+        if (c >= job.ncols) { continue; }
+        x_exp_[column(j, c)] = ggml_encode_column(job.x[c], kHidden, &xg_[column(j, c) * kGgmlXSlices]);
+        beat(w);
+    }
+    barrier();
+    const int unit_items = n_jobs * kUnits;
+    for (int i = next_unit_.fetch_add(1, std::memory_order_relaxed); i < unit_items;
+         i = next_unit_.fetch_add(1, std::memory_order_relaxed)) {
+        const int j = i / kUnits, u = i % kUnits;
+        const CpuExpertJob& job = jobs_[static_cast<std::size_t>(j)];
+        const CpuLimbSlice* xs[kMaxColumns];
+        std::uint16_t* hv[kMaxColumns];
+        for (int c = 0; c < job.ncols; ++c) {
+            xs[c] = &xg_[column(j, c) * kGgmlXSlices];
+            hv[c] = &hv_[column(j, c) * kIntermediate];
+        }
+        ggml_gate_up(isa_, job.record, job.ggml, xs, &x_exp_[column(j, 0)], job.ncols, kUnitSize * u, kUnitSize * u + kUnitSize, hv);
+        beat(w);
+    }
+    barrier();
+    for (int i = next_encode_h_.fetch_add(1, std::memory_order_relaxed); i < column_items;
+         i = next_encode_h_.fetch_add(1, std::memory_order_relaxed)) {
+        const int j = i / kMaxColumns, c = i % kMaxColumns;
+        if (c >= jobs_[static_cast<std::size_t>(j)].ncols) { continue; }
+        h_exp_[column(j, c)] = ggml_encode_column(&hv_[column(j, c) * kIntermediate], kIntermediate,
+                                                  &hg_[column(j, c) * kGgmlHSlices]);
+        beat(w);
+    }
+    barrier();
+    const int row_items = n_jobs * kRowItems;
+    for (int i = next_rows_.fetch_add(1, std::memory_order_relaxed); i < row_items;
+         i = next_rows_.fetch_add(1, std::memory_order_relaxed)) {
+        const int j = i / kRowItems, r = (i % kRowItems) * kRowsPerItem;
+        const CpuExpertJob& job = jobs_[static_cast<std::size_t>(j)];
+        const CpuLimbSlice* hs[kMaxColumns];
+        for (int c = 0; c < job.ncols; ++c) { hs[c] = &hg_[column(j, c) * kGgmlHSlices]; }
+        ggml_down(isa_, job.record, job.ggml, hs, &h_exp_[column(j, 0)], job.ncols, r, r + kRowsPerItem, job.y);
+        beat(w);
+    }
+}
+
 void CpuExpertTeam::work(int w) {
-    (void)w;
+    if (!jobs_.empty() && jobs_.front().ggml.valid()) {
+        work_ggml(w);
+        return;
+    }
     if (activation_ == ExpertActivation::kA16) {
         work_a16(w);
         return;
@@ -249,8 +313,10 @@ void CpuExpertTeam::worker_main(int w) {
 void CpuExpertTeam::run(std::span<const CpuExpertJob> jobs, CpuExpertHeartbeat heartbeat) {
     if (jobs.empty()) { return; }
     if (static_cast<int>(jobs.size()) > max_jobs_) { throw std::invalid_argument("CpuExpertTeam: too many jobs"); }
+    const bool ggml = jobs.front().ggml.valid();
     for (const auto& job : jobs) {
-        if (job.ncols < 1 || job.ncols > kMaxColumns || !job.record) {
+        if (job.ncols < 1 || job.ncols > kMaxColumns || !job.record || job.ggml.valid() != ggml ||
+            (ggml && (!ggml_ || !ggml_cpu_supported(job.ggml)))) {
             throw std::invalid_argument("CpuExpertTeam: invalid job");
         }
     }

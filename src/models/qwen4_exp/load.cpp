@@ -1,13 +1,16 @@
 #include "models/qwen4_exp/load.h"
 
 #include "artifact/binder.h"
+#include "artifact/formats.h"
 #include "artifact/reader.h"
+#include "core/ggml_format.h"
 #include "artifact/views.h"
 #include "models/qwen3_5/load/vision_overlay.h"
 #include "models/registry.h"
 
 #include <cmath>
 #include <cstring>
+#include <algorithm>
 #include <map>
 #include <utility>
 
@@ -121,7 +124,8 @@ GdnWeights bind_gdn(Bindings& b, const TextConfig& c, const std::string& prefix)
     out.z            = b.parameter(p + "z", {vw, h}, input);
     out.a_projection = b.parameter(p + "a_projection", {nv, h}, input);
     out.b_projection = b.parameter(p + "b_projection", {nv, h}, input);
-    out.a_log        = b.direct(p + "a_log", {nv}, QType::FP32);
+    // A GGUF import stores A = -exp(A_log) itself (gdn_a: direct); a_log then holds A.
+    out.a_log        = b.direct(p + (c.gdn.a_direct ? "a" : "a_log"), {nv}, QType::FP32);
     out.dt_bias      = b.direct(p + "dt_bias", {nv}, QType::FP32);
     out.convolution  = b.direct(p + "convolution", {c.gdn.conv_kernel, c.gdn.conv_channels()});
     out.norm         = b.direct(p + "norm", {c.gdn.value_head_dim});
@@ -138,7 +142,9 @@ MoeWeights bind_moe(Bindings& b, const TextConfig& c, const std::string& prefix,
     out.shared_gate  = b.parameter(p + "shared/gate", {s, h}, input);
     out.shared_up    = b.parameter(p + "shared/up", {s, h}, input);
     out.shared_down  = b.parameter(p + "shared/down", {h, s}, p + "shared/product");
-    out.experts      = b.parameter(p + "experts", {e, h, c.moe.intermediate}, input, QType::NVFP4_MUL, experts);
+    // NVFP4 banks (nvfp4_mul), block-FP8 banks or a GGUF import's ggml banks; plan_load checks the
+    // layouts.
+    out.experts      = b.parameter(p + "experts", {e, h, c.moe.intermediate}, input, std::nullopt, experts);
     // A bank whose use allows A4 is W4A4 and carries its activation scales; an A16-only bank is
     // W4A16 (design §16.2.1) and has none.
     if (b.weights.at(out.experts.index).policy != ops::LinearPolicy::A16Only) {
@@ -157,14 +163,17 @@ PleWeights bind_ple(Bindings& b, const TextConfig& c, const std::string& prefix)
     out.query_norm       = b.direct(p + "query_norm", {width});
     out.conv_norm        = b.direct(p + "conv_norm", {width});
     out.convolution      = b.direct(p + "convolution", {c.ple.conv_kernel, width});
-    out.ngram_scale      = b.direct(p + "ngram_scale", {1});
+    // An FP8 table's per-tensor scale; IQ4_NL rows carry their scales.
+    if (c.ple.table.format == NgramRowFormat::Fp8E4m3) { out.ngram_scale = b.direct(p + "ngram_scale", {1}); }
     return out;
 }
 
 TextWeights bind_text(Bindings& b, const TextConfig& c, Residency experts) {
     TextWeights out;
     const std::uint64_t h = c.hidden_size, v = c.vocab_size;
-    out.token_embedding = b.parameter("text/token_embedding", {v, h}, {}, QType::BF16,
+    // BF16 rows, or a GGUF import's IQ4_XS rows (Parameters checks the format).
+    out.token_embedding = b.parameter("text/token_embedding", {v, h}, {},
+                                      c.ggml_weights ? std::nullopt : std::optional<QType>(QType::BF16),
                                       Residency::HostPinned);
     out.output_head = b.parameter("text/output_head", {v, h}, "text/final_hidden");
     out.final_mixer = bind_hc(b, c, "text/final_mixer/", false);
@@ -348,6 +357,7 @@ struct LoadPlan::Impl {
     FrontendResources resources;
     InstanceInfo info;
     std::optional<qwen3_5::VisionOverlayLayout> vision_overlay; // vision offload
+    std::uint64_t embedding_bytes = 0; // the token embedding's stored bytes (pinned)
 };
 
 LoadPlan::LoadPlan(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -363,8 +373,7 @@ const artifact::MaterializationPlan& LoadPlan::materialization() const {
 
 std::uint64_t LoadPlan::pinned_other_bytes() const {
     // Besides the expert banks: the token embedding (bind_text) and, with vision offload, the tower.
-    const auto& c = impl_->config.text;
-    std::uint64_t bytes = std::uint64_t(c.vocab_size) * c.hidden_size * 2U;
+    std::uint64_t bytes = impl_->embedding_bytes;
     if (impl_->vision_overlay) {
         const auto& v = *impl_->vision_overlay;
         bytes += v.prelude.bytes + v.merger.bytes;
@@ -456,6 +465,51 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
                 binder.values(bindings.weights.at(layer.moe.input_scales.index).reference.binding, QType::FP32));
         }
     }
+    {
+        // One bank kind for every layer: NVFP4, block-FP8, or (exactly in a GGUF import) ggml banks.
+        // Exact banks' frames take the largest stored record stride (a GGUF import's vary by layer).
+        std::optional<QuantLayout> kind;
+        std::uint64_t stride_sum = 0;
+        for (const auto& layer : out->weights.layers) {
+            for (const auto& part : bindings.weights.at(layer.moe.experts.index).reference.binding.parts) {
+                const auto& tensor = reader.directory().tensor(part.object);
+                const auto g = weight_geometry(artifact::parse_format(tensor.format), artifact::parse_layout(tensor.layout),
+                                               tensor.shape);
+                const QuantLayout k = is_ggml_expert_layout(g.layout) ? QuantLayout::GgmlExpertIq4Nl : g.layout;
+                if (k != QuantLayout::ExpertRg16 && k != QuantLayout::Fp8ExpertB128 && k != QuantLayout::GgmlExpertIq4Nl) {
+                    throw ArtifactError("Qwen4Exp: routed experts must be NVFP4, block-FP8 or ggml expert banks");
+                }
+                if (kind && *kind != k) { throw ArtifactError("Qwen4Exp: every layer's expert bank must be of one kind"); }
+                kind = k;
+                if ((k == QuantLayout::GgmlExpertIq4Nl) != out->config.text.ggml_weights) {
+                    throw ArtifactError("Qwen4Exp: ggml expert banks belong to a GGUF import (and only there)");
+                }
+                if (k == QuantLayout::ExpertRg16 && g.format != QType::NVFP4_MUL) {
+                    throw ArtifactError("Qwen4Exp: an nvfp4_expert_rg16_v1 bank must be nvfp4_mul");
+                }
+                if (k != QuantLayout::ExpertRg16) {
+                    out->config.text.exact_experts       = true;
+                    out->config.text.expert_frame_stride = std::max(out->config.text.expert_frame_stride, g.record_stride);
+                    stride_sum += g.record_stride;
+                }
+            }
+        }
+        if (out->config.text.exact_experts) {
+            const std::uint64_t layers = out->weights.layers.size();
+            out->config.text.expert_frame_bytes = (stride_sum + layers - 1) / layers;
+        }
+        if (out->config.text.exact_experts && !out->config.text.moe.a16_experts) {
+            throw ArtifactError("Qwen4Exp: exact expert banks are A16 only (no activation scales)");
+        }
+    }
+    {
+        // The embedding's stored objects: BF16 rows, or a GGUF import's IQ4_XS rows.
+        std::vector<artifact::ObjectHandle> objects;
+        for (const auto& part : bindings.weights.at(out->weights.token_embedding.index).reference.binding.parts) {
+            if (std::find(objects.begin(), objects.end(), part.object) == objects.end()) { objects.push_back(part.object); }
+        }
+        for (const auto object : objects) { out->embedding_bytes += artifact::object_bytes(reader.directory().object(object)); }
+    }
     out->pending         = std::move(bindings.weights);
     out->materialization = std::move(binder).finish();
     if (out->weights.vision && options.overlay_vision()) {
@@ -501,9 +555,10 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
     std::vector<ExpertBank> banks;
     const auto& layers = data->weights.layers;
     // Streamed banks (the SSD tier): the records stay in the artifact; each layer's multipliers
-    // (the scale tail) are read here into Model memory.
+    // (the scale tail; a GGUF import's banks have none) are read here into Model memory.
     const bool streamed = data->options.stream_experts;
     std::vector<artifact::ObjectHandle> bank_objects;
+    std::vector<std::uint64_t> bank_strides;
     std::vector<std::vector<float>> multipliers;
     for (std::size_t i = 0; i < layers.size(); ++i) {
         const auto& view = bound.at(layers[i].moe.experts.index).view;
@@ -516,11 +571,16 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
             const auto& reference = data->pending.at(layers[i].moe.experts.index).reference;
             const auto object     = reference.binding.parts.front().object;
             const auto& parent    = *view.parts.front().parent;
-            std::vector<float> words(parent.geometry.scale_bytes / sizeof(float));
-            reader.read_into(artifact::object_offset(reader.directory().object(object)) + parent.geometry.scale_offset,
-                             std::as_writable_bytes(std::span(words)));
-            bank.planes = expert_bank_layout(parent.geometry, words.data());
+            std::vector<float> words(is_ggml_expert_layout(parent.geometry.layout)
+                                         ? 0
+                                         : parent.geometry.scale_bytes / sizeof(float));
+            if (!words.empty()) {
+                reader.read_into(artifact::object_offset(reader.directory().object(object)) + parent.geometry.scale_offset,
+                                 std::as_writable_bytes(std::span(words)));
+            }
+            bank.planes = expert_bank_layout(parent.geometry, words.empty() ? nullptr : words.data());
             bank_objects.push_back(object);
+            bank_strides.push_back(bank.planes.record_stride);
             multipliers.push_back(std::move(words));
         } else {
             bank.planes = expert_bank_planes(*view.parts.front().parent);
@@ -530,7 +590,16 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
             bank.planes.intermediate != data->config.text.moe.intermediate) {
             throw ArtifactError("expert bank geometry differs from the text config");
         }
-        if (!data->config.text.moe.a16_experts) {
+        const bool exact = bank.planes.gate_up_format != QType::NVFP4_MUL;
+        if (exact != data->config.text.exact_experts) {
+            throw ArtifactError(bound.at(layers[i].moe.experts.index).name + ": expert bank kind differs from the plan's");
+        }
+        if (exact) {
+            // Exact A16 over the records' own block scales (ops/ggml/ggml_exact.h, ops/fp8_block/
+            // fp8_exact.h): no scalars.
+            bank.activation = ops::offloaded_moe::ExpertActivation::kA16;
+            bank.scales.assign(bank.planes.experts, ops::offloaded_moe::ExpertScales{});
+        } else if (!data->config.text.moe.a16_experts) {
             bank.scales = expert_scales(bank.planes, data->input_scales.at(i),
                                         bound.at(layers[i].moe.input_scales.index).name);
         } else {
@@ -542,7 +611,7 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
     std::optional<ExpertStore> store;
     if (streamed) {
         const auto& c = data->config.text;
-        store.emplace(backing.stream_source(), bank_objects, banks.front().planes.record_stride, c.moe.experts,
+        store.emplace(backing.stream_source(), bank_objects, std::move(bank_strides), c.moe.experts,
                       std::move(multipliers)); // the vectors move, so the planes' pointers stay valid
     }
     std::optional<qwen3_5::VisionOverlayAssets> overlay;

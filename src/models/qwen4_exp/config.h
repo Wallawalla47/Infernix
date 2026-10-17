@@ -52,6 +52,11 @@ struct GdnConfig {
     std::uint32_t value_head_dim = 0;
     std::uint32_t conv_kernel   = 0;
     GateActivation output_gate  = GateActivation::Sigmoid;
+    // A GGUF import (tools/convert/qwen4_exp_gguf.py): the output projection reads its value heads
+    // in ggml's tiled order (slot g holds head (g % key_heads) * per_key + g / key_heads), and the
+    // decay parameter is A = -exp(A_log) itself (gdn/a), not A_log.
+    bool output_ggml_tiled = false;
+    bool a_direct          = false;
 
     [[nodiscard]] std::uint32_t key_width() const noexcept { return key_heads * key_head_dim; }
     [[nodiscard]] std::uint32_t value_width() const noexcept { return value_heads * value_head_dim; }
@@ -86,8 +91,14 @@ struct QsaConfig {
     }
 };
 
-// The FP8 n-gram table volume written beside the artifact (design §12.2).
+// The n-gram table volume written beside the artifact (design §12.2): FP8 E4M3FN rows with one
+// per-tensor scale, a GGUF's IQ4_NL rows (plan §9.1), or the unquantized table's BF16 rows (an exact
+// conversion bound to a BF16 volume). A BF16 volume (tools/flash_next/ngram_bf16.py) may also replace
+// a quantized table at run time (resolve_ngram_volume).
+enum class NgramRowFormat : std::uint8_t { Fp8E4m3, Iq4Nl, Bf16 };
+
 struct NgramTableConfig {
+    NgramRowFormat format = NgramRowFormat::Fp8E4m3;
     std::uint64_t rows            = 0;
     std::uint32_t row_bytes       = 0;
     std::uint32_t rows_per_block  = 0;
@@ -136,6 +147,18 @@ struct TextConfig {
     HyperConnectionConfig hc;
     QsaConfig qsa;
     PleConfig ple;
+    // Weights imported from a GGUF (tools/convert/qwen4_exp_gguf.py; the converter writes the gdn_a and
+    // gdn_output_order keys): ggml block formats, an IQ4_XS embedding and ggml expert banks.
+    bool ggml_weights = false;
+    // The routed experts run exact A16 arithmetic over their records' own block scales: a GGUF
+    // import's ggml banks or Qwen's block-FP8 banks (fp8_expert_b128_v1). Set by the loader.
+    bool exact_experts = false;
+    // The largest record stride of exact banks (a GGUF import's strides differ by layer: staging,
+    // stream-ring and RAM slots take it), set by the loader from the stored banks; 0 means the NVFP4
+    // record's. expert_frame_bytes: the mean stride, rounded up (the expert cache's sizing unit: its
+    // pools give every layer the same frame count; ExpertResidency::average_frame_bytes).
+    std::uint64_t expert_frame_stride = 0;
+    std::uint64_t expert_frame_bytes  = 0;
 
     // The positions a context may use: the native ones times the YaRN factor, at most 1,048,576.
     [[nodiscard]] std::uint32_t context_ceiling() const noexcept {

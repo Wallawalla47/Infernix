@@ -23,4 +23,11 @@ namespace infernix::ops {
 void gdn_gating(const Tensor& a, const Tensor& b, const Tensor& A_log, const Tensor& dt_bias,
                 Tensor& g, Tensor& beta, cudaStream_t stream);
 
+/**
+ * gdn_gating with the decay parameter stored as A = -exp(A_log) itself (a GGUF import):
+ * g[h,t] = A[h] * softplus(a[h,t] + dt_bias[h]); every other contract as gdn_gating.
+ */
+void gdn_gating_direct(const Tensor& a, const Tensor& b, const Tensor& A, const Tensor& dt_bias,
+                       Tensor& g, Tensor& beta, cudaStream_t stream);
+
 } // namespace infernix::ops

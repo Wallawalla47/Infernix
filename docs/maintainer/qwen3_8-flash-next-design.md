@@ -1894,6 +1894,11 @@ tok/s (older build) against 72 aggregate for plain C = 2.
   range, so prefill reads that touch nearby rows coalesce into one block.
 - The file is its own volume (`*.ninfer.ngram`). It may live on a different NVMe drive from the
   expert banks, which are only read at load.
+- The artifact's `ngram_table` names the row format: `fp8_e4m3fn` (above), `iq4_nl` (the GGUF
+  import, 90 B rows) or `bf16` (Qwen's unquantized table, 320 B rows, 12 per block, 109.2 GB, no
+  scale parameter). FP8 F-A binds `bf16`: `--ngram-reuse` with a BF16 volume checks that sampled
+  rows quantize to the checkpoint's FP8 codes by ModelOpt's per-tensor rule. A BF16 volume may also
+  replace a quantized table at run time (`resolve_ngram_volume`); nothing replaces a `bf16` table.
 
 ### 12.3 Host-hashed row cache and gated reads
 
@@ -2835,7 +2840,7 @@ the user asked, not part of the Qwen3.5 family.
 | Source correction (2026-10-07) | Every conversion and measurement before 2026-10-07 used a local checkpoint that was in fact `RadixArk/Qwen3.8-Flash-Next-NVFP4` (the same Model Optimizer recipe for the routed experts, its own calibration, MTP experts left BF16 and fused), not NVIDIA's; it had been taken for NVIDIA's because the MTP layout was read from it. The artifacts were rebuilt from `nvidia/Qwen3.8-Flash-Next-NVFP4` (MTP experts block-FP8, §6.1) and the published measurements repeated; the older figures in this log describe the RadixArk weights. |
 | M2 recipe A | Done. Converted with no requantization: 24,576 experts, 1,638 tensors, every input scale and all 320,001,536 n-gram rows word-exact. Loads in 25 s with unbuffered reads straight into 64.47 GiB of pinned memory (8.03 GiB device). The loader refuses a pinned block that would leave less than 8 GiB of RAM. |
 | M3 ops | Forward ops in place and checked per op chain against the FP64 reference on the model's own activations (§16.5): `hyper_connection`, `ple`, `qsa` (BF16 and INT8 KV), `offloaded_sparse_moe` layer kernels, `projection_fp32`, `rows`. Standalone oracle tests per op are still to be written. |
-| M4 functional | Done for text generation through the public Engine (`infernix`, `infernix-serve`, `infernix_bench`): `EngineCore` over the hybrid-manager surface, whole-extent KV reservation at admission, `--ngram-volume`. MTP drafter (`--spec mtp`) since the third session. Not yet: CausalScoring, vision, prefix cache. |
+| M4 functional | Done for text generation through the public Engine (`infernix`, `infernix-serve`, `infernix_bench`): `EngineCore` over the hybrid-manager surface, whole-extent KV reservation at admission, `--ngram-volume`. MTP drafter (`--spec mtp`) since the third session. Vision and the prefix cache followed; CausalScoring since 2026-10-11 (`program/score.cpp`: the prompt prefilled on lane 0 through the generation path with its final residuals kept, then the LM head over them in 64-column FP32 tiles). |
 | M5 expert cache | Free VRAM (less a 384 MiB reserve and 64 staging slots) as frames (9,443 on the 5090 with recipe B), LFRU via `expert_cache::CacheController` with no slack frames, promotions on a copy stream: one per layer call per generated token until the frames fill, then one every fourth token; 16 per layer call in prefill. Misses are shared between the CPU expert engine (six workers) and a PCIe stage through device slots (below). No prefetch, loans, warm list or saved profile yet. |
 | M6 decode | CUDA graphs per decode batch size; skinny BF16 GEMV for every unregistered dense shape; expert kernels stage their weight slices with `cp.async`. |
 | M7 speculation | Verify rounds with GDN replay records and fold, PLE/QSA commit-after-acceptance, on-device acceptance and graphs per (B, W); MTP drafter (resident q4 experts, own QSA KV layer, catch-up after commit, chained draft graph, proposal head) with an acceptance-driven draft length, and n-gram copy proposals. Greedy output equals plain decode. tg512 133.5 tok/s with MTP against 88.7 plain (C = 1). |
@@ -2973,7 +2978,8 @@ roughly halve the miss stall.
 **CPU-served misses (adopted, §10.3).** For each decode or verify layer call:
 
 1. One GPU kernel picks up to `cpu_expert_jobs` non-resident experts. It takes all but
-   misses / `cpu_pcie_divisor` of them (§19.3.12), the fewest-column ones first, each with at most 8 columns.
+   misses / d of them (§19.3.12; d = 1 in a GGUF import's one-column calls without speculation), the fewest-column ones
+   first, each with at most 8 columns.
 2. It writes x and a request into mapped host memory (`offloaded_moe::MissRequest`), fences at
    system scope, and publishes a device-counted sequence number. Graph replays stay valid.
 3. A host service thread (`CpuMissService`, worker 0 of the existing `CpuExpertTeam`) computes
@@ -2981,7 +2987,8 @@ roughly halve the miss stall.
    misses and computes everything else.
 4. A one-CTA kernel waits for the answer and places the outputs before the combine. The wait
    lasts while the service's heartbeat word changes; a silent host fails the call through its
-   error word after 1 s (§19.3.7, R9; it trapped after 2 s before).
+   error word after 10 s (§19.3.7, R9; it trapped after 2 s before, and gave up after 1 s until
+   2026-10-17).
 
 The outputs are bit-identical: the layer-route test checks CPU channels of 2 and 8 jobs against
 the CPU engine, and greedy token ids are unchanged. Prefill chunks (more than 64 columns) stay on
@@ -3304,9 +3311,17 @@ Cold-cache CLI with K = 3 and `--lm-head-draft`:
 
 - **Choice of K.** Each round, each row drafts the K in [0, max] that maximizes
   E[tokens(K)] / (1 + c·K). E[tokens(K)] = 1 + Σ_j Π_{i≤j} a_i, from the row's EWMA of the
-  conditional acceptance a_i at each draft position (prior 0.75, weight 0.1). c = 0.38 is the
-  measured cost of a draft column in plain rounds: warm tg512 W = 3, 4, 5 rounds took 1.84, 2.13
-  and 2.54 plain rounds.
+  conditional acceptance a_i at each draft position (prior 0.75, weight 0.1). c is the cost of a
+  draft in plain rounds, learned online (2026-10-12): the start-to-start times of consecutive
+  one-row MTP rounds (drafting, verification, commit and host work) against their drafter steps K
+  fit t = a + b K by exponentially weighted least squares (decay 0.98, about 50 rounds), and c = b / a.
+  n-gram rounds are not sampled; a cycle past three predicted rounds held an idle gap and is
+  skipped. Until the fit has 16 rounds with spread in K (the probes provide it), or when it is not
+  positive, the prior c = 0.38 stands: warm tg512 W = 3, 4, 5 rounds took 1.84, 2.13 and 2.54 plain
+  rounds on NVFP4. On the IQ3_S import (~1.09 + 0.25 K) the learned cost took MTP tg512 191.3 ->
+  200.1 tok/s; on NVIDIA NVFP4 Dense8 MTP 4 at 4K + 512 151.7 -> 157.3-159.4 (2026-10-17). Draft
+  lengths, and so the rounds of a generation, then depend on measured times; outputs do not. Unlike the rejected per-width EWMA below, one line over every chosen K keeps
+  refreshing (the probes vary K) and a cold or stale cost decays.
 - **Probing.** Every 8th round a row drafts one token more than its choice, so the estimate for
   the next position stays current. K = 0 then probes one draft.
 - **K = 0 rounds** are plain decode rounds. The drafter writes the round's cell afterwards (a
@@ -4666,7 +4681,7 @@ The rest is the lending API.
 | Component | Change |
 |---|---|
 | `FramePool`, `LfruPolicy` (`program/expert_cache/expert_cache.{h,cpp}`, CUDA-free) | `FramePool`: state `kLoaned`, `lend(first, count)` (free frames only; the controller evicts held ones first), `give_back(first, count)`, `loaned_count()`. `LfruPolicy`: `erase` public as `evict(key)`; `set_capacity(n, victims&)` shrinks by evicting the lowest-score residents, or grows. |
-| `CacheController` | Maintains `frame_key_[frame]` on load and evict. `choose_run(count, busy)`: the contiguous run with the minimum summed LFRU score, by sliding window over ~9,400 frames (~10 µs, estimated); free frames score 0, **loaned frames are ineligible**, busy frames (targets of in-flight loads) are avoided while a run without them exists. `lend`: `set_capacity(capacity − count)` evicts the lowest-score residents wherever they are (an `Absent` entry write each), then every other expert in the run moves to a free frame outside it (a `kRelocate` command each), and the run's frames go to `kLoaned`. A lent run so costs the cache its least valuable experts, not the ones its frames happened to hold. `give_back`: frames to free, `set_capacity(+count)`, `drain_queue`. |
+| `CacheController` | Maintains `frame_key_[frame]` on load and evict. `choose_run(count, busy)`: the contiguous run with the minimum summed LFRU score, by sliding window over ~9,400 frames (~10 µs, estimated); free frames score 0, **loaned frames are ineligible**, busy frames (targets of in-flight loads) are avoided while a run without them exists. `lend`: `set_capacity(capacity − count)` evicts the lowest-score residents wherever they are (an `Absent` entry write each), then every other expert in the run moves to a free frame outside it (a `kRelocate` command each), and the run's frames go to `kLoaned`. A lent run so costs the cache its least valuable experts, not the ones its frames happened to hold; the evicted keys are remembered. `give_back`: frames to free, `set_capacity(+count)`, `drain_queue`, then the remembered keys reload, the best (last evicted) first, while the policy has room (in SSD-tier mode only keys with a RAM copy). Without the reload a prefill's leases left decode short of the cache's lowest-ranked experts until misses re-admitted them: after 32K and 128K prompts with 8,192-token chunks the IQ3_S server's decode-only hit rate was 86-88 % and 81-85 %, with the reload 94-95 % and 90-97 % (2026-10-12; Strata refills its lent slots the same way). |
 | No pending frames at a boundary | `after_round` always calls `on_quiescent`, with slack 0 and `rounds_in_flight = 1` (§9.5 as built); `lend` asserts `pending_count() == 0` |
 | **Load serial (ABA fix)** | A host `std::vector<std::uint64_t> load_serial_` per key, set when a copy is issued. `complete_load(key, frame, serial)` is true only if the entry is `Ready` and frame and serial both match. `Batch.loads` becomes `(key, frame, serial)` and `before_round` calls `complete_load` instead of the state-and-frame test, which also closes the case without lending. |
 | `ExpertResidency::lend(count, compute, std::span<const cudaStream_t> writers) → FrameLease` | Waits for the copy stream (the moves need every promotion landed and published); `choose_run`, `controller.lend`; applies the `Absent` writes and the moves to `table_host_` and moves the frames on compute with one `copy_device_blocks` launch (`core/block_copy.h`; a `cudaMemcpyAsync` per frame held the host ~10 ms for the ~1,300 moves of a warm 8K prompt's lease, 76-82 ms at 128K, and cost the first token ~13-19 ms at 8K); `upload_table(compute)`; each writer waits for the moves (`table_ready_`); returns `{first, count, DeviceSpan(frame_base + first·stride, count·stride)}`. The pool shrink (`resize`) moves its survivors the same way. |
@@ -5275,6 +5290,10 @@ K1a, or a cluster.
 **Shared-expert criticality.** The shared expert runs while the host computes CPU-served misses;
 when the CPU is the long pole, gate/up and down savings partly become a longer `cpu_wait`, which
 Phase 2's warming turns into progress. Per-round kernel time and wall clock are reported together.
+Since 2026-10-12 decode and verification calls also run it on its own stream (`ForwardExperts::
+shared_stream`, forked at the MoE input and joined before the combine), beside the routed experts
+instead of after the resident pass on the layer's stream (Strata forks it the same way): IQ3_S
+tg512 112.7 -> 121.5, MTP 199.6 -> 205.6 tok/s. Prefill chunks keep it in order.
 
 #### Tests and measurements
 
@@ -7050,7 +7069,7 @@ measured results are under "Status" at the end of this section.
   failure. Prefill, overflow and CPU-off calls publish their SSD-only experts to a mapped
   `MoeFetchChannel`; a host agent reads them into a 128-slot landing ring in job order, one device
   poller mirrors `landed` into L2, the stage kernel copies each record as it lands, and SSD-only jobs
-  run last. Waits are bounded by a host heartbeat (1 s without progress), never a trap; the existing
+  run last. Waits are bounded by a host heartbeat (10 s without progress; 1 s until 2026-10-17), never a trap; the existing
   2 s `cpu_wait` trap becomes the same wait, and both channel sequences become wrap-safe. Exposed
   cost per SSD read ≈ 0.6-0.7 ms (estimated).
 - **RAM policy** (§4.7): decayed LFU, score `Σ w · 2^−(t − t_use)/h`, kept as the time-invariant key
@@ -7256,8 +7275,18 @@ change at merge time.
 
 - **Snapshot** (`core/host_memory`): `host_memory_snapshot()` reads total and available physical
   memory, available commit (Windows `ullAvailPageFile`; Linux MemAvailable plus free swap) and the
-  process's private bytes; on Linux available memory is lowered to the cgroup v2 limit and
-  `RLIMIT_MEMLOCK` is read. `reserve_process_working_set` sets the hard minimum working set.
+  process's private bytes; on Linux available memory is lowered to the cgroup v2 limit.
+  `reserve_process_working_set` sets the hard minimum working set.
+- **Pin room** (2026-10-11). Windows WDDM counts every CUDA pin of a process, `cudaHostAlloc` and
+  `cudaHostRegister` alike, in the adapter's NON_LOCAL segment, and pins fail just past its
+  per-process budget whatever RAM is free (RTX 5090, 95.8 GiB of RAM: DXGI budget 75.86 GiB,
+  shared system memory 76.61 GiB; pins failed at 76.07 GiB of usage with 5.3 GiB of RAM free;
+  another process's pins do not count). `VramSnapshot` reports the NON_LOCAL budget and usage;
+  startup sets `HostMemorySnapshot::pin_room` to their difference, and the ledger keeps every pin
+  (other, later, prefix cache, staging and the experts) within it, the full-mode margin excepted
+  (it is RAM, not pins). Before this, the FP8 artifact's automatic 77 GiB of expert RAM failed to
+  pin. Linux has no such bound in the snapshot: `RLIMIT_MEMLOCK` was read but never applied, and
+  is no longer read.
 - **Ledger** (`models/qwen4_exp/memory_plan`, pure, RT1): planned = the other pins (the token
   embedding) and later pins (a 256 MiB allowance for the Program's pinned and mapped buffers),
   each with 0.25 % lock overhead, plus the n-gram row cache, load staging (264 MiB) and 1 GiB of
@@ -7422,8 +7451,9 @@ R7 and R8 implemented on `claude/fn-memory-tier` (from the integration branch, 2
   any order and publishes the complete prefix. A fetch channel needs staging (the zero-copy route
   could not release ring slots) and at most `kMaxFetch` = 512 jobs. Tier records are read with
   `.cv` loads (their host slots are rewritten; the full-mode bank keeps `.cs`). Waits: the CPU
-  wait and the fetch poller end when the host's heartbeat has not changed for 1 s and write
-  `kErrorHostSilent` (no trap unless the source has no error word); host failures write their
+  wait and the fetch poller end when the host's heartbeat has not changed for 10 s and write
+  `kErrorHostSilent` (the CPU service) or `kErrorFetchSilent` (the fetch responder; no trap unless
+  the source has no error word); host failures write their
   errno; an SSD-only expert with no path writes `kErrorUnservedRecord`. Tests (layer test): SSD-only
   sets served by CPU jobs (caps 8 and 256, fork, zero staging) and by the fetch channel (serial
   passes of 1 and 3 slots, overlap, fork, landing, with CPU jobs taking the narrow ones), a
@@ -7778,6 +7808,13 @@ the drive's knee) remains open.
   arithmetic is placement-invariant.
   - `Forward::run` is now `begin_call`, `embed`, `layer` × 48 and `finish`; the walk calls the
     same steps per (layer, chunk).
+  - **MoE groups (2026-10-12).** The walk runs each layer in two halves: `layer_mixer` per chunk
+    (everything before the MoE; its input and inject weights go to the span area), then
+    `layer_moe` once over a group of consecutive chunks (up to `kWalkMoeColumns` = 16,384 columns,
+    and what the active arena holds, `Forward::moe_workspace_bytes`). Every MoE step acts column by
+    column, so the outputs are the chunk-major ones; the expert calls see 2-4x the columns (the IQ3_S
+    expert tiles run 33-50 % more effective TOPS at 16,384 tokens than at 4,096). The route log keeps
+    the group's last chunk (`route_columns`), the span's last as before.
 - **Spans.** Consecutive calls of at least 256 columns, up to `kWalkMaxTokens` = 65,536 tokens.
   - A prefix tap due at an inner chunk end is captured inside the span (`walk_plan_taps`, decided as
     `prefix_after_prefill_call` decides after a chunk-major call). At the span's start a staged
@@ -7789,8 +7826,9 @@ the drive's knee) remains open.
     handled as before. Until 2026-10-11 a span ended at each such call instead, and every tap
     streamed the non-resident experts once more.
   - A single call keeps the chunk-major path.
-- **Memory.** The span's residual stream (BF16 [S·H, tokens], 20 KB per token: 1.3 GB at 64K)
-  and every chunk's staged io image live in the stream lease after the ring.
+- **Memory.** The span's residual stream (BF16 [S·H, tokens], 20 KB per token: 1.3 GB at 64K),
+  every chunk's staged io image and an MoE group's input (84 MB) live in the stream lease after
+  the ring.
   - At the prompt's first walk the lease is lent with that area, and the ring's halves are widened
     by the experts the larger lease evicts.
   - Without enough lendable frames the prompt runs chunk-major.
@@ -8375,11 +8413,29 @@ elastic pool does the same job with no kernel change:
   1 / (1 + C t) was tried and dropped: at a share near 1/2 the noise flips floor(M share) for M = 2
   between startups (3 workers: 100.8 against 107.5 tok/s plain).
   `cpu_pcie_divisor = 0`, the default, derives d; a positive value fixes it.
+- Without speculation, a GGUF import's one-column calls (plain decode) take their divisor from the
+  round's context: d = 1 (every host-memory miss on the link) below 1,536 context tokens, d = 2 from
+  there; each round writes it into a device io word (`MoeCpuChannel::one_column_divisor_device`) that
+  the captured decode graphs read. Its wider calls keep the derived d. Its CPU route is compute-bound
+  (exact integer arithmetic), unlike the NVFP4 route the rule above was fitted on. Measured
+  2026-10-13 on IQ3_S (16 workers, derived d = 2), tg512 with d fixed for every call at 1 / 2 / 3 / 4:
+  126.5 / 122.7 / 122.1 / 121.8 tok/s; MTP 197.3 / 215.6 / 208.0 / 204.0. d = 1 in one-column calls
+  only (same binary): plain 123.1 -> 126.4 tok/s, MTP 216.2 -> 212.9 (its rounds' one-column calls
+  lose), so with MTP or n-gram drafts every call keeps d. The context threshold (2026-10-16, Q2
+  artifact, plain decode, d = 1 / d = 2, prompt + output): 512 + 256 151.5 / 139-141 tok/s, 1K + 256
+  152.4 / 143.8, 2K + 256 124.9 / 129.9, 4K + 512 99.5 / 114.4, 32K + 256 119.5 / 126.3; the rule
+  gave 151.4 / 115.2 at 512 / 4K and 114.4 at 1K + 1,024 (d = 1 105.5, d = 2 121.0). A divisor
+  following the expert hit rate over eight-token windows was rejected: below the better fixed
+  divisor at every length (47 switches in a 4K run). The prefill CPU split sets no one-column
+  divisor; a fixed `cpu_pcie_divisor` applies to every call.
 - The CPU team's decode rate C is measured at startup for the configured workers
   (`program/cpu_rates.cpp`, ~30 ms): the best of 3 batches of 8 rounds of 16 one-column jobs on
   real records from the pinned banks (across layers, past the last-level cache) while the link
-  copies records into the staging slots (the staging's DRAM reads compete with the CPU's). Without host records (the SSD tier) the
-  i9-13900K's 6-worker rate stands (21,000 experts/s). The prefill CPU split below keeps its fitted
+  copies records into the staging slots (the staging's DRAM reads compete with the CPU's). The SSD
+  tier measures it on its RAM copies once its startup fill is done, and the channels' divisor
+  follows (2026-10-11: with the i9-13900K's 6-worker NVFP4 rate of 21,000 experts/s as the
+  reference, the FP8 artifact's 4.69 MiB records gave d = 5); before any host record exists the
+  reference stands. The prefill CPU split below keeps its fitted
   rates; on measured ones (lower under the link's load: 6 workers 17,000 experts/s and 46,000
   expert columns/s against 21,000 / 66,000) it is not yet qualified.
   Measured (2026-10-09, tg512 cold, Dense8, two passes in opposite orders). With fixed divisors the

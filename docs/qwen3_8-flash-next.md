@@ -2,7 +2,8 @@
 
 Infernix runs NVIDIA's NVFP4 checkpoint of Qwen3.8-Flash-Next
 ([nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4)) on one
-RTX 5090 (32 GB). The 24,576
+RTX 5090 (32 GB), and ISTA-DASLab's GSQ-RCO IQ3_S GGUF bit-exactly
+([GGUF import](#gguf-import-ista-daslab-gsq-rco-iq3_s)). The 24,576
 routed experts (63 GiB) live in pinned host RAM. A VRAM expert cache holds the hot ones, and the
 CPU computes part of each layer's misses. The 52 GB PLE n-gram table lives on an NVMe volume. The
 design, measurements and open work are in the
@@ -14,7 +15,8 @@ drafter (`--spec mtp`), n-gram copy proposals, images and video (`--vision`), an
 decode-quality judge) runs teacher-forced through the generation path; `--a16-activations` scores
 with 16-bit activations in every linear and every expert bank (the exact W4A16 expert
 arithmetic): the [quality reference](maintainer/model-quality.md#6-numerical-acceptance-policy-and-fast-paths).
-Pass the n-gram volume with `--ngram-volume` when it is not `<artifact>.ngram`.
+Pass the n-gram volume with `--ngram-volume` when it is not `<artifact>.ngram`, and an expert stripe
+with `--expert-stripe` in the SSD tier.
 
 ## Requirements
 
@@ -29,6 +31,14 @@ Pass the n-gram volume with `--ngram-volume` when it is not `<artifact>.ngram`.
   Windows lets the GPU page-lock RAM only up to its *shared GPU memory* (Task Manager → Performance
   → GPU; often half of RAM). Experts past that limit stay in RAM unpinned and the CPU serves them
   (see [Page-locking limit](#page-locking-limit)), so the limit costs some speed, not RAM.
+  An artifact whose experts exceed RAM (the FP8 conversion's 112.6 GiB) takes everything the
+  ledger allows, so only about the headroom stays available while it runs: other programs page,
+  and Windows may stall Infernix's own threads for a moment (rounds wait up to 10 s for its CPU
+  expert service and SSD reads before they fail). A larger `--ram-headroom-mib` leaves more for
+  other programs and costs the experts it keeps out of RAM: with the FP8 artifact on a 96 GB
+  machine (2026-10-17, one run each), plain tg512 measured 43.8 tok/s at 2048, 38.3 at 5120 and
+  35.6 at 8192; MTP 4 at 4K + 512 measured 36.3-43.5, 40.4-40.9 and 39.6-39.7 (two runs each; how
+  much RAM is free at startup moves it as much as the headroom does).
 - **VRAM.** All of it: the expert cache takes what the dense weights, the KV cache, the
   workspaces and a reserve for CUDA graphs leave, less a headroom for the display and other
   programs (see [VRAM](#vram)).
@@ -91,6 +101,158 @@ opens part 1. `--resource` stores the maintained Qwen3.8 template, as for Qwen3.
   512 of its rows against the checkpoint, so a volume of another checkpoint is refused.
 - **Duration.** A conversion takes ~11 minutes from a warm disk cache; the MTP experts' MSE
   scale search accounts for several of them.
+
+### GGUF import: ISTA-DASLab GSQ-RCO IQ3_S
+
+Recipe `qwen3_8_flash_next_gsq_rco_iq3s` imports
+[ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)
+`IQ3_S` bit-exactly into one artifact, `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix` (not published):
+
+- Every quantized GGUF tensor is stored as its own GGUF blocks, byte for byte. That covers the
+  imatrix mix of `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_XS` and `IQ4_NL` gate/up experts, `IQ4_NL` and
+  `Q2_0` down experts, and `Q4_K`, `Q5_K`, `Q6_K`, `IQ4_XS` and `IQ4_NL` dense projections. The one
+  `Q8_0` tensor is stored as the identical `q8_g32_fp16` words, and BF16/F32 tensors keep their
+  values.
+- The `Q4_K`, `Q5_K`, `Q6_K` and `IQ4_XS` dense projections keep the same blocks in tiles of 16 rows
+  (`ggml_tiles16_v1`), which the decode and verification kernels read in 16-byte runs. The outputs
+  are bit-identical; MTP with n-gram drafts decodes about 3.7 % faster than from GGUF row order.
+- The converter undoes llama.cpp's layout transforms exactly, and checks every one: norms stored
+  as 1 + g, the GDN value-head order, `ssm_a` = −exp(A_log) and the concatenated indexer
+  projections.
+- The imatrix only shaped the quantization, so it needs nothing at run time.
+- The PLE n-gram table is the GGUF's `IQ4_NL` table, a 29.1 GB volume (27.1 GiB).
+- The GGUF has no MTP head, so `--model` names a Qwen checkpoint directory that supplies it: the
+  `mtp.*` tensors, `config.json` and the tokenizer files. `tools/convert/fetch_tensors.py` range-reads
+  just those from
+  [Qwen/Qwen3.8-Flash-Next-FP8](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8) at a pinned
+  revision (~2.7 GB instead of the whole checkpoint). The drafter is re-quantized as in recipes
+  A-C, except that its routed experts are `q2_g64_fp16` instead of `q4_g64_fp16`. It only proposes
+  tokens, so the outputs are unchanged, and MTP with n-gram drafts decodes about 3 % faster.
+- The vision tower comes from the repository's `mmproj` (BF16; unsloth's `mmproj-BF16.gguf` is the
+  same file content): `--components text,vision,mtp --mmproj <mmproj-BF16.gguf>`. Every value must
+  be exact in BF16, and the 441 tensors equal the tower recipes A-C import from Qwen's checkpoint
+  bit for bit (`verify_gguf_artifact --mmproj ... --vision-reference <recipe B artifact>`).
+
+Every weight is computed with BF16 activations in an exact integer arithmetic. Each output is the
+exact sum, rounded once, so the GPU's result has the same bits wherever an expert is computed and
+at any batch width. The arithmetic is described in
+[the plan](maintainer/qwen3_8-flash-next-iq3s-plan.md) §6. llama.cpp quantizes activations to
+Q8_1 instead, so its logits differ slightly from these.
+
+```text
+python -m tools.convert.fetch_tensors --repo Qwen/Qwen3.8-Flash-Next-FP8 --revision 236dfdf285828023ca3bcd3f37366c58a3469b13 \
+  --out <dir>/Qwen3.8-Flash-Next-FP8-partial --pattern "mtp.*"
+python -m tools.convert --model <dir>/Qwen3.8-Flash-Next-FP8-partial --gguf <IQ3_S-00001-of-00002.gguf> \
+  --gguf <IQ3_S-00002-of-00002.gguf> --mmproj <mmproj-BF16.gguf> --recipe qwen3_8_flash_next_gsq_rco_iq3s \
+  --components text,vision,mtp --proposal --device cpu \
+  --name Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix --out <dir>/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix.infernix \
+  --ngram-out <nvme>/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix.ngram
+python -m tools.artifact.rename <dir>/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix.infernix Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix.infernix --numbered
+python -m tools.flash_next.verify_gguf_artifact --model <dir>/Qwen3.8-Flash-Next-FP8-partial \
+  --gguf <shard 1> --gguf <shard 2> --mmproj <mmproj-BF16.gguf> \
+  --artifact <dir>/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix-00001-of-00002.infernix --ngram <volume> --ngram-rows all
+```
+
+The rename names the two files as numbered parts, as for recipe B; open part 1. The conversion took
+11-14 minutes. The verification compares every expert record, GGUF row, tensor
+and n-gram row with the GGUF (a tiled matrix after untiling) and found no difference. The artifact
+is 56.8 GB, of which the routed experts are 46.9 GiB.
+
+- **Vision** (`--vision`) runs the same tower and kernels as recipe B. A 1024 x 1024 image encoded
+  in 1.9-2.0 s against recipe B's 1.4 s (1.7-1.8 s before the expert cache's size classes; the
+  difference is not attributed); the IQ3_S model read the image's label and described it as
+  recipe B did.
+- **Experts beyond RAM.** The SSD tier serves this artifact as it serves recipe B: with
+  `--expert-ram-mib 24576` (24 of 46.9 GiB in RAM) tg512 measured 107.4 tok/s and pp4096 821 tok/s,
+  against 109.6 and ~2,215 with every expert in RAM. Greedy output is the same with every expert in
+  RAM, with 24 GiB and with 8 GiB (400 tokens).
+- **Expert cache.** The records come in five sizes (mean 1.95 MiB, largest 2.54 MiB). The cache
+  keeps one frame pool per size, each with its own frames and LFRU counters, so it holds 13,008
+  experts where frames of the largest size held about 10,200.
+
+**Speed and quality** (RTX 5090 on PCIe 5.0 x8, i9-13900K, INT8 KV, one request, against recipe B
+in the same session on 2026-10-16; the n-gram table in RAM, `auto`; one run of `-r 3`, or `-r 1`
+at 128K):
+
+| `infernix_bench` | GSQ-RCO IQ3_S | Recipe B |
+|---|---:|---:|
+| tg512, plain | 145.6 tok/s | 110.3 tok/s |
+| tg512, `--spec mtp --draft-tokens 4 --lm-head-draft` | 259.9 tok/s (75 % of drafts accepted) | 143.1 tok/s |
+| pp4096, `--prefill-chunk 4096` | 2,228 tok/s | 1,662 tok/s |
+| pp131072, `--prefill-chunk 4096`, code and docs | 4,324 tok/s | 10,933 tok/s |
+
+Earlier the IQ3_S column measured 109.6, 187.4, 2,215 and 2,836 tok/s. Between the two, the
+narrow-width IQ3_S kernels, the tiled dense layout, the Q2 drafter and plain decode's divisor by
+context landed, each measured on its own in the [plan](maintainer/qwen3_8-flash-next-iq3s-plan.md);
+this table does not split the gain between them. Recipe B's column measured
+120.5 and 176.3 tok/s for decode before; its lower decode here (84.5 % of routed experts hit the
+cache in tg512) is not attributed.
+
+- **Decode** is faster than recipe B's: the IQ3_S experts are smaller (the cache holds 13,008 of
+  them, and 98.6 % of routed experts hit it in tg512), and the CPU expert engine computes part of
+  the misses with the same bits as the GPU.
+- **Prefill** of 4K tokens is faster: the smaller experts cross PCIe sooner, and dense and expert
+  projections run as exact integer tensor-core tiles. At 128K the tiles' integer arithmetic is the
+  limit against recipe B's FP4 tensor cores, so recipe B is 2.5× faster.
+- **Quality.** Teacher-forced perplexity over the three frozen texts below (2,557 positions, INT8
+  KV) is 4.794, against 4.653 for recipe B (+0.030 ± 0.011 nats per token, mostly on chat:
+  +0.058 ± 0.019). Against Strata's UD-Q4_K_XL (4.864) it is −0.015 ± 0.012 nats, level within
+  the error. The mean KL divergence from recipe B's distribution is 0.10.
+
+### Official FP8 checkpoint
+
+Recipe `qwen3_8_flash_next_fp8` imports
+[Qwen/Qwen3.8-Flash-Next-FP8](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8) bit-exactly into
+one artifact, `Qwen3.8-Flash-Next-FP8-Infernix` (not published):
+
+- Each routed expert's E4M3FN codes and BF16 128×128 tile scales are stored unchanged
+  (`fp8_e4m3fn_b128`, a 4.69 MiB record). They are computed with BF16 activations in exact integer
+  arithmetic, rounded once, so every placement (VRAM, PCIe, CPU, SSD) gives the same bits.
+- Every other tensor of the checkpoint keeps its values (its dense layers are BF16).
+- The n-gram table is the [BF16 n-gram table](#bf16-n-gram-table): the checkpoint's FP8 table is
+  that table quantized, so `--ngram-reuse` with the BF16 volume checks that sampled rows quantize to
+  the checkpoint's FP8 codes and records the volume as the artifact's own
+  (`verify_artifact --ngram ... --ngram-rows all` checks every row).
+- The MTP drafter is re-quantized as for the IQ3_S import: projections in `q8_g32_fp16`, routed
+  experts in `q2_g64_fp16`. With `q4_g64_fp16` drafter experts instead, the outputs were identical
+  (24 teacher-forced MTP segments) and decode measured the same within run-to-run spread (MTP 4 at
+  4K + 512, four alternating pairs: the 2-bit drafter ahead in two by 1.0-2.0 tok/s and behind in
+  two by 0.6-1.2), so the smaller drafter leaves its 0.63 GB of VRAM to the expert cache.
+
+```text
+python -m tools.convert --model <dir>/Qwen3.8-Flash-Next-FP8 --recipe qwen3_8_flash_next_fp8 \
+  --components text,vision,mtp --proposal --device cpu --name Qwen3.8-Flash-Next-FP8-Infernix \
+  --out <dir>/Qwen3.8-Flash-Next-FP8-Infernix.infernix --ngram-reuse <fast drive>/Qwen3.8-Flash-Next-BF16.ngram
+python -m tools.artifact.rename <dir>/Qwen3.8-Flash-Next-FP8-Infernix.infernix Qwen3.8-Flash-Next-FP8-Infernix.infernix --numbered
+python -m tools.flash_next.verify_artifact --model <dir>/Qwen3.8-Flash-Next-FP8 \
+  --artifact <dir>/Qwen3.8-Flash-Next-FP8-Infernix-00001-of-0000N.infernix \
+  --ngram <fast drive>/Qwen3.8-Flash-Next-BF16.ngram --ngram-rows all
+```
+
+The artifact is 132.7 GB in five numbered parts, of which the routed experts are 112.6 GiB: more
+than a 96 GB machine can hold, so it always runs in the [SSD expert tier](#ssd-expert-tier) (on
+this machine 74.1 GiB of experts page-locked plus up to 8 GiB of unpinned records, by the RAM free
+at startup). The verification found every expert, all 1,615 imported tensors and all 320,001,536
+n-gram rows equal to the checkpoint (2026-10-17).
+
+Measured with default options (INT8 KV, one request, the BF16 n-gram table; 2026-10-16/17):
+
+| `infernix_bench` | FP8 |
+|---|---:|
+| tg512, plain | 43.8-44.4 tok/s |
+| pp4096 + tg512, `--spec mtp --draft-tokens 4 --lm-head-draft` (decode) | 43.5-49.3 tok/s |
+| the same with `--ngram-draft-tokens 7 --ngram-min-match 4` | 53.8-54.2 tok/s |
+| pp4096, `--prefill-chunk 4096` | 690 tok/s |
+
+Decode is bound by the CPU expert engine serving about a third of routed experts (50-60 % hit the
+VRAM cache), and prefill by reading ~38 GiB of experts per 4K-token prompt from one drive; the
+MTP range follows the unpinned records the RAM free at startup allows (4.2 to 7.4 GiB in those
+runs, rising run by run). On 2026-10-12, before the FP8 route work and the unpinned records, the
+4-bit-drafter conversion measured tg512 26.4, tg512 with MTP 39.0 and pp4096 449 tok/s.
+
+On the 1M-token perplexity corpus (quick, 4K context, INT8 KV) it scores 3.487 against recipe B's
+3.508, with a mean KL divergence of 0.050 from recipe B's distribution (the exact route, which the
+drafter does not change).
 
 ## Run
 
@@ -169,6 +331,8 @@ infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8
 - The engine starts six CPU worker threads for missed experts (up to 16 per layer call). They
   spin while decoding. More
   workers measured slower: the CPU and the PCIe stage share the host's memory bandwidth.
+  The GSQ-RCO IQ3_S artifact's CPU route decodes its GGUF blocks before multiplying, so it is
+  compute-bound and starts 16 workers instead (decode 98.4 tok/s with six, 103.7 with 16).
 - On Windows the engine opts its process out of power throttling. Windows otherwise slows a
   process it considers in the background (a server whose console is not in front, a job without a
   window) and moves its threads to efficiency cores; a hidden run decoded 37.6 tok/s at 8K throttled
@@ -198,6 +362,52 @@ infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8
   text reads most of its rows from the volume. Rows missing from that cache are read while the
   GPU starts the round (draft tokens' rows while the verification round starts), so most of that
   read time is hidden.
+
+## N-gram table in RAM
+
+`--ngram-residency auto|ram|volume` chooses where the PLE n-gram table lives:
+
+- `volume` reads rows from the NVMe volume on demand, through a host cache of 2^20 rows.
+- `ram` reads the whole volume into pinned RAM at startup and never touches the drive again. The
+  GGUF import's `IQ4_NL` table takes 27.1 GiB; NVIDIA's FP8 table takes 48.8 GiB. The read uses
+  unbuffered 1 GiB requests. The RAM ledger counts the table, and startup stops if it does not fit.
+- `auto`, the default, takes RAM only when the ledger still holds every routed expert in RAM
+  beside the table, and the volume otherwise. On a 96 GB machine that means RAM for the GGUF
+  import (46.9 + 27.1 GiB) and the volume for recipes A and B (64.5 + 48.8 GiB do not fit).
+
+The startup line names the choice: `n-gram table: in RAM (N MiB pinned)`, or `n-gram table: read
+from its volume`, which `auto` follows with `(the RAM ledger keeps the experts resident first)`.
+The rows are the same bytes either way, so outputs do not change.
+
+## BF16 n-gram table
+
+Most artifacts bind a quantized n-gram table: NVIDIA's FP8 rows with one scale for the whole table
+(recipes A-C), or the GGUF import's IQ4_NL rows. A BF16 volume holds the table as Qwen's
+BF16 checkpoint stores it, and any Qwen3.8-Flash-Next artifact runs with it: pass it with
+`--ngram-volume`. The engine reads the row format from the volume's header (a startup line names
+it), and the PLE takes the BF16 rows as its embedding, with no dequantization. A volume of the other
+quantized format (FP8 rows for the GGUF import, IQ4_NL rows for the others) is refused. The FP8
+checkpoint's artifact binds the BF16 table as its own (`--ngram-reuse` with the BF16 volume), so
+it needs this volume and accepts no quantized one.
+
+```text
+python -m tools.convert.fetch_tensors --repo Qwen/Qwen3.8-Flash-Next --revision <sha> --out <dir> \
+  --pattern "model.language_model.layers.*.ple.ple_embedding.*"
+python -m tools.flash_next.ngram_bf16 --model <dir> --out <fast drive>/Qwen3.8-Flash-Next-BF16.ngram
+python -m tools.flash_next.ngram_bf16 --model <dir> --out <fast drive>/Qwen3.8-Flash-Next-BF16.ngram --verify
+infernix-serve <artifact part 1> --ngram-volume <fast drive>/Qwen3.8-Flash-Next-BF16.ngram ...
+```
+
+Any checkpoint that carries Qwen's BF16 table unchanged serves as `--model`: UkisAI's Swift 1.5
+NVFP4 export keeps it in its `embedding-*.safetensors` files, and all 128 shards are byte-identical to
+Qwen/Qwen3.8-Flash-Next's (31 files by SHA256, the other 4 tensors compared byte for byte). Writing
+the volume from local shards took 205 s; `--verify` of 1,000,000 sampled rows 215 s.
+
+The table is ~102 GB in the checkpoint and the volume ~109 GB (rows of 320 bytes, 12 per 4 KiB
+block, against 52 GB for FP8). A token reads as many 4 KiB blocks as with the FP8 volume, so a drive
+with fast random reads serves it as fast; it does not fit in RAM (`--ngram-residency auto` keeps it
+on the volume). A persistent prefix cache saved with one table is not restored with the other.
+The quality change against the FP8 table has not been measured yet.
 
 ## Chat template
 
@@ -264,7 +474,29 @@ experts read from disk. The tier needs at least 2.6 GiB (1,024 slots). A read th
 requests running in that round with an error and the server keeps serving; queued requests wait as
 usual, and the prefix cache is emptied (the failed round may have published state it never
 computed). If the tier's read thread or the CPU expert service itself stops, every later round
-would fail too, so the server stops with that cause.
+would fail too, so the server stops with that cause. A round waits for either while it shows signs
+of life, and fails only when one has been silent for 10 s ("the CPU expert service stopped
+answering" or "the SSD expert tier's read agent stopped answering"); until 2026-10-17 that was 1 s,
+which RAM pressure alone could exceed (FP8 runs at the default headroom failed 8 times in 34).
+
+**A second drive (`--expert-stripe FILE`).** One drive bounds the tier's reads, most of all in
+prefill, which reads every expert missing from RAM (about 38 GiB for a 4K-token prompt with the FP8
+artifact). An expert stripe holds the tail of every expert record on another drive; the tier then
+reads each record's head from the artifact and its tail from the stripe at the same time, at the
+same queue depth on each drive. The artifact is unchanged and keeps every record whole, so the
+stripe costs a copy of the tails only (by default half the experts: 56 GiB for the FP8 artifact).
+The stripe names its artifact, which refuses any other. Write it once, on a drive other than the
+artifact's (and the n-gram volume's), and check it against the artifact:
+
+```text
+python -m tools.flash_next.expert_stripe <artifact part 1> D:\stripes\<model>.stripe
+python -m tools.flash_next.expert_stripe <artifact part 1> D:\stripes\<model>.stripe --verify
+infernix-serve <artifact part 1> --expert-stripe D:\stripes\<model>.stripe ...
+```
+
+`--tail-fraction F` (default 0.5) moves more of each record to a faster second drive. Records then
+are read in two parts each, never as runs of neighbouring records. With every expert in RAM the
+stripe is not used. Outputs are the same bits with or without it.
 
 The tier and the n-gram volume read with unbuffered, 4 KiB-aligned I/O. On ZFS (NInfer #404) a
 dataset's `recordsize` (128 KiB by default) is the unit the filesystem reads, so each small read

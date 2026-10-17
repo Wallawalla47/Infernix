@@ -137,7 +137,7 @@ int run_tests() {
                       "CLI narrow ngram/wide MTP pair changed");
     failures += check(rejects([] {
                           (void)parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--spec",
-                                       "mtp", "--draft-tokens", "6", "--ngram-draft-tokens", "15"});
+                                       "mtp", "--draft-tokens", "8", "--ngram-draft-tokens", "15"});
                       }),
                       "CLI admitted unsupported MTP neural width");
     const infernix::cli::Options configured =
@@ -325,6 +325,11 @@ int run_tests() {
     const auto state_file = parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--expert-state", "cache.state"});
     failures += check(state_file.expert_state && *state_file.expert_state == "cache.state",
                       "CLI --expert-state FILE must name the file");
+    failures += check(parse({"infernix-cli", "model.ninfer", "--prompt", "x"}).expert_stripe_path.empty(),
+                      "CLI expert stripe must default to none");
+    failures += check(parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--expert-stripe", "D:/m.stripe"})
+                              .expert_stripe_path == "D:/m.stripe",
+                      "CLI --expert-stripe FILE must name the file");
     // --fast-path NAME: a qualification candidate, repeatable; unknown names are refused.
     const auto candidate = parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--fast-path", "sampled-mtp-drafts",
                                   "--fast-path", "preemption"});

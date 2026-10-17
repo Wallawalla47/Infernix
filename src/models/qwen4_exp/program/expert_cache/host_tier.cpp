@@ -194,6 +194,34 @@ std::uint32_t HostTier::release_shadows() {
     return released;
 }
 
+std::vector<std::uint32_t> HostTier::lend(std::uint32_t n) {
+    std::vector<std::uint32_t> out;
+    while (out.size() < n) {
+        std::int32_t s = -1;
+        if (!free_resident_.empty()) {
+            s = static_cast<std::int32_t>(free_resident_.back());
+            free_resident_.pop_back();
+        } else {
+            s = peek_victim(Victims::kShadow);
+            if (s < 0) { s = peek_victim(Victims::kResident); }
+            if (s < 0) { break; }
+            evict(static_cast<std::uint32_t>(s));
+        }
+        slots_[static_cast<std::uint32_t>(s)].list = SlotList::kLent;
+        lent_.push_back(static_cast<std::uint32_t>(s));
+        out.push_back(static_cast<std::uint32_t>(s));
+    }
+    return out;
+}
+
+void HostTier::give_back() {
+    for (const std::uint32_t s : lent_) {
+        slots_[s].list = SlotList::kNone;
+        free_resident_.push_back(s);
+    }
+    lent_.clear();
+}
+
 void HostTier::mark_used(std::uint32_t slot) {
     if (!(slots_[slot].pins & kPinUse)) {
         slots_[slot].pins |= kPinUse;
@@ -405,6 +433,12 @@ void HostTier::check() const {
     for (const auto s : free_resident_) {
         place(s, "free");
         if (slots_[s].list != SlotList::kNone || slots_[s].state != SlotState::kFree) { fail("free slot state"); }
+    }
+    for (const auto s : lent_) {
+        place(s, "lent");
+        if (slots_[s].list != SlotList::kLent || slots_[s].state != SlotState::kFree || slots_[s].pins != 0) {
+            fail("lent slot state");
+        }
     }
     std::size_t residents = 0, shadows = 0;
     for (std::uint32_t s = 0; s < slots_.size(); ++s) {

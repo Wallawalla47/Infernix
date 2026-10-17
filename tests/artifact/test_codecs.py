@@ -79,6 +79,17 @@ def test_direct_layout_preserves_exact_little_endian_words(
     ),
     [
         pytest.param(
+            "q2_g64_fp16",
+            65,
+            64,
+            128,
+            256,
+            (-2, -1, 0, 1, -1),
+            b"\x4e\x03",
+            b"",
+            id="q2",
+        ),
+        pytest.param(
             "q4_g64_fp16",
             65,
             64,

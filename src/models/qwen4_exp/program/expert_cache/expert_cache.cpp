@@ -542,6 +542,7 @@ std::uint32_t CacheController::lend(std::uint32_t first, std::uint32_t count, st
     for (std::uint32_t v : victims) {
         if (table_[v].state == ResidencyState::kAbsent) { continue; } // still queued: drain drops it
         frames_.release_now(make_absent(v, out));
+        lent_victims_.push_back(v);
         ++evicted;
     }
     // The run's other experts move into free frames outside it, so the loan costs the cache its
@@ -562,11 +563,28 @@ std::uint32_t CacheController::lend(std::uint32_t first, std::uint32_t count, st
     return evicted;
 }
 
-void CacheController::give_back(std::uint32_t first, std::uint32_t count, std::vector<Command>& out) {
+void CacheController::give_back(std::uint32_t first, std::uint32_t count, std::vector<Command>& out, bool refill,
+                                const LfruPolicy::Admissible* admissible) {
     frames_.give_back(first, count);
     std::vector<std::uint32_t> none;
     policy_.set_capacity(policy_.capacity() + count, none);
     drain_queue(out);
+    // The loans' victims, the last evicted (the best of them) first.
+    while (refill && !lent_victims_.empty() && policy_.resident_count() < policy_.capacity()) {
+        const std::uint32_t key = lent_victims_.back();
+        if (table_[key].state != ResidencyState::kAbsent || policy_.resident(key) ||
+            (admissible != nullptr && !(*admissible)(key))) {
+            lent_victims_.pop_back();
+            continue;
+        }
+        const auto frame = frames_.acquire();
+        if (!frame) { break; }
+        lent_victims_.pop_back();
+        const std::uint32_t one[] = {key};
+        policy_.seed(one, {});
+        load(key, *frame, out);
+    }
+    if (frames_.loaned_count() == 0) { lent_victims_.clear(); }
 }
 
 } // namespace infernix::models::qwen4_exp::expert_cache

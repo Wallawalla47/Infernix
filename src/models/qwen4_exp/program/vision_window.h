@@ -35,14 +35,15 @@ struct VisionWindowPlan {
     std::size_t window_bytes     = 0; // weight staging (offload) + pass arena
     double seconds               = 0; // estimated tower time
     bool lease                   = false; // placement L
-    std::uint32_t frames         = 0;     // frames lent: the handoff (W) or handoff + window (L)
+    std::size_t lease_bytes      = 0;     // bytes lent: the handoff (W) or handoff + window (L)
+    std::uint32_t frames         = 0;     // lease_bytes in frames of frame_bytes
     std::uint32_t steps          = 0;     // admission steps (W: 1)
     std::uint32_t layers_per_step = 0;    // L: encoder layers per step
 };
 
 // Plans the window over `items` (prompt order) past `reused` tokens. `pass_bytes` is the pass arena
 // of the encoded items, `staging_bytes` the weight staging (0 when resident), `work_capacity` the
-// prefill workspace, `frame_bytes` the expert frame stride, `out` the tower's output width,
+// prefill workspace, `frame_bytes` the pitch of the frames it is lent from, `out` the tower's output width,
 // `hidden` its width and `depth` its layers.
 [[nodiscard]] VisionWindowPlan plan_vision_window(std::span<const VisionWindowItem> items, std::uint32_t reused,
                                                   std::size_t pass_bytes, std::size_t staging_bytes,

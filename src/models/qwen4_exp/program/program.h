@@ -303,7 +303,8 @@ struct ProgramDevicePlan {
     std::uint64_t state     = 0; // GDN, PLE and QSA tail state, verification records, MTP columns
     std::uint64_t io        = 0; // per-call inputs, logits, sampling and round arrays
     std::uint64_t residency = 0; // the expert frame tables and route log
-    std::uint64_t expert_record_stride = 0; // one expert frame
+    std::uint64_t expert_record_stride = 0; // the largest expert record (staging and stream-ring slots)
+    std::uint64_t expert_frame_bytes   = 0; // one average expert frame (the cache's sizing unit)
     std::uint32_t max_frames           = 0; // the most frames the expert cache uses
     std::uint32_t graph_bound          = 0; // CUDA graph executables the Program may instantiate
 
@@ -339,11 +340,19 @@ struct ProgramOptions {
     // The fast paths the Forward runs (fast_paths.h); all off on the exact route.
     execution::ForwardFastPaths fast_paths;
     std::filesystem::path ngram_volume;
+    // The table that volume holds (resolve_ngram_volume): a BF16 volume replaces the artifact's FP8 or
+    // IQ4_NL table. Empty: the artifact's table.
+    std::optional<NgramTableConfig> ngram_table;
+    // The whole n-gram table read into pinned RAM at startup (EngineOptions::ngram_residency,
+    // resolved by the RAM ledger); rows are then never read from the volume.
+    bool ngram_in_ram = false;
     // The expert cache's saved state (design §19.3.5 S4b): read at startup to fill the frames, written
     // at stop and every 10 minutes between requests. Empty: no warm start. The identity names the
     // artifact the state belongs to.
     std::filesystem::path expert_state;
     std::string expert_state_identity;
+    // The SSD tier reads each record's tail from this expert stripe (EngineOptions::expert_stripe_path).
+    std::filesystem::path expert_stripe;
     // Device memory left free for the display and other programs once the fixed allocations and
     // the expert frames are made (design §19.3.7); empty selects it from the display state.
     std::optional<std::uint64_t> vram_headroom;
@@ -394,6 +403,10 @@ struct ProgramOptions {
     // Defaults measured fastest on the i9-13900K (design sections 19.2 and 19.3.16): 16 jobs pay in
     // calls with many misses (C = 4 fill +7 %, cold MTP +3 %) and are neutral elsewhere; 32 is no faster.
     std::uint32_t cpu_expert_workers = 6;
+    // The workers for a GGUF import's banks (the ggml CPU route, compute-bound where the NVFP4
+    // route is DRAM-bound): on the i9-13900K, tg512 decoded 100.5 tok/s without CPU service, 98.4
+    // with 6 workers, 103.7 with 16 and 103.6 with 20 (2026-10-11; 16 workers with divisor 3: 101.1).
+    std::uint32_t cpu_ggml_expert_workers = 16;
     std::uint32_t cpu_expert_jobs    = 16;
     std::int32_t cpu_pcie_divisor    = 0;
     // Prefill CPU assist (design §19.3.1 P7): prefill calls wider than a decode round and narrower

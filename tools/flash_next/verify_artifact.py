@@ -7,13 +7,17 @@ Every logical parameter the recipe stores as the checkpoint has it must equal th
 
 - each routed expert's E2M1 codes, E4M3 block scales and FP32 multiplier (decoded from the
   ``nvfp4_expert_rg16_v1`` record): ModelOpt's ``weight_scale_2`` with its gate/up/down
-  ``input_scale`` words, or a weight-only compressed-tensors export's reciprocal global scale;
+  ``input_scale`` words, or a weight-only compressed-tensors export's reciprocal global scale; or,
+  for Qwen's official FP8 checkpoint, each ``fp8_expert_b128_v1`` record byte for byte (its E4M3FN
+  codes and BF16 tile scales);
 - every FP8 row-scaled projection's E4M3FN codes and BF16 row scales;
 - every BF16 tensor bit for bit, and every FP32 widening of a BF16 tensor exactly;
-- the n-gram volume's header, geometry and id, and its FP8 rows (all of them, or a sample): the
-  checkpoint's FP8 words, or its BF16 table's per-tensor quantization (qwen4_exp.NgramTable).
+- the n-gram volume's header, geometry and id, and its rows (all of them, or a sample): FP8 rows
+  equal the checkpoint's FP8 words, or its BF16 table's per-tensor quantization; the BF16 rows of an
+  artifact bound to a BF16 volume equal its BF16 table, or quantize to its FP8 table's words
+  (qwen4_exp.NgramTable).
 
-Parameters the recipe re-quantizes (``q8_g32_fp16``/``q4_g64_fp16``: every recipe's MTP drafter,
+Parameters the recipe re-quantizes (``q8_g32_fp16``/``q4_g64_fp16``/``q2_g64_fp16``: every recipe's MTP drafter,
 recipes B and C's 8-bit classes) are listed per component, not compared. Recipe A passes with only
 the drafter re-quantized.
 
@@ -32,17 +36,21 @@ import time
 
 import torch
 
+import numpy as np
+
+from tools.artifact.codecs.fp8_b128 import decode_expert as decode_fp8_expert
 from tools.artifact.codecs.fp8_row import decode_fp8_row_scaled_words
 from tools.artifact.codecs.nvfp4_expert import decode_nvfp4_expert_bank_words
+from tools.artifact.layouts import fp8_expert_geometry
 from tools.artifact.reader import Artifact
 from tools.convert import qwen4_exp
-from tools.convert.sources.modelopt import nvfp4_matrix_words, nvfp4_packed_matrix_words
+from tools.convert.sources.modelopt import fp8_block_matrix_raw, nvfp4_matrix_words, nvfp4_packed_matrix_words
 from tools.convert.sources.safetensors import SafetensorsSource
 
 _FP8_ROWS = "fp8_e4m3fn_row_bf16"
 
 _WORD = {"bf16": (torch.bfloat16, 2), "fp32": (torch.float32, 4), "int32": (torch.int32, 4)}
-_REQUANTIZED = {"q8_g32_fp16", "q4_g64_fp16"}
+_REQUANTIZED = {"q8_g32_fp16", "q4_g64_fp16", "q2_g64_fp16"}
 
 
 def _binding_formats(artifact: Artifact, binding: dict) -> set[str]:
@@ -105,8 +113,40 @@ def verify_bank(artifact, store, binding, prefix, shape, packed) -> int:
     return bad
 
 
+def verify_fp8_bank(artifact, binding, source: qwen4_exp.Fp8ExpertBankSource) -> int:
+    """Each ``fp8_expert_b128_v1`` record equals the checkpoint's codes and BF16 tile scales of its
+    expert, then zero padding; returns the mismatching experts."""
+
+    obj = artifact.object(binding["object"])
+    g = fp8_expert_geometry(obj.format, obj.shape)
+    if tuple(obj.shape) != source.shape or obj.layout != "fp8_expert_b128_v1":
+        raise ValueError(f"{source.label}: stored bank differs from the checkpoint's shape or layout")
+    _, hidden, inter = source.shape
+    pad = bytes(g.record_stride - g.record_bytes)
+    bad = 0
+    for e in range(source.shape[0]):
+        record = artifact.read_range(obj.offset + e * g.record_stride, g.record_stride)
+        leaf = f"{source.prefix}{e}."
+        expected = (fp8_block_matrix_raw(source.store, leaf + "gate_proj", (inter, hidden)),
+                    fp8_block_matrix_raw(source.store, leaf + "up_proj", (inter, hidden)),
+                    fp8_block_matrix_raw(source.store, leaf + "down_proj", (hidden, inter)))
+        same = record[g.record_bytes :] == pad and all(
+            np.array_equal(codes, got_codes) and np.array_equal(words, got_words)
+            for (codes, words), (got_codes, got_words) in zip(expected, decode_fp8_expert(record, hidden, inter)))
+        bad += not same
+    return bad
+
+
 def verify_ngram(source: qwen4_exp.NgramTable, path: Path, table: dict, rows: str) -> tuple[int, int]:
     shards = source.shards
+    bf16 = table["format"] == "bf16"
+
+    def mismatches(name: str, begin: int, end: int, vol: torch.Tensor) -> int:
+        # FP8 rows equal the checkpoint's words; BF16 rows are its BF16 table (NgramTable.bf16_rows_match).
+        if bf16:
+            return int((~source.bf16_rows_match(name, begin, end, vol)).sum())
+        return int((vol != source.codes(name, begin, end)).any(dim=1).sum())
+
     with path.open("rb") as stream:
         header = stream.read(qwen4_exp.NGRAM_HEADER.size)
         magic, version, header_bytes, nrows, row_bytes, per_block, block_bytes, blocks, vid = (
@@ -130,14 +170,13 @@ def verify_ngram(source: qwen4_exp.NgramTable, path: Path, table: dict, rows: st
                 step = 1 << 20
                 for begin in range(0, count, step):
                     end = min(count, begin + step)
-                    src = source.codes(name, begin, end)
                     r0, r1 = first + begin, first + end
                     b0, b1 = r0 // per_block, (r1 - 1) // per_block
                     stream.seek(header_bytes + b0 * block_bytes)
                     raw = torch.frombuffer(bytearray(stream.read((b1 - b0 + 1) * block_bytes)), dtype=torch.uint8)
                     vol = raw.reshape(-1, block_bytes)[:, : per_block * row_bytes].reshape(-1, row_bytes)
                     vol = vol[r0 - b0 * per_block : r1 - b0 * per_block]
-                    bad += int((vol != src).any(dim=1).sum())
+                    bad += mismatches(name, begin, end, vol)
                     checked += end - begin
             return checked, bad
         rng = random.Random(7)
@@ -147,10 +186,9 @@ def verify_ngram(source: qwen4_exp.NgramTable, path: Path, table: dict, rows: st
             index = max(i for i, s in enumerate(starts) if s <= r)
             name, _ = shards[index]
             local = r - starts[index]
-            src = source.codes(name, local, local + 1).reshape(row_bytes)
             stream.seek(header_bytes + (r // per_block) * block_bytes + (r % per_block) * row_bytes)
-            vol = torch.frombuffer(bytearray(stream.read(row_bytes)), dtype=torch.uint8)
-            bad += not torch.equal(src, vol)
+            vol = torch.frombuffer(bytearray(stream.read(row_bytes)), dtype=torch.uint8).reshape(1, row_bytes)
+            bad += mismatches(name, local, local + 1, vol)
         return len(sample), bad
 
 
@@ -168,7 +206,7 @@ def main() -> int:
     with SafetensorsSource(args.model) as store, Artifact(args.artifact) as artifact:
         text = artifact.directory.components["text"]["config"]
         components = tuple(artifact.directory.components)
-        model = qwen4_exp.build_model(store, components=components)
+        model = qwen4_exp.build_model(store, components=components, ngram_format=text["ngram_table"]["format"])
         # The proposal head (--lm-head-draft) is built from a frequency ranking, outside the logical model.
         bindings = {k: v for k, v in artifact.directory.bindings.items() if not k.startswith("proposal/")}
         report["proposal_bindings"] = len(artifact.directory.bindings) - len(bindings)
@@ -180,8 +218,11 @@ def main() -> int:
             binding = bindings[name]
             if name.endswith("/moe/experts") and name.startswith("text/"):
                 source = parameter.source
-                report["expert_mismatches"] += verify_bank(artifact, store, binding, source.prefix, source.shape,
-                                                           source.packed)
+                if isinstance(source, qwen4_exp.Fp8ExpertBankSource):
+                    report["expert_mismatches"] += verify_fp8_bank(artifact, binding, source)
+                else:
+                    report["expert_mismatches"] += verify_bank(artifact, store, binding, source.prefix, source.shape,
+                                                               source.packed)
                 report["experts"] += source.shape[0]
                 print(f"{name}: {source.shape[0]} experts verified ({time.time() - start:.0f}s)", flush=True)
                 continue

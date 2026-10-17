@@ -36,6 +36,20 @@ foreach(op IN LISTS infernix_op_tests)
     LIBRARIES infernix_ops)
 endforeach()
 
+# GGUF expert banks through the layer route (frames, zero-copy, staged and forked misses) against the
+# exact host expert, bit for bit.
+infernix_add_op_test(infernix_offloaded_moe_ggml_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_ggml.cu"
+  LIBRARIES infernix_ops)
+# Block-FP8 expert banks (Qwen's official FP8 experts) through the layer route and the CPU route
+# against the exact host expert, bit for bit; that reference against a bignum sum.
+infernix_add_op_test(infernix_offloaded_moe_fp8_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_fp8.cu"
+  LIBRARIES infernix_ops)
+# GGUF block projections against an independent exact oracle (every ggml format, K, width).
+infernix_add_op_test(infernix_ggml_linear_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ggml_linear.cpp"
+  LIBRARIES infernix_ops)
 infernix_add_op_test(infernix_linear_topk_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_linear_topk.cu"
   LIBRARIES infernix_ops)
@@ -222,6 +236,11 @@ infernix_add_op_test(infernix_offloaded_moe_cpu_test
 # Canonical W4A16 arithmetic and its CPU route (experts without activation scales); host-only.
 infernix_add_op_test(infernix_offloaded_moe_a16_cpu_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_a16_cpu.cpp"
+  LIBRARIES infernix_offloaded_moe_cpu)
+
+# The CPU route of GGUF (ggml) expert banks against the exact expert, on every ISA; host-only.
+infernix_add_op_test(infernix_offloaded_moe_ggml_cpu_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_ggml_cpu.cpp"
   LIBRARIES infernix_offloaded_moe_cpu)
 
 # The CPU worker team: any worker count gives expert_forward's bits.

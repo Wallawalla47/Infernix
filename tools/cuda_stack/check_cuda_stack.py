@@ -36,7 +36,8 @@ def stable_name(name: str) -> str:
     match = FILE_STATIC.match(name)
     if match:
         file_end = match.end() + int(match.group(1))
-        tail = re.match(r"_[0-9a-f]+_\d+__", name[file_end:])
+        # The id after the file's hash is absent for some kernels (`qsa_cu_940f13ef__ZN...`).
+        tail = re.match(r"_[0-9a-f]+(?:_\d+)?__", name[file_end:])
         if tail:
             name = f"__nv_static__{name[match.end():file_end]}__{name[file_end + tail.end():]}"
     out, pos = [], 0
@@ -57,9 +58,12 @@ def stable_name(name: str) -> str:
                     end = candidate
                     out.append(name[pos:match.start(1) + k])
                     break
-        if end is None:  # not the expected shape: keep the text as it is
-            out.append(name[pos:match.end()])
-            pos = match.end()
+        if end is None:
+            # A namespace with no id after the file's hash (`..._6_qsa_cu_940f13ef11pool_kernel`):
+            # only the per-build hash before the file's name is dropped.
+            out.append(name[pos:start])
+            out.append(f"_GLOBAL__N__{name[match.end():file_end]}")
+            pos = file_end
             continue
         out.append(f"_GLOBAL__N__{name[match.end():file_end]}")
         pos = end

@@ -1,6 +1,6 @@
 # Infernix Persistent Tensor Numeric Formats
 
-This reference defines the nine persistent numeric tensor formats accepted by current `.ninfer`
+This reference defines the twenty persistent numeric tensor formats accepted by current `.ninfer`
 artifacts: their logical words, quantization semantics, canonical reference encoders where
 applicable, and conformance boundaries. [Container framing](artifact-container.md),
 [physical layouts](storage-layouts.md), weight recipes and runtime-state codecs are defined
@@ -8,7 +8,7 @@ separately.
 
 ## 1. Registered formats
 
-Infernix has exactly eleven persistent numeric tensor formats in four categories.
+Infernix has exactly twenty persistent numeric tensor formats in five categories.
 
 Direct scalar formats preserve one logical scalar word per tensor element:
 
@@ -22,6 +22,7 @@ Grouped quantized-weight formats preserve signed codes plus one scale per logica
 
 | Canonical name | Code width | Group size | Legal signed codes | Scale | Full-group logical bits/weight |
 |---|---:|---:|---:|---|---:|
+| `q2_g64_fp16` | 2 | 64 | `[-2, 1]` | one signed binary16 scale/group | 2.25 |
 | `q4_g64_fp16` | 4 | 64 | `[-8, 7]` | one binary16 scale/group | 4.25 |
 | `q5_g64_fp16` | 5 | 64 | `[-16, 15]` | one binary16 scale/group | 5.25 |
 | `q6_g64_fp16` | 6 | 64 | `[-32, 31]` | one binary16 scale/group | 6.25 |
@@ -39,6 +40,21 @@ The scaled FP8 weight formats are:
 | Canonical name | Code | Scale granularity | Scale |
 |---|---|---|---|
 | `fp8_e4m3fn_row_bf16` | E4M3FN, 8 bits/weight | one multiplier per logical row | BF16 |
+| `fp8_e4m3fn_b128` | E4M3FN, 8 bits/weight | one multiplier per 128 x 128 tile (Section 3.7) | BF16 |
+
+The GGUF (ggml) block formats store llama.cpp's blocks verbatim (Section 3.6):
+
+| Canonical name | ggml type | Block elements | Block bytes | Bits/weight |
+|---|---|---:|---:|---:|
+| `ggml_q2_0` | `Q2_0` (42) | 64 | 18 | 2.25 |
+| `ggml_q4_k` | `Q4_K` (12) | 256 | 144 | 4.50 |
+| `ggml_q5_k` | `Q5_K` (13) | 256 | 176 | 5.50 |
+| `ggml_q6_k` | `Q6_K` (14) | 256 | 210 | 6.5625 |
+| `ggml_iq2_s` | `IQ2_S` (22) | 256 | 82 | 2.5625 |
+| `ggml_iq3_xxs` | `IQ3_XXS` (18) | 256 | 98 | 3.0625 |
+| `ggml_iq3_s` | `IQ3_S` (21) | 256 | 110 | 3.4375 |
+| `ggml_iq4_xs` | `IQ4_XS` (23) | 256 | 136 | 4.25 |
+| `ggml_iq4_nl` | `IQ4_NL` (20) | 32 | 18 | 4.50 |
 
 Each name fixes a code and scale contract. The format registry is implemented in
 [`tools/artifact/formats.py`](../../tools/artifact/formats.py) and
@@ -222,10 +238,10 @@ logical parameter role.
 ### 3.2 Grouped signed-integer weight identities
 
 The identifiers record code width, group size and scale type. For example, `q4_g64_fp16` uses
-4-bit signed codes and one IEEE-754 binary16 scale per group of 64 weights. `q5_g64_fp16`,
-`q6_g64_fp16`, and `q8_g32_fp16` follow the same naming convention.
+4-bit signed codes and one IEEE-754 binary16 scale per group of 64 weights. `q2_g64_fp16`,
+`q5_g64_fp16`, `q6_g64_fp16`, and `q8_g32_fp16` follow the same naming convention.
 
-The parser resolves names through the format registry. `Q4`, `Q5`, `Q6`, and `Q8` are prose
+The parser resolves names through the format registry. `Q2`, `Q4`, `Q5`, `Q6`, and `Q8` are prose
 abbreviations; artifacts store the complete canonical names.
 
 ### 3.3 `nvfp4`
@@ -320,6 +336,58 @@ two formats are distinct. The only producer is `import_encoded`. ModelOpt's acti
 `input_scale` is a separate model-role tensor. The format's only layout is `nvfp4_expert_rg16_v1`
 ([storage layouts §6](storage-layouts.md#6-nvfp4_expert_rg16_v1)).
 
+### 3.6 GGUF (ggml) block formats
+
+A `ggml_*` tensor is a row-major matrix `[N, K]` whose rows are `K / block_elems` whole blocks of
+the named ggml type, byte for byte as llama.cpp's `ggml-common.h` defines them; `K` must be a
+multiple of the block size. Every element of every type decodes to
+
+```text
+W = kappa * (d * sub * code - dmin * min_sub)
+```
+
+with an integer code (|code| <= 127; IQ2_S/IQ3_* codes come from the grid tables with their sign
+bits), an integer sub-scale, the block's binary16 `d` (and `dmin` with an integer `min_sub` for
+`Q4_K`/`Q5_K`; zero otherwise) and the power-of-two constant kappa: 1/8 for `IQ2_S`, 1/4 for
+`IQ3_XXS`, 1 for every other type. The products are exact in binary64.
+[`tools/artifact/codecs/ggml.py`](../../tools/artifact/codecs/ggml.py) holds the exact decoders
+(equal to gguf-py's dequantization for every type). Its grid tables are generated from
+llama.cpp's `ggml-common.h` by `tools/artifact/codecs/generate_ggml_tables.py`, which also
+writes the C++ and CUDA copies under `src/ops/ggml/`.
+
+The only producers are `import_ggml_rows`, which copies the GGUF rows, and
+`import_ggml_expert_bank`. The layouts are `ggml_rows_v1` (verbatim rows) and the expert-bank
+records `ggml_expert_iq4_nl_v1` and `ggml_expert_q2_0_v1` ([storage layouts §7, §8](storage-layouts.md#7-ggml_rows_v1)).
+In these records the format names the gate/up type and the layout names the down type.
+Consumers compute with BF16 activations in the exact arithmetic of
+[`src/ops/ggml/ggml_exact.h`](../../src/ops/ggml/ggml_exact.h) (A16 activations, an exact int128
+sum, one binary32 rounding). Scale words must be finite: that arithmetic reads a word as
+mantissa × 2^(e − 25), and both producers reject infinities and NaNs. Zero and subnormal words are
+legal.
+
+### 3.7 `fp8_e4m3fn_b128`
+
+Qwen's official block-FP8 experts (Qwen/Qwen3.8-Flash-Next-FP8), stored verbatim. A matrix
+`[N, K]` (both multiples of 128) has one E4M3FN code byte per weight and one BF16 scale word per
+128 x 128 tile:
+
+```text
+W[n,k] = decode_e4m3fn(c[n,k]) * bf16(s[floor(n/128), floor(k/128)])
+```
+
+The NaN codes (`S.1111.111`) are illegal. A scale must be a positive, normal, finite BF16 value, and
+within one row of tiles the scale exponents span at most 62 binades (the shift bound of the exact
+sum; the checkpoint's span at most 4). Every E4M3FN value is an integer multiple of 2^-9, so the
+product is exact in binary64. [`tools/artifact/codecs/fp8_b128.py`](../../tools/artifact/codecs/fp8_b128.py)
+holds the exact decoder (equal to PyTorch's `float8_e4m3fn` on every code).
+
+The only producer is `import_fp8_expert_bank`, which copies the checkpoint's codes and scale words
+per expert; the only layout is the expert-bank record `fp8_expert_b128_v1`
+([storage layouts §9](storage-layouts.md#9-fp8_expert_b128_v1)). Consumers compute with BF16 activations in the exact
+arithmetic of [`src/ops/fp8_block/fp8_exact.h`](../../src/ops/fp8_block/fp8_exact.h): A16
+activations, per tile an exact int64 sum of `w = decode_e4m3fn(c) * 2^9` times X, the tiles combined
+in int128 relative to the row's smallest scale exponent, one binary32 rounding.
+
 ## 4. Grouped signed-integer tensor model
 
 ### 4.1 Shape and group axis
@@ -378,16 +446,17 @@ them at its own boundary. A logical encoder produces no physical padding.
 
 ## 5. Grouped signed-integer code domains
 
-All four schemes are zero-point-free, weight-only signed-integer schemes. “Symmetric” in this
+All five schemes are zero-point-free, weight-only signed-integer schemes. “Symmetric” in this
 document means that reconstruction is `scale * signed_code` with zero point zero. It does not mean
 that every legal interval has equal positive and negative magnitude.
 
-### 5.1 Q4, Q5, and Q6
+### 5.1 Q2, Q4, Q5, and Q6
 
 The logical code is a two's-complement signed integer of the stated width:
 
 | Scheme | Width | Sign bit | Legal code interval | `qmax` used by reference encoder |
 |---|---:|---:|---:|---:|
+| `q2_g64_fp16` | 2 | `0x2` | `[-2, 1]` | 1 |
 | `q4_g64_fp16` | 4 | `0x8` | `[-8, 7]` | 7 |
 | `q5_g64_fp16` | 5 | `0x10` | `[-16, 15]` | 15 |
 | `q6_g64_fp16` | 6 | `0x20` | `[-32, 31]` | 31 |
@@ -430,6 +499,11 @@ A valid scale is either:
 - a finite positive binary16 normal or subnormal number.
 
 Negative finite values, negative zero, positive or negative infinity, and every NaN are invalid.
+
+`q2_g64_fp16` is the exception: its scale may also be a finite negative binary16 number, so a
+group can give its larger-magnitude side the code `-2` (four levels make the interval's asymmetry
+matter; `grouped_mse` chooses the sign with the magnitude). Reconstruction is unchanged, the
+scale's sign included; negative zero, infinities and NaN remain invalid.
 Positive binary16 subnormals are valid; consumers must preserve their defined value. In particular,
 the minimum positive binary16 scale is `2^-24`, bit pattern `0x0001`.
 
@@ -651,7 +725,7 @@ enum spellings or private kernel layout. The retained codec and encoder evidence
 
 - exact representative BF16, FP32, and I32 word round trips, including signed zeros, subnormals, NaN
   payload bits, and integer extrema, plus rejection of implicit cross-type encoding;
-- Q4, Q5, Q6, and Q8 plane bit order, legal interval endpoints, encoded-size geometry, partial-K zero
+- Q2, Q4, Q5, Q6, and Q8 plane bit order, legal interval endpoints, encoded-size geometry, partial-K zero
   padding, consecutive row views, and arbitrary row gathers;
 - all 16 E2M1 words, all 256 E4M3FN words, NVFP4 scale/divisor validity, the exact divisor-based
   reconstruction equation, and known block-scale swizzle offsets;

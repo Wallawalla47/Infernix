@@ -22,8 +22,6 @@ struct HostMemorySnapshot {
     std::uint64_t available_commit = 0;
     // This process's private committed bytes (Windows PrivateUsage, Linux VmRSS).
     std::uint64_t process_private = 0;
-    // Linux RLIMIT_MEMLOCK when limited; Windows has no such limit for CUDA pinned memory.
-    std::optional<std::uint64_t> lock_limit;
 };
 
 [[nodiscard]] HostMemorySnapshot host_memory_snapshot();

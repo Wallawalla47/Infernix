@@ -12,14 +12,18 @@ The storage registry contains exactly these identities:
 | Identity | Kind | Compatible numeric formats | Logical shape | Object alignment |
 |---|---|---|---|---:|
 | `contiguous_le_v1` | tensor layout | `bf16`, `fp32`, `int32` | rank `0..16` | 256 bytes |
-| `row_split_k128_v1` | tensor layout | `q4_g64_fp16`, `q5_g64_fp16`, `q6_g64_fp16`, `q8_g32_fp16` | rank 2 `[N,K]` | 256 bytes |
+| `row_split_k128_v1` | tensor layout | `q2_g64_fp16`, `q4_g64_fp16`, `q5_g64_fp16`, `q6_g64_fp16`, `q8_g32_fp16` | rank 2 `[N,K]` | 256 bytes |
 | `block_scale_k16_m128x4_v1` | tensor layout | `nvfp4` | rank 2 `[N,K]`, `N % 128 == 0`, `K % 64 == 0` | 256 bytes |
 | `row_scale_v1` | tensor layout | `fp8_e4m3fn_row_bf16` | rank 2 `[N,K]` | 256 bytes |
 | `nvfp4_expert_rg16_v1` | tensor layout | `nvfp4_mul` | rank 3 `[E,H,I]`, `H % 16 == 0`, `I % 16 == 0` | 4096 bytes |
+| `ggml_rows_v1` | tensor layout | every `ggml_*` format | rank 2 `[N,K]`, `K` whole blocks | 256 bytes |
+| `ggml_tiles16_v1` | tensor layout | `ggml_q4_k`, `ggml_q5_k`, `ggml_q6_k`, `ggml_iq4_xs` | rank 2 `[N,K]`, `K` whole blocks | 256 bytes |
+| `ggml_expert_iq4_nl_v1`, `ggml_expert_q2_0_v1` | tensor layout | `ggml_iq2_s`, `ggml_iq3_xxs`, `ggml_iq3_s`, `ggml_iq4_xs` | rank 3 `[E,H,I]`, whole blocks | 4096 bytes |
+| `fp8_expert_b128_v1` | tensor layout | `fp8_e4m3fn_b128` | rank 3 `[E,H,I]`, `H % 128 == 0`, `I % 128 == 0` | 4096 bytes |
 | `raw_bytes_v1` | resource encoding | not applicable | nonempty byte string | 1 byte |
 
 These format/layout pairs define the current codec support. Native consumer requirements are
-covered separately in Section 10.
+covered separately in Section 12.
 
 Object alignment applies to the object's payload-relative `offset` in the `.ninfer` JSON. Internal
 plane offsets and padding belong to the selected layout. Inter-object padding belongs to the
@@ -86,6 +90,7 @@ group size `G`:
 
 | Format | `b` | `G` | Base bytes per group `B` | High bytes per group `H` |
 |---|---:|---:|---:|---:|
+| `q2_g64_fp16` | 2 | 64 | 16 | 0 |
 | `q4_g64_fp16` | 4 | 64 | 32 | 0 |
 | `q5_g64_fp16` | 5 | 64 | 32 | 8 |
 | `q6_g64_fp16` | 6 | 64 | 32 | 16 |
@@ -120,7 +125,7 @@ zero padding to a 256-byte boundary
 binary16 scale plane
 ```
 
-Q4 and Q8 have no high-bit bytes. They still place the scale plane at the first 256-byte boundary
+Q2, Q4 and Q8 have no high-bit bytes. They still place the scale plane at the first 256-byte boundary
 after the base-code plane. There is no padding after the scale plane inside the object.
 
 Within every plane, traversal order is:
@@ -151,6 +156,14 @@ occupies 32 base bytes.
 For Q8, each lane occupies one byte containing its exact 8-bit two's-complement word. Lane `i`
 occupies byte `i`, so every G32 group occupies 32 base bytes. The numeric-format restriction that
 excludes code `-128` remains in force.
+
+For Q2, four consecutive lanes occupy one base byte, lane `i` in bits `2 * (i mod 4)`:
+
+```text
+base[j] = u[4*j] | (u[4*j + 1] << 2) | (u[4*j + 2] << 4) | (u[4*j + 3] << 6)
+```
+
+so every G64 group occupies 16 base bytes.
 
 The complete base plane is the concatenation of these per-group byte sequences in plane traversal
 order.
@@ -364,7 +377,76 @@ The layout has no row views: a binding addresses the complete bank, and consumer
 and multiplier planes from `expert_bank_planes`. Activation input scales are separate model-role
 tensors.
 
-## 7. `raw_bytes_v1`
+## 7. `ggml_rows_v1`
+
+`ggml_rows_v1` stores a `ggml_*` matrix `[N,K]` as its N rows of `K / block_elems` whole GGUF
+blocks, byte for byte as the GGUF stores them, contiguous and unpadded:
+
+```text
+row_bytes     = K / block_elems * block_bytes
+payload_bytes = N * row_bytes
+```
+
+Row n begins at `n * row_bytes`. Row views and whole-row slices are byte ranges of whole rows.
+
+### 7.1 `ggml_tiles16_v1`
+
+`ggml_tiles16_v1` stores the same blocks as `ggml_rows_v1` (formats of 256-element blocks only)
+in tiles of 16 rows, so that a tile's 16 rows of one block are one contiguous run that the narrow
+kernels copy in 16-byte units (`ops/ggml/ggml_linear.cu`, tiled rows):
+
+```text
+tiles         = ceil(N / 16)
+payload_bytes = tiles * 16 * row_bytes
+block b of row n at   (n / 16) * 16 * row_bytes + (16 * b + n % 16) * block_bytes
+```
+
+Rows `N .. 16 * tiles - 1` are zero blocks (scale 0). Tile i begins at `16 * i * row_bytes`, where
+row `16 i` begins in `ggml_rows_v1`, so a whole-row view or slice must start at a multiple of 16
+rows and end at one or at `N`. Untiling (the inverse permutation) returns the `ggml_rows_v1` bytes
+exactly; the token embedding (a row gather) is never tiled.
+
+## 8. GGUF expert banks: `ggml_expert_iq4_nl_v1`, `ggml_expert_q2_0_v1`
+
+These store one MoE layer's routed experts `[E,H,I]` of a GGUF import. The object's format is the
+gate/up matrices' ggml type; the layout names the down matrices' (`ggml_iq4_nl` or `ggml_q2_0`).
+Each expert is one record of its gate rows, its up rows (`[I,H]` each, rows of `H / block_elems`
+blocks of the gate/up type) and its down rows (`[H,I]`, blocks of the down type), every row
+verbatim GGUF blocks:
+
+```text
+gate_row      = H / block_elems(gate/up) * block_bytes(gate/up)
+down_row      = I / block_elems(down) * block_bytes(down)
+record_bytes  = 2 * I * gate_row + H * down_row
+record_stride = align_up(record_bytes, 4096)
+payload_bytes = E * record_stride
+```
+
+Record e begins at `e * record_stride`; the up rows at `I * gate_row` within it and the down rows at
+`2 * I * gate_row`. Zero bytes pad each record to its stride. There is no tail plane.
+
+## 9. `fp8_expert_b128_v1`
+
+`fp8_expert_b128_v1` stores one MoE layer's routed experts `[E,H,I]` of `fp8_e4m3fn_b128` words
+(Qwen3.8-Flash-Next FP8 plan §5.2). Each expert is one record: its gate rows, its up rows (`[I,H]`
+each) and its down rows (`[H,I]`), one E4M3FN code byte per weight in row-major order, then the
+scale plane: the gate's, the up's and the down's BF16 tile scales, each row-major
+`[rows / 128][K / 128]` (little-endian words):
+
+```text
+tiles         = (I / 128) * (H / 128)        per matrix
+scale_offset  = 3 * H * I
+record_bytes  = scale_offset + 3 * tiles * 2
+record_stride = align_up(record_bytes, 4096)
+payload_bytes = E * record_stride
+```
+
+Record e begins at `e * record_stride`; up rows at `I * H` and down rows at `2 * I * H` within it.
+Zero bytes pad each record to its stride. For the Flash-Next shape `[512, 2560, 640]` a record is
+4,915,800 bytes in a 4,919,296-byte stride. Every row is addressed as `base + r * K`, as in the GGUF
+banks, so expert routes read rows and their tile row in place.
+
+## 10. `raw_bytes_v1`
 
 `raw_bytes_v1` is a resource encoding, not a tensor layout. Its enclosing object payload is
 the resource byte string itself:
@@ -379,7 +461,7 @@ trailing padding. The resource object's JSON `bytes` is its exact nonzero length
 returns the complete span unchanged. A model contract assigns a resource name and interprets those
 bytes; the common encoding does not infer that meaning from the name.
 
-## 8. Decode boundary
+## 11. Decode boundary
 
 Layout decoding yields only persistent logical words:
 
@@ -393,13 +475,17 @@ Layout decoding yields only persistent logical words:
 - `nvfp4_expert_rg16_v1` yields, per expert, the gate, up and down E2M1 code words and E4M3FN
   scale words in natural `[rows, K]` order (undoing the unit packing and row interleave), and the
   three FP32 multipliers;
+- `ggml_rows_v1` and the GGUF expert banks yield the verbatim GGUF block rows; `ggml_tiles16_v1`
+  the same rows after untiling;
+- `fp8_expert_b128_v1` yields, per expert, the gate, up and down E4M3FN code bytes in natural
+  `[rows, K]` order and their BF16 tile scale words;
 - `raw_bytes_v1` yields the enclosing resource bytes.
 
 Dequantized values follow the reconstruction rule in `tensor-formats.md`. This document does
 not select a quantization encoder, output dtype, accumulation dtype, kernel, runtime device layout,
 or model consumer.
 
-## 10. Logical views and native operands
+## 12. Logical views and native operands
 
 Bindings address C-order logical element ranges of a parent object. The parent retains its full
 geometry and backing allocation, so a view can locate code and scale planes using the original

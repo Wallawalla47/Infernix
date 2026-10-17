@@ -5,6 +5,8 @@
 #include "infernix/ops/gated_delta_net.h"
 #include "infernix/ops/gated_rmsnorm.h"
 #include "infernix/ops/gdn_gating.h"
+#include "infernix/ops/ggml_linear.h"
+#include "infernix/ops/ggml_rows.h"
 #include "infernix/ops/gdn_input_proj.h"
 #include "infernix/ops/hyper_connection.h"
 #include "infernix/ops/kv_cache_append.h"
@@ -43,15 +45,31 @@ ops::offloaded_moe::ExpertActivation expert_activation(const TextConfig& c) {
 }
 
 // `routes` carries the selected fast paths' linear route flags (ForwardFastPaths::dense_routes) to the
-// projections they serve; a problem without a route for a flag runs its exact route.
+// projections they serve; a problem without a route for a flag runs its exact route. A GGUF import's
+// projection runs the exact ggml route.
 void project(const Tensor& x, const LinearParameters& p, Tensor& out, WorkspaceArena& work, cudaStream_t s,
              ops::LinearRoutes routes = ops::LinearRoutes::Exact) {
+    if (p.is_ggml()) {
+        ops::ggml_linear(x, p.ggml, out, p.input_perm, p.perm_block, work, s);
+        return;
+    }
     ops::linear(x, p.weight, out, p.policy, work, s, routes);
 }
 
-// FP32 logits of the text head (BF16 or Q8) for the columns of x.
-void text_head_logits(const Parameters& parameters, const Tensor& x, Tensor& logits, cudaStream_t s) {
-    if (parameters.output_head_q8) {
+// Token rows: BF16, or a GGUF import's IQ4_XS rows decoded exactly.
+void embed_tokens(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t s) {
+    if (table.layout == QuantLayout::GgmlRows) {
+        ops::ggml_embedding(ids, table, out, s);
+    } else {
+        ops::embedding(ids, table, out, s);
+    }
+}
+
+// FP32 logits of the text head (BF16, Q8 or a GGUF import's ggml rows) for the columns of x.
+void text_head_logits(const Parameters& parameters, const Tensor& x, Tensor& logits, WorkspaceArena& work, cudaStream_t s) {
+    if (parameters.output_head_q8 && parameters.output_head_q8->is_ggml()) {
+        ops::ggml_linear(x, parameters.output_head_q8->ggml, logits, nullptr, 0, work, s);
+    } else if (parameters.output_head_q8) {
         ops::projection_fp32(x, parameters.output_head_q8->weight, logits, s);
     } else {
         const Tensor* head[] = {&parameters.output_head};
@@ -72,6 +90,16 @@ void shared_swiglu(const Tensor& x, const LinearParameters& gate_up, Tensor& out
     }
     auto scope = work.scope();
     const std::int32_t I = out.ne[0], T = out.ne[1];
+    if (gate_up.is_ggml() && gate_up.input_perm == nullptr) {
+        // A GGUF import: the gate and up rows straight into their own tensors (no split copy).
+        Tensor gate = work.alloc(DType::BF16, {I, T});
+        Tensor up   = work.alloc(DType::BF16, {I, T});
+        const std::int32_t bounds[] = {0, I, 2 * I};
+        Tensor* parts[]             = {&gate, &up};
+        ops::ggml_linear(x, ops::ggml_split_segments(gate_up.ggml, x.ne[0], bounds), parts, nullptr, 0, work, s);
+        ops::silu_mul(gate, up, out, s);
+        return;
+    }
     Tensor projected = work.alloc(DType::BF16, {2 * I, T});
     project(x, gate_up, projected, work, s, routes);
     Tensor gate = work.alloc(DType::BF16, {I, T});
@@ -150,6 +178,11 @@ std::size_t Forward::workspace_bytes(const TextConfig& c, std::int32_t columns, 
     // Linear and GDN scratch (chunked recurrence), plus alignment slack per allocation.
     bytes += ops::gated_delta_net_workspace_capacity_bytes(dim(c.gdn.key_heads), dim(c.gdn.value_heads), 1,
                                                            std::max(columns, 1));
+    // A GGUF import's projections encode their input columns (K up to the GDN/QSA value width).
+    if (c.ggml_weights) {
+        const std::int32_t k = dim(std::max<std::size_t>({h, std::size_t(c.gdn.value_width()), std::size_t(c.attention.query_width())}));
+        bytes += ops::ggml_linear_workspace_bytes(k, std::max(columns, 1));
+    }
     bytes += 64ULL << 20;
     return bytes;
 }
@@ -189,7 +222,9 @@ void Forward::run(const ForwardBatch& batch, Tensor& logits, const ForwardTap* t
     begin_call(batch, &logits);
     Tensor residual = work_.alloc(DType::BF16, {dim(config_.residual_width()), batch.ids.ne[0]});
     embed(batch, residual);
-    for (std::uint32_t l = 0; l < config_.num_hidden_layers; ++l) { layer(l, batch, residual, tap); }
+    for (std::uint32_t l = 0; l < config_.num_hidden_layers; ++l) {
+        layer(l, batch, residual, tap);
+    }
     finish(batch, residual, &logits);
 }
 
@@ -198,7 +233,7 @@ void Forward::embed(const ForwardBatch& batch, Tensor& residual) {
     const std::int32_t T = batch.ids.ne[0], H = dim(config_.hidden_size);
     auto scope = work_.scope();
     Tensor x0  = work_.alloc(DType::BF16, {H, T});
-    ops::embedding(batch.ids, parameters_.token_embedding, x0, s);
+    embed_tokens(batch.ids, parameters_.token_embedding, x0, s);
     if (batch.vision != nullptr && batch.vision->columns.data != nullptr) {
         ops::scatter(batch.vision->embeddings, batch.vision->columns, x0, s);
     }
@@ -215,35 +250,13 @@ void Forward::layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& resi
         if (block.ple) { ple(*block.ple, residual, batch); }
         Tensor inject = work_.alloc(DType::FP32, {dim(config_.hc.streams), T});
         Tensor xa     = mix(block.attn_hc, residual, &inject);
-        const std::uint32_t compact = config_.compact_layer_indices[layer];
-        Tensor y;
-        if (config_.layer_types[layer] == MixerKind::Gdn) {
-            y = gdn(std::get<GdnParameters>(block.mixer), xa, compact, batch);
-        } else {
-            // A verification call records the raw index keys for the tail commit.
-            const AttentionCall call{
-                .layer        = kv_.layers.at(compact),
-                .tails        = state_.qsa_tails.at(compact),
-                .key_records  = batch.verify != nullptr
-                                    ? batch.verify->qsa_keys.slice(3, static_cast<std::int32_t>(compact), 1)
-                                          .view({dim(config_.qsa.index_head_dim), T})
-                                    : Tensor{},
-                .update_tails     = batch.verify == nullptr,
-                .positions        = batch.positions,
-                .rope_positions   = batch.rope_positions,
-                .block_start_rope = batch.block_start_rope,
-                .slots            = batch.slots,
-                .table_rows   = batch.table_rows,
-                .batch        = batch.batch,
-                .width        = batch.width};
-            y = attention(std::get<AttentionParameters>(block.mixer), xa, call);
-        }
+        Tensor y      = mixer(layer, batch, xa);
         ops::hyper_connection_inject(y, inject, residual, s);
         Tensor xm = mix(block.mlp_hc, residual, &inject);
         // The combine injects its output directly unless a tap records it.
         const bool fused_inject = tap == nullptr || tap->moe_outputs == nullptr;
         Tensor ym = moe(block.moe, xm, layer,
-                        tap != nullptr && tap->routes != nullptr ? &tap->routes->at(layer) : nullptr, &batch,
+                        tap != nullptr && tap->routes != nullptr ? &tap->routes->at(layer) : nullptr, &batch, -1,
                         fused_inject ? &inject : nullptr, fused_inject ? &residual : nullptr);
         if (!fused_inject) { ops::hyper_connection_inject(ym, inject, residual, s); }
         if (tap != nullptr) {
@@ -267,6 +280,74 @@ void Forward::layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& resi
             throw std::runtime_error("Qwen4Exp forward: residual tap copy failed");
         }
     }
+}
+
+Tensor Forward::mixer(std::uint32_t layer, const ForwardBatch& batch, const Tensor& xa) {
+    const auto& block           = parameters_.layers[layer];
+    const std::int32_t T        = batch.ids.ne[0];
+    const std::uint32_t compact = config_.compact_layer_indices[layer];
+    if (config_.layer_types[layer] == MixerKind::Gdn) {
+        return gdn(std::get<GdnParameters>(block.mixer), xa, compact, batch);
+    }
+    // A verification call records the raw index keys for the tail commit.
+    const AttentionCall call{.layer       = kv_.layers.at(compact),
+                             .tails       = state_.qsa_tails.at(compact),
+                             .key_records = batch.verify != nullptr
+                                                ? batch.verify->qsa_keys.slice(3, static_cast<std::int32_t>(compact), 1)
+                                                      .view({dim(config_.qsa.index_head_dim), T})
+                                                : Tensor{},
+                             .update_tails     = batch.verify == nullptr,
+                             .positions        = batch.positions,
+                             .rope_positions   = batch.rope_positions,
+                             .block_start_rope = batch.block_start_rope,
+                             .slots            = batch.slots,
+                             .table_rows       = batch.table_rows,
+                             .batch            = batch.batch,
+                             .width            = batch.width};
+    return attention(std::get<AttentionParameters>(block.mixer), xa, call);
+}
+
+void Forward::layer_mixer(std::uint32_t layer, const ForwardBatch& batch, Tensor& residual, Tensor& xm, Tensor& inject) {
+    const cudaStream_t s = device_.stream;
+    const auto& block    = parameters_.layers[layer];
+    wait_layer(batch, layer);
+    try {
+        auto scope = work_.scope();
+        if (block.ple) { ple(*block.ple, residual, batch); }
+        Tensor xa = mix(block.attn_hc, residual, &inject);
+        Tensor y  = mixer(layer, batch, xa);
+        ops::hyper_connection_inject(y, inject, residual, s);
+        (void)mix(block.mlp_hc, residual, &inject, &xm);
+    } catch (const std::exception& error) {
+        throw std::runtime_error("qwen4_exp/layers/" + std::to_string(layer) + ": " + error.what());
+    }
+}
+
+void Forward::layer_moe(std::uint32_t layer, const ForwardBatch& batch, const Tensor& xm, const Tensor& inject,
+                        Tensor& residual, std::int32_t route_columns) {
+    const cudaStream_t s = device_.stream;
+    try {
+        auto scope = work_.scope();
+        Tensor ym  = moe(parameters_.layers[layer].moe, xm, layer, nullptr, &batch, route_columns);
+        ops::hyper_connection_inject(ym, inject, residual, s);
+    } catch (const std::exception& error) {
+        throw std::runtime_error("qwen4_exp/layers/" + std::to_string(layer) + ": " + error.what());
+    }
+}
+
+std::size_t Forward::moe_workspace_bytes(const TextConfig& c, std::int32_t columns) {
+    const std::size_t t = static_cast<std::size_t>(columns);
+    const std::size_t h = c.hidden_size, k = c.moe.top_k;
+    std::size_t bytes = (c.moe.experts + 1) * t * 4 + k * t * 8 + t * 4; // router logits, routing
+    bytes += ops::moe_dispatch_bytes(dim(c.moe.experts), dim(k * t));
+    bytes += h * k * t * 2 + ops::moe_experts_workspace_bytes(dim(c.moe.experts), dim(k * t), std::max(columns, 1),
+                                                             expert_activation(c));
+    bytes += 2 * std::size_t(c.moe.shared_intermediate) * t * 2 * 3 + h * t * 2 * 2; // shared expert, y
+    if (c.ggml_weights) { // the shared expert's projections encode their inputs
+        bytes += ops::ggml_linear_workspace_bytes(dim(h), std::max(columns, 1)) +
+                 ops::ggml_linear_workspace_bytes(dim(c.moe.shared_intermediate), std::max(columns, 1));
+    }
+    return bytes + (16ULL << 20); // alignment slack
 }
 
 void Forward::finish(const ForwardBatch& batch, Tensor& residual, Tensor* logits) {
@@ -329,7 +410,7 @@ void Forward::finish(const ForwardBatch& batch, Tensor& residual, Tensor* logits
     Tensor final_x = mix(parameters_.final_mixer, residual, nullptr);
     Tensor last    = work_.alloc(DType::BF16, {H, batch.logit_columns.ne[0]});
     ops::gather_columns(final_x, batch.logit_columns, last, s);
-    text_head_logits(parameters_, last, *logits, s);
+    text_head_logits(parameters_, last, *logits, work_, s);
 }
 
 void Forward::head_logits(const Tensor& residuals, Tensor& logits) {
@@ -342,14 +423,14 @@ void Forward::head_logits(const Tensor& residuals, Tensor& logits) {
     work_.reset();
     auto scope           = work_.scope();
     const Tensor final_x = mix(parameters_.final_mixer, residuals, nullptr);
-    text_head_logits(parameters_, final_x, logits, device_.stream);
+    text_head_logits(parameters_, final_x, logits, work_, device_.stream);
 }
 
-Tensor Forward::mix(const HyperConnectionParameters& p, const Tensor& residual, Tensor* inject) {
+Tensor Forward::mix(const HyperConnectionParameters& p, const Tensor& residual, Tensor* inject, Tensor* into) {
     const cudaStream_t s = device_.stream;
     const std::int32_t T = residual.ne[1], H = dim(config_.hidden_size);
     const std::int32_t S = dim(config_.hc.streams), rank = dim(config_.hc.rank);
-    Tensor x = work_.alloc(DType::BF16, {H, T});
+    Tensor x = into != nullptr ? *into : work_.alloc(DType::BF16, {H, T});
     ops::hyper_connection_mix(residual, p.norm, p.down.weight, p.up.weight, p.down.policy, S, rank, config_.rms_norm_eps,
                               x, p.combine ? inject : nullptr, work_, s);
     return x;
@@ -359,13 +440,28 @@ void Forward::ple(const PleParameters& p, Tensor& residual, const ForwardBatch& 
     const cudaStream_t s = device_.stream;
     const std::int32_t T = residual.ne[1], W = residual.ne[0], H = dim(config_.hidden_size);
     auto scope = work_.scope();
-    Tensor e = work_.alloc(DType::BF16, {dim(config_.ple.embed_dim), T});
     if (const NgramRowGate* gate = batch.ngram_gate) {
         // ple_embed is a plain launch (no PDL), so stream order holds it behind the copy.
         upload_pinned_when(batch.ngram_rows.data, gate->pinned_rows, batch.ngram_rows.bytes(), gate->ready,
                            gate->expected, gate->wait_stats, gate->wait_row, s);
     }
-    ops::ple_embed(batch.ngram_rows, p.ngram_scale, e, s);
+    const NgramRowFormat format = batch.ngram_format.value_or(config_.ple.table.format);
+    Tensor e;
+    if (format == NgramRowFormat::Bf16) {
+        // BF16 rows are the embedding itself: rows [W, heads] of a column are e[h * W + j] (ple_embed's
+        // order), so the rows are read in place.
+        if (batch.ngram_rows.ne[0] != 2 * dim(config_.ple.head_width())) {
+            throw std::invalid_argument("Qwen4Exp forward: BF16 n-gram rows must be 2 x head width bytes");
+        }
+        e = Tensor(batch.ngram_rows.data, DType::BF16, {dim(config_.ple.embed_dim), T});
+    } else {
+        e = work_.alloc(DType::BF16, {dim(config_.ple.embed_dim), T});
+        if (format == NgramRowFormat::Iq4Nl) {
+            ops::ple_embed_iq4_nl(batch.ngram_rows, e, s);
+        } else {
+            ops::ple_embed(batch.ngram_rows, p.ngram_scale, e, s);
+        }
+    }
     Tensor kv = work_.alloc(DType::BF16, {W + H, T});
     project(e, p.projection, kv, work_, s);
     Tensor key = work_.alloc(DType::BF16, {W, T});
@@ -398,8 +494,10 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
     const bool fused_conv = fast_.gdn_conv_fused && decode && p.projection.weight.qtype == QType::Q8_G32_FP16;
     Tensor qkv;
     if (!fused_conv) { qkv = batch.verify != nullptr ? records.conv.view({C, T}) : work_.alloc(DType::BF16, {C, T}); }
-    Tensor z = work_.alloc(DType::BF16, {VW, T});
+    Tensor z  = work_.alloc(DType::BF16, {VW, T});
+    Tensor ab = work_.alloc(DType::BF16, {2 * NV, T}); // the control projection: a's rows, then b's
     Tensor q, k, v;
+    const bool ggml = p.projection.is_ggml() && p.projection.input_perm == nullptr;
     if (fused_conv) {
         q = work_.alloc(DType::BF16, {KW, T});
         k = work_.alloc(DType::BF16, {KW, T});
@@ -410,24 +508,47 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
                z_rows = z.view({VW, 1, T});
         ops::gdn_input_proj_conv_snapshot(x_rows, p.projection.weight, p.convolution, layer.conv, batch.slots,
                                           batch.slots, q_rows, k_rows, v_rows, z_rows, fast_.dense_routes, s);
-    } else if (p.projection.weight.qtype == QType::Q8_G32_FP16) {
-        // Q8 (Dense8): the projection writes q/k/v and z to their destinations itself.
-        ops::gdn_input_proj(x, p.projection.weight, qkv, z, s, fast_.dense_routes);
+        project(x, p.control, ab, work_, s);
+    } else if (ggml && p.control.is_ggml() && p.control.input_perm == nullptr) {
+        // A GGUF import's two projections of x in one call (one encoding of x), each part written to
+        // its own tensor.
+        std::vector<ops::GgmlSegment> segments = p.projection.ggml;
+        for (ops::GgmlSegment segment : p.control.ggml) {
+            segment.out_offset += C + VW;
+            segments.push_back(segment);
+        }
+        const std::int32_t bounds[] = {0, C, C + VW, C + VW + 2 * NV};
+        Tensor* parts[]             = {&qkv, &z, &ab};
+        ops::ggml_linear(x, ops::ggml_split_segments(segments, x.ne[0], bounds), parts, nullptr, 0, work_, s);
     } else {
-        Tensor projected = work_.alloc(DType::BF16, {C + VW, T});
-        project(x, p.projection, projected, work_, s, fast_.dense_routes);
-        Tensor* parts[] = {&qkv, &z};
-        ops::split_rows(projected, parts, s);
+        if (ggml) {
+            // A GGUF import's projection (its control projection BF16): qkv and z in their own tensors.
+            const std::int32_t bounds[] = {0, C, C + VW};
+            Tensor* parts[]             = {&qkv, &z};
+            ops::ggml_linear(x, ops::ggml_split_segments(p.projection.ggml, x.ne[0], bounds), parts, nullptr, 0, work_, s);
+        } else if (p.projection.weight.qtype == QType::Q8_G32_FP16) {
+            // Q8 (Dense8): the projection writes q/k/v and z to their destinations itself.
+            ops::gdn_input_proj(x, p.projection.weight, qkv, z, s, fast_.dense_routes);
+        } else {
+            Tensor projected = work_.alloc(DType::BF16, {C + VW, T});
+            project(x, p.projection, projected, work_, s, fast_.dense_routes);
+            Tensor* parts[] = {&qkv, &z};
+            ops::split_rows(projected, parts, s);
+        }
+        project(x, p.control, ab, work_, s);
     }
-    Tensor ab = work_.alloc(DType::BF16, {2 * NV, T});
-    project(x, p.control, ab, work_, s);
     // Verification and prefill chunks evaluate the gates once for their recurrence; decode evaluates
-    // them inside the recurrent update.
+    // them inside the recurrent update, except a GGUF import's (its third input holds A itself), whose
+    // decode takes them from gdn_gating_direct too.
     Tensor gate, beta;
-    if (batch.verify != nullptr || batch.width > 1) {
+    if (batch.verify != nullptr || batch.width > 1 || g.a_direct) {
         gate = work_.alloc(DType::FP32, {NV, T});
         beta = work_.alloc(DType::FP32, {NV, T});
-        ops::gdn_gating(ab.slice(0, 0, NV), ab.slice(0, NV, NV), p.a_log, p.dt_bias, gate, beta, s);
+        if (g.a_direct) {
+            ops::gdn_gating_direct(ab.slice(0, 0, NV), ab.slice(0, NV, NV), p.a_log, p.dt_bias, gate, beta, s);
+        } else {
+            ops::gdn_gating(ab.slice(0, 0, NV), ab.slice(0, NV, NV), p.a_log, p.dt_bias, gate, beta, s);
+        }
     }
 
     if (!fused_conv) {
@@ -468,11 +589,17 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
                                                    batch.slots, batch.slots, q, k, v, s);
         }
         Tensor o_batch = o.view({DV, NV, 1, T});
-        // The gates are evaluated inside the update from the control projection (no gdn_gating kernel).
-        ops::gated_delta_net_batch_update_gating(q.view({DK, NK, 1, T}), k.view({DK, NK, 1, T}), v.view({DV, NV, 1, T}),
-                                                 ab.slice(0, 0, NV), ab.slice(0, NV, NV), p.a_log, p.dt_bias, scale,
-                                                 /*normalize_qk=*/true, layer.recurrent, batch.slots, batch.slots,
-                                                 o_batch, s);
+        if (g.a_direct) {
+            ops::gated_delta_net_batch_update(q.view({DK, NK, 1, T}), k.view({DK, NK, 1, T}), v.view({DV, NV, 1, T}),
+                                              gate.view({NV, 1, T}), beta.view({NV, 1, T}), scale, /*normalize_qk=*/true,
+                                              layer.recurrent, batch.slots, batch.slots, o_batch, s);
+        } else {
+            // The gates are evaluated inside the update from the control projection (no gdn_gating kernel).
+            ops::gated_delta_net_batch_update_gating(q.view({DK, NK, 1, T}), k.view({DK, NK, 1, T}),
+                                                     v.view({DV, NV, 1, T}), ab.slice(0, 0, NV), ab.slice(0, NV, NV),
+                                                     p.a_log, p.dt_bias, scale, /*normalize_qk=*/true, layer.recurrent,
+                                                     batch.slots, batch.slots, o_batch, s);
+        }
     }
     Tensor normed      = work_.alloc(DType::BF16, {DV, NV * T});
     const Tensor rows  = o.view({DV, NV * T});
@@ -492,15 +619,32 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const A
     const std::int32_t QW = dim(a.query_width()), KW = dim(a.key_width()), D = dim(a.head_dim);
     const std::int32_t IH = dim(config_.qsa.index_heads), ID = dim(config_.qsa.index_head_dim);
     const std::int32_t index_rows = IH * ID + ID;
-    Tensor projected = work_.alloc(DType::BF16, {2 * QW + 2 * KW + (p.index_projection ? 0 : index_rows), T});
-    project(x, p.projection, projected, work_, s, fast_.dense_routes);
     Tensor q = work_.alloc(DType::BF16, {D, dim(a.heads), T});
     Tensor gate = work_.alloc(DType::BF16, {QW, T});
     Tensor k = work_.alloc(DType::BF16, {D, dim(a.kv_heads), T});
     Tensor v = work_.alloc(DType::BF16, {D, dim(a.kv_heads), T});
     Tensor iq = work_.alloc(DType::BF16, {ID, IH, T});
     Tensor ik = call.key_records.data != nullptr ? call.key_records.view({ID, T}) : work_.alloc(DType::BF16, {ID, T});
-    {
+    const bool ggml = p.projection.is_ggml() && p.projection.input_perm == nullptr &&
+                      (!p.index_projection || (p.index_projection->is_ggml() && p.index_projection->input_perm == nullptr));
+    if (ggml) {
+        // A GGUF import: the projection and the index projection of x in one call (one encoding of
+        // x), each part written to its own tensor.
+        std::vector<ops::GgmlSegment> segments = p.projection.ggml;
+        if (p.index_projection) {
+            for (ops::GgmlSegment segment : p.index_projection->ggml) {
+                segment.out_offset += 2 * QW + 2 * KW;
+                segments.push_back(segment);
+            }
+        }
+        Tensor qf = q.view({QW, T}), kf = k.view({KW, T}), vf = v.view({KW, T}), iqf = iq.view({IH * ID, T});
+        const std::int32_t bounds[] = {0, QW, 2 * QW, 2 * QW + KW, 2 * QW + 2 * KW, 2 * QW + 2 * KW + IH * ID,
+                                       2 * QW + 2 * KW + index_rows};
+        Tensor* parts[] = {&qf, &gate, &kf, &vf, &iqf, &ik};
+        ops::ggml_linear(x, ops::ggml_split_segments(segments, x.ne[0], bounds), parts, nullptr, 0, work_, s);
+    } else {
+        Tensor projected = work_.alloc(DType::BF16, {2 * QW + 2 * KW + (p.index_projection ? 0 : index_rows), T});
+        project(x, p.projection, projected, work_, s, fast_.dense_routes);
         Tensor qf = q.view({QW, T}), kf = k.view({KW, T}), vf = v.view({KW, T}), iqf = iq.view({IH * ID, T});
         if (p.index_projection) {
             Tensor indexed = work_.alloc(DType::BF16, {index_rows, T});
@@ -595,7 +739,7 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const A
 }
 
 Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer, Tensor* route_tap,
-                    const ForwardBatch* batch, const Tensor* inject, Tensor* residual) {
+                    const ForwardBatch* batch, std::int32_t route_columns, const Tensor* inject, Tensor* residual) {
     const cudaStream_t s = device_.stream;
     const auto& m        = config_.moe;
     const std::int32_t T = x.ne[1], H = dim(config_.hidden_size), E = dim(m.experts), K = dim(m.top_k);
@@ -604,12 +748,21 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     ops::projection_fp32(x, rows, logits, s);
     ops::MoeRouting routing{work_.alloc(DType::I32, {K, T}), work_.alloc(DType::FP32, {K, T}),
                             work_.alloc(DType::FP32, {T})};
-    std::int32_t* route_log = nullptr;
+    // The route log holds the call's last `logged` columns: all of them (written by the dispatch), or
+    // the trailing ones (a layer walk's grouped call logs its last chunk), copied from the routing.
+    const std::int32_t logged = route_columns < 0 ? T : std::min(route_columns, T);
+    std::int32_t* route_log   = nullptr;
+    std::int32_t* log_tail    = nullptr;
     if (experts_.route_log != nullptr) {
-        if (static_cast<std::size_t>(K) * T > experts_.route_stride) {
+        if (static_cast<std::size_t>(K) * logged > experts_.route_stride) {
             throw std::invalid_argument("Qwen4Exp MoE: route log is too small for this call");
         }
-        route_log = experts_.route_log + layer * experts_.route_stride; // written by the dispatch
+        std::int32_t* log = experts_.route_log + layer * experts_.route_stride;
+        if (logged == T) {
+            route_log = log;
+        } else {
+            log_tail = log;
+        }
     }
     const DeviceSpan dispatch_bytes = work_.alloc_bytes(ops::moe_dispatch_bytes(E, K * T));
     ops::MoeDispatch dispatch       = ops::carve_moe_dispatch(dispatch_bytes.data, E, K * T);
@@ -624,7 +777,7 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
             cudaSuccess) {
         throw std::runtime_error("Qwen4Exp forward: route tap copy failed");
     }
-    ops::MoeExpertSource source{.frame_base   = experts_.frame_base,
+    ops::MoeExpertSource source{.frame_base   = experts_.frame_bases.empty() ? nullptr : experts_.frame_bases.at(layer),
                                 .frames       = experts_.frames.at(layer),
                                 .host_records = reinterpret_cast<const std::uint8_t*>(p.bank->planes.device_records),
                                 .record_stride = p.bank->planes.record_stride,
@@ -659,45 +812,63 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     // in the order its dense chain reads them. A one-column call (plain decode) warms the chain up to
     // 40 MiB: tg512 plain 121.8 -> 123.3 tok/s against the attention mixer and 16 MiB of input (32 MiB
     // +0.7 %, 48-56 MiB alike, 64-80 MiB less). A wider call keeps that smaller set: under MTP the
-    // wait is shorter and 48-64 MiB measured 0.4-1.4 % slower (design §19.3.20b).
+    // wait is shorter and 48-64 MiB measured 0.4-1.4 % slower (design §19.3.20b). A GGUF import's
+    // projections warm their segments in order.
     if (source.cpu.max_jobs > 0 && layer + 1 < config_.num_hidden_layers) {
         const auto& next = parameters_.layers[layer + 1];
         const bool whole_chain = T == 1;
         constexpr std::size_t kChainWarm = 40ULL << 20, kInputWarm = 16ULL << 20;
-        std::array<std::pair<const void*, std::size_t>, 11> chain{};
+        std::array<std::pair<const void*, std::size_t>, 16> chain{};
         std::size_t spans = 0;
-        const auto add = [&](const void* p, std::size_t bytes) { chain[spans++] = {p, bytes}; };
+        const auto add = [&](const void* data, std::size_t bytes) {
+            if (spans < chain.size()) { chain[spans++] = {data, bytes}; }
+        };
+        // A linear's weights, at most `cap` bytes of them.
+        const auto add_linear = [&](const LinearParameters& linear, std::int32_t k, std::size_t cap) {
+            if (!linear.is_ggml()) {
+                add(linear.weight.payload, std::min(linear.weight.payload_bytes, cap));
+                return;
+            }
+            for (const auto& segment : linear.ggml) {
+                const std::size_t bytes = static_cast<std::size_t>(segment.rows) * ops::ggml_row_bytes(segment.format, k);
+                add(segment.data, std::min(bytes, cap));
+                cap -= std::min(bytes, cap);
+                if (cap == 0) { break; }
+            }
+        };
         add(next.attn_hc.down.weight.payload, next.attn_hc.down.weight.payload_bytes);
         add(next.attn_hc.up.weight.payload, next.attn_hc.up.weight.payload_bytes);
         const LinearParameters* input  = nullptr;
         const LinearParameters* output = nullptr;
         const LinearParameters* extra  = nullptr; // GDN control or the separate QSA index projection
+        std::int32_t output_k          = 0;
         if (config_.layer_types[layer + 1] == MixerKind::Gdn) {
             const auto& g = std::get<GdnParameters>(next.mixer);
             input = &g.projection, extra = &g.control, output = &g.output;
+            output_k = dim(config_.gdn.value_width());
         } else {
             const auto& a = std::get<AttentionParameters>(next.mixer);
             input = &a.projection, output = &a.output;
+            output_k = dim(config_.attention.query_width());
             if (a.index_projection) { extra = &*a.index_projection; }
         }
-        add(input->weight.payload,
-            whole_chain ? input->weight.payload_bytes : std::min<std::size_t>(input->weight.payload_bytes, kInputWarm));
+        add_linear(*input, H, whole_chain ? ~std::size_t{0} : kInputWarm);
         if (whole_chain) {
-            if (extra != nullptr) { add(extra->weight.payload, extra->weight.payload_bytes); }
-            add(output->weight.payload, output->weight.payload_bytes);
+            if (extra != nullptr) { add_linear(*extra, H, ~std::size_t{0}); }
+            add_linear(*output, output_k, ~std::size_t{0});
             add(next.mlp_hc.down.weight.payload, next.mlp_hc.down.weight.payload_bytes);
             add(next.mlp_hc.up.weight.payload, next.mlp_hc.up.weight.payload_bytes);
             add(next.moe.router.data, next.moe.router.bytes());
-            add(next.moe.shared_gate_up.weight.payload, next.moe.shared_gate_up.weight.payload_bytes);
-            add(next.moe.shared_down.weight.payload, next.moe.shared_down.weight.payload_bytes);
+            add_linear(next.moe.shared_gate_up, H, ~std::size_t{0});
+            add_linear(next.moe.shared_down, dim(config_.moe.shared_intermediate), ~std::size_t{0});
         }
         std::size_t left = whole_chain ? kChainWarm : ~std::size_t{0};
         int i = 0;
         for (std::size_t n = 0; n < spans && i < ops::MoeL2Warm::kSpans && left >= 16; ++n) {
-            const auto [p, bytes] = chain[n];
-            if (p == nullptr || reinterpret_cast<std::uintptr_t>(p) % 16 != 0 || bytes < 16) { continue; }
+            const auto [data, bytes] = chain[n];
+            if (data == nullptr || reinterpret_cast<std::uintptr_t>(data) % 16 != 0 || bytes < 16) { continue; }
             const std::size_t take  = std::min(bytes, left);
-            source.l2_warm.ptr[i]   = p;
+            source.l2_warm.ptr[i]   = data;
             source.l2_warm.bytes[i] = take;
             left -= take;
             ++i;
@@ -722,21 +893,39 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
         split_streamed_experts_ += streaming->plan_layer(layer, split_columns_, split_cpu_);
         split_cpu_experts_ += cpu;
         if (cpu > 0) {
-            source.cpu.max_columns  = ops::offloaded_moe::kMaxCpuCallColumns;
-            source.cpu.pcie_divisor = 0;
-            source.cpu.wide_from    = 1;
-            source.cpu.wide_jobs    = static_cast<std::int32_t>(cpu);
+            source.cpu.max_columns        = ops::offloaded_moe::kMaxCpuCallColumns;
+            source.cpu.pcie_divisor       = 0;
+            source.cpu.one_column_divisor = 0;
+            source.cpu.one_column_divisor_device = nullptr;
+            source.cpu.wide_from          = 1;
+            source.cpu.wide_jobs          = static_cast<std::int32_t>(cpu);
         } else {
             source.cpu = ops::MoeCpuChannel{};
         }
     }
     if (streaming != nullptr) {
         streaming->before_experts(layer, s);
-        source.prefetched    = streaming->slots(layer);
-        source.prefetch_base = streaming->base();
+        source.prefetched      = streaming->slots(layer);
+        source.prefetch_base   = streaming->base();
+        source.prefetch_stride = streaming->pitch(); // the ring's slots: the largest record
     }
-    if (experts_.frame_stride != 0 && experts_.frame_stride != source.record_stride) {
-        throw std::invalid_argument("Qwen4Exp MoE: frame stride differs from the bank record stride");
+    // The layer's frame pool: its pitch is the layer's own record stride.
+    const std::uint64_t pitch = experts_.frame_pitches.empty() ? 0 : experts_.frame_pitches.at(layer);
+    const auto& planes = p.bank->planes;
+    if (planes.gate_up_format != QType::NVFP4_MUL) {
+        // A GGUF import's or block-FP8 bank: its own record size in frames of its pool's pitch, the
+        // exact A16 kernels on every column count, and CPU-served misses through the exact CPU
+        // route; the SSD tier's fetch channel hands over its records like any other. Stages copy the
+        // record rounded up to 16 bytes (the stride's zero padding).
+        source.ggml = ops::MoeGgmlBank{.gate_up_format = planes.gate_up_format,
+                                       .down_format    = planes.down_format,
+                                       .gate_row_bytes = static_cast<std::uint32_t>(planes.gate_row_bytes),
+                                       .down_row_bytes = static_cast<std::uint32_t>(planes.down_row_bytes),
+                                       .record_bytes   = (planes.record_bytes + 15) / 16 * 16};
+    }
+    source.frame_stride = pitch;
+    if (pitch != 0 && pitch != source.record_stride) {
+        throw std::invalid_argument("Qwen4Exp MoE: the layer's frame pitch differs from its bank's record stride");
     }
     Tensor outputs = work_.alloc(DType::BF16, {H, K * T});
     const std::int32_t max_jobs = std::min(E, K * T);
@@ -746,16 +935,33 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
                                                                                  source.wide_a16));
     const bool planned = route_plans && ops::moe_route_dispatch_plan(logits, K, routing, dispatch, route_log, x, source,
                                                                      max_jobs, expert_ws.data, outputs, s);
-    // The shared expert runs while the host computes the CPU-served misses.
-    ops::moe_experts(x, dispatch, source, K, max_jobs, expert_ws.data, outputs, s, /*wait_for_cpu=*/false, planned);
-    if (streaming != nullptr && batch->release_stream) { streaming->after_experts(layer, s); }
-
+    if (log_tail != nullptr) {
+        CUDA_CHECK(cudaMemcpyAsync(log_tail, static_cast<const std::int32_t*>(routing.ids.data) + static_cast<std::size_t>(K) * (T - logged),
+                                   static_cast<std::size_t>(K) * logged * sizeof(std::int32_t), cudaMemcpyDeviceToDevice, s));
+    }
     const std::int32_t I = dim(m.shared_intermediate);
     Tensor product = work_.alloc(DType::BF16, {I, T});
-    shared_swiglu(x, p.shared_gate_up, product, work_, s, fast_.dense_routes);
-    Tensor shared = work_.alloc(DType::BF16, {H, T});
-    project(product, p.shared_down, shared, work_, s, fast_.dense_routes);
+    Tensor shared  = work_.alloc(DType::BF16, {H, T});
+    // The shared expert runs while the host computes the CPU-served misses, and in decode and
+    // verification calls on its own stream while the routed experts compute too. It reads only x,
+    // and its scoped workspace lies past every buffer the routed experts use; this stream allocates
+    // nothing more until the join.
+    const bool side = !eager_chunk_ && experts_.shared_stream != nullptr;
+    cudaStream_t shared_s = s;
+    if (side) {
+        CUDA_CHECK(cudaEventRecord(experts_.shared_events[0], s));
+        CUDA_CHECK(cudaStreamWaitEvent(experts_.shared_stream, experts_.shared_events[0], 0));
+        shared_s = experts_.shared_stream;
+    }
+    ops::moe_experts(x, dispatch, source, K, max_jobs, expert_ws.data, outputs, s, /*wait_for_cpu=*/false, planned);
+    if (streaming != nullptr && batch->release_stream) { streaming->after_experts(layer, s); }
+    shared_swiglu(x, p.shared_gate_up, product, work_, shared_s, fast_.dense_routes);
+    project(product, p.shared_down, shared, work_, shared_s, fast_.dense_routes);
     ops::moe_experts_cpu_wait(x, dispatch, source, max_jobs, expert_ws.data, outputs, s);
+    if (side) {
+        CUDA_CHECK(cudaEventRecord(experts_.shared_events[1], shared_s));
+        CUDA_CHECK(cudaStreamWaitEvent(s, experts_.shared_events[1], 0));
+    }
     if (inject != nullptr) {
         ops::moe_combine_inject(outputs, routing, shared, *inject, *residual, s);
         return Tensor{};
@@ -793,7 +999,7 @@ void Forward::mtp_block(const MtpCall& call, Tensor& rows) {
         auto scope = work_.scope();
         // Input fusion: R = fc_hidden(per stream of RMSNorm_{S*H}(rows)) + fc_embedding(RMSNorm_H(embed(id))).
         Tensor x0 = work_.alloc(DType::BF16, {H, T});
-        ops::embedding(call.ids, parameters_.token_embedding, x0, s);
+        embed_tokens(call.ids, parameters_.token_embedding, x0, s);
         if (call.vision != nullptr && call.vision->columns.data != nullptr) {
             ops::scatter(call.vision->embeddings, call.vision->columns, x0, s);
         }
@@ -853,17 +1059,17 @@ void Forward::mtp_block(const MtpCall& call, Tensor& rows) {
         // The draft token: argmax of the draft head (the proposal head's rows mapped to token ids,
         // or the text head over the public tokens).
         Tensor final_x = mix(p.final_mixer, residual, nullptr);
-        const auto& head = parameters_.draft_head;
+        const auto& head            = parameters_.draft_head;
         const std::int32_t rows_out = head.rows ? head.rows->weight.n : dim(config_.vocab_size);
         Tensor head_logits = work_.alloc(DType::FP32, {rows_out, T});
         if (head.rows) {
             ops::projection_fp32(final_x, head.rows->weight, head_logits, s);
         } else {
-            text_head_logits(parameters_, final_x, head_logits, s);
+            text_head_logits(parameters_, final_x, head_logits, work_, s);
         }
+        Tensor drafts = call.drafts;
         Tensor narrow = work_.alloc(DType::BF16, {rows_out, T});
         ops::cast_fp32_to_bf16(head_logits, narrow, s);
-        Tensor drafts = call.drafts;
         if (call.sample_configs != nullptr) {
             // Sampled drafts: the head's top rows, one draw each under the column's sampler; the top
             // row's log-probability is also the --spec-min-p confidence.

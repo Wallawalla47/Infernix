@@ -18,8 +18,9 @@ from typing import Mapping
 
 import torch
 
+from tools.artifact.codecs.fp8_b128 import encode_expert as encode_fp8_expert
 from tools.artifact.codecs.nvfp4_expert import encode_nvfp4_expert_bank
-from tools.artifact.layouts import expert_bank_geometry
+from tools.artifact.layouts import expert_bank_geometry, fp8_expert_geometry
 from tools.flash_next.ngram import NgramConfig, head_tables, layer_multipliers
 
 from .methods import PrepareRequest, PreparedMethod
@@ -29,6 +30,7 @@ from .resources import load_resources
 from .sources.logical import LogicalSource
 from .sources.modelopt import (
     dequantize_fp8_block128,
+    fp8_block_matrix_raw,
     fp8_block_matrix_words,
     nvfp4_matrix_words,
     nvfp4_packed_matrix_words,
@@ -267,6 +269,60 @@ def import_expert_bank(request: PrepareRequest) -> PreparedMethod:
     return request.job(produce=produce)
 
 
+@dataclass(frozen=True, slots=True)
+class Fp8ExpertBankSource:
+    """One layer's block-FP8 experts (Qwen/Qwen3.8-Flash-Next-FP8: E4M3FN codes, one BF16 scale per
+    128 x 128 tile, per expert); only ``import_fp8_expert_bank`` can read it."""
+
+    shape: tuple[int, int, int]
+    label: str
+    store: SafetensorsSource
+    prefix: str  # "...mlp.experts." so expert e's gate is f"{prefix}{e}.gate_proj"
+    read_encoded: object = None
+    weight_divisor: object = None
+    input_divisor: object = None
+
+    def values(self, begin: int = 0, end: int | None = None) -> torch.Tensor:
+        raise ValueError(f"{self.label}: an expert bank is imported exactly, never as values")
+
+
+def fp8_expert_records(source: Fp8ExpertBankSource, first: int, count: int) -> bytes:
+    """Experts [first, first + count) of a block-FP8 bank as ``fp8_expert_b128_v1`` records."""
+
+    _, hidden, intermediate = source.shape
+    parts = []
+    for e in range(first, first + count):
+        leaf = f"{source.prefix}{e}."
+        parts.append(encode_fp8_expert(
+            fp8_block_matrix_raw(source.store, leaf + "gate_proj", (intermediate, hidden)),
+            fp8_block_matrix_raw(source.store, leaf + "up_proj", (intermediate, hidden)),
+            fp8_block_matrix_raw(source.store, leaf + "down_proj", (hidden, intermediate)),
+            label=f"{source.label}.{e}"))
+    return b"".join(parts)
+
+
+def import_fp8_expert_bank(request: PrepareRequest) -> PreparedMethod:
+    """Write one layer's block-FP8 experts verbatim in ``fp8_expert_b128_v1`` (FP8 plan §5.2)."""
+
+    if request.target.format != "fp8_e4m3fn_b128" or request.target.layout != "fp8_expert_b128_v1":
+        raise ValueError("import_fp8_expert_bank requires fp8_e4m3fn_b128 in fp8_expert_b128_v1")
+    if request.parameters:
+        raise ValueError("import_fp8_expert_bank accepts no numerical parameters")
+    if len(request.inputs) != 1 or not isinstance(request.inputs[0].source, Fp8ExpertBankSource):
+        raise ValueError("import_fp8_expert_bank requires exactly one block-FP8 expert-bank source")
+    source = request.inputs[0].source
+    if tuple(request.target.shape) != source.shape:
+        raise ValueError("expert bank target shape differs from its source")
+    geometry = fp8_expert_geometry("fp8_e4m3fn_b128", source.shape)
+
+    def produce(output):
+        for first in range(0, source.shape[0], _BANK_CHUNK):
+            count = min(_BANK_CHUNK, source.shape[0] - first)
+            output.write_bytes(first * geometry.record_stride, fp8_expert_records(source, first, count))
+
+    return request.job(produce=produce)
+
+
 def _expert_input_scales(store: SafetensorsSource, prefix: str, experts: int) -> LogicalSource:
     """FP32 ``[experts, 3]`` activation global scales in (gate, up, down) order, as stored."""
 
@@ -419,6 +475,13 @@ class _Qwen4ExpBuilder(_Builder):
             self.group(*gate_up)
             self.group(*downs)
             return
+        # Qwen's official FP8 export: block-FP8 experts, imported verbatim and run W8A16 (FP8 plan).
+        if not store.has(sp + "experts.0.gate_proj.weight_packed") and \
+                store.describe(sp + "experts.0.gate_proj.weight").dtype == "F8_E4M3":
+            bank = Fp8ExpertBankSource((e, h, ir), f"{store.path}:{sp}experts", store, sp + "experts.")
+            self.model.add(Parameter(p + "experts", (e, h, ir), bank, None, (ffn_input,), "fp8_e4m3fn_b128",
+                                     residency="text"))
+            return
         # ModelOpt W4A4 banks carry each matrix's activation scale; a weight-only compressed-tensors
         # bank (weight_packed) has none and is W4A16 (design §16.2.1).
         packed = store.has(sp + "experts.0.gate_proj.weight_packed")
@@ -440,7 +503,10 @@ class _Qwen4ExpBuilder(_Builder):
             self.add(prefix + "ple/" + role, store, sp + field + ".weight", (width,))
         self.add(prefix + "ple/convolution", store, sp + "conv1d.weight", (taps, width),
                  source_shape=(width, 1, taps), transpose=(2, 0, 1))
-        # The n-gram volume's per-tensor scale: the checkpoint's own, or a BF16 table's derived one.
+        # An FP8 volume's per-tensor scale: the checkpoint's own, or a BF16 table's derived one. A BF16
+        # volume's rows are the values themselves.
+        if config["ngram_table"]["format"] != "fp8_e4m3fn":
+            return
         table = self.ngram
         scale = LogicalSource((1,), f"{store.path}:{table.prefix}scale", lambda begin, end: table.scale()[begin:end])
         self.model.add(Parameter(prefix + "ple/ngram_scale", (1,), scale, None, (), "bf16", residency="text"))
@@ -481,9 +547,13 @@ class NgramTable:
     export) are quantized by the per-tensor rule ModelOpt applies in the table's own dtype:
     s = bf16(amax / 448) and code = e4m3_rn_satfinite(bf16(v / s)). From the same BF16 table this
     reproduces NVIDIA's FP8 table word for word, so such a conversion can reuse its n-gram volume.
+
+    With ``keep_bf16`` a BF16 table's words are kept as they are (rows of 2 x width bytes): the BF16
+    volume any Qwen3.8-Flash-Next artifact accepts in place of its quantized table
+    (tools/flash_next/ngram_bf16.py).
     """
 
-    def __init__(self, store: SafetensorsSource, prefix: str, config: dict, rows: int):
+    def __init__(self, store: SafetensorsSource, prefix: str, config: dict, rows: int, *, keep_bf16: bool = False):
         self.store = store
         self.prefix = prefix + "ple.ple_embedding.ngram_embedding."
         width = config["ple_embed_dim"] // ((config["ngram_size"] - 1) * config["heads_per_ngram"])
@@ -499,8 +569,12 @@ class NgramTable:
         if len(dtypes) != 1:
             raise ValueError("n-gram shards mix dtypes")
         self.bf16 = dtypes == {"BF16"}
+        if keep_bf16 and not self.bf16:
+            raise ValueError("a BF16 n-gram volume needs the checkpoint's BF16 table (this one is FP8)")
+        self.keep_bf16 = keep_bf16
         self.rows = sum(count for _, count in self.shards)
-        self.row_bytes = width  # one E4M3FN byte per element
+        self.width = width
+        self.row_bytes = 2 * width if keep_bf16 else width  # BF16 words, or one E4M3FN byte per element
         if self.rows != rows:
             raise ValueError(f"n-gram shards hold {self.rows} rows, the hash domain needs {rows}")
         self._scale: torch.Tensor | None = None
@@ -515,7 +589,7 @@ class NgramTable:
                     step = 1 << 20
                     for begin in range(0, count, step):
                         end = min(count, begin + step)
-                        chunk = self.store.read_flat(name, begin * self.row_bytes, end * self.row_bytes)
+                        chunk = self.store.read_flat(name, begin * self.width, end * self.width)
                         amax = torch.maximum(amax, chunk.abs().max())
                 if not bool(torch.isfinite(amax)) or float(amax) <= 0:
                     raise ValueError("the BF16 n-gram table must have a positive finite absolute maximum")
@@ -533,14 +607,33 @@ class NgramTable:
         return self._scale
 
     def codes(self, name: str, begin: int, end: int) -> torch.Tensor:
-        """E4M3FN words ``uint8 [end - begin, row_bytes]`` of rows [begin, end) of shard ``name``."""
+        """The volume's bytes ``uint8 [end - begin, row_bytes]`` of rows [begin, end) of shard ``name``:
+        E4M3FN words, or with ``keep_bf16`` the BF16 words unchanged."""
 
-        values = self.store.read_flat(name, begin * self.row_bytes, end * self.row_bytes)
+        values = self.store.read_flat(name, begin * self.width, end * self.width)
+        if self.keep_bf16:
+            return values.contiguous().view(torch.uint8).reshape(end - begin, self.row_bytes)
         if not self.bf16:
             return values.view(torch.uint8).reshape(end - begin, self.row_bytes)
+        return self.quantize(values).reshape(end - begin, self.row_bytes)
+
+    def quantize(self, values: torch.Tensor) -> torch.Tensor:
+        """E4M3FN words (``uint8``) of BF16 ``values`` by the per-tensor rule and this table's scale."""
+
         quotient = values / self.scale()  # BF16 division: one rounding to BF16, as ModelOpt
         codes = quotient.float().clamp(-448.0, 448.0).to(torch.float8_e4m3fn)  # BF16 -> FP32 is exact
-        return codes.view(torch.uint8).reshape(end - begin, self.row_bytes)
+        return codes.view(torch.uint8)
+
+    def bf16_rows_match(self, name: str, begin: int, end: int, rows: torch.Tensor) -> torch.Tensor:
+        """Per row, whether BF16 volume rows (``uint8 [end - begin, 2 x width]``) are rows [begin, end) of
+        shard ``name`` of this table: a BF16 table's words, or values whose per-tensor quantization is
+        an FP8 table's words (the FP8 checkpoint of the same BF16 table: the rule ModelOpt applies)."""
+
+        values = rows.contiguous().view(torch.bfloat16).reshape(end - begin, self.width)
+        stored = self.store.read_flat(name, begin * self.width, end * self.width).reshape(end - begin, self.width)
+        if self.bf16:
+            return (values.view(torch.int16) == stored.contiguous().view(torch.int16)).all(dim=1)
+        return (self.quantize(values) == stored.view(torch.uint8)).all(dim=1)
 
 
 def build_model(
@@ -548,10 +641,16 @@ def build_model(
     *,
     components: tuple[str, ...] = ("text",),
     resource_overrides: Mapping[str, str | Path] | None = None,
+    ngram_format: str = "fp8_e4m3fn",
 ) -> Model:
+    """The logical model; ``ngram_format`` "bf16" binds the n-gram table as BF16 rows (a BF16 volume,
+    ``--ngram-reuse``) instead of FP8 rows with their per-tensor scale."""
+
     selected = set(components)
     if "text" not in selected or selected - {"text", "vision", "mtp"}:
         raise ValueError("select text and optional vision and mtp components")
+    if ngram_format not in ("fp8_e4m3fn", "bf16"):
+        raise ValueError(f"unknown n-gram table format {ngram_format!r}")
     config = text_config(base.config, mtp="mtp" in selected)
     text_prefix = "model.language_model." if "text_config" in base.config else "model."
     (ple_layer,) = config["ple_layer_ids"]
@@ -559,8 +658,8 @@ def build_model(
     rows = _check_ngram_buffers(base, ple_prefix, config, 0)
     table = NgramTable(base, ple_prefix, config, rows)
     config["ngram_table"] = {
-        "format": "fp8_e4m3fn",
-        **ngram_geometry(rows, table.row_bytes),
+        "format": ngram_format,
+        **ngram_geometry(rows, 2 * table.width if ngram_format == "bf16" else table.row_bytes),
     }
     records = {"text": {"config": config}}
     if "vision" in selected:
@@ -641,7 +740,18 @@ def ngram_geometry(rows: int, row_bytes: int) -> dict:
 NGRAM_REUSE_SAMPLES = 512
 
 
-def read_ngram_volume_id(table: NgramTable, path: Path) -> bytes:
+def ngram_volume_format(base: SafetensorsSource, path: Path) -> str:
+    """"bf16" for a volume of BF16 rows (2 x the head width), else "fp8_e4m3fn"
+    (read_ngram_volume_id checks the rest)."""
+
+    config = text_config(base.config, mtp=False)
+    width = config["ple_embed_dim"] // ((config["ngram_size"] - 1) * config["heads_per_ngram"])
+    with Path(path).open("rb") as stream:
+        row_bytes = NGRAM_HEADER.unpack(stream.read(NGRAM_HEADER.size))[4]
+    return "bf16" if row_bytes == 2 * width else "fp8_e4m3fn"
+
+
+def read_ngram_volume_id(table: NgramTable, path: Path, *, bf16: bool = False) -> bytes:
     """The volume id of an existing n-gram volume written from this table's words.
 
     Another recipe of the same checkpoint (recipe B) shares recipe A's volume, and so does a BF16
@@ -650,9 +760,14 @@ def read_ngram_volume_id(table: NgramTable, path: Path) -> bytes:
     table (the first and last included) must equal this table's rows byte for byte, so a volume
     written from another table with the same geometry is refused instead of adopted (the runtime
     only compares the id the artifact stores).
+
+    With ``bf16`` the volume holds the unquantized table's BF16 rows (tools/flash_next/ngram_bf16.py):
+    each sampled row must be a BF16 table's words, or quantize to an FP8 table's words
+    (NgramTable.bf16_rows_match), so an FP8 checkpoint binds the BF16 table it was quantized from.
     """
 
-    row_bytes, rows, shards = table.row_bytes, table.rows, table.shards
+    row_bytes = 2 * table.width if bf16 else table.row_bytes
+    rows, shards = table.rows, table.shards
     geometry = ngram_geometry(rows, row_bytes)
     path = Path(path)
     with path.open("rb") as stream:
@@ -682,10 +797,15 @@ def read_ngram_volume_id(table: NgramTable, path: Path) -> bytes:
         for row in samples:
             shard_first, name, _ = next(s for s in reversed(starts) if s[0] <= row)
             local = row - shard_first
-            expected = table.codes(name, local, local + 1)
             per_block = geometry["rows_per_block"]
             stream.seek(NGRAM_BLOCK_BYTES + (row // per_block) * NGRAM_BLOCK_BYTES + (row % per_block) * row_bytes)
-            if stream.read(row_bytes) != expected.numpy().tobytes():
+            stored = stream.read(row_bytes)
+            if bf16:
+                words = torch.frombuffer(bytearray(stored), dtype=torch.uint8).reshape(1, row_bytes)
+                same = bool(table.bf16_rows_match(name, local, local + 1, words)[0])
+            else:
+                same = stored == table.codes(name, local, local + 1).numpy().tobytes()
+            if not same:
                 raise ValueError(f"{path}: row {row} differs from this checkpoint's n-gram table "
                                  "(a volume written from another checkpoint)")
     return volume_id

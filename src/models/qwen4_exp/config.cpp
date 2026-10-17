@@ -80,10 +80,21 @@ NgramTableConfig ngram_table(const Json& value, std::uint64_t hash_rows, std::ui
                     {"format", "rows", "row_bytes", "rows_per_block", "block_bytes",
                      "header_bytes", "blocks", "file_bytes", "volume_id"},
                     {}, "n-gram table");
-    if (value.at("format") != "fp8_e4m3fn") {
-        throw ArtifactError("n-gram table must hold FP8 E4M3FN codes");
-    }
     NgramTableConfig out;
+    if (value.at("format") == "fp8_e4m3fn") {
+        out.format = NgramRowFormat::Fp8E4m3;
+    } else if (value.at("format") == "iq4_nl") {
+        // A GGUF table's rows verbatim: IQ4_NL blocks of 32 (fp16 scale and 16 nibble bytes).
+        out.format = NgramRowFormat::Iq4Nl;
+        if (head_width % 32) { throw ArtifactError("an IQ4_NL n-gram row must be whole 32-element blocks"); }
+        head_width = head_width / 32 * 18;
+    } else if (value.at("format") == "bf16") {
+        // The unquantized table's BF16 words (an exact conversion bound to a BF16 volume).
+        out.format = NgramRowFormat::Bf16;
+        head_width = 2 * head_width;
+    } else {
+        throw ArtifactError("n-gram table must hold FP8 E4M3FN, IQ4_NL or BF16 rows");
+    }
     out.rows           = wide(value, "rows");
     out.row_bytes      = dimension(value, "row_bytes");
     out.rows_per_block = dimension(value, "rows_per_block");
@@ -125,7 +136,7 @@ TextConfig text(const Json& value) {
          "ple_embed_dim", "ple_conv_kernel_size", "ngram_size", "heads_per_ngram",
          "ngram_vocab_size_base", "make_ngram_vocab_size_divisible_by", "seed",
          "split_ngram_parts", "eos_token_id", "ngram_table"},
-        {}, "text config");
+        {"gdn_output_order", "gdn_a"}, "text config");
     const auto& names = value.at("architectures");
     if (!names.is_array() || names.size() != 1) {
         throw ArtifactError("architectures must name one implementation");
@@ -183,6 +194,20 @@ TextConfig text(const Json& value) {
     } else {
         throw ArtifactError("output_gate_type must be sigmoid or silu");
     }
+    // A GGUF import: the output projection's columns in ggml's tiled value-head order, and the
+    // decay as A = -exp(A_log) itself (tools/convert/qwen4_exp_gguf.py).
+    if (value.contains("gdn_output_order")) {
+        if (value.at("gdn_output_order") != "ggml_tiled") { throw ArtifactError("gdn_output_order must be ggml_tiled"); }
+        out.gdn.output_ggml_tiled = true;
+    }
+    if (value.contains("gdn_a")) {
+        if (value.at("gdn_a") != "direct") { throw ArtifactError("gdn_a must be direct"); }
+        out.gdn.a_direct = true;
+    }
+    if (out.gdn.a_direct != out.gdn.output_ggml_tiled) {
+        throw ArtifactError("gdn_a and gdn_output_order describe one GGUF import and come together");
+    }
+    out.ggml_weights = out.gdn.a_direct;
     out.moe = {dimension(value, "num_experts"), dimension(value, "num_experts_per_tok"),
                dimension(value, "moe_intermediate_size"),
                dimension(value, "shared_expert_intermediate_size")};

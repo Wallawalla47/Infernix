@@ -15,7 +15,9 @@
 namespace infernix::ops {
 
 // a and b hold each column's 48 heads contiguously, at column strides a_ld and b_ld (elements), so
-// both may be row slices of one control projection [a; b].
+// both may be row slices of one control projection [a; b]. ADirect: the third input holds A =
+// -exp(A_log) itself (a GGUF import), used as stored.
+template <bool ADirect>
 __global__ void gdn_gating_kernel(const __nv_bfloat16* a, const __nv_bfloat16* b, std::int64_t a_ld,
                                   std::int64_t b_ld, const float* A_log, const float* dt_bias, float* g,
                                   float* beta, std::int64_t n) {
@@ -25,7 +27,7 @@ __global__ void gdn_gating_kernel(const __nv_bfloat16* a, const __nv_bfloat16* b
     for (std::int64_t i = start; i < n; i += stride) {
         const int h           = static_cast<int>(i % 48);
         const std::int64_t t  = i / 48;
-        gdn_gate_values(a[t * a_ld + h], b[t * b_ld + h], A_log[h], dt_bias[h], g[i], beta[i]);
+        gdn_gate_values<ADirect>(a[t * a_ld + h], b[t * b_ld + h], A_log[h], dt_bias[h], g[i], beta[i]);
     }
 }
 

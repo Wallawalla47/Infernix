@@ -151,7 +151,7 @@ int main() {
                           mtp_ngram.speculative.ngram_draft_tokens == 15,
                       "MTP and ngram widths were not kept separate");
     for (const std::string backend : {"mtp", "dflash", "dflash2"}) {
-        const int neural_limit = backend == "mtp" ? 5 : 15;
+        const int neural_limit = backend == "mtp" ? 7 : 15;
         for (int neural = 1; neural <= neural_limit; ++neural) {
             for (int lookup = 1; lookup <= 63; ++lookup) {
                 const auto options =
@@ -989,6 +989,11 @@ int main() {
     const auto state_file = parse({"infernix-serve", "model.ninfer", "--expert-state", "cache.state"});
     failures += check(state_file.expert_state && *state_file.expert_state == "cache.state",
                       "serve --expert-state FILE must name the file");
+    failures += check(parse({"infernix-serve", "model.ninfer"}).expert_stripe_path.empty(),
+                      "serve expert stripe must default to none");
+    failures += check(parse({"infernix-serve", "model.ninfer", "--expert-stripe", "D:/m.stripe"}).expert_stripe_path ==
+                          "D:/m.stripe",
+                      "serve --expert-stripe FILE must name the file");
 
     // --claude-code-prompt as-sent|local: Claude Code's System prompt is used as sent by default.
     failures += check(defaults.claude_code_prompt == ClaudeCodePrompt::AsSent,

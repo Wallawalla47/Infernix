@@ -60,9 +60,11 @@ public:
 // Where each layer's routed experts live: device frames for resident experts, the pinned host
 // bank otherwise.
 struct ForwardExperts {
-    const std::uint8_t* frame_base = nullptr;
-    std::uint64_t frame_stride     = 0;
-    std::vector<const std::int32_t*> frames; // per layer, device I32 [E]: frame or -1
+    // Per layer: its frame pool's base and pitch (frame f at frame_bases[l] + f * frame_pitches[l];
+    // empty: no frames), and its device I32 [E] table (frame or -1).
+    std::vector<const std::uint8_t*> frame_bases;
+    std::vector<std::uint64_t> frame_pitches;
+    std::vector<const std::int32_t*> frames;
     // Optional route log for the expert cache: layer l's routed ids (I32 [k, T]) are copied to
     // route_log + l * route_stride.
     std::int32_t* route_log  = nullptr;
@@ -84,6 +86,10 @@ struct ForwardExperts {
     // Prefill chunks stage their next pass of misses on this stream while one pass computes.
     cudaStream_t overlap_stream = nullptr;
     std::array<cudaEvent_t, 5> overlap_events{};
+    // Decode and verification calls run the shared expert on this stream (forked at the layer's
+    // input, joined before the combine) while the routed experts compute. Null: in order.
+    cudaStream_t shared_stream = nullptr;
+    std::array<cudaEvent_t, 2> shared_events{};
     // Landing frames of decode and verification calls (design §19.3.5 S4; see
     // ops::MoeExpertSource::landing): layer l uses landing + l * landing_slots and landed + l *
     // landing_slots. Null disables.
@@ -151,7 +157,9 @@ struct ForwardBatch {
     Tensor rope_positions;   // I32 [T, 3] axis-major: RoPE position of each column
     Tensor block_start_rope; // I32 [batch, 3] axis-major: RoPE position of each sequence's first
                              // pooled-block token (ops::QsaBatch::block_start_rope)
-    Tensor ngram_rows; // U8 [row bytes, heads, T]: each column's FP8 n-gram rows
+    Tensor ngram_rows; // U8 [row bytes, heads, T]: each column's n-gram rows
+    // The rows' format when it is not the artifact's table's (a BF16 volume, resolve_ngram_volume).
+    std::optional<NgramRowFormat> ngram_format;
     const NgramRowGate* ngram_gate = nullptr; // when set: ngram_rows are written by the gate
     Tensor slots;      // I32 [batch]: state slot of each sequence, updated in place
     Tensor table_rows; // I32 [batch]: KV block-table row of each sequence
@@ -253,7 +261,18 @@ public:
     void begin_call(const ForwardBatch& batch, const Tensor* logits);
     void embed(const ForwardBatch& batch, Tensor& residual);
     void layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& residual, const ForwardTap* tap = nullptr);
+    // layer() in two halves, for a walk whose MoE runs once over several chunks' columns (every
+    // step of both halves acts column by column, so the outputs are layer()'s bit for bit).
+    // layer_mixer runs everything before the MoE and writes its input xm (BF16 [H, T]) and its
+    // inject weights (FP32 [S, T]) into the caller's tensors; layer_moe runs the MoE over xm (any
+    // T, after begin_call of any of its chunks) and injects its output into `residual` (the same
+    // columns), its route log holding the trailing `route_columns` columns (-1: all).
+    void layer_mixer(std::uint32_t layer, const ForwardBatch& batch, Tensor& residual, Tensor& xm, Tensor& inject);
+    void layer_moe(std::uint32_t layer, const ForwardBatch& batch, const Tensor& xm, const Tensor& inject,
+                   Tensor& residual, std::int32_t route_columns);
     void finish(const ForwardBatch& batch, Tensor& residual, Tensor* logits);
+    // Workspace of one layer_moe call over `columns` columns.
+    [[nodiscard]] static std::size_t moe_workspace_bytes(const TextConfig& config, std::int32_t columns);
 
     // Runs the MTP drafter (requires MTP parameters and state).
     void run_mtp(const MtpCall& call);
@@ -274,7 +293,10 @@ public:
 
 private:
     void ple(const PleParameters& p, Tensor& residual, const ForwardBatch& batch);
-    Tensor mix(const HyperConnectionParameters& p, const Tensor& residual, Tensor* inject);
+    // The block's mixed input (into `into` when given, else the workspace).
+    Tensor mix(const HyperConnectionParameters& p, const Tensor& residual, Tensor* inject, Tensor* into = nullptr);
+    // The layer's token mixer (GDN or QSA attention) over its mixed input.
+    Tensor mixer(std::uint32_t layer, const ForwardBatch& batch, const Tensor& xa);
     Tensor gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index, const ForwardBatch& batch);
     // One QSA block's attention through `layer` and `tails`. Index keys go to `key_records` when
     // set (verification and MTP catch-up: tails unchanged) or advance the tails when update_tails;
@@ -293,9 +315,11 @@ private:
         std::int32_t batch = 0, width = 0;
     };
     Tensor attention(const AttentionParameters& p, const Tensor& x, const AttentionCall& call);
-    // With inject and residual, the output is injected into the residual streams (and not returned).
+    // `route_columns` >= 0: a layer walk's grouped call, whose route log keeps its last that many
+    // columns. With inject and residual, the output is injected into the residual streams (and not
+    // returned).
     Tensor moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer, Tensor* route_tap,
-               const ForwardBatch* batch = nullptr, const Tensor* inject = nullptr,
+               const ForwardBatch* batch = nullptr, std::int32_t route_columns = -1, const Tensor* inject = nullptr,
                Tensor* residual = nullptr);
     void wait_layer(const ForwardBatch& batch, std::size_t entry);
     void mtp_block(const MtpCall& call, Tensor& residual);

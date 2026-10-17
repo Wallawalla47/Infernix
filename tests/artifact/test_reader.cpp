@@ -135,6 +135,29 @@ void geometry_and_views() {
     rejects<std::invalid_argument>(
         [&] { (void)weight_geometry(QType::NVFP4_MUL, QuantLayout::ExpertRg16, std::array<std::uint64_t, 3>{3, 64, 40}); },
         "expert bank layout accepted an intermediate size that is not a multiple of 16");
+
+    // Block-FP8 banks (fp8_expert_b128_v1): the official Qwen3.8-Flash-Next-FP8 experts, sizes equal
+    // tools/artifact/layouts.py's fp8_expert_geometry.
+    const auto fp8_bank = weight_geometry(QType::FP8_E4M3FN_B128, QuantLayout::Fp8ExpertB128,
+                                     std::array<std::uint64_t, 3>{512, 2560, 640});
+    require(fp8_bank.record_bytes == 4915800 && fp8_bank.record_stride == 4919296 && fp8_bank.bytes == 512ULL * 4919296 &&
+                fp8_bank.alignment == 4096 && fp8_bank.scale_bytes == 0,
+            "block-FP8 expert bank size differs from the Python layout");
+    const auto fp8_small = weight_geometry(QType::FP8_E4M3FN_B128, QuantLayout::Fp8ExpertB128,
+                                           std::array<std::uint64_t, 3>{2, 256, 128});
+    std::vector<std::byte> fp8_bytes(fp8_small.bytes);
+    const auto fp8_planes = expert_bank_planes(WeightParent{fp8_small, fp8_bytes.data()});
+    require(fp8_planes.record_bytes == 3 * 256 * 128 + 12 && fp8_planes.record_stride == 102400 &&
+                fp8_planes.gate_row_bytes == 256 && fp8_planes.down_row_bytes == 128 &&
+                fp8_planes.gate_up_bytes == 2 * 128 * 256 && fp8_planes.multipliers == nullptr &&
+                fp8_planes.gate_up_format == QType::FP8_E4M3FN_B128 && fp8_planes.down_format == QType::FP8_E4M3FN_B128,
+            "block-FP8 expert bank planes lost their geometry");
+    rejects<std::invalid_argument>(
+        [&] { (void)weight_geometry(QType::FP8_E4M3FN_B128, QuantLayout::Fp8ExpertB128, std::array<std::uint64_t, 3>{2, 256, 64}); },
+        "block-FP8 expert bank accepted a partial 128 x 128 tile");
+    rejects<std::invalid_argument>(
+        [&] { (void)weight_geometry(QType::NVFP4_MUL, QuantLayout::Fp8ExpertB128, std::array<std::uint64_t, 3>{2, 256, 128}); },
+        "block-FP8 expert bank layout accepted another format");
 }
 
 void invalid_directories() {

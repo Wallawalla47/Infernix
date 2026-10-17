@@ -164,7 +164,22 @@ def main(argv=None):
     parser.add_argument(
         "--ngram-reuse",
         type=Path,
-        help="Qwen4Exp: bind the artifact to this existing volume of the same checkpoint instead of writing one",
+        help="Qwen4Exp: bind the artifact to this existing volume of the same checkpoint instead of writing one; "
+        "a BF16 volume (tools.flash_next.ngram_bf16) binds the unquantized table, checked against the checkpoint's",
+    )
+    parser.add_argument(
+        "--gguf",
+        type=Path,
+        action="append",
+        default=[],
+        metavar="SHARD",
+        help="Qwen4Exp: import the weights bit-exactly from these GGUF shards (all of one split model); "
+        "--model then supplies the config, frontend resources and, with the mtp component, the MTP head",
+    )
+    parser.add_argument(
+        "--mmproj",
+        type=Path,
+        help="Qwen4Exp with --gguf and the vision component: the vision tower from this BF16 mmproj GGUF",
     )
     args = parser.parse_args(argv)
     components = tuple(args.components.split(","))
@@ -178,15 +193,44 @@ def main(argv=None):
         base = stack.enter_context(SafetensorsSource(args.model))
         sources = SourceInputs(base, paths, stack)
         qwen4 = qwen4_exp.is_qwen4_exp(base.config)
+        gguf_store = None
+        if args.gguf:
+            if not qwen4:
+                raise ValueError("--gguf imports Qwen4Exp GGUFs; --model must be its Qwen checkpoint")
+            from . import qwen4_exp_gguf
+            from .sources.gguf_raw import GgufStore
+
+            gguf_store = stack.enter_context(GgufStore(args.gguf))
+        mmproj = None
+        if args.mmproj is not None:
+            if gguf_store is None:
+                raise ValueError("--mmproj supplies the vision tower of a --gguf import")
+            from .sources.gguf import GGUFSource
+
+            mmproj = stack.enter_context(GGUFSource(args.mmproj))
         if qwen4:
-            model = qwen4_exp.build_model(
-                base, components=components, resource_overrides=overrides
-            )
+            # A BF16 volume (tools/flash_next/ngram_bf16.py) binds the table as its unquantized rows.
+            ngram_format = "fp8_e4m3fn"
+            if args.ngram_reuse is not None:
+                ngram_format = qwen4_exp.ngram_volume_format(base, args.ngram_reuse)
+            if gguf_store is not None:
+                if ngram_format == "bf16":
+                    raise ValueError("a GGUF import binds its own IQ4_NL volume; give it a BF16 volume at run "
+                                     "time with --ngram-volume")
+                model = qwen4_exp_gguf.build_model(
+                    base, gguf_store, components=components, resource_overrides=overrides, mmproj=mmproj
+                )
+                table_of = lambda: qwen4_exp_gguf.Iq4NlTable(gguf_store, model.config["ngram_table"]["rows"])
+            else:
+                model = qwen4_exp.build_model(
+                    base, components=components, resource_overrides=overrides, ngram_format=ngram_format
+                )
+                table_of = lambda: qwen4_exp.ngram_table(base, model.config)
             # The volume id ties the separately placed n-gram volume to this artifact.
             if args.ngram_reuse is not None:
                 if args.ngram_out is not None:
                     raise ValueError("--ngram-reuse and --ngram-out are exclusive")
-                volume_id = qwen4_exp.read_ngram_volume_id(qwen4_exp.ngram_table(base, model.config), args.ngram_reuse)
+                volume_id = qwen4_exp.read_ngram_volume_id(table_of(), args.ngram_reuse, bf16=ngram_format == "bf16")
                 model.config["ngram_table"]["volume_id"] = volume_id.hex()
                 ngram_out = None
             else:
@@ -227,6 +271,10 @@ def main(argv=None):
             "recipe": args.recipe,
             "sources": sources.provenance(),
         }
+        if gguf_store is not None:
+            provenance["gguf"] = [str(path) for path in gguf_store.paths]
+        if mmproj is not None:
+            provenance["mmproj"] = str(mmproj.path)
         if args.override:
             provenance["override"] = args.override
         if args.proposal:
@@ -254,7 +302,7 @@ def main(argv=None):
                 print(f"[ngram {index+1}/{total}]", flush=True)
 
             qwen4_exp.write_ngram_volume(
-                qwen4_exp.ngram_table(base, model.config),
+                table_of(),
                 ngram_out,
                 bytes.fromhex(table["volume_id"]),
                 progress=ngram_progress,

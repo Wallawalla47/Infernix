@@ -29,6 +29,9 @@ constexpr std::uint64_t kPrefillRunTag = 3; // index: a run of prefill entries
 // first record lands soon.
 constexpr std::size_t kFillRunBytes  = std::size_t{32} << 20;
 constexpr std::size_t kFetchRunBytes = std::size_t{12} << 20;
+// Read-ahead (Options::ahead_min, ahead) keeps the drive reading while the device finishes a layer
+// and routes the next. Decode calls (a few records each) never read ahead.
+constexpr std::int32_t kAheadFetch = -2; // Ticket::fetch of a read-ahead ticket not yet adopted
 // An open round with no work for this long (one that was abandoned without end_round) stops the
 // agent's spinning; it then polls about once per millisecond.
 constexpr auto kIdleSpin = std::chrono::seconds(2);
@@ -158,9 +161,12 @@ HostExpertTier::HostExpertTier(const ExpertStore& store, Options options)
     queue_ = std::make_unique<DirectReadQueue>(options_.io);
     for (const auto& path : store_.files()) { files_.push_back(queue_->open(path)); }
     // A layer call reads each of its experts once, so a round demands at most its layer calls'
-    // experts (every key once when a round calls each layer once).
-    ticket_capacity_ = options_.layer_calls > 0 ? options_.layer_calls * store_.experts() : keys();
+    // experts (every key once when a round calls each layer once), and each layer call's request
+    // may leave Options::ahead read-ahead tickets unadopted.
+    const std::uint32_t calls = options_.layer_calls > 0 ? options_.layer_calls : store_.layers();
+    ticket_capacity_ = (options_.layer_calls > 0 ? options_.layer_calls * store_.experts() : keys()) + calls * options_.ahead;
     tickets_         = std::make_unique<Ticket[]>(ticket_capacity_);
+    stream_state_    = std::make_unique<std::atomic<std::uint32_t>[]>(std::max<std::uint32_t>(options_.stream, 1));
     {
         std::lock_guard<std::mutex> lock(mutex_);
         tier_.begin_round(0);
@@ -215,6 +221,8 @@ void HostExpertTier::submit(std::uint32_t key, std::uint8_t* destination, std::u
     }
 }
 
+// Whole records that follow each other in one file. A record split across files (one that straddles
+// part files, or an expert stripe's head and tail) is read segment by segment.
 bool HostExpertTier::follows(std::uint32_t before, std::uint32_t key) const {
     const auto a = store_.segments(before / store_.experts(), before % store_.experts());
     const auto b = store_.segments(key / store_.experts(), key % store_.experts());
@@ -317,6 +325,7 @@ void HostExpertTier::begin_round(std::uint32_t allowance) {
     stats_.fetch_from_ram  = agent_fetch_from_ram_.load(std::memory_order_relaxed);
     stats_.run_reads       = agent_run_reads_.load(std::memory_order_relaxed);
     stats_.run_records     = agent_run_records_.load(std::memory_order_relaxed);
+    stats_.stream_reads    = agent_stream_reads_.load(std::memory_order_relaxed);
     stats_.unpinned_served = unpinned_served_.load(std::memory_order_relaxed);
     stats_.unpinned_copies = unpinned_copies_.load(std::memory_order_relaxed);
     tier_.begin_round(allowance);
@@ -370,6 +379,59 @@ std::uint32_t HostExpertTier::new_ticket(std::uint32_t key, std::int32_t fetch) 
     ticket.state.store(0, std::memory_order_relaxed);
     in_flight_.fetch_add(1, std::memory_order_acq_rel);
     return t;
+}
+
+std::uint32_t HostExpertTier::lend_stream(std::uint32_t n) {
+    const std::vector<std::uint32_t> slots = tier_.lend(std::min(n, options_.stream));
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!stream_slot_.empty()) { throw std::logic_error("SSD tier: stream slots are lent already"); }
+    stream_slot_ = slots;
+    stream_free_.clear();
+    for (std::uint32_t s = static_cast<std::uint32_t>(slots.size()); s > 0; --s) { stream_free_.push_back(s - 1); }
+    return static_cast<std::uint32_t>(slots.size());
+}
+
+void HostExpertTier::return_stream() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (stream_slot_.empty()) { return; }
+        if (stream_free_.size() != stream_slot_.size()) { throw std::logic_error("SSD tier: a stream slot is still in use"); }
+        stream_slot_.clear();
+        stream_free_.clear();
+    }
+    tier_.give_back();
+}
+
+std::int32_t HostExpertTier::stream_read(std::uint32_t key) {
+    std::int32_t slot = -1;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!agent_failure_.empty() || stream_free_.empty()) { return -1; }
+        slot = static_cast<std::int32_t>(stream_free_.back());
+        stream_free_.pop_back();
+        stream_state_[slot].store(0, std::memory_order_relaxed);
+        stream_jobs_.emplace_back(key, static_cast<std::uint32_t>(slot));
+    }
+    wake_.notify_all();
+    return slot;
+}
+
+const std::uint8_t* HostExpertTier::stream_wait(std::int32_t slot) noexcept {
+    for (std::uint32_t spins = 0;; ++spins) {
+        const std::uint32_t state = stream_state_[slot].load(std::memory_order_acquire);
+        if (state == 1) { return slot_bytes(stream_slot_[static_cast<std::size_t>(slot)]); }
+        if (state == 2) { return nullptr; }
+        if (spins < 4096) {
+            relax();
+        } else {
+            std::this_thread::yield();
+        }
+    }
+}
+
+void HostExpertTier::stream_release(std::int32_t slot) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    stream_free_.push_back(static_cast<std::uint32_t>(slot));
 }
 
 std::uint32_t HostExpertTier::demand(int layer, int expert) noexcept {
@@ -470,6 +532,11 @@ void HostExpertTier::agent_failed(std::string what) noexcept {
         for (std::uint32_t t = 0; t < count; ++t) { fail_ticket(t); }
         new_demands_.clear();
         prefill_jobs_.clear();
+        stream_jobs_.clear();
+        for (std::uint32_t s = 0; s < options_.stream; ++s) { // pending stream reads fail
+            std::uint32_t pending = 0;
+            stream_state_[s].compare_exchange_strong(pending, 2, std::memory_order_acq_rel);
+        }
         if (prefill_pending_ != 0) {
             prefill_failures_ += prefill_pending_;
             prefill_pending_ = 0;
@@ -543,6 +610,16 @@ void HostExpertTier::agent_loop() {
     std::vector<std::pair<std::uint32_t, std::uint8_t*>> prefills;
     std::vector<PrefillEntry> prefill_entries;
     std::uint32_t prefill_left = 0;
+    // Stream reads in flight: (stream slot, segments left, failed), tagged as prefill reads whose
+    // index (or run member) carries kStreamEntry.
+    struct StreamEntry {
+        std::uint32_t slot, remaining;
+        bool failed;
+    };
+    constexpr std::uint32_t kStreamEntry = 0x80000000U;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> streams;
+    std::vector<StreamEntry> stream_entries;
+    std::uint32_t stream_left = 0;
     // The members of each scatter read in flight (tickets or prefill entries), by tag index.
     std::vector<std::vector<std::uint32_t>> runs;
     std::vector<DirectReadQueue::Completion> done;
@@ -553,6 +630,37 @@ void HostExpertTier::agent_loop() {
     std::vector<std::uint32_t> fetch_ticket;
     std::uint32_t released     = 0;
     bool fetch_failed          = false;
+    // Read-ahead tickets of the last request's guess (fetch kAheadFetch until adopted), by key
+    // (ticket + 1) for adoption. They stay out of round_ticket_of_key_ until adopted, so a CPU demand
+    // never shares one (it reads its own copy).
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> ahead; // (ticket, key)
+    std::vector<std::uint32_t> ahead_of_key(keys(), 0);
+    const auto new_ahead_ticket = [&](std::uint32_t k) {
+        const std::uint32_t t = ticket_count_.fetch_add(1, std::memory_order_acq_rel);
+        if (t >= ticket_capacity_) { return kNoTicket; }
+        Ticket& ticket  = tickets_[t];
+        ticket.key      = k;
+        ticket.resident = false;
+        ticket.recycled = false;
+        ticket.fetch    = kAheadFetch;
+        ticket.done.store(false, std::memory_order_relaxed);
+        ticket.status.store(0, std::memory_order_relaxed);
+        ticket.state.store(0, std::memory_order_relaxed);
+        in_flight_.fetch_add(1, std::memory_order_acq_rel);
+        return t;
+    };
+    // Read-ahead tickets still waiting for a ring slot are dropped (nothing will read them).
+    const auto drop_waiting_ahead = [&] {
+        for (auto it = waiting.begin(); it != waiting.end();) {
+            if (tickets_[*it].fetch == kAheadFetch) {
+                if (ahead_of_key[tickets_[*it].key] == *it + 1) { ahead_of_key[tickets_[*it].key] = 0; }
+                fail_ticket(*it);
+                it = waiting.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    };
     std::uint64_t round        = 0;
     auto last_work             = Clock::now();
     auto* const fetch          = options_.fetch;
@@ -576,21 +684,27 @@ void HostExpertTier::agent_loop() {
         {
             std::unique_lock<std::mutex> lock(mutex_);
             if (outstanding == 0 && waiting.empty() && !open_) {
-                wake_.wait(lock, [&] { return stop_ || open_ || !new_demands_.empty() || !prefill_jobs_.empty(); });
+                wake_.wait(lock, [&] {
+                    return stop_ || open_ || !new_demands_.empty() || !prefill_jobs_.empty() || !stream_jobs_.empty();
+                });
                 last_work = Clock::now();
             }
             // Stopping abandons demands still waiting for a slot (their readers are gone).
             if (stop_ && outstanding == 0) { return; }
             demands.swap(new_demands_);
             prefills.swap(prefill_jobs_);
+            streams.swap(stream_jobs_);
             open = open_;
             if (round_ != round) { // a boundary reset the tickets: the last request is over
                 round = round_;
                 fetch_ticket.clear();
+                for (const auto& [t, k] : ahead) { ahead_of_key[k] = 0; }
+                ahead.clear();
                 released     = 0;
                 fetch_failed = false;
             }
         }
+        if (!open) { drop_waiting_ahead(); } // the round is over: no request will adopt them
         if (fetch != nullptr && open) {
             fetch->beat();
             ops::offloaded_moe::FetchChannel::Request request;
@@ -605,9 +719,27 @@ void HostExpertTier::agent_loop() {
                 agent_fetch_requests_.fetch_add(1, std::memory_order_relaxed);
                 agent_fetch_records_.fetch_add(request.experts.size(), std::memory_order_relaxed);
                 for (std::size_t i = 0; i < request.experts.size(); ++i) {
-                    const std::uint32_t t = new_ticket(key(static_cast<std::uint32_t>(request.layer),
-                                                           static_cast<std::uint32_t>(request.experts[i])),
-                                                       static_cast<std::int32_t>(i));
+                    const std::uint32_t k = key(static_cast<std::uint32_t>(request.layer),
+                                                static_cast<std::uint32_t>(request.experts[i]));
+                    // A read-ahead ticket of this key is adopted: it lands as this request's record i
+                    // (finish_ticket, or now if it already has), and becomes the round's ticket of k.
+                    if (const std::uint32_t known = ahead_of_key[k]; known != 0) {
+                        const std::uint32_t t = known - 1;
+                        ahead_of_key[k] = 0;
+                        Ticket& ticket = tickets_[t];
+                        ticket.fetch    = static_cast<std::int32_t>(i);
+                        fetch_ticket[i] = t;
+                        round_ticket_of_key_[k] = t + 1;
+                        const std::uint32_t state = ticket.state.load(std::memory_order_acquire);
+                        if (state == 1) {
+                            fetch->land(static_cast<std::uint32_t>(i), slot_bytes(ticket.slot));
+                        } else if (state == 2 && !fetch_failed) {
+                            fetch->fail(EIO);
+                            fetch_failed = true;
+                        }
+                        continue;
+                    }
+                    const std::uint32_t t = new_ticket(k, static_cast<std::int32_t>(i));
                     if (t == kNoTicket) {
                         fetch->fail(ENOBUFS);
                         fetch_failed = true;
@@ -618,6 +750,29 @@ void HostExpertTier::agent_loop() {
                         fetch->land(static_cast<std::uint32_t>(i), tickets_[t].bytes);
                         agent_fetch_from_ram_.fetch_add(1, std::memory_order_relaxed);
                     } else {
+                        waiting.push_back(t);
+                    }
+                }
+                // The last guess's records this request did not name: their slots may be reused.
+                drop_waiting_ahead();
+                for (const auto& [t, k] : ahead) {
+                    if (ahead_of_key[k] == t + 1) { // not adopted
+                        ahead_of_key[k] = 0;
+                        tickets_[t].done.store(true, std::memory_order_release);
+                    }
+                }
+                ahead.clear();
+                // A wide request reads the next layer's records without a host copy behind its own.
+                if (!fetch_failed && options_.ahead > 0 && request.experts.size() >= options_.ahead_min &&
+                    static_cast<std::uint32_t>(request.layer) + 1 < store_.layers()) {
+                    const auto next = static_cast<std::uint32_t>(request.layer) + 1;
+                    for (std::uint32_t e = 0; e < store_.experts() && ahead.size() < options_.ahead; ++e) {
+                        const std::uint32_t k = key(next, e);
+                        if (round_ticket_of_key_[k] != 0 || tier_.slot_of(k) >= 0) { continue; }
+                        const std::uint32_t t = new_ahead_ticket(k);
+                        if (t == kNoTicket) { break; }
+                        ahead_of_key[k] = t + 1;
+                        ahead.emplace_back(t, k);
                         waiting.push_back(t);
                     }
                 }
@@ -731,6 +886,40 @@ void HostExpertTier::agent_loop() {
             }
         }
         prefills.clear();
+        // Stream reads in the order asked (a layer's experts, ascending): records that follow each
+        // other in a file are read as one run.
+        for (std::size_t i = 0; i < streams.size();) {
+            std::size_t end   = i + 1;
+            std::size_t bytes = store_.record_bytes();
+            while (end < streams.size() && end - i < DirectReadQueue::kMaxTargets && bytes + store_.record_bytes() <= kFillRunBytes &&
+                   follows(streams[end - 1].first, streams[end].first)) {
+                bytes += store_.record_bytes();
+                ++end;
+            }
+            if (end - i == 1) {
+                const auto [key, slot] = streams[i];
+                const auto index       = static_cast<std::uint32_t>(stream_entries.size());
+                const auto n = static_cast<std::uint32_t>(store_.segments(key / store_.experts(), key % store_.experts()).size());
+                stream_entries.push_back({slot, n, false});
+                submit(key, const_cast<std::uint8_t*>(slot_bytes(stream_slot_[slot])), tag_of(kPrefillTag, index | kStreamEntry, 0));
+                outstanding += n;
+            } else {
+                std::vector<std::uint32_t> members;
+                std::vector<std::pair<std::uint32_t, std::uint8_t*>> records;
+                for (std::size_t k = i; k < end; ++k) {
+                    members.push_back(static_cast<std::uint32_t>(stream_entries.size()) | kStreamEntry);
+                    stream_entries.push_back({streams[k].second, 1, false});
+                    records.emplace_back(streams[k].first, const_cast<std::uint8_t*>(slot_bytes(stream_slot_[streams[k].second])));
+                }
+                const auto index = static_cast<std::uint32_t>(runs.size());
+                runs.push_back(std::move(members));
+                submit_run(records, tag_of(kPrefillRunTag, index, 0));
+                ++outstanding;
+            }
+            stream_left += static_cast<std::uint32_t>(end - i);
+            i = end;
+        }
+        streams.clear();
         done.clear();
         // While a round is open the agent spins (a fetch request must not wait for a timer).
         queue_->poll(done, outstanding != 0 && !open ? std::chrono::microseconds(200) : std::chrono::microseconds(0));
@@ -762,6 +951,23 @@ void HostExpertTier::agent_loop() {
                 }
             }
         };
+        const auto stream_done = [&](std::uint32_t index, bool ok) {
+            StreamEntry& entry = stream_entries[index];
+            entry.failed       = entry.failed || !ok;
+            if (--entry.remaining == 0) {
+                stream_state_[entry.slot].store(entry.failed ? 2 : 1, std::memory_order_release);
+                agent_stream_reads_.fetch_add(1, std::memory_order_relaxed);
+                if (--stream_left == 0) { stream_entries.clear(); }
+            }
+        };
+        // A prefill-kind index or run member is a stream read's when it carries kStreamEntry.
+        const auto fill_read = [&](std::uint32_t index, bool ok) {
+            if ((index & kStreamEntry) != 0) {
+                stream_done(index & ~kStreamEntry, ok);
+            } else {
+                prefill_read(index, ok);
+            }
+        };
         for (const auto& c : done) {
             --outstanding;
             const std::uint64_t kind = c.tag >> 62U;
@@ -770,13 +976,13 @@ void HostExpertTier::agent_loop() {
             if (kind == kDemandTag) {
                 ticket_read(index, ok);
             } else if (kind == kPrefillTag) {
-                prefill_read(index, ok);
+                fill_read(index, ok);
             } else {
                 for (const std::uint32_t member : runs[index]) {
                     if (kind == kDemandRunTag) {
                         ticket_read(member, ok);
                     } else {
-                        prefill_read(member, ok);
+                        fill_read(member, ok);
                     }
                 }
                 runs[index].clear();

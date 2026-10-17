@@ -277,7 +277,7 @@ Call make_call(const q4::TextConfig& c, const q4::NgramVolume& volume, const std
     const auto batch = static_cast<std::int32_t>(histories.size());
     const std::int32_t columns = batch * width;
     const q4::NgramHash hash(c.ple.ngram, 0);
-    const std::size_t row_bytes = c.ple.table.row_bytes;
+    const std::size_t row_bytes = volume.table().row_bytes; // the artifact's table, or a BF16 volume's
     const std::size_t heads     = hash.heads();
     std::vector<std::int32_t> ids, positions, last;
     // Text prompts: RoPE positions equal the index on all three axes.
@@ -331,6 +331,7 @@ Call make_call(const q4::TextConfig& c, const q4::NgramVolume& volume, const std
         Tensor(put(last.data(), last.size() * i32), DType::I32, {static_cast<std::int32_t>(last.size())});
     call.batch.ngram_rows = Tensor(put(ngram.data(), ngram.size()), DType::U8,
                                    {static_cast<std::int32_t>(row_bytes), static_cast<std::int32_t>(heads), columns});
+    call.batch.ngram_format = volume.table().format;
     call.host_slots       = std::move(slots);
     call.host_rows        = std::move(rows);
     call.batch.host_slots = call.host_slots;
@@ -539,9 +540,9 @@ int main(int argc, char** argv) {
         print_memory("parameters");
         const auto& c = model->config().text;
         const char* ngram_env = std::getenv("INFERNIX_QWEN4_NGRAM");
-        const q4::NgramVolume volume(ngram_env != nullptr ? std::filesystem::path(ngram_env)
-                                                          : q4::default_ngram_volume(artifact_env),
-                                     c.ple.table);
+        const std::filesystem::path volume_path =
+            ngram_env != nullptr ? std::filesystem::path(ngram_env) : q4::default_ngram_volume(artifact_env);
+        const q4::NgramVolume volume(volume_path, q4::resolve_ngram_volume(volume_path, c.ple));
         const std::size_t vocab = c.vocab_size;
         if (scoring) {
             // Teacher-forced scoring: chunked prefill of each whole text in slot 0 of its own harness.

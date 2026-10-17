@@ -302,6 +302,11 @@ OperationalRecord render_request_done(const RequestLogContext& context,
             << product::format_pretty_percent(static_cast<double>(metrics.expert_cache->hits) /
                                               static_cast<double>(metrics.expert_cache->routed))
             << " hit";
+        if (metrics.expert_cache->decode_routed != 0) {
+            out << ", decode "
+                << product::format_pretty_percent(static_cast<double>(metrics.expert_cache->decode_hits) /
+                                                  static_cast<double>(metrics.expert_cache->decode_routed));
+        }
     }
     if (metrics.tree_rounds != 0) {
         out << " | trees " << product::format_pretty_count(metrics.tree_rounds) << " rounds, "

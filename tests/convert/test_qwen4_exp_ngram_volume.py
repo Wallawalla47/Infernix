@@ -96,3 +96,76 @@ def test_bf16_export_reuses_the_volume_of_its_fp8_quantization(tmp_path):
     volume = tmp_path / "shared.ngram"
     write_ngram_volume(fp8, volume, bytes(range(16, 32)))
     assert read_ngram_volume_id(bf16, volume) == bytes(range(16, 32))
+
+
+def test_bf16_volume_keeps_the_words_twelve_rows_per_block(tmp_path):
+    # The BF16 volume (tools/flash_next/ngram_bf16.py): rows of 2 x 160 bytes, the table's BF16 words
+    # unchanged, 12 per 4 KiB block (the engine reads the format from this row size).
+    shards = _bf16_values(6, (30, 7))
+    store  = _save(tmp_path, "bf16", {f"{NAME}shard_{i}.weight": v for i, v in enumerate(shards)})
+    table  = NgramTable(store, PREFIX, CONFIG, 37, keep_bf16=True)
+    assert table.row_bytes == 2 * ROW_BYTES
+    volume = tmp_path / "bf16.ngram"
+    geometry = write_ngram_volume(table, volume, bytes(range(16)))
+    assert geometry["rows_per_block"] == 12 and geometry["blocks"] == 4
+    data = volume.read_bytes()
+    assert len(data) == geometry["file_bytes"]
+    rows = torch.cat(shards).view(torch.uint8).reshape(37, 2 * ROW_BYTES)
+    for r in (0, 11, 12, 30, 36):  # block edges and the second shard
+        at = 4096 + (r // 12) * 4096 + (r % 12) * 2 * ROW_BYTES
+        assert data[at : at + 2 * ROW_BYTES] == rows[r].numpy().tobytes()
+
+
+def _bf16_and_fp8_tables(tmp_path, seed: int, rows: tuple[int, int]) -> tuple[list[torch.Tensor], NgramTable, NgramTable]:
+    """A BF16 table and the FP8 checkpoint of it (its per-tensor quantization and scale, as ModelOpt)."""
+    shards = _bf16_values(seed, rows)
+    bf16 = NgramTable(_save(tmp_path, f"bf16_{seed}", {f"{NAME}shard_{i}.weight": v for i, v in enumerate(shards)}),
+                      PREFIX, CONFIG, sum(rows))
+    fp8_tensors = {f"{NAME}shard_{i}.weight": bf16.codes(f"{NAME}shard_{i}.weight", 0, v.shape[0]).view(torch.float8_e4m3fn)
+                   for i, v in enumerate(shards)}
+    fp8_tensors[NAME + "weight_scale"] = bf16.scale().float()
+    return shards, bf16, NgramTable(_save(tmp_path, f"fp8_{seed}", fp8_tensors), PREFIX, CONFIG, sum(rows))
+
+
+def _bf16_volume(tmp_path, label: str, shards: list[torch.Tensor], volume_id: bytes):
+    store = _save(tmp_path, label, {f"{NAME}shard_{i}.weight": v for i, v in enumerate(shards)})
+    volume = tmp_path / f"{label}.ngram"
+    write_ngram_volume(NgramTable(store, PREFIX, CONFIG, sum(v.shape[0] for v in shards), keep_bf16=True), volume, volume_id)
+    return volume
+
+
+def test_fp8_checkpoint_binds_the_bf16_volume_it_was_quantized_from(tmp_path):
+    # Recipe F-A with the BF16 table: the FP8 checkpoint's sampled rows are the BF16 rows' quantization.
+    shards, bf16, fp8 = _bf16_and_fp8_tables(tmp_path, 8, (600, 400))
+    volume = _bf16_volume(tmp_path, "full", shards, bytes(range(32, 48)))
+    assert read_ngram_volume_id(fp8, volume, bf16=True) == bytes(range(32, 48))
+    assert read_ngram_volume_id(bf16, volume, bf16=True) == bytes(range(32, 48))  # a BF16 checkpoint: its words
+    # Every row, as verify_artifact checks it.
+    rows = volume.read_bytes()
+    first = torch.frombuffer(bytearray(rows[4096 : 4096 + 12 * 2 * ROW_BYTES]), dtype=torch.uint8).reshape(12, -1)
+    assert bool(fp8.bf16_rows_match(f"{NAME}shard_0.weight", 0, 12, first).all())
+
+
+def test_fp8_checkpoint_refuses_a_bf16_volume_of_another_table(tmp_path):
+    shards, _, fp8 = _bf16_and_fp8_tables(tmp_path, 9, (600, 400))
+    # The last row (always sampled) moved by far more than one FP8 step.
+    changed = [shards[0], shards[1].clone()]
+    changed[1][-1] = changed[1][-1] * 3
+    volume = _bf16_volume(tmp_path, "changed", changed, bytes(16))
+    with pytest.raises(ValueError, match="row 999 differs"):
+        read_ngram_volume_id(fp8, volume, bf16=True)
+    # A volume of the FP8 rows is no BF16 volume of this table.
+    fp8_volume = tmp_path / "fp8.ngram"
+    write_ngram_volume(fp8, fp8_volume, bytes(16))
+    with pytest.raises(ValueError, match="not an n-gram volume of this checkpoint's table"):
+        read_ngram_volume_id(fp8, fp8_volume, bf16=True)
+
+
+def test_bf16_volume_needs_a_bf16_table(tmp_path):
+    with pytest.raises(ValueError, match="needs the checkpoint's BF16 table"):
+        generator = torch.Generator().manual_seed(7)
+        tensors = {f"{NAME}shard_{i}.weight": torch.randint(0, 0x7F, (10, ROW_BYTES), dtype=torch.uint8,
+                                                             generator=generator).view(torch.float8_e4m3fn)
+                   for i in range(2)}
+        tensors[NAME + "weight_scale"] = torch.tensor([0.001], dtype=torch.float32)
+        NgramTable(_save(tmp_path, "fp8", tensors), PREFIX, CONFIG, 20, keep_bf16=True)

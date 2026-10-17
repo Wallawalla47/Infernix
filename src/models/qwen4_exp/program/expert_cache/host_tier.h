@@ -55,7 +55,7 @@ enum SlotPin : std::uint8_t {
 };
 
 // The list a non-resident slot belongs to.
-enum class SlotList : std::uint8_t { kNone, kRing, kPrefetch, kDemotion };
+enum class SlotList : std::uint8_t { kNone, kRing, kPrefetch, kDemotion, kLent };
 
 // One landing the agent reports at a boundary: the record of `key` was read into `slot` while the
 // slot carried `serial`.
@@ -129,6 +129,13 @@ public:
     // eviction demotes it (T4) or drops it (T5) like any key without a host copy. Returns how many.
     // The warm start uses it so RAM holds the keys ranked below the VRAM seeds, not copies of them.
     std::uint32_t release_shadows();
+    // ---- lending (engine thread, no round in flight)
+    // Lends up to `n` resident slots (free ones first, then the lowest-ranked unpinned residents,
+    // shadows before residents, which leave RAM): they hold no key until give_back. Returns them.
+    std::vector<std::uint32_t> lend(std::uint32_t n);
+    // Every lent slot becomes a free resident slot again.
+    void give_back();
+    [[nodiscard]] std::size_t lent() const { return lent_.size(); }
 
     // ---- round boundaries (engine thread, no round in flight)
     // A new round begins: every Use pin is released and each ring slot gets a fresh serial (an
@@ -223,6 +230,7 @@ private:
     std::size_t held_count_ = 0;
     std::vector<std::uint32_t> free_resident_; // free slots of the resident partition
     std::vector<std::uint32_t> ring_, prefetch_, demotion_;
+    std::vector<std::uint32_t> lent_; // lend(): free slots out of the resident partition
     std::vector<std::uint32_t> used_; // slots holding a Use pin
     std::vector<std::uint32_t> streamed_; // slots holding a Stream pin
     std::vector<HeapEntry> heap_[2];

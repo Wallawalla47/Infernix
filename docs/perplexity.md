@@ -34,7 +34,10 @@ between two NVFP4 builds or settings as noise unless it holds at several chunk s
 `--a16-activations` runs every linear with 16-bit activations (at least 3x slower on NVFP4
 artifacts): saved with `--save-top-tokens`, it is the reference that `--kl-reference` measures
 other runs against. [Model-level numerical quality](maintainer/model-quality.md) has the method and
-the recorded results. The available Main
+the recorded results. Qwen3.8-Flash-Next reads its n-gram volume from `<model>.ngram` unless
+`--ngram-volume FILE` names it, as in `infernix` (`--expert-stripe FILE` as there too). Its windows
+prefill through the generation path, the SSD expert tier included, keeping each position's final
+residual; the LM head then runs over them in tiles of 64 positions with FP32 logits. The available Main
 KV representations are `bf16`, `int8`, `fp8`, `nvfp4`, `k8v4`, `vq2`, and `k4v2`; unlike `infernix` and
 `infernix-serve`, which default to `bf16`, `infernix-perplexity` defaults to `fp8`. `int8` scores with the fast
 prompt-attention kernel, and `nvfp4` with its fast kernel over more than 768 visible keys, as

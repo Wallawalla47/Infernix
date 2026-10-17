@@ -269,9 +269,10 @@ def fp8_row_maxabs(request: PrepareRequest) -> PreparedMethod:
 
 
 def import_encoded(request: PrepareRequest) -> PreparedMethod:
-    """Preserve the current FP8/NVFP4 source codes, scales and weight divisor."""
+    """Preserve the current FP8/NVFP4 source codes, scales and weight divisor (or a GGUF Q8_0
+    tensor's codes and scales as q8_g32_fp16, the same words)."""
     if (
-        request.target.format not in ("nvfp4", "fp8_e4m3fn_row_bf16")
+        request.target.format not in ("nvfp4", "fp8_e4m3fn_row_bf16", "q8_g32_fp16")
         or len(request.target.shape) != 2
     ):
         raise ValueError("import_encoded requires a known encoded matrix target")
@@ -319,6 +320,68 @@ def import_encoded(request: PrepareRequest) -> PreparedMethod:
             output.write_codes(begin, words.codes, words.scales, words.weight_divisor)
 
     return request.job(produce=produce, auxiliaries=auxiliaries)
+
+
+def ggml_tiles16_blocks(codes: torch.Tensor, block_bytes: int) -> torch.Tensor:
+    """``ggml_rows_v1`` rows (uint8 [rows, row_bytes], rows a multiple of 16 or the matrix's last
+    ones) in ``ggml_tiles16_v1`` order: tile i, then block b, then row r within the tile, the last
+    tile padded with zero blocks. Exact: a permutation of whole blocks."""
+    rows, row_bytes = codes.shape
+    tiles = (rows + 15) // 16
+    padded = torch.zeros((tiles * 16, row_bytes), dtype=torch.uint8)
+    padded[:rows] = codes
+    blocks = row_bytes // block_bytes
+    return padded.view(tiles, 16, blocks, block_bytes).permute(0, 2, 1, 3).contiguous().view(-1)
+
+
+def ggml_tiles16_rows(payload: torch.Tensor, rows: int, row_bytes: int, block_bytes: int) -> torch.Tensor:
+    """The ``ggml_rows_v1`` rows of a ``ggml_tiles16_v1`` payload (uint8): ggml_tiles16_blocks' inverse."""
+    tiles = (rows + 15) // 16
+    blocks = row_bytes // block_bytes
+    return payload.view(tiles, blocks, 16, block_bytes).permute(0, 2, 1, 3).contiguous().view(tiles * 16, row_bytes)[:rows]
+
+
+def import_ggml_rows(request: PrepareRequest) -> PreparedMethod:
+    """Copy GGUF block rows verbatim into a ``ggml_rows_v1`` parent, or rearranged into a
+    ``ggml_tiles16_v1`` one (bit-exact import: the same blocks).
+
+    Each input's ``read_encoded`` returns its rows' stored bytes (EncodedRows.codes, uint8
+    [rows, row_bytes]) in the target's ggml format; grouped inputs concatenate by rows.
+    """
+    from tools.artifact.codecs.ggml import GGML_TYPES, require_finite_scales
+    from tools.artifact.formats import GgmlFormat
+    from tools.artifact.layouts import ggml_rows_geometry, ggml_tiles16_geometry
+
+    fmt = get_format(request.target.format)
+    layout = request.target.layout
+    if not isinstance(fmt, GgmlFormat) or layout not in ("ggml_rows_v1", "ggml_tiles16_v1"):
+        raise ValueError("import_ggml_rows requires a ggml format in ggml_rows_v1 or ggml_tiles16_v1")
+    _preflight(request, values=False)
+    tiles = layout == "ggml_tiles16_v1"
+    geometry = ggml_tiles16_geometry(fmt, request.target.shape) if tiles else ggml_rows_geometry(fmt, request.target.shape)
+    for item in request.inputs:
+        if item.source.read_encoded is None:
+            raise ValueError(f"{item.parameter}: stored GGUF rows are unavailable")
+        first = item.source.read_encoded(0, 1)
+        if first.format != fmt.name:
+            raise ValueError(f"{item.parameter}: source {first.format} differs from target {fmt.name}")
+    n = geometry.n
+    chunk = max(1, request.rows_per_chunk)
+    if tiles:  # whole tiles per chunk: tile i lands at 16 i row_bytes, as row 16 i of the rows layout
+        chunk = (chunk + 15) // 16 * 16
+
+    def produce(output):
+        for begin in range(0, n, chunk):
+            end = min(n, begin + chunk)
+            words = request.encoded_rows(begin, end)
+            codes = words.codes
+            if codes.dtype != torch.uint8 or tuple(codes.shape) != (end - begin, geometry.row_bytes):
+                raise ValueError(f"{request.target.id}: GGUF rows have the wrong byte shape")
+            require_finite_scales(GGML_TYPES[fmt.name], codes.numpy(), end - begin, geometry.k, request.target.id)
+            data = ggml_tiles16_blocks(codes.contiguous(), fmt.block_bytes) if tiles else codes.contiguous().view(-1)
+            output.write_bytes(begin * geometry.row_bytes, data.numpy().tobytes())
+
+    return request.job(produce=produce)
 
 
 # The MSE divisor maps the parent's largest magnitude to 4 at the largest scale, so its largest
@@ -378,6 +441,7 @@ METHODS: dict[str, Method] = {
     "grouped_mse": grouped_mse,
     "fp8_row_maxabs": fp8_row_maxabs,
     "import_encoded": import_encoded,
+    "import_ggml_rows": import_ggml_rows,
     "nvfp4_absmax": nvfp4_absmax,
     "nvfp4_mse": nvfp4_mse,
 }

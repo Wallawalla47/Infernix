@@ -8,6 +8,7 @@
 #include "core/tensor.h"
 #include "models/qwen3_5/execution/parameters.h"
 #include "models/qwen4_exp/model.h"
+#include "infernix/ops/ggml_linear.h"
 #include "infernix/ops/offloaded_sparse_moe.h"
 #include "infernix/ops/weight_input.h"
 
@@ -18,7 +19,16 @@
 
 namespace infernix::models::qwen4_exp::execution {
 
-using LinearParameters = ops::SingleProjectionWeight;
+// One projection: a native Weight, or (a GGUF import) the GGUF block segments of its rows in
+// order, run by ops::ggml_linear (then `weight` names the first segment's format and holds no data).
+struct LinearParameters {
+    Weight weight;
+    ops::LinearPolicy policy = ops::LinearPolicy::A16Only;
+    std::vector<ops::GgmlSegment> ggml;
+    const std::int32_t* input_perm = nullptr; // device: the input's block permutation (GDN output)
+    std::int32_t perm_block        = 0;
+    [[nodiscard]] bool is_ggml() const noexcept { return !ggml.empty(); }
+};
 
 struct HyperConnectionParameters {
     Tensor norm;           // BF16 [S*H]
@@ -59,7 +69,7 @@ struct PleParameters {
     LinearParameters projection; // [key (S*H) | value (H), embed]
     Tensor key_norm, query_norm, conv_norm; // BF16 [S*H]
     Tensor convolution;                     // BF16 [S*H, K]
-    Tensor ngram_scale;                     // BF16 [1]
+    Tensor ngram_scale;                     // BF16 [1] (FP8 tables; empty for an IQ4_NL table)
 };
 
 // The MTP drafter (design §11.2).
@@ -95,9 +105,10 @@ public:
     Parameters& operator=(const Parameters&) = delete;
 
     const Model& model;
-    Weight token_embedding; // BF16 rows in pinned host memory, read zero-copy
+    Weight token_embedding; // BF16 (or a GGUF import's IQ4_XS) rows in pinned host memory, read zero-copy
     Tensor output_head; // BF16 [H, V]: one vocabulary row per column (FP32 logits)
-    // Recipe B's 8-bit head (q8_g32_fp16 [V, H], FP32 logits); output_head is then empty.
+    // Recipe B's 8-bit head (q8_g32_fp16 [V, H], FP32 logits), or a GGUF import's head (ggml blocks,
+    // FP32 logits from ops::ggml_linear); output_head is then empty.
     std::optional<LinearParameters> output_head_q8;
     HyperConnectionParameters final_mixer;
     std::vector<BlockParameters> layers;
@@ -108,6 +119,9 @@ public:
 private:
     // Device copy of every layer's ExpertScales, [layers][E].
     DeviceBuffer scales_;
+    // A GGUF import's GDN output permutation: input block j of the output projection is value head
+    // gdn_value_perm_[j] (ggml's tiled order).
+    DeviceBuffer gdn_value_perm_;
 };
 
 } // namespace infernix::models::qwen4_exp::execution

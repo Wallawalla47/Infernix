@@ -1,7 +1,7 @@
 // The Qwen3.8-Flash-Next startup memory plans (design §19.3.7). RT1, the RAM ledger: the experts
 // take what the reserve and every planned allocation leave, full mode needs the banks plus the
-// margin, the commit limit bounds the experts like physical memory, and the reserve is applied
-// once. RT7, the VRAM sizing: the display headroom by display state, the OS budget without
+// margin, the commit limit and the OS's pin bound limit the experts like physical memory, and the
+// reserve is applied once. RT7, the VRAM sizing: the display headroom by display state, the OS budget without
 // stacking the headroom on it, the graph reserve, fixed allocations that do not fit, the frame
 // clamp, and the spill test with noisy free-memory readings. RT9, the runtime law of the elastic
 // pool: shrink on low free memory or an exceeded budget, hysteresis, the grow delay and per-boundary

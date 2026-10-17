@@ -18,6 +18,8 @@ from tools.artifact.layouts import (
 from tools.artifact.formats import QuantFormat, get_format
 
 _FP16_MIN_SUBNORMAL = 2.0**-24
+# The 2-bit formats' extra MSE candidates: |scale| = max_abs * f (quantize_matrix_mse).
+_Q2_SWEEP = np.arange(0.300, 1.0001, 0.025)
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,6 +188,17 @@ def quantize_matrix_mse(
         flat_base_scales,
     )
     candidates, candidate_valid = _mse_scale_candidates(flat_base_scales, s_ls)
+    if spec.bits == 2:
+        # Four levels {-2, -1, 0, 1}: the candidates above barely reach -2. A dense sweep of
+        # max_abs * f in both signs (a negative scale gives the group's positive side -2) lets
+        # each group put its larger-magnitude side on the wider half of the code range.
+        sweep = np.concatenate([_Q2_SWEEP, -_Q2_SWEEP])
+        dense = (host_max.reshape(-1, 1) * sweep[None, :]).astype(np.float16)
+        dense_words = dense.view(np.uint16)
+        dense_valid = (dense_words & 0x7FFF) <= 0x7BFF
+        dense_valid &= (dense_words & 0x7FFF) != 0
+        candidates = np.concatenate([candidates, dense.astype(np.float64)], axis=1)
+        candidate_valid = np.concatenate([candidate_valid, dense_valid], axis=1)
 
     # True encoded error per candidate, using the exact engine code formula.
     # A valid zero scale encodes every value to code 0 (reciprocal 0), and an
@@ -195,9 +208,9 @@ def quantize_matrix_mse(
     for index in range(candidates.shape[1]):
         scale_c = candidates[:, index]
         valid_c = candidate_valid[:, index]
-        positive = valid_c & (scale_c > 0.0)
+        nonzero = valid_c & (scale_c != 0.0)
         reciprocal = np.zeros(candidates.shape[0], dtype=np.float32)
-        reciprocal[positive] = (1.0 / scale_c[positive]).astype(np.float32)
+        reciprocal[nonzero] = (1.0 / scale_c[nonzero]).astype(np.float32)
         codes_c = np.clip(
             np.rint(values32 * reciprocal[:, None]), spec.qmin, spec.qmax
         ).astype(np.float64)
@@ -212,8 +225,8 @@ def quantize_matrix_mse(
     # Emit codes through the same formula the runtime dequantisation assumes.
     scales = chosen.astype(np.float16)
     reciprocal = np.zeros(candidates.shape[0], dtype=np.float32)
-    positive = scales > 0
-    reciprocal[positive] = (1.0 / scales[positive].astype(np.float64)).astype(
+    nonzero = scales != 0
+    reciprocal[nonzero] = (1.0 / scales[nonzero].astype(np.float64)).astype(
         np.float32
     )
     codes = np.clip(

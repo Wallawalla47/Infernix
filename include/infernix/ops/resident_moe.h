@@ -23,9 +23,9 @@ namespace infernix::ops {
 ///   out_jt = bf16(D_e h)                           written to outputs[:, t * k + j] (BF16 [H, k*T])
 ///
 /// gate_up is the bank [E * 2I, H]: expert e's I gate rows at e*2I, then its I up rows; down is
-/// [E * H, I]. Both are Q4_G64_FP16 or Q8_G32_FP16 row-split weights; each weight is decoded
-/// exactly as code * FP16 group scale and every dot product accumulates in FP32 with the group
-/// scale applied once per 16-weight (Q8) or 32-weight (Q4) chunk. ids outside [0, E) are a
+/// [E * H, I]. Both are Q2_G64_FP16, Q4_G64_FP16 or Q8_G32_FP16 row-split weights; each weight is
+/// decoded exactly as code * FP16 group scale and every dot product accumulates in FP32 with the
+/// group scale applied once per 16-weight (Q8), 32-weight (Q4) or 64-weight (Q2) chunk. ids outside [0, E) are a
 /// precondition violation. The oracle is the same formula in FP64 over the decoded weights.
 void resident_moe_experts(const Tensor& x, const Tensor& ids, const Weight& gate_up, const Weight& down,
                           std::int32_t experts, std::int32_t intermediate, void* workspace,

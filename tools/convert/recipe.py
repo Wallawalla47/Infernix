@@ -9,7 +9,16 @@ from math import prod
 from typing import Sequence
 
 from tools.artifact.layouts import encoded_size
-from tools.artifact.formats import DirectFormat, Fp8RowFormat, Nvfp4Format, Nvfp4MulFormat, QuantFormat, get_format
+from tools.artifact.formats import (
+    DirectFormat,
+    Fp8BlockFormat,
+    Fp8RowFormat,
+    GgmlFormat,
+    Nvfp4Format,
+    Nvfp4MulFormat,
+    QuantFormat,
+    get_format,
+)
 from tools.artifact.schema import ACTIVATION_POLICIES, TensorSpec
 from .methods import (
     AuxiliaryValue,
@@ -22,6 +31,7 @@ from .methods import (
     grouped_mse,
     fp8_row_maxabs,
     import_encoded,
+    import_ggml_rows,
     nvfp4_absmax,
     nvfp4_mse,
 )
@@ -70,6 +80,10 @@ def default_layout(format: str) -> str:
         return "nvfp4_expert_rg16_v1"
     if isinstance(kind, QuantFormat):
         return "row_split_k128_v1"
+    if isinstance(kind, GgmlFormat):
+        return "ggml_rows_v1"
+    if isinstance(kind, Fp8BlockFormat):
+        return "fp8_expert_b128_v1"
     raise ValueError(f"no default layout for format {format!r}")
 
 
@@ -392,6 +406,7 @@ class Recipe:
             grouped_mse,
             fp8_row_maxabs,
             import_encoded,
+            import_ggml_rows,
             nvfp4_absmax,
             nvfp4_mse,
         )

@@ -38,6 +38,8 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--api-key"},
     ServeOptionArity{"--model-id"},
     ServeOptionArity{"--ngram-volume"},
+    ServeOptionArity{"--ngram-residency"},
+    ServeOptionArity{"--expert-stripe"},
     ServeOptionArity{"--expert-state"},
     ServeOptionArity{"--chat-template"},
     ServeOptionArity{"--claude-code-prompt"},
@@ -386,12 +388,22 @@ std::string serve_usage_text(const char* argv0) {
            "                             Anthropic Messages from Claude Code: keep its system\n"
            "                             prompt (as-sent, default) or replace its Claude-\n"
            "                             specific parts with a short local-agent preamble\n"
-           "  --ngram-volume FILE        Qwen3.8-Flash-Next n-gram embedding volume\n"
+           "  --ngram-volume FILE        Qwen3.8-Flash-Next n-gram embedding volume: the\n"
+           "                             artifact's, or a BF16 volume (tools/flash_next/\n"
+           "                             ngram_bf16.py) in place of its quantized table\n"
            "                             (default: the artifact path + .ngram)\n"
+           "  --ngram-residency auto|ram|volume\n"
+           "                             where the n-gram table lives: ram reads it all into\n"
+           "                             pinned RAM at startup, volume reads rows on demand;\n"
+           "                             auto (default) takes RAM while every expert still\n"
+           "                             fits in RAM beside it\n"
            "  --expert-state FILE|off    Qwen3.8-Flash-Next expert-cache state: read at\n"
            "                             startup to fill the VRAM expert cache, written at\n"
            "                             stop and every 10 minutes between requests\n"
            "                             (default: the artifact path + .expert-state)\n"
+           "  --expert-stripe FILE       Qwen3.8-Flash-Next expert stripe on a second drive:\n"
+           "                             the SSD expert tier reads each record's tail from it\n"
+           "                             beside its head in the artifact\n"
            "  --context-cost-presets F   runtime context-cost preset file (overrides\n"
            "                             matching compiled-in values)\n"
            "  --rope-yarn-factor F       runtime YaRN context extension factor, finite [1,4]\n"
@@ -653,9 +665,13 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
         } else if (arg == "--ngram-volume") {
             options.ngram_volume_path = require_value("--ngram-volume");
+        } else if (arg == "--ngram-residency") {
+            options.ngram_residency = parse_ngram_residency(require_value("--ngram-residency"));
         } else if (arg == "--expert-state") {
             const std::string path = require_value("--expert-state");
             options.expert_state   = path == "off" ? std::filesystem::path{} : std::filesystem::path(path);
+        } else if (arg == "--expert-stripe") {
+            options.expert_stripe_path = require_value("--expert-stripe");
         } else if (arg == "--chat-template") {
             options.chat_template_path = require_value("--chat-template");
             if (options.chat_template_path.empty()) {

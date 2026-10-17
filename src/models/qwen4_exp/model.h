@@ -7,6 +7,7 @@
 #include "models/qwen4_exp/config.h"
 #include "models/qwen4_exp/expert_store.h"
 #include "models/qwen4_exp/weights.h"
+#include "ops/offloaded_sparse_moe/cpu/ggml_expert.h"
 #include "ops/offloaded_sparse_moe/cpu/w4a4_expert.h"
 
 #include <memory>
@@ -37,6 +38,15 @@ struct ExpertBank {
     ops::offloaded_moe::ExpertActivation activation = ops::offloaded_moe::ExpertActivation::kA4;
     std::vector<ops::offloaded_moe::ExpertScales> scales; // [experts]
 };
+
+// A GGUF import's bank: its records' ggml formats for the CPU route (invalid for an NVFP4 bank).
+[[nodiscard]] inline ops::offloaded_moe::GgmlExpertFormat ggml_format(const ExpertBank& bank) noexcept {
+    if (bank.planes.gate_up_format == QType::NVFP4_MUL) { return {}; }
+    return {.gate_up        = bank.planes.gate_up_format,
+            .down           = bank.planes.down_format,
+            .gate_row_bytes = static_cast<std::uint32_t>(bank.planes.gate_row_bytes),
+            .down_row_bytes = static_cast<std::uint32_t>(bank.planes.down_row_bytes)};
+}
 
 class LoadPlan;
 

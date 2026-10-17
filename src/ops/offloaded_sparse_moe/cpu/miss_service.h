@@ -29,13 +29,15 @@ public:
     struct Layer {
         const std::uint8_t* records = nullptr; // pinned host bank, record_stride apart
         std::uint64_t record_stride = 0;
-        const ExpertScales* scales  = nullptr; // host [E]
+        const ExpertScales* scales  = nullptr; // host [E] (NVFP4 banks)
+        GgmlExpertFormat ggml{};               // a GGUF bank: its records' formats (ggml_expert.h)
     };
     struct Options {
         int workers     = 8;     // including the service thread
         int max_jobs    = 4;     // CPU-served experts per layer call, at most kMaxCpuJobs
         int max_columns = 64;    // calls with more columns stay on the GPU, at most kMaxCpuCallColumns
         int pcie_divisor = 3;    // misses / pcie_divisor stay on the GPU stage (0: none)
+        int one_column_divisor = 0; // one-column calls' divisor instead (0: pcie_divisor)
         int max_job_columns = kMaxCpuColumns; // misses with more columns stay on the GPU
         int wide_from   = 0;     // calls of at least this many columns (0: none) take wide_jobs as their cap
         int wide_jobs   = 0;     // prefill assist cap, at most kMaxCpuJobs

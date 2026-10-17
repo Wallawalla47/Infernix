@@ -1,5 +1,7 @@
 #include "core/weight_view.h"
 
+#include "core/ggml_format.h"
+
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
@@ -110,13 +112,75 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         out.bytes          = add(out.scale_offset, out.scale_bytes);
         return out;
     }
+    if (is_ggml_expert_layout(layout)) {
+        const QType down = ggml_expert_down_format(layout);
+        if (!is_ggml(format) || shape.size() != 3 || format == QType::GGML_IQ4_NL || format == QType::GGML_Q2_0 ||
+            shape[1] % ggml_block_elems(format) || shape[2] % ggml_block_elems(down)) {
+            throw std::invalid_argument(
+                "a ggml expert bank requires an IQ2_S/IQ3_XXS/IQ3_S/IQ4_XS [experts, hidden, intermediate] with whole "
+                "blocks on both matrices");
+        }
+        const auto experts = shape[0], hidden = shape[1], inter = shape[2];
+        const auto gate_row = mul(hidden / ggml_block_elems(format), ggml_block_bytes(format));
+        const auto down_row = mul(inter / ggml_block_elems(down), ggml_block_bytes(down));
+        out.group_size     = ggml_block_elems(format);
+        out.alignment      = 4096;
+        out.code_bytes_per_row = gate_row;
+        out.high_bytes_per_row = down_row; // the down rows' bytes (expert banks have no high plane)
+        out.record_bytes   = add(mul(2, mul(inter, gate_row)), mul(hidden, down_row));
+        out.record_stride  = aligned(out.record_bytes, 4096);
+        out.code_bytes     = mul(experts, out.record_stride);
+        out.scale_offset   = out.code_bytes;
+        out.bytes          = out.code_bytes;
+        return out;
+    }
+    if (layout == QuantLayout::Fp8ExpertB128) {
+        constexpr std::uint64_t kTile = 128;
+        if (format != QType::FP8_E4M3FN_B128 || shape.size() != 3 || shape[1] % kTile || shape[2] % kTile) {
+            throw std::invalid_argument(
+                "fp8_expert_b128_v1 requires fp8_e4m3fn_b128 [experts, hidden, intermediate] of whole 128 x 128 tiles");
+        }
+        const auto experts = shape[0], hidden = shape[1], inter = shape[2];
+        const auto tiles   = mul(hidden / kTile, inter / kTile); // per matrix
+        out.group_size         = kTile;
+        out.alignment          = 4096;
+        out.code_bytes_per_row = hidden; // a gate/up row: one byte per weight
+        out.high_bytes_per_row = inter;  // a down row
+        out.record_bytes       = add(mul(3, mul(hidden, inter)), mul(3, mul(tiles, 2)));
+        out.record_stride      = aligned(out.record_bytes, 4096);
+        out.code_bytes         = mul(experts, out.record_stride);
+        out.scale_offset       = out.code_bytes;
+        out.bytes              = out.code_bytes;
+        return out;
+    }
     if (shape.size() != 2) { throw std::invalid_argument("quantized weight must be a matrix"); }
+    if (layout == QuantLayout::GgmlRows || layout == QuantLayout::GgmlTiles16) {
+        if (!is_ggml(format) || shape[1] % ggml_block_elems(format)) {
+            throw std::invalid_argument("ggml_rows_v1 requires a ggml format and whole blocks per row");
+        }
+        const bool tiles = layout == QuantLayout::GgmlTiles16;
+        if (tiles && ggml_block_elems(format) != 256) {
+            throw std::invalid_argument("ggml_tiles16_v1 requires a ggml format of 256-element blocks");
+        }
+        out.padded_columns     = shape[1];
+        out.group_size         = ggml_block_elems(format);
+        out.code_bytes_per_row = mul(shape[1] / ggml_block_elems(format), ggml_block_bytes(format));
+        // A tiled matrix holds whole tiles of 16 rows (row r's tile at r / 16 * 16 rows).
+        out.code_bytes   = mul(tiles ? (shape[0] + 15) / 16 * 16 : shape[0], out.code_bytes_per_row);
+        out.scale_offset = out.code_bytes;
+        out.bytes        = out.code_bytes;
+        return out;
+    }
     const auto n       = shape[0];
     const auto k       = shape[1];
     out.padded_columns = k;
     if (layout == QuantLayout::RowSplit) {
-        std::uint64_t high_per_group = 0;
+        std::uint64_t high_per_group = 0, code_per_group = 32;
         switch (format) {
+        case QType::Q2_G64_FP16:
+            out.group_size = 64;
+            code_per_group = 16; // four 2-bit codes per byte
+            break;
         case QType::Q4_G64_FP16:
             out.group_size = 64;
             break;
@@ -136,7 +200,7 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         }
         out.padded_columns      = aligned(k, 128);
         const auto groups       = out.padded_columns / out.group_size;
-        out.code_bytes_per_row  = mul(groups, 32);
+        out.code_bytes_per_row  = mul(groups, code_per_group);
         out.high_bytes_per_row  = mul(groups, high_per_group);
         out.scale_bytes_per_row = mul(groups, 2);
         out.code_bytes          = mul(n, out.code_bytes_per_row);
@@ -221,7 +285,7 @@ WeightRowPlanes weight_row_planes(const WeightRegion& region) {
     validate_region(region);
     const auto& parent = *region.parent;
     const auto& g      = parent.geometry;
-    if (g.layout == QuantLayout::ExpertRg16) {
+    if (is_expert_bank_layout(g.layout)) {
         throw std::invalid_argument("expert banks have no row planes");
     }
     if (!parent.data || g.shape.size() != 2 || region.begin % g.shape[1] ||
@@ -267,7 +331,7 @@ Weight native_weight(const WeightView& view, float input_divisor) {
     if (view.shape.size() != 2 || !region.parent->data) {
         throw std::invalid_argument("native Weight requires a resident logical matrix");
     }
-    if (g.layout == QuantLayout::ExpertRg16) {
+    if (is_expert_bank_layout(g.layout)) {
         throw std::invalid_argument("expert banks bind through their planes");
     }
     Weight out;
@@ -334,18 +398,35 @@ Weight device_native_weight(const WeightView& view, float input_divisor) {
 
 ExpertBankPlanes expert_bank_planes(const WeightParent& parent) {
     if (!parent.data) {
-        throw std::invalid_argument("expert bank planes require a resident nvfp4_expert_rg16_v1 parent");
+        throw std::invalid_argument("expert bank planes require a resident expert-bank parent");
     }
-    ExpertBankPlanes out = expert_bank_layout(parent.geometry, reinterpret_cast<const float*>(parent.data +
-                                                                                            parent.geometry.scale_offset));
+    // Only nvfp4_expert_rg16_v1 has a multiplier tail; the other banks' scales are inside each record.
+    const bool tail   = parent.geometry.layout == QuantLayout::ExpertRg16;
+    ExpertBankPlanes out = expert_bank_layout(
+        parent.geometry, tail ? reinterpret_cast<const float*>(parent.data + parent.geometry.scale_offset) : nullptr);
     out.records        = parent.data;
     out.device_records = parent.device;
     return out;
 }
 
 ExpertBankPlanes expert_bank_layout(const WeightGeometry& g, const float* multipliers) {
+    if (is_ggml_expert_layout(g.layout) || g.layout == QuantLayout::Fp8ExpertB128) {
+        // Row-major gate, up and down rows (a block-FP8 record's tile scales follow the down rows).
+        ExpertBankPlanes out;
+        out.record_bytes   = g.record_bytes;
+        out.record_stride  = g.record_stride;
+        out.experts        = static_cast<std::uint32_t>(dimension(g.shape[0]));
+        out.hidden         = static_cast<std::uint32_t>(dimension(g.shape[1]));
+        out.intermediate   = static_cast<std::uint32_t>(dimension(g.shape[2]));
+        out.gate_up_format = g.format;
+        out.down_format    = g.layout == QuantLayout::Fp8ExpertB128 ? g.format : ggml_expert_down_format(g.layout);
+        out.gate_row_bytes = g.code_bytes_per_row;
+        out.down_row_bytes = g.high_bytes_per_row;
+        out.gate_up_bytes  = 2ULL * out.intermediate * out.gate_row_bytes;
+        return out;
+    }
     if (g.layout != QuantLayout::ExpertRg16) {
-        throw std::invalid_argument("expert bank layout requires an nvfp4_expert_rg16_v1 parent");
+        throw std::invalid_argument("expert bank layout requires an expert-bank parent");
     }
     ExpertBankPlanes out;
     out.multipliers   = multipliers;

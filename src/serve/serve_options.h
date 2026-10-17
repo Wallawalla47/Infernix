@@ -33,8 +33,11 @@ struct ServeOptions {
     std::string artifact_path;
     std::filesystem::path chat_template_path;
     std::filesystem::path ngram_volume_path;
+    NgramResidency ngram_residency = NgramResidency::Auto;
     // --expert-state FILE|off: absent uses the artifact path + .expert-state, "off" disables.
     std::optional<std::filesystem::path> expert_state;
+    // --expert-stripe FILE: the experts' record tails on a second drive (EngineOptions::expert_stripe_path).
+    std::filesystem::path expert_stripe_path;
     std::string host = "127.0.0.1";
     int port         = 8080;
     std::string api_key;                          // empty => no auth

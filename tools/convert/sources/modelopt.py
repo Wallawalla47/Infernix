@@ -94,8 +94,8 @@ def fp8_block_matrix_words(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Read one block-FP8 matrix: E4M3FN codes ``[N, K]`` and FP32 tile multipliers.
 
-    Qwen's FP8 checkpoints store the multipliers in FP32 and NVIDIA's MTP experts in BF16; a BF16
-    multiplier widens to FP32 exactly.
+    Qwen/Qwen3.8-Flash-Next-FP8 and NVIDIA's MTP experts store the multipliers in BF16 (other
+    checkpoints may use FP32); a BF16 multiplier widens to FP32 exactly.
     """
 
     n, k = shape
@@ -108,6 +108,24 @@ def fp8_block_matrix_words(
     codes = store.read_flat(leaf + ".weight").view(torch.uint8).reshape(n, k).clone()
     scales = store.read_flat(scale).reshape(rows, cols).to(torch.float32).clone()
     return codes, scales
+
+
+def fp8_block_matrix_raw(store: SafetensorsSource, leaf: str, shape: tuple[int, int], block: int = 128):
+    """One block-FP8 matrix as stored: E4M3FN code bytes ``[N, K]`` (numpy uint8) and its BF16 tile
+    scale words ``[N/block, K/block]`` (numpy uint16), for a verbatim import (``fp8_e4m3fn_b128``)."""
+
+    n, k = shape
+    if n % block or k % block:
+        raise ValueError(f"{leaf}: {shape} is not whole {block} x {block} tiles")
+    _signature(store, leaf + ".weight", (n, k), "F8_E4M3")
+    scale = leaf + ".weight_scale_inv"
+    info = store.describe(scale)
+    if tuple(info.shape) != (n // block, k // block) or info.dtype != "BF16":
+        raise ValueError(f"{scale}: fp8_e4m3fn_b128 stores BF16{(n // block, k // block)} scales verbatim, "
+                         f"got {info.dtype}{tuple(info.shape)}")
+    codes = store.read_flat(leaf + ".weight").view(torch.uint8).reshape(n, k).numpy().copy()
+    words = store.read_flat(scale).reshape(n // block, k // block).view(torch.int16).numpy().view("<u2").copy()
+    return codes, words
 
 
 @dataclass(frozen=True)

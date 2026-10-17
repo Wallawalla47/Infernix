@@ -231,8 +231,12 @@ public:
     // run's remaining experts into free frames outside it, and lends the run. Returns the number
     // of evicted experts.
     std::uint32_t lend(std::uint32_t first, std::uint32_t count, std::vector<Command>& out);
-    // Returns the run: capacity grows back and queued experts load into it.
-    void give_back(std::uint32_t first, std::uint32_t count, std::vector<Command>& out);
+    // Returns the run: capacity grows back and queued experts load into it. With `refill`, the
+    // experts the loans evicted then load into it too, best first, while the policy has room (a
+    // prefill's loans would otherwise leave decode a cache short of them until misses re-admit them);
+    // `admissible` (when given) gates them. Without, the frames stay free for decode's landings.
+    void give_back(std::uint32_t first, std::uint32_t count, std::vector<Command>& out, bool refill = true,
+                   const LfruPolicy::Admissible* admissible = nullptr);
     // Warm start (design §19.3.5 S4b): sets every key's count from `counts` (empty: unchanged), then
     // loads `keys`, best first, into free frames while the policy has capacity. Before the first
     // round only. Returns the number of keys loaded.
@@ -281,6 +285,7 @@ private:
     std::vector<std::uint8_t> is_queued_;
     std::vector<std::uint64_t> load_serial_; // per key: the serial of its latest issued copy
     std::vector<std::uint32_t> frame_key_;   // per frame: the key it holds, or kNoKey
+    std::vector<std::uint32_t> lent_victims_; // keys the outstanding loans evicted, lowest score first
     std::uint64_t next_serial_ = 0;
     LfruPolicy::Step step_;
 };

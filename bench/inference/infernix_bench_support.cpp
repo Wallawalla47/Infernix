@@ -353,7 +353,10 @@ std::string usage_text(std::string_view program) {
         << "Options:\n"
         << "  --weights <path>            required .ninfer artifact\n"
         << "  --corpus <path>             token-id corpus (default: " << kDefaultCorpusPath << ")\n"
-        << "  --ngram-volume <path>       Qwen3.8-Flash-Next n-gram volume (default: <weights>.ngram)\n"
+        << "  --ngram-volume <path>       Qwen3.8-Flash-Next n-gram volume, or a BF16 one in place of the\n"
+        << "                              artifact's quantized table (default: <weights>.ngram)\n"
+        << "  --expert-stripe <path>      Qwen3.8-Flash-Next expert stripe: the SSD tier reads each record's\n"
+        << "                              tail from it (a second drive) beside its head in the artifact\n"
         << "  --ram-headroom-mib <N>      physical Host RAM pinned weights and caches leave free (default "
         << (infernix::kDefaultRamHeadroomBytes >> 20) << ")\n"
         << "  --expert-ram-mib <N|auto>   Qwen3.8-Flash-Next: Host RAM for the routed experts (default auto);\n"
@@ -398,7 +401,7 @@ std::string usage_text(std::string_view program) {
         << kDefaultPrefillSplitWorkspaceMiB << ";\n"
         << "                              128-384 recommended, 0 = no splitting)\n"
         << "  --spec <mtp|dflash|dflash2> speculative backend (default: none)\n"
-        << "  --draft-tokens <n>         MTP 1..5; DFlash/DFlash2 1..15\n"
+        << "  --draft-tokens <n>         MTP 1..7 (Qwen3.5/3.6 1..5); DFlash/DFlash2 1..15\n"
         << "  --spec-min-p <p>           Qwen3.8-Flash-Next MTP draft-confidence gate 0..1\n"
         << "                             (default: the model's 0.5; 0 verifies every draft)\n"
         << "  --ngram-draft-tokens <n>   copy proposals 1..63; 0 disables (default: 0)\n"
@@ -444,6 +447,8 @@ BenchOptions parse_args(int argc, char** argv) {
             options.corpus_path = value("--corpus");
         } else if (arg == "--ngram-volume") {
             options.ngram_volume_path = value("--ngram-volume");
+        } else if (arg == "--expert-stripe") {
+            options.expert_stripe_path = value("--expert-stripe");
         } else if (arg == "--ram-headroom-mib") {
             const std::string text = value("--ram-headroom-mib");
             std::size_t used       = 0;

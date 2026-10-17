@@ -10,11 +10,12 @@ import torch
 from tools.convert.methods import cast_direct, grouped_absmax, grouped_mse
 from tools.convert.model import Model, Parameter
 from tools.convert.official_recipes import (
+    qwen3_8_flash_next_fp8,
     qwen3_8_flash_next_nvfp4,
     qwen3_8_flash_next_nvfp4_dense8,
     qwen3_8_flash_next_nvfp4_orcarouter,
 )
-from tools.convert.qwen4_exp import ExpertBankSource, import_expert_bank
+from tools.convert.qwen4_exp import ExpertBankSource, Fp8ExpertBankSource, import_expert_bank, import_fp8_expert_bank
 from tools.convert.recipe import Recipe
 from tools.convert.sources.logical import array_source
 
@@ -118,3 +119,128 @@ def test_weight_only_experts_take_recipe_c_and_modelopt_ones_recipes_a_and_b() -
     model = _model()
     with pytest.raises(ValueError, match="weight-only"):
         qwen3_8_flash_next_nvfp4_orcarouter(model, Recipe(model), {"base": None})
+
+
+def _fp8_model() -> Model:
+    model = _model()
+    del model.parameters[BANK]
+    bank = Fp8ExpertBankSource((2, 128, 128), BANK, None, "experts.")
+    model.add(Parameter(BANK, (2, 128, 128), bank, inputs=("input",)))
+    return model
+
+
+def test_fp8_recipe_imports_the_block_fp8_banks_verbatim() -> None:
+    """F-A keeps every dense tensor as stored and the experts as fp8_e4m3fn_b128 records; only the
+    drafter is re-quantized, its routed experts q2_g64_fp16 (MSE scales). The NVFP4 recipes refuse an
+    FP8 bank and the FP8 recipe an NVFP4 one."""
+
+    model = _fp8_model()
+    recipe = Recipe(model)
+    qwen3_8_flash_next_fp8(model, recipe, {})
+    bank = _only(recipe.selections, BANK)
+    assert (bank.format, bank.layout, bank.method) == ("fp8_e4m3fn_b128", "fp8_expert_b128_v1", import_fp8_expert_bank)
+    for name in (*DENSE8, *KEPT, *DRAFTER_KEPT):
+        chosen = _only(recipe.selections, name)
+        assert (chosen.format, chosen.method) == ("bf16", cast_direct), name
+    for name in DRAFTER_Q8:
+        chosen = _only(recipe.selections, name)
+        assert (chosen.format, chosen.method) == (Q8, grouped_absmax), name
+    for name in DRAFTER_EXPERTS:
+        chosen = _only(recipe.selections, name)
+        assert (chosen.format, chosen.method) == ("q2_g64_fp16", grouped_mse), name
+    for recipe_function in (qwen3_8_flash_next_nvfp4, qwen3_8_flash_next_nvfp4_dense8):
+        model = _fp8_model()
+        with pytest.raises(ValueError, match="FP8 recipe"):
+            recipe_function(model, Recipe(model), {})
+    model = _model()
+    with pytest.raises(ValueError, match="block-FP8"):
+        qwen3_8_flash_next_fp8(model, Recipe(model), {})
+
+
+def test_iq3s_recipe_tiles_the_tiled_formats_and_takes_a_q2_drafter() -> None:
+    """On a GGUF-built model the IQ3_S recipe stores the Q4_K, Q5_K, Q6_K and IQ4_XS dense matrices in
+    ggml_tiles16_v1 and every other GGUF format, and the token embedding (a row gather), in
+    ggml_rows_v1, each by the verbatim import; the drafter's routed experts take q2_g64_fp16."""
+
+    from types import SimpleNamespace
+
+    from tools.convert.methods import import_ggml_rows
+    from tools.convert.official_recipes import qwen3_8_flash_next_gsq_rco_iq3s
+
+    encoded = {f"{LAYER}/gdn/query": "ggml_q6_k", f"{LAYER}/gdn/z": "ggml_iq4_xs", f"{LAYER}/moe/shared/gate": "ggml_q4_k",
+               f"{LAYER}/attention/query": "ggml_q5_k", f"{LAYER}/attention/output": "ggml_iq4_nl",
+               "text/token_embedding": "ggml_q6_k"}
+    tiled = {"ggml_q4_k", "ggml_q5_k", "ggml_q6_k", "ggml_iq4_xs"}
+    m = Model({"text": {"config": {"architectures": ["Qwen4ExpForCausalLM"], "gdn_a": "direct"}}})
+    for name, fmt in encoded.items():
+        source = SimpleNamespace(shape=(32, 256), read_encoded=lambda start, count, fmt=fmt: SimpleNamespace(format=fmt))
+        m.add(Parameter(name, (32, 256), source, inputs=() if name == "text/token_embedding" else ("input",)))
+    for name in (*DRAFTER_Q8, *DRAFTER_KEPT, *DRAFTER_EXPERTS):
+        m.add(Parameter(name, (4, 64), array_source(torch.ones((4, 64), dtype=torch.bfloat16), name), inputs=("input",)))
+    recipe = Recipe(m)
+    qwen3_8_flash_next_gsq_rco_iq3s(m, recipe, {})
+    for name, fmt in encoded.items():
+        chosen = _only(recipe.selections, name)
+        layout = "ggml_tiles16_v1" if fmt in tiled and name != "text/token_embedding" else "ggml_rows_v1"
+        assert (chosen.format, chosen.layout or "ggml_rows_v1", chosen.method) == (fmt, layout, import_ggml_rows), name
+    for name in DRAFTER_EXPERTS:
+        chosen = _only(recipe.selections, name)
+        assert (chosen.format, chosen.method) == ("q2_g64_fp16", grouped_mse), name
+
+
+def test_fp8_bank_import_writes_each_expert_verbatim(tmp_path) -> None:
+    """Each record is the expert's gate, up and down codes, then their BF16 tile scales, padded to
+    4 KiB, read back by the codec's decoder; a non-BF16 scale plane is refused."""
+
+    import numpy as np
+    from safetensors.torch import save_file
+
+    from tools.artifact.codecs.fp8_b128 import decode_expert
+    from tools.artifact.layouts import fp8_expert_geometry
+    from tools.artifact.schema import TensorSpec
+    from tools.convert.methods import MethodInput, PrepareRequest
+    from tools.convert.sources.safetensors import SafetensorsSource
+
+    rng = np.random.default_rng(3)
+    experts, hidden, inter = 2, 256, 128
+    tensors, expected = {}, []
+    for e in range(experts):
+        parts = []
+        for role, shape in (("gate", (inter, hidden)), ("up", (inter, hidden)), ("down", (hidden, inter))):
+            codes = rng.integers(0, 256, size=shape, dtype=np.uint8)
+            codes[codes & 0x7F == 0x7F] = 0x3C  # no NaN codes
+            scales = torch.from_numpy(rng.uniform(2.0**-12, 2.0**-6, size=(shape[0] // 128, shape[1] // 128)))
+            scales = scales.to(torch.bfloat16)
+            tensors[f"experts.{e}.{role}_proj.weight"] = torch.from_numpy(codes).view(torch.float8_e4m3fn)
+            tensors[f"experts.{e}.{role}_proj.weight_scale_inv"] = scales
+            parts.append((codes, scales.view(torch.int16).numpy().view(np.uint16)))
+        expected.append(parts)
+    save_file(tensors, str(tmp_path / "model.safetensors"))
+
+    class Output:
+        def __init__(self, size):
+            self.data = bytearray(size)
+
+        def write_bytes(self, offset, data):
+            self.data[offset : offset + len(data)] = data
+
+    with SafetensorsSource(tmp_path / "model.safetensors") as store:
+        bank = Fp8ExpertBankSource((experts, hidden, inter), BANK, store, "experts.")
+        g = fp8_expert_geometry("fp8_e4m3fn_b128", bank.shape)
+        assert g.record_stride % 4096 == 0 and g.record_bytes == 3 * hidden * inter + 3 * 2 * 2
+        spec = TensorSpec("weight/0", bank.shape, "fp8_e4m3fn_b128", "fp8_expert_b128_v1")
+        out = Output(g.payload_bytes)
+        import_fp8_expert_bank(PrepareRequest(spec, (MethodInput("experts", bank, ()),), {}, {})).produce(out)
+    for e in range(experts):
+        record = bytes(out.data[e * g.record_stride : (e + 1) * g.record_stride])
+        for (codes, words), (got_codes, got_words) in zip(expected[e], decode_expert(record, hidden, inter)):
+            assert np.array_equal(codes, got_codes) and np.array_equal(words, got_words)
+        assert record[g.record_bytes :] == bytes(g.record_stride - g.record_bytes)
+
+    tensors["experts.1.down_proj.weight_scale_inv"] = tensors["experts.1.down_proj.weight_scale_inv"].float()
+    save_file(tensors, str(tmp_path / "f32.safetensors"))
+    with SafetensorsSource(tmp_path / "f32.safetensors") as store:
+        bank = Fp8ExpertBankSource((experts, hidden, inter), BANK, store, "experts.")
+        out = Output(g.payload_bytes)
+        with pytest.raises(ValueError, match="BF16"):
+            import_fp8_expert_bank(PrepareRequest(spec, (MethodInput("experts", bank, ()),), {}, {})).produce(out)

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <stdexcept>
+#include <string>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -13,7 +14,6 @@
 #include <psapi.h>
 #else
 #include <sys/mman.h>
-#include <sys/resource.h>
 
 #include <fstream>
 #include <sstream>
@@ -89,10 +89,6 @@ HostMemorySnapshot host_memory_snapshot() {
     }
     out.available_commit = out.available_physical + proc_kib_field("/proc/meminfo", "SwapFree:").value_or(0);
     out.process_private  = proc_kib_field("/proc/self/status", "VmRSS:").value_or(0);
-    rlimit lock{};
-    if (::getrlimit(RLIMIT_MEMLOCK, &lock) == 0 && lock.rlim_cur != RLIM_INFINITY) {
-        out.lock_limit = static_cast<std::uint64_t>(lock.rlim_cur);
-    }
 #endif
     return out;
 }

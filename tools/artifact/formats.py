@@ -55,8 +55,27 @@ class Nvfp4MulFormat:
     group_size: int
 
 
+@dataclass(frozen=True, slots=True)
+class GgmlFormat:
+    """A GGUF (ggml) block format stored verbatim: ``block_bytes`` per ``block_elems`` K-axis
+    elements (tools/artifact/codecs/ggml.py holds each one's exact decoder)."""
+
+    name: str
+    block_elems: int
+    block_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class Fp8BlockFormat:
+    """E4M3FN weights with one BF16 scale per ``block`` x ``block`` tile (the official
+    Qwen3.8-Flash-Next-FP8 experts; tools/artifact/codecs/fp8_b128.py holds the exact decoder)."""
+
+    name: str
+    block: int
+
+
 NumericFormat: TypeAlias = (
-    DirectFormat | QuantFormat | Nvfp4Format | Fp8RowFormat | Nvfp4MulFormat
+    DirectFormat | QuantFormat | Nvfp4Format | Fp8RowFormat | Nvfp4MulFormat | GgmlFormat | Fp8BlockFormat
 )
 
 
@@ -64,6 +83,9 @@ BF16 = DirectFormat("bf16", 2)
 FP32 = DirectFormat("fp32", 4)
 INT32 = DirectFormat("int32", 4)
 
+# Two-bit codes {-2, -1, 0, 1}: draft-only weights (the Qwen4Exp MTP drafter's experts), whose
+# precision moves only the drafts' acceptance.
+Q2_G64_FP16 = QuantFormat("q2_g64_fp16", 2, 64, -2, 1)
 Q4_G64_FP16 = QuantFormat("q4_g64_fp16", 4, 64, -8, 7)
 Q5_G64_FP16 = QuantFormat("q5_g64_fp16", 5, 64, -16, 15)
 Q6_G64_FP16 = QuantFormat("q6_g64_fp16", 6, 64, -32, 31)
@@ -72,14 +94,35 @@ NVFP4 = Nvfp4Format("nvfp4", 16)
 FP8_E4M3FN_ROW_BF16 = Fp8RowFormat("fp8_e4m3fn_row_bf16")
 NVFP4_MUL = Nvfp4MulFormat("nvfp4_mul", 16)
 
+GGML_Q2_0 = GgmlFormat("ggml_q2_0", 64, 18)
+GGML_Q4_K = GgmlFormat("ggml_q4_k", 256, 144)
+GGML_Q5_K = GgmlFormat("ggml_q5_k", 256, 176)
+GGML_Q6_K = GgmlFormat("ggml_q6_k", 256, 210)
+GGML_IQ2_S = GgmlFormat("ggml_iq2_s", 256, 82)
+GGML_IQ3_XXS = GgmlFormat("ggml_iq3_xxs", 256, 98)
+GGML_IQ3_S = GgmlFormat("ggml_iq3_s", 256, 110)
+GGML_IQ4_XS = GgmlFormat("ggml_iq4_xs", 256, 136)
+GGML_IQ4_NL = GgmlFormat("ggml_iq4_nl", 32, 18)
+FP8_E4M3FN_B128 = Fp8BlockFormat("fp8_e4m3fn_b128", 128)
+
 
 DIRECT_FORMATS = MappingProxyType({item.name: item for item in (BF16, FP32, INT32)})
 QUANT_FORMATS = MappingProxyType(
-    {item.name: item for item in (Q4_G64_FP16, Q5_G64_FP16, Q6_G64_FP16, Q8_G32_FP16)}
+    {item.name: item for item in (Q2_G64_FP16, Q4_G64_FP16, Q5_G64_FP16, Q6_G64_FP16, Q8_G32_FP16)}
 )
 NVFP4_FORMATS = MappingProxyType({NVFP4.name: NVFP4})
 FP8_ROW_FORMATS = MappingProxyType({FP8_E4M3FN_ROW_BF16.name: FP8_E4M3FN_ROW_BF16})
 NVFP4_MUL_FORMATS = MappingProxyType({NVFP4_MUL.name: NVFP4_MUL})
+GGML_FORMATS = MappingProxyType(
+    {
+        item.name: item
+        for item in (
+            GGML_Q2_0, GGML_Q4_K, GGML_Q5_K, GGML_Q6_K, GGML_IQ2_S, GGML_IQ3_XXS, GGML_IQ3_S,
+            GGML_IQ4_XS, GGML_IQ4_NL,
+        )
+    }
+)
+FP8_BLOCK_FORMATS = MappingProxyType({FP8_E4M3FN_B128.name: FP8_E4M3FN_B128})
 NUMERIC_FORMATS = MappingProxyType(
     {
         **DIRECT_FORMATS,
@@ -87,6 +130,8 @@ NUMERIC_FORMATS = MappingProxyType(
         **NVFP4_FORMATS,
         **FP8_ROW_FORMATS,
         **NVFP4_MUL_FORMATS,
+        **GGML_FORMATS,
+        **FP8_BLOCK_FORMATS,
     }
 )
 
@@ -171,6 +216,7 @@ __all__ = [
     "BF16",
     "FP32",
     "INT32",
+    "Q2_G64_FP16",
     "Q4_G64_FP16",
     "Q5_G64_FP16",
     "Q6_G64_FP16",
@@ -178,12 +224,17 @@ __all__ = [
     "NVFP4",
     "FP8_E4M3FN_ROW_BF16",
     "NVFP4_MUL",
+    "FP8_E4M3FN_B128",
     "DIRECT_FORMATS",
     "QUANT_FORMATS",
     "NVFP4_FORMATS",
     "FP8_ROW_FORMATS",
     "NVFP4_MUL_FORMATS",
+    "GGML_FORMATS",
+    "FP8_BLOCK_FORMATS",
     "NUMERIC_FORMATS",
+    "GgmlFormat",
+    "Fp8BlockFormat",
     "DirectFormat",
     "QuantFormat",
     "Nvfp4Format",

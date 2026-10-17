@@ -57,6 +57,28 @@ struct Q4 {
     }
 };
 
+// Q2: one chunk is one 64-code group (element i of the chunk in byte i / 4, bits 2 (i % 4); codes
+// {-2, -1, 0, 1}). A chunk spans two bank rows, so the rotation by the chunk index alone (kChunksPerRow
+// 1) already puts a quarter warp's eight reads in eight distinct bank groups.
+struct Q2 {
+    static constexpr int kCodes = 64, kGroup = 64, kQuads = kCodes / 4, kChunksPerRow = 1;
+    __device__ static float chunk_dot(uint4 w, const float4* x, int c) {
+        const std::uint32_t words[4] = {w.x, w.y, w.z, w.w};
+        float dot = 0.0F;
+#pragma unroll
+        for (int q = 0; q < kQuads; ++q) {
+            const float4 v    = x[(q + c / kChunksPerRow) % kQuads];
+            const float xs[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int u = static_cast<int>((words[q / 4] >> (2 * (4 * (q % 4) + j))) & 0x3U);
+                dot = fmaf(static_cast<float>(u >= 2 ? u - 4 : u), xs[j], dot);
+            }
+        }
+        return dot;
+    }
+};
+
 struct Q8 {
     static constexpr int kCodes = 16, kGroup = 32, kQuads = kCodes / 4, kChunksPerRow = 2;
     __device__ static float chunk_dot(uint4 w, const float4* x, int c) {
@@ -203,8 +225,11 @@ void resident_moe_experts(const Tensor& x, const Tensor& ids, const Weight& gate
     } else if (row_split(gate_up, QType::Q8_G32_FP16) && row_split(down, QType::Q8_G32_FP16)) {
         require(gate_up.padded_shape[1] % 32 == 0 && down.padded_shape[1] % 32 == 0, "Q8 rows must hold whole groups");
         launch<Q8>(x, ids, gate_up, down, top_k, hidden, intermediate, h, outputs, stream);
+    } else if (row_split(gate_up, QType::Q2_G64_FP16) && row_split(down, QType::Q2_G64_FP16)) {
+        require(gate_up.padded_shape[1] % 64 == 0 && down.padded_shape[1] % 64 == 0, "Q2 rows must hold whole groups");
+        launch<Q2>(x, ids, gate_up, down, top_k, hidden, intermediate, h, outputs, stream);
     } else {
-        throw std::invalid_argument("resident_moe_experts: banks must be row-split Q4_G64_FP16 or Q8_G32_FP16");
+        throw std::invalid_argument("resident_moe_experts: banks must be row-split Q2_G64_FP16, Q4_G64_FP16 or Q8_G32_FP16");
     }
 }
 

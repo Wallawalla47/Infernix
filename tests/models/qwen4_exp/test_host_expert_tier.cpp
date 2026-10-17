@@ -10,7 +10,8 @@
 // of a fetch channel (mapped words, so a CUDA context), this thread playing the device's half of the
 // protocol (ops/offloaded_sparse_moe/cpu/fetch_request.h): records landed from RAM and read from disk,
 // more records than ring slots (slots reused as the "device" consumes them), the heartbeat, a request
-// failing on an unreadable record, and admission of fetched landings at the next boundary.
+// failing on an unreadable record, and admission of fetched landings at the next boundary. An
+// expert stripe moves each record's tail to another file; records still land whole.
 #include "models/qwen4_exp/expert_store.h"
 #include "models/qwen4_exp/program/host_expert_tier.h"
 #include "ops/offloaded_sparse_moe/cpu/fetch_channel.h"
@@ -21,6 +22,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -247,6 +249,259 @@ void test_fetch(const ExpertStore& store) {
     tier.end_round();
 }
 
+// One request of `layer`'s `experts`, consumed record by record: whether every record landed with
+// its bytes.
+bool fetch_all(DeviceSide& device, std::uint32_t layer, const std::vector<std::int32_t>& experts) {
+    device.publish(layer, experts);
+    bool all = true;
+    for (std::uint32_t i = 0; i < experts.size(); ++i) {
+        std::uint32_t status = 0;
+        const std::uint8_t* record = device.wait(i, status);
+        all = all && status == 0 && matches(record, layer * kExperts + static_cast<std::uint32_t>(experts[i]));
+        device.consume(i + 1);
+    }
+    return all;
+}
+
+// Read-ahead (Options::ahead_min, ahead): a wide request also reads the next layer's first records
+// without a host copy, behind its own; the next request adopts them, so each record is read once
+// and lands whole. A request naming none of them releases their slots, and the round still ends.
+void test_read_ahead(const ExpertStore& store) {
+    infernix::ops::offloaded_moe::FetchChannel channel;
+    auto o      = options();
+    o.fetch     = &channel;
+    o.ahead_min = 16;
+    o.ahead     = 6;
+    HostExpertTier tier(store, o);
+    std::vector<std::uint32_t> ranked(kKeys);
+    for (std::uint32_t k = 0; k < kKeys; ++k) { ranked[k] = k; }
+    check(tier.prefill(ranked) == 50, "read-ahead: pre-fill fills the resident slots (keys 0-49)");
+    DeviceSide device{channel.channel(0)};
+    tier.begin_round(32);
+    const std::uint64_t reads_before = tier.stats().demand_reads;
+    std::vector<std::int32_t> experts;
+    for (std::int32_t e = 0; e < 20; ++e) { experts.push_back(e); }
+    // Layer 1, keys 40..59 (50..59 from disk): wide, so layer 2's keys 80..85 are read ahead.
+    check(fetch_all(device, 1, experts), "read-ahead: the wide request's records land with their bytes");
+    // Layer 2, keys 80..89: 80..85 adopted from the read-ahead, 86..89 read now.
+    experts.resize(10);
+    check(fetch_all(device, 2, experts), "read-ahead: adopted records land with their bytes");
+    tier.end_round();
+    tier.begin_round(32); // publishes the agent's counters
+    std::cout << "read-ahead: " << tier.stats().demand_reads - reads_before << " reads for 20 records from disk\n";
+    check(tier.stats().demand_reads - reads_before == 20, "read-ahead: an adopted record is read once");
+    // A wide request of layer 0 (keys 20..39, in RAM) reads ahead layer 1's records without a host
+    // copy; the next request (layer 2, keys 110..118) names none of them.
+    experts.clear();
+    for (std::int32_t e = 20; e < 40; ++e) { experts.push_back(e); }
+    check(fetch_all(device, 0, experts), "read-ahead: a request served from RAM lands");
+    experts.clear();
+    for (std::int32_t e = 30; e < 39; ++e) { experts.push_back(e); }
+    check(fetch_all(device, 2, experts), "read-ahead: a request naming no read-ahead record lands whole");
+    tier.end_round();
+    tier.begin_round(32); // drains every read, the unadopted read-ahead included
+    tier.controller().check();
+    tier.end_round();
+}
+
+// Stream slots (Options::stream), lent from the resident slots: lending evicts the lowest-ranked
+// residents; a read lands with the file's bytes whether or not a round is open and whatever the
+// key's RAM state; the slots run out and come back on release; the loan returns them to RAM.
+void test_stream_reads(const ExpertStore& store) {
+    auto o   = options();
+    o.stream = 4;
+    HostExpertTier tier(store, o);
+    std::vector<std::uint32_t> ranked(kKeys);
+    for (std::uint32_t k = 0; k < kKeys; ++k) { ranked[k] = k; }
+    check(tier.prefill(ranked) == 50, "stream reads: pre-fill fills the resident slots (keys 0-49)");
+    check(tier.stream_slots() == 0 && tier.stream_read(60) == -1, "stream reads: none before a loan");
+    check(tier.lend_stream(10) == 4 && tier.stream_slots() == 4, "stream reads: the loan is capped by the option");
+    std::uint32_t in_ram = 0;
+    for (std::uint32_t k = 0; k < 50; ++k) { in_ram += tier.record(k) != nullptr ? 1U : 0U; }
+    check(in_ram == 46, "stream reads: the loan evicts four residents");
+    tier.controller().check();
+    // Between rounds: keys 60..62 (SSD-only) and 3 (in RAM).
+    const std::uint32_t keys[] = {60, 61, 62, 3};
+    std::int32_t slots[4];
+    for (int i = 0; i < 4; ++i) { slots[i] = tier.stream_read(keys[i]); }
+    check(slots[0] >= 0 && slots[1] >= 0 && slots[2] >= 0 && slots[3] >= 0, "stream reads: four slots for four reads");
+    check(tier.stream_read(63) == -1, "stream reads: none left for a fifth");
+    bool all = true;
+    for (int i = 0; i < 4; ++i) { all = all && matches(tier.stream_wait(slots[i]), keys[i]); }
+    check(all, "stream reads: every record lands with the file's bytes");
+    // During an open round, after a release.
+    tier.stream_release(slots[1]);
+    tier.begin_round(32);
+    const std::int32_t again = tier.stream_read(70);
+    check(again >= 0 && matches(tier.stream_wait(again), 70), "stream reads: a released slot reads again during a round");
+    tier.end_round();
+    tier.begin_round(32);
+    std::cout << "stream reads: " << tier.stats().stream_reads << " records read into stream slots\n";
+    check(tier.stats().stream_reads == 5, "stream reads: the agent counts every stream read");
+    tier.end_round();
+    bool refused = false;
+    try {
+        tier.return_stream();
+    } catch (const std::logic_error&) { refused = true; }
+    check(refused, "stream reads: the loan cannot return while a slot is in use");
+    for (const std::int32_t s : {slots[0], slots[2], slots[3], again}) { tier.stream_release(s); }
+    tier.return_stream();
+    tier.controller().check();
+    check(tier.stream_slots() == 0 && tier.prefill(ranked) == 4, "stream reads: the returned slots refill RAM");
+    // Destruction with a stream read in flight.
+    check(tier.lend_stream(4) == 4, "stream reads: a second loan");
+    (void)tier.stream_read(71);
+}
+
+// A GGUF import's layers: records of different pitches (layer 0 two blocks, layer 1 one) and no
+// scale tail. Slots take the largest pitch; a record shorter than its slot lands whole, alone and in
+// a scatter run, and the bytes past it are never read as its own.
+void test_mixed_strides() {
+    constexpr std::uint32_t kExpertsHere = 20;
+    const std::uint64_t pitch[2] = {kRecord, kRecord / 2};
+    const auto path = std::filesystem::temp_directory_path() / "infernix_host_tier_mixed.bin";
+    std::vector<std::vector<ExpertStore::Segment>> records(2 * kExpertsHere);
+    {
+        std::ofstream f(path, std::ios::binary | std::ios::trunc);
+        std::uint64_t at = 0;
+        std::vector<char> rec(kRecord);
+        for (std::uint32_t key = 0; key < 2 * kExpertsHere; ++key) {
+            const std::uint64_t bytes = pitch[key / kExpertsHere];
+            for (std::uint64_t i = 0; i < bytes; ++i) { rec[i] = static_cast<char>(oracle(key, i)); }
+            f.write(rec.data(), static_cast<std::streamsize>(bytes));
+            records[key] = {{0, at, 0, static_cast<std::uint32_t>(bytes)}};
+            at += bytes;
+        }
+        if (!f) { throw std::runtime_error("cannot write the mixed-stride test file"); }
+    }
+    const auto holds = [&](const std::uint8_t* p, std::uint32_t key) {
+        if (p == nullptr) { return false; }
+        for (std::uint64_t i = 0; i < pitch[key / kExpertsHere]; ++i) {
+            if (p[i] != oracle(key, i)) { return false; }
+        }
+        return true;
+    };
+    const ExpertStore store({path}, {pitch[0], pitch[1]}, kExpertsHere, records, {{}, {}});
+    check(store.record_bytes() == kRecord && store.record_bytes(1) == kRecord / 2 && store.multipliers(1) == nullptr,
+          "mixed strides: slots of the largest pitch, each layer its own, no scale tail");
+    HostExpertTier::Options o = options();
+    o.slots = 24; // ring 8 + prefetch 2 + demotion 4 + 10 resident slots
+    HostExpertTier tier(store, o);
+    // Layer 1's keys 20..29 follow each other in the file: one scatter run of half-size records.
+    std::vector<std::uint32_t> ranked;
+    for (std::uint32_t k = kExpertsHere; k < kExpertsHere + 10; ++k) { ranked.push_back(k); }
+    check(tier.prefill(ranked) == 10, "mixed strides: the pre-fill fills the resident slots");
+    bool all = true;
+    for (const auto k : ranked) { all = all && holds(tier.record(k), k); }
+    check(all && tier.stats().run_reads == 1 && tier.stats().run_records == 10,
+          "mixed strides: a run of short records lands in full-size slots");
+    tier.begin_round(32);
+    std::vector<const std::uint8_t*> got(3);
+    std::vector<std::uint32_t> status(3);
+    const std::uint32_t keys[3] = {3, kExpertsHere + 15, 7};
+    std::thread service([&] {
+        std::uint32_t tickets[3];
+        for (int i = 0; i < 3; ++i) {
+            tickets[i] = tier.demand(static_cast<int>(keys[i] / kExpertsHere), static_cast<int>(keys[i] % kExpertsHere));
+        }
+        for (int i = 0; i < 3; ++i) {
+            got[i] = tier.wait(tickets[i], status[i]);
+            got[i] = status[i] == 0 && holds(got[i], keys[i]) ? got[i] : nullptr;
+            tier.done(tickets[i]);
+        }
+    });
+    service.join();
+    check(got[0] != nullptr && got[1] != nullptr && got[2] != nullptr,
+          "mixed strides: demanded records of either pitch equal the file bytes");
+    tier.end_round();
+    tier.controller().check();
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+}
+
+// Writes an expert stripe of the test artifact: each record's tail past `head` bytes, layer by layer,
+// after a 4 KiB header (format v1, expert_store.h). `stride` is written as each layer's stride.
+void write_stripe(const std::filesystem::path& path, const infernix::artifact::ArtifactId& id, std::uint64_t head,
+                  std::uint64_t stride, bool magic = true, std::uint32_t layers_written = kLayers) {
+    std::vector<std::uint8_t> header(4096, 0);
+    const auto put = [&](std::size_t at, std::uint64_t v, int bytes) {
+        for (int i = 0; i < bytes; ++i) { header[at + static_cast<std::size_t>(i)] = static_cast<std::uint8_t>(v >> (8 * i)); }
+    };
+    if (magic) { std::memcpy(header.data(), "INFXSTR1", 8); }
+    put(8, 1, 4);
+    put(12, kLayers, 4);
+    put(16, kExperts, 4);
+    put(20, 4096, 4);
+    std::memcpy(&header[24], id.data(), id.size());
+    const std::uint64_t tail = kRecord - head;
+    for (std::uint32_t l = 0; l < kLayers; ++l) {
+        put(40 + 24 * l, stride, 8);
+        put(48 + 24 * l, head, 8);
+        put(56 + 24 * l, 4096 + static_cast<std::uint64_t>(l) * kExperts * tail, 8);
+    }
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    f.write(reinterpret_cast<const char*>(header.data()), static_cast<std::streamsize>(header.size()));
+    std::vector<char> rec(tail);
+    for (std::uint32_t key = 0; key < layers_written * kExperts; ++key) {
+        for (std::uint64_t i = 0; i < tail; ++i) { rec[i] = static_cast<char>(oracle(key, head + i)); }
+        f.write(rec.data(), static_cast<std::streamsize>(tail));
+    }
+    if (!f) { throw std::runtime_error("cannot write the stripe test file"); }
+}
+
+// An expert stripe (tools/flash_next/expert_stripe.py): each record's tail is read from the stripe
+// file, its head from the artifact (the straddling record's head is its file-A part), and the record
+// lands whole; a stripe of another artifact, of other strides, cut short or without its magic is refused.
+void test_stripe(const ExpertStore& base) {
+    using infernix::models::qwen4_exp::read_expert_stripe;
+    using infernix::models::qwen4_exp::with_stripe;
+    infernix::artifact::ArtifactId id{};
+    for (std::size_t i = 0; i < id.size(); ++i) { id[i] = static_cast<std::byte>(i + 1); }
+    const auto path = std::filesystem::temp_directory_path() / "infernix_host_tier.stripe";
+    write_stripe(path, id, 4096, kRecord);
+    const ExpertStore store = with_stripe(base, read_expert_stripe(path), id);
+    const auto straddler    = store.segments(kStraddle / kExperts, kStraddle % kExperts);
+    const auto plain        = store.segments(1, 3);
+    check(straddler.size() == 2 && straddler[0].file == 0 && straddler[0].bytes == 4096 && straddler[1].file == 2 &&
+              plain.size() == 2 && plain[1].at == 4096 && plain[1].offset == 4096 + (kExperts + 3) * 4096ULL &&
+              store.multipliers(2) != nullptr,
+          "stripe: heads from the artifact (the straddler's from file A), tails at their stripe offsets");
+    {
+        HostExpertTier tier(store, options());
+        std::vector<std::uint32_t> ranked(kKeys);
+        for (std::uint32_t k = 0; k < kKeys; ++k) { ranked[k] = k; }
+        check(tier.prefill(ranked) == 50, "stripe: the pre-fill fills the resident slots");
+        bool all = true;
+        for (std::uint32_t k = 0; k < 50; ++k) { all = all && matches(tier.record(k), k); }
+        check(all && tier.stats().run_reads == 0, "stripe: pre-filled records equal the bytes, read segment by segment");
+        tier.begin_round(32);
+        std::vector<std::uint32_t> statuses;
+        std::vector<bool> valid;
+        (void)serve(tier, {55, kStraddle, 70, 90}, statuses, valid);
+        check(valid[0] && valid[1] && valid[2] && valid[3], "stripe: demanded records (the straddler included) land whole");
+        const auto bad = serve(tier, {kKeys - 1}, statuses, valid);
+        check(bad[0] == nullptr && statuses[0] == EIO, "stripe: an unreadable head still fails its ticket");
+        tier.begin_round(32);
+    }
+    const auto refused = [&](auto&& make) {
+        try {
+            (void)make();
+        } catch (const infernix::artifact::ArtifactError&) { return true; }
+        return false;
+    };
+    infernix::artifact::ArtifactId other = id;
+    other[0] = std::byte{0x7F};
+    check(refused([&] { return with_stripe(base, read_expert_stripe(path), other); }), "stripe: another artifact's is refused");
+    write_stripe(path, id, 4096, 3 * 4096);
+    check(refused([&] { return with_stripe(base, read_expert_stripe(path), id); }), "stripe: other strides are refused");
+    write_stripe(path, id, 4096, kRecord, true, kLayers - 1);
+    check(refused([&] { return read_expert_stripe(path); }), "stripe: a file without every tail is refused");
+    write_stripe(path, id, 4096, kRecord, false);
+    check(refused([&] { return read_expert_stripe(path); }), "stripe: a file without its magic is refused");
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+}
+
 // Pinning refused after three of four chunks (the Windows page-locking limit): the tier gives back a
 // chunk for later pins and keeps the slots it lost as unpinned records, beside those asked for.
 HostExpertTier::Options refusing_options(int& chunks) {
@@ -362,8 +617,11 @@ int main(int argc, char** argv) {
     try {
         const Files files = make_files();
         std::vector<std::vector<float>> multipliers(kLayers, std::vector<float>(3 * kExperts, 1.0F));
-        const ExpertStore store({files.a, files.b}, kRecord, kLayers, kExperts, files.records, multipliers);
+        const ExpertStore store({files.a, files.b}, std::vector<std::uint64_t>(kLayers, kRecord), kExperts, files.records,
+                                multipliers);
         check(store.straddling() == 1, "one straddling record");
+        test_mixed_strides();
+        test_stripe(store);
         {
             HostExpertTier tier(store, options());
             // Startup pre-fill: keys 0..49 fill the 50 resident slots, best first.
@@ -466,8 +724,10 @@ int main(int argc, char** argv) {
         test_unpinned(store);
         if (argc > 1 && std::string_view(argv[1]) == "--fetch") {
             test_fetch(store);
+            test_read_ahead(store);
             test_fetch_unpinned(store);
         }
+        test_stream_reads(store);
         {
             // Destruction with reads in flight.
             HostExpertTier tier(store, options());

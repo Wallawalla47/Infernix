@@ -40,13 +40,15 @@ VisionWindowPlan plan_vision_window(std::span<const VisionWindowItem> items, std
     };
     if (plan.window_bytes <= work_capacity && plan.seconds <= kVisionStepSeconds) {
         plan.lease           = false;
-        plan.frames          = frames_for(plan.handoff_bytes);
+        plan.lease_bytes     = plan.handoff_bytes;
+        plan.frames          = frames_for(plan.lease_bytes);
         plan.steps           = 1;
         plan.layers_per_step = depth;
     } else {
         plan.lease           = true;
         // The handoff first, then the window, each starting on a 256-byte boundary.
-        plan.frames          = frames_for((plan.handoff_bytes + 255) / 256 * 256 + plan.window_bytes);
+        plan.lease_bytes     = (plan.handoff_bytes + 255) / 256 * 256 + plan.window_bytes;
+        plan.frames          = frames_for(plan.lease_bytes);
         plan.layers_per_step = std::max<std::uint32_t>(
             1, static_cast<std::uint32_t>(std::ceil(depth * kVisionStepSeconds / std::max(plan.seconds, 1e-9))));
         plan.layers_per_step = std::min(plan.layers_per_step, depth);

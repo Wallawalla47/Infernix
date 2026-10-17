@@ -1,6 +1,179 @@
 # Qwen3.8-Flash-Next official FP8: implementation plan
 
-**Status: plan, not implemented.** This is a temporary planning document for an Infernix artifact of
+**Outcome (2026-10-17): implemented as one recipe.** `qwen3_8_flash_next_fp8` is F-A (every
+checkpoint tensor bit-exact, the BF16 n-gram table) with `q2_g64_fp16` drafter experts; F-B
+(Dense8) and its recipe were dropped on 2026-10-12, so the F-B entries below are history. The
+current figures are in the [user guide](../qwen3_8-flash-next.md#official-fp8-checkpoint).
+
+**Status (2026-10-11): partly implemented** in worktree `iq3s-gsq-rco` (not committed):
+
+- **M0, source.** The checkpoint is downloaded at the pinned revision to `C:\models\Qwen3.8-Flash-Next-FP8`
+  (all 131 shards, 185.6 GB, every shard's SHA256 equal to the LFS hash). All 48 x 512 routed
+  experts are E4M3FN `[640, 2560]` / `[2560, 640]` codes with BF16 `[5, 20]` / `[20, 5]` tile scales;
+  every scale word is positive, normal and finite; the per-row exponent spread is at most 4
+  (0: 128,629 rows, 1: 542,690, 2: 60,560, 3: 5,302, 4: 99); 629 M sampled gate codes hold no NaN.
+  Route-trace replays of the FP8 capacities are not done.
+- **M1.** `fp8_e4m3fn_b128` in `fp8_expert_b128_v1` (Python codec, layout, C++ registration and
+  geometry), the converter's bank import and recipes F-A/F-B, `verify_artifact`'s bank check.
+  Codec exact against PyTorch on every code; two real MTP experts round-trip byte for byte.
+- **M2/M3.** The exact arithmetic (`src/ops/fp8_block/fp8_exact.h`, sharing
+  `src/ops/common/exact_combine.h` with the GGUF route), GPU narrow kernels for every column count
+  (`dp4a` over three base-64 weight digits), the CPU route (scalar, AVX2, AVX-VNNI, AVX-512 VNNI)
+  through the GGUF route's team, and loader support (`exact_experts`). Op tests pass:
+  `infernix_offloaded_moe_fp8_test` (every width 1-300 and placement, CPU-served included, bit-equal
+  to the scalar reference, itself equal to a bignum sum) and the FP8 case of
+  `infernix_offloaded_moe_ggml_cpu_test` (every ISA; 1.0 ms per expert on one AVX-VNNI thread).
+- **F-B artifact.** `E:\Infernix-staging\Qwen3.8-Flash-Next-FP8-Dense8-Infernix-00001-of-00005.infernix` (129.8 GB,
+  five files; routed experts 112.6 GiB in 4.69 MiB records). `verify_artifact` (121 s): 24,576
+  experts and 987 tensors equal to the checkpoint, 629 text and 1,556 MTP tensors re-quantized by
+  the recipe. It runs with recipe B's n-gram volume: its header and volume id match the
+  artifact's table and 50,000 sampled rows (`verify_ngram`, 7.8 s) equal this checkpoint's table;
+  the full 320M-row comparison is pending.
+- **Windows pinned ceiling (M0).** WDDM counts every CUDA pin of a process in the GPU's NON_LOCAL
+  segment and refuses pins just past its per-process budget: 75.86 GiB budget, pins failed at
+  76.07 GiB of usage with 5.3 GiB of RAM still free (both `cudaHostAlloc` and `cudaHostRegister`).
+  The RAM ledger now keeps every pin within the budget less the usage (FN §19.3.7, R4 "Pin room");
+  before that, F-B's automatic 77 GiB of expert slots failed to pin at startup. F-B now pins 73.9 GiB
+  of expert slots (15,700 experts, 64 % of the bank) by default, more than §8.5's 64 GiB.
+- **First measurements** (F-B, default options, INT8 KV, one request, the expert state of earlier
+  runs; RTX 5090 on PCIe 5.0 x8, i9-13900K):
+
+  | `infernix_bench` | F-B | Model (§10) | Recipe B, same day |
+  |---|---:|---:|---:|
+  | tg512 plain | 41.1 tok/s | ~79 central, ~62 pessimistic | 120.5 |
+  | tg512 MTP 4, `--lm-head-draft` | 50.3 tok/s (76 % accepted) | ~95 central | 176.3 |
+  | pp4096, `--prefill-chunk 4096` | 448 tok/s | — | 1,679 |
+
+  Decode is below the pessimistic model. The VRAM cache holds 5,303 frames (§8.1 modelled 5,290)
+  but hits 66 % of routed experts in tg512 against the central 82 %, and about 149 misses per token
+  go to the CPU engine (~76K per 512 tokens), against the 82 modelled. With 1.0 ms per expert per
+  thread (4.9 GB/s), the CPU engine at ~150 experts per token is the decode's critical path; M5's
+  divisor and `cpu_rates` (still calibrated for 2.6 MB NVFP4 and ~2 MB GGUF records) are next.
+  Prefill reads about 38 GiB from `E:` per 4K-token prompt (~4.3 GB/s; 8.1-8.6K reads of 64 ms
+  mean latency), so it is bound by the single volume: M4 (striped volumes, S3) is the lever.
+  Not done: F-A conversion (disk), greedy invariance on F-B, the KL protocol, pp131072, route-trace
+  replays.
+- **M4/S3, second drive (built, not yet measured).** In place of §8.3's striped copies in 1.1 MiB
+  units, an *expert stripe* holds only the tail of every record on a second drive
+  (`tools/flash_next/expert_stripe.py`, format in `expert_store.h`, `--expert-stripe` on every
+  CLI): the tier reads the head from the artifact and the tail from the stripe at once, at depth 8
+  per drive. No second copy of the experts (56 GiB for F-B's tails on `D:` instead of 113 GiB on
+  two drives) and no new read engine: an `ExpertStore` record takes a third segment. Records split
+  this way are never read as runs of neighbours (the heads are not contiguous). Tests: the tier's
+  synthetic stripe (straddling records, refusals) and the writer against the artifact's bytes.
+  Measurement (pp4096, tg512, the split fraction) waits for the GPU and for `D:` to be free.
+- **BF16 n-gram table (built, not yet run; user request).** `NgramRowFormat::Bf16`: a volume of the
+  checkpoint's BF16 rows (`tools/flash_next/ngram_bf16.py`, 320-byte rows, ~109 GB) replaces any
+  artifact's FP8 or IQ4_NL table through `--ngram-volume`; `resolve_ngram_volume` reads the format
+  from the row size in the header (no format change), the Program sizes its n-gram buffers from the
+  effective table, and the PLE reads BF16 rows in place as its embedding. The prefix-cache file's
+  fingerprint names the table. Qualification queued: a BF16 volume of the FP8 table's own values
+  (`--dequantize`) must give recipe B's FP8-volume greedy text and perplexity bit for bit. The real
+  BF16 volume is built: `D:\Infernix-staging\Qwen3.8-Flash-Next-BF16.ngram` (109.2 GB, 205 s) from
+  the local Swift 1.5 NVFP4 export, whose 128 n-gram shards are byte-identical to Qwen's BF16 table
+  (no download); 1,000,000 sampled rows verified. Its KL against recipe B's FP8 table is queued.
+- **Causal scoring for Qwen4Exp (built, not yet run).** The KL protocol needs teacher-forced
+  distributions of the FP8 artifact, which only runs in the SSD tier; the earlier route
+  (`infernix_qwen4_exp_forward_real_test --dump-logits`) pins every expert. The Engine's
+  CausalScoring now runs on Qwen4Exp (`program/score.cpp`): the prompt prefills on lane 0 through
+  the generation path (tier, streaming, layer walks), every call keeping its final residuals
+  (`ForwardBatch::residual_out`, a `[S*H, max_context]` buffer in the device plan), then
+  `Forward::head_logits` (final mixer and LM head) runs in 64-column FP32 tiles, with
+  `ops::target_logprobs` / `ops::top_logprobs` now accepting FP32 logits (oracle tests added).
+  `infernix-perplexity` gains `--ngram-volume` and `--expert-stripe`. Qualification:
+  `infernix_qwen4_exp_score_real_test` against the Forward's dump of the same ids (IQ3_S, every
+  expert in RAM and through the tier), then the KL runs (recipe B's top-32 as the reference).
+  **Qualified (2026-10-11):** IQ3_S chat ids, 1,023 positions, RAM and tier 8 GiB alike: perplexity
+  3.6877 against the reference's 3.6877, |Δ logprob| mean 0.00005 (max 0.0035), top-1 agreement
+  100 %, top-8 ids equal at all 428 separated positions. (The first run failed: `causal_score`
+  cleared its scoring flag before the head tiles, so they read an empty residual view; fixed.)
+- **KL protocol, first results** (quick 1M corpus, 261,167 tokens, context 4096 / stride 2048, INT8
+  KV, chunk 4096; reference recipe B's top-32): recipe B perplexity 3.5077 (756 tok/s); F-B
+  perplexity 3.4863, mean KL 0.0488, top-1 agreement 92.2 % (195 tok/s through the tier); GSQ-RCO
+  IQ3_S perplexity 3.5223, mean KL 0.0905, top-1 agreement 89.3 % (1,083 tok/s). F-B is lower than
+  recipe B in every domain (Chinese 4.348 / 4.386, English long-form 6.583 / 6.600, English
+  reference 3.086 / 3.118, code 1.661 / 1.666). With the BF16 n-gram table (`--ngram-volume`, same
+  reference): recipe B 3.5094, KL 0.0421, top-1 92.6 %; F-B 3.4863, KL 0.0490; IQ3_S 3.5198, KL
+  0.0893. The BF16 table moves recipe B's distribution about as far as F-B's experts do, at the
+  same perplexity. The BF16 route is exact (bf16q, 2026-10-12): recipe B with its FP8 volume and
+  with a BF16 volume holding that table's dequantized values gives the same 400-token greedy text and
+  the same mean NLL to every printed digit (1.5817995854760287 over 10,325 tokens), so the KL move is
+  the BF16 table's values, not the route.
+- **Tier-measured CPU rate (built, measured: no gain).** On F-B the team measured 6,682 experts/s on
+  the tier's RAM copies (16 workers), so decode keeps 1/2 of the misses on the link (5 before).
+  tg512 40.6 tok/s (41.1 before), MTP 42.8 (50.3 before, −15 %), pp4096 448 (448). The MTP
+  regression is unexplained; the earlier divisor stays the better measured setting.
+- **Speed work (2026-10-12, user request; built and measured).** On F-A (INT8 KV, BF16 table, 3
+  runs, against the F-A run below with the earlier binaries): tg512 26.4 -> 38.3 tok/s (+45 %), MTP 39.0 -> 46.0 (+18 %, 78 % accepted),
+  pp4096 449 -> 646 (+44 %). The CPU team's tier-measured rate is 12,545 experts/s at 16 workers
+  (6,682 before, on F-B); the Op bench's team rates are 14,790 at 16 workers and 15,970 at 24.
+  Exactness: `infernix_offloaded_moe_ggml_cpu_test` (every ISA against the scalar oracle),
+  `infernix_offloaded_moe_fp8_test` and the tier's `--fetch` test (read-ahead: 20 reads for 20
+  records, an unadopted guess released) pass. Not separated: how much of pp4096's gain is the
+  read-ahead against the CPU route. F-B was not re-measured: its files are no longer on `E:`.
+- **Long-prompt prefill (2026-10-12, measured).** A 32K prompt's debug log showed the layer walk
+  streaming the 15,647 RAM-resident experts once (71.7 GiB) while the 6,686 SSD-only experts were
+  fetched again by every 4,096-token call: 57,019 SSD reads (261 GiB) for one prompt, 784 tok/s.
+  Two changes:
+  - *SSD-only experts in the walk's stream* (`ExpertStream::SsdReads`, `HostExpertTier::stream_read`):
+    a span's stream plans them into ring slots too (at most a quarter of the stream slots per
+    layer), the tier reads each into a stream slot two layers before its copy, and the slot comes
+    back once the copy has landed; the MoE reads them from the ring like any streamed record. The
+    slots (640, at most 1/8 of the tier's) are lent from the RAM residents for the span
+    (`HostTier::lend`, the lowest-ranked leave RAM) and returned at the next boundary outside a
+    walk, where admissions refill them. A fixed pool instead measured F-A tg512 38.0 -> 35.0
+    (-8 %, fewer RAM residents) and was replaced. Single calls keep the fetch channel (streaming
+    them measured pp4096 649 -> 563: the host waited for the drive while enqueueing).
+  - *FP8 tensor-core tiles* for prefill jobs of more than 8 columns (`fp8_expert.cuh`, `fp8t`):
+    nine int8 MMAs per digit x limb plane, each accumulating over a 128-element scale tile, the
+    tile's P added with `fp8b128::add_tile`: the same integers. Op bench (512 experts, top-10, one
+    4,096-token chunk, all resident): 56.1 -> 13.9 ms per layer call (4.0x); bit-equal at 40 and
+    300 columns (`infernix_offloaded_moe_fp8_test`).
+  Measured (F-A, INT8 KV, BF16 table): 32K prompt 784 -> 2,360 tok/s (3.0x; SSD reads 54,602 ->
+  4,654 plus 6,738 stream reads), the same 32 greedy tokens; pp4096 649 -> 658; tg512 38.0 -> 37.7.
+  Bounds from the measurements above: decode misses ~163 experts per token at 66 % VRAM hits, each
+  reading 4.9 MB of DRAM whether the CPU computes it or the link copies it, so DDR5-5800 caps plain
+  decode near 60 tok/s at this hit rate; pp4096 reads ~38 GiB from one 990 PRO at ~4.3 GB/s of its
+  ~7. Changes: (1) the CPU route's weight decode (`fp8_expert.cpp`): w = A + 2^8 B by exponent, each
+  a signed 4-bit mantissa times a power of two at most 128 from two `vpshufb` tables, multiplied by
+  `vpmaddubsw` on even and odd bytes (columns split to match): about 17 instructions per 32 codes
+  instead of ~68, the same integers; (2) the GPU kernels' digits from a 256-entry shared table and
+  byte permutes (~11 instructions per code word instead of ~60), decoded once per slice for all of a
+  pass's columns (they were decoded per column); (3) SSD read-ahead in the tier's agent
+  (`HostExpertTier::Options::ahead_min`, `ahead`): a fetch request of 64 or more records queues up to
+  32 of the next layer's records without a host copy behind its own, adopted by the next request.
+  Not done: an IMMA wide route (the GPU's ~0.8 s per 4K chunk, estimated from the dp4a count, is far
+  below the I/O's measured ~9 s; the whole pp4096 now takes ~6.3 s); the read depth (8 per drive).
+- **User decision (2026-10-12): the published FP8 artifact is F-A with the BF16 n-gram table**, and
+  its repository is to host the BF16 volume for every Flash-Next artifact's model card. The artifact
+  format gains `ngram_table.format = "bf16"` (320-byte rows, no `ngram_scale`; `config.cpp`), and
+  `--ngram-reuse` binds a BF16 volume to the FP8 checkpoint when its sampled rows quantize to the
+  checkpoint's FP8 codes (ModelOpt's rule with the checkpoint's scale; `NgramTable.bf16_rows_match`).
+  Checked on the real files: 512 + 20,000 rows, no mismatch. No dedicated F-A against F-B study:
+  the Dense8 classes' cost was measured on recipe B (FN §6.1).
+- **F-A artifact (2026-10-12).** `E:\Infernix-staging\Qwen3.8-Flash-Next-FP8-Infernix-00001-of-00005.infernix`
+  (133.3 GB, five files; conversion 1,627 s on the CPU), bound to
+  `D:\Infernix-staging\Qwen3.8-Flash-Next-BF16.ngram`. `verify_artifact` (301 s): 24,576 experts and
+  1,615 tensors equal to the checkpoint, 1,556 MTP tensors re-quantized, and all 320,001,536 n-gram
+  rows of the BF16 volume quantize to the checkpoint's FP8 codes. Measured (INT8 KV, one request,
+  BF16 table; F-B's figures are with the FP8 table): tg512 26.4 tok/s (F-B 40.6), MTP 39.0 (42.8,
+  78 % accepted), pp4096 449 (448); perplexity 3.4870, KL 0.0496, top-1 92.1 % (F-B with the same
+  BF16 table: 3.4863, 0.0490). Plain decode is 35 % below F-B, more than §10's ~20 % model; the
+  BF16 dense reads and the smaller frame count are the modelled causes, not yet separated from the
+  table's reads. With the speed work's binaries: a two-drive stripe of F-A's experts
+  (`expert_stripe`, a 60.5 GB tail on `D:`, verified with no mismatch, removed afterwards) gives pp4096 743 tok/s against
+  588 unstriped in the same run (+26 %; the earlier unstriped run gave 646, so the run-to-run
+  spread is large) and tg512 40.5. Greedy invariance on F-A: the default tier, 24 GiB and 8 GiB of
+  expert RAM, and 8 GiB with the stripe generate the same 400 tokens.
+
+Changes against this plan: the record keeps gate, up and down rows row-major (not gate/up
+interleaved in 16-row groups), so rows are addressed as the GGUF banks' are; the scale-exponent
+spread limit is 62 (the exact sum's shift bound), not 64; outputs round once to binary32 at the
+result's binade (`exact::to_f32_scaled_rn`), equal to §6.1's form whenever the result is normal. No
+wide IMMA route yet: the narrow kernels' estimated cost per 4,096-token chunk is far below the
+expert stream's, so it waits for a measurement (M3 gate).
+
+This is a temporary planning document for an Infernix artifact of
 [Qwen/Qwen3.8-Flash-Next-FP8](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8) that imports the
 official block-FP8 routed experts bit-exactly and runs them with exact arithmetic on one RTX 5090.
 When the work lands, its stable content moves into the authorities named in

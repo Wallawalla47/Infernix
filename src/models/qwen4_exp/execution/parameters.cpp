@@ -35,10 +35,84 @@ public:
     }
 
     LinearParameters linear(std::span<const WeightId> ids) const {
+        if (ggml(ids)) {
+            return with_context(model_.weight(ids.front()).name, [&] { return ggml_linear(ids); });
+        }
         std::vector<ops::WeightInput> rows;
         for (const auto id : ids) { rows.push_back(input(id)); }
-        return with_context(model_.weight(ids.front()).name,
+        return with_context(model_.weight(ids.front()).name, [&] {
+            const auto single = ops::prepare_linear_weight(std::span<const ops::WeightInput>(rows));
+            LinearParameters out;
+            out.weight = single.weight;
+            out.policy = single.policy;
+            return out;
+        });
+    }
+
+    // A native single-parent projection in the shared tower's type (the Vision tower).
+    ops::SingleProjectionWeight native(std::initializer_list<WeightId> ids) const {
+        std::vector<ops::WeightInput> rows;
+        for (const auto id : ids) { rows.push_back(input(id)); }
+        return with_context(model_.weight(*ids.begin()).name,
                             [&] { return ops::prepare_linear_weight(std::span<const ops::WeightInput>(rows)); });
+    }
+
+    // Whether the parameters are stored as GGUF blocks (ggml_rows_v1, ggml_tiles16_v1); a group
+    // mixing them with native formats is refused.
+    bool ggml(std::span<const WeightId> ids) const {
+        bool any = false, all = true;
+        for (const auto id : ids) {
+            for (const auto& part : model_.weight(id).view.parts) {
+                const bool g = is_ggml_matrix_layout(part.parent->geometry.layout);
+                any = any || g;
+                all = all && g;
+            }
+        }
+        if (any && !all) {
+            throw std::invalid_argument(model_.weight(ids.front()).name + ": a projection mixes GGUF blocks with native formats");
+        }
+        return any;
+    }
+
+    // The projection's rows in order: one segment per contiguous region of a GGUF parent.
+    LinearParameters ggml_linear(std::span<const WeightId> ids) const {
+        LinearParameters out;
+        std::int32_t row = 0;
+        std::uint64_t k  = 0;
+        for (const auto id : ids) {
+            const auto& view = model_.weight(id).view;
+            if (view.shape.size() != 2) { throw std::invalid_argument("a GGUF projection parameter must be a matrix"); }
+            if (k == 0) { k = view.shape[1]; }
+            if (view.shape[1] != k) { throw std::invalid_argument("a GGUF projection's parameters must share K"); }
+            for (const auto& part : view.parts) {
+                const auto& parent = *part.parent;
+                const auto& g      = parent.geometry;
+                if (g.shape[1] != k || part.begin % k || part.end % k) {
+                    throw std::invalid_argument("a GGUF projection region must be whole rows");
+                }
+                const std::byte* base = parent.device != nullptr ? parent.device : parent.data;
+                if (base == nullptr) { throw std::invalid_argument("a GGUF projection needs device-visible weights"); }
+                // A tiled parent's region starts on a tile (tile i at 16 i row bytes, as row 16 i of
+                // ggml_rows_v1), and only the parent's last tile may be partial.
+                const bool tiles = g.layout == QuantLayout::GgmlTiles16;
+                if (tiles && (part.begin / k % 16 != 0 || (part.end != g.shape[0] * k && part.end / k % 16 != 0))) {
+                    throw std::invalid_argument("a ggml_tiles16_v1 projection region must be whole tiles of 16 rows");
+                }
+                ops::GgmlSegment s;
+                s.format     = g.format;
+                s.data       = reinterpret_cast<const std::uint8_t*>(base + part.begin / k * g.code_bytes_per_row);
+                s.rows       = static_cast<std::int32_t>((part.end - part.begin) / k);
+                s.out_offset = row;
+                s.layout     = tiles ? ops::GgmlLayout::Tiles16 : ops::GgmlLayout::Rows;
+                row += s.rows;
+                out.ggml.push_back(s);
+            }
+        }
+        out.weight.qtype = out.ggml.front().format;
+        out.weight.n     = row;
+        out.weight.k     = static_cast<std::int32_t>(k);
+        out.policy       = ops::LinearPolicy::A16Only;
+        return out;
     }
 
     // The converter packs the six input projections into one parent, unless the index projections
@@ -101,7 +175,7 @@ public:
         using qwen3_5::execution::NormParameters;
         const auto norm = [&](const VisionNormWeights& n) { return NormParameters{tensor(n.weight), tensor(n.bias)}; };
         qwen3_5::execution::VisionParameters out;
-        out.patch_embedding      = linear({w.patch_embedding});
+        out.patch_embedding      = native({w.patch_embedding});
         out.patch_embedding_bias = tensor(w.patch_embedding_bias);
         out.position_embedding   = tensor(w.position_embedding);
         out.layers.reserve(w.layers.size());
@@ -113,17 +187,17 @@ public:
                                                                  norm(layer.norm2),
                                                                  ops::prepare_linear_weight(qkv),
                                                                  joined_bias({layer.query_bias, layer.key_bias, layer.value_bias}),
-                                                                 linear({layer.output}),
-                                                                 linear({layer.fc1}),
-                                                                 linear({layer.fc2}),
+                                                                 native({layer.output}),
+                                                                 native({layer.fc1}),
+                                                                 native({layer.fc2}),
                                                                  tensor(layer.output_bias),
                                                                  tensor(layer.fc1_bias),
                                                                  tensor(layer.fc2_bias)};
             }));
         }
         out.merger_norm     = norm(w.merger_norm);
-        out.merger_fc1      = linear({w.merger_fc1});
-        out.merger_fc2      = linear({w.merger_fc2});
+        out.merger_fc1      = native({w.merger_fc1});
+        out.merger_fc2      = native({w.merger_fc2});
         out.merger_fc1_bias = tensor(w.merger_fc1_bias);
         out.merger_fc2_bias = tensor(w.merger_fc2_bias);
         return out;
@@ -163,8 +237,13 @@ Parameters::Parameters(const Model& source) : model(source) {
     const auto& c = source.config().text;
     const auto& embedding = source.weight(w.token_embedding);
     token_embedding = with_context(embedding.name, [&] { return device_native_weight(embedding.view); });
+    if (token_embedding.qtype != QType::BF16 &&
+        !(token_embedding.layout == QuantLayout::GgmlRows && token_embedding.qtype == QType::GGML_IQ4_XS)) {
+        throw std::invalid_argument(embedding.name + ": the token embedding must be BF16 or IQ4_XS rows");
+    }
     const auto& head = source.weight(w.output_head);
-    if (!head.view.parts.empty() && head.view.parts.front().parent->geometry.format == QType::Q8_G32_FP16) {
+    if (!head.view.parts.empty() && (head.view.parts.front().parent->geometry.format == QType::Q8_G32_FP16 ||
+                                     is_ggml_matrix_layout(head.view.parts.front().parent->geometry.layout))) {
         output_head_q8 = prepare.linear({w.output_head});
     } else {
         output_head = prepare.tensor(w.output_head);
@@ -173,6 +252,15 @@ Parameters::Parameters(const Model& source) : model(source) {
 
     const auto banks = source.expert_banks();
     if (banks.size() != w.layers.size()) { throw std::logic_error("Qwen4Exp: one expert bank per layer"); }
+    if (c.gdn.output_ggml_tiled) {
+        // Input block j of a GDN output projection (one value head) is HF head
+        // (j % key_heads) * per_key + j / key_heads (llama.cpp's tiled order).
+        const std::uint32_t nv = c.gdn.value_heads, nk = c.gdn.key_heads, per_key = nv / nk;
+        std::vector<std::int32_t> perm(nv);
+        for (std::uint32_t j = 0; j < nv; ++j) { perm[j] = static_cast<std::int32_t>((j % nk) * per_key + j / nk); }
+        gdn_value_perm_ = DeviceBuffer(perm.size() * sizeof(std::int32_t));
+        gdn_value_perm_.copy_from_host(perm.data(), perm.size() * sizeof(std::int32_t), 0);
+    }
     const std::size_t per_layer = sizeof(ops::offloaded_moe::ExpertScales) * c.moe.experts;
     scales_ = DeviceBuffer(per_layer * banks.size());
     for (std::size_t i = 0; i < banks.size(); ++i) {
@@ -188,13 +276,21 @@ Parameters::Parameters(const Model& source) : model(source) {
             out.mixer = prepare.attention(*a);
         } else {
             const auto& g = std::get<GdnWeights>(layer.mixer);
-            out.mixer     = GdnParameters{prepare.linear({g.query, g.key, g.value, g.z}),
-                                          prepare.linear({g.a_projection, g.b_projection}),
-                                          prepare.tensor(g.a_log),
-                                          prepare.tensor(g.dt_bias),
-                                          prepare.tensor(g.convolution),
-                                          prepare.tensor(g.norm),
-                                          prepare.linear({g.output})};
+            GdnParameters gdn{prepare.linear({g.query, g.key, g.value, g.z}),
+                              prepare.linear({g.a_projection, g.b_projection}),
+                              prepare.tensor(g.a_log),
+                              prepare.tensor(g.dt_bias),
+                              prepare.tensor(g.convolution),
+                              prepare.tensor(g.norm),
+                              prepare.linear({g.output})};
+            if (c.gdn.output_ggml_tiled) {
+                if (!gdn.output.is_ggml()) {
+                    throw std::invalid_argument("Qwen4Exp: a ggml-tiled GDN output projection must be GGUF blocks");
+                }
+                gdn.output.input_perm = static_cast<const std::int32_t*>(gdn_value_perm_.p);
+                gdn.output.perm_block = static_cast<std::int32_t>(c.gdn.value_head_dim);
+            }
+            out.mixer = std::move(gdn);
         }
         out.moe.router         = prepare.tensor(layer.moe.router);
         out.moe.shared_score   = prepare.tensor(layer.moe.shared_score);
@@ -210,7 +306,7 @@ Parameters::Parameters(const Model& source) : model(source) {
                                           prepare.tensor(p.query_norm),
                                           prepare.tensor(p.conv_norm),
                                           prepare.tensor(p.convolution),
-                                          prepare.tensor(p.ngram_scale)};
+                                          p.ngram_scale.valid() ? prepare.tensor(p.ngram_scale) : Tensor{}};
         }
         layers.push_back(std::move(out));
     }

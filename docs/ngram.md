@@ -27,7 +27,7 @@ This example is not a memory-sizing recommendation.
 
 | Selected backend | Neural draft tokens | Ngram draft tokens (C=1) | Ngram draft tokens (C>1) |
 |---|---:|---:|---:|
-| MTP | 1..5 | 1..63 | 1..15 |
+| MTP | 1..7 (Qwen3.5/3.6 1..5) | 1..63 | 1..15 |
 | DFlash | 1..15 | 1..63 | 1..15 |
 | DFlash2 | 1..15 | 1..63 | 1..15 |
 | none (Qwen3.8-Flash-Next only) | — | 1..15 | 1..15 |

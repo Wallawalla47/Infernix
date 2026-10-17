@@ -17,8 +17,11 @@ struct Options {
     std::filesystem::path artifact_path;
     std::filesystem::path chat_template_path;
     std::filesystem::path ngram_volume_path;
+    NgramResidency ngram_residency = NgramResidency::Auto;
     // --expert-state FILE|off: absent uses the artifact path + .expert-state, "off" disables.
     std::optional<std::filesystem::path> expert_state;
+    // --expert-stripe FILE: the experts' record tails on a second drive (EngineOptions::expert_stripe_path).
+    std::filesystem::path expert_stripe_path;
     std::uint64_t ram_headroom_bytes = kDefaultRamHeadroomBytes;
     std::optional<std::uint64_t> expert_ram_bytes; // --expert-ram-mib; empty: the RAM ledger's share
     std::optional<std::uint64_t> expert_pin_bytes; // --expert-pin-mib; empty: what the OS lets it pin
