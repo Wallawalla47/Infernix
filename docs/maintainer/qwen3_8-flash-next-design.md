@@ -9786,6 +9786,12 @@ bit-identical greedy output, plain decode 397.4 → 398.6 tok/s (every four-bloc
   is the calibrated order, not a single session's state.
   It replaces shipping a profile in the artifact (kido5217 PR #28): every existing artifact gets it.
   A saved state still wins, and `--expert-state off` (and `infernix_bench`) still starts empty.
+  Built in (2026-10-17, same prompt, ABBA): decode 147.0 / 148.0 -> 162.6 / 162.5 tok/s, prefill
+  52.2 / 59.8 -> 66.1 / 65.4; the start loads 4,319 frames (11.1 GiB) in 0.43 s.
+- Sampled MTP drafts (`sampled-mtp-drafts`, model-quality 6.7; the donor's sparse rejection
+  sampling, kept to the head's top four tokens, measured best against 8 and 16): exact in
+  distribution (chi-square against plain decoding), greedy unchanged; sampled decode geomean
+  +2.7 % over six cells (worst -0.9 %).
 
 **Built, measured and not adopted (2026-10-16):**
 - A 32,768-token prefill chunk: pp32768 11,173 → 11,596 tok/s (+3.8 %), pp65536 11,274 → 10,627

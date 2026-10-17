@@ -575,7 +575,8 @@ int exercise_cancel_prefill(const char* artifact, infernix::SpeculativeBackend b
     const std::vector<infernix::TokenId> suffix = synthetic_tokens(60, 12);
     extended.insert(extended.end(), suffix.begin(), suffix.end());
     const std::vector<infernix::TokenId> unrelated = synthetic_tokens(2 * kPrefillChunk + 30, 13);
-    const infernix::EngineOptions options = hybrid_options(artifact, backend, 16384, 1ULL << 30, 8);
+    infernix::EngineOptions options = hybrid_options(artifact, backend, 16384, 1ULL << 30, 8);
+    options.max_context             = 8192; // the prompt is longer than the other cases' 4,096
 
     std::vector<infernix::TokenId> extended_uncached;
     std::vector<infernix::TokenId> unrelated_alone;

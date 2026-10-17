@@ -81,6 +81,17 @@ constexpr std::array kQualified{
     Qualification{FastPath::ExpertA4Residual, {QType::FP8_E4M3FN_ROW_BF16, false, KvCacheStorage::Fp8KeyNvfp4Value}},
     Qualification{FastPath::ExpertA4Residual, {QType::FP8_E4M3FN_ROW_BF16, false, KvCacheStorage::Vq2}},
     Qualification{FastPath::ExpertA4Residual, {QType::FP8_E4M3FN_ROW_BF16, false, KvCacheStorage::Q4KeyVq2Value}},
+    // NVIDIA NVFP4 Dense8: sampled MTP drafts (2026-10-17). They change no logit, so the gate is the
+    // sampler's distribution (2,000 seeded requests per arm, chi-square per position against plain
+    // decoding, INT8 KV) and greedy identity (INT8, NVFP4), which no KV format affects; speed on
+    // INT8 (MTP 4, T 1.0 / top-p 0.95 / top-k 20, geomean +2.7 %, 5 of 6 cells).
+    Qualification{FastPath::SampledMtpDrafts, {QType::Q8_G32_FP16, true, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::SampledMtpDrafts, {QType::Q8_G32_FP16, true, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::SampledMtpDrafts, {QType::Q8_G32_FP16, true, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::SampledMtpDrafts, {QType::Q8_G32_FP16, true, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::SampledMtpDrafts, {QType::Q8_G32_FP16, true, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::SampledMtpDrafts, {QType::Q8_G32_FP16, true, KvCacheStorage::Vq2}},
+    Qualification{FastPath::SampledMtpDrafts, {QType::Q8_G32_FP16, true, KvCacheStorage::Q4KeyVq2Value}},
 };
 
 const char* dense_name(QType dense) {

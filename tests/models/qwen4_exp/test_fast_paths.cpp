@@ -137,6 +137,16 @@ int main() {
     failures += check(q::fast_path_applies(FastPath::SampledMtpDrafts, dense8, mtp) &&
                           !q::fast_path_applies(FastPath::SampledMtpDrafts, dense8, options),
                       "sampled-mtp-drafts applies with the MTP drafter only");
+    for (const auto kv : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
+                          KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2,
+                          KvCacheStorage::Q4KeyVq2Value}) {
+        failures += check(q::fast_path_qualified(FastPath::SampledMtpDrafts, {QType::Q8_G32_FP16, true, kv}),
+                          "sampled-mtp-drafts is qualified on Dense8 with every KV format");
+    }
+    failures += check(!q::fast_path_qualified(FastPath::SampledMtpDrafts, recipe_c),
+                      "sampled-mtp-drafts was measured on Dense8 only");
+    failures += check(!q::fast_path_qualified(FastPath::GdnF16Accumulate, dense8),
+                      "gdn-f16-accumulate has passed no gate");
     failures += check(exact.gdn_arithmetic == infernix::ops::GdnChunkArithmetic::Exact,
                       "the exact route keeps the GDN prefill exact");
     selection.paths = {FastPath::GdnF16Accumulate};

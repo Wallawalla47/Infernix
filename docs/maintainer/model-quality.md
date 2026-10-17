@@ -778,6 +778,34 @@ tokens. The recipe C gates (`expert-a4-residual`, `fp8-a8-pair`) are re-scored i
 | `idle-wide-prefill` | Qwen3.8-27B / Qwen3.6-35B-A3B generation engines | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
 | `adaptive-mtp` | Qwen3.8-27B / Qwen3.6-35B-A3B with MTP | none (no speed gain shown, below) |
 | Qwen3.8-Flash-Next: `expert-a4-residual` | artifacts with W4A16 experts (recipe C), expert calls of more than eight columns | FP8 dense, 16-bit expert activations, with INT8, FP8, NVFP4, K8V4, VQ2 or K4V2 KV (fails on BF16 KV, below) |
+| Qwen3.8-Flash-Next: `sampled-mtp-drafts` | MTP rounds with a sampled request | Q8 dense, 4-bit experts, with every KV format (distribution and greedy identity, below; no logit changes) |
+| `gdn-f16-accumulate` | chunked GDN calls (16+ tokens) of every Qwen3.5-family and Flash-Next artifact | none yet (prefill gain measured, gates pending, below) |
+
+**`sampled-mtp-drafts`: drafts drawn from the draft head's top four tokens (Flash-Next, qualified
+2026-10-17).** It changes no logit: a sampled request's drafts are drawn from the head's four most
+probable tokens under its sampler and verified by sparse rejection sampling against that proposal,
+and its rounds verify every draft (no `--spec-min-p` cut). The output distribution stays the
+sampler's, but a seeded request's text changes, so it cannot be the exact route; greedy requests
+keep the argmax drafts. Its gate is therefore the distribution, not 6.4/6.5
+(`tests/models/qwen4_exp/test_sampled_drafts_real.cpp`, Dense8, INT8 KV, exact route otherwise):
+2,000 seeded requests x 8 tokens per arm at T 1.0 / top-p 0.95 / top-k 20, two-sample chi-square
+against plain decoding at each position and jointly for the first two tokens (family alpha 1e-3,
+Bonferroni 1.1e-4): sampled drafts least p 0.21 (7,115 rounds, 5,717 of 12,545 drafts accepted),
+one-hot drafts (positive control) 0.037, plain decoding at T 0.8 (power) 1.2e-29. Greedy output
+equals the one-hot route on INT8 and NVFP4 KV, and no KV format enters the draft or its
+proposal, so every format is registered. Speed (INT8 KV, MTP 4 with the proposal head, 1,536
+tokens, cold expert cache, against the default route): AIME 153.5 -> 154.6 / 155.8 -> 165.4,
+code 144.4 -> 150.8 / 147.6 -> 153.1, story 137.1 -> 139.9 / 141.0 -> 139.7 tok/s (seeds 7 / 43):
+geomean +2.7 %, 5 of 6 cells faster, worst -0.9 % (each arm decodes its own text). The switch
+prototype measured +9.1 % (6 of 6) on a warm cache; greedy MTP decode is unchanged (150.3 against
+150.3 tok/s). Not measured on FP8 or recipe C dense, which stay unregistered.
+
+**`gdn-f16-accumulate`: FP16-accumulate chunked GDN (not qualified yet).** See
+`ops::GdnChunkArithmetic::Fp16Accumulate`. Op: 1.20x at the 27B's shapes, and closer to the FP64
+oracle than the exact route (output relative RMS 2.08e-3 against 3.60e-3, state 8.6e-4 against
+2.6e-3). Prefill (INT8 KV, default route against default + the path, ABBA): 27B pp4096 12,956 ->
+12,986 and pp16384 11,965 -> 11,994 tok/s (+0.24 %, both runs of each arm ahead); Flash-Next
+pp16384 6,574 -> 6,564 (-0.15 %, ranges overlap), pp65536 11,186 -> 11,214 (+0.26 %).
 
 **The request-coupling paths.** These were the default behaviour until the exact route became
 request-invariant (2026-10-14). Each makes a request's arithmetic depend on the other requests of
