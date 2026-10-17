@@ -10163,7 +10163,9 @@ dispatches per format (`cuda/ggml_expert.cuh`, `cuda/fp8_expert.cuh`, `cpu/ggml_
   keeps 64.
 - **The SSD tier with FP8 records.** SSD-only experts join the layer walk's stream
   (`ExpertStream::SsdReads`, at most a quarter of the stream slots per layer, lent from the RAM
-  residents for the span): a 32K prompt's SSD reads 54,602 → 4,654, 784 → 2,360 tok/s. A fetch of 64
+  residents for the span): a 32K prompt's SSD reads 54,602 → 4,654, 784 → 2,360 tok/s. With 1,280
+  stream slots (`kStreamReadSlots`, from 640) the stream takes every SSD-only expert of a span: 32K
+  prefill 2,850-2,867 → 3,945-3,986 tok/s, the decode after it no slower (2026-10-16). A fetch of 64
   or more records reads up to 32 of the next layer's records ahead. `--expert-stripe` reads a
   record's tail from a second drive while the artifact serves its head (pp4096 743 against 588
   tok/s unstriped in the same run, a large spread). The tier-measured CPU rate as the decode
