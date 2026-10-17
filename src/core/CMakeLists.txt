@@ -16,7 +16,7 @@ add_library(infernix_core STATIC
   dtype.cpp
   host_memory.cpp
   host_worker_pool.cpp
-  link_probe.cpp
+  link_probe.cu
   power_throttling.cpp
   vram_budget.cpp
   gdn_replay_records.cpp

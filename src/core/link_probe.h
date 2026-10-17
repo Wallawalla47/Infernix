@@ -9,8 +9,10 @@
 namespace infernix {
 
 // Copies `bytes` from `source` (pinned host memory) to `destination` (device memory) on a private
-// stream, once to warm up and then `repetitions` times, and returns the best rate in bytes per
-// second. `destination` is overwritten; the caller's streams are not involved.
+// stream, repeatedly while a spin kernel keeps every SM busy for 200 ms (an idle GPU's link runs at
+// a lower PCIe generation), then `repetitions` times with the SMs still busy, and returns the best
+// timed rate in bytes per second. `destination` is overwritten; the caller's streams are not
+// involved, but the spin occupies the device while it runs.
 [[nodiscard]] double measure_h2d_bytes_per_second(const void* source, void* destination, std::size_t bytes,
                                                   int repetitions);
 

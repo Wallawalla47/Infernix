@@ -10361,14 +10361,19 @@ nothing: IQ3_S pp4096 (one call, cold, bound by the expert stream over the link)
 2,216-2,217 tok/s, pp8192 3,844-3,855 against 3,905-3,917 (−1.5 %), pp32768 (16K calls) 3,516-3,538
 against 3,541. Not kept.
 
-**The startup link probe (open).** About one IQ3_S startup in seven (10 of 69 in these runs, none
+**The startup link probe (fixed).** About one IQ3_S startup in seven (10 of 69 in these runs, none
 of the Dense8 ones; 16 of the 750-odd probes logged since 2026-10-16, all but one IQ3_S) measured
-the link at 3.0 GB/s (once 12.0) instead of ~27.5. The session then promotes every 8 tokens, keeps
-1/12 of decode misses on the link and lets the CPU split prefill calls up to 4,096 columns: IQ3_S
-pp4096 3,454 → ~2,183 tok/s in a warm pg run, 2,216 → 1,496 cold. The probe
-(`measure_h2d_bytes_per_second`) takes the best of three copies after one warm-up, so the link
-stayed slow for the whole probe (cause not established: an idle link state, or the probe
-overlapping the bank fill). The runs above that measured it were excluded or rerun.
+the link at 3.0 GB/s (once 12.0) instead of ~27.5: the rates of PCIe Gen2 and Gen4 x8, so the link
+had not left a lower generation. The session then promotes every 8 tokens, keeps 1/12 of decode
+misses on the link and lets the CPU split prefill calls up to 4,096 columns: IQ3_S pp4096 3,454 →
+~2,183 tok/s in a warm pg run, 2,216 → 1,496 cold. The runs above that measured it were excluded or
+rerun. The probe (`measure_h2d_bytes_per_second`) took the best of three copies after one warm-up
+copy, so copies alone did not raise the link. A probe from an idle GPU (P8, Gen1) read 27.5 in
+every one of eight tries, so idleness alone is not the trigger; the misreadings followed another
+process's run (a Dense8 startup, an op bench). The probe now keeps every SM spinning (one warp each,
+no memory traffic) for 200 ms while it copies, then times its copies with the SMs still busy. IQ3_S
+startups right after a Dense8 run: the previous probe misread 2 of 20 (3.0 GB/s), the warmed one 0
+of 60 (27.1-27.6).
 
 ---
 
