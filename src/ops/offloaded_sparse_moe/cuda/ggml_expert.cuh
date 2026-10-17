@@ -1,4 +1,4 @@
-// GGUF (ggml) expert banks on the GPU (docs/maintainer/qwen3_8-flash-next-iq3s-plan.md §7), included
+// GGUF (ggml) expert banks on the GPU (docs/maintainer/qwen3_8-flash-next-design.md §19.3.25), included
 // by moe_layer.cu after its pass helpers. A record holds the gate rows, the up rows (one ggml
 // format) and the down rows (another), each row verbatim GGUF blocks.
 //
@@ -203,7 +203,7 @@ constexpr int kGgmlPlanThreads = 512;
 constexpr int kGgmlTileColumns = ggml::tile::kTileColumns; // columns per planned tile (one CTA)
 // Threads of a gate/up or down tile CTA: sixteen warps of 16 x 16 outputs (one CTA per SM within 128
 // registers), against eight warps of 32 x 16 that needed 253 registers for one CTA per SM. Measured
-// on the RTX 5090: see docs/maintainer/qwen3_8-flash-next-iq3s-plan.md.
+// on the RTX 5090: see docs/maintainer/qwen3_8-flash-next-design.md §19.3.25.
 constexpr int kGgmlTileThreads = 512;
 constexpr int kGgmlTileUnits   = ggml::tile::kTileRows / 2; // intermediates per gate/up tile
 static_assert(kGgmlTileColumns >= moe::wide::kTileColumns, "the workspace's tile list bounds the plan's tiles");

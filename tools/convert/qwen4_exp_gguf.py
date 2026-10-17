@@ -4,7 +4,7 @@ The logical model is the one ``qwen4_exp.build_model`` describes (the same param
 shapes), with every source read from the GGUF instead of the Hugging Face checkpoint: quantized
 tensors expose their stored block rows (``read_encoded``) so recipes copy them verbatim, and plain
 tensors (BF16, F32, F16) their exact values. llama.cpp's export transforms are undone exactly and
-checked (docs/maintainer/qwen3_8-flash-next-iq3s-plan.md §2.5, §5.3):
+checked (docs/maintainer/qwen3_8-flash-next-design.md §19.3.25):
 
 * ``+1`` on the zero-centred RMSNorm gammas: g - 1 must be a BF16 value (checked per tensor);
 * the GDN value heads in ggml's tiled order: rows are permuted back (whole rows, exact); the

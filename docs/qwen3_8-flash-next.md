@@ -136,7 +136,8 @@ Recipe `qwen3_8_flash_next_gsq_rco_iq3s` imports
 Every weight is computed with BF16 activations in an exact integer arithmetic. Each output is the
 exact sum, rounded once, so the GPU's result has the same bits wherever an expert is computed and
 at any batch width. The arithmetic is described in
-[the plan](maintainer/qwen3_8-flash-next-iq3s-plan.md) §6. llama.cpp quantizes activations to
+[the design](maintainer/qwen3_8-flash-next-design.md#1622-exact-arithmetic-over-gguf-blocks-and-block-fp8-2026-10-10)
+§16.2.2. llama.cpp quantizes activations to
 Q8_1 instead, so its logits differ slightly from these.
 
 ```text
@@ -183,7 +184,7 @@ at 128K):
 
 Earlier the IQ3_S column measured 109.6, 187.4, 2,215 and 2,836 tok/s. Between the two, the
 narrow-width IQ3_S kernels, the tiled dense layout, the Q2 drafter and plain decode's divisor by
-context landed, each measured on its own in the [plan](maintainer/qwen3_8-flash-next-iq3s-plan.md);
+context landed, each measured on its own in the [design](maintainer/qwen3_8-flash-next-design.md) §19.3.25;
 this table does not split the gain between them. Recipe B's column measured
 120.5 and 176.3 tok/s for decode before; its lower decode here (84.5 % of routed experts hit the
 cache in tg512) is not attributed.

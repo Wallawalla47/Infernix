@@ -1,9 +1,9 @@
 """Block-scaled FP8 (``fp8_e4m3fn_b128``) and its expert record (``fp8_expert_b128_v1``), exactly.
 
-The format is the official Qwen3.8-Flash-Next-FP8 checkpoint's (docs/maintainer/qwen3_8-flash-next-fp8-
-plan.md §5.2, docs/maintainer/tensor-formats.md): ``W[n, k] = e4m3fn(c[n, k]) * s[n // 128, k // 128]``
+The format is the official Qwen3.8-Flash-Next-FP8 checkpoint's (docs/maintainer/tensor-formats.md §3.7,
+docs/maintainer/storage-layouts.md §9): ``W[n, k] = e4m3fn(c[n, k]) * s[n // 128, k // 128]``
 with one E4M3FN code byte per weight and one BF16 scale per 128 x 128 tile. Every E4M3FN value is an
-integer multiple of 2^-9, so the exact arithmetic (plan §6.1) uses ``w_int = e4m3fn(c) * 2^9``:
+integer multiple of 2^-9, so the exact arithmetic (design §16.2.2) uses ``w_int = e4m3fn(c) * 2^9``:
 
     normal (e in 1..15):  w_int = (-1)^s * (8 + m) * 2^(e - 1)     |w_int| <= 14 * 2^14 < 2^18
     subnormal (e = 0):    w_int = (-1)^s * m

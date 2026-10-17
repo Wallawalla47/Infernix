@@ -1,7 +1,7 @@
 #pragma once
 
-// Exact arithmetic over GGUF (ggml) block formats (docs/maintainer/qwen3_8-flash-next-iq3s-plan.md
-// §6). Shared by the GPU kernels and the CPU engine: every function returns identical bits on both.
+// Exact arithmetic over GGUF (ggml) block formats (docs/maintainer/qwen3_8-flash-next-design.md
+// §16.2.2). Shared by the GPU kernels and the CPU engine: every function returns identical bits on both.
 //
 // A weight is kappa * (d * sub * code - dmin * min_sub): an integer code, an integer sub-scale, a
 // binary16 block scale (and a second term for Q4_K/Q5_K) and a power-of-two format constant. An

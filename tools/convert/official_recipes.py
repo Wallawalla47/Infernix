@@ -353,7 +353,7 @@ def _flash_next_dense8(model, recipe):
 
 
 def qwen3_8_flash_next_fp8(model, recipe, sources):
-    """Recipe F-A of Qwen3.8-Flash-Next (docs/maintainer/qwen3_8-flash-next-fp8-plan.md): Qwen's official
+    """Qwen3.8-Flash-Next's official FP8 checkpoint (docs/maintainer/qwen3_8-flash-next-design.md §19.3.25): Qwen's official
     FP8 checkpoint bit-exact. The routed experts keep their E4M3FN codes and BF16 128 x 128 tile scales
     (``fp8_e4m3fn_b128`` in ``fp8_expert_b128_v1``, run W8A16 with exact arithmetic); every BF16 or
     FP32 tensor keeps its dtype; the n-gram table is the FP8 volume recipes A-C write. Only the MTP
@@ -441,7 +441,7 @@ def qwen3_8_flash_next_nvfp4_orcarouter(model, recipe, sources):
 
 def qwen3_8_flash_next_gsq_rco_iq3s(model, recipe, sources):
     """ISTA-DASLab's GSQ-RCO IQ3_S GGUF of Qwen3.8-Flash-Next, bit-exact
-    (docs/maintainer/qwen3_8-flash-next-iq3s-plan.md). Every GGUF block format is stored verbatim:
+    (docs/maintainer/qwen3_8-flash-next-design.md §19.3.25). Every GGUF block format is stored verbatim:
     dense matrices of the tiled formats (Q4_K, Q5_K, Q6_K, IQ4_XS) in ``ggml_tiles16_v1`` (the same
     blocks in 16-row tiles, so a tile's block is one contiguous run for the narrow kernels), the
     others and the token embedding (a row gather) in ``ggml_rows_v1``, each in its own per-tensor

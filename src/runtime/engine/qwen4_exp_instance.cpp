@@ -156,7 +156,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     auto vram             = open_vram_budget_source(device.device, options.vram_past_budget);
     demand.pin_room       = models::qwen4_exp::pin_room(vram->query());
     demand.expert_pin_cap = options.expert_pin_bytes;
-    // The n-gram table in RAM (plan §9.2): pinned at Program start, so it is a later pin. Auto keeps it
+    // The n-gram table in RAM (design §12.5): pinned at Program start, so it is a later pin. Auto keeps it
     // only while every expert stays pinned in RAM with it; Ram keeps it whatever the experts' placement.
     const auto snapshot = host_memory_snapshot();
     bool ngram_in_ram   = false;

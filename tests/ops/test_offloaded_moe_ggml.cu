@@ -1,5 +1,5 @@
 // GGUF (ggml) expert banks through the layer route of offloaded_sparse_moe (moe_route, moe_dispatch,
-// moe_experts; docs/maintainer/qwen3_8-flash-next-iq3s-plan.md §7, §12.1).
+// moe_experts; docs/maintainer/qwen3_8-flash-next-design.md §16.2.2, §19.3.25).
 //
 // Records are random ggml blocks (finite binary16 scales) in a pinned host bank, some copied into
 // device frames whose pitch exceeds the record stride (the shared frame pool of a model whose

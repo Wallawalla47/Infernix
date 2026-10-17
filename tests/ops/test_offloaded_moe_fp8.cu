@@ -1,5 +1,5 @@
 // Block-FP8 expert banks (fp8_expert_b128_v1) through the layer route of offloaded_sparse_moe
-// (moe_route, moe_dispatch, moe_experts; docs/maintainer/qwen3_8-flash-next-fp8-plan.md §7, §11).
+// (moe_route, moe_dispatch, moe_experts; docs/maintainer/qwen3_8-flash-next-design.md §16.2.2, §19.3.25).
 //
 // Records are random E4M3FN codes (no NaN) with random positive BF16 tile scales spanning several
 // binades, in a pinned host bank, some copied into device frames whose pitch exceeds the record

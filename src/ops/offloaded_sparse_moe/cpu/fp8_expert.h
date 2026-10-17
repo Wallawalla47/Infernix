@@ -1,7 +1,7 @@
 #pragma once
 
 // CPU route of offloaded_sparse_moe for block-FP8 expert banks (fp8_expert_b128_v1; docs/maintainer/
-// qwen3_8-flash-next-fp8-plan.md §7.3): one routed expert computed in place from its host record with
+// qwen3_8-flash-next-design.md §16.2.2, §19.3.25): one routed expert computed in place from its host record with
 // the exact arithmetic of ops/fp8_block/fp8_exact.h, so every output has the GPU kernels' bits.
 //
 // The record holds the gate rows, the up rows ([kIntermediate, kHidden], one E4M3FN byte each), the

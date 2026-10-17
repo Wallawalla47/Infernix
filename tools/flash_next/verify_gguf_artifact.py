@@ -1,5 +1,5 @@
 """Byte-equality qualification of a Qwen3.8-Flash-Next artifact imported from a GGUF
-(docs/maintainer/qwen3_8-flash-next-iq3s-plan.md §1.3, §12.2).
+(docs/maintainer/qwen3_8-flash-next-design.md §19.3.25).
 
     python -m tools.flash_next.verify_gguf_artifact --model QWEN_DIR --gguf SHARD [--gguf SHARD ...] \
         --artifact OUT.infernix [--ngram OUT.ngram] [--ngram-rows all|N]

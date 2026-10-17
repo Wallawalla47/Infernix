@@ -55,7 +55,7 @@ struct GgmlSegment {
                                                            std::span<const std::int32_t> bounds);
 
 /**
- * Exact projection over GGUF block weights (docs/maintainer/qwen3_8-flash-next-iq3s-plan.md §6).
+ * Exact projection over GGUF block weights (docs/maintainer/qwen3_8-flash-next-design.md §16.2.2).
  *
  * out[n, t] = round(sum_k w[n, k] * x[perm(k), t]) where w are the stored weights' exact values,
  * each column x[:, t] is first encoded as A16 integers (canon::a16_value: exact for every element

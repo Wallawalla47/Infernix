@@ -1,7 +1,7 @@
 #pragma once
 
 // Exact W8A16 arithmetic over block-scaled FP8 (fp8_e4m3fn_b128: Qwen's official FP8 experts;
-// docs/maintainer/qwen3_8-flash-next-fp8-plan.md §6.1). Shared by the GPU kernels and the CPU
+// docs/maintainer/qwen3_8-flash-next-design.md §16.2.2). Shared by the GPU kernels and the CPU
 // engine: every function returns identical bits on both.
 //
 // A weight is e4m3fn(c) * s with one BF16 scale s = mant(s) * 2^(E(s) - 134) per 128 x 128 tile

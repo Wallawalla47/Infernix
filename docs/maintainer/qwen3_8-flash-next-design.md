@@ -1980,6 +1980,39 @@ process-wide fault seam for the engine test; S3 only past its threshold; S4 park
   than 0.02. tg512 and repeated serve requests are n-gram-warm, so n-gram changes are judged on
   n-gram-cold runs.
 
+### 12.5 Row formats and RAM residency (2026-10-11)
+
+Three row formats share the volume layout of §12.2 and the read paths above; the engine reads the
+format from the volume header's row size (`resolve_ngram_volume`, `config.h`):
+
+| Format | Row | Rows per 4 KiB block | Volume | Source |
+|---|---:|---:|---:|---|
+| FP8 (E4M3FN, one per-tensor scale) | 160 B | 25 | 52.4 GB | recipes A-C; NVIDIA's table |
+| IQ4_NL (llama.cpp blocks: fp16 d, 16 nibble bytes) | 90 B | 45 | 29.1 GB (27.1 GiB) | the GSQ-RCO GGUF's shard 2, byte for byte |
+| BF16 | 320 B | 12 | 109.2 GB | Qwen's unquantized table (`tools/flash_next/ngram_bf16.py`) |
+
+- **IQ4_NL.** `ple_embed` decodes each value as `bf16_rn(fl32(d) · kvalue)`: the product is exact in
+  FP32 and rounds once at the BF16 boundary the FP8 rows have. Nibble order is llama.cpp's (elements
+  0-15 low nibbles, 16-31 high). `ngram_scale` does not apply.
+- **BF16.** The PLE takes the rows as its embedding with no decode. Any Flash-Next artifact runs with
+  a BF16 volume in place of its quantized table (`--ngram-volume`); a volume of the other quantized
+  format is refused. The FP8 checkpoint's artifact binds the BF16 table as its own: `--ngram-reuse`
+  checks that sampled rows quantize to the checkpoint's FP8 codes (ModelOpt's rule with the
+  checkpoint's scale, `NgramTable.bf16_rows_match`), and `verify_artifact --ngram-rows all` checks
+  every row. Exactness of the route (2026-10-12): recipe B with its FP8 volume and with a BF16 volume
+  of that table's dequantized values gave the same 400-token greedy text and the same mean NLL to
+  every printed digit (1.5817995854760287 over 10,325 tokens). The prefix-cache file's fingerprint
+  names the table, so a cache saved with one table is not restored with the other.
+- **RAM residency** (`--ngram-residency auto|ram|volume`). `volume` is §12.3's path. `ram` reads the
+  whole volume into pinned host memory at Program start (unbuffered 1 GiB requests) and serves rows
+  from it; the ledger (§19.3.7) counts it as a later pin, and startup stops if it does not fit.
+  `auto` takes RAM only while every routed expert stays pinned beside the table: the GGUF import
+  (46.9 + 27.1 GiB) on a 96 GB machine, never recipes A-B (64.5 + 48.8 GiB) or a BF16 table. The
+  gate machinery stays; with the table in RAM it never waits on I/O. Open: device-side PLE (the hash
+  and the row reads on the GPU over UVA), gated on ≥ 0.1 ms of after-draft GPU idle per verification
+  round that it would remove (not measured with the RAM mode); a cold 16K prompt with and without
+  RAM residency (not measured).
+
 ---
 
 ## 13. Prefill
@@ -2567,6 +2600,72 @@ depends neither on placement nor on how many columns share its call.
 **Cost.** Three byte products per weight instead of one: the GPU narrow kernels stay bound by the
 record reads they share with A4, while the CPU's integer work per miss triples (§10.2); recipe C
 measures its effect on decode.
+
+### 16.2.2 Exact arithmetic over GGUF blocks and block FP8 (2026-10-10)
+
+The GGUF IQ3_S import and the official FP8 checkpoint (§19.3.25) store weights that are integer codes
+times integer sub-scales times floating block scales. Every such weight is computed against §16.2.1's
+A16 activation encoding (integers X with |X| < 2^21 and one column exponent emax: v = X · 2^(emax −
+147)) with every sum exact, and one rounding at the end. Experts and dense projections share the
+contract, so a column's output depends on nothing but its own values: placement (VRAM frame,
+staging, landing, CPU on every ISA, SSD-landed), column count, segment splits and schedules return
+the same bits, and every route may split K, rows and columns however it likes.
+
+- **GGUF blocks** (`src/ops/ggml/ggml_exact.h`; formats in [tensor formats](tensor-formats.md) §3.6).
+  A weight is κ · (d · sub · code − dmin · min_sub): an integer code (|code| ≤ 127), an integer
+  sub-scale, a binary16 block scale d (and a second term for Q4_K/Q5_K), and a power-of-two format
+  constant κ. With d = mant · 2^(e − 25) (subnormals take e = 1):
+
+  ```text
+  R = Σ over 8-element chunks of mant(d) · sub · (Σ code · X) · 2^(e(d) − 1)
+      − mant(dmin) · min_sub · (Σ X) · 2^(e(dmin) − 1)                  exact, int128
+  y = fl32(R) · 2^(log2 κ + emax − 171)                                 one rounding to binary32
+  ```
+
+  Chunk sums fit int32 (8 terms), chunk terms int64 (< 2^49), R int128 (< 2^89 for K ≤ 8,192).
+- **Block FP8** (`src/ops/fp8_block/fp8_exact.h`; `fp8_e4m3fn_b128`, tensor formats §3.7). Every
+  E4M3FN value is w · 2^−9 with an integer |w| ≤ 14 · 2^14 < 2^18; each 128 × 128 tile has one BF16
+  scale s = mant(s) · 2^(E(s) − 134). With E_min the smallest scale exponent of a row's tiles:
+
+  ```text
+  P_t = Σ over tile t's 128 elements of w · X                 exact int64 (< 2^46)
+  R   = Σ_t P_t · mant(s_t) · 2^(E(s_t) − E_min)               exact int128
+  y   = bf16_rn( fl32_rn( R · 2^(E_min + emax − 290) ) )
+  ```
+
+  The converter refuses NaN codes, subnormal or non-finite scales, and a row whose tile exponents
+  span more than 62 binades (`kMaxExponentSpread`, the shift bound of `exact::add_shifted`); the
+  real checkpoint's spread is at most 4.
+- **The rounding** (`src/ops/common/exact_combine.h`). R rounds once to binary32 at the result's
+  binade (`exact::to_f32_scaled_rn`), equal to the formulas above whenever the result is normal;
+  a BF16 output rounds once more, an FP32 output (the `lm_head` logits) does not.
+- **Experts** follow §16.2.1's chain: x (BF16) → A16 → gate/up → BF16 → SwiGLU → BF16 h → A16 →
+  down → BF16 y_e → combine.
+- **Embedding and n-gram rows.** The IQ4_XS token embedding rows are decoded exactly on the device
+  from pinned host memory (`ggml_embedding`: a product of at most 24 significant bits, exact in
+  binary32) and rounded once to BF16; IQ4_NL n-gram rows the same way (§12.5).
+- **Limb forms.** How a route forms the exact products is its own choice:
+  - GPU GGUF routes: X as three byte limbs (lo and mid unsigned, hi signed) against int8 codes,
+    dp4a on the narrow routes and int8 `mma.sync` (k32; k16 for the half-sub formats Q6_K and IQ2_S)
+    on the tensor-core routes;
+  - CPU GGUF engine: X as two int16 limbs (X = hi · 2048 + lo) against int16 weights code · sub,
+    16-bit multiply-adds (`vpmaddwd`, or `vpdpwssd` with VNNI), 1.5× faster than its first int32
+    form;
+  - GPU FP8: the weight as three base-64 digits against X's limbs (dp4a narrow; nine int8 MMAs per
+    digit × limb plane in the tiles, each accumulating over one 128-element scale tile);
+  - CPU FP8: w = A + 2^8 · B by exponent, each a signed 4-bit mantissa times a power of two from two
+    `vpshufb` tables, multiplied by `vpmaddubsw` on even and odd bytes.
+- **Oracle.** Exact rationals over the independently decoded stored values and the encoded X, then
+  the same roundings; every route is qualified **bit-equal** (op development §6), not normwise. Tests:
+  `infernix_ggml_linear_test`, `infernix_offloaded_moe_ggml_test`, `infernix_offloaded_moe_ggml_cpu_test`
+  (every ISA), `infernix_offloaded_moe_fp8_test` (every width 1-300 and placement, CPU-served
+  included, against a scalar reference that itself equals a bignum sum).
+
+Rejected for these formats: llama.cpp's and Strata's Q8_1/Q8_K activations (less accurate than A16,
+and Strata's GPU and CPU forms disagree, so its output depends on placement: its issues #152 and
+#410); FP8 tensor cores with FP32 accumulation for the FP8 experts (narrower than FP32 and
+undocumented on sm_120, half rate, not reproducible on the CPU); a canonical fixed-order FP32 sum
+(one reduction tree for every route, which the tensor-core routes cannot follow).
 
 ### 16.3 Recipe qualification
 
@@ -9953,6 +10052,226 @@ ignored, which exposed these:
 **Not carried over:** preemption. Under resource pressure a Qwen4Exp request is not paused and
 replayed, because its whole KV extent is reserved at binding. It matters only at concurrency
 above 1 when the KV pool is short. A request that does not fit waits in the queue, as on dev.
+
+### 19.3.25 Exact imports: the GGUF IQ3_S and the official FP8 checkpoint (2026-10-10 to 10-17)
+
+Two recipes import other publishers' quantizations bit for bit and run them on the same Qwen4Exp
+route. Usage, sizes and current speed are in the [user guide](../qwen3_8-flash-next.md#gguf-import-ista-daslab-gsq-rco-iq3_s);
+the formats in [tensor formats](tensor-formats.md) §3.6-3.7; the record and tile layouts in
+[storage layouts](storage-layouts.md) §7-9; the arithmetic in §16.2.2; the n-gram rows and RAM
+residency in §12.5. Measurements below: RTX 5090 on PCIe 5.0 x8, i9-13900K, 96 GB DDR5-5800,
+INT8 KV, `infernix_bench` unless stated; A/Bs in one binary through temporary switches, rounds
+rotated; every kept variant exact on the Op tests and the teacher-forced identity check.
+
+**Recipes and sources.**
+
+- **`qwen3_8_flash_next_gsq_rco_iq3s`** imports [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)
+  `IQ3_S` (revision `ed59f920`; shard 1: 1,223 tensors, BF16 484, F32 292, Q6_K 129, IQ4_NL 86,
+  Q4_K 47, IQ4_XS 45, IQ2_S 40, Q5_K 35, IQ3_XXS 34, IQ3_S 20, Q2_0 9, F16 1, Q8_0 1; shard 2: the
+  IQ4_NL n-gram table) and its BF16 `mmproj`:
+  - Routed experts in seven per-layer format pairs (gate and up always share a type): IQ2_S,
+    IQ3_XXS, IQ3_S or IQ4_XS gate/up with IQ4_NL or Q2_0 down, one record per expert in
+    `ggml_expert_iq4_nl_v1` / `ggml_expert_q2_0_v1` (five record sizes, mean 1.95 MiB, largest
+    2.54 MiB; 46.9 GiB in all, against NVFP4's 2.64 MiB records).
+  - Dense Q4_K, Q5_K, Q6_K and IQ4_XS matrices in `ggml_tiles16_v1` (the same blocks in 16-row
+    tiles), IQ4_NL dense in `ggml_rows_v1`; the one Q8_0 tensor as identical `q8_g32_fp16` words (no
+    code is −128); plain tensors at their exact values; the n-gram table byte for byte (§12.5).
+  - llama.cpp's export transforms are undone exactly and checked (`tools/convert/qwen4_exp_gguf.py`):
+    the `+1` on zero-centred norm gammas (g − 1 must be a BF16 value), the GDN value heads in ggml's
+    tiled order (rows permuted back: whole rows, exact), `A_log` stored as `−exp(A_log)` (kept as
+    FP32 A and used directly), the indexer's fused q/k projection (concatenated again). The output
+    projection's *columns* cannot be permuted back (its K-blocks span two heads), so `ssm_out`
+    stays in GGUF order, the config records `gdn_output_order: ggml_tiled`, and `ggml_linear` reads
+    its input blocks through that permutation.
+  - The GGUF has no MTP head (llama.cpp's exporter drops it). `--model` names a Qwen checkpoint for
+    the `mtp.*` tensors, config and tokenizer; `tools/convert/fetch_tensors.py` range-reads just those
+    from Qwen/Qwen3.8-Flash-Next-FP8 at a pinned revision (~2.7 GB).
+  - Vision from the `mmproj` (`--mmproj`): its 441 tensors equal recipe B's tower bit for bit.
+- **`qwen3_8_flash_next_fp8`** imports [Qwen/Qwen3.8-Flash-Next-FP8](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8)
+  (revision `236dfdf2`; 131 shards, 185.5 GB). Only the routed experts (main and MTP) and the
+  n-gram table are FP8; every dense linear, `lm_head`, embedding and vision are BF16. This corrects
+  §6.1's premise for rejecting "the dense FP8 tensors of the FP8 checkpoint": there are none (the
+  rejection stands for recipe B on other grounds).
+  - Experts: E4M3FN codes with BF16 [5, 20] / [20, 5] tile scales per matrix, every scale positive
+    and normal, per-row exponent spread at most 4 (0: 128,629 rows, 1: 542,690, 2: 60,560, 3: 5,302,
+    4: 99). Stored verbatim as `fp8_e4m3fn_b128` in `fp8_expert_b128_v1` (gate, up and down rows
+    row-major, then the scale words; 4.69 MiB per expert, 112.6 GiB in all).
+  - Every other tensor keeps its values; the n-gram table binds Qwen's BF16 volume (§12.5).
+  - A second recipe, F-B (recipe B's 8-bit dense classes over the same experts), was built and
+    measured (tg512 41.1, MTP 50.3, pp4096 448 tok/s at the time; perplexity 3.4863 against F-A's
+    3.4870 with the same table) and removed on 2026-10-12 by the user's decision to publish the exact
+    artifact only.
+- **Both drafters** are re-quantized as in recipes A-C, except that their routed experts are
+  `q2_g64_fp16` (`grouped_mse`) instead of `q4_g64_fp16`: drafts only change which tokens a round
+  verifies, never the output. IQ3_S: 201.4-203.1 against 196.1-196.7 tok/s with MTP 4 + n-gram 7
+  (acceptance 0.90 against 0.885). FP8: identical exact-route output (24 teacher-forced MTP segments)
+  and level speed (MTP 4 at 4K + 512, four alternating pairs: the 2-bit drafter ahead by 1.0-2.0
+  tok/s in two and behind by 0.6-1.2 in two), so the smaller drafter leaves 0.63 GB to the cache.
+- **Verification.** `tools/flash_next/verify_gguf_artifact.py` compares every expert record, GGUF
+  row (a tiled matrix after untiling), tensor and n-gram row with the GGUF, and the vision tower with
+  a reference artifact; `tools/flash_next/verify_artifact.py` compares the FP8 import's experts,
+  tensors and n-gram rows with the checkpoint, listing the drafter's re-quantized tensors. Both final
+  artifacts (2026-10-17): no difference (24,576 experts; 385 GGUF and 1,218 plain tensors, or 1,615
+  tensors; all 320,001,536 n-gram rows).
+
+**Expert routes.** `MoeExpertSource` names the bank's format (`ggml` gate/up and down formats, record
+bytes and frame pitch, or `FP8_E4M3FN_B128`); the NVFP4 family is unchanged and `launch_pass`
+dispatches per format (`cuda/ggml_expert.cuh`, `cuda/fp8_expert.cuh`, `cpu/ggml_expert.cpp`,
+`cpu/fp8_expert.cpp`).
+
+- **GPU narrow (≤ 8 columns).** dp4a kernels decode each slice's codes once for every column; IQ4
+  values by two `__byte_perm` lookups; grid signs and Q2_0/Q6_K offsets in native arithmetic (IQ3_S,
+  IQ3_XXS and IQ2_S grid bytes are never zero, so m = (s4 · 0x00204081) & 0x01010101 and
+  (v ^ m · 0xFF) + m negate without borrows: five instructions where `__vcmpne4`/`__vsub4` compiled
+  to about ten per word); 2-byte-aligned GGUF words through N + 1 aligned 4-byte loads and funnel
+  shifts (`ld_words_a2`: op at one column −10 % to +5 %, tg512 ~+1 %). The FP8 kernels decode a
+  word's three base-64 digits from a 256-entry shared table and byte permutes (~11 instructions per
+  code word instead of ~60), once per slice for all of a pass's columns.
+- **GPU wide (prefill).** Exact int8 tensor-core tiles, 64 × 64, decode-then-MMA: sixteen warps of
+  16 × 16 outputs within 128 registers (eight warps of 32 × 16 needed 253 for one CTA per SM); codes
+  and sub-scales in A-fragment order; `ldmatrix.x4` limb fragments; int64 accumulators relative to a
+  row's smallest scale shift when a tile's rows lie within 62 − term bound − ⌈log2 blocks⌉ binades
+  (`row_bases`: 100 % of 64-row tiles for every expert format, Q6_K and IQ4_XS, 96.5 % Q4_K, 79.6 %
+  Q5_K), int128 otherwise. Expert calls at 4,096 tokens (512 experts, top-10, all resident) IQ2_S
+  17.97 → 13.66 ms, IQ3_XXS 14.72 → 13.27, IQ3_S 14.46 → 13.12. The FP8 tiles (`fp8t`) run nine
+  int8 MMAs per digit × limb plane: 56.1 → 13.9 ms per layer call (4.0×) against the narrow kernels.
+- **CPU engine.** One engine per format pair, scalar (the oracle), AVX2, AVX-VNNI and AVX-512 VNNI,
+  through the existing team, miss service and fetch channel; 16 workers for GGUF banks (decode 100.5
+  tok/s without CPU serving, 98.4 at six workers, 103.7 at 16). Grid indices load as scalars packed
+  with `_mm256_set_epi64x` (`vpgatherdd` measured 0.9 % slower end to end, MTP 4 + n-gram 7 at 4K).
+  FP8: about 17 instructions per 32 codes (from ~68), 12,545 experts/s at 16 workers on the SSD
+  tier's RAM copies.
+- **Frame pools by record size** (`ExpertResidency` pools). One frame of the largest GGUF record
+  wasted 23 %. Replay of recipe B's 6,061-token decode trace with this artifact's seven strides and
+  25.3 GiB: one max-size frame 10,206 frames, 10.44 % decode misses; static classes 13,248 frames,
+  6.37 %; byte-exact global LFRU (the bound of rebalancing classes) 6.23 %. Built: one pool per
+  stride, each with its own LFRU controller, VMM arena and halving period; leases carry their pool
+  and lend from the pool with the most room; the prefill stream's lease is split into ring,
+  wide-call and walk leases. Measured: 13,008 frames (from ~10,200), tg512 103.3 → 109.6, MTP 166.9
+  → 187.4 tok/s. The prefill workspace fit (FIX-12) uses the lending pool's capacity.
+- **A loan's give-back** reloads the experts the loan evicted, best first (Strata refills its lent
+  slots the same way), only where landing (§9) cannot use the returned frames: when the scarcest pool
+  has no frame per layer to spare (a GGUF import) or behind the SSD tier (only victims with a RAM
+  copy). IQ3_S: the server's decode-only hit rate after 32K and 128K prompts 86-88 / 81-85 % →
+  94-95 / 90-97 %; MTP 4 at 4K + 512 162.2 → 185.4, plain 115.7 → 129.0 tok/s. Unconditionally it
+  took NVIDIA NVFP4 Dense8's landing frames: MTP 150.2 (main) → 136.8-139.2 (plain 94.4 → 98.1);
+  with the rule Dense8 measures MTP 154.8 and plain equal to main (the same hits, promotions and
+  landings). FP8 keeps it (44.0-44.2 against 39.6-43.5 tok/s without).
+- **Staging slots by width.** Without the SSD tier a verification call's misses (top-k × width: 80
+  at MTP 4 + n-gram 7) stage in one pass, keeping the fork route: 204.0 against 190.3 tok/s
+  (+7.2 %). With the tier the larger ring took RAM residents (FP8 48.6-49.8 against 51.2), so it
+  keeps 64.
+- **The SSD tier with FP8 records.** SSD-only experts join the layer walk's stream
+  (`ExpertStream::SsdReads`, at most a quarter of the stream slots per layer, lent from the RAM
+  residents for the span): a 32K prompt's SSD reads 54,602 → 4,654, 784 → 2,360 tok/s. A fetch of 64
+  or more records reads up to 32 of the next layer's records ahead. `--expert-stripe` reads a
+  record's tail from a second drive while the artifact serves its head (pp4096 743 against 588
+  tok/s unstriped in the same run, a large spread). The tier-measured CPU rate as the decode
+  divisor's input gave no gain (MTP 50.3 → 42.8, unexplained) and was not kept. Windows' page-lock
+  limit and the unpinned records are §19.3.7's; the 10 s host heartbeat is §19.3.7's too.
+
+**Dense routes (GGUF).** `ops::ggml_linear` over one or more outputs (`src/ops/ggml/`):
+
+- Row-major matrices (IQ4_NL): `rows_kernel` (dp4a) at 1-2 columns, `mma_rows_kernel` at 3-8
+  (16-row CTAs of four warps, four CTAs per SM; measured on row-major matrices before the tiles, at
+  5 columns: Q6_K attn_qkv 36.8 → 24.6 µs, Q5_K 46.9 → 22.9, Q4_K 33.1 → 19.8, IQ4_XS 30.9 → 20.5).
+  Tiled matrices take tensor-core tiled kernels at every narrow width, except one-column Q6_K and
+  IQ4_XS calls, which keep `rows_kernel` with tiled addressing (single Q6_K calls at one column were
+  1-3 % slower tiled). The tiled kernels' warps copy a tile's 16-row block runs by 16-byte
+  `cp.async` (L2 evict-first) into two-slot rings, with K split across warps and exact int128
+  partials in shared memory. CTA shapes come from the occupancy
+  API: the first of 8/4/2/4/4/2 warps split 8/4/2/2/1/1 whose CTAs fit one wave and keep the call
+  within 1,024 warps or give a warp at least four blocks; past one wave, 4 warps unsplit (a second
+  wave cost a call 25-30 %). Two-format calls take one tiled launch at every narrow width.
+- The tiled layout against the row-major routes: weighted op time per token (36 GDN, 12 attention,
+  48 shared-expert calls, one head) −11.9 / −22.9 / −25.6 / −26.7 / −31.8 % at 1 / 2 / 4 / 5 / 8
+  columns; MTP 4 + n-gram 7 221.7-222.6 against 214.0-214.5 tok/s (+3.7 %, every tiled round ahead);
+  plain 99.6-99.7 against 99.5-99.6; pp4096 equal; the exact route bit-identical (64 segments). The
+  row-major route's own two-format launch, as a control, measured 213.0-214.8, so the gain is the
+  layout's. A first tiled iteration (a staged dp4a kernel, no occupancy rule) measured +0.9 % MTP and
+  −0.8 % plain, and was not adopted.
+- One call per fused projection into its part tensors (GDN q/k/v/z, attention q/gate/k/v/index,
+  the shared expert's gate/up straight into SwiGLU; one encode of x, no split copies): pp32768
+  +1.1 %, tg512 +1.5 %.
+- Prefill (≥ 32 columns): `plane_kernel` decodes each segment once per call into 64 MiB of
+  workspace and `compute_plane` reads the planes by `cp.async` with no decode in the loop: 15-34 %
+  faster at 4,096 columns (Q6_K attn_qkv 3,912 → 2,839 µs), pp32768 3,204 → 3,484 tok/s. The layer
+  walk runs the MoE once per group of chunks (up to 16,384 columns): pp32768 3,845 → 4,035.
+- The shared expert runs on its own stream in decode and verification calls, beside the routed
+  experts: tg512 112.7 → 121.5, MTP 199.6 → 205.6 tok/s.
+
+**Decode policy.**
+
+- Plain decode's CPU-miss divisor by context for GGUF imports: d = 1 below 1,536 tokens, d = 2 from
+  there (`plain_divisor`), written to a device word the captured graphs read. Fixed d = 1 / d = 2:
+  151.5 / 139-141 tok/s at 512 + 256, 152.4 / 143.8 at 1K + 256, 124.9 / 129.9 at 2K + 256, 99.5 /
+  114.4 at 4K + 512, 119.5 / 126.3 at 32K + 256; the rule 151.4 at 512 + 256 and 115.2 at 4K + 512.
+  A divisor following the hit rate over 4,096 routed uses switched 47 times in a 4K run (eight-token
+  windows swing around any threshold) and lost to the better fixed d at every length: rejected. With
+  MTP or n-gram drafts the divisor is unchanged (d = 1 in one-column calls cost MTP 1.5 %).
+- The MTP draft cost learned online (§11.3). MTP drafts up to 7 on Flash-Next (`--draft-tokens`
+  1..7; Qwen3.5/3.6 1..5): 5 against 4 drafts +1.6 % at acceptance 0.69-0.70 against 0.74; the
+  guides keep 4.
+
+**Results and quality.** Current speed tables are the user guide's. Quality on the 1M-token corpus
+(261,167 tokens, 4K context, stride 2,048, INT8 KV; reference recipe B's top-32): recipe B 3.5077;
+IQ3_S 3.5223 (KL 0.0905, top-1 89.3 %; 3.5198 / 0.0893 with the BF16 table); FP8 3.4870 (KL 0.0496,
+top-1 92.1 %). Teacher-forced over §16.5's texts (2,557 positions): IQ3_S 4.794 against recipe B
+4.653 (+0.030 ± 0.011 nats per token, mostly chat) and Strata's UD-Q4_K_XL 4.864 (−0.015 ± 0.012).
+Causal scoring runs on Qwen4Exp through the generation path (`program/score.cpp`), so the SSD-tier
+FP8 artifact could be scored: on IQ3_S its perplexity equalled the Forward dump's (3.6877, |Δ log p|
+mean 0.00005, top-1 100 %) in RAM and through an 8 GiB tier.
+
+**Invariance.** Greedy text identical for IQ3_S and FP8 across prefill chunks 2,048 / 4,096 / 8,192
+on a 32K prompt; plain, MTP and MTP + n-gram; `infernix-serve --max-concurrency 4` with requests
+alone and together; every expert in RAM, 24 GiB and 8 GiB (FP8: the default tier, 24 / 8 GiB, and
+the stripe). Teacher-forced log-probabilities bit-identical across repeats, chunks, concurrency 2-8
+and MTP; a prefix hit resuming inside the prompt differs, as §19.3.1's contract states (E3/E4).
+
+**Against Strata** (2026-10-12; v0.1.43 from source for sm_120, the same GGUF, MTP 4, INT8 KV,
+OpenAI servers, unique-prefix code prompts, greedy, 256 tokens, median of 3). Strata 4K / 32K /
+108K prefill 3,226 / 5,181 / 5,322 tok/s, decode 198 / 188.5 / 160; Infernix (later the same day,
+chunk 8,192) 4K / 32K / 128K 2,887 / 3,644 / 3,930 and 137.9 / 137.3 / 138.6. Strata prefills its
+dense GGUF projections as FP16 cuBLAS GEMMs over a per-chunk dequantization and its experts as
+llama.cpp MMQ on q8_1 activations (one 8-bit limb, inexact), at about 30 % of its peak against
+Infernix's ~13 % (estimated from both peak budgets; equal at ~41-43 µs per token). Its default `STRATA_ROUTE_TAIL_SKIP=7` skips a missed expert that every token of a
+verification window routes at rank 7 or lower: it fails model-quality §6's decode gate (INT8: TV
+excess bound 4.26e-3 > 4e-3, top-1 0.75 pt, p99.9 KL ratio 1.41), as does a +1 logit bias for
+resident experts (TV 2.93e-2, top-1 3.8 pt).
+
+**Rejected** (all exact unless stated):
+
+- Sliced-K int8 narrow dense route (warps splitting K, `cp.async` one unit ahead, codes through
+  shared memory): Q6_K attn_qkv at one column 22.2 → 34.9 µs, tg512 109.9 → 84.7.
+- Tensor-core narrow expert kernels (`mma_rows` arithmetic per job): expert call 0.034 → 0.049-0.057
+  ms at one token, tg512 121.8 → 112.3, MTP 214.1 → 200.1.
+- Narrow expert loops unrolled with every load in flight, the down kernel's slices decoded before
+  the PDL wait, the dense rows decoding one slice ahead: together tg512 112.1 → 105.0. An int64-run
+  slice accumulator in the dp4a rows: MTP 186.2 → 177.9. Narrow lanes taking runs of five slices:
+  tg512 122.9 → 120.1. Encoding x in every rows CTA: −4 %.
+- Prefill tiles: double-buffered code stages (−3-5 % for the K-quants); runtime warp layouts (−3-9 %);
+  32-row tiles of four warps at two CTAs per SM (dense −6-27 %, experts −75 %); 64 × 128 dense plane
+  tiles (pp32768 4,139 → 3,258); a warp-specialised gate/up tile (no gain; IQ2_S 18.4 → 23.3 ms);
+  scale-folded down tiles (12.2-12.9 → 17.7-18.4 ms); sub-scales folded into byte planes (mixed,
+  within run spread); decoded planes for the expert tiles (net −2 %); two down-tile CTAs per SM (no
+  change).
+- L2 lookahead of the next projections, early PDL triggers and L2 prefetch of a CTA's rows, CPU
+  encodes in parts, the GDN fold on a side stream, KV page tables through the host mapping: each
+  within 0.3 %. The engine thread pinned to an E-core: within run spread, prefill 0.3 % slower.
+- The HC-Q8 variant (hyper-connection and final mixer projections in `q8_g32_fp16`): fails the
+  decode gate (INT8: TV 4.71e-3, top-1 0.73 pt, tail 1.36) and decodes 14.5 % slower.
+- A fixed pool of SSD stream slots (tg512 38.0 → 35.0: fewer RAM residents); streaming single SSD
+  calls (pp4096 649 → 563: the host waited for the drive).
+- Loading the GGUF in place (the v3 container is the only artifact, and runtime repacking is
+  excluded); dequantizing to FP32 and re-quantizing (a second quantization).
+
+**Deferred or not applicable.** A persistent Stream-K expert schedule (the expert tiles are bound by
+their decode, not by its alternation with the MMAs); an FP8 A8 prefill permission through
+block-scaled MMAs (inexact; prefill is I/O-bound); exact FP8 MTP experts; a trained pre-router for
+SSD lookahead. Not applicable: int4 `mma` (IQ3_S codes reach ±15, IQ4_NL ±127), FP8/FP6/FP4 and
+block-scaled `mma` (floating-point accumulation), `ldmatrix .b4x16_p64` (an FP4 container, no
+codebook), LUT-GEMM activation tables (13-bit grid indices: 32 KiB per group and column), fewer
+activation limbs (X needs 21 bits).
 
 ---
 

@@ -302,7 +302,7 @@ def fp8_expert_records(source: Fp8ExpertBankSource, first: int, count: int) -> b
 
 
 def import_fp8_expert_bank(request: PrepareRequest) -> PreparedMethod:
-    """Write one layer's block-FP8 experts verbatim in ``fp8_expert_b128_v1`` (FP8 plan §5.2)."""
+    """Write one layer's block-FP8 experts verbatim in ``fp8_expert_b128_v1`` (storage layouts §9)."""
 
     if request.target.format != "fp8_e4m3fn_b128" or request.target.layout != "fp8_expert_b128_v1":
         raise ValueError("import_fp8_expert_bank requires fp8_e4m3fn_b128 in fp8_expert_b128_v1")
@@ -475,7 +475,7 @@ class _Qwen4ExpBuilder(_Builder):
             self.group(*gate_up)
             self.group(*downs)
             return
-        # Qwen's official FP8 export: block-FP8 experts, imported verbatim and run W8A16 (FP8 plan).
+        # Qwen's official FP8 export: block-FP8 experts, imported verbatim and run W8A16 (design §19.3.25).
         if not store.has(sp + "experts.0.gate_proj.weight_packed") and \
                 store.describe(sp + "experts.0.gate_proj.weight").dtype == "F8_E4M3":
             bank = Fp8ExpertBankSource((e, h, ir), f"{store.path}:{sp}experts", store, sp + "experts.")

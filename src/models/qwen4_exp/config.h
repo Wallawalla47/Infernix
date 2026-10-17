@@ -92,7 +92,7 @@ struct QsaConfig {
 };
 
 // The n-gram table volume written beside the artifact (design §12.2): FP8 E4M3FN rows with one
-// per-tensor scale, a GGUF's IQ4_NL rows (plan §9.1), or the unquantized table's BF16 rows (an exact
+// per-tensor scale, a GGUF's IQ4_NL rows (design §12.5), or the unquantized table's BF16 rows (an exact
 // conversion bound to a BF16 volume). A BF16 volume (tools/flash_next/ngram_bf16.py) may also replace
 // a quantized table at run time (resolve_ngram_volume).
 enum class NgramRowFormat : std::uint8_t { Fp8E4m3, Iq4Nl, Bf16 };

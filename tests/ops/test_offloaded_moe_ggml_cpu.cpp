@@ -1,6 +1,6 @@
 // The CPU route for GGUF (ggml) and block-FP8 expert banks (src/ops/offloaded_sparse_moe/cpu/ggml_expert.h,
 // fp8_expert.h;
-// docs/maintainer/qwen3_8-flash-next-iq3s-plan.md §7.4, §12.1). Host-only.
+// docs/maintainer/qwen3_8-flash-next-design.md §16.2.2, §19.3.25). Host-only.
 //
 // Records are random ggml blocks (finite binary16 scales) of every expert format pair. Oracle: the
 // exact expert of ops/ggml/ggml_exact.h on A16 integers (whose decode, sums and rounding

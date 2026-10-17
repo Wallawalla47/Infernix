@@ -6,7 +6,7 @@
 // round, and the LFRU policy (expert_cache::CacheController) that decides promotions and evictions
 // at round boundaries.
 //
-// Pools (size classes; docs/maintainer/qwen3_8-flash-next-iq3s-plan.md §7.5). The layers whose
+// Pools (size classes; docs/maintainer/qwen3_8-flash-next-design.md §19.3.25). The layers whose
 // records share a stride share a pool: its frames have that pitch, and its own LFRU decides among
 // its layers' experts. An NVFP4 or block-FP8 artifact has one pool; a GGUF import's layers have up
 // to seven record sizes. Frames are sized as average frames (frame_bytes(), the mean of the layers'

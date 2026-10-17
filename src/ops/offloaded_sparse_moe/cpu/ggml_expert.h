@@ -1,7 +1,7 @@
 #pragma once
 
 // CPU route of offloaded_sparse_moe for GGUF (ggml) expert banks (docs/maintainer/
-// qwen3_8-flash-next-iq3s-plan.md §7.4): one routed expert computed in place from its host record
+// qwen3_8-flash-next-design.md §16.2.2, §19.3.25): one routed expert computed in place from its host record
 // (gate rows, up rows, down rows, each verbatim GGUF blocks) with the exact arithmetic of
 // ops/ggml/ggml_exact.h. Every output is the exact int128 sum rounded once, so every ISA variant
 // returns the bits of the GPU kernels.

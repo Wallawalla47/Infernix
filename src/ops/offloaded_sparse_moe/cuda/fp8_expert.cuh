@@ -1,5 +1,5 @@
 // Block-FP8 expert banks (fp8_expert_b128_v1, Qwen's official FP8 experts) on the GPU
-// (docs/maintainer/qwen3_8-flash-next-fp8-plan.md §7), included by moe_layer.cu after
+// (docs/maintainer/qwen3_8-flash-next-design.md §19.3.25), included by moe_layer.cu after
 // ggml_expert.cuh, whose x encoding, h plane and pass plumbing they share. A record holds the gate,
 // up and down rows (one E4M3FN byte per weight), then the three matrices' BF16 128 x 128 tile scales.
 //

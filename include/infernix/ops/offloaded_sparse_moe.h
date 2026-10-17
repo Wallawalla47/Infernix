@@ -151,10 +151,10 @@ struct MoeFetchChannel {
 };
 
 /// The record geometry of an exact-arithmetic expert bank: a GGUF (ggml) bank
-/// (docs/maintainer/qwen3_8-flash-next-iq3s-plan.md §7: gate rows, up rows in gate_up_format, then
+/// (docs/maintainer/qwen3_8-flash-next-design.md §19.3.25, storage layouts §8: gate rows, up rows in gate_up_format, then
 /// down rows in down_format, every row verbatim ggml blocks) or a block-FP8 bank (fp8_expert_b128_v1,
 /// both formats FP8_E4M3FN_B128: the rows, one byte per weight, then their BF16 tile scales;
-/// qwen3_8-flash-next-fp8-plan.md §7). gate_up_format == NVFP4_MUL selects the NVFP4 record and its
+/// storage layouts §9). gate_up_format == NVFP4_MUL selects the NVFP4 record and its
 /// routes. Both banks run exact A16 arithmetic on every column count, so their outputs depend on
 /// neither placement nor batch.
 struct MoeGgmlBank {

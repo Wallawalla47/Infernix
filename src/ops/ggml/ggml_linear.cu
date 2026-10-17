@@ -7,7 +7,7 @@
 // pass of up to kColumns columns and adds their exact terms into one int128 per column; the
 // group's partial sums are added exactly (order cannot matter) and its first lane rounds. (Every
 // rows CTA encoding a decode call's column into shared memory instead of encode_kernel measured
-// 4 % slower end to end: 98.0 -> 94.0 tok/s, design note in the IQ3_S plan.)
+// 4 % slower end to end: 98.0 -> 94.0 tok/s, design §19.3.25.)
 //
 // Calls of kMmaMinColumns..kMmaMaxColumns columns (MTP verification) run mma_rows_kernel on tensor
 // cores; calls of kTileMinColumns or more (prefill) first decode each segment's weights once into
