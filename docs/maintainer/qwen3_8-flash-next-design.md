@@ -8554,7 +8554,9 @@ elastic pool does the same job with no kernel change:
 - The CPU team's decode rate C is measured at startup for the configured workers
   (`program/cpu_rates.cpp`, ~30 ms): the best of 3 batches of 8 rounds of 16 one-column jobs on
   real records from the pinned banks (across layers, past the last-level cache) while the link
-  copies records into the staging slots (the staging's DRAM reads compete with the CPU's). The SSD
+  copies records into the staging slots (the staging's DRAM reads compete with the CPU's). An
+  attempt during which other processes used 25 % or more of the CPU is repeated after 0.5 s, for
+  up to 20 s, and the best rates stand (§19.3.28). The SSD
   tier measures it on its RAM copies once its startup fill is done, and the channels' divisor
   follows (2026-10-11: with the i9-13900K's 6-worker NVFP4 rate of 21,000 experts/s as the
   reference, the FP8 artifact's 4.69 MiB records gave d = 5); before any host record exists the
@@ -10480,6 +10482,55 @@ so its hit rates sit ~2.4 points below the engine's) ranked credit 16 / 64 / 256
 +0.15 / +0.34 / +0.59 / +0.54 points of decode hits, a window of the prompt's last 256 or 512 tokens
 the same as all of them, and promotions at +0.46 (8 per layer) and +0.54 (32) points. Not measured:
 the SSD tier (credit only there too; its demotion gate is untouched), concurrent lanes.
+
+### 19.3.28 The startup CPU-rate probe under another program's load (2026-10-18)
+
+**Symptom.** Twice in §19.3.27's runs, the first Flash-Next start right after a long full-parallel
+build (another session's full build; a 5.8-minute rebuild) read the CPU expert team at 9,457 and
+10,840 experts/s instead of 16,000-17,200 (6 workers, Dense8 records), chose d = 2 instead of 3
+(§19.3.12) and decoded 20-27 % slower for the whole session (84.7 against 66.5 s of decode for
+the same 12,288 tokens); output was unchanged.
+
+**Cause.** A synthetic copy of the probe (the same team, jobs and batches on 320 random W4A4
+records in RAM, no link copies) sampled every 3 s:
+
+| Machine | Unpinned team | Pinned to 6 P-cores | One worker | CPU performance level |
+|---|---:|---:|---:|---:|
+| Idle | ~19,500 | ~19,800 | ~4,100 | ~173 % of base |
+| 32 busy-loop processes (5 min) | ~10,500 | ~12,200 | ~2,650 | ~146 % |
+| From 3 s after they stop | ~19,500 | ~19,700 | ~4,100 | ~173 % |
+
+Another program's load on every logical CPU halves the reading, and the reading recovers within one
+sample once that load stops: no heat or power-budget after-effect, and pinning recovers little.
+A light 111-second rebuild (one compiler at a time but for a ten-second link burst) lowered only
+the sample inside that burst. The two misreads were taken about 20 s after their builds ended,
+with something still busy on the machine (in one, 1.8 GiB less RAM free than in the next run); the
+probe's three ~10 ms batches all fell inside that load, and its best-of-three cannot see past a
+load that lasts longer than the probe. Partial load, as the other processes' share of 32 logical
+CPUs: 4 / 8 / 12 / 16 / 24 / 32 busy processes (12.5-100 %) read 2 / 6 / 11 / 13 / 35 / 46 % low;
+d = 3 holds while C t ≥ 1.35, about 18 % below the idle reading.
+
+**Fix.** `measure_cpu_rate` samples the CPU time of the rest of the machine around each attempt
+(`core/host_load.h`: Windows `GetSystemTimes` minus `GetProcessTimes`, Linux `/proc/stat` minus
+`getrusage`, over wall time × logical CPUs). An attempt during which other processes used 25 % or
+more is repeated after 0.5 s, for up to 20 s; the best rates of the attempts stand, and the
+startup line says how many attempts ran and the share in the first and last. If the machine never
+quietens, a warning says the split follows a busy reading for this session. Only startup changes:
+the divisor stays a launch argument of the captured graphs. Dense8 startups (RTX 5090, 1-segment
+generator runs):
+
+| Startup | Attempts | Other processes' share | Experts/s | d |
+|---|---:|---|---:|---:|
+| Idle | 1 | 4 % | 16,553 | 3 |
+| 32 busy-loop processes stopped 3 s after the link probe line | 4 | 98 % at first, 9 % last | 18,030 | 3 |
+| The same load throughout the startup | 20 | 91 %, then 89 % | 10,840 | 2, and the warning |
+
+(A first build with a 10 % threshold gave the same outcomes: idle 7 %, one attempt; 5 attempts,
+94 → 5 %; 20 attempts at 89-92 %.)
+
+Not done: re-measuring later in a session (the divisor would have to move to a device word the
+graphs read, as the one-column divisor does); a session that starts under a load lasting more than
+20 s keeps the busy reading until restarted, as the warning says.
 
 ---
 

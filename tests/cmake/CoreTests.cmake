@@ -90,6 +90,10 @@ infernix_add_test(infernix_host_timing_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_host_timing.cpp"
   LIBRARIES infernix_core)
 
+infernix_add_test(infernix_host_load_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_host_load.cpp"
+  LIBRARIES infernix_core)
+
 infernix_add_test(infernix_jinja_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../text/test_jinja.cpp"
   LIBRARIES infernix_jinja infernix::json)

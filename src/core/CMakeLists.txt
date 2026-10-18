@@ -14,6 +14,7 @@ add_library(infernix_core STATIC
   device.cu
   direct_read_queue.cpp
   dtype.cpp
+  host_load.cpp
   host_memory.cpp
   host_worker_pool.cpp
   link_probe.cu
