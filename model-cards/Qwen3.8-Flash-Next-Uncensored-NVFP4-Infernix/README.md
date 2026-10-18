@@ -34,19 +34,23 @@ tags:
 > You are responsible for how you use it and for what it produces.
 
 > [!IMPORTANT]
-> **You also need the 52 GB PLE n-gram volume, which is not in this repository.** It is the same file
-> as for the NVIDIA conversions; download
+> **You also need a PLE n-gram volume, which is not in this repository.** The recommended one is the
+> 52 GB FP8 volume, the same file as for the NVIDIA conversions:
 > **[`Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram`](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix/blob/main/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram)**
 > from [Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix)
-> (the Dense8 repository has an identical copy), put it on an NVMe drive and pass it with
-> `--ngram-volume`:
+> (the Dense8 repository has an identical copy). The 109 GB BF16 volume
+> ([Qwen3.8-Flash-Next-FP8-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-FP8-Infernix))
+> and the 29 GB IQ4_NL volume
+> ([Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix))
+> also run it. Put the volume on an NVMe drive and pass it with `--ngram-volume`:
 >
 > ```text
 > hf download Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram --local-dir <nvme dir>
 > ```
 >
-> If you already run either NVIDIA conversion, use the volume you have. [`NGRAM-VOLUME.md`](NGRAM-VOLUME.md)
-> in this repository repeats these links.
+> If you already have a volume for another Flash-Next conversion, use it. See
+> [PLE n-gram tables](#ple-n-gram-tables); [`NGRAM-VOLUME.md`](NGRAM-VOLUME.md) in this repository
+> repeats these links.
 
 orcarouter's [Qwen3.8-Flash-Next-Uncensored-NVFP4](https://huggingface.co/orcarouter/Qwen3.8-Flash-Next-Uncensored-NVFP4)
 (revision `cddc6ec5`) — 48 layers, 512 routed experts per layer (top-10), an MTP drafter and vision
@@ -65,7 +69,11 @@ conversion stores in 8 bits are stored in 8 bits here as well.
 > [Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix)
 > and the bit-exact
 > [Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix),
-> both from NVIDIA's (not abliterated) checkpoint.
+> both from NVIDIA's (not abliterated) checkpoint;
+> [Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix)
+> (faster) and the bit-exact
+> [Qwen3.8-Flash-Next-FP8-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-FP8-Infernix)
+> (slower, most accurate), from ISTA-DASLab's GGUF and Qwen's FP8 checkpoint.
 
 ## Files
 
@@ -75,17 +83,41 @@ conversion stores in 8 bits are stored in 8 bits here as well.
 | `Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix-00002-of-00003.infernix` | 32,000,000,000 | model, part 2 of 3 |
 | `Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix-00003-of-00003.infernix` | 12,302,074,624 | model, part 3 of 3 |
 | `Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix.conversion.json` | 967,282 | conversion report: sources, methods and formats per object |
-| `NGRAM-VOLUME.md` | | where to download the n-gram volume (not in this repository) |
+| `NGRAM-VOLUME.md` | | where to download an n-gram volume (none is in this repository) |
 | `LICENSE` | | the Qwen Community License 1.0 of the base model (see [License](#license)) |
 
 Keep the three model parts in one directory and give Infernix part 1, as with a split GGUF.
 
-**PLE n-gram volume.** The abliteration left the n-gram table untouched: quantized to FP8 by the
-rule NVIDIA uses, it equals NVIDIA's table byte for byte (all 320,001,536 rows checked). So this
-model uses the same 52 GB volume as the NVIDIA conversions,
-`Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram` from
-[Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix).
-Put it on an NVMe drive and pass it with `--ngram-volume`; one copy serves all three models.
+## PLE n-gram tables
+
+Qwen3.8-Flash-Next's PLE n-gram table (320,001,536 rows) is not in the model files: it is a
+separate volume, read in random 4 KiB blocks from an NVMe drive and passed with `--ngram-volume`.
+Three volumes of the table exist, one per row format, none of them in this repository, and any of
+them runs any Qwen3.8-Flash-Next model. **The FP8 volume is the recommended one.**
+
+| Table | File | Bytes | Download from |
+|---|---|---:|---|
+| **FP8**, one scale for the table (NVIDIA's), **recommended** | `Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram` | 52,429,058,048 | [Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix/blob/main/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram), or the identical copy in [Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix/blob/main/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram) |
+| BF16, unquantized (Qwen's) | `Qwen3.8-Flash-Next-BF16.ngram` | 109,227,196,416 | [Qwen3.8-Flash-Next-FP8-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-FP8-Infernix/blob/main/Qwen3.8-Flash-Next-BF16.ngram) |
+| IQ4_NL, 4.5 bits per value (ISTA-DASLab's GSQ-RCO GGUF) | `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix.ngram` | 29,127,258,112 | [Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix/blob/main/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix.ngram) |
+
+```text
+hf download Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram --local-dir <nvme dir>
+hf download Wallawalla47/Qwen3.8-Flash-Next-FP8-Infernix Qwen3.8-Flash-Next-BF16.ngram --local-dir <nvme dir>
+hf download Wallawalla47/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix.ngram --local-dir <nvme dir>
+```
+
+One copy of a volume serves every Flash-Next model.
+
+orcarouter's checkpoint stores the table in BF16. The abliteration left it untouched as far as FP8
+can tell: quantized to FP8 by the rule NVIDIA uses, it equals NVIDIA's table byte for byte (all
+320,001,536 rows checked). So this model was converted with the FP8 table, and every figure below
+was measured with it. The BF16 volume holds Qwen's table, which has not been compared with
+orcarouter's value for value (the FP8 match is all that was checked); the IQ4_NL table rounds it to
+4.5 bits per value. Neither has been measured on this model (on the GSQ-RCO IQ3_S conversion, BF16
+lowered perplexity from 3.5223 to 3.5198). On a 96 GB machine no table fits in RAM beside this
+model's experts, so each is read from the drive. Older Infernix builds run this artifact with the
+FP8 and BF16 volumes only.
 
 ## What is bit-exact and what is quantized
 

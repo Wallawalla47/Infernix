@@ -62,6 +62,35 @@ for the full model to verify, is quantized further.
 Keep the three model parts in one directory and give Infernix part 1, as with a split GGUF. Put the
 n-gram volume on an NVMe drive and pass it with `--ngram-volume`.
 
+## PLE n-gram tables
+
+Qwen3.8-Flash-Next's PLE n-gram table (320,001,536 rows) is not in the model files: it is a
+separate volume, read in random 4 KiB blocks from an NVMe drive and passed with `--ngram-volume`.
+Three volumes of the table exist, one per row format, and any of them runs any Qwen3.8-Flash-Next
+model. **The FP8 volume is the recommended one.**
+
+| Table | File | Bytes | Download from |
+|---|---|---:|---|
+| **FP8**, one scale for the table (NVIDIA's), **recommended** | `Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram` | 52,429,058,048 | this repository, or the identical copy in [Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix/blob/main/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram) |
+| BF16, unquantized (Qwen's) | `Qwen3.8-Flash-Next-BF16.ngram` | 109,227,196,416 | [Qwen3.8-Flash-Next-FP8-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-FP8-Infernix/blob/main/Qwen3.8-Flash-Next-BF16.ngram) |
+| IQ4_NL, 4.5 bits per value (ISTA-DASLab's GSQ-RCO GGUF) | `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix.ngram` | 29,127,258,112 | [Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix/blob/main/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix.ngram) |
+
+```text
+hf download Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram --local-dir <nvme dir>
+hf download Wallawalla47/Qwen3.8-Flash-Next-FP8-Infernix Qwen3.8-Flash-Next-BF16.ngram --local-dir <nvme dir>
+hf download Wallawalla47/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix.ngram --local-dir <nvme dir>
+```
+
+One copy of a volume serves every Flash-Next model.
+
+This artifact was converted with the FP8 table, NVIDIA's own rows byte for byte, and every figure
+below was measured with it; only with it is the main model bit-exact to NVIDIA's checkpoint.
+NVIDIA's FP8 rows are Qwen's BF16 table quantized, so with the BF16 volume the PLE uses Qwen's
+values unrounded; the IQ4_NL table rounds them to 4.5 bits per value. Neither has been measured on
+this model (on the GSQ-RCO IQ3_S conversion, BF16 lowered perplexity from 3.5223 to 3.5198). On a
+96 GB machine no table fits in RAM beside this model's experts, so each is read from the drive.
+Older Infernix builds run this artifact with the FP8 and BF16 volumes only.
+
 ## What is bit-exact and what is quantized
 
 Converted from [nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4)

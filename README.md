@@ -299,46 +299,63 @@ first; reads through `/mnt/` are slow.
 
 ## Models
 
-- **[Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix)**
-  (**recommended** for Qwen3.8-Flash-Next): [nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4)
-  with NVIDIA's NVFP4 experts and n-gram table bit-exact and the dense projections in 8 bits. It
-  decodes about 22 % faster than the bit-exact conversion at the same quality (perplexity 4.654
-  against 4.666).
-- **[Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix)**:
-  every weight the model computes with exactly as NVIDIA stores it, for when the weights must be
-  unchanged.
-- **[Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix)**:
-  [orcarouter/Qwen3.8-Flash-Next-Uncensored-NVFP4](https://huggingface.co/orcarouter/Qwen3.8-Flash-Next-Uncensored-NVFP4),
-  an abliterated build of Qwen3.8-Flash-Next whose refusal behaviour has been removed (see its model
-  card). Its weight-only NVFP4 experts and FP8 dense projections are kept bit-exact and run with BF16
-  activations; the other dense classes are stored in 8 bits as in Dense8. Perplexity 4.772 (Strata's
-  base-model GGUF 4.844, NVIDIA Dense8 4.653: abliteration changes the weights). It needs Infernix
-  `windows-2026.10.09.2` or later; earlier releases refuse it.
-- **[Swift-1.5-Qwen3.8-Flash-Next-NVFP4-Dense8-Infernix](https://huggingface.co/Wallawalla47/Swift-1.5-Qwen3.8-Flash-Next-NVFP4-Dense8-Infernix)**:
-  [ukisai/Swift-1.5-Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-NVFP4),
-  UkisAI's fine-tune of Qwen3.8-Flash-Next that thinks with fewer tokens (see its model card),
-  converted like NVIDIA Dense8: experts bit-exact, dense projections in 8 bits. Smoke-tested; its
-  quality and speed are not yet measured.
-- **[Qwen3.8-27B-NVIDIA-NVFP4-NInferV3](https://huggingface.co/Wallawalla47/Qwen3.8-27B-NVIDIA-NVFP4-NInferV3)**
-  (**recommended** for the 27B): [nvidia/Qwen3.8-27B-NVFP4](https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4)
-  with a DFlash2 draft model and a proposal head for `--lm-head-draft`.
-- **[Qwen3.8-27B-Quasar-NVFP4-NInferV3](https://huggingface.co/Wallawalla47/Qwen3.8-27B-Quasar-NVFP4-NInferV3)**:
-  the QAT-trained [QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4](https://huggingface.co/QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4),
-  with the same draft model and proposal head.
-- **[Qwen3.8-27B-Uncensored-NVFP4-NInferV3](https://huggingface.co/Wallawalla47/Qwen3.8-27B-Uncensored-NVFP4-NInferV3)**:
-  [orcarouter/Qwen3.8-27B-Uncensored-NVFP4](https://huggingface.co/orcarouter/Qwen3.8-27B-Uncensored-NVFP4),
-  an abliterated build of Qwen3.8-27B whose safety alignment has been substantially removed (see its
-  model card), with the same draft model and proposal head.
-- **[Swift-Qwen3.8-27B-NVFP4-NInferV3](https://huggingface.co/Wallawalla47/Swift-Qwen3.8-27B-NVFP4-NInferV3)**:
-  [ukisai/Swift-Qwen3.8-27B-NVFP4](https://huggingface.co/ukisai/Swift-Qwen3.8-27B-NVFP4), UkisAI's
-  token-efficient fine-tune of Qwen3.8-27B in NVIDIA's NVFP4/FP8 layout, converted like the NVIDIA
-  artifact with the same draft model and proposal head. Smoke-tested on Infernix and NInfer; its
-  quality and speed are not yet measured.
+Every model Infernix supports, with the Hugging Face repository to download it from. Each
+repository's model card gives its files, requirements, recommended command, quality and speed.
+`python -m tools.convert` converts your own checkpoints of these architectures
+([weight conversion](docs/weight-conversion.md)).
 
-All four Flash-Next conversions use the same 52 GB n-gram volume,
-[`Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram`](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix/blob/main/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram)
-(the uncensored and Swift repos do not carry their own copy). `python -m tools.convert` converts
-your own checkpoints ([weight conversion](docs/weight-conversion.md)).
+### Qwen3.8-Flash-Next
+
+| Repository | Converted from | What it is |
+|---|---|---|
+| **[Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix)** (**recommended**) | [nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) | NVIDIA's NVFP4 experts and FP8 n-gram table bit-exact, the dense projections in 8 bits. It decodes about 22 % faster than the bit-exact conversion at the same quality (perplexity 4.654 against 4.666) and is the one benchmarked [above](#qwen38-flash-next-nvfp4-infernix-vs-strata). |
+| [Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix) | [nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) | Every weight the model computes with exactly as NVIDIA stores it, for when the weights must be unchanged. |
+| [Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix) | [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) (`IQ3_S`) | Every GGUF tensor bit-exact, computed in exact integer arithmetic, plus an MTP drafter and vision. The fastest decode: 146 tok/s plain and 260 with MTP against Dense8's 110 and 143 in the same session, with the experts in 46.9 GiB of RAM. Long prompts prefill slower than NVFP4 (4,324 against 10,933 tok/s at 131K tokens). |
+| [Qwen3.8-Flash-Next-FP8-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-FP8-Infernix) | [Qwen/Qwen3.8-Flash-Next-FP8](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8) | Qwen's FP8 checkpoint bit-exact, with Qwen's BF16 n-gram table: the most accurate conversion and the slowest (about 44 tok/s plain), since its 112.6 GiB of experts exceed what a 96 GB machine can pin and the SSD tier reads the rest. |
+| [Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix) | [orcarouter/Qwen3.8-Flash-Next-Uncensored-NVFP4](https://huggingface.co/orcarouter/Qwen3.8-Flash-Next-Uncensored-NVFP4) | An abliterated build whose refusal behaviour has been removed (see its model card). Its weight-only NVFP4 experts and FP8 dense projections are kept bit-exact and run with BF16 activations; the other dense classes are stored in 8 bits as in Dense8. Perplexity 4.772 (Strata's base-model GGUF 4.844, NVIDIA Dense8 4.653: abliteration changes the weights). Needs Infernix `windows-2026.10.09.2` or later. |
+| [Swift-1.5-Qwen3.8-Flash-Next-NVFP4-Dense8-Infernix](https://huggingface.co/Wallawalla47/Swift-1.5-Qwen3.8-Flash-Next-NVFP4-Dense8-Infernix) | [ukisai/Swift-1.5-Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-NVFP4) | UkisAI's fine-tune that thinks with fewer tokens (see its model card), converted like NVIDIA Dense8: experts bit-exact, dense projections in 8 bits. Smoke-tested; its quality and speed are not yet measured. |
+
+On the 1M-token perplexity corpus (4,096-token context, INT8 KV) the FP8 conversion scores 3.487,
+NVIDIA Dense8 3.508 and IQ3_S 3.522. The IQ3_S and FP8 conversions need an Infernix built from
+`main` after `windows-2026.10.11`; no release holds their recipes yet.
+
+Every Flash-Next conversion also needs a PLE n-gram volume (`--ngram-volume`), kept apart from the
+model files and read from an NVMe drive. There are three, one per row format, and any of them runs
+any Flash-Next conversion; **the FP8 volume is the recommended one**:
+
+| Volume | Format | Bytes | Repository |
+|---|---|---:|---|
+| [`Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram`](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix/blob/main/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram) (**recommended**) | FP8, one scale for the table (NVIDIA's) | 52,429,058,048 | [Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix), identical copy in [Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix) |
+| [`Qwen3.8-Flash-Next-BF16.ngram`](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-FP8-Infernix/blob/main/Qwen3.8-Flash-Next-BF16.ngram) | BF16, unquantized (Qwen's) | 109,227,196,416 | [Qwen3.8-Flash-Next-FP8-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-FP8-Infernix) |
+| [`Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix.ngram`](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix/blob/main/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix.ngram) | IQ4_NL, 4.5 bits per value (the GSQ-RCO GGUF's) | 29,127,258,112 | [Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix) |
+
+Each conversion was made and measured with one of them: the four NVFP4 conversions with the FP8
+table, IQ3_S with its IQ4_NL table and FP8 with the BF16 table; the uncensored and Swift
+repositories carry no volume. Older Infernix builds accept only an artifact's own table or BF16.
+The [BF16 n-gram table](docs/qwen3_8-flash-next.md#bf16-n-gram-table) section of the guide explains
+the formats.
+
+### Qwen3.8-27B
+
+| Repository | Converted from | What it is |
+|---|---|---|
+| **[Qwen3.8-27B-NVIDIA-NVFP4-NInferV3](https://huggingface.co/Wallawalla47/Qwen3.8-27B-NVIDIA-NVFP4-NInferV3)** (**recommended**) | [nvidia/Qwen3.8-27B-NVFP4](https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4) | NVIDIA's NVFP4 checkpoint with a DFlash2 draft model and a proposal head for `--lm-head-draft`. |
+| [Qwen3.8-27B-Quasar-NVFP4-NInferV3](https://huggingface.co/Wallawalla47/Qwen3.8-27B-Quasar-NVFP4-NInferV3) | [QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4](https://huggingface.co/QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4) | The QAT-trained NVFP4 model, with the same draft model and proposal head. |
+| [Qwen3.8-27B-Uncensored-NVFP4-NInferV3](https://huggingface.co/Wallawalla47/Qwen3.8-27B-Uncensored-NVFP4-NInferV3) | [orcarouter/Qwen3.8-27B-Uncensored-NVFP4](https://huggingface.co/orcarouter/Qwen3.8-27B-Uncensored-NVFP4) | An abliterated build whose safety alignment has been substantially removed (see its model card), with the same draft model and proposal head. |
+| [Swift-Qwen3.8-27B-NVFP4-NInferV3](https://huggingface.co/Wallawalla47/Swift-Qwen3.8-27B-NVFP4-NInferV3) | [ukisai/Swift-Qwen3.8-27B-NVFP4](https://huggingface.co/ukisai/Swift-Qwen3.8-27B-NVFP4) | UkisAI's token-efficient fine-tune in NVIDIA's NVFP4/FP8 layout, converted like the NVIDIA artifact with the same draft model and proposal head. Smoke-tested on Infernix and NInfer; its quality and speed are not yet measured. |
+| [neroued/Qwen3.8-27B-nvfp4-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) | [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) | NInfer's official NVFP4 artifact, the one benchmarked [above](#qwen38-27b-infernix-vs-ninfer). |
+| [neroued/Qwen3.8-27B-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) | NInfer's official `groupwise-int` artifact. |
+
+### Qwen3.6
+
+| Repository | Converted from | What it is |
+|---|---|---|
+| [neroued/Qwen3.6-27B-NInfer](https://huggingface.co/neroued/Qwen3.6-27B-NInfer) | [Qwen/Qwen3.6-27B](https://huggingface.co/Qwen/Qwen3.6-27B) | NInfer's official `groupwise-int` artifact. |
+| [neroued/Qwen3.6-27B-nvfp4-NInfer](https://huggingface.co/neroued/Qwen3.6-27B-nvfp4-NInfer) | [Qwen/Qwen3.6-27B](https://huggingface.co/Qwen/Qwen3.6-27B) | NInfer's official NVFP4 artifact. |
+| [neroued/Qwen3.6-35B-A3B-NInfer](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) | [Qwen/Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) | NInfer's official `groupwise-int` artifact of the MoE model, with a DFlash drafter. |
+
+The `neroued` artifacts are NInfer's (Infernix loads `.ninfer` files unchanged); their model cards
+are versioned in [`model-cards/`](model-cards/) beside those of the other repositories.
 
 ## Documentation
 

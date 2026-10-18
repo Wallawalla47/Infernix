@@ -36,8 +36,9 @@ Infernix's SSD expert tier keeps as many as fit in pinned host RAM and reads the
 artifact; a VRAM cache holds the hot ones, and the CPU computes part of each layer's misses.
 
 **The main model and the vision tower are bit-exact to Qwen's checkpoint**: every expert keeps its
-E4M3FN codes and BF16 128×128 tile scales, every BF16 or FP32 tensor keeps its values, and the PLE
-n-gram table is Qwen's BF16 table, of which the checkpoint's FP8 table is the quantization. Infernix
+E4M3FN codes and BF16 128×128 tile scales, every BF16 or FP32 tensor keeps its values, and with
+this repository's n-gram volume the PLE n-gram table is Qwen's BF16 table, of which the
+checkpoint's FP8 table is the quantization (see [PLE n-gram tables](#ple-n-gram-tables)). Infernix
 computes the experts with BF16 activations in exact integer arithmetic, rounded once, so the result
 has the same bits wherever an expert runs (VRAM, PCIe, CPU, SSD). Only the MTP drafter, which
 proposes tokens for the full model to verify, is quantized further.
@@ -62,8 +63,34 @@ This is the most accurate Flash-Next artifact for Infernix, and the slowest: see
 Keep the five model parts in one directory and give Infernix part 1, as with a split GGUF. Put the
 n-gram volume on an NVMe drive and pass it with `--ngram-volume`.
 
-The BF16 n-gram volume also runs Infernix's other Qwen3.8-Flash-Next conversions in place of their
-quantized tables (`--ngram-volume <nvme>/Qwen3.8-Flash-Next-BF16.ngram`).
+## PLE n-gram tables
+
+Qwen3.8-Flash-Next's PLE n-gram table (320,001,536 rows) is not in the model files: it is a
+separate volume, read in random 4 KiB blocks from an NVMe drive (or held in RAM when it fits) and
+passed with `--ngram-volume`. Three volumes of the table exist, one per row format, and any of them
+runs any Qwen3.8-Flash-Next model. **The FP8 volume is the recommended one.**
+
+| Table | File | Bytes | Download from |
+|---|---|---:|---|
+| **FP8**, one scale for the table (NVIDIA's), **recommended** | `Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram` | 52,429,058,048 | [Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix/blob/main/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram), or the identical copy in [Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix/blob/main/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram) |
+| BF16, unquantized (Qwen's) | `Qwen3.8-Flash-Next-BF16.ngram` | 109,227,196,416 | this repository |
+| IQ4_NL, 4.5 bits per value (ISTA-DASLab's GSQ-RCO GGUF) | `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix.ngram` | 29,127,258,112 | [Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix/blob/main/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix.ngram) |
+
+```text
+hf download Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram --local-dir <nvme dir>
+hf download Wallawalla47/Qwen3.8-Flash-Next-FP8-Infernix Qwen3.8-Flash-Next-BF16.ngram --local-dir <nvme dir>
+hf download Wallawalla47/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix.ngram --local-dir <nvme dir>
+```
+
+One copy of a volume serves every Flash-Next model.
+
+This artifact was converted with the BF16 table, the one in this repository: with it the PLE uses
+Qwen's BF16 values unrounded, the whole main model is bit-exact to Qwen's checkpoint, and the
+[Quality](#quality) and [Performance](#performance) figures below were measured with it. The FP8
+and IQ4_NL tables round those values (FP8 with one scale for the whole table, IQ4_NL to 4.5 bits per
+value); their effect on this model has not been measured. On a 96 GB machine no table fits in RAM
+beside this model's experts, so each is read from the drive. Older Infernix builds run this
+artifact with the BF16 volume only.
 
 ## What is bit-exact and what is quantized
 
@@ -96,20 +123,24 @@ tensors are listed, not compared).
 
 - **GPU:** NVIDIA RTX 5090 (Blackwell, `sm_120a`), all of its 32 GB.
 - **RAM:** as much as possible. Infernix pins what the operating system allows (on a 96 GB Windows
-  machine, 73.9 GiB of the 112.6 GiB of experts) and reads the rest from the artifact; the 101.7 GiB
-  BF16 n-gram table is read from its volume.
-- **Disk:** ~133 GB for the artifact on a fast NVMe drive (the SSD tier reads from it), plus the
-  109 GB n-gram volume on an NVMe drive.
+  machine, 73.9 GiB of the 112.6 GiB of experts) and reads the rest from the artifact; the n-gram
+  table is read from its volume.
+- **Disk:** ~133 GB for the artifact on a fast NVMe drive (the SSD tier reads from it), plus an
+  n-gram volume on an NVMe drive: 52 GB for the recommended FP8 table, 109 GB for this repository's
+  BF16 one.
 - **Engine:** [Infernix](https://github.com/Wallawalla47/Infernix) (Windows or Linux).
 
 ## Run
 
 ```text
 infernix-serve Qwen3.8-Flash-Next-FP8-Infernix-00001-of-00005.infernix \
-  --ngram-volume <nvme>/Qwen3.8-Flash-Next-BF16.ngram \
+  --ngram-volume <nvme>/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram \
   --max-context 262144 --kv-dtype int8 \
   --spec mtp --draft-tokens auto --lm-head-draft --max-concurrency 2
 ```
+
+The command uses the recommended FP8 n-gram table; for the bit-exact BF16 table, with which the
+figures below were measured, pass `--ngram-volume <nvme>/Qwen3.8-Flash-Next-BF16.ngram` instead.
 
 N-gram copy drafts (`--ngram-draft-tokens 7`) speed up highly repetitive text (the benchmark row
 below) but made no difference in a replayed agentic coding workload, so the command leaves them

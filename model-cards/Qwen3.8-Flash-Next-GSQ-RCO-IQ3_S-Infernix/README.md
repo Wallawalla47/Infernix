@@ -36,8 +36,8 @@ ISTA-DASLab's [Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASL
 GSQ with RCO's per-tensor bit allocation — packed for [Infernix](https://github.com/Wallawalla47/Infernix),
 a C++/CUDA engine that runs it on **one RTX 5090** (32 GB), with an MTP drafter and vision. The
 24,576 routed experts (46.9 GiB) live in pinned host RAM, a VRAM cache holds the hot ones, the CPU
-computes part of each layer's misses, and the 29 GB PLE n-gram table is held in RAM too when it fits
-(read from an NVMe drive otherwise).
+computes part of each layer's misses, and the PLE n-gram table is read from an NVMe drive (or held
+in RAM when it fits, as this repository's 29 GB IQ4_NL table does on a 96 GB machine).
 
 Every GGUF tensor is kept bit for bit, and Infernix computes them with BF16 activations in exact
 integer arithmetic: each output is the exact sum of the GGUF weights times the activations, rounded
@@ -57,6 +57,35 @@ width. (llama.cpp rounds the activations to 8 bits instead, so its logits differ
 
 Keep the two model parts in one directory and give Infernix part 1, as with a split GGUF. Put the
 n-gram volume on an NVMe drive and pass it with `--ngram-volume`.
+
+## PLE n-gram tables
+
+Qwen3.8-Flash-Next's PLE n-gram table (320,001,536 rows) is not in the model files: it is a
+separate volume, read in random 4 KiB blocks from an NVMe drive (or held in RAM when it fits) and
+passed with `--ngram-volume`. Three volumes of the table exist, one per row format, and any of them
+runs any Qwen3.8-Flash-Next model. **The FP8 volume is the recommended one.**
+
+| Table | File | Bytes | Download from |
+|---|---|---:|---|
+| **FP8**, one scale for the table (NVIDIA's), **recommended** | `Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram` | 52,429,058,048 | [Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix/blob/main/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram), or the identical copy in [Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix/blob/main/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram) |
+| BF16, unquantized (Qwen's) | `Qwen3.8-Flash-Next-BF16.ngram` | 109,227,196,416 | [Qwen3.8-Flash-Next-FP8-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-FP8-Infernix/blob/main/Qwen3.8-Flash-Next-BF16.ngram) |
+| IQ4_NL, 4.5 bits per value (ISTA-DASLab's GSQ-RCO GGUF) | `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix.ngram` | 29,127,258,112 | this repository |
+
+```text
+hf download Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram --local-dir <nvme dir>
+hf download Wallawalla47/Qwen3.8-Flash-Next-FP8-Infernix Qwen3.8-Flash-Next-BF16.ngram --local-dir <nvme dir>
+hf download Wallawalla47/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix.ngram --local-dir <nvme dir>
+```
+
+One copy of a volume serves every Flash-Next model.
+
+This artifact was converted with the IQ4_NL table, the one in this repository (the GGUF's own rows,
+byte for byte), and the [Quality](#quality) and [Performance](#performance) figures below were
+measured with it held in RAM. With the BF16 table perplexity measured slightly better (3.5198
+against 3.5223); the FP8 table has not been measured on this model. On a 96 GB machine only the
+IQ4_NL table (27.1 GiB) fits in RAM beside the experts; the FP8 (48.8 GiB) and BF16 (101.7 GiB)
+tables are read from the drive. Older Infernix builds run this artifact with the IQ4_NL and BF16
+volumes only.
 
 ## What is bit-exact and what is quantized
 
@@ -94,20 +123,26 @@ rows.
 ## Requirements
 
 - **GPU:** NVIDIA RTX 5090 (Blackwell, `sm_120a`), all of its 32 GB.
-- **RAM:** 46.9 GiB for the experts, and 27.1 GiB more to hold the n-gram table in RAM (the default
-  when it fits; otherwise its rows are read from the volume as needed). With less RAM, Infernix's SSD
-  expert tier keeps what fits and reads the rest from the artifact (slower).
-- **Disk:** ~57 GB for the artifact, plus the 29 GB n-gram volume on an NVMe drive.
+- **RAM:** 46.9 GiB for the experts, and to hold the n-gram table in RAM (the default when it
+  fits; otherwise its rows are read from the volume as needed) 27.1 GiB more for the IQ4_NL table or
+  48.8 GiB for the FP8 one. With less RAM, Infernix's SSD expert tier keeps what fits and reads the
+  rest from the artifact (slower).
+- **Disk:** ~57 GB for the artifact, plus an n-gram volume on an NVMe drive: 52 GB for the
+  recommended FP8 table, 29 GB for this repository's IQ4_NL one.
 - **Engine:** [Infernix](https://github.com/Wallawalla47/Infernix) (Windows or Linux).
 
 ## Run
 
 ```text
 infernix-serve Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix-00001-of-00002.infernix \
-  --ngram-volume <nvme>/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix.ngram \
+  --ngram-volume <nvme>/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram \
   --max-context 262144 --kv-dtype int8 \
   --spec mtp --draft-tokens auto --lm-head-draft --max-concurrency 2
 ```
+
+The command uses the recommended FP8 n-gram table; for this repository's IQ4_NL table, with which
+the figures below were measured, pass
+`--ngram-volume <nvme>/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix.ngram` instead.
 
 N-gram copy drafts (`--ngram-draft-tokens 7`) speed up highly repetitive text (the benchmark row
 below) but were level within 1 % in a replayed agentic coding workload, so the command leaves them
@@ -119,10 +154,6 @@ covers the KV formats, YaRN beyond 262K, images and video, the prefix cache, the
 and tuning. This artifact stores the checkpoint's own chat template; `--chat-template qwen3_8.jinja`
 (the maintained Qwen3.8 template, in the release zip's `chat_templates`) keeps a System message
 that arrives after the first turn in place.
-
-The BF16 n-gram table (Qwen's unquantized one, 109 GB) also runs this model, with
-`--ngram-volume <nvme>/Qwen3.8-Flash-Next-BF16.ngram`; it is in
-[Qwen3.8-Flash-Next-FP8-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-FP8-Infernix).
 
 ## Quality
 
