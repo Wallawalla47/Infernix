@@ -29,6 +29,7 @@ add_library(infernix_core STATIC
   tensor.cpp
   weight_view.cpp
   decode_graph.cpp
+  decode_graph_gate.cu
 )
 infernix_internal_includes(infernix_core)
 infernix_cuda_archive(infernix_core)

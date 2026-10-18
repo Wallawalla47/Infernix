@@ -2,10 +2,16 @@
 
 #include <cuda_runtime.h>
 
+#include <cstdint>
 #include <functional>
 #include <stdexcept>
 
 namespace infernix {
+
+// Enqueues on `stream` a one-thread kernel that sets the CUDA Graph conditional `handle` to 0 when
+// `*value < threshold` and to 1 otherwise (NaN included), the float widened to binary64 as a host
+// comparison of a float with a double does. Only inside a graph that owns `handle`.
+void launch_graph_gate(const float* value, double threshold, cudaGraphConditionalHandle handle, cudaStream_t stream);
 
 // A CUDA Graph executable found no device memory to instantiate or upload into. The device stays
 // usable (the error is not sticky), so a caller may free memory and retry; every other CUDA error
@@ -26,6 +32,13 @@ public:
     DecodeGraphDefinition& operator=(DecodeGraphDefinition&& other) noexcept;
 
     void capture(cudaStream_t stream, const std::function<void()>& body);
+    // Captures `steps` bodies as one chain in which body j > 0 runs only while the gates pass:
+    // `gate(j, handle)` enqueues on `stream`, after body j, the kernel that sets `handle`
+    // (launch_graph_gate), and body j + 1 is captured into the IF node that handle controls, so a
+    // gate that clears it skips every later body. Bodies hold only what a conditional body may:
+    // kernels, device copies and sets (no event, host or host-memory copy nodes).
+    void capture_gated_chain(cudaStream_t stream, std::int32_t steps, const std::function<void(std::int32_t)>& body,
+                             const std::function<void(std::int32_t, cudaGraphConditionalHandle)>& gate);
     [[nodiscard]] bool ready() const noexcept;
     void reset() noexcept;
 

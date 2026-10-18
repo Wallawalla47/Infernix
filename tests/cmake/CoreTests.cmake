@@ -38,6 +38,9 @@ set_tests_properties(infernix_device_sync_empty_test PROPERTIES
 infernix_add_test(infernix_decode_graph_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_decode_graph.cpp"
   LIBRARIES infernix_core)
 
+infernix_add_test(infernix_decode_graph_gated_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_decode_graph_gated.cu"
+  LIBRARIES infernix_core)
+
 infernix_add_test(infernix_tensor_test       SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_tensor.cpp"
   LIBRARIES infernix_core)
 
@@ -74,6 +77,7 @@ infernix_add_test(infernix_gdn_replay_records_test
 set_tests_properties(
   infernix_device_test
   infernix_decode_graph_test
+  infernix_decode_graph_gated_test
   infernix_arena_test
   infernix_copy_batch_test
   infernix_block_copy_test

@@ -3,6 +3,7 @@
 #include "core/device.h"
 #include "core/nvtx.h"
 
+#include <cstddef>
 #include <cstdio>
 #include <stdexcept>
 #include <string>
@@ -82,6 +83,63 @@ void DecodeGraphDefinition::capture(cudaStream_t stream, const std::function<voi
     }
 
     graph_ = graph;
+}
+
+void DecodeGraphDefinition::capture_gated_chain(
+    cudaStream_t stream, std::int32_t steps, const std::function<void(std::int32_t)>& body,
+    const std::function<void(std::int32_t, cudaGraphConditionalHandle)>& gate) {
+    nvtx::ScopedRange capture_range(nvtx::Name::CudaGraphCapture, nvtx::Category::Graph);
+    if (steps < 1) { throw std::invalid_argument("a gated graph chain needs at least one step"); }
+    reset();
+
+    cudaGraph_t chain = nullptr;
+    CUDA_CHECK(cudaGraphCreate(&chain, 0));
+    // Body j is captured into `target`: the chain itself for j = 0, else the IF body that the gate
+    // after body j - 1 controls (owned by its conditional node, so by the chain).
+    cudaGraph_t target = chain;
+    try {
+        for (std::int32_t j = 0; j < steps; ++j) {
+            CUDA_CHECK(cudaStreamBeginCaptureToGraph(stream, target, nullptr, nullptr, 0,
+                                                     cudaStreamCaptureModeThreadLocal));
+            cudaGraph_t next = nullptr;
+            try {
+                body(j);
+                if (j + 1 < steps) {
+                    cudaGraphConditionalHandle handle{};
+                    CUDA_CHECK(cudaGraphConditionalHandleCreate(&handle, target, 0, cudaGraphCondAssignDefault));
+                    gate(j, handle);
+                    cudaStreamCaptureStatus status   = cudaStreamCaptureStatusNone;
+                    cudaGraph_t captured             = nullptr;
+                    const cudaGraphNode_t* leaves    = nullptr;
+                    const cudaGraphEdgeData* edges   = nullptr;
+                    std::size_t count                = 0;
+                    CUDA_CHECK(cudaStreamGetCaptureInfo(stream, &status, nullptr, &captured, &leaves, &edges, &count));
+                    cudaGraphNodeParams params{};
+                    params.type               = cudaGraphNodeTypeConditional;
+                    params.conditional.handle = handle;
+                    params.conditional.type   = cudaGraphCondTypeIf;
+                    params.conditional.size   = 1;
+                    cudaGraphNode_t node      = nullptr;
+                    CUDA_CHECK(cudaGraphAddNode(&node, captured, leaves, edges, count, &params));
+                    CUDA_CHECK(cudaStreamUpdateCaptureDependencies(stream, &node, nullptr, 1,
+                                                                   cudaStreamSetCaptureDependencies));
+                    next = params.conditional.phGraph_out[0];
+                }
+            } catch (...) {
+                // The capture's graph is `target`, which the chain owns: end it without destroying it.
+                cudaGraph_t ended = nullptr;
+                log_cuda_error("cudaStreamEndCapture(discard)", cudaStreamEndCapture(stream, &ended));
+                throw;
+            }
+            cudaGraph_t captured = nullptr;
+            CUDA_CHECK(cudaStreamEndCapture(stream, &captured));
+            target = next;
+        }
+    } catch (...) {
+        destroy_graph(chain);
+        throw;
+    }
+    graph_ = chain;
 }
 
 bool DecodeGraphDefinition::ready() const noexcept { return graph_ != nullptr; }

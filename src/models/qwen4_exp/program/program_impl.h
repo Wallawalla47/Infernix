@@ -3571,6 +3571,28 @@ private:
         }
     }
 
+    // replay for a chain of `steps` bodies whose body j > 0 runs only while the gate after body
+    // j - 1 passes (DecodeGraphDefinition::capture_gated_chain). The eager first run runs every body.
+    void replay_gated(DecodeGraph& graph, std::int32_t steps, const std::function<void(std::int32_t)>& body,
+                      const std::function<void(std::int32_t, cudaGraphConditionalHandle)>& gate) {
+        const cudaStream_t s = device_.stream;
+        if (graph.executable.ready()) {
+            graph.executable.launch(s);
+        } else if (!graph.warmed) {
+            for (std::int32_t j = 0; j < steps; ++j) { body(j); }
+            graph.warmed = true;
+        } else {
+            if (wide_active_ || !next_waits_[0].empty() || !next_waits_[1].empty()) {
+                throw std::logic_error("Qwen4Exp: a graph capture inside a wide call or with pending layer waits");
+            }
+            const std::size_t free_before = trace_ ? trace_free() : 0;
+            graph.definition.capture_gated_chain(s, steps, body, gate);
+            graph.executable.instantiate(graph.definition);
+            graph.executable.launch(s);
+            if (trace_) { trace_graph(graph, free_before); }
+        }
+    }
+
     // Device free bytes, and the route trace's record of a graph executable just instantiated
     // (its family and shape follow from the slot it occupies).
     static std::size_t trace_free() {
@@ -3586,7 +3608,8 @@ private:
             family = RouteTraceGraph::Verify;
             stride = max_width_;
         } else if (at < 0 && ((at = route_trace_index(mtp_draft_graphs_, &graph)) >= 0 ||
-                              (at = route_trace_index(mtp_sampled_graphs_, &graph)) >= 0)) {
+                              (at = route_trace_index(mtp_sampled_graphs_, &graph)) >= 0 ||
+                              (at = route_trace_index(mtp_gated_graphs_, &graph)) >= 0)) {
             family = RouteTraceGraph::MtpDraft;
             stride = mtp_k_;
         } else if (at < 0 && (at = route_trace_index(mtp_catch_graphs_, &graph)) >= 0) {
@@ -3996,6 +4019,7 @@ private:
         for (auto& d : mtp_drafts_) { d.assign(static_cast<std::size_t>(mtp_k_), 0); }
         mtp_catch_graphs_.resize(static_cast<std::size_t>(lanes) * max_width_);
         mtp_draft_graphs_.resize(static_cast<std::size_t>(lanes) * mtp_k_);
+        mtp_gated_graphs_.resize(static_cast<std::size_t>(mtp_k_));
         if (sampled_drafts_) { mtp_sampled_graphs_.resize(static_cast<std::size_t>(lanes) * mtp_k_); }
     }
 
@@ -4249,9 +4273,7 @@ private:
             }
             upload_pinned(configs_.p, configs, sizeof(ops::SamplingConfig) * batch, s);
         }
-        auto& draft_graphs = sampled ? mtp_sampled_graphs_ : mtp_draft_graphs_;
-        replay(draft_graphs[static_cast<std::size_t>(batch - 1) * mtp_k_ + (steps - 1)], [&] {
-        for (std::int32_t j = 0; j < steps; ++j) {
+        const auto draft_step = [&](std::int32_t j) {
             Tensor drafts(mtp_device(mtp_io_.drafts + static_cast<std::size_t>(j) * batch), DType::I32, {batch});
             const std::size_t step = 3ULL * static_cast<std::size_t>(batch) * j;
             // Sampled drafts: step j's top-rank scratch and proposal planes.
@@ -4286,8 +4308,25 @@ private:
                                .sample_logprobs  = plane(mtp_io_.sample_logprobs, kSampledDraftRanks, DType::FP32),
                                .draft_candidates = plane(mtp_io_.draft_candidates, C, DType::I32),
                                .draft_q          = plane(mtp_io_.draft_q, C, DType::FP32)});
+        };
+        // A one-row argmax round verifies its drafts only up to the first below --spec-min-p, so a
+        // draft step runs only while every earlier draft cleared it: the device applies the host's
+        // cut (the same binary64 comparison) and skips the steps whose drafts it would discard. A
+        // skipped step leaves its draft and confidence words stale, beyond the cut that reads them.
+        // (Design §19.3.27: 34 % of the steps of mixed-topic MTP 4 rounds, decode +2.2 %.)
+        if (!sampled && batch == 1 && steps > 1 && std::isfinite(draft_min_logprob_)) {
+            replay_gated(mtp_gated_graphs_[static_cast<std::size_t>(steps - 1)], steps, draft_step,
+                         [&](std::int32_t j, cudaGraphConditionalHandle next) {
+                             const auto* confidence =
+                                 reinterpret_cast<const float*>(mtp_device(mtp_io_.logprobs + static_cast<std::size_t>(j)));
+                             launch_graph_gate(confidence, draft_min_logprob_, next, s);
+                         });
+        } else {
+            auto& draft_graphs = sampled ? mtp_sampled_graphs_ : mtp_draft_graphs_;
+            replay(draft_graphs[static_cast<std::size_t>(batch - 1) * mtp_k_ + (steps - 1)], [&] {
+                for (std::int32_t j = 0; j < steps; ++j) { draft_step(j); }
+            });
         }
-        });
         CUDA_CHECK(cudaMemcpyAsync(mtp_host(mtp_io_.drafts), mtp_device(mtp_io_.drafts), 4ULL * steps * batch,
                                    cudaMemcpyDeviceToHost, s));
         CUDA_CHECK(cudaMemcpyAsync(mtp_host(mtp_io_.logprobs), mtp_device(mtp_io_.logprobs), 4ULL * steps * batch,
@@ -5035,6 +5074,7 @@ private:
     std::vector<DecodeGraph> mtp_draft_graphs_; // (batch - 1) * mtp_k_ + steps - 1
     // With sampled drafts, the same for rounds with a sampled row (greedy rounds keep the argmax).
     std::vector<DecodeGraph> mtp_sampled_graphs_;
+    std::vector<DecodeGraph> mtp_gated_graphs_; // one-row argmax rounds: steps - 1
     // Whether this round's MTP drafts were sampled (their proposals wait in the drafter's io).
     bool mtp_sampled_round_ = false;
     std::vector<DecodeGraph> mtp_catch_graphs_; // (batch - 1) * max_width_ + width - 1
