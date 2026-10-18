@@ -343,8 +343,13 @@ different route may ship, what it is measured against, how much it may cost, and
   change that alters any exact-route output bit is a *numerics change*. It is allowed only to fix
   a defect or to improve precision, and only when the gates of 6.5, with the previous exact route
   in the default role and the new one in the fast role, show the new route's estimated excess is
-  at most zero and its bound within budget (6.8 records each one). Speed alone never justifies an
-  exact-route numerics change: a faster route whose arithmetic differs is a fast path. The exact route is the quality
+  at most zero and its bound within budget (6.8 records each one). When the change also alters
+  the reference route's arithmetic (a kernel the 16-bit reference runs too), each build's reference
+  favours its own route, so the FP64 Op oracle decides which route is more precise, and the gate
+  above runs against that route's reference. A precision fix whose Op error against the oracle is
+  lower therefore runs the gate against the new route's reference, and the corpus NLL, which no
+  reference enters, must not rise. Speed alone never justifies an exact-route numerics change: a faster route whose
+  arithmetic differs is a fast path. The exact route is the quality
   reference's route and every gate's default run. Prompt attention there runs P×V in FP16 for every
   KV format; until 2026-10-13 NVFP4, K8V4 and VQ2 KV defaulted to their 8-bit forms, which are now
   the prompt-pv8 fast path. The fast INT8 and NVFP4 prompt kernels, measured when adopted, remain
@@ -1715,4 +1720,7 @@ The KL and top-1 excesses change sign with the reference and are about equal in 
 measure which route the reference shares, not fidelity; BF16 KV shows it most because no KV
 quantization hides it (the new build's BF16 KL against the old reference, 3.19e-3, is its INT8 KL).
 The corpus NLL, which no reference enters, is lower with the new route in both formats, as the Op
-oracle predicts. The change stays on the exact route as a precision fix.
+oracle predicts. Under 6.1's rule for a change to the reference route, the new route is the more
+precise one (its Op error is lower), so the new-build rows decide: every excess estimate is at most
+zero and every criterion passes on both formats. The change stays on the exact route as a
+precision fix, and the new route is the reference.
