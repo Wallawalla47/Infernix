@@ -499,6 +499,11 @@ void launch_pass_ggml(const MoeDispatch& dispatch, const MoeExpertSource& source
                       const std::uint8_t* const* job_records, const std::int32_t* flags, int base, int jobs,
                       const moe::wide::ExpertsWorkspace& layout, bf16* outputs, cudaStream_t stream, PassPhase phase,
                       int entries) {
+    // The wide tiles run every job of the pass: a forked call (Staged/Resident phases) must not have
+    // wide entries, which forked()'s column bound guarantees today.
+    if (entries > 0 && phase != PassPhase::All) {
+        throw std::logic_error("offloaded_sparse_moe: the GGUF wide tiles do not split by pass phase");
+    }
     const QType gu = source.ggml.gate_up_format, d = source.ggml.down_format;
 #define INFERNIX_GGML_PAIR(G, DD)                                                                                       \
     if (gu == G && d == DD) {                                                                                          \

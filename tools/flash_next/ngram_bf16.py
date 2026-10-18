@@ -55,6 +55,10 @@ class DequantizedTable:
         values = self.fp8.codes(name, begin, end).view(torch.float8_e4m3fn).float() * self._scale
         return values.to(torch.bfloat16).contiguous().view(torch.uint8).reshape(end - begin, self.row_bytes)
 
+    def bf16_rows_match(self, name: str, begin: int, end: int, rows: torch.Tensor) -> torch.Tensor:
+        """Per row, whether BF16 volume rows are these dequantized rows, word for word."""
+        return (rows == self.codes(name, begin, end)).all(dim=1)
+
 
 def bf16_table(store: SafetensorsSource, dequantize: bool = False):
     """The checkpoint's n-gram table as BF16 rows: its BF16 words, or with `dequantize` its FP8 rows'
@@ -92,7 +96,8 @@ def verify(model: Path, volume: Path, rows: str, dequantize: bool = False) -> di
         table = bf16_table(store, dequantize)
         fields = qwen4_exp.NGRAM_HEADER.unpack(stream.read(qwen4_exp.NGRAM_HEADER.size))
         geometry = qwen4_exp.ngram_geometry(table.rows, table.row_bytes)
-        checked, bad = verify_ngram(table, volume, {**geometry, "volume_id": fields[-1].hex()}, rows)
+        checked, bad = verify_ngram(table, volume,
+                                    {**geometry, "format": "bf16", "volume_id": fields[-1].hex()}, rows)
     return {"volume": str(volume), "rows_checked": checked, "row_mismatches": bad,
             "seconds": round(time.time() - start, 1)}
 

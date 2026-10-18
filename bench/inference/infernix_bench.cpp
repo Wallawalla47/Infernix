@@ -227,6 +227,11 @@ int main(int argc, char** argv) {
         env.original_nvfp4_prefill_kernel = options.original_nvfp4_prefill_kernel;
         env.fast_paths                   = options.fast_paths;
         env.expert_tail_skip             = options.expert_tail_skip;
+        env.ngram_volume_path            = options.ngram_volume_path;
+        env.ngram_residency              = options.ngram_residency;
+        env.expert_stripe_path           = options.expert_stripe_path;
+        env.expert_ram_bytes             = options.expert_ram_bytes;
+        env.expert_pin_bytes             = options.expert_pin_bytes;
         env.kv_cache                 = options.kv_cache;
         env.speculative              = options.speculative;
         env.use_cuda_graph           = options.use_cuda_graph;

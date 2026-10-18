@@ -82,7 +82,9 @@ HostExpertTier::Options HostExpertTier::normalized(Options options) {
     if (options.copy_threads == 0) {
         options.copy_threads = std::clamp(std::thread::hardware_concurrency() / 3, 2U, 8U);
     }
-    options.bounce        = options.bounce / 2 * 2; // two halves
+    // Two halves, at least one slot each: unpinned records promote through them, and the bounced
+    // promotion loop advances by a half (ExpertResidency, zero would never advance).
+    options.bounce        = std::max<std::uint32_t>(2, options.bounce / 2 * 2);
     options.stream_bounce = options.stream_bounce / 2 * 2;
     return options;
 }
@@ -643,6 +645,11 @@ void HostExpertTier::agent_loop() {
         ticket.resident = false;
         ticket.recycled = false;
         ticket.fetch    = kAheadFetch;
+        // Every field new_ticket sets: indices recycle each round, so a stale copy_from would copy
+        // another key's unpinned record into this key's ring slot. A key with an unpinned record of
+        // its own is copied from it, as a fetch ticket is; any other is read from the artifact.
+        ticket.copy_from = unpinned_record(k);
+        ticket.bytes     = nullptr;
         ticket.done.store(false, std::memory_order_relaxed);
         ticket.status.store(0, std::memory_order_relaxed);
         ticket.state.store(0, std::memory_order_relaxed);

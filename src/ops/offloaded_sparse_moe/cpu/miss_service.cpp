@@ -217,6 +217,13 @@ void CpuMissService::serve() {
                 job.ggml          = layer.ggml;
                 job.scales        = layer.ggml.valid() ? ExpertScales{} : layer.scales[expert];
                 job.ncols         = r.ncols[j];
+                // The device publishes 1..kMaxCpuColumns columns (cpu_plan_body); any other count
+                // would index past the job's x/y and the kernels' accumulators.
+                if (job.ncols < 1 || job.ncols > kMaxCpuColumns) {
+                    job.ncols = 0;
+                    status    = EINVAL;
+                    continue;
+                }
                 for (int c = 0; c < job.ncols; ++c) {
                     job.x[c] = x_ + static_cast<std::size_t>(r.column[j][c]) * kHidden;
                     job.y[c] = y_ + (static_cast<std::size_t>(j) * kMaxCpuColumns + c) * kHidden;

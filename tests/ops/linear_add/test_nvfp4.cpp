@@ -34,6 +34,7 @@ constexpr ReductionCriterion kA4ResidualTolerance{2.5e-2, kBf16UnitRoundoff, 5.0
 struct Invocation {
     std::int32_t tokens;
     ops::LinearPolicy policy;
+    ops::LinearRoutes routes = ops::LinearRoutes::Exact;
 };
 
 std::vector<std::int32_t> sampled_indices(std::int32_t extent) {
@@ -150,6 +151,12 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
         Invocation{65, ops::LinearPolicy::AllowA4Residual},
         Invocation{128, ops::LinearPolicy::AllowA4Residual},
         Invocation{129, ops::LinearPolicy::AllowA4Residual},
+        // batched-decode's down tiles (8 K-warps at K=17408, 5-16 columns): the A16 criterion.
+        Invocation{5, ops::LinearPolicy::A16Only, ops::LinearRoutes::WideDownTile},
+        Invocation{8, ops::LinearPolicy::A16Only, ops::LinearRoutes::WideDownTile},
+        Invocation{12, ops::LinearPolicy::A16Only, ops::LinearRoutes::WideDownTile},
+        Invocation{16, ops::LinearPolicy::A16Only, ops::LinearRoutes::WideDownTile},
+        Invocation{9, ops::LinearPolicy::AllowA4, ops::LinearRoutes::WideDownTile},
     };
     // The invocation list is what drives the host buffers, so take the bound from it rather than
     // from a literal that silently caps it.
@@ -185,7 +192,7 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
         const std::size_t capacity = ops::linear_add_workspace_capacity_bytes(
             QType::NVFP4, n, k, invocation.policy, invocation.tokens, invocation.tokens);
         WorkspaceArena workspace(std::max<std::size_t>(capacity, 256));
-        ops::linear_add(x, weight, residual, invocation.policy, workspace, nullptr);
+        ops::linear_add(x, weight, residual, invocation.policy, workspace, nullptr, invocation.routes);
         cuda_check(cudaDeviceSynchronize(), "synchronize NVFP4 linear_add");
 
         if (invocation.tokens == 128) {
@@ -194,7 +201,7 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
             cudaGraphExec_t executable;
             CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
             CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
-            ops::linear_add(x, weight, residual, invocation.policy, workspace, stream);
+            ops::linear_add(x, weight, residual, invocation.policy, workspace, stream, invocation.routes);
             CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
             CUDA_CHECK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
             for (int replay = 0; replay < 2; ++replay) {
@@ -213,7 +220,8 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
         const std::string label = "NVFP4 linear_add [" + std::to_string(n) + "," +
                                   std::to_string(k) + "] " +
                                   (a4 ? "A4" : (a4_residual ? "A4 residual" : "A16")) +
-                                  " T=" + std::to_string(invocation.tokens);
+                                  " T=" + std::to_string(invocation.tokens) +
+                                  (invocation.routes == ops::LinearRoutes::WideDownTile ? " wide-down-tile" : "");
         if (workspace.peak_used() != capacity) {
             std::cerr << label << ": workspace query/execution high-water mismatch\n";
             ++failures;

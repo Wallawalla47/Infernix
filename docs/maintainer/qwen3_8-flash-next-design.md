@@ -1196,7 +1196,7 @@ How each part handles the profiles:
 - **Prefill.**
   - While the visible context is ≤ 2,051 tokens, every token is selected, and QSA equals dense
     causal attention. The existing prompt kernels serve it, with their P×V options
-    (`--prefill-8bit-pv`) unchanged.
+    (the `prompt-pv8` fast path) unchanged.
   - Beyond that, the built prompt kernel is one CTA per `(column, kv_head)`: each column gathers its
     own selected blocks. A shared tile over the union of a query tile's selected blocks with a
     per-query mask (the QUILT idea, arXiv 2610.11134) was evaluated and **rejected** by Fedor
@@ -1999,9 +1999,19 @@ format from the volume header's row size (`resolve_ngram_volume`, `config.h`):
 - **IQ4_NL.** `ple_embed` decodes each value as `bf16_rn(fl32(d) · kvalue)`: the product is exact in
   FP32 and rounds once at the BF16 boundary the FP8 rows have. Nibble order is llama.cpp's (elements
   0-15 low nibbles, 16-31 high). `ngram_scale` does not apply.
-- **BF16.** The PLE takes the rows as its embedding with no decode. Any Flash-Next artifact runs with
-  a BF16 volume in place of its quantized table (`--ngram-volume`); a volume of the other quantized
-  format is refused. The FP8 checkpoint's artifact binds the BF16 table as its own: `--ngram-reuse`
+- **BF16.** The PLE takes the rows as its embedding with no decode.
+- **Any format for any artifact (2026-10-18).** `resolve_ngram_volume` takes a volume that is not
+  the artifact's own (another format, or another id) when its geometry is the model's table, the
+  format following from the row size; the Program then hands the Forward that volume's format
+  (`ForwardBatch::ngram_format`). FP8 rows need their table's scale: the artifact's `ngram_scale`
+  serves only its own volume, so another FP8 volume supplies it: the BF16 word at header byte 60,
+  after the fixed fields (0 = none; `write_ngram_volume` writes it since 2026-10-18), or for an FP8
+  volume published before, the scale `resolve_ngram_volume` knows for its volume id (NVIDIA's table:
+  `59e5d77e…2301`, 0x3951), so published files stay byte-identical. The Program uploads it
+  (`ForwardBatch::ngram_scale`); an FP8 volume with neither is refused for other artifacts. The prefix cache's persistent-file signature names the format, the volume id and that
+  scale. The three published volumes hold one table row for row (3,002 sampled rows against the BF16
+  volume: FP8 2.7 % median relative L2, IQ4_NL 7.6 %; a one-row shift 142 %).
+- **BF16 binding.** The FP8 checkpoint's artifact binds the BF16 table as its own: `--ngram-reuse`
   checks that sampled rows quantize to the checkpoint's FP8 codes (ModelOpt's rule with the
   checkpoint's scale, `NgramTable.bf16_rows_match`), and `verify_artifact --ngram-rows all` checks
   every row. Exactness of the route (2026-10-12): recipe B with its FP8 volume and with a BF16 volume
@@ -9738,7 +9748,7 @@ KV format the same day; model-quality.md 6.7):
     stay exact and could speed up MTP verification.
 - **Recipe C `fp8-a8-pair`** (two E4M3 activation terms): qualified at op level only.
   - Error: 0.78 of the A16 criterion.
-  - Admitted per shape where it is faster: [16384, 2560] from T = 17, [13312, 2560] from 97,
+  - Admitted per shape where it is faster: [16384, 2560] from T = 33, [13312, 2560] from 97,
     [2560, 6144] and [2560, 640] from 513, [1280, 2560] from 1,025.
   - Gated on the recipe C artifact on 2026-10-15 (beside three-term `expert-a4-residual`, §19.3.23): prefill passes on every format but BF16, the INT8 decode gate fails its tail (p99.9 KL ratio 1.35 against 1.25); beside two-term `expert-a4-residual` (2026-10-16) INT8 fails prefill KL narrowly (bound 1.14e-3 of 1.0e-3; it passes the later single 1.5e-3 budget) and the decode tail (1.266 against 1.25) for +6.2-6.6 % prefill. The INT8 decode gate over 1,024 segments (2026-10-16) fails top-1 (bound 5.31e-3 of 5.0e-3), the NLL cap (1.23e-2 of 1.0e-2) and the tail (1.261). Power-of-two column scales (2026-10-17) make the two terms exact for every value within 2^14 of its column maximum at the same speed (+5.4/+6.0 % prefill): prefill passes on every format but BF16 (by construction), and the INT8 decode gate fails only its tail (1.270 against 1.25; top-1 bound 4.50e-3, NLL 9.8e-3), its increment over two-term `expert-a4-residual` passing every criterion. Gated on each format directly, its decode passes on FP8, NVFP4 and K4V2 (1,024 segments) and K8V4 and VQ2 (256), where it is registered; INT8 keeps it off. A third h term for `expert-a4-residual` (2 + 3) gave +3.2/+3.7 % with the pair on INT8 but failed INT8 decode more clearly (model-quality.md 6.7).
 

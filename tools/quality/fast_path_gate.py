@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -206,6 +207,14 @@ class ChunkPair:
     fast: dict
 
 
+def same_artifact(first: str, second: str) -> bool:
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return (os.path.normcase(os.path.abspath(first)) ==
+                os.path.normcase(os.path.abspath(second)))
+
+
 def check_pair(pair: ChunkPair, *, fast_route: bool, fast_chunk: int = 0) -> None:
     """fast_chunk: the fast run prefills at this width instead of its default run's chunk
     (prefill --fast-chunk, a schedule fast path that widens prefill steps)."""
@@ -216,6 +225,10 @@ def check_pair(pair: ChunkPair, *, fast_route: bool, fast_chunk: int = 0) -> Non
     if a["kl_divergence"]["reference"] != b["kl_divergence"]["reference"]:
         raise MeasurementError(f"{pair.label}: the runs used different references")
     if fast_route:
+        # Both routes of one artifact (compare-prefill may set two artifacts against one reference).
+        if (not same_artifact(a["artifact"]["path"], b["artifact"]["path"]) or
+                a["artifact"]["prefill_signature"] != b["artifact"]["prefill_signature"]):
+            raise MeasurementError(f"{pair.label}: the default and fast runs scored other artifacts")
         if a["execution"]["kv_dtype"] != b["execution"]["kv_dtype"]:
             raise MeasurementError(f"{pair.label}: default and fast differ in kv_dtype")
         expected = fast_chunk or a["execution"]["prefill_chunk_tokens"]
@@ -462,6 +475,9 @@ def evaluate_forced(default_path: Path, fast_path: Path, reference_path: Path,
             raise MeasurementError(f"the teacher-forced runs differ in {key}")
     if fast_route and (default["fast_paths"] or not fast["fast_paths"]):
         raise MeasurementError("expected an exact-route run and a run with fast paths active")
+    if fast_route and not all(same_artifact(run["artifact"], reference["artifact"])
+                              for run in (default, fast)):
+        raise MeasurementError("the reference and the teacher-forced runs scored other artifacts")
     if reference.get("kind") != "reference" or reference["forced_tokens"] != default["forced_tokens"]:
         raise MeasurementError(f"{reference_path} is not a reference for these runs")
     a, coverage = forced_segments(default, reference)
@@ -674,9 +690,45 @@ def run(command: list[str], log: Path) -> None:
         raise MeasurementError(f"command failed ({result.returncode}); see {log}")
 
 
+def claim_out(out: Path, settings: dict, fast_path: Sequence[str],
+              fast_runs: Sequence[str]) -> None:
+    """Reused runs are skipped, so a run directory (gate.json) serves one artifact and one set of
+    run settings: another artifact or workload needs a fresh --out. Another candidate set reuses
+    the reference and default runs once the fast runs (the fast_runs globs) are removed."""
+    out.mkdir(parents=True, exist_ok=True)
+    manifest = out / "gate.json"
+    settings = dict(settings, artifact=os.path.abspath(settings["artifact"]))
+    candidates = sorted(fast_path)
+    if not manifest.is_file():
+        if any(out.iterdir()):
+            raise MeasurementError(f"{out} holds runs without a gate.json; use a fresh --out")
+    else:
+        recorded = json.loads(manifest.read_text(encoding="utf-8"))
+        differ = sorted(key for key in settings.keys() | recorded["settings"].keys()
+                        if key != "artifact" and recorded["settings"].get(key) != settings.get(key))
+        if not same_artifact(recorded["settings"].get("artifact", ""), settings["artifact"]):
+            differ.insert(0, "artifact")
+        if differ:
+            raise MeasurementError(f"{out} holds runs of other settings ({', '.join(differ)}); "
+                                   "use a fresh --out")
+        if recorded["fast_path"] == candidates:
+            return
+        stale = [str(p) for pattern in fast_runs for p in out.glob(pattern)]
+        if stale:
+            raise MeasurementError(
+                f"{out}'s fast runs were made with --fast-path {recorded['fast_path'] or 'none'}; "
+                f"remove {', '.join(stale)} to rerun them with this candidate set")
+    manifest.write_text(json.dumps({"settings": settings, "fast_path": candidates}, indent=2) + "\n",
+                        encoding="utf-8")
+
+
 def run_prefill(args: argparse.Namespace) -> Path:
     out = Path(args.out)
-    out.mkdir(parents=True, exist_ok=True)
+    claim_out(out, {"command": "prefill", "artifact": args.artifact, "corpus": args.corpus,
+                    "text": args.text, "quick": args.quick, "context": args.context,
+                    "stride": args.stride, "ngram_volume": args.ngram_volume,
+                    "fast_chunk": args.fast_chunk},
+              args.fast_path, ["*/fast-c*"])
     workload = ["--context", str(args.context), "--stride", str(args.stride), "--log-level",
                 "warning"]
     workload += ["--corpus", args.corpus] if args.corpus else ["--text", args.text]
@@ -730,7 +782,14 @@ def corpus_text(manifest: Path, out: Path) -> Path:
 
 def run_decode(args: argparse.Namespace) -> list[Verdict]:
     out = Path(args.out)
-    out.mkdir(parents=True, exist_ok=True)
+    claim_out(out, {"command": "decode", "artifact": args.artifact, "corpus": args.corpus,
+                    "text": args.text, "mode": args.mode, "kv": args.kv,
+                    "segments": args.segments, "prompts": args.prompts,
+                    "concurrency": args.concurrency, "kv_tokens": args.kv_tokens,
+                    "prefix_reuse": args.prefix_reuse, "warm_tokens": args.warm_tokens,
+                    "ngram_volume": args.ngram_volume,
+                    "free_running_segments": args.free_running_segments},
+              args.fast_path, ["fast-forced.json", "fast.txt", "judge.json"])
     text = args.text or str(corpus_text(Path(args.corpus), out))
     volume = ["--ngram-volume", args.ngram_volume] if args.ngram_volume else []
     segments = ["--segments", str(args.segments), "--prompts",
@@ -757,6 +816,11 @@ def run_decode(args: argparse.Namespace) -> list[Verdict]:
         run([args.forced, args.artifact, text, str(target), "--observe", str(reference),
              "--mode", args.mode, "--kv-dtype", args.kv] + segments + arm + volume + extra,
             out / f"{route}-forced.log")
+    # The preemption path acts only on a preempted request: a run that never preempted is no
+    # evidence for it.
+    if "preemption" in args.fast_path and load_forced(out / "fast-forced.json")["preemptions"] == 0:
+        raise MeasurementError("the fast run never preempted; lower --kv-tokens or raise "
+                               "--concurrency so the preemption candidate acts")
     verdicts = [evaluate_forced(out / "default-forced.json", out / "fast-forced.json", reference)]
     if args.free_running:
         modes = [] if args.mode == "dflash2" else [args.mode]

@@ -88,7 +88,7 @@ Options parse_options(int argc, char** argv) {
         } else if (argument == "--profile") {
             options.profile = true;
         } else if (argument == "--help" || argument == "-h") {
-            std::printf("Usage: %s [--policy a16|a8] [--t-sweep 1,2,...] [--warmup N] "
+            std::printf("Usage: %s [--policy a16|a8|a8r|invariant] [--t-sweep 1,2,...] [--warmup N] "
                         "[--repeat N] [--profile]\n",
                         argv[0]);
             std::exit(0);
@@ -107,6 +107,7 @@ Options parse_options(int argc, char** argv) {
 
 const char* policy_name(ops::LinearPolicy policy) {
     if (policy == ops::LinearPolicy::AllowA8Residual) { return "A8R"; }
+    if (policy == ops::LinearPolicy::A16ColumnInvariant) { return "A16CI"; }
     return policy == ops::LinearPolicy::AllowA8 ? "A8" : "A16";
 }
 

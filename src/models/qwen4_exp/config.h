@@ -93,12 +93,15 @@ struct QsaConfig {
 
 // The n-gram table volume written beside the artifact (design §12.2): FP8 E4M3FN rows with one
 // per-tensor scale, a GGUF's IQ4_NL rows (design §12.5), or the unquantized table's BF16 rows (an exact
-// conversion bound to a BF16 volume). A BF16 volume (tools/flash_next/ngram_bf16.py) may also replace
-// a quantized table at run time (resolve_ngram_volume).
+// conversion bound to a BF16 volume). Any volume of the model's table, in any of the three formats,
+// may replace the artifact's at run time (resolve_ngram_volume).
 enum class NgramRowFormat : std::uint8_t { Fp8E4m3, Iq4Nl, Bf16 };
 
 struct NgramTableConfig {
     NgramRowFormat format = NgramRowFormat::Fp8E4m3;
+    // An FP8 volume that is not the artifact's own: its per-tensor scale (BF16 bits), from its header
+    // or its known volume id. Empty for the artifact's own table (its ngram_scale parameter) and other formats.
+    std::optional<std::uint16_t> fp8_scale;
     std::uint64_t rows            = 0;
     std::uint32_t row_bytes       = 0;
     std::uint32_t rows_per_block  = 0;

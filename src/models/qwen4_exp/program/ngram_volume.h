@@ -89,10 +89,12 @@ private:
 [[nodiscard]] std::filesystem::path default_ngram_volume(const std::filesystem::path& artifact);
 
 // The table a volume holds for this model, from its header: the artifact's own table when the volume
-// stores that format (the NgramVolume constructor then checks its volume id), or a BF16 table (rows
-// of head_width BF16 values: the checkpoint's table unquantized), which any Qwen3.8-Flash-Next
-// artifact of this geometry accepts in place of its FP8 or IQ4_NL table. Throws std::runtime_error
-// for any other volume (another row format than the artifact's, or another geometry).
+// is its own (its format and volume id), else the volume's table, in any of the three formats (the
+// format follows from the row size), which any Qwen3.8-Flash-Next artifact of this geometry accepts
+// in place of its own. Such an FP8 volume needs its per-tensor scale (NgramTableConfig::fp8_scale):
+// the BF16 word after the header's fixed fields, which volumes written since record, or for a volume
+// published before, the scale known for its volume id. Throws std::runtime_error for another
+// geometry, an unknown row size or an FP8 volume whose scale is unknown.
 [[nodiscard]] NgramTableConfig resolve_ngram_volume(const std::filesystem::path& path, const PleConfig& ple);
 
 } // namespace infernix::models::qwen4_exp

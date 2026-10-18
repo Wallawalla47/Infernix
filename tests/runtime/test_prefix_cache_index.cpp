@@ -728,8 +728,15 @@ void test_unbacked_slot_values() {
     const SnapshotRef other_end =
         index.publish_snapshot(other_path[1], 128, {}, std::nullopt, *slot, SnapshotKind::Endpoint)
             .snapshot;
-    // Device-only owners hold at most D - 1 slots: with both slots theirs, even a snapshot worth
-    // less than every owner takes the least valuable one's slot, and the long one keeps its own.
+    // Device-only owners hold at most D - 1 slots, but the rotation never takes the most valuable
+    // one's slot: with the less valuable owner pinned, the long one is the only evictable owner and
+    // keeps its slot (the pin is released later, and the rotation resumes then).
+    index.pin_snapshot(other_end);
+    require(!index.acquire_device_slot(0.0).has_value() && index.valid(long_end) && index.valid(other_end),
+            "the rotation must not take the most valuable Device-only owner's slot");
+    index.unpin_snapshot(other_end);
+    // With both slots theirs, even a snapshot worth less than every owner takes the least valuable
+    // one's slot, and the long one keeps its own.
     const auto rotated = index.acquire_device_slot(0.0);
     require(rotated.has_value() && index.valid(long_end) && !index.valid(other_end),
             "Device-only owners must not hold every slot for good");

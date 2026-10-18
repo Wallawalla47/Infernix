@@ -265,7 +265,7 @@ LinearPolicy parse_policy(std::string_view text) {
     if (value == "a8" || value == "allowa8") { return LinearPolicy::AllowA8; }
     if (value == "a4" || value == "allowa4") { return LinearPolicy::AllowA4; }
     if (value == "invariant") { return LinearPolicy::A16ColumnInvariant; }
-    throw std::invalid_argument("Linear benchmark policy must be a16, a8, or a4");
+    throw std::invalid_argument("Linear benchmark policy must be a16, a8, a4 or invariant");
 }
 
 std::uint64_t parse_u64(std::string_view text, const char* label) {
@@ -328,7 +328,7 @@ void usage(const char* argv0) {
                  "[options]\n"
                  "  %s --suite qwen3_6_27b|qwen3_6_35b_a3b|all [options]\n\n"
                  "Options:\n"
-                 "  --policy a16|a8|a4 Activation-compute policy (default a16).\n"
+                 "  --policy a16|a8|a4|invariant  Activation-compute policy (default a16).\n"
                  "  --routes exact|fast Route set (default exact; fast admits fast-path routes).\n"
                  "  --execution MODE   eager (default) or graph; time the complete Op.\n"
                  "  --graph-calls N    Calls per timed graph (1..64, default 1); report per call.\n"

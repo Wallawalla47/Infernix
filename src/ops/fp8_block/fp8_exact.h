@@ -26,7 +26,9 @@ namespace infernix::fp8b128 {
 using exact::I128;
 
 constexpr int kTile              = 128;
-constexpr int kMaxExponentSpread = 62; // a tile term's shift (exact::add_shifted)
+// A tile term's largest shift (exact::add_shifted's domain). The converter refuses a row whose tile
+// scales span more (tools/artifact/codecs/fp8_b128.py MAX_EXPONENT_SPREAD), so add_tile need not check.
+constexpr int kMaxExponentSpread = 62;
 
 // The integer e4m3fn(c) * 2^9 of a finite E4M3FN code (the NaN codes 0x7F/0xFF never occur).
 INFERNIX_EXACT_HD std::int32_t fp8_int(std::uint8_t c) {

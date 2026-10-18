@@ -343,8 +343,8 @@ different route may ship, what it is measured against, how much it may cost, and
   change that alters any exact-route output bit is a *numerics change*. It is allowed only to fix
   a defect or to improve precision, and only when the gates of 6.5, with the previous exact route
   in the default role and the new one in the fast role, show the new route's estimated excess is
-  at most zero and its bound within budget. Speed alone never justifies an exact-route numerics
-  change: a faster route whose arithmetic differs is a fast path. The exact route is the quality
+  at most zero and its bound within budget (6.8 records each one). Speed alone never justifies an
+  exact-route numerics change: a faster route whose arithmetic differs is a fast path. The exact route is the quality
   reference's route and every gate's default run. Prompt attention there runs P×V in FP16 for every
   KV format; until 2026-10-13 NVFP4, K8V4 and VQ2 KV defaulted to their 8-bit forms, which are now
   the prompt-pv8 fast path. The fast INT8 and NVFP4 prompt kernels, measured when adopted, remain
@@ -663,7 +663,11 @@ for a decode-only change). NVFP4 KV's NLL bound was 1.06e-2 and the INT8 pair's 
 
 `tools/quality/fast_path_gate.py` (Python 3.11, standard library only) runs the measurements,
 reuses any run already present in its directory, and prints each criterion with its estimate, bound,
-budget and result. Exit status 0 is a pass, 1 a failed criterion, 2 an unusable measurement.
+budget and result. Exit status 0 is a pass, 1 a failed criterion, 2 an unusable measurement. A run
+directory's `gate.json` records the artifact and run settings it serves; another artifact or
+workload needs a fresh `--out`, and another candidate set reuses the reference and default runs
+once the fast runs are removed (the gate names them). Every pair it decides must come from one
+artifact, and a `preemption` candidate's decode run must have preempted.
 
 ```bat
 rem Prefill: reference, then default and fast-path runs at four chunk sizes per KV format
@@ -1118,7 +1122,10 @@ on the [5120, 17408] down projection (one-term A4 6-12 %, A16 0.16 %); the gate/
 activations put its second term's scales near E4M3's subnormal range, so its error there (1.6-2.2 %)
 does not fall with a third term. The plain arm never reaches 9 columns, so it also re-qualifies
 `batched-decode` after its [5120, 17408] down tile changed (8 K-warps at 5-16 columns, 35.6-51.8
-against 41.6-60.8 us). Every arm passes, jointly with the paths above:
+against 41.6-60.8 us). That tile is `batched-decode`'s own route (`ops::LinearRoutes::WideDownTile`,
+decode and verification rounds only): until 2026-10-18 it also served exact-route prefill calls of
+5-16 columns, an unqualified exact-route numerics change since `1fe367b4`, and those now run the
+release's 4 K-warp tiles again. Every arm passes, jointly with the paths above:
 
 | 27B, KV | Arm | TV excess (bound) / budget | Top-1 excess, points (bound) / budget | KL excess / cap |
 |---|---|---|---|---|
@@ -1559,7 +1566,7 @@ and recomputes the previous output) or admission (whole extents held without `pr
 **`fp8-a8-pair`: two E4M3 activation terms in recipe C's FP8 projections (recipe C with FP8, NVFP4, K8V4, VQ2 or K4V2 KV).**
 - **What changes:** prefill-width calls of Flash-Next's row-FP8 dense problems carry each 16-bit
   activation as two E4M3 terms on the 8-bit Tensor Core path, admitted per problem where faster
-  than the exact route (cold L2, graph): [16384, 2560] from T = 17, [13312, 2560] from 97,
+  than the exact route (cold L2, graph): [16384, 2560] from T = 33, [13312, 2560] from 97,
   [2560, 6144] and [2560, 640] from 513, [1280, 2560] from 1,025 (0.65-0.93 of the exact route
   beyond, except [2560, 6144] at T = 1,040-1,088: 1.18).
 - **Arithmetic (since 2026-10-17):** both terms' per-column scales are powers of two (the least
@@ -1681,3 +1688,31 @@ and recomputes the previous output) or admission (whole extents held without `pr
 
   Every criterion fails in both formats (p99.9 KL ratio 11.9 and 2.1), so the path runs in no
   configuration.
+
+### 6.8 Exact-route numerics changes
+
+A change to exact-route bits (6.1) is recorded here with its gate.
+
+**35B-A3B Q8 shared-expert prefill (`4f0bb18f`, NInfer `610f79e9d`).** The Q8 gate/up and down
+prefill kernels of `Qwen3.6-35B-A3B` apply each 32-wide group's FP16 scale to the FP32 partial sum
+and pass the SiLU output as a BF16 high/low pair, where the old route rounded each code × scale to
+BF16 before the MMA. Against the FP64 oracle the worst relative L2 error fell 3× (Q4/Q5) and 5× (Q8);
+prefill got 2.3-2.6 % slower, decode is unchanged. It shipped without the model-level gate 6.1 asks
+for; the gate was run on 2026-10-18 (`compare-prefill`, the build before `4f0bb18f` as base and the
+current one as candidate, both `--disable-fast-paths`; `qwen3_6_35b_a3b.ninfer`, the quick corpus,
+14,336-token windows at stride 7,168, chunks 896-7,168, 36 windows, 1,044,668 positions per route).
+The reference route runs the same shared-expert kernels as the route that writes it, so the gate ran
+against each build's reference:
+
+| KV | Reference from | KL excess (bound) | Top-1 excess (bound) | Corpus NLL excess | p99.9 KL ratio | Verdict |
+|---|---|---:|---:|---:|---:|---|
+| INT8 | base build | 5.8e-5 (1.7e-4) | 2.1e-4 (3.8e-4) | -6.3e-5 | 1.01 | pass |
+| INT8 | new build | -3.4e-5 (2.4e-5) | -3.0e-4 (-1.1e-4) | -6.3e-5 | 1.00 | pass |
+| BF16 | base build | 7.7e-4 (1.0e-3) | 5.0e-3 (5.5e-3) | -3.0e-5 | 1.38 | fails top-1 and tail |
+| BF16 | new build | -9.2e-4 (-7.0e-4) | -5.1e-3 (-4.5e-3) | -3.0e-5 | 0.72 | pass |
+
+The KL and top-1 excesses change sign with the reference and are about equal in size, so they
+measure which route the reference shares, not fidelity; BF16 KV shows it most because no KV
+quantization hides it (the new build's BF16 KL against the old reference, 3.19e-3, is its INT8 KL).
+The corpus NLL, which no reference enters, is lower with the new route in both formats, as the Op
+oracle predicts. The change stays on the exact route as a precision fix.

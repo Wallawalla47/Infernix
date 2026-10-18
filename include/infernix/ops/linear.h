@@ -52,6 +52,9 @@ enum class LinearRoutes : std::uint8_t {
     Q8SlicedK = 1, ///< q8-sliced-k: NInfer's Q8 GEMV/sliced-K routes (Flash-Next [16384,2560], [2560,6144]).
     Fp8A8Pair = 2, ///< fp8-a8-pair: FP8 weights with the activation as two E4M3 terms.
     Q4W4A8    = 4, ///< q4-w4a8: groupwise Q4 weights with int8 activations.
+    /// batched-decode: NVFP4 linear_add [5120,17408] A16 tiles of 8 K-warps at 5-16 columns (the
+    /// exact route keeps the release's 4 K-warp tiles; the K-warp count sets the reduction order).
+    WideDownTile = 8,
 };
 
 [[nodiscard]] constexpr LinearRoutes operator|(LinearRoutes a, LinearRoutes b) noexcept {
@@ -63,7 +66,7 @@ enum class LinearRoutes : std::uint8_t {
 }
 
 [[nodiscard]] constexpr bool valid_linear_routes(LinearRoutes routes) noexcept {
-    return (static_cast<std::uint8_t>(routes) & ~std::uint8_t{7}) == 0;
+    return (static_cast<std::uint8_t>(routes) & ~std::uint8_t{15}) == 0;
 }
 
 [[nodiscard]] constexpr bool valid_linear_policy(LinearPolicy policy) noexcept {

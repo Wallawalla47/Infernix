@@ -387,16 +387,34 @@ The startup line names the choice: `n-gram table: in RAM (N MiB pinned)`, or `n-
 from its volume`, which `auto` follows with `(the RAM ledger keeps the experts resident first)`.
 The rows are the same bytes either way, so outputs do not change.
 
-## BF16 n-gram table
+## N-gram table formats
 
-Most artifacts bind a quantized n-gram table: NVIDIA's FP8 rows with one scale for the whole table
-(recipes A-C), or the GGUF import's IQ4_NL rows. A BF16 volume holds the table as Qwen's
-BF16 checkpoint stores it, and any Qwen3.8-Flash-Next artifact runs with it: pass it with
-`--ngram-volume`. The engine reads the row format from the volume's header (a startup line names
-it), and the PLE takes the BF16 rows as its embedding, with no dequantization. A volume of the other
-quantized format (FP8 rows for the GGUF import, IQ4_NL rows for the others) is refused. The FP8
-checkpoint's artifact binds the BF16 table as its own (`--ngram-reuse` with the BF16 volume), so
-it needs this volume and accepts no quantized one.
+The PLE n-gram table has three volume formats: NVIDIA's FP8 rows with one scale for the whole table
+(recipes A-C bind it), the GGUF import's IQ4_NL rows (4.5 bits per value), and the BF16 rows of
+Qwen's checkpoint (the FP8 checkpoint's exact artifact binds it). Every artifact binds one of them as
+its own, and **any Qwen3.8-Flash-Next artifact runs with a volume of any of the three formats**:
+pass it with `--ngram-volume`. The engine reads the row format from the volume's header and logs
+`n-gram table: <format> rows from <volume> in place of the artifact's <format> table`; the PLE
+decodes the FP8 or IQ4_NL rows (or takes the BF16 rows as its embedding) as it does for the
+artifact's own table. The three volumes hold the same table row for row: on 3,002 sampled rows,
+the FP8 rows' relative L2 error against the BF16 rows was 2.7 % (median; 3.1 % at the 99th
+percentile) and the IQ4_NL rows' 7.6 % (8.7 %), against 142 % for rows shifted by one. With the
+NVIDIA NVFP4 Dense8 artifact (the 1M-token corpus's quick subset, 4,096-token windows at stride
+2,048, INT8 KV; 2026-10-18) the perplexity was 3.5102 with its own FP8 table, 3.5101 with the BF16
+table and 3.5140 with the IQ4_NL table.
+
+FP8 rows need the table's scale. An FP8 artifact stores it (`ngram_scale`), so its own volume always
+works. For any other artifact the engine reads it from the volume's header, which FP8 volumes record
+since 2026-10-18, or, for NVIDIA's published FP8 volume (written before), recognises that file by
+the volume id in its header and uses its known scale, so the downloaded file works unchanged. An
+FP8 volume with neither serves only its own artifact.
+
+The FP8 checkpoint's artifact, converted with the BF16 table, is bit-exact to Qwen's checkpoint
+only with its own BF16 volume; another table rounds the PLE's values as that table's artifacts do.
+
+### BF16 n-gram table
+
+A BF16 volume holds the table as Qwen's BF16 checkpoint stores it:
 
 ```text
 python -m tools.convert.fetch_tensors --repo Qwen/Qwen3.8-Flash-Next --revision <sha> --out <dir> \
@@ -606,7 +624,8 @@ headroom 256 (auto); expert frames 9300 (23.95 GiB); 380 free after startup
   - It saves the PCIe copies and CPU work of those misses, so it helps most when many experts miss
     VRAM (the SSD tier, small cards); with every expert in VRAM it changes nothing.
   - The output changes and is slightly worse, and it depends on which experts the cache holds at
-    the time, so it is neither the exact route nor request-invariant. Prefill, forced and scored
+    the time, so it is neither the exact route nor request-invariant (`--disable-fast-paths` refuses
+    it, and the load summary reports the Engine as not request-invariant). Prefill, forced and scored
     tokens are unchanged, and a skipped expert still counts as routed for the cache, so it can be
     promoted.
   - Experts that a round routes from more than 8 tokens are always computed.

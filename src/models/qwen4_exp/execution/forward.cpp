@@ -335,13 +335,14 @@ void Forward::layer_moe(std::uint32_t layer, const ForwardBatch& batch, const Te
     }
 }
 
-std::size_t Forward::moe_workspace_bytes(const TextConfig& c, std::int32_t columns) {
+std::size_t Forward::moe_workspace_bytes(const TextConfig& c, std::int32_t columns,
+                                         ops::offloaded_moe::WideA16 wide_a16) {
     const std::size_t t = static_cast<std::size_t>(columns);
     const std::size_t h = c.hidden_size, k = c.moe.top_k;
     std::size_t bytes = (c.moe.experts + 1) * t * 4 + k * t * 8 + t * 4; // router logits, routing
     bytes += ops::moe_dispatch_bytes(dim(c.moe.experts), dim(k * t));
     bytes += h * k * t * 2 + ops::moe_experts_workspace_bytes(dim(c.moe.experts), dim(k * t), std::max(columns, 1),
-                                                             expert_activation(c));
+                                                             expert_activation(c), wide_a16);
     bytes += 2 * std::size_t(c.moe.shared_intermediate) * t * 2 * 3 + h * t * 2 * 2; // shared expert, y
     if (c.ggml_weights) { // the shared expert's projections encode their inputs
         bytes += ops::ggml_linear_workspace_bytes(dim(h), std::max(columns, 1)) +
@@ -459,7 +460,11 @@ void Forward::ple(const PleParameters& p, Tensor& residual, const ForwardBatch& 
         if (format == NgramRowFormat::Iq4Nl) {
             ops::ple_embed_iq4_nl(batch.ngram_rows, e, s);
         } else {
-            ops::ple_embed(batch.ngram_rows, p.ngram_scale, e, s);
+            const Tensor& scale = batch.ngram_scale.data != nullptr ? batch.ngram_scale : p.ngram_scale;
+            if (scale.data == nullptr) {
+                throw std::invalid_argument("Qwen4Exp forward: FP8 n-gram rows need their table's scale");
+            }
+            ops::ple_embed(batch.ngram_rows, scale, e, s);
         }
     }
     Tensor kv = work_.alloc(DType::BF16, {W + H, T});
@@ -931,8 +936,11 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     }
     Tensor outputs = work_.alloc(DType::BF16, {H, K * T});
     const std::int32_t max_jobs = std::min(E, K * T);
-    source.wide_a16             = fast_.expert_a4_residual ? ops::offloaded_moe::WideA16::kA4Residual
-                                                           : ops::offloaded_moe::WideA16::kExact;
+    // The two-term route exists for NVFP4 W4A16 banks only; its layout carries no x limbs, which the
+    // GGUF and block-FP8 wide routes read, so another bank keeps the exact layout whatever the flag.
+    source.wide_a16 = fast_.expert_a4_residual && source.ggml.gate_up_format == QType::NVFP4_MUL
+                          ? ops::offloaded_moe::WideA16::kA4Residual
+                          : ops::offloaded_moe::WideA16::kExact;
     const DeviceSpan expert_ws  = work_.alloc_bytes(ops::moe_experts_workspace_bytes(max_jobs, K * T, T, source.activation,
                                                                                  source.wide_a16));
     const bool planned = route_plans && ops::moe_route_dispatch_plan(logits, K, routing, dispatch, route_log, x, source,

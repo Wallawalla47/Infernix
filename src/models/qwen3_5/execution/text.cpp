@@ -1177,7 +1177,9 @@ void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase ph,
     ops::rmsnorm(x, weights.post_attention_norm, config_.rms_norm_eps, true, h, ctx_.stream);
     const std::int32_t width = row_width(x.ne[1]);
     ffn(h, weights.ffn, x, hints, work_, ctx_.execution_view(), false,
-        wide_residual_verification(ph, width, width), execution_schedule_.linear_routes);
+        wide_residual_verification(ph, width, width), execution_schedule_.linear_routes,
+        ph == Phase::Verify && execution_schedule_.wide_down_tile ? ops::LinearRoutes::WideDownTile
+                                                                   : ops::LinearRoutes::Exact);
 }
 
 template <class Tap>

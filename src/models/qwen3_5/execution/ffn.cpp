@@ -59,7 +59,8 @@ std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t fi
 
 void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual,
          const ops::SparseMoeHints& hints, WorkspaceArena& workspace, DeviceExecutionView execution,
-         bool mtp, bool wide_verification, ops::LinearRoutes gate_up_routes) {
+         bool mtp, bool wide_verification, ops::LinearRoutes gate_up_routes,
+         ops::LinearRoutes down_routes) {
     const auto stream  = execution.stream;
     auto scope         = workspace.scope();
     const auto columns = hidden.ne[1];
@@ -99,7 +100,8 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
                            gate_up_routes);
     }
     ops::linear_add(activation, down, residual,
-                    residual_projection_policy(p.down, wide_verification), workspace, stream);
+                    residual_projection_policy(p.down, wide_verification), workspace, stream,
+                    down_routes);
 }
 
 } // namespace infernix::models::qwen3_5::execution

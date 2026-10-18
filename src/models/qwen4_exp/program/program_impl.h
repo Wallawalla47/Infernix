@@ -625,7 +625,8 @@ public:
                   (d.mtp ? d.mtp_column_bytes * lanes * (W + 2) + 2ULL * di * W * lanes : 0);
         b.io = d.io.bytes + d.logits32 + d.logits16 + 4ULL * lanes + 4ULL * lanes +
                sizeof(ops::SamplingConfig) * lanes + d.token_counts + 4ULL * d.spec.words + d.mtp_ones +
-               4ULL * d.mtp_io.words + kGateStatsBytes * lanes + constraint_bytes(lanes, W) +
+               4ULL * d.mtp_io.words + kGateStatsBytes * lanes +
+               (o.ngram_table && o.ngram_table->fp8_scale ? sizeof(std::uint16_t) : 0) + constraint_bytes(lanes, W) +
                grammar_mask_bytes(d.token_domain, lanes, W) + d.score_residuals + d.score_logits + d.score_io;
         b.residency            = ExpertResidency::table_bytes(c, d.columns);
         b.expert_record_stride = d.record_stride;
@@ -796,6 +797,12 @@ public:
         host_configs_ = PinnedHostBuffer(sizeof(ops::SamplingConfig) * lanes);
         allocate(gate_stats_, kGateStatsBytes * lanes, allocated);
         gate_stats_.fill(0);
+        // Another FP8 volume's per-tensor scale (resolve_ngram_volume): the artifact's ngram_scale serves only
+        // its own table.
+        if (const auto scale = ngram_table().fp8_scale) {
+            allocate(ngram_scale_, sizeof(*scale), allocated);
+            ngram_scale_.copy_from_host(&*scale, sizeof(*scale), 0);
+        }
         allocate(constraint_, constraint_bytes(lanes, max_width_), allocated);
         allocate(grammar_masks_, grammar_mask_bytes(token_domain_, lanes, max_width_), allocated);
         grammar_host_ = PinnedHostBuffer(grammar_mask_bytes(token_domain_, lanes, max_width_));
@@ -3273,7 +3280,15 @@ private:
         split_call_ = streamed && split_policy_ && batch * width <= split_columns();
         if (streamed) { expert_stream_->begin(ring_span(), residency_->host_table(), s, split_call_); }
         const WideWork wide(*this, batch * width);
-        forward_call(batch, width, logit_columns, nullptr, chunk, vision, nullptr, streamed);
+        try {
+            forward_call(batch, width, logit_columns, nullptr, chunk, vision, nullptr, streamed);
+        } catch (...) {
+            // A failed call (an unreadable record, say) still returns the stream's slots: left
+            // active, the next streamed chunk could never begin and the release would refuse.
+            if (streamed) { expert_stream_->end(); }
+            split_call_ = false;
+            throw;
+        }
         if (streamed) { expert_stream_->end(); }
         split_call_ = false;
         residency_->enqueue_route_download(s, batch * width);
@@ -3632,6 +3647,7 @@ private:
         fb.ngram_rows    = Tensor(base + io_layout_.ngram, DType::U8,
                                   {dim(ngram_table().row_bytes), dim(hash_.heads()), cols});
         fb.ngram_format  = ngram_table().format;
+        if (ngram_scale_.p != nullptr) { fb.ngram_scale = Tensor(ngram_scale_.p, DType::BF16, {1}); }
         fb.host_slots      = std::span<const std::int32_t>(host_lanes_.data(), static_cast<std::size_t>(batch));
         fb.host_table_rows = fb.host_slots;
         fb.batch           = batch;
@@ -4727,7 +4743,7 @@ private:
     }
     DeviceBuffer io_device_, logits32_, logits16_, sampled_, sample_pos_, configs_, token_counts_;
 
-    // The n-gram table the volume holds: the artifact's, or a BF16 volume's (ProgramOptions::ngram_table).
+    // The n-gram table the volume holds: the artifact's, or another volume's (ProgramOptions::ngram_table).
     [[nodiscard]] const NgramTableConfig& ngram_table() const noexcept {
         return options_.ngram_table ? *options_.ngram_table : c_.ple.table;
     }
@@ -5095,6 +5111,7 @@ private:
     PinnedHostBuffer gate_host_{64};
     std::uint32_t gate_sequence_ = 0;
     DeviceBuffer gate_stats_;
+    DeviceBuffer ngram_scale_; // BF16 [1]: NgramTableConfig::fp8_scale, when the volume records it
     std::vector<std::uint8_t> live_;
     std::vector<std::int32_t> window_;
     std::vector<std::uint32_t> row_ids_;

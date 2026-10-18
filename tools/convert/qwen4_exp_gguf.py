@@ -374,11 +374,12 @@ class _Builder:
 
 
 def ggml_or_plain(store: GgufStore, name: str, shape: tuple[int, int]) -> LogicalSource:
-    """A 2-D GGUF tensor: stored rows for ggml formats and Q8_0, exact values for BF16/F32/F16."""
+    """A 2-D GGUF tensor: stored rows for ggml formats and Q8_0, exact values for BF16/F32/F16 (a
+    BF16 binding: every value must be a BF16 value, so an F32 matrix is never rounded silently)."""
 
     t = store.tensor(name)
     if t.ggml_type in (GGUF_F32, GGUF_F16, GGUF_BF16):
-        return plain(store, name, shape, bf16_exact=t.ggml_type != GGUF_F32)
+        return plain(store, name, shape)
     return ggml_matrix(store, name, shape)
 
 

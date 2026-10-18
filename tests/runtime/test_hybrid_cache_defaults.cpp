@@ -204,6 +204,12 @@ int main() {
         failures += check(rejected, "--expert-tail-skip was accepted on Qwen3.5");
         failures += check(normalize_engine_options(options, infernix::models::Architecture::Qwen4Exp).expert_tail_skip == 7U,
                           "--expert-tail-skip did not reach Qwen3.8-Flash-Next");
+        options.fast_paths = false;
+        rejected           = false;
+        try {
+            (void)normalize_engine_options(options, infernix::models::Architecture::Qwen4Exp);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "--expert-tail-skip was accepted on the exact route");
     }
     for (int variant = 0; variant < 3; ++variant) {
         EngineOptions options;

@@ -4,7 +4,7 @@
 // call hits the host cache, two rows of one cache slot both return their own bytes, a row past the
 // table throws, and a volume of the wrong size is refused at open. A call of thousands of distinct
 // blocks (a prefill chunk) takes the multi-threaded route: the same oracle, counters and cache.
-// resolve_ngram_volume accepts a BF16 volume in place of a quantized table and refuses mismatches.
+// resolve_ngram_volume accepts a volume of any format in place of the artifact's table and refuses mismatches.
 
 #include "models/qwen4_exp/program/ngram_volume.h"
 
@@ -14,6 +14,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <random>
 #include <set>
 #include <stdexcept>
@@ -99,8 +100,9 @@ std::uint64_t distinct_blocks(const std::vector<std::uint32_t>& rows) {
 }
 
 // A volume header alone (resolve_ngram_volume reads nothing else): rows of `row_bytes`, as the
-// converter lays them out, with `id`.
-void write_header(const std::filesystem::path& path, std::uint64_t rows, std::uint32_t row_bytes, std::uint8_t id) {
+// converter lays them out, with `id` and an FP8 scale word (0: none recorded).
+void write_header(const std::filesystem::path& path, std::uint64_t rows, std::uint32_t row_bytes, std::uint8_t id,
+                  std::uint16_t scale = 0) {
     std::vector<std::byte> header(4096);
     const std::uint32_t per_block = kBlockBytes / row_bytes;
     std::memcpy(header.data(), "NINFERNG", 8);
@@ -112,67 +114,79 @@ void write_header(const std::filesystem::path& path, std::uint64_t rows, std::ui
     put<std::uint32_t>(header, 32, kBlockBytes);
     put<std::uint64_t>(header, 36, (rows + per_block - 1) / per_block);
     std::memset(header.data() + 44, id, 16);
+    put<std::uint16_t>(header, 60, scale);
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
     out.write(reinterpret_cast<const char*>(header.data()), static_cast<std::streamsize>(header.size()));
 }
 
-// resolve_ngram_volume: the artifact's own volume keeps the artifact's table; a BF16 volume (rows of
-// 2 x head width) replaces an FP8 or an IQ4_NL table; a volume of the other quantized format, of
-// another row count or of no known row size is refused.
+// resolve_ngram_volume: the artifact's own volume (its format and id) keeps the artifact's table; a
+// volume of the same table geometry in any of the three formats (FP8 rows of the head width, IQ4_NL
+// blocks of 18 bytes per 32, BF16 rows of twice the width) replaces any artifact's table with its own
+// geometry and id, an FP8 one only with a scale in its header; another row count or row size is refused.
 void test_resolve(const std::filesystem::path& path) {
-    constexpr std::uint64_t rows = 100'003;
-    q4::PleConfig ple;
-    ple.embed_dim             = 2560;
-    ple.ngram.ngram_size      = 3;
-    ple.ngram.heads_per_ngram = 8; // 16 heads of 160
-    ple.table.format          = q4::NgramRowFormat::Fp8E4m3;
-    ple.table.rows            = rows;
-    ple.table.row_bytes       = 160;
-    ple.table.volume_id.fill(0xAA);
-    const auto refused = [&] {
-        try {
-            (void)q4::resolve_ngram_volume(path, ple);
-        } catch (const std::runtime_error&) { return true; }
-        return false;
-    };
+    constexpr std::uint64_t rows        = 100'003;
+    constexpr std::uint16_t kScale      = 0x3A83; // a positive normal BF16 value
+    const q4::NgramRowFormat formats[]  = {q4::NgramRowFormat::Fp8E4m3, q4::NgramRowFormat::Iq4Nl,
+                                           q4::NgramRowFormat::Bf16};
+    const std::uint32_t row_bytes[]     = {160, 90, 320};
+    for (int own = 0; own < 3; ++own) {
+        q4::PleConfig ple;
+        ple.embed_dim             = 2560;
+        ple.ngram.ngram_size      = 3;
+        ple.ngram.heads_per_ngram = 8; // 16 heads of 160
+        ple.table.format          = formats[own];
+        ple.table.rows            = rows;
+        ple.table.row_bytes       = row_bytes[own];
+        ple.table.volume_id.fill(0xAA);
+        const std::string name = "artifact table " + std::to_string(own) + ": ";
+        const auto refused = [&] {
+            try {
+                (void)q4::resolve_ngram_volume(path, ple);
+            } catch (const std::runtime_error&) { return true; }
+            return false;
+        };
 
-    write_header(path, rows, 160, 0xAA);
-    const q4::NgramTableConfig own = q4::resolve_ngram_volume(path, ple);
-    check(own.format == q4::NgramRowFormat::Fp8E4m3 && own.volume_id == ple.table.volume_id,
-          "the artifact's own volume keeps its table");
-    write_header(path, rows, 320, 0x55);
-    const q4::NgramTableConfig bf16 = q4::resolve_ngram_volume(path, ple);
-    check(bf16.format == q4::NgramRowFormat::Bf16 && bf16.row_bytes == 320 && bf16.rows_per_block == 12 &&
-              bf16.blocks == (rows + 11) / 12 && bf16.file_bytes == 4096 + bf16.blocks * 4096 &&
-              bf16.volume_id[0] == 0x55,
-          "a BF16 volume replaces an FP8 table, with its own geometry and id");
-    write_header(path, rows + 1, 320, 0x55);
-    check(refused(), "a BF16 volume of another row count is refused");
-    write_header(path, rows, 90, 0x55);
-    check(refused(), "an IQ4_NL volume cannot replace an FP8 table");
-    write_header(path, rows, 200, 0x55);
-    check(refused(), "a row size of no known format is refused");
-
-    ple.table.format    = q4::NgramRowFormat::Iq4Nl;
-    ple.table.row_bytes = 90;
-    write_header(path, rows, 320, 0x55);
-    check(q4::resolve_ngram_volume(path, ple).format == q4::NgramRowFormat::Bf16,
-          "a BF16 volume replaces an IQ4_NL table");
-    write_header(path, rows, 160, 0x55);
-    check(refused(), "an FP8 volume cannot replace an IQ4_NL table");
-
-    // An exact conversion bound to a BF16 volume: that volume is its own (the id is checked when it
-    // opens); a quantized volume cannot stand in for its BF16 table.
-    ple.table.format    = q4::NgramRowFormat::Bf16;
-    ple.table.row_bytes = 320;
-    write_header(path, rows, 320, 0xAA);
-    const q4::NgramTableConfig bf16_own = q4::resolve_ngram_volume(path, ple);
-    check(bf16_own.format == q4::NgramRowFormat::Bf16 && bf16_own.volume_id == ple.table.volume_id,
-          "a BF16 artifact's own volume keeps its table");
-    write_header(path, rows, 160, 0x55);
-    check(refused(), "an FP8 volume cannot replace a BF16 table");
-    write_header(path, rows, 90, 0x55);
-    check(refused(), "an IQ4_NL volume cannot replace a BF16 table");
+        write_header(path, rows, row_bytes[own], 0xAA);
+        const q4::NgramTableConfig mine = q4::resolve_ngram_volume(path, ple);
+        check(mine.format == formats[own] && mine.volume_id == ple.table.volume_id && !mine.fp8_scale,
+              name + "the artifact's own volume keeps its table (and its own scale)");
+        for (int other = 0; other < 3; ++other) {
+            // Another volume of any format, the artifact's own format included (another id).
+            write_header(path, rows, row_bytes[other], 0x55, formats[other] == q4::NgramRowFormat::Fp8E4m3 ? kScale : 0);
+            const q4::NgramTableConfig t = q4::resolve_ngram_volume(path, ple);
+            const std::uint32_t per_block = kBlockBytes / row_bytes[other];
+            check(t.format == formats[other] && t.row_bytes == row_bytes[other] && t.rows_per_block == per_block &&
+                      t.blocks == (rows + per_block - 1) / per_block && t.file_bytes == 4096 + t.blocks * 4096 &&
+                      t.volume_id[0] == 0x55 &&
+                      t.fp8_scale == (formats[other] == q4::NgramRowFormat::Fp8E4m3 ? std::optional<std::uint16_t>(kScale)
+                                                                                    : std::nullopt),
+                  name + "another volume of format " + std::to_string(other) + " replaces the table");
+            write_header(path, rows + 1, row_bytes[other], 0x55, kScale);
+            check(refused(), name + "another volume of another row count is refused");
+        }
+        write_header(path, rows, 160, 0x55);
+        check(refused(), name + "another FP8 volume without a recorded scale is refused");
+        // NVIDIA's published FP8 volume (written before volumes recorded a scale): its id names its scale.
+        write_header(path, rows, 160, 0x55);
+        {
+            constexpr std::uint8_t kNvidia[16] = {0x59, 0xE5, 0xD7, 0x7E, 0x80, 0x2A, 0xC9, 0x5D,
+                                                  0x8F, 0xAF, 0x0A, 0x80, 0x0B, 0x8F, 0x23, 0x01};
+            std::fstream file(path, std::ios::binary | std::ios::in | std::ios::out);
+            file.seekp(44);
+            file.write(reinterpret_cast<const char*>(kNvidia), 16);
+        }
+        if (formats[own] != q4::NgramRowFormat::Fp8E4m3) {
+            const q4::NgramTableConfig nvidia = q4::resolve_ngram_volume(path, ple);
+            check(nvidia.format == q4::NgramRowFormat::Fp8E4m3 && nvidia.fp8_scale == std::uint16_t{0x3951},
+                  name + "NVIDIA's published FP8 volume brings its known scale");
+        }
+        write_header(path, rows, 160, 0x55, 0xBA83);
+        check(refused(), name + "a negative recorded scale is refused");
+        write_header(path, rows, 160, 0x55, 0x7F80);
+        check(refused(), name + "an infinite recorded scale is refused");
+        write_header(path, rows, 200, 0x55);
+        check(refused(), name + "a row size of no known format is refused");
+    }
 }
 
 } // namespace

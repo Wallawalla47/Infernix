@@ -53,6 +53,9 @@ struct ExecutionSchedule {
     // adaptive-mtp: MTP rounds choose their draft length (only where speculation is adaptive).
     bool adaptive_mtp                 = false;
     ops::LinearRoutes linear_routes   = ops::LinearRoutes::Exact;
+    // batched-decode: the decode and verification rounds' MLP down projections take its tiles
+    // (ops::LinearRoutes::WideDownTile).
+    bool wide_down_tile               = false;
     // gdn-f16-accumulate: the chunked GDN calls' arithmetic.
     ops::GdnChunkArithmetic gdn_arithmetic = ops::GdnChunkArithmetic::Exact;
 

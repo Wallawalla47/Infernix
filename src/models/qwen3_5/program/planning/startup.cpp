@@ -1192,6 +1192,7 @@ ExecutionSchedule execution_schedule(const execution::Parameters& parameters,
                                        !fast_paths.invariant(FastPath::AdaptiveSpeculation),
             .linear_routes           = fast_paths.selected(FastPath::Q4W4A8) ? ops::LinearRoutes::Q4W4A8
                                                                              : ops::LinearRoutes::Exact,
+            .wide_down_tile          = fast_paths.selected(FastPath::BatchedDecode),
             .gdn_arithmetic          = fast_paths.selected(FastPath::GdnF16Accumulate)
                                            ? ops::GdnChunkArithmetic::Fp16Accumulate
                                            : ops::GdnChunkArithmetic::Exact};
@@ -1279,6 +1280,10 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         }
     }
     TreeWidthPlan tree_widths = resolve_tree_widths(parameters, options);
+    // Fixed speculation (the exact route of an invariance-capable artifact) verifies the chain at a
+    // fixed width every round and never picks a tree (decode_mtp/dflash rounds), so no tree family is
+    // planned or captured: its column-invariant attention workspace does not hold the tree route.
+    if (execution_schedule(parameters, options).fixed_speculation) { tree_widths = TreeWidthPlan{}; }
     const bool adaptive_mtp = execution_schedule(parameters, options).adaptive_mtp;
     // resolve_auto_draft_length made --draft-tokens auto a fixed length wherever adaptive-mtp does
     // not act; without it the rounds would silently draft the ceiling.

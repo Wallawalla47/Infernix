@@ -332,7 +332,7 @@ any Flash-Next conversion; **the FP8 volume is the recommended one**:
 Each conversion was made and measured with one of them: the four NVFP4 conversions with the FP8
 table, IQ3_S with its IQ4_NL table and FP8 with the BF16 table; the uncensored and Swift
 repositories carry no volume. Older Infernix builds accept only an artifact's own table or BF16.
-The [BF16 n-gram table](docs/qwen3_8-flash-next.md#bf16-n-gram-table) section of the guide explains
+The [n-gram table formats](docs/qwen3_8-flash-next.md#n-gram-table-formats) section of the guide explains
 the formats.
 
 ### Qwen3.8-27B

@@ -27,7 +27,7 @@ def _fp8_table(tmp_path, seed: int, rows: tuple[int, int]) -> NgramTable:
     for index, count in enumerate(rows):
         words = torch.randint(0, 0x7F, (count, ROW_BYTES), dtype=torch.uint8, generator=generator)
         tensors[f"{NAME}shard_{index}.weight"] = words.view(torch.float8_e4m3fn)
-    tensors[NAME + "weight_scale"] = torch.tensor([0.001], dtype=torch.float32)
+    tensors[NAME + "weight_scale"] = torch.tensor([2.0**-10], dtype=torch.float32)  # exact in BF16, as checkpoints
     return NgramTable(_save(tmp_path, f"fp8_{seed}", tensors), PREFIX, CONFIG, sum(rows))
 
 
@@ -98,6 +98,28 @@ def test_bf16_export_reuses_the_volume_of_its_fp8_quantization(tmp_path):
     assert read_ngram_volume_id(bf16, volume) == bytes(range(16, 32))
 
 
+def _recorded_scale(volume) -> int:
+    from tools.convert.qwen4_exp import NGRAM_SCALE, NGRAM_SCALE_OFFSET
+
+    data = volume.read_bytes()[NGRAM_SCALE_OFFSET : NGRAM_SCALE_OFFSET + NGRAM_SCALE.size]
+    return NGRAM_SCALE.unpack(data)[0]
+
+
+def test_an_fp8_volume_records_its_scale_and_others_none(tmp_path):
+    # The scale lets the FP8 volume serve any artifact (the engine reads it from the header); BF16
+    # rows need none.
+    shards, bf16, fp8 = _bf16_and_fp8_tables(tmp_path, 11, (600, 400))
+    volume = tmp_path / "fp8.ngram"
+    write_ngram_volume(fp8, volume, bytes(16))
+    bits = int(fp8.scale().view(torch.int16)[0]) & 0xFFFF
+    assert _recorded_scale(volume) == bits and bits != 0
+    quantized = tmp_path / "quantized.ngram"  # a BF16 checkpoint's table, quantized with its derived scale
+    write_ngram_volume(bf16, quantized, bytes(16))
+    assert _recorded_scale(quantized) == bits
+    words = _bf16_volume(tmp_path, "words", shards, bytes(16))
+    assert _recorded_scale(words) == 0
+
+
 def test_bf16_volume_keeps_the_words_twelve_rows_per_block(tmp_path):
     # The BF16 volume (tools/flash_next/ngram_bf16.py): rows of 2 x 160 bytes, the table's BF16 words
     # unchanged, 12 per 4 KiB block (the engine reads the format from this row size).
@@ -159,6 +181,29 @@ def test_fp8_checkpoint_refuses_a_bf16_volume_of_another_table(tmp_path):
     write_ngram_volume(fp8, fp8_volume, bytes(16))
     with pytest.raises(ValueError, match="not an n-gram volume of this checkpoint's table"):
         read_ngram_volume_id(fp8, fp8_volume, bf16=True)
+
+
+def test_ngram_bf16_verify_compares_every_bf16_row(tmp_path):
+    # ngram_bf16 --verify: a BF16 volume against the checkpoint's BF16 table, and a --dequantize
+    # volume against the FP8 table's dequantized rows (verify_artifact.verify_ngram, format bf16).
+    from tools.convert.qwen4_exp import ngram_geometry
+    from tools.flash_next.ngram_bf16 import DequantizedTable
+    from tools.flash_next.verify_artifact import verify_ngram
+
+    shards, _, fp8 = _bf16_and_fp8_tables(tmp_path, 10, (600, 400))
+    store = _save(tmp_path, "keep", {f"{NAME}shard_{i}.weight": v for i, v in enumerate(shards)})
+    for label, table in (("keep", NgramTable(store, PREFIX, CONFIG, 1000, keep_bf16=True)),
+                         ("dequantized", DequantizedTable(fp8))):
+        volume = tmp_path / f"{label}.ngram"
+        write_ngram_volume(table, volume, bytes(range(16)))
+        geometry = {**ngram_geometry(table.rows, table.row_bytes), "format": "bf16",
+                    "volume_id": bytes(range(16)).hex()}
+        assert verify_ngram(table, volume, geometry, "all") == (1000, 0)
+        assert verify_ngram(table, volume, geometry, "50") == (50, 0)
+        data = bytearray(volume.read_bytes())
+        data[4096] ^= 0x01  # row 0
+        volume.write_bytes(bytes(data))
+        assert verify_ngram(table, volume, geometry, "all") == (1000, 1)
 
 
 def test_bf16_volume_needs_a_bf16_table(tmp_path):

@@ -44,6 +44,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -164,6 +165,11 @@ infernix::KvCacheStorage kv_storage(std::string_view name) {
     throw std::invalid_argument("--kv-dtype must be int8, bf16, fp8, nvfp4, k8v4, vq2 or k4v2");
 }
 
+// The artifact as the runs record it, so a run and its reference can be matched.
+std::string artifact_path(const std::string& artifact) {
+    return std::filesystem::absolute(artifact).lexically_normal().string();
+}
+
 void write_string(std::ostream& out, const std::string& text) {
     out << '"';
     for (const char c : text) {
@@ -249,7 +255,7 @@ void write_reference(const Options& options, std::uint32_t longest, std::ostream
     constexpr std::uint32_t kTop = infernix::kMaximumObservedTokens;
     static_assert(kTop <= infernix::kMaximumScoreTopTokens);
     out << "{\"artifact\": ";
-    write_string(out, options.artifact);
+    write_string(out, artifact_path(options.artifact));
     out << ", \"kind\": \"reference\", \"forced_tokens\": " << options.forced
         << ", \"top_tokens\": " << kTop << ", \"segments\": [";
     for (std::uint32_t segment = 0; segment < options.segments; ++segment) {
@@ -282,6 +288,14 @@ std::vector<std::vector<std::vector<infernix::TokenId>>> read_observe(const Opti
     if (reference.at("kind") != "reference" || reference.at("forced_tokens") != options.forced) {
         throw std::runtime_error(options.observe + " is not a reference for " +
                                  std::to_string(options.forced) + " forced tokens");
+    }
+    // Another artifact's top tokens would score this run against the wrong distribution.
+    const std::filesystem::path recorded = reference.at("artifact").get<std::string>();
+    std::error_code error;
+    if (!std::filesystem::equivalent(recorded, options.artifact, error) &&
+        artifact_path(recorded.string()) != artifact_path(options.artifact)) {
+        throw std::runtime_error(options.observe + " was written for " + recorded.string() + ", not " +
+                                 options.artifact);
     }
     const auto& list = reference.at("segments");
     if (list.size() != options.segments) {
@@ -371,8 +385,8 @@ int main(int argc, char** argv) {
                                  : read_observe(options, segments);
 
         out << "{\"artifact\": ";
-        write_string(out, options.artifact);
-        out << ", \"mode\": \"" << options.mode << "\", \"kv_dtype\": \"" << options.kv
+        write_string(out, artifact_path(options.artifact));
+        out << ", \"mode\":\"" << options.mode << "\", \"kv_dtype\": \"" << options.kv
             << "\", \"fast_paths\": [";
         const infernix::LoadSummary load = engine.load_summary();
         for (std::size_t i = 0; i < load.fast_paths.size(); ++i) {

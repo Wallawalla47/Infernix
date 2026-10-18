@@ -153,8 +153,9 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, Workspac
 }
 
 void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPolicy policy,
-                WorkspaceArena& ws, cudaStream_t stream) {
+                WorkspaceArena& ws, cudaStream_t stream, LinearRoutes routes) {
     validate_policy(policy, w.qtype);
+    if (!valid_linear_routes(routes)) { throw std::invalid_argument("linear_add: unknown route flags"); }
     const std::int32_t t = x.ne[1];
     if (t <= 0) { throw std::invalid_argument("linear_add: T must be positive"); }
     require_tensor(x, DType::BF16, w.k, t, "x");
@@ -230,7 +231,8 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
         if (!aligned_to(x.data, 16) || !aligned_to(residual_out.data, 16)) {
             throw std::invalid_argument("linear_add: NVFP4 requires 16-byte x/residual alignment");
         }
-        detail::nvfp4_linear_add_dispatch(x, w, residual_out, policy, ws, stream);
+        detail::nvfp4_linear_add_dispatch(x, w, residual_out, policy, ws, stream,
+                                          has_route(routes, LinearRoutes::WideDownTile));
         return;
     }
 

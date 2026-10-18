@@ -491,6 +491,10 @@ void launch_expert_pass_fp8(const MoeDispatch& dispatch, const MoeExpertSource& 
                             const std::uint8_t* const* job_records, const std::int32_t* flags, int base, int jobs,
                             const moe::wide::ExpertsWorkspace& layout, bf16* outputs, cudaStream_t stream,
                             PassPhase phase, int entries) {
+    // As launch_pass_ggml: the wide tiles run every job of the pass, so no phase split.
+    if (entries > 0 && phase != PassPhase::All) {
+        throw std::logic_error("offloaded_sparse_moe: the block-FP8 wide tiles do not split by pass phase");
+    }
     auto* h_plane        = reinterpret_cast<std::uint16_t*>(layout.h_rows);
     const int narrow_max = entries > 0 ? moe::kMaxColumns : std::numeric_limits<int>::max();
     gate_up_kernel_fp8<<<dim3(moe::kIntermediate / kGgmlGateUpUnits, jobs), kGgmlThreads, 0, stream>>>(

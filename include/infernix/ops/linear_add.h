@@ -71,7 +71,10 @@ namespace infernix::ops {
 void linear_add(const Tensor& x, const Weight& w, Tensor& residual, WorkspaceArena& ws,
                 cudaStream_t stream);
 
+/// `routes` admits fast-path routes (LinearRoutes): under LinearRoutes::WideDownTile the NVFP4
+/// [5120,17408] A16 calls of 5-16 columns take the 8 K-warp tiles; without a flag every profile
+/// runs its exact route.
 void linear_add(const Tensor& x, const Weight& w, Tensor& residual, LinearPolicy policy,
-                WorkspaceArena& ws, cudaStream_t stream);
+                WorkspaceArena& ws, cudaStream_t stream, LinearRoutes routes = LinearRoutes::Exact);
 
 } // namespace infernix::ops

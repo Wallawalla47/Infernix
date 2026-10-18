@@ -1232,7 +1232,9 @@ reproducible outputs. The default rule is `residency`.
 cache state, so the same prompt can give different tokens on different runs, and greedy outputs are
 not reproducible. That is inherent to the mode, which is why it is opt-in and labelled. Everything else
 stays exact: an expert that is computed is computed with the canonical arithmetic, so placement still
-never changes the bits of a kept term.
+never changes the bits of a kept term. Like CausalScoring, the exact route (`--disable-fast-paths`)
+refuses the mode at startup, either rule: its output must not depend on the cache state or on a
+declared approximation.
 
 **Interactions.**
 
@@ -1988,7 +1990,7 @@ reported whether they pass or fail.
 
 ### 20.4 Engine and system tests
 
-- **Placement invariance end to end:** greedy ids identical with `--expert-frames 0`, a small and the
+- **Placement invariance end to end** (approximate expert mode off, §9.8): greedy ids identical with `--expert-frames 0`, a small and the
   full VRAM cache; RAM tier caps of 16, 48 GiB and full; one, two and three volumes; lookahead off
   and depth 1-3; every CPU ISA (AVX-VNNI, AVX2 without VNNI, scalar) and every core-type mix;
   randomized unit completion order (fault seam); CPU cap 0 and 16.

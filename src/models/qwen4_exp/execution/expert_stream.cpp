@@ -289,18 +289,21 @@ void ExpertStream::enqueue(std::uint32_t layer) {
 
 void ExpertStream::end() noexcept {
     active_ = false;
-    try {
-        // Every read requested is waited for (a read in flight still writes its slot), every copy
-        // has landed (the chunk's work waited for each), then the slots go back.
-        for (std::uint32_t l = 0; l < layers_; ++l) {
-            for (std::int32_t& s : ssd_slots_[l]) {
-                if (s >= 0 && std::find(ssd_held_.begin(), ssd_held_.end(), l) == ssd_held_.end()) {
+    // Every read requested is waited for (a read in flight still writes its slot), every copy has
+    // landed (the chunk's work waited for each), then the slots go back. Each slot on its own, so
+    // one failed wait or release (after a failed call) does not keep the others lent.
+    for (std::uint32_t l = 0; l < layers_; ++l) {
+        for (std::int32_t& s : ssd_slots_[l]) {
+            if (s >= 0 && std::find(ssd_held_.begin(), ssd_held_.end(), l) == ssd_held_.end()) {
+                try {
                     (void)ssd_.wait(s);
                     ssd_.release(s);
-                    s = -1;
-                }
+                } catch (...) {}
+                s = -1;
             }
         }
+    }
+    try {
         while (release_landed(true)) {}
     } catch (...) {}
 }

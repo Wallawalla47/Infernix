@@ -161,8 +161,10 @@ struct ForwardBatch {
     Tensor block_start_rope; // I32 [batch, 3] axis-major: RoPE position of each sequence's first
                              // pooled-block token (ops::QsaBatch::block_start_rope)
     Tensor ngram_rows; // U8 [row bytes, heads, T]: each column's n-gram rows
-    // The rows' format when it is not the artifact's table's (a BF16 volume, resolve_ngram_volume).
+    // The rows' format when it is not the artifact's table's (another volume, resolve_ngram_volume),
+    // and an FP8 volume's scale (BF16 [1]) when it is not the artifact's ngram_scale.
     std::optional<NgramRowFormat> ngram_format;
+    Tensor ngram_scale;
     const NgramRowGate* ngram_gate = nullptr; // when set: ngram_rows are written by the gate
     Tensor slots;      // I32 [batch]: state slot of each sequence, updated in place
     Tensor table_rows; // I32 [batch]: KV block-table row of each sequence
@@ -277,8 +279,10 @@ public:
     void layer_moe(std::uint32_t layer, const ForwardBatch& batch, const Tensor& xm, const Tensor& inject,
                    Tensor& residual, std::int32_t route_columns);
     void finish(const ForwardBatch& batch, Tensor& residual, Tensor* logits);
-    // Workspace of one layer_moe call over `columns` columns.
-    [[nodiscard]] static std::size_t moe_workspace_bytes(const TextConfig& config, std::int32_t columns);
+    // Workspace of one layer_moe call over `columns` columns, with the W4A16 experts' wide route
+    // `wide_a16` (the expert-a4-residual layout is larger: Forward::moe carves it when selected).
+    [[nodiscard]] static std::size_t moe_workspace_bytes(const TextConfig& config, std::int32_t columns,
+                                                         ops::offloaded_moe::WideA16 wide_a16);
 
     // Runs the MTP drafter (requires MTP parameters and state).
     void run_mtp(const MtpCall& call);

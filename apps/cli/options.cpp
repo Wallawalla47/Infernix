@@ -142,8 +142,9 @@ std::string usage_text(const char* argv0) {
            "  --expert-tail-skip R     Qwen3.8-Flash-Next: trade quality for decode speed by\n"
            "                           skipping a routed expert missing from VRAM that every\n"
            "                           token of a decode round routes at top-10 rank R or\n"
-           "                           lower (1-9; 9 skips least). Changes the output.\n"
-           "                           Default off; Strata's default is 7\n"
+           "                           lower (1-9; 9 skips least). Changes the output; not\n"
+           "                           with --disable-fast-paths. Default off; Strata's\n"
+           "                           default is 7\n"
            "  --vram-headroom-mib N|auto\n"
            "                           VRAM in MiB startup sizing leaves free: Qwen3.5,\n"
            "                           after --kv-capacity auto (auto " +

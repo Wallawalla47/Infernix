@@ -71,7 +71,7 @@ struct Measurement {
                  "error: %s\n"
                  "usage: infernix_gdn_input_proj_bench "
                  "[--format q4q5|q8|nvfp4|fp8|all] [--nvfp4-policy a16|a4|invariant] "
-                 "[--fp8-policy a16|a8] "
+                 "[--fp8-policy a16|a8|a8r|invariant] "
                  "[--tokens T,...] [--cache cold|warm|both] [--execution eager|graph] "
                  "[--warmup N] [--repeat N] "
                  "[--profile] [--csv-out PATH]\n",
@@ -150,7 +150,7 @@ Options parse_options(int argc, char** argv) {
             else if (value == "invariant")
                 options.fp8_policy = ops::LinearPolicy::A16ColumnInvariant;
             else
-                usage("--fp8-policy expects a16, a8 or invariant");
+                usage("--fp8-policy expects a16, a8, a8r or invariant");
         } else if (argument == "--tokens") {
             options.tokens = parse_list(next("--tokens requires a value"), "--tokens");
         } else if (argument == "--cache") {

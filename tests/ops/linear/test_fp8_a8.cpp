@@ -252,7 +252,7 @@ int run_fp8_a8() {
 struct PairProblem {
     std::int32_t n, k, min_tokens;
 };
-constexpr std::array<PairProblem, 5> kFlashNextProblems{{{16384, 2560, 17},
+constexpr std::array<PairProblem, 5> kFlashNextProblems{{{16384, 2560, 33},
                                                          {13312, 2560, 97},
                                                          {2560, 6144, 513},
                                                          {1280, 2560, 1025},

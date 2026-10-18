@@ -328,6 +328,20 @@ std::string fast_path_list(const BenchEnvironment& env) {
     return out;
 }
 
+const char* ngram_residency_name(NgramResidency residency) {
+    switch (residency) {
+    case NgramResidency::Ram: return "ram";
+    case NgramResidency::Volume: return "volume";
+    case NgramResidency::Auto: break;
+    }
+    return "auto";
+}
+
+// A MiB budget as the options spell it; "auto" when unset.
+std::string mib_or_auto(const std::optional<std::uint64_t>& bytes) {
+    return bytes ? std::to_string(*bytes >> 20) : std::string("auto");
+}
+
 } // namespace
 
 std::uint32_t BenchTest::requested_output_tokens() const {
@@ -353,8 +367,8 @@ std::string usage_text(std::string_view program) {
         << "Options:\n"
         << "  --weights <path>            required .ninfer artifact\n"
         << "  --corpus <path>             token-id corpus (default: " << kDefaultCorpusPath << ")\n"
-        << "  --ngram-volume <path>       Qwen3.8-Flash-Next n-gram volume, or a BF16 one in place of the\n"
-        << "                              artifact's quantized table (default: <weights>.ngram)\n"
+        << "  --ngram-volume <path>       Qwen3.8-Flash-Next n-gram volume: the artifact's, or any FP8,\n"
+        << "                              IQ4_NL or BF16 volume of the table (default: <weights>.ngram)\n"
         << "  --ngram-residency <mode>    Qwen3.8-Flash-Next n-gram table: auto, ram (all of it in pinned\n"
         << "                              RAM) or volume (rows read on demand) (default: auto)\n"
         << "  --expert-stripe <path>      Qwen3.8-Flash-Next expert stripe: the SSD tier reads each record's\n"
@@ -865,6 +879,11 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << " original_nvfp4_prefill_kernel=" << (env.original_nvfp4_prefill_kernel ? "on" : "off")
         << " fast_paths=" << fast_path_list(env)
         << " expert_tail_skip=" << env.expert_tail_skip
+        << " ngram_volume=" << (env.ngram_volume_path.empty() ? "default" : env.ngram_volume_path)
+        << " ngram_residency=" << ngram_residency_name(env.ngram_residency)
+        << " expert_stripe=" << (env.expert_stripe_path.empty() ? "none" : env.expert_stripe_path)
+        << " expert_ram_mib=" << mib_or_auto(env.expert_ram_bytes)
+        << " expert_pin_mib=" << mib_or_auto(env.expert_pin_bytes)
         << " rope_yarn_factor=" << env.rope_yarn_factor
         << " kv_cache=" << kv_cache_name(env.kv_cache)
         << " spec=" << product::speculative_backend_name(env.speculative.backend)
@@ -1009,6 +1028,13 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << (env.original_nvfp4_prefill_kernel ? "true" : "false") << ",\n"
         << "    \"fast_paths\": \"" << fast_path_list(env) << "\",\n"
         << "    \"expert_tail_skip\": " << env.expert_tail_skip << ",\n"
+        << "    \"ngram_volume\": \"" << json_escape(env.ngram_volume_path) << "\",\n"
+        << "    \"ngram_residency\": \"" << ngram_residency_name(env.ngram_residency) << "\",\n"
+        << "    \"expert_stripe\": \"" << json_escape(env.expert_stripe_path) << "\",\n"
+        << "    \"expert_ram_mib\": "
+        << (env.expert_ram_bytes ? std::to_string(*env.expert_ram_bytes >> 20) : "null") << ",\n"
+        << "    \"expert_pin_mib\": "
+        << (env.expert_pin_bytes ? std::to_string(*env.expert_pin_bytes >> 20) : "null") << ",\n"
         << "    \"kv_cache\": \"" << kv_cache_name(env.kv_cache) << "\",\n"
         << "    \"speculative_backend\": \""
         << product::speculative_backend_name(env.speculative.backend) << "\",\n"

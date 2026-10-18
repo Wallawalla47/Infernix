@@ -719,6 +719,17 @@ NGRAM_VERSION = 1
 NGRAM_BLOCK_BYTES = 4096
 NGRAM_HEADER = struct.Struct("<8sIIQIIIQ16s")  # magic, version, header bytes, rows, row bytes,
 #                                               rows per block, block bytes, blocks, volume id
+# An FP8 volume's per-tensor scale (BF16 bits) right after the fixed fields; 0 in volumes written
+# before 2026-10-18. It lets the volume serve any artifact of the model (the artifact's own FP8 table
+# keeps its ngram_scale; the engine knows the scale of NVIDIA's published volume by its id).
+NGRAM_SCALE = struct.Struct("<H")
+NGRAM_SCALE_OFFSET = NGRAM_HEADER.size
+
+
+def bf16_bits(value: torch.Tensor) -> int:
+    """The BF16 word of a one-element BF16 tensor."""
+
+    return int(value.reshape(1).view(torch.int16)[0]) & 0xFFFF
 
 
 def ngram_geometry(rows: int, row_bytes: int) -> dict:
@@ -832,6 +843,9 @@ def write_ngram_volume(table: NgramTable, path: Path, volume_id: bytes, *, progr
         NGRAM_MAGIC, NGRAM_VERSION, NGRAM_BLOCK_BYTES, rows, row_bytes, per_block, NGRAM_BLOCK_BYTES,
         geometry["blocks"], volume_id,
     )
+    # FP8 rows record their scale (a BF16 or IQ4_NL volume's rows are self-contained).
+    fp8 = isinstance(table, NgramTable) and not table.keep_bf16
+    header += NGRAM_SCALE.pack(bf16_bits(table.scale()) if fp8 else 0)
     batch_blocks = 4096  # 16 MiB of output per write
     try:
         with temporary.open("xb") as stream:

@@ -51,13 +51,22 @@ __device__ __forceinline__ void load_bf16_b(const float* p, int k, int n, int la
 // GdnChunkArithmetic::Fp16Accumulate's helpers. Its packet holds FP16 Q/K; the 16-bit ldmatrix
 // loads above are type-agnostic.
 
+// The FP32 state and delta operands as FP16, saturating: in range the bits of pack_f16x2 (round to
+// nearest even), beyond +-65504 the largest finite value instead of an infinity, which would turn
+// the products to NaN and persist in the FP32 state for the rest of the sequence.
+__device__ __forceinline__ std::uint32_t pack_f16x2_sat(float lo, float hi) {
+    std::uint32_t out;
+    asm("cvt.rn.satfinite.f16x2.f32 %0, %1, %2;\n" : "=r"(out) : "f"(hi), "f"(lo));
+    return out;
+}
+
 template <int DV>
 __device__ __forceinline__ void load_f16_b(const float* p, int k, int n, int lane, unsigned& b0,
                                            unsigned& b1) {
     const int t = lane & 3, col = n * 8 + lane / 4;
-    b0 = pack_f16x2(p[value_index<DV>(k + 2 * t, col)], p[value_index<DV>(k + 2 * t + 1, col)]);
+    b0 = pack_f16x2_sat(p[value_index<DV>(k + 2 * t, col)], p[value_index<DV>(k + 2 * t + 1, col)]);
     b1 =
-        pack_f16x2(p[value_index<DV>(k + 2 * t + 8, col)], p[value_index<DV>(k + 2 * t + 9, col)]);
+        pack_f16x2_sat(p[value_index<DV>(k + 2 * t + 8, col)], p[value_index<DV>(k + 2 * t + 9, col)]);
 }
 
 // D = A B in FP16 from a zero accumulator (mma_f16_f16acc accumulates into D).
@@ -291,7 +300,7 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
                         const float b1 = sm.snapshot[value_index<DV>(k + 2 * t + 1, n * 8 + g)];
                         const float b2 = sm.snapshot[value_index<DV>(k + 2 * t + 8, n * 8 + g)];
                         const float b3 = sm.snapshot[value_index<DV>(k + 2 * t + 9, n * 8 + g)];
-                        const unsigned s0 = pack_f16x2(b0, b1), s1 = pack_f16x2(b2, b3);
+                        const unsigned s0 = pack_f16x2_sat(b0, b1), s1 = pack_f16x2_sat(b2, b3);
                         mma_f16_partial(prediction[ni], prediction_part[ni], k / 16, ka, s0, s1);
                         mma_f16_partial(history[ni], history_part[ni], k / 16, qa, s0, s1);
                     }
@@ -431,10 +440,10 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
             for (int ni = 0; ni < NPW; ++ni) {
                 const int col = (n_start + ni * kWarps) * 8 + g;
                 delta_b[ni][0] =
-                    pack_f16x2(p.suffix[2 * t] * sm.delta[value_index<DV>(2 * t, col)],
+                    pack_f16x2_sat(p.suffix[2 * t] * sm.delta[value_index<DV>(2 * t, col)],
                                p.suffix[2 * t + 1] * sm.delta[value_index<DV>(2 * t + 1, col)]);
                 delta_b[ni][1] =
-                    pack_f16x2(p.suffix[2 * t + 8] * sm.delta[value_index<DV>(2 * t + 8, col)],
+                    pack_f16x2_sat(p.suffix[2 * t + 8] * sm.delta[value_index<DV>(2 * t + 8, col)],
                                p.suffix[2 * t + 9] * sm.delta[value_index<DV>(2 * t + 9, col)]);
             }
 #pragma unroll

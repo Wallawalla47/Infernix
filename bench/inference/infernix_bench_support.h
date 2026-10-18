@@ -133,6 +133,12 @@ struct BenchEnvironment {
     bool original_nvfp4_prefill_kernel = false;
     bool fast_paths                    = true;
     std::uint32_t expert_tail_skip     = 0; // approximate: changes the output when set
+    // Qwen3.8-Flash-Next placement (they move its throughput): empty paths and budgets are the defaults.
+    std::string ngram_volume_path;
+    NgramResidency ngram_residency = NgramResidency::Auto;
+    std::string expert_stripe_path;
+    std::optional<std::uint64_t> expert_ram_bytes;
+    std::optional<std::uint64_t> expert_pin_bytes;
     KvCacheStorage kv_cache           = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     bool use_cuda_graph                            = true;

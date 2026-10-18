@@ -10,10 +10,13 @@
 namespace infernix {
 namespace {
 
-// Keeps one warp of each SM spinning for `cycles` clock cycles: compute load, no memory traffic.
-__global__ void spin_kernel(long long cycles) {
+// Keeps one warp of each SM spinning for `cycles` clock cycles, or with `stop` until the word is set
+// (bounded by `cycles`): compute load, no host memory traffic.
+__global__ void spin_kernel(long long cycles, const volatile unsigned* stop) {
     const long long start = clock64();
-    while (clock64() - start < cycles) {}
+    while (clock64() - start < cycles) {
+        if (stop != nullptr && *stop != 0U) { return; }
+    }
 }
 
 // The warm-up's length. Copies alone did not bring the link to its top PCIe generation: probes of a
@@ -35,8 +38,10 @@ double measure_h2d_bytes_per_second(const void* source, void* destination, std::
     const auto cycles = [&](float ms) { return static_cast<long long>(static_cast<double>(clock_khz) * ms); };
     cudaStream_t stream = nullptr, busy = nullptr;
     cudaEvent_t start = nullptr, stop = nullptr, warm = nullptr;
+    unsigned* done = nullptr;
     double best = 0.0;
     const auto release = [&] {
+        if (done != nullptr) { cudaFree(done); }
         if (start != nullptr) { cudaEventDestroy(start); }
         if (stop != nullptr) { cudaEventDestroy(stop); }
         if (warm != nullptr) { cudaEventDestroy(warm); }
@@ -49,19 +54,22 @@ double measure_h2d_bytes_per_second(const void* source, void* destination, std::
         CUDA_CHECK(cudaEventCreate(&start));
         CUDA_CHECK(cudaEventCreate(&stop));
         CUDA_CHECK(cudaEventCreateWithFlags(&warm, cudaEventDisableTiming));
+        CUDA_CHECK(cudaMalloc(&done, sizeof(unsigned)));
+        CUDA_CHECK(cudaMemsetAsync(done, 0, sizeof(unsigned), busy));
         // Warm-up: the SMs busy for kWarmMilliseconds, which brings the GPU (and its link) out of its
-        // idle state, while the link copies; then the timed copies run with the SMs still busy.
-        spin_kernel<<<sms, 32, 0, busy>>>(cycles(kWarmMilliseconds));
+        // idle state, while the link copies; then the timed copies run with the SMs still busy, under
+        // one spin the copy stream stops once they are done (bounded at 2 s).
+        spin_kernel<<<sms, 32, 0, busy>>>(cycles(kWarmMilliseconds), nullptr);
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaEventRecord(warm, busy));
+        spin_kernel<<<sms, 32, 0, busy>>>(cycles(2000.0F), done);
+        CUDA_CHECK(cudaGetLastError());
         do {
             CUDA_CHECK(cudaMemcpyAsync(destination, source, bytes, cudaMemcpyHostToDevice, stream));
             CUDA_CHECK(cudaStreamSynchronize(stream));
         } while (cudaEventQuery(warm) == cudaErrorNotReady);
         CUDA_CHECK(cudaEventSynchronize(warm));
         for (int r = 0; r < repetitions; ++r) {
-            spin_kernel<<<sms, 32, 0, busy>>>(cycles(50.0F)); // outlasts one copy at the probe's sizes
-            CUDA_CHECK(cudaGetLastError());
             CUDA_CHECK(cudaEventRecord(start, stream));
             CUDA_CHECK(cudaMemcpyAsync(destination, source, bytes, cudaMemcpyHostToDevice, stream));
             CUDA_CHECK(cudaEventRecord(stop, stream));
@@ -70,6 +78,9 @@ double measure_h2d_bytes_per_second(const void* source, void* destination, std::
             CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
             if (ms > 0.0F) { best = std::max(best, static_cast<double>(bytes) / (static_cast<double>(ms) * 1e-3)); }
         }
+        const unsigned one = 1U;
+        CUDA_CHECK(cudaMemcpyAsync(done, &one, sizeof(one), cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
         CUDA_CHECK(cudaStreamSynchronize(busy));
     } catch (...) {
         release();

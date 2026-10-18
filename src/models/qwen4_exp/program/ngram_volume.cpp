@@ -16,6 +16,9 @@ namespace {
 constexpr char kMagic[8]          = {'N', 'I', 'N', 'F', 'E', 'R', 'N', 'G'};
 constexpr std::uint32_t kVersion  = 1;
 constexpr std::size_t kHeaderSize = 8 + 4 + 4 + 8 + 4 + 4 + 4 + 8 + 16;
+// An FP8 table's per-tensor scale (BF16 bits) after the fixed fields; 0 when not recorded.
+constexpr std::size_t kScaleOffset = kHeaderSize;
+static_assert(kScaleOffset + 2 <= 4096);
 
 template <class T>
 T read_le(const std::byte* p) {
@@ -23,6 +26,25 @@ T read_le(const std::byte* p) {
     std::memcpy(&value, p, sizeof(T));
     return value;
 }
+
+// A recorded scale is a positive, finite, normal BF16 value.
+bool valid_fp8_scale(std::uint16_t bits) noexcept {
+    const unsigned exponent = (bits >> 7U) & 0xFFU;
+    return (bits & 0x8000U) == 0 && exponent != 0 && exponent != 0xFFU;
+}
+
+// FP8 volumes published before volumes recorded their scale, by volume id (16 random bytes the
+// converter drew, so an id names one file): their scale is the artifacts' ngram_scale. Published
+// files stay unchanged.
+struct KnownFp8Volume {
+    std::array<std::uint8_t, 16> id;
+    std::uint16_t scale;
+};
+constexpr KnownFp8Volume kKnownFp8Volumes[] = {
+    // NVIDIA's table (Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram, 52,429,058,048 bytes, in the
+    // NVIDIA NVFP4 and Dense8 repositories): 0x3951 = 1.9931793e-4.
+    {{0x59, 0xE5, 0xD7, 0x7E, 0x80, 0x2A, 0xC9, 0x5D, 0x8F, 0xAF, 0x0A, 0x80, 0x0B, 0x8F, 0x23, 0x01}, 0x3951},
+};
 
 } // namespace
 
@@ -199,7 +221,7 @@ std::filesystem::path default_ngram_volume(const std::filesystem::path& artifact
 
 NgramTableConfig resolve_ngram_volume(const std::filesystem::path& path, const PleConfig& ple) {
     const auto fail = [&](const std::string& why) { throw std::runtime_error(path.string() + ": " + why); };
-    std::array<std::byte, kHeaderSize> header{};
+    std::array<std::byte, kScaleOffset + 2> header{};
     {
         std::ifstream file(path, std::ios::binary);
         if (!file) { fail("cannot open the n-gram volume"); }
@@ -231,19 +253,28 @@ NgramTableConfig resolve_ngram_volume(const std::filesystem::path& path, const P
     } else {
         fail("n-gram rows of " + std::to_string(out.row_bytes) + " bytes fit no table of this model");
     }
-    if (out.format == ple.table.format) { return ple.table; } // its own volume: NgramVolume checks the id
-    if (ple.table.format == NgramRowFormat::Bf16) {
-        fail("this artifact's n-gram table is BF16; a quantized volume cannot replace it (use its BF16 volume)");
-    }
-    if (out.format != NgramRowFormat::Bf16) {
-        fail("an n-gram volume of another quantized format than the artifact's cannot replace its table; "
-             "use the artifact's volume or a BF16 volume (tools/flash_next/ngram_bf16.py)");
-    }
+    // Its own volume (the artifact's format and volume id): the artifact's table and, for FP8, its scale.
+    if (out.format == ple.table.format && out.volume_id == ple.table.volume_id) { return ple.table; }
+    // Another table of this model, in any of the three formats: its own geometry and id, and an FP8
+    // table's scale from its header (a quantization's scale is a property of the volume, not of the
+    // artifact).
     out.file_bytes = static_cast<std::uint64_t>(out.header_bytes) + out.blocks * out.block_bytes;
     if (out.rows != ple.table.rows || out.block_bytes != 4096 || out.header_bytes != 4096 ||
         out.rows_per_block != out.block_bytes / out.row_bytes ||
         out.blocks != (out.rows + out.rows_per_block - 1) / out.rows_per_block) {
-        fail("the BF16 n-gram volume's geometry differs from this model's table");
+        fail("the n-gram volume's geometry differs from this model's table");
+    }
+    if (out.format == NgramRowFormat::Fp8E4m3) {
+        // Its header's scale, or a published volume's known one.
+        std::uint16_t scale = read_le<std::uint16_t>(p + kScaleOffset);
+        for (const KnownFp8Volume& known : kKnownFp8Volumes) {
+            if (scale == 0 && known.id == out.volume_id) { scale = known.scale; }
+        }
+        if (!valid_fp8_scale(scale)) {
+            fail("this FP8 n-gram volume records no scale, so it can only serve the artifact it was written for; "
+                 "use the BF16 or IQ4_NL volume, or NVIDIA's published FP8 volume");
+        }
+        out.fp8_scale = scale;
     }
     return out;
 }

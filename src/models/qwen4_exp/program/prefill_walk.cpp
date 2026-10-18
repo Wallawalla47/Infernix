@@ -116,7 +116,7 @@ void ProgramImpl::walk_begin(Lane& lane, std::uint32_t index, std::size_t end) {
         std::size_t e       = c + 1;
         std::int32_t columns = walk_.widths[c];
         while (e < n && columns + walk_.widths[e] <= kWalkMoeColumns &&
-               execution::Forward::moe_workspace_bytes(c_, columns + walk_.widths[e]) <= arena) {
+               execution::Forward::moe_workspace_bytes(c_, columns + walk_.widths[e], wide_a16(options_)) <= arena) {
             columns += walk_.widths[e];
             ++e;
         }

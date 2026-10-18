@@ -134,8 +134,8 @@ prefix_cache::CacheCostModel hybrid_cache_cost(const ContextMachineCostModel& mo
 
 } // namespace
 
-// The exact artifact, its execution signature, the KV and speculative formats, RoPE scaling and the
-// product binary's build identity. Any difference makes the saved state meaningless, so the file is
+// The exact artifact, its execution signature, the KV and speculative formats, RoPE scaling, the
+// prefill chunk and the product binary's build identity. Any difference makes the saved state meaningless, so the file is
 // ignored.
 std::string hybrid_cache_fingerprint(const EngineOptions& options, const std::string& signature) {
     std::error_code error;
@@ -148,6 +148,9 @@ std::string hybrid_cache_fingerprint(const EngineOptions& options, const std::st
     out += ";kv=" + std::to_string(static_cast<int>(options.kv_cache));
     out += ";speculative=" + std::to_string(static_cast<int>(options.speculative.backend));
     out += ";yarn=" + std::to_string(options.rope_yarn_factor);
+    // Qwen3.5's exact-route prefill bits follow the chunk grid, so a state prefilled at another
+    // chunk would not be the one this engine computes.
+    out += ";chunk=" + std::to_string(options.prefill_chunk);
     out += ";host_state=" +
            std::to_string(static_cast<int>(options.context_cache.hybrid.host_state_precision));
     // Fast paths change the numbers cached KV and state hold.
@@ -213,6 +216,10 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
     if (options.prefill_chunk == 0) { options.prefill_chunk = qwen4_exp ? 16384U : 1024U; }
     if (options.expert_tail_skip != 0 && !qwen4_exp) {
         throw std::invalid_argument("--expert-tail-skip applies to Qwen3.8-Flash-Next (its offloaded experts) only");
+    }
+    // An approximation whose output depends on the cache state: never on the exact route.
+    if (options.expert_tail_skip != 0 && !options.fast_paths) {
+        throw std::invalid_argument("--expert-tail-skip is approximate; the exact route (--disable-fast-paths) refuses it");
     }
     // An automatic MTP draft length chooses up to the model's most drafts unless given a ceiling:
     // Qwen3.8-Flash-Next verifies 8 columns column-invariantly, the Qwen3.5 planner captures 5.

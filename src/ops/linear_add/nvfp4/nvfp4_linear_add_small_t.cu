@@ -36,9 +36,11 @@ constexpr auto make_launchers(std::index_sequence<Offsets...>) {
         &launch_exact<Geometry, 2 + static_cast<int>(Offsets)>...};
 }
 
+// 2-5 tokens: the exact route's K=17408 calls take this kernel to 5 (the release's cut-off; the
+// batched-decode route's wide tiles from 5), K=6144 to 2.
 template <class Geometry>
 constexpr auto make_launchers() {
-    return make_launchers<Geometry>(std::make_index_sequence<4 - 2 + 1>{});
+    return make_launchers<Geometry>(std::make_index_sequence<5 - 2 + 1>{});
 }
 
 constexpr auto kResidual6144Launchers  = make_launchers<Nvfp4N5120K6144>();
@@ -49,6 +51,9 @@ constexpr auto kResidual17408Launchers = make_launchers<Nvfp4N5120K17408>();
 void nvfp4_linear_add_small_t_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                      cudaStream_t stream) {
     const std::size_t index = static_cast<std::size_t>(x.ne[1] - 2);
+    if (x.ne[1] < 2 || index >= kResidual17408Launchers.size()) {
+        throw std::invalid_argument("nvfp4 linear_add: the small-T kernel serves 2-5 tokens");
+    }
     switch (resolve_nvfp4_geometry(weight.n, weight.k)) {
     case Nvfp4GeometryId::N5120K6144:
         kResidual6144Launchers[index](x, weight, residual, stream);

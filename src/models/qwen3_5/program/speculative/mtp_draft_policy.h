@@ -19,9 +19,9 @@ namespace infernix::models::qwen3_5::detail {
 // length with the most expected committed tokens per unit of round time: one row chooses among
 // every length in [1, ceiling], a round of several rows takes one common length among the batch
 // lengths (mtp_batch_draft_length). A row's expected tokens follow from its learned per-position
-// acceptance; a round's time from a measured table (set_round_seconds) when one is given, else the
-// cost learned from the rounds themselves (observe_cycle), else the fixed model
-// 1 + kModelDraftCost * K.
+// acceptance; a round's time from a measured table (set_round_seconds; only tests give one) when
+// one is given, else the cost learned from the rounds themselves (observe_cycle), else the fixed
+// model 1 + kModelDraftCost * K.
 //
 // A choice reads only earlier rounds, never the round's own draws, so speculative acceptance and
 // sampling are unchanged: only the verification width (and with it the target's linear routes)
@@ -127,7 +127,8 @@ public:
     // The lengths a round of batch_size rows chooses among, ascending.
     [[nodiscard]] std::vector<std::uint32_t> lengths(std::uint32_t batch_size) const;
 
-    // The measured time of a round of batch_size rows at draft length k (served lengths only).
+    // The measured time of a round of batch_size rows at draft length k (served lengths only). The
+    // Engine sets none (it learns round costs, observe_cycle); tests use it to fix the costs.
     void set_round_seconds(std::uint32_t k, std::uint32_t batch_size, double seconds);
 
     // Round-cost learning (as Qwen3.8-Flash-Next's, its design 11.3): the start-to-start time of two

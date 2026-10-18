@@ -708,7 +708,8 @@ the criterion was fixed before the Q6 runs: a KV format keeps 8-bit P×V on by d
 mean KL stays within 1.10× its FP16 form's, the same holds in the longest buckets, and top-1
 agreement drops by at most 0.1 pp. NVFP4 and K8V4 pass; INT8 fails, so `EngineOptions::
 prefill_8bit_pv` is a three-way `PrefillPv8 {Auto, On, Off}` whose Auto keeps FP16 P×V for INT8 and
-the E4M3 form for NVFP4 and K8V4, with `--prefill-8bit-pv` / `--no-prefill-8bit-pv` forcing either.
+the E4M3 form for NVFP4 and K8V4, with `--prefill-8bit-pv` / `--no-prefill-8bit-pv` forcing either
+(since replaced by the `prompt-pv8` fast path, docs/maintainer/model-quality.md section 6).
 End to end (one request, DFlash2, 4096-token chunks, two runs each) the default forms remove 4.7 %
 (NVFP4) and 5.0 % (K8V4) of prefill time at 64K tokens and 6.8 % and 7.5 % at 128K; INT8's opt-in
 8-bit P×V would remove 4.2 % and 5.1 %.

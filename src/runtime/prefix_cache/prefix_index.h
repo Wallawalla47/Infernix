@@ -332,8 +332,8 @@ public:
     // ------------------------------------------------------- Returns a device snapshot slot for a
     // tap/endpoint destination (staging): a free one, else a superseded owner's, else the least
     // valuable Device-only owner's when the new snapshot's `claim` priority is at least its GDSF
-    // priority, or when Device-only owners hold every one of two or more slots (that snapshot is
-    // lost), else the least
+    // priority, or when Device-only owners hold every one of two or more slots and another of them
+    // is worth at least as much (that snapshot is lost), else the least
     // recently hit Host-backed owner's (which keeps its Host copy). Absent with no Device slots
     // configured, or when every owner is pinned, held or worth more (counted as a refusal).
     [[nodiscard]] std::optional<std::uint32_t>

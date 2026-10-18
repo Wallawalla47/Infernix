@@ -988,11 +988,18 @@ std::optional<std::uint32_t> PrefixCacheIndex::acquire_device_slot(double claim)
     // Device-only owners hold at most D - 1 slots, though: GDSF time advances only on an eviction,
     // so owners worth more than every new claim would otherwise keep all D slots for the rest of
     // the session and no new conversation could publish a snapshot (issue #29). The least
-    // valuable yields; the most valuable keeps its slot. A single slot keeps value's rule alone.
-    const bool every_slot_device_only =
-        slot_state_.size() >= 2 && device_only_slots == slot_state_.size();
-    if (unbacked != kNoId &&
-        (snapshots_[slot_owner_[unbacked]].priority <= claim || every_slot_device_only)) {
+    // valuable evictable owner yields, unless it is the most valuable Device-only owner (the
+    // others pinned or held): that one keeps its slot. A single slot keeps value's rule alone.
+    bool rotate = false;
+    if (unbacked != kNoId && slot_state_.size() >= 2 && device_only_slots == slot_state_.size()) {
+        const double candidate = snapshots_[slot_owner_[unbacked]].priority;
+        for (std::uint32_t slot = 0; slot < slot_state_.size() && !rotate; ++slot) {
+            const Snapshot& owner = snapshots_[slot_owner_[slot]];
+            rotate = slot != unbacked && !owner.superseded && owner.host != CopyState::Resident &&
+                     owner.priority >= candidate;
+        }
+    }
+    if (unbacked != kNoId && (snapshots_[slot_owner_[unbacked]].priority <= claim || rotate)) {
         inflation_ = std::max(inflation_, snapshots_[slot_owner_[unbacked]].priority);
         remove_snapshot(slot_owner_[unbacked]);
         return take(unbacked);

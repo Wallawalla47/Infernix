@@ -143,16 +143,22 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     if (options.context_cache.enabled) {
         demand.prefix_cache = options.context_cache.host_capacity_bytes.value();
     }
-    // The n-gram table its volume holds: the artifact's, or a BF16 volume's in its place.
+    // The n-gram table its volume holds: the artifact's, or another volume's (any format) in its place.
     const std::filesystem::path volume = options.ngram_volume_path.empty()
                                              ? models::qwen4_exp::default_ngram_volume(options.artifact_path)
                                              : options.ngram_volume_path;
     const models::qwen4_exp::NgramTableConfig table =
         models::qwen4_exp::resolve_ngram_volume(volume, plan.config().text.ple);
-    if (table.format == models::qwen4_exp::NgramRowFormat::Bf16 &&
-        plan.config().text.ple.table.format != models::qwen4_exp::NgramRowFormat::Bf16) {
+    if (const auto& own = plan.config().text.ple.table;
+        table.format != own.format || table.volume_id != own.volume_id) {
+        const auto name = [](models::qwen4_exp::NgramRowFormat format) {
+            return format == models::qwen4_exp::NgramRowFormat::Bf16    ? std::string("BF16")
+                   : format == models::qwen4_exp::NgramRowFormat::Iq4Nl ? std::string("IQ4_NL")
+                                                                        : std::string("FP8");
+        };
         report(options, DiagnosticLevel::Info,
-               "n-gram table: BF16 rows from " + volume.string() + " in place of the artifact's quantized table");
+               "n-gram table: " + name(table.format) + " rows from " + volume.string() + " in place of the artifact's " +
+                   name(own.format) + " table");
     }
     demand.pageable     = models::qwen4_exp::NgramVolume::cache_bytes(table);
     demand.load_staging = kLoadStagingBytes;
@@ -412,13 +418,14 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     LoadSummary::PrefixCacheRestore restore;
     if (const std::filesystem::path& file = options.context_cache.hybrid.persistent_file;
         options.context_cache.enabled && !file.empty()) {
-        // Saved states depend on the n-gram rows: a BF16 volume's differ from the artifact's table.
+        // Saved states depend on the n-gram rows: another volume's differ from the artifact's table.
         std::string signature = "qwen4_exp;ngram=" + std::to_string(static_cast<int>(table.format)) + ":";
         for (const std::uint8_t byte : table.volume_id) {
             constexpr char kHex[] = "0123456789abcdef";
             signature += kHex[byte >> 4U];
             signature += kHex[byte & 15U];
         }
+        if (table.fp8_scale) { signature += ";scale=" + std::to_string(*table.fp8_scale); }
         const models::qwen4_exp::PrefixCachePersistence loaded = instance->program->attach_prefix_cache_file(
             file, hybrid_cache_fingerprint(options, signature), options.startup_observer);
         restore = LoadSummary::PrefixCacheRestore{
@@ -455,7 +462,8 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     for (const FastPath path : fast.paths) { summary.fast_paths.emplace_back(fast_path_name(path)); }
     summary.fast_paths_disabled        = !options.fast_paths;
     summary.request_invariance_capable = true;
-    summary.request_invariant          = fast.request_invariant();
+    // Tail skip makes the output depend on which experts the cache holds.
+    summary.request_invariant          = fast.request_invariant() && options.expert_tail_skip == 0;
 
     ModelMetadata metadata;
     metadata.model_id       = instance->model->info().name;

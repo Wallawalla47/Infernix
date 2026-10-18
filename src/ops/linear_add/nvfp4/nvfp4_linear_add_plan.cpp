@@ -64,14 +64,15 @@ std::size_t nvfp4_linear_add_workspace_capacity_bytes(std::int32_t output_rows,
 
 void nvfp4_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,
                                LinearPolicy policy, WorkspaceArena& workspace,
-                               cudaStream_t stream) {
+                               cudaStream_t stream, bool wide_down_tile) {
     const Nvfp4LinearAddRoute route = resolve_route(weight.n, weight.k, policy, x.ne[1]);
     if (route == Nvfp4LinearAddRoute::ColumnInvariantA16) {
         nvfp4_linear_add_invariant_launch(x, weight, residual, stream);
         return;
     }
     if (route == Nvfp4LinearAddRoute::A16) {
-        nvfp4_linear_add_a16_launch(x, weight, residual, stream);
+        // The faster 8 K-warp tiles change the reduction order: their fast path's route flag only.
+        nvfp4_linear_add_a16_launch(x, weight, residual, wide_down_tile, stream);
         return;
     }
     auto scope = workspace.scope();

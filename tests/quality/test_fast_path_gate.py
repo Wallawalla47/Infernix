@@ -16,11 +16,13 @@ def window(positions: int, mean_kl: float, agreement: float, nll: float) -> dict
 
 
 def write_report(directory: Path, *, chunk: int, fast: bool, windows: list[dict],
-                 p999: float, reference: str = "ref.top", coverage: float = 0.95) -> None:
+                 p999: float, reference: str = "ref.top", coverage: float = 0.95,
+                 artifact: str = "model.infernix") -> None:
     directory.mkdir(parents=True)
     positions = sum(w["positions"] for w in windows)
     mean_kl = sum(w["positions"] * w["mean_kl"] for w in windows) / positions
     report = {
+        "artifact": {"path": artifact, "prefill_signature": "sig"},
         "execution": {"context_tokens": 14336, "stride_tokens": 7168, "kv_dtype": "int8-g64",
                       "prefill_chunk_tokens": chunk,
                       "fast_paths": ["decode-split64"] if fast else []},
@@ -191,6 +193,44 @@ def test_mismatched_runs_cannot_decide(tmp_path):
         gate.evaluate_prefill(root)
 
 
+def test_a_fast_route_pairs_runs_of_one_artifact(tmp_path):
+    root = make_prefill(tmp_path, windows=40, floor=0.02, excess=0.0, noise=0.0, chunks=(896,))
+    report_path = root / "fast-c896" / "report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["artifact"]["prefill_signature"] = "other"
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    with pytest.raises(gate.MeasurementError, match="other artifacts"):
+        gate.evaluate_prefill(root)
+    # A comparison may set two artifacts against one reference.
+    pairs = gate.compared_pairs([root / "default-c896"], [root / "fast-c896"])
+    assert gate.evaluate_prefill_pairs(pairs, "control").passed
+
+
+def test_a_run_directory_serves_one_artifact_and_settings(tmp_path):
+    settings = {"command": "decode", "artifact": "a.infernix", "kv_tokens": 4096}
+    fast_runs = ["fast-forced.json"]
+    out = tmp_path / "out"
+    gate.claim_out(out, settings, ["preemption"], fast_runs)
+    (out / "default-forced.json").write_text("{}", encoding="utf-8")
+    (out / "fast-forced.json").write_text("{}", encoding="utf-8")
+    gate.claim_out(out, settings, ["preemption"], fast_runs)  # reuse under the same settings
+    with pytest.raises(gate.MeasurementError, match="artifact"):
+        gate.claim_out(out, dict(settings, artifact="b.infernix"), ["preemption"], fast_runs)
+    with pytest.raises(gate.MeasurementError, match="kv_tokens"):
+        gate.claim_out(out, dict(settings, kv_tokens=0), ["preemption"], fast_runs)
+    # Another candidate set keeps the reference and default runs but not the fast run.
+    with pytest.raises(gate.MeasurementError, match="fast-forced.json"):
+        gate.claim_out(out, settings, [], fast_runs)
+    (out / "fast-forced.json").unlink()
+    gate.claim_out(out, settings, [], fast_runs)
+    assert json.loads((out / "gate.json").read_text(encoding="utf-8"))["fast_path"] == []
+    legacy = tmp_path / "legacy"
+    legacy.mkdir()
+    (legacy / "reference.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(gate.MeasurementError, match="gate.json"):
+        gate.claim_out(legacy, settings, [], fast_runs)
+
+
 def test_a_fast_route_needs_the_fast_path_flag_but_a_comparison_does_not(tmp_path):
     root = make_prefill(tmp_path, windows=40, floor=0.02, excess=0.0, noise=0.0, chunks=(896,),
                         fast_flag=False)
@@ -203,7 +243,7 @@ def test_a_fast_route_needs_the_fast_path_flag_but_a_comparison_does_not(tmp_pat
 def write_forced(path: Path, segments: list[tuple[int, list[float]]], *, fast: bool,
                  observed: list[tuple[list[float], list[float]]] | None = None) -> Path:
     run = {
-        "mode": "plain", "kv_dtype": "int8", "forced_tokens": 64,
+        "artifact": "model.infernix", "mode": "plain", "kv_dtype": "int8", "forced_tokens": 64,
         "fast_paths": ["decode-split64"] if fast else [],
         "underflows": 0,
         "observed_reference": "reference.json" if observed is not None else "",
@@ -234,7 +274,8 @@ REFERENCE_TOP = [math.log(p) for p in (0.55, 0.22, 0.10, 0.05)]
 def write_reference(path: Path, count: int, coverage_scale: float = 1.0) -> Path:
     top = [lp + math.log(coverage_scale) for lp in REFERENCE_TOP]
     path.write_text(json.dumps({
-        "kind": "reference", "forced_tokens": 64, "top_tokens": len(top),
+        "artifact": "model.infernix", "kind": "reference", "forced_tokens": 64,
+        "top_tokens": len(top),
         "segments": [{"offset": 1000 * i, "prompt_tokens": [512, 2048, 8192][i % 3],
                       "logprobs": [-1.0] * 64, "top_ids": list(range(4)) * 64,
                       "top_logprobs": top * 64} for i in range(count)]}), encoding="utf-8")
@@ -363,6 +404,11 @@ def test_teacher_forced_runs_must_match(tmp_path):
     blind = write_forced(tmp_path / "blind.json", logprobs, fast=True)
     with pytest.raises(gate.MeasurementError, match="observe"):
         gate.evaluate_forced(default, blind, reference)
+    other = json.loads(reference.read_text(encoding="utf-8"))
+    other["artifact"] = "other.infernix"
+    (tmp_path / "other.json").write_text(json.dumps(other), encoding="utf-8")
+    with pytest.raises(gate.MeasurementError, match="other artifacts"):
+        gate.evaluate_forced(default, fast, tmp_path / "other.json")
 
 
 def test_decode_needs_reference_coverage(tmp_path):

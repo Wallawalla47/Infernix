@@ -1,4 +1,4 @@
-// ggml_linear and ggml_embedding against an independent exact oracle
+// ggml_linear, ggml_embedding and ple_embed_iq4_nl against an independent exact oracle
 // (docs/maintainer/qwen3_8-flash-next-design.md §16.2.2).
 //
 // Weights are random block bytes (every byte pattern is a valid encoding once the binary16 scales
@@ -8,7 +8,8 @@
 // Op documents). The oracle sums w * X exactly in a bignum, rounds once to binary32 (ties to even),
 // scales by 2^(emax - 147) (exact for these normal-range outputs) and rounds to BF16. The Op must
 // return those bits for every format, K, column count (across its 512-column batches) and with the
-// input permutation, into one output or split among several (ggml_split_segments).
+// input permutation, into one output or split among several (ggml_split_segments). The row gathers
+// must return each element's decoded value (exact in binary32) rounded once to BF16.
 
 #include "core/device.h"
 #include "core/ggml_format.h"
@@ -739,6 +740,91 @@ void bench(int columns, bool tiled) {
     CUDA_CHECK(cudaStreamDestroy(stream));
 }
 
+// The row gathers' outputs are their elements' values; a zero's sign is not part of them (an
+// IQ4_XS sub-scale of 0 gives d x 0 x kvalue, whose sign follows the evaluation order).
+bool same_value(std::uint16_t a, std::uint16_t b) {
+    return a == b || ((a & 0x7FFFU) == 0 && (b & 0x7FFFU) == 0);
+}
+
+// An element's exact value as BF16 bits: the oracle's binary64 value must be exact in binary32 (the
+// rows Ops' contract: at most 24 significant bits), then one rounding to BF16.
+std::uint16_t exact_bf16(double v, const std::string& label) {
+    const auto f = static_cast<float>(v);
+    if (static_cast<double>(f) != v) { throw std::logic_error(label + ": an element is not exact in binary32"); }
+    return bf16_rne(f);
+}
+
+// ggml_embedding: out[:, t] = bf16(row ids[t]) for every id (first, last and repeated rows).
+void run_embedding(QType q, int vocab, int hidden, Scales scales, std::mt19937& rng) {
+    const std::string label = "embedding format " + std::to_string(static_cast<int>(q)) + " H=" + std::to_string(hidden);
+    const int elems = static_cast<int>(ggml_block_elems(q)), size = static_cast<int>(ggml_block_bytes(q));
+    const int row_bytes = hidden / elems * size;
+    const auto table = random_blocks(q, vocab, hidden, rng, scales);
+    std::vector<std::int32_t> ids = {0, vocab - 1, 7, 7};
+    for (int i = 0; i < 37; ++i) { ids.push_back(static_cast<std::int32_t>(rng() % vocab)); }
+    const int columns = static_cast<int>(ids.size());
+    std::vector<std::uint16_t> expected(static_cast<std::size_t>(hidden) * columns);
+    std::vector<double> y(static_cast<std::size_t>(elems));
+    for (int t = 0; t < columns; ++t) {
+        const std::uint8_t* row = table.data() + static_cast<std::size_t>(ids[static_cast<std::size_t>(t)]) * row_bytes;
+        for (int b = 0; b < hidden / elems; ++b) {
+            decode_block(q, row + static_cast<std::size_t>(b) * size, y.data());
+            for (int j = 0; j < elems; ++j) {
+                expected[static_cast<std::size_t>(t) * hidden + b * elems + j] = exact_bf16(y[static_cast<std::size_t>(j)], label);
+            }
+        }
+    }
+    DeviceBuffer dtable(table.size()), dids(ids.size() * 4), dout(expected.size() * 2);
+    dtable.copy_from_host(table.data(), table.size(), 0);
+    dids.copy_from_host(ids.data(), ids.size() * 4, 0);
+    Weight weight;
+    weight.qtype  = q;
+    weight.qdata  = dtable.p;
+    weight.n      = vocab;
+    weight.k      = hidden;
+    weight.layout = QuantLayout::GgmlRows;
+    Tensor tids(dids.p, DType::I32, {columns});
+    Tensor tout(dout.p, DType::BF16, {hidden, columns});
+    ops::ggml_embedding(tids, weight, tout, nullptr);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector<std::uint16_t> actual(expected.size());
+    dout.copy_to_host(actual.data(), actual.size() * 2, 0);
+    std::size_t mismatches = 0;
+    for (std::size_t i = 0; i < actual.size(); ++i) { mismatches += !same_value(actual[i], expected[i]); }
+    check(mismatches == 0, label + ": " + std::to_string(mismatches) + " of " + std::to_string(actual.size()) + " outputs differ");
+}
+
+// ple_embed_iq4_nl: rows U8 [row_bytes, heads, T] to out BF16 [heads * W, T], element by element.
+void run_ple(int heads, int width, int columns, Scales scales, std::mt19937& rng) {
+    const std::string label = "ple iq4_nl heads=" + std::to_string(heads) + " W=" + std::to_string(width) +
+                              " T=" + std::to_string(columns);
+    const QType q = QType::GGML_IQ4_NL;
+    const int elems = static_cast<int>(ggml_block_elems(q)), size = static_cast<int>(ggml_block_bytes(q));
+    const int row_bytes = width / elems * size;
+    const auto rows = random_blocks(q, heads * columns, width, rng, scales);
+    std::vector<std::uint16_t> expected(static_cast<std::size_t>(heads) * width * columns);
+    std::vector<double> y(static_cast<std::size_t>(elems));
+    for (int r = 0; r < heads * columns; ++r) { // row r = t * heads + h
+        for (int b = 0; b < width / elems; ++b) {
+            decode_block(q, rows.data() + static_cast<std::size_t>(r) * row_bytes + static_cast<std::size_t>(b) * size, y.data());
+            for (int j = 0; j < elems; ++j) {
+                expected[static_cast<std::size_t>(r) * width + b * elems + j] = exact_bf16(y[static_cast<std::size_t>(j)], label);
+            }
+        }
+    }
+    DeviceBuffer drows(rows.size()), dout(expected.size() * 2);
+    drows.copy_from_host(rows.data(), rows.size(), 0);
+    Tensor trows(drows.p, DType::U8, {row_bytes, heads, columns});
+    Tensor tout(dout.p, DType::BF16, {heads * width, columns});
+    ops::ple_embed_iq4_nl(trows, tout, nullptr);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector<std::uint16_t> actual(expected.size());
+    dout.copy_to_host(actual.data(), actual.size() * 2, 0);
+    std::size_t mismatches = 0;
+    for (std::size_t i = 0; i < actual.size(); ++i) { mismatches += !same_value(actual[i], expected[i]); }
+    check(mismatches == 0, label + ": " + std::to_string(mismatches) + " of " + std::to_string(actual.size()) + " outputs differ");
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -800,11 +886,22 @@ int main(int argc, char** argv) {
             run_tiled(q, 70, 6144, 33, true, false, rng, Scales::Wider);
             run_tiled(q, 67, 2560, 72, false, true, rng, Scales::Edge);
         }
+        // The row gathers: the IQ4_XS token embedding (the model's H = 2560 and a one-block row) and
+        // the PLE n-gram rows (the model's 16 heads of W = 160 per token, and one-block rows), over every
+        // scale span.
+        for (const Scales scales : {Scales::Narrow, Scales::Wide, Scales::Wider, Scales::Edge}) {
+            run_embedding(QType::GGML_IQ4_XS, 300, 2560, scales, rng);
+            run_embedding(QType::GGML_IQ4_XS, 50, 256, scales, rng);
+            run_ple(16, 160, 1, scales, rng);
+            run_ple(16, 160, 37, scales, rng);
+            run_ple(3, 32, 300, scales, rng);
+        }
         if (failures != 0) {
             std::cerr << failures << " ggml_linear checks failed\n";
             return 1;
         }
-        std::cout << "ggml_linear: every format, K, width and output split bit-equal to the exact oracle\n";
+        std::cout << "ggml_linear: every format, K, width and output split bit-equal to the exact oracle; "
+                     "ggml_embedding and ple_embed_iq4_nl element for element\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "error: " << error.what() << "\n";

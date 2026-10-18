@@ -340,8 +340,8 @@ struct ProgramOptions {
     // The fast paths the Forward runs (fast_paths.h); all off on the exact route.
     execution::ForwardFastPaths fast_paths;
     std::filesystem::path ngram_volume;
-    // The table that volume holds (resolve_ngram_volume): a BF16 volume replaces the artifact's FP8 or
-    // IQ4_NL table. Empty: the artifact's table.
+    // The table that volume holds (resolve_ngram_volume): another volume, in any format, replaces the
+    // artifact's table. Empty: the artifact's table.
     std::optional<NgramTableConfig> ngram_table;
     // The whole n-gram table read into pinned RAM at startup (EngineOptions::ngram_residency,
     // resolved by the RAM ledger); rows are then never read from the volume.
