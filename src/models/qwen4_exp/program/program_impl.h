@@ -4853,8 +4853,8 @@ private:
                                       (drafts.size() + 1) * words);
         grammar_dead_[row] = grammar_->fill(row, drafts, host);
         auto* device_words = static_cast<std::uint32_t*>(grammar_masks_.p) + offset;
-        CUDA_CHECK(cudaMemcpyAsync(device_words, host.data(), host.size_bytes(), cudaMemcpyHostToDevice,
-                                   device_.stream));
+        // Read through the host mapping: a copy-engine copy would wait behind expert promotions.
+        upload_pinned(device_words, host.data(), host.size_bytes(), device_.stream);
         grammar_->uploaded(row, host.size_bytes());
         return {device_words, static_cast<std::int32_t>(words)};
     }

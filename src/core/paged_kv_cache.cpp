@@ -1191,8 +1191,10 @@ void KVExecutionTablePool::publish_indices(KVExecutionRowHandle row_handle,
     if (indices.empty()) { return; }
     Tensor destination_row = row(row_handle);
     auto* destination      = static_cast<std::int32_t*>(destination_row.data) + logical_begin;
-    CUDA_CHECK(cudaMemcpyAsync(destination, indices.data(), indices.size_bytes(),
-                               cudaMemcpyHostToDevice, stream));
+    // The SMs read the pinned shadow through the host mapping: a copy-engine copy would queue
+    // behind other streams' bulk host-to-device transfers (expert promotions), which share the
+    // engine in FIFO order, and hold the stream for them.
+    upload_pinned(destination, indices.data(), indices.size_bytes(), stream);
     cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
     CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
     if (capture != cudaStreamCaptureStatusNone) { return; }
