@@ -234,6 +234,13 @@ struct MoeExpertSource {
     // frames of a layer's bank have that bank's record stride (a frame pool per record size).
     std::uint64_t frame_stride = 0;
     MoeGgmlBank ggml;
+    // Approximate tail skip (0: off; 1..top_k-1): in a CPU-served call (moe_experts' CPU plan runs), an
+    // expert neither resident nor prefetched, of at most kMaxColumns columns, that every column of the
+    // call routes at top-k slot >= tail_skip_rank (the smallest router weights) is neither staged,
+    // fetched nor computed: its outputs are zero and the other experts keep their weights (no
+    // renormalisation). It changes the output; the routing and route log are unchanged, so the
+    // expert is still credited as routed.
+    std::int32_t tail_skip_rank = 0;
 };
 
 /// Workspace of one moe_experts call of `columns` (T) columns and `entries` (k*T) routed entries

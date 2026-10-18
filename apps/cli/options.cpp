@@ -139,6 +139,11 @@ std::string usage_text(const char* argv0) {
            "                           OS budget withholds (~0.6 GiB more expert cache on\n"
            "                           an RTX 5090; may move to system memory if another\n"
            "                           program needs VRAM)\n"
+           "  --expert-tail-skip R     Qwen3.8-Flash-Next: trade quality for decode speed by\n"
+           "                           skipping a routed expert missing from VRAM that every\n"
+           "                           token of a decode round routes at top-10 rank R or\n"
+           "                           lower (1-9; 9 skips least). Changes the output.\n"
+           "                           Default off; Strata's default is 7\n"
            "  --vram-headroom-mib N|auto\n"
            "                           VRAM in MiB startup sizing leaves free: Qwen3.5,\n"
            "                           after --kv-capacity auto (auto " +
@@ -286,6 +291,8 @@ Options parse_options(int argc, char** argv) {
             kv_capacity_explicit = true;
         } else if (arg == "--vram-past-budget") {
             options.vram_past_budget = true;
+        } else if (arg == "--expert-tail-skip") {
+            options.expert_tail_skip = parse_u32(value(arg), "expert-tail-skip", true);
         } else if (arg == "--vram-headroom-mib") {
             const char* text = value(arg);
             if (std::string_view(text) == "auto") {

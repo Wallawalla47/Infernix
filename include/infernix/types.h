@@ -508,6 +508,13 @@ struct EngineOptions {
     // budget withholds (~0.6 GiB on an RTX 5090), measured at startup (--vram-past-budget). That
     // memory may be moved to system memory when another program needs VRAM.
     bool vram_past_budget = false;
+    // Qwen3.8-Flash-Next, approximate (--expert-tail-skip R, 1..9; 0 off): in decode and verification
+    // rounds, a routed expert not resident in VRAM that every token of the round routes at top-10
+    // rank R or lower (0-based, the smallest router weights) is neither copied nor computed; it adds
+    // zero and the other experts keep their weights. Faster decode when experts miss VRAM, at the
+    // cost of changed and slightly worse output that depends on the expert cache's contents. Strata
+    // does the same by default at rank 7 (STRATA_ROUTE_TAIL_SKIP=7).
+    std::uint32_t expert_tail_skip = 0;
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;

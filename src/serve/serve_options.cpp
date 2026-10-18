@@ -48,6 +48,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--kv-capacity"},
     ServeOptionArity{"--vram-headroom-mib"},
     ServeOptionArity{"--vram-past-budget", false},
+    ServeOptionArity{"--expert-tail-skip"},
     ServeOptionArity{"--max-concurrency"},
     ServeOptionArity{"--max-pending-requests"},
     ServeOptionArity{"--pending-timeout-ms"},
@@ -447,6 +448,11 @@ std::string serve_usage_text(const char* argv0) {
            "                             the OS budget withholds (~0.6 GiB more expert\n"
            "                             cache on an RTX 5090; may move to system memory\n"
            "                             if another program needs VRAM)\n"
+           "  --expert-tail-skip R       Qwen3.8-Flash-Next: trade quality for decode speed by\n"
+           "                             skipping a routed expert missing from VRAM that every\n"
+           "                             token of a decode round routes at top-10 rank R or\n"
+           "                             lower (1-9; 9 skips least). Changes the output.\n"
+           "                             Default off; Strata's default is 7\n"
            "  --kv-dtype T               KV storage: bf16 (default) | int8 | fp8 | nvfp4 | k8v4 |\n"
            "                             vq2 | k4v2\n"
            "  --no-prefix-reuse          disable the prefix cache: every request starts from\n"
@@ -712,6 +718,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 parse_vram_headroom(require_value("--vram-headroom-mib"));
         } else if (arg == "--vram-past-budget") {
             options.vram_past_budget = true;
+        } else if (arg == "--expert-tail-skip") {
+            options.expert_tail_skip = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--expert-tail-skip"), "expert-tail-skip"));
         } else if (arg == "--max-concurrency") {
             options.max_concurrency = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--max-concurrency"), "max-concurrency"));

@@ -368,6 +368,9 @@ std::string usage_text(std::string_view program) {
         << "  --vram-headroom-mib <N|auto> Qwen3.8-Flash-Next: VRAM the expert cache leaves free for the\n"
         << "                              display and other programs (default auto: 1024 with a display, else 256)\n"
         << "  --vram-past-budget          Qwen3.8-Flash-Next on Windows: also use the VRAM the OS budget withholds\n"
+        << "  --expert-tail-skip <1..9>   Qwen3.8-Flash-Next: skip a VRAM-missing expert every token of a decode\n"
+        << "                              round routes at top-10 rank R or lower (faster, lower quality; changes\n"
+        << "                              the output; default off, Strata's default 7)\n"
         << "  --concurrency <1..8>       simultaneous requests per repetition (default: 1)\n"
         << "  --grammar-file <path>      constrain output with GBNF\n"
         << "  --json-object              constrain output to a JSON object\n"
@@ -470,6 +473,8 @@ BenchOptions parse_args(int argc, char** argv) {
             options.ram_headroom_bytes = static_cast<std::uint64_t>(mib) << 20;
         } else if (arg == "--vram-past-budget") {
             options.vram_past_budget = true;
+        } else if (arg == "--expert-tail-skip") {
+            options.expert_tail_skip = parse_u32(value("--expert-tail-skip"), "expert-tail-skip");
         } else if (arg == "--expert-ram-mib") {
             const std::string text = value("--expert-ram-mib");
             if (text == "auto") {
@@ -859,6 +864,7 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << " prefill_split_workspace_mib=" << env.prefill_split_workspace_mib
         << " original_nvfp4_prefill_kernel=" << (env.original_nvfp4_prefill_kernel ? "on" : "off")
         << " fast_paths=" << fast_path_list(env)
+        << " expert_tail_skip=" << env.expert_tail_skip
         << " rope_yarn_factor=" << env.rope_yarn_factor
         << " kv_cache=" << kv_cache_name(env.kv_cache)
         << " spec=" << product::speculative_backend_name(env.speculative.backend)
@@ -1002,6 +1008,7 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "    \"original_nvfp4_prefill_kernel\": "
         << (env.original_nvfp4_prefill_kernel ? "true" : "false") << ",\n"
         << "    \"fast_paths\": \"" << fast_path_list(env) << "\",\n"
+        << "    \"expert_tail_skip\": " << env.expert_tail_skip << ",\n"
         << "    \"kv_cache\": \"" << kv_cache_name(env.kv_cache) << "\",\n"
         << "    \"speculative_backend\": \""
         << product::speculative_backend_name(env.speculative.backend) << "\",\n"

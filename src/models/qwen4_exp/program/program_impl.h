@@ -1128,6 +1128,7 @@ public:
         experts.landing       = residency_->landing_table();
         experts.landed        = residency_->landed_log();
         experts.landing_slots = static_cast<std::int32_t>(ExpertResidency::kLandingSlots);
+        experts.tail_skip_rank = static_cast<std::int32_t>(options_.expert_tail_skip);
         if (tier_) {
             for (std::uint32_t l = 0; l < c_.num_hidden_layers; ++l) {
                 experts.host_tables.push_back(residency_->record_table(l));
@@ -3522,7 +3523,7 @@ private:
         residency_->before_round(s, /*landing=*/true, /*walking=*/walk_.active);
         const execution::NgramRowGate gate = row_gate();
         replay(graphs_[static_cast<std::size_t>(batch - 1)],
-               [&] { forward_call(batch, 1, batch, nullptr, nullptr, nullptr, &gate); });
+               [&] { forward_call(batch, 1, batch, nullptr, nullptr, nullptr, &gate, false, /*decode_round=*/true); });
         residency_->enqueue_route_download(s, batch);
     }
 
@@ -3594,9 +3595,10 @@ private:
     void forward_call(std::int32_t batch, std::int32_t width, std::int32_t logit_columns,
                       const execution::ForwardVerify* verify = nullptr, const execution::MtpChunk* chunk = nullptr,
                       const execution::VisionInput* vision = nullptr, const execution::NgramRowGate* gate = nullptr,
-                      bool streamed = false) {
+                      bool streamed = false, bool decode_round = false) {
         require_tier_round();
         execution::ForwardBatch fb = io_batch(static_cast<std::byte*>(io_device_.p), batch, width, logit_columns);
+        fb.decode_round  = decode_round;
         fb.ngram_gate    = gate;
         fb.verify        = verify;
         fb.mtp_chunk     = chunk;
@@ -3729,7 +3731,7 @@ private:
         const execution::NgramRowGate gate = row_gate();
         replay(graph, [&] {
             const execution::ForwardVerify view = verify_view(batch, W);
-            forward_call(batch, W, batch * W, &view, nullptr, nullptr, &gate);
+            forward_call(batch, W, batch * W, &view, nullptr, nullptr, &gate, false, /*decode_round=*/true);
         });
         // From here an enqueued gate waits for `word`: an error before it is published still
         // publishes it (over zeroed rows), so the stream drains and the error keeps its class.

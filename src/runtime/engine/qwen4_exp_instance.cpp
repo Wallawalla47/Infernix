@@ -91,6 +91,12 @@ void validate(const EngineOptions& options) {
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
     }
+    if (options.expert_tail_skip > 9) {
+        throw std::invalid_argument("--expert-tail-skip takes a top-10 rank 1-9 (0: off)");
+    }
+    if (options.expert_tail_skip != 0 && options.purpose != EnginePurpose::Generation) {
+        throw std::invalid_argument("--expert-tail-skip applies to generation (its decode rounds) only");
+    }
 }
 
 } // namespace
@@ -278,6 +284,14 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.vram_grow_delay_seconds = models::qwen4_exp::testing::vram_grow_delay();
     program_options.vram_headroom = options.vram_headroom_bytes;
     program_options.vram_past_budget = options.vram_past_budget;
+    program_options.expert_tail_skip = options.expert_tail_skip;
+    if (options.expert_tail_skip != 0) {
+        report(options, DiagnosticLevel::Warning,
+               "--expert-tail-skip " + std::to_string(options.expert_tail_skip) +
+                   ": decode and verification rounds skip a routed expert missing from VRAM that every token "
+                   "routes at top-10 rank " + std::to_string(options.expert_tail_skip) +
+                   " or lower; output changes (lower quality) for faster decode");
+    }
     if (tier) {
         program_options.expert_ram_bytes =
             static_cast<std::uint64_t>(static_cast<double>(ledger.expert_pinned) / (1.0 + demand.lock_overhead));

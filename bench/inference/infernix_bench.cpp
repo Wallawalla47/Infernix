@@ -210,6 +210,7 @@ int main(int argc, char** argv) {
         engine_options.expert_pin_bytes   = options.expert_pin_bytes;
         engine_options.vram_headroom_bytes = options.vram_headroom_bytes;
         engine_options.vram_past_budget    = options.vram_past_budget;
+        engine_options.expert_tail_skip    = options.expert_tail_skip;
         engine_options.context_cache.enabled             = false;
         engine_options.context_cache.host_capacity_bytes = 0;
         engine_options.speculative                       = options.speculative;
@@ -225,6 +226,7 @@ int main(int argc, char** argv) {
         env.prefill_split_workspace_mib  = options.prefill_split_workspace_mib;
         env.original_nvfp4_prefill_kernel = options.original_nvfp4_prefill_kernel;
         env.fast_paths                   = options.fast_paths;
+        env.expert_tail_skip             = options.expert_tail_skip;
         env.kv_cache                 = options.kv_cache;
         env.speculative              = options.speculative;
         env.use_cuda_graph           = options.use_cuda_graph;

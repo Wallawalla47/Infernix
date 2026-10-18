@@ -145,6 +145,10 @@ int main() {
         }
     }
 
+    failures += check(parse({"infernix-serve", "model.ninfer", "--expert-tail-skip", "7"}).expert_tail_skip == 7 &&
+                          parse({"infernix-serve", "model.ninfer"}).expert_tail_skip == 0,
+                      "--expert-tail-skip did not parse (default off)");
+
     const auto mtp_ngram = parse({"infernix-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens",
                                   "3", "--ngram-draft-tokens", "15"});
     failures += check(mtp_ngram.speculative.draft_tokens == 3 &&

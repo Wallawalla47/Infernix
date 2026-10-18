@@ -138,7 +138,8 @@ JSON and CSV identify DFlash2 explicitly. MTP alone reserves its extra lookahead
 Schema v20 adds `rope_yarn_factor`, `ngram_draft_tokens` and `ngram_min_match` to `config`.
 Schema v21 adds `spec_min_p` (`--spec-min-p`; `null` keeps the default, CSV empty).
 Schema v22 adds `draft_tokens_auto` (`--draft-tokens auto`; `draft_tokens` is then the resolved
-ceiling).
+ceiling, or the fixed length a Qwen3.5/3.6 configuration without adaptive-mtp runs, with
+`draft_tokens_auto` false). Schema v23 adds `expert_tail_skip` (`--expert-tail-skip`; 0 off).
 
 `--ngram-draft-tokens 1..63 --ngram-min-match 4..64` enables the single-request
 [ngram copy proposer](../docs/ngram.md) alongside the selected neural backend.

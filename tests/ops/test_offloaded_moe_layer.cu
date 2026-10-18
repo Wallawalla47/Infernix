@@ -756,6 +756,157 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
 // entries as a set, and the route-log copy. The dispatch arrays start as garbage, and a captured
 // call is replayed on new ids, so neither route may depend on memory cleared outside the call.
 // Entries <= 1024 take the one-CTA kernel, more the count/scan/scatter kernels.
+// Tail skip (MoeExpertSource::tail_skip_rank, --expert-tail-skip): with the CPU service planning the
+// call, an expert neither resident nor wider than kMaxColumns columns that every column routes at slot
+// >= rank has zero outputs; every other output keeps the CPU engine's bits (the exact narrow route).
+// Both plans (moe_experts' own and moe_route_dispatch_plan's fused one), serial and forked.
+void test_tail_skip(int experts, int columns, int top_k, int rank, std::uint32_t seed) {
+    std::mt19937 rng(seed);
+    const std::size_t stride = moe::kRecordBytes;
+    std::vector<fixtures::Expert> bank;
+    std::vector<moe::ExpertScales> scales;
+    for (int e = 0; e < experts; ++e) {
+        bank.push_back(fixtures::random_expert(rng, e % 3 == 0));
+        scales.push_back(bank.back().scales);
+    }
+    std::uint8_t* host = nullptr;
+    cuda_check(cudaHostAlloc(reinterpret_cast<void**>(&host), stride * experts, cudaHostAllocMapped), "cudaHostAlloc");
+    for (int e = 0; e < experts; ++e) { std::memcpy(host + stride * e, bank[e].record.data(), moe::kRecordBytes); }
+    std::uint8_t* host_device = nullptr;
+    cuda_check(cudaHostGetDevicePointer(reinterpret_cast<void**>(&host_device), host, 0), "cudaHostGetDevicePointer");
+    std::vector<std::int32_t> frames(experts, -1);
+    std::vector<std::uint8_t> frame_bytes;
+    int resident = 0;
+    for (int e = 0; e < experts; e += 3) {
+        frames[e] = resident++;
+        frame_bytes.insert(frame_bytes.end(), bank[e].record.begin(), bank[e].record.end());
+    }
+    auto* d_frame_base = device_copy(frame_bytes);
+    auto* d_frames     = device_copy(frames);
+    auto* d_scales     = device_copy(scales);
+    std::normal_distribution<float> n(0.0F, 1.0F);
+    std::vector<float> logits(static_cast<std::size_t>(experts + 1) * columns);
+    for (auto& v : logits) { v = n(rng); }
+    auto* d_logits = device_copy(logits);
+    std::int32_t* d_ids  = nullptr;
+    float* d_weights     = nullptr;
+    float* d_shared_gate = nullptr;
+    cuda_check(cudaMalloc(&d_ids, sizeof(std::int32_t) * top_k * columns), "cudaMalloc");
+    cuda_check(cudaMalloc(&d_weights, sizeof(float) * top_k * columns), "cudaMalloc");
+    cuda_check(cudaMalloc(&d_shared_gate, sizeof(float) * columns), "cudaMalloc");
+    infernix::ops::MoeRouting routing{Tensor(d_ids, DType::I32, {top_k, columns}),
+                                    Tensor(d_weights, DType::FP32, {top_k, columns}),
+                                    Tensor(d_shared_gate, DType::FP32, {columns})};
+    const Tensor t_logits(d_logits, DType::FP32, {experts + 1, columns});
+    infernix::ops::moe_route(t_logits, top_k, routing, nullptr);
+    void* d_dispatch = nullptr;
+    cuda_check(cudaMalloc(&d_dispatch, infernix::ops::moe_dispatch_bytes(experts, top_k * columns)), "cudaMalloc");
+    auto dispatch = infernix::ops::carve_moe_dispatch(d_dispatch, experts, top_k * columns);
+    const auto x = fixtures::random_activations(rng, columns);
+    auto* d_x    = device_copy(x);
+    std::vector<std::int32_t> ids(static_cast<std::size_t>(top_k) * columns);
+    cuda_check(cudaMemcpy(ids.data(), d_ids, ids.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost), "cudaMemcpy");
+
+    // The oracle: an expert is skipped when it misses VRAM, has at most kMaxColumns columns and every
+    // column routes it at slot >= rank; its outputs are zero, every other output is the CPU engine's.
+    std::vector<int> expert_columns(experts, 0), best_slot(experts, top_k);
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        ++expert_columns[ids[i]];
+        best_slot[ids[i]] = std::min(best_slot[ids[i]], static_cast<int>(i % top_k));
+    }
+    const auto skipped = [&](int e) {
+        return frames[e] < 0 && expert_columns[e] <= moe::kMaxColumns && best_slot[e] >= rank;
+    };
+    std::vector<std::uint16_t> expected(static_cast<std::size_t>(moe::kHidden) * top_k * columns, 0);
+    int skipped_entries = 0, computed_misses = 0;
+    for (int t = 0; t < columns; ++t) {
+        for (int s = 0; s < top_k; ++s) {
+            const int e = ids[static_cast<std::size_t>(t) * top_k + s];
+            if (skipped(e)) {
+                ++skipped_entries;
+                continue;
+            }
+            computed_misses += frames[e] < 0 ? 1 : 0;
+            const auto y = cpu_column(bank[e], &x[static_cast<std::size_t>(t) * moe::kHidden], moe::ExpertActivation::kA4);
+            std::memcpy(&expected[(static_cast<std::size_t>(t) * top_k + s) * moe::kHidden], y.data(),
+                        moe::kHidden * sizeof(std::uint16_t));
+        }
+    }
+    check(skipped_entries > 0 && computed_misses > 0, "the tail-skip case skips some misses and computes others");
+
+    const int max_jobs = std::min(experts, top_k * columns);
+    std::uint8_t* d_staging = nullptr;
+    cuda_check(cudaMalloc(&d_staging, stride * 64), "cudaMalloc");
+    void* d_workspace = nullptr;
+    cuda_check(cudaMalloc(&d_workspace, infernix::ops::moe_experts_workspace_bytes(max_jobs, top_k * columns, columns,
+                                                                                   moe::ExpertActivation::kA4)),
+               "cudaMalloc");
+    std::uint16_t* d_out = nullptr;
+    cuda_check(cudaMalloc(&d_out, expected.size() * sizeof(std::uint16_t)), "cudaMalloc");
+    std::vector<moe::CpuMissService::Layer> layers{{.records = host, .record_stride = stride, .scales = scales.data()}};
+    moe::CpuMissService service(layers, {.workers = 4, .max_jobs = 8, .max_columns = 64, .cpus = {}});
+    // The service thread takes the request word's sequence as seen when it starts; a request published
+    // before then would wait forever (the Engine starts its service long before its first round).
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    cudaStream_t fork_stream = nullptr;
+    cudaEvent_t fork_events[2] = {};
+    cuda_check(cudaStreamCreateWithFlags(&fork_stream, cudaStreamNonBlocking), "cudaStreamCreate");
+    for (auto& event : fork_events) { cuda_check(cudaEventCreateWithFlags(&event, cudaEventDisableTiming), "event"); }
+    Tensor tx(d_x, DType::BF16, {moe::kHidden, columns});
+    Tensor out(d_out, DType::BF16, {moe::kHidden, top_k * columns});
+    for (const bool fork : {false, true}) {
+        for (const bool fused : {false, true}) {
+            infernix::ops::moe_dispatch(routing, experts, dispatch, nullptr, nullptr);
+            cuda_check(cudaMemset(d_out, 0xFF, expected.size() * sizeof(std::uint16_t)), "cudaMemset");
+            infernix::ops::MoeExpertSource source{.frame_base    = d_frame_base,
+                                                .frames        = d_frames,
+                                                .host_records  = host_device,
+                                                .record_stride = stride,
+                                                .scales        = d_scales,
+                                                .staging_base  = d_staging,
+                                                .staging_slots = 64,
+                                                .cpu           = service.channel(0)};
+            source.heartbeat_timeout_ns = kTestHeartbeatTimeoutNs;
+            source.tail_skip_rank       = rank;
+            if (fork) {
+                source.fork_stream    = fork_stream;
+                source.fork_events[0] = fork_events[0];
+                source.fork_events[1] = fork_events[1];
+            }
+            const bool planned = fused && infernix::ops::moe_route_dispatch_plan(t_logits, top_k, routing, dispatch, nullptr,
+                                                                                 tx, source, max_jobs, d_workspace, out, nullptr);
+            infernix::ops::moe_experts(tx, dispatch, source, top_k, max_jobs, d_workspace, out, nullptr, true, planned);
+            cuda_check(cudaDeviceSynchronize(), "moe_experts");
+            std::vector<std::uint16_t> got(expected.size());
+            cuda_check(cudaMemcpy(got.data(), d_out, got.size() * sizeof(std::uint16_t), cudaMemcpyDeviceToHost),
+                       "cudaMemcpy");
+            // Bits are compared where the CPU engine's are the route's (test_layer's `narrow`): every skipped
+            // output, and experts of at most kMaxCpuColumns columns or with separate gate/up scales.
+            long mismatches = 0;
+            for (std::size_t i = 0; i < got.size(); ++i) {
+                const int e = ids[i / moe::kHidden];
+                if (skipped(e) || expert_columns[e] <= moe::kMaxCpuColumns || e % 3 == 0) {
+                    mismatches += got[i] != expected[i] ? 1 : 0;
+                }
+            }
+            std::printf("E=%d T=%d k=%d tail skip %d (%s, %s plan): %d entries skipped, %d misses computed, %ld "
+                        "mismatches\n",
+                        experts, columns, top_k, rank, fork ? "forked" : "serial", planned ? "fused" : "own",
+                        skipped_entries, computed_misses, mismatches);
+            check(mismatches == 0, "tail skip zeroes the skipped experts' outputs and keeps every other output exact");
+        }
+    }
+    cuda_check(cudaStreamDestroy(fork_stream), "cudaStreamDestroy");
+    for (auto& event : fork_events) { cuda_check(cudaEventDestroy(event), "event"); }
+    for (void* p : {static_cast<void*>(d_frame_base), static_cast<void*>(d_frames), static_cast<void*>(d_scales),
+                    static_cast<void*>(d_logits), static_cast<void*>(d_ids), static_cast<void*>(d_weights),
+                    static_cast<void*>(d_shared_gate), d_dispatch, static_cast<void*>(d_x),
+                    static_cast<void*>(d_staging), d_workspace, static_cast<void*>(d_out)}) {
+        cuda_check(cudaFree(p), "cudaFree");
+    }
+    cuda_check(cudaFreeHost(host), "cudaFreeHost");
+}
+
 void test_dispatch(int experts, int entries, std::uint32_t seed) {
     std::mt19937 rng(seed);
     std::uniform_int_distribution<int> pick(0, experts - 1);
@@ -1079,6 +1230,9 @@ int main() {
         test_layer(400, 64, 10, 23); // more than 256 jobs: the plan ranks in several chunks
         test_layer(512, 512, 10, 29);  // a short prompt's call: ~10 columns per expert, hundreds of narrow jobs
         test_layer(512, 2048, 10, 31); // a wider call: x published from thousands of columns
+        test_tail_skip(48, 1, 10, 7, 401);  // decode: one column, Strata's default rank
+        test_tail_skip(48, 6, 10, 5, 403);  // MTP verification width: an expert skips only if every column ranks it low
+        test_tail_skip(96, 16, 10, 8, 409); // two verify rows: past the fork route, wide experts never skipped
         // W4A16 experts (§16.2.1): decode, verification, several columns per expert, many misses, and
         // a short prompt's call (experts of more than eight columns on the narrow kernels). Calls of
         // four columns take the one-column kernels and of five or more the multi-column ones.

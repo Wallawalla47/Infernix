@@ -49,6 +49,9 @@ int run_tests() {
                                        "a", "--json-object"});
                       }),
                       "regex and JSON were accepted together");
+    failures += check(parse({"infernix", "model.ninfer", "--prompt", "hello", "--expert-tail-skip", "8"})
+                              .expert_tail_skip == 8,
+                      "--expert-tail-skip did not parse");
     const auto gated = parse({"infernix", "model.ninfer", "--prompt", "hello", "--spec", "mtp",
                               "--draft-tokens", "3", "--spec-min-p", "0.7"});
     failures += check(gated.speculative.draft_min_p && *gated.speculative.draft_min_p == 0.7F,

@@ -2823,7 +2823,10 @@ Considered and rejected:
 - **Lossless entropy coding of NVFP4 codes in VRAM** to fit more experts. E2M1 codes of
   MSE-calibrated weights carry roughly 3.5-3.8 bits of entropy, a ≤ 12% capacity gain. Decoding at
   1.5 TB/s would cost more GPU time than the extra hit rate saves.
-- **GPU-side expert skipping or dynamic top-k.** It changes the model's mathematics.
+- **GPU-side expert skipping or dynamic top-k.** It changes the model's mathematics. Since
+  2026-10-18 Strata's tail rule is offered as an explicit, approximate option, off by default
+  (`--expert-tail-skip R`, EngineOptions::expert_tail_skip): decode and verification rounds skip a
+  miss that every column routes at rank R or lower (ops::MoeExpertSource::tail_skip_rank).
 - **Mixed SM copy kernels for prefetch.** They steal SMs and HBM bandwidth from the decode kernels.
   The copy engine is free.
 - **Floating-point atomics in the expert kernels** (as in b12x's W4A4 path and MonoMoE). They make

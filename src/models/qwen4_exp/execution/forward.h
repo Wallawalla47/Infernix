@@ -101,6 +101,9 @@ struct ForwardExperts {
     ExpertStream* stream = nullptr;
     // A gated stream's split of each layer's experts between the link and the CPU (§19.3.12).
     const CpuSplitPolicy* split = nullptr;
+    // --expert-tail-skip (approximate, 0: off): the generation rounds' ops::MoeExpertSource::
+    // tail_skip_rank.
+    std::int32_t tail_skip_rank = 0;
 };
 
 // A speculative verification call (design §11): `batch` sequences of `width` >= 2 positions. It
@@ -170,6 +173,9 @@ struct ForwardBatch {
     std::int32_t batch = 0;
     std::int32_t width = 0;
     const ForwardVerify* verify = nullptr; // set for a speculative verification call
+    // A generation round (decode or verification), not a prefill chunk, forced token or scored
+    // position: the only calls ForwardExperts::tail_skip_rank applies to.
+    bool decode_round = false;
     Tensor residual_out;                   // when set: BF16 [S*H, T] copy of the final residual
     const MtpChunk* mtp_chunk = nullptr;   // when set: the chunk's MTP cells (one sequence)
     // Prefix-cache copies of the call's lane in flight (a restore into it, a copy-out of it): each

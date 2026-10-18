@@ -574,6 +574,7 @@ std::string format_server_start_json(
               product::speculative_backend_name(engine_options.speculative.backend)},
              {"speculative_draft_window", engine_options.speculative.draft_tokens},
              {"speculative_draft_auto", engine_options.speculative.draft_tokens_auto},
+             {"expert_tail_skip", engine_options.expert_tail_skip},
              {"spec_min_p", engine_options.speculative.draft_min_p
                                 ? Json(static_cast<double>(*engine_options.speculative.draft_min_p))
                                 : Json(nullptr)},

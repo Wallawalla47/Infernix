@@ -792,6 +792,8 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
         if (!experts_.fetch.empty()) { source.fetch = experts_.fetch.at(layer); }
     }
     source.error = experts_.error;
+    // --expert-tail-skip acts in generation rounds only; prefill, forced and scored tokens stay exact.
+    if (batch != nullptr && batch->decode_round) { source.tail_skip_rank = experts_.tail_skip_rank; }
     // Prefill chunks (one sequence of many positions, run eagerly) overlap staging with compute.
     if (eager_chunk_ && experts_.overlap_stream != nullptr) {
         source.overlap_stream = experts_.overlap_stream;

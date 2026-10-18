@@ -211,6 +211,9 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
     // and idle-wide-prefill already widens its idle steps (16,384 measured 3.5 % slower at
     // pp16384 and pp32768 on the 27B).
     if (options.prefill_chunk == 0) { options.prefill_chunk = qwen4_exp ? 16384U : 1024U; }
+    if (options.expert_tail_skip != 0 && !qwen4_exp) {
+        throw std::invalid_argument("--expert-tail-skip applies to Qwen3.8-Flash-Next (its offloaded experts) only");
+    }
     // An automatic MTP draft length chooses up to the model's most drafts unless given a ceiling:
     // Qwen3.8-Flash-Next verifies 8 columns column-invariantly, the Qwen3.5 planner captures 5.
     if (options.speculative.draft_tokens_auto) {

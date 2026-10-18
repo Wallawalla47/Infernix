@@ -1353,9 +1353,21 @@ __device__ __forceinline__ void cpu_plan_body(const MoeDispatch& dispatch, const
         const int expert = dispatch.jobs[j];
         // A streamed record counts as resident: neither staged nor CPU-served.
         if (source.frames[expert] >= 0 || (source.prefetched != nullptr && source.prefetched[expert] >= 0)) { continue; }
+        const int count = dispatch.offsets[expert + 1] - dispatch.offsets[expert];
+        // Tail skip (MoeExpertSource::tail_skip_rank): a miss every column routes at slot >= R only is
+        // flagged 2, which every route passes over like a CPU job, and is not counted as a miss. Experts
+        // of more than kMaxColumns columns are kept (the wide route does not read the flags).
+        if (source.tail_skip_rank > 0 && count <= moe::kMaxColumns) {
+            const int first = dispatch.offsets[expert];
+            bool tail       = true;
+            for (int c = 0; c < count && tail; ++c) { tail = dispatch.entries[first + c] % top_k >= source.tail_skip_rank; }
+            if (tail) {
+                cpu_flags[j] = 2;
+                continue;
+            }
+        }
         const bool ssd  = source.host_table != nullptr && source.host_table[expert] == nullptr;
         own += ssd ? 0 : 1;
-        const int count = dispatch.offsets[expert + 1] - dispatch.offsets[expert];
         if (count <= max_width) { atomicAdd(&width_misses[(ssd ? 0 : kWidths) + count], 1); }
     }
     own = __reduce_add_sync(0xFFFFFFFFU, own);
@@ -1393,7 +1405,8 @@ __device__ __forceinline__ void cpu_plan_body(const MoeDispatch& dispatch, const
         int width = 0, cat = 0, expert = -1, first = 0;
         if (j < jobs) {
             expert = dispatch.jobs[j];
-            if (source.frames[expert] < 0 && (source.prefetched == nullptr || source.prefetched[expert] < 0)) {
+            if (source.frames[expert] < 0 && (source.prefetched == nullptr || source.prefetched[expert] < 0) &&
+                cpu_flags[j] != 2) { // a skipped tail expert is not a miss to serve
                 first           = dispatch.offsets[expert];
                 const int count = dispatch.offsets[expert + 1] - first;
                 width           = count <= max_width ? count : 0;
@@ -1540,6 +1553,25 @@ __device__ void warm_l2(const MoeL2Warm& warm, int w) {
         const auto* address = static_cast<const std::uint8_t*>(warm.ptr[span]) + offset;
         asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(address), "r"(static_cast<unsigned>(piece))
                      : "memory");
+    }
+}
+
+// Tail skip (MoeExpertSource::tail_skip_rank): no route writes a skipped expert's outputs, so they are
+// zeroed for the combine. CTA b clears the entries of jobs b, b + gridDim.x, ... flagged 2.
+__global__ void __launch_bounds__(kThreads)
+    tail_zero_kernel(MoeDispatch dispatch, int max_jobs, const std::int32_t* __restrict__ cpu_flags, int hidden,
+                     bf16* __restrict__ outputs) {
+    const int jobs    = min(*dispatch.job_count, max_jobs);
+    const int vectors = hidden * 2 / 16; // 16-byte vectors per column
+    auto* out         = reinterpret_cast<int4*>(outputs);
+    for (int j = static_cast<int>(blockIdx.x); j < jobs; j += static_cast<int>(gridDim.x)) {
+        if (cpu_flags[j] != 2) { continue; }
+        const int expert = dispatch.jobs[j];
+        const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
+        for (int i = threadIdx.x; i < count * vectors; i += blockDim.x) {
+            out[static_cast<std::size_t>(dispatch.entries[first + i / vectors]) * vectors + i % vectors] =
+                make_int4(0, 0, 0, 0);
+        }
     }
 }
 
@@ -1843,7 +1875,13 @@ void moe_experts_cpu_wait(const Tensor& x, const MoeDispatch& dispatch, const Mo
                           std::int32_t max_jobs, void* workspace, Tensor& outputs, cudaStream_t stream) {
     if (forked(source, max_jobs, x.ne[1])) { CUDA_CHECK(cudaStreamWaitEvent(stream, source.fork_events[1], 0)); }
     if (!cpu_served(x, source)) { return; }
-    CpuCall* call    = cpu_call_of(workspace, x, source, max_jobs, outputs.ne[1], nullptr);
+    std::int32_t* cpu_flags = nullptr;
+    CpuCall* call    = cpu_call_of(workspace, x, source, max_jobs, outputs.ne[1], &cpu_flags);
+    if (source.tail_skip_rank > 0) {
+        tail_zero_kernel<<<kWaitCtas, kThreads, 0, stream>>>(dispatch, static_cast<int>(max_jobs), cpu_flags,
+                                                             moe::kHidden, static_cast<bf16*>(outputs.data));
+        check_launch("tail zero");
+    }
     bool warm        = false;
     for (int i = 0; i < MoeL2Warm::kSpans; ++i) {
         require(source.l2_warm.bytes[i] == 0 || reinterpret_cast<std::uintptr_t>(source.l2_warm.ptr[i]) % 16 == 0,

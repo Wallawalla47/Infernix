@@ -357,6 +357,8 @@ struct ProgramOptions {
     // the expert frames are made (design §19.3.7); empty selects it from the display state.
     std::optional<std::uint64_t> vram_headroom;
     bool vram_past_budget = false; // EngineOptions::vram_past_budget
+    // EngineOptions::expert_tail_skip (approximate, 0: off): execution::ForwardExperts::tail_skip_rank.
+    std::uint32_t expert_tail_skip = 0;
     bool expert_cache = true;
     // SSD expert tier (design §19.3.7): pinned RAM for expert slots when the model's banks are
     // streamed from the artifact (LoadOptions::stream_experts; the RAM ledger's pinned expert

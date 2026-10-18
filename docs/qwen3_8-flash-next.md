@@ -595,6 +595,27 @@ headroom 256 (auto); expert frames 9300 (23.95 GiB); 380 free after startup
   - If Windows lowers the budget later, the cache shrinks by the same amount.
   - The cost: memory past the budget may be moved to system memory if another program needs VRAM,
     which slows decode until the cache shrinks. It is off by default.
+- <a id="expert-tail-skip"></a>**`--expert-tail-skip R`** (approximate, off by default) trades
+  quality for decode speed. Each token routes 10 experts, ranked by router weight (rank 0 the
+  largest). In a decode or verification round, an expert missing from VRAM that every token of the
+  round routes at rank `R` or lower (`1..9`) is neither copied nor computed: it adds zero, and the
+  other experts keep the weights the router gave them (no renormalisation).
+  - It saves the PCIe copies and CPU work of those misses, so it helps most when many experts miss
+    VRAM (the SSD tier, small cards); with every expert in VRAM it changes nothing.
+  - The output changes and is slightly worse, and it depends on which experts the cache holds at
+    the time, so it is neither the exact route nor request-invariant. Prefill, forced and scored
+    tokens are unchanged, and a skipped expert still counts as routed for the cache, so it can be
+    promoted.
+  - Experts that a round routes from more than 8 tokens are always computed.
+  - Measured (2026-10-18, RTX 5090 on PCIe 5.0 x8, INT8 KV, `infernix_bench` pp2048 + tg512, MTP
+    `auto`, two runs per arm alternating; each arm decodes its own text): rank 7 took Dense8 from
+    155 to 207 tok/s (+33 %), FP8 from 47 to 61 (+28 %) and IQ3_S from 210 to 234 (+12 %), every run
+    ahead; rank 9 on FP8 changed nothing beyond spread (+0.4 %). Its quality cost was not measured
+    on these artifacts.
+  - Strata turns the same rule on by default at rank 7 (`STRATA_ROUTE_TAIL_SKIP=7`, single-request
+    windows; it reports KL 0.003-0.006 and +10-20 % decode on 12-16 GB cards). Rank 7 failed
+    Infernix's fast-path decode gate (model-quality §6; [design §19.3](maintainer/qwen3_8-flash-next-design.md)),
+    which is why it is an option rather than a fast path. 9 skips least, 1 most.
 - On a system without CUDA virtual memory management the cache cannot resize: the headroom with a
   display is then 1 GiB, and a warning names the headroom to set when free VRAM runs short.
 - `--kv-capacity auto` means `--max-context` x `--max-concurrency`, the same as omitting it.

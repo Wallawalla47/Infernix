@@ -193,6 +193,18 @@ int main() {
         } catch (const std::invalid_argument&) { rejected = true; }
         failures += check(rejected, "--draft-tokens auto was accepted without MTP");
     }
+    // --expert-tail-skip skips offloaded experts: Qwen3.8-Flash-Next only.
+    {
+        EngineOptions options;
+        options.expert_tail_skip = 7;
+        bool rejected = false;
+        try {
+            (void)normalize_engine_options(options);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "--expert-tail-skip was accepted on Qwen3.5");
+        failures += check(normalize_engine_options(options, infernix::models::Architecture::Qwen4Exp).expert_tail_skip == 7U,
+                          "--expert-tail-skip did not reach Qwen3.8-Flash-Next");
+    }
     for (int variant = 0; variant < 3; ++variant) {
         EngineOptions options;
         options.context_cache.hybrid.tool_call_hold = std::chrono::seconds(variant == 0 ? -1 : 30);

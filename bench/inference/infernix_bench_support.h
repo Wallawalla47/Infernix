@@ -15,7 +15,7 @@
 
 namespace infernix::bench {
 
-inline constexpr int kSchemaVersion                   = 22;
+inline constexpr int kSchemaVersion                   = 23;
 inline constexpr std::string_view kArtifactType       = "infernix_bench_report";
 inline constexpr std::string_view kDefaultCorpusPath  = "bench/fixtures/bench_corpus.ids";
 inline constexpr int kDecodeSeedTokens                = 1;
@@ -61,6 +61,7 @@ struct BenchOptions {
     std::optional<std::uint64_t> expert_pin_bytes; // --expert-pin-mib; empty: what the OS lets it pin
     std::optional<std::size_t> vram_headroom_bytes; // empty: the model's automatic headroom
     bool vram_past_budget = false;
+    std::uint32_t expert_tail_skip = 0; // EngineOptions::expert_tail_skip
     std::string corpus_path{kDefaultCorpusPath};
     std::string constraint_file;
     std::optional<OutputConstraint> constraint;
@@ -131,6 +132,7 @@ struct BenchEnvironment {
     std::uint32_t prefill_split_workspace_mib = kDefaultPrefillSplitWorkspaceMiB;
     bool original_nvfp4_prefill_kernel = false;
     bool fast_paths                    = true;
+    std::uint32_t expert_tail_skip     = 0; // approximate: changes the output when set
     KvCacheStorage kv_cache           = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     bool use_cuda_graph                            = true;
