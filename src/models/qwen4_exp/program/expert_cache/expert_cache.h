@@ -71,6 +71,11 @@ public:
               std::size_t admission_budget = static_cast<std::size_t>(-1), const Admissible* admissible = nullptr,
               const Admissible* evictable = nullptr);
 
+    // Prompt seeding (design §19.3.27): adds amounts[i] to keys[i]'s count and marks it used now,
+    // with no clock tick (the prompt's prefill calls ticked already) and no admission: the credit
+    // ranks later admissions and evictions.
+    void credit(std::span<const std::uint32_t> keys, std::span<const double> amounts);
+
     // Promote a non-resident key (for example a staged prefetch whose frame changes role).
     // Returns the victim, or nothing when the pool still has room.
     std::optional<std::uint32_t> promote(std::uint32_t key, std::span<const std::uint32_t> protect);
@@ -207,6 +212,8 @@ public:
     void on_route(std::span<const std::uint32_t> group, std::uint64_t round_started,
                   std::vector<Command>& out, std::size_t admission_budget = static_cast<std::size_t>(-1),
                   const LfruPolicy::Admissible* admissible = nullptr, const LfruPolicy::Admissible* evictable = nullptr);
+    // A prompt's weighted routes at its end (LfruPolicy::credit); issues no command.
+    void credit(std::span<const std::uint32_t> keys, std::span<const double> amounts) { policy_.credit(keys, amounts); }
     // The SSD tier's demotion (design §19.3.7 T4/T7): after on_route evicted an expert and before
     // on_quiescent, its retired frame is held while its record is copied to RAM; release_held frees
     // it once the copy completed and loads queued experts into free frames.

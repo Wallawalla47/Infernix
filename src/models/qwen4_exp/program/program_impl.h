@@ -416,6 +416,10 @@ public:
         // position by the proposal's match length (kNgramBuckets).
         std::array<double, 4> ngram_accept{};
         LanePrefix prefix;
+        // Prompt seeding (design §19.3.27): of the prompt's prefilled tokens counted, how many
+        // routed to each (layer, expert); [layers][experts], allocated on first use.
+        std::vector<std::uint32_t> prompt_uses;
+        std::uint32_t prompt_counted = 0;
     };
 
     // Everything the Program allocates on the device besides the expert frames; validates the
@@ -1383,6 +1387,7 @@ public:
             lane.calls = plan_prefill(data, 0, {}, false).ends;
         }
         lane.next_call = 0;
+        clear_prompt_uses(lane);
         lane.mtp_accept.fill(kAcceptancePrior);
         lane.mtp_policy_rounds = 0;
         lane.ngram_accept      = kNgramAcceptancePriors;
@@ -1564,6 +1569,7 @@ public:
             lane.calls = prefix::plan_calls(0, r.target, static_cast<std::uint32_t>(chunk_), {}, call_cost()).ends;
         }
         lane.next_call = 0;
+        clear_prompt_uses(lane);
         if (max_width_ > 1 && options_.ngram_draft_tokens > 0) {
             lane.proposer = std::make_unique<qwen3_5::detail::NgramProposer>(proposer_tokens_, proposer_tokens_ / 2);
             for (const auto token : lane.history) { lane.proposer->append(token); }
@@ -1867,11 +1873,47 @@ public:
                                                     static_cast<std::uint64_t>(width));
             trace_round(RouteTraceKind::PrefillChunk, 1, width, static_cast<std::uint32_t>(width), promotions,
                         static_cast<std::uint32_t>(begin));
+            note_prompt_routes(lane, width);
             residency_->after_round(device_.stream, width, promotions);
             apply_vram_target(false);
         }
 
         return prefill_progress(lane, index, begin, width, static_cast<std::uint32_t>(width), last, promotions, start);
+    }
+
+    // Prompt seeding (design §19.3.27): a prefill call's per-token routes, read from the route log
+    // its after_round is about to apply, add to the lane's prompt uses. A layer walk's span counts
+    // its last chunk, the one its route log holds.
+    void note_prompt_routes(Lane& lane, std::int32_t width) {
+        if (width <= 0) { return; }
+        const std::uint32_t L = c_.num_hidden_layers, E = c_.moe.experts, K = c_.moe.top_k;
+        if (lane.prompt_uses.size() != static_cast<std::size_t>(L) * E) {
+            lane.prompt_uses.assign(static_cast<std::size_t>(L) * E, 0);
+            lane.prompt_counted = 0;
+        }
+        const std::int32_t* routes = residency_->route_host();
+        const std::size_t stride   = residency_->route_stride();
+        for (std::uint32_t l = 0; l < L; ++l) {
+            const std::int32_t* ids = routes + static_cast<std::size_t>(l) * stride;
+            std::uint32_t* uses     = lane.prompt_uses.data() + static_cast<std::size_t>(l) * E;
+            for (std::size_t i = 0; i < static_cast<std::size_t>(width) * K; ++i) {
+                const std::int32_t expert = ids[i];
+                if (expert >= 0 && static_cast<std::uint32_t>(expert) < E) { ++uses[expert]; }
+            }
+        }
+        lane.prompt_counted += static_cast<std::uint32_t>(width);
+    }
+
+    // At the prompt's end, after its last after_round: an expert that every counted token routed to
+    // gains kPromptSeedCredit of LFRU count, the others in proportion.
+    void seed_prompt_experts(Lane& lane) {
+        if (lane.prompt_counted == 0) { return; }
+        residency_->seed_prompt(lane.prompt_uses, kPromptSeedCredit / lane.prompt_counted);
+        clear_prompt_uses(lane);
+    }
+    static void clear_prompt_uses(Lane& lane) {
+        std::fill(lane.prompt_uses.begin(), lane.prompt_uses.end(), 0U);
+        lane.prompt_counted = 0;
     }
 
     // The progress of a prefill unit whose calls were enqueued (the last ends at `begin + width`,
@@ -1894,7 +1936,9 @@ public:
             }
             trace_round(RouteTraceKind::PrefillChunk, 1, width, static_cast<std::uint32_t>(width), promotions,
                         static_cast<std::uint32_t>(begin));
+            note_prompt_routes(lane, width);
             residency_->after_round(device_.stream, width, promotions);
+            seed_prompt_experts(lane);
             apply_vram_target(false);
             lane.replay = false;
             lane.phase  = Phase::Decode;
@@ -1912,7 +1956,9 @@ public:
                                                         static_cast<std::uint64_t>(width));
                 trace_round(RouteTraceKind::PrefillChunk, 1, width, static_cast<std::uint32_t>(width), promotions,
                             static_cast<std::uint32_t>(begin));
+                note_prompt_routes(lane, width);
                 residency_->after_round(device_.stream, width, promotions);
+                seed_prompt_experts(lane);
                 apply_vram_target(false);
             }
             const SequenceHandle rows[] = {handle(index)};
@@ -5130,6 +5176,10 @@ private:
     // Strata's --spec-min-p rule (C = 1 MTP, AIME prompts sampled on the 5090: 138.8 -> 147.2 tok/s,
     // acceptance 75.6 -> 81.8 %, repeatable to the decimal; 0.7 gave 142.6; design 19.3.5).
     double draft_min_logprob_ = 0.0;
+    // Prompt seeding (seed_prompt_experts): the LFRU count an expert gains when every token of the
+    // prompt routed to it. Mixed-topic Dense8 decode, credit only: 64 -0.9 %, 256 -1.8 % time, and
+    // replayed decode hits +0.34 / +0.59 / +0.54 points at 64 / 256 / 1,024 (design §19.3.27).
+    static constexpr double kPromptSeedCredit = 256.0;
     // sampled-mtp-drafts (ProgramOptions::sampled_mtp_drafts) on a token domain the sparse
     // acceptance serves: sampled rows draw their drafts and skip the confidence cut.
     bool sampled_drafts_ = false;

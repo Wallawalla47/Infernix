@@ -538,6 +538,47 @@ void test_seed() {
     check(cache.seed(ranked, {}, cmds) == 0 && cmds.empty(), "a full cache seeds nothing more");
 }
 
+// Prompt seeding (design §19.3.27): credit adds weighted uses, marked used now, with no clock tick
+// and no admission; the credit then ranks the next budgeted admission and its victim.
+void test_prompt_credit() {
+    LfruPolicy policy(64, 4);
+    LfruPolicy::Step step;
+    const std::vector<std::uint32_t> fill{0, 1, 2, 3};
+    policy.step(fill, step); // now 1: every key count 1
+    const std::vector<std::uint32_t> hot{0, 1};
+    for (int i = 0; i < 3; ++i) { policy.step(hot, step); } // now 4: keys 0, 1 count 4; keys 2, 3 age 3
+    const std::uint64_t now = policy.now();
+    const std::vector<std::uint32_t> keys{10, 2};
+    const std::vector<double> amounts{5.0, 2.0};
+    policy.credit(keys, amounts);
+    check(policy.now() == now, "credit does not tick the clock");
+    check(!policy.resident(10) && policy.resident_count() == 4, "credit admits nothing");
+    check(policy.count(10) == 5.0 && policy.score(10) == 5.0, "a credited miss gains its amount, used now");
+    check(policy.count(2) == 3.0 && policy.score(2) == 3.0, "a credited resident gains its amount, used now");
+    // The next call routes keys 10 and 11, both missing, with room for one admission: credited key 10
+    // (6 / 1) outranks 11 (1 / 1), and the victim is key 3 (1 / 5), not key 2, which tied with it
+    // before the credit (lowest key first) and now scores 3 / 2.
+    const std::vector<std::uint32_t> next{10, 11};
+    policy.step(next, step, 1);
+    check(step.admitted == std::vector<std::uint32_t>{10} && step.victims == std::vector<std::uint32_t>{3},
+          "the credit ranks the next admission and its victim");
+    check(policy.resident(2) && !policy.resident(3), "the credited resident outlives its uncredited twin");
+    bool threw = false;
+    try {
+        const std::vector<double> one{1.0};
+        policy.credit(keys, one);
+    } catch (const std::invalid_argument&) { threw = true; }
+    check(threw, "credit rejects mismatched key and amount counts");
+
+    // The controller forwards the credit and issues nothing.
+    CacheController cache(64, 6, 2, 1);
+    const std::vector<std::uint32_t> prompt{40};
+    const std::vector<double> credit{8.0};
+    cache.credit(prompt, credit);
+    check(cache.policy().count(40) == 8.0 && !cache.policy().resident(40) && cache.queued_loads() == 0,
+          "the controller credits without loading");
+}
+
 // The saved state file: a round trip keeps counts and ranking; another identity, key count, version
 // or a truncated file loads nothing (with a reason).
 void test_state_file() {
@@ -685,6 +726,7 @@ int main() {
     test_load_serials();
     test_lending();
     test_seed();
+    test_prompt_credit();
     test_landing();
     test_state_file();
     test_calibrated_order();

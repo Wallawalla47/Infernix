@@ -643,6 +643,24 @@ void ExpertResidency::after_round(cudaStream_t compute, std::int32_t columns, st
     sync_queue_pins();
 }
 
+void ExpertResidency::seed_prompt(std::span<const std::uint32_t> uses, double scale) {
+    if (uses.size() != static_cast<std::size_t>(layers_) * experts_) {
+        throw std::invalid_argument("expert residency: prompt uses have another key count");
+    }
+    if (!(scale > 0.0)) { return; }
+    for (std::uint32_t layer = 0; layer < layers_; ++layer) {
+        group_.clear();
+        amounts_.clear();
+        for (std::uint32_t expert = 0; expert < experts_; ++expert) {
+            const std::uint32_t key = layer * experts_ + expert;
+            if (uses[key] == 0) { continue; }
+            group_.push_back(key);
+            amounts_.push_back(scale * static_cast<double>(uses[key]));
+        }
+        if (!group_.empty()) { pools_[pool_of_layer_[layer]].controller->credit(group_, amounts_); }
+    }
+}
+
 ExpertResidency::SavedState ExpertResidency::saved_state() const {
     SavedState out;
     const std::size_t keys = static_cast<std::size_t>(layers_) * experts_;

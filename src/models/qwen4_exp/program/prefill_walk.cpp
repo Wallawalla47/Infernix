@@ -475,6 +475,7 @@ PrefillProgress ProgramImpl::walk_step(Lane& lane, std::uint32_t index, Clock::t
                                                 static_cast<std::uint64_t>(width));
         // The route log holds the span's last chunk (every chunk routes nearly every expert).
         trace_round(RouteTraceKind::PrefillChunk, 1, width, tokens, 0, static_cast<std::uint32_t>(begin));
+        note_prompt_routes(lane, width);
         residency_->after_round(device_.stream, width, 0);
         apply_vram_target(false);
     }

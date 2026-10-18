@@ -101,6 +101,42 @@ def test_full_mode_never_reads_the_ssd():
     assert total['ssd_reads'] == 0 and total['promotions'] > 0 and total['vram_hit_live'] > 0.2
 
 
+def test_prompt_seeding_credits_the_prompt_and_promotes_within_its_budget():
+    # The engine's seed_prompt (design §17 H8): at a prompt's end its routed experts gain credit in
+    # proportion to their uses; with a budget the best credited misses are promoted, which on prompts
+    # that predict their answers' topic raises the first decode tokens' VRAM hit rate.
+    trace = ht.synthetic_trace(layers=4, experts=64, top_k=4, requests=6, prompt=192, decode=128, chunk=64,
+                               topics=3, seed=5)
+    for r in trace.rounds:
+        if r.kind == ht.PREFILL:
+            r.budget = 0  # the engine's wide prefill calls promote nothing
+
+    def run(seed):
+        sim = ht.TierSim(trace.header, vram=48, ram_slots=None, prior='none', vram_budget='recorded',
+                         prompt_seed=seed)
+        sim.run(trace.rounds)
+        return sim.summary()['total']
+
+    plain, credit, promoted = run(None), run((64.0, 0, 0)), run((64.0, 8, 0))
+    assert plain['prompt_seeds'] == 0 and credit['prompt_seeds'] == 6 and promoted['prompt_seeds'] == 6
+    assert credit['prompt_seed_promotions'] == 0 and 0 < promoted['prompt_seed_promotions'] <= 6 * 4 * 8
+    assert promoted['early_vram_hit_live'] > plain['early_vram_hit_live']
+    assert promoted['early_live_keys'] == plain['early_live_keys'] > 0
+
+
+def test_prompt_seeding_counts_only_the_window():
+    header = {'layers': 1, 'experts': 8, 'top_k': 1}
+    routes = np.array([[[0], [0], [1], [2]]], np.int32)  # positions 0-3 route to experts 0, 0, 1, 2
+    prompt = ht.Round(ht.PREFILL, 1, 4, 4, 16, 0, np.zeros(1, np.int32), np.ones(4, bool), routes)
+    decode = ht.Round(ht.DECODE, 1, 1, 1, 1, ht.UNKNOWN_POSITION, np.zeros(1, np.int32), np.ones(1, bool),
+                      np.array([[[3]]], np.int32))
+    sim = ht.TierSim(header, vram=4, ram_slots=None, prior='none', prompt_seed=(8.0, 0, 2))
+    sim.run([prompt, decode])
+    # The prefill chunk adds one use per distinct expert; the window of the last two positions credits
+    # experts 1 and 2 with 8 x 1/2 each and expert 0 with nothing.
+    assert sim.v_count[0] == 1.0 and sim.v_count[1] == 5.0 and sim.v_count[2] == 5.0
+
+
 def _covering(header, rounds, allowance):
     n = header['layers'] * header['experts']
     vram = 120

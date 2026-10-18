@@ -165,6 +165,19 @@ void LfruPolicy::step(std::span<const std::uint32_t> group, Step& out, std::size
     }
 }
 
+void LfruPolicy::credit(std::span<const std::uint32_t> keys, std::span<const double> amounts) {
+    if (keys.size() != amounts.size()) { throw std::invalid_argument("LFRU credit: key and amount counts differ"); }
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        const std::uint32_t k = keys[i];
+        count_[k] += amounts[i];
+        last_[k] = now_;
+        if (resident(k)) {
+            resident_count_[slot_[k]] = count_[k];
+            resident_last_[slot_[k]]  = static_cast<double>(now_);
+        }
+    }
+}
+
 std::optional<std::uint32_t> LfruPolicy::promote(std::uint32_t key, std::span<const std::uint32_t> protect) {
     if (resident(key)) { return std::nullopt; }
     std::optional<std::uint32_t> victim;

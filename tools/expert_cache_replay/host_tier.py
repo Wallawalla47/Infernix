@@ -76,6 +76,7 @@ PREFILL_CLOCK_MAX = 16
 DEMOTION_FACTOR = 1.25
 PREFETCH_FACTOR = 1.25
 PREFETCH_MAX = 512
+EARLY_TOKENS = 256  # design §17 H8: the hit rate of the first decode tokens after a prompt
 UNKNOWN_POSITION = 0xFFFFFFFF
 
 PREFILL, FORCED, DECODE, VERIFY, GRAPH = 0, 1, 2, 3, 4
@@ -225,8 +226,9 @@ def use_counts(traces, num_keys, experts):
 # ---------------------------------------------------------------------------------------------- model
 
 class Metrics:
+    # early_*: live keys of one-row decode and verification rounds within EARLY_TOKENS of their prompt.
     COUNTERS = ('rounds', 'tokens', 'prompt_tokens', 'computed', 'vram_hits', 'ram_hits', 'ssd_reads',
-                'layers_with_reads', 'live_keys', 'live_vram_hits')
+                'layers_with_reads', 'live_keys', 'live_vram_hits', 'early_live_keys', 'early_live_vram_hits')
 
     def __init__(self):
         self.by_kind = {kind: dict.fromkeys(self.COUNTERS, 0) for kind in KIND_NAMES}
@@ -234,7 +236,8 @@ class Metrics:
         self.events = dict.fromkeys(('promotions', 'demotions', 'overflow_demotions', 'deferred_admissions',
                                      'vram_drops', 'landings_admitted', 'landings_rejected', 'landings_overwritten',
                                      'ram_evictions',
-                                     'reserve_slots', 'reserve_landings', 'prefetch_reads'), 0)
+                                     'reserve_slots', 'reserve_landings', 'prefetch_reads',
+                                     'prompt_seeds', 'prompt_seed_promotions'), 0)
 
     def summary(self):
         k = self.by_kind
@@ -243,6 +246,10 @@ class Metrics:
         prompt = k[PREFILL]['prompt_tokens']
         live = sum(v['live_keys'] for v in k.values())
         live_hits = sum(v['live_vram_hits'] for v in k.values())
+        decode_live = sum(k[x]['live_keys'] for x in (DECODE, VERIFY))
+        decode_hits = sum(k[x]['live_vram_hits'] for x in (DECODE, VERIFY))
+        early_live = sum(k[x]['early_live_keys'] for x in (DECODE, VERIFY))
+        early_hits = sum(k[x]['early_live_vram_hits'] for x in (DECODE, VERIFY))
         computed = sum(v['computed'] for v in k.values())
         reads = sorted(self.round_reads)
         out = {
@@ -259,6 +266,9 @@ class Metrics:
             'round_reads_p90': reads[min(len(reads) - 1, int(0.9 * len(reads)))] if reads else 0,
             'round_reads_max': reads[-1] if reads else 0,
             'vram_hit_live': live_hits / live if live else 0.0,
+            'decode_vram_hit_live': decode_hits / decode_live if decode_live else 0.0,
+            'early_vram_hit_live': early_hits / early_live if early_live else 0.0,
+            'early_live_keys': early_live,
             'vram_share': sum(v['vram_hits'] for v in k.values()) / computed if computed else 0.0,
             'ram_share': sum(v['ram_hits'] for v in k.values()) / computed if computed else 0.0,
         }
@@ -273,7 +283,7 @@ class TierSim:
 
     def __init__(self, header, *, vram, ram_slots, policy='lfu:64', mode='exclusive', prior='spread',
                  prior_counts=None, demotion_allowance=DECODE_DEMOTION_ALLOWANCE, reserve=True,
-                 prefetch_after_prefill=False, vram_budget='rule', seed=1):
+                 prefetch_after_prefill=False, vram_budget='rule', prompt_seed=None, seed=1):
         self.L, self.E, self.K = header['layers'], header['experts'], header['top_k']
         self.N = self.L * self.E
         self.V = max(0, min(int(vram), self.N - 1))
@@ -295,11 +305,17 @@ class TierSim:
         self.allowance_per_decode = demotion_allowance
         self.reserve_on = reserve and not self.full
         self.prefetch_on = prefetch_after_prefill and not self.full
+        # Prompt seeding (ExpertResidency::seed_prompt; the engine's is (256, 0, 0)): (credit, per-layer
+        # budget, window).
+        self.prompt_seed = prompt_seed
+        self.prompt_rounds = {}  # lane -> the prefill rounds of its prompt not yet seeded
+        self.since_prompt = {}   # lane -> tokens decoded since its prompt ended
         self.rng = np.random.default_rng(seed)
 
         n = self.N
-        # VRAM: the engine's LfruPolicy, a dense resident list and a per-key position.
-        self.v_count = np.zeros(n, np.int64)
+        # VRAM: the engine's LfruPolicy, a dense resident list and a per-key position. Counts are
+        # binary64 as in the engine (prompt credits are fractions).
+        self.v_count = np.zeros(n, np.float64)
         self.v_last = np.zeros(n, np.int64)
         self.v_now = 0
         self.v_pos = np.full(n, -1, np.int64)
@@ -456,6 +472,61 @@ class TierSim:
                 admitted += 1
         finally:
             self.mark[group] = False
+
+    def _seed_prompt(self, rounds):
+        """ExpertResidency::seed_prompt at a prompt's end: each key gains credit x (its counted tokens /
+        the counted tokens), used now (no clock tick). The engine seeds credit 256 over every prompt
+        token with no admissions (design §19.3.27); `budget` (full mode only) and `window` are this
+        replay's alternatives: up to `budget` of each layer's credited misses admitted where they
+        outrank the lowest resident outside the layer's credited keys, and only the prompt's last
+        `window` tokens counted."""
+        credit, budget, window = self.prompt_seed
+        known = [r for r in rounds if r.position != UNKNOWN_POSITION]
+        end = max((r.position + r.rows * r.width for r in known), default=None)
+        uses = np.zeros(self.N, np.int64)
+        counted = 0
+        layer_base = (np.arange(self.L) * self.E)[:, None]
+        for r in rounds:
+            columns = r.rows * r.width
+            start = 0
+            if window and end is not None and r.position != UNKNOWN_POSITION:
+                start = min(max(end - window - r.position, 0), columns)
+            if start >= columns:
+                continue
+            keys = (r.routes[:, start:, :].reshape(self.L, -1) + layer_base).ravel()
+            uses += np.bincount(keys, minlength=self.N)
+            counted += columns - start
+        if counted == 0:
+            return
+        events = self._m().events
+        events['prompt_seeds'] += 1
+        credited = np.nonzero(uses)[0]
+        self.v_count[credited] += credit * uses[credited] / counted
+        self.v_last[credited] = self.v_now
+        if not self.full or budget == 0 or self.V == 0:
+            return
+        for layer in range(self.L):
+            group = credited[(credited >= layer * self.E) & (credited < (layer + 1) * self.E)]
+            misses = group[self.v_pos[group] < 0]
+            if misses.size == 0:
+                continue
+            self.mark[group] = True
+            try:
+                score = self.v_count[misses] / (self.v_now - self.v_last[misses] + 1)
+                admitted = 0
+                for i in np.lexsort((misses, -score)):
+                    if admitted >= budget:
+                        break
+                    if self.v_n >= self.V:
+                        victims = self._vram_victims(1)
+                        if not victims or not score[i] > self._vscore(victims[0]):
+                            break
+                        self._vram_evict(victims[0])
+                    self._vram_admit(int(misses[i]), held=False)
+                    events['prompt_seed_promotions'] += 1
+                    admitted += 1
+            finally:
+                self.mark[group] = False
 
     def _gate(self, v):
         """The eviction gate (plan section 4.8): 'keep' (host copy), 'drop', 'demote' or None (wait)."""
@@ -700,6 +771,19 @@ class TierSim:
         m = self._m().by_kind[r.kind]
         self.allowance = 1 << 60 if r.kind == PREFILL else self.allowance_per_decode
         self._publish()
+        # A lane's prefill rounds form its prompt until its first decode or verification round, before
+        # which the prompt seeds (the engine seeds right after the prompt's last chunk).
+        if r.kind == PREFILL:
+            self.prompt_rounds.setdefault(int(r.lanes[0]), []).append(r)
+        elif r.kind in (DECODE, VERIFY):
+            for lane in (int(x) for x in r.lanes):
+                rounds = self.prompt_rounds.pop(lane, None)
+                if rounds is not None:
+                    self.since_prompt[lane] = 0
+                    if self.prompt_seed is not None:
+                        self._seed_prompt(rounds)
+        early = (r.kind in (DECODE, VERIFY) and r.rows == 1
+                 and self.since_prompt.get(int(r.lanes[0]), EARLY_TOKENS) < EARLY_TOKENS)
         if self.prefetch_on and r.kind in (DECODE, VERIFY):
             for lane in r.lanes:
                 if int(lane) in self.prefetch_due:
@@ -754,8 +838,12 @@ class TierSim:
         for layer in range(self.L):
             keys, counts = np.unique(live_routes[layer], return_counts=True)
             groups.append(keys)
+            hits = int(np.count_nonzero((self.v_pos[keys] >= 0) & (self.visible[keys] <= self.round)))
             m['live_keys'] += keys.size
-            m['live_vram_hits'] += int(np.count_nonzero((self.v_pos[keys] >= 0) & (self.visible[keys] <= self.round)))
+            m['live_vram_hits'] += hits
+            if early:
+                m['early_live_keys'] += keys.size
+                m['early_live_vram_hits'] += hits
             if not self.full:
                 self._ram_use(keys, counts * weight)
 
@@ -785,6 +873,10 @@ class TierSim:
         for layer in range(self.L):
             self._vram_step(groups[layer], budget)
         self.protect.clear()
+        if r.kind in (DECODE, VERIFY):
+            for lane in (int(x) for x in r.lanes):
+                if lane in self.since_prompt:
+                    self.since_prompt[lane] += r.tokens
         self.round += 1
 
     def summary(self):
@@ -801,6 +893,21 @@ class TierSim:
 
 
 # ---------------------------------------------------------------------------------------------- driver
+
+def parse_prompt_seed(text):
+    """"none" or CREDIT[,BUDGET[,WINDOW]] -> None or (credit, budget, window)."""
+    text = text.strip()
+    if text in ('', 'none'):
+        return None
+    parts = [float(x) for x in text.split(',')] + [0, 0]
+    if not parts[0] > 0:
+        raise ValueError(f'prompt seed {text!r}: CREDIT must be > 0')
+    return (parts[0], int(parts[1]), int(parts[2]))
+
+
+def format_prompt_seed(seed):
+    return 'none' if seed is None else f'credit {seed[0]:g}, budget {seed[1]}, window {seed[2]}'
+
 
 def ram_slots_for_mib(mib):
     return int(mib * 2**20 // RECORD_BYTES)
@@ -864,7 +971,12 @@ def main(argv=None):
     ap.add_argument('--json', default=None)
     ap.add_argument('--validate', action='store_true',
                     help='full mode at the trace frames with recorded budgets: VRAM hit rate vs the engine')
+    ap.add_argument('--prompt-seeds', default='none',
+                    help='";"-separated prompt seedings, each "none" or CREDIT[,BUDGET[,WINDOW]] '
+                         '(the engine seeds 256 with no budget or window; a trace captured from it '
+                         'already carries that seeding\'s effect on its routes)')
     args = ap.parse_args(argv)
+    seeds = [parse_prompt_seed(x) for x in args.prompt_seeds.split(';')]
 
     paths = tuple(args.traces)
     traces = _load(paths)
@@ -879,11 +991,15 @@ def main(argv=None):
           f'{header["max_width"]}, MTP {header["mtp_draft_tokens"]}, n-gram {header["ngram_draft_tokens"]}')
 
     if args.validate:
-        result = run_config(paths, {'vram': header['frames'], 'ram_slots': None, 'vram_budget': 'recorded',
-                                    'prior': 'none'})
-        s = result['total']
-        print(f'full mode, {header["frames"]} frames, recorded budgets: VRAM hits {100 * s["vram_hit_live"]:.2f} % '
-              f'of live routed experts (engine report: "since start" hit rate), {s["promotions"]} promotions')
+        for seed in seeds:
+            result = run_config(paths, {'vram': header['frames'], 'ram_slots': None, 'vram_budget': 'recorded',
+                                        'prior': 'none', 'prompt_seed': seed})
+            s = result['total']
+            print(f'full mode, {header["frames"]} frames, recorded budgets, prompt seed {format_prompt_seed(seed)}: '
+                  f'VRAM hits {100 * s["vram_hit_live"]:.2f} % of live routed experts (engine report: "since start" '
+                  f'hit rate), decode {100 * s["decode_vram_hit_live"]:.2f} %, first {EARLY_TOKENS} decode tokens '
+                  f'{100 * s["early_vram_hit_live"]:.2f} % ({s["early_live_keys"]} keys), {s["promotions"]} promotions '
+                  f'({s["prompt_seed_promotions"]} by {s["prompt_seeds"]} seeds)')
         recorded = [r for t in traces for r in t.rounds if r.frames]
         if recorded:
             weights = [max(r.tokens, 1) for r in recorded]
@@ -910,11 +1026,13 @@ def main(argv=None):
             for vram in (int(x) for x in args.vram.split(',')):
                 for slots, mib in ram:
                     for policy in args.policies.split(','):
-                        config = {'vram': vram, 'ram_slots': slots, 'policy': policy, 'mode': mode, 'prior': prior,
-                                  'demotion_allowance': args.demotion_allowance, 'reserve': not args.no_reserve,
-                                  'prefetch_after_prefill': args.prefetch_after_prefill,
-                                  'vram_budget': args.vram_budget}
-                        jobs.append((paths, config, counts, mib))
+                        for seed in seeds:
+                            config = {'vram': vram, 'ram_slots': slots, 'policy': policy, 'mode': mode,
+                                      'prior': prior, 'demotion_allowance': args.demotion_allowance,
+                                      'reserve': not args.no_reserve,
+                                      'prefetch_after_prefill': args.prefetch_after_prefill,
+                                      'vram_budget': args.vram_budget, 'prompt_seed': seed}
+                            jobs.append((paths, config, counts, mib))
     if args.jobs > 1:
         with ProcessPoolExecutor(args.jobs) as pool:
             results = list(pool.map(_job, [(p, c, k) for p, c, k, _ in jobs]))
@@ -926,12 +1044,13 @@ def main(argv=None):
     cells = {}
     for result in results:
         c = result['config']
-        cells.setdefault((c['prior'], c['mode'], c['vram'], c['ram_slots'], result['ram_mib']), []).append(result)
+        cells.setdefault((c['prior'], c['mode'], c['vram'], c['ram_slots'], result['ram_mib'],
+                          format_prompt_seed(c['prompt_seed'])), []).append(result)
     verdicts = []
-    for (prior, mode, vram, slots, mib), group in cells.items():
+    for (prior, mode, vram, slots, mib, seed), group in cells.items():
         h_res = None if slots is None else max(0, slots - RAM_EXTRA_SLOTS)
         print(f'\n=== V {vram}, RAM {"all" if slots is None else f"{mib} MiB = {slots} slots (H_res {h_res})"}, '
-              f'fast capacity {"all" if slots is None else vram + h_res}, {mode}, prior {prior}')
+              f'fast capacity {"all" if slots is None else vram + h_res}, {mode}, prior {prior}, prompt seed {seed}')
         print(f'{"policy":9s} {"reads/tok":>9s} {"2nd half":>8s} {"1st half":>8s} {"prefill/1K":>10s} '
               f'{"SSD total":>9s} {"VRAM%":>6s} {"RAM%":>6s} {"demote/tok":>10s} {"deferred":>8s} {"drops":>6s} '
               f'{"tok/s 2nd":>9s}')
@@ -946,7 +1065,8 @@ def main(argv=None):
             reads[result['config']['policy']] = s['ssd_reads']
         verdict = policy_verdict(reads)
         if verdict:
-            verdicts.append({'prior': prior, 'mode': mode, 'vram': vram, 'ram_slots': slots, **verdict})
+            verdicts.append({'prior': prior, 'mode': mode, 'vram': vram, 'ram_slots': slots, 'prompt_seed': seed,
+                             **verdict})
             print(f'Q13: {verdict["policy"]}' + (f' (deviation: {verdict["reads"]} vs {verdict["best_lfu"]} '
                                                 f'{verdict["best_lfu_reads"]} SSD reads)' if verdict['deviation']
                                                 else f' ({verdict["reads"]} SSD reads)'))

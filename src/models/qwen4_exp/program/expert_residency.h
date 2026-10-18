@@ -223,6 +223,10 @@ public:
     // first and use up its budget: max(0, per_layer_budget - landed) promotions remain.
     void after_round(cudaStream_t compute, std::int32_t columns, std::size_t per_layer_budget,
                      std::span<const std::uint8_t> live = {});
+    // At a prompt's end (design §19.3.27): every key with uses[key] > 0 (the prompt's tokens that
+    // routed to it, [layers][experts]) gains `scale * uses[key]` of LFRU count, used now. Nothing is
+    // copied: the credit ranks the decode's admissions and evictions.
+    void seed_prompt(std::span<const std::uint32_t> uses, double scale);
 
     [[nodiscard]] const Stats& stats() const noexcept { return stats_; }
     // The layer split of stats().routed and stats().hits: cumulative routed (layer, expert) uses
@@ -302,6 +306,7 @@ private:
     std::vector<Command> load_commands_; // kCopy commands of every pool, issued together
     std::vector<std::uint32_t> move_to_, move_from_; // a lend's relocations: destination and source frames
     std::vector<std::uint32_t> group_;
+    std::vector<double> amounts_; // seed_prompt's per-key credits of one layer
     std::vector<std::uint8_t> seen_;
     std::uint64_t round_ = 0;
 
