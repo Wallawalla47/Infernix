@@ -108,8 +108,13 @@ tensors are listed, not compared).
 infernix-serve Qwen3.8-Flash-Next-FP8-Infernix-00001-of-00005.infernix \
   --ngram-volume <nvme>/Qwen3.8-Flash-Next-BF16.ngram \
   --max-context 262144 --kv-dtype int8 \
-  --spec mtp --draft-tokens auto --lm-head-draft --ngram-draft-tokens 7
+  --spec mtp --draft-tokens auto --lm-head-draft --max-concurrency 2
 ```
+
+N-gram copy drafts (`--ngram-draft-tokens 7`) speed up highly repetitive text (the benchmark row
+below) but made no difference in a replayed agentic coding workload, so the command leaves them
+off. Builds before 2026-10-18 could stop serving during a long prompt at the default prefill chunk
+("no run of frames to lend"); on those, add `--prefill-chunk 4096`.
 
 It serves the OpenAI Chat Completions and Responses APIs and the Anthropic Messages API. The
 [Flash-Next guide](https://github.com/Wallawalla47/Infernix/blob/main/docs/qwen3_8-flash-next.md)

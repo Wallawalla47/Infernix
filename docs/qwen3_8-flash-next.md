@@ -308,7 +308,10 @@ infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8
     see `--max-concurrency` below.
 - `--ngram-draft-tokens 7` verifies copy proposals. It works alone or beside MTP; a longer copy
   proposal replaces a round's MTP drafts. On code-editing prompts it accepts most drafts; on prose
-  it finds none and costs nothing. See [ngram copy proposals](ngram.md).
+  it finds none and costs nothing. In the agentic replay (`bench/agentic_ab`, greedy, seed 42, two
+  lanes, 2026-10-18) copy drafts came to under 3 % of the output tokens, and 7/12, 7/4 and 15/12 (drafts /
+  minimum match) were level with none on IQ3_S (within 1 %) and no faster on Dense8 or FP8, so the
+  recommended commands leave it off. See [ngram copy proposals](ngram.md).
 - `--max-concurrency N` (1-8) runs up to N requests at once. Its main gain is a shorter wait for
   requests that would otherwise queue (time to first token): requests that decode together share
   each round's dense weight reads, but their routed experts barely overlap.

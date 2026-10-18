@@ -106,8 +106,12 @@ rows.
 infernix-serve Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix-00001-of-00002.infernix \
   --ngram-volume <nvme>/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix.ngram \
   --max-context 262144 --kv-dtype int8 \
-  --spec mtp --draft-tokens auto --lm-head-draft --ngram-draft-tokens 7
+  --spec mtp --draft-tokens auto --lm-head-draft --max-concurrency 2
 ```
+
+N-gram copy drafts (`--ngram-draft-tokens 7`) speed up highly repetitive text (the benchmark row
+below) but were level within 1 % in a replayed agentic coding workload, so the command leaves them
+off.
 
 It serves the OpenAI Chat Completions and Responses APIs and the Anthropic Messages API. The
 [Flash-Next guide](https://github.com/Wallawalla47/Infernix/blob/main/docs/qwen3_8-flash-next.md)
