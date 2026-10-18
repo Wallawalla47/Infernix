@@ -179,6 +179,66 @@ Quality is level: on the repository's 1.04M-token perplexity corpus (16K
 context, INT8 KV cache) Infernix scores 4.468 against 4.479 for NInfer (`master` at `81c8ce09` with
 the Windows port).
 
+## Quality
+
+Infernix runs two routes:
+
+- **The exact route** (`--disable-fast-paths`) gives bit-identical output from run to run and from
+  release to release. Where an artifact's formats allow it (the NVFP4 Qwen3.8-27B and the NVFP4,
+  FP8 and GGUF Flash-Next imports, for example), it is also request-invariant: other requests, concurrency,
+  prefix-cache state and memory pressure do not change a request's output.
+- **Fast paths** (on by default) are faster kernels and scheduling choices that change the
+  arithmetic. Each one runs only for the kernels it was qualified on, only after passing the quality
+  gate below, and only where it was measured faster.
+
+### The quality gate
+
+A fast path is measured against a high-precision reference: the same model with 16-bit activations
+in every layer and a BF16 KV cache. Infernix charges a path only for the distance it adds beyond
+the exact route's own, so the quantization a model already carries is not counted against it.
+
+- **Prefill**: teacher-forced over a 1.04M-token corpus at four chunk sizes, measuring the KL
+  divergence from the reference and top-1 token agreement.
+- **Decode**: 1,024 forced decoding segments (prompts of 512 to 8,192 tokens, 65,536 scored
+  positions), measuring total variation (TV) and top-1 agreement. The fast run reproduces the
+  conditions the path acts in: concurrent requests, speculative verification, cache resumes and a
+  short KV pool.
+- **Budgets**, shared by all of a configuration's fast paths together: KL 1.5e-3 (about what
+  llama.cpp's q8_0 costs over FP16), top-1 0.5 percentage points and decode TV 4e-3. There are also
+  checks on the worst positions (the 99.9th-percentile KL may grow by at most 25 %), on every prompt
+  length and context range, and caps on KL and perplexity in decode.
+- **The decision** uses the 95 % upper confidence bound, not the average, so a noisy measurement
+  makes a path harder to pass, never easier.
+- **Every KV format** is gated. A qualification follows the kernels a path changes, so artifacts
+  that run the same kernels share it.
+
+The full policy is in [model quality §6](docs/maintainer/model-quality.md#6-numerical-acceptance-policy-and-fast-paths).
+Other engines check speed-motivated changes more loosely:
+
+| Engine | How a numerics change is accepted |
+|---|---|
+| vLLM, SGLang (CI) | each side's next token within the other's top 5, or top-5 log-probabilities within 0.05-0.08 of Hugging Face, plus GSM8K accuracy floors |
+| llama.cpp | kernel error against the CPU backend; KL is reported for new quantizations without a threshold |
+| Strata | KL against a reference or its own run-to-run noise, with no fixed bound; its two non-exact defaults moved KL by 4e-3 and 5.8e-3 |
+| Fireworks | KL below 7e-3 for a whole quantized deployment |
+| **Infernix** | **1.5e-3 KL, 0.5 points of top-1 and 4e-3 TV for all fast paths together, at 95 % confidence** |
+
+### Defaults elsewhere that Infernix rejected
+
+These routes are on by default in another engine. As implemented and measured in Infernix, each
+failed the gate:
+
+| Route | On by default in | What it does | Why it failed |
+|---|---|---|---|
+| Expert tail skip at rank 7 | Strata (`STRATA_ROUTE_TAIL_SKIP=7`) | In a decode round, skips an expert missing from VRAM that every token routes at rank 7 or lower (of its top 10), without renormalising the rest | GGUF IQ3_S Flash-Next, INT8 KV, MTP decode: TV bound 4.26e-3 against 4e-3, top-1 0.75 against 0.5 points and the 99.9th-percentile KL up 41 % against 25 %. The dropped experts' contributions are small but not zero, and which ones are dropped depends on what the cache happens to hold. Infernix offers it as an opt-in, `--expert-tail-skip R` (+12 % to +33 % decode on an RTX 5090) |
+| 4-bit activations in wide decode rounds | NInfer (and Infernix, inherited, until 2026-10-14) | Wide rounds quantize the NVFP4 MLP projections' input activations once to 4 bits (gate/up from 5 columns, down from 8) | Qwen3.8-27B NVFP4, INT8 KV: decode TV 1.57e-2 (about four times the budget) and top-1 +1.8 points; the 4-bit activations add about two thirds of the model's whole quantization noise. Perplexity does not show it (its excess was negative). Replaced by `batched-a4-residual-decode`, which sums two 4-bit terms and passes |
+| 8-bit activations in wide decode rounds | NInfer (and Infernix, inherited, until 2026-10-14) | Rounds of 5 columns (17 when verifying drafts) or more quantize the FP8 projections' input activations once to 8 bits | Passes plain decode, where few rounds are that wide, but fails speculative verification of 32 columns (DFlash2 with n-gram drafts, four requests): TV bound 4.38e-3 against 4e-3 and top-1 0.55 against 0.5 points. Replaced by `batched-a8-residual-decode` (two 8-bit terms), which passes |
+
+The replacements cost some speed. When they landed (2026-10-15), speculative decode on the 27B
+(DFlash2 with n-gram drafts) measured 4 % slower than with the rejected routes at one request, 6 %
+at two and 20 % at four. In the agentic replay the 27B now runs
+3.7 % fewer decode rounds a second than the release benchmarked above, which still used them.
+
 ## Quick start (Windows)
 
 Prerequisites: Visual Studio 2026 (MSVC; the VS 2022 compiler, MSVC 14.44, also builds it), the

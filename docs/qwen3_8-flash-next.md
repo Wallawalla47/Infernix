@@ -613,8 +613,10 @@ headroom 256 (auto); expert frames 9300 (23.95 GiB); 380 free after startup
   - Measured (2026-10-18, RTX 5090 on PCIe 5.0 x8, INT8 KV, `infernix_bench` pp2048 + tg512, MTP
     `auto`, two runs per arm alternating; each arm decodes its own text): rank 7 took Dense8 from
     155 to 207 tok/s (+33 %), FP8 from 47 to 61 (+28 %) and IQ3_S from 210 to 234 (+12 %), every run
-    ahead; rank 9 on FP8 changed nothing beyond spread (+0.4 %). Its quality cost was not measured
-    on these artifacts.
+    ahead; rank 9 on FP8 changed nothing beyond spread (+0.4 %). Rank 7 was gated before the
+    option was built, on an IQ3_S prototype (INT8 KV, MTP decode, 256 segments, 2026-10-16): TV
+    excess bound 4.26e-3 against 4e-3, top-1 0.75 against 0.5 points, p99.9 KL ratio 1.41 against
+    1.25. The option as built has not been gated again.
   - Strata turns the same rule on by default at rank 7 (`STRATA_ROUTE_TAIL_SKIP=7`, single-request
     windows; it reports KL 0.003-0.006 and +10-20 % decode on 12-16 GB cards). Rank 7 failed
     Infernix's fast-path decode gate (model-quality §6; [design §19.3](maintainer/qwen3_8-flash-next-design.md)),
