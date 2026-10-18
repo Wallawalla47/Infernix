@@ -254,6 +254,9 @@ public:
                std::uint64_t round_started, std::vector<Command>& out);
     void release(std::uint32_t frame);
     [[nodiscard]] std::uint32_t loaned_frames() const { return frames_.loaned_count(); }
+    // The longest run of backed frames none of which is lent: the most one more lease can take, since
+    // a lease is one contiguous run (an earlier lease in the middle of the pool splits the rest).
+    [[nodiscard]] std::uint32_t longest_unloaned_run() const;
     // The key held in `frame`, or nothing.
     [[nodiscard]] std::optional<std::uint32_t> frame_key(std::uint32_t frame) const;
 

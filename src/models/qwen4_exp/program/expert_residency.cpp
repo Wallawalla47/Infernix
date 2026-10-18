@@ -707,8 +707,12 @@ std::uint32_t ExpertResidency::warm_start(const SavedState& state, std::uint32_t
 }
 
 std::uint32_t ExpertResidency::pool_lendable(const Pool& pool) const noexcept {
+    // A quarter of the frames is never lent, and a lease is one contiguous run: after a lease in the
+    // middle of the pool the next one fits only the longest piece left (FP8 SSD tier, 16,384-token
+    // prefill: the wide arena, walk area and ring leases once failed "no run of frames to lend").
     const std::uint32_t lent = pool.controller->loaned_frames(), floor = pool.frames / 4;
-    return pool.frames > lent + floor ? pool.frames - lent - floor : 0;
+    const std::uint32_t total = pool.frames > lent + floor ? pool.frames - lent - floor : 0;
+    return std::min(total, pool.controller->longest_unloaned_run());
 }
 
 std::size_t ExpertResidency::lend_pool() const noexcept {

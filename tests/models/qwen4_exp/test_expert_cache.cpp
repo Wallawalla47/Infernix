@@ -476,6 +476,10 @@ void test_lending() {
     for (std::uint32_t k = 0; k < kKeys; ++k) { clear &= frame_of[k] == ~0U || frame_of[k] < first || frame_of[k] >= first + 3; }
     check(clear, "no expert maps to a lent frame");
     check(!cache.choose_run(kFrames, none).has_value(), "lent frames are never chosen");
+    // Frames 5..7 of 8 are lent: one more lease is one run, at most frames 0..4.
+    check(cache.longest_unloaned_run() == 5 && cache.choose_run(5, none).has_value() &&
+              !cache.choose_run(6, none).has_value(),
+          "the longest unlent run bounds the next lease");
 
     // Routes K until it is resident again (queued while the frames are lent, then loaded).
     const auto route_k = [&] {

@@ -497,6 +497,15 @@ std::optional<std::uint32_t> CacheController::frame_key(std::uint32_t frame) con
     return frame_key_[frame];
 }
 
+std::uint32_t CacheController::longest_unloaned_run() const {
+    std::uint32_t longest = 0, run = 0;
+    for (std::uint32_t f = 0; f < frames_.backed(); ++f) {
+        run     = frames_.is_loaned(f) ? 0 : run + 1;
+        longest = std::max(longest, run);
+    }
+    return longest;
+}
+
 std::optional<std::uint32_t> CacheController::choose_run(std::uint32_t count, std::span<const std::uint8_t> busy) const {
     const std::uint32_t n = frames_.backed();
     if (count == 0 || count > n) { return std::nullopt; }
