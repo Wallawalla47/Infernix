@@ -178,7 +178,7 @@ at 128K):
 | `infernix_bench` | GSQ-RCO IQ3_S | Recipe B |
 |---|---:|---:|
 | tg512, plain | 145.6 tok/s | 110.3 tok/s |
-| tg512, `--spec mtp --draft-tokens 4 --lm-head-draft` | 259.9 tok/s (75 % of drafts accepted) | 143.1 tok/s |
+| tg512, `--spec mtp --draft-tokens 4 --lm-head-draft` (then a per-round length up to 4, now `auto`) | 259.9 tok/s (75 % of drafts accepted) | 143.1 tok/s |
 | pp4096, `--prefill-chunk 4096` | 2,228 tok/s | 1,662 tok/s |
 | pp131072, `--prefill-chunk 4096`, code and docs | 4,324 tok/s | 10,933 tok/s |
 
@@ -241,7 +241,7 @@ Measured with default options (INT8 KV, one request, the BF16 n-gram table; 2026
 | `infernix_bench` | FP8 |
 |---|---:|
 | tg512, plain | 43.8-44.4 tok/s |
-| pp4096 + tg512, `--spec mtp --draft-tokens 4 --lm-head-draft` (decode) | 43.5-49.3 tok/s |
+| pp4096 + tg512, `--spec mtp --draft-tokens 4 --lm-head-draft` (then a per-round length up to 4, now `auto`) (decode) | 43.5-49.3 tok/s |
 | the same with `--ngram-draft-tokens 7 --ngram-min-match 4` | 53.8-54.2 tok/s |
 | pp4096, `--prefill-chunk 4096` | 690 tok/s |
 
@@ -296,9 +296,12 @@ infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8
   never lend (more than three quarters of its frames, e.g. 65,536 tokens under the SSD tier, ~27
   GiB) is halved at startup until it can, with a warning, since the output does not depend on the
   chunk.
-- `--spec mtp --draft-tokens 4 --lm-head-draft` drafts with the model's MTP layer.
-  - `--draft-tokens` sets the maximum. Each round drafts the number of tokens the recent
-    acceptance makes worthwhile, down to none on text it predicts poorly.
+- `--spec mtp --draft-tokens auto --lm-head-draft` drafts with the model's MTP layer.
+  - `auto`: each round drafts the number of tokens, 0 to 7, the request's recent acceptance makes
+    worthwhile (down to none on text it predicts poorly), and verifies them up to the first the
+    drafter gives below 0.5 probability (`--spec-min-p`).
+  - `--draft-tokens N` (1-7): every round drafts and verifies N tokens (fewer only near the output
+    limit), whatever the acceptance; `--spec-min-p` then defaults to 0.
   - The drafter's 512 experts (1.34 GB), its workspace and the proposal head (178 MB) stay in
     VRAM, so the expert cache gets about 710 fewer frames.
   - Greedy output is the same as without it when one request runs at a time. For several lanes,
@@ -311,11 +314,12 @@ infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8
   each round's dense weight reads, but their routed experts barely overlap.
   - Speculation (`--spec mtp`, `--ngram-draft-tokens`) depends on how many requests decode
     together:
-    - one: the request picks its own draft length, and verifies its drafts only up to the first
-      the drafter gives less than 0.5 probability (C = 1 sampled MTP on an RTX 5090: 138.8 ->
-      147.2 tok/s, 75.6 -> 81.8 % of drafts accepted; output unchanged, since every draft is still
-      verified);
-    - two: both draft the same number of tokens, 0-2 chosen from their acceptance, so neither is
+    - one: with `auto`, the request picks its own draft length, and verifies its drafts only up
+      to the first the drafter gives less than 0.5 probability (C = 1 sampled MTP on an RTX 5090:
+      138.8 -> 147.2 tok/s, 75.6 -> 81.8 % of drafts accepted; output unchanged, since every draft
+      is still verified); with N, it drafts and verifies N;
+    - two: both draft the same number of tokens (`auto`: 0-2 chosen from their acceptance; N:
+      min(N, 2)), so neither is
       padded to the other's draft. Such a round has at most 6 columns, where concurrent requests
       give the same greedy output as each alone (design §19.3.5). Measured on an RTX 5090 with
       sampled AIME answers: 164.9 tok/s for the pair against 143.8 without drafts (+14.7 %);
@@ -429,7 +433,8 @@ conversation's next turn resumes from a snapshot of the model state and prefills
 tokens; KV blocks are shared across requests. `infernix` (one request) runs without it.
 
 - **Host RAM.** Snapshots (116 MB each) and KV blocks live in one pinned Host pool,
-  `--host-context-mib` (default 4096, must be positive). It is pinned at startup and counted in the
+  `--host-context-mib` (default 8192, must be positive; it comes out of the RAM the automatic
+  `--expert-ram-mib` and `--expert-pin-mib` leave the experts). It is pinned at startup and counted in the
   RAM ledger (`prefix cache` in the ledger line that `--log-level debug` prints). `--no-prefix-reuse` turns the cache off and frees
   that RAM for the experts.
 - **Snapshots.** Each turn leaves one at the generation opener (the assistant turn's start) and one
@@ -609,7 +614,7 @@ later at 8K, level from 128K (the bit-exact
 
 | Workload | tok/s |
 |---|---:|
-| `infernix_bench` tg512, `--spec mtp --draft-tokens 4 --lm-head-draft` (warm cache) | ~134 |
+| `infernix_bench` tg512, `--spec mtp --draft-tokens 4 --lm-head-draft` (then a per-round length up to 4, now `auto`) (warm cache) | ~134 |
 | `infernix_bench` tg512, plain decode (warm cache) | ~87 |
 | Single CLI request, cold cache, plain: code rewrite / prose story | ~66 / ~65 |
 | Single CLI request, cold cache, MTP: code rewrite / prose story | ~84 / ~67 |

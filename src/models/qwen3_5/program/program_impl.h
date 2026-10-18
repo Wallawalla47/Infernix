@@ -436,6 +436,13 @@ public:
     // The adaptive-mtp draft-length policy (FastPath::AdaptiveMtp): present when the plan captures
     // a neural MTP family per draft length; each all-neural MTP round then runs the length it picks.
     std::optional<MtpDraftPolicy> mtp_draft_policy;
+    // The last MTP round's start, all-neural draft length (0: not a policy round) and batch size,
+    // closing its start-to-start cycle for the policy's round-cost learning.
+    struct MtpCostRound {
+        std::chrono::steady_clock::time_point start{};
+        std::uint32_t drafts = 0;
+        std::uint32_t batch  = 0;
+    } mtp_cost_round;
     const std::uint32_t ngram_draft_window;
     const std::uint32_t ngram_min_match;
     const SpeculativeBackend speculative_backend;

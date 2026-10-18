@@ -71,6 +71,11 @@ struct FastPathConfiguration {
 // Whether the path passed the acceptance gate in this configuration (the registry, section 6.7).
 [[nodiscard]] bool fast_path_qualified(FastPath path, const FastPathConfiguration& configuration);
 
+// The fixed MTP draft length --draft-tokens auto runs where the adaptive-mtp policy does not (not
+// qualified for the configuration, or fast paths disabled): the single length measured fastest
+// overall for the configuration (section 6.7, adaptive-mtp), else 3.
+[[nodiscard]] std::uint32_t auto_fixed_draft_tokens(const FastPathConfiguration& configuration) noexcept;
+
 struct FastPathSelection {
     FastPathConfiguration configuration;
     // In kFastPaths order.

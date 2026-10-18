@@ -24,16 +24,14 @@ inline constexpr std::size_t kMaximumExplicitPromptCacheMarkers  = 4;
 inline constexpr std::size_t kMaximumPromptMediaBytes = 256ULL << 20;
 inline constexpr std::size_t kDefaultMediaCacheBytes  = 1ULL << 30;
 inline constexpr std::size_t kDefaultMediaLiveBytes   = 2ULL << 30;
-// The hybrid prefix cache's Host tier for Qwen3.8-Flash-Next when --host-context-mib is not
-// given: its expert cache needs the rest of the pinnable RAM.
-inline constexpr std::size_t kDefaultQwen4ExpHybridHostCacheBytes = 4ULL << 30;
 // Physical Host memory left free for the OS and other programs once every pinned allocation is
 // locked, when --ram-headroom-mib is not given.
 inline constexpr std::uint64_t kDefaultRamHeadroomBytes = 2ULL << 30;
 // Prompt-attention split workspace when --prefill-split-workspace-mib is not given.
 inline constexpr std::uint32_t kDefaultPrefillSplitWorkspaceMiB = 256;
 inline constexpr std::uint32_t kMaximumPrefillSplitWorkspaceMiB = 16384;
-// Pinned Host slab pool of the hybrid prefix cache when --host-context-mib is not given.
+// Pinned Host slab pool of the hybrid prefix cache when --host-context-mib is not given, for every
+// architecture.
 inline constexpr std::size_t kDefaultHybridHostCacheBytes = 8ULL << 30;
 // How long the prefix cache holds a conversation's state after a reply ending in a tool call,
 // when --cache-tool-hold-secs is not given (Qwen3.5): longer than most tools take to run.
@@ -136,9 +134,9 @@ enum class FastPath : std::uint8_t {
     // tree tables and controller, the round's longest n-gram copy. Without it each round verifies
     // the configured chain at a fixed width.
     AdaptiveSpeculation,
-    // With adaptive-speculation, Qwen3.8-27B / 35B MTP rounds choose their draft length from the
-    // rows' learned acceptance and the round costs (one common length for several rows). Without it
-    // they draft the configured length.
+    // With adaptive-speculation and --draft-tokens auto (draft_tokens_auto), Qwen3.8-27B / 35B MTP
+    // rounds choose their draft length from the rows' learned acceptance and the round costs (one
+    // common length for several rows). Without it they draft the configured length.
     AdaptiveMtp,
     // The prefix cache resumes from any tap or endpoint and splits prefill at taps and sibling
     // boundaries. Without it prefill splits and the cache publishes and resumes only on the
@@ -255,7 +253,16 @@ draft_tree_auto_widths(std::uint32_t draft_tokens) noexcept {
 struct SpeculativeOptions {
     SpeculativeBackend backend = SpeculativeBackend::None;
     // Startup-fixed K: MTP 1..7 (Qwen3.5/3.6 1..5); DFlash and DFlash2 1..15 (query width K+1).
+    // With draft_tokens_auto it is the most a round may draft; 0 there takes the model's most
+    // (Qwen3.8-Flash-Next 7, Qwen3.5/3.6 5), which Engine::options() reports.
     std::uint32_t draft_tokens = 0;
+    // MTP (--draft-tokens auto): each round chooses its draft length, 0..draft_tokens, from the
+    // request's learned acceptance; Qwen3.8-Flash-Next's one-row rounds also verify only the drafts
+    // above draft_min_p (default 0.5). On Qwen3.5/3.6 it is the adaptive-mtp fast path; where that
+    // path does not run, startup makes it the configuration's fastest fixed length (Engine::options()
+    // then reports false and that length). False: every round drafts and verifies draft_tokens
+    // (fewer only near the output limit; draft_min_p defaults to 0).
+    bool draft_tokens_auto = false;
     ProposalHead proposal_head = ProposalHead::Full;
     // Optional target-verified copy proposals with MTP, DFlash or DFlash2, C1 only.
     // Zero disables the proposer; enabled draft width is 1..63 and minimum match 4..64.
@@ -263,7 +270,8 @@ struct SpeculativeOptions {
     std::uint32_t ngram_min_match    = 12;
     // Qwen3.8-Flash-Next MTP (--spec-min-p): a one-row round verifies its drafts up to the first
     // whose draft-head probability is below this value; 0 verifies every draft. In [0, 1]; unset
-    // keeps the model's measured default (0.5). Other models refuse it.
+    // is the measured 0.5 with draft_tokens_auto and 0 with a fixed draft length. Other models
+    // refuse it.
     std::optional<float> draft_min_p;
     // DFlash2 tree verification by batch size: entry c-1 is the column count (anchor included,
     // draft_tokens+2..32) a neural round of c rows verifies per row as a draft tree built from the

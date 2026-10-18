@@ -351,9 +351,13 @@ different route may ship, what it is measured against, how much it may cost, and
   part of the exact route.
 - **The fast paths** (`infernix::FastPath`) are routes whose arithmetic differs from the exact
   route's. By default (no `--disable-fast-paths`) the Engine runs every fast path qualified for the
-  loaded **configuration**: the attention geometry, the activation class (the narrowest activation
-  precision any text-decoder linear permits: 4, 8 or 16 bits) and the KV format (on Qwen3.5, also
-  whether the text MLP gate/up is groupwise Q4, the format q4-w4a8 runs on). A path runs only
+  loaded **configuration**, the kernels the artifact runs and its KV format. On Qwen3.5 that is the
+  attention geometry, the activation class (the narrowest activation precision any text-decoder
+  linear permits: 4, 8 or 16 bits), the KV format and whether the text MLP gate/up is groupwise Q4
+  (the format q4-w4a8 runs on); on Qwen3.8-Flash-Next it is the dense kernel family of the GDN
+  q/k/v/z projection (Q8, BF16, row FP8, NVFP4 or GGUF, every GGUF block format being one family),
+  whether the routed experts take 4-bit activations, and the KV format. A configuration names
+  kernels, never a checkpoint, so every artifact that runs the same kernels shares its paths. A path runs only
   in the configurations the registry (6.7) lists, so each configuration gets the fast paths that
   meet its own budget and no others; startup logs the selection (`fast paths | ...`) and
   `LoadSummary::fast_paths` reports it. A fast path stays deterministic for a fixed configuration
@@ -382,6 +386,49 @@ A fast path is qualified for a configuration only when all three hold there:
 Qualification evidence comes from a real artifact of the configuration; the quality tools'
 `--fast-path NAME` options run a candidate before it is listed. The configurations, the kernels'
 reach and the evidence are in [6.7](#67-fast-path-registry).
+
+**Approval follows the kernels a path changes** (since 2026-10-18). A configuration is the set of
+kernels an artifact runs, never a checkpoint: another training instance, derivative or conversion
+that runs the same kernels on the same formats inherits every qualification without a gate (the
+Swift and Uncensored NVFP4 Dense8 conversions take Dense8's). What a new configuration needs depends
+on what the path changes:
+
+1. **A kernel path** (one that changes a kernel's arithmetic: `q8-sliced-k`, `expert-a4-residual`,
+   `prompt-pv8`, ...) passes its Op criterion against the oracle and one model-level gate (6.5) on
+   one artifact that runs the kernel, jointly with the paths already qualified there. Its KV
+   formats follow the rules below: every format when it changes attention or KV arithmetic, else
+   the prefill gate on every format and decode on INT8 and on the lowest-floor format.
+2. **A request-coupling path** (`adaptive-speculation`, `free-cache-resume`, `preemption`) adds no
+   arithmetic of its own: it reshapes calls (where prefill splits and resumes, how many columns a
+   verify round has, whether a token's state was computed by decode or by prefill). Its
+   model-level gates on one reference artifact per KV format decide the shared kernels it reshapes
+   (GDN, attention, KV). A configuration with other dense or expert kernels takes those verdicts
+   when (a) each of its kernels passes its Op criterion, (b) the real-artifact equivalence tests
+   pass on it with the candidate (`infernix_qwen4_exp_prefix_cache_real_test`,
+   `infernix_qwen4_exp_preemption_real_test`; minutes), and (c) one decode gate on INT8 KV, the
+   joint arm of 6.7 at 256 segments, bounds what its own decode and prefill kernels add where the
+   path mixes their results. Its other KV formats take the reference artifact's per-format verdicts.
+3. **A model-level gate is re-run only when a kernel's arithmetic changes**, or a path reaches a
+   kernel no gate has covered; a new artifact of a covered configuration never needs one.
+4. **Every registration needs a resolved speedup** (criterion 3 above), including one made by
+   composition or by a coupling path's verdict: timed against the exact route on an artifact of
+   the configuration (alternating runs, the gain ahead in every round), or taken from a similar
+   configuration's timing when all of these hold:
+   - (a) every kernel the path changes runs at the same shapes in both (the same matrix and
+     attention dimensions and call widths), so a kernel faster at a shape is faster there too;
+   - (b) the path adds no cost the two would pay differently (workspace taken from the expert
+     cache or KV pool, more CUDA graphs, host work);
+   - (c) the source configuration's gain is clear of its run-to-run spread with room to spare (a
+     marginal gain shrinks where the rest of the model is slower, so it is timed again);
+   - (d) for a request-coupling path, the gain has the same mechanism (prefill not repeated, MTP
+     kept at two rows, requests admitted under a short pool).
+
+   Each 6.7 entry names the configuration whose timing it takes. A kernel's gain at other shapes
+   does not carry: `gdn-f16-accumulate` gained 0.24 % on the 27B and nothing on Flash-Next.
+
+A path that changes no logit (`sampled-mtp-drafts`: drafts from the head's top tokens, verified by
+rejection sampling) is decided by its distribution test once; it is registered on every
+configuration whose drafter it runs on.
 
 **Every KV format is gated** (since 2026-10-15): a path is registered only for formats it passed a
 gate on, never for INT8 alone by inference. The minimum per format is the reduced protocol (prefill
@@ -635,7 +682,7 @@ already qualified for the configuration, plus each `--fast-path NAME` candidate,
 always measured together with the paths it will run beside. Without a candidate the gate re-checks
 the configuration's current selection. `--mode` selects the decode route a fast path touches:
 `plain` (no speculation, single-column kernels), `dflash2` (DFlash2 with 7 drafts and the optimized
-proposal head), `ngram` (DFlash2 with n-gram drafting) or `mtp`; `--free-running` adds the greedy
+proposal head), `ngram` (DFlash2 with n-gram drafting), `mtp` (4 drafts) or `mtp-ngram` (MTP with n-gram copies, for models without DFlash2); `--free-running` adds the greedy
 generations and the judge. The request-coupling paths act only between requests, so the decode
 gate runs both routes under the same Engine conditions: `--concurrency N` (requests per round),
 `--kv-tokens N` (a short KV pool, so the fast run preempts) and `--prefix-reuse --warm-tokens N`
@@ -664,7 +711,9 @@ experts' 4-bit activations cost; pass `--ngram-volume` to the gate when the volu
 `<artifact>.ngram`. Its Engine scoring is checked against the Forward's own teacher-forced logits
 (`infernix_qwen4_exp_score_real_test`): on 3,000 tokens the perplexity matches, top-1 agrees at
 every position, and the RAM and SSD expert tiers give the same output. Its qualified paths are
-three request-coupling paths and the three Q8 dense-kernel paths (6.7).
+the three request-coupling paths (every configuration but recipe C), sampled MTP drafts, the three
+Q8 dense-kernel paths (Dense8), FP16 GDN (IQ3_S and FP8) and recipe C's expert and FP8 pair paths
+(6.7).
 
 ### 6.6 Calibration and comparison with other engines
 
@@ -745,7 +794,9 @@ qualified for, and the evidence that admitted it. The configurations are the one
 `models/qwen3_5/program/planning/fast_paths.cpp` lists (`kQualified`); a configuration not listed
 runs the path's exact counterpart. Qwen3.8-Flash-Next has three of the request-coupling paths
 below and its own kernel paths, among them `expert-a4-residual`
-(`models/qwen4_exp/program/fast_paths.cpp` lists their configurations).
+(`models/qwen4_exp/program/fast_paths.cpp` lists their configurations). Since 2026-10-18 a
+registration follows the kernels (6.1, items 1-4): the entries name the gate and the timing each
+configuration takes.
 
 **Re-scored under the single budgets (2026-10-16).** Every saved gate run in `profiles/quality`
 was decided again by `fast_path_gate.py` with the budgets of 6.3. Every registered configuration
@@ -759,10 +810,21 @@ standard error, which set the caps at 1e-2 (6.3). Spec arms were scored against 
 their configuration in plain decode, which the request-invariant exact route makes the same
 tokens. The recipe C gates (`expert-a4-residual`, `fp8-a8-pair`) are re-scored in their entries.
 
+The configurations by the artifacts that have them: **NVFP4 27B** (24 heads, 4-bit activations:
+the official, NVIDIA, quasar and uncensored Qwen3.8-27B NVFP4 artifacts), **groupwise 27B** (24
+heads, 16-bit activations, Q4 gate/up), **35B-A3B** (16 heads, 16-bit activations); for
+Qwen3.8-Flash-Next **Dense8** (Q8 dense, 4-bit experts: NVIDIA, uncensored and Swift NVFP4
+Dense8), **IQ3_S** (GGUF dense, 16-bit experts: every GGUF import), **FP8** (BF16 dense, 16-bit
+experts: the official FP8 import), **recipe A** (BF16 dense, 4-bit experts) and **recipe C** (FP8
+dense, 16-bit experts). "Every format" is BF16, INT8, FP8, NVFP4, K8V4, VQ2 and K4V2 KV. The
+groupwise 27B and the 35B-A3B cannot be request-invariant, so their request-coupling behaviours
+always run and are not listed. The NVFP4 27B variants select identical paths (each startup's
+`fast paths |` line, 2026-10-18).
+
 | Fast path | Kernels run with | Qualified configurations |
 |---|---|---|
-| `decode-split64` | INT8 KV, 24 query heads | 24 heads, 4-bit activations, INT8 KV |
-| `prompt-pv8` | INT8 KV (fast prompt kernel), NVFP4 KV (fast kernel), K8V4, VQ2, K4V2 KV | 24 heads, 4-bit activations, with INT8, NVFP4, K8V4, VQ2 or K4V2 KV |
+| `decode-split64` | INT8 KV, 24 query heads | NVFP4 27B and groupwise 27B, INT8 KV |
+| `prompt-pv8` | INT8 KV (fast prompt kernel), NVFP4 KV (fast kernel), K8V4, VQ2, K4V2 KV | NVFP4 27B, groupwise 27B and 35B-A3B, with INT8, NVFP4, K8V4, VQ2 or K4V2 KV |
 | `batched-decode`, `batch-split-attention` | request-invariance-capable artifacts | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
 | `batched-a8-decode`, `batched-a4-decode` | the same, with 8-bit (FP8) or 4-bit (NVFP4) activations | none (each fails, below) |
 | `batched-a4-residual-decode` | the same, with 4-bit (NVFP4) MLP activations | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
@@ -770,16 +832,15 @@ tokens. The recipe C gates (`expert-a4-residual`, `fp8-a8-pair`) are re-scored i
 | `adaptive-speculation` | the same, with speculative decoding | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
 | `free-cache-resume` | the same, with the prefix cache | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
 | `preemption` | request-invariance-capable artifacts | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
-| Qwen3.8-Flash-Next: `adaptive-speculation` (MTP), `free-cache-resume` | every Flash-Next artifact | Q8 dense, 4-bit experts, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
-| Qwen3.8-Flash-Next: `preemption` | every Flash-Next artifact | Q8 dense, 4-bit experts, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
+| Qwen3.8-Flash-Next: `adaptive-speculation` (MTP), `free-cache-resume`, `preemption` | every Flash-Next artifact | Dense8, IQ3_S, FP8 and recipe A, every format; not recipe C (its exact route is not request-invariant, below) |
 | Qwen3.8-Flash-Next: `q8-sliced-k`, `gdn-conv-fused`, `qsa-prepare-fused` | Q8 dense weights (`qsa-prepare-fused`: BF16, INT8, FP8, NVFP4 or K8V4 KV) | Q8 dense, 4-bit experts, every KV format (`qsa-prepare-fused`: the five it serves) |
 | `fp8-a8-pair` | row-FP8 dense weights (recipe C) | FP8 dense, 16-bit experts, with FP8, NVFP4, K8V4, VQ2 or K4V2 KV (INT8 fails its decode tail, BF16 its prefill; below) |
 | `q4-w4a8` | groupwise Q4 MLP gate/up | none (fails, below) |
-| `idle-wide-prefill` | Qwen3.8-27B / Qwen3.6-35B-A3B generation engines | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
-| `adaptive-mtp` | Qwen3.8-27B / Qwen3.6-35B-A3B with MTP | none (no speed gain shown, below) |
+| `idle-wide-prefill` | Qwen3.8-27B / Qwen3.6-35B-A3B generation engines | NVFP4 27B, groupwise 27B and 35B-A3B, every format |
+| `adaptive-mtp` | Qwen3.8-27B / Qwen3.6-35B-A3B with MTP and `--draft-tokens auto` | NVFP4 27B and 35B-A3B, every format |
 | Qwen3.8-Flash-Next: `expert-a4-residual` | artifacts with W4A16 experts (recipe C), expert calls of more than eight columns | FP8 dense, 16-bit expert activations, with INT8, FP8, NVFP4, K8V4, VQ2 or K4V2 KV (fails on BF16 KV, below) |
-| Qwen3.8-Flash-Next: `sampled-mtp-drafts` | MTP rounds with a sampled request | Q8 dense, 4-bit experts, with every KV format (distribution and greedy identity, below; no logit changes) |
-| `gdn-f16-accumulate` | chunked GDN calls (16+ tokens) of every Qwen3.5-family and Flash-Next artifact | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2); not Flash-Next (no consistent prefill gain, below) |
+| Qwen3.8-Flash-Next: `sampled-mtp-drafts` | MTP rounds with a sampled request | every Flash-Next configuration, every format (distribution and greedy identity, below; no logit changes) |
+| `gdn-f16-accumulate` | chunked GDN calls (16+ tokens) of every Qwen3.5-family and Flash-Next artifact | NVFP4 27B, groupwise 27B, IQ3_S and FP8, every format; not the 35B-A3B or Dense8 (no gain beyond spread, below) |
 
 **`sampled-mtp-drafts`: drafts drawn from the draft head's top four tokens (Flash-Next, qualified
 2026-10-17).** It changes no logit: a sampled request's drafts are drawn from the head's four most
@@ -798,15 +859,29 @@ tokens, cold expert cache, against the default route): AIME 153.5 -> 154.6 / 155
 code 144.4 -> 150.8 / 147.6 -> 153.1, story 137.1 -> 139.9 / 141.0 -> 139.7 tok/s (seeds 7 / 43):
 geomean +2.7 %, 5 of 6 cells faster, worst -0.9 % (each arm decodes its own text). The switch
 prototype measured +9.1 % (6 of 6) on a warm cache; greedy MTP decode is unchanged (150.3 against
-150.3 tok/s). Not measured on FP8 or recipe C dense, which stay unregistered.
+150.3 tok/s). The other configurations (2026-10-18; INT8 KV, `--draft-tokens auto` with the
+proposal head, T 1.0, seed 7, 1,024 tokens, the exact route against the exact route plus the path,
+ABBA): IQ3_S math 166.4 -> 197.6 (+18.8 %), story 130.4 -> 159.6 (+22.4 %), code 155.8 -> 162.2
+tok/s (+4.1 %, overlapping); FP8 math 48.0 -> 57.8 (+20.4 %), story 41.7 -> 48.2 (+15.6 %), every
+run ahead, code 46.1 -> 40.1 (-13.0 %, overlapping: one exact run at 52.5 against 39.7-40.1 for the
+other three; FP8 decode is SSD-bound and its runs vary by up to 30 %). Tokens per round did not
+rise with it (IQ3_S math 2.84 and 2.63 exact against 2.42 and 2.78 with the path), so the gain is
+not explained by acceptance alone and was not attributed further. Recipe A and recipe C are
+registered by the rule for a path that changes no logit (6.1), with these as the nearest timings;
+recipe C's exact-route defect (below) does not bear on such a path.
 
 **`gdn-f16-accumulate`: FP16-accumulate chunked GDN (qualified on the 27B, 2026-10-17).** See
 `ops::GdnChunkArithmetic::Fp16Accumulate`. Op: 1.20x at the 27B's shapes, and closer to the FP64
 oracle than the exact route (output relative RMS 2.08e-3 against 3.60e-3, state 8.6e-4 against
 2.6e-3). Prefill (INT8 KV, default route against default + the path, ABBA): 27B pp4096 12,956 ->
 12,986 and pp16384 11,965 -> 11,994 tok/s (+0.24 %, both runs of each arm ahead); Flash-Next
-pp16384 6,574 -> 6,564 (-0.15 %, ranges overlap), pp65536 11,186 -> 11,214 (+0.26 %), so it is
-not registered there. Gates on the official 27B NVFP4, jointly with the qualified paths (the path
+Dense8 pp16384 6,574 -> 6,564 (-0.15 %, ranges overlap), pp65536 11,186 -> 11,214 (+0.26 %), so it
+is not registered on Dense8. Exact route against exact route plus the path, pp16384, INT8 KV
+(2026-10-18): IQ3_S 4,227.5 -> 4,236.4 (+0.21 %), FP8 2,529.8 -> 2,538.2 (+0.33 %, the lower fast run
+0.3 tok/s above the higher exact one), groupwise 27B +0.12 %, every run ahead in each; 35B-A3B
++0.05 %, within spread, not registered. IQ3_S and FP8 take the NVFP4 27B's gates below (one gate
+per kernel, 6.1 item 1), the groupwise 27B its own prefill gate (under `idle-wide-prefill`); the
+path touches no attention or KV, so every format is registered with the INT8 timing. Gates on the official 27B NVFP4, jointly with the qualified paths (the path
 touches no attention or KV: reduced prefill gate on every format, decode on INT8 and on BF16, the
 lowest floor):
 
@@ -994,6 +1069,41 @@ verdict, which replaces the 256-segment one. Before the increment rule, the BF16
 (TV bound 4.57e-3, KL excess 1.23e-2, p99.9 ratio 1.63), and the kernel paths alone failed it the same
 way; its exact route was bit-identical with and without the short pool and across reruns (6.1).
 
+**Flash-Next IQ3_S, FP8, recipe A and recipe C** (2026-10-17/18, the kernel rule of 6.1 item 2).
+On IQ3_S (GSQ-RCO IQ3_S) and FP8 (the official FP8 import) the prefix-cache and preemption real
+tests pass on the exact route with the candidates (bit-level resume and Replay equivalences), and
+one INT8 joint decode gate each (MTP 4 at concurrency 2, every segment resuming from a warm
+3,000-token entry, 256 segments, `adaptive-speculation` + `free-cache-resume` + `preemption`)
+passes; the other formats take Dense8's per-format verdicts above:
+
+| Artifact | TV excess (bound) / 4.0e-3 | Top-1 excess, points (bound) / 0.50 | KL excess / 1.0e-2 | NLL excess / 1.0e-2 | p99.9 KL ratio / 1.25 |
+|---|---|---|---|---|---|
+| IQ3_S | 4.4e-4 (6.4e-4) | -0.03 (0.09) | 2.4e-4 | -9.6e-5 | 1.12 |
+| FP8 | 3.7e-4 (5.6e-4) | +0.13 (0.26) | 1.2e-4 | 7.6e-4 | 1.02 |
+
+Speed, each path alone against the exact route (INT8 KV, `infernix-serve`, MTP `auto`, ABBA):
+- `free-cache-resume` (three conversations, time to each second turn's first token): IQ3_S
+  1.65-1.67 and 0.66 s -> 0.10-0.12 s for the second and third (the first, 1.66 s, is cold in both
+  arms), FP8 3.8-5.7 s -> 0.26-0.51 s.
+- `adaptive-speculation` (two concurrent requests): IQ3_S 160 -> 200 tok/s (+25 %), every run
+  ahead; FP8, whose SSD-bound decode varies run to run, over three ABBA blocks of 2 + 2 runs:
+  +2.6, +3.8 and +7.3 % (37.4 -> 39.2 tok/s overall), every block ahead.
+- `preemption`: with four requests that run to their 512-token limit under a 1,280-token pool it
+  costs IQ3_S 3.0 % (158.4 -> 153.5 tok/s, every run behind; Replay redoes work) and FP8 is mixed.
+  Where it acts in practice, eight brief requests asking for 4,096 tokens each under an
+  8,192-token pool (the exact route holds whole extents and admits about two at once): IQ3_S 118.1
+  -> 131.3 tok/s (+11.3 %), FP8 26.7 -> 28.3 (+5.9 %), every run ahead. It is registered for that
+  regime, which agent clients produce (`max_tokens` 64,000 on short turns).
+
+Recipe A (BF16 dense, 4-bit experts) is registered for the three coupling paths and sampled drafts
+without runs of its own, at the owner's request (2026-10-18): `free-cache-resume` takes FP8's timing
+(the same dense kernels), `adaptive-speculation` Dense8's and IQ3_S's (4-bit experts streamed as
+Dense8's), `preemption` IQ3_S's and FP8's, and the quality verdicts Dense8's. Its exact-route
+equivalences were not run on the artifact. Recipe C fails: its real tests diverge on the exact
+route at token 29 (a resumed request against a cold one, and concurrent against solo), so its exact
+route is not request-invariant, and its joint gate fails the p99.9 KL ratio (1.33); no coupling
+path is registered on it, and the exact-route defect is open.
+
 Every prompt-length bucket and p99.9 KL ratio passes too (largest ratio 1.13, 27B K8V4 spec). The
 closest bound is 27B NVFP4 spec's top-1 at 82 % of its budget. Speed (official 27B, INT8 KV, 2,048
 prompt, 256 output tokens, three rounds; the qualified set against the exact route): plain decode
@@ -1157,8 +1267,9 @@ and recomputes the previous output) or admission (whole extents held without `pr
   The attention Op itself takes 16.2 → 13.7 µs at 512 keys and 16.0 → 14.2 µs at 2,048 keys, and
   is unchanged from 4,096. Longer rows already saturate the split target, so they keep their
   partition.
-- **Not yet qualified:** 24-head artifacts with 8- or 16-bit activations, where the kernel runs
-  unchanged but the budget is smaller (about 2e-4 at 16 bits); none exists on this machine.
+- **Groupwise 27B** (24 heads, 16-bit activations, 2026-10-18): the same kernel at the same shapes,
+  so it takes this gate (6.1 item 1); timed on the artifact, +0.25 % at 512-token prompts with every
+  run ahead and level at 4,096, so it is registered on INT8 KV.
 
 **`prompt-pv8`: 8-bit P×V in prompt attention.**
 - **Selected by:** `CausalAttentionExecutionEnvelope::fast_prompt_pv8`.
@@ -1221,31 +1332,69 @@ and recomputes the previous output) or admission (whole extents held without `pr
   | K4V2 | 11,300 → 11,530 tok/s, +2.0 % | 7,939 → 8,393 tok/s, +5.7 % |
 
   The path acts only in the prompt (tiled) attention kernels; decode throughput was not measured.
-- **Not yet qualified:** 24-head artifacts with 8- or 16-bit activations (smaller budgets), and
-  other attention geometries; none exists on this machine.
+- **Groupwise 27B** (24 heads, 16-bit activations): the same kernels at the same shapes, so it
+  takes these gates and timings on the same five formats (6.1 items 1 and 4); its own prefill gate
+  with the path passes (under `idle-wide-prefill`).
+- **35B-A3B** (16 heads, 16-bit activations; 2026-10-18): its own prefill gate with the path passes
+  (under `idle-wide-prefill`), and its 16-head shapes are its own, so each format was timed
+  (pp16384, ABBA, every run ahead): INT8 +0.24 %, NVFP4 +1.51 %, K8V4 +1.59 %, VQ2 +0.15 %, K4V2
+  +0.27 %.
 
-**`adaptive-mtp`: MTP draft length chosen per round (candidate, not qualified).**
-- **Selected by:** `--fast-path adaptive-mtp` with `--spec mtp` on Qwen3.8-27B / Qwen3.6-35B-A3B;
-  the policy is `models/qwen3_5/program/speculative/mtp_draft_policy.h`.
-- **What changes:** `--draft-tokens N` becomes a ceiling. Each all-neural round of one row runs a
+**`adaptive-mtp`: MTP draft length chosen per round (qualified 2026-10-18 on the NVFP4 27B and the
+35B-A3B).**
+- **Selected by:** `--spec mtp --draft-tokens auto` on Qwen3.8-27B / Qwen3.6-35B-A3B, where it is
+  registered (it is `auto`'s policy: a fixed `--draft-tokens N` refuses it); it acts where
+  speculation is adaptive (`adaptive-speculation` selected, or an artifact that cannot be
+  request-invariant). Where it does not act (another configuration, or `--disable-fast-paths`),
+  `auto` drafts the configuration's fastest single length every round: 5 on the NVFP4 27B, 3 on the
+  groupwise 27B, the 35B-A3B and unmeasured configurations (`auto_fixed_draft_tokens`). The policy is
+  `models/qwen3_5/program/speculative/mtp_draft_policy.h`.
+- **What changes:** the ceiling N is 5. Each all-neural round of one row runs a
   draft length K in 1..N, and a round of several rows one common K among 1, 2, 3 and N, whichever
   maximizes the rows' expected committed tokens per unit of round time. Expected tokens come from
   each request's decayed per-position acceptance (carried through preemption and Replay with the
-  request); a round of K drafts costs the fixed model 1 + 0.2 K plain rounds (calibrated on the
-  captured graphs), so the choices repeat run to run.
-  Every 16 choices the next longer K runs for two rounds so its acceptance stays measured. A choice
-  reads only earlier rounds: drafts, acceptance and sampling are unchanged, but the verification
-  width, and with it the target's linear routes, varies by round. Copy (n-gram) rounds keep their
-  widths and propose at N.
+  request). A round's time is learned from the rounds themselves: a decayed (0.98 per cycle) fit of
+  start-to-start cycle time against K per batch size, used once it has 24 cycles and some spread of
+  K, with cycles more than three times the fit's prediction (host gaps) left out; before that a
+  round of K drafts costs 1 + 0.2 K plain rounds. The learned cost depends on measured times, so the
+  choices no longer repeat exactly run to run (two identical exact-route runs on the 27B: 152.0 and
+  139.4 tok/s). Every 16 choices the next longer K runs for two rounds so its acceptance stays
+  measured. A choice reads only earlier rounds: drafts, acceptance and sampling are unchanged; only
+  the verification width varies by round, and every width is one a fixed `--draft-tokens K` already
+  runs through routes qualified at that width, so the path changes no kernel arithmetic and is
+  decided by speed (6.1 item 3). Copy (n-gram) rounds keep their widths and propose at N.
 - **Cost:** one Forward/Finish graph pair per extra (K, batch size): K < N for one row, K in 1..3
   for every batch size (about +4 MiB of graph allowance each).
-- **Speed** (2026-10-15, RTX 5090, INT8 KV, `infernix_bench` pp2048+tg256 on the bench corpus,
-  `--draft-tokens 5`): slower than a fixed five drafts everywhere measured. Official 27B NVFP4: 312.6
-  against 326.1 tok/s at one request (−4.1 %), 311.8 against 314.9 at two (−1.0 %), 273.6 against
-  276.9 at four (−1.2 %); 35B-A3B: 892.7 against 928.4 at one (−3.9 %). The corpus accepts almost
-  every draft (mean accepted length 5.9 of 6), so the policy keeps K = 5 and loses only its probe
-  rounds; text with low acceptance, where shorter drafts pay, was not measured. Not gated: no
-  speed gain is shown.
+- **Speed** (2026-10-18, RTX 5090, INT8 KV, `infernix_bench` tg512 on the bench corpus at
+  concurrency 1, 2 and 4 on the default route, two runs per setting; `infernix` sampled text, math,
+  story and code at seeds 7 and 43, 1,024 tokens; tok/s):
+
+  | Artifact | Setting | Fixed 3 | Fixed 5 | `auto` |
+  |---|---|---|---|---|
+  | NVFP4 27B | concurrency 1 | 142.5 | 139.0 | **147.1** |
+  | NVFP4 27B | concurrency 2 | **137.5** | 133.3 | 134.8 |
+  | NVFP4 27B | concurrency 4 | 136.3 | 141.2 | **142.8** |
+  | NVFP4 27B | sampled text, six runs summed | 875.5 | 895.5 | **899.3** |
+  | 35B-A3B | concurrency 1 | 776.9 | 794.3 | **803.1** |
+  | 35B-A3B | concurrency 2 | **575.0** | 504.1 | 564.3 |
+  | 35B-A3B | concurrency 4 | 348.6 | 302.9 | **368.3** |
+  | 35B-A3B | sampled text, six runs summed | 3,781 | 3,494 | **3,900** |
+  | 35B-A3B | exact route, tg512 (fixed 4: 756.4) | 775.9 | 794.2 | **825.3** |
+  | 35B-A3B | exact route, pp2048+tg512 (fixed 4: **800.9**) | 746.9 | 730.0 | 713.8 |
+
+  Against the best single fixed length overall (the 27B's 5, the 35B's 3), the geometric mean over
+  these settings is +2.1 % and +2.0 %. It is not the fastest everywhere: at concurrency 2 it is
+  1.9-2.0 % behind fixed 3 on both, and on the 35B's predictable pp2048+tg512 text it chose short
+  drafts too often ([0, 144, 138, 24, 171] rounds at K = 1..5) and trails fixed 4 by 10.9 %. The
+  27B's exact-route sweep ran `auto` with `adaptive-speculation` (needed there for the policy to
+  act) against fixed lengths without it, so it is not used. The other KV formats take the INT8
+  timing: a format changes only the round cost the policy learns. The groupwise 27B, timed the same
+  way (2026-10-18), is not registered: against fixed 3, its best single length overall, `auto` is
+  +2.7 % at one request (146.9 against 143.0, from runs of 163.8 and 130.0), -4.7 % at two, -2.0 %
+  at four and +3.6 % on sampled text (762 against 736 summed), a geometric mean of -0.15 %. The two
+  one-request runs show the learned cost can settle on a worse length in one run than another (also
+  the 27B's 152.0 and 139.4 above). Earlier (2026-10-15, the fixed cost model, bench corpus at 5.9 of
+  6 accepted): 1.0-4.1 % slower than five fixed drafts, from its probe rounds.
 
 **`idle-wide-prefill`: wider prefill steps while no request waits to decode (qualified
 2026-10-15).**
@@ -1297,7 +1446,18 @@ and recomputes the previous output) or admission (whole extents held without `pr
   never widened a step, so its fast runs measured only the qualified paths. The evaluation then
   needed `evaluate-prefill --fast-chunk` (fixed the same day: the pair check had required equal
   chunks).
-- **Qualified:** 24 heads, 4-bit activations, with every KV format.
+- **Groupwise 27B and 35B-A3B** (2026-10-18, their own evidence; both 16-bit activations, neither
+  request-invariant). The same prefill gate on INT8 KV, the idle width (3,584) against the 896- and
+  1,792-token chunks, jointly with `prompt-pv8` and `gdn-f16-accumulate`, passes on both:
+
+  | Artifact | KL excess (bound) / 1.5e-3 | Top-1 excess, points (bound) / 0.50 | NLL excess | p99.9 KL ratio / 1.25 |
+  |---|---|---|---|---|
+  | Groupwise 27B | 2.7e-4 (4.5e-4) | +0.15 (0.18) | 3.4e-4 | 1.75 (passes: the fast p99.9 KL, 0.025, is below the 0.05 floor) |
+  | 35B-A3B | 5.9e-4 (7.6e-4) | +0.26 (0.31) | -1.0e-4 | 1.23 |
+
+  Speed, pp16384 ABBA, every run ahead: groupwise 27B +3.31 %, 35B-A3B +16.9 %. The other formats
+  take the NVFP4 27B's per-format verdicts above (the path changes the step width, not a kernel).
+- **Qualified:** NVFP4 27B, groupwise 27B and 35B-A3B, with every KV format.
 
 **`q8-sliced-k`, `gdn-conv-fused`, `qsa-prepare-fused`: Qwen3.8-Flash-Next dense kernels (qualified 2026-10-15).**
 - **What changes:** `q8-sliced-k` runs NInfer's GEMV, sliced-K and grouped sliced-K tables for the
@@ -1349,6 +1509,17 @@ and recomputes the previous output) or admission (whole extents held without `pr
   be at least INT8's.
 - **Speed** (`infernix_bench`, two rounds): plain decode +1.4 %, MTP (four drafts) +3.4 to
   +4.2 %, prefill +0.3 to +1.0 % (qwen3_8-flash-next-design.md §19.3.22).
+- **`qsa-prepare-fused` elsewhere** (2026-10-18; it serves every dense format, and Dense8's gates
+  cover its kernel): timed alone against the exact route (INT8 KV, ABBA) it is not faster on IQ3_S
+  (pp16384 +0.15 %; plain decode after a 2,048-token prompt 122.4 -> 121.8 tok/s, -0.47 %, every
+  run behind) or FP8 (pp16384 -0.04 %, MTP decode +0.47 %, both overlapping), so it is not
+  registered there. Its MTP timings move with the text it changes, not with its own cost: IQ3_S MTP
+  4 tg512 ran 241.8 -> 198.3 tok/s (-18.0 %, 450 -> 489 rounds), while Dense8 (beside `q8-sliced-k`
+  and `gdn-conv-fused`) ran 116.3 -> 139.3 (+19.8 %, 579 -> 447 rounds; one exact run cold at 104.8),
+  each arm's rounds also taking different expert-cache time on its own text. Dense8's plain decode,
+  where acceptance cannot enter, is 102.4 -> 102.6 tok/s (+0.23 %, every run ahead) and its pp16384
+  level (-0.88 %, overlapping, from one exact run at 7,034 against 6,911-6,913 for the other three),
+  so the Dense8 registration stands.
 - **Not qualified:** 16-bit expert activations, and other dense formats (no kernels).
 
 **`expert-a4-residual`: two-term A4 activations in recipe C's wide expert calls (qualified

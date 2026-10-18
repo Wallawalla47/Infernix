@@ -5,6 +5,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -18,9 +19,9 @@ namespace infernix::models::qwen3_5::detail {
 // length with the most expected committed tokens per unit of round time: one row chooses among
 // every length in [1, ceiling], a round of several rows takes one common length among the batch
 // lengths (mtp_batch_draft_length). A row's expected tokens follow from its learned per-position
-// acceptance; a round's time follows the fixed model 1 + kModelDraftCost * K, calibrated from round
-// times measured on the captured graphs (2026-10-15), or a measured table (set_round_seconds) when
-// one is given.
+// acceptance; a round's time from a measured table (set_round_seconds) when one is given, else the
+// cost learned from the rounds themselves (observe_cycle), else the fixed model
+// 1 + kModelDraftCost * K.
 //
 // A choice reads only earlier rounds, never the round's own draws, so speculative acceptance and
 // sampling are unchanged: only the verification width (and with it the target's linear routes)
@@ -101,8 +102,17 @@ public:
     // past the current choice stays measured.
     static constexpr std::uint32_t kProbePeriod = 16;
     static constexpr std::uint32_t kProbeRounds = 2;
-    // Without measured round times a round of K drafts costs 1 + kModelDraftCost * K.
+    // Without measured or learned round times a round of K drafts costs 1 + kModelDraftCost * K.
+    // The cost is the model's (2026-10-18, INT8 KV, from fixed-length runs: about 0.06 on the
+    // NVFP4 27B, 0.19 on the 35B-A3B), so the learned fit replaces it once determined.
     static constexpr double kModelDraftCost = 0.2;
+    // The learned fit: per observed cycle decay, the rounds and length spread it needs, the gap
+    // filter, and the largest cost it reports.
+    static constexpr double kCostDecay      = 0.98;
+    static constexpr double kCostMinRounds  = 24.0;
+    static constexpr double kCostMinSpread  = 0.1; // variance of k
+    static constexpr double kCostGapRatio   = 3.0;
+    static constexpr double kCostMax        = 1.0;
 
     // Lengths 1..ceiling for one row, the batch lengths for 2..max_batch rows.
     MtpDraftPolicy(std::uint32_t ceiling, std::uint32_t max_batch);
@@ -119,6 +129,16 @@ public:
 
     // The measured time of a round of batch_size rows at draft length k (served lengths only).
     void set_round_seconds(std::uint32_t k, std::uint32_t batch_size, double seconds);
+
+    // Round-cost learning (as Qwen3.8-Flash-Next's, its design 11.3): the start-to-start time of two
+    // consecutive all-neural rounds of batch_size rows, the first of draft length k. Fit per batch
+    // size as t = a + b k by exponentially weighted least squares; a draft then costs b / a rounds.
+    // A cycle past kCostGapRatio predicted rounds held an idle gap and is skipped.
+    void observe_cycle(std::uint32_t k, std::uint32_t batch_size, double seconds) noexcept;
+
+    // The learned cost of one draft in rounds of batch_size rows, once its fit has kCostMinRounds
+    // rounds of spread lengths and is positive.
+    [[nodiscard]] std::optional<double> learned_draft_cost(std::uint32_t batch_size) const noexcept;
 
     // Whether every length of batch_size has a measured time.
     [[nodiscard]] bool measured(std::uint32_t batch_size) const noexcept;
@@ -142,8 +162,14 @@ private:
     [[nodiscard]] std::uint32_t step(MtpDraftMemory& memory,
                                      std::span<const MtpAcceptanceEstimate* const> rows) const;
 
+    struct CostFit {
+        double n = 0.0, k = 0.0, kk = 0.0, t = 0.0, kt = 0.0;
+    };
+    [[nodiscard]] static bool solve(const CostFit& fit, double& a, double& b) noexcept;
+
     std::uint32_t ceiling_   = 0;
     std::uint32_t max_batch_ = 0;
+    std::array<CostFit, kMaximumConcurrency> cost_{};
     // [(batch_size - 1) * ceiling + k - 1]; 0 where unmeasured.
     std::vector<double> seconds_;
     std::array<MtpDraftMemory, kMaximumConcurrency> batches_{};

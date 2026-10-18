@@ -123,6 +123,75 @@ constexpr std::array kQualified{
     Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value}},
     Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A4, KvCacheStorage::Vq2}},
     Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value}},
+    // The groupwise Qwen3.8-27B (24 heads, 16-bit activations, groupwise Q4 gate/up) by composition
+    // (model-quality.md 6.1, 2026-10-18): prompt-pv8 changes only the prompt attention kernels it
+    // shares, at the same 24-head shapes and with no added cost, with the NVFP4 27B, whose gates it
+    // passed with a clear prefill gain (+1.6-5.7 %), so it takes that verdict and timing.
+    Qualification{FastPath::PromptPv8, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, true}},
+    Qualification{FastPath::PromptPv8, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16, true}},
+    Qualification{FastPath::PromptPv8, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value, true}},
+    Qualification{FastPath::PromptPv8, {24, ActivationClass::A16, KvCacheStorage::Vq2, true}},
+    Qualification{FastPath::PromptPv8, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value, true}},
+    // The groupwise 27B, its own evidence (2026-10-18; it cannot be request-invariant, so its
+    // request-coupling paths always act). idle-wide-prefill with prompt-pv8 and gdn-f16-accumulate:
+    // prefill gate (quick corpus, INT8, 896/1,792 against 3,584) passes; pp16384 +3.31 % and +0.12 %,
+    // every run ahead; the other KV formats take the NVFP4 27B's per-format verdicts (6.1). decode-split64:
+    // the NVFP4 27B's kernel and shapes, +0.25 % at 512-token prompts here, level at 4,096.
+    Qualification{FastPath::DecodeSplit64, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, true}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A16, KvCacheStorage::BFloat16, true}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, true}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256, true}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16, true}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value, true}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A16, KvCacheStorage::Vq2, true}},
+    Qualification{FastPath::IdleWidePrefill, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value, true}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A16, KvCacheStorage::BFloat16, true}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, true}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256, true}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16, true}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value, true}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A16, KvCacheStorage::Vq2, true}},
+    Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value, true}},
+    // Qwen3.6-35B-A3B (16 heads, 16-bit activations; never request-invariant), its own evidence
+    // (2026-10-18): the same prefill gate passes; idle-wide-prefill pp16384 +16.9 % (other KV formats
+    // from the NVFP4 27B's verdicts), prompt-pv8 +0.24 % on INT8 KV (its 16-head shapes are its own,
+    // so each other format is timed before it is listed). gdn-f16-accumulate's +0.05 % was within
+    // run-to-run spread, so it is not listed.
+    Qualification{FastPath::IdleWidePrefill, {16, ActivationClass::A16, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::IdleWidePrefill, {16, ActivationClass::A16, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::IdleWidePrefill, {16, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::IdleWidePrefill, {16, ActivationClass::A16, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::IdleWidePrefill, {16, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::IdleWidePrefill, {16, ActivationClass::A16, KvCacheStorage::Vq2}},
+    Qualification{FastPath::IdleWidePrefill, {16, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::PromptPv8, {16, ActivationClass::A16, KvCacheStorage::Int8Group64}},
+    // The 35B's prompt-pv8 on the other formats it serves, each timed (pp16384, 2026-10-18): NVFP4
+    // +1.51 %, K8V4 +1.59 %, VQ2 +0.15 %, K4V2 +0.27 %, every run ahead.
+    Qualification{FastPath::PromptPv8, {16, ActivationClass::A16, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::PromptPv8, {16, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::PromptPv8, {16, ActivationClass::A16, KvCacheStorage::Vq2}},
+    Qualification{FastPath::PromptPv8, {16, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value}},
+    // --draft-tokens auto's policy with the learned round cost (2026-10-18, INT8 KV). It changes no
+    // kernel: each round's verify width is one a fixed --draft-tokens K already runs, through routes
+    // qualified at every such width (6.1, item 3), so it is decided by speed alone. Against the best
+    // single fixed length overall (NVFP4 27B: 5; 35B-A3B: 3), geometric mean over the default route at
+    // concurrency 1, 2 and 4, sampled CLI text and (35B) the exact route: +2.1 % and +2.0 %; the
+    // exceptions are in model-quality.md 6.7. The KV format changes only the round cost the policy
+    // learns, so every format takes the INT8 timing.
+    Qualification{FastPath::AdaptiveMtp, {24, ActivationClass::A4, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::AdaptiveMtp, {24, ActivationClass::A4, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::AdaptiveMtp, {24, ActivationClass::A4, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::AdaptiveMtp, {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::AdaptiveMtp, {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::AdaptiveMtp, {24, ActivationClass::A4, KvCacheStorage::Vq2}},
+    Qualification{FastPath::AdaptiveMtp, {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::AdaptiveMtp, {16, ActivationClass::A16, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::AdaptiveMtp, {16, ActivationClass::A16, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::AdaptiveMtp, {16, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::AdaptiveMtp, {16, ActivationClass::A16, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::AdaptiveMtp, {16, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::AdaptiveMtp, {16, ActivationClass::A16, KvCacheStorage::Vq2}},
+    Qualification{FastPath::AdaptiveMtp, {16, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value}},
 };
 
 const char* kv_name(KvCacheStorage kv) {
@@ -223,9 +292,11 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
     case FastPath::Q8SlicedK:
     case FastPath::GdnConvFused:
     case FastPath::QsaPrepareFused: return false; // Qwen3.8-Flash-Next kernels only
-    // It runs only where speculation is adaptive (adaptive-speculation selected, or an artifact the
-    // exact route cannot make request-invariant), see ExecutionSchedule::adaptive_mtp.
-    case FastPath::AdaptiveMtp: return options.speculative.backend == SpeculativeBackend::Mtp;
+    // It is --draft-tokens auto's policy, and runs only where speculation is adaptive
+    // (adaptive-speculation selected, or an artifact the exact route cannot make request-invariant),
+    // see ExecutionSchedule::adaptive_mtp. A fixed --draft-tokens N drafts N.
+    case FastPath::AdaptiveMtp:
+        return options.speculative.backend == SpeculativeBackend::Mtp && options.speculative.draft_tokens_auto;
     // Causal scoring has no idle steps (each window's chunks are the caller's); the path is a no-op
     // there, which lets the gate name it while its fast run prefills at --fast-chunk.
     case FastPath::IdleWidePrefill: return true;
@@ -245,6 +316,14 @@ bool fast_path_qualified(FastPath path, const FastPathConfiguration& configurati
     return std::any_of(kQualified.begin(), kQualified.end(), [&](const Qualification& entry) {
         return entry.path == path && entry.configuration == configuration;
     });
+}
+
+std::uint32_t auto_fixed_draft_tokens(const FastPathConfiguration& configuration) noexcept {
+    // 2026-10-18 sweeps (INT8 KV; tg512 at concurrency 1, 2 and 4 and sampled text, model-quality.md
+    // 6.7): the NVFP4 27B is fastest overall at 5, the groupwise 27B and the 35B-A3B at 3. The KV
+    // format changes the round cost only slightly, so every format takes these.
+    if (configuration.query_heads == 24 && configuration.activations == ActivationClass::A4) { return 5; }
+    return 3;
 }
 
 bool FastPathSelection::selected(FastPath path) const noexcept {

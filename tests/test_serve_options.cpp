@@ -182,6 +182,16 @@ int main() {
             } catch (const std::invalid_argument&) { rejected = true; }
             failures += check(rejected, "unsupported neural/ngram pair admitted");
         }
+        // --draft-tokens auto: MTP only, the count left to the Engine.
+        bool auto_rejected = false;
+        try {
+            const auto automatic =
+                parse({"infernix-serve", "model.ninfer", "--spec", backend, "--draft-tokens", "auto"});
+            failures += check(automatic.speculative.draft_tokens_auto && automatic.speculative.draft_tokens == 0,
+                              "--draft-tokens auto did not select the automatic length");
+        } catch (const std::invalid_argument&) { auto_rejected = true; }
+        failures += check(auto_rejected == (backend != "mtp"),
+                          "--draft-tokens auto is accepted with --spec mtp only");
         const auto wide_single =
             parse({"infernix-serve", "model.ninfer", "--spec", backend, "--draft-tokens", "3",
                    "--ngram-draft-tokens", "63", "--max-concurrency", "1"});
@@ -987,6 +997,19 @@ int main() {
                       "--disable-fast-paths was not preserved");
     failures += check(serve_usage_text("infernix-serve").find("--disable-fast-paths") != std::string::npos,
                       "serve help omits --disable-fast-paths");
+    {
+        const auto timed = parse({"infernix-serve", "model.ninfer", "--disable-fast-paths", "--fast-path",
+                                  "free-cache-resume", "--fast-path", "adaptive-speculation"});
+        failures += check(timed.fast_path_candidates == std::vector<infernix::FastPath>{
+                                                            infernix::FastPath::FreeCacheResume,
+                                                            infernix::FastPath::AdaptiveSpeculation},
+                          "--fast-path candidates were not kept in order");
+        bool rejected = false;
+        try {
+            (void)parse({"infernix-serve", "model.ninfer", "--fast-path", "no-such-path"});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "an unknown --fast-path name was accepted");
+    }
     failures += check(serve_usage_text("infernix-serve").find("prefill-8bit-pv") == std::string::npos,
                       "serve help still lists the removed 8-bit prefill P*V flags");
     failures += check(archive.prefill_split_workspace_mib == infernix::kDefaultPrefillSplitWorkspaceMiB,

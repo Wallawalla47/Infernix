@@ -62,6 +62,9 @@ struct ServeOptions {
     std::uint32_t prefill_split_workspace_mib = kDefaultPrefillSplitWorkspaceMiB;
     bool original_nvfp4_prefill_kernel = false;
     bool fast_paths                    = true; // off with --disable-fast-paths (EngineOptions)
+    // --fast-path NAME (repeatable): also run these, qualified or not (qualification and timing
+    // runs; EngineOptions::fast_path_candidates).
+    std::vector<FastPath> fast_path_candidates;
     std::filesystem::path context_cost_presets;
     std::uint32_t log_stats_interval_ms    = 5000; // 0 disables periodic Engine throughput logs
     std::size_t max_request_bytes          = kDefaultMaxRequestBytes;

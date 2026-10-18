@@ -1248,6 +1248,25 @@ std::vector<std::uint32_t> idle_prefill_widths_impl(const execution::Parameters&
     return idle_prefill_width_ladder(effective_prefill_chunk(parameters, options), steps);
 }
 
+std::uint32_t resolve_auto_draft_length_impl(const execution::Parameters& parameters,
+                                             EngineOptions& options) {
+    if (!options.speculative.draft_tokens_auto || execution_schedule(parameters, options).adaptive_mtp) {
+        return 0;
+    }
+    // adaptive-mtp acts only where speculation is adaptive; a qualification run that names it must
+    // also name adaptive-speculation on an artifact that can be request-invariant.
+    if (std::find(options.fast_path_candidates.begin(), options.fast_path_candidates.end(),
+                  FastPath::AdaptiveMtp) != options.fast_path_candidates.end()) {
+        throw std::invalid_argument("--fast-path adaptive-mtp acts only where speculation is adaptive: "
+                                    "add --fast-path adaptive-speculation");
+    }
+    const FastPathSelection fast =
+        select_fast_paths(parameters.model, options, parameters.invariant_text.has_value());
+    options.speculative.draft_tokens_auto = false;
+    options.speculative.draft_tokens      = auto_fixed_draft_tokens(fast.configuration);
+    return options.speculative.draft_tokens;
+}
+
 std::unique_ptr<qwen3_5::detail::SequencePlannerImpl>
 make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContext& device,
                            const EngineOptions& options, std::uint32_t idle_prefill_width) {
@@ -1260,9 +1279,15 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         }
     }
     TreeWidthPlan tree_widths = resolve_tree_widths(parameters, options);
-    const std::vector<SpeculativeRoundShape> round_shapes = speculative_round_shapes(
-        options, tree_widths,
-        execution_schedule(parameters, options).adaptive_mtp);
+    const bool adaptive_mtp = execution_schedule(parameters, options).adaptive_mtp;
+    // resolve_auto_draft_length made --draft-tokens auto a fixed length wherever adaptive-mtp does
+    // not act; without it the rounds would silently draft the ceiling.
+    if (options.speculative.draft_tokens_auto && !adaptive_mtp) {
+        throw std::logic_error("--draft-tokens auto reached planning without adaptive-mtp; "
+                               "resolve_auto_draft_length was not applied");
+    }
+    const std::vector<SpeculativeRoundShape> round_shapes =
+        speculative_round_shapes(options, tree_widths, adaptive_mtp);
     std::uint32_t draft_window = 0;
     for (const SpeculativeRoundShape& shape : round_shapes) {
         draft_window = std::max(draft_window, shape.verify_drafts);

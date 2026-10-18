@@ -267,6 +267,12 @@ int test_cli_contract() {
                                   "--draft-tokens", "8"});
         },
         "unsupported MTP window");
+    {
+        const auto automatic = parse_for_test(
+            {"infernix_bench", "--weights", "model.ninfer", "--spec", "mtp", "--draft-tokens", "auto"});
+        failures += expect(automatic.speculative.draft_tokens_auto && automatic.speculative.draft_tokens == 0,
+                           "automatic MTP draft length");
+    }
     failures += expect_throws<std::invalid_argument>(
         [] {
             (void)parse_for_test(
@@ -493,7 +499,7 @@ int test_report_contract() {
 
     failures += expect(report.at("config").at("rope_yarn_factor") == 2.5,
                        "report preserves runtime YaRN factor");
-    failures += expect(report.at("schema_version") == 21, "report schema v21");
+    failures += expect(report.at("schema_version") == 22, "report schema v22");
     failures += expect(report.at("config").at("speculative_backend") == "mtp" &&
                            report.at("config").at("draft_tokens") == 5,
                        "report identifies its backend and window");

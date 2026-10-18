@@ -53,6 +53,18 @@ namespace infernix::product {
     return text;
 }
 
+// Applies a --draft-tokens value: "auto" selects the automatic MTP draft length up to the model's
+// most (draft_tokens 0 until the Engine resolves it), anything else a fixed count.
+inline void apply_draft_tokens(SpeculativeOptions& options, std::string_view value) {
+    options.draft_tokens_auto = value == "auto";
+    options.draft_tokens      = 0;
+    if (options.draft_tokens_auto) { return; }
+    if (value.empty() || value.size() > 3 || value.find_first_not_of("0123456789") != std::string_view::npos) {
+        throw std::invalid_argument("--draft-tokens takes a count or auto: " + std::string(value));
+    }
+    options.draft_tokens = static_cast<std::uint32_t>(std::stoul(std::string(value)));
+}
+
 // Parses --draft-tree-nodes: one to eight comma-separated column counts, entry c-1 applying to
 // rounds of c rows and the last entry to every larger batch; 0 keeps a batch size on chain
 // verification.
@@ -150,6 +162,9 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
     if (options.draft_min_p && options.backend != SpeculativeBackend::Mtp) {
         throw std::invalid_argument("--spec-min-p requires --spec mtp");
     }
+    if (options.draft_tokens_auto && options.backend != SpeculativeBackend::Mtp) {
+        throw std::invalid_argument("--draft-tokens auto requires --spec mtp");
+    }
     if (options.draft_tree_paths < 2 || options.draft_tree_paths > 8) {
         throw std::invalid_argument("--draft-tree-paths must be in [2,8]");
     }
@@ -162,9 +177,10 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
         return;
     case SpeculativeBackend::Mtp:
         // Qwen3.8-Flash-Next verifies up to 8 columns with column-invariant kernels (1..7); the
-        // Qwen3.5/3.6 MTP planner accepts 1..5 itself.
+        // Qwen3.5/3.6 MTP planner accepts 1..5 itself. auto leaves the count to the Engine.
+        if (options.draft_tokens_auto) { return; }
         if (options.draft_tokens == 0 || options.draft_tokens > 7) {
-            throw std::invalid_argument("--spec mtp requires --draft-tokens in [1,7]");
+            throw std::invalid_argument("--spec mtp requires --draft-tokens in [1,7] or auto");
         }
         return;
     case SpeculativeBackend::DFlash:

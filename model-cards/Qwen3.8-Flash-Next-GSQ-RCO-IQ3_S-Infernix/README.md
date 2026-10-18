@@ -105,8 +105,8 @@ rows.
 ```text
 infernix-serve Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix-00001-of-00002.infernix \
   --ngram-volume <nvme>/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix.ngram \
-  --max-context 262144 --kv-dtype int8 --prefill-chunk 4096 \
-  --spec mtp --draft-tokens 4 --lm-head-draft --ngram-draft-tokens 7
+  --max-context 262144 --kv-dtype int8 \
+  --spec mtp --draft-tokens auto --lm-head-draft --ngram-draft-tokens 7
 ```
 
 It serves the OpenAI Chat Completions and Responses APIs and the Anthropic Messages API. The

@@ -396,16 +396,19 @@ std::string usage_text(std::string_view program) {
         << "  --use-original-nvfp4-prefill-kernel  tiled NVFP4-KV prompt kernel (default:\n"
         << "                              fast kernel); requires --kv-dtype nvfp4\n"
         << "  --disable-fast-paths        the exact route (default: every fast path qualified\n"
-        << "                              for the configuration)\n"
+        << "                              for the configuration, the artifact's kernels and KV)\n"
         << "  --fast-path <name>          qualification: also run this fast path, qualified\n"
-        << "                              or not (prompt-pv8, decode-split64)\n"
+        << "                              or not (a registry name; repeatable)\n"
         << "  --prefill-split-workspace-mib <n>  prompt-attention split workspace (default: "
         << kDefaultPrefillSplitWorkspaceMiB << ";\n"
         << "                              128-384 recommended, 0 = no splitting)\n"
         << "  --spec <mtp|dflash|dflash2> speculative backend (default: none)\n"
-        << "  --draft-tokens <n>         MTP 1..7 (Qwen3.5/3.6 1..5); DFlash/DFlash2 1..15\n"
+        << "  --draft-tokens <n>|auto    MTP 1..7 (Qwen3.5/3.6 1..5); DFlash/DFlash2 1..15; n drafts\n"
+        << "                             n every round, auto lets MTP pick each round's length\n"
+        << "                             (0..7; Qwen3.5/3.6 1..5 by adaptive-mtp where qualified,\n"
+        << "                             else the model's fastest fixed length)\n"
         << "  --spec-min-p <p>           Qwen3.8-Flash-Next MTP draft-confidence gate 0..1\n"
-        << "                             (default: the model's 0.5; 0 verifies every draft)\n"
+        << "                             (default 0.5 with --draft-tokens auto, else 0 (every draft))\n"
         << "  --ngram-draft-tokens <n>   copy proposals 1..63; 0 disables (default: 0)\n"
         << "  --ngram-min-match <n>      copy admission 4..64 (default: 12)\n"
         << "  --draft-tree-nodes <auto|list>  DFlash2 tree verification (default: off): auto\n"
@@ -577,7 +580,7 @@ BenchOptions parse_args(int argc, char** argv) {
         } else if (arg == "--spec") {
             options.speculative.backend = product::parse_speculative_backend(value("--spec"));
         } else if (arg == "--draft-tokens") {
-            options.speculative.draft_tokens = parse_u32(value("--draft-tokens"), "draft-tokens");
+            product::apply_draft_tokens(options.speculative, value("--draft-tokens"));
         } else if (arg == "--spec-min-p") {
             options.speculative.draft_min_p = product::parse_draft_min_p(value("--spec-min-p"));
         } else if (arg == "--ngram-draft-tokens") {
@@ -860,6 +863,7 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << " kv_cache=" << kv_cache_name(env.kv_cache)
         << " spec=" << product::speculative_backend_name(env.speculative.backend)
         << " draft_tokens=" << env.speculative.draft_tokens
+        << " draft_auto=" << (env.speculative.draft_tokens_auto ? "on" : "off")
         << " draft_tree=" << product::draft_tree_nodes_text(env.speculative) << '/'
         << env.speculative.draft_tree_paths
         << " ngram_draft_tokens=" << env.speculative.ngram_draft_tokens
@@ -1002,6 +1006,7 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "    \"speculative_backend\": \""
         << product::speculative_backend_name(env.speculative.backend) << "\",\n"
         << "    \"draft_tokens\": " << env.speculative.draft_tokens << ",\n"
+        << "    \"draft_tokens_auto\": " << (env.speculative.draft_tokens_auto ? "true" : "false") << ",\n"
         << "    \"ngram_draft_tokens\": " << env.speculative.ngram_draft_tokens << ",\n"
         << "    \"ngram_min_match\": " << env.speculative.ngram_min_match << ",\n"
         << "    \"spec_min_p\": "

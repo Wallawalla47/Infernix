@@ -107,8 +107,8 @@ tensors are listed, not compared).
 ```text
 infernix-serve Qwen3.8-Flash-Next-FP8-Infernix-00001-of-00005.infernix \
   --ngram-volume <nvme>/Qwen3.8-Flash-Next-BF16.ngram \
-  --max-context 262144 --kv-dtype int8 --prefill-chunk 4096 \
-  --spec mtp --draft-tokens 4 --lm-head-draft --ngram-draft-tokens 7
+  --max-context 262144 --kv-dtype int8 \
+  --spec mtp --draft-tokens auto --lm-head-draft --ngram-draft-tokens 7
 ```
 
 It serves the OpenAI Chat Completions and Responses APIs and the Anthropic Messages API. The

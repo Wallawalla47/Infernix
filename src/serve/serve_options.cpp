@@ -56,6 +56,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--prefill-split-workspace-mib"},
     ServeOptionArity{"--use-original-nvfp4-prefill-kernel", false},
     ServeOptionArity{"--disable-fast-paths", false},
+    ServeOptionArity{"--fast-path"},
     ServeOptionArity{"--context-cost-presets"},
     ServeOptionArity{"--log-stats-interval-ms"},
     ServeOptionArity{"--log-colours"},
@@ -358,10 +359,12 @@ std::string serve_usage_text(const char* argv0) {
            "                             slows 1-2K-token chunks over long context (64: up\n"
            "                             to 27% slower attention; 0: no splitting)\n"
            "  --disable-fast-paths       run the exact route: without it, every faster\n"
-           "                             kernel qualified for this model's activation\n"
-           "                             precision and KV type runs (within Infernix's\n"
-           "                             numerical quality policy; startup lists them;\n"
-           "                             docs/serving.md)\n"
+           "                             path qualified and measured faster for this\n"
+           "                             artifact's kernels and KV type runs (within\n"
+           "                             Infernix's numerical quality policy; startup\n"
+           "                             lists them; docs/serving.md)\n"
+           "  --fast-path NAME           also run this fast path, qualified or not\n"
+           "                             (qualification and timing runs; repeatable)\n"
            "  --no-cuda-graph            disable CUDA-graph decode rounds (on by default)\n"
            "  --default-max-tokens N     default max_tokens when a request omits it\n"
            "                             (default " +
@@ -456,8 +459,7 @@ std::string serve_usage_text(const char* argv0) {
            "  (--kv-capacity defaults to auto) and every option below is optional.\n"
            "  --host-context-mib N       pinned Host pool in decimal MiB (whole bytes) that\n"
            "                             KV blocks and state snapshots share (default 8192;\n"
-           "                             0 = GPU only). Qwen3.8-Flash-Next: default 4096,\n"
-           "                             must be positive\n"
+           "                             0 = GPU only; Qwen3.8-Flash-Next: must be positive)\n"
            "  --prefix-cache-file PATH   restore the host tier from PATH at startup when\n"
            "                             present (written by this binary for the same\n"
            "                             artifact and KV format) and save it there on clean\n"
@@ -498,11 +500,17 @@ std::string serve_usage_text(const char* argv0) {
            "\n"
            "SPECULATIVE DECODING (off by default)\n"
            "  --spec mtp|dflash|dflash2    speculative decoding backend\n"
-           "  --draft-tokens N           draft tokens per round (mtp 1-5; dflash/dflash2 1-15)\n"
+           "  --draft-tokens N|auto      drafts per round: mtp 1-7 (Qwen3.5/3.6 1-5),\n"
+           "                             dflash/dflash2 1-15\n"
+           "                               N     every round drafts and verifies N\n"
+           "                               auto  mtp: each round picks 0-7 from recent\n"
+           "                                     acceptance (Qwen3.5/3.6: 1-5 where\n"
+           "                                     qualified, else the model's fastest\n"
+           "                                     fixed length)\n"
            "  --lm-head-draft            use the optimized proposal head\n"
-           "  --spec-min-p P             Qwen3.8-Flash-Next mtp: one-request rounds verify\n"
-           "                             drafts until one is below probability P, 0-1\n"
-           "                             (default 0.5; 0 verifies every draft)\n"
+           "  --spec-min-p P             Qwen3.8-Flash-Next mtp: verify drafts only up to\n"
+           "                             the first below probability P, 0-1 (default 0.5\n"
+           "                             with --draft-tokens auto, else 0 = all)\n"
            "  --draft-tree-nodes auto|LIST\n"
            "                             dflash2: verify a small tree of alternative drafts\n"
            "                             each round instead of a single draft, so more drafted\n"
@@ -728,6 +736,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.original_nvfp4_prefill_kernel = true;
         } else if (arg == "--disable-fast-paths") {
             options.fast_paths = false;
+        } else if (arg == "--fast-path") {
+            const std::string name(require_value("--fast-path"));
+            const std::optional<FastPath> path = parse_fast_path(name);
+            if (!path) { throw std::invalid_argument("unknown fast path: " + name); }
+            options.fast_path_candidates.push_back(*path);
         } else if (arg == "--context-cost-presets") {
             options.context_cost_presets = require_value("--context-cost-presets");
             if (options.context_cost_presets.empty()) {
@@ -914,8 +927,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.speculative.backend =
                 product::parse_speculative_backend(require_value("--spec"));
         } else if (arg == "--draft-tokens") {
-            options.speculative.draft_tokens = static_cast<std::uint32_t>(
-                parse_nonnegative_int(require_value("--draft-tokens"), "draft-tokens"));
+            product::apply_draft_tokens(options.speculative, require_value("--draft-tokens"));
         } else if (arg == "--spec-min-p") {
             options.speculative.draft_min_p = product::parse_draft_min_p(require_value("--spec-min-p"));
         } else if (arg == "--draft-tree-nodes") {

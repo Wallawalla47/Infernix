@@ -290,6 +290,39 @@ void invalid_inputs() {
     check(single.choose(lane) == 1 && single.choose(lane) == 1, "a ceiling of 1 always drafts 1");
 }
 
+// Round-cost learning: cycles of a + b K recover the cost b / a, idle gaps are skipped, a fit
+// needs spread lengths, and a cheaper learned draft lengthens the choice the fixed model makes.
+void learned_cost() {
+    MtpDraftPolicy policy(kCeiling, 2);
+    check(!policy.learned_draft_cost(1).has_value(), "no cost before any cycle");
+    for (int i = 0; i < 40; ++i) { policy.observe_cycle(3, 1, 0.012 + 0.003 * 3); }
+    check(!policy.learned_draft_cost(1).has_value(), "one length alone determines no cost");
+    for (int i = 0; i < 40; ++i) {
+        const std::uint32_t k = 1U + static_cast<std::uint32_t>(i % static_cast<int>(kCeiling));
+        policy.observe_cycle(k, 1, 0.012 + 0.0008 * k);
+        if (i % 10 == 0) { policy.observe_cycle(k, 1, 1.0); } // an idle gap
+    }
+    const auto cost = policy.learned_draft_cost(1);
+    check(cost.has_value() && *cost > 0.03 && *cost < 0.2, "the fit learns a draft cost near 0.07 rounds");
+    check(!policy.learned_draft_cost(2).has_value(), "each batch size learns its own cost");
+    check(close_to(policy.round_seconds(4, 1), 1.0 + 4.0 * *cost), "a learned cost replaces the fixed model");
+
+    // About 60 % first-draft acceptance, falling off after: the fixed 0.2 model stops at two
+    // drafts, the learned ~0.07 drafts further.
+    constexpr std::array<std::uint32_t, 10> kAccepted{0, 1, 0, 2, 0, 1, 3, 0, 5, 1};
+    MtpLaneDraftState fixed_lane;
+    for (int round = 0; round < 3; ++round) {
+        for (const std::uint32_t accepted : kAccepted) { fixed_lane.acceptance.observe(5, accepted); }
+    }
+    MtpLaneDraftState learned_lane = fixed_lane;
+    const MtpDraftPolicy modelled(kCeiling, 1);
+    const std::uint32_t fixed_choice   = modelled.choose(fixed_lane);
+    const std::uint32_t learned_choice = policy.choose(learned_lane);
+    check(learned_choice > fixed_choice, "a cheaper learned draft chooses a longer length (fixed " +
+                                             std::to_string(fixed_choice) + ", learned " +
+                                             std::to_string(learned_choice) + ")");
+}
+
 } // namespace
 
 int main() {
@@ -302,6 +335,7 @@ int main() {
         batch_choice();
         save_and_restore();
         invalid_inputs();
+        learned_cost();
     } catch (const std::exception& error) {
         std::cerr << "MTP draft policy test threw: " << error.what() << '\n';
         return 1;

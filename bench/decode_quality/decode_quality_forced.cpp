@@ -30,7 +30,7 @@
 //
 // Usage: infernix_decode_quality_forced <artifact> <corpus.txt> <out.json> [--segments N]
 //          [--prompts L1,L2,...] [--forced N] [--reference | --observe REFERENCE.json]
-//          [--mode plain|dflash2|ngram|mtp] [--kv-dtype int8|bf16|fp8|nvfp4]
+//          [--mode plain|dflash2|ngram|mtp|mtp-ngram] [--kv-dtype int8|bf16|fp8|nvfp4]
 //          [--disable-fast-paths] [--fast-path NAME]...
 //          [--concurrency 1..8] [--prefill-chunk N] [--prefix-reuse [--warm-tokens N]]
 //          [--ngram-volume FILE] (Qwen3.8-Flash-Next; default <artifact>.ngram)
@@ -350,12 +350,18 @@ int main(int argc, char** argv) {
                 engine_options.speculative.ngram_draft_tokens = 15;
                 engine_options.speculative.ngram_min_match    = 12;
             }
-        } else if (options.mode == "mtp") {
+        } else if (options.mode == "mtp" || options.mode == "mtp-ngram") {
             engine_options.speculative.backend       = infernix::SpeculativeBackend::Mtp;
             engine_options.speculative.draft_tokens  = 4;
             engine_options.speculative.proposal_head = infernix::ProposalHead::Optimized;
+            // MTP with n-gram copies: the round's longest copy sets its width (adaptive-speculation)
+            // on models without DFlash2.
+            if (options.mode == "mtp-ngram") {
+                engine_options.speculative.ngram_draft_tokens = 15;
+                engine_options.speculative.ngram_min_match    = 12;
+            }
         } else if (options.mode != "plain") {
-            throw std::invalid_argument("--mode must be plain, dflash2, ngram or mtp");
+            throw std::invalid_argument("--mode must be plain, dflash2, ngram, mtp or mtp-ngram");
         }
         infernix::Engine engine(engine_options);
         const std::vector<infernix::TokenId> tokens = read_tokens(engine, options);

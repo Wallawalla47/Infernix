@@ -43,7 +43,7 @@ KV representations are `bf16`, `int8`, `fp8`, `nvfp4`, `k8v4`, `vq2`, and `k4v2`
 prompt-attention kernel, and `nvfp4` with its fast kernel over more than 768 visible keys, as
 `infernix-serve` prefills them by default; `--use-original-int8-prefill-kernel` and
 `--use-original-nvfp4-prefill-kernel` score them with the original kernels and require the matching
-`--kv-dtype`. As in `infernix-serve`, the fast paths qualified for the artifact and KV format run
+`--kv-dtype`. As in `infernix-serve`, the fast paths qualified for the artifact's configuration (its kernels and KV format) run
 unless `--disable-fast-paths` selects the exact route; `--a16-activations` always runs the exact
 route. `report.json` records the kernels as `original_int8_prefill_kernel` and
 `original_nvfp4_prefill_kernel`, and the fast paths that ran as `fast_paths`.

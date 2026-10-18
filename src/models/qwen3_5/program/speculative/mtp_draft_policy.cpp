@@ -88,6 +88,36 @@ bool MtpDraftPolicy::measured(std::uint32_t batch_size) const noexcept {
     return true;
 }
 
+bool MtpDraftPolicy::solve(const CostFit& fit, double& a, double& b) noexcept {
+    const double spread = fit.n * fit.kk - fit.k * fit.k;
+    if (fit.n < kCostMinRounds || spread < kCostMinSpread * fit.n * fit.n) { return false; }
+    b = (fit.n * fit.kt - fit.k * fit.t) / spread;
+    a = (fit.t - b * fit.k) / fit.n;
+    return a > 0.0 && b > 0.0;
+}
+
+void MtpDraftPolicy::observe_cycle(std::uint32_t k, std::uint32_t batch_size, double seconds) noexcept {
+    if (k == 0 || k > ceiling_ || batch_size == 0 || batch_size > max_batch_ || !(seconds > 0.0)) { return; }
+    CostFit& fit = cost_[batch_size - 1U];
+    double a = 0.0, b = 0.0;
+    const double x       = static_cast<double>(k);
+    // Before the fit, a cycle past kCostGapRatio mean cycles is a gap.
+    const double predict = solve(fit, a, b) ? a + b * x : (fit.n > 0.0 ? fit.t / fit.n : seconds);
+    if (seconds >= kCostGapRatio * predict) { return; }
+    fit.n  = kCostDecay * fit.n + 1.0;
+    fit.k  = kCostDecay * fit.k + x;
+    fit.kk = kCostDecay * fit.kk + x * x;
+    fit.t  = kCostDecay * fit.t + seconds;
+    fit.kt = kCostDecay * fit.kt + x * seconds;
+}
+
+std::optional<double> MtpDraftPolicy::learned_draft_cost(std::uint32_t batch_size) const noexcept {
+    if (batch_size == 0 || batch_size > max_batch_) { return std::nullopt; }
+    double a = 0.0, b = 0.0;
+    if (!solve(cost_[batch_size - 1U], a, b)) { return std::nullopt; }
+    return std::min(b / a, kCostMax);
+}
+
 double MtpDraftPolicy::round_seconds(std::uint32_t k, std::uint32_t batch_size) const {
     if (!serves(k, batch_size)) {
         throw std::invalid_argument("MTP draft policy has no round of this length and batch size");
@@ -95,7 +125,8 @@ double MtpDraftPolicy::round_seconds(std::uint32_t k, std::uint32_t batch_size) 
     if (measured(batch_size)) {
         return seconds_[static_cast<std::size_t>(batch_size - 1U) * ceiling_ + (k - 1U)];
     }
-    return 1.0 + kModelDraftCost * static_cast<double>(k);
+    const double cost = learned_draft_cost(batch_size).value_or(kModelDraftCost);
+    return 1.0 + cost * static_cast<double>(k);
 }
 
 double MtpDraftPolicy::rate(std::span<const MtpAcceptanceEstimate* const> rows,

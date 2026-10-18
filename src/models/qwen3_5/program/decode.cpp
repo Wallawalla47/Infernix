@@ -516,7 +516,17 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
     // configured MTP depth.
     const bool fixed_width        = execution_schedule.fixed_speculation;
     std::uint32_t neural_drafts   = neural_draft_window;
-    if (!fixed_width && execution_schedule.adaptive_mtp && mtp_draft_policy && !any_ngram) {
+    const bool policy_round = !fixed_width && execution_schedule.adaptive_mtp && mtp_draft_policy && !any_ngram;
+    if (mtp_draft_policy) {
+        // The previous policy round's start-to-start cycle at its length teaches the round cost.
+        const auto batch = static_cast<std::uint32_t>(lanes.size());
+        if (mtp_cost_round.drafts != 0 && mtp_cost_round.batch == batch) {
+            mtp_draft_policy->observe_cycle(mtp_cost_round.drafts, batch,
+                                            std::chrono::duration<double>(started - mtp_cost_round.start).count());
+        }
+        mtp_cost_round = {.start = started, .drafts = 0, .batch = batch};
+    }
+    if (policy_round) {
         if (lanes.size() == 1) {
             neural_drafts = mtp_draft_policy->choose(active_sequence(lanes.front()).mtp_draft);
         } else {
@@ -527,6 +537,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
             neural_drafts = mtp_draft_policy->choose_batch(
                 std::span<const MtpAcceptanceEstimate* const>(acceptance.data(), lanes.size()));
         }
+        mtp_cost_round.drafts = neural_drafts;
     }
     SpeculativeRoundFamily& family =
         fixed_width ? (ngram_draft_window != 0

@@ -188,10 +188,53 @@ int main() {
                       "idle-wide-prefill is not qualified at 16-bit activations");
     auto mtp                 = options;
     mtp.speculative.backend  = infernix::SpeculativeBackend::Mtp;
+    failures += check(!q::fast_path_applies(FastPath::AdaptiveMtp, int8_24, mtp, false),
+                      "adaptive-mtp must not apply to a fixed --draft-tokens N");
+    mtp.speculative.draft_tokens_auto = true;
     failures += check(q::fast_path_applies(FastPath::AdaptiveMtp, int8_24, mtp, false),
-                      "adaptive-mtp applies to MTP where request invariance is impossible");
+                      "adaptive-mtp applies to --draft-tokens auto where request invariance is impossible");
     failures += check(!q::fast_path_applies(FastPath::AdaptiveMtp, int8_24, options, true),
                       "adaptive-mtp needs the MTP backend");
+    // Where adaptive-mtp does not run, auto drafts the configuration's fastest fixed length.
+    failures += check(q::auto_fixed_draft_tokens(int8_24) == 5 &&
+                          q::auto_fixed_draft_tokens({24, ActivationClass::A4, KvCacheStorage::Vq2}) == 5,
+                      "auto drafts five on the NVFP4 27B");
+    failures += check(q::auto_fixed_draft_tokens({24, ActivationClass::A16, KvCacheStorage::Int8Group64, true}) == 3 &&
+                          q::auto_fixed_draft_tokens({16, ActivationClass::A16, KvCacheStorage::Int8Group64}) == 3,
+                      "auto drafts three on the groupwise 27B and the 35B-A3B");
+
+    // The groupwise 27B takes prompt-pv8 by composition (model-quality.md 6.1): the NVFP4 27B's
+    // kernels, shapes and clear gain, on the same KV formats.
+    for (const auto kv : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
+                          KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2,
+                          KvCacheStorage::Q4KeyVq2Value}) {
+        failures += check(q::fast_path_qualified(FastPath::PromptPv8, {24, ActivationClass::A16, kv, true}) ==
+                              q::fast_path_qualified(FastPath::PromptPv8, {24, ActivationClass::A4, kv}),
+                          "the groupwise 27B takes prompt-pv8 where the NVFP4 27B has it");
+    }
+
+    // The groupwise 27B's and the 35B-A3B's own evidence: idle-wide-prefill on every KV format, the
+    // 27B's GDN path everywhere and decode-split64 on INT8; the 35B's prompt-pv8 on each format it was
+    // timed on and no gdn-f16-accumulate (its gain was within spread). adaptive-mtp: the NVFP4 27B and
+    // the 35B on every format.
+    for (const auto kv : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
+                          KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2,
+                          KvCacheStorage::Q4KeyVq2Value}) {
+        failures += check(q::fast_path_qualified(FastPath::IdleWidePrefill, {24, ActivationClass::A16, kv, true}) &&
+                              q::fast_path_qualified(FastPath::GdnF16Accumulate, {24, ActivationClass::A16, kv, true}) &&
+                              q::fast_path_qualified(FastPath::IdleWidePrefill, {16, ActivationClass::A16, kv}) &&
+                              !q::fast_path_qualified(FastPath::GdnF16Accumulate, {16, ActivationClass::A16, kv}),
+                          "the groupwise 27B and 35B prefill paths");
+        failures += check(q::fast_path_qualified(FastPath::PromptPv8, {16, ActivationClass::A16, kv}) ==
+                              q::fast_path_qualified(FastPath::PromptPv8, {24, ActivationClass::A4, kv}),
+                          "the 35B's prompt-pv8 on every format the kernel serves");
+        failures += check(q::fast_path_qualified(FastPath::AdaptiveMtp, {24, ActivationClass::A4, kv}) &&
+                              q::fast_path_qualified(FastPath::AdaptiveMtp, {16, ActivationClass::A16, kv}),
+                          "adaptive-mtp on the NVFP4 27B and the 35B");
+    }
+    failures += check(q::fast_path_qualified(FastPath::DecodeSplit64, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, true}) &&
+                          q::fast_path_qualified(FastPath::PromptPv8, {16, ActivationClass::A16, KvCacheStorage::Int8Group64}),
+                      "the groupwise 27B's decode-split64 and the 35B's prompt-pv8 on INT8 KV");
 
     // q4-w4a8: only where the text MLP gate/up is groupwise Q4; it fails its gate, so nowhere qualified.
     const FastPathConfiguration groupwise{24, ActivationClass::A16, KvCacheStorage::Int8Group64, true};

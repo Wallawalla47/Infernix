@@ -836,7 +836,7 @@ def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
                                help="corpus manifest whose streams, joined, the segments are cut "
                                     "from (default: the decode corpus infernix-decode-v1)")
     decode_source.add_argument("--text", help="one UTF-8 file the segments are cut from")
-    decode.add_argument("--mode", choices=("plain", "dflash2", "mtp", "ngram"), default="plain")
+    decode.add_argument("--mode", choices=("plain", "dflash2", "mtp", "ngram", "mtp-ngram"), default="plain")
     decode.add_argument("--kv", default="int8", choices=KV_FORMATS)
     decode.add_argument("--segments", type=int, default=1024)
     decode.add_argument("--concurrency", type=int, default=1,

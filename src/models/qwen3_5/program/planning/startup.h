@@ -212,6 +212,9 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
 // unless the fast path is selected and some width is wider than the chunk.
 [[nodiscard]] std::vector<std::uint32_t>
 idle_prefill_widths_impl(const execution::Parameters& parameters, const EngineOptions& options);
+// qwen3_5::resolve_auto_draft_length (program.h).
+[[nodiscard]] std::uint32_t resolve_auto_draft_length_impl(const execution::Parameters& parameters,
+                                                           EngineOptions& options);
 [[nodiscard]] std::unique_ptr<SequencePlanImpl>
 finalize_sequence_plan_impl(std::unique_ptr<qwen3_5::detail::SequencePlannerImpl> planner,
                             std::uint32_t main_page_groups);

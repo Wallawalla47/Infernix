@@ -1795,6 +1795,11 @@ block-scaled routed experts with the activation scheme the checkpoint declares (
 
 ### 11.3 Draft length
 
+**As built (2026-10-17): `--draft-tokens auto` only.** The policy below, and the default 0.5
+`--spec-min-p` cut on one-row rounds (§19.3.5), run with `--draft-tokens auto`, which allows K up
+to 7. `--draft-tokens N` (1..7) drafts and verifies N every one-row round and min(N, 2) every pair
+round (`--spec-min-p` then defaults to 0), so a deployment can fix the round shape.
+
 Every round, the policy picks the draft length K (and, under option H9, a tree shape) that
 maximizes expected tokens per second:
 
@@ -2353,7 +2358,9 @@ Additional rules:
   explicit size that would leave less than the reserve plus the vision media reserve available
   fails at startup with the ledger's message; under 126 slabs (≈ 118 MB) the tier is off with a
   warning. **Decided (default, 2026-10-04):** 4 GiB; alternative 8-12 GiB for ~100K-token agentic
-  sessions when ≥ 16 GiB stays free.
+  sessions when ≥ 16 GiB stays free. **Changed (2026-10-17):** 8 GiB, the Qwen3.5 default
+  (`kDefaultHybridHostCacheBytes`), at the owner's request; the extra 4 GiB comes out of what
+  `--expert-ram-mib auto` and `--expert-pin-mib auto` leave the experts.
 - **Machines with less than ~88 GB of RAM** are outside the supported range. Exclusive VRAM/host
   residency (an expert lives in exactly one tier) could support 64 GB machines later. It is listed
   as a future option and is not designed here.
@@ -2848,7 +2855,7 @@ guide, is `--kv-dtype int8 --max-context 262144` at C=1, with the recipe-B artif
 | `--record-routing PATH` | off | Opt-in route log, expert ids only, for calibration Stage 4 and M1 |
 | `--ngram-volume FILE` | `<artifact>.ngram` | N-gram table volume, which may sit on another NVMe drive (§12.3) |
 | `--no-prefix-reuse` | existing (reuse on in `infernix-serve`; `infernix` keeps the cache off) | Disables prefix reuse, for strict run-to-run reproducibility. **Reuse changes output at near-ties:** a resume equals its capturing lineage, not an uncached run (§19.3.1) |
-| `--host-context-mib N`, `--device-snapshot-slots N` | 4096 and 0 for this model | Prefix Host tier (§15.2); Device snapshot slots, 41.8 frames each; 0 MiB needs ≥ 1 slot |
+| `--host-context-mib N`, `--device-snapshot-slots N` | 8192 and 0 for this model | Prefix Host tier (§15.2); Device snapshot slots, 41.8 frames each; 0 MiB needs ≥ 1 slot |
 | `--prefix-cache-file PATH` | existing (off) | Prefix-cache persistence; for this model blocks also store `mtp_next` and snapshots their meta. Decided (default, 2026-10-04): built after P6, since any rebuild invalidates it (§19.3.1) |
 | `--kv-capacity N\|auto` | existing | Plus one copy-on-write page per lane (0.34 frames each) for prefix resumes (§19.3.1) |
 | `--vision-offload auto\|on\|off` | `auto`: on here, off for Qwen3.5 | Vision weights in pinned host RAM, streamed per window (§19.3.2) |
@@ -4199,7 +4206,7 @@ GPU's staging reads; worker scheduling on P- and E-cores.
 | Flag | Qwen4Exp semantics |
 |---|---|
 | `--no-prefix-reuse` | Disables the cache: `allow_prefix_reuse = false` → `publish_continuation = false` (today hard-coded false, `program.cpp:389`) |
-| `--host-context-mib N` | **Default 4096**, clamped as above; 0 = Device-only (requires `--device-snapshot-slots ≥ 1`) |
+| `--host-context-mib N` | **Default 8192** (4096 until 2026-10-17), clamped as above; 0 = Device-only (requires `--device-snapshot-slots ≥ 1`) |
 | `--device-snapshot-slots N` | **Default 0** (Qwen3.5: C + 1) |
 | `--cache-taps-per-request`, `--cache-tap-ladder`, `--cache-tap-min-gap` | Unchanged: 8 / max(4096, 2·chunk) / max(1024, chunk) |
 | `--prefix-cache-file PATH` | Unchanged; Qwen4Exp blocks persist `mtp_next`, snapshots their meta (after P6) |
@@ -4384,7 +4391,7 @@ binding) and `prefix/prefix_program.cpp` (the Program side).
 **P6 as built** (same branch, 2026-10-05). Per-model resolution lives in
 `normalize_engine_options(options, Architecture)`; the Engine reads the artifact's architecture
 first (an unreadable artifact falls back to the Qwen3.5 rules and fails in construction). Qwen4Exp:
-Host tier default 4 GiB (`kDefaultQwen4ExpHybridHostCacheBytes`), 0 refused; no Device snapshot
+Host tier default 4 GiB (since 2026-10-17 the common 8 GiB `kDefaultHybridHostCacheBytes`), 0 refused; no Device snapshot
 slots (refused if given); Legacy enabled refused (`infernix` and `infernix_bench` already disable the
 cache; the two real tests that used the default now disable it); `--prefix-cache-file` refused
 until persistence. The RAM ledger gained a `prefix cache` term: the Host tier is planned with the

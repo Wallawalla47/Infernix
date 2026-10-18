@@ -375,8 +375,14 @@ struct ProgramOptions {
     // MTP drafts per round when the drafter is loaded (design section 11, at most 7). A longer
     // n-gram proposal, when enabled, replaces a round's MTP drafts.
     std::uint32_t mtp_draft_tokens = 0;
+    // The automatic draft length (--draft-tokens auto, design 11.3): each one-row round drafts the
+    // length in 0..mtp_draft_tokens that maximizes its expected tokens per round time, and a pair
+    // round one length in 0..min(mtp_draft_tokens, 2) from both rows' acceptance. False: one-row
+    // rounds draft mtp_draft_tokens and pair rounds min(mtp_draft_tokens, 2).
+    bool auto_draft_length = false;
     // A one-row MTP round verifies its drafts up to the first whose draft-head probability is below
-    // this value (design §19.3.5; --spec-min-p); 0 verifies every draft. 0.5 is the measured default.
+    // this value (design §19.3.5; --spec-min-p); 0 verifies every draft. 0.5 is the measured value
+    // the Engine passes with the automatic draft length, 0 with a fixed one.
     double mtp_draft_min_p = 0.5;
     // The request-coupling fast paths (FastPath; docs/maintainer/model-quality.md section 6.7). Each
     // is off unless selected, and with all three off a request's output does not depend on the other

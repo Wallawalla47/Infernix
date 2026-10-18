@@ -254,6 +254,9 @@ int main(int argc, char** argv) {
                   << ", kv_cache=" << infernix::bench::kv_cache_name(options.kv_cache) << ")\n";
         infernix::Engine engine(std::move(engine_options));
         env.prefill_chunk = engine.options().prefill_chunk; // the model's default when unset
+        // auto resolves to a ceiling, or on Qwen3.5/3.6 without adaptive-mtp to a fixed length.
+        env.speculative.draft_tokens      = engine.options().speculative.draft_tokens;
+        env.speculative.draft_tokens_auto = engine.options().speculative.draft_tokens_auto;
         fill_cuda_environment(env, options.device);
         env.load   = engine.load_summary();
         env.memory = engine.memory_summary();

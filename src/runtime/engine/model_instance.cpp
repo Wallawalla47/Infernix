@@ -211,6 +211,18 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
     // and idle-wide-prefill already widens its idle steps (16,384 measured 3.5 % slower at
     // pp16384 and pp32768 on the 27B).
     if (options.prefill_chunk == 0) { options.prefill_chunk = qwen4_exp ? 16384U : 1024U; }
+    // An automatic MTP draft length chooses up to the model's most drafts unless given a ceiling:
+    // Qwen3.8-Flash-Next verifies 8 columns column-invariantly, the Qwen3.5 planner captures 5.
+    if (options.speculative.draft_tokens_auto) {
+        if (options.speculative.backend != SpeculativeBackend::Mtp) {
+            throw std::invalid_argument("--draft-tokens auto requires --spec mtp");
+        }
+        if (options.speculative.draft_tokens == 0) { options.speculative.draft_tokens = qwen4_exp ? 7U : 5U; }
+    } else if (std::find(options.fast_path_candidates.begin(), options.fast_path_candidates.end(),
+                         FastPath::AdaptiveMtp) != options.fast_path_candidates.end()) {
+        throw std::invalid_argument("--fast-path adaptive-mtp is the policy of --draft-tokens auto; "
+                                    "a fixed --draft-tokens N drafts N");
+    }
     // The draft-confidence gate exists only on Qwen3.8-Flash-Next's one-row MTP rounds; another
     // model refuses it rather than ignoring a tuning value.
     if (const auto& p = options.speculative.draft_min_p) {
@@ -225,8 +237,7 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
     if (cache.enabled) {
         // One pinned Host slab pool serves blocks and snapshots alike; its size is the only
         // capacity a deployment has to choose (docs/maintainer/hybrid-prefix-cache-spec.md §5.4).
-        cache.host_capacity_bytes = cache.host_capacity_bytes.value_or(
-            qwen4_exp ? kDefaultQwen4ExpHybridHostCacheBytes : kDefaultHybridHostCacheBytes);
+        cache.host_capacity_bytes = cache.host_capacity_bytes.value_or(kDefaultHybridHostCacheBytes);
         const bool host_tier             = *cache.host_capacity_bytes != 0;
         HybridPrefixCacheOptions& hybrid = cache.hybrid;
         // Whether a turn resumes from lossy Host state depends on what eviction left, so the exact
@@ -352,6 +363,13 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
     frontend.complete();
     std::optional<StartupPhaseScope> planning;
     planning.emplace(options.startup_observer, StartupPhase::TargetFinalize);
+    // --draft-tokens auto where adaptive-mtp does not run: the configuration's fastest fixed length.
+    if (const std::uint32_t fixed = models::qwen3_5::resolve_auto_draft_length(instance->parameters, options)) {
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                           "--draft-tokens auto: adaptive-mtp is not selected for this artifact (or fast paths "
+                           "are disabled), so every round drafts %u, its fastest fixed length",
+                           fixed);
+    }
     const auto signature = models::qwen3_5::prefill_signature(*instance->model);
     auto context_cost    = resolve_context_machine_cost(
         {.hardware_class =

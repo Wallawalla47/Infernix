@@ -111,8 +111,10 @@ reproduce unfused materializations unless an intermediate is an observable seman
 The exact route (`--disable-fast-paths`) stays bit-exact from release to release and, where the
 artifact's formats allow, request-invariant (other requests, concurrency, cache state and resource
 pressure do not change a request's output); a change that alters it for speed ships as a fast
-path, qualified per configuration under the
-[numerical acceptance policy](docs/maintainer/model-quality.md#6-numerical-acceptance-policy-and-fast-paths).
+path, qualified under the
+[numerical acceptance policy](docs/maintainer/model-quality.md#6-numerical-acceptance-policy-and-fast-paths)
+for the kernels it changes (a configuration is the set of kernels an artifact runs, so artifacts
+with the same kernels share a qualification) and registered only where it is measured faster.
 
 Measure performance at the claimed scope. An Op microbenchmark establishes an Op result, not an
 end-to-end improvement. Use whole-inference profiling when an in-scope end-to-end attribution is

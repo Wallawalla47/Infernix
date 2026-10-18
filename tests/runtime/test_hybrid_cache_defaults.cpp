@@ -122,14 +122,14 @@ int main() {
         failures += check(rejected, "a Host budget below one snapshot was accepted");
     }
 
-    // Qwen3.8-Flash-Next resolves its own defaults: a 4 GiB Host tier, no Device snapshot slots
-    // (its snapshots are Host-born), the common tap budget; Qwen3.5 keeps C + 1 slots and 8 GiB.
+    // Qwen3.8-Flash-Next resolves its own defaults: the common 8 GiB Host tier, no Device snapshot
+    // slots (its snapshots are Host-born), the common tap budget; Qwen3.5 keeps C + 1 slots.
     {
         EngineOptions options;
         options.max_concurrency = 2;
         const infernix::ContextCacheOptions qwen4 =
             normalize_engine_options(options, infernix::models::Architecture::Qwen4Exp).context_cache;
-        failures += check(qwen4.host_capacity_bytes == infernix::kDefaultQwen4ExpHybridHostCacheBytes &&
+        failures += check(qwen4.host_capacity_bytes == infernix::kDefaultHybridHostCacheBytes &&
                               qwen4.hybrid.device_snapshot_slots == 0U && qwen4.hybrid.max_new_taps == 8U,
                           "Qwen3.8-Flash-Next prefix cache defaults are wrong");
         const infernix::ContextCacheOptions qwen35 = normalize_engine_options(options).context_cache;
@@ -163,6 +163,35 @@ int main() {
         failures += check(normalize_engine_options(disabled).context_cache.hybrid.tool_call_hold ==
                               std::chrono::milliseconds{0},
                           "a disabled prefix cache kept a tool-call hold");
+    }
+    // --draft-tokens auto takes the model's most drafts unless given a ceiling (Qwen3.8-Flash-Next 7,
+    // Qwen3.5 5); adaptive-mtp is auto's policy, so a fixed length refuses it.
+    {
+        EngineOptions options;
+        options.speculative.backend           = infernix::SpeculativeBackend::Mtp;
+        options.speculative.draft_tokens_auto = true;
+        failures += check(normalize_engine_options(options, infernix::models::Architecture::Qwen4Exp)
+                                      .speculative.draft_tokens == 7U &&
+                              normalize_engine_options(options).speculative.draft_tokens == 5U,
+                          "--draft-tokens auto did not resolve to the model's most drafts");
+        options.speculative.draft_tokens = 3;
+        failures += check(normalize_engine_options(options).speculative.draft_tokens == 3U,
+                          "an automatic draft length lost its ceiling");
+        EngineOptions fixed               = options;
+        fixed.speculative.draft_tokens_auto = false;
+        fixed.fast_path_candidates        = {infernix::FastPath::AdaptiveMtp};
+        bool rejected = false;
+        try {
+            (void)normalize_engine_options(fixed);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "adaptive-mtp was accepted with a fixed draft length");
+        EngineOptions dflash               = options;
+        dflash.speculative.backend         = infernix::SpeculativeBackend::DFlash2;
+        rejected = false;
+        try {
+            (void)normalize_engine_options(dflash);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "--draft-tokens auto was accepted without MTP");
     }
     for (int variant = 0; variant < 3; ++variant) {
         EngineOptions options;

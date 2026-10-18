@@ -87,7 +87,7 @@ std::string usage_text(const char* argv0) {
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
            "       [--device N]\n"
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2] [--spec mtp|dflash|dflash2 --draft-tokens "
-           "N]\n"
+           "N|auto]\n"
            "       [--lm-head-draft] [--spec-min-p P] [--draft-tree-nodes auto|N] [--draft-tree-paths N]\n"
            "       [--ngram-draft-tokens 1..63] [--ngram-min-match 4..64]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
@@ -163,20 +163,25 @@ std::string usage_text(const char* argv0) {
            "                           to 27% slower attention; 0: no splitting)\n"
            "  --disable-fast-paths     run the exact route: bit-exact across releases and,\n"
            "                           for NVFP4/FP8 dense models, independent of other\n"
-           "                           requests. Without it, every faster kernel qualified\n"
-           "                           for this model's activation precision and KV type\n"
-           "                           runs (within Infernix's numerical quality policy;\n"
-           "                           startup lists them; docs/cli.md)\n"
+           "                           requests. Without it, every path qualified and\n"
+           "                           measured faster for this artifact's kernels and KV\n"
+           "                           type runs (within Infernix's numerical quality\n"
+           "                           policy; startup lists them; docs/cli.md)\n"
            "  --fast-path NAME         also run this fast path, qualified or not\n"
            "                           (qualification runs; repeatable)\n"
            "\n"
            "SPECULATIVE DECODING (off by default)\n"
            "  --spec mtp|dflash|dflash2 speculative backend\n"
-           "  --draft-tokens N         draft tokens per round (mtp 1-5; dflash 1-15)\n"
+           "  --draft-tokens N|auto    drafts per round: mtp 1-7 (Qwen3.5/3.6 1-5),\n"
+           "                           dflash/dflash2 1-15\n"
+           "                             N     every round drafts and verifies N\n"
+           "                             auto  mtp: each round picks 0-7 from recent\n"
+           "                                   acceptance (Qwen3.5/3.6: 1-5 where qualified,\n"
+           "                                   else the model's fastest fixed length)\n"
            "  --lm-head-draft          use the optimized proposal head\n"
-           "  --spec-min-p P           Qwen3.8-Flash-Next mtp: verify drafts until one is\n"
-           "                           below probability P, 0-1 (default 0.5; 0 verifies\n"
-           "                           every draft)\n"
+           "  --spec-min-p P           Qwen3.8-Flash-Next mtp: verify drafts only up to the\n"
+           "                           first below probability P, 0-1 (default 0.5 with\n"
+           "                           --draft-tokens auto, else 0 = all)\n"
            "  --draft-tree-nodes auto|N\n"
            "                           dflash2: verify a small tree of alternative drafts each\n"
            "                           round instead of a single draft, so more drafted tokens\n"
@@ -332,7 +337,7 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--spec") {
             options.speculative.backend = product::parse_speculative_backend(value(arg));
         } else if (arg == "--draft-tokens") {
-            options.speculative.draft_tokens = parse_u32(value(arg), "draft-tokens");
+            product::apply_draft_tokens(options.speculative, value(arg));
         } else if (arg == "--spec-min-p") {
             options.speculative.draft_min_p = product::parse_draft_min_p(value(arg));
         } else if (arg == "--ngram-draft-tokens") {

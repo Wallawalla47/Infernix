@@ -124,8 +124,8 @@ The n-gram volume's 8.19 includes its 4 KiB block padding; the table itself is 8
 ```text
 infernix-serve Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix-00001-of-00003.infernix \
   --ngram-volume <nvme>/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram \
-  --max-context 262144 --kv-dtype int8 --prefill-chunk 4096 \
-  --spec mtp --draft-tokens 4 --lm-head-draft --max-concurrency 2
+  --max-context 262144 --kv-dtype int8 \
+  --spec mtp --draft-tokens auto --lm-head-draft --max-concurrency 2
 ```
 
 It serves the OpenAI Chat Completions and Responses APIs and the Anthropic Messages API. The

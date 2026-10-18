@@ -4049,8 +4049,10 @@ private:
     // position acceptances (learned online); a round of K drafts costs 1 + kWidthCost * K plain
     // rounds, the slope measured on the 5090 (design 19.2), so the plain round time cancels. Every
     // kProbeInterval rounds a row drafts one token more than its choice, so the estimate of the
-    // next position stays current (K = 0 then probes one draft).
+    // next position stays current (K = 0 then probes one draft). A fixed draft length (no
+    // auto_draft_length) drafts mtp_k_ every round.
     std::int32_t choose_draft_length(Lane& lane) const {
+        if (!options_.auto_draft_length) { return mtp_k_; }
         std::int32_t best = 0;
         double best_score = 1.0;
         double reach = 1.0, tokens = 1.0;
@@ -4121,10 +4123,12 @@ private:
     // Two-row rounds (design 19.3.5): the K in [0, kPairMaxDrafts] that maximizes both rows' expected
     // tokens per round time, where a round of K drafts per row costs 1 + kPairWidthCost * K plain
     // two-row rounds. Every kProbeInterval pair rounds it drafts one token more than its choice, so
-    // the rows' estimates of the next position stay current.
+    // the rows' estimates of the next position stay current. A fixed draft length drafts the most a
+    // pair round allows.
     std::int32_t choose_pair_draft_length(const Lane& a, const Lane& b) {
         if (!a.mtp_live || !b.mtp_live) { return 0; }
         const std::int32_t most = std::min(kPairMaxDrafts, mtp_k_);
+        if (!options_.auto_draft_length) { return most; }
         std::int32_t best = 0;
         double best_score = 2.0;
         double reach_a = 1.0, reach_b = 1.0, tokens = 2.0;

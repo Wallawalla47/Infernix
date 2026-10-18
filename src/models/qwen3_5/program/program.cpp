@@ -261,6 +261,10 @@ std::vector<std::uint32_t> idle_prefill_widths(const execution::Parameters& para
     return detail::idle_prefill_widths_impl(parameters, options);
 }
 
+std::uint32_t resolve_auto_draft_length(const execution::Parameters& parameters, EngineOptions& options) {
+    return detail::resolve_auto_draft_length_impl(parameters, options);
+}
+
 std::unique_ptr<Program> create_program(const execution::Parameters& parameters,
                                         SequencePlan&& plan, DeviceContext& device,
                                         const StartupObserver& startup_observer) {

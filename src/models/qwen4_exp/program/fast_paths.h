@@ -13,11 +13,17 @@ namespace execution {
 class Parameters;
 }
 
+// The dense kernels an artifact's GDN q/k/v/z projection runs: one family per kernel set, so every
+// GGUF block format (one exact A16 kernel family, design 19.3.25) is one configuration.
+enum class DenseKernels : std::uint8_t { Bf16, Q8, Fp8Row, Nvfp4, Ggml, Other };
+
+[[nodiscard]] DenseKernels dense_kernels(QType qtype) noexcept;
+
 // What a Qwen3.8-Flash-Next fast path is qualified by (docs/maintainer/model-quality.md section 6):
-// the precision that sets the exact route's noise floor (the routed experts' activations and the
-// KV format) and the dense weight format the fast kernels run on (the GDN q/k/v/z projection's).
+// the kernels it runs on (the dense family and whether the routed experts take 4-bit activations)
+// and the KV format. Approval follows the kernels (6.1): every artifact of a configuration shares it.
 struct FastPathConfiguration {
-    QType dense        = QType::BF16;
+    DenseKernels dense = DenseKernels::Bf16;
     bool a4_experts    = false; // W4A4 experts (NVFP4 with activation scales), else 16-bit activations
     KvCacheStorage kv  = KvCacheStorage::Int8Group64;
 

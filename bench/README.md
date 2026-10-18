@@ -136,7 +136,9 @@ The benchmark disables context retention because every repetition is an independ
 Schema v16 records `speculative_backend`, `draft_tokens`, and the proposal head independently;
 JSON and CSV identify DFlash2 explicitly. MTP alone reserves its extra lookahead KV margin.
 Schema v20 adds `rope_yarn_factor`, `ngram_draft_tokens` and `ngram_min_match` to `config`.
-Schema v21 adds `spec_min_p` (`--spec-min-p`; `null` keeps the model's default, CSV empty).
+Schema v21 adds `spec_min_p` (`--spec-min-p`; `null` keeps the default, CSV empty).
+Schema v22 adds `draft_tokens_auto` (`--draft-tokens auto`; `draft_tokens` is then the resolved
+ceiling).
 
 `--ngram-draft-tokens 1..63 --ngram-min-match 4..64` enables the single-request
 [ngram copy proposer](../docs/ngram.md) alongside the selected neural backend.
@@ -702,7 +704,7 @@ so broad Graph-envelope measurements can be distinguished from exact-length meas
 `--split-workspace-mib N` sets the prompt split-workspace bound (default 256, as
 `--prefill-split-workspace-mib`). `--decode-split64` selects the decode-split64 fast path's
 schedule (INT8 KV: 64-key splits for 24-head single-column rows). In `infernix_bench`, the fast
-paths qualified for the configuration run unless `--disable-fast-paths`, and `--fast-path NAME`
+paths qualified for the configuration (the artifact's kernels and KV format) run unless `--disable-fast-paths`, and `--fast-path NAME`
 also runs a candidate path; the report records the paths that ran as `fast_paths`.
 
 ```bash
@@ -1309,7 +1311,7 @@ exposure must not be summed across requests, and CPU constraint work must not be
 - each request sample's `speculative`: window, rounds, drafted/accepted tokens, fallbacks, separate
   ngram rounds/drafted/accepted tokens, per-position
 acceptance, and (MTP on Qwen3.5-family models) `rounds_by_draft_length`, the all-neural rounds per
-draft length, which `--fast-path adaptive-mtp` spreads over 1..`--draft-tokens`.
+draft length, which `--draft-tokens auto` (the `adaptive-mtp` fast path) spreads over 1..5.
 
 Each test reports `workspace_peak_bytes` from the planned phase markers, including CUDA Graph
 replay, and `workspace_allocator_peak_bytes` from host-side arena allocation activity. These are

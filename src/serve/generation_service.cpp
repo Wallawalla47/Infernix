@@ -338,6 +338,7 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.prefill_split_workspace_mib  = options_.prefill_split_workspace_mib;
     engine_options.original_nvfp4_prefill_kernel = options_.original_nvfp4_prefill_kernel;
     engine_options.fast_paths                    = options_.fast_paths;
+    engine_options.fast_path_candidates          = options_.fast_path_candidates;
     engine_options.kv_cache                  = options_.kv_cache;
     engine_options.enable_vision             = options_.enable_vision;
     engine_options.vision_offload            = options_.vision_offload;

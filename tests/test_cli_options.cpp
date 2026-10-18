@@ -140,6 +140,24 @@ int run_tests() {
                                        "mtp", "--draft-tokens", "8", "--ngram-draft-tokens", "15"});
                       }),
                       "CLI admitted unsupported MTP neural width");
+    // auto leaves the count to the Engine (the model's most); a fixed N stays fixed.
+    const auto mtp_auto = parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--spec", "mtp",
+                                 "--draft-tokens", "auto"});
+    failures += check(mtp_auto.speculative.draft_tokens_auto && mtp_auto.speculative.draft_tokens == 0,
+                      "CLI did not select the automatic MTP draft length");
+    const auto mtp_fixed = parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--spec", "mtp",
+                                  "--draft-tokens", "7"});
+    failures += check(!mtp_fixed.speculative.draft_tokens_auto && mtp_fixed.speculative.draft_tokens == 7,
+                      "CLI did not keep a fixed MTP draft length of 7");
+    for (const auto* rejected : {"dflash2", "Auto"}) {
+        const std::string backend = std::string(rejected) == "Auto" ? "mtp" : rejected;
+        const std::string tokens  = std::string(rejected) == "Auto" ? "Auto" : "auto";
+        failures += check(rejects([&] {
+                              (void)parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--spec",
+                                           backend, "--draft-tokens", tokens});
+                          }),
+                          ("CLI admitted --draft-tokens " + tokens + " with --spec " + backend).c_str());
+    }
     const infernix::cli::Options configured =
         parse({"infernix-cli", "model.ninfer", "--prompt", "hello", "--thinking-budget", "37"});
     failures += check(configured.thinking_budget == 37,
