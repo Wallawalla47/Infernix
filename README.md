@@ -316,8 +316,8 @@ repository's model card gives its files, requirements, recommended command, qual
 | [Swift-1.5-Qwen3.8-Flash-Next-NVFP4-Dense8-Infernix](https://huggingface.co/Wallawalla47/Swift-1.5-Qwen3.8-Flash-Next-NVFP4-Dense8-Infernix) | [ukisai/Swift-1.5-Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-NVFP4) | UkisAI's fine-tune that thinks with fewer tokens (see its model card), converted like NVIDIA Dense8: experts bit-exact, dense projections in 8 bits. Smoke-tested; its quality and speed are not yet measured. |
 
 On the 1M-token perplexity corpus (4,096-token context, INT8 KV) the FP8 conversion scores 3.487,
-NVIDIA Dense8 3.508 and IQ3_S 3.522. The IQ3_S and FP8 conversions need an Infernix built from
-`main` after `windows-2026.10.11`; no release holds their recipes yet.
+NVIDIA Dense8 3.508 and IQ3_S 3.522. The IQ3_S and FP8 conversions need Infernix
+`windows-2026.10.18` or later.
 
 Every Flash-Next conversion also needs a PLE n-gram volume (`--ngram-volume`), kept apart from the
 model files and read from an NVMe drive. There are three, one per row format, and any of them runs
