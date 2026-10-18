@@ -225,14 +225,15 @@ Other engines check speed-motivated changes more loosely:
 
 ### Defaults elsewhere that Infernix rejected
 
-These routes are on by default in another engine. As implemented and measured in Infernix, each
+These routes are on by default in another engine (NInfer as of `master` 64d10fbf9 and `dev`
+4126ecf4, checked on 2026-10-18; Strata 0.1.42). As implemented and measured in Infernix, each
 failed the gate:
 
 | Route | On by default in | What it does | Why it failed |
 |---|---|---|---|
 | Expert tail skip at rank 7 | Strata (`STRATA_ROUTE_TAIL_SKIP=7`) | In a decode round, skips an expert missing from VRAM that every token routes at rank 7 or lower (of its top 10), without renormalising the rest | GGUF IQ3_S Flash-Next, INT8 KV, MTP decode: TV bound 4.26e-3 against 4e-3, top-1 0.75 against 0.5 points and the 99.9th-percentile KL up 41 % against 25 %. The dropped experts' contributions are small but not zero, and which ones are dropped depends on what the cache happens to hold. Infernix offers it as an opt-in, `--expert-tail-skip R` (+12 % to +33 % decode on an RTX 5090) |
-| 4-bit activations in wide decode rounds | NInfer (and Infernix, inherited, until 2026-10-14) | Wide rounds quantize the NVFP4 MLP projections' input activations once to 4 bits (gate/up from 5 columns, down from 8) | Qwen3.8-27B NVFP4, INT8 KV: decode TV 1.57e-2 (about four times the budget) and top-1 +1.8 points; the 4-bit activations add about two thirds of the model's whole quantization noise. Perplexity does not show it (its excess was negative). Replaced by `batched-a4-residual-decode`, which sums two 4-bit terms and passes |
-| 8-bit activations in wide decode rounds | NInfer (and Infernix, inherited, until 2026-10-14) | Rounds of 5 columns (17 when verifying drafts) or more quantize the FP8 projections' input activations once to 8 bits | Passes plain decode, where few rounds are that wide, but fails speculative verification of 32 columns (DFlash2 with n-gram drafts, four requests): TV bound 4.38e-3 against 4e-3 and top-1 0.55 against 0.5 points. Replaced by `batched-a8-residual-decode` (two 8-bit terms), which passes |
+| 4-bit activations in wide decode rounds | NInfer, for artifacts that permit it, as its official NVFP4 Qwen3.8-27B does (and Infernix, inherited, until 2026-10-14) | Wide rounds quantize the NVFP4 MLP projections' input activations once to 4 bits (gate/up from 5 columns, down from 8) | Qwen3.8-27B NVFP4, INT8 KV: decode TV 1.57e-2 (about four times the budget) and top-1 +1.8 points; the 4-bit activations add about two thirds of the model's whole quantization noise. Perplexity does not show it (its excess was negative). Replaced by `batched-a4-residual-decode`, which sums two 4-bit terms and passes |
+| 8-bit activations in wide decode rounds | NInfer, likewise (and Infernix, inherited, until 2026-10-14) | Rounds of 5 columns (17 when verifying drafts) or more quantize the FP8 projections' input activations once to 8 bits | Passes plain decode, where few rounds are that wide, but fails speculative verification of 32 columns (DFlash2 with n-gram drafts, four requests): TV bound 4.38e-3 against 4e-3 and top-1 0.55 against 0.5 points. Replaced by `batched-a8-residual-decode` (two 8-bit terms), which passes |
 
 The replacements cost some speed. When they landed (2026-10-15), speculative decode on the 27B
 (DFlash2 with n-gram drafts) measured 4 % slower than with the rejected routes at one request, 6 %
