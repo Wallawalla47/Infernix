@@ -32,13 +32,33 @@ benchmark informed them. Where this repository's own reading or measurement diff
 | [#72](https://github.com/kido5217/Infernix/issues/72) | Whole-model per-matmul precision map kept current with each change | Candidate (documentation practice) |
 | [#73](https://github.com/kido5217/Infernix/issues/73) | Expert-cache-lent prefill chunk sizing (`--prefill auto`) | **Not needed** (2026-10-16). The fork qualified it on its GPU ([#76](https://github.com/kido5217/Infernix/issues/76): +5-10 % over a fixed 4,096 chunk at 16K). Here Flash-Next's exact route measured bit-identical across chunks and now defaults to a fixed 16,384-token chunk, +14-16 % at 32K-64K over 4,096 with decode unchanged ([design record](qwen3_8-flash-next-design.md) §19.3.24), which captures the gain without the lent io view and its lifetime hazards |
 
+## Speed mechanisms (second review, 2026-10-18)
+
+A review of Basalt at `6e53eee` read its decode, scheduling and kernel code for what explains its
+speed. Its published decode figures run at a 400 W limit with an RTX 5060 Ti as a peer expert tier
+(the two cards hold 71-83 % of the experts) on short prompts, with int8 (q8_1) activations into
+every quantized matmul and every decode miss on a CPU path that rounds differently from the GPU.
+It publishes no single-GPU IQ3_S decode figure.
+
+| Mechanism | Here |
+|---|---|
+| Draft chain stops on the device at the draft cut (conditional graph nodes) | **Adopted**: one-row argmax MTP rounds skip the steps past `--spec-min-p`, decode +2.2 % on mixed-topic text ([design record](qwen3_8-flash-next-design.md) §19.3.27) |
+| Small table uploads ordered ahead of expert copies | **Adopted** as `upload_pinned` for the KV page tables and grammar masks; no resolved speed change (§19.3.27) |
+| Expert usage seeded from the prompt's routing | **Adopted** as LFRU count credit (256 × each expert's share of the prompt's routes, no copies): decode −1.8 % on mixed-topic text (§19.3.27, the design's option H8) |
+| Two-stage Q6_K verify head (2-bit screen, exact rescore of the top rows) | Candidate as a gated fast path: −1.8 to −3.3 % per window there, softmax tail approximate; a converter-written 2-bit copy (no runtime repacking) |
+| Every decode miss on the CPU, planned on the device | Not applicable: our CPU route is exact and compute-bound (every miss on the CPU measured −2.3 %); device-side planning is already ours (§19.3.20e/f) |
+| int8 activations (q8_1) into dense and expert matmuls; int8 hyper-connection copies; 6-bit dense | Not adopted: our one- and two-limb activation fast paths and the Q8 hyper-connection variant failed the [acceptance policy](model-quality.md#6-numerical-acceptance-policy-and-fast-paths); 6-bit dense costs KL +0.0063 there |
+| Relaxed drafting (keep a draft with target probability ≥ P) | Product decision: 0.022-0.089 total variation per token, beyond the fast-path budget; only an explicit per-request mode |
+| `dense_tc` int8 tensor-core GEMV | Not needed: our Dense8 GEMVs run at 90-97 % of DRAM bandwidth |
+
 ## Parked: needs a product change or a later decision
 
 - **Peer-GPU expert tier.** Expert slots on a second card computed with the same kernels, so rows
   stay bit-identical; it breaks the one-GPU product contract.
 - **Self-distilled per-pack MTP drafter.** The engine already loads a drafter per source; the cost is
-  training and shipping a tuned MTP layer per pack, and Basalt publishes no distilled-vs-stock
-  comparison.
+  training and shipping a tuned MTP layer per pack. Basalt now publishes its comparison (NVFP4 pack,
+  peer card, 400 W): prose +1.9 % tok/s and +4.3 % tokens per window, conversation and structured
+  output within noise; its training recipe is not published.
 - **Shared slot contexts (`max-context / N`).** Full-context fixed lanes are a scheduling invariant
   here (bounded FIFO ingress, one compact decode batch, per-lane graphs).
 - **Per-section SHA-256 in the container.** No current integrity gap.

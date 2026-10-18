@@ -1798,7 +1798,10 @@ block-scaled routed experts with the activation scheme the checkpoint declares (
 **As built (2026-10-17): `--draft-tokens auto` only.** The policy below, and the default 0.5
 `--spec-min-p` cut on one-row rounds (§19.3.5), run with `--draft-tokens auto`, which allows K up
 to 7. `--draft-tokens N` (1..7) drafts and verifies N every one-row round and min(N, 2) every pair
-round (`--spec-min-p` then defaults to 0), so a deployment can fix the round shape.
+round (`--spec-min-p` then defaults to 0), so a deployment can fix the round shape. A one-row
+argmax round with the cut stops drafting on the device at its first draft below it: each later
+draft step is an IF node of the draft graph, set by a one-thread gate after the step before
+(§19.3.27).
 
 Every round, the policy picks the draft length K (and, under option H9, a tree shape) that
 maximizes expected tokens per second:
@@ -2811,7 +2814,7 @@ model estimates for recipe B at C=1 unless marked otherwise.
 | **H4** | **Two-layer-ahead prediction** (router of l+2 applied to x_l) | Doubles the prefetch window, so more misses become staged hits | Low. Lower recall, wasted DMA. | M1 recall@k′ and M5 useful-byte ratio > 0.5 |
 | **H5** | **Multi-token protection predictor** (§9.3, policy item 6) | Up to 2.5-10 points of hit rate on top of LFRU, with perfect prediction | Research | M1 on the hidden-state trace set |
 | **H6** | **Chained rounds (asynchronous scheduling).** Enqueue round r+1 before r completes. The device carries the sampled or accepted tokens. The host commits round r while r+1 runs. This needs a device-side accepted-prefix fold and an abort path for rounds launched past a stop. | Hides the host's per-round work (ingress build, commit, output): 2-6% at 4.5 ms tokens | High. Engine transaction changes; see [engine architecture §6](engine-architecture.md). | M6 nsys: GPU idle between rounds > 3% of the token |
-| **H8** | **Prompt-seeded cache.** Prefill already routes every prompt token. At the end of prefill, the prompt's per-layer expert counts seed the LFRU state, and the top uncached experts are promoted while the copy engine is otherwise idle, before the first decode token (MoE-Infinity's request-level activation idea). | Fewer cold misses in the first hundreds of decode tokens after a topic switch | Low | M1 replay with prefill routing: hit rate of the first 256 decode tokens with and without seeding |
+| **H8** | **Prompt-seeded cache** (built 2026-10-18 as counts only, credit 256, no promotions: §19.3.27). Prefill already routes every prompt token. At the end of prefill, the prompt's per-layer expert counts seed the LFRU state, and the top uncached experts are promoted while the copy engine is otherwise idle, before the first decode token (MoE-Infinity's request-level activation idea). | Fewer cold misses in the first hundreds of decode tokens after a topic switch | Low | M1 replay with prefill routing: hit rate of the first 256 decode tokens with and without seeding |
 | **H9** | **Draft trees** (the existing DFlash2-style tree verification over MTP top-2 at the first one or two positions) | +10-25% accepted tokens per round in the literature. Here each extra column adds ~2 distinct experts per layer, ~0.2 ms with recipe B, so a tree must add more than ~12% accepted tokens to pay. | More columns, so more misses on rejected branches | M7 cost model: chosen per round only when expected tokens/s rise |
 | **H11** | **Exclusive residency** (an expert lives in VRAM *or* RAM) for 64 GB hosts | Supports smaller machines | Write-back and eviction complexity | Outside the current product scope |
 | **H12** | **BF16 GDN recurrent state** (opt-in; changes numerics) | Halves 6.3 MB of state traffic per layer and sequence: ~2% at C=1, ~5% at C=8. Measured on DGX Spark for this model: +6.8% at 1 stream, +8.5% at 8. | The reference keeps FP32 state. INT8 state lost up to 21.6 accuracy points in the literature unless quantized with decay awareness, so BF16 is the floor. | Off by default. Adopted as an option only if it passes the §16.3 recipe-B thresholds against FP32 state. |
@@ -3561,7 +3564,8 @@ generated token: 11.0 ms wall against 8.5 ms GPU busy, so the GPU was idle 22.5 
   48 promotions (132 MB, ~4.8 ms) go out.
 - **Pinned uploads (adopted).** A Core primitive, `upload_pinned`, copies pinned (UVA-mapped)
   host memory to the device with a small kernel in stream order. Every per-round staging copy
-  uses it; prefill chunks keep the bulk copy. GPU idle time fell from 22.5 % to 10.9 % of MTP
+  uses it, as do the KV page-table publication and the grammar masks of constrained rows since
+  §19.3.27; prefill chunks keep the bulk copy. GPU idle time fell from 22.5 % to 10.9 % of MTP
   decode. Greedy ids are unchanged.
 
   | Workload (same flags) | Before | After |
@@ -10395,6 +10399,88 @@ no memory traffic) for 200 ms while it copies, then times its copies with the SM
 startups right after a Dense8 run: the previous probe misread 2 of 20 (3.0 GB/s), the warmed one 0
 of 60 (27.1-27.6).
 
+### 19.3.27 Draft steps past the cut, uploads off the copy engine, prompt-seeded cache (2026-10-18)
+
+Three ideas from the review of Basalt (`jesdga95/basalt` `6e53eee`, a Strata fork for this model
+and GPU; [assessment](basalt-port-assessment.md)) and of this program's own record, built and
+measured on the RTX 5090 (PCIe 5.0 x8). Every arm wrote the same greedy tokens: 27 runs of
+`infernix_decode_quality_gen` over three settings, Dense8 and IQ3_S.
+
+**Workload.** `infernix_decode_quality_gen` over 32 evenly spaced segments of a fiction +
+encyclopedia + code corpus (`decode-4m`'s pg19, wikitext and sglang streams), 384 greedy tokens
+each, INT8 KV, after a warm-up run, arms in ABC... CBA order. Two pitfalls were found on the way:
+a 1,536-token prompt sits on the startup-measured CPU prefill split (1,529-1,541 columns on
+Dense8), so the prefill mode flipped between runs (116 against 137-138 s); and the generator's
+fixed four drafts verify every draft (`--spec-min-p` defaults to 0 for a fixed length). The
+generator therefore gained `min-p=P`, `auto`, `route-trace=FILE` and a prefill/decode split of its
+time; the decisive runs use 1,280-token prompts, `mtp min-p=0.5` (every run then has the same rounds:
+4,608 of them, 18,432 draft steps) and compare decode seconds. `infernix_bench` with
+`--draft-tokens auto` proved too noisy on Dense8 for a 2 % effect (repetitions 125-161 tok/s; the
+timing-learned lengths gave 2.4-4.1 tokens per round from run to run).
+
+**Draft steps past the cut stop on the device (adopted).** A one-row argmax round drafted all of
+its steps, read them back and only then cut at the first draft below `--spec-min-p`; the steps
+after that draft ran for nothing. The draft graph of such a round is now a chain of IF nodes
+(`DecodeGraphDefinition::capture_gated_chain`): after step j a one-thread kernel
+(`launch_graph_gate`) applies the host's comparison (the float log-probability widened to binary64
+against `log(min_p)`) to step j's confidence and sets the conditional that runs step j + 1, captured
+into its IF body (kernels with programmatic dependencies and device copies run there as before).
+Skipped steps leave their draft and confidence words stale, beyond the cut that reads them; the
+eager first run of a shape still runs every step. Sampled rounds (`sampled-mtp-drafts`) and pair
+rounds keep the ungated graph. Core test `infernix_decode_graph_gated_test`: 70 replays of a
+five-step chain against the host's cut, NaN and the float rounding of log 0.5 included, every one
+equal.
+
+| Dense8, 32 × 1,280 + 384, MTP 4, cut 0.5 | Decode s, round 1 / 2 | Mean |
+|---|---:|---:|
+| Gate | 68.13 / 68.80 | 68.46 |
+| Every step (before) | 69.59 / 70.36 | 69.97 (+2.2 %) |
+
+34 % of the draft steps lay past the cut (6,297 of 18,432); 1.5 s over them is 0.24 ms per step,
+the cost of a draft step (§19.3.5). On the bench (pp4096 + tg512, `--draft-tokens auto`), 6-21 %
+of steps lay past it: IQ3_S tg512 258.8 against 250.1 tok/s pooled (+3.5 %), and +4.3 % between the
+two runs that chose the same lengths (4.15 tokens per round: 256.9 ± 0.9 against 246.4 ± 0.5);
+IQ3_S pp4096 + tg512 168.4 against 169.8 (−0.8 %, ±8 within runs); Dense8 within its noise. The
+gate's own cost (a one-thread kernel and an IF node per step) was not measured apart; it is inside
+the gated arm above.
+
+**KV page tables and grammar masks through the host mapping (adopted).** `KVExecutionTablePool::
+publish_indices` (a lane's new page every 64 decode tokens, on both models) and the per-round
+grammar masks of constrained rows now use `upload_pinned` instead of a copy-engine copy, which
+queued behind promotion batches (up to 47.5 ms in a 2026-10-14 server trace). Measured: no
+resolved change. Mixed-topic decode (the table above's workload, both arms without the gate)
+69.83 / 70.64 s with the copy engine against 69.59 / 70.36 (+0.35 %, the same sign in both rounds, below the ~1 %
+drift between rounds); Dense8 and IQ3_S at 1,536 tokens with a fixed draft length 138.41 against
+138.34 s and 105.81 (one 108.00 outlier) against 103.55 s. None of these workloads reproduced the
+server stall; the change is kept as exact and free of measured cost.
+
+**Prompt-seeded expert counts (adopted: credit 256, no promotions; option H8 of §17).** A prefill
+call counts each routed expert once per call, so after a long chunk nearly every expert holds the
+same fresh use and the cache knows nothing of what the prompt used most. Each lane now counts its
+prompt's per-token routes from the route log its prefill calls download (a layer walk's span: its
+last chunk), and at the prompt's end `ExpertResidency::seed_prompt` adds to every expert's LFRU
+count 256 × the share of counted tokens that routed to it, used now, without a clock tick and
+without copies (`LfruPolicy::credit`); the decode's own admissions and evictions then follow it.
+Basalt seeds its usage counts from the prompt the same way (`d327073`, unmeasured there). Placement
+only: output unchanged.
+
+| Dense8, 32 × 1,280 + 384, MTP 4, cut 0.5, decode s | Round 1 / 2 | Mean | Hits |
+|---|---:|---:|---:|
+| No seeding | 68.77 / 67.30 | 68.03 | 82.1 % |
+| Credit 64 | 67.89 / 66.93 | 67.41 (−0.9 %) | 82.4 % |
+| Credit 256 | 66.96 / 66.71 | 66.84 (−1.8 %) | 82.5 % |
+
+Credit 64 also measured −0.7 % in the runs of the gate's table and −0.95 % (total time) with
+1,536-token prompts. Promotions at the prompt's end as well, the best credited misses that outrank
+the lowest resident, eight per layer: Dense8 −0.70 % (12,288 extra copies; slower than credit
+alone, as §19.3.17 found for prompt promotions), IQ3_S −1.5 % against no seeding (hits 88.5 → 89.1
+%, 696 copies; IQ3_S credit alone was not run). `tools/expert_cache_replay/host_tier.py --validate
+--prompt-seeds` on the Dense8 trace of that run (full mode, recorded budgets; landings not modelled,
+so its hit rates sit ~2.4 points below the engine's) ranked credit 16 / 64 / 256 / 1,024 at
++0.15 / +0.34 / +0.59 / +0.54 points of decode hits, a window of the prompt's last 256 or 512 tokens
+the same as all of them, and promotions at +0.46 (8 per layer) and +0.54 (32) points. Not measured:
+the SSD tier (credit only there too; its demotion gate is untouched), concurrent lanes.
+
 ---
 
 ## 20. Documentation and authority changes
@@ -10618,7 +10704,7 @@ severity, and each points to the section that now resolves it.
 | P4 | No per-kernel budget: the 4.0 ms GPU assumption was unsupported | Per-kernel byte and time budget, 4.5 ms (B) and 7.3 ms (A) at T=1, grounded in this repo's measured 1,674.5 GB/s sustained read (§8.3) |
 | P5 | Recurrence and dense GEMV tiling were constrained by per-head norms in epilogues | Norms move to consumer prologues; recurrence splits state rows across 192 CTAs (§8.3) |
 | P6 | Megakernel, chained rounds and BAR mailboxes were unscoped | Specified as options H1 and H6 with measured gates. BAR mailboxes are not available on GeForce and are rejected (§17). |
-| P7 | Prompt routing was not used to warm the cache | Option H8 (§17) |
+| P7 | Prompt routing was not used to warm the cache | Option H8 (§17), built as count credit (§19.3.27) |
 | P8 | The miss decision ignored in-flight DMAs and per-layer completion time | Arbiter minimizes each layer's latest completion, including waiting for in-flight loads and the shared copy engine's queue (§8.6) |
 | P9 | Each router was read twice from HBM: once for prediction and once for routing | Router l+1 is loaded evict-last and re-read from L2: 126 MB per token (§8.3 rule 5) |
 | P10 | Fixed-order floating-point reductions forced extra passes and partial traffic | Exact int64 expert sums; the down kernel owns rows and fuses the combine (§8.5) |
