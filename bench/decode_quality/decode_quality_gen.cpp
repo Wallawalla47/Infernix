@@ -13,8 +13,9 @@
 // decode with NInfer's.
 //
 // Usage: infernix_decode_quality_gen <artifact> <corpus.txt> <out.txt> <segments> <prompt_tokens>
-//                                  <new_tokens> [ngram] [mtp] [plain] [exact] [path=NAME]...
+//                                  <new_tokens> [ngram] [mtp [auto] [min-p=P]] [plain] [exact] [path=NAME]...
 //                                  [ngram-volume=FILE] (Qwen3.8-Flash-Next; default <artifact>.ngram)
+//                                  [route-trace=FILE] (Qwen3.8-Flash-Next's route trace, route_trace.h)
 // Output, one line per segment: <corpus token offset> <prompt_tokens> <generated ids...>
 
 #include "infernix/engine.h"
@@ -23,6 +24,7 @@
 #include <cstdint>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -31,7 +33,7 @@
 int main(int argc, char** argv) {
     if (argc < 7) {
         std::cerr << "usage: infernix_decode_quality_gen <artifact> <corpus.txt> <out.txt> <segments> "
-                     "<prompt_tokens> <new_tokens> [ngram] [mtp] [plain] [exact] [path=NAME]... "
+                     "<prompt_tokens> <new_tokens> [ngram] [mtp [auto] [min-p=P]] [plain] [exact] [path=NAME]... "
                      "[kv=bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2]\n";
         return 2;
     }
@@ -39,9 +41,10 @@ int main(int argc, char** argv) {
         const auto segments      = static_cast<std::uint32_t>(std::stoul(argv[4]));
         const auto prompt_tokens = static_cast<std::uint32_t>(std::stoul(argv[5]));
         const auto new_tokens    = static_cast<std::uint32_t>(std::stoul(argv[6]));
-        bool ngram = false, mtp = false, plain = false, exact = false;
+        bool ngram = false, mtp = false, plain = false, exact = false, draft_auto = false;
         std::vector<std::string> paths;
-        std::string ngram_volume;
+        std::string ngram_volume, route_trace;
+        std::optional<float> min_p;
         infernix::KvCacheStorage kv = infernix::KvCacheStorage::Int8Group64;
         for (int i = 7; i < argc; ++i) {
             const std::string flag = argv[i];
@@ -49,12 +52,18 @@ int main(int argc, char** argv) {
                 ngram = true;
             } else if (flag == "mtp") {
                 mtp = true;
+            } else if (flag == "auto") {
+                draft_auto = true;
+            } else if (flag.starts_with("min-p=")) {
+                min_p = std::stof(flag.substr(6));
             } else if (flag == "plain") {
                 plain = true;
             } else if (flag == "exact") {
                 exact = true;
             } else if (flag.starts_with("ngram-volume=")) {
                 ngram_volume = flag.substr(13);
+            } else if (flag.starts_with("route-trace=")) {
+                route_trace = flag.substr(12);
             } else if (flag.starts_with("path=")) {
                 paths.push_back(flag.substr(5));
             } else if (flag.starts_with("kv=")) {
@@ -79,7 +88,7 @@ int main(int argc, char** argv) {
                 }
             } else {
                 std::cerr << "unknown option " << flag
-                          << " (ngram, mtp, plain, exact, path=NAME, ngram-volume=FILE, kv=NAME)\n";
+                          << " (ngram, mtp, auto, min-p=P, plain, exact, path=NAME, ngram-volume=FILE, route-trace=FILE, kv=NAME)\n";
                 return 2;
             }
         }
@@ -109,6 +118,10 @@ int main(int argc, char** argv) {
             // infernix-serve's production Qwen3.8-Flash-Next drafting (--spec mtp --draft-tokens 4).
             options.speculative.backend      = infernix::SpeculativeBackend::Mtp;
             options.speculative.draft_tokens = 4;
+            // `auto`: --draft-tokens auto, each round's own length up to 4 and the --spec-min-p 0.5 cut.
+            options.speculative.draft_tokens_auto = draft_auto;
+            // `min-p=P`: --spec-min-p P, the draft-confidence cut (a fixed length's default is none).
+            options.speculative.draft_min_p = min_p;
 #endif
         }
         options.context_cache.enabled             = false;
@@ -125,11 +138,13 @@ int main(int argc, char** argv) {
         }
         if (plain) { options.speculative = {}; }
 #if defined(INFERNIX_DECODE_QUALITY_NINFER)
-        if (exact || !paths.empty()) {
-            std::cerr << "fast-path options are not available in NInfer\n";
+        if (exact || !paths.empty() || !route_trace.empty()) {
+            std::cerr << "fast-path and route-trace options are not available in NInfer\n";
             return 2;
         }
 #else
+        // Qwen3.8-Flash-Next: the per-round expert routes for tools/expert_cache_replay/host_tier.py.
+        options.route_trace_path = route_trace;
         options.fast_paths = !exact;
         for (const std::string& name : paths) {
             const std::optional<infernix::FastPath> path = infernix::parse_fast_path(name);
@@ -159,6 +174,7 @@ int main(int argc, char** argv) {
         std::ofstream out(argv[3]);
         const auto started      = std::chrono::steady_clock::now();
         std::uint64_t generated = 0;
+        double prefill_seconds = 0.0, decode_seconds = 0.0;
         for (std::uint32_t segment = 0; segment < segments; ++segment) {
             const std::size_t offset =
                 static_cast<std::size_t>(segment) * (tokens.size() - prompt_tokens) / segments;
@@ -170,8 +186,18 @@ int main(int argc, char** argv) {
             request.execution.sampling.temperature    = 0.0F;
             request.execution.allow_prefix_reuse      = false;
             request.stop.include_model_defaults       = false;
+#if defined(INFERNIX_DECODE_QUALITY_NINFER)
             const infernix::GenerationResult result = engine.generate(
                 engine.prepare_tokens(std::move(prompt), false), std::move(request));
+#else
+            // Phase timings only observe (they change no execution): prefill and decode apart.
+            const infernix::GenerationResult result =
+                engine.submit(engine.prepare_tokens(std::move(prompt), false), std::move(request),
+                              infernix::OutputConsumerMode::Aggregate, {.phase_timings = true})
+                    .wait();
+            prefill_seconds += result.timings.prefill_seconds;
+            decode_seconds += result.timings.decode_seconds;
+#endif
             out << offset << ' ' << prompt_tokens;
             for (const infernix::TokenId id : result.generated_token_ids) { out << ' ' << id; }
             out << '\n';
@@ -182,6 +208,9 @@ int main(int argc, char** argv) {
         const double seconds =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
         std::cerr << "generated " << generated << " tokens in " << seconds << " s\n";
+#if !defined(INFERNIX_DECODE_QUALITY_NINFER)
+        std::cerr << "phases: prefill " << prefill_seconds << " s, decode " << decode_seconds << " s\n";
+#endif
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "infernix_decode_quality_gen: " << error.what() << '\n';

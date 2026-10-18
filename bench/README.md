@@ -195,7 +195,9 @@ are in [Model-level numerical quality](../docs/maintainer/model-quality.md).
   and continues each greedily for `new_tokens` tokens through the production decode path:
   DFlash2 with 7 drafts and the optimized proposal head, INT8 KV, CUDA Graph decode, prefix reuse
   off. `ngram` adds the production n-gram drafting (15 drafts, minimum match 12); `mtp` drafts with
-  the MTP layer instead (4 drafts), Qwen3.8-Flash-Next's production path; `plain` drafts nothing
+  the MTP layer instead (4 drafts), Qwen3.8-Flash-Next's production path, and `auto` with it lets each
+  round choose its length with the `--spec-min-p` 0.5 cut (`--draft-tokens auto`), `min-p=P` sets that
+  cut for the fixed length; `plain` drafts nothing
   (one token per round through the single-column decode kernels). Fast paths run as in
   `infernix-serve`; `exact` runs the exact route and `path=NAME` also runs a candidate fast path.
   It writes one line per segment: the corpus token offset, the prompt length and the generated
@@ -212,7 +214,8 @@ are in [Model-level numerical quality](../docs/maintainer/model-quality.md).
   pass): it measures what decoding changes (KV format, chunking, speculation, batching), not the
   cost of the stored activation precision. Qwen3.8-Flash-Next's 16-bit-activation reference runs
   every expert bank W4A16; `--ngram-volume FILE` (judge) and `ngram-volume=FILE` (generator) name
-  its n-gram volume when it is not `<artifact>.ngram`.
+  its n-gram volume when it is not `<artifact>.ngram`. The generator's `route-trace=FILE` writes
+  Qwen3.8-Flash-Next's per-round expert routes for `tools/expert_cache_replay/host_tier.py`.
 
 ```bat
 infernix_decode_quality_gen model.ninfer corpus.txt base.txt 32 1536 384
