@@ -60,6 +60,10 @@ infernix_add_test(infernix_request_log_test
 infernix_add_test(infernix_metrics_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_metrics.cpp"
   LIBRARIES infernix_serve)
+
+infernix_add_test(infernix_metrics_json_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_metrics_json.cpp"
+  LIBRARIES infernix_serve)
 infernix_add_test(infernix_console_stats_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_console_stats.cpp"
   LIBRARIES infernix_serve infernix_product_logging)
