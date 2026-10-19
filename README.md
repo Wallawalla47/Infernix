@@ -19,13 +19,18 @@ Infernix keeps the experts in pinned system RAM, caches the hot ones in VRAM, co
 layer's cache misses on the CPU while the rest cross PCIe, and reads the 52 GB n-gram embedding
 table from an NVMe drive.
 
-- **Faster than [Strata](https://github.com/Niko1221/Strata)** on the same machine: 5.4-7.0× sooner
-  to the first token and 1.4-1.6× the decode speed from 8K to 250K tokens of context. In a replayed
-  agentic coding workload it reaches the first token in 5.2 s on average against 19.3 s and
-  finishes in about a third of the time ([benchmarks](#qwen38-flash-next-nvfp4-infernix-vs-strata)).
+- **Faster than [Strata](https://github.com/Niko1221/Strata)** on the same machine: 4.6-7.4× sooner
+  to the first token and 1.5-1.7× the decode speed from 8K to 250K tokens of context. In a replayed
+  agentic coding workload it reaches the first token in 4.9 s on average against 17.0 s and
+  finishes in under half the time. Against the
+  [strata-nvfp4](https://github.com/sergqwer/strata-nvfp4) fork on the same NVIDIA weights it
+  reaches the first token 10-19 % sooner, and in the replay 4.9 s against 10.7 s
+  ([benchmarks](#qwen38-flash-next-nvfp4-infernix-vs-strata-and-strata-nvfp4)). On the IQ3_S GGUF
+  Strata prefills 20-30 % faster and Infernix decodes up to 25 % faster
+  ([benchmarks](#qwen38-flash-next-iq3_s-infernix-vs-strata)).
 - **At least Strata's quality**: perplexity 4.654 against 4.844 on the same token ids.
 - **Long context**: 262K tokens natively and up to 1M with YaRN; a 250K-token prompt prefills in
-  about 30 s.
+  about 25 s.
 - **Less RAM than the model needs?** An SSD expert tier keeps what fits in RAM and reads the rest
   from the artifact.
 - **Uncensored too**: the
@@ -41,9 +46,9 @@ Setup and tuning: the [Qwen3.8-Flash-Next guide](docs/qwen3_8-flash-next.md).
 - **Hybrid prefix cache** built for Qwen's linear-attention layers: KV cached by content in 64-token
   blocks, snapshots of the recurrent state at the points that get reused, and three tiers (GPU,
   host RAM, and a file that survives restarts). In an agentic workload it serves 85 % of prompt
-  tokens from cache against NInfer's 79 %, reaches the first token a third sooner on average and
-  more than halves the median ([benchmarks](#qwen38-27b-infernix-vs-ninfer)).
-- **Faster prefill**: 1.4-1.5× NInfer's on long prompts (FlashAttention-2 style INT8 prompt
+  tokens from cache against NInfer's 79 % and more than halves the median time to the first token
+  ([benchmarks](#qwen38-27b-infernix-vs-ninfer)).
+- **Faster prefill**: 1.6-1.8× NInfer's on long prompts (FlashAttention-2 style INT8 prompt
   attention, FP4/FP8 Tensor Core paths, wave-aligned chunks).
 - **Faster decode**: DFlash2 tree verification and n-gram copy drafting alongside DFlash2 and MTP.
 - **Smaller KV**: the `vq2` and `k4v2` formats hold three to four times the context of INT8.
@@ -79,105 +84,178 @@ Setup and tuning: the [Qwen3.8-Flash-Next guide](docs/qwen3_8-flash-next.md).
 
 One machine: an RTX 5090 (32 GB) in a **PCIe Gen5 x8** link, a Core i9-13900K, 96 GB of DDR5 and
 Windows 11. At Gen5 x16 speeds are likely to be higher, most of all for Qwen3.8-Flash-Next, whose
-expert-cache misses cross PCIe on every token. Each engine runs as its own OpenAI-compatible server
-and is driven by the same client, and every time to first token is measured the same way, on the
-client: from sending the request to the first streamed token. The latest Infernix
-(`23d310d6`) is compared with its competitor and with Infernix's first release
-(`windows-2026.10.09`). In the single-request tables the two Infernix builds run in interleaved
-sessions (latest, first, first, latest), pooled per build; the other engine runs one session. The
-agentic replay ([`bench/agentic_ab`](bench/agentic_ab/README.md)) interleaves three coding-agent
-sessions and eleven subagents with tool calls, compactions, retries and aborts, up to eight
-requests in flight, sampling at temperature 1.0, at half length (68 requests per seed); cells are
-means over the seeds with the range in brackets.
+expert-cache misses cross PCIe on every token. Infernix is release
+[`windows-2026.10.18`](https://github.com/Wallawalla47/Infernix/releases/tag/windows-2026.10.18), run
+from its published zip. Each engine runs as its own OpenAI-compatible server and is driven by the
+same client, and every time to first token is measured the same way, on the client: from sending
+the request to the first streamed token. All were measured on 2026-10-19.
 
-### Qwen3.8-Flash-Next-NVFP4: Infernix vs Strata
+- **Context length**: one request at a time, greedy, 1,024 output tokens; three ~8K prompts and two
+  each of ~128K and ~250K (~230K on the 27B), means per size. Two Infernix sessions bracket the
+  other engines' sessions (Infernix, the others, Infernix) and are pooled; each other engine runs
+  one session, in its default single-slot configuration.
+- **Agentic replay** ([`bench/agentic_ab`](bench/agentic_ab/README.md)): three coding-agent sessions
+  and eleven subagents with tool calls, compactions, retries and aborts, up to eight requests in
+  flight, sampled at temperature 1.0, at half length (68 requests per seed). Every engine serves two
+  requests at once (Strata and strata-nvfp4 with `"parallel": 2` and `--batch-mtp`), and every arm
+  of a seed replays the same observations. Cells are means over the seeds with the range in
+  brackets, comparison columns the mean of the per-seed differences; every engine completed every
+  request.
+- Every Flash-Next engine uses the model's MTP drafter and INT8 KV at 262,144 tokens. Infernix
+  starts each session from the same saved expert-cache state; Strata and strata-nvfp4 from their
+  bundled expert profiles. Every engine verifies every draft, so drafting changes speed, not output.
 
-Infernix runs the [Dense8 conversion](#models) of NVIDIA's checkpoint; Strata runs Unsloth's
-`Qwen3.8-Flash-Next-UD-Q4_K_XL` GGUF, its native format. Both use the model's MTP drafter and INT8
-KV at 262,144 tokens, so this compares each engine as it is run in practice, each with its own
-quantization and drafter.
+### Qwen3.8-Flash-Next NVFP4: Infernix vs Strata and strata-nvfp4
 
-**Context length** (one request at a time, greedy, 1,024 output tokens; Strata 0.1.42 in its
-default single-slot configuration):
+Infernix runs the [Dense8 conversion](#models) of NVIDIA's NVFP4 checkpoint (`--draft-tokens auto`).
+[Strata](https://github.com/Niko1221/Strata) 0.1.45 runs Unsloth's
+`Qwen3.8-Flash-Next-UD-Q4_K_XL` GGUF, its native format.
+[strata-nvfp4](https://github.com/sergqwer/strata-nvfp4) 0.1.44.1-nvfp4.2, a Strata fork for
+NVIDIA's checkpoint, runs NVIDIA's NVFP4 checkpoint as its `prepare-model` converts it (`--spec 6
+--spec-min-p 0.7`; no control vector or vision; route tail skip off, its default with NVFP4 experts). So this compares each engine as it is run in
+practice, each with its own quantization and drafter.
 
-| Context | Time to first token: Infernix | first release | Strata | Decode tok/s: Infernix | first release | Strata |
+Strata runs the configuration its 0.1.45 setup writes for this machine (calibrated `--pcie-frac
+0.00`, `--spec-min-p 0.70`, `--pool-workers 15`, `STRATA_HC_Q8=1`), with one change: the all-in-RAM
+mode that setup picks pins 71.7 GiB of experts and 3.1 GiB of KV, close to the 76 GiB a process
+can pin on this machine, and the server did not start (no VRAM was left). It runs with
+`--resident-budget-gib 68`, the RAM-budget mode, in which route tail skip stays on by default.
+
+**Context length**:
+
+| Context | Time to first token: Infernix | Strata | strata-nvfp4 | Decode tok/s: Infernix | Strata | strata-nvfp4 |
 |---|---:|---:|---:|---:|---:|---:|
-| ~8K | 2.00 s | **1.95 s** | 12.17 s | **139.8** | 138.7 | 97.6 |
-| ~128K | **14.71 s** | 17.95 s | 103.02 s | **137.8** | 134.5 | 92.7 |
-| ~250K | **30.09 s** | 34.14 s | 163.52 s | **170.7** | 157.7 | 104.7 |
+| ~8K | **2.29 s** | 10.51 s | 2.54 s | **157.2** | 103.9 | 143.6 |
+| ~128K | **12.58 s** | 93.59 s | 15.22 s | **142.7** | 92.1 | 134.9 |
+| ~250K | **25.17 s** | 139.64 s | 31.22 s | 155.2 | 93.0 | **161.0** |
 
-Long prompts prefill 18 % (128K) and 12 % (250K) faster than in the first release: the prefix
-cache now snapshots a long prompt inside its layer walk instead of ending a walk at each snapshot,
-which made the walk stream the uncached experts again. At 8K the first latest-build session, which
-ran straight after another GPU job, was the slowest (2.06-2.10 s); the second took 1.92 s, against
-1.91-1.97 s for the first release.
+Infernix reaches the first token 4.6-7.4× sooner than Strata and decodes 1.5-1.7× as fast.
+Against strata-nvfp4, on the same NVIDIA weights, it reaches the first token 10-19 % sooner and
+decodes 6-9 % faster at 8K and 128K, and 4 % slower at 250K. The Strata row comes from a session
+run after the others. An earlier session kept the all-in-RAM mode's `STRATA_ROUTE_TAIL_SKIP=0`
+beside the RAM budget by mistake; it reached the first token about as soon (10.19, 92.22 and 141.67 s)
+but decoded at 91.7, 87.0 and 81.7 tok/s.
 
-**Agentic replay** (three seeds; Strata 0.1.42 with `"parallel": 2` and `--batch-mtp`, so that both
-engines serve two requests at once):
+**Agentic replay** (three seeds):
 
-| Metric | Strata | Infernix | Infernix first release | Infernix vs Strata | vs first release |
+| Metric | Strata | strata-nvfp4 | Infernix | Infernix vs Strata | vs strata-nvfp4 |
 |---|---:|---:|---:|---:|---:|
-| Average time to first token | 19.3 s (17.4-20.9) | **5.2 s** (5.0-5.5) | 6.3 s (6.0-6.6) | −73 % | −17 % |
-| Median time to first token | 8.94 s (7.15-9.99) | **2.78 s** (2.61-2.93) | 2.85 s (2.68-3.11) | −68 % | −2 % |
-| 90th-percentile time to first token | 53.1 s (47.7-57.9) | **11.9 s** (11.4-12.5) | 14.4 s (12.8-15.3) | −77 % | −17 % |
-| Prompt tokens served from cache | 72.1 % (71.0-73.8) | **84.7 %** (84.7-84.8) | 84.7 % (84.6-84.8) | +12.6 points | 0 points |
-| Prefill tok/s, requests with no cache hit | 1,059 | **6,081** | 5,097 | 5.7× | +19 % |
-| Output tok/s, one request decoding | 78 (78-79) | **131** (127-135) | 127 (123-130) | +68 % | +3 % |
-| Output tok/s, at the run's own batching | 44 (39-47) | **129** (122-137) | 120 (115-123) | 2.9× | +8 % |
-| Tokens per round (draft acceptance) | 2.06 | 2.37 | **2.38** | +15 % | 0 % |
-| Workload wall time | 20.1 min (18.9-20.8) | **7.2 min** (6.7-8.0) | 7.7 min (6.9-8.3) | −64 % | −6 % |
+| Average time to first token | 17.0 s (16.5-17.8) | 10.7 s (9.3-11.6) | **4.9 s** (4.2-5.9) | −71 % | −54 % |
+| Median time to first token | 9.77 s (9.64-9.92) | 6.74 s (5.41-7.53) | **3.55 s** (3.36-3.92) | −64 % | −46 % |
+| 90th-percentile time to first token | 41.1 s (38.7-44.0) | 24.4 s (19.4-28.8) | **9.6 s** (8.6-11.5) | −77 % | −59 % |
+| Average TTFT, new long prompts | 31.4 s (29.4-35.4) | 10.1 s (9.1-10.8) | **6.5 s** (6.3-6.7) | −79 % | −35 % |
+| Prompt tokens served from cache | 72.5 % (68.8-75.0) | 68.9 % (67.5-71.0) | **84.9 %** (84.7-85.1) | +12.4 points | +16.0 points |
+| Prompt tokens prefilled | 726K | 826K | **402K** | −44 % | −51 % |
+| Prefill tok/s, requests with no cache hit | 1,977 | 5,674 | **6,536** | 3.3× | +15 % |
+| Output tok/s, one request decoding | 94 (92-96) | 109 (105-112) | **135** (123-145) | +43 % | +24 % |
+| Output tok/s, at the run's own batching | 59 (57-60) | 85 (81-90) | **121** (106-128) | 2.1× | +42 % |
+| Tokens per round (draft acceptance) | 2.01 | 2.17 | **2.24** | +12 % | +4 % |
+| Workload wall time | 15.9 min (15.5-16.6) | 11.5 min (11.0-12.0) | **6.7 min** (6.4-7.0) | −58 % | −41 % |
 
-With two slots and batched MTP, Strata failed 5, 6 and 7 of the 68 requests of the three seeds
-("BGEN: no such free slot"); the table covers the 61-63 requests per seed that every engine
-completed. Both engines verify every draft, so drafting changes speed, not output.
+Strata re-prefilled the whole prompt on 4-7 of the 41 continuing main-session turns per seed and
+strata-nvfp4 on 6-7, Infernix on none. With two slots Strata does not apply route tail skip, so the
+Strata arm's configuration is the same as in the mistaken first session, whose replay gave the same
+picture (average time to first token 18.5 s, 95 output tok/s for one request, 16.2 min).
+
+### Qwen3.8-Flash-Next IQ3_S: Infernix vs Strata
+
+Both run ISTA-DASLab's GSQ-RCO `IQ3_S` GGUF: Infernix its [bit-exact conversion](#models) with
+the GGUF's IQ4_NL n-gram table, Strata 0.1.45 the GGUF with the configuration its setup writes
+(`--spec 4 --spec-min-p 0.5 --pool-workers 15`, every expert in RAM). In that configuration
+Strata's route tail skip is on: when it is active, a missed expert that every token of a verify
+window ranks 7th or lower is neither copied nor computed, which is faster and changes the answers
+slightly. The third column turns it off (`STRATA_ROUTE_TAIL_SKIP=0`).
+
+**Context length**:
+
+| Context | Time to first token: Infernix | Strata | Strata, tail skip off | Decode tok/s: Infernix | Strata | Strata, tail skip off |
+|---|---:|---:|---:|---:|---:|---:|
+| ~8K | 2.14 s | **1.65 s** | 1.66 s | 195.9 | **198.7** | 183.7 |
+| ~128K | 29.37 s | **23.92 s** | **23.92 s** | **184.9** | 169.1 | 160.3 |
+| ~250K | 58.77 s | 49.04 s | **48.99 s** | **205.6** | 164.4 | 166.7 |
+
+Strata prefills the IQ3_S model faster: Infernix takes 30 % longer to the first token at 8K, 23 %
+at 128K and 20 % at 250K. Infernix decodes level at 8K (−1 %) and faster at 128K (+9 %) and 250K
+(+25 %). Turning tail skip off cost Strata 8 % and 5 % of decode at 8K and 128K and gained 1 % at
+250K; prefill did not change.
+
+**Agentic replay** (three seeds):
+
+| Metric | Strata | Strata, tail skip off | Infernix | Infernix vs Strata |
+|---|---:|---:|---:|---:|
+| Average time to first token | 8.6 s (7.7-9.6) | 9.0 s (8.6-9.3) | **4.9 s** (4.0-5.7) | −43 % |
+| Median time to first token | 5.29 s (5.20-5.36) | 5.05 s (3.95-5.90) | **2.70 s** (2.41-2.86) | −49 % |
+| 90th-percentile time to first token | 19.5 s (16.3-21.6) | 20.9 s (19.1-21.8) | **13.1 s** (8.2-16.8) | −31 % |
+| Average TTFT, new long prompts | 14.3 s (12.8-15.2) | 13.2 s (11.9-13.8) | **12.7 s** (12.4-12.8) | −11 % |
+| Prompt tokens served from cache | 73.5 % (72.7-74.3) | 72.0 % (70.6-73.4) | **84.9 %** (84.7-85.1) | +11.4 points |
+| Prompt tokens prefilled | 700K | 742K | **401K** | −43 % |
+| Prefill tok/s, requests with no cache hit | 4,695 | **4,731** | 3,722 | −21 % |
+| Output tok/s, one request decoding | 144 (142-146) | 144 (143-147) | **164** (160-167) | +14 % |
+| Output tok/s, at the run's own batching | 107 (103-110) | 103 (100-110) | **158** (152-167) | +48 % |
+| Tokens per round (draft acceptance) | 2.19 | 2.13 | **2.40** | +10 % |
+| Workload wall time | 9.1 min (8.6-9.4) | 9.3 min (8.9-9.6) | **6.2 min** (5.8-6.6) | −32 % |
+
+Infernix reaches the first token sooner because it serves more of each prompt from cache (Strata
+re-prefilled the whole prompt on 4-6 of the 41 continuing main-session turns, Infernix on none),
+although it prefills a prompt with no cache hit 21 % slower. With two slots Strata does not apply
+tail skip at all (its documentation: a window then mixes requests), and neither run printed its
+tail-skip line, so the two Strata columns of this table ran the same computation and differ only by
+run-to-run spread.
 
 ### Qwen3.8-27B: Infernix vs NInfer
 
 Both serve NInfer's official
 [Qwen3.8-27B-nvfp4-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) artifact with
-DFlash2 drafting, INT8 KV and the same flags (NInfer `master` at `81c8ce09` with the Windows port;
-Infernix also uses n-gram drafting in the agentic replay).
+INT8 KV and the same flags. NInfer is upstream `master` at
+[`64d10fbf`](https://github.com/Neroued/ninfer/commit/64d10fbf9) with the Windows port (Win32 file
+I/O, an IOCP read queue and MSVC build fixes in place of the Linux-only pieces).
 
-**Context length** (one request at a time, greedy, 1,024 output tokens; the latest Infernix ran as
-`f7dae66e`, whose later commits leave the 27B unchanged):
+**Context length** (DFlash2 decode at `--max-context 228000`, the largest NInfer starts at with
+DFlash2 on 32 GB, so no ~230K row for it; time to first token and plain decode at
+`--max-context 240000`):
 
-| Context | Time to first token: Infernix | first release | NInfer | DFlash2 decode tok/s: Infernix | first release | NInfer |
+| Context | Time to first token: Infernix | NInfer | DFlash2 decode tok/s: Infernix | NInfer | Plain decode tok/s: Infernix | NInfer |
 |---|---:|---:|---:|---:|---:|---:|
-| ~8K | **0.75 s** | 0.76 s | 0.76 s | **209.0** | **209.0** | 198.9 |
-| ~128K | **21.61 s** | 21.64 s | 29.39 s | **212.7** | **212.7** | 186.8 |
-| ~230K | 53.79 s | **53.78 s** | 82.23 s | 161.9 | 162.0 | **227.5** |
+| ~8K | **0.65 s** | 0.76 s | **207.7** | 199.9 | **82.6** | 80.1 |
+| ~128K | **18.75 s** | 29.51 s | **209.4** | 183.3 | **69.6** | 67.1 |
+| ~230K | **47.30 s** | 83.24 s | 175.2 | — | **61.4** | 59.0 |
 
-The two Infernix builds compute the same tokens at the same speed. Long prompts prefill 1.36×
-(128K) and 1.53× (230K) faster than NInfer. At 230K NInfer's drafts were accepted more often on
-this prompt (4.67 against 3.15 tokens per round), so it decoded faster; without speculation decode
-is level (59.5 tok/s against 58.9 at 230K, 79.7 against 78.9 at 8K). NInfer kept the 8K prompt
-cached through the two 230K prompts that followed it (a repeat took 0.29 s); Infernix had evicted
-it (0.85 s).
+Long prompts prefill 1.57× (128K) and 1.76× (230K) faster than NInfer; plain decode is 3-4 %
+faster. DFlash2 decode depends on how many drafts each engine's text accepts: NInfer decoded the
+two 128K prompts at 206 and 161 tok/s, Infernix at 218 and 201. NInfer kept the 8K prompt cached
+through the two 128K prompts that followed it (a repeat took 0.15 s); Infernix had evicted it
+(0.76 s).
 
-**Agentic replay** (five seeds; `--max-context 150000` for every engine: the largest at which
-NInfer starts with two requests and DFlash2 on 32 GB):
+**Agentic replay** (five seeds; `--max-context 200000` for both engines, the largest at which NInfer
+starts with two requests and DFlash2; Infernix also uses n-gram drafting):
 
-| Metric | NInfer | Infernix | Infernix first release | Infernix vs NInfer | vs first release |
-|---|---:|---:|---:|---:|---:|
-| Average time to first token | 4.1 s (3.2-5.0) | 2.8 s (2.0-3.2) | **2.5 s** (2.3-2.7) | −33 % | +12 % |
-| Median time to first token | 1.10 s (0.93-1.58) | 0.43 s (0.38-0.50) | **0.41 s** (0.35-0.46) | −59 % | +5 % |
-| 90th-percentile time to first token | 12.1 s (9.3-15.2) | 8.4 s (5.0-10.1) | **8.1 s** (6.3-9.7) | −30 % | +4 % |
-| Prompt tokens served from cache | 79.2 % (78.7-79.4) | **85.4 %** (85.0-85.6) | **85.4 %** (85.0-85.6) | +6.2 points | 0 points |
-| Prompt tokens prefilled | 562K | **398K** | 399K | −29 % | −0.2 % |
-| Prefill tok/s, requests with no cache hit | 5,228 | **7,193** | 7,150 | +38 % | +1 % |
-| Output tok/s, one request decoding | 193 (189-202) | **202** (195-213) | 200 (194-205) | +5 % | +1 % |
-| Output tok/s, at the run's own batching | 231 (222-250) | **261** (254-269) | 254 (240-278) | +13 % | +3 % |
-| Workload wall time | 7.1 min (6.2-8.0) | **6.2 min** (5.6-6.6) | 6.3 min (5.9-6.7) | −13 % | −2 % |
+| Metric | NInfer | Infernix | Infernix vs NInfer |
+|---|---:|---:|---:|
+| Average time to first token | 3.4 s (2.7-3.8) | **3.1 s** (2.8-3.3) | −7 % |
+| Median time to first token | 1.14 s (0.95-1.35) | **0.52 s** (0.45-0.61) | −54 % |
+| 90th-percentile time to first token | 10.0 s (7.4-11.8) | 10.0 s (8.8-11.4) | +3 % |
+| Average TTFT, continuing-session turns | **2.57 s** (1.77-3.26) | 2.93 s (2.62-3.39) | +18 % |
+| Average TTFT, new long prompts | 10.2 s (9.4-10.9) | **6.4 s** (6.1-6.9) | −37 % |
+| Prompt tokens served from cache | 79.0 % (78.7-79.4) | **85.3 %** (85.0-85.6) | +6.3 points |
+| Prompt tokens prefilled | 562K | **396K** | −30 % |
+| Prefill tok/s, requests with no cache hit | 4,986 | **7,176** | +44 % |
+| Output tok/s, one request decoding | **194** (187-199) | 192 (187-198) | −1 % |
+| Output tok/s, at the run's own batching | 229 (213-241) | **254** (238-274) | +11 % |
+| Tokens per round (draft acceptance) | **3.23** | 3.17 | −2 % |
+| Workload wall time | 7.1 min (6.2-8.0) | **6.0 min** (5.6-6.6) | −13 % |
 
-Against the first release the engine does the same work at the same speed: each request's prompt
-takes the engine 0.74 s on average on both builds, and the requests hold a lane for 2,253 s in all
-against 2,277 s (5.16 against 5.22 ms per output token). The higher time to the first token is time
-spent waiting for one of the two lanes (2.03 s against 1.81 s per request, more on four of the five
-seeds), which depends on how long the sampled replies ahead of a request ran: both builds wrote
-390K output tokens in all, but in different turns (67-88K per seed). Wall time depends on it too.
-Quality is level: on the repository's 1.04M-token perplexity corpus (16K
-context, INT8 KV cache) Infernix scores 4.468 against 4.479 for NInfer (`master` at `81c8ce09` with
-the Windows port).
+Infernix's continuing-session turns reached the first token later on average (2.93 s against
+2.57 s; later on three of the five seeds, by 15-48 %, and sooner on two), and the 90th percentile
+is level. That time is mostly waiting for one of the two lanes behind other sessions' replies,
+whose lengths are sampled and differ between the arms (2.63 s against 2.04 s of queueing per
+turn). Without the queue, as the servers report it, Infernix reached the first token sooner on 249
+of the 255 continuing turns (0.29 s against 0.52 s on average). The six exceptions were
+0.05-0.12 s slower: one had more to prefill, and five were the first prefill after the GPU had been
+idle for 3 s or more, which costs both engines about 0.29 s. Infernix also holds a lane for less
+time per output token (6.1-6.4 ms against 6.6-7.8 ms per seed). Single-request decode is level.
+Quality is level: on the repository's
+1.04M-token perplexity corpus (16K context, INT8 KV cache) Infernix scores 4.468 against 4.479 for
+NInfer (measured with `master` at `81c8ce09` and the Windows port).
 
 ## Quality
 
@@ -308,9 +386,9 @@ repository's model card gives its files, requirements, recommended command, qual
 
 | Repository | Converted from | What it is |
 |---|---|---|
-| **[Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix)** (**recommended**) | [nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) | NVIDIA's NVFP4 experts and FP8 n-gram table bit-exact, the dense projections in 8 bits. It decodes about 22 % faster than the bit-exact conversion at the same quality (perplexity 4.654 against 4.666) and is the one benchmarked [above](#qwen38-flash-next-nvfp4-infernix-vs-strata). |
+| **[Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix)** (**recommended**) | [nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) | NVIDIA's NVFP4 experts and FP8 n-gram table bit-exact, the dense projections in 8 bits. It decodes about 22 % faster than the bit-exact conversion at the same quality (perplexity 4.654 against 4.666) and is the one benchmarked [above](#qwen38-flash-next-nvfp4-infernix-vs-strata-and-strata-nvfp4). |
 | [Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix) | [nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) | Every weight the model computes with exactly as NVIDIA stores it, for when the weights must be unchanged. |
-| [Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix) | [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) (`IQ3_S`) | Every GGUF tensor bit-exact, computed in exact integer arithmetic, plus an MTP drafter and vision. The fastest decode: 146 tok/s plain and 260 with MTP against Dense8's 110 and 143 in the same session, with the experts in 46.9 GiB of RAM. Long prompts prefill slower than NVFP4 (4,324 against 10,933 tok/s at 131K tokens). |
+| [Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix) | [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) (`IQ3_S`) | Every GGUF tensor bit-exact, computed in exact integer arithmetic, plus an MTP drafter and vision. The fastest decode: 146 tok/s plain and 260 with MTP against Dense8's 110 and 143 in the same session, with the experts in 46.9 GiB of RAM. Long prompts prefill slower than NVFP4 (4,324 against 10,933 tok/s at 131K tokens) and than Strata on the same GGUF ([benchmarks](#qwen38-flash-next-iq3_s-infernix-vs-strata)). |
 | [Qwen3.8-Flash-Next-FP8-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-FP8-Infernix) | [Qwen/Qwen3.8-Flash-Next-FP8](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8) | Qwen's FP8 checkpoint bit-exact, with Qwen's BF16 n-gram table: the most accurate conversion and the slowest (about 44 tok/s plain), since its 112.6 GiB of experts exceed what a 96 GB machine can pin and the SSD tier reads the rest. |
 | [Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix) | [orcarouter/Qwen3.8-Flash-Next-Uncensored-NVFP4](https://huggingface.co/orcarouter/Qwen3.8-Flash-Next-Uncensored-NVFP4) | An abliterated build whose refusal behaviour has been removed (see its model card). Its weight-only NVFP4 experts and FP8 dense projections are kept bit-exact and run with BF16 activations; the other dense classes are stored in 8 bits as in Dense8. Perplexity 4.772 (Strata's base-model GGUF 4.844, NVIDIA Dense8 4.653: abliteration changes the weights). Needs Infernix `windows-2026.10.09.2` or later. |
 | [Swift-1.5-Qwen3.8-Flash-Next-NVFP4-Dense8-Infernix](https://huggingface.co/Wallawalla47/Swift-1.5-Qwen3.8-Flash-Next-NVFP4-Dense8-Infernix) | [ukisai/Swift-1.5-Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-NVFP4) | UkisAI's fine-tune that thinks with fewer tokens (see its model card), converted like NVIDIA Dense8: experts bit-exact, dense projections in 8 bits. Smoke-tested; its quality and speed are not yet measured. |

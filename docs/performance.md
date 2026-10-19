@@ -22,7 +22,8 @@ not product support. C is configured request concurrency; K is the number of dra
 | Qwen3.8-27B / `nvfp4` | [8K–256K](performance/qwen3.8-27b.md#no-speculation-context-profile) | [MTP3; DFlash2 K=7](performance/qwen3.8-27b.md#single-request-speculative-decode) | [MTP3 C=1, 2, 4, 8; DFlash2 C=1](performance/qwen3.8-27b.md#corpus-makespan) | [C=1, 2, 4, 8](performance/qwen3.8-27b.md#decode-saturation) |
 
 Qwen3.8-Flash-Next has no row: its published figures are the README's
-[comparison with Strata](../README.md#qwen38-flash-next-nvfp4-infernix-vs-strata), measured with that
+comparisons with [Strata and strata-nvfp4](../README.md#qwen38-flash-next-nvfp4-infernix-vs-strata-and-strata-nvfp4)
+and [Strata on IQ3_S](../README.md#qwen38-flash-next-iq3_s-infernix-vs-strata), measured with that
 section's client-side method rather than this page's, and its own guide's
 [performance notes](qwen3_8-flash-next.md#performance).
 
