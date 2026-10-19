@@ -884,6 +884,9 @@ JsonlRequestLog::JsonlRequestLog(const std::string& path,
                                  std::shared_ptr<spdlog::logger> logger,
                                  RequestLogRotation rotation)
     : path_(path), logger_(std::move(logger)), rotation_(rotation) {
+    // The metrics JSON reports this id even when no request log is written, so assign it before
+    // the disabled-path return.
+    server_instance_id_ = new_server_instance_id();
     if (path_.empty()) { return; }
     if (rotation_.keep > kMaximumRequestLogKeep) {
         throw std::invalid_argument("request JSONL log keeps too many rotated files");
@@ -901,7 +904,6 @@ JsonlRequestLog::JsonlRequestLog(const std::string& path,
             }
         }
     }
-    server_instance_id_ = new_server_instance_id();
     output_.open(path_, std::ios::out | std::ios::app);
     if (!output_) {
         throw std::runtime_error("failed to open request JSONL log for append: " + path_);
