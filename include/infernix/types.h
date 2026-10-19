@@ -49,6 +49,26 @@ enum class KvCacheStorage : std::uint8_t {
     Q4KeyVq2Value,
 };
 
+[[nodiscard]] inline const char* kv_cache_name(KvCacheStorage storage) noexcept {
+    switch (storage) {
+    case KvCacheStorage::BFloat16:
+        return "bf16";
+    case KvCacheStorage::Int8Group64:
+        return "int8";
+    case KvCacheStorage::Fp8E4M3Row256:
+        return "fp8";
+    case KvCacheStorage::Nvfp4Group16:
+        return "nvfp4";
+    case KvCacheStorage::Fp8KeyNvfp4Value:
+        return "k8v4";
+    case KvCacheStorage::Vq2:
+        return "vq2";
+    case KvCacheStorage::Q4KeyVq2Value:
+        return "k4v2";
+    }
+    return "unknown";
+}
+
 // A fast path: a route whose arithmetic differs from the default route's, run only under
 // EngineOptions::fast_paths and only for the configurations it is qualified for
 // (docs/maintainer/model-quality.md section 6.7 lists each with its evidence).

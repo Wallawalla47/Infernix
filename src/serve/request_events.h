@@ -94,6 +94,26 @@ struct RequestFailure {
     std::string machine_message;
 };
 
+// The terminal finish reason as it appears in the request log and the metrics JSON.
+// One spelling for every writer; changing a string changes an external contract.
+[[nodiscard]] inline const char* finish_reason_name(infernix::FinishReason reason) noexcept {
+    switch (reason) {
+    case infernix::FinishReason::None:
+        return "none";
+    case infernix::FinishReason::OutputLimit:
+        return "output_limit";
+    case infernix::FinishReason::ContextCapacity:
+        return "context_capacity";
+    case infernix::FinishReason::StopToken:
+        return "stop_token";
+    case infernix::FinishReason::StopString:
+        return "stop_string";
+    case infernix::FinishReason::Cancelled:
+        return "cancelled";
+    }
+    return "unknown";
+}
+
 struct ThroughputReport {
     double interval_seconds               = 0.0;
     std::uint64_t computed_prefill_tokens = 0;

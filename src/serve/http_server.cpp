@@ -1,6 +1,7 @@
 #include "serve/http_server.h"
 
 #include "product/logging/logging.h"
+#include "product/speculative_options.h"
 #include "serve/anthropic_messages.h"
 #include "serve/http_transport.h"
 #include "serve/openai_common.h"
@@ -277,6 +278,7 @@ infernix::GenerationSchedulingObserver HttpServer::scheduling_observer(std::uint
 void HttpServer::record_request_done(const RequestLogContext& context,
                                      const GenerationOutcome& outcome) {
     metrics_.done(outcome);
+    metrics_json_history_.done(context, outcome);
     request_jsonl_.write_request_done(context, outcome);
     operational_log_.request_done(context, outcome);
     if (console_stats_) { console_stats_->request_done(outcome); }
@@ -284,7 +286,10 @@ void HttpServer::record_request_done(const RequestLogContext& context,
 
 void HttpServer::record_request_failure(const RequestLogContext& context,
                                         const RequestFailure& failure) {
-    metrics_.failed(failure.classification == RequestFailureClass::ClientDisconnected);
+    const bool cancelled =
+        failure.classification == RequestFailureClass::ClientDisconnected;
+    metrics_.failed(cancelled);
+    metrics_json_history_.failure(context, cancelled);
     request_jsonl_.write_request_error(context, failure.machine_message);
     operational_log_.request_failure(context, failure);
     if (console_stats_) { console_stats_->request_failure(failure); }
@@ -295,7 +300,49 @@ void HttpServer::record_response_failure(std::uint64_t request_id, const Request
     operational_log_.response_failure(request_id, failure);
 }
 
+namespace {
+
+double unix_time_seconds_now() {
+    return std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+} // namespace
+
+std::string HttpServer::metrics_json_body() const {
+    MetricsJsonSnapshot snapshot;
+    const infernix::LoadSummary load      = service_->load_summary();
+    const infernix::EngineOptions& engine = service_->engine_options();
+    const Metrics::RequestCounts counts   = metrics_.counts();
+
+    snapshot.instance_id         = request_jsonl_.server_instance_id();
+    snapshot.model               = public_model_id_;
+    snapshot.architecture        = load.architecture;
+    snapshot.weights             = load.weight_formats.empty() ? std::string{}
+                                                               : load.weight_formats.front();
+    snapshot.kv                  = infernix::kv_cache_name(engine.kv_cache);
+    snapshot.speculative_backend = product::speculative_backend_name(engine.speculative.backend);
+    snapshot.time_unix           = unix_time_seconds_now();
+    snapshot.start_time_unix     = metrics_.start_time_seconds();
+    snapshot.max_context         = engine.max_context;
+    snapshot.max_concurrency     = engine.max_concurrency;
+    snapshot.stats               = service_->runtime_stats();
+    snapshot.counts              = {.completed = counts.completed,
+                                    .cancelled = counts.cancelled,
+                                    .failed    = counts.failed,
+                                    .rejected  = counts.rejected};
+    snapshot.requests            = metrics_json_history_.rows();
+    snapshot.rates_valid         = metrics_json_history_.rates(snapshot.decode_tokens_per_second,
+                                                               snapshot.prefill_tokens_per_second);
+    return render_metrics_json(snapshot);
+}
+
 void HttpServer::record_throughput(const ThroughputReport& report) {
+    if (report.interval_seconds > 0.0) {
+        metrics_json_history_.set_rates(
+            static_cast<double>(report.committed_decode_tokens) / report.interval_seconds,
+            static_cast<double>(report.computed_prefill_tokens) / report.interval_seconds);
+    }
     request_jsonl_.write_throughput(report);
     operational_log_.throughput(report);
 }
@@ -472,10 +519,22 @@ void HttpServer::register_routes() {
                 [this](const httplib::Request& req, httplib::Response& res) {
                     handle_models(req, res);
                 });
-    server_.Get("/metrics", [this](const httplib::Request&, httplib::Response& res) {
-        const auto stats = service_->runtime_stats();
+    server_.Get("/metrics", [this](const httplib::Request& req, httplib::Response& res) {
+        const MetricsFormat format = select_metrics_format(req.get_param_value("format"),
+                                                           req.get_header_value("Accept"));
         res.set_header("Cache-Control", "no-store");
-        res.set_content(metrics_.render(stats, service_->is_available()),
+        if (format == MetricsFormat::Invalid) {
+            res.status = 400;
+            res.set_content(
+                R"({"error":{"code":"invalid_format","message":"format must be json or prometheus"}})",
+                "application/json; charset=utf-8");
+            return;
+        }
+        if (format == MetricsFormat::Json) {
+            res.set_content(metrics_json_body(), "application/json; charset=utf-8");
+            return;
+        }
+        res.set_content(metrics_.render(service_->runtime_stats(), service_->is_available()),
                         "text/plain; version=0.0.4; charset=utf-8");
     });
     server_.Get(api_route_pattern(R"(/models/(.+))"),

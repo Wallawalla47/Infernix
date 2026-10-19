@@ -21,6 +21,16 @@ public:
     void response_failed();
     [[nodiscard]] std::string render(const RuntimeStats& runtime, bool ready) const;
 
+    struct RequestCounts {
+        std::uint64_t completed         = 0;
+        std::uint64_t cancelled         = 0;
+        std::uint64_t failed            = 0;
+        std::uint64_t rejected          = 0;
+        std::uint64_t response_failures = 0;
+    };
+    [[nodiscard]] RequestCounts counts() const;
+    [[nodiscard]] double start_time_seconds() const noexcept { return start_seconds_; }
+
 private:
     struct Histogram {
         // Disjoint bins while recording; cumulative buckets are produced only when scraped.

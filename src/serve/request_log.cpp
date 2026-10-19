@@ -84,24 +84,6 @@ std::string cuda_uuid_string(const cudaUUID_t& uuid) {
     return out.str();
 }
 
-const char* finish_reason_name(infernix::FinishReason reason) {
-    switch (reason) {
-    case infernix::FinishReason::None:
-        return "none";
-    case infernix::FinishReason::OutputLimit:
-        return "output_limit";
-    case infernix::FinishReason::ContextCapacity:
-        return "context_capacity";
-    case infernix::FinishReason::StopToken:
-        return "stop_token";
-    case infernix::FinishReason::StopString:
-        return "stop_string";
-    case infernix::FinishReason::Cancelled:
-        return "cancelled";
-    }
-    return "unknown";
-}
-
 Json tool_call_parse_json(const infernix::ToolCallParseDiagnostics& diagnostics) {
     return Json{{"marker_seen", diagnostics.marker_seen},
                 {"structured_call_count", diagnostics.structured_call_count},
