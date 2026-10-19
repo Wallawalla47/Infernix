@@ -1505,10 +1505,10 @@ would make the series cardinality unbounded.
 | `requests` | the last 128 settled generation requests (completed, cancelled, failed), oldest first; requests rejected before generation appear only in `totals.rejected` |
 
 Each request row carries its id, completion time in Unix seconds, protocol, finish reason, token
-counts, cache reuse, TTFT/prefill/decode/total seconds, speculative draft and accept counts, and the
-Qwen3.8-Flash-Next expert-cache lookups. Time sums the engine does not accumulate (`prompt_ms` and
-`decode_ms` at the totals level) are `null`. There is no `hardware` object: the engine measures no
-GPU telemetry, and an absent block is honest where a zero would not be.
+counts, cache reuse, TTFT/prompt/decode milliseconds, total seconds, speculative draft and accept
+counts, and the Qwen3.8-Flash-Next expert-cache lookups. Time sums the engine does not accumulate
+(`prompt_ms` and `decode_ms` at the totals level) are `null`. There is no `hardware` object: the
+engine measures no GPU telemetry, and an absent block is honest where a zero would not be.
 
 The route follows the server's API-key authentication. The document contains no prompt, completion,
 tool argument, header value, key, or client address. `requests` is a bounded window, not a durable
