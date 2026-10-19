@@ -1,5 +1,6 @@
 #include "infernix_build_id.h"
 #include "options.h"
+#include "product/config/config_file.h"
 #include "product/logging/logging.h"
 #include "product/logging/pretty_format.h"
 #include "product/logging/engine_diagnostics.h"
@@ -307,6 +308,9 @@ int main(int argc, char** argv) {
 #ifdef INFERNIX_BUILD_ID
     logger->info("build {}", INFERNIX_BUILD_ID);
 #endif
+    if (cli.config_path) {
+        logger->info("{}", infernix::product::describe_config(*cli.config_path, cli.config_arguments));
+    }
     infernix::product::StartupLogRenderer startup_log(logging);
 
     try {

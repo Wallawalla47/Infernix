@@ -42,7 +42,7 @@ std::string parse_error(std::vector<std::string> arguments) {
 // Replaces the scratch --config file's contents and returns its path.
 std::string write_config(const std::string& text) {
     const std::filesystem::path path =
-        std::filesystem::temp_directory_path() / "infernix-serve-options-config.json";
+        std::filesystem::temp_directory_path() / "infernix-serve-options-config.toml";
     std::ofstream file(path, std::ios::binary | std::ios::trunc);
     file << text;
     return path.string();
@@ -1069,13 +1069,18 @@ int main() {
                           std::string::npos,
                       "serve help omits --claude-code-prompt");
 
-    // --config FILE: options from a JSON object keyed by their long names. The command line
+    // --config FILE: options from a TOML file keyed by their long names. The command line
     // overrides the file wherever --config appears, and the file overrides the defaults.
     {
-        const std::string config = write_config(
-            R"({"port": 9000, "max-context": 4096, "kv-dtype": "int8", "temperature": 0.7,)"
-            R"( "greedy": true, "no-thinking": true, "preserve-thinking": false,)"
-            R"( "claude-code-prompt": "local"})");
+        const std::string config = write_config("# serving defaults\n"
+                                                 "port = 9000\n"
+                                                 "max-context = 4096\n"
+                                                 "kv-dtype = \"int8\"\n"
+                                                 "temperature = 0.7\n"
+                                                 "greedy = true\n"
+                                                 "no-thinking = true\n"
+                                                 "preserve-thinking = false\n"
+                                                 "claude-code-prompt = \"local\"\n");
         const ServeOptions from_file = parse({"infernix-serve", "model.ninfer", "--config", config});
         failures += check(from_file.port == 9000 && from_file.max_context == 4096 &&
                               from_file.kv_cache == infernix::KvCacheStorage::Int8Group64 &&
@@ -1098,28 +1103,74 @@ int main() {
                                   overridden.max_context == 4096 && overridden.greedy,
                               "the command line did not override --config");
         }
-        failures += check(parse({"infernix-serve", "model.ninfer", "--config",
-                                 write_config(R"({"api-key": "from-file"})")})
-                                  .api_key == "from-file",
-                          "--config did not set a secret-bearing option");
+        // A secret-bearing value reaches the option but is redacted in the recorded provenance.
+        const ServeOptions secret = parse(
+            {"infernix-serve", "model.ninfer", "--config", write_config("api-key = \"from-file\"\nport = 9001\n")});
+        failures += check(secret.api_key == "from-file" && secret.config_path &&
+                              secret.config_arguments == std::vector<std::string>{"--api-key", "<redacted>",
+                                                                                  "--port", "9001"},
+                          "--config did not set a secret-bearing option, or recorded its value");
 
-        // Each rejection names the offending key, so a bad file is never applied in part silently.
+        // The [serve] table overrides the top level; [cli] is infernix's and is not read here.
+        const ServeOptions tabled =
+            parse({"infernix-serve", "model.ninfer", "--config",
+                   write_config("max-context = 4096\ntop-k = 20\n[serve]\nmax-context = 8192\n"
+                                "[cli]\nprompt = \"hello\"\nmax-context = 2048\n")});
+        failures += check(tabled.max_context == 8192 && tabled.sampling_overrides.top_k == 20,
+                          "[serve] did not override the top level, or [cli] was read by infernix-serve");
+
+        // The `model` key names the artifact when the command line does not.
+        const std::string with_model = write_config("model = \"from-file.infernix\"\nport = 9002\n");
+        failures += check(parse({"infernix-serve", "--config", with_model}).artifact_path == "from-file.infernix" &&
+                              parse({"infernix-serve", "--config", with_model}).port == 9002,
+                          "--config's model key did not name the artifact");
+        failures += check(parse({"infernix-serve", "cmd.infernix", "--config", with_model}).artifact_path ==
+                              "cmd.infernix",
+                          "the command line's artifact path did not override the file's");
+        failures += check(parse_error({"infernix-serve", "--config", write_config("port = 9000\n")})
+                                  .find("artifact path is required") != std::string::npos,
+                          "a config without a model ran with no artifact path");
+
+        // The repository's example file configures infernix-serve as written.
+        const ServeOptions example =
+            parse({"infernix-serve", "--config", std::string(INFERNIX_SOURCE_DIR) + "/infernix.example.toml"});
+        failures += check(example.artifact_path.ends_with(".infernix") && example.max_context == 262144 &&
+                              example.max_concurrency == 2 &&
+                              example.kv_cache == infernix::KvCacheStorage::Int8Group64,
+                          "infernix.example.toml does not configure infernix-serve as written");
+
+        // A repeatable option takes an array; the command line's values add to the file's.
+        const ServeOptions repeated =
+            parse({"infernix-serve", "model.ninfer", "--config",
+                   write_config("fast-path = [\"sampled-mtp-drafts\"]\n"), "--fast-path", "preemption"});
+        failures += check(repeated.fast_path_candidates ==
+                              std::vector<infernix::FastPath>{infernix::FastPath::SampledMtpDrafts,
+                                                              infernix::FastPath::Preemption},
+                          "--config's array of a repeatable option did not reach the option in order");
+
+        // Each rejection names the offending key and its line, so a bad file is never applied in
+        // part silently.
         for (const auto& [text, expected] : std::vector<std::pair<std::string, std::string>>{
-                 {R"({"prefil-chunk": 4096})", "unknown option 'prefil-chunk'"},
-                 {R"({"--port": 9000})", "unknown option '--port'"},
-                 {R"({"help": true})", "unknown option 'help'"},
-                 {R"({"port": true})", "'port' takes a string or a number"},
-                 {R"({"port": [8080, 8081]})", "'port' takes a string or a number"},
-                 {R"({"port": null})", "'port' takes a string or a number"},
-                 {R"({"max-context": {"tokens": 4096}})", "'max-context' takes a string or a number"},
-                 {R"({"greedy": "yes"})", "'greedy' is a flag"},
-                 {R"({"greedy": 1})", "'greedy' is a flag"},
-                 {R"({"port": 9000, "port": 9100})", "repeats the key 'port'"},
-                 {R"({"config": "other.json"})", "cannot name another"},
-                 {R"([{"port": 9000}])", "must be a JSON object"},
-                 {R"({"port": 9000,)", "invalid JSON"},
-                 {R"({"prefill-chunk": 100})", "--prefill-chunk must be a positive multiple of 128"},
-                 {R"({"port": "http"})", "invalid port: http"}}) {
+                 {"prefil-chunk = 4096", "unknown option 'prefil-chunk'"},
+                 {"\n\nprefil-chunk = 4096", ":3:1: unknown option 'prefil-chunk'"},
+                 {"\"--port\" = 9000", "unknown option '--port'"},
+                 {"help = true", "unknown option 'help'"},
+                 {"max_context = 4096", "option names use dashes"},
+                 {"port = true", "'port' takes a string or a number"},
+                 {"port = [8080, 8081]", "'port' takes one value, not an array"},
+                 {"fast-path = [true]", "'fast-path' takes strings or numbers"},
+                 {"max-context = 2026-10-19", "'max-context' takes a string or a number"},
+                 {"greedy = \"yes\"", "'greedy' is a flag"},
+                 {"greedy = 1", "'greedy' is a flag"},
+                 {"port = 9000\nport = 9100", "invalid TOML"},
+                 {"config = \"other.toml\"", "cannot name another"},
+                 {"model = 5", "'model' takes the artifact path as a string"},
+                 {"[server]\nport = 9000", "unknown table 'server'"},
+                 {"serve = 1", "'serve' must be a table"},
+                 {"[serve.http]\nport = 9000", "a table holds options, not other tables"},
+                 {"port = 9000,", "invalid TOML"},
+                 {"prefill-chunk = 100", "--prefill-chunk must be a positive multiple of 128"},
+                 {"port = \"http\"", "invalid port: http"}}) {
             const std::string error =
                 parse_error({"infernix-serve", "model.ninfer", "--config", write_config(text)});
             failures += check(error.find(expected) != std::string::npos,
@@ -1132,7 +1183,7 @@ int main() {
                  {{"infernix-serve", "model.ninfer", "--config"}, "--config needs a value"},
                  {{"infernix-serve", "model.ninfer", "--config",
                    (std::filesystem::temp_directory_path() / "infernix-missing-directory-for-test" /
-                    "serve.json")
+                    "serve.toml")
                        .string()},
                   "cannot be read"}}) {
             failures += check(parse_error(command).find(expected) != std::string::npos,
@@ -1164,12 +1215,13 @@ int main() {
             const bool takes_value = parse_error({"infernix-serve", "model.ninfer", option})
                                          .ends_with(option + " needs a value");
             const std::string key   = option.substr(2);
-            const std::string error = parse_error(
-                {"infernix-serve", "model.ninfer", "--config",
-                 write_config(takes_value ? "{\"" + key + "\": \"1\"}" : "{\"" + key + "\": true}")});
+            const std::string error =
+                parse_error({"infernix-serve", "model.ninfer", "--config",
+                             write_config(takes_value ? key + " = \"1\"\n" : key + " = true\n")});
             failures += check(error.find("unknown option") == std::string::npos &&
                                   error.find("is a flag") == std::string::npos &&
                                   error.find("takes a string") == std::string::npos &&
+                                  error.find("invalid TOML") == std::string::npos &&
                                   error.find("has no parser") == std::string::npos,
                               ("--config does not accept the serve option " + option).c_str());
         }

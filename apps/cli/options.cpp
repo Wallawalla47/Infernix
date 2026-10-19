@@ -1,12 +1,16 @@
 #include "options.h"
+#include "product/config/config_file.h"
 #include "product/speculative_options.h"
 
+#include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cmath>
 #include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string_view>
+#include <utility>
 
 namespace infernix::cli {
 namespace {
@@ -68,6 +72,88 @@ KvCapacityPolicy parse_kv_capacity(const char* text) {
     return KvCapacityPolicy::explicit_capacity(parse_u32(text, "kv-capacity"));
 }
 
+// Every option parse_options accepts after the model path, whether it takes a value and whether it
+// repeats. --config maps a file's keys through this table, so a config file accepts exactly the
+// command line's options with the same arity.
+using CliOption = product::ConfigOption;
+
+constexpr std::array kCliOptions{
+    CliOption{"--prompt"},
+    CliOption{"--messages"},
+    CliOption{"--chat-template"},
+    CliOption{"--ngram-volume"},
+    CliOption{"--ngram-residency"},
+    CliOption{"--expert-state"},
+    CliOption{"--expert-stripe"},
+    CliOption{"--grammar-file"},
+    CliOption{"--json-object", false},
+    CliOption{"--json-schema-file"},
+    CliOption{"--regex"},
+    CliOption{"--choice", true, true},
+    CliOption{"--max-new"},
+    CliOption{"--rope-yarn-factor"},
+    CliOption{"--max-context"},
+    CliOption{"--kv-capacity"},
+    CliOption{"--vram-past-budget", false},
+    CliOption{"--expert-tail-skip"},
+    CliOption{"--vram-headroom-mib"},
+    CliOption{"--prefill-chunk"},
+    CliOption{"--device"},
+    CliOption{"--ram-headroom-mib"},
+    CliOption{"--expert-ram-mib"},
+    CliOption{"--expert-pin-mib"},
+    CliOption{"--kv-dtype"},
+    CliOption{"--spec"},
+    CliOption{"--draft-tokens"},
+    CliOption{"--spec-min-p"},
+    CliOption{"--ngram-draft-tokens"},
+    CliOption{"--ngram-min-match"},
+    CliOption{"--draft-tree-nodes"},
+    CliOption{"--draft-tree-paths"},
+    CliOption{"--lm-head-draft", false},
+    CliOption{"--raw-output", false},
+    CliOption{"--print-token-ids", false},
+    CliOption{"--log-colours"},
+    CliOption{"--no-thinking", false},
+    CliOption{"--thinking-budget"},
+    CliOption{"--reasoning-loop"},
+    CliOption{"--reasoning-effort"},
+    CliOption{"--vision", false},
+    CliOption{"--vision-offload"},
+    CliOption{"--vision-max-merged"},
+    CliOption{"--no-cuda-graph", false},
+    CliOption{"--use-original-int8-prefill-kernel", false},
+    CliOption{"--prefill-split-workspace-mib"},
+    CliOption{"--use-original-nvfp4-prefill-kernel", false},
+    CliOption{"--disable-fast-paths", false},
+    CliOption{"--fast-path", true, true},
+    CliOption{"--stop-token-id", true, true},
+    CliOption{"--stop", true, true},
+    CliOption{"--reasoning-stop", true, true},
+    CliOption{"--temperature"},
+    CliOption{"--top-p"},
+    CliOption{"--top-k"},
+    CliOption{"--min-p"},
+    CliOption{"--presence-penalty"},
+    CliOption{"--frequency-penalty"},
+    CliOption{"--seed"},
+    CliOption{"--greedy", false},
+    CliOption{"--log-level"},
+};
+
+const CliOption* find_option(std::string_view name) noexcept {
+    const auto found = std::find_if(kCliOptions.begin(), kCliOptions.end(),
+                                    [&](const CliOption& option) { return option.name == name; });
+    return found == kCliOptions.end() ? nullptr : &*found;
+}
+
+// infernix's --config: top-level keys and the [cli] table; [serve] is infernix-serve's.
+const product::ConfigProgram& cli_config_program() {
+    static const product::ConfigProgram program{
+        .table = "cli", .other_table = "serve", .find_option = [](std::string_view name) { return find_option(name); }};
+    return program;
+}
+
 ReasoningEffort parse_reasoning_effort(std::string_view text) {
     if (text == "none") { return ReasoningEffort::None; }
     if (text == "minimal") { return ReasoningEffort::Minimal; }
@@ -104,10 +190,19 @@ std::string usage_text(const char* argv0) {
            "       [--vision] [--vision-offload auto|on|off] [--vision-max-merged N]\n"
            "       [--no-cuda-graph]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n"
+           "       " + argv0 + " --config FILE [options]   (FILE gives the model)\n"
            "\n"
            "Runs one generation: answer content streams to stdout, reasoning and\n"
            "diagnostics to stderr. Sampling defaults come from the loaded model and\n"
            "thinking mode; flags override individual fields.\n"
+           "\n"
+           "  --config FILE            read options from a TOML file keyed by the long option\n"
+           "                           names without the dashes, e.g. max-context = 32768,\n"
+           "                           kv-dtype = \"int8\", greedy = true (a flag takes true or\n"
+           "                           false; a repeatable option an array); model = \"PATH\"\n"
+           "                           names the model; keys in a [cli] table apply only here,\n"
+           "                           [serve] only to infernix-serve. Options on the command\n"
+           "                           line override the file\n"
            "\n"
            "CONTEXT\n"
            "  --max-context N          max context tokens (default 2048)\n"
@@ -245,16 +340,24 @@ Options parse_options(int argc, char** argv) {
         options.help_requested = true;
         return options;
     }
-    if (argc < 2) { throw std::invalid_argument("a model path (.infernix or .ninfer) is required"); }
-    options.artifact_path     = argv[1];
+    product::ProgramArguments program = product::read_program_arguments(argc, argv, cli_config_program());
+    if (program.model.empty()) {
+        throw std::invalid_argument("a model path (.infernix or .ninfer) is required: give it first on "
+                                    "the command line or as `model` in the --config file");
+    }
+    options.artifact_path     = program.model;
+    options.config_path       = std::move(program.config_path);
+    options.config_arguments  = program.config_arguments;
     bool kv_capacity_explicit = false;
 
-    for (int i = 2; i < argc; ++i) {
-        const std::string_view arg(argv[i]);
+    const std::vector<std::string>& arguments = program.arguments;
+    for (std::size_t i = 0; i < arguments.size(); ++i) {
+        const std::string_view arg(arguments[i]);
         const auto value = [&](std::string_view flag) -> const char* {
-            if (++i >= argc) { throw std::invalid_argument(std::string(flag) + " needs a value"); }
-            return argv[i];
+            if (++i >= arguments.size()) { throw std::invalid_argument(std::string(flag) + " needs a value"); }
+            return arguments[i].c_str();
         };
+        if (find_option(arg) == nullptr) { throw std::invalid_argument("unknown argument: " + std::string(arg)); }
 
         if (arg == "--prompt") {
             options.prompt = value(arg);
@@ -462,7 +565,7 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--log-level") {
             options.log_level = product::parse_log_level(value(arg));
         } else {
-            throw std::invalid_argument("unknown argument: " + std::string(arg));
+            throw std::logic_error("CLI option " + std::string(arg) + " has no parser");
         }
     }
 

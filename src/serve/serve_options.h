@@ -125,11 +125,15 @@ struct ServeOptions {
     // Exact process argv for the server-start record. Secret-bearing option values are redacted
     // while parsing; this is provenance only and never affects execution.
     std::vector<std::string> startup_argv;
+    // --config FILE and the options it gave, secret-bearing values redacted (provenance only).
+    std::optional<std::string> config_path;
+    std::vector<std::string> config_arguments;
 };
 
-// argv[1] is the artifact path and the rest are options. `--config FILE` reads further options from
-// a JSON object keyed by their long names without the dashes; options on the command line override
-// the file, and the file overrides the defaults.
+// argv[1] is the artifact path and the rest are options. `--config FILE` reads further options, and
+// the artifact path when the command line has none, from a TOML file keyed by their long names
+// without the dashes (product/config/config_file.h); options on the command line override the
+// file, and the file overrides the defaults.
 ServeOptions parse_serve_options(int argc, char** argv);
 // "off", "stop" or "conclude".
 const char* reasoning_loop_name(infernix::ReasoningLoopAction action) noexcept;

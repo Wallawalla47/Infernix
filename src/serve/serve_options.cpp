@@ -1,7 +1,6 @@
 #include "serve/serve_options.h"
+#include "product/config/config_file.h"
 #include "product/speculative_options.h"
-
-#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <array>
@@ -9,28 +8,22 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
-#include <fstream>
-#include <iterator>
 #include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
 namespace infernix::serve {
 namespace {
 
-// Every option parse_serve_options accepts after the artifact path, and whether it takes a value.
-// The argument loop accepts nothing outside this table, and --config maps its keys through it, so
-// a config file accepts exactly the command line's options with the same arity.
-struct ServeOptionArity {
-    std::string_view name;
-    bool takes_value = true;
-};
+// Every option parse_serve_options accepts after the artifact path, whether it takes a value and
+// whether it repeats. The argument loop accepts nothing outside this table, and --config maps its
+// keys through it, so a config file accepts exactly the command line's options with the same arity.
+using ServeOptionArity = product::ConfigOption;
 
 constexpr std::array kServeOptionArities{
     ServeOptionArity{"--host"},
@@ -57,7 +50,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--prefill-split-workspace-mib"},
     ServeOptionArity{"--use-original-nvfp4-prefill-kernel", false},
     ServeOptionArity{"--disable-fast-paths", false},
-    ServeOptionArity{"--fast-path"},
+    ServeOptionArity{"--fast-path", true, true},
     ServeOptionArity{"--context-cost-presets"},
     ServeOptionArity{"--log-stats-interval-ms"},
     ServeOptionArity{"--log-colours"},
@@ -131,89 +124,14 @@ const ServeOptionArity* find_option(std::string_view name) noexcept {
     return found == kServeOptionArities.end() ? nullptr : &*found;
 }
 
-// The options of a --config file as command-line arguments, in the file's order. Keys are long
-// option names without the dashes; a flag takes true or false (false leaves it unset), any other
-// option a string or a number, which reaches the option's parser as its JSON text. Unknown and
-// repeated keys and other value types are rejected by name.
-std::vector<std::string> read_config_arguments(const std::string& path) {
-    using ConfigJson          = nlohmann::ordered_json;
-    const std::string context = "--config " + path + ": ";
-    std::ifstream file(std::filesystem::path(path), std::ios::binary);
-    if (!file) { throw std::invalid_argument(context + "cannot be read"); }
-    const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-    if (file.bad()) { throw std::invalid_argument(context + "cannot be read"); }
-
-    std::unordered_set<std::string> keys;
-    const ConfigJson::parser_callback_t reject_repeated_keys =
-        [&](int depth, ConfigJson::parse_event_t event, ConfigJson& parsed) {
-            if (event == ConfigJson::parse_event_t::key && depth == 1 &&
-                !keys.insert(parsed.get<std::string>()).second) {
-                throw std::invalid_argument(context + "repeats the key '" +
-                                            parsed.get<std::string>() + "'");
-            }
-            return true;
-        };
-    ConfigJson config;
-    try {
-        config = ConfigJson::parse(text, reject_repeated_keys);
-    } catch (const ConfigJson::exception& error) {
-        throw std::invalid_argument(context + "invalid JSON: " + error.what());
-    }
-    if (!config.is_object()) {
-        throw std::invalid_argument(context + "must be a JSON object of option names and values");
-    }
-
-    std::vector<std::string> arguments;
-    for (const auto& item : config.items()) {
-        const std::string& key  = item.key();
-        const ConfigJson& value = item.value();
-        if (key == "config") {
-            throw std::invalid_argument(context + "a config file cannot name another one");
-        }
-        const std::string option      = "--" + key;
-        const ServeOptionArity* arity = find_option(option);
-        if (arity == nullptr) { throw std::invalid_argument(context + "unknown option '" + key + "'"); }
-        if (!arity->takes_value) {
-            if (!value.is_boolean()) {
-                throw std::invalid_argument(context + "'" + key +
-                                            "' is a flag and takes true or false");
-            }
-            if (value.get<bool>()) { arguments.push_back(option); }
-        } else if (value.is_string() || value.is_number()) {
-            arguments.push_back(option);
-            arguments.push_back(value.is_string() ? value.get<std::string>() : value.dump());
-        } else {
-            throw std::invalid_argument(context + "'" + key + "' takes a string or a number");
-        }
-    }
-    return arguments;
-}
-
-// The options after the artifact path, with those of `--config FILE` ahead of the command line's:
-// a later option overrides an earlier one, so the command line takes precedence over the file.
-std::vector<std::string> collect_arguments(int argc, char** argv) {
-    std::vector<std::string> command_line;
-    std::optional<std::string> config_path;
-    for (int i = 2; i < argc; ++i) {
-        std::string arg = argv[i];
-        if (arg == "--config") {
-            if (++i >= argc) { throw std::invalid_argument("--config needs a value"); }
-            if (config_path) { throw std::invalid_argument("--config may be given only once"); }
-            config_path = argv[i];
-            continue;
-        }
-        const ServeOptionArity* arity = find_option(arg);
-        command_line.push_back(std::move(arg));
-        // An option's value is never read as an option: `--model-id --config` names a model id.
-        if (arity != nullptr && arity->takes_value && i + 1 < argc) {
-            command_line.emplace_back(argv[++i]);
-        }
-    }
-    if (!config_path) { return command_line; }
-    std::vector<std::string> arguments = read_config_arguments(*config_path);
-    arguments.insert(arguments.end(), std::make_move_iterator(command_line.begin()),
-                     std::make_move_iterator(command_line.end()));
-    return arguments;
+// infernix-serve's --config: top-level keys and the [serve] table; [cli] is infernix's.
+const product::ConfigProgram& serve_config_program() {
+    static const product::ConfigProgram program{.table       = "serve",
+                                                .other_table = "cli",
+                                                .find_option = [](std::string_view name) {
+                                                    return find_option(name);
+                                                }};
+    return program;
 }
 
 int parse_nonnegative_int(const char* text, const char* label) {
@@ -331,13 +249,16 @@ std::optional<std::size_t> parse_vram_headroom(const char* text) {
 std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.infernix> [options]\n"
+           "       " + argv0 + " --config FILE [options]   (FILE gives the model)\n"
            "\n"
            "Serves the OpenAI Responses/Chat Completions and Anthropic Messages APIs.\n"
            "  --help, -h                 show this help and exit\n"
-           "  --config FILE              read options from a JSON object keyed by the long\n"
-           "                             option names without the dashes, e.g.\n"
-           "                             {\"port\": 8080, \"kv-dtype\": \"int8\", \"greedy\": true}\n"
-           "                             (a flag takes true or false); options on the command\n"
+           "  --config FILE              read options from a TOML file keyed by the long option\n"
+           "                             names without the dashes, e.g. port = 8080,\n"
+           "                             kv-dtype = \"int8\", greedy = true (a flag takes true or\n"
+           "                             false; a repeatable option an array); model = \"PATH\"\n"
+           "                             names the artifact; keys in a [serve] table apply only\n"
+           "                             here, [cli] only to infernix. Options on the command\n"
            "                             line override the file\n"
            "\n"
            "MODEL & CONTEXT\n"
@@ -659,9 +580,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         options.help_requested = true;
         return options;
     }
-    if (argc < 2) { throw std::invalid_argument("artifact path is required"); }
-    options.artifact_path                    = argv[1];
-    const std::vector<std::string> arguments = collect_arguments(argc, argv);
+    product::ProgramArguments program = product::read_program_arguments(argc, argv, serve_config_program());
+    if (program.model.empty()) {
+        throw std::invalid_argument("artifact path is required: give it first on the command line or "
+                                    "as `model` in the --config file");
+    }
+    options.artifact_path    = std::move(program.model);
+    options.config_path      = std::move(program.config_path);
+    options.config_arguments = product::redact_option_values(std::move(program.config_arguments), {"--api-key"});
+    const std::vector<std::string>& arguments = program.arguments;
     for (std::size_t i = 0; i < arguments.size(); ++i) {
         const std::string arg    = arguments[i];
         const auto require_value = [&](const char* flag) -> const char* {

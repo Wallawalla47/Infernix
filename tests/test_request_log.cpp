@@ -280,6 +280,19 @@ int main() {
                       "server JSON leaked the API key");
     failures += check(server.at("argv").at(3) == "<redacted>",
                       "server argv did not retain the redaction marker");
+    failures += check(server.at("config").is_null(), "server_start reports a config file it was not given");
+    {
+        ServeOptions configured     = options;
+        configured.config_path      = "serve.toml";
+        configured.config_arguments = {"--port", "9000", "--api-key", "<redacted>"};
+        const Json with_config      = Json::parse(format_server_start_json(
+            "serve-test", 1000, configured, engine_options, sampling_defaults, "deployment-alias", load, memory,
+            environment, std::uint64_t{123456}));
+        failures += check(with_config.at("config").at("path") == "serve.toml" &&
+                              with_config.at("config").at("arguments").size() == 4 &&
+                              with_config.at("config").at("arguments").at(3) == "<redacted>",
+                          "server_start does not record the config file and its redacted options");
+    }
 
     GenerationRequest request;
     request.max_tokens = 4096;

@@ -20,6 +20,7 @@ add_executable(infernix
 infernix_internal_includes(infernix)
 target_link_libraries(infernix PRIVATE
   infernix_engine
+  infernix_product_config
   infernix_product_logging
   infernix_product_prompt_input)
 add_dependencies(infernix infernix_build_id_stamp)
@@ -38,7 +39,7 @@ target_include_directories(infernix-serve PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party
   ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib
   ${CMAKE_BINARY_DIR}/generated)
-target_link_libraries(infernix-serve PRIVATE infernix_serve infernix_product_logging)
+target_link_libraries(infernix-serve PRIVATE infernix_serve infernix_product_config infernix_product_logging)
 infernix_stage_runtime_dlls(infernix-serve)
 
 add_executable(infernix-perplexity

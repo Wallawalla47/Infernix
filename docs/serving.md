@@ -1222,7 +1222,7 @@ The table lists executable defaults. The startup example selects a long-context 
 
 | Option | Meaning | Default |
 |---|---|---:|
-| `--config FILE` | read options from a JSON file ([Configuration file](#configuration-file)); command-line options override it | unset |
+| `--config FILE` | read options, and the artifact path, from a TOML file ([Configuration file](#configuration-file)); command-line options override it | unset |
 | `--host H` | listen address | `127.0.0.1` |
 | `--port N` | listen port | `8080` |
 | `--api-key KEY` | required bearer or `x-api-key` value | unset |
@@ -1386,36 +1386,56 @@ call can be diagnosed from the console. The request JSONL records only the class
 
 ### Configuration file
 
-`--config FILE` reads options from a JSON object whose keys are the long option names without the
-leading dashes. The artifact path stays the first command-line argument:
+`--config FILE` reads options from a [TOML 1.0](https://toml.io/en/v1.0.0) file whose keys are the
+long option names without the leading dashes. `infernix` (the [CLI](cli.md#configuration-file))
+reads the same format, so one file can configure both: top-level keys apply to whichever program
+reads the file, keys in a `[serve]` table only to `infernix-serve` and keys in a `[cli]` table only
+to `infernix`. A key in the program's own table overrides the same key at the top level, and each
+program skips the other's table. [`infernix.example.toml`](../infernix.example.toml) is a commented
+example.
 
-```json
-{
-  "max-context": 240000,
-  "max-concurrency": 2,
-  "kv-dtype": "int8",
-  "spec": "dflash2",
-  "draft-tokens": 7,
-  "lm-head-draft": true,
-  "prefix-cache-file": "qwen3_8_27b.cache",
-  "api-key": "local-secret"
-}
+```toml
+model = "models/qwen3_8_27b_nvfp4.ninfer"
+max-context = 240000
+kv-dtype = "int8"
+spec = "dflash2"
+draft-tokens = 7
+lm-head-draft = true
+
+[serve]
+max-concurrency = 2
+prefix-cache-file = "qwen3_8_27b.cache"
+api-key = "local-secret"
+
+[cli]
+max-context = 32768
 ```
 
 ```bash
-./build/apps/infernix-serve models/qwen3_8_27b_nvfp4.ninfer --config serve.json --port 8081
+./build/apps/infernix-serve --config infernix.toml --port 8081
 ```
 
-A flag takes `true` or `false` (`false` leaves it unset); every other option takes a string or a
-number, which reaches the option exactly as its command-line text would (`"auto"`, `4096`, `0.7`).
-Each value is validated as on the command line, and relative paths resolve against the launch
-directory, not the file's. Options on the command line override the file wherever `--config`
-appears, and the file overrides the defaults; a flag the file sets cannot be turned off from the
-command line, since flags have no negative form. Startup refuses a file that is not a JSON object,
-names an unknown option (including a dashed name or `config`), repeats a key, or gives a value of
-another type, naming the key. `--config` may be given once. The `server_start` record's `argv` shows
-the `--config FILE` argument, not the file's contents, so keep the file with the log when its
-values matter.
+- `model` names the artifact. The command line's first argument, when it is not an option, takes
+  precedence over it; startup refuses to run with neither.
+- A flag takes `true` or `false` (`false` leaves it unset). Every other option takes a string, an
+  integer or a float, which reaches the option exactly as its command-line text would (`"auto"`,
+  `4096`, `0.7`).
+- A repeatable option (`fast-path`; for the CLI also `stop`, `reasoning-stop`, `stop-token-id` and
+  `choice`) takes an array, each element given once in order; any other option refuses an array.
+- Each value is validated as on the command line. Relative paths resolve against the launch
+  directory, not the file's.
+- Options on the command line override the file wherever `--config` appears, and the file overrides
+  the defaults. Values of a repeatable option accumulate: the command line's are added to the
+  file's. A flag the file sets cannot be turned off from the command line, since flags have no
+  negative form.
+- Startup refuses a file it cannot parse as TOML, an unknown key (including a dashed name, an
+  underscored one such as `max_context`, `help` and `config`), a table other than `[serve]` and
+  `[cli]`, a table inside either, or a value of another type, naming the key and its line.
+  `--config` may be given once.
+
+The startup log has a line listing the options the file gave
+(`config FILE: --max-context 240000 ...`). The `server_start` record's `config` holds the file's path and the same arguments
+(`null` without `--config`), with the `api-key` value redacted as in `argv`.
 
 ## Live metrics
 
@@ -1488,7 +1508,7 @@ they do not infer request behavior from process-global counter deltas.
 
 | Event | Contents |
 |---|---|
-| `server_start` | artifact path, architecture, public name, actual formats and prefill signature; resolved Engine and context-cache capacities, prompt-attention kernel and n-gram drafting options, thinking/non-thinking sampler defaults plus process overrides, thinking-history and thinking-budget defaults, Device arenas, the optional non-additive Vision layout inside the unified workspace, unified Host context capacity and occupancy, KV sizing ledger, CUDA Graph allowance, CUDA/GPU environment, and redacted argv |
+| `server_start` | artifact path, architecture, public name, actual formats and prefill signature; resolved Engine and context-cache capacities, prompt-attention kernel and n-gram drafting options, thinking/non-thinking sampler defaults plus process overrides, thinking-history and thinking-budget defaults, Device arenas, the optional non-additive Vision layout inside the unified workspace, unified Host context capacity and occupancy, KV sizing ledger, CUDA Graph allowance, CUDA/GPU environment, redacted argv, and the `--config` file's path and redacted options (`null` without one) |
 | `request_start` | protocol, resolved sampler and seed, requested reasoning effort, actual initial thinking mode and optional budget, Responses semantic-change flag, output budget, stream/message/tool shape |
 | `request_rejected` | parsed request shape, requested reasoning effort, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
 | `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, tool-call parse diagnostics, preemption/recovery counters, thinking-budget application counters, unrounded request-stage seconds, per-request Engine Host exposure, and complete speculative-decoding counters including n-gram and draft-archive counters |

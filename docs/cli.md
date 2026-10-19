@@ -257,6 +257,7 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 
 | Option | Meaning | Default |
 |---|---|---:|
+| `--config FILE` | read options, and the model path, from a TOML file ([Configuration file](#configuration-file)); command-line options override it | unset |
 | `--rope-yarn-factor F` | startup-fixed runtime YaRN factor, finite `[1,4]`; extends allowed ceiling only | `1` |
 | `--max-context N` | per-sequence logical context ceiling | `2048` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `2048` |
@@ -327,6 +328,34 @@ Repeat `--stop-token-id`, `--stop`, or `--reasoning-stop` to add stop conditions
 generated token IDs in diagnostics.
 
 Run `./build/apps/infernix --help` for the exact option contract.
+
+## Configuration file
+
+`--config FILE` reads options from a TOML file keyed by the long option names without the dashes,
+in the format `infernix-serve` reads ([serving](serving.md#configuration-file) has the full rules).
+Top-level keys and those of a `[cli]` table apply to `infernix`, the `[cli]` table's overriding
+the top level's; a `[serve]` table is `infernix-serve`'s and is skipped. `model` names the model
+when the command line does not, and repeatable options take arrays:
+
+```toml
+model = "models/qwen3_8_27b_nvfp4.ninfer"
+kv-dtype = "int8"
+spec = "dflash2"
+draft-tokens = 7
+
+[cli]
+max-context = 32768
+max-new = 1024
+prompt = "Summarize sparse attention."
+stop = ["END", "STOP"]
+```
+
+```bash
+./build/apps/infernix --config infernix.toml --temperature 0.6
+```
+
+Options on the command line override the file; the values of a repeatable option such as `--stop`
+add to the file's. The startup log lists the options the file gave.
 
 ## CUDA synchronization
 

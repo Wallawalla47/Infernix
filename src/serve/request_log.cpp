@@ -631,6 +631,9 @@ std::string format_server_start_json(
              {"cuda_runtime_version", environment.cuda_runtime_version},
              {"cuda_driver_version", environment.cuda_driver_version}};
     record["argv"] = options.startup_argv;
+    record["config"] =
+        options.config_path ? Json{{"path", *options.config_path}, {"arguments", options.config_arguments}}
+                            : Json(nullptr);
     return record.dump();
 }
 

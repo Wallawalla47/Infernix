@@ -19,7 +19,7 @@ MECHANISM_COUNTERS = {
 }
 
 OCCUPANCY_FIELDS = ("device_state_slots", "device_main_kv_pages", "device_backend_kv_pages")
-REQUEST_LOG_SCHEMA_VERSION = 27
+REQUEST_LOG_SCHEMA_VERSION = 29
 
 TTFT_STAGES = ("prepare", "queue", "initial_binding", "paused", "resident", "http_residual")
 ENGINE_HOST_PHASES = (

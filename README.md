@@ -364,8 +364,9 @@ infernix-serve.exe qwen3_8_27b_nvfp4-nvidia.ninfer --max-context 240000 --max-co
 
 Add `--prefix-cache-file PATH` to keep the prefix cache across restarts. Stop the server with
 Ctrl+C twice; it saves the cache and exits. `infernix-serve.exe --help` lists every option by
-category; `--config FILE` reads them from a JSON file instead
-([configuration file](docs/serving.md#configuration-file)).
+category; `--config FILE` reads them, and the model path, from a TOML file that `infernix` can
+share ([configuration file](docs/serving.md#configuration-file);
+[`infernix.example.toml`](infernix.example.toml) is an example).
 
 Running on another PC needs an RTX 50-series GPU and an NVIDIA driver of 580 or later (CUDA 13); no
 CUDA toolkit is needed. Copy the DLLs next to `infernix-serve.exe` and install the Visual C++

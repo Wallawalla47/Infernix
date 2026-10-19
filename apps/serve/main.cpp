@@ -1,5 +1,6 @@
 #include "infernix_build_id.h"
 
+#include "product/config/config_file.h"
 #include "product/logging/logging.h"
 #include "product/logging/engine_diagnostics.h"
 #include "product/logging/startup_log.h"
@@ -293,6 +294,9 @@ int main(int argc, char** argv) {
 #ifdef INFERNIX_BUILD_ID
         logger->info("build {}", INFERNIX_BUILD_ID);
 #endif
+        if (options.config_path) {
+            logger->info("{}", infernix::product::describe_config(*options.config_path, options.config_arguments));
+        }
         infernix::serve::GenerationService service(
             options, startup_log.observer(), infernix::product::engine_diagnostic_observer(logger));
         startup_log.engine_ready(service.load_summary());

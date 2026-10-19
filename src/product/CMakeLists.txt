@@ -13,6 +13,13 @@ add_library(infernix_product_prompt_input STATIC
 infernix_internal_includes(infernix_product_prompt_input)
 target_link_libraries(infernix_product_prompt_input PRIVATE infernix_media_acquire infernix::json)
 
+# --config FILE for infernix and infernix-serve: a TOML file's options as command-line arguments.
+add_library(infernix_product_config STATIC
+  config/config_file.cpp
+)
+infernix_internal_includes(infernix_product_config)
+target_link_libraries(infernix_product_config PRIVATE infernix::toml)
+
 add_library(infernix_product_logging STATIC
   logging/logging.cpp
   logging/pretty_format.cpp

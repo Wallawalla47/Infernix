@@ -1,0 +1,35 @@
+# Example configuration for infernix-serve and infernix (--config FILE).
+# Copy it, set the paths, and run:  infernix-serve --config my.toml   or   infernix --config my.toml
+#
+# Keys are the programs' long option names without the dashes (see --help); each value is checked
+# exactly as on the command line, and options on the command line override the file.
+# - A flag takes true or false; every other option takes a string, an integer or a float.
+# - A repeatable option (fast-path; for infernix also stop, reasoning-stop, stop-token-id, choice)
+#   takes an array.
+# - Top-level keys apply to both programs, so they must be options of both. Keys in [serve] apply
+#   only to infernix-serve and keys in [cli] only to infernix, overriding the top level.
+# - Relative paths resolve against the directory the program is started from.
+# Full rules: docs/serving.md#configuration-file.
+
+# Qwen3.8-Flash-Next, NVIDIA's NVFP4 checkpoint in the Dense8 conversion (README "Models").
+model = "Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix-00001-of-00003.infernix"
+ngram-volume = "Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram"
+kv-dtype = "int8"
+spec = "mtp"
+draft-tokens = "auto"
+lm-head-draft = true
+
+[serve]
+max-context = 262144
+max-concurrency = 2
+host = "127.0.0.1"
+port = 8080
+# prefix-cache-file = "flash-next.cache"   # keep the prefix cache across restarts
+# api-key = "change-me"                    # require this key on every request
+# tolerant-tool-calls = true
+
+[cli]
+max-context = 32768
+max-new = 1024
+prompt = "Explain sparse attention briefly."
+# stop = ["END"]                           # repeatable: an array

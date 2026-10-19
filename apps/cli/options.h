@@ -74,8 +74,15 @@ struct Options {
     SamplingOverrides sampling;
     bool greedy                 = false;
     product::LogLevel log_level = product::LogLevel::Info;
+
+    // --config FILE and the options it gave (provenance for the startup log).
+    std::optional<std::string> config_path;
+    std::vector<std::string> config_arguments;
 };
 
+// argv[1] is the model path and the rest are options. `--config FILE` reads further options, and the
+// model path when the command line has none, from a TOML file (product/config/config_file.h);
+// options on the command line override the file.
 [[nodiscard]] Options parse_options(int argc, char** argv);
 [[nodiscard]] std::string usage_text(const char* argv0);
 

@@ -40,6 +40,9 @@ endif()
 add_library(infernix::json INTERFACE IMPORTED GLOBAL)
 target_include_directories(infernix::json INTERFACE
   ${PROJECT_SOURCE_DIR}/third_party)
+add_library(infernix::toml INTERFACE IMPORTED GLOBAL)
+target_include_directories(infernix::toml INTERFACE
+  ${PROJECT_SOURCE_DIR}/third_party/tomlplusplus)
 
 # Source base for the custom-template frontend; consumers will link it explicitly.
 add_subdirectory(third_party/llama-jinja EXCLUDE_FROM_ALL)
