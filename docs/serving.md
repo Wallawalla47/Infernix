@@ -290,11 +290,11 @@ text-only `audio` configuration, and `prediction` are accepted without changing 
 Metadata, user/safety identifiers, service-tier and prompt-cache hints are likewise advisory.
 Unknown top-level fields are ignored.
 
-A string `name` on a `tool` message is accepted as an ignored, output-neutral compatibility
-extension for clients that mirror the function name onto tool results. It does not participate in
-tool identity, prompt rendering, or output. Non-string values are malformed; non-empty names on
-other message roles remain unsupported because they carry participant identity that the loaded chat
-template cannot represent.
+A string `name` on a message of any role is accepted and ignored, as llama.cpp does: agent
+frameworks stamp names onto system, assistant and tool messages, and the Qwen chat templates have no
+place for a participant name. It does not participate in tool identity, prompt rendering, or output,
+so two participants that share a role are not told apart. Non-string values are malformed. The
+legacy `function` role keeps `name` as the function name.
 
 For commonly generated OpenAI-compatible payloads, `repetition_penalty` is accepted only at its
 neutral value `1`, and `mm_processor_kwargs` when empty or containing only null values. String-form

@@ -415,18 +415,12 @@ std::optional<std::string> parse_assistant_reasoning(const Json& message, std::s
     return reasoning ? reasoning : content;
 }
 
-void validate_message_name(const Json& item, ChatRole role) {
+// A string message name on any role is accepted and ignored, as llama.cpp does: the Qwen chat
+// templates never render it, and agent frameworks stamp it onto system, assistant and tool messages
+// (GitHub #33). It never reaches the Engine or prompt renderer.
+void validate_message_name(const Json& item) {
     if (!item.contains("name") || item.at("name").is_null()) { return; }
     if (!item.at("name").is_string()) { bad_request("message name must be a string", "messages"); }
-    const std::string& name = item.at("name").get_ref<const std::string&>();
-    // Some OpenAI-compatible clients mirror the function name onto role=tool messages. Accept
-    // that non-standard field as an ignored compatibility hint; it never reaches the Engine or
-    // prompt renderer.
-    if (!name.empty() && role != ChatRole::Tool) {
-        bad_request("a non-empty message name changes participant identity, which Infernix's chat "
-                    "template cannot represent",
-                    "messages", "message_name_not_supported");
-    }
 }
 
 void validate_non_assistant_fields(const Json& item, ChatRole role) {
@@ -545,7 +539,7 @@ ChatTurn parse_message(const Json& item, std::size_t index) {
     const bool legacy_function  = role_name == "function";
     const ChatRole role         = legacy_function ? ChatRole::Tool : parse_message_role(role_name);
 
-    validate_message_name(item, role);
+    validate_message_name(item);
     if (legacy_function) {
         (void)require_function_name(item, "messages[" + std::to_string(index) + "].name");
     }

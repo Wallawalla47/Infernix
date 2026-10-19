@@ -693,10 +693,47 @@ int test_messages_and_media() {
     failures += check(api_error([&] { (void)parse(body); }).code == "modality_not_supported",
                       "file input rejected");
 
+    // GitHub #33: an agent framework's first tool round names the system, assistant and tool
+    // messages. Every string name is accepted and ignored: the request parses to the same history
+    // as without names.
+    const Json unnamed_agent_round = Json::array(
+        {Json{{"role", "system"}, {"content", "You are planning a code wiki."}},
+         Json{{"role", "user"}, {"content", "Plan this repository wiki now."}},
+         Json{{"role", "assistant"},
+              {"content", nullptr},
+              {"tool_calls",
+               Json::array({Json{{"id", "call_ls"},
+                                 {"type", "function"},
+                                 {"function", Json{{"name", "ls"}, {"arguments", "{}"}}}}})}},
+         Json{{"role", "tool"}, {"tool_call_id", "call_ls"}, {"content", "/.git/ (directory)"}}});
+    Json named_agent_round       = unnamed_agent_round;
+    named_agent_round[0]["name"] = "openwiki";
+    named_agent_round[1]["name"] = "maintainer";
+    named_agent_round[2]["name"] = "planning agent";
+    named_agent_round[3]["name"] = "ls";
+    body                         = base_request();
+    body["messages"]             = unnamed_agent_round;
+    const GenerationRequest unnamed = parse(body).generation;
+    body["messages"]                = named_agent_round;
+    const GenerationRequest named   = parse(body).generation;
+    bool same_history = named.messages.size() == unnamed.messages.size();
+    for (std::size_t i = 0; same_history && i < named.messages.size(); ++i) {
+        const ChatTurn& a = named.messages[i];
+        const ChatTurn& b = unnamed.messages[i];
+        same_history      = a.role == b.role && a.content.size() == b.content.size() &&
+                       a.tool_calls.size() == b.tool_calls.size() && a.tool_call_id == b.tool_call_id &&
+                       a.tool_result_name == b.tool_result_name;
+        for (std::size_t p = 0; same_history && p < a.content.size(); ++p) {
+            same_history = a.content[p].kind == b.content[p].kind && a.content[p].text == b.content[p].text;
+        }
+    }
+    failures += check(same_history, "message names on every role are accepted and ignored");
+
     body                        = base_request();
-    body["messages"][0]["name"] = "speaker";
-    failures += check(api_error([&] { (void)parse(body); }).code == "message_name_not_supported",
-                      "message name rejected");
+    body["messages"][0]["name"] = 7;
+    const ApiError numeric_name = api_error([&] { (void)parse(body); });
+    failures += check(numeric_name.status == 400 && numeric_name.param == "messages",
+                      "a non-string message name is malformed");
 
     body = base_request();
     body["messages"].push_back(Json{
