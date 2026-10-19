@@ -111,7 +111,7 @@ Json requested_reasoning_effort_json(const std::optional<RequestedReasoningEffor
                      : Json(nullptr);
 }
 
-const char* kv_cache_name(infernix::KvCacheStorage storage) {
+const char* kv_cache_json_name(infernix::KvCacheStorage storage) {
     switch (storage) {
     case infernix::KvCacheStorage::BFloat16:
         return "bf16";
@@ -548,7 +548,7 @@ std::string format_server_start_json(
              {"original_nvfp4_prefill_kernel", engine_options.original_nvfp4_prefill_kernel},
              {"fast_paths", engine_options.fast_paths},
              {"log_stats_interval_ms", options.log_stats_interval_ms},
-             {"kv_cache", kv_cache_name(engine_options.kv_cache)},
+             {"kv_cache", kv_cache_json_name(engine_options.kv_cache)},
              {"vision", engine_options.enable_vision},
              {"cuda_graph", engine_options.use_cuda_graph},
              {"prefix_reuse", options.allow_prefix_reuse},

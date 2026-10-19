@@ -75,7 +75,7 @@ OperationalSeverity failure_severity(RequestFailureClass classification) noexcep
     return OperationalSeverity::Error;
 }
 
-const char* finish_reason_name(infernix::FinishReason reason) noexcept {
+const char* finish_reason_text(infernix::FinishReason reason) noexcept {
     switch (reason) {
     case infernix::FinishReason::None:
         return "none";
@@ -121,7 +121,7 @@ const char* protocol_name(std::string_view protocol) noexcept {
     return "http";
 }
 
-const char* kv_cache_name(infernix::KvCacheStorage storage) noexcept {
+const char* kv_cache_text(infernix::KvCacheStorage storage) noexcept {
     switch (storage) {
     case infernix::KvCacheStorage::BFloat16:
         return "bf16";
@@ -247,7 +247,7 @@ OperationalRecord render_request_done(const RequestLogContext& context,
     std::ostringstream out;
     out << "req#" << context.id << " done | " << protocol_name(context.protocol) << " | ";
     if (outcome.tool_calls.empty()) {
-        out << finish_reason_name(outcome.finish_reason);
+        out << finish_reason_text(outcome.finish_reason);
     } else {
         out << "tool calls " << product::format_pretty_count(outcome.tool_calls.size());
     }
@@ -546,9 +546,9 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
     const infernix::ContextCostSummary context_cost = service.load_summary().context_cost;
 
     logger_->info("capacity | {} tokens of context across all requests ({} KV)",
-                  product::format_pretty_count(memory.kv_capacity), kv_cache_name(memory.kv_cache));
+                  product::format_pretty_count(memory.kv_capacity), kv_cache_text(memory.kv_cache));
     logger_->debug("capacity | KV {} tokens, {}, {} | pages {}/{} | runtime {} | free {}",
-                   product::format_pretty_count(memory.kv_capacity), kv_cache_name(memory.kv_cache),
+                   product::format_pretty_count(memory.kv_capacity), kv_cache_text(memory.kv_cache),
                    kv_capacity_mode_name(memory.kv_capacity_mode),
                    product::format_pretty_count(memory.kv_capacity_page_groups),
                    product::format_pretty_count(memory.kv_capacity_max_page_groups),
