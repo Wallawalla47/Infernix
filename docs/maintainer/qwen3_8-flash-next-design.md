@@ -10624,9 +10624,15 @@ The release run repeats the README's (29.24-29.51 s at 128K). Decode after those
 192.8 tok/s for this branch's sessions (identical text in both) against 194.6-196.5 for the three
 release sessions; rounds per second overlap (69.3-71.8 against 70.9-73.4), the text differs from the
 release's in every request (the prefill's arithmetic moves greedy ties), no decode kernel changed and
-the decode expert-cache hit rate is the same (93.6 against 93.4 %). Not resolved: the difference is
-within what two sessions of one build differ by on the same text (3 %), but both branch sessions sit
-below every release session. NVIDIA Dense8 takes the exact items
+the decode expert-cache hit rate is the same (93.6 against 93.4 %). A same-text check settles it: the
+same workload on the exact route (`--disable-fast-paths`, four MTP drafts verified every round, so
+both builds write the same text in the same rounds), sessions ABBA: this branch (rebased on main
+dd18d403) 174.5 and 182.6 tok/s, the release 182.3 and 183.6; every request has the same text, rounds
+and decode cache hits in all four. The second branch session equals the release (rounds per second
+63.6 against 63.5 and 64.0); the first, started minutes after a build and its tests, was 4.4 % slower
+on every request, as the first session after the 11:49 build was in the run above. The serve log does
+not show the startup CPU-rate reading, so that probe (§19.3.28) is the likely but unconfirmed cause.
+NVIDIA Dense8 takes the exact items
 too: pp32768 7,266 → 7,408 (+1.9 %), pp65536 11,378 → 11,543 tok/s (+1.5 %), two rounds, no
 overlap.
 
@@ -10640,9 +10646,12 @@ the exact one (every column within 2⁻⁶ normwise; 99.77-99.86 % of outputs eq
 3.5e-3) and a binary64 chain on 48 sampled (token, slot) pairs, at 14,373 columns over passes,
 resident and staged experts. The model-level gates (model-quality.md 6.7, `ggml-bf16-prefill`): the
 prefill gate passes on INT8, FP8, NVFP4, K8V4, VQ2 and K4V2 KV (KL excess bounds 3.7e-4 to 7.8e-4 of
-1.5e-3) and fails jointly on BF16 KV, where a run with the qualified paths alone puts the whole
-excess on `gdn-f16-accumulate` and the path's own increment is below zero; decode (plain, 256
-segments) passes on INT8. The exact items are bit-identical: `fast_path_gate identical` on the quick
+1.5e-3) and fails on BF16 KV, where the IQ3_S exact route is the reference (floor 0) and any change
+of its arithmetic moves it by about KL 5.6e-3 (this path alone 5.5e-3, `gdn-f16-accumulate` alone
+5.9e-3, both 5.6-5.7e-3; INT8 KV's own floor is 5.3e-3), probably through near-tied expert routing;
+`gdn-f16-accumulate` was removed from that configuration for the same failure. Decode (plain, 256
+segments) passes on INT8, and on BF16 fails narrowly with either path alone (TV bounds 4.45e-3 and
+4.6e-3 of 4e-3, in the 2,048- and 8,192-token prompts). The exact items are bit-identical: `fast_path_gate identical` on the quick
 corpus in 49,152-token windows at 8,192-token chunks (MoE groups of two chunks before, four after),
 8 of 8 windows on IQ3_S and on Dense8, `--disable-fast-paths`, release-equivalent route against the new one.
 

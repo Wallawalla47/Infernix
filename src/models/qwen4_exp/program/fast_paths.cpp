@@ -110,7 +110,9 @@ constexpr std::array kQualified{
     // formats take Dense8's verdicts), timed on INT8 (2026-10-18): second-turn resume 1.65 -> 0.11 s,
     // two-row MTP 160 -> 200 tok/s. Sampled drafts change no logit (6.1): math +18.8 %, story +22.4 %,
     // code +4.1 % (overlapping). FP16 GDN (qualified on the 27B, every Flash-Next artifact): pp16384
-    // +0.21 %, every run ahead; it touches no attention or KV.
+    // +0.21 %, every run ahead; it touches no attention or KV. Not with BF16 KV (2026-10-19): there the
+    // IQ3_S exact route is the gate's reference (floor 0) and FP16 GDN alone fails the prefill gate (KL
+    // bound 7.5e-3 of 1.5e-3) and the decode gate (TV bound 4.6e-3 of 4e-3), as ggml-bf16-prefill does.
     Qualification{FastPath::AdaptiveSpeculation, {DenseKernels::Ggml, false, KvCacheStorage::BFloat16}},
     Qualification{FastPath::AdaptiveSpeculation, {DenseKernels::Ggml, false, KvCacheStorage::Int8Group64}},
     Qualification{FastPath::AdaptiveSpeculation, {DenseKernels::Ggml, false, KvCacheStorage::Fp8E4M3Row256}},
@@ -132,7 +134,6 @@ constexpr std::array kQualified{
     Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Ggml, false, KvCacheStorage::Fp8KeyNvfp4Value}},
     Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Ggml, false, KvCacheStorage::Vq2}},
     Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Ggml, false, KvCacheStorage::Q4KeyVq2Value}},
-    Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Ggml, false, KvCacheStorage::BFloat16}},
     Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Ggml, false, KvCacheStorage::Int8Group64}},
     Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Ggml, false, KvCacheStorage::Fp8E4M3Row256}},
     Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Ggml, false, KvCacheStorage::Nvfp4Group16}},
@@ -140,11 +141,12 @@ constexpr std::array kQualified{
     Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Ggml, false, KvCacheStorage::Vq2}},
     Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Ggml, false, KvCacheStorage::Q4KeyVq2Value}},
     // GGUF imports: the BF16 prefill tiles (2026-10-19). Prefill gate (quick corpus, 896 and 7,168
-    // tokens) on every format jointly with the qualified paths: BF16 KV fails (its exact route is the
-    // reference, floor 0; KL 5.7e-3), the others pass (KL excess bounds 3.7e-4 to 7.8e-4); decode plain
-    // on INT8 (the passing format with the lowest floor), 256 segments: TV bound 9.3e-4. Timed on INT8
-    // against the exact route: pp32768 +33 %, pp65536 +44 % (design §19.3.29); no KV format enters
-    // its kernels.
+    // tokens) on every format jointly with the qualified paths: KL excess bounds 3.7e-4 to 7.8e-4 on
+    // INT8, FP8, NVFP4, K8V4, VQ2 and K4V2; decode plain on INT8 (the passing format with the lowest
+    // floor), 256 segments: TV bound 9.3e-4. BF16 KV fails, alone as with gdn-f16-accumulate: there the
+    // exact route is the reference (floor 0), and either path alone moves prefill by KL 5.5-5.9e-3 and
+    // decode by TV 4.0-4.2e-3 (2026-10-19). Timed on INT8 against the exact route: pp32768 +33 %,
+    // pp65536 +44 % (design §19.3.29); no KV format enters its kernels.
     Qualification{FastPath::GgmlBf16Prefill, {DenseKernels::Ggml, false, KvCacheStorage::Int8Group64}},
     Qualification{FastPath::GgmlBf16Prefill, {DenseKernels::Ggml, false, KvCacheStorage::Fp8E4M3Row256}},
     Qualification{FastPath::GgmlBf16Prefill, {DenseKernels::Ggml, false, KvCacheStorage::Nvfp4Group16}},

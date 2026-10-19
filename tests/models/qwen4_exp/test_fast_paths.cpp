@@ -187,11 +187,11 @@ int main() {
                                   "the coupling paths are qualified on IQ3_S, FP8 and recipe A");
             }
         }
-        // FP16 GDN: faster on IQ3_S and FP8 prefill, not on Dense8's.
-        failures += check(q::fast_path_qualified(FastPath::GdnF16Accumulate, iq3s) &&
+        // FP16 GDN: faster on IQ3_S and FP8 prefill, not on Dense8's; IQ3_S with BF16 KV fails its gates.
+        failures += check(q::fast_path_qualified(FastPath::GdnF16Accumulate, iq3s) == (kv != KvCacheStorage::BFloat16) &&
                               q::fast_path_qualified(FastPath::GdnF16Accumulate, fp8) &&
                               !q::fast_path_qualified(FastPath::GdnF16Accumulate, {DenseKernels::Q8, true, kv}),
-                          "gdn-f16-accumulate is registered where it was measured faster");
+                          "gdn-f16-accumulate is registered where it was measured faster and passed");
     }
     failures += check(exact.gdn_arithmetic == infernix::ops::GdnChunkArithmetic::Exact,
                       "the exact route keeps the GDN prefill exact");
@@ -221,7 +221,7 @@ int main() {
                           "ggml-bf16-prefill is qualified on GGUF imports with every KV format that passed its gate");
     }
     failures += check(!q::fast_path_qualified(FastPath::GgmlBf16Prefill, {kGgml, false, KvCacheStorage::BFloat16}),
-                      "ggml-bf16-prefill is not qualified with BF16 KV (it fails the prefill gate there)");
+                      "ggml-bf16-prefill is not qualified with BF16 KV (it fails the gates there)");
 
     std::cout << (failures == 0 ? "PASS" : "FAIL") << " Qwen3.8-Flash-Next fast-path selection\n";
     return failures == 0 ? 0 : 1;

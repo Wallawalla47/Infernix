@@ -850,7 +850,7 @@ always run and are not listed. The NVFP4 27B variants select identical paths (ea
 | Qwen3.8-Flash-Next: `expert-a4-residual` | artifacts with W4A16 experts (recipe C), expert calls of more than eight columns | FP8 dense, 16-bit expert activations, with INT8, FP8, NVFP4, K8V4, VQ2 or K4V2 KV (fails on BF16 KV, below) |
 | Qwen3.8-Flash-Next: `sampled-mtp-drafts` | MTP rounds with a sampled request | every Flash-Next configuration, every format (distribution and greedy identity, below; no logit changes) |
 | Qwen3.8-Flash-Next: `ggml-bf16-prefill` | GGUF dense projections in prefill calls of 32+ columns, GGUF expert calls of 14,336+ columns | IQ3_S with INT8, FP8, NVFP4, K8V4, VQ2 or K4V2 KV (fails on BF16 KV, below) |
-| `gdn-f16-accumulate` | chunked GDN calls (16+ tokens) of every Qwen3.5-family and Flash-Next artifact | NVFP4 27B, groupwise 27B, IQ3_S and FP8, every format; not the 35B-A3B or Dense8 (no gain beyond spread, below) |
+| `gdn-f16-accumulate` | chunked GDN calls (16+ tokens) of every Qwen3.5-family and Flash-Next artifact | NVFP4 27B, groupwise 27B and FP8, every format; IQ3_S, every format but BF16 (fails there, under `ggml-bf16-prefill`); not the 35B-A3B or Dense8 (no gain beyond spread, below) |
 
 **`sampled-mtp-drafts`: drafts drawn from the draft head's top four tokens (Flash-Next, qualified
 2026-10-17).** It changes no logit: a sampled request's drafts are drawn from the head's four most
@@ -891,7 +891,13 @@ is not registered on Dense8. Exact route against exact route plus the path, pp16
 0.3 tok/s above the higher exact one), groupwise 27B +0.12 %, every run ahead in each; 35B-A3B
 +0.05 %, within spread, not registered. IQ3_S and FP8 take the NVFP4 27B's gates below (one gate
 per kernel, 6.1 item 1), the groupwise 27B its own prefill gate (under `idle-wide-prefill`); the
-path touches no attention or KV, so every format is registered with the INT8 timing. Gates on the official 27B NVFP4, jointly with the qualified paths (the path
+path touches no attention or KV, so every format is registered with the INT8 timing. **IQ3_S with
+BF16 KV was removed (2026-10-19):** gated there alone (under `ggml-bf16-prefill`, below) it fails the
+prefill gate (KL bound 7.5e-3 of 1.5e-3; the IQ3_S exact route with BF16 KV is the reference, floor 0)
+and the decode gate (TV bound 4.6e-3 of 4e-3); the 27B's BF16 floor is not 0, and there it passed.
+`ggml-bf16-prefill` fails the same cell by the same amount: at floor 0 any change of IQ3_S's
+arithmetic does.
+Gates on the official 27B NVFP4, jointly with the qualified paths (the path
 touches no attention or KV: reduced prefill gate on every format, decode on INT8 and on BF16, the
 lowest floor):
 
@@ -1695,37 +1701,39 @@ NVFP4, K8V4, VQ2 or K4V2 KV; qualified 2026-10-19).**
   | K4V2 | 1.40e-2 / 3.96 % | 4.0e-4 (7.8e-4) | +0.01 (0.07) | 2.9e-4 | 1.09 | passes |
   | VQ2 | 2.00e-2 / 4.68 % | 0.6e-4 (3.7e-4) | +0.05 (0.10) | 3.2e-4 | 0.99 | passes |
 
-  Every context bucket passes on the six. BF16 KV fails jointly: the IQ3_S exact route with BF16 KV
-  is the reference itself, so the whole divergence counts as excess. Split by a run with the
-  qualified paths alone (the same corpus, chunks and reference), the excess is `gdn-f16-accumulate`'s,
-  registered here from the 27B's gates (above): exact → qualified paths KL 5.9e-3 (bound 7.5e-3),
-  top-1 +2.62 points (2.92), NLL 5.2e-4; qualified paths → with `ggml-bf16-prefill` KL −1.9e-4
-  (bound 1.2e-4), top-1 −0.41 points (0.04), NLL −1.3e-4, p99.9 KL ratio 0.98, every bucket passing.
-  The path's own increment moves BF16 KV slightly toward the reference; the joint rule (6.1, item 2)
-  still keeps BF16 KV unregistered while `gdn-f16-accumulate` is qualified there.
+  Every context bucket passes on the six. BF16 KV fails, and not through this path alone: the IQ3_S
+  exact route with BF16 KV is the reference itself (floor 0), so any change of its arithmetic counts
+  whole, and every change measured there moves it by about the same amount. Against the reference
+  (mean KL, top-1 agreement, NLL change): `gdn-f16-accumulate` alone 5.9e-3, 97.38 %, +5.2e-4; this
+  path alone (after `gdn-f16-accumulate` was removed there, below) 5.5e-3, 97.43-97.44 %, −0.9e-4 and
+  −4.8e-4 at the two chunks; both together 5.6-5.7e-3, 97.40-97.45 %, +3.0e-4 / +4.7e-4. Either one
+  takes about what INT8 KV's quantization takes (its floor, 5.3e-3), and the second adds nothing
+  measurable (its increment over the first: KL −1.9e-4, bound 1.2e-4): most likely near-tied expert
+  routing that any perturbation flips, as for `expert-a4-residual` (not measured). An increment
+  measured first suggested the excess was `gdn-f16-accumulate`'s alone; the path's own run shows it
+  is not. With floor 0 the absolute budgets (1.5e-3) admit no change of IQ3_S's arithmetic on BF16 KV.
 - **Decode gate** (plain, 256 segments, prompts of 512-8,192 tokens, whose prefill takes the dense
   tiles but not the expert tiles): INT8, the passing format with the lowest floor, passes (TV excess
   5.4e-4, bound 9.3e-4 of 4e-3; top-1 +0.10 points, bound 0.32; KL 2.4e-4; NLL −2.9e-4; p99.9 KL
   ratio 1.09; every prompt length). BF16, run as well, fails on a nonzero floor (TV 0.029): TV excess
   3.9e-3 (bound 4.34e-3 of 4e-3), top-1 +0.51 points (bound 0.75), p99.9 KL ratio 1.47, the excess
-  in the 2,048- and 8,192-token prompts (TV 6.0e-3 and 5.3e-3, against 4.3e-4 at 512). Split as
-  above, that is `gdn-f16-accumulate`'s too: exact → qualified paths TV excess 4.2e-3 (bound 4.6e-3),
-  top-1 +0.62 points (0.84), p99.9 KL ratio 1.30, each failing; qualified paths → with
-  `ggml-bf16-prefill` TV −2.7e-4 (bound 1.2e-4), top-1 −0.11 points (0.12), p99.9 ratio 1.13, every
-  criterion and prompt length passing. No decode, verification or drafting kernel changes, so the
-  decode criteria are not required (6.1, item 2); BF16 KV is not registered anyway.
-- **`gdn-f16-accumulate` on IQ3_S with BF16 KV** (found by the split above, not acted on): alone it
-  fails both the prefill gate (KL bound 7.5e-3 of 1.5e-3, on a floor of 0: the IQ3_S exact route with
-  BF16 KV is the reference) and the decode gate (TV bound 4.6e-3 of 4e-3, floor 0.029) there; its
-  registration rests on the 27B's gates (one gate per kernel), whose BF16 prefill floor is not 0.
+  in the 2,048- and 8,192-token prompts (TV 6.0e-3 and 5.3e-3, against 4.3e-4 at 512). The same
+  holds for each path alone: `gdn-f16-accumulate` TV excess 4.2e-3 (bound 4.6e-3), top-1 +0.62
+  points (0.84); this path alone 4.0e-3 (bound 4.45e-3), +0.48 points (0.70), p99.9 KL ratio 1.17,
+  again in the 2,048- and 8,192-token prompts: a fixed set of fragile segments. No decode,
+  verification or drafting kernel changes, so the decode criteria are not required (6.1, item 2).
+- **`gdn-f16-accumulate` removed from IQ3_S with BF16 KV** (2026-10-19, the owner's decision): alone
+  it fails both gates there (above); its registration rested on the 27B's gates (one gate per
+  kernel), whose BF16 floors are not 0. IQ3_S with BF16 KV now runs both paths' exact counterparts.
 - **Speed** (`infernix_bench`, INT8 KV, three rotated rounds, design §19.3.29): against the exact
   route, pp32768 3,839 → 5,113 tok/s (+33.2 %), pp65536 4,809 → 6,924 (+44.0 %), every round ahead;
   the dense tiles alone +20.5 % / +25.9 %. The other formats take INT8's timing (6.1, item 4): the
   path's kernels see no KV format, at the same shapes and widths. Server time to first token,
   `windows-2026.10.18` against this build (the path together with design §19.3.29's exact items;
   the README workload, INT8 KV): 128K 29.3-29.5 → 19.7-19.9 s, 250K 58.8-58.9 →
-  39.2-39.4 s, 8K 2.16-2.17 → 1.62-1.65 s; decode after them 194.6-196.5 → 187.1 / 192.8 tok/s on
-  different greedy text, not resolved (design §19.3.29).
+  39.2-39.4 s, 8K 2.16-2.17 → 1.62-1.65 s. Decode is unchanged: on the same text (the exact route, a
+  fixed draft length, ABBA) the branch's second session ran 182.6 tok/s against the release's 182.3
+  and 183.6; its first, right after a build, ran 174.5 (design §19.3.29).
 - **Not qualified:** BF16 KV (above); other dense families (no kernels).
 
 **`q4-w4a8`: int8 activations in the groupwise Q4 MLP gate/up (fails; not qualified).**
