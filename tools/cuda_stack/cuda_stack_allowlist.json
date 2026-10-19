@@ -474,6 +474,7 @@
   "__nv_static__moe_layer_cu__ZN8infernix3ops_GLOBAL__N__moe_layer_cu17gate_up_tile_ggmlILNS_5QTypeE15EEEvPKhPKiNS0_11MoeDispatchENS0_15MoeExpertSourceEiPKS5_S7_S7_iiPt": {"stack": 40, "local": 0},
   "__nv_static__moe_layer_cu__ZN8infernix3ops_GLOBAL__N__moe_layer_cu17gate_up_tile_ggmlILNS_5QTypeE16EEEvPKhPKiNS0_11MoeDispatchENS0_15MoeExpertSourceEiPKS5_S7_S7_iiPt": {"stack": 40, "local": 0},
   "__nv_static__moe_layer_cu__ZN8infernix3ops_GLOBAL__N__moe_layer_cu17gate_up_tile_ggmlILNS_5QTypeE17EEEvPKhPKiNS0_11MoeDispatchENS0_15MoeExpertSourceEiPKS5_S7_S7_iiPt": {"stack": 40, "local": 0},
+  "__nv_static__moe_layer_cu__ZN8infernix3ops_GLOBAL__N__moe_layer_cu17ggml_gate_up_bf16ILNS_4ggml4bf167ScalingE1EEEvPKtNS0_11MoeDispatchEiPKiSA_iiiPKhPti": {"stack": 40, "local": 0},
   "__nv_static__moe_layer_cu__ZN8infernix3ops_GLOBAL__N__moe_layer_cu18down_resident_ggmlILNS_5QTypeE18EEEvNS0_11MoeDispatchENS0_15MoeExpertSourceEiPKPKhPKiSB_iPKtSB_P13__nv_bfloat16": {"stack": 8, "local": 0},
   "__nv_static__q4_linear_swiglu_w4a8_cu__ZN8infernix3ops6detail57_GLOBAL__N__q4_linear_swiglu_w4a8_cu_a8b1e21628q4_linear_swiglu_w4a8_kernelEPKaPKfPKhS8_P13__nv_bfloat16iii": {"stack": 40, "local": 0},
   "__nv_static__qsa_cu__ZN8infernix3ops38_GLOBAL__N__qsa_cu_940f13ef11pool_kernelEPK13__nv_bfloat16S4_S4_PKiiS6_S6_S6_S6_S6_iiiifNS0_12PreparedRopeEfPS2_NS0_13QsaPageSpacesE": {"stack": 32, "local": 0},

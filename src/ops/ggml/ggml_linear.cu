@@ -12,13 +12,15 @@
 // Calls of kMmaMinColumns..kMmaMaxColumns columns (MTP verification) run mma_rows_kernel on tensor
 // cores; calls of kTileMinColumns or more (prefill) first decode each segment's weights once into
 // a plane (plane_kernel, workspace kPlaneBytes) and run the tensor-core tiles over it. Every route
-// returns the same integers.
+// returns the same integers. With LinearRoutes::GgmlBf16Wide (ggml-bf16-prefill) the wide calls run
+// ops/ggml/ggml_bf16_tile.cuh's BF16 tiles over the same planes instead (no column encoding).
 
 #include "infernix/ops/ggml_linear.h"
 
 #include "core/device.h"
 #include "core/pdl.cuh"
 #include "core/ggml_format.h"
+#include "ops/ggml/ggml_bf16_tile.cuh"
 #include "ops/ggml/ggml_dp4a.cuh"
 #include "ops/ggml/ggml_exact.h"
 #include "ops/ggml/ggml_mma_rows.cuh"
@@ -1003,6 +1005,67 @@ void decode_plane(const GgmlSegment& s, int k, std::uint8_t* plane, cudaStream_t
 #undef INFERNIX_GGML_PLANE
     check_launch("plane");
 }
+
+// Column c's sum of x over each 32-element slice (input element j at x[perm(j)]), in element order:
+// the K-quants' min term for the BF16 tiles. One CTA per column.
+__global__ void __launch_bounds__(128)
+    bf16_xsum_kernel(const std::uint16_t* __restrict__ x, int k, const std::int32_t* __restrict__ perm,
+                     int perm_block, float* __restrict__ xsum) {
+    const int c = static_cast<int>(blockIdx.x), slices = k / 32;
+    const std::uint16_t* column = x + static_cast<std::size_t>(c) * k;
+    for (int s = static_cast<int>(threadIdx.x); s < slices; s += static_cast<int>(blockDim.x)) {
+        float sum = 0.0F;
+        for (int e = 0; e < 32; ++e) {
+            const int j   = 32 * s + e;
+            const int src = perm == nullptr ? j : perm[j / perm_block] * perm_block + j % perm_block;
+            sum += __uint_as_float(static_cast<unsigned>(column[src]) << 16);
+        }
+        xsum[static_cast<std::size_t>(c) * slices + s] = sum;
+    }
+}
+
+// The ggml-bf16-prefill tiles over one slab's plane (ggml_bf16_tile.cuh), every column at once.
+struct Bf16Input {
+    const std::uint16_t* x  = nullptr;
+    int k                   = 0;
+    const std::int32_t* perm = nullptr;
+    int perm_block          = 0;
+    const float* xsum       = nullptr; // the K-quants' slice sums
+};
+
+template <ggml::bf16::Scaling S, bool OutF32>
+void launch_bf16_scaling(const GgmlSegment& s, const Bf16Input& in, int columns, void* out, int n,
+                         const std::uint8_t* plane, cudaStream_t stream) {
+    namespace b = ggml::bf16;
+    constexpr int kShared = static_cast<int>(sizeof(b::Shared));
+    static const bool configured = [] {
+        return cudaFuncSetAttribute(b::tile_kernel<S, OutF32>, cudaFuncAttributeMaxDynamicSharedMemorySize, kShared) ==
+               cudaSuccess;
+    }();
+    require(configured, "the BF16 tile kernel's shared memory exceeds the device's");
+    const int tiles = (s.rows + ggml::tile::kTileRows - 1) / ggml::tile::kTileRows;
+    const dim3 grid((s.rows + b::kRows - 1) / b::kRows, (columns + b::kColumns - 1) / b::kColumns);
+    const b::DenseColumns cols{.x = in.x, .k = in.k, .perm = in.perm, .perm_block = in.perm_block, .xsum = in.xsum,
+                               .col0 = 0, .columns = columns};
+    b::tile_kernel<S, OutF32><<<grid, b::kThreads, kShared, stream>>>(plane, tiles, s.rows, in.k / 32, cols, out, n,
+                                                                     s.out_offset, ggml::kappa_log2(s.format));
+    check_launch("bf16 tile");
+}
+
+template <bool OutF32>
+void launch_bf16(const GgmlSegment& s, const Bf16Input& in, int columns, void* out, int n, const std::uint8_t* plane,
+                 cudaStream_t stream) {
+#define INFERNIX_GGML_BF16(Q)                                                                                          \
+    case Q:                                                                                                            \
+        launch_bf16_scaling<ggml::bf16::kScaling<Q>, OutF32>(s, in, columns, out, n, plane, stream);                   \
+        break;
+    switch (s.format) {
+        INFERNIX_GGML_FORMATS(INFERNIX_GGML_BF16)
+    default:
+        throw std::invalid_argument("ggml_linear: segment format is not a ggml block format");
+    }
+#undef INFERNIX_GGML_BF16
+}
 #undef INFERNIX_GGML_FORMATS
 
 // Bytes of a decoded plane of `rows` rows of K = 32 slices.
@@ -1043,13 +1106,53 @@ std::vector<std::vector<Slab>> plan_slabs(std::span<const GgmlSegment> segments,
     return passes;
 }
 
+// Whether a call of `columns` columns takes the tiles over decoded planes (the exact route's or the
+// BF16 route's).
+bool wide_call(int k, int columns) { return columns >= kTileMinColumns && (k / 32) % ggml::tile::kStageSlices == 0; }
+
+// The BF16 route of a wide call (LinearRoutes::GgmlBf16Wide): the same slabs and planes as the exact
+// route's, every column in one launch per slab, no encoding.
+void linear_bf16(const Tensor& x, std::span<const GgmlSegment> segments, std::span<Tensor* const> outs,
+                 const std::int32_t* input_perm, std::int32_t perm_block, WorkspaceArena& workspace, cudaStream_t stream) {
+    const int k = x.ne[0], columns = x.ne[1];
+    require(input_perm == nullptr || perm_block % 4 == 0, "the BF16 route reads x in four-element units of the permutation");
+    require(reinterpret_cast<std::uintptr_t>(x.data) % 16 == 0, "the BF16 route reads x in 8-byte units");
+    const DType dtype = outs.front()->dtype;
+    const auto passes = plan_slabs(segments, k);
+    auto* planes      = static_cast<std::uint8_t*>(workspace.alloc(DType::U8, {static_cast<int>(kPlaneBytes)}).data);
+    Bf16Input in{.x = static_cast<const std::uint16_t*>(x.data), .k = k, .perm = input_perm, .perm_block = perm_block};
+    const bool min_terms = std::any_of(segments.begin(), segments.end(), [](const GgmlSegment& s) {
+        return s.format == QType::GGML_Q4_K || s.format == QType::GGML_Q5_K;
+    });
+    if (min_terms) {
+        float* xsum = static_cast<float*>(workspace.alloc(DType::FP32, {k / 32, columns}).data);
+        bf16_xsum_kernel<<<columns, 128, 0, stream>>>(in.x, k, input_perm, perm_block, xsum);
+        check_launch("bf16 xsum");
+        in.xsum = xsum;
+    }
+    for (const auto& pass : passes) {
+        for (const auto& slab : pass) { decode_plane(slab.segment, k, planes + slab.offset, stream); }
+        for (const auto& slab : pass) {
+            const Tensor& out = *outs[static_cast<std::size_t>(slab.segment.output)];
+            if (dtype == DType::FP32) {
+                launch_bf16<true>(slab.segment, in, columns, out.data, out.ne[0], planes + slab.offset, stream);
+            } else {
+                launch_bf16<false>(slab.segment, in, columns, out.data, out.ne[0], planes + slab.offset, stream);
+            }
+        }
+    }
+}
+
 } // namespace
 
 std::size_t ggml_linear_workspace_bytes(std::int32_t k, std::int32_t columns) {
     const auto align = [](std::size_t v) { return (v + 255) / 256 * 256; };
     const std::size_t t = static_cast<std::size_t>(std::min(columns, kEncodeColumns));
-    const std::size_t planes = columns >= kTileMinColumns ? kPlaneBytes : 0;
-    return align(fast::encoded_column_words(k) * t * 4) + align(t * 4) + planes;
+    if (!wide_call(k, columns)) { return align(fast::encoded_column_words(k) * t * 4) + align(t * 4); }
+    // The exact route's encoded batch, or the BF16 route's slice sums (both with the planes).
+    const std::size_t exact = align(fast::encoded_column_words(k) * t * 4) + align(t * 4);
+    const std::size_t bf16  = align(static_cast<std::size_t>(k / 32) * static_cast<std::size_t>(columns) * 4);
+    return std::max(exact, bf16) + kPlaneBytes;
 }
 
 std::size_t ggml_row_bytes(QType format, std::int32_t k) {
@@ -1082,14 +1185,16 @@ std::vector<GgmlSegment> ggml_split_segments(std::span<const GgmlSegment> segmen
 }
 
 void ggml_linear(const Tensor& x, std::span<const GgmlSegment> segments, Tensor& out, const std::int32_t* input_perm,
-                 std::int32_t perm_block, WorkspaceArena& workspace, cudaStream_t stream) {
+                 std::int32_t perm_block, WorkspaceArena& workspace, cudaStream_t stream, LinearRoutes routes) {
     for (const auto& s : segments) { require(s.output == 0, "a one-output call's segments name output 0"); }
     Tensor* const outs[] = {&out};
-    ggml_linear(x, segments, outs, input_perm, perm_block, workspace, stream);
+    ggml_linear(x, segments, outs, input_perm, perm_block, workspace, stream, routes);
 }
 
 void ggml_linear(const Tensor& x, std::span<const GgmlSegment> segments, std::span<Tensor* const> outs,
-                 const std::int32_t* input_perm, std::int32_t perm_block, WorkspaceArena& workspace, cudaStream_t stream) {
+                 const std::int32_t* input_perm, std::int32_t perm_block, WorkspaceArena& workspace, cudaStream_t stream,
+                 LinearRoutes routes) {
+    require(valid_linear_routes(routes), "unknown linear route flags");
     require(x.data != nullptr && x.dtype == DType::BF16 && x.is_contiguous(), "x must be contiguous BF16 [K, T]");
     require(!outs.empty() && outs.front() != nullptr, "no outputs");
     const DType dtype = outs.front()->dtype;
@@ -1112,14 +1217,18 @@ void ggml_linear(const Tensor& x, std::span<const GgmlSegment> segments, std::sp
     require(input_perm == nullptr || (perm_block > 0 && k % perm_block == 0), "input permutation needs whole blocks");
     const std::size_t out_bytes = dtype == DType::FP32 ? 4 : 2;
     auto scope = workspace.scope();
+    // Wide calls decode each segment's weights once into planes for the tiles; segments whose
+    // planes exceed kPlaneBytes run in passes of row slabs, each re-encoding the columns.
+    const bool wide = wide_call(k, columns);
+    if (wide && has_route(routes, LinearRoutes::GgmlBf16Wide)) {
+        linear_bf16(x, segments, outs, input_perm, perm_block, workspace, stream);
+        return;
+    }
     const int batch = std::min(columns, kEncodeColumns);
     Tensor encoded = workspace.alloc(DType::I32, {static_cast<int>(fast::encoded_column_words(k)), batch});
     Tensor emax    = workspace.alloc(DType::I32, {batch});
     const Columns in{.encoded = static_cast<const std::int32_t*>(encoded.data),
                      .emax    = static_cast<const std::int32_t*>(emax.data)};
-    // Wide calls decode each segment's weights once into planes for the tiles; segments whose
-    // planes exceed kPlaneBytes run in passes of row slabs, each re-encoding the columns.
-    const bool wide = columns >= kTileMinColumns && (k / 32) % ggml::tile::kStageSlices == 0;
     std::vector<std::vector<Slab>> passes;
     std::uint8_t* planes = nullptr;
     if (wide) {

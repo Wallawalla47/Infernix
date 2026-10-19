@@ -160,6 +160,8 @@ struct Offsets {
     std::size_t h_blocks, x_plane;                      // W4A4
     std::size_t x_limbs, h_rows, x_emax, h_emax;        // W4A16
     std::size_t x_terms_plane, x_row_scale, h_terms_plane, h_row_scale; // W4A16 two-term A4
+    std::size_t ggml_planes;                            // GGUF banks' kGgmlBf16
+    bool has_ggml_planes;
     std::size_t end;
 };
 
@@ -195,6 +197,10 @@ Offsets offsets(std::int32_t max_jobs, std::int32_t entries, std::int32_t column
         o.h_rows  = take(e * kA16HRowBytes);
         o.x_emax  = take(t * sizeof(std::int32_t));
         o.h_emax  = take(e * sizeof(std::int32_t));
+        if (wide_a16 == WideA16::kGgmlBf16 && columns >= kGgmlBf16MinColumns) {
+            o.ggml_planes     = take(kGgmlBf16PlaneBytes);
+            o.has_ggml_planes = true;
+        }
     } else {
         o.h_blocks = take(e * kHBlocks * sizeof(canon::A4Block));
         o.x_plane  = take(e * kXRowBytes);
@@ -520,6 +526,7 @@ ExpertsWorkspace carve_experts_workspace(void* base, std::int32_t max_jobs, std:
         w.h_rows  = reinterpret_cast<std::uint8_t*>(p + o.h_rows);
         w.x_emax  = reinterpret_cast<std::int32_t*>(p + o.x_emax);
         w.h_emax  = reinterpret_cast<std::int32_t*>(p + o.h_emax);
+        w.ggml_planes = o.has_ggml_planes ? reinterpret_cast<std::uint8_t*>(p + o.ggml_planes) : nullptr;
     } else {
         w.h_blocks = reinterpret_cast<canon::A4Block*>(p + o.h_blocks);
         w.x_plane  = reinterpret_cast<std::uint8_t*>(p + o.x_plane);

@@ -308,6 +308,7 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
     case FastPath::SampledMtpDrafts: return false; // Qwen3.8-Flash-Next's MTP drafter only
     // Every Text GDN layer normalizes Q/K, and its chunked calls serve prefill.
     case FastPath::GdnF16Accumulate: return true;
+    case FastPath::GgmlBf16Prefill: return false; // Qwen3.8-Flash-Next's GGUF imports only
     }
     return false;
 }

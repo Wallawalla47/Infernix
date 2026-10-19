@@ -92,6 +92,22 @@ inline constexpr int kResidualTerms  = 2;
 inline constexpr int kXTermsRowBytes = kResidualTerms * kXRowBytes;
 inline constexpr int kHTermsRowBytes = kResidualTerms * kHRowStride;
 
+// GGUF banks' kGgmlBf16 route (ggml_expert.cuh): every wide job's records decoded into planes
+// (ggml_tile.cuh CodeStage images: kGgmlCodeStageBytes per 64 rows x 64 elements), its gate and up
+// rows (2 kIntermediate x kHidden) then its down rows (kHidden x kIntermediate), kGgmlBf16Experts
+// jobs at a time. Calls of fewer than kGgmlBf16MinColumns columns carve no planes and keep the exact
+// tiles: below it the BF16 route measured no faster, its planes a per-expert cost (RTX 5090, IQ3_S banks:
+// 8,192 columns 0 to +7 %, 12,288 columns -10 to +3 %, 14,336 columns 7-9 % faster, 32,768 columns
+// 15-18 % faster; the walk's MoE groups reach it from 14,336-token prompts).
+inline constexpr int kGgmlBf16Experts         = 32;
+inline constexpr int kGgmlBf16MinColumns      = 14336;
+inline constexpr std::size_t kGgmlCodeStageBytes = 6144;
+inline constexpr std::size_t kGgmlBf16GateUpImages = static_cast<std::size_t>(2 * kIntermediate / 64) * (kHidden / 64);
+inline constexpr std::size_t kGgmlBf16DownImages   = static_cast<std::size_t>(kHidden / 64) * (kIntermediate / 64);
+inline constexpr std::size_t kGgmlBf16ExpertBytes =
+    (kGgmlBf16GateUpImages + kGgmlBf16DownImages) * kGgmlCodeStageBytes;
+inline constexpr std::size_t kGgmlBf16PlaneBytes = kGgmlBf16Experts * kGgmlBf16ExpertBytes;
+
 // The layout of moe_experts' workspace, the single place that defines it. The bookkeeping comes
 // first, so its offsets depend only on max_jobs and entries; the activation planes follow.
 struct ExpertsWorkspace {
@@ -113,6 +129,8 @@ struct ExpertsWorkspace {
     float* x_row_scale;           // [columns]
     std::uint8_t* h_terms_plane;  // [entries][kHTermsRowBytes]
     float* h_row_scale;           // [entries]
+    // GGUF banks, kGgmlBf16 in calls of kGgmlBf16MinColumns or more (else null): kGgmlBf16PlaneBytes
+    std::uint8_t* ggml_planes;
 };
 
 // Bytes of a call's CPU bookkeeping (moe_layer.cu's CpuCall: two words and kMaxCpuJobs job indices).

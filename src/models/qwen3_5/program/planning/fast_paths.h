@@ -63,7 +63,8 @@ struct FastPathConfiguration {
     case FastPath::FreeCacheResume:
     case FastPath::Preemption:
     case FastPath::AdaptiveMtp:
-    case FastPath::IdleWidePrefill: return true;
+    case FastPath::IdleWidePrefill:
+    case FastPath::GgmlBf16Prefill: return true;
     }
     return false;
 }

@@ -12,7 +12,8 @@
 // the exact arithmetic (ops/ggml/ggml_exact.h, whose decode, sums and rounding
 // infernix_ggml_linear_test qualifies against an independent bignum oracle): x and h A16-encoded,
 // gate/up rows rounded to BF16, SwiGLU, the down rows. Every output must be bit-equal to it in
-// every configuration.
+// every configuration. The ggml-bf16-prefill route (run_bf16) is checked against the exact route and a
+// binary64 chain within bounds instead.
 //
 // `--bench [tokens]` times one layer's expert call of a prefill chunk (512 experts, top-10, every
 // record resident) per format pair instead.
@@ -27,6 +28,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -315,10 +317,217 @@ void run(QType gu, QType down, int columns, std::mt19937& rng, Spread spread = S
     for (auto e : fork_events) { cudaEventDestroy(e); }
 }
 
+// One block's exact values in binary64 (llama.cpp's dequantize_row_* through ggml_exact.h's chunks):
+// every element of a row of `k` elements.
+void decode_row(QType q, const std::uint8_t* row, int k, double* out) {
+    for (int i = 0; i < k / 8; ++i) {
+        ggml::Chunk c{};
+        switch (q) {
+        case QType::GGML_IQ2_S: c = ggml::row_chunk<QType::GGML_IQ2_S>(row, i); break;
+        case QType::GGML_IQ3_XXS: c = ggml::row_chunk<QType::GGML_IQ3_XXS>(row, i); break;
+        case QType::GGML_IQ3_S: c = ggml::row_chunk<QType::GGML_IQ3_S>(row, i); break;
+        case QType::GGML_IQ4_XS: c = ggml::row_chunk<QType::GGML_IQ4_XS>(row, i); break;
+        case QType::GGML_IQ4_NL: c = ggml::row_chunk<QType::GGML_IQ4_NL>(row, i); break;
+        case QType::GGML_Q2_0: c = ggml::row_chunk<QType::GGML_Q2_0>(row, i); break;
+        default: throw std::logic_error("format");
+        }
+        std::int64_t mant;
+        int shift;
+        bool negative;
+        ggml::f16_parts(c.d, mant, shift, negative);
+        const double d = std::ldexp(static_cast<double>(negative ? -mant : mant), shift - 24 + ggml::kappa_log2(q));
+        for (int j = 0; j < 8; ++j) { out[8 * i + j] = d * c.sub * c.code[j]; }
+    }
+}
+
+double bf16_value(std::uint16_t bits) {
+    const std::uint32_t u = static_cast<std::uint32_t>(bits) << 16;
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+}
+
+std::uint16_t bf16_round(double v) {
+    const auto f = static_cast<float>(v);
+    std::uint32_t u;
+    std::memcpy(&u, &f, 4);
+    return static_cast<std::uint16_t>((u + 0x7FFF + ((u >> 16) & 1)) >> 16);
+}
+
+// The ggml-bf16-prefill route (WideA16::kGgmlBf16) of a call wide enough for its planes
+// (kGgmlBf16MinColumns): 64 experts, top-4, some resident, the rest read zero-copy in one pass or staged
+// through 24 slots (passes of 24 jobs, each one sub-batch), a few rarely routed experts left to
+// the narrow kernels. Its arithmetic is not the exact route's (x and h as stored, FP32 sums), so the
+// exact route of the same call (bit-equal to the host oracle at the other widths) is the control: per
+// output column the normwise difference must stay within 2^-6 and at least 90 % of the outputs must
+// be equal. A sample of 48 (token, slot) pairs is checked against a binary64 chain with the route's
+// semantic boundaries (gate and up rounded to BF16, swiglu_bf16, BF16 h, the down rows): within
+// 2^-7 of sum |w h| plus half a BF16 ulp per output.
+void run_bf16(QType gu, QType down, int columns, std::mt19937& rng) {
+    constexpr int experts = 64, top_k = 4;
+    const int H = moe::kHidden, I = moe::kIntermediate;
+    const std::uint32_t gr = row_bytes(gu, H), dr = row_bytes(down, I);
+    const std::uint64_t record = 2ULL * I * gr + static_cast<std::uint64_t>(H) * dr;
+    const std::uint64_t stride = (record + 4095) / 4096 * 4096;
+    std::uint8_t* host = nullptr;
+    cuda_check(cudaHostAlloc(reinterpret_cast<void**>(&host), stride * experts, cudaHostAllocMapped), "cudaHostAlloc");
+    std::memset(host, 0, stride * experts);
+    for (int e = 0; e < experts; ++e) {
+        random_rows(gu, 2 * I, H, rng, host + e * stride, Spread::kModel);
+        random_rows(down, H, I, rng, host + e * stride + 2ULL * I * gr, Spread::kModel);
+    }
+    std::uint8_t* host_device = nullptr;
+    cuda_check(cudaHostGetDevicePointer(reinterpret_cast<void**>(&host_device), host, 0), "cudaHostGetDevicePointer");
+    std::vector<std::int32_t> frames(experts, -1);
+    int resident = 0;
+    for (int e = 0; e < experts; e += 3) { frames[static_cast<std::size_t>(e)] = resident++; }
+    std::uint8_t* d_frames_base = nullptr;
+    cuda_check(cudaMalloc(&d_frames_base, stride * resident), "cudaMalloc");
+    for (int e = 0; e < experts; ++e) {
+        if (frames[static_cast<std::size_t>(e)] >= 0) {
+            cuda_check(cudaMemcpy(d_frames_base + frames[static_cast<std::size_t>(e)] * stride, host + e * stride, stride,
+                                  cudaMemcpyHostToDevice), "cudaMemcpy");
+        }
+    }
+    auto* d_frames = device_copy(frames);
+    std::normal_distribution<float> n(0.0F, 1.0F);
+    std::vector<float> logits(static_cast<std::size_t>(experts + 1) * columns);
+    for (auto& v : logits) { v = n(rng); }
+    for (int t = 0; t < columns; ++t) {
+        for (int e = 60; e < 64; ++e) { logits[static_cast<std::size_t>(t) * (experts + 1) + e] -= 7.0F; } // narrow jobs
+        logits[static_cast<std::size_t>(t) * (experts + 1) + 1] += 2.0F; // a job of many tiles
+    }
+    auto* d_logits = device_copy(logits);
+    std::int32_t* d_ids = nullptr;
+    float *d_weights = nullptr, *d_gate = nullptr;
+    cuda_check(cudaMalloc(&d_ids, sizeof(std::int32_t) * top_k * columns), "cudaMalloc");
+    cuda_check(cudaMalloc(&d_weights, sizeof(float) * top_k * columns), "cudaMalloc");
+    cuda_check(cudaMalloc(&d_gate, sizeof(float) * columns), "cudaMalloc");
+    infernix::ops::MoeRouting routing{Tensor(d_ids, DType::I32, {top_k, columns}), Tensor(d_weights, DType::FP32, {top_k, columns}),
+                                      Tensor(d_gate, DType::FP32, {columns})};
+    infernix::ops::moe_route(Tensor(d_logits, DType::FP32, {experts + 1, columns}), top_k, routing, nullptr);
+    void* d_dispatch = nullptr;
+    cuda_check(cudaMalloc(&d_dispatch, infernix::ops::moe_dispatch_bytes(experts, top_k * columns)), "cudaMalloc");
+    auto dispatch = infernix::ops::carve_moe_dispatch(d_dispatch, experts, top_k * columns);
+    std::vector<std::uint16_t> x(static_cast<std::size_t>(H) * columns);
+    for (auto& v : x) { v = bf16_round(n(rng)); }
+    auto* d_x = device_copy(x);
+    std::vector<std::int32_t> ids(static_cast<std::size_t>(top_k) * columns);
+    cuda_check(cudaMemcpy(ids.data(), d_ids, ids.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost), "cudaMemcpy");
+    const int max_jobs  = std::min(experts, top_k * columns);
+    const std::size_t outputs = static_cast<std::size_t>(H) * top_k * columns;
+    std::uint8_t* d_staging = nullptr;
+    cuda_check(cudaMalloc(&d_staging, stride * 64), "cudaMalloc");
+    void* d_workspace = nullptr;
+    cuda_check(cudaMalloc(&d_workspace, infernix::ops::moe_experts_workspace_bytes(max_jobs, top_k * columns, columns,
+                                                                                  moe::ExpertActivation::kA16,
+                                                                                  moe::WideA16::kGgmlBf16)),
+               "cudaMalloc");
+    std::vector<moe::ExpertScales> scales(experts);
+    auto* d_scales = device_copy(scales);
+    std::uint16_t* d_out = nullptr;
+    cuda_check(cudaMalloc(&d_out, outputs * sizeof(std::uint16_t)), "cudaMalloc");
+    const auto call = [&](moe::WideA16 route, int slots) {
+        infernix::ops::moe_dispatch(routing, experts, dispatch, nullptr, nullptr);
+        cuda_check(cudaMemset(d_out, 0xFF, outputs * sizeof(std::uint16_t)), "cudaMemset");
+        infernix::ops::MoeExpertSource source{.frame_base = d_frames_base, .frames = d_frames, .host_records = host_device,
+                                              .record_stride = stride, .scales = d_scales,
+                                              .staging_base = slots > 0 ? d_staging : nullptr, .staging_slots = slots};
+        source.activation   = moe::ExpertActivation::kA16;
+        source.wide_a16     = route;
+        source.frame_stride = stride;
+        source.ggml         = {.gate_up_format = gu, .down_format = down, .gate_row_bytes = gr, .down_row_bytes = dr,
+                               .record_bytes = record};
+        Tensor tx(d_x, DType::BF16, {H, columns});
+        Tensor out(d_out, DType::BF16, {H, top_k * columns});
+        infernix::ops::moe_experts(tx, dispatch, source, top_k, max_jobs, d_workspace, out, nullptr);
+        cuda_check(cudaDeviceSynchronize(), "moe_experts");
+        std::vector<std::uint16_t> got(outputs);
+        cuda_check(cudaMemcpy(got.data(), d_out, outputs * sizeof(std::uint16_t), cudaMemcpyDeviceToHost), "cudaMemcpy");
+        return got;
+    };
+    const auto exact = call(moe::WideA16::kExact, 0);
+    for (const int slots : {0, 24}) {
+        const auto fast = call(moe::WideA16::kGgmlBf16, slots);
+        std::size_t same = 0, bad_columns = 0;
+        double worst = 0;
+        for (int c = 0; c < top_k * columns; ++c) {
+            double diff = 0, norm = 0;
+            for (int r = 0; r < H; ++r) {
+                const std::size_t i = static_cast<std::size_t>(c) * H + r;
+                same += fast[i] == exact[i];
+                const double a = bf16_value(fast[i]), b = bf16_value(exact[i]);
+                diff += (a - b) * (a - b);
+                norm += b * b;
+            }
+            const double rel = norm > 0 ? std::sqrt(diff / norm) : std::sqrt(diff);
+            worst = std::max(worst, std::isnan(rel) ? 1e30 : rel);
+            bad_columns += !(rel <= 1.0 / 64);
+        }
+        char what[200];
+        std::snprintf(what, sizeof what, "ggml bf16 experts (%d, %d) x %d columns, %d slots: %zu output columns beyond 2^-6 of the exact route",
+                      static_cast<int>(gu), static_cast<int>(down), columns, slots, bad_columns);
+        check(bad_columns == 0, what);
+        std::snprintf(what, sizeof what, "ggml bf16 experts (%d, %d) x %d columns, %d slots: only %.1f %% of outputs equal the exact route's",
+                      static_cast<int>(gu), static_cast<int>(down), columns, slots, 100.0 * static_cast<double>(same) / outputs);
+        check(same * 10 >= outputs * 9, what);
+        std::printf("info ggml bf16 experts (%d, %d) x %d columns, %d slots: %.2f %% of outputs equal the exact route's, worst column %.2e\n",
+                    static_cast<int>(gu), static_cast<int>(down), columns, slots, 100.0 * static_cast<double>(same) / outputs, worst);
+        if (slots != 0) { continue; }
+        // The binary64 chain on a sample of (token, slot) pairs.
+        std::vector<double> wg(static_cast<std::size_t>(H)), wu(static_cast<std::size_t>(H)), wd(static_cast<std::size_t>(I));
+        std::size_t sample_bad = 0;
+        for (int s = 0; s < 48; ++s) {
+            const int pair = static_cast<int>(rng() % static_cast<unsigned>(top_k * columns));
+            const int t = pair / top_k, e = ids[static_cast<std::size_t>(pair)];
+            const std::uint8_t* rec = host + e * stride;
+            std::vector<std::uint16_t> h(static_cast<std::size_t>(I));
+            for (int i = 0; i < I; ++i) {
+                decode_row(gu, rec + static_cast<std::size_t>(i) * gr, H, wg.data());
+                decode_row(gu, rec + static_cast<std::size_t>(I + i) * gr, H, wu.data());
+                double g = 0, u = 0;
+                for (int j = 0; j < H; ++j) {
+                    const double xv = bf16_value(x[static_cast<std::size_t>(t) * H + j]);
+                    g += wg[static_cast<std::size_t>(j)] * xv;
+                    u += wu[static_cast<std::size_t>(j)] * xv;
+                }
+                h[static_cast<std::size_t>(i)] = canon::swiglu_bf16(bf16_round(g), bf16_round(u));
+            }
+            for (int r = 0; r < H; ++r) {
+                decode_row(down, rec + 2ULL * I * gr + static_cast<std::size_t>(r) * dr, I, wd.data());
+                double y = 0, mag = 0;
+                for (int i = 0; i < I; ++i) {
+                    const double p = wd[static_cast<std::size_t>(i)] * bf16_value(h[static_cast<std::size_t>(i)]);
+                    y += p;
+                    mag += std::fabs(p);
+                }
+                const double got = bf16_value(fast[static_cast<std::size_t>(pair) * H + r]);
+                sample_bad += !(std::fabs(got - y) <= mag / 128 + std::ldexp(std::fabs(y), -8));
+            }
+        }
+        std::snprintf(what, sizeof what, "ggml bf16 experts (%d, %d) x %d columns: %zu sampled outputs beyond the binary64 chain's bound",
+                      static_cast<int>(gu), static_cast<int>(down), columns, sample_bad);
+        check(sample_bad == 0, what);
+    }
+    cudaFree(d_out);
+    cudaFree(d_scales);
+    cudaFree(d_workspace);
+    cudaFree(d_staging);
+    cudaFree(d_x);
+    cudaFree(d_dispatch);
+    cudaFree(d_ids);
+    cudaFree(d_weights);
+    cudaFree(d_gate);
+    cudaFree(d_logits);
+    cudaFree(d_frames);
+    cudaFree(d_frames_base);
+    cudaFreeHost(host);
+}
+
 // --bench: one layer call of the real geometry (512 experts, top-10; 4,096 tokens, a prefill chunk of
 // about 80 columns per expert, or a decode or verification width) with every record resident and
 // the model's job bound, timed over repeated moe_experts calls.
-void bench(QType gu, QType down, int columns, std::mt19937& rng) {
+void bench(QType gu, QType down, int columns, std::mt19937& rng, moe::WideA16 route) {
     constexpr int experts = 512, top_k = 10, reps = 10;
     const int H = moe::kHidden, I = moe::kIntermediate;
     const std::uint64_t record = 2ULL * I * row_bytes(gu, H) + static_cast<std::uint64_t>(H) * row_bytes(down, I);
@@ -359,7 +568,7 @@ void bench(QType gu, QType down, int columns, std::mt19937& rng) {
     auto* d_x = device_copy(x);
     void* d_workspace = nullptr;
     cuda_check(cudaMalloc(&d_workspace, infernix::ops::moe_experts_workspace_bytes(experts, top_k * columns, columns,
-                                                                                  moe::ExpertActivation::kA16)),
+                                                                                  moe::ExpertActivation::kA16, route)),
                "cudaMalloc");
     std::vector<moe::ExpertScales> scales(experts);
     auto* d_scales = device_copy(scales);
@@ -371,6 +580,7 @@ void bench(QType gu, QType down, int columns, std::mt19937& rng) {
                                           .staging_slots = 0};
     source.activation   = moe::ExpertActivation::kA16;
     source.frame_stride = stride;
+    source.wide_a16     = route;
     source.ggml         = {.gate_up_format = gu, .down_format = down, .gate_row_bytes = row_bytes(gu, H),
                            .down_row_bytes = row_bytes(down, I), .record_bytes = record};
     Tensor tx(d_x, DType::BF16, {H, columns});
@@ -389,8 +599,9 @@ void bench(QType gu, QType down, int columns, std::mt19937& rng) {
     cuda_check(cudaEventElapsedTime(&ms, start, stop), "event");
     ms /= reps;
     const double macs = static_cast<double>(top_k) * columns * (2.0 * I * H + static_cast<double>(H) * I);
-    std::printf("experts (%d, %d) x %d tokens: %8.3f ms per layer call, %6.1f effective TOPS\n", static_cast<int>(gu),
-                static_cast<int>(down), columns, ms, 2.0 * macs / (ms * 1e-3) / 1e12);
+    std::printf("experts (%d, %d) x %d tokens, %s: %8.3f ms per layer call, %6.1f effective TOPS\n", static_cast<int>(gu),
+                static_cast<int>(down), columns, route == moe::WideA16::kGgmlBf16 ? "bf16" : "exact", ms,
+                2.0 * macs / (ms * 1e-3) / 1e12);
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
     cudaFree(d_out);
@@ -411,11 +622,14 @@ void bench(QType gu, QType down, int columns, std::mt19937& rng) {
 int main(int argc, char** argv) {
     std::mt19937 rng(20261010);
     if (argc > 1 && std::strcmp(argv[1], "--bench") == 0) {
+        // --bench [tokens] [bf16]: the exact route and, with bf16, the ggml-bf16-prefill route too.
         const int columns = argc > 2 ? std::atoi(argv[2]) : 4096;
+        const bool bf16   = argc > 3 && std::strcmp(argv[3], "bf16") == 0;
         for (const auto& [gu, down] : {std::pair{QType::GGML_IQ2_S, QType::GGML_IQ4_NL}, std::pair{QType::GGML_IQ3_XXS, QType::GGML_IQ4_NL},
                                        std::pair{QType::GGML_IQ3_S, QType::GGML_IQ4_NL}, std::pair{QType::GGML_IQ3_S, QType::GGML_Q2_0}}) {
             try {
-                bench(gu, down, columns, rng);
+                bench(gu, down, columns, rng, moe::WideA16::kExact);
+                if (bf16) { bench(gu, down, columns, rng, moe::WideA16::kGgmlBf16); }
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "bench: %s\n", e.what());
                 return 1;
@@ -437,11 +651,14 @@ int main(int argc, char** argv) {
             run(gu, down, columns, rng, Spread::kEdge);
             run(gu, down, columns, rng, Spread::kWide);
         }
+        // The ggml-bf16-prefill route at a width that carves its planes (a partial last tile).
+        run_bf16(gu, down, 14336 + 37, rng); // wide_expert.h kGgmlBf16MinColumns = 14336
     }
     if (g_failures != 0) {
         std::fprintf(stderr, "%d ggml expert checks failed\n", g_failures);
         return 1;
     }
-    std::printf("ggml experts: every format pair, width and placement bit-equal to the exact host expert\n");
+    std::printf("ggml experts: every format pair, width and placement bit-equal to the exact host expert; the "
+                "ggml-bf16-prefill route within its bounds of the exact route and a binary64 chain\n");
     return 0;
 }

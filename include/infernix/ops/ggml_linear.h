@@ -3,6 +3,7 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "core/weight.h"
+#include "infernix/ops/linear.h"
 
 #include <cuda_runtime.h>
 
@@ -70,9 +71,17 @@ struct GgmlSegment {
  * projection reads its value heads in ggml's tiled order). The workspace holds the encoded columns
  * (ggml_linear_workspace_bytes: 3.125 bytes per element, in batches of at most 512 columns) and,
  * for calls of 32 or more columns, 64 MiB of decoded weight planes.
+ *
+ * `routes` with LinearRoutes::GgmlBf16Wide (the ggml-bf16-prefill fast path) runs calls of 32 or
+ * more columns on BF16 tensor cores instead: x as stored (no A16 encoding), each code exactly as
+ * BF16, the FP32 sum of each 16- or 32-element sub-block's products scaled by d * sub (and the
+ * K-quants' - dmin * min * sum(x)) and added to an FP32 accumulator in K order, one rounding to the
+ * output. Every product is exact and only the FP32 sums round; an output still depends only on its
+ * row, column and K, but its bits are not the exact route's. Narrower calls and other flags run the
+ * exact route.
  */
 void ggml_linear(const Tensor& x, std::span<const GgmlSegment> segments, Tensor& out, const std::int32_t* input_perm,
-                 std::int32_t perm_block, WorkspaceArena& workspace, cudaStream_t stream);
+                 std::int32_t perm_block, WorkspaceArena& workspace, cudaStream_t stream, LinearRoutes routes);
 
 /**
  * ggml_linear into several outputs (one encoding of x): segment s writes rows [s.out_offset,
@@ -80,7 +89,8 @@ void ggml_linear(const Tensor& x, std::span<const GgmlSegment> segments, Tensor&
  * or FP32), so a fused projection's parts land in their own tensors with no split copy.
  */
 void ggml_linear(const Tensor& x, std::span<const GgmlSegment> segments, std::span<Tensor* const> outs,
-                 const std::int32_t* input_perm, std::int32_t perm_block, WorkspaceArena& workspace, cudaStream_t stream);
+                 const std::int32_t* input_perm, std::int32_t perm_block, WorkspaceArena& workspace, cudaStream_t stream,
+                 LinearRoutes routes);
 
 [[nodiscard]] std::size_t ggml_linear_workspace_bytes(std::int32_t k, std::int32_t columns);
 

@@ -55,6 +55,9 @@ enum class LinearRoutes : std::uint8_t {
     /// batched-decode: NVFP4 linear_add [5120,17408] A16 tiles of 8 K-warps at 5-16 columns (the
     /// exact route keeps the release's 4 K-warp tiles; the K-warp count sets the reduction order).
     WideDownTile = 8,
+    /// ggml-bf16-prefill: GGUF projections of 32 or more columns on BF16 tensor cores with FP32 sums
+    /// (ops::ggml_linear) instead of the exact A16 integer tiles.
+    GgmlBf16Wide = 16,
 };
 
 [[nodiscard]] constexpr LinearRoutes operator|(LinearRoutes a, LinearRoutes b) noexcept {
@@ -66,7 +69,7 @@ enum class LinearRoutes : std::uint8_t {
 }
 
 [[nodiscard]] constexpr bool valid_linear_routes(LinearRoutes routes) noexcept {
-    return (static_cast<std::uint8_t>(routes) & ~std::uint8_t{15}) == 0;
+    return (static_cast<std::uint8_t>(routes) & ~std::uint8_t{31}) == 0;
 }
 
 [[nodiscard]] constexpr bool valid_linear_policy(LinearPolicy policy) noexcept {

@@ -139,6 +139,18 @@ constexpr std::array kQualified{
     Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Ggml, false, KvCacheStorage::Fp8KeyNvfp4Value}},
     Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Ggml, false, KvCacheStorage::Vq2}},
     Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Ggml, false, KvCacheStorage::Q4KeyVq2Value}},
+    // GGUF imports: the BF16 prefill tiles (2026-10-19). Prefill gate (quick corpus, 896 and 7,168
+    // tokens) on every format jointly with the qualified paths: BF16 KV fails (its exact route is the
+    // reference, floor 0; KL 5.7e-3), the others pass (KL excess bounds 3.7e-4 to 7.8e-4); decode plain
+    // on INT8 (the passing format with the lowest floor), 256 segments: TV bound 9.3e-4. Timed on INT8
+    // against the exact route: pp32768 +33 %, pp65536 +44 % (design §19.3.29); no KV format enters
+    // its kernels.
+    Qualification{FastPath::GgmlBf16Prefill, {DenseKernels::Ggml, false, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::GgmlBf16Prefill, {DenseKernels::Ggml, false, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::GgmlBf16Prefill, {DenseKernels::Ggml, false, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::GgmlBf16Prefill, {DenseKernels::Ggml, false, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::GgmlBf16Prefill, {DenseKernels::Ggml, false, KvCacheStorage::Vq2}},
+    Qualification{FastPath::GgmlBf16Prefill, {DenseKernels::Ggml, false, KvCacheStorage::Q4KeyVq2Value}},
     // Official FP8 (BF16 dense, 16-bit expert activations): the same tests (2026-10-17/18): second-turn
     // resume 3.9-5.7 -> 0.26-0.51 s; sampled drafts math +20.4 %, story +15.6 % (every run ahead), code
     // -13.0 % (overlapping: one exact run at 52.5 against 39.7-40.1 for the other three); FP16 GDN
@@ -337,6 +349,8 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
     // with them (FP8-row dense). GGUF and block-FP8 experts also take 16-bit activations but have no
     // such kernel.
     case FastPath::ExpertA4Residual: return !configuration.a4_experts && configuration.dense == DenseKernels::Fp8Row;
+    // The GGUF imports' dense projections (ops::ggml_linear's BF16 prefill tiles).
+    case FastPath::GgmlBf16Prefill: return configuration.dense == DenseKernels::Ggml;
     case FastPath::QsaPrepareFused:
         // ops::qsa_prepare_supports's KV formats (bf16, int8, fp8, nvfp4, k8v4); VQ2 and K4V2 append
         // inside qsa_attention and keep the composed prepare.
@@ -362,10 +376,12 @@ bool FastPathSelection::request_invariant() const noexcept {
         // q8-sliced-k picks its reduction order by the round's column count, so a decode column's bits
         // depend on the other requests of its round.
         // expert-a4-residual routes an expert, and fp8-a8-pair a dense problem, by its column count in
-        // the call, which batched rounds share between requests.
+        // the call, which batched rounds share between requests. ggml-bf16-prefill routes a prompt's
+        // GGUF projections by its calls' widths, whose boundaries prefix-cache resumes move.
         return path == FastPath::AdaptiveSpeculation || path == FastPath::FreeCacheResume ||
                path == FastPath::Preemption || path == FastPath::Q8SlicedK ||
-               path == FastPath::ExpertA4Residual || path == FastPath::Fp8A8Pair;
+               path == FastPath::ExpertA4Residual || path == FastPath::Fp8A8Pair ||
+               path == FastPath::GgmlBf16Prefill;
     });
 }
 
@@ -373,6 +389,7 @@ execution::ForwardFastPaths FastPathSelection::forward() const noexcept {
     ops::LinearRoutes routes = ops::LinearRoutes::Exact;
     if (selected(FastPath::Q8SlicedK)) { routes = routes | ops::LinearRoutes::Q8SlicedK; }
     if (selected(FastPath::Fp8A8Pair)) { routes = routes | ops::LinearRoutes::Fp8A8Pair; }
+    if (selected(FastPath::GgmlBf16Prefill)) { routes = routes | ops::LinearRoutes::GgmlBf16Wide; }
     return {.dense_routes       = routes,
             .gdn_conv_fused     = selected(FastPath::GdnConvFused),
             .qsa_prepare_fused  = selected(FastPath::QsaPrepareFused),

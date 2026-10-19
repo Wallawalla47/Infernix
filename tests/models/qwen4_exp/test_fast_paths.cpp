@@ -201,6 +201,28 @@ int main() {
                       "gdn-f16-accumulate applies to every artifact and sets its Forward flag");
     failures += check(selection.request_invariant(), "gdn-f16-accumulate keeps a request invariant");
 
+    // ggml-bf16-prefill acts on GGUF dense projections only, sets the BF16 route flag, and couples a
+    // prompt's arithmetic to where its calls start.
+    failures += check(q::fast_path_applies(FastPath::GgmlBf16Prefill, {kGgml, false, KvCacheStorage::Int8Group64}, options),
+                      "ggml-bf16-prefill runs on GGUF dense weights");
+    for (const DenseKernels dense : {DenseKernels::Q8, DenseKernels::Bf16, DenseKernels::Fp8Row}) {
+        failures += check(!q::fast_path_applies(FastPath::GgmlBf16Prefill, {dense, false, KvCacheStorage::Int8Group64}, options),
+                          "ggml-bf16-prefill has no route for non-GGUF dense weights");
+    }
+    failures += check(!infernix::ops::has_route(exact.dense_routes, infernix::ops::LinearRoutes::GgmlBf16Wide),
+                      "the exact route keeps GGUF projections exact");
+    selection.paths = {FastPath::GgmlBf16Prefill};
+    failures += check(infernix::ops::has_route(selection.forward().dense_routes, infernix::ops::LinearRoutes::GgmlBf16Wide),
+                      "ggml-bf16-prefill sets its route flag");
+    failures += check(!selection.request_invariant(), "ggml-bf16-prefill couples a prompt to its call boundaries");
+    for (const auto kv : {KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256, KvCacheStorage::Nvfp4Group16,
+                          KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2, KvCacheStorage::Q4KeyVq2Value}) {
+        failures += check(q::fast_path_qualified(FastPath::GgmlBf16Prefill, {kGgml, false, kv}),
+                          "ggml-bf16-prefill is qualified on GGUF imports with every KV format that passed its gate");
+    }
+    failures += check(!q::fast_path_qualified(FastPath::GgmlBf16Prefill, {kGgml, false, KvCacheStorage::BFloat16}),
+                      "ggml-bf16-prefill is not qualified with BF16 KV (it fails the prefill gate there)");
+
     std::cout << (failures == 0 ? "PASS" : "FAIL") << " Qwen3.8-Flash-Next fast-path selection\n";
     return failures == 0 ? 0 : 1;
 }

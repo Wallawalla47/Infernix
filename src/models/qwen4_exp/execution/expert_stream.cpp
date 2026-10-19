@@ -44,6 +44,7 @@ ExpertStream::ExpertStream(std::uint32_t layers, std::uint32_t experts, std::uin
         CUDA_CHECK(cudaEventCreateWithFlags(&consumed_[l], cudaEventDisableTiming));
     }
     streams_.assign(layers_, 0);
+    complete_.assign(layers_, 0);
 }
 
 ExpertStream::~ExpertStream() {
@@ -107,6 +108,7 @@ void ExpertStream::begin(DeviceSpan ring, const std::int32_t* residency, cudaStr
     if (gated) {
         uploading_ = false;
         std::fill(streams_.begin(), streams_.end(), std::uint8_t{0});
+        std::fill(complete_.begin(), complete_.end(), std::uint8_t{0});
         CUDA_CHECK(cudaEventRecord(start_, compute));
         CUDA_CHECK(cudaStreamWaitEvent(stream_, start_, 0));
         active_ = true;
@@ -120,9 +122,14 @@ void ExpertStream::begin(DeviceSpan ring, const std::int32_t* residency, cudaStr
         std::int32_t* row = tables + static_cast<std::size_t>(l) * experts_;
         const std::int32_t* frames = residency + static_cast<std::size_t>(l) * experts_;
         std::uint32_t taken = 0, staged = 0;
+        bool complete = true;
         for (std::uint32_t e = 0; e < experts_; ++e) {
             row[e] = -1;
-            if (frames[e] >= 0 || taken >= half_) { continue; }
+            if (frames[e] >= 0) { continue; }
+            if (taken >= half_) {
+                complete = false;
+                continue;
+            }
             if (takes(l, e, taken, staged)) { // a pinned record, or an unpinned one while staging has room
                 row[e] = static_cast<std::int32_t>((l % 2) * half_ + taken++);
                 if (hold_) { hold_(l, e); }
@@ -130,10 +137,13 @@ void ExpertStream::begin(DeviceSpan ring, const std::int32_t* residency, cudaStr
                        ssd_planned_[l].size() < ssd_cap) { // SSD-only: a stream read
                 row[e] = static_cast<std::int32_t>((l % 2) * half_ + taken++);
                 ssd_planned_[l].emplace_back(e, row[e]);
+            } else {
+                complete = false;
             }
         }
         ssd_slots_[l].assign(ssd_planned_[l].size(), -1);
-        streams_[l] = taken > 0 ? 1 : 0;
+        streams_[l]  = taken > 0 ? 1 : 0;
+        complete_[l] = complete ? 1 : 0;
     }
     const std::size_t table_bytes = static_cast<std::size_t>(layers_) * experts_ * sizeof(std::int32_t);
     CUDA_CHECK(cudaMemcpyAsync(tables_, tables_host_.data(), table_bytes, cudaMemcpyHostToDevice, compute));

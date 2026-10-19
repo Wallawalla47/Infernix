@@ -17,6 +17,7 @@
 #include "ops/common/canonical_math.h"
 #include "ops/ggml/ggml_dp4a.cuh"
 #include "ops/ggml/ggml_exact.h"
+#include "ops/ggml/ggml_bf16_tile.cuh"
 #include "ops/ggml/ggml_tile.cuh"
 #include "ops/fp8_block/fp8_exact.h"
 #include "ops/offloaded_sparse_moe/cuda/wide_expert.h"
@@ -1271,7 +1272,7 @@ void launch_pass(int columns, const bf16* x, const MoeDispatch& dispatch, const 
         return;
     }
     if (ggml_bank(source)) {
-        launch_pass_ggml(dispatch, source, top_k, job_records, flags, base, jobs, layout, outputs, stream, phase,
+        launch_pass_ggml(x, dispatch, source, top_k, job_records, flags, base, jobs, layout, outputs, stream, phase,
                          wide ? columns_out : 0);
         return;
     }

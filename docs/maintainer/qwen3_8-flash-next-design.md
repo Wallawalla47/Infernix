@@ -7933,11 +7933,17 @@ the drive's knee) remains open.
     same steps per (layer, chunk).
   - **MoE groups (2026-10-12).** The walk runs each layer in two halves: `layer_mixer` per chunk
     (everything before the MoE; its input and inject weights go to the span area), then
-    `layer_moe` once over a group of consecutive chunks (up to `kWalkMoeColumns` = 16,384 columns,
-    and what the active arena holds, `Forward::moe_workspace_bytes`). Every MoE step acts column by
-    column, so the outputs are the chunk-major ones; the expert calls see 2-4x the columns (the IQ3_S
-    expert tiles run 33-50 % more effective TOPS at 16,384 tokens than at 4,096). The route log keeps
-    the group's last chunk (`route_columns`), the span's last as before.
+    `layer_moe` once over a group of consecutive chunks (up to `kWalkMoeColumns` = 32,768 columns
+    since 2026-10-19, 16,384 before, and what the active arena holds, `Forward::moe_workspace_bytes`).
+    Every MoE step acts column by column, so the outputs are the chunk-major ones; the expert calls
+    see 2-8x the columns (the IQ3_S expert tiles run 33-50 % more effective TOPS at 16,384 tokens
+    than at 4,096, and 7-14 % more again at 32,768; §19.3.29). The route log keeps the group's last
+    chunk (`route_columns`), the span's last as before.
+  - **One pass (2026-10-19).** A walk MoE call whose layer has every non-resident expert in the
+    ring and every record in RAM (`ExpertStream::complete`) stages nothing, so it runs as one pass
+    over all its jobs (`staging_slots` 0) instead of double-buffered staging passes of half the
+    slots; an expert a decode round evicted meanwhile is read in place from its host record, the
+    same bytes (§19.3.29).
 - **Spans.** Consecutive calls of at least 256 columns, up to `kWalkMaxTokens` = 65,536 tokens.
   - A prefix tap due at an inner chunk end is captured inside the span (`walk_plan_taps`, decided as
     `prefix_after_prefill_call` decides after a chunk-major call). At the span's start a staged
@@ -7950,7 +7956,7 @@ the drive's knee) remains open.
     streamed the non-resident experts once more.
   - A single call keeps the chunk-major path.
 - **Memory.** The span's residual stream (BF16 [S·H, tokens], 20 KB per token: 1.3 GB at 64K),
-  every chunk's staged io image and an MoE group's input (84 MB) live in the stream lease after
+  every chunk's staged io image and an MoE group's input (168 MB at 32,768 columns) live in the stream lease after
   the ring.
   - At the prompt's first walk the lease is lent with that area, and the ring's halves are widened
     by the experts the larger lease evicts.
@@ -10531,6 +10537,130 @@ generator runs):
 Not done: re-measuring later in a session (the divisor would have to move to a device word the
 graphs read, as the one-column divisor does); a session that starts under a load lasting more than
 20 s keeps the busy reading until restarted, as the warning says.
+
+### 19.3.29 IQ3_S prefill: BF16 tiles over the decoded planes, one-pass walk MoE calls (2026-10-19)
+
+**The gap.** At 128K tokens the GSQ-RCO IQ3_S import reached its first token in 29.4 s on
+`windows-2026.10.18` against 23.9 s on Strata 0.1.45 (server runs of the README tables, INT8 KV).
+An nsys trace of the release route's 64K walk span (`infernix_bench` pp65536, below) put 14.3 s on
+the GPU, 218 µs per token: the dense GGUF projections' exact tiles 81.7 µs (37 %), the experts'
+exact tiles 90.1 µs (gate/up 56.7, down 33.4), the A16 encodings 11.4 µs, attention scoring and the
+other projections 28.7 µs, GDN, norms and routing 6.6 µs. The link was not the limit (the ring holds
+a span's non-resident experts, so the walk stages nothing), nor were the 16,384-column MoE groups:
+the time is in the exact three-limb integer kernels.
+
+**`ggml-bf16-prefill`: BF16 tensor-core tiles over the exact route's planes (fast path, a kernel
+path that couples requests).** `ops/ggml/ggml_bf16_tile.cuh`. Prefill calls of 32 or more columns
+(`LinearRoutes::GgmlBf16Wide`, eager calls only: `Forward::dense_routes`) decode their slabs into
+the same `CodeStage` planes the exact tiles read and run m16n8k16 BF16 MMAs with FP32 accumulation
+on them: each code converts exactly to BF16, each product is exact, and only the sums round. Per
+32-element slice the sums over 16 elements are scaled by d · sub (exact in binary32), the K-quants
+subtract dmin · min · Σx (a per-slice column sum, `bf16_xsum_kernel`), slice by slice in K order,
+and κ applies at the end. The planes keep their m16n8k32 A-fragment order: an MMA's sum does not
+depend on how K is labelled, so registers 0 and 2 of the k16 fragment carry elements 4t .. 4t + 3,
+and x is staged as permuted 8-byte units (unit u at 2 (u % 4) + u / 4) so one 16-byte load gives a
+thread both halves' B registers. A CTA computes 128 rows × 128 columns with 8 warps of 64 × 32 and a
+three-stage cp.async ring. An output's bits depend on its row, column and K only, not on how many
+columns share the call. The GGUF expert banks take the same tiles (`WideA16::kGgmlBf16`,
+`ggml_expert.cuh`) in calls of 14,336 or more columns: each wide job's gate/up and down rows are
+decoded into planes in the experts' workspace (32 experts, 225 MiB, `kGgmlBf16PlaneBytes`), gate/up
+tiles pair 64 gate rows with their 64 up rows and write SwiGLU's BF16 h through shared memory, and
+the down tiles scatter each entry's output. The exact route (`--disable-fast-paths`) is unchanged.
+
+**One-pass walk MoE calls and 32,768-column groups (exact).** A walk MoE call whose layer has every
+non-resident expert in the ring and every record in RAM (`ExpertStream::complete`) runs as one
+pass over its jobs (`staging_slots` 0) instead of double-buffered passes of half the slots (13 for
+a 16,384-column call); `kWalkMoeColumns` rises from 16,384 to 32,768. Both leave every output bit
+as it was (the experts' arithmetic is placement-invariant and acts column by column, §19.3.8 F4;
+checked bit for bit below).
+
+**Op measurements** (RTX 5090, CUDA 13.4, `infernix_ggml_linear_test --bench N tiled bf16`, IQ3_S
+dense shapes, exact → BF16 µs per call): at 8,192 columns gdn q/k/v/z 9,025 → 4,841 (−46 %),
+attention q/gate/k/v 7,243 → 3,884 (−46 %), shared expert gate/up 1,479 → 421 (−72 %), ssm_out
+(permuted input) 3,303 → 2,230 (−32 %), attn_qkv Q5_K 5,320 → 3,193 (−40 %), attn_gate Q4_K 3,338
+→ 1,952 (−42 %); at 4,096 columns −32 to −71 %. Experts (`infernix_offloaded_moe_ggml_test --bench
+N bf16`, one layer call, ms, exact → BF16):
+
+| Columns | IQ3_S / IQ4_NL | IQ3_S / Q2_0 | IQ2_S / IQ4_NL | IQ3_XXS / IQ4_NL |
+|---|---|---|---|---|
+| 8,192 | 16.0 → 17.1 (+7 %) | 15.8 → 15.9 (0 %) | 16.4 → 16.6 (+1 %) | 15.1 → 19.4 (+28 %) |
+| 12,288 | 20.9 → 21.6 (+3 %) | 19.8 → 17.8 (−10 %) | 22.1 → 18.3 (−17 %) | 20.5 → 18.6 (−9 %) |
+| 14,336 | 24.6 → 22.8 (−7 %) | 23.7 → 21.7 (−9 %) | 26.2 → 22.7 (−13 %) | 24.4 → 24.0 (−2 %) |
+| 16,384 | 27.2 → 23.4 (−14 %) | 26.2 → 22.1 (−16 %) | 28.9 → 23.2 (−20 %) | 27.1 → 25.8 (−5 %) |
+| 32,768 | 48.3 → 40.9 (−15 %) | 48.8 → 40.2 (−18 %) | 53.6 → 40.1 (−25 %) | 47.5 → 39.9 (−16 %) |
+
+Below about 14K columns the route is no faster, probably because each expert's planes (7.4 MB) are
+written and read again in every call, a fixed cost per expert that only wider calls amortise (not
+profiled apart). `kGgmlBf16MinColumns` is therefore 14,336, the narrowest width at which every pair
+measured faster (the first build's 4,096 would have slowed 8K-column calls by up to 28 %).
+
+**End to end** (`infernix_bench`, IQ3_S, pp32768 and pp65536 in one process, INT8 KV, the primed
+expert state of the README runs copied in before every run, `--ngram-residency volume`, three
+rounds with the arms rotated; prefill tok/s, median of three, every arm within 1.3 % of its median):
+
+| Arm | pp32768 | pp65536 | µs per token at 64K |
+|---|---:|---:|---:|
+| Release route (staging passes, 16,384-column groups) | 3,631 | 4,440 | 225.2 |
+| One-pass walk MoE calls | 3,786 (+4.3 %) | 4,694 (+5.7 %) | 213.0 |
+| One pass and 32,768-column groups (the exact route now) | 3,839 (+5.7 %) | 4,809 (+8.3 %) | 207.9 |
+| With `ggml-bf16-prefill`'s dense tiles only | 4,626 (+27.4 %) | 6,054 (+36.4 %) | 165.2 |
+| With `ggml-bf16-prefill` (dense and experts) | 5,113 (+40.8 %) | 6,924 (+56.0 %) | 144.4 |
+
+The fastest arm's trace of the same span: 9.27 s on the GPU, 141 µs per token (dense BF16 tiles
+44.3 µs plus 0.5 µs of plane decode and slice sums, experts 52.5 µs: gate/up 35.6, down 12.8, planes
+4.1; A16 encodings 9.0 µs; the rest unchanged).
+
+The README's server workload (`bench-readme/bench_driver.py`, plan r1019iq3's requests: INT8 KV, MTP
+`auto`, greedy, 1,024 tokens each; this build, the release binary, this build again, 2026-10-19,
+time to first token):
+
+| Prompt | `windows-2026.10.18` | This branch (two sessions) | Strata 0.1.45 (README run, same prompts) |
+|---|---:|---:|---:|
+| 8K (three) | 2.16-2.17 s | 1.62-1.65 s (−25 %) | 1.63-1.67 s |
+| 128K (two) | 29.29 / 29.48 s | 19.71-19.89 s (−33 %) | 23.91 / 23.94 s |
+| 250K (two) | 58.79 / 58.86 s | 39.21-39.40 s (−33 %) | 48.98 / 49.09 s |
+
+The release run repeats the README's (29.24-29.51 s at 128K). Decode after those prompts: 187.1 and
+192.8 tok/s for this branch's sessions (identical text in both) against 194.6-196.5 for the three
+release sessions; rounds per second overlap (69.3-71.8 against 70.9-73.4), the text differs from the
+release's in every request (the prefill's arithmetic moves greedy ties), no decode kernel changed and
+the decode expert-cache hit rate is the same (93.6 against 93.4 %). Not resolved: the difference is
+within what two sessions of one build differ by on the same text (3 %), but both branch sessions sit
+below every release session. NVIDIA Dense8 takes the exact items
+too: pp32768 7,266 → 7,408 (+1.9 %), pp65536 11,378 → 11,543 tok/s (+1.5 %), two rounds, no
+overlap.
+
+**Numerics.** `infernix_ggml_linear_test` holds the dense route to an FP64 oracle at
+(3 K / 32 + 64) · 2⁻²⁴ · Σ|wx| (plus 2⁻⁸ |ref| for BF16 outputs) on every GGUF format, K, width,
+permutation and the tiled layout, and calls under 32 columns to the exact route's bits: with BF16
+outputs 99.8-100 % of the outputs equal the exact route's; with FP32 outputs the BF16 route's
+largest error is 1.4-5.9e-7 of Σ|wx| against 2.2e-7 to 6.4e-6 for the exact route (whose A16
+encoding rounds x to 21 bits). `infernix_offloaded_moe_ggml_test` checks the expert route against
+the exact one (every column within 2⁻⁶ normwise; 99.77-99.86 % of outputs equal, the worst column
+3.5e-3) and a binary64 chain on 48 sampled (token, slot) pairs, at 14,373 columns over passes,
+resident and staged experts. The model-level gates (model-quality.md 6.7, `ggml-bf16-prefill`): the
+prefill gate passes on INT8, FP8, NVFP4, K8V4, VQ2 and K4V2 KV (KL excess bounds 3.7e-4 to 7.8e-4 of
+1.5e-3) and fails jointly on BF16 KV, where a run with the qualified paths alone puts the whole
+excess on `gdn-f16-accumulate` and the path's own increment is below zero; decode (plain, 256
+segments) passes on INT8. The exact items are bit-identical: `fast_path_gate identical` on the quick
+corpus in 49,152-token windows at 8,192-token chunks (MoE groups of two chunks before, four after),
+8 of 8 windows on IQ3_S and on Dense8, `--disable-fast-paths`, release-equivalent route against the new one.
+
+**Rejected or not built.**
+- A liveness-sized workspace that would let IQ3_S prefill 16K chunks (its 16,384-column chunk needs
+  7,009 MiB, more than the cache lends, so it prefills at 8,192): on Dense8, which lends a 16K
+  arena, 16K chunks ran −0.6 % at 32K and −0.1 % at 64K tokens against 8K (two rounds), and the BF16
+  dense tiles gain 1-4 % per column at 16K over 8K (the shared expert loses 5 %), about 1 µs per
+  token in all.
+- The BF16 expert route below 14,336 columns (above).
+- A two-limb expert codec: not built once the BF16 tiles measured faster than the exact tiles from
+  14K columns.
+
+**Pitfall.** With about 79 GiB of RAM free, the n-gram table's automatic residency flipped between
+runs (read from its volume, or 27.8 GiB pinned while the first test ran), costing that test 25 %;
+every arm above passes `--ngram-residency volume`. The `ggml_gate_up_bf16` instance of the IQ formats
+(half sub-scales) holds 40 bytes of stack for loop invariants outside its MMA loop (allow-listed,
+like the exact `gate_up_tile_ggml`'s 40 bytes).
 
 ---
 

@@ -660,10 +660,13 @@ public:
         return static_cast<std::size_t>(std::count(need.begin(), need.end(), std::uint8_t{1})) * kKvChunkBytes;
     }
 
-    // W4A16 experts' wide route under these options (the expert-a4-residual fast path).
+    // 16-bit-activation experts' wide route under these options, which sizes the workspace: the
+    // expert-a4-residual fast path's (NVFP4 W4A16 banks) or ggml-bf16-prefill's (GGUF banks' BF16
+    // planes, a superset of the exact layout).
     static ops::offloaded_moe::WideA16 wide_a16(const ProgramOptions& o) noexcept {
-        return o.fast_paths.expert_a4_residual ? ops::offloaded_moe::WideA16::kA4Residual
-                                               : ops::offloaded_moe::WideA16::kExact;
+        if (o.fast_paths.expert_a4_residual) { return ops::offloaded_moe::WideA16::kA4Residual; }
+        return ops::has_route(o.fast_paths.dense_routes, ops::LinearRoutes::GgmlBf16Wide) ? ops::offloaded_moe::WideA16::kGgmlBf16
+                                                                                          : ops::offloaded_moe::WideA16::kExact;
     }
 
     // The workspace arena of a Program with `lanes` lanes and the plan's widths: the forward at its
@@ -5010,8 +5013,10 @@ private:
     std::uint64_t walk_prefetched_chunks_ = 0, prefetched_at_lease_ = 0; // chunks whose rows were prefetched
     static constexpr std::uint32_t kWalkMaxTokens = 65536;
     // A walk's MoE calls take up to this many columns (several chunks'): at 16,384 tokens the
-    // experts run 33-50 % more effective TOPS than at 4,096 (infernix_offloaded_moe_ggml_test --bench).
-    static constexpr std::int32_t kWalkMoeColumns = 16384;
+    // experts run 33-50 % more effective TOPS than at 4,096, and at 32,768 a further 7-14 %
+    // (infernix_offloaded_moe_ggml_test --bench; IQ3_S prefill +1.4 % at 32K tokens and +2.5 % at
+    // 64K end to end, design §19.3.29).
+    static constexpr std::int32_t kWalkMoeColumns = 32768;
 
     [[nodiscard]] std::size_t walk_bytes(std::uint32_t tokens, std::size_t chunks) const noexcept;
     std::size_t walk_span_end(const Lane& lane, std::uint32_t index);

@@ -104,6 +104,9 @@ public:
     std::uint32_t plan_layer(std::uint32_t layer, std::span<const std::int32_t> columns,
                              std::span<const std::uint8_t> cpu);
     [[nodiscard]] bool gated() const noexcept { return gated_; }
+    // Whether the active (ungated) chunk copies every expert of `layer` that was not resident when it
+    // began: its MoE then has nothing to stage.
+    [[nodiscard]] bool complete(std::uint32_t layer) const noexcept { return active_ && !gated_ && complete_[layer] != 0; }
     // Records per half of the active ring.
     [[nodiscard]] std::uint32_t half() const noexcept { return half_; }
     [[nodiscard]] bool active() const noexcept { return active_; }
@@ -156,6 +159,7 @@ private:
     std::uint8_t* records_    = nullptr; // device, after the tables
     std::uint32_t half_       = 0;       // slots per half
     std::vector<std::uint8_t> streams_;  // per layer: whether it has copies
+    std::vector<std::uint8_t> complete_; // per layer: every non-resident expert copied (complete())
     bool active_    = false;
     bool uploading_ = false;
     bool gated_     = false;

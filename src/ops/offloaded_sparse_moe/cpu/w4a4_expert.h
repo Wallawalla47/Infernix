@@ -51,11 +51,14 @@ struct ExpertScales {
 // w4a16_expert.h), whose ExpertScales hold zero input scales and the multipliers in alpha_*.
 enum class ExpertActivation : std::uint8_t { kA4, kA16 };
 
-// The wide route of W4A16 experts (design §19.3.23): kExact, the exact limb arithmetic of §16.2.1;
-// kA4Residual, a fast path that rounds each x and h row to two NVFP4 terms (the row's NVFP4 and the
-// NVFP4 of its remainder, one FP32 row scale) and runs them on the FP4 Tensor Cores, so its outputs
-// depend on that rounding and on the tensor core's FP32 order, not only on the weights.
-enum class WideA16 : std::uint8_t { kExact, kA4Residual };
+// The wide route of 16-bit-activation experts (design §19.3.23, §19.3.29): kExact, the exact limb
+// arithmetic of §16.2.1 / §16.2.2; kA4Residual (NVFP4 W4A16 banks), a fast path that rounds each x and h
+// row to two NVFP4 terms (the row's NVFP4 and the NVFP4 of its remainder, one FP32 row scale) and runs
+// them on the FP4 Tensor Cores, so its outputs depend on that rounding and on the tensor core's FP32
+// order, not only on the weights; kGgmlBf16 (GGUF banks, the ggml-bf16-prefill fast path), BF16 tiles
+// over each expert's decoded planes with x and h as stored and FP32 sums (ops/ggml/ggml_bf16_tile.cuh).
+// Every other bank ignores the value it does not name.
+enum class WideA16 : std::uint8_t { kExact, kA4Residual, kGgmlBf16 };
 
 enum class CpuIsa { kScalar, kAvx2, kAvxVnni, kAvx512Vnni };
 

@@ -849,6 +849,7 @@ always run and are not listed. The NVFP4 27B variants select identical paths (ea
 | `adaptive-mtp` | Qwen3.8-27B / Qwen3.6-35B-A3B with MTP and `--draft-tokens auto` | NVFP4 27B and 35B-A3B, every format |
 | Qwen3.8-Flash-Next: `expert-a4-residual` | artifacts with W4A16 experts (recipe C), expert calls of more than eight columns | FP8 dense, 16-bit expert activations, with INT8, FP8, NVFP4, K8V4, VQ2 or K4V2 KV (fails on BF16 KV, below) |
 | Qwen3.8-Flash-Next: `sampled-mtp-drafts` | MTP rounds with a sampled request | every Flash-Next configuration, every format (distribution and greedy identity, below; no logit changes) |
+| Qwen3.8-Flash-Next: `ggml-bf16-prefill` | GGUF dense projections in prefill calls of 32+ columns, GGUF expert calls of 14,336+ columns | IQ3_S with INT8, FP8, NVFP4, K8V4, VQ2 or K4V2 KV (fails on BF16 KV, below) |
 | `gdn-f16-accumulate` | chunked GDN calls (16+ tokens) of every Qwen3.5-family and Flash-Next artifact | NVFP4 27B, groupwise 27B, IQ3_S and FP8, every format; not the 35B-A3B or Dense8 (no gain beyond spread, below) |
 
 **`sampled-mtp-drafts`: drafts drawn from the draft head's top four tokens (Flash-Next, qualified
@@ -967,7 +968,8 @@ output was identical across concurrency 1-8 and to plain decode, 2026-10-14), so
 draft length chosen from both rows (without it two rows decode plain, as three or more do);
 `free-cache-resume` is prefill calls, taps and resumes off its 16-token GDN sub-chunk grid,
 sibling coalescing, and endpoints and blocks holding decode-computed state; `preemption` as above.
-Its kernel path `q8-sliced-k` (below) couples requests too: its routes depend on the round's width.
+Its kernel path `q8-sliced-k` (below) couples requests too: its routes depend on the round's width;
+so does `ggml-bf16-prefill`, whose routes depend on a prompt's call boundaries and MoE grouping.
 
 **Evidence** (2026-10-14, RTX 5090, CUDA 13.4; official 27B NVFP4 and Qwen3.8-Flash-Next NVIDIA
 NVFP4 Dense8; 1,024 segments of the decode corpus, 65,536 forced positions per route). Each
@@ -1659,6 +1661,72 @@ and recomputes the previous output) or admission (whole extents held without `pr
   exact route's time at 4,096 columns). Speed beside two-term
   `expert-a4-residual` (`infernix_bench`, INT8 KV, chunk 4,096, ABBA): pp32768 8,732 → 9,277 tok/s
   (+6.2 %), pp65536 9,022 → 9,619 (+6.6 %). The other formats were not gated with these scales.
+
+**`ggml-bf16-prefill`: BF16 tensor-core tiles in Flash-Next's GGUF prefill (IQ3_S with INT8, FP8,
+NVFP4, K8V4, VQ2 or K4V2 KV; qualified 2026-10-19).**
+- **What changes:** eager prefill calls of 32 or more columns run the GGUF dense projections
+  (`ops::ggml_linear`, `LinearRoutes::GgmlBf16Wide`) as BF16 m16n8k16 MMAs with FP32 accumulation over
+  the exact route's decoded planes: each code is exact in BF16, x is read as stored, each
+  sub-block's FP32 sum is scaled by d · sub (exact in binary32), the K-quants subtract
+  dmin · min · Σx, and κ applies at the end. The GGUF expert banks' MoE calls of 14,336 or more
+  columns run the same tiles over expert planes decoded into the experts' workspace
+  (`WideA16::kGgmlBf16`). The exact route rounds every activation column to 21-bit integers and sums
+  exactly; this one keeps x exact and rounds the sums. A prompt's bits depend on its call boundaries
+  and the layer walk's MoE grouping, so it couples requests (`request_invariant` is false). Decode,
+  verification and drafting keep their kernels (graph calls never take it).
+- **Op qualification:** `infernix_ggml_linear_test` against an FP64 oracle with the bound
+  (3 K / 32 + 64) · 2⁻²⁴ · Σ|wx| (plus 2⁻⁸ |ref| for BF16 outputs) on every GGUF format, K, width,
+  input permutation and the tiled layout; calls under 32 columns keep the exact bits. With FP32
+  outputs its largest error is 1.4-5.9e-7 of Σ|wx|, the exact route's 2.2e-7 to 6.4e-6; with BF16
+  outputs 99.8-100 % of outputs equal the exact route's. `infernix_offloaded_moe_ggml_test` holds
+  the expert route to the exact one (every column within 2⁻⁶ normwise; 99.77-99.86 % of outputs
+  equal) and a binary64 chain on sampled (token, slot) pairs, at 14,373 columns.
+- **Prefill gate** (RTX 5090, CUDA 13.4, the GSQ-RCO IQ3_S import, quick corpus, 14,336-token windows
+  at chunks 896 and 7,168, so the walk's MoE groups reach the expert tiles; jointly with the
+  qualified paths, of which `gdn-f16-accumulate` acts in prefill):
+
+  | KV | Floor KL / top-1 | KL excess (bound) / 1.5e-3 | Top-1 excess, points (bound) / 0.5 | NLL excess | p99.9 KL ratio | Result |
+  |---|---|---|---|---|---|---|
+  | BF16 | 0 / 0 | 5.7e-3 (7.0e-3) | +2.58 (2.88) | 3.9e-4 | ∞ (floor 0) | fails |
+  | INT8 | 5.3e-3 / 2.48 % | 4.9e-4 (5.5e-4) | +0.11 (0.16) | 2.5e-5 | 1.11 | passes |
+  | FP8 | 6.6e-3 / 2.80 % | 4.6e-4 (6.5e-4) | +0.08 (0.13) | 1.6e-4 | 1.13 | passes |
+  | K8V4 | 1.09e-2 / 3.68 % | 2.5e-4 (5.4e-4) | −0.03 (0.03) | 7.1e-4 | 1.03 | passes |
+  | NVFP4 | 1.36e-2 / 4.08 % | 3.5e-4 (7.3e-4) | +0.01 (0.08) | 5.6e-4 | 1.02 | passes |
+  | K4V2 | 1.40e-2 / 3.96 % | 4.0e-4 (7.8e-4) | +0.01 (0.07) | 2.9e-4 | 1.09 | passes |
+  | VQ2 | 2.00e-2 / 4.68 % | 0.6e-4 (3.7e-4) | +0.05 (0.10) | 3.2e-4 | 0.99 | passes |
+
+  Every context bucket passes on the six. BF16 KV fails jointly: the IQ3_S exact route with BF16 KV
+  is the reference itself, so the whole divergence counts as excess. Split by a run with the
+  qualified paths alone (the same corpus, chunks and reference), the excess is `gdn-f16-accumulate`'s,
+  registered here from the 27B's gates (above): exact → qualified paths KL 5.9e-3 (bound 7.5e-3),
+  top-1 +2.62 points (2.92), NLL 5.2e-4; qualified paths → with `ggml-bf16-prefill` KL −1.9e-4
+  (bound 1.2e-4), top-1 −0.41 points (0.04), NLL −1.3e-4, p99.9 KL ratio 0.98, every bucket passing.
+  The path's own increment moves BF16 KV slightly toward the reference; the joint rule (6.1, item 2)
+  still keeps BF16 KV unregistered while `gdn-f16-accumulate` is qualified there.
+- **Decode gate** (plain, 256 segments, prompts of 512-8,192 tokens, whose prefill takes the dense
+  tiles but not the expert tiles): INT8, the passing format with the lowest floor, passes (TV excess
+  5.4e-4, bound 9.3e-4 of 4e-3; top-1 +0.10 points, bound 0.32; KL 2.4e-4; NLL −2.9e-4; p99.9 KL
+  ratio 1.09; every prompt length). BF16, run as well, fails on a nonzero floor (TV 0.029): TV excess
+  3.9e-3 (bound 4.34e-3 of 4e-3), top-1 +0.51 points (bound 0.75), p99.9 KL ratio 1.47, the excess
+  in the 2,048- and 8,192-token prompts (TV 6.0e-3 and 5.3e-3, against 4.3e-4 at 512). Split as
+  above, that is `gdn-f16-accumulate`'s too: exact → qualified paths TV excess 4.2e-3 (bound 4.6e-3),
+  top-1 +0.62 points (0.84), p99.9 KL ratio 1.30, each failing; qualified paths → with
+  `ggml-bf16-prefill` TV −2.7e-4 (bound 1.2e-4), top-1 −0.11 points (0.12), p99.9 ratio 1.13, every
+  criterion and prompt length passing. No decode, verification or drafting kernel changes, so the
+  decode criteria are not required (6.1, item 2); BF16 KV is not registered anyway.
+- **`gdn-f16-accumulate` on IQ3_S with BF16 KV** (found by the split above, not acted on): alone it
+  fails both the prefill gate (KL bound 7.5e-3 of 1.5e-3, on a floor of 0: the IQ3_S exact route with
+  BF16 KV is the reference) and the decode gate (TV bound 4.6e-3 of 4e-3, floor 0.029) there; its
+  registration rests on the 27B's gates (one gate per kernel), whose BF16 prefill floor is not 0.
+- **Speed** (`infernix_bench`, INT8 KV, three rotated rounds, design §19.3.29): against the exact
+  route, pp32768 3,839 → 5,113 tok/s (+33.2 %), pp65536 4,809 → 6,924 (+44.0 %), every round ahead;
+  the dense tiles alone +20.5 % / +25.9 %. The other formats take INT8's timing (6.1, item 4): the
+  path's kernels see no KV format, at the same shapes and widths. Server time to first token,
+  `windows-2026.10.18` against this build (the path together with design §19.3.29's exact items;
+  the README workload, INT8 KV): 128K 29.3-29.5 → 19.7-19.9 s, 250K 58.8-58.9 →
+  39.2-39.4 s, 8K 2.16-2.17 → 1.62-1.65 s; decode after them 194.6-196.5 → 187.1 / 192.8 tok/s on
+  different greedy text, not resolved (design §19.3.29).
+- **Not qualified:** BF16 KV (above); other dense families (no kernels).
 
 **`q4-w4a8`: int8 activations in the groupwise Q4 MLP gate/up (fails; not qualified).**
 - **Selected by:** `--fast-path q4-w4a8` on artifacts whose text MLP gate/up is RowSplit

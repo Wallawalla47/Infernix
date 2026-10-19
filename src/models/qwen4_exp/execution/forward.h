@@ -333,6 +333,10 @@ private:
                Tensor* residual = nullptr);
     void wait_layer(const ForwardBatch& batch, std::size_t entry);
     void mtp_block(const MtpCall& call, Tensor& residual);
+    // The dense projections' route flags for the current call: ggml-bf16-prefill's only in eager
+    // calls (prefill chunks, forced tokens), so decode and verification rounds keep the exact GGUF
+    // route whatever their column count.
+    [[nodiscard]] ops::LinearRoutes dense_routes() const noexcept;
 
     const Parameters& parameters_;
     const TextConfig& config_;

@@ -8,8 +8,10 @@
 // Op documents). The oracle sums w * X exactly in a bignum, rounds once to binary32 (ties to even),
 // scales by 2^(emax - 147) (exact for these normal-range outputs) and rounds to BF16. The Op must
 // return those bits for every format, K, column count (across its 512-column batches) and with the
-// input permutation, into one output or split among several (ggml_split_segments). The row gathers
-// must return each element's decoded value (exact in binary32) rounded once to BF16.
+// input permutation, into one output or split among several (ggml_split_segments). The
+// ggml-bf16-prefill route (run_bf16) is checked against a binary64 reference within an FP32-sum
+// bound instead. The row gathers must return each element's decoded value (exact in binary32)
+// rounded once to BF16.
 
 #include "core/device.h"
 #include "core/ggml_format.h"
@@ -387,7 +389,7 @@ void run_linear(QType q, int rows, int k, int columns, bool permute, std::mt1993
     const ops::GgmlSegment segments[] = {
         {q, static_cast<const std::uint8_t*>(dw.p), half, 0},
         {q, static_cast<const std::uint8_t*>(dw.p) + static_cast<std::size_t>(half) * row_bytes, rows - half, half}};
-    ops::ggml_linear(tx, segments, tout, permute ? static_cast<const std::int32_t*>(dperm.p) : nullptr, pb, work, nullptr);
+    ops::ggml_linear(tx, segments, tout, permute ? static_cast<const std::int32_t*>(dperm.p) : nullptr, pb, work, nullptr, ops::LinearRoutes::Exact);
     CUDA_CHECK(cudaDeviceSynchronize());
     std::vector<std::uint16_t> actual(expected.size());
     dout.copy_to_host(actual.data(), actual.size() * 2, 0);
@@ -406,7 +408,7 @@ void run_linear(QType q, int rows, int k, int columns, bool permute, std::mt1993
     }
     Tensor* const outs[] = {&part_tensors[0], &part_tensors[1], &part_tensors[2]};
     ops::ggml_linear(tx, ops::ggml_split_segments(segments, k, bounds), outs,
-                     permute ? static_cast<const std::int32_t*>(dperm.p) : nullptr, pb, work, nullptr);
+                     permute ? static_cast<const std::int32_t*>(dperm.p) : nullptr, pb, work, nullptr, ops::LinearRoutes::Exact);
     CUDA_CHECK(cudaDeviceSynchronize());
     std::size_t split_mismatches = 0;
     for (int i = 0; i < 3; ++i) {
@@ -481,7 +483,7 @@ void run_tiled(QType q, int rows, int k, int columns, bool permute, bool f32, st
     segments.push_back({q, static_cast<const std::uint8_t*>(d1.p), rows - first, first, 0, ops::GgmlLayout::Tiles16});
     const auto run_once = [&](const std::string& what) {
         CUDA_CHECK(cudaMemset(dout.p, 0xFF, dout.bytes));
-        ops::ggml_linear(tx, segments, tout, permute ? static_cast<const std::int32_t*>(dperm.p) : nullptr, pb, work, nullptr);
+        ops::ggml_linear(tx, segments, tout, permute ? static_cast<const std::int32_t*>(dperm.p) : nullptr, pb, work, nullptr, ops::LinearRoutes::Exact);
         CUDA_CHECK(cudaDeviceSynchronize());
         std::vector<std::uint32_t> actual(expected.size());
         if (f32) {
@@ -556,14 +558,14 @@ void run_mixed(QType q0, QType q1, int rows, int k, int columns, std::mt19937& r
     Tensor* const outs[] = {&part_tensors[0], &part_tensors[1], &part_tensors[2]};
     const auto run_once = [&](const std::string& what) {
         CUDA_CHECK(cudaMemset(dout.p, 0xFF, dout.bytes));
-        ops::ggml_linear(tx, segments, tout, nullptr, 0, work, nullptr);
+        ops::ggml_linear(tx, segments, tout, nullptr, 0, work, nullptr, ops::LinearRoutes::Exact);
         CUDA_CHECK(cudaDeviceSynchronize());
         std::vector<std::uint16_t> actual(expected.size());
         dout.copy_to_host(actual.data(), actual.size() * 2, 0);
         std::size_t bad = 0;
         for (std::size_t i = 0; i < actual.size(); ++i) { bad += actual[i] != expected[i]; }
         check(bad == 0, label + what + ": " + std::to_string(bad) + " of " + std::to_string(actual.size()) + " outputs differ");
-        ops::ggml_linear(tx, ops::ggml_split_segments(segments, k, bounds), outs, nullptr, 0, work, nullptr);
+        ops::ggml_linear(tx, ops::ggml_split_segments(segments, k, bounds), outs, nullptr, 0, work, nullptr, ops::LinearRoutes::Exact);
         CUDA_CHECK(cudaDeviceSynchronize());
         std::size_t split_bad = 0;
         for (int i = 0; i < 3; ++i) {
@@ -577,6 +579,135 @@ void run_mixed(QType q0, QType q1, int rows, int k, int columns, std::mt19937& r
         check(split_bad == 0, label + what + " split into three outputs: " + std::to_string(split_bad) + " outputs differ");
     };
     run_once("");
+}
+
+// ---- the ggml-bf16-prefill route (LinearRoutes::GgmlBf16Wide)
+//
+// Its arithmetic is not the exact route's: every product is exact (codes exact in BF16, x as stored)
+// and only FP32 sums round, so it is checked against a binary64 reference over the exactly decoded
+// weights and the BF16 inputs themselves (no A16 encoding): |y - ref| <= (K / 32 + 48) * 2^-24 *
+// sum |w x| per output (an FP32 accumulator over K / 32 slices plus one MMA sum each), plus half a
+// BF16 ulp of ref for BF16 outputs. Calls narrower than 32 columns must keep the exact route's bits.
+// An information line gives both routes' largest and mean error against the reference, in units of
+// sum |w x|, and the share of BF16 outputs equal to the exact route's.
+void run_bf16(QType q, int rows, int k, int columns, bool permute, bool tiled, bool f32, Scales scales, std::mt19937& rng) {
+    const std::string label = "bf16 route format " + std::to_string(static_cast<int>(q)) + " rows=" + std::to_string(rows) +
+                              " k=" + std::to_string(k) + " T=" + std::to_string(columns) + (permute ? " perm" : "") +
+                              (tiled ? " tiled" : "") + (f32 ? " f32" : "");
+    const std::size_t row_bytes = ops::ggml_row_bytes(q, k);
+    const auto weights          = random_blocks(q, rows, k, rng, scales);
+    // The K-quants' min term on its own (each block decoded with its codes zeroed: -dmin * min): the
+    // route sums it apart from the codes' term, so its error scales with both magnitudes.
+    const bool min_format = q == QType::GGML_Q4_K || q == QType::GGML_Q5_K;
+    std::vector<double> w(static_cast<std::size_t>(rows) * k), minterm(min_format ? w.size() : 0);
+    for (int r = 0; r < rows; ++r) {
+        for (int b = 0; b < k / static_cast<int>(ggml_block_elems(q)); ++b) {
+            const std::uint8_t* block = weights.data() + static_cast<std::size_t>(r) * row_bytes + b * ggml_block_bytes(q);
+            decode_block(q, block, w.data() + static_cast<std::size_t>(r) * k + b * ggml_block_elems(q));
+            if (min_format) {
+                std::vector<std::uint8_t> zeroed(block, block + ggml_block_bytes(q));
+                std::fill(zeroed.begin() + 16, zeroed.end(), std::uint8_t{0}); // Q4_K qs, Q5_K qh and qs
+                decode_block(q, zeroed.data(), minterm.data() + static_cast<std::size_t>(r) * k + b * ggml_block_elems(q));
+            }
+        }
+    }
+    std::vector<std::uint16_t> x(static_cast<std::size_t>(k) * columns);
+    std::normal_distribution<float> normal(0.0F, 1.0F);
+    for (std::size_t i = 0; i < x.size(); ++i) { x[i] = bf16_rne(normal(rng) * (i % 97 == 0 ? 64.0F : 1.0F)); }
+    const int pb = 128;
+    std::vector<std::int32_t> perm(static_cast<std::size_t>(k / pb));
+    for (std::size_t i = 0; i < perm.size(); ++i) { perm[i] = static_cast<std::int32_t>(i); }
+    if (permute) { std::shuffle(perm.begin(), perm.end(), rng); }
+    const auto value = [](std::uint16_t bits) {
+        const std::uint32_t u = static_cast<std::uint32_t>(bits) << 16;
+        float f;
+        std::memcpy(&f, &u, 4);
+        return static_cast<double>(f);
+    };
+    std::vector<double> ref(static_cast<std::size_t>(rows) * columns), mag(ref.size());
+    for (int t = 0; t < columns; ++t) {
+        const std::uint16_t* col = x.data() + static_cast<std::size_t>(t) * k;
+        for (int r = 0; r < rows; ++r) {
+            double sum = 0, abs_sum = 0;
+            for (int j = 0; j < k; ++j) {
+                const double xv = value(col[permute ? perm[j / pb] * pb + j % pb : j]);
+                const double p  = w[static_cast<std::size_t>(r) * k + j] * xv;
+                sum += p;
+                abs_sum += std::fabs(p) + (min_format ? 2.0 * std::fabs(minterm[static_cast<std::size_t>(r) * k + j] * xv) : 0.0);
+            }
+            ref[static_cast<std::size_t>(t) * rows + r] = sum;
+            mag[static_cast<std::size_t>(t) * rows + r] = abs_sum;
+        }
+    }
+    const auto weights_on_device = tiled ? tiles16(q, rows, k, weights.data()) : weights;
+    DeviceBuffer dw(weights_on_device.size()), dx(x.size() * 2), dperm(perm.size() * 4);
+    dw.copy_from_host(weights_on_device.data(), weights_on_device.size(), 0);
+    dx.copy_from_host(x.data(), x.size() * 2, 0);
+    dperm.copy_from_host(perm.data(), perm.size() * 4, 0);
+    const std::size_t out_bytes = f32 ? 4 : 2;
+    DeviceBuffer dout(ref.size() * out_bytes);
+    WorkspaceArena work(ops::ggml_linear_workspace_bytes(k, columns) + (1 << 20));
+    Tensor tx(dx.p, DType::BF16, {k, columns});
+    Tensor tout(dout.p, f32 ? DType::FP32 : DType::BF16, {rows, columns});
+    const ops::GgmlLayout layout = tiled ? ops::GgmlLayout::Tiles16 : ops::GgmlLayout::Rows;
+    // Rows-layout calls in two segments (a row offset); a tiled matrix as one.
+    std::vector<ops::GgmlSegment> segments;
+    if (tiled) {
+        segments.push_back({q, static_cast<const std::uint8_t*>(dw.p), rows, 0, 0, layout});
+    } else {
+        const int half = rows / 2;
+        segments.push_back({q, static_cast<const std::uint8_t*>(dw.p), half, 0, 0, layout});
+        segments.push_back({q, static_cast<const std::uint8_t*>(dw.p) + static_cast<std::size_t>(half) * row_bytes, rows - half, half, 0, layout});
+    }
+    const auto run = [&](ops::LinearRoutes routes) {
+        CUDA_CHECK(cudaMemset(dout.p, 0xFF, dout.bytes));
+        ops::ggml_linear(tx, segments, tout, permute ? static_cast<const std::int32_t*>(dperm.p) : nullptr, pb, work, nullptr, routes);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        std::vector<double> got(ref.size());
+        std::vector<std::uint32_t> bits(ref.size());
+        if (f32) {
+            std::vector<float> v(ref.size());
+            dout.copy_to_host(v.data(), v.size() * 4, 0);
+            for (std::size_t i = 0; i < v.size(); ++i) {
+                got[i] = v[i];
+                std::memcpy(&bits[i], &v[i], 4);
+            }
+        } else {
+            std::vector<std::uint16_t> v(ref.size());
+            dout.copy_to_host(v.data(), v.size() * 2, 0);
+            for (std::size_t i = 0; i < v.size(); ++i) {
+                got[i]  = value(v[i]);
+                bits[i] = v[i];
+            }
+        }
+        return std::pair(got, bits);
+    };
+    const auto [fast, fast_bits]   = run(ops::LinearRoutes::GgmlBf16Wide);
+    const auto [exact, exact_bits] = run(ops::LinearRoutes::Exact);
+    if (columns < 32) {
+        check(fast_bits == exact_bits, label + ": a narrow call must keep the exact route's bits");
+        return;
+    }
+    // Up to three FP32 roundings per slice (two halves' scaled sums, the min term) and the MMAs'
+    // sums of 16 products, each within 2^-24 of the magnitudes it adds.
+    const double slack = (3 * (k / 32) + 64) * std::ldexp(1.0, -24);
+    std::size_t bad = 0, same = 0;
+    double worst_fast = 0, worst_exact = 0, mean_fast = 0, mean_exact = 0;
+    for (std::size_t i = 0; i < ref.size(); ++i) {
+        const double tol = slack * mag[i] + (f32 ? 0.0 : std::ldexp(std::fabs(ref[i]), -8)) + 1e-30;
+        const double e   = std::fabs(fast[i] - ref[i]);
+        bad += !(e <= tol); // NaN fails
+        same += fast_bits[i] == exact_bits[i];
+        const double scale = mag[i] > 0 ? mag[i] : 1.0;
+        worst_fast  = std::max(worst_fast, e / scale);
+        worst_exact = std::max(worst_exact, std::fabs(exact[i] - ref[i]) / scale);
+        mean_fast += e / scale;
+        mean_exact += std::fabs(exact[i] - ref[i]) / scale;
+    }
+    check(bad == 0, label + ": " + std::to_string(bad) + " of " + std::to_string(ref.size()) + " outputs outside the FP32-sum bound");
+    std::printf("info %s: error / sum|wx| max %.2e mean %.2e (exact route %.2e / %.2e); %.1f %% of outputs equal the exact route's\n",
+                label.c_str(), worst_fast, mean_fast / static_cast<double>(ref.size()), worst_exact,
+                mean_exact / static_cast<double>(ref.size()), 100.0 * static_cast<double>(same) / static_cast<double>(ref.size()));
 }
 
 // ---- benchmarks (information only)
@@ -688,7 +819,7 @@ public:
         work_ = std::make_unique<WorkspaceArena>(ops::ggml_linear_workspace_bytes(k, columns) + (1 << 20));
     }
 
-    void time(const std::string& route, cudaStream_t stream) {
+    void time(const std::string& route, ops::LinearRoutes routes, cudaStream_t stream) {
         Tensor tx(x_.p, DType::BF16, {call_.k, columns_});
         const auto run = [&](int i, cudaStream_t s) {
             std::vector<ops::GgmlSegment> segs;
@@ -698,7 +829,7 @@ public:
                                 call_.parts[j].rows, 0, static_cast<std::int32_t>(j),
                                 tiled_ ? ops::GgmlLayout::Tiles16 : ops::GgmlLayout::Rows});
             }
-            ops::ggml_linear(tx, segs, out_ptrs_, call_.perm ? static_cast<const std::int32_t*>(perm_.p) : nullptr, 128, *work_, s);
+            ops::ggml_linear(tx, segs, out_ptrs_, call_.perm ? static_cast<const std::int32_t*>(perm_.p) : nullptr, 128, *work_, s, routes);
         };
         const int calls = head_ || columns_ >= 32 ? 4 : 50;
         double us       = 0;
@@ -729,13 +860,16 @@ private:
     std::unique_ptr<WorkspaceArena> work_;
 };
 
-// --bench N [tiled]: every bench call at N columns, rows or tiled (the default or switched shapes).
-void bench(int columns, bool tiled) {
+// --bench N [tiled] [bf16]: every bench call at N columns, rows or tiled, on the exact route and, with
+// bf16, also on the ggml-bf16-prefill route (LinearRoutes::GgmlBf16Wide; 32 or more columns).
+void bench(int columns, bool tiled, bool bf16) {
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
     for (const auto& call : bench_calls()) {
         if (call.f32 && columns > 8) { continue; } // the LM head runs at decode widths only
-        PreparedCall(call, columns, tiled).time("default", stream);
+        PreparedCall prepared(call, columns, tiled);
+        prepared.time("exact", ops::LinearRoutes::Exact, stream);
+        if (bf16) { prepared.time("bf16", ops::LinearRoutes::GgmlBf16Wide, stream); }
     }
     CUDA_CHECK(cudaStreamDestroy(stream));
 }
@@ -829,7 +963,12 @@ void run_ple(int heads, int width, int columns, Scales scales, std::mt19937& rng
 
 int main(int argc, char** argv) {
     if (argc > 1 && std::string(argv[1]) == "--bench") {
-        bench(argc > 2 ? std::atoi(argv[2]) : 1, argc > 3 && std::string(argv[3]) == "tiled");
+        bool tiled = false, bf16 = false;
+        for (int i = 3; i < argc; ++i) {
+            tiled = tiled || std::string(argv[i]) == "tiled";
+            bf16  = bf16 || std::string(argv[i]) == "bf16";
+        }
+        bench(argc > 2 ? std::atoi(argv[2]) : 1, tiled, bf16);
         return 0;
     }
     try {
@@ -886,6 +1025,20 @@ int main(int argc, char** argv) {
             run_tiled(q, 70, 6144, 33, true, false, rng, Scales::Wider);
             run_tiled(q, 67, 2560, 72, false, true, rng, Scales::Edge);
         }
+        // The ggml-bf16-prefill route within its FP32-sum bound: every format, partial row tiles (two
+        // segments of 100 or 65 rows; 45 tiled rows) and column tiles, the input permutation, FP32
+        // outputs, every scale span; a call narrower than 32 columns keeps the exact route's bits.
+        for (const QType q : formats) {
+            const int k = ggml_block_elems(q) == 256 ? 2560 : 640;
+            run_bf16(q, 200, k, 40, false, false, false, Scales::Narrow, rng);
+            run_bf16(q, 130, k, 300, false, false, true, Scales::Wide, rng);
+            run_bf16(q, 70, k == 2560 ? 6144 : 2560, 129, true, false, false, Scales::Wider, rng);
+            run_bf16(q, 64, k, 8, false, false, false, Scales::Narrow, rng);
+        }
+        for (const QType q : {QType::GGML_Q4_K, QType::GGML_Q5_K, QType::GGML_Q6_K, QType::GGML_IQ4_XS}) {
+            run_bf16(q, 300, 2560, 200, false, true, false, Scales::Narrow, rng);
+            run_bf16(q, 45, 6144, 33, true, true, true, Scales::Edge, rng);
+        }
         // The row gathers: the IQ4_XS token embedding (the model's H = 2560 and a one-block row) and
         // the PLE n-gram rows (the model's 16 heads of W = 160 per token, and one-block rows), over every
         // scale span.
@@ -900,8 +1053,9 @@ int main(int argc, char** argv) {
             std::cerr << failures << " ggml_linear checks failed\n";
             return 1;
         }
-        std::cout << "ggml_linear: every format, K, width and output split bit-equal to the exact oracle; "
-                     "ggml_embedding and ple_embed_iq4_nl element for element\n";
+        std::cout << "ggml_linear: every format, K, width and output split bit-equal to the exact oracle, the "
+                     "ggml-bf16-prefill route within its FP32-sum bound; ggml_embedding and ple_embed_iq4_nl element "
+                     "for element\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "error: " << error.what() << "\n";

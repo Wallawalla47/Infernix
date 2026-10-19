@@ -148,9 +148,17 @@ enum class FastPath : std::uint8_t {
     // Prefill steps take a wider chunk while no request is waiting to decode (the chunk boundaries,
     // and with them the prefill arithmetic, depend on load).
     IdleWidePrefill,
+    // Qwen3.8-Flash-Next GGUF imports: dense projections of prefill calls of 32 or more columns run on
+    // BF16 tensor cores (each code exact in BF16, x as stored, FP32 sums of each sub-block scaled by
+    // d * sub; ops::LinearRoutes::GgmlBf16Wide) instead of the exact A16 integer tiles, and the GGUF
+    // expert banks' MoE calls of 14,336 or more columns run the same tiles over decoded expert planes.
+    // A prompt's arithmetic then depends on where its calls start and how the layer walk groups them
+    // (a narrower tail call stays exact), which prefix-cache resumes share between requests. Without
+    // it every GGUF projection and expert is exact.
+    GgmlBf16Prefill,
 };
 
-inline constexpr std::array<FastPath, 21> kFastPaths{
+inline constexpr std::array<FastPath, 22> kFastPaths{
     FastPath::PromptPv8,           FastPath::DecodeSplit64,
     FastPath::Q8SlicedK,           FastPath::GdnConvFused,
     FastPath::QsaPrepareFused,     FastPath::Fp8A8Pair,
@@ -161,7 +169,8 @@ inline constexpr std::array<FastPath, 21> kFastPaths{
     FastPath::BatchedA8ResidualDecode, FastPath::ExpertA4Residual,
     FastPath::BatchSplitAttention, FastPath::AdaptiveSpeculation,
     FastPath::AdaptiveMtp,         FastPath::FreeCacheResume,
-    FastPath::Preemption,          FastPath::IdleWidePrefill};
+    FastPath::Preemption,          FastPath::IdleWidePrefill,
+    FastPath::GgmlBf16Prefill};
 
 [[nodiscard]] constexpr const char* fast_path_name(FastPath path) noexcept {
     switch (path) {
@@ -186,6 +195,7 @@ inline constexpr std::array<FastPath, 21> kFastPaths{
     case FastPath::Q4W4A8: return "q4-w4a8";
     case FastPath::SampledMtpDrafts: return "sampled-mtp-drafts";
     case FastPath::GdnF16Accumulate: return "gdn-f16-accumulate";
+    case FastPath::GgmlBf16Prefill: return "ggml-bf16-prefill";
     }
     return "unknown";
 }

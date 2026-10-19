@@ -46,11 +46,11 @@ ops::offloaded_moe::ExpertActivation expert_activation(const TextConfig& c) {
 
 // `routes` carries the selected fast paths' linear route flags (ForwardFastPaths::dense_routes) to the
 // projections they serve; a problem without a route for a flag runs its exact route. A GGUF import's
-// projection runs the exact ggml route.
+// projection runs the ggml route (ggml-bf16-prefill's BF16 tiles at prefill widths, else exact).
 void project(const Tensor& x, const LinearParameters& p, Tensor& out, WorkspaceArena& work, cudaStream_t s,
              ops::LinearRoutes routes = ops::LinearRoutes::Exact) {
     if (p.is_ggml()) {
-        ops::ggml_linear(x, p.ggml, out, p.input_perm, p.perm_block, work, s);
+        ops::ggml_linear(x, p.ggml, out, p.input_perm, p.perm_block, work, s, routes);
         return;
     }
     ops::linear(x, p.weight, out, p.policy, work, s, routes);
@@ -68,7 +68,7 @@ void embed_tokens(const Tensor& ids, const Weight& table, Tensor& out, cudaStrea
 // FP32 logits of the text head (BF16, Q8 or a GGUF import's ggml rows) for the columns of x.
 void text_head_logits(const Parameters& parameters, const Tensor& x, Tensor& logits, WorkspaceArena& work, cudaStream_t s) {
     if (parameters.output_head_q8 && parameters.output_head_q8->is_ggml()) {
-        ops::ggml_linear(x, parameters.output_head_q8->ggml, logits, nullptr, 0, work, s);
+        ops::ggml_linear(x, parameters.output_head_q8->ggml, logits, nullptr, 0, work, s, ops::LinearRoutes::Exact);
     } else if (parameters.output_head_q8) {
         ops::projection_fp32(x, parameters.output_head_q8->weight, logits, s);
     } else {
@@ -96,7 +96,7 @@ void shared_swiglu(const Tensor& x, const LinearParameters& gate_up, Tensor& out
         Tensor up   = work.alloc(DType::BF16, {I, T});
         const std::int32_t bounds[] = {0, I, 2 * I};
         Tensor* parts[]             = {&gate, &up};
-        ops::ggml_linear(x, ops::ggml_split_segments(gate_up.ggml, x.ne[0], bounds), parts, nullptr, 0, work, s);
+        ops::ggml_linear(x, ops::ggml_split_segments(gate_up.ggml, x.ne[0], bounds), parts, nullptr, 0, work, s, routes);
         ops::silu_mul(gate, up, out, s);
         return;
     }
@@ -152,6 +152,12 @@ Forward::Forward(const Parameters& parameters, DeviceContext& device, WorkspaceA
 
 Forward::~Forward() {
     if (split_ready_ != nullptr) { (void)cudaEventDestroy(split_ready_); }
+}
+
+ops::LinearRoutes Forward::dense_routes() const noexcept {
+    if (eager_chunk_) { return fast_.dense_routes; }
+    return static_cast<ops::LinearRoutes>(static_cast<std::uint8_t>(fast_.dense_routes) &
+                                          ~static_cast<std::uint8_t>(ops::LinearRoutes::GgmlBf16Wide));
 }
 
 std::size_t Forward::workspace_bytes(const TextConfig& c, std::int32_t columns, std::int32_t max_context,
@@ -512,7 +518,7 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
         Tensor q_rows = q.view({KW, 1, T}), k_rows = k.view({KW, 1, T}), v_rows = v.view({VW, 1, T}),
                z_rows = z.view({VW, 1, T});
         ops::gdn_input_proj_conv_snapshot(x_rows, p.projection.weight, p.convolution, layer.conv, batch.slots,
-                                          batch.slots, q_rows, k_rows, v_rows, z_rows, fast_.dense_routes, s);
+                                          batch.slots, q_rows, k_rows, v_rows, z_rows, dense_routes(), s);
         project(x, p.control, ab, work_, s);
     } else if (ggml && p.control.is_ggml() && p.control.input_perm == nullptr) {
         // A GGUF import's two projections of x in one call (one encoding of x), each part written to
@@ -524,19 +530,21 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
         }
         const std::int32_t bounds[] = {0, C, C + VW, C + VW + 2 * NV};
         Tensor* parts[]             = {&qkv, &z, &ab};
-        ops::ggml_linear(x, ops::ggml_split_segments(segments, x.ne[0], bounds), parts, nullptr, 0, work_, s);
+        ops::ggml_linear(x, ops::ggml_split_segments(segments, x.ne[0], bounds), parts, nullptr, 0, work_, s,
+                         dense_routes());
     } else {
         if (ggml) {
             // A GGUF import's projection (its control projection BF16): qkv and z in their own tensors.
             const std::int32_t bounds[] = {0, C, C + VW};
             Tensor* parts[]             = {&qkv, &z};
-            ops::ggml_linear(x, ops::ggml_split_segments(p.projection.ggml, x.ne[0], bounds), parts, nullptr, 0, work_, s);
+            ops::ggml_linear(x, ops::ggml_split_segments(p.projection.ggml, x.ne[0], bounds), parts, nullptr, 0, work_, s,
+                             dense_routes());
         } else if (p.projection.weight.qtype == QType::Q8_G32_FP16) {
             // Q8 (Dense8): the projection writes q/k/v and z to their destinations itself.
-            ops::gdn_input_proj(x, p.projection.weight, qkv, z, s, fast_.dense_routes);
+            ops::gdn_input_proj(x, p.projection.weight, qkv, z, s, dense_routes());
         } else {
             Tensor projected = work_.alloc(DType::BF16, {C + VW, T});
-            project(x, p.projection, projected, work_, s, fast_.dense_routes);
+            project(x, p.projection, projected, work_, s, dense_routes());
             Tensor* parts[] = {&qkv, &z};
             ops::split_rows(projected, parts, s);
         }
@@ -613,7 +621,7 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
                        g.output_gate == GateActivation::Sigmoid ? ops::RmsGate::Sigmoid : ops::RmsGate::Silu,
                        config_.rms_norm_eps, normed, device_.execution_view().on_stream(s));
     Tensor y = work_.alloc(DType::BF16, {H, T});
-    project(normed.view({VW, T}), p.output, y, work_, s, fast_.dense_routes);
+    project(normed.view({VW, T}), p.output, y, work_, s, dense_routes());
     return y;
 }
 
@@ -646,10 +654,11 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const A
         const std::int32_t bounds[] = {0, QW, 2 * QW, 2 * QW + KW, 2 * QW + 2 * KW, 2 * QW + 2 * KW + IH * ID,
                                        2 * QW + 2 * KW + index_rows};
         Tensor* parts[] = {&qf, &gate, &kf, &vf, &iqf, &ik};
-        ops::ggml_linear(x, ops::ggml_split_segments(segments, x.ne[0], bounds), parts, nullptr, 0, work_, s);
+        ops::ggml_linear(x, ops::ggml_split_segments(segments, x.ne[0], bounds), parts, nullptr, 0, work_, s,
+                         dense_routes());
     } else {
         Tensor projected = work_.alloc(DType::BF16, {2 * QW + 2 * KW + (p.index_projection ? 0 : index_rows), T});
-        project(x, p.projection, projected, work_, s, fast_.dense_routes);
+        project(x, p.projection, projected, work_, s, dense_routes());
         Tensor qf = q.view({QW, T}), kf = k.view({KW, T}), vf = v.view({KW, T}), iqf = iq.view({IH * ID, T});
         if (p.index_projection) {
             Tensor indexed = work_.alloc(DType::BF16, {index_rows, T});
@@ -739,7 +748,7 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const A
     Tensor gated = out.view({QW, T});
     ops::sigmoid_mul(gate, gated, s);
     Tensor y = work_.alloc(DType::BF16, {H, T});
-    project(gated, p.output, y, work_, s, fast_.dense_routes);
+    project(gated, p.output, y, work_, s, dense_routes());
     return y;
 }
 
@@ -915,6 +924,14 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
         source.prefetched      = streaming->slots(layer);
         source.prefetch_base   = streaming->base();
         source.prefetch_stride = streaming->pitch(); // the ring's slots: the largest record
+        // Every expert not resident when the chunk began has a ring slot and every record is in RAM:
+        // the call stages nothing, so it runs as one pass over every job instead of staging passes of
+        // half the slots (13 for a 16,384-column call of the layer walk). An expert a decode round
+        // evicted since is read in place from its host record (the same bytes, so the same bits).
+        if (streaming->complete(layer) && experts_.host_tables.empty()) {
+            source.staging_slots  = 0;
+            source.overlap_stream = nullptr;
+        }
     }
     // The layer's frame pool: its pitch is the layer's own record stride.
     const std::uint64_t pitch = experts_.frame_pitches.empty() ? 0 : experts_.frame_pitches.at(layer);
@@ -938,8 +955,13 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     const std::int32_t max_jobs = std::min(E, K * T);
     // The two-term route exists for NVFP4 W4A16 banks only; its layout carries no x limbs, which the
     // GGUF and block-FP8 wide routes read, so another bank keeps the exact layout whatever the flag.
+    // ggml-bf16-prefill takes a GGUF bank's wide jobs in prefill calls onto the BF16 planes.
+    const bool ggml_bank = source.ggml.gate_up_format != QType::NVFP4_MUL &&
+                           source.ggml.gate_up_format != QType::FP8_E4M3FN_B128;
     source.wide_a16 = fast_.expert_a4_residual && source.ggml.gate_up_format == QType::NVFP4_MUL
                           ? ops::offloaded_moe::WideA16::kA4Residual
+                      : ggml_bank && ops::has_route(dense_routes(), ops::LinearRoutes::GgmlBf16Wide)
+                          ? ops::offloaded_moe::WideA16::kGgmlBf16
                           : ops::offloaded_moe::WideA16::kExact;
     const DeviceSpan expert_ws  = work_.alloc_bytes(ops::moe_experts_workspace_bytes(max_jobs, K * T, T, source.activation,
                                                                                  source.wide_a16));
@@ -965,8 +987,8 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     }
     ops::moe_experts(x, dispatch, source, K, max_jobs, expert_ws.data, outputs, s, /*wait_for_cpu=*/false, planned);
     if (streaming != nullptr && batch->release_stream) { streaming->after_experts(layer, s); }
-    shared_swiglu(x, p.shared_gate_up, product, work_, shared_s, fast_.dense_routes);
-    project(product, p.shared_down, shared, work_, shared_s, fast_.dense_routes);
+    shared_swiglu(x, p.shared_gate_up, product, work_, shared_s, dense_routes());
+    project(product, p.shared_down, shared, work_, shared_s, dense_routes());
     ops::moe_experts_cpu_wait(x, dispatch, source, max_jobs, expert_ws.data, outputs, s);
     if (side) {
         CUDA_CHECK(cudaEventRecord(experts_.shared_events[1], shared_s));
