@@ -11,11 +11,6 @@ namespace {
 
 using Json = nlohmann::json;
 
-double unix_now() {
-    return std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch())
-        .count();
-}
-
 Json number_or_null(bool valid, double value) {
     return valid && std::isfinite(value) ? Json(value) : Json(nullptr);
 }
@@ -33,9 +28,7 @@ const char* state_name(const infernix::RuntimeStats& stats) noexcept {
 MetricsFormat select_metrics_format(std::string_view format_param,
                                     std::string_view accept_header) noexcept {
     if (format_param == "json") { return MetricsFormat::Json; }
-    if (format_param == "prometheus" || format_param == "text") {
-        return MetricsFormat::Prometheus;
-    }
+    if (format_param == "prometheus") { return MetricsFormat::Prometheus; }
     if (!format_param.empty()) { return MetricsFormat::Invalid; }
     return accept_header.find("application/json") != std::string_view::npos
                ? MetricsFormat::Json
@@ -176,13 +169,13 @@ std::string render_metrics_json(const MetricsJsonSnapshot& s) {
 
 void RequestHistory::done(const RequestLogContext& context, const GenerationOutcome& outcome) {
     std::lock_guard lock(mutex_);
-    rows_.push_back(make_metrics_json_request(context.id, context, outcome, unix_now()));
+    rows_.push_back(make_metrics_json_request(context.id, context, outcome, unix_time_seconds()));
     while (rows_.size() > kMetricsRequestLimit) { rows_.pop_front(); }
 }
 
 void RequestHistory::failure(const RequestLogContext& context, bool cancelled) {
     std::lock_guard lock(mutex_);
-    rows_.push_back(make_metrics_json_failure(context.id, context, cancelled, unix_now()));
+    rows_.push_back(make_metrics_json_failure(context.id, context, cancelled, unix_time_seconds()));
     while (rows_.size() > kMetricsRequestLimit) { rows_.pop_front(); }
 }
 

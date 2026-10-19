@@ -53,7 +53,7 @@ int main() {
 
     RequestLogContext context;
     context.id       = 41;
-    context.protocol = "openai.chat";
+    context.protocol = "openai_chat_completions";
 
     GenerationOutcome outcome;
     outcome.prompt_tokens                       = 1200;

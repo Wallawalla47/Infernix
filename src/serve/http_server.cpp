@@ -300,15 +300,6 @@ void HttpServer::record_response_failure(std::uint64_t request_id, const Request
     operational_log_.response_failure(request_id, failure);
 }
 
-namespace {
-
-double unix_time_seconds_now() {
-    return std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch())
-        .count();
-}
-
-} // namespace
-
 std::string HttpServer::metrics_json_body() const {
     MetricsJsonSnapshot snapshot;
     const infernix::LoadSummary load      = service_->load_summary();
@@ -322,7 +313,7 @@ std::string HttpServer::metrics_json_body() const {
                                                                : load.weight_formats.front();
     snapshot.kv                  = infernix::kv_cache_name(engine.kv_cache);
     snapshot.speculative_backend = product::speculative_backend_name(engine.speculative.backend);
-    snapshot.time_unix           = unix_time_seconds_now();
+    snapshot.time_unix           = unix_time_seconds();
     snapshot.start_time_unix     = metrics_.start_time_seconds();
     snapshot.max_context         = engine.max_context;
     snapshot.max_concurrency     = engine.max_concurrency;

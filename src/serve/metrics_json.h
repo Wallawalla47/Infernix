@@ -1,12 +1,14 @@
 #pragma once
 
 // The JSON representation of GET /metrics?format=json. The key names are a consumer contract:
-// monitor.py's frozen Strata mapping reads them directly (see docs/serving.md). The types below
-// cannot carry prompt, completion, tool, header, key, or client text.
+// monitor.py's frozen Strata mapping reads them directly (see docs/serving.md). Every string in
+// the types below is engine-authored (protocol and finish are server constants); no request text
+// is copied into them.
 
 #include "serve/generation_service.h"
 #include "serve/request_events.h"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -19,6 +21,11 @@ namespace infernix::serve {
 
 inline constexpr const char* kMetricsJsonSchema   = "infernix.telemetry/1";
 inline constexpr std::size_t kMetricsRequestLimit = 128;
+
+[[nodiscard]] inline double unix_time_seconds() {
+    return std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
 
 struct MetricsJsonRequest {
     std::uint64_t id                      = 0;

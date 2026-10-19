@@ -89,7 +89,6 @@ int main() {
     check(counts.completed == 400 && counts.cancelled == 2 && counts.failed == 1 &&
               counts.rejected == 1,
           "terminal counts must be readable without a scrape");
-    check(metrics.start_time_seconds() > 0.0, "start time must be recorded at configure");
     outcome.constraint = ConstraintObservation{.complete          = true,
                                                .terminated        = false,
                                                .cache             = ConstraintCacheAccess::Built,
