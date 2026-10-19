@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/weight.h"
+#include "ops/host_parallel.h"
 #include "ops/op_tester.h"
 
 #include <cstddef>
@@ -45,19 +46,22 @@ inline HostWeight make_patterned(std::int32_t n, std::int32_t k, std::uint32_t s
     result.n = n;
     result.k = k;
     result.bits.resize(static_cast<std::size_t>(n) * k);
-    for (std::int32_t row = 0; row < n; ++row) {
-        for (std::int32_t column = 0; column < k; ++column) {
-            std::uint32_t hash = static_cast<std::uint32_t>(row) * 0x9e3779b9U ^
-                                 static_cast<std::uint32_t>(column) * 0x85ebca6bU ^
-                                 seed * 0xc2b2ae35U;
-            hash ^= hash >> 16;
-            hash *= 0x7feb352dU;
-            hash ^= hash >> 15;
-            const int centered = static_cast<int>((hash >> 8) & 0xffU) - 128;
-            const float value  = static_cast<float>(centered) * (1.0F / 1024.0F);
-            result.bits[static_cast<std::size_t>(row) * k + column] = f32_to_bf16(value);
+    // Every element is a function of its indices, so rows fill on the host threads.
+    parallel_ranges(n, threads_for_rows(n), [&](std::int64_t first, std::int64_t last) {
+        for (auto row = static_cast<std::int32_t>(first); row < last; ++row) {
+            for (std::int32_t column = 0; column < k; ++column) {
+                std::uint32_t hash = static_cast<std::uint32_t>(row) * 0x9e3779b9U ^
+                                     static_cast<std::uint32_t>(column) * 0x85ebca6bU ^
+                                     seed * 0xc2b2ae35U;
+                hash ^= hash >> 16;
+                hash *= 0x7feb352dU;
+                hash ^= hash >> 15;
+                const int centered = static_cast<int>((hash >> 8) & 0xffU) - 128;
+                const float value  = static_cast<float>(centered) * (1.0F / 1024.0F);
+                result.bits[static_cast<std::size_t>(row) * k + column] = f32_to_bf16(value);
+            }
         }
-    }
+    });
     return result;
 }
 

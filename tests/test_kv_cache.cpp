@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -324,8 +325,19 @@ int exercise_vmm_range() {
     return failures;
 }
 
-void CUDART_CB hold_stream(void* milliseconds) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(*static_cast<int*>(milliseconds)));
+// Holds a stream until the test opens the gate or `hold` passes, so work queued behind the hold
+// stays pending however slowly the host runs until the test releases it.
+struct StreamGate {
+    std::chrono::milliseconds hold;
+    std::atomic<bool> open{false};
+};
+
+void CUDART_CB hold_stream(void* opaque) {
+    auto* gate       = static_cast<StreamGate*>(opaque);
+    const auto until = std::chrono::steady_clock::now() + gate->hold;
+    while (!gate->open.load() && std::chrono::steady_clock::now() < until) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
 }
 
 // A publication's copy reads the row's pinned shadow when the stream reaches it. Work queued
@@ -353,8 +365,9 @@ int exercise_republish_while_copy_queued(infernix::DeviceContext& context) {
     }
     infernix::KVExecutionRowLease owner = tables.acquire(0);
     const infernix::Tensor device_row   = tables.row(owner.handle());
-    int hold_ms                       = 300;
-    if (cudaLaunchHostFunc(context.stream, hold_stream, &hold_ms) != cudaSuccess) {
+    // The republication overlaps the queued copy and waits for it: the hold releases itself.
+    StreamGate republish_gate{.hold = std::chrono::milliseconds(300)};
+    if (cudaLaunchHostFunc(context.stream, hold_stream, &republish_gate) != cudaSuccess) {
         throw std::runtime_error("stream hold failed");
     }
     tables.publish(owner.handle(), 0, first, context.stream);
@@ -366,6 +379,7 @@ int exercise_republish_while_copy_queued(infernix::DeviceContext& context) {
     owner.release();
     infernix::KVExecutionRowLease next = tables.acquire(0);
     tables.publish(next.handle(), 0, second, context.stream);
+    republish_gate.open = true;
     context.synchronize();
 
     std::vector<std::int32_t> seen(2);
@@ -378,7 +392,8 @@ int exercise_republish_while_copy_queued(infernix::DeviceContext& context) {
                        "the next owner's publication did not land");
 
     // A disjoint extension of a row with a copy still queued does not wait for it.
-    if (cudaLaunchHostFunc(context.stream, hold_stream, &hold_ms) != cudaSuccess) {
+    StreamGate extension_gate{.hold = std::chrono::seconds(10)};
+    if (cudaLaunchHostFunc(context.stream, hold_stream, &extension_gate) != cudaSuccess) {
         throw std::runtime_error("stream hold failed");
     }
     tables.publish(next.handle(), 0, second, context.stream);
@@ -386,8 +401,10 @@ int exercise_republish_while_copy_queued(infernix::DeviceContext& context) {
     tables.publish(next.handle(), 2, std::span<const infernix::DeviceKVPageHandle>(first.data(), 1),
                    context.stream);
     const auto waited = std::chrono::steady_clock::now() - started;
+    extension_gate.open = true;
     context.synchronize();
-    failures += expect(waited < std::chrono::milliseconds(100),
+    // Waiting for the queued copy would last until the gate's 10 s bound: the copy sits behind it.
+    failures += expect(waited < std::chrono::seconds(5),
                        "a disjoint publication waited for an unrelated queued copy");
     failures += expect(read_mapping(tables.row(next.handle()), 3) ==
                            std::vector<std::int32_t>({2, 0, 0}),

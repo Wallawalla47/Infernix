@@ -12,6 +12,7 @@
 // more records than ring slots (slots reused as the "device" consumes them), the heartbeat, a request
 // failing on an unreadable record, and admission of fetched landings at the next boundary. An
 // expert stripe moves each record's tail to another file; records still land whole.
+#include "test_temp_path.h"
 #include "models/qwen4_exp/expert_store.h"
 #include "models/qwen4_exp/program/host_expert_tier.h"
 #include "ops/offloaded_sparse_moe/cpu/fetch_channel.h"
@@ -73,9 +74,8 @@ struct Files {
 
 Files make_files() {
     Files f;
-    const auto dir = std::filesystem::temp_directory_path();
-    f.a = dir / "infernix_host_tier_a.bin";
-    f.b = dir / "infernix_host_tier_b.bin";
+    f.a = infernix::test::unique_temp_path("infernix_host_tier_a.bin");
+    f.b = infernix::test::unique_temp_path("infernix_host_tier_b.bin");
     std::ofstream a(f.a, std::ios::binary | std::ios::trunc), b(f.b, std::ios::binary | std::ios::trunc);
     std::vector<char> header(4096, 0x11);
     a.write(header.data(), static_cast<std::streamsize>(header.size()));
@@ -359,7 +359,7 @@ void test_stream_reads(const ExpertStore& store) {
 void test_mixed_strides() {
     constexpr std::uint32_t kExpertsHere = 20;
     const std::uint64_t pitch[2] = {kRecord, kRecord / 2};
-    const auto path = std::filesystem::temp_directory_path() / "infernix_host_tier_mixed.bin";
+    const auto path = infernix::test::unique_temp_path("infernix_host_tier_mixed.bin");
     std::vector<std::vector<ExpertStore::Segment>> records(2 * kExpertsHere);
     {
         std::ofstream f(path, std::ios::binary | std::ios::trunc);
@@ -457,7 +457,7 @@ void test_stripe(const ExpertStore& base) {
     using infernix::models::qwen4_exp::with_stripe;
     infernix::artifact::ArtifactId id{};
     for (std::size_t i = 0; i < id.size(); ++i) { id[i] = static_cast<std::byte>(i + 1); }
-    const auto path = std::filesystem::temp_directory_path() / "infernix_host_tier.stripe";
+    const auto path = infernix::test::unique_temp_path("infernix_host_tier.stripe");
     write_stripe(path, id, 4096, kRecord);
     const ExpertStore store = with_stripe(base, read_expert_stripe(path), id);
     const auto straddler    = store.segments(kStraddle / kExperts, kStraddle % kExperts);

@@ -272,9 +272,15 @@ int run_selector_linear() {
 // FP64 oracle for the listed tokens of the fixed activation pattern, result[i * n + row] for
 // tokens[i]: every complete dot product accumulated naively in FP64. Rows are taken eight at a time
 // so one token's activation stays in cache while it meets eight weight rows.
-std::vector<double> oracle_tokens(const HostWeight& weight, std::span<const std::int32_t> tokens) {
+std::vector<double> oracle_tokens(const HostWeight& weight, std::span<const std::int32_t> requested) {
     const std::int32_t n = weight.n, k = weight.k;
     const auto columns   = static_cast<std::size_t>(k);
+    // activation_bit repeats in the token with period 256 (token * 71 mod 256; 71 is odd), so each
+    // distinct activation column is evaluated once and its outputs copied to every token that has it.
+    std::vector<std::int32_t> tokens;
+    for (const std::int32_t token : requested) tokens.push_back(token & 0xff);
+    std::sort(tokens.begin(), tokens.end());
+    tokens.erase(std::unique(tokens.begin(), tokens.end()), tokens.end());
     std::vector<double> w(weight.bits.size());
     for (std::size_t index = 0; index < w.size(); ++index) {
         w[index] = bf16_to_f32(weight.bits[index]);
@@ -311,7 +317,14 @@ std::vector<double> oracle_tokens(const HostWeight& weight, std::span<const std:
     const unsigned threads = std::max(1U, std::thread::hardware_concurrency());
     for (unsigned thread = 0; thread < threads; ++thread) workers.emplace_back(work);
     for (std::thread& worker : workers) worker.join();
-    return result;
+    std::vector<double> expanded(requested.size() * static_cast<std::size_t>(n));
+    for (std::size_t i = 0; i < requested.size(); ++i) {
+        const auto distinct = static_cast<std::size_t>(
+            std::lower_bound(tokens.begin(), tokens.end(), requested[i] & 0xff) - tokens.begin());
+        std::copy_n(result.begin() + static_cast<std::ptrdiff_t>(distinct * n), n,
+                    expanded.begin() + static_cast<std::ptrdiff_t>(i * n));
+    }
+    return expanded;
 }
 
 // One call at T tokens compared against the oracle at `checked` tokens (oracle[i * n + row] for

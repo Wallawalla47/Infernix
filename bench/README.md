@@ -178,11 +178,14 @@ forced step also record the log-probabilities of those tokens and its own larges
 
 The log-probabilities are printed exactly, so the same segments also measure request invariance:
 `tools/quality/fast_path_gate.py identical a.json b.json` compares two exact-route runs bit for
-bit. `--concurrency N` (1-8) submits the segments in groups of N that run together (their prompt
-lengths differ, so prefills overlap decodes), `--prefill-chunk N` sets the prompt chunk (default
-4096, rounded down to the prompt-attention wave), and `--prefix-reuse` runs each segment's prompt
-alone first (with `--warm-tokens N`, only its first N tokens) and then the group's measured
-requests together from the prefix cache (the report's `reused_prompt_tokens` counts the restored tokens). `--kv-tokens N`
+bit. `--concurrency N` (1-8) keeps N segments in flight, each lane taking the next segment when
+its previous one completes (their prompt lengths differ, so prefills overlap decodes, and no lane
+idles behind a group's longest prompt), `--prefill-chunk N` sets the prompt chunk (default
+4096, rounded down to the prompt-attention wave), and `--prefix-reuse` submits groups of N instead:
+each segment's prompt runs alone first (with `--warm-tokens N`, only its first N tokens) and then
+the group's measured requests together from the prefix cache (the report's `reused_prompt_tokens`
+counts the restored tokens). The last log line sums the requests' prefill time and their share of
+the decode rounds, which shows where a run's time went. `--kv-tokens N`
 sizes the KV pool (default: every lane's whole context), so a short pool makes concurrent requests
 preempt; the report's `preemptions` and `replayed_tokens` count what happened.
 

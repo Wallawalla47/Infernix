@@ -1,6 +1,7 @@
 // Real-artifact scenarios for the hybrid prefix cache (docs/maintainer/hybrid-prefix-cache-spec.md
 // §13.3). Requires INFERNIX_TEST_ARTIFACT; INFERNIX_HYBRID_REAL_SCENARIO selects one scenario.
 
+#include "test_temp_path.h"
 #include "kv_cache_storage.h"
 #include "infernix/engine.h"
 
@@ -246,7 +247,7 @@ int exercise_restore_exact(const char* artifact, infernix::SpeculativeBackend ba
 // the previous file and leaves no temporary one.
 int exercise_persist(const char* artifact) {
     const std::filesystem::path file =
-        std::filesystem::temp_directory_path() / "infernix-hybrid-persist-real-test.bin";
+        infernix::test::unique_temp_path("infernix-hybrid-persist-real-test.bin");
     std::error_code ignored;
     std::filesystem::remove(file, ignored);
     const std::vector<infernix::TokenId> first = synthetic_tokens(1500, 4);
@@ -302,7 +303,7 @@ int exercise_persist(const char* artifact) {
     }
     // The saver's file, for the smaller Host tier below (the loader saves over `file`).
     const std::filesystem::path partial =
-        std::filesystem::temp_directory_path() / "infernix-hybrid-persist-real-test-partial.bin";
+        infernix::test::unique_temp_path("infernix-hybrid-persist-real-test-partial.bin");
     std::filesystem::copy_file(file, partial, std::filesystem::copy_options::overwrite_existing);
     // The file read is published as one startup phase: the whole file, never a failure (a failed
     // phase would be logged as a failed startup).

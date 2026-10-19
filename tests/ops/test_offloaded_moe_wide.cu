@@ -405,6 +405,7 @@ void test_layer(const char* name, int experts, int columns, int top_k, const std
         std::uint8_t* frames_v = base + kChunk - stride / 2;
         std::uint8_t* stage_v  = base + 2 * kChunk - stride - stride / 3;
         cuda_check(cudaMemcpy(frames_v, d_frame_base, frame_bytes.size(), cudaMemcpyDeviceToDevice), "copy frames");
+        cuda_check(cudaDeviceSynchronize(), "settle frame copy before the side stream reads it");
         struct Placement {
             const char* name;
             const std::uint8_t* frames;

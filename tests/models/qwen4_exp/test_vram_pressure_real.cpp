@@ -148,17 +148,40 @@ int main() {
         check(shrank, "the cache shrank during the generation (" + std::to_string(during.size()) + " resizes)");
         check(regrew, "the cache grew back after the memory was freed");
 
-        // 2. Pressure while idle: the monitor wakes the engine, which resizes outside any round.
-        std::this_thread::sleep_for(std::chrono::milliseconds(3000)); // finish any regrowth
+        // 2. Pressure while idle: the monitor wakes the engine, which resizes outside any round. Each
+        // wait polls for the resize it expects (the monitor samples once a second) with a generous
+        // bound, so a loaded machine only delays it.
+        const auto wait_until = [&](auto&& done) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+            while (!done() && std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+        };
+        // Finish any regrowth: no resize for two monitor samples.
+        {
+            std::size_t seen  = diagnostics.resizes(0).size();
+            auto quiet_since  = std::chrono::steady_clock::now();
+            wait_until([&] {
+                const std::size_t now = diagnostics.resizes(0).size();
+                if (now != seen) {
+                    seen        = now;
+                    quiet_since = std::chrono::steady_clock::now();
+                }
+                return std::chrono::steady_clock::now() - quiet_since > std::chrono::milliseconds(2200);
+            });
+        }
         const std::size_t idle_mark = diagnostics.size();
         taken = 2 * kGiB;
-        std::this_thread::sleep_for(std::chrono::milliseconds(3000));
+        wait_until([&] { return !diagnostics.resizes(idle_mark).empty(); });
         const auto idle_shrink = diagnostics.resizes(idle_mark);
         check(!idle_shrink.empty() && idle_shrink.front().second < idle_shrink.front().first,
               "an idle engine shrinks the cache");
         const std::size_t grow_mark = diagnostics.size();
         taken = 0;
-        std::this_thread::sleep_for(std::chrono::milliseconds(4000));
+        wait_until([&] {
+            const auto resizes = diagnostics.resizes(grow_mark);
+            return !resizes.empty() && resizes.back().second > resizes.back().first;
+        });
         const auto idle_grow = diagnostics.resizes(grow_mark);
         check(!idle_grow.empty() && idle_grow.back().second > idle_grow.back().first,
               "an idle engine grows the cache back");

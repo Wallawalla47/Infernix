@@ -12,7 +12,11 @@
 //                 Bonferroni), and plain decoding at T 0.8 must not (the test's power).
 //   greedy        Two prompts, 256 greedy tokens: sampled drafts give the one-hot arm's tokens.
 //
-//   infernix_qwen4_exp_sampled_drafts_real_test [--greedy-only] [--trials N] [--tokens G]
+//   infernix_qwen4_exp_sampled_drafts_real_test [--greedy-only] [--trials N] [--tokens G] [--concurrency C]
+//
+// Every arm keeps C = 8 requests in flight by default (the sparse acceptance takes up to 8 rows):
+// the exact route is request-invariant and each request has its own seed, so batching does not
+// change an arm's distribution, and the MTP arms finish about as fast as plain decoding.
 
 #include "kv_cache_storage.h"
 #include "infernix/engine.h"
@@ -209,10 +213,13 @@ int main(int argc, char** argv) {
     }
     const char* ngram   = std::getenv("INFERNIX_QWEN4_NGRAM");
     bool greedy_only    = false;
-    std::uint32_t trials = 2000, tokens = 8;
+    std::uint32_t trials = 2000, tokens = 8, concurrency = 8;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--greedy-only") { greedy_only = true; }
+        if (arg == "--concurrency" && i + 1 < argc) {
+            concurrency = static_cast<std::uint32_t>(std::clamp(std::stoul(argv[++i]), 1UL, 8UL));
+        }
         if (arg == "--trials" && i + 1 < argc) { trials = static_cast<std::uint32_t>(std::stoul(argv[++i])); }
         if (arg == "--tokens" && i + 1 < argc) { tokens = static_cast<std::uint32_t>(std::max(2UL, std::stoul(argv[++i]))); }
     }
@@ -222,19 +229,20 @@ int main(int argc, char** argv) {
         Arm plain, cold;
         std::vector<infernix::TokenId> prompt;
         if (!greedy_only) {
-            std::printf("== plain decoding (C = 8): %u requests at T 1.0 and at T 0.8, %u tokens\n", trials, tokens);
-            infernix::Engine engine(engine_options(artifact, ngram, false, false, 8));
+            std::printf("== plain decoding (C = %u): %u requests at T 1.0 and at T 0.8, %u tokens\n", concurrency,
+                        trials, tokens);
+            infernix::Engine engine(engine_options(artifact, ngram, false, false, concurrency));
             prompt = engine.tokenize_text(kPrompt);
-            plain  = sample(engine, prompt, 1.0F, 1, trials, tokens, 8);
-            cold   = sample(engine, prompt, 0.8F, 3ULL * trials + 1, trials, tokens, 8);
+            plain  = sample(engine, prompt, 1.0F, 1, trials, tokens, concurrency);
+            cold   = sample(engine, prompt, 0.8F, 3ULL * trials + 1, trials, tokens, concurrency);
         }
         std::vector<std::vector<infernix::TokenId>> greedy_one_hot, greedy_sampled;
         {
-            std::printf("== MTP 4, one-hot drafts (C = 1)\n");
-            infernix::Engine engine(engine_options(artifact, ngram, true, false, 1));
+            std::printf("== MTP 4, one-hot drafts (C = %u)\n", concurrency);
+            infernix::Engine engine(engine_options(artifact, ngram, true, false, concurrency));
             greedy_one_hot = greedy(engine);
             if (!greedy_only) {
-                const Arm one_hot = sample(engine, prompt, 1.0F, trials + 1ULL, trials, tokens, 1);
+                const Arm one_hot = sample(engine, prompt, 1.0F, trials + 1ULL, trials, tokens, concurrency);
                 std::printf("  rounds %llu, accepted %llu of %llu drafts\n",
                             static_cast<unsigned long long>(one_hot.speculative.rounds),
                             static_cast<unsigned long long>(one_hot.speculative.accepted_tokens),
@@ -243,11 +251,11 @@ int main(int argc, char** argv) {
             }
         }
         {
-            std::printf("== MTP 4, sampled drafts (C = 1)\n");
-            infernix::Engine engine(engine_options(artifact, ngram, true, true, 1));
+            std::printf("== MTP 4, sampled drafts (C = %u)\n", concurrency);
+            infernix::Engine engine(engine_options(artifact, ngram, true, true, concurrency));
             greedy_sampled = greedy(engine);
             if (!greedy_only) {
-                const Arm drafts = sample(engine, prompt, 1.0F, 2ULL * trials + 1, trials, tokens, 1);
+                const Arm drafts = sample(engine, prompt, 1.0F, 2ULL * trials + 1, trials, tokens, concurrency);
                 std::printf("  rounds %llu, accepted %llu of %llu drafts\n",
                             static_cast<unsigned long long>(drafts.speculative.rounds),
                             static_cast<unsigned long long>(drafts.speculative.accepted_tokens),

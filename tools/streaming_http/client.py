@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import errno
 import http.client
 import socket
 import ssl
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -14,6 +16,20 @@ from urllib.parse import urlsplit
 
 class HttpClientError(RuntimeError):
     pass
+
+
+# Winsock's shutdown() does not wake a recv() blocked in another thread (it waits for the socket
+# timeout), so a Windows cancel also closes the handle. The blocked or next socket call then
+# fails with one of these: WSAEINTR, WSAENOTSOCK, WSAECONNABORTED (or EBADF once Python has
+# dropped the descriptor).
+_CLOSES_HANDLE_ON_CANCEL = sys.platform == "win32"
+_CLOSED_HANDLE_WINERRORS = frozenset({10004, 10038, 10053})
+
+
+def _closed_by_cancel(error: BaseException) -> bool:
+    return isinstance(error, OSError) and (
+        getattr(error, "winerror", None) in _CLOSED_HANDLE_WINERRORS or error.errno == errno.EBADF
+    )
 
 
 class _StreamingResponse(http.client.HTTPResponse):
@@ -115,6 +131,14 @@ class PreparedExchange:
                     self._shutdown = True
                 except OSError:
                     pass
+                if _CLOSES_HANDLE_ON_CANCEL:
+                    # The response's makefile() reference defers socket.close(); close the
+                    # handle itself.
+                    try:
+                        transport._real_close()
+                        self._shutdown = True
+                    except OSError:
+                        pass
         return self._cancel_ns
 
     def execute(
@@ -194,6 +218,7 @@ class PreparedExchange:
                     or (response is None and isinstance(error, http.client.RemoteDisconnected))
                     or (response is not None and isinstance(error, http.client.IncompleteRead))
                     or isinstance(error, ssl.SSLEOFError)
+                    or (_CLOSES_HANDLE_ON_CANCEL and _closed_by_cancel(error))
                 )
             )
             result.cancelled = shutdown_error

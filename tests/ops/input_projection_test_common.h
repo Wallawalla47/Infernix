@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/weight.h"
+#include "ops/host_parallel.h"
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
 
@@ -160,24 +161,33 @@ inline std::vector<double>
 projection_oracle(const quantized_weight::PackedWeight& weight, std::int32_t weight_row_offset,
                   std::int32_t output_rows, const std::vector<float>& activation,
                   std::int32_t hidden, std::int32_t tokens, std::int32_t sample_count = 7) {
-    std::vector<double> expected;
     const std::vector<std::int32_t> selected = sampled_rows(output_rows, sample_count);
-    expected.reserve(selected.size() * static_cast<std::size_t>(tokens));
-    for (const std::int32_t local_row : selected) {
-        // Decode each represented coefficient once; every token still evaluates the full
-        // naive FP64 dot product, without production staging or intermediate rounding.
-        std::vector<double> decoded(hidden);
-        for (std::int32_t column = 0; column < hidden; ++column)
-            decoded[column] = quantized_weight::logical_weight_fp64(
-                weight, weight_row_offset + local_row, column);
-        for (std::int32_t token = 0; token < tokens; ++token) {
-            const float* input = activation.data() + static_cast<std::size_t>(token) * hidden;
-            double sum         = 0.0;
+    const auto rows = static_cast<std::int64_t>(selected.size());
+    // Decode each represented coefficient once; every output still evaluates the full naive FP64
+    // dot product in column order, without production staging or intermediate rounding. Rows and
+    // outputs are independent, so they spread over the host threads with identical results.
+    std::vector<double> decoded(static_cast<std::size_t>(rows) * hidden);
+    parallel_ranges(rows, host_thread_count(), [&](std::int64_t first, std::int64_t last) {
+        for (std::int64_t r = first; r < last; ++r) {
             for (std::int32_t column = 0; column < hidden; ++column)
-                sum += decoded[column] * static_cast<double>(input[column]);
-            expected.push_back(sum);
+                decoded[static_cast<std::size_t>(r) * hidden + column] = quantized_weight::logical_weight_fp64(
+                    weight, weight_row_offset + selected[static_cast<std::size_t>(r)], column);
         }
-    }
+    });
+    const std::int64_t outputs = rows * tokens;
+    std::vector<double> expected(static_cast<std::size_t>(outputs));
+    parallel_ranges(outputs, threads_for_rows(outputs, 16), [&](std::int64_t first, std::int64_t last) {
+        for (std::int64_t index = first; index < last; ++index) {
+            const std::int64_t r     = index / tokens;
+            const std::int64_t token = index % tokens;
+            const double* row        = decoded.data() + static_cast<std::size_t>(r) * hidden;
+            const float* input       = activation.data() + static_cast<std::size_t>(token) * hidden;
+            double sum               = 0.0;
+            for (std::int32_t column = 0; column < hidden; ++column)
+                sum += row[column] * static_cast<double>(input[column]);
+            expected[static_cast<std::size_t>(index)] = sum;
+        }
+    });
     return expected;
 }
 

@@ -5,6 +5,7 @@
 // read correctly, and every later call does too. FileMapping::None maps nothing and reads the same
 // bytes.
 
+#include "test_temp_path.h"
 #include "core/read_only_file.h"
 
 #include <cstddef>
@@ -120,7 +121,7 @@ void check_consume_error(const infernix::ReadOnlyFile& file) {
 void check_large_reads() {
     constexpr std::size_t kLarge = 8ULL << 20;
     constexpr std::size_t kPages = (5 * kLarge) / kBlock + 3;
-    const auto path = std::filesystem::temp_directory_path() / "infernix_read_only_file_large_test.bin";
+    const auto path = infernix::test::unique_temp_path("infernix_read_only_file_large_test.bin");
     {
         std::ofstream out(path, std::ios::binary | std::ios::trunc);
         std::vector<std::byte> block(kBlock);
@@ -158,7 +159,7 @@ void check_large_reads() {
 } // namespace
 
 int main() {
-    const auto path = std::filesystem::temp_directory_path() / "infernix_read_only_file_test.bin";
+    const auto path = infernix::test::unique_temp_path("infernix_read_only_file_test.bin");
     {
         std::ofstream out(path, std::ios::binary | std::ios::trunc);
         std::vector<std::byte> block(kBlock);

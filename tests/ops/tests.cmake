@@ -29,7 +29,8 @@ set(infernix_op_tests
   target_logprobs
   top_logprobs
   token_constraint
-  position)
+  position
+  ple)
 foreach(op IN LISTS infernix_op_tests)
   infernix_add_op_test(infernix_${op}_test
     SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_${op}.cpp"
@@ -259,10 +260,17 @@ infernix_add_op_test(infernix_speculative_state_ops_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_speculative_state_ops.cu"
   LIBRARIES infernix_ops)
 
-# QSA index queries, pooled keys and tails, selection and attention against FP64 oracles.
-infernix_add_op_test(infernix_qsa_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_qsa.cpp"
-  LIBRARIES infernix_ops)
+# QSA index queries, pooled keys and tails, selection and attention against FP64 oracles. One
+# entry per independent part (infernix_qsa_<part>_test), so `ctest -j` runs them concurrently;
+# together they run every case of the unsharded executable.
+add_executable(infernix_qsa_test "${CMAKE_CURRENT_LIST_DIR}/test_qsa.cpp")
+infernix_test_includes(infernix_qsa_test)
+target_link_libraries(infernix_qsa_test PRIVATE infernix_ops)
+infernix_op_oracle_options(infernix_qsa_test)
+foreach(part index bf16 int8 fp8 nvfp4 k8v4 vq2 k4v2)
+  add_test(NAME infernix_qsa_${part}_test COMMAND infernix_qsa_test --part ${part})
+  set_tests_properties(infernix_qsa_${part}_test PROPERTIES SKIP_RETURN_CODE 77)
+endforeach()
 
 # QSA block selection against the kernel it replaced (bit for bit), the exact top-k of its own
 # scores and an FP64 oracle, also under CUDA Graph replay.

@@ -486,3 +486,115 @@ def test_identity_compares_forced_runs_and_generations(tmp_path):
     y.write_text("0 4 1 2 3\n100 4 5 7\n", encoding="utf-8")
     assert gate.identical(x, x)[0]
     assert not gate.identical(x, y)[0]
+
+
+# --- shared reference cache ----------------------------------------------------------------------
+
+
+class Producer:
+    """Stands for the reference tool: writes a reference file and a report directory."""
+
+    def __init__(self, out: Path, content: str) -> None:
+        self.out, self.content, self.calls = out, content, 0
+
+    def __call__(self) -> None:
+        self.calls += 1
+        (self.out / "reference.json").write_text(self.content, encoding="utf-8")
+        (self.out / "reference").mkdir(exist_ok=True)
+        (self.out / "reference" / "report.json").write_text(self.content, encoding="utf-8")
+
+
+NAMES = ["reference.json", "reference"]
+
+
+def reference_key(artifact: Path, corpus: Path, segments: int = 256) -> dict:
+    return {"kind": "decode", "artifact": gate.artifact_identity(str(artifact)),
+            "corpus": gate.corpus_identity(None, str(corpus)), "segments": segments}
+
+
+@pytest.fixture
+def inputs(tmp_path):
+    artifact = tmp_path / "model.infernix"
+    artifact.write_bytes(b"weights")
+    corpus = tmp_path / "corpus.txt"
+    corpus.write_text("some text", encoding="utf-8")
+    return artifact, corpus, tmp_path / "cache"
+
+
+def test_a_reference_is_computed_once_and_reused_by_other_run_directories(tmp_path, inputs):
+    artifact, corpus, cache = inputs
+    first, second = tmp_path / "a", tmp_path / "b"
+    first.mkdir()
+    second.mkdir()
+    produce = Producer(first, "reference A")
+    assert gate.ensure_reference(first, NAMES, reference_key(artifact, corpus), produce, cache,
+                                 False).startswith("computed")
+    reuse = Producer(second, "never written")
+    assert gate.ensure_reference(second, NAMES, reference_key(artifact, corpus), reuse, cache,
+                                 False).startswith("reused")
+    assert (produce.calls, reuse.calls) == (1, 0)
+    assert (second / "reference.json").read_text(encoding="utf-8") == "reference A"
+    assert (second / "reference" / "report.json").read_text(encoding="utf-8") == "reference A"
+    # A directory that has its reference keeps it.
+    assert gate.ensure_reference(second, NAMES, reference_key(artifact, corpus), reuse, cache,
+                                 False) == "kept"
+
+
+def test_another_corpus_artifact_or_setting_computes_its_own_reference(tmp_path, inputs):
+    artifact, corpus, cache = inputs
+    base = tmp_path / "base"
+    base.mkdir()
+    gate.ensure_reference(base, NAMES, reference_key(artifact, corpus), Producer(base, "A"), cache,
+                          False)
+    other_corpus = tmp_path / "other.txt"
+    other_corpus.write_text("other text", encoding="utf-8")
+    rewritten = tmp_path / "rewritten.infernix"
+    rewritten.write_bytes(b"weights, rewritten")
+    for index, key in enumerate((reference_key(artifact, other_corpus),
+                                 reference_key(rewritten, corpus),
+                                 reference_key(artifact, corpus, segments=1024))):
+        out = tmp_path / f"run{index}"
+        out.mkdir()
+        produce = Producer(out, f"reference {index}")
+        gate.ensure_reference(out, NAMES, key, produce, cache, False)
+        assert produce.calls == 1
+    # The corpus key follows content, not the file name.
+    renamed = tmp_path / "renamed.txt"
+    renamed.write_text("some text", encoding="utf-8")
+    assert reference_key(artifact, renamed) == reference_key(artifact, corpus)
+
+
+def test_recompute_replaces_the_entry_and_refuses_with_dependent_runs(tmp_path, inputs):
+    artifact, corpus, cache = inputs
+    key = reference_key(artifact, corpus)
+    first = tmp_path / "a"
+    first.mkdir()
+    gate.ensure_reference(first, NAMES, key, Producer(first, "old"), cache, False)
+    (first / "default-forced.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(gate.MeasurementError):
+        gate.ensure_reference(first, NAMES, key, Producer(first, "new"), cache, True,
+                              [first / "default-forced.json"])
+    fresh = tmp_path / "b"
+    fresh.mkdir()
+    produce = Producer(fresh, "new")
+    gate.ensure_reference(fresh, NAMES, key, produce, cache, True)
+    assert produce.calls == 1
+    later = tmp_path / "c"
+    later.mkdir()
+    gate.ensure_reference(later, NAMES, key, Producer(later, "unused"), cache, False)
+    assert (later / "reference.json").read_text(encoding="utf-8") == "new"
+    # The earlier directory's linked files kept their own content.
+    assert (first / "reference.json").read_text(encoding="utf-8") == "old"
+
+
+def test_without_a_cache_every_directory_computes_its_reference(tmp_path, inputs):
+    artifact, corpus, _ = inputs
+    for name in ("a", "b"):
+        out = tmp_path / name
+        out.mkdir()
+        produce = Producer(out, name)
+        assert gate.ensure_reference(out, NAMES, reference_key(artifact, corpus), produce, None,
+                                     False) == "computed"
+        assert produce.calls == 1
+    args = gate.parse_arguments(["decode", "model", "--out", "x", "--reference-cache", "none"])
+    assert args.reference_cache is None

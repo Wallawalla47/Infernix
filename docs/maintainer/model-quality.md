@@ -674,6 +674,18 @@ workload needs a fresh `--out`, and another candidate set reuses the reference a
 once the fast runs are removed (the gate names them). Every pair it decides must come from one
 artifact, and a `preemption` candidate's decode run must have preempted.
 
+A reference depends only on the artifact, the corpus content and the settings that shape it (prefill:
+context, stride, `--quick`, the n-gram volume; decode: segments, prompt lengths, the n-gram volume),
+never on the KV format, mode, arm or candidates, so the gate shares references between run
+directories through `--reference-cache DIR` (default `profiles/quality/reference-cache`, `none`
+disables it). The key holds the artifact's resolved path, size and modification time, a SHA-256 of
+the corpus text (a manifest with its streams), and those settings; a directory takes an existing
+entry by hard link (a copy across volumes) and stores what it computes, and the gate prints which
+it did. The key cannot see a change to the reference route itself (6.1): after one,
+`--recompute-reference` recomputes the reference into a directory without runs and replaces the
+cache entry. Sharing changes no measurement: every run directory still observes the same reference
+it would have computed.
+
 ```bat
 rem Prefill: reference, then default and fast-path runs at four chunk sizes per KV format
 py -3.11 -m tools.quality.fast_path_gate prefill model.ninfer ^

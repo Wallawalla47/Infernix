@@ -1452,6 +1452,9 @@ public:
         for (int i = 0; i < 4; ++i)
             CUDA_CHECK(cudaMemcpy(to[i]->data(), from[i]->data(), to[i]->bytes(),
                                   cudaMemcpyDeviceToDevice));
+        // Device-to-device copies return before they complete; the Ops that read this cache run
+        // on non-blocking streams.
+        CUDA_CHECK(cudaStreamSynchronize(nullptr));
     }
 
     PagedKVLayerView single_view(int row) {

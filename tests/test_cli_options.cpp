@@ -1,3 +1,4 @@
+#include "test_temp_path.h"
 #include "options.h"
 
 #include <filesystem>
@@ -14,7 +15,7 @@ namespace {
 
 // Replaces the scratch --config file's contents and returns its path.
 std::string write_config(const std::string& text) {
-    const std::filesystem::path path = std::filesystem::temp_directory_path() / "infernix-cli-options-config.toml";
+    const std::filesystem::path path = infernix::test::unique_temp_path("infernix-cli-options-config.toml");
     std::ofstream file(path, std::ios::binary | std::ios::trunc);
     file << text;
     return path.string();

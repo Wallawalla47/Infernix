@@ -22,11 +22,13 @@
 // whether or not it is qualified (qualification).
 //
 // The same segments also measure request invariance: their log-probabilities are printed exactly,
-// so `fast_path_gate identical` compares two runs bit for bit. --concurrency N submits the segments
-// in groups of N that run together (their prompt lengths differ, so prefills overlap decodes),
-// --prefill-chunk N sets the prompt chunk, and --prefix-reuse first runs each segment's prompt (or
-// with --warm-tokens N its first N tokens) alone and then the group's measured requests together
-// from the prefix cache.
+// so `fast_path_gate identical` compares two runs bit for bit. --concurrency N keeps N segments in
+// flight, each lane taking the next segment as its previous one completes (their prompt lengths
+// differ, so prefills overlap decodes and no lane idles behind a longer prompt), --prefill-chunk N
+// sets the prompt chunk, and --prefix-reuse submits the segments in groups of N instead: each
+// segment's prompt (or with --warm-tokens N its first N tokens) runs alone first, and then the
+// group's measured requests together from the prefix cache. The run's last line reports the summed
+// prefill and decode time, which shows which of the two its wall time went to.
 //
 // Usage: infernix_decode_quality_forced <artifact> <corpus.txt> <out.json> [--segments N]
 //          [--prompts L1,L2,...] [--forced N] [--reference | --observe REFERENCE.json]
@@ -40,10 +42,12 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -53,6 +57,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -411,11 +416,80 @@ int main(int argc, char** argv) {
             }
             return request;
         };
-        for (std::uint32_t group = 0; group < options.segments; group += options.concurrency) {
+        double prefill_seconds = 0, decode_seconds = 0;
+        const auto write_segment = [&](std::uint32_t segment, const infernix::GenerationResult& result) {
+            if (result.constrained_draws.size() != options.forced) {
+                throw std::runtime_error("segment " + std::to_string(segment) + " forced " +
+                                         std::to_string(result.constrained_draws.size()) + " of " +
+                                         std::to_string(options.forced) + " tokens");
+            }
+            reused += result.reused_prompt_tokens;
+            prefill_seconds += result.timings.prefill_seconds;
+            decode_seconds += result.timings.decode_share_seconds;
+            out << (segment ? ", " : "") << "{\"offset\": " << segments.offset(segment)
+                << ", \"prompt_tokens\": " << segments.prompt_tokens(segment) << ", \"logprobs\": [";
+            for (std::size_t i = 0; i < result.constrained_draws.size(); ++i) {
+                const float mass = result.constrained_draws[i].mass;
+                // An FP32 probability below the smallest normal is reported at it.
+                underflows += mass < 1.0e-37F ? 1U : 0U;
+                out << (i ? ", " : "") << std::log(std::max(static_cast<double>(mass), 1.0e-37));
+            }
+            out << ']';
+            if (!observe.empty()) {
+                // Step-major: each step's observed log-probabilities of the reference's top tokens.
+                out << ", \"observed\": [";
+                bool first = true;
+                for (const infernix::ConstrainedDraw& draw : result.constrained_draws) {
+                    for (const float value : draw.observed_logprobs) {
+                        out << (first ? "" : ", ") << value;
+                        first = false;
+                    }
+                }
+                out << "], \"top_logprobs\": [";
+                for (std::size_t i = 0; i < result.constrained_draws.size(); ++i) {
+                    out << (i ? ", " : "") << result.constrained_draws[i].top_logprob;
+                }
+                out << ']';
+            }
+            out << '}';
+            if ((segment + 1) % 16 == 0) { std::cerr << "segment " << segment + 1 << "/" << options.segments << '\n'; }
+        };
+        if (!options.prefix_reuse) {
+            // Rolling: `concurrency` requests stay in flight, each lane taking the next segment as its
+            // previous one completes, so no lane idles behind a group's longest prompt. Results are
+            // written in segment order.
+            std::vector<std::optional<infernix::GenerationResult>> results(options.segments);
+            std::atomic<std::uint32_t> next{0};
+            std::vector<std::exception_ptr> errors(options.concurrency);
+            std::vector<std::thread> lanes;
+            for (std::uint32_t lane = 0; lane < options.concurrency; ++lane) {
+                lanes.emplace_back([&, lane] {
+                    try {
+                        for (std::uint32_t segment = next++; segment < options.segments; segment = next++) {
+                            results[segment] = engine
+                                                   .submit(engine.prepare_tokens(segments.prompt(segment), false),
+                                                           request_of(segment, options.forced))
+                                                   .wait();
+                        }
+                    } catch (...) {
+                        errors[lane] = std::current_exception();
+                        next         = options.segments; // stop the other lanes
+                    }
+                });
+            }
+            for (std::thread& lane : lanes) { lane.join(); }
+            for (const std::exception_ptr& error : errors) {
+                if (error) { std::rethrow_exception(error); }
+            }
+            for (std::uint32_t segment = 0; segment < options.segments; ++segment) {
+                write_segment(segment, *results[segment]);
+            }
+        }
+        for (std::uint32_t group = 0; options.prefix_reuse && group < options.segments; group += options.concurrency) {
             const std::uint32_t end = std::min(options.segments, group + options.concurrency);
             // Each warm request publishes its segment's prompt prefix (its first --warm-tokens tokens
             // when set) before the round; the measured requests then resume from them together.
-            for (std::uint32_t segment = group; options.prefix_reuse && segment < end; ++segment) {
+            for (std::uint32_t segment = group; segment < end; ++segment) {
                 std::vector<infernix::TokenId> warm = segments.prompt(segment);
                 if (options.warm_tokens != 0 && options.warm_tokens < warm.size()) {
                     warm.resize(options.warm_tokens);
@@ -435,42 +509,7 @@ int main(int argc, char** argv) {
                                                 request_of(segment, options.forced)));
             }
             for (std::uint32_t segment = group; segment < end; ++segment) {
-                const infernix::GenerationResult result = handles[segment - group].wait();
-                if (result.constrained_draws.size() != options.forced) {
-                    throw std::runtime_error("segment " + std::to_string(segment) + " forced " +
-                                             std::to_string(result.constrained_draws.size()) + " of " +
-                                             std::to_string(options.forced) + " tokens");
-                }
-                reused += result.reused_prompt_tokens;
-                out << (segment ? ", " : "") << "{\"offset\": " << segments.offset(segment)
-                    << ", \"prompt_tokens\": " << segments.prompt_tokens(segment) << ", \"logprobs\": [";
-                for (std::size_t i = 0; i < result.constrained_draws.size(); ++i) {
-                    const float mass = result.constrained_draws[i].mass;
-                    // An FP32 probability below the smallest normal is reported at it.
-                    underflows += mass < 1.0e-37F ? 1U : 0U;
-                    out << (i ? ", " : "") << std::log(std::max(static_cast<double>(mass), 1.0e-37));
-                }
-                out << ']';
-                if (!observe.empty()) {
-                    // Step-major: each step's observed log-probabilities of the reference's top tokens.
-                    out << ", \"observed\": [";
-                    bool first = true;
-                    for (const infernix::ConstrainedDraw& draw : result.constrained_draws) {
-                        for (const float value : draw.observed_logprobs) {
-                            out << (first ? "" : ", ") << value;
-                            first = false;
-                        }
-                    }
-                    out << "], \"top_logprobs\": [";
-                    for (std::size_t i = 0; i < result.constrained_draws.size(); ++i) {
-                        out << (i ? ", " : "") << result.constrained_draws[i].top_logprob;
-                    }
-                    out << ']';
-                }
-                out << '}';
-                if ((segment + 1) % 16 == 0) {
-                    std::cerr << "segment " << segment + 1 << "/" << options.segments << '\n';
-                }
+                write_segment(segment, handles[segment - group].wait());
             }
         }
         out << "], \"observed_reference\": ";
@@ -483,7 +522,9 @@ int main(int argc, char** argv) {
         const double seconds =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
         std::cerr << "forced " << static_cast<std::uint64_t>(options.segments) * options.forced
-                  << " tokens in " << seconds << " s (" << underflows << " underflows)\n";
+                  << " tokens in " << seconds << " s (" << underflows << " underflows; requests' prefill "
+                  << prefill_seconds << " s summed over lanes, decode " << decode_seconds
+                  << " s of shared rounds)\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "infernix_decode_quality_forced: " << error.what() << '\n';

@@ -2029,83 +2029,119 @@ void test_prepare(KvCacheStorage storage, std::uint32_t seed) {
     }
 }
 
+// The index queries and pooled keys (plain RoPE, YaRN over a short span and Flash-Next's YaRN x4),
+// and the fused prepare under YaRN.
+void run_index_part() {
+    for (const int columns : {1, 5, 64, 1024}) { test_index_query(columns, 100U + columns); }
+    test_pool(7);
+    // Under YaRN (factor 4 over an original span of 4096, so the ramp falls inside the rotary
+    // pairs and positions reach past the span).
+    g_index_geometry.yarn_factor        = 4.0F;
+    g_index_geometry.original_positions = 4096;
+    for (const int columns : {1, 64}) { test_index_query(columns, 200U + columns); }
+    test_pool(9);
+    // Qwen3.8-Flash-Next's YaRN x4: an original span of 262144, positions up to the last of 1M.
+    g_index_geometry.original_positions = 262144;
+    for (const int columns : {1, 64}) { test_index_query(columns, 300U + columns, 1048575); }
+    g_index_geometry = kGeometry;
+    expect(!ops::qsa_prepare_supports(KvCacheStorage::Vq2) &&
+               !ops::qsa_prepare_supports(KvCacheStorage::Q4KeyVq2Value),
+           "qsa_prepare: the vector-quantized storages keep the composed prepare");
+    g_index_geometry.yarn_factor        = 4.0F;
+    g_index_geometry.original_positions = 4096;
+    test_prepare(KvCacheStorage::Int8Group64, 601);
+    g_index_geometry = kGeometry;
+}
+
+// Attention over one scalar KV storage, and its fused prepare (qsa-prepare-fused).
+void run_storage_part(KvCacheStorage storage, std::uint32_t prepare_seed) {
+    // Decode across the dense/selected boundary (2,051 visible tokens is the last dense one),
+    // verification across a page boundary, prefill columns crossing the boundary inside one
+    // call (one attention split), and a split-K prefill width.
+    // Calls the FP32 kernel would run unsplit (columns x KV heads of at least half the SMs: 43+
+    // columns on an RTX 5090) take the Tensor Core prompt
+    // route: dense columns, the dense/selected boundary inside the call, selected blocks with
+    // tails over several pages, two rows, a list length off the 16-token tile, and the class's
+    // narrowest call. Every column of a prompt-route call must also equal, bit for bit, the
+    // same column computed in a call of another width of the class (checked below).
+    const AttentionCase cases[] = {{"decode W=1 B=2", 1, {2050, 2051}},
+                                   {"decode W=1 B=4", 1, {2600, 3100, 4093, 2051}},
+                                   {"decode W=1 B=8", 1, {2051, 2300, 2700, 3001, 3500, 4000, 4500, 5003}},
+                                   {"verify W=4 B=2", 4, {2500, 3700}},
+                                   {"verify W=5 B=2", 5, {3001, 4093}},
+                                   {"prefill W=192 B=1", 192, {1900}},
+                                   {"prefill W=40 B=1", 40, {5000}},
+                                   {"prompt W=256 B=1 dense", 256, {0}},
+                                   {"prompt W=300 B=1 boundary", 300, {1901}},
+                                   {"prompt W=256 B=2 selected", 256, {6001, 9013}},
+                                   {"prompt W=257 B=1 selected", 257, {4093}},
+                                   {"prompt W=86 B=1 selected", 86, {7000}},
+                                   {"prompt W=43 B=1 class edge (170 SMs)", 43, {7000}}};
+    std::uint32_t seed = 31;
+    for (const auto& c : cases) { test_attention(storage, c, seed++); }
+    expect(ops::qsa_prepare_supports(storage), std::string("qsa_prepare supports ") + storage_name(storage));
+    test_prepare(storage, prepare_seed);
+}
+
+// Vector-quantized storages: the Op's own append; decode, verification and prefill with the
+// exact window (the prompt route from 86 columns of one row or 43 of two; a staged call wider
+// than kKVWindowInlineWidth), and decode and a prompt call without one.
+void run_vq_part(KvCacheStorage storage) {
+    const VqCase vq_cases[] = {{"decode W=1 B=2 window", 1, {2050, 3001}, true},
+                               {"verify W=5 B=1 window", 5, {4093}, true},
+                               {"prefill W=40 B=1 window", 40, {2500}, true},
+                               {"prompt W=100 B=2 window", 100, {3000, 7000}, true},
+                               {"prompt W=200 B=1 window", 200, {6000}, true},
+                               {"prompt W=300 B=1 window staged", 300, {5000}, true},
+                               {"prompt W=300 B=1 codes only", 300, {5000}, false},
+                               {"decode W=1 B=1 codes only", 1, {3000}, false}};
+    std::uint32_t seed = 71;
+    for (const auto& c : vq_cases) { test_vq_attention(storage, c, seed++); }
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    // --part selects one independent part, so CTest runs them concurrently: `index` (index queries,
+    // pooled keys, the YaRN prepare), one KV storage (`bf16`, `int8`, `fp8`, `nvfp4`, `k8v4`:
+    // attention and the fused prepare) or one vector-quantized storage (`vq2`, `k4v2`). Each case
+    // keeps its seed, so the parts together run exactly the cases of one unsharded invocation.
+    std::string part = "all";
+    if (argc == 3 && std::string(argv[1]) == "--part") {
+        part = argv[2];
+    } else if (argc != 1) {
+        std::fprintf(stderr,
+                     "usage: infernix_qsa_test [--part index|bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2]\n");
+        return 2;
+    }
+    const std::array<std::pair<const char*, KvCacheStorage>, 5> scalar_storages{{
+        {"bf16", KvCacheStorage::BFloat16},
+        {"int8", KvCacheStorage::Int8Group64},
+        {"fp8", KvCacheStorage::Fp8E4M3Row256},
+        {"nvfp4", KvCacheStorage::Nvfp4Group16},
+        {"k8v4", KvCacheStorage::Fp8KeyNvfp4Value},
+    }};
+    const bool known = part == "all" || part == "index" || part == "vq2" || part == "k4v2" ||
+                       std::any_of(scalar_storages.begin(), scalar_storages.end(),
+                                   [&](const auto& entry) { return part == entry.first; });
+    if (!known) {
+        std::fprintf(stderr, "unknown --part %s\n", part.c_str());
+        return 2;
+    }
     if (t::cuda_unavailable()) {
         std::printf("SKIP: no usable CUDA device\n");
         return 77;
     }
+    const auto selected = [&](const char* name) { return part == "all" || part == name; };
     try {
-        for (const int columns : {1, 5, 64, 1024}) { test_index_query(columns, 100U + columns); }
-        test_pool(7);
-        // Under YaRN (factor 4 over an original span of 4096, so the ramp falls inside the rotary
-        // pairs and positions reach past the span).
-        g_index_geometry.yarn_factor        = 4.0F;
-        g_index_geometry.original_positions = 4096;
-        for (const int columns : {1, 64}) { test_index_query(columns, 200U + columns); }
-        test_pool(9);
-        // Qwen3.8-Flash-Next's YaRN x4: an original span of 262144, positions up to the last of 1M.
-        g_index_geometry.original_positions = 262144;
-        for (const int columns : {1, 64}) { test_index_query(columns, 300U + columns, 1048575); }
-        g_index_geometry = kGeometry;
-        // Decode across the dense/selected boundary (2,051 visible tokens is the last dense one),
-        // verification across a page boundary, prefill columns crossing the boundary inside one
-        // call (one attention split), and a split-K prefill width.
-        // Calls the FP32 kernel would run unsplit (columns x KV heads of at least half the SMs: 43+
-        // columns on an RTX 5090) take the Tensor Core prompt
-        // route: dense columns, the dense/selected boundary inside the call, selected blocks with
-        // tails over several pages, two rows, a list length off the 16-token tile, and the class's
-        // narrowest call. Every column of a prompt-route call must also equal, bit for bit, the
-        // same column computed in a call of another width of the class (checked below).
-        const AttentionCase cases[] = {{"decode W=1 B=2", 1, {2050, 2051}},
-                                       {"decode W=1 B=4", 1, {2600, 3100, 4093, 2051}},
-                                       {"decode W=1 B=8", 1, {2051, 2300, 2700, 3001, 3500, 4000, 4500, 5003}},
-                                       {"verify W=4 B=2", 4, {2500, 3700}},
-                                       {"verify W=5 B=2", 5, {3001, 4093}},
-                                       {"prefill W=192 B=1", 192, {1900}},
-                                       {"prefill W=40 B=1", 40, {5000}},
-                                       {"prompt W=256 B=1 dense", 256, {0}},
-                                       {"prompt W=300 B=1 boundary", 300, {1901}},
-                                       {"prompt W=256 B=2 selected", 256, {6001, 9013}},
-                                       {"prompt W=257 B=1 selected", 257, {4093}},
-                                       {"prompt W=86 B=1 selected", 86, {7000}},
-                                       {"prompt W=43 B=1 class edge (170 SMs)", 43, {7000}}};
-        for (const auto storage : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
-                                   KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
-            std::uint32_t seed = 31;
-            for (const auto& c : cases) { test_attention(storage, c, seed++); }
-        }
-        // Vector-quantized storages: the Op's own append; decode, verification and prefill with the
-        // exact window (the prompt route from 86 columns of one row or 43 of two; a staged call wider
-        // than kKVWindowInlineWidth), and decode and a prompt call without one.
-        const VqCase vq_cases[] = {{"decode W=1 B=2 window", 1, {2050, 3001}, true},
-                                   {"verify W=5 B=1 window", 5, {4093}, true},
-                                   {"prefill W=40 B=1 window", 40, {2500}, true},
-                                   {"prompt W=100 B=2 window", 100, {3000, 7000}, true},
-                                   {"prompt W=200 B=1 window", 200, {6000}, true},
-                                   {"prompt W=300 B=1 window staged", 300, {5000}, true},
-                                   {"prompt W=300 B=1 codes only", 300, {5000}, false},
-                                   {"decode W=1 B=1 codes only", 1, {3000}, false}};
-        for (const auto storage : {KvCacheStorage::Vq2, KvCacheStorage::Q4KeyVq2Value}) {
-            std::uint32_t seed = 71;
-            for (const auto& c : vq_cases) { test_vq_attention(storage, c, seed++); }
-        }
-        // The fused prepare (qsa-prepare-fused) for every storage it supports, and under YaRN.
+        if (selected("index")) { run_index_part(); }
         std::uint32_t prepare_seed = 501;
-        for (const auto storage : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
-                                   KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
-            expect(ops::qsa_prepare_supports(storage), std::string("qsa_prepare supports ") + storage_name(storage));
-            test_prepare(storage, prepare_seed);
+        for (const auto& [name, storage] : scalar_storages) {
+            if (selected(name)) { run_storage_part(storage, prepare_seed); }
             prepare_seed += 10;
         }
-        expect(!ops::qsa_prepare_supports(KvCacheStorage::Vq2) &&
-                   !ops::qsa_prepare_supports(KvCacheStorage::Q4KeyVq2Value),
-               "qsa_prepare: the vector-quantized storages keep the composed prepare");
-        g_index_geometry.yarn_factor        = 4.0F;
-        g_index_geometry.original_positions = 4096;
-        test_prepare(KvCacheStorage::Int8Group64, 601);
-        g_index_geometry = kGeometry;
+        if (selected("vq2")) { run_vq_part(KvCacheStorage::Vq2); }
+        if (selected("k4v2")) { run_vq_part(KvCacheStorage::Q4KeyVq2Value); }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL: %s\n", e.what());
         return 1;
@@ -2114,6 +2150,6 @@ int main() {
         std::fprintf(stderr, "%d check(s) failed\n", g_failures);
         return 1;
     }
-    std::printf("all qsa checks passed\n");
+    std::printf("all qsa checks passed (%s)\n", part.c_str());
     return 0;
 }

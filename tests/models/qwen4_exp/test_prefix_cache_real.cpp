@@ -18,12 +18,15 @@
 //                generates what the capturing run generated.
 //   X12          (plain mode) Engine 1 serves two chat turns and stops, saving its Host tier to a file;
 //                Engine 2 loads the file and resumes turn 2 from it, generating what Engine 1 did.
+//                Between the turns, Engine 1's periodic save writes the file once and, with the Host
+//                tier unchanged, not again.
 //   one context  (MTP mode, own Engine with kv_capacity = max_context) A recomputed cached prefix
 //                replaces the cached copies instead of pinning them beside its pages: the request
 //                completes, equals its cold run, and the Engine keeps serving.
 //
 //   infernix_qwen4_exp_prefix_cache_real_test [--mtp] [--plain]   (default: both modes)
 
+#include "test_temp_path.h"
 #include "kv_cache_storage.h"
 #include "infernix/engine.h"
 
@@ -286,7 +289,7 @@ int run_one_context(const char* artifact, const char* ngram) {
 // X12: the Host tier saved at an Engine's stop and loaded by the next Engine.
 int run_persistence(const char* artifact, const char* ngram) {
     std::printf("== persistence (X12)\n");
-    const std::filesystem::path file = std::filesystem::temp_directory_path() / "infernix_qwen4_exp_x12.cache";
+    const std::filesystem::path file = infernix::test::unique_temp_path("infernix_qwen4_exp_x12.cache");
     std::error_code ignored;
     std::filesystem::remove(file, ignored);
     const auto options = [&] {
@@ -301,18 +304,46 @@ int run_persistence(const char* artifact, const char* ngram) {
     int failures = 0;
     std::vector<infernix::ChatMessage> turn2 = turn1;
     infernix::GenerationResult before;
+    std::filesystem::file_time_type periodic_write{};
     {
-        infernix::Engine engine(options());
+        // Engine 1 also saves periodically (persistent_save_interval): after turn 1 the file appears
+        // while the Engine runs, through its .tmp, once the interval has passed after a change. A save
+        // during the request may find the Host tier still filling and the next one rewrite it; once
+        // the Host tier stops changing, the file holds the endpoint and is not rewritten.
+        infernix::EngineOptions o                       = options();
+        o.context_cache.hybrid.persistent_save_interval = std::chrono::seconds(1);
+        infernix::Engine engine(o);
         failures += check(!engine.load_summary().prefix_cache.restored, "Engine 1 starts without a saved file");
+        failures += check(!std::filesystem::exists(file), "the periodic save starts without a file");
         const infernix::GenerationResult r1 = chat_on(engine, turn1, 32);
+        std::filesystem::path tmp = file;
+        tmp += ".tmp";
+        bool saved = false;
+        for (int i = 0; i < 300 && !saved; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            saved = std::filesystem::exists(file) && !std::filesystem::exists(tmp);
+        }
+        failures += check(saved, "the periodic save wrote the file while the Engine was idle");
+        bool settled = false;
+        for (int i = 0; i < 6 && saved && !settled; ++i) {
+            const auto written = std::filesystem::last_write_time(file, ignored);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1600)); // more than one interval
+            settled = std::filesystem::last_write_time(file, ignored) == written;
+        }
+        failures += check(settled, "an unchanged Host tier is not saved again");
+        const std::uintmax_t periodic_size = saved ? std::filesystem::file_size(file, ignored) : 0;
+        failures += check(periodic_size > (std::uintmax_t{64} << 20),
+                          "the settled periodic file holds turn 1's snapshot (" + std::to_string(periodic_size) +
+                              " bytes)");
+        periodic_write = std::filesystem::last_write_time(file, ignored);
         turn2.push_back(message(infernix::ChatRole::Assistant, r1.content));
         turn2.push_back(message(infernix::ChatRole::User, context + "And colour 3?"));
         before = chat_on(engine, turn2, 32);
     } // the stop saves the Host tier
     std::error_code size_error;
     const std::uintmax_t saved_bytes = std::filesystem::file_size(file, size_error);
-    failures += check(!size_error && saved_bytes > 0, "the stop saved the Host tier (" +
-                                                          std::to_string(size_error ? 0U : saved_bytes) + " bytes)");
+    failures += check(!size_error && saved_bytes > 0 && std::filesystem::last_write_time(file, ignored) != periodic_write,
+                      "the stop saved the Host tier (" + std::to_string(size_error ? 0U : saved_bytes) + " bytes)");
     {
         infernix::Engine engine(options());
         const infernix::LoadSummary::PrefixCacheRestore restore = engine.load_summary().prefix_cache;
@@ -330,37 +361,6 @@ int run_persistence(const char* artifact, const char* ngram) {
         failures += check(after.generated_token_ids == before.generated_token_ids,
                           "the restored resume equals Engine 1's turn 2 (" +
                               first_difference(after.generated_token_ids, before.generated_token_ids) + ")");
-    }
-    std::filesystem::remove(file, ignored);
-
-    // The periodic save (persistent_save_interval): the file appears while the Engine runs, through
-    // its .tmp, once the interval has passed after a change. A save during the request may find the
-    // Host tier still filling and the next one rewrite it; once the Host tier stops changing, the
-    // file holds the endpoint and is not rewritten.
-    {
-        infernix::EngineOptions o                       = options();
-        o.context_cache.hybrid.persistent_save_interval = std::chrono::seconds(1);
-        infernix::Engine engine(o);
-        failures += check(!std::filesystem::exists(file), "the periodic test starts without a file");
-        (void)chat_on(engine, turn1, 16);
-        std::filesystem::path tmp = file;
-        tmp += ".tmp";
-        bool saved = false;
-        for (int i = 0; i < 100 && !saved; ++i) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            saved = std::filesystem::exists(file) && !std::filesystem::exists(tmp);
-        }
-        failures += check(saved, "the periodic save wrote the file while the Engine was idle");
-        bool settled = false;
-        for (int i = 0; i < 4 && saved && !settled; ++i) {
-            const auto written = std::filesystem::last_write_time(file, ignored);
-            std::this_thread::sleep_for(std::chrono::milliseconds(2500));
-            settled = std::filesystem::last_write_time(file, ignored) == written;
-        }
-        failures += check(settled, "an unchanged Host tier is not saved again");
-        const std::uintmax_t size = saved ? std::filesystem::file_size(file, ignored) : 0;
-        failures += check(size > (std::uintmax_t{64} << 20),
-                          "the settled periodic file holds turn 1's snapshot (" + std::to_string(size) + " bytes)");
     }
     std::filesystem::remove(file, ignored);
     return failures;

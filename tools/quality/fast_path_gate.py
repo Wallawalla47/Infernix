@@ -35,14 +35,16 @@ Exit status: 0 every criterion passes, 1 a criterion fails, 2 the measurement is
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
 
 
 @dataclass(frozen=True)
@@ -690,6 +692,103 @@ def run(command: list[str], log: Path) -> None:
         raise MeasurementError(f"command failed ({result.returncode}); see {log}")
 
 
+DEFAULT_REFERENCE_CACHE = Path("profiles/quality/reference-cache")
+
+
+def file_digest(*paths: Path) -> str:
+    """SHA-256 of the files' contents, in order."""
+    digest = hashlib.sha256()
+    for path in paths:
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(block)
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def artifact_identity(artifact: str) -> dict:
+    """The artifact as a reference depends on it: its file, and the size and modification time
+    that change whenever it is rewritten (published artifacts are never rewritten in place)."""
+    path = Path(artifact).resolve()
+    stat = path.stat()
+    return {"path": os.path.normcase(str(path)), "bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+
+def corpus_identity(corpus: str | None, text: str | None) -> str:
+    """The content of the text a reference scores (a manifest with its streams, or one file)."""
+    if text:
+        return file_digest(Path(text))
+    manifest = Path(corpus)
+    spec = json.loads(manifest.read_text(encoding="utf-8"))
+    return file_digest(manifest, *[manifest.parent / s["path"] for s in spec["streams"]])
+
+
+def ensure_reference(out: Path, names: Sequence[str], key: dict, produce: Callable[[], None],
+                     cache: Path | None, recompute: bool, dependents: Sequence[Path] = ()) -> str:
+    """Puts the reference files `names` (relative to `out`) in place and says where they came from.
+
+    A reference is deterministic in its key (the artifact, the corpus content and every setting
+    that shapes it, never the KV format, mode or candidate), so a run directory takes it from the
+    shared cache when an entry for the key exists, linked (or copied) in, and stores what it
+    computes there. recompute (--recompute-reference) recomputes it and replaces the cache entry,
+    for a change to the reference route itself, which the key does not see; it refuses while
+    `dependents` (runs already scored against the directory's reference) exist.
+    """
+    present = all((out / name).exists() for name in names)
+    if present and not recompute:
+        return "kept"
+    if recompute:
+        if dependents:
+            raise MeasurementError(
+                f"{out} holds runs scored against its reference ({', '.join(map(str, dependents))}); "
+                "remove them or use a fresh --out to recompute the reference")
+        for name in names:
+            remove_path(out / name)
+    entry = None
+    if cache is not None:
+        digest = hashlib.sha256(json.dumps(key, sort_keys=True).encode("utf-8")).hexdigest()[:32]
+        entry = cache / digest
+        if not recompute and (entry / "key.json").is_file():
+            for name in names:
+                place(entry / name, out / name)
+            return f"reused {entry}"
+    produce()
+    if entry is not None:
+        staging = entry.with_name(entry.name + f".tmp{os.getpid()}")
+        remove_path(staging)
+        staging.mkdir(parents=True)
+        for name in names:
+            place(out / name, staging / name)
+        (staging / "key.json").write_text(json.dumps(key, indent=2, sort_keys=True) + "\n",
+                                          encoding="utf-8")
+        remove_path(entry)
+        staging.rename(entry)
+        return f"computed, stored in {entry}"
+    return "computed"
+
+
+def remove_path(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    elif path.exists() or path.is_symlink():
+        path.unlink()
+
+
+def place(source: Path, target: Path) -> None:
+    """target becomes source's content: hard links (references are large and never modified),
+    a copy where linking fails (another volume)."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if source.is_dir():
+        target.mkdir(exist_ok=True)
+        for child in source.iterdir():
+            place(child, target / child.name)
+        return
+    try:
+        os.link(source, target)
+    except OSError:
+        shutil.copy2(source, target)
+
+
 def claim_out(out: Path, settings: dict, fast_path: Sequence[str],
               fast_runs: Sequence[str]) -> None:
     """Reused runs are skipped, so a run directory (gate.json) serves one artifact and one set of
@@ -740,10 +839,18 @@ def run_prefill(args: argparse.Namespace) -> Path:
     # 16-bit activations, BF16 KV, one pass per window.
     one_pass = ["--kv-dtype", "bf16", "--prefill-chunk", str(args.context), "--a16-activations"]
     reference = out / "reference.top"
-    if not (out / "reference" / "report.json").is_file():
-        run(common + one_pass + ["--save-top-tokens", str(reference), "--output",
-                                 str(out / "reference")],
-            out / "reference.log")
+    key = {"kind": "prefill", "artifact": artifact_identity(args.artifact),
+           "corpus": corpus_identity(args.corpus, args.text), "quick": args.quick,
+           "context": args.context, "stride": args.stride,
+           "ngram_volume": os.path.abspath(args.ngram_volume) if args.ngram_volume else None,
+           "route": one_pass}
+    source = ensure_reference(
+        out, ["reference.top", "reference"], key,
+        lambda: run(common + one_pass + ["--save-top-tokens", str(reference), "--output",
+                                         str(out / "reference")], out / "reference.log"),
+        args.reference_cache, args.recompute_reference,
+        [p for p in out.glob("*/*-c*") if p.is_dir()])
+    print(f"  reference: {source}", flush=True)
     for kv in args.kv:
         for chunk in args.chunk:
             for route, extra in (("default", ["--disable-fast-paths"]),
@@ -805,9 +912,17 @@ def run_decode(args: argparse.Namespace) -> list[Verdict]:
         arm += ["--warm-tokens", str(args.warm_tokens)]
     # The reference: the 16-bit-activation, BF16-KV scoring route at the same positions.
     reference = out / "reference.json"
-    if not reference.is_file():
-        run([args.forced, args.artifact, text, str(reference), "--reference"] + segments + volume,
-            out / "reference.log")
+    key = {"kind": "decode", "artifact": artifact_identity(args.artifact),
+           "corpus": corpus_identity(None, text), "segments": args.segments,
+           "prompts": list(args.prompts),
+           "ngram_volume": os.path.abspath(args.ngram_volume) if args.ngram_volume else None}
+    source = ensure_reference(
+        out, ["reference.json"], key,
+        lambda: run([args.forced, args.artifact, text, str(reference), "--reference"] + segments
+                    + volume, out / "reference.log"),
+        args.reference_cache, args.recompute_reference,
+        [p for p in (out / "default-forced.json", out / "fast-forced.json") if p.exists()])
+    print(f"  reference: {source}", flush=True)
     for route, extra in (("default", ["--disable-fast-paths"]),
                          ("fast", candidate_options(args, "--fast-path"))):
         target = out / f"{route}-forced.json"
@@ -867,6 +982,16 @@ def finish(verdicts: Iterable[Verdict], output: Path | None) -> int:
     return 0 if all(v.passed for v in verdicts) else 1
 
 
+def add_reference_options(command: argparse.ArgumentParser) -> None:
+    command.add_argument("--reference-cache", type=Path, default=DEFAULT_REFERENCE_CACHE,
+                         help="directory of references shared between run directories, keyed by "
+                              "artifact, corpus content and reference settings (default "
+                              f"{DEFAULT_REFERENCE_CACHE}; 'none' disables it)")
+    command.add_argument("--recompute-reference", action="store_true",
+                         help="recompute the reference and replace its cache entry (after a "
+                              "change to the reference route, which the key does not see)")
+
+
 def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -892,6 +1017,7 @@ def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
                               "at its --chunk (a schedule fast path that widens prefill steps); "
                               "use a separate --out")
     prefill.add_argument("--out", required=True, help="run directory (reused runs are skipped)")
+    add_reference_options(prefill)
 
     decode = commands.add_parser("decode", help="run and decide the decode criteria")
     decode.add_argument("artifact")
@@ -923,6 +1049,7 @@ def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
     decode.add_argument("--gen", default=default_tool("infernix_decode_quality_gen"))
     decode.add_argument("--judge", default=default_tool("infernix_decode_quality_judge"))
     decode.add_argument("--out", required=True)
+    add_reference_options(decode)
 
     evaluate = commands.add_parser("evaluate-prefill", help="decide an existing prefill run")
     evaluate.add_argument("directory",
@@ -956,7 +1083,10 @@ def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
     same = commands.add_parser("identical", help="check two default-route runs for bit-exactness")
     same.add_argument("first")
     same.add_argument("second")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if getattr(args, "reference_cache", None) is not None and str(args.reference_cache) == "none":
+        args.reference_cache = None
+    return args
 
 
 def prefill_verdicts(directory: Path, fast_chunk: int = 0) -> list[Verdict]:

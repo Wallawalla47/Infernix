@@ -44,12 +44,22 @@ uses Python 3.11; CMake finds Python 3 without restricting its minor version.
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON \
   -DPython3_EXECUTABLE="$(command -v python3)"
 cmake --build build -j
-ctest --test-dir build --output-on-failure
+ctest --test-dir build -j 8 --output-on-failure
 ```
 
 Alternatively, `cmake --preset dev` enables products, tests and benchmarks together.
-After building, `ctest --preset dev` runs the same CTest suite. See
+After building, `ctest --preset dev` runs the same CTest suite with the same concurrency. See
 [Build system](../docs/maintainer/build-system.md) for local interpreter presets.
+
+The suite is safe to run concurrently on one GPU. `tests/CMakeLists.txt` applies two rules to
+every registered entry after all registrations: an entry whose name contains `_real` (it loads a
+real artifact and holds most of the device and its pinned host memory) gets `RUN_SERIAL`, the
+`gpu;real` labels and skip code 77, and every entry without its own `TIMEOUT` gets one (900 s, or
+3600 s for `_real` entries), so a hung wait fails its entry instead of stalling the run.
+`ctest -LE real` runs everything else. Tests that need a scratch file name it with
+`unique_temp_path()` (`tests/test_temp_path.h`, the process id in the name), so concurrent runs from
+other build trees or worktrees never share one. Assertions about elapsed time wait for the observed
+event with a generous bound rather than assuming a fixed sleep is enough on a loaded machine.
 
 The chat-template reference test uses Python Jinja2.
 
@@ -109,6 +119,15 @@ index queries, pooled keys read back from the paged plane, the raw-key tails exa
 rewriting the last position of a block completed inside a call or a verification commit, as the
 MTP drafter does), chunking invariance, block selection (exact, on a value grid where FP32 scores
 are exact), and attention over decoded `bf16` and `int8` K/V across the dense/selected boundary.
+`--part index|bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2` runs one independent part (the index queries and
+pooled keys, one scalar KV storage's attention and fused prepare, or one vector-quantized storage);
+CTest registers one entry per part (`infernix_qsa_<part>_test`), and together they run every case
+of one unsharded invocation.
+
+`infernix_ple_test` checks the PLE n-gram injection Ops: `ple_embed` exactly (an E4M3 code times a
+BF16 scale is exact in FP32, so each output is the FP64 product rounded once, every non-NaN code
+included), and `ple_gate` and `ple_conv_inject` (residual update and history shift, in place, into
+another slot, and with no destination) against the FP64 formula within one BF16 rounding.
 
 `infernix_qsa_select_test` qualifies QSA block selection (`ops::detail::qsa_select`) against three
 oracles: the one-CTA-per-column kernel it replaced, kept verbatim in the test (counts and selected
@@ -159,13 +178,16 @@ The Linear, LinearAdd and LinearSwiGLU common `.cpp` implementations each compil
 test support library. Both those libraries and the Op test executables receive the oracle's
 `-fno-fast-math` and `-ffp-contract=off` options on GNU/Clang C++ compilers.
 
-Run the native Python suites with the project Python environment:
+Run the native Python suites with the project Python environment from the repository root
+(`pytest.ini` lists them: `tests/artifact`, `tests/convert`, `tests/bench/ttft`, `tests/quality` and
+the root `tests/test_*.py` files; it keeps collection out of `.claude/worktrees` and build trees):
 
 ```bash
-python3 -m pytest \
-  tests/artifact tests/convert tests/bench/ttft tests/quality \
-  tests/test_serve_corpus.py
+python3 -m pytest
 ```
+
+With `pytest-xdist` installed, `python3 -m pytest -n auto` runs them in parallel. The suites under
+`tests/text` and `tests/models` drive built probe binaries and run through CTest.
 
 The Python suites exercise conversion, encoded output and measurement tools without model inference.
 The maintained environment uses Python 3.11 with the dependencies for those suites. C++ binding and Engine tests

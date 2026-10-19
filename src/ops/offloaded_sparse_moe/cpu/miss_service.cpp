@@ -176,7 +176,9 @@ void CpuMissService::serve() {
         std::uint32_t beat    = 0;
         auto* volatile_sequence = reinterpret_cast<volatile std::uint32_t*>(&request_->sequence);
         auto* volatile_done     = reinterpret_cast<volatile std::uint32_t*>(done_);
-        std::uint32_t seen      = *volatile_sequence;
+        // The constructor zeroed the request word before starting this thread, so a request
+        // published before the thread first runs is still served.
+        std::uint32_t seen      = 0;
         auto last               = std::chrono::steady_clock::now();
         std::uint32_t polls     = 0;
         while (!stop_.load(std::memory_order_acquire)) {

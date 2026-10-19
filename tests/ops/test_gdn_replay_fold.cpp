@@ -92,6 +92,9 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
     std::vector<std::int32_t> destination_slots  = source_slots;
     if (distinct_destination) { destination_slots[0] = rows == 1 ? 1 : 3; }
     const std::int32_t slot_count = rows == 1 ? 3 : 11;
+    // Records hold a block of rows per layer (the Program's lane count). A one-row case still sits in
+    // a two-row block, so layer and row strides stay distinct, without moving eight rows' records.
+    const std::int32_t record_capacity = rows == 1 ? 2 : kRecordCapacity;
     const std::size_t recurrent_slot_elements =
         static_cast<std::size_t>(kStateDim) * kStateDim * profile.value_heads;
     const std::size_t recurrent_slot_bytes = recurrent_slot_elements * sizeof(float);
@@ -100,7 +103,7 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
 
     const GdnReplayRecordSpec record_spec{
         .layers          = profile.layers,
-        .record_capacity = kRecordCapacity,
+        .record_capacity = record_capacity,
         .width           = storage_width > width ? storage_width : width,
         .conv_channels   = profile.conv_channels,
         .qk_heads        = kQkHeads,
@@ -131,7 +134,7 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
             for (std::int32_t row = 0; row < rows; ++row) {
                 const std::int32_t commit = commits[static_cast<std::size_t>(row)];
                 const std::int64_t record_outer =
-                    static_cast<std::int64_t>(layer) * kRecordCapacity + row;
+                    static_cast<std::int64_t>(layer) * record_capacity + row;
                 for (std::int32_t token = 0; token < (commit == 0 ? 0 : width); ++token) {
                     const std::int64_t column = record_outer * width + token;
                     for (std::int32_t channel = 0; channel < profile.conv_channels; ++channel) {
@@ -232,7 +235,7 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
                 std::fill(expected.begin(), expected.end(), 0);
             if (commit > 0) {
                 const std::int64_t record_outer =
-                    static_cast<std::int64_t>(layer) * kRecordCapacity + row;
+                    static_cast<std::int64_t>(layer) * record_capacity + row;
                 for (std::int32_t channel = 0; channel < profile.conv_channels; ++channel) {
                     const auto record_value = [&](std::int32_t token) {
                         return conv_records[static_cast<std::size_t>(
@@ -313,7 +316,7 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
             std::vector<float> g_host(static_cast<std::size_t>(profile.value_heads) * width);
             std::vector<float> beta_host(static_cast<std::size_t>(profile.value_heads) * width);
             const std::int64_t record_outer =
-                static_cast<std::int64_t>(layer) * kRecordCapacity + row;
+                static_cast<std::int64_t>(layer) * record_capacity + row;
             for (std::int32_t token = 0; token < width; ++token) {
                 for (std::int32_t head = 0; head < profile.value_heads; ++head) {
                     const std::size_t source = static_cast<std::size_t>(
@@ -383,6 +386,9 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
         DeviceBuffer original(state_bytes);
         cuda_check(cudaMemcpy(original.p, state_base, state_bytes, cudaMemcpyDeviceToDevice),
                    "save graph initial state");
+        // A device-to-device cudaMemcpy returns before the copy completes, and the restores below
+        // run on a non-blocking stream that does not order against the default stream.
+        cuda_synchronize();
         DeviceContext context;
         DecodeGraphDefinition definition;
         DecodeGraphExecutable graph;

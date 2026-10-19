@@ -1,3 +1,4 @@
+#include "test_temp_path.h"
 #include "serve/serve_options.h"
 #include "serve/translate.h"
 
@@ -42,7 +43,7 @@ std::string parse_error(std::vector<std::string> arguments) {
 // Replaces the scratch --config file's contents and returns its path.
 std::string write_config(const std::string& text) {
     const std::filesystem::path path =
-        std::filesystem::temp_directory_path() / "infernix-serve-options-config.toml";
+        infernix::test::unique_temp_path("infernix-serve-options-config.toml");
     std::ofstream file(path, std::ios::binary | std::ios::trunc);
     file << text;
     return path.string();

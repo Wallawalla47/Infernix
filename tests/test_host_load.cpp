@@ -51,8 +51,9 @@ void test_arithmetic() {
 void test_live_samples() {
     const infernix::HostCpuTimes first = infernix::host_cpu_times();
     check(first.cpus >= 1, "at least one logical CPU");
-    // Keep two threads of this process busy for ~300 ms: the own time grows by about as much as
-    // they spin, and the others' share stays a share.
+    // Keep two threads of this process busy until the own time has grown past 0.3 s (on an idle
+    // machine ~150 ms; a loaded one only delays it, bounded at 30 s), and the others' share stays a
+    // share.
     std::atomic<bool> stop{false};
     std::vector<std::thread> spinners;
     for (int i = 0; i < 2; ++i) {
@@ -61,14 +62,20 @@ void test_live_samples() {
             while (!stop.load(std::memory_order_relaxed)) { x = x * 6364136223846793005ULL + 1; }
         });
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    const auto started = std::chrono::steady_clock::now();
+    infernix::HostCpuTimes second = first;
+    do {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        second = infernix::host_cpu_times();
+    } while (static_cast<double>(second.own_ns - first.own_ns) / 1e9 <= 0.35 &&
+             std::chrono::steady_clock::now() - started < std::chrono::seconds(30));
     stop = true;
     for (auto& t : spinners) { t.join(); }
-    const infernix::HostCpuTimes second = infernix::host_cpu_times();
     const double own_s = static_cast<double>(second.own_ns - first.own_ns) / 1e9;
+    const double wall_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
     const double share = infernix::other_process_cpu_share(first, second);
-    std::printf("own CPU %.3f s over ~0.3 s with two spinning threads; other processes' share %.3f of %u CPUs\n", own_s,
-                share, second.cpus);
+    std::printf("own CPU %.3f s over %.3f s with two spinning threads; other processes' share %.3f of %u CPUs\n",
+                own_s, wall_s, share, second.cpus);
     check(own_s > 0.3, "the process's own CPU time counts its spinning threads");
     check(share >= 0.0 && share <= 1.0, "the live share is a share");
 }

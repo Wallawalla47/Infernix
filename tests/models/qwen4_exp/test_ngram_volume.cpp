@@ -6,6 +6,7 @@
 // blocks (a prefill chunk) takes the multi-threaded route: the same oracle, counters and cache.
 // resolve_ngram_volume accepts a volume of any format in place of the artifact's table and refuses mismatches.
 
+#include "test_temp_path.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
 
 #include <algorithm>
@@ -192,7 +193,7 @@ void test_resolve(const std::filesystem::path& path) {
 } // namespace
 
 int main() {
-    const auto path = std::filesystem::temp_directory_path() / "infernix_ngram_volume_test.ngram";
+    const auto path = infernix::test::unique_temp_path("infernix_ngram_volume_test.ngram");
     try {
         const q4::NgramTableConfig table = make_volume(path);
         const q4::NgramVolume volume(path, table);
@@ -279,7 +280,7 @@ int main() {
             const q4::NgramVolume bad(path, wrong);
         } catch (const std::runtime_error&) { threw = true; }
         check(threw, "a volume of the wrong size is refused at open");
-        const auto headers = std::filesystem::temp_directory_path() / "infernix_ngram_resolve_test.ngram";
+        const auto headers = infernix::test::unique_temp_path("infernix_ngram_resolve_test.ngram");
         test_resolve(headers); // its own file: the volume above holds `path` without write sharing
         std::error_code removed;
         std::filesystem::remove(headers, removed);

@@ -30,7 +30,7 @@
 namespace {
 
 constexpr std::uint32_t kPrompt  = 1024;
-constexpr std::uint32_t kOutputs = 1200;
+constexpr std::uint32_t kOutputs = 600;
 
 std::vector<infernix::TokenId> synthetic_tokens(std::size_t count, std::uint32_t seed) {
     std::vector<infernix::TokenId> tokens;
@@ -70,8 +70,9 @@ int run_mode(const char* artifact, const char* ngram, bool mtp) {
     options.artifact_path = artifact;
     if (ngram != nullptr) { options.ngram_volume_path = ngram; }
     options.max_context = 4096;
-    // 48 pages: both prompts bind (2 x 17 pages) but both extents (2 x 35) do not fit.
-    options.kv_capacity          = infernix::KvCapacityPolicy::explicit_capacity(3072);
+    // 40 pages of 64 tokens: both prompts bind (2 x 17 pages) but both extents (2 x 26: 1,024 +
+    // 600 tokens) do not, so the pool runs out about 190 tokens into the paired runs.
+    options.kv_capacity          = infernix::KvCapacityPolicy::explicit_capacity(2560);
     options.prefill_chunk        = 512;
     const char* kv               = std::getenv("INFERNIX_QWEN4_KV");
     options.kv_cache             = kv != nullptr ? infernix::test::parse_kv_cache_storage(kv)

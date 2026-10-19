@@ -518,6 +518,8 @@ public:
         cuda_check(cudaMemcpy(destination_storage.data(), residual_seed.p, residual_seed.bytes,
                               cudaMemcpyDeviceToDevice),
                    "seed SparseMoe destination");
+        // The copy returns before it completes; SparseMoe runs on a non-blocking stream.
+        cuda_check(cudaStreamSynchronize(nullptr), "settle SparseMoe destination seed");
 
         const ops::SparseMoeWeights weights{
             dense_bf16_weight(device_router_.p, kExperts + 1, kHidden),

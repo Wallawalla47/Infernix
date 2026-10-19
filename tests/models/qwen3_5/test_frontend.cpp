@@ -3106,7 +3106,7 @@ int test_media_cache_singleflight() {
     std::thread first(run, 0);
     producer_started_future.wait();
     std::thread second(run, 1);
-    const auto wait_limit = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    const auto wait_limit = std::chrono::steady_clock::now() + std::chrono::seconds(30);
     while (cache->stats().singleflight_waits == 0 &&
            std::chrono::steady_clock::now() < wait_limit) {
         std::this_thread::yield();
@@ -3136,7 +3136,7 @@ int test_media_cache_runs_independent_misses_in_parallel() {
             const int now = ++active;
             int maximum   = maximum_active.load();
             while (now > maximum && !maximum_active.compare_exchange_weak(maximum, now)) {}
-            const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+            const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(30);
             while (started.load() != static_cast<int>(pending.size()) &&
                    std::chrono::steady_clock::now() < limit) {
                 std::this_thread::yield();

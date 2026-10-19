@@ -4,6 +4,7 @@
 // §19.3.7, RT8) evicts the lowest-score experts wherever they sit, moves the survivors below the new
 // top and never names a frame above it.
 
+#include "test_temp_path.h"
 #include "models/qwen4_exp/program/expert_cache/calibrated_order.h"
 #include "models/qwen4_exp/program/expert_cache/expert_cache.h"
 #include "models/qwen4_exp/program/expert_cache/expert_state.h"
@@ -582,8 +583,7 @@ void test_prompt_credit() {
 // The saved state file: a round trip keeps counts and ranking; another identity, key count, version
 // or a truncated file loads nothing (with a reason).
 void test_state_file() {
-    const auto dir  = std::filesystem::temp_directory_path();
-    const auto path = dir / "infernix_expert_state_test.bin";
+    const auto path = infernix::test::unique_temp_path("infernix_expert_state_test.bin");
     SavedState state;
     state.counts = {5, 0, 9, 1};
     state.ranked = {2, 0, 3};
@@ -592,7 +592,7 @@ void test_state_file() {
     check(same.state && same.state->counts == state.counts && same.state->ranked == state.ranked, "a saved state round-trips");
     check(!load_expert_state(path, "artifact B", 4).state, "another artifact's state is ignored");
     check(!load_expert_state(path, "artifact A", 5).state, "a state with another key count is ignored");
-    check(!load_expert_state(dir / "infernix_expert_state_missing.bin", "artifact A", 4).state, "a missing file loads nothing");
+    check(!load_expert_state(infernix::test::unique_temp_path("infernix_expert_state_missing.bin"), "artifact A", 4).state, "a missing file loads nothing");
     {
         const auto size = std::filesystem::file_size(path);
         std::filesystem::resize_file(path, size - 3);

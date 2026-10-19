@@ -2,6 +2,7 @@
 // closed-form byte oracle, with out-of-order completion, demand-before-prefetch issue order,
 // prefetch sub-reads, transient-error backoff, retry of a hard error, timeouts, short reads,
 // delayed completions, cancel_all and destruction with reads in flight. CPU and disk only.
+#include "test_temp_path.h"
 #include "core/direct_read_queue.h"
 
 #include <algorithm>
@@ -66,7 +67,7 @@ std::vector<DirectReadQueue::Completion> drain(DirectReadQueue& queue, std::size
 }
 
 std::filesystem::path make_file() {
-    const auto path = std::filesystem::temp_directory_path() / "infernix_direct_read_queue_test.bin";
+    const auto path = infernix::test::unique_temp_path("infernix_direct_read_queue_test.bin");
     std::ofstream f(path, std::ios::binary | std::ios::trunc);
     std::vector<char> chunk(1 << 20);
     for (std::uint64_t at = 0; at < kFileBytes; at += chunk.size()) {
@@ -179,12 +180,12 @@ void test_faults(const std::filesystem::path& path) {
     }
     {
         DirectReadQueue::Options o;
-        o.timeout = std::chrono::milliseconds(30);
+        o.timeout = std::chrono::milliseconds(500); // a real 64 KiB retry finishes well inside it under disk load
         DirectReadQueue queue(o);
         const auto file = queue.open(path);
         queue.set_faults({.stall_read = 1});
         auto c = one(queue, file, 0, 64 * 1024);
-        check(c.status == DirectReadQueue::Status::Ok && c.attempts == 2 && c.latency_ns >= 30'000'000,
+        check(c.status == DirectReadQueue::Status::Ok && c.attempts == 2 && c.latency_ns >= 500'000'000,
               "a read past its timeout is cancelled and retried once");
         queue.set_faults({.stall_read = queue.stats().issued + 1, .stall_count = 2});
         c = one(queue, file, 0, 64 * 1024);

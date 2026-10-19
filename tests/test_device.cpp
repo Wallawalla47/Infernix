@@ -2,6 +2,7 @@
 
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -78,14 +79,24 @@ int check_pinned_gate(const infernix::DeviceContext& ctx) {
     const auto fill = [&](std::size_t bytes, std::uint32_t round) {
         for (std::size_t i = 0; i < bytes; ++i) { host[i] = static_cast<std::byte>((i * 131 + round * 7 + 3) & 0xff); }
     };
-    // Poison, launch, wait, write the data, publish; returns whether the copy holds the data.
+    // Poison, launch, wait until the gate waits, write the data, publish; returns whether the copy
+    // holds the data. The host waits for the stream to pass a marker just before the gate, then
+    // 200 ms: a fixed sleep after the launch alone let a busy GPU (other processes' kernels) start
+    // the gate after the publish, so it recorded no wait or a short one; under a parallel CTest run
+    // the gate was seen starting about 19 ms after the marker.
+    std::atomic<bool> reached{false};
     const auto produce = [&](std::size_t bytes, std::uint32_t round, const std::function<void()>& launch) {
         std::memset(src, 0xa5, bytes);
         *expected_h = ++word;
         CUDA_CHECK(cudaMemcpyAsync(expected, expected_h, sizeof(std::uint32_t), cudaMemcpyHostToDevice, ctx.stream));
+        reached = false;
+        CUDA_CHECK(cudaLaunchHostFunc(
+            ctx.stream, [](void* flag) { static_cast<std::atomic<bool>*>(flag)->store(true); }, &reached));
         launch();
         ctx.flush();
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (!reached.load() && std::chrono::steady_clock::now() < until) { std::this_thread::yield(); }
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
         fill(bytes, round);
         std::memcpy(src, host.data(), bytes);
         infernix::publish_pinned_word(ready, word);
