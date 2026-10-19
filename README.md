@@ -10,6 +10,20 @@ RTX 50-series GPU (tuned on the RTX 5090). It began as a fork of
 [NInfer](https://github.com/Neroued/ninfer) by [Neroued](https://github.com/Neroued) and has grown
 into its own engine; it reads NInfer's `.ninfer` artifacts as well as its own `.infernix` files.
 
+## Headline results
+
+Release `windows-2026.10.18` on one RTX 5090 (PCIe Gen5 x8), measured on 2026-10-19 against each
+engine's latest version. The context-length columns cover one request at a time with ~8K to ~250K
+tokens of context; the replay is an agentic coding workload with two requests served at once.
+Method, configurations and full results: [Benchmarks](#benchmarks).
+
+| Infernix vs | Time to first token, by context | Decode tok/s, by context | Replay: average time to first token | Replay: wall time |
+|---|---|---|---|---|
+| [Strata](https://github.com/Niko1221/Strata) 0.1.45 on Unsloth's UD-Q4_K_XL (Infernix on NVIDIA Dense8) | 4.6-7.4× sooner | 1.5-1.7× as fast | 4.9 s against 17.0 s | 6.7 min against 15.9 min |
+| [strata-nvfp4](https://github.com/sergqwer/strata-nvfp4) on the same NVIDIA NVFP4 weights | 10-19 % sooner | 6-9 % faster at 8K and 128K, 4 % slower at 250K | 4.9 s against 10.7 s | 6.7 min against 11.5 min |
+| Strata 0.1.45 on the same IQ3_S GGUF | Strata 20-30 % sooner | level at 8K, 9 % and 25 % faster at 128K and 250K | 4.9 s against 8.6 s | 6.2 min against 9.1 min |
+| [NInfer](https://github.com/Neroued/ninfer) `64d10fbf` + Windows port on the official 27B NVFP4 | 15 % sooner at 8K, 1.6× and 1.8× sooner at 128K and 230K | DFlash2 4 % and 14 % faster at 8K and 128K; plain 3-4 % faster | 3.1 s against 3.4 s (median 0.52 s against 1.14 s) | 6.0 min against 7.1 min |
+
 ## Why Infernix
 
 ### Qwen3.8-Flash-Next on one RTX 5090
