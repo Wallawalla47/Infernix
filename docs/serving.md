@@ -75,6 +75,7 @@ tier must be saved. Before the server is ready, one Ctrl+C ends startup at once.
 |---|---|
 | `GET /health` | Engine readiness |
 | `GET /metrics` | Prometheus counters, gauges and latency histograms |
+| `GET /metrics?format=json` | JSON snapshot: engine identity, live gauges, totals, and the last 128 terminal requests (`Accept: application/json` also selects it) |
 | `GET /v1/models` | configured OpenAI model alias, effective `max_model_len`, and llama.cpp-compatible `meta` and `chat_template_caps` objects |
 | `GET /v1/models/{id}` | lookup of the configured alias, `max_model_len`, `meta` and `chat_template_caps` |
 | `POST /v1/chat/completions` | OpenAI-style chat generation |
@@ -1481,6 +1482,38 @@ The handler copies published snapshots and formats them outside the Engine worke
 not reset counters or initiate device work. Detailed per-request records remain available through
 the JSONL log. Monitoring tools with engine-specific metric names need an Infernix adapter.
 
+### JSON representation
+
+`GET /metrics?format=json` (or `Accept: application/json`) returns one JSON document instead of the
+text exposition. Prometheus text remains the default; `?format=prometheus` selects it explicitly.
+An unknown `format` is a `400`, never a silent fallback.
+
+```bash
+curl 'http://127.0.0.1:8080/metrics?format=json'
+```
+
+The document carries `schema`, `time`, `engine`, `live`, `totals`, and `requests`. It exists because
+the text exposition cannot carry per-request records: a request id or a per-row timing in a label
+would make the series cardinality unbounded.
+
+| Field | Meaning |
+|---|---|
+| `schema` | `infernix.telemetry/1`; additive-only within v1 |
+| `engine` | model id, architecture, weight and KV formats, speculative backend, context and concurrency limits |
+| `live` | engine phase (`idle`, `reading`, `generating`), request counts by phase, and the interval prefill/decode rates. A rate is `null` until the throughput reporter has produced one |
+| `totals` | monotonic counters since startup, plus terminal request counts |
+| `requests` | the last 128 settled generation requests (completed, cancelled, failed), oldest first; requests rejected before generation appear only in `totals.rejected` |
+
+Each request row carries its id, completion time in Unix seconds, protocol, finish reason, token
+counts, cache reuse, TTFT/prefill/decode/total seconds, speculative draft and accept counts, and the
+Qwen3.8-Flash-Next expert-cache lookups. Time sums the engine does not accumulate (`prompt_ms` and
+`decode_ms` at the totals level) are `null`. There is no `hardware` object: the engine measures no
+GPU telemetry, and an absent block is honest where a zero would not be.
+
+The route follows the server's API-key authentication. The document contains no prompt, completion,
+tool argument, header value, key, or client address. `requests` is a bounded window, not a durable
+log; use `--request-log-jsonl` when every request must be retained.
+
 ## Structured request log
 
 `--request-log-jsonl FILE` enables the machine-readable measurement log. The server opens `FILE`
@@ -1500,7 +1533,7 @@ because another process holds `FILE` open without delete sharing on Windows, the
 warning, keeps appending to `FILE`, and tries again after another `N` MiB. Rotated names are also
 checked against the model artifact path.
 
-Every line is one `infernix_serve_request_log` schema-v28 JSON object. All events carry
+Every line is one `infernix_serve_request_log` schema-v29 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance. Successful request-start records include request-scoped acquisition,
 media-preprocessing wall/work, tokenizer, cache hit/miss/single-flight, and payload-size fields;
