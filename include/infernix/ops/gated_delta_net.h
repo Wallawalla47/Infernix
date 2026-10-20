@@ -30,8 +30,10 @@ namespace infernix::ops {
 // Delta) take FP16 operands (S and the scaled Delta rounded to FP16) and accumulate each pair of
 // k16 products (32 terms) in FP16 before adding it to an FP32 accumulator; the update's product is
 // rounded once and added to the decayed FP32 state. The control products and the master state stay
-// FP32. It runs the state products at the FP16-accumulate tensor rate.
-enum class GdnChunkArithmetic : std::uint8_t { Exact, Fp16Accumulate };
+// FP32. It runs the state products at the FP16-accumulate tensor rate. Recurrent (the reference route,
+// docs/maintainer/model-quality.md §6.2) runs every T on the recurrent route, FP32 operands token by
+// token, instead of the chunked route's BF16 and TF32 products.
+enum class GdnChunkArithmetic : std::uint8_t { Exact, Fp16Accumulate, Recurrent };
 
 /**
  * Applies the Gated DeltaNet recurrence independently for each value head h. Let

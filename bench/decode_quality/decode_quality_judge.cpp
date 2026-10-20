@@ -1,16 +1,15 @@
 // End-to-end decode quality, judge half. Scores the greedy continuations that
 // infernix_decode_quality_gen wrote, for any number of builds, with one reference: a CausalScoring
-// Engine with 16-bit activations in every linear (EngineOptions::a16_activations), BF16 KV, and
-// each sequence in one prefill pass. Each build is judged on its own prefixes, so builds whose
+// Engine on the reference route (EngineOptions::reference), BF16 KV, and each sequence in one
+// prefill pass. Each build is judged on its own prefixes, so builds whose
 // continuations diverge are still compared fairly. Per build it reports how often the generated
 // token is the reference's most probable token, the mean reference log-probability of the
 // generated tokens, and the mean regret (top log-probability minus the generated token's); per
 // pair of builds, the generated prefix they share exactly.
 //
-// --stored-activations scores with the activations the artifact records instead (every other
-// condition the same). It is the reference for models without a 16-bit-activation route
-// (Qwen3.8-Flash-Next): it isolates what decoding changes (KV format, chunking, speculation,
-// batching) but not the cost of the stored activation precision itself.
+// --stored-activations scores on the exact route with the activations the artifact records instead
+// (every other condition the same): it isolates what decoding changes (KV format, chunking,
+// speculation, batching) but not the cost of the stored activation precision itself.
 //
 // --report FILE also writes each build's per-segment counts as JSON (segments are independent
 // samples: tools/quality/fast_path_gate.py pairs them between builds).
@@ -112,7 +111,7 @@ int main(int argc, char** argv) {
         options.max_context     = context;
         options.prefill_chunk   = context;
         options.kv_cache        = infernix::KvCacheStorage::BFloat16;
-        options.a16_activations = !stored;
+        options.reference       = !stored;
         // The reference runs the exact route.
         options.fast_paths      = false;
         if (!ngram_volume.empty()) { options.ngram_volume_path = ngram_volume; }
@@ -193,7 +192,7 @@ int main(int argc, char** argv) {
             std::ofstream report(report_path);
             if (!report) { throw std::runtime_error("cannot write " + report_path); }
             report << std::setprecision(17) << "{\"reference\": \""
-                   << (stored ? "stored_activations" : "a16_activations")
+                   << (stored ? "stored_activations" : "reference")
                    << "\", \"runs\": [";
             for (std::size_t run = 0; run < runs.size(); ++run) {
                 // Generation files are paths the user chose; JSON-escape the two characters a

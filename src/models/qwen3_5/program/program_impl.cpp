@@ -4,6 +4,7 @@
 #include "models/qwen3_5/execution/linear.h"
 #include "core/startup.h"
 #include "core/device.h"
+#include "infernix/ops/precise_linear.h"
 #include "infernix/ops/target_logprobs.h"
 #include "infernix/ops/top_logprobs.h"
 
@@ -354,8 +355,10 @@ ScoreResult ProgramImpl::causal_score(PreparedPromptData&& prompt, std::uint32_t
             const auto columns = static_cast<std::int32_t>(staged_columns);
             // The staged columns' first scored position.
             const std::size_t first_position = output.logprobs.size();
-            Tensor logits      = work.alloc(
-                DType::BF16, {dimension(parameters.model.config().text.vocab_size), columns});
+            // The reference route scores from FP32 logits of the precise head.
+            const bool reference = execution_schedule.reference;
+            Tensor logits        = work.alloc(reference ? DType::FP32 : DType::BF16,
+                                              {dimension(parameters.model.config().text.vocab_size), columns});
             Tensor target_ids = work.alloc(DType::I32, {1, columns});
             Tensor logprobs   = work.alloc(DType::FP32, {1, columns});
             const auto distribution = [&](DType dtype, std::uint32_t rows) {
@@ -367,7 +370,11 @@ ScoreResult ProgramImpl::causal_score(PreparedPromptData&& prompt, std::uint32_t
             Tensor candidate_ids      = distribution(DType::I32, per_position);
             Tensor candidate_logprobs = distribution(DType::FP32, per_position);
             Tensor hidden             = score_hidden->slice(1, 0, columns);
-            execution::project(hidden, parameters.text.output_head, logits, work, device.stream);
+            if (reference) {
+                ops::precise_linear(hidden, parameters.text.output_head.weight, logits, device.stream);
+            } else {
+                execution::project(hidden, parameters.text.output_head, logits, work, device.stream);
+            }
             CUDA_CHECK(cudaMemcpyAsync(target_ids.data, staged_targets.data(), target_ids.bytes(),
                                        cudaMemcpyHostToDevice, device.stream));
             ops::target_logprobs(logits, target_ids, public_tokens, logprobs, device.stream);

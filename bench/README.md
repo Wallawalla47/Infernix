@@ -208,9 +208,8 @@ are in [Model-level numerical quality](../docs/maintainer/model-quality.md).
   `infernix-serve`; `exact` runs the exact route and `path=NAME` also runs a candidate fast path.
   It writes one line per segment: the corpus token offset, the prompt length and the generated
   token ids.
-- The judge scores any number of generator outputs with one reference: a CausalScoring Engine with
-  16-bit activations in every linear (`EngineOptions::a16_activations`), BF16 KV, each sequence in
-  one pass. For each build it reports how often the generated token is the reference's most
+- The judge scores any number of generator outputs with one reference: a CausalScoring Engine on
+  the reference route (`EngineOptions::reference`), BF16 KV, each sequence in one pass. For each build it reports how often the generated token is the reference's most
   probable token given that build's own prefix, the mean reference log-probability and the mean
   regret (top log-probability minus the generated token's); for each pair, the generated prefix
   they share exactly. `--report FILE` also writes each build's per-segment counts as JSON, which

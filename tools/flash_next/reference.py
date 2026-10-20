@@ -1,6 +1,6 @@
 """Independent FP64 reference forward of Qwen3.8-Flash-Next (Qwen4Exp) on an NVIDIA checkpoint.
 
-    python -m tools.flash_next.reference --model PATH --tokens 248045,9707,11 --out ref.npz [--expert-a16]
+    python -m tools.flash_next.reference --model PATH --tokens 248045,9707,11 --out ref.npz [--reference-points] [--a16-experts]
 
 This is the model-level oracle for Infernix's Qwen4Exp implementation (AGENTS.md "Verification"). It
 is written from the upstream ``qwen4_exp`` definitions (transformers ``modular_qwen4_exp.py`` and
@@ -10,15 +10,21 @@ artifact or converter:
 - every dense and BF16 tensor is widened exactly and every product is formed in binary64; an MXFP8
   matrix (nvidia/Qwen3.8-Flash-Next-FP4-Local: E4M3FN ``weight`` with a UE8M0 ``weight_scale`` per
   32 inputs) is its exact decoded value;
-- routed experts use NVIDIA's NVFP4 words, decoded exactly, with activations quantized to A4 by the
-  ModelOpt rule (design §16.2) on BF16 inputs with each matrix's own ``input_scale``; with
-  ``--expert-a16`` they take the BF16 inputs as they are (design §16.2.1, FP4-Local's default);
+- routed experts use NVIDIA's NVFP4 words (or Qwen's block-FP8 codes and tile scales), decoded
+  exactly, with activations quantized to A4 by the ModelOpt rule (design §16.2) on BF16 inputs with
+  each matrix's own ``input_scale``; a bank without input scales (block FP8), or every bank with
+  ``--a16-experts`` (FP4-Local's default, design §16.2.1), takes its BF16 inputs unquantized;
 - the PLE n-gram rows are the checkpoint's FP8 codes times its BF16 scale, or (FP4-Local) its NVFP4
   codes times their E4M3FN block scales and the FP32 ``weight_scale_2``, rounded to BF16.
 
 ``--bf16-boundaries`` (default on) rounds the activations that deployed BF16 runtimes store in
 BF16 -- the residual streams, every block input and output -- so differences against Infernix are
-kernel arithmetic, not storage precision. QSA selection is evaluated exactly; for prompts up to
+kernel arithmetic, not storage precision. ``--reference-points`` also rounds at every other point
+where Infernix's reference route (docs/maintainer/model-quality.md §6.2) stores a BF16 activation:
+each projection's output, the hyper-connection's z, m and u, the GDN convolution and recurrence
+outputs and its gated norm, the QSA normalized and rotated q and k, attention output and gate, and
+the shared expert's h and output; with it, the route's remaining error against this evaluation is
+its arithmetic between those points. QSA selection is evaluated exactly; for prompts up to
 ``indexer_budget + compress_ratio - 1`` tokens every token is selected and QSA equals causal
 attention, which the script checks.
 """
@@ -34,7 +40,7 @@ import time
 import numpy as np
 import torch
 
-from tools.convert.sources.modelopt import nvfp4_matrix_words
+from tools.convert.sources.modelopt import dequantize_fp8_block128, fp8_block_matrix_words, nvfp4_matrix_words
 from tools.convert.sources.safetensors import SafetensorsSource
 from tools.flash_next.ngram import NgramConfig, head_tables, layer_multipliers, row_ids
 
@@ -144,11 +150,14 @@ def a4_dequantized(x_bf16: torch.Tensor, input_scale: torch.Tensor) -> torch.Ten
 class Experts:
     """Decodes each routed expert when it is used; one decoded expert is ~40 MB in binary64."""
 
-    def __init__(self, weights: Weights, *, a4: bool = True):
+    def __init__(self, weights: Weights, *, a16: bool = False):
         self.w = weights
-        self.a4 = a4
+        self.a16 = a16
 
     def _matrix(self, leaf: str, shape):
+        if self.w.store.describe(leaf + ".weight").dtype == "F8_E4M3":
+            codes, scales = fp8_block_matrix_words(self.w.store, leaf, shape)
+            return dequantize_fp8_block128(codes, scales), None
         words = nvfp4_matrix_words(self.w.store, leaf, shape)
         n, k = shape
         codes = torch.stack((words.codes & 0xF, words.codes >> 4), dim=-1).reshape(n, k).long()
@@ -166,28 +175,35 @@ class Experts:
         )
 
     def forward(self, layer: int, expert: int, x_bf16: torch.Tensor) -> torch.Tensor:
-        """One routed expert on rows x [n, H] (BF16 values): W4A4 (or W4A16) with BF16 at its
-        outputs."""
+        """One routed expert on rows x [n, H] (BF16 values) with BF16 at its outputs: W4A4, or with
+        16-bit activations (no input scales, or ``a16``)."""
         (wg, sg), (wu, su), (wd, sd) = self.get(layer, expert)
-        act = a4_dequantized if self.a4 else (lambda x, _scale: x)
-        g = bf16(act(x_bf16, sg) @ wg.T)
-        u = bf16(act(x_bf16, su) @ wu.T)
+        if self.a16 or sg is None:
+            g = bf16(x_bf16 @ wg.T)
+            u = bf16(x_bf16 @ wu.T)
+            h = bf16(silu(g) * u)
+            return bf16(h @ wd.T)
+        g = bf16(a4_dequantized(x_bf16, sg) @ wg.T)
+        u = bf16(a4_dequantized(x_bf16, su) @ wu.T)
         h = bf16(silu(g) * u)
-        return bf16(act(h, sd) @ wd.T)
+        return bf16(a4_dequantized(h, sd) @ wd.T)
 
 
 # ---------------------------------------------------------------------------- model
 
 
 class Reference:
-    def __init__(self, root: Path, *, bf16_boundaries: bool = True, expert_a16: bool = False):
+    def __init__(self, root: Path, *, bf16_boundaries: bool = True, reference_points: bool = False,
+                 a16_experts: bool = False):
         self.w = Weights(root)
         self.c = self.w.config
         self.eps = float(self.c["rms_norm_eps"])
         self.hc = int(self.c["hc_count"])
         self.H = int(self.c["hidden_size"])
-        self.experts = Experts(self.w, a4=not expert_a16)
+        self.experts = Experts(self.w, a16=a16_experts)
         self.round = bf16 if bf16_boundaries else (lambda x: x)
+        # The reference route's other BF16 points (see the module docstring).
+        self.point = bf16 if reference_points else (lambda x: x)
         rope = self.c["rope_parameters"]
         self.theta = float(rope["rope_theta"])
         self.rotary = int(self.c["head_dim"] * rope["partial_rotary_factor"])
@@ -203,14 +219,14 @@ class Reference:
         w = self.w
         Rn = rmsnorm_1p(R, w.text(prefix + "hc_norm.weight"), self.eps, group=self.H)
         Rn = self.round(Rn)
-        z = Rn @ w.text(prefix + "input_mix_weight_down.weight").T
-        m = silu(z / self.hc)
-        u = torch.sigmoid(m @ w.text(prefix + "input_mix_weight_up.weight").T)
+        z = self.point(Rn @ w.text(prefix + "input_mix_weight_down.weight").T)
+        m = self.point(silu(z / self.hc))
+        u = torch.sigmoid(self.point(m @ w.text(prefix + "input_mix_weight_up.weight").T))
         T = R.shape[0]
         x = (u.reshape(T, self.hc, self.H) * Rn.reshape(T, self.hc, self.H)).mean(dim=1)
         if not combine:
             return self.round(x)
-        inj = 2.0 * torch.sigmoid((Rn @ w.text(prefix + "block_inject_weight.weight").T) / self.hc)
+        inj = 2.0 * torch.sigmoid(self.point(Rn @ w.text(prefix + "block_inject_weight.weight").T) / self.hc)
         return self.round(x), inj
 
     def inject(self, R: torch.Tensor, y: torch.Tensor, inj: torch.Tensor) -> torch.Tensor:
@@ -225,15 +241,15 @@ class Reference:
         nk, dk = c["linear_num_key_heads"], c["linear_key_head_dim"]
         nv, dv = c["linear_num_value_heads"], c["linear_value_head_dim"]
         T = x.shape[0]
-        qkv = x @ w.text(p + "in_proj_qkv.weight").T
-        z = x @ w.text(p + "in_proj_z.weight").T
-        b = x @ w.text(p + "in_proj_b.weight").T
-        a = x @ w.text(p + "in_proj_a.weight").T
+        qkv = self.point(x @ w.text(p + "in_proj_qkv.weight").T)
+        z = self.point(x @ w.text(p + "in_proj_z.weight").T)
+        b = self.point(x @ w.text(p + "in_proj_b.weight").T)
+        a = self.point(x @ w.text(p + "in_proj_a.weight").T)
         conv = w.text(p + "conv1d.weight")[:, 0, :]  # [C, taps]
         taps = conv.shape[1]
         padded = torch.cat((torch.zeros(taps - 1, qkv.shape[1], dtype=F64), qkv), dim=0)
         mixed = sum(conv[:, j][None, :] * padded[j : j + T] for j in range(taps))
-        mixed = silu(mixed)
+        mixed = self.point(silu(mixed))
         q, k, v = mixed.split([nk * dk, nk * dk, nv * dv], dim=-1)
         q = q.reshape(T, nk, dk).repeat_interleave(nv // nk, dim=1)
         k = k.reshape(T, nk, dk).repeat_interleave(nv // nk, dim=1)
@@ -250,9 +266,10 @@ class Reference:
             delta = (v[t] - kv) * beta[t][:, None]
             S = S + k[t][:, :, None] * delta[:, None, :]
             out[t] = (S * q[t][:, :, None]).sum(dim=1)
+        out = self.point(out)
         on = out * torch.rsqrt(out.pow(2).mean(-1, keepdim=True) + self.eps)
         gate = torch.sigmoid if (c.get("output_gate_type") or c["hidden_act"]) == "sigmoid" else silu
-        on = w.text(p + "norm.weight") * on * gate(z.reshape(T, nv, dv))
+        on = self.point(w.text(p + "norm.weight") * on * gate(z.reshape(T, nv, dv)))
         return self.round(on.reshape(T, nv * dv) @ w.text(p + "out_proj.weight").T)
 
     # -- QSA
@@ -261,12 +278,14 @@ class Reference:
         p = f"layers.{layer}.self_attn."
         nh, nkv, d = c["num_attention_heads"], c["num_key_value_heads"], c["head_dim"]
         T = x.shape[0]
-        qg = (x @ w.text(p + "q_proj.weight").T).reshape(T, nh, 2 * d)
+        qg = self.point(x @ w.text(p + "q_proj.weight").T).reshape(T, nh, 2 * d)
         q, gate = qg[..., :d], qg[..., d:].reshape(T, nh * d)
-        k = (x @ w.text(p + "k_proj.weight").T).reshape(T, nkv, d)
-        v = (x @ w.text(p + "v_proj.weight").T).reshape(T, nkv, d)
-        q = rope(rmsnorm_1p(q, w.text(p + "q_norm.weight"), self.eps), positions, self.theta, self.rotary)
-        k = rope(rmsnorm_1p(k, w.text(p + "k_norm.weight"), self.eps), positions, self.theta, self.rotary)
+        k = self.point(x @ w.text(p + "k_proj.weight").T).reshape(T, nkv, d)
+        v = self.point(x @ w.text(p + "v_proj.weight").T).reshape(T, nkv, d)
+        q = self.point(rope(self.point(rmsnorm_1p(q, w.text(p + "q_norm.weight"), self.eps)), positions, self.theta,
+                            self.rotary))
+        k = self.point(rope(self.point(rmsnorm_1p(k, w.text(p + "k_norm.weight"), self.eps)), positions, self.theta,
+                            self.rotary))
         selected = self.qsa_select(layer, x, positions)
         rep = nh // nkv
         out = torch.zeros(T, nh, d, dtype=F64)
@@ -277,7 +296,7 @@ class Reference:
             scores = torch.einsum("hd,nhd->hn", q[t], kk) / math.sqrt(d)
             prob = torch.softmax(scores, dim=-1)
             out[t] = torch.einsum("hn,nhd->hd", prob, vv)
-        o = out.reshape(T, nh * d) * torch.sigmoid(gate)
+        o = self.point(self.point(out.reshape(T, nh * d)) * torch.sigmoid(gate))
         return self.round(o @ w.text(p + "o_proj.weight").T)
 
     def qsa_select(self, layer: int, x: torch.Tensor, positions: torch.Tensor) -> list[torch.Tensor]:
@@ -287,10 +306,11 @@ class Reference:
         nh, d, ratio = c["indexer_n_heads"], c["indexer_head_dim"], c["indexer_compress_ratio"]
         budget = c["indexer_budget"] // ratio
         T = x.shape[0]
-        qk = x @ w.text(p + "index_qk_proj.weight").T
+        qk = self.point(x @ w.text(p + "index_qk_proj.weight").T)
         q = qk[:, : nh * d].reshape(T, nh, d)
         raw = self.round(qk[:, nh * d :])  # [T, d], cached in BF16 upstream
-        q = rope(rmsnorm_1p(q, w.text(p + "q_layernorm.weight"), self.eps), positions, self.theta, self.rotary)
+        q = self.point(rope(rmsnorm_1p(q, w.text(p + "q_layernorm.weight"), self.eps), positions, self.theta,
+                            self.rotary))
         out = []
         for t in range(T):
             visible = t + 1
@@ -332,7 +352,7 @@ class Reference:
             routed.index_add_(0, rows, y * top[rows, slots][:, None])
         g = x @ w.text(p + "shared_expert.gate_proj.weight").T
         u = x @ w.text(p + "shared_expert.up_proj.weight").T
-        shared = (silu(g) * u) @ w.text(p + "shared_expert.down_proj.weight").T
+        shared = self.point(self.point(silu(g) * u) @ w.text(p + "shared_expert.down_proj.weight").T)
         shared = shared * torch.sigmoid(x @ w.text(p + "shared_expert_gate.weight").T)
         return self.round(routed + shared), idx
 
@@ -437,16 +457,17 @@ def main() -> int:
     parser.add_argument("--tokens", required=True, help="comma-separated token ids")
     parser.add_argument("--layers", type=int, help="stop after this many layers (no logits)")
     parser.add_argument("--no-bf16-boundaries", action="store_true")
-    parser.add_argument(
-        "--expert-a16", action="store_true", help="routed experts with 16-bit activations (FP4-Local's default)"
-    )
+    parser.add_argument("--reference-points", action="store_true",
+                        help="also round at the reference route's BF16 points (module docstring)")
+    parser.add_argument("--a16-experts", action="store_true", help="16-bit expert activations for every bank")
     parser.add_argument("--threads", type=int, default=0)
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
     if args.threads:
         torch.set_num_threads(args.threads)
     ids = [int(v) for v in args.tokens.split(",") if v]
-    ref = Reference(args.model, bf16_boundaries=not args.no_bf16_boundaries, expert_a16=args.expert_a16)
+    ref = Reference(args.model, bf16_boundaries=not args.no_bf16_boundaries, reference_points=args.reference_points,
+                    a16_experts=args.a16_experts)
     record = ref.forward(ids, layers=args.layers)
     arrays = {"tokens": np.array(ids, dtype=np.int64), "final_residual": record["final_residual"]}
     if "logits" in record:

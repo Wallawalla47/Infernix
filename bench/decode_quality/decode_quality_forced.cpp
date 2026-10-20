@@ -7,7 +7,7 @@
 // diverges after the first rounding difference. tools/quality/fast_path_gate.py pairs a default and a
 // fast-path run.
 //
-// --reference writes the reference instead: the 16-bit-activation, BF16-KV scoring route's
+// --reference writes the reference instead: the reference route's (EngineOptions::reference) BF16-KV
 // log-probability of every forced token and its 64 most probable tokens there (Engine::score_tokens,
 // one pass), for the same segments. --observe REFERENCE then makes each forced step also report the
 // log-probabilities of the reference's top tokens and its own largest log-probability
@@ -40,6 +40,7 @@
 //          [--disable-fast-paths] [--fast-path NAME]... [--expert-a4-activations]
 //          [--concurrency 1..8] [--prefill-chunk N] [--prefix-reuse [--warm-tokens N]]
 //          [--ngram-volume FILE] (Qwen3.8-Flash-Next; default <artifact>.ngram)
+//          [--expert-pin-mib N] (Qwen3.8-Flash-Next: page-locked expert RAM; the CPU serves the rest)
 
 #include "infernix/engine.h"
 
@@ -88,6 +89,9 @@ struct Options {
     std::string observe;
     std::string ngram_volume;
     bool expert_a4_activations = false;
+    // Qwen3.8-Flash-Next: page-locked expert RAM (EngineOptions::expert_pin_bytes); the rest the CPU
+    // serves. Empty: the default.
+    std::optional<std::uint64_t> expert_pin_mib;
 };
 
 std::uint32_t parse_u32(std::string_view text, const char* label) {
@@ -138,6 +142,8 @@ Options parse(int argc, char** argv) {
             out.prefix_reuse = true;
         } else if (option == "--warm-tokens") {
             out.warm_tokens = parse_u32(value(), "warm tokens");
+        } else if (option == "--expert-pin-mib") {
+            out.expert_pin_mib = parse_u32(value(), "expert pin MiB");
         } else if (option == "--reference") {
             out.reference = true;
         } else if (option == "--observe") {
@@ -260,7 +266,7 @@ std::vector<infernix::TokenId> read_tokens(infernix::Engine& engine, const Optio
     return tokens;
 }
 
-// The reference: the 16-bit-activation, BF16-KV scoring route in one pass per segment.
+// The reference: the reference route's BF16-KV scoring in one pass per segment.
 void write_reference(const Options& options, std::uint32_t longest, std::ostream& out) {
     infernix::EngineOptions engine_options;
     engine_options.artifact_path   = options.artifact;
@@ -269,7 +275,7 @@ void write_reference(const Options& options, std::uint32_t longest, std::ostream
     engine_options.kv_capacity     = infernix::KvCapacityPolicy::explicit_capacity(engine_options.max_context);
     engine_options.kv_cache        = infernix::KvCacheStorage::BFloat16;
     engine_options.prefill_chunk   = engine_options.max_context;
-    engine_options.a16_activations = true;
+    engine_options.reference       = true;
     engine_options.fast_paths      = false;
     if (!options.ngram_volume.empty()) { engine_options.ngram_volume_path = options.ngram_volume; }
     infernix::Engine engine(engine_options);
@@ -381,6 +387,7 @@ int main(int argc, char** argv) {
         engine_options.fast_path_candidates  = options.candidates;
         engine_options.expert_a4_activations = options.expert_a4_activations;
         if (!options.ngram_volume.empty()) { engine_options.ngram_volume_path = options.ngram_volume; }
+        if (options.expert_pin_mib) { engine_options.expert_pin_bytes = *options.expert_pin_mib << 20; }
         if (!options.prefix_reuse) {
             engine_options.context_cache.enabled             = false;
             engine_options.context_cache.host_capacity_bytes = 0;

@@ -526,6 +526,9 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                                             wide_verification, ffn_routes),
                              execution::ffn_workspace_bytes(block.ffn, first, last, false, false,
                                                             ffn_routes)));
+            if (plan.execution_schedule.reference) {
+                scratch(layout, execution::ffn_reference_workspace_bytes(block.ffn, last));
+            }
         }
         if (!plan.causal_scoring) { linear_scratch(layout, text.output_head, first, last); }
     };
@@ -625,8 +628,9 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
 
     if (plan.causal_scoring) {
         WorkspaceLayoutBuilder causal_score;
-        matrix(causal_score, DType::BF16, dimension(config.vocab_size),
-               static_cast<std::int32_t>(kCausalScoreTile));
+        // The reference route's logits are FP32.
+        matrix(causal_score, plan.execution_schedule.reference ? DType::FP32 : DType::BF16,
+               dimension(config.vocab_size), static_cast<std::int32_t>(kCausalScoreTile));
         matrix(causal_score, DType::I32, 1, static_cast<std::int32_t>(kCausalScoreTile));
         matrix(causal_score, DType::FP32, 1, static_cast<std::int32_t>(kCausalScoreTile));
         // Top tokens and candidates: ids and log-probabilities of each.
@@ -1193,6 +1197,12 @@ static_assert(std::size_t{kDefaultPrefillSplitWorkspaceMiB} << 20 ==
 // route at prefill widths when that path is selected.
 ExecutionSchedule execution_schedule(const execution::Parameters& parameters,
                                      const EngineOptions& options) {
+    // The reference route scores prompts (causal_softmax_attention_reference reads BF16 KV).
+    if (options.reference && (options.purpose != EnginePurpose::CausalScoring ||
+                              options.kv_cache != KvCacheStorage::BFloat16)) {
+        throw std::invalid_argument(
+            "the Qwen3.5 reference route is a CausalScoring Engine with BF16 KV");
+    }
     // The exact route is request-invariant (docs/maintainer/model-quality.md, 6.1); each request-coupling
     // fast path gives up one part of it, and each part holds whenever its coupling path is not selected.
     const FastPathSelection fast_paths = select_fast_paths(parameters.model, options);
@@ -1216,9 +1226,11 @@ ExecutionSchedule execution_schedule(const execution::Parameters& parameters,
             .linear_routes           = fast_paths.selected(FastPath::Q4W4A8) ? ops::LinearRoutes::Q4W4A8
                                                                              : ops::LinearRoutes::Exact,
             .wide_down_tile          = fast_paths.selected(FastPath::BatchedDecode),
-            .gdn_arithmetic          = fast_paths.selected(FastPath::GdnF16Accumulate)
+            .gdn_arithmetic          = options.reference ? ops::GdnChunkArithmetic::Recurrent
+                                       : fast_paths.selected(FastPath::GdnF16Accumulate)
                                            ? ops::GdnChunkArithmetic::Fp16Accumulate
-                                           : ops::GdnChunkArithmetic::Exact};
+                                           : ops::GdnChunkArithmetic::Exact,
+            .reference               = options.reference};
 }
 // The fast INT8, NVFP4, VQ2 and K4V2 prompt kernels and the MXFP8 tiled kernel of FP8 and K8V4 KV
 // run one 128-row CTA of one query head per SM; BF16 KV and the original INT8 and NVFP4 kernels use

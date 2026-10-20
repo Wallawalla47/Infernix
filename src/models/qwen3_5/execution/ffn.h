@@ -18,4 +18,11 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
          ops::LinearRoutes gate_up_routes = ops::LinearRoutes::Exact,
          ops::LinearRoutes down_routes    = ops::LinearRoutes::Exact);
 
+// The reference route's FFN (ExecutionSchedule::reference): precise_swiglu then precise_linear_add,
+// or the sparse MoE's precise form.
+[[nodiscard]] std::size_t ffn_reference_workspace_bytes(const FfnParameters& parameters,
+                                                        std::int32_t columns);
+void ffn_reference(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual,
+                   WorkspaceArena& workspace, cudaStream_t stream);
+
 } // namespace infernix::models::qwen3_5::execution

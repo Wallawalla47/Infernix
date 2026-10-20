@@ -821,9 +821,9 @@ bank with activation scales is W4A4 and one without is W4A16. Recipe D stores th
 binds the scales only for W4A4 (and checks that each layer stores them), and the W4A4 route is recipe
 A's (§16.2), with its kernels and their fast-path qualifications (the configuration reports `4-bit
 expert activations`). The option is refused by an artifact without the marker, by Qwen3.5/3.6, and
-with 16-bit activations everywhere (`--a16-activations`). The persistent prefix cache's signature
-records the experts' activation precision, so a file saved under one setting is not loaded under
-the other.
+by the reference route (`--reference`, 16-bit activations everywhere). The persistent prefix
+cache's signature records the experts' activation precision, so a file saved under one setting is
+not loaded under the other.
 
 ### 6.2 Expert storage layout `nvfp4_expert_rg16_v1`
 

@@ -56,8 +56,12 @@ struct ExecutionSchedule {
     // batched-decode: the decode and verification rounds' MLP down projections take its tiles
     // (ops::LinearRoutes::WideDownTile).
     bool wide_down_tile               = false;
-    // gdn-f16-accumulate: the chunked GDN calls' arithmetic.
+    // gdn-f16-accumulate: the chunked GDN calls' arithmetic (Recurrent on the reference route).
     ops::GdnChunkArithmetic gdn_arithmetic = ops::GdnChunkArithmetic::Exact;
+    // The reference route (EngineOptions::reference, a CausalScoring Program with BF16 KV): prompt
+    // projections precise_linear's forms, attention causal_softmax_attention_reference, the FFN
+    // ffn_reference, the scoring head FP32 (docs/maintainer/model-quality.md 6.2).
+    bool reference = false;
 
     // A prefill chunk's envelope.
     [[nodiscard]] ops::CausalAttentionExecutionEnvelope

@@ -13,9 +13,10 @@ Generation works through `infernix`, `infernix-serve` and `infernix_bench`, with
 drafter (`--spec dflash2 --draft-model FILE`, [recommended](#run)) or the model's MTP drafter
 (`--spec mtp`), n-gram copy proposals, images and video (`--vision`), and in
 `infernix-serve` the hybrid prefix cache. Causal scoring (`infernix-perplexity`, the
-decode-quality judge) runs teacher-forced through the generation path; `--a16-activations` scores
-with 16-bit activations in every linear and every expert bank (the exact W4A16 expert
-arithmetic): the [quality reference](maintainer/model-quality.md#6-numerical-acceptance-policy-and-fast-paths).
+decode-quality judge) runs teacher-forced through the generation path; `--reference` scores with
+16-bit activations in every linear and every expert bank and precise arithmetic between the
+model's BF16 rounding points (on the GPU, many times slower): the
+[quality reference](maintainer/model-quality.md#6-numerical-acceptance-policy-and-fast-paths).
 Pass the n-gram volume with `--ngram-volume` when it is not `<artifact>.ngram`, and an expert stripe
 with `--expert-stripe` in the SSD tier.
 

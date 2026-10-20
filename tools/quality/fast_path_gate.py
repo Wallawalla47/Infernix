@@ -836,8 +836,8 @@ def run_prefill(args: argparse.Namespace) -> Path:
     if args.ngram_volume:
         workload += ["--ngram-volume", args.ngram_volume]
     common = [args.perplexity, args.artifact] + workload
-    # 16-bit activations, BF16 KV, one pass per window.
-    one_pass = ["--kv-dtype", "bf16", "--prefill-chunk", str(args.context), "--a16-activations"]
+    # The reference route, BF16 KV, one pass per window.
+    one_pass = ["--kv-dtype", "bf16", "--prefill-chunk", str(args.context), "--reference"]
     reference = out / "reference.top"
     key = {"kind": "prefill", "artifact": artifact_identity(args.artifact),
            "corpus": corpus_identity(args.corpus, args.text), "quick": args.quick,

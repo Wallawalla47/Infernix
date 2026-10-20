@@ -555,22 +555,25 @@ struct EngineOptions {
     // (block-scaled FP4 QK). True selects the tiled NVFP4 prompt kernel; it requires the NVFP4
     // KV cache.
     bool original_nvfp4_prefill_kernel = false;
-    // Every linear projection computes with 16-bit activations, even where the artifact permits
-    // 8- or 4-bit activation compute. Same weights, no activation quantization: the reference for
-    // measuring what activation quantization costs (infernix-perplexity --a16-activations, the
-    // decode-quality judge). On the Qwen3.8-27B NVFP4 artifacts prefill is at least 3x slower.
-    bool a16_activations               = false;
+    // The quality reference's route (docs/maintainer/model-quality.md section 6.2; infernix-perplexity
+    // --reference, the decode-quality tools). Same weights, no activation quantization: every linear
+    // computes with 16-bit activations. Qwen3.8-Flash-Next (causal scoring only) also computes every
+    // projection, expert, GDN recurrence and attention precisely between the exact route's BF16
+    // boundaries (weights decoded exactly, binary64 or FP32 sums, one rounding each), on the GPU; it
+    // is many times slower than the exact route. Qwen3.5 keeps its exact kernels with 16-bit
+    // activations. On the Qwen3.8-27B NVFP4 artifacts prefill is at least 3x slower.
+    bool reference                     = false;
     // Qwen3.8-Flash-Next artifacts whose routed experts offer 4-bit activations as an option (only
     // nvidia/Qwen3.8-Flash-Next-FP4-Local, whose experts NVIDIA calibrated for them): run the routed
     // experts W4A4 with their stored activation scales (--expert-a4-activations) instead of the
-    // default 16-bit activations. Other artifacts refuse it, as does a16_activations.
+    // default 16-bit activations. Other artifacts refuse it, as does the reference route.
     bool expert_a4_activations         = false;
     // Run every fast path qualified for this configuration (model geometry, activation precision
     // and KV format): routes whose arithmetic differs from the exact route but whose measured cost
     // stays within Infernix's numerical acceptance policy (docs/maintainer/model-quality.md
     // section 6; the registry is 6.7). LoadSummary::fast_paths reports the selection. False
-    // (--disable-fast-paths) runs the exact route, which is bit-exact from release to release and
-    // is the quality reference's route; 16-bit activations (a16_activations) require it.
+    // (--disable-fast-paths) runs the exact route, which is bit-exact from release to release; the
+    // reference route (`reference`) requires it.
     bool fast_paths                    = true;
     // Qualification only (the quality tools, never a product route): also run these fast paths
     // whether or not they are qualified for this configuration, so their cost can be measured.

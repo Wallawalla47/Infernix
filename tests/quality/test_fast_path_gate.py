@@ -424,7 +424,7 @@ def write_judge(path: Path, default: list[tuple[int, int, float]],
         return [{"offset": 100 * i, "tokens": t, "agree": a, "logprob": -r, "regret": r}
                 for i, (t, a, r) in enumerate(values)]
 
-    path.write_text(json.dumps({"reference": "a16_activations", "runs": [
+    path.write_text(json.dumps({"reference": "reference", "runs": [
         {"file": "default.txt", "segments": segments(default)},
         {"file": "fast.txt", "segments": segments(fast)}]}), encoding="utf-8")
     return path

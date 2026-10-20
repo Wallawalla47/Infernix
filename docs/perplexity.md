@@ -31,9 +31,10 @@ a KL divergence of 0.025-0.033 from the one-pass run (about 4 % of positions cha
 token), as large as switching the KV cache between BF16 and INT8. The Q6 artifact, with 16-bit
 activations, moved 15 times less (KL 0.0021). So treat a perplexity difference under about 1 %
 between two NVFP4 builds or settings as noise unless it holds at several chunk sizes.
-`--a16-activations` runs every linear with 16-bit activations (at least 3x slower on NVFP4
-artifacts): saved with `--save-top-tokens`, it is the reference that `--kl-reference` measures
-other runs against. [Model-level numerical quality](maintainer/model-quality.md) has the method and
+`--reference` runs the quality reference's route, with BF16 KV and no fast path: every projection,
+expert, GDN recurrence and attention computed precisely between the model's BF16 rounding points,
+many times slower than the exact route. Saved with `--save-top-tokens`, it is the
+reference that `--kl-reference` measures other runs against. [Model-level numerical quality](maintainer/model-quality.md) has the method and
 the recorded results. Qwen3.8-Flash-Next reads its n-gram volume from `<model>.ngram` unless
 `--ngram-volume FILE` names it, as in `infernix` (`--expert-stripe FILE` as there too). Its windows
 prefill through the generation path, the SSD expert tier included, keeping each position's final
@@ -44,8 +45,7 @@ prompt-attention kernel, and `nvfp4` with its fast kernel over more than 768 vis
 `infernix-serve` prefills them by default; `--use-original-int8-prefill-kernel` and
 `--use-original-nvfp4-prefill-kernel` score them with the original kernels and require the matching
 `--kv-dtype`. As in `infernix-serve`, the fast paths qualified for the artifact's configuration (its kernels and KV format) run
-unless `--disable-fast-paths` selects the exact route; `--a16-activations` always runs the exact
-route. `report.json` records the kernels as `original_int8_prefill_kernel` and
+unless `--disable-fast-paths` selects the exact route; `--reference` never runs a fast path. `report.json` records the kernels as `original_int8_prefill_kernel` and
 `original_nvfp4_prefill_kernel`, and the fast paths that ran as `fast_paths`.
 
 ```bash
@@ -101,10 +101,15 @@ without quantiles or buckets), so stream- and window-level paired comparisons ar
 evaluator refuses a reference recorded for a different corpus, mode, context or stride, or whose
 windows hold different tokens.
 
+`--save-tokens FILE` writes each scored window's input tokens, targets and fingerprint as JSON, so an
+external evaluator can write a `--kl-reference` file for the same windows
+(`tools/flash_next/fp64_kl_reference.py` does so with the FP64 reference forward of
+Qwen3.8-Flash-Next).
+
 `--fast-path NAME` (repeatable) also runs that fast path whether or not it is qualified for the
 configuration; it exists to measure a candidate. Qwen3.8-Flash-Next artifacts score through the
 same route as generation; `--ngram-volume FILE` names their n-gram volume when it is not
-`<artifact>.ngram`, and `--a16-activations` runs every expert bank W4A16.
+`<artifact>.ngram`, and `--reference` runs every expert bank W4A16 on the GPU.
 `--expert-a4-activations` scores nvidia/Qwen3.8-Flash-Next-FP4-Local with 4-bit expert activations
 ([guide](qwen3_8-flash-next.md#nvidia-fp4-local-checkpoint)); `report.json` records it as
 `expert_a4_activations`. `tools/quality/fast_path_gate.py` pairs an

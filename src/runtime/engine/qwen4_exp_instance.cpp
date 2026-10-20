@@ -84,19 +84,17 @@ void validate(const EngineOptions& options) {
                     [](std::uint32_t nodes) { return nodes != 0; })) {
         throw std::invalid_argument("Qwen3.8-Flash-Next verifies chains: --draft-tree-nodes is not supported");
     }
-    // 16-bit activations run every linear A16 and every expert bank W4A16 (the exact W4A16
-    // arithmetic of design §16.2.1): the quality reference, so causal scoring only, on the exact
-    // route.
-    if (options.a16_activations && options.purpose != EnginePurpose::CausalScoring) {
-        throw std::invalid_argument(
-            "Qwen3.8-Flash-Next runs 16-bit activations (the quality reference) for causal scoring only");
+    // The reference route runs every linear and expert bank with 16-bit activations and computes
+    // them precisely (TextConfig::reference; docs/maintainer/model-quality.md §6.2): the quality
+    // reference, so causal scoring only, without fast paths.
+    if (options.reference && options.purpose != EnginePurpose::CausalScoring) {
+        throw std::invalid_argument("Qwen3.8-Flash-Next runs the reference route for causal scoring only");
     }
-    if (options.a16_activations && options.fast_paths) {
-        throw std::invalid_argument(
-            "16-bit activations (the quality reference) run the exact route: disable fast paths");
+    if (options.reference && options.fast_paths) {
+        throw std::invalid_argument("the reference route runs no fast path: disable fast paths");
     }
-    if (options.a16_activations && !options.fast_path_candidates.empty()) {
-        throw std::invalid_argument("16-bit activations (the quality reference) run no fast path");
+    if (options.reference && !options.fast_path_candidates.empty()) {
+        throw std::invalid_argument("the reference route runs no fast path");
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("Engine max_concurrency must be in [1,8]");

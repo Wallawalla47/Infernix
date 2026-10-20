@@ -103,6 +103,10 @@ struct QsaBatch {
     // False leaves the tails unchanged (speculative verification, committed later by
     // qsa_commit_tails); pooled keys of blocks completing in the call are still written.
     bool update_tails = true;
+    // The reference route (docs/maintainer/model-quality.md §6.2): qsa_attention runs every width on
+    // the FP32 kernel unsplit (one pass over a column's attended tokens per KV head), instead of the
+    // split decode kernel or the FP16 Tensor Core prompt route.
+    bool reference = false;
 };
 
 /// q: BF16 [Di, index_heads, T] in place: q = RoPE(norm(q; weight), rope_positions), with

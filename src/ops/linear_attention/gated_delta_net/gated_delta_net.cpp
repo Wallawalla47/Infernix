@@ -260,7 +260,7 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
         throw std::invalid_argument("gated_delta_net: FP16 accumulation requires normalize_qk");
     }
     namespace chunked = detail::gated_delta_net::chunked;
-    if (q.ne[2] < chunked::kMinTokens) {
+    if (q.ne[2] < chunked::kMinTokens || arithmetic == GdnChunkArithmetic::Recurrent) {
         detail::gated_delta_net::launch_recurrent_inout(q, k, v, g, beta, scale, normalize_qk,
                                                         ssm_state_in, ssm_state_out, out,
                                                         execution.stream);

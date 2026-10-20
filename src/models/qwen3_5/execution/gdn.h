@@ -21,6 +21,14 @@ void gdn_projection(const Tensor& hidden, const GdnParameters& parameters, Tenso
 void gdn_norm_control(const Tensor& residual, const Tensor& norm, float epsilon,
                       const GdnParameters& parameters, Tensor& hidden, Tensor& g, Tensor& beta,
                       WorkspaceArena& workspace, DeviceExecutionView execution);
+// The reference route's GDN input projection (gdn_input_proj's row maps, by ops::precise_linear_rows)
+// and its control: the input RMSNorm into the BF16 `hidden` the other projections read, then the
+// gates from that input (ops::precise_gdn_gating).
+void gdn_projection_reference(const Tensor& hidden, const GdnParameters& parameters, Tensor& qkv,
+                              Tensor& z, cudaStream_t stream);
+void gdn_norm_control_reference(const Tensor& residual, const Tensor& norm, float epsilon,
+                                const GdnParameters& parameters, Tensor& hidden, Tensor& g,
+                                Tensor& beta, cudaStream_t stream);
 void gdn_projection_snapshot(const Tensor& hidden, const GdnParameters& parameters,
                              const GdnConfig& config, Tensor& conv_states,
                              const Tensor& valid_columns, const Tensor& initial_slots,

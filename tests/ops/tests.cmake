@@ -47,9 +47,23 @@ infernix_add_op_test(infernix_offloaded_moe_ggml_test
 infernix_add_op_test(infernix_offloaded_moe_fp8_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_fp8.cu"
   LIBRARIES infernix_ops)
+# The reference route's experts (every A16 bank kind) against a binary64 oracle, bit for bit.
+infernix_add_op_test(infernix_offloaded_moe_precise_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_precise.cu"
+  LIBRARIES infernix_ops)
 # GGUF block projections against an independent exact oracle (every ggml format, K, width).
 infernix_add_op_test(infernix_ggml_linear_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ggml_linear.cpp"
+  LIBRARIES infernix_ops)
+# The reference route's projections against the binary64 loop and a compensated exact sum (every
+# dense and GGUF format, both GGUF layouts, permutation, several outputs, SwiGLU, widths; the row
+# range, residual-add, GDN-gate and 35B-A3B sparse-MoE forms).
+infernix_add_op_test(infernix_precise_linear_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_precise_linear.cpp"
+  LIBRARIES infernix_ops)
+# The reference route's Qwen3.5 attention against FP64 (cached prefix, run-to-run and width bits).
+infernix_add_op_test(infernix_causal_attention_reference_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_causal_attention_reference.cpp"
   LIBRARIES infernix_ops)
 infernix_add_op_test(infernix_linear_topk_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_linear_topk.cu"

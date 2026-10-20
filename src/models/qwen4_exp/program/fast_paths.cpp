@@ -146,10 +146,12 @@ constexpr std::array kQualified{
     // GGUF imports: the BF16 prefill tiles (2026-10-19). Prefill gate (quick corpus, 896 and 7,168
     // tokens) on every format jointly with the qualified paths: KL excess bounds 3.7e-4 to 7.8e-4 on
     // INT8, FP8, NVFP4, K8V4, VQ2 and K4V2; decode plain on INT8 (the passing format with the lowest
-    // floor), 256 segments: TV bound 9.3e-4. BF16 KV fails, alone as with gdn-f16-accumulate: there the
-    // exact route is the reference (floor 0), and either path alone moves prefill by KL 5.5-5.9e-3 and
-    // decode by TV 4.0-4.2e-3 (2026-10-19). Timed on INT8 against the exact route: pp32768 +33 %,
-    // pp65536 +44 % (design §19.3.29); no KV format enters its kernels.
+    // floor), 256 segments: TV bound 9.3e-4. BF16 KV failed against the old reference, which was the
+    // exact route itself there (floor 0); against the precise reference (2026-10-20) the joint prefill
+    // gate with gdn-f16-accumulate passes on BF16 (KL excess -1.4e-4, bound 4.2e-5), INT8 and VQ2. The
+    // path changes no decode kernel. Timed on INT8 against the exact route: pp32768 +33 %, pp65536
+    // +44 % (design §19.3.29); no KV format enters its kernels.
+    Qualification{FastPath::GgmlBf16Prefill, {DenseKernels::Ggml, false, KvCacheStorage::BFloat16}},
     Qualification{FastPath::GgmlBf16Prefill, {DenseKernels::Ggml, false, KvCacheStorage::Int8Group64}},
     Qualification{FastPath::GgmlBf16Prefill, {DenseKernels::Ggml, false, KvCacheStorage::Fp8E4M3Row256}},
     Qualification{FastPath::GgmlBf16Prefill, {DenseKernels::Ggml, false, KvCacheStorage::Nvfp4Group16}},
@@ -174,6 +176,8 @@ constexpr std::array kQualified{
     Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Bf16, false, KvCacheStorage::Fp8KeyNvfp4Value}},
     Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Bf16, false, KvCacheStorage::Vq2}},
     Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Bf16, false, KvCacheStorage::Q4KeyVq2Value}},
+    // BF16 KV: its decode gate against the exact kernels failed (2026-10-19, TV excess bound 4.9e-3 of
+    // 4e-3); it stays registered until a gate against the precise reference fails it (6.2).
     Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Bf16, false, KvCacheStorage::BFloat16}},
     Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Bf16, false, KvCacheStorage::Int8Group64}},
     Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Bf16, false, KvCacheStorage::Fp8E4M3Row256}},

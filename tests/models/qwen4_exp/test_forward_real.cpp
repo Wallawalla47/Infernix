@@ -24,7 +24,11 @@
 // scored (long texts: the logits of every position would not fit on disk). Several such texts are
 // scored in order with one model load. --rope-yarn-factor F, anywhere, loads the model with that text
 // YaRN factor (contexts up to the native positions times F); --expert-a4-activations, anywhere, runs
-// nvidia/Qwen3.8-Flash-Next-FP4-Local's routed experts with 4-bit activations.
+// nvidia/Qwen3.8-Flash-Next-FP4-Local's routed experts with 4-bit activations; --reference, anywhere,
+// runs the reference route (docs/maintainer/model-quality.md §6.2) with --dump-logits or --blocks; and
+// --stream-experts, anywhere, leaves the expert banks in the artifact and reads each layer's records
+// into a pinned buffer before the layer runs (artifacts whose experts exceed the pinned ceiling, such
+// as the FP8 import; not with --cpu-columns).
 // Otherwise the test prefills all but the last token as one chunk,
 // then decodes the last token twice in one batch (two sequences with identical histories), and
 // checks that both decode rows equal each other bit for bit and agree with a single prefill of
@@ -119,8 +123,69 @@ double seconds_since(std::chrono::steady_clock::time_point t) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
 }
 
+// --stream-experts: the banks stay in the artifact (LoadOptions::stream_experts; an FP8 import's 120 GB of
+// experts exceed the pinned ceiling). Before each layer runs, all of that layer's records are read into
+// one pinned, mapped buffer, which every layer's host-record table points into, and the Forward reads them
+// zero-copy as it does from the RAM tier.
+class StreamedExperts {
+public:
+    StreamedExperts(const q4::ExpertStore& store, const q4::execution::Parameters& parameters)
+        : store_(store), experts_(store.experts()) {
+        for (std::uint32_t l = 0; l < store.layers(); ++l) {
+            if (parameters.layers[l].moe.bank->planes.record_stride != store.record_bytes(l)) {
+                throw std::runtime_error("streamed experts: a bank's record stride differs from its store's");
+            }
+        }
+        const std::size_t bytes = static_cast<std::size_t>(experts_) * store.record_bytes();
+        check(cudaHostAlloc(reinterpret_cast<void**>(&host_), bytes, cudaHostAllocMapped), "cudaHostAlloc");
+        void* mapped = nullptr;
+        check(cudaHostGetDevicePointer(&mapped, host_, 0), "cudaHostGetDevicePointer");
+        std::vector<const std::uint8_t*> table(static_cast<std::size_t>(store.layers()) * experts_);
+        for (std::uint32_t l = 0; l < store.layers(); ++l) {
+            for (std::uint32_t e = 0; e < experts_; ++e) {
+                table[static_cast<std::size_t>(l) * experts_ + e] =
+                    static_cast<const std::uint8_t*>(mapped) + static_cast<std::size_t>(e) * store.record_bytes(l);
+            }
+        }
+        table_ = DeviceBuffer(table.size() * sizeof(void*));
+        table_.copy_from_host(table.data(), table.size() * sizeof(void*), 0);
+        for (const auto& path : store.files()) {
+            files_.emplace_back(path, std::ios::binary);
+            if (!files_.back()) { throw std::runtime_error("streamed experts: cannot open " + path.string()); }
+        }
+    }
+    ~StreamedExperts() { cudaFreeHost(host_); }
+    StreamedExperts(const StreamedExperts&)            = delete;
+    StreamedExperts& operator=(const StreamedExperts&) = delete;
+
+    // Layer l's device table of host-record pointers.
+    [[nodiscard]] const std::uint8_t* const* table(std::uint32_t layer) const {
+        return static_cast<const std::uint8_t* const*>(table_.p) + static_cast<std::size_t>(layer) * experts_;
+    }
+    // Reads every record of `layer` into the buffer; the caller has synchronized the device first.
+    void load(std::uint32_t layer) {
+        for (std::uint32_t e = 0; e < experts_; ++e) {
+            std::uint8_t* record = host_ + static_cast<std::size_t>(e) * store_.record_bytes(layer);
+            for (const auto& segment : store_.segments(layer, e)) {
+                auto& file = files_.at(segment.file);
+                file.seekg(static_cast<std::streamoff>(segment.offset));
+                file.read(reinterpret_cast<char*>(record + segment.at), segment.bytes);
+                if (!file) { throw std::runtime_error("streamed experts: short read"); }
+            }
+        }
+    }
+
+private:
+    const q4::ExpertStore& store_;
+    std::uint32_t experts_ = 0;
+    std::uint8_t* host_    = nullptr;
+    DeviceBuffer table_;
+    std::vector<std::ifstream> files_;
+};
+
 // Every slot's recurrent state, KV pages for `rows` sequences of up to `context` tokens, and no
-// resident experts (every expert is read zero-copy from the pinned bank).
+// resident experts (every expert is read zero-copy from the pinned bank, or with streamed banks from
+// the layer's records read into a pinned buffer before the layer runs).
 struct Harness {
     Harness(const q4::execution::Parameters& parameters, DeviceContext& device, std::int32_t context, std::int32_t columns,
             std::int32_t rows, KvCacheStorage storage)
@@ -230,6 +295,10 @@ struct Harness {
         for (std::uint32_t l = 0; l < c.num_hidden_layers; ++l) {
             experts.frames.push_back(static_cast<const std::int32_t*>(frames_backing.p) + l * c.moe.experts);
         }
+        if (parameters.model.expert_store()) {
+            streamed = std::make_unique<StreamedExperts>(*parameters.model.expert_store(), parameters);
+            for (std::uint32_t l = 0; l < c.num_hidden_layers; ++l) { experts.host_tables.push_back(streamed->table(l)); }
+        }
         work_capacity = q4::execution::Forward::workspace_bytes(c, columns, context, storage);
         work          = std::make_unique<WorkspaceArena>(work_capacity);
         state_view    = state;
@@ -266,8 +335,32 @@ struct Harness {
     std::int32_t pages_per_row = 0;
     std::size_t work_capacity  = 0;
     std::unique_ptr<WorkspaceArena> work;
+    std::unique_ptr<StreamedExperts> streamed; // with streamed banks only
     std::unique_ptr<q4::execution::Forward> forward;
 };
+
+// One call of the harness's Forward: run(), or with streamed banks the same steps layer by layer
+// (Forward::run's composition, bit for bit), each layer's records read before it runs.
+void run_call(Harness& harness, DeviceContext& device, const q4::execution::ForwardBatch& batch, Tensor& logits,
+              const q4::execution::ForwardTap* tap = nullptr) {
+    if (!harness.streamed) {
+        harness.forward->run(batch, logits, tap);
+        return;
+    }
+    auto& forward = *harness.forward;
+    const auto& c = harness.config;
+    forward.begin_call(batch, &logits);
+    DeviceBuffer backing(static_cast<std::size_t>(c.residual_width()) * batch.ids.ne[0] * 2);
+    Tensor residual(backing.p, DType::BF16, {static_cast<std::int32_t>(c.residual_width()), batch.ids.ne[0]});
+    forward.embed(batch, residual);
+    for (std::uint32_t l = 0; l < c.num_hidden_layers; ++l) {
+        device.synchronize(); // the previous layer's experts are no longer read
+        harness.streamed->load(l);
+        forward.layer(l, batch, residual, tap);
+    }
+    forward.finish(batch, residual, &logits);
+    device.synchronize();
+}
 
 // Device copies of one call's inputs.
 struct Call {
@@ -316,7 +409,7 @@ Call make_call(const q4::TextConfig& c, const q4::NgramVolume& volume, const std
     const std::size_t bytes = padded_bytes(ids.size() * i32) + padded_bytes(positions.size() * i32) +
                               padded_bytes(rope.size() * i32) + padded_bytes(block_rope.size() * i32) +
                               padded_bytes(slots.size() * i32) + padded_bytes(rows.size() * i32) +
-                              padded_bytes(last.size() * i32) + padded_bytes(ngram.size());
+                              padded_bytes(last.size() * i32) + padded_bytes(ngram.size()) + padded_bytes(2);
     call.buffer = DeviceBuffer(bytes);
     auto* base = static_cast<std::byte*>(call.buffer.p);
     std::size_t offset = 0;
@@ -337,6 +430,10 @@ Call make_call(const q4::TextConfig& c, const q4::NgramVolume& volume, const std
     call.batch.ngram_rows = Tensor(put(ngram.data(), ngram.size()), DType::U8,
                                    {static_cast<std::int32_t>(row_bytes), static_cast<std::int32_t>(heads), columns});
     call.batch.ngram_format = volume.table().format;
+    // An FP8 volume that is not the artifact's own carries its per-tensor scale (as the Engine passes it).
+    if (const auto scale = volume.table().fp8_scale) {
+        call.batch.ngram_scale = Tensor(put(&*scale, sizeof(*scale)), DType::BF16, {1});
+    }
     call.host_slots       = std::move(slots);
     call.host_rows        = std::move(rows);
     call.batch.host_slots = call.host_slots;
@@ -585,8 +682,9 @@ int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     try {
         std::vector<Job> jobs;
-        // Anywhere: --rope-yarn-factor F (the model's YaRN factor) and --expert-a4-activations
-        // (NVIDIA FP4-Local's optional 4-bit expert activations).
+        // Anywhere: --rope-yarn-factor F (the model's YaRN factor), --expert-a4-activations (NVIDIA
+        // FP4-Local's optional 4-bit expert activations) and --reference (the reference route,
+        // TextConfig::reference).
         models::LoadOptions load;
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
@@ -597,6 +695,14 @@ int main(int argc, char** argv) {
             }
             if (arg == "--expert-a4-activations") {
                 load.expert_a4_activations = true;
+                continue;
+            }
+            if (arg == "--reference") {
+                load.reference = true;
+                continue;
+            }
+            if (arg == "--stream-experts") {
+                load.stream_experts = true;
                 continue;
             }
             if (arg.rfind("--", 0) != 0) {
@@ -705,7 +811,7 @@ int main(int argc, char** argv) {
                     const std::int32_t width = std::min(chunk, n - first);
                     auto call = make_call(c, volume, {tokens}, first, width, {0}, {0}, true);
                     Tensor chunk_logits(logits.p, DType::FP32, {static_cast<std::int32_t>(vocab), width});
-                    harness.forward->run(call.batch, chunk_logits, job.blocks_path.empty() ? nullptr : &block_tap);
+                    run_call(harness, device, call.batch, chunk_logits, job.blocks_path.empty() ? nullptr : &block_tap);
                     device.synchronize();
                     if (!job.blocks_path.empty()) {
                         // [position][block][mixer in, mixer out, moe in, moe out][H]
@@ -753,6 +859,7 @@ int main(int argc, char** argv) {
         const std::string& routes_path    = job.routes_path;
         const std::string& blocks_path    = job.blocks_path;
         if (job.cpu_columns) {
+            if (load.stream_experts) { throw std::invalid_argument("--cpu-columns reads a pinned bank: not with --stream-experts"); }
             return check_cpu_columns(parameters, device, volume, tokens, context, job.kv) ? 0 : 1;
         }
         if (job.decode_widths) { return check_decode_widths(parameters, device, volume, tokens, context, job.kv) ? 0 : 1; }
@@ -786,7 +893,7 @@ int main(int argc, char** argv) {
         }
         q4::execution::ForwardTap tap{&residual_taps, &route_taps, &io_taps[0], &io_taps[1], &io_taps[2], &io_taps[3]};
         t0 = std::chrono::steady_clock::now();
-        harness.forward->run(full.batch, full_logits, &tap);
+        run_call(harness, device, full.batch, full_logits, &tap);
         device.synchronize();
         const auto dump = [&](const std::string& path, std::size_t offset, std::size_t bytes) {
             if (path.empty()) { return; }
@@ -814,12 +921,12 @@ int main(int argc, char** argv) {
         for (std::int32_t slot : {1, 2}) {
             auto head = make_call(c, volume, {tokens}, 0, n - 1, {slot}, {slot});
             Tensor head_logits(logits.p, DType::FP32, {static_cast<std::int32_t>(vocab), 1});
-            harness.forward->run(head.batch, head_logits);
+            run_call(harness, device, head.batch, head_logits);
         }
         auto step = make_call(c, volume, {tokens, tokens}, n - 1, 1, {1, 2}, {1, 2});
         Tensor step_logits(logits.p, DType::FP32, {static_cast<std::int32_t>(vocab), 2});
         t0 = std::chrono::steady_clock::now();
-        harness.forward->run(step.batch, step_logits);
+        run_call(harness, device, step.batch, step_logits);
         device.synchronize();
         std::printf("batched decode of 2 sequences: %.1f ms\n", seconds_since(t0) * 1e3);
         const auto decode = to_float(logits, 2 * vocab);

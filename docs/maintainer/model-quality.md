@@ -29,8 +29,9 @@ and the chunk size only picks the scatter. So:
   chunk size, and report the spread.
 - Prefer KL divergence to a fixed reference over perplexity: it measures the distance from the
   intended distribution, not whether noise happened to favour the corpus.
-- The best reference for a given weight set is the same artifact with 16-bit activations
-  (`EngineOptions::a16_activations`), scored in one pass with BF16 KV.
+- The best reference for a given weight set is the same artifact on the reference route
+  (`EngineOptions::reference`: 16-bit activations, precise arithmetic between the model's BF16
+  rounding points, 6.2), scored in one pass with BF16 KV.
 - Exact outputs (for example BF16 KV prefill, where no Infernix kernel differs from NInfer) must
   still match exactly; noise tolerance applies only to paths whose arithmetic changed.
 
@@ -39,10 +40,10 @@ and the chunk size only picks the scatter. So:
 | Tool | Measures |
 |---|---|
 | `infernix-perplexity --prefill-chunk N` | perplexity at a chosen prefill pass size ([guide](../perplexity.md)) |
-| `infernix-perplexity --a16-activations --save-top-tokens FILE` | the 16-bit-activation reference distribution |
+| `infernix-perplexity --reference --save-top-tokens FILE` | the reference distribution (6.2) |
 | `infernix-perplexity --kl-reference FILE` | KL divergence and top-1 agreement against a saved reference |
 | `infernix_decode_quality_forced` | the decode route's log-probability of forced corpus tokens, paired position by position between builds ([benchmarks](../../bench/README.md#decode-quality)) |
-| `infernix_decode_quality_gen` / `infernix_decode_quality_judge` | end-to-end greedy decode through the production speculative path, judged token by token against the 16-bit reference (Qwen3.8-Flash-Next: every expert bank W4A16) ([benchmarks](../../bench/README.md#decode-quality)) |
+| `infernix_decode_quality_gen` / `infernix_decode_quality_judge` | end-to-end greedy decode through the production speculative path, judged token by token against the reference (6.2) ([benchmarks](../../bench/README.md#decode-quality)) |
 | `tools/quality/fast_path_gate.py` | the acceptance decisions of section 6 from the tools above |
 
 Perplexity scoring runs prefill only; decode kernels, speculative verification and n-gram drafting
@@ -55,9 +56,10 @@ Measured on 2026-10-05 on an RTX 5090 (CUDA 13.4, Windows), Gold-Star-Infer at `
 NInfer `68c54356` plus the Windows port (with only a `--prefill-chunk` option added to its
 perplexity tool), official Qwen3.8-27B NVFP4 artifact unless stated. The reference in these runs
 lifted only the 4-bit (MLP) sites to 16-bit activations; sites that run 8-bit activations (FP8
-projections) kept them. `a16_activations` lifts those too, so it is a stricter reference: the KL
-figures in sections 1, 3.1 and 3.4 are against the narrower one, and the decode comparison (3.3)
-was repeated with `a16_activations`.
+projections) kept them. The reference route (`--reference`, on Qwen3.8-27B 16-bit activations at
+every site) lifts those too, so it is a stricter reference: the KL figures in sections 1, 3.1 and
+3.4 are against the narrower one, and the decode comparison (3.3) was repeated with the reference
+route.
 
 ### 3.1 Where the activation error comes from
 
@@ -72,7 +74,7 @@ KL to the reference at one pass / 4096-token chunks, with uncached prefill time 
 | MLP down | 0.0169 / 0.0184 | 0.969 | 1.4x |
 | every 4-bit site (the reference here) | 0 | 1 | 3.0x |
 
-`a16_activations` also lifts the 8-bit sites, so it is at least as slow as the last row.
+The reference route also lifts the 8-bit sites, so it is at least as slow as the last row.
 
 ### 3.2 Infernix against NInfer, prefill
 
@@ -93,9 +95,9 @@ kernels are as accurate as NInfer's within this resolution.
 32 corpus segments of 1,536 tokens, 384 greedy tokens each (12,288 tokens per build), DFlash2 with
 7 drafts and the proposal head, INT8 KV, judged on each build's own prefixes. The same generated
 tokens were judged twice: by the study's reference (4-bit sites at 16 bits) and by the committed
-`infernix_decode_quality_judge` (`a16_activations`, every site at 16 bits):
+`infernix_decode_quality_judge` (the reference route, every site at 16 bits):
 
-| Build | Agreement, 4-bit sites lifted | Regret | Agreement, `a16_activations` | Regret |
+| Build | Agreement, 4-bit sites lifted | Regret | Agreement, reference route | Regret |
 |---|---|---|---|---|
 | NInfer | 0.9736 | 0.0080 | 0.9743 | 0.0073 |
 | Infernix | 0.9736 | 0.0086 | 0.9762 | 0.0072 |
@@ -308,9 +310,9 @@ Neither path below is built.
 ## 5. Repeating the measurements
 
 ```bat
-rem 16-bit reference, one pass per window
+rem the reference, one pass per window
 infernix-perplexity model.ninfer --text corpus.txt --context 14336 --stride 7168 --kv-dtype bf16 ^
-  --prefill-chunk 14336 --a16-activations --save-top-tokens ref.top
+  --prefill-chunk 14336 --reference --save-top-tokens ref.top
 rem a build or setting under test, at several chunk sizes
 infernix-perplexity model.ninfer --text corpus.txt --context 14336 --stride 7168 --kv-dtype int8 ^
   --prefill-chunk 4096 --kl-reference ref.top
@@ -362,14 +364,16 @@ different route may ship, what it is measured against, how much it may cost, and
   change that alters any exact-route output bit is a *numerics change*. It is allowed only to fix
   a defect or to improve precision, and only when the gates of 6.5, with the previous exact route
   in the default role and the new one in the fast role, show the new route's estimated excess is
-  at most zero and its bound within budget (6.8 records each one). When the change also alters
-  the reference route's arithmetic (a kernel the 16-bit reference runs too), each build's reference
-  favours its own route, so the FP64 Op oracle decides which route is more precise, and the gate
-  above runs against that route's reference. A precision fix whose Op error against the oracle is
-  lower therefore runs the gate against the new route's reference, and the corpus NLL, which no
+  at most zero and its bound within budget (6.8 records each one). On Qwen3.8-Flash-Next the
+  reference route has its own precise kernels (6.2), so an exact-route change leaves the reference
+  unchanged; so on Qwen3.5 once its precise reference (6.2) is adopted. Until then Qwen3.5's
+  reference runs its exact kernels with 16-bit activations, and a
+  change that also alters the reference route's arithmetic makes each build's reference favour its
+  own route, so the FP64 Op oracle decides which route is more precise, and the gate above runs
+  against that route's reference. A precision fix whose Op error against the oracle is lower
+  therefore runs the gate against the new route's reference, and the corpus NLL, which no
   reference enters, must not rise. Speed alone never justifies an exact-route numerics change: a faster route whose
-  arithmetic differs is a fast path. The exact route is the quality
-  reference's route and every gate's default run. Prompt attention there runs P×V in FP16 for every
+  arithmetic differs is a fast path. The exact route is every gate's default run. Prompt attention there runs P×V in FP16 for every
   KV format; until 2026-10-13 NVFP4, K8V4 and VQ2 KV defaulted to their 8-bit forms, which are now
   the prompt-pv8 fast path. The fast INT8 and NVFP4 prompt kernels, measured when adopted, remain
   part of the exact route.
@@ -484,9 +488,55 @@ joint gates; this arm decides only what preemption adds.
 
 ### 6.2 What is measured
 
-- **The reference** for an artifact is the same artifact with 16-bit activations in every linear
-  (`--a16-activations`), BF16 KV, each window or sequence in one pass. It holds the weights fixed,
-  so it measures what the route's arithmetic costs, not what the weight format costs.
+- **The reference** for an artifact is the same artifact on the **reference route**
+  (`EngineOptions::reference`, `--reference`), BF16 KV, each window or sequence in one pass. It
+  holds the weights fixed, so it measures what a route's arithmetic costs, not what the weight
+  format costs. It never quantizes an activation below 16 bits, and it keeps the model's BF16
+  rounding points: the places where the exact route stores a 16-bit activation (every projection's
+  output, the hyper-connection's Rn, z, m and u, a routed expert's gate and up outputs and h, the
+  residual stream, K and V). Between them it computes more precisely than any production route and
+  rounds once at each point. On Qwen3.8-Flash-Next (since 2026-10-19):
+  - every weight is decoded exactly from its stored form, and every projection, routed expert
+    matrix, router and head forms each product exactly in binary32 and sums the products in
+    ascending k in double-binary32 arithmetic, within (4096 + 2 K) u² of the exact sum relative to
+    the terms' magnitudes (`precise_linear`, `precise_swiglu`, the experts' `WideA16::kPrecise`
+    route; until 2026-10-20 binary64 sums, which the RTX 5090 runs at 1/64 of its binary32 rate);
+    its outputs are correctly rounded except within that bound of a tie, checked by
+    `infernix_precise_linear_test` and `infernix_offloaded_moe_precise_test` against a compensated
+    exact sum;
+  - GDN runs its FP32 recurrence token by token (`GdnChunkArithmetic::Recurrent`) instead of the
+    chunked route's BF16 and TF32 products, and attention runs the FP32 kernel unsplit at every
+    width (`QsaBatch::reference`) instead of the FP16 prompt route;
+  - the norms, RoPE, gates and other element-wise ops are the exact route's FP32 kernels, which
+    already round once; BF16 KV keeps V as FP16, which is exact for |v| ≥ 2^-14 and within 2^-25
+    below, far under every rounding the reference makes.
+  It runs on the GPU only (no CPU-served experts) and is many times slower than the exact route.
+  On Qwen3.5 (coded 2026-10-20; its acceptance, step 23 of that day's queue, is pending, and until
+  the owner adopts it Qwen3.5's gates keep their recorded verdicts) the same route scores prompts
+  only (a CausalScoring Engine with BF16 KV): every projection `precise_linear` with the fused
+  projections' row maps (`precise_linear_rows`), the residual projections `precise_linear_add`
+  (residual plus the sum, one rounding), the MLP `precise_swiglu`, the GDN gates `precise_gdn_gating`
+  from the normalized BF16 input, the 35B-A3B's sparse MoE `precise_sparse_moe` (FP32 router scores,
+  binary64 routing weights, BF16 expert activations, FP32 accumulation), the scoring head in FP32;
+  attention `causal_softmax_attention_reference` (FP32 scores, probabilities and P x V over the BF16
+  K and FP16 V cache, one column per query at every width); GDN `Recurrent`. Before it, Qwen3.5's
+  reference was its exact kernels with 16-bit activations. **Why precise between
+  BF16 points:** a reference made of the exact route's own kernels is the exact route itself
+  wherever an artifact already runs 16-bit activations (the IQ3_S and FP8 imports and recipe C on
+  BF16 KV had floor 0), so any arithmetic change, more precise or not, read as cost. **Why not FP32
+  activations throughout:** an FP32 residual stream made every op more accurate but raised
+  perplexity by 0.030 ± 0.009 nats (Flash-Next design §16.5): the checkpoint is calibrated to its
+  BF16 rounding points, so a reference without them measures a different model. The reference is
+  accepted only when three checks hold, recorded in 6.8: on a few hundred positions it is closer than
+  the exact route to the binary64 evaluation at the same BF16 points
+  (`tools/flash_next/reference.py --bf16-boundaries`); a known-bad change still fails the gates
+  clearly; and the exact route's floors against it are nonzero and small next to KV quantization's.
+  All three held on 2026-10-20, and since then (the owner's decision) it is the reference of every
+  Qwen3.8-Flash-Next gate. A path registered on an earlier gate against the exact kernels stays
+  registered; it is removed only when a gate against the precise reference fails it, never on the
+  expectation that one would. A sample of earlier verdicts is re-measured to confirm that they carry
+  over, and a cell an earlier gate failed (above all, floor-0 cells of 16-bit-activation artifacts with
+  BF16 KV) is registered once a gate against the precise reference passes it.
 - **Cost, not difference.** Every route scatters around the reference: on the official 27B NVFP4
   artifact, two chunk sizes differ from each other by more (KL 0.025-0.033, section 1) than either
   differs from the reference (KL 0.020-0.023). The direct divergence between two routes is mostly
@@ -522,7 +572,7 @@ joint gates; this arm decides only what preemption adds.
   (`eval/corpora/decode-4m`: PG-19, WikiText-103 validation, Chinese Wikipedia and SGLang source,
   none of it in the prefill corpus), so no two share text. Every position has the same context in
   both routes, so the measures pair position by position (65,536 per route). The reference at
-  those positions is the same 16-bit-activation, BF16-KV route, scored in one pass (`--reference`), and each forced step also
+  those positions is the same reference route with BF16 KV, scored in one pass (`--reference`), and each forced step also
   reports the log-probabilities of the reference's 64 most probable tokens and its own largest one
   (`TokenConstraint::observe`). Decode therefore has the prefill measures (KL from the reference
   over its top 64 plus one bucket, top-1 disagreement, the forced tokens' NLL) and total variation
@@ -744,10 +794,10 @@ The exact route needs no budget: `identical` compares two builds' perplexity run
 their generations token by token. Run it at the production chunk size and KV format for any change
 that could touch default arithmetic.
 
-**Coverage.** Both Engine models score teacher-forced and have the 16-bit-activation reference.
-Qwen3.8-Flash-Next's reference runs every dense linear A16 and every routed expert bank W4A16 (the
-placement-invariant W4A16 arithmetic of its design §16.2.1), so its floor includes what the W4A4
-experts' 4-bit activations cost; pass `--ngram-volume` to the gate when the volume is not
+**Coverage.** Both Engine models score teacher-forced and have a reference route (6.2).
+Qwen3.8-Flash-Next's runs every dense linear and routed expert bank with 16-bit activations and
+precise arithmetic, so its floor includes what the W4A4 experts' 4-bit activations cost and what
+every exact kernel's own rounding costs; pass `--ngram-volume` to the gate when the volume is not
 `<artifact>.ngram`. Its Engine scoring is checked against the Forward's own teacher-forced logits
 (`infernix_qwen4_exp_score_real_test`, both at the same prefill chunk): on 3,000 tokens the
 perplexity matches, top-1 agrees at every position, and the RAM and SSD expert tiers give the same
@@ -883,8 +933,8 @@ always run and are not listed. The NVFP4 27B variants select identical paths (ea
 | Qwen3.8-Flash-Next: `expert-a4-residual` | artifacts with NVFP4 W4A16 experts (recipe C; NVIDIA FP4-Local at its default 16-bit expert activations), expert calls of more than eight columns | FP8 dense (recipe C) and MXFP8 dense (FP4-Local, by recipe C's kernel verdicts and its own timing), 16-bit expert activations, every KV format (BF16 by FP4-Local's gates against the precise reference, below) |
 | Qwen3.8-Flash-Next: `expert-a4-residual-3` | the same calls as `expert-a4-residual`, three NVFP4 terms per x and h row (its more precise form, design §19.3.23; it takes precedence where both are selected) | none: two terms pass on every configuration and format they run in (2026-10-21), so it stays an unregistered candidate (`--fast-path expert-a4-residual-3`) for a cell where two terms fail; three terms cost 7-8 points of prefill speed (below) |
 | Qwen3.8-Flash-Next: `sampled-mtp-drafts` | MTP rounds with a sampled request | every Flash-Next configuration, every format (distribution and greedy identity, below; no logit changes) |
-| Qwen3.8-Flash-Next: `ggml-bf16-prefill` | GGUF dense projections in prefill calls of 32+ columns, GGUF expert calls of 14,336+ columns | IQ3_S with INT8, FP8, NVFP4, K8V4, VQ2 or K4V2 KV (fails on BF16 KV, below) |
-| `gdn-f16-accumulate` | chunked GDN calls (16+ tokens) of every Qwen3.5-family and Flash-Next artifact | NVFP4 27B, groupwise 27B and FP8, every format; IQ3_S, every format but BF16 (fails there, under `ggml-bf16-prefill`); not the 35B-A3B or Dense8 (no gain beyond spread, below) |
+| Qwen3.8-Flash-Next: `ggml-bf16-prefill` | GGUF dense projections in prefill calls of 32+ columns, GGUF expert calls of 14,336+ columns | IQ3_S, every format (BF16 KV since 2026-10-20, against the precise reference; below) |
+| `gdn-f16-accumulate` | chunked GDN calls (16+ tokens) of every Qwen3.5-family and Flash-Next artifact | NVFP4 27B, groupwise 27B and FP8, every format (FP8 with BF16 KV pending its decode gate against the precise reference, below); IQ3_S, every format but BF16 (fails there, under `ggml-bf16-prefill`); not the 35B-A3B or Dense8 (no gain beyond spread, below) |
 
 **`sampled-mtp-drafts`: drafts drawn from the draft head's top four tokens (Flash-Next, qualified
 2026-10-17).** It changes no logit: a sampled request's drafts are drawn from the head's four most
@@ -931,7 +981,11 @@ BF16 KV was removed (2026-10-19):** gated there alone (under `ggml-bf16-prefill`
 prefill gate (KL bound 7.5e-3 of 1.5e-3; the IQ3_S exact route with BF16 KV is the reference, floor 0)
 and the decode gate (TV bound 4.6e-3 of 4e-3); the 27B's BF16 floor is not 0, and there it passed.
 `ggml-bf16-prefill` fails the same cell by the same amount: at floor 0 any change of IQ3_S's
-arithmetic does.
+arithmetic does. Against the precise reference (2026-10-20) the prefill cell passes (under
+`ggml-bf16-prefill`); the decode cell (TV floor 0.029 against the exact kernels) is to be gated
+against it. FP8 with BF16 KV failed the same decode gate against the exact kernels (2026-10-19, plain,
+256 segments; floor KL 7.4e-3, TV 0.032; TV excess bound 4.9e-3 of 4e-3, top-1 bound 0.85 points of
+0.5); it stays registered until a gate against the precise reference fails it (6.2).
 Gates on the official 27B NVFP4, jointly with the qualified paths (the path
 touches no attention or KV: reduced prefill gate on every format, decode on INT8 and on BF16, the
 lowest floor):
@@ -1785,7 +1839,7 @@ and recomputes the previous output) or admission (whole extents held without `pr
   (+6.2 %), pp65536 9,022 → 9,619 (+6.6 %). The other formats were not gated with these scales.
 
 **`ggml-bf16-prefill`: BF16 tensor-core tiles in Flash-Next's GGUF prefill (IQ3_S with INT8, FP8,
-NVFP4, K8V4, VQ2 or K4V2 KV; qualified 2026-10-19).**
+NVFP4, K8V4, VQ2 or K4V2 KV, qualified 2026-10-19; BF16 KV, 2026-10-20).**
 - **What changes:** eager prefill calls of 32 or more columns run the GGUF dense projections
   (`ops::ggml_linear`, `LinearRoutes::GgmlBf16Wide`) as BF16 m16n8k16 MMAs with FP32 accumulation over
   the exact route's decoded planes: each code is exact in BF16, x is read as stored, each
@@ -1828,6 +1882,19 @@ NVFP4, K8V4, VQ2 or K4V2 KV; qualified 2026-10-19).**
   routing that any perturbation flips, as for `expert-a4-residual` (not measured). An increment
   measured first suggested the excess was `gdn-f16-accumulate`'s alone; the path's own run shows it
   is not. With floor 0 the absolute budgets (1.5e-3) admit no change of IQ3_S's arithmetic on BF16 KV.
+- **Against the precise reference** (2026-10-20, 6.2; the same artifact, corpus, chunks and joint
+  set, 36 windows, 522,334 positions per route), the cell is decided on fidelity instead:
+
+  | KV | Floor KL / top-1 | KL excess (bound) / 1.5e-3 | Top-1 excess, points (bound) / 0.5 | NLL excess | p99.9 KL ratio | Result |
+  |---|---|---|---|---|---|---|
+  | BF16 | 5.66e-3 / 2.60 % | −1.4e-4 (4.2e-5) | −0.05 (−0.01) | 3.9e-4 | 1.00 | passes |
+  | INT8 | 5.74e-3 / 2.62 % | −0.8e-4 (−0.7e-5) | −0.02 (0.03) | 2.5e-5 | 0.93 | passes |
+  | VQ2 | 2.01e-2 / 4.69 % | −1.8e-4 (8.3e-5) | −0.00 (0.05) | 3.2e-4 | 1.02 | passes |
+
+  Every context bucket passes on the three. BF16 KV is registered for this path, whose kernels see
+  no KV format and which changes no decode kernel (the decode criteria are not required), with
+  INT8's timing. `gdn-f16-accumulate`, which also failed BF16's decode gate on a nonzero floor
+  (above), stays off IQ3_S with BF16 KV until that gate is run against the precise reference.
 - **Decode gate** (plain, 256 segments, prompts of 512-8,192 tokens, whose prefill takes the dense
   tiles but not the expert tiles): INT8, the passing format with the lowest floor, passes (TV excess
   5.4e-4, bound 9.3e-4 of 4e-3; top-1 +0.10 points, bound 0.32; KL 2.4e-4; NLL −2.9e-4; p99.9 KL
@@ -1888,7 +1955,58 @@ NVFP4, K8V4, VQ2 or K4V2 KV; qualified 2026-10-19).**
 
 ### 6.8 Exact-route numerics changes
 
-A change to exact-route bits (6.1) is recorded here with its gate.
+A change to exact-route bits (6.1) is recorded here with its gate, and so is the acceptance of a
+reference (6.2).
+
+**Qwen3.8-Flash-Next precise reference (accepted 2026-10-20; the gate reference since, by the
+owner's decision).** The three checks of 6.2:
+1. *More precise:* on the official FP8 import's blocks, with identical inputs, the mean relative
+   error against the binary64 evaluation at the same BF16 points (`tools/flash_next/reference.py
+   --bf16-boundaries`) falls from the exact route's to the reference's: projections 4.7e-3 → 3.6e-4,
+   MoE 2.0e-3 → 6.2e-5, whole block 2.4e-3 → 4.2e-4; attention's largest error is about unchanged
+   (5.7e-3 → 5.3e-3). Model-level KL cannot rank the two (it saturates), hence the block check.
+2. *Still has teeth:* VQ2 KV measured as if it were a fast path (IQ3_S prefill, quick corpus) fails
+   every criterion: KL excess 1.4e-2 against the 1.5e-3 budget.
+3. *Sane floors:* the IQ3_S exact route's prefill floors against it are KL 5.7e-3 on BF16 and INT8
+   KV and 2.0e-2 on VQ2, nonzero, where the exact-kernel reference gave BF16 KV a floor of 0.
+
+**Faster reference arithmetic (2026-10-20).** The reference route spent over 99 % of its GPU time in
+binary64 dot products (Nsight Systems over one gate window, RTX 5090, CUDA 13.4: recipe C 538 s, routed
+experts 57.5 % and dense projections 42 %; IQ3_S 492 s, 59 % and 40 %), which the RTX 5090 runs at 1/64
+of its binary32 rate. They now form each product exactly in binary32 (BF16 x times a weight of at most
+16 significant bits; Q8 and dense NVFP4 weights split by an FMA; GGUF codes, with each sub-block's scale
+and offset applied to its sums) and sum in double-binary32 arithmetic (Sum2 blocks of 32 terms joined by
+AccurateDWPlusDW): within (4096 + 2 K) u² of the exact sum relative to the terms' magnitudes, against
+binary64's 2 K 2^-53.
+- Op oracles: all 255,750 outputs of `infernix_precise_linear_test` (every dense and GGUF format, BF16
+  and FP32 outputs, widths 1-37) are correctly rounded, none lies within the route's error of a tie,
+  and none differs from the binary64 loop; every routed-expert output of the four bank kinds equals the
+  correctly rounded oracle, bit-identical in every placement.
+- Against the binary64 reference on the IQ3_S prefill gate's corpus (quick, 14,336/7,168, BF16 KV,
+  261,167 positions): 21 of 36 windows are bit-identical throughout. In the other 15 a rounding falls
+  differently once (first differing scored position 0 to 6,003) and the difference propagates through
+  later layers and tokens: 75.3 % of positions keep bit-identical target log-probabilities and top-64
+  lists, KL from the binary64 reference is 1.47e-4, top-1 agreement 99.79 %, corpus NLL 1.226203
+  against 1.226187. Two references that each round correctly except within their own error of a tie
+  differ wherever an exact value lies inside either error band; over the window's billions of
+  roundings a few do. Which op rounds differently first was not traced.
+- Check 1 on the FP8 import is unchanged: KL against the binary64 evaluation 1.6477e-2, as before, and
+  the block errors against it equal the binary64 reference's to three digits (projections 3.59e-4,
+  MoE 6.2e-5, whole block 4.18e-4).
+- Speed: recipe C's window takes 82 s of GPU time (538 s, 6.5x: NVFP4 experts 5.9x gate/up and 7.3x
+  down, FP8 projections 9.9x, Q8 4.0x) and IQ3_S's 153 s (492 s, 3.2x: GGUF experts 3.3x gate/up and
+  3.9x down, GGUF projections 2.8x, BF16 5.5x); the GGUF decoders are now the slowest part. The IQ3_S
+  gate corpus scored at 98.3 tok/s (38.6 before) with the first version of the kernels, before the
+  decode improvements the window profiles measure.
+The owner adopted this arithmetic as the gate reference on 2026-10-20, with the IQ3_S prefill gate
+(checks 2 and 3 and the `ggml-bf16-prefill` BF16 verdict) re-run against it the same evening (quick
+corpus, 36 windows, chunks 896 and 7,168, `ggml-bf16-prefill` + `gdn-f16-accumulate`; the reference
+pass took 37 minutes): the floors are BF16 5.67e-3, INT8 5.74e-3 and VQ2 2.01e-2 (check 3; 5.7e-3,
+5.7e-3 and 2.0e-2 under the binary64 sums), VQ2's default runs as the candidate against BF16's still
+fail every criterion (check 2: KL excess 1.44e-2, bound 1.68e-2, p99.9 ratio 3.64), and the joint
+paths pass on BF16 (KL excess -1.43e-4, bound 4.1e-5; top-1 -0.04 points, bound 0.009; p99.9 ratio
+1.007), INT8 (KL -7.9e-5, bound -6.0e-6) and VQ2 (KL -1.77e-4, bound 8.2e-5), as they did under the
+binary64 sums.
 
 **35B-A3B Q8 shared-expert prefill (`4f0bb18f`, NInfer `610f79e9d`).** The Q8 gate/up and down
 prefill kernels of `Qwen3.6-35B-A3B` apply each 32-wide group's FP16 scale to the FP32 partial sum

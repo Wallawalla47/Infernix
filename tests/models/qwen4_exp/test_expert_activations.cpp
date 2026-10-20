@@ -55,7 +55,7 @@ struct Case {
     std::optional<std::string> marker; // the text config's expert_a4_activations
     bool scales;                       // the banks store their activation scales
     bool expert_a4;                    // LoadOptions::expert_a4_activations
-    bool a16;                          // LoadOptions::a16_activations
+    bool reference;                    // LoadOptions::reference
     int expected;                      // 1: W4A16, 0: W4A4, -1: refused
     const char* refusal = "";          // a fragment of the refusal
 };
@@ -66,13 +66,13 @@ int main() {
     const Case cases[] = {
         {"W4A4 bank", std::nullopt, true, false, false, 0},
         {"weight-only bank", std::nullopt, false, false, false, 1},
-        {"W4A4 bank, 16-bit activations", std::nullopt, true, false, true, 1},
+        {"W4A4 bank, reference route", std::nullopt, true, false, true, 1},
         {"W4A4 bank, option", std::nullopt, true, true, false, -1, "--expert-a4-activations"},
         {"weight-only bank, option", std::nullopt, false, true, false, -1, "--expert-a4-activations"},
         {"optional bank", "optional", true, false, false, 1},
         {"optional bank, option", "optional", true, true, false, 0},
-        {"optional bank, 16-bit activations", "optional", true, false, true, 1},
-        {"optional bank, option and 16-bit activations", "optional", true, true, true, -1, "contradicts"},
+        {"optional bank, reference route", "optional", true, false, true, 1},
+        {"optional bank, option and reference route", "optional", true, true, true, -1, "contradicts"},
         {"optional bank without scales", "optional", false, false, false, -1, "activation scales"},
         {"unknown marker", "required", true, false, false, -1, "must be optional"},
     };
@@ -85,7 +85,7 @@ int main() {
         if (c.scales) { directory.bindings[kScales] = artifact::Binding{}; }
         models::LoadOptions options;
         options.expert_a4_activations = c.expert_a4;
-        options.a16_activations       = c.a16;
+        options.reference             = c.reference;
         try {
             const models::qwen4_exp::Config parsed = parse_config(directory, options);
             const int got       = parsed.text.moe.a16_experts ? 1 : 0;

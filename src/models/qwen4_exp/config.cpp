@@ -286,8 +286,8 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
         out.text = text(directory.component("text").config);
         out.text.rope.yarn_factor = options.rope_yarn_factor;
         // A weight-only export stores its banks without activation scales (bind_moe checks every
-        // layer); banks whose 4-bit activations are optional run them only when asked; the
-        // 16-bit-activation reference (LoadOptions::a16_activations) runs every bank W4A16.
+        // layer); banks whose 4-bit activations are optional run them only when asked; the reference
+        // route (LoadOptions::reference) runs every bank W4A16.
         const bool scales = directory.bindings.contains("text/layers/0/moe/expert_input_scales");
         if (out.text.moe.a4_optional && !scales) {
             throw ArtifactError("optional 4-bit expert activations need the banks' activation scales");
@@ -296,10 +296,11 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
             throw ArtifactError("--expert-a4-activations needs an artifact whose routed experts offer 4-bit "
                                 "activations as an option (nvidia/Qwen3.8-Flash-Next-FP4-Local)");
         }
-        if (options.expert_a4_activations && options.a16_activations) {
-            throw ArtifactError("--expert-a4-activations contradicts 16-bit activations");
+        if (options.expert_a4_activations && options.reference) {
+            throw ArtifactError("--expert-a4-activations contradicts the reference route");
         }
-        out.text.moe.a16_experts = options.a16_activations ||
+        out.text.reference       = options.reference;
+        out.text.moe.a16_experts = options.reference ||
                                    (out.text.moe.a4_optional ? !options.expert_a4_activations : !scales);
         if (options.rope_yarn_factor > 1.0F && out.text.rope.theta <= 1.0F) {
             throw ArtifactError("YaRN needs a RoPE theta above 1");

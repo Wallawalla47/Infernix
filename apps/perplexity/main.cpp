@@ -50,6 +50,7 @@ struct Options {
     std::optional<std::filesystem::path> text;
     std::optional<std::filesystem::path> output;
     std::optional<std::filesystem::path> save_top_tokens;
+    std::optional<std::filesystem::path> save_tokens;
     std::optional<std::filesystem::path> kl_reference;
     std::filesystem::path expert_stripe; // Qwen3.8-Flash-Next's record tails on a second drive
     float rope_yarn_factor              = 1.0F;
@@ -61,7 +62,7 @@ struct Options {
     bool quick                          = false;
     bool original_int8_prefill_kernel   = false;
     bool original_nvfp4_prefill_kernel  = false;
-    bool a16_activations                = false;
+    bool reference                      = false;
     bool expert_a4_activations          = false;
     bool fast_paths                     = true;
     std::vector<infernix::FastPath> fast_path_candidates;
@@ -79,9 +80,9 @@ std::string usage_text() {
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2] (default fp8)\n"
            "       [--use-original-int8-prefill-kernel (int8 only; default fast kernel)]\n"
            "       [--use-original-nvfp4-prefill-kernel (nvfp4 only; default fast kernel)]\n"
-           "       [--a16-activations] (16-bit activations in every linear: the reference for\n"
-           "        measuring activation quantization, on the exact route; at least 3x slower\n"
-           "        on NVFP4 artifacts)\n"
+           "       [--reference] (the quality reference's route, no fast path, BF16 KV: every\n"
+           "        projection, expert, recurrence and attention computed precisely between\n"
+           "        the model's BF16 boundaries; many times slower)\n"
            "       [--expert-a4-activations] (nvidia/Qwen3.8-Flash-Next-FP4-Local only: routed\n"
            "        experts with 4-bit activations, using the activation scales NVIDIA\n"
            "        calibrated for them; default 16-bit)\n"
@@ -93,6 +94,8 @@ std::string usage_text() {
            "        <artifact>.ngram)\n"
            "       [--output <directory>]\n"
            "       [--save-top-tokens <file>] (record each position's 64 most probable tokens)\n"
+           "       [--save-tokens <file>] (record each window's input tokens as JSON, for an external\n"
+           "        evaluator that writes a --kl-reference of the same windows)\n"
            "       [--kl-reference <file>] (KL divergence from a --save-top-tokens run of the\n"
            "        same corpus, context and stride, by context length)\n"
            "       [--expert-stripe <file>] (Qwen3.8-Flash-Next's expert record tails on a second\n"
@@ -149,8 +152,8 @@ Options parse_options(int argc, char** argv) {
             out.original_int8_prefill_kernel = true;
         } else if (option == "--use-original-nvfp4-prefill-kernel") {
             out.original_nvfp4_prefill_kernel = true;
-        } else if (option == "--a16-activations") {
-            out.a16_activations = true;
+        } else if (option == "--reference") {
+            out.reference = true;
         } else if (option == "--expert-a4-activations") {
             out.expert_a4_activations = true;
         } else if (option == "--ngram-volume") {
@@ -185,6 +188,8 @@ Options parse_options(int argc, char** argv) {
             out.output = std::filesystem::path(value("--output"));
         } else if (option == "--save-top-tokens") {
             out.save_top_tokens = std::filesystem::path(value("--save-top-tokens"));
+        } else if (option == "--save-tokens") {
+            out.save_tokens = std::filesystem::path(value("--save-tokens"));
         } else if (option == "--kl-reference") {
             out.kl_reference = std::filesystem::path(value("--kl-reference"));
         } else if (option == "--expert-stripe") {
@@ -298,10 +303,10 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.kv_cache         = options.kv;
     engine_options.original_int8_prefill_kernel = options.original_int8_prefill_kernel;
     engine_options.original_nvfp4_prefill_kernel = options.original_nvfp4_prefill_kernel;
-    engine_options.a16_activations               = options.a16_activations;
+    engine_options.reference                     = options.reference;
     engine_options.expert_a4_activations         = options.expert_a4_activations;
-    // The 16-bit-activation reference runs the exact route.
-    engine_options.fast_paths           = options.fast_paths && !options.a16_activations;
+    // The reference route runs no fast path.
+    engine_options.fast_paths           = options.fast_paths && !options.reference;
     engine_options.fast_path_candidates = options.fast_path_candidates;
     if (options.ngram_volume) { engine_options.ngram_volume_path = *options.ngram_volume; }
     engine_options.expert_stripe_path   = options.expert_stripe;
@@ -366,6 +371,8 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     const std::uint32_t own_top_tokens =
         top_tokens ? infernix::perplexity::kReferenceTopTokens : (kl_reference ? 1U : 0U);
     DivergenceAggregate overall_divergence;
+    // --save-tokens: every window's input tokens and its targets, in scoring order.
+    json saved_windows                           = json::array();
     const Clock::time_point scoring_started      = Clock::now();
     logger->info("scoring | {} streams | {} tokens | {} windows",
                  infernix::product::format_pretty_count(streams.size()),
@@ -400,6 +407,14 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
                 stream.tokens.begin() + static_cast<std::ptrdiff_t>(window.input_end));
             const Clock::time_point window_started = Clock::now();
             const std::uint64_t input_hash = infernix::perplexity::token_fingerprint(input);
+            if (options.save_tokens) {
+                saved_windows.push_back({{"stream_index", stream_index},
+                                         {"target_begin", window.target_begin},
+                                         {"target_end", window.target_end},
+                                         {"first_target", window.first_target},
+                                         {"input_hash", input_hash},
+                                         {"tokens", input}});
+            }
             infernix::ScoreOptions score_options{.top_k = own_top_tokens};
             std::optional<infernix::perplexity::ReferenceWindow> reference;
             if (kl_reference) {
@@ -532,6 +547,16 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     progress->clear();
     if (top_tokens) { top_tokens->finish(); }
     if (kl_reference) { kl_reference->finish(); }
+    if (options.save_tokens) {
+        std::ofstream file(*options.save_tokens);
+        file << json{{"corpus_id", corpus.corpus_id},
+                     {"mode", corpus.mode},
+                     {"context", options.context},
+                     {"stride", options.stride},
+                     {"windows", std::move(saved_windows)}}
+                    .dump();
+        if (!file) { throw std::runtime_error("cannot write " + options.save_tokens->string()); }
+    }
     logger->info("scoring complete | {} tokens | {} windows | PPL {:.6g} | {} | {}",
                  infernix::product::format_pretty_count(overall.scored_tokens), completed_windows,
                  overall.ppl(), infernix::product::format_pretty_duration(scoring_seconds),
@@ -566,7 +591,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
           {"rope_yarn_factor", options.rope_yarn_factor},
           {"original_int8_prefill_kernel", options.original_int8_prefill_kernel},
           {"original_nvfp4_prefill_kernel", options.original_nvfp4_prefill_kernel},
-          {"a16_activations", options.a16_activations},
+          {"reference", options.reference},
           {"expert_a4_activations", options.expert_a4_activations},
           {"fast_paths", load.fast_paths},
           {"fast_path_configuration", load.fast_path_configuration},

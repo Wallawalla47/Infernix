@@ -94,10 +94,9 @@ void validate_engine_options(const EngineOptions& options, models::Architecture 
         throw std::invalid_argument(
             "the original NVFP4 prefill kernel requires the NVFP4 KV cache (--kv-dtype nvfp4)");
     }
-    // 16-bit activations are the reference the fast paths are measured against.
-    if (options.a16_activations && (options.fast_paths || !options.fast_path_candidates.empty())) {
-        throw std::invalid_argument(
-            "16-bit activations (the quality reference) run the exact route: disable fast paths");
+    // The reference route is what the fast paths are measured against.
+    if (options.reference && (options.fast_paths || !options.fast_path_candidates.empty())) {
+        throw std::invalid_argument("the reference route runs no fast path: disable fast paths");
     }
 }
 

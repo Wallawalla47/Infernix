@@ -41,10 +41,10 @@ struct PendingWeight {
 // Logical demands of the selected model; each parameter is declared exactly once.
 class Bindings {
 public:
-    // a16_activations binds every Use A16Only (LoadOptions::a16_activations). first_id: the
-    // WeightId of this binder's first parameter (a companion artifact's follow the main artifact's).
-    Bindings(artifact::Binder& binder, bool a16_activations, std::size_t first_id = 0)
-        : binder_(binder), a16_activations_(a16_activations), first_id_(first_id) {}
+    // The reference route binds every Use A16Only (LoadOptions::reference). first_id: the WeightId
+    // of this binder's first parameter (a companion artifact's follow the main artifact's).
+    Bindings(artifact::Binder& binder, bool reference, std::size_t first_id = 0)
+        : binder_(binder), reference_(reference), first_id_(first_id) {}
 
     WeightId parameter(std::string name, Shape shape, std::string_view input = {},
                        std::optional<QType> exact_format = {},
@@ -60,8 +60,7 @@ public:
             if (!use.auxiliaries.empty()) {
                 throw ArtifactError(name + ": Qwen4Exp weights carry no Use auxiliaries");
             }
-            pending.policy = a16_activations_ ? ops::LinearPolicy::A16Only
-                                              : linear_policy(*use.activation_policy);
+            pending.policy = reference_ ? ops::LinearPolicy::A16Only : linear_policy(*use.activation_policy);
         }
         const WeightId id{first_id_ + weights.size()};
         ids_.emplace(std::move(name), id);
@@ -91,7 +90,7 @@ public:
 
 private:
     artifact::Binder& binder_;
-    bool a16_activations_ = false;
+    bool reference_       = false;
     std::size_t first_id_ = 0;
     std::map<std::string, WeightId, std::less<>> ids_;
 };
@@ -504,7 +503,7 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     }
     artifact::Binder binder(reader);
     out->resources = bind_resources(binder, out->config);
-    Bindings bindings(binder, options.a16_activations);
+    Bindings bindings(binder, options.reference);
     out->weights = bind_text(bindings, out->config.text,
                              options.stream_experts ? Residency::Streamed : Residency::HostPinned);
     if (out->config.vision) {
@@ -534,7 +533,7 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
         }
     }
     // Every layer's bank runs the arithmetic parse_config chose (bind_moe checked each against it);
-    // W4A4 banks read their activation scales.
+    // W4A4 banks read their activation scales. The reference route runs every bank W4A16.
     if (!out->config.text.moe.a16_experts) {
         for (const auto& layer : out->weights.layers) {
             out->input_scales.push_back(
@@ -606,7 +605,7 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
             d.fused_head          = !d.ggml_head && (proposal ? tensor.format == "q4_g64_fp16" && d.head_rows == 131072U
                                                               : tensor.format == "q8_g32_fp16");
         }
-        Bindings draft(draft_binder, options.a16_activations, out->pending.size());
+        Bindings draft(draft_binder, options.reference, out->pending.size());
         out->draft_first     = out->pending.size();
         out->weights.dflash2 = bind_dflash2(draft, *out->config.dflash2, out->config.text);
         for (auto& weight : draft.weights) { out->pending.push_back(std::move(weight)); }

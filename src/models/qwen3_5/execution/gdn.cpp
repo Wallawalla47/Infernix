@@ -2,6 +2,8 @@
 
 #include "infernix/ops/gdn_gating_proj.h"
 #include "infernix/ops/gdn_input_proj.h"
+#include "infernix/ops/precise_linear.h"
+#include "infernix/ops/rmsnorm.h"
 
 #include <algorithm>
 #include <stdexcept>
@@ -74,6 +76,36 @@ void gdn_projection(const Tensor& hidden, const GdnParameters& parameters, Tenso
         const auto& single = std::get<LinearParameters>(parameters.projection);
         ops::gdn_input_proj(hidden, single.weight, qkv, z, single.policy, workspace, stream);
     }
+}
+
+void gdn_projection_reference(const Tensor& hidden, const GdnParameters& parameters, Tensor& qkv,
+                              Tensor& z, cudaStream_t stream) {
+    const std::int32_t channels = qkv.ne[0];
+    const std::int32_t gates    = z.ne[0];
+    if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection)) {
+        // qkv = [query-key rows; value rows], z = the value/z parent's z rows.
+        const std::int32_t qk = pair->first.n;
+        ops::precise_linear_rows(hidden, pair->first, 0, qk, qkv, 0, stream);
+        ops::precise_linear_rows(hidden, pair->second, 0, channels - qk, qkv, qk, stream);
+        ops::precise_linear_rows(hidden, pair->second, channels - qk, gates, z, 0, stream);
+        return;
+    }
+    const Weight& w = std::get<LinearParameters>(parameters.projection).weight;
+    ops::precise_linear_rows(hidden, w, 0, channels, qkv, 0, stream);
+    ops::precise_linear_rows(hidden, w, channels, gates, z, 0, stream);
+}
+
+void gdn_norm_control_reference(const Tensor& residual, const Tensor& norm, float epsilon,
+                                const GdnParameters& parameters, Tensor& hidden, Tensor& g,
+                                Tensor& beta, cudaStream_t stream) {
+    ops::rmsnorm(residual, norm, epsilon, true, hidden, stream);
+    if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.control)) {
+        const Weight* ab[] = {&pair->first, &pair->second};
+        ops::precise_gdn_gating(hidden, ab, parameters.a_log, parameters.dt_bias, g, beta, stream);
+        return;
+    }
+    const Weight* ab[] = {&std::get<LinearParameters>(parameters.control).weight};
+    ops::precise_gdn_gating(hidden, ab, parameters.a_log, parameters.dt_bias, g, beta, stream);
 }
 
 void gdn_norm_control(const Tensor& residual, const Tensor& norm, float epsilon,

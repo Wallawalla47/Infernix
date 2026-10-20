@@ -58,8 +58,11 @@ enum class ExpertActivation : std::uint8_t { kA4, kA16 };
 // order, not only on the weights; kA4Residual3, the same with three terms (the third encodes what two
 // left: more precise, slower); kGgmlBf16 (GGUF banks, the ggml-bf16-prefill fast path), BF16 tiles over
 // each expert's decoded planes with x and h as stored and FP32 sums (ops/ggml/ggml_bf16_tile.cuh).
-// Every other bank ignores the value it does not name.
-enum class WideA16 : std::uint8_t { kExact, kA4Residual, kA4Residual3, kGgmlBf16 };
+// Every other bank ignores the value it does not name. kPrecise (every A16 bank, every column count,
+// GPU only) is the reference route (docs/maintainer/model-quality.md §6.2): exactly decoded weights,
+// x and h as stored, binary64 sums in ascending k, one rounding at each of the exact route's BF16
+// boundaries (y_gate, y_up, h, y).
+enum class WideA16 : std::uint8_t { kExact, kA4Residual, kA4Residual3, kGgmlBf16, kPrecise };
 
 enum class CpuIsa { kScalar, kAvx2, kAvxVnni, kAvx512Vnni };
 

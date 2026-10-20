@@ -51,6 +51,14 @@ void hyper_connection_mix(const Tensor& residual, const Tensor& norm_weight, con
                           std::int32_t rank, float eps, Tensor& x, Tensor* inject,
                           WorkspaceArena& workspace, cudaStream_t stream);
 
+/// The reference route's mixer (docs/maintainer/model-quality.md §6.2), at every T: the composed
+/// route's BF16 boundaries (Rn, z, m, u, then x) with both projections precise_linear's (exactly decoded
+/// weights, binary64 sums, one rounding each). Operands as hyper_connection_mix; down and up may be
+/// any weight precise_linear takes. Uses hyper_connection_mix_workspace_capacity_bytes.
+void hyper_connection_mix_precise(const Tensor& residual, const Tensor& norm_weight, const Weight& down,
+                                  const Weight& up, std::int32_t streams, std::int32_t rank, float eps, Tensor& x,
+                                  Tensor* inject, WorkspaceArena& workspace, cudaStream_t stream);
+
 /// The workspace hyper_connection_mix needs for every T in [1, max_tokens].
 [[nodiscard]] std::size_t hyper_connection_mix_workspace_capacity_bytes(
     const Weight& down, const Weight& up, LinearPolicy policy, std::int32_t streams,
