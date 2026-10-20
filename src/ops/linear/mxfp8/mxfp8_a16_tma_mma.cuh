@@ -28,7 +28,7 @@
 //
 // A TMA refill is an async-proxy write into a stage the consumers have read through the generic
 // proxy, so each consumer thread orders its reads before its warp releases the stage
-// (fence.proxy.async.shared::cta). Without that fence TMA-staged outputs came out wrong in up to 37 %
+// (fence_reads_before_async_refill, ops/common/mbarrier.cuh). Without that fence TMA-staged outputs came out wrong in up to 37 %
 // of the calls while offloaded_sparse_moe's routed experts ran beside the kernel
 // (tests/ops/linear/test_mxfp8_overlap.cu, 2026-10-20).
 
@@ -345,7 +345,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
         // Release only after every lane in this consumer warp has finished its shared reads; a TMA
         // refill is an async-proxy write, so each thread first orders its generic-proxy reads before
         // it.
-        if constexpr (kTma) { asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory"); }
+        if constexpr (kTma) { fence_reads_before_async_refill(); }
         __syncwarp();
         if (lane == 0) cta_mbarrier_arrive(empty + stage);
     }

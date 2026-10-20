@@ -1,5 +1,6 @@
 #pragma once
 #include "ops/linear/fp8/fp8_launch.h"
+#include "ops/linear/fp8/fp8_a16_ring_mma.cuh"
 #include "ops/linear/fp8/fp8_a16_tma_mma.cuh"
 #include "ops/linear/fp8/fp8_template_launch.cuh"
 #include "ops/linear/fp8/fp8_instances.cuh"
@@ -34,8 +35,16 @@ void fp8_linear_a16_sliced_k(const Tensor& x, const Weight& w, Tensor& out, cuda
         LinearIdentityEpilogue{}, stream);
 }
 
-// The warp-specialized TMA A16 GEMM (both operands streamed through TMA, codes widened to BF16 in
-// registers) as a plain linear.
+// The warp-specialized A16 GEMM (both operands staged by a producer warp's cp.async through a
+// stage ring, codes widened to BF16 in registers) as a plain linear.
+template <class Geometry, class Schedule>
+void fp8_linear_a16_ring(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    launch_fp8_a16_ring_mma<Fp8ScheduleInstance<Schedule, Geometry::kInputRows>>(
+        fp8_a16_operands(x, w), LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), w.n},
+        LinearIdentityEpilogue{}, stream);
+}
+
+// The same GEMM with the TMA producer (fp8_a16_tma_mma.cuh): the ring's consumers and bits.
 template <class Geometry, class Schedule>
 void fp8_linear_a16_tma(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     launch_fp8_a16_tma_mma<Fp8ScheduleInstance<Schedule, Geometry::kInputRows>>(

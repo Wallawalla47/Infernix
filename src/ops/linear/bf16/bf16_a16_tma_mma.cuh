@@ -163,7 +163,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_t
         cta_mbarrier_wait(full + stage, (kt / S) & 1U);
         bf16_mma_compute_stage<Schedule>(a + stage * BR * BK, b + stage * BT * BK, accum, warp,
                                          lane);
-        // Every lane must finish its shared reads before the elected lane releases this stage.
+        // Every lane must finish its shared reads (ordered before the TMA refill) before the elected
+        // lane releases this stage.
+        fence_reads_before_async_refill();
         __syncwarp();
         if (lane == 0) cta_mbarrier_arrive(empty + stage);
     }

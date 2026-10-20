@@ -207,7 +207,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a8_tma
         cta_mbarrier_wait(full + stage, (kt / S) & 1U);
         fp8_mma_compute_stage<Schedule>(activation + stage * BT * BK, weight + stage * BR * BK,
                                         accumulators, warp, lane);
-        // Release only after every lane in this consumer warp has finished its shared reads.
+        // Release only after every lane in this consumer warp has finished its shared reads,
+        // ordered before the TMA refill.
+        fence_reads_before_async_refill();
         __syncwarp();
         if (lane == 0) cta_mbarrier_arrive(empty + stage);
     }

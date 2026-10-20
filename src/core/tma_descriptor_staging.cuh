@@ -61,11 +61,14 @@ __global__ void store_descriptor_words(const DescriptorWords<Words> source,
 
 } // namespace tma_staging_detail
 
-// Makes the tensor map at `tensor_map` (128 bytes in global memory, stored by the staging
-// kernel through the generic proxy) visible to the TMA proxy. Call once per tensor map, in the
-// thread that issues cp.async.bulk.tensor with it, before its first use.
+// Makes the tensor map at `tensor_map` (128 bytes in global memory) visible to the TMA proxy. Call
+// once per tensor map, in the thread that issues cp.async.bulk.tensor with it, before its first use.
+// System scope: an eager launch's map was stored by the staging kernel (a .gpu release, which a .sys
+// acquire also pairs with), but a captured launch's map was written by the host with cudaMemcpy, which
+// the CUDA Programming Guide (Asynchronous Data Copies, tensor maps in global memory) pairs with a
+// .sys acquire.
 __device__ __forceinline__ void acquire_staged_tensor_map(const void* tensor_map) {
-    asm volatile("fence.proxy.tensormap::generic.acquire.gpu [%0], 128;"
+    asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;"
                  :
                  : "l"(tensor_map)
                  : "memory");

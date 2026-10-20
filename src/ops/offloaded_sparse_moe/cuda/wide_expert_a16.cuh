@@ -248,6 +248,7 @@ __global__ __launch_bounds__(ScheduleA16::kThreads, ScheduleA16::kMinBlocksPerSm
                     }
                 }
             }
+            fence_reads_before_async_refill(); // the shared reads before the bulk refills
             __syncwarp();
             if (lane == 0) { cta_mbarrier_arrive(&shared.empty[stage]); }
         }

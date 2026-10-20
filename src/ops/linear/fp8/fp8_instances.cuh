@@ -39,10 +39,10 @@ using Fp8A8ResidualT64R128 =
     Fp8A8MmaSchedule<64, 128, 128, 2, 4, 2, 1, Cache::cg, Cache::cg,
                      Fp8MmaFragmentPipeline::PingPong, Fp8MmaRaster::TokenFast, 1, 2>;
 
-using Fp8A16TmaT32R64   = Fp8A16TmaMmaSchedule<32, 64, 1, 4, 6, 1>;
-using Fp8A16TmaT32R64S3 = Fp8A16TmaMmaSchedule<32, 64, 1, 4, 3, 2>;
-using Fp8A16TmaT32R128  = Fp8A16TmaMmaSchedule<32, 128, 1, 8, 4, 1>;
-using Fp8A16TmaT64R128  = Fp8A16TmaMmaSchedule<64, 128, 2, 4, 3, 1>;
+using Fp8A16RingT32R64   = Fp8A16RingMmaSchedule<32, 64, 1, 4, 6, 1>;
+using Fp8A16RingT32R64S3 = Fp8A16RingMmaSchedule<32, 64, 1, 4, 3, 2>;
+using Fp8A16RingT32R128  = Fp8A16RingMmaSchedule<32, 128, 1, 8, 4, 1>;
+using Fp8A16RingT64R128  = Fp8A16RingMmaSchedule<64, 128, 2, 4, 3, 1>;
 template <int Tokens, int Warps, int Stages>
 using Fp8SlicedInstance = Fp8A16SlicedKMmaSchedule<
     Warps, Tokens, (Stages * (16 * Warps * 64 + Warps * Tokens * 128) > 48 * 1024 ? 1 : 2),

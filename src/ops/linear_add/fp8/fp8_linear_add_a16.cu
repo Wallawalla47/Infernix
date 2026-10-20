@@ -7,7 +7,7 @@
 #include "ops/linear/fp8/fp8_schedule.cuh"
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/fp8/fp8_a16_simt.cuh"
-#include "ops/linear/fp8/fp8_a16_tma_mma.cuh"
+#include "ops/linear/fp8/fp8_a16_ring_mma.cuh"
 
 #include <stdexcept>
 
@@ -42,20 +42,20 @@ void launch_matrix(const Tensor& x, const Weight& weight, Tensor& residual, cuda
         if (x.ne[1] <= 8) return sliced.template operator()<8, 8, 2>();
     }
     if (x.ne[1] <= 16) return sliced.template operator()<16, 8, 2>();
-    // Wider verification rows stream both operands through TMA. 32-column tiles keep every SM busy
+    // Wider verification rows stream both operands through the ring GEMM. 32-column tiles keep every SM busy
     // through 192 columns, where the stream rather than BF16 Tensor Core work sets the time; the
     // 64-column tile then holds the Tensor Core limit beyond 192, except where its tile count
     // would add a wave (257..384 columns).
-    const auto tma = [&]<class Schedule>() {
-        launch_fp8_a16_tma_mma<Fp8ScheduleInstance<Schedule, K>>(operands, output, epilogue,
+    const auto ring = [&]<class Schedule>() {
+        launch_fp8_a16_ring_mma<Fp8ScheduleInstance<Schedule, K>>(operands, output, epilogue,
                                                                  stream);
     };
     const int tokens = x.ne[1];
-    if (tokens <= 64) return tma.template operator()<Fp8A16TmaT32R64>();
+    if (tokens <= 64) return ring.template operator()<Fp8A16RingT32R64>();
     if (tokens <= 128 || (tokens > 256 && tokens <= 384))
-        return tma.template operator()<Fp8A16TmaT32R128>();
-    if (tokens <= 192) return tma.template operator()<Fp8A16TmaT32R64S3>();
-    tma.template operator()<Fp8A16TmaT64R128>();
+        return ring.template operator()<Fp8A16RingT32R128>();
+    if (tokens <= 192) return ring.template operator()<Fp8A16RingT32R64S3>();
+    ring.template operator()<Fp8A16RingT64R128>();
 }
 
 void fp8_linear_add_invariant_launch(const Tensor& x, const Weight& weight, Tensor& residual,

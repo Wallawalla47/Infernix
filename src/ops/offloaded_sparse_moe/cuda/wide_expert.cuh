@@ -342,6 +342,7 @@ __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void grouped_kerne
                     }
                 }
             }
+            fence_reads_before_async_refill(); // the shared reads before the TMA and bulk refills
             __syncwarp();
             if (lane == 0) { cta_mbarrier_arrive(&shared.empty[stage]); }
         }

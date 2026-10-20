@@ -212,13 +212,14 @@ struct Fp8A8TmaSplitKSchedule : TmaSchedule {
                   0);
 };
 
-// TMA-staged A16 GEMM. One producer warp streams E4M3 weight tiles (BlockK codes per row) and BF16
-// activation tiles (BlockK values per row, staged as 64-value 128-byte halves) through a
-// Stages-deep mbarrier ring. Consumer warps widen the codes to BF16 B fragments in registers and
+// Ring-staged A16 GEMM (fp8_a16_ring_mma.cuh). One producer warp streams E4M3 weight tiles (BlockK
+// codes per row) and BF16 activation tiles (BlockK values per row, staged as 64-value 128-byte
+// halves) with cp.async through a Stages-deep mbarrier ring, in the layout a 128-byte-swizzled TMA
+// load gives (kTmaSwizzle). Consumer warps widen the codes to BF16 B fragments in registers and
 // accumulate complete K in FP32.
 template <int BlockTokens, int BlockRows, int WarpsTokens, int WarpsRows, int Stages,
           int MinBlocksPerSm, int BlockK = 128, Fp8MmaRaster Raster = Fp8MmaRaster::TokenFast>
-struct Fp8A16TmaMmaSchedule {
+struct Fp8A16RingMmaSchedule {
     static constexpr bool kTmaSwizzle     = true;
     static constexpr int kStaticK         = 0;
     static constexpr int kBlockTokens     = BlockTokens;
@@ -239,7 +240,7 @@ struct Fp8A16TmaMmaSchedule {
     static constexpr int kMmaTokens       = kWarpTokens / 16;
     static constexpr int kMmaRows         = kWarpRows / 8;
     static constexpr int kMmaK            = kBlockK / 16;
-    // E4M3 weight rows are kBlockK bytes under the matching TMA swizzle.
+    // E4M3 weight rows are kBlockK bytes under the matching TMA-layout swizzle.
     static constexpr int kSegmentsPerRow = kBlockK / 16;
     // Each 64-value activation half is one 128-byte swizzle span per token row.
     static constexpr int kActivationHalves     = kBlockK / 64;

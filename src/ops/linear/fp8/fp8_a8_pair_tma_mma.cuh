@@ -195,7 +195,9 @@ fp8_a8_pair_tma_mma_kernel(
         fp8_mma_pair_compute_stage<Schedule>(activation_hi + stage * BT * BK,
                                              activation_lo + stage * BT * BK,
                                              weight + stage * BR * BK, hi, lo, warp, lane);
-        // Release only after every lane in this consumer warp has finished its shared reads.
+        // Release only after every lane in this consumer warp has finished its shared reads,
+        // ordered before the TMA refill.
+        fence_reads_before_async_refill();
         __syncwarp();
         if (lane == 0) cta_mbarrier_arrive(empty + stage);
     }

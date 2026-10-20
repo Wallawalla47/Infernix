@@ -40,6 +40,16 @@ __device__ __forceinline__ void cta_mbarrier_arrive_expect_tx(std::uint64_t* bar
                  : "memory");
 }
 
+// Called by each thread that read a pipeline stage with generic-proxy loads (ld.shared, ldmatrix)
+// before its warp releases the stage (the empty-barrier arrive) to a producer that refills it with
+// async-proxy copies (cp.async.bulk.tensor or cp.async.bulk). The arrive's release orders the reads
+// only against generic-proxy writes; without this fence the refill could overwrite the stage while the
+// reads were still in flight (tile-ai/tilelang #3529). On the RTX 5090 such stages came out corrupted,
+// a warp's MMA fragment at a time, while shared-memory-heavy kernels shared the SMs (2026-10-20).
+__device__ __forceinline__ void fence_reads_before_async_refill() {
+    asm volatile("fence.proxy.async.shared::cta;" : : : "memory");
+}
+
 __device__ __forceinline__ void cta_mbarrier_fence_init() {
     asm volatile("fence.mbarrier_init.release.cluster;" : : : "memory");
 }

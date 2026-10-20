@@ -1,17 +1,16 @@
 #pragma once
 
-// Wide-T row-scaled E4M3 weight x BF16 activation Tensor Core GEMM with TMA staging.
-//
-//   out[N,T] = (scale[N] * e4m3_codes[N,K]) * x[K,T]
-//
-// One producer warp streams BF16 activation and E4M3 weight tiles through an mbarrier ring, so the
-// weight stream keeps several K tiles in flight per CTA. Consumer warps use the activations as the
-// MMA A operand and widen each code pair exactly to a BF16 B fragment in registers. Tensor Cores
-// accumulate the complete K reduction in FP32; the represented BF16 row scale is applied once
-// before the epilogue. The public activation is never quantized.
+// The ring GEMM (fp8_a16_ring_mma.cuh) with a TMA producer: one producer thread loads each stage's
+// BF16 activation halves and E4M3 weight tile with TMA (128-byte swizzle, the layout the ring's
+// consumers read), and the consumer warps, the arithmetic and so every output bit are the ring's. A
+// TMA refill is an async-proxy write, so each consumer thread orders its generic-proxy reads of a stage
+// before the warp releases it (fence_reads_before_async_refill, ops/common/mbarrier.cuh; without it a
+// refill overwrote stages still being read while other kernels shared the SMs,
+// tests/ops/linear/test_fp8_moe_overlap.cu). A shape's selector takes it at the widths where it
+// measures faster than the cp.async producer (bench/ops/fp8_flash_next_sweep.cu).
 
-#include "ops/linear/fp8/fp8_a16_codec.cuh"
-#include "ops/linear/fp8/fp8_a8_tma_mma.cuh"
+#include "ops/common/mbarrier.cuh"
+#include "ops/linear/fp8/fp8_a16_ring_mma.cuh"
 
 namespace infernix::ops::detail {
 
@@ -36,59 +35,6 @@ inline CUtensorMap fp8_a16_tma_activation_map(const __nv_bfloat16* pointer, int 
                                  (name ? name : "CUDA error"));
     }
     return result;
-}
-
-template <class Schedule>
-__device__ __forceinline__ void
-fp8_a16_tma_compute_stage(const unsigned char* activation_stage, const std::uint8_t* weight_stage,
-                          float (&accumulators)[Schedule::kMmaTokens][Schedule::kMmaRows][4],
-                          int warp, int lane) {
-    constexpr int kRowBytes = Schedule::kActivationRowBytes;
-    static_assert(kRowBytes == 128, "the activation swizzle assumes one 128-byte span per row");
-    constexpr int kStepsPerHalf = 64 / 16;
-    const int warp_token        = warp / Schedule::kWarpsRows;
-    const int warp_row          = warp % Schedule::kWarpsRows;
-    const int a_matrix          = lane >> 3;
-    const int a_row_offset      = (lane & 7) + ((a_matrix & 1) << 3);
-    const int a_byte            = (a_matrix >> 1) * 16;
-    const int b_row_offset      = lane >> 2;
-    const int b_byte            = 2 * (lane & 3);
-#pragma unroll
-    for (int k_step = 0; k_step < Schedule::kMmaK; ++k_step) {
-        unsigned a[Schedule::kMmaTokens][4];
-#pragma unroll
-        for (int mma_token = 0; mma_token < Schedule::kMmaTokens; ++mma_token) {
-            const int row     = warp_token * Schedule::kWarpTokens + mma_token * 16 + a_row_offset;
-            const int logical = (k_step % kStepsPerHalf) * 32 + a_byte;
-            ldmatrix_x4(a[mma_token][0], a[mma_token][1], a[mma_token][2], a[mma_token][3],
-                        smem_addr(activation_stage +
-                                  (k_step / kStepsPerHalf) * Schedule::kActivationHalfBytes +
-                                  row * kRowBytes + (logical ^ ((row & 7) << 4))));
-        }
-        unsigned b[Schedule::kMmaRows][2];
-#pragma unroll
-        for (int mma_row = 0; mma_row < Schedule::kMmaRows; ++mma_row) {
-            const int row        = warp_row * Schedule::kWarpRows + mma_row * 8 + b_row_offset;
-            const int low        = k_step * 16 + b_byte;
-            const auto code_pair = [&](int logical) {
-                return static_cast<unsigned>(*reinterpret_cast<const std::uint16_t*>(
-                    weight_stage + row * Schedule::kBlockK +
-                    fp8_mma_shared_byte<Schedule>(row, logical)));
-            };
-            b[mma_row][0] = fp8_e4m3x2_to_bf16x2_bits(code_pair(low));
-            b[mma_row][1] = fp8_e4m3x2_to_bf16x2_bits(code_pair(low + 8));
-        }
-#pragma unroll
-        for (int mma_token = 0; mma_token < Schedule::kMmaTokens; ++mma_token) {
-#pragma unroll
-            for (int mma_row = 0; mma_row < Schedule::kMmaRows; ++mma_row) {
-                mma_bf16(accumulators[mma_token][mma_row][0], accumulators[mma_token][mma_row][1],
-                         accumulators[mma_token][mma_row][2], accumulators[mma_token][mma_row][3],
-                         a[mma_token][0], a[mma_token][1], a[mma_token][2], a[mma_token][3],
-                         b[mma_row][0], b[mma_row][1]);
-            }
-        }
-    }
 }
 
 template <class Schedule, bool FullTokens, class Output, class Epilogue>
@@ -159,11 +105,12 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_tm
     for (int kt = 0; kt < tiles_k; ++kt) {
         const int stage = kt % S;
         cta_mbarrier_wait(full + stage, (kt / S) & 1U);
-        fp8_a16_tma_compute_stage<Schedule>(
+        fp8_a16_ring_compute_stage<Schedule>(
             activation + stage * Schedule::kActivationStageBytes,
             reinterpret_cast<const std::uint8_t*>(weight + stage * Schedule::kWeightStageBytes),
             accumulators, warp, lane);
-        // Release only after every lane in this consumer warp has finished its shared reads.
+        // Every lane's reads of the stage come before the TMA refill the release admits.
+        fence_reads_before_async_refill();
         __syncwarp();
         if (lane == 0) cta_mbarrier_arrive(empty + stage);
     }

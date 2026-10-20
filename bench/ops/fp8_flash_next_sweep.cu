@@ -7,7 +7,9 @@
 // tensor-core tiles), each checked for column invariance (column 0's bits at every T equal its bits at
 // T = 8, which speculative verification relies on, §11.3) and grouped by the bits it produces, so a
 // selector only mixes candidates of one family.
-// Verification and prefill widths (T >= 9): sliced-K, MMA and TMA MMA candidates, each first screened
+// Verification and prefill widths (T >= 9): sliced-K, MMA and ring MMA candidates (the ring's
+// schedules with the cp.async producer, ring_*, and with the fenced TMA producer, tma_*: the same
+// consumers and bits, so a selector may mix them by width), each first screened
 // against an FP64 host reference on sampled rows at T = 77 and 1000, then timed with cold-L2 CUDA
 // graphs; a proposed selector keeps the fastest candidate per measured T, merged into intervals within
 // --tolerance-pct.
@@ -18,7 +20,7 @@
 #include "core/device.h"
 #include "core/weight.h"
 #include "infernix_bench_common.h"
-#include "ops/linear/fp8/fp8_a16_tma_mma.cuh"
+#include "ops/linear/fp8/fp8_a16_ring_mma.cuh"
 #include "ops/linear/fp8/fp8_launch.cuh"
 #include "quantized_weight.cuh"
 
@@ -48,7 +50,7 @@ namespace {
 
 using Fp8Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
-enum class Kind { Gemv, Simt, Sliced, Mma, Tma };
+enum class Kind { Gemv, Simt, Sliced, Mma, Ring, Tma };
 
 struct Candidate {
     const char* name;
@@ -65,6 +67,7 @@ const char* launcher(Kind kind) {
     case Kind::Simt: return "fp8_linear_a16_simt<Geometry, 8, %s>";
     case Kind::Sliced: return "fp8_linear_a16_sliced_k<Geometry, %s>";
     case Kind::Mma: return "fp8_linear_a16_mma<Geometry, %s>";
+    case Kind::Ring: return "fp8_linear_a16_ring<Geometry, %s>";
     case Kind::Tma: return "fp8_linear_a16_tma<Geometry, %s>";
     }
     return "?";
@@ -116,8 +119,8 @@ using MmaR64T64K128   = Fp8A16MmaSchedule<64, 64, 128, 32, 16, 2, 2>;
 using MmaR64T96K128   = Fp8A16MmaSchedule<64, 96, 128, 64, 16, 1, 2>;
 using MmaR64T128K64   = Fp8A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>;
 using MmaR128T128K64  = Fp8A16MmaSchedule<128, 128, 64, 64, 32, 2, 1>;
-using TmaT64R256      = Fp8A16TmaMmaSchedule<64, 256, 2, 8, 2, 1>;
-using TmaT128R128     = Fp8A16TmaMmaSchedule<128, 128, 4, 4, 2, 1>;
+using RingT64R256      = Fp8A16RingMmaSchedule<64, 256, 2, 8, 2, 1>;
+using RingT128R128     = Fp8A16RingMmaSchedule<128, 128, 4, 4, 2, 1>;
 
 #define INFERNIX_C(kind, name, max_t, rows, ...) \
     Candidate { name, #__VA_ARGS__, kind, launch_of<kind, __VA_ARGS__, K>(), max_t, rows }
@@ -128,6 +131,7 @@ constexpr Fp8Launch launch_of() {
     if constexpr (kind == Kind::Simt) return fp8_linear_a16_simt<G<K>, 8, Schedule>;
     if constexpr (kind == Kind::Sliced) return fp8_linear_a16_sliced_k<G<K>, Schedule>;
     if constexpr (kind == Kind::Mma) return fp8_linear_a16_mma<G<K>, Schedule>;
+    if constexpr (kind == Kind::Ring) return fp8_linear_a16_ring<G<K>, Schedule>;
     if constexpr (kind == Kind::Tma) return fp8_linear_a16_tma<G<K>, Schedule>;
     return nullptr;
 }
@@ -182,12 +186,19 @@ const std::vector<Candidate>& candidates() {
         INFERNIX_C(Kind::Mma, "mma_r64t96k128", INT_MAX, 64, MmaR64T96K128),
         INFERNIX_C(Kind::Mma, "mma_r64t128k64", INT_MAX, 64, MmaR64T128K64),
         INFERNIX_C(Kind::Mma, "mma_r128t128k64", INT_MAX, 128, MmaR128T128K64),
-        INFERNIX_C(Kind::Tma, "tma_t32r64s6", INT_MAX, 64, Fp8A16TmaT32R64),
-        INFERNIX_C(Kind::Tma, "tma_t32r64s3b2", INT_MAX, 64, Fp8A16TmaT32R64S3),
-        INFERNIX_C(Kind::Tma, "tma_t32r128s4", INT_MAX, 128, Fp8A16TmaT32R128),
-        INFERNIX_C(Kind::Tma, "tma_t64r128s3", INT_MAX, 128, Fp8A16TmaT64R128),
-        INFERNIX_C(Kind::Tma, "tma_t64r256s2", INT_MAX, 256, TmaT64R256),
-        INFERNIX_C(Kind::Tma, "tma_t128r128s2", INT_MAX, 128, TmaT128R128),
+        INFERNIX_C(Kind::Ring, "ring_t32r64s6", INT_MAX, 64, Fp8A16RingT32R64),
+        INFERNIX_C(Kind::Ring, "ring_t32r64s3b2", INT_MAX, 64, Fp8A16RingT32R64S3),
+        INFERNIX_C(Kind::Ring, "ring_t32r128s4", INT_MAX, 128, Fp8A16RingT32R128),
+        INFERNIX_C(Kind::Ring, "ring_t64r128s3", INT_MAX, 128, Fp8A16RingT64R128),
+        INFERNIX_C(Kind::Ring, "ring_t64r256s2", INT_MAX, 256, RingT64R256),
+        INFERNIX_C(Kind::Ring, "ring_t128r128s2", INT_MAX, 128, RingT128R128),
+        // The same schedules with the TMA producer (same consumers, same bits).
+        INFERNIX_C(Kind::Tma, "tma_t32r64s6", INT_MAX, 64, Fp8A16RingT32R64),
+        INFERNIX_C(Kind::Tma, "tma_t32r64s3b2", INT_MAX, 64, Fp8A16RingT32R64S3),
+        INFERNIX_C(Kind::Tma, "tma_t32r128s4", INT_MAX, 128, Fp8A16RingT32R128),
+        INFERNIX_C(Kind::Tma, "tma_t64r128s3", INT_MAX, 128, Fp8A16RingT64R128),
+        INFERNIX_C(Kind::Tma, "tma_t64r256s2", INT_MAX, 256, RingT64R256),
+        INFERNIX_C(Kind::Tma, "tma_t128r128s2", INT_MAX, 128, RingT128R128),
     };
     return list;
 }
