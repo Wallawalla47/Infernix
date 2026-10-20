@@ -209,8 +209,9 @@ int main() {
                                   "the coupling paths are qualified on NVIDIA FP4-Local");
             }
         }
-        // FP16 GDN: faster on IQ3_S and FP8 prefill, not on Dense8's; IQ3_S with BF16 KV fails its gates.
-        failures += check(q::fast_path_qualified(FastPath::GdnF16Accumulate, iq3s) == (kv != KvCacheStorage::BFloat16) &&
+        // FP16 GDN: faster on IQ3_S and FP8 prefill, not on Dense8's (IQ3_S with BF16 KV since it passed
+        // its prefill gate against the precise reference).
+        failures += check(q::fast_path_qualified(FastPath::GdnF16Accumulate, iq3s) &&
                               q::fast_path_qualified(FastPath::GdnF16Accumulate, fp8) &&
                               !q::fast_path_qualified(FastPath::GdnF16Accumulate, {DenseKernels::Q8, true, kv}),
                           "gdn-f16-accumulate is registered where it was measured faster and passed");

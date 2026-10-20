@@ -113,9 +113,10 @@ constexpr std::array kQualified{
     // formats take Dense8's verdicts), timed on INT8 (2026-10-18): second-turn resume 1.65 -> 0.11 s,
     // two-row MTP 160 -> 200 tok/s. Sampled drafts change no logit (6.1): math +18.8 %, story +22.4 %,
     // code +4.1 % (overlapping). FP16 GDN (qualified on the 27B, every Flash-Next artifact): pp16384
-    // +0.21 %, every run ahead; it touches no attention or KV. Not with BF16 KV (2026-10-19): there the
-    // IQ3_S exact route is the gate's reference (floor 0) and FP16 GDN alone fails the prefill gate (KL
-    // bound 7.5e-3 of 1.5e-3) and the decode gate (TV bound 4.6e-3 of 4e-3), as ggml-bf16-prefill does.
+    // +0.21 %, every run ahead; it touches no attention or KV. BF16 KV failed against the old reference,
+    // the IQ3_S exact route itself there (floor 0); against the precise reference (2026-10-20) the joint
+    // prefill gate with ggml-bf16-prefill passes on BF16, INT8 and VQ2, and a path that changes only
+    // chunked GDN calls is decided by its prefill gate (model-quality.md 6.1), so BF16 is registered too.
     Qualification{FastPath::AdaptiveSpeculation, {DenseKernels::Ggml, false, KvCacheStorage::BFloat16}},
     Qualification{FastPath::AdaptiveSpeculation, {DenseKernels::Ggml, false, KvCacheStorage::Int8Group64}},
     Qualification{FastPath::AdaptiveSpeculation, {DenseKernels::Ggml, false, KvCacheStorage::Fp8E4M3Row256}},
@@ -137,6 +138,7 @@ constexpr std::array kQualified{
     Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Ggml, false, KvCacheStorage::Fp8KeyNvfp4Value}},
     Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Ggml, false, KvCacheStorage::Vq2}},
     Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Ggml, false, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Ggml, false, KvCacheStorage::BFloat16}},
     Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Ggml, false, KvCacheStorage::Int8Group64}},
     Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Ggml, false, KvCacheStorage::Fp8E4M3Row256}},
     Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Ggml, false, KvCacheStorage::Nvfp4Group16}},

@@ -934,7 +934,7 @@ always run and are not listed. The NVFP4 27B variants select identical paths (ea
 | Qwen3.8-Flash-Next: `expert-a4-residual-3` | the same calls as `expert-a4-residual`, three NVFP4 terms per x and h row (its more precise form, design §19.3.23; it takes precedence where both are selected) | none: two terms pass on every configuration and format they run in (2026-10-21), so it stays an unregistered candidate (`--fast-path expert-a4-residual-3`) for a cell where two terms fail; three terms cost 7-8 points of prefill speed (below) |
 | Qwen3.8-Flash-Next: `sampled-mtp-drafts` | MTP rounds with a sampled request | every Flash-Next configuration, every format (distribution and greedy identity, below; no logit changes) |
 | Qwen3.8-Flash-Next: `ggml-bf16-prefill` | GGUF dense projections in prefill calls of 32+ columns, GGUF expert calls of 14,336+ columns | IQ3_S, every format (BF16 KV since 2026-10-20, against the precise reference; below) |
-| `gdn-f16-accumulate` | chunked GDN calls (16+ tokens) of every Qwen3.5-family and Flash-Next artifact | NVFP4 27B, groupwise 27B and FP8, every format (FP8 with BF16 KV pending its decode gate against the precise reference, below); IQ3_S, every format but BF16 (fails there, under `ggml-bf16-prefill`); not the 35B-A3B or Dense8 (no gain beyond spread, below) |
+| `gdn-f16-accumulate` | chunked GDN calls (16+ tokens) of every Qwen3.5-family and Flash-Next artifact | NVFP4 27B, groupwise 27B, FP8 and IQ3_S, every format (FP8 with BF16 KV pending its prefill gate against the precise reference; IQ3_S with BF16 since 2026-10-20, below); not the 35B-A3B, Dense8 or FP4-Local (no gain beyond spread, below; recipe C and recipe A are timed in the 2026-10-20 queue) |
 
 **`sampled-mtp-drafts`: drafts drawn from the draft head's top four tokens (Flash-Next, qualified
 2026-10-17).** It changes no logit: a sampled request's drafts are drawn from the head's four most
@@ -1893,8 +1893,11 @@ NVFP4, K8V4, VQ2 or K4V2 KV, qualified 2026-10-19; BF16 KV, 2026-10-20).**
 
   Every context bucket passes on the three. BF16 KV is registered for this path, whose kernels see
   no KV format and which changes no decode kernel (the decode criteria are not required), with
-  INT8's timing. `gdn-f16-accumulate`, which also failed BF16's decode gate on a nonzero floor
-  (above), stays off IQ3_S with BF16 KV until that gate is run against the precise reference.
+  INT8's timing. `gdn-f16-accumulate` is registered on IQ3_S with BF16 KV on the same footing
+  (2026-10-20): it changes only chunked GDN calls, which decode reaches only through the prompt's
+  state, and the prefill gate's later positions carry that state through many chunks; its BF16
+  decode gate had failed against the old reference (above), whose exact-kernel scoring is the very
+  arithmetic the path replaces, while at Op level the path is closer to FP64 than the exact route.
 - **Decode gate** (plain, 256 segments, prompts of 512-8,192 tokens, whose prefill takes the dense
   tiles but not the expert tiles): INT8, the passing format with the lowest floor, passes (TV excess
   5.4e-4, bound 9.3e-4 of 4e-3; top-1 +0.10 points, bound 0.32; KL 2.4e-4; NLL −2.9e-4; p99.9 KL
