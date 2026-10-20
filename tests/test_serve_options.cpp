@@ -187,7 +187,7 @@ int main() {
             } catch (const std::invalid_argument&) { rejected = true; }
             failures += check(rejected, "unsupported neural/ngram pair admitted");
         }
-        // --draft-tokens auto: MTP only, the count left to the Engine.
+        // --draft-tokens auto: MTP and DFlash2 (Qwen3.8-Flash-Next's policy), the count left to the Engine.
         bool auto_rejected = false;
         try {
             const auto automatic =
@@ -195,8 +195,8 @@ int main() {
             failures += check(automatic.speculative.draft_tokens_auto && automatic.speculative.draft_tokens == 0,
                               "--draft-tokens auto did not select the automatic length");
         } catch (const std::invalid_argument&) { auto_rejected = true; }
-        failures += check(auto_rejected == (backend != "mtp"),
-                          "--draft-tokens auto is accepted with --spec mtp only");
+        failures += check(auto_rejected == (backend == "dflash"),
+                          "--draft-tokens auto is accepted with --spec mtp and dflash2 only");
         const auto wide_single =
             parse({"infernix-serve", "model.ninfer", "--spec", backend, "--draft-tokens", "3",
                    "--ngram-draft-tokens", "63", "--max-concurrency", "1"});
@@ -207,6 +207,21 @@ int main() {
                    "--ngram-draft-tokens", "0", "--max-concurrency", "8"});
         failures += check(disabled.speculative.ngram_draft_tokens == 0,
                           "disabled ngram changed multi-slot configuration");
+    }
+    // Qwen3.8-Flash-Next's DFlash2 drafter is a companion artifact named by path, with dflash2 only.
+    const auto companion = parse({"infernix-serve", "model.infernix", "--spec", "dflash2", "--draft-tokens", "5",
+                                  "--draft-model", "drafter.infernix", "--lm-head-draft"});
+    failures += check(companion.speculative.draft_model == std::filesystem::path("drafter.infernix") &&
+                          companion.speculative.draft_tokens == 5 &&
+                          companion.speculative.proposal_head == infernix::ProposalHead::Optimized,
+                      "--draft-model did not keep the companion artifact");
+    {
+        bool rejected = false;
+        try {
+            (void)parse({"infernix-serve", "model.infernix", "--spec", "mtp", "--draft-tokens", "3", "--draft-model",
+                         "drafter.infernix"});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "--draft-model admitted without --spec dflash2");
     }
     // DFlash2 tree table: entry c applies to rounds of c rows and the last entry to larger batches.
     using TreeTable  = std::array<std::uint32_t, infernix::kMaximumConcurrency>;
@@ -919,17 +934,21 @@ int main() {
     failures +=
         check(serve_usage_text("infernix-serve").find("--route-trace") != std::string::npos,
               "serve help omits --route-trace");
-    // --spec-min-p: unset keeps the model's default; a probability in [0,1], MTP only.
+    // --spec-min-p: unset keeps the model's default; a probability in [0,1], MTP and DFlash2 only.
     failures += check(!defaults.speculative.draft_min_p, "--spec-min-p must default to the model's value");
     const ServeOptions gated =
         parse({"infernix-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "4", "--spec-min-p", "0"});
     failures += check(gated.speculative.draft_min_p && *gated.speculative.draft_min_p == 0.0F,
                       "--spec-min-p 0 did not survive parsing");
+    const ServeOptions selector = parse({"infernix-serve", "model.ninfer", "--spec", "dflash2", "--draft-tokens", "7",
+                                         "--draft-model", "drafter.infernix", "--spec-min-p", "0.4"});
+    failures += check(selector.speculative.draft_min_p && *selector.speculative.draft_min_p == 0.4F,
+                      "--spec-min-p was refused with dflash2");
     for (const auto& tail : std::vector<std::vector<std::string>>{
              {"--spec", "mtp", "--draft-tokens", "4", "--spec-min-p", "1.01"},
              {"--spec", "mtp", "--draft-tokens", "4", "--spec-min-p", "-1"},
              {"--spec", "mtp", "--draft-tokens", "4", "--spec-min-p", ""},
-             {"--spec", "dflash2", "--draft-tokens", "7", "--spec-min-p", "0.5"},
+             {"--spec", "dflash", "--draft-tokens", "7", "--spec-min-p", "0.5"},
              {"--spec-min-p", "0.5"}}) {
         std::vector<std::string> command{"infernix-serve", "model.ninfer"};
         command.insert(command.end(), tail.begin(), tail.end());

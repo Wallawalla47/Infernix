@@ -1,0 +1,9 @@
+{
+  "_comment": "Infernix does not read this file. It lets the Hugging Face Hub count downloads of this repository, which it does through requests for config.json. Pass the .infernix file to infernix-serve with --spec dflash2 --draft-model, beside a Qwen3.8-Flash-Next artifact.",
+  "format": "infernix-v3",
+  "engine": "https://github.com/Wallawalla47/Infernix",
+  "artifact": "Qwen3.8-Flash-Next-DFlash2-Infernix.infernix",
+  "kind": "companion",
+  "component": "dflash2",
+  "target": "Qwen4ExpForCausalLM (Qwen3.8-Flash-Next)"
+}

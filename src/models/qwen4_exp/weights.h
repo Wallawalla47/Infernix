@@ -80,6 +80,27 @@ struct MtpWeights {
     std::vector<WeightId> expert_down;    // per expert: [H, I]
 };
 
+// One DFlash2 layer (docs/maintainer/dflash.md): its dynamic convolutions' base kernels BF16
+// [2 sides, taps, H] and coefficient projections, the query block's Q/K/V parent and the context
+// K/V (the converter shares the K/V words between the two roles), and the gate/up parent.
+struct DFlash2LayerWeights {
+    WeightId input_norm, post_attention_norm;
+    WeightId query, key, value, context_key, context_value;
+    WeightId query_norm, key_norm, output;
+    WeightId gate, up, down;
+    WeightId attention_base, attention_projection, mlp_base, mlp_projection;
+};
+
+// The DFlash2 drafter of a companion artifact (--draft-model); it shares the token embedding and
+// the head (or the proposal head) with the text model.
+struct DFlash2Weights {
+    WeightId feature_projection; // [H, taps * H]
+    WeightId context_norm, final_norm;
+    std::vector<DFlash2LayerWeights> layers;
+    WeightId selector_hidden;                            // [rank, H]
+    WeightId predecessor_codebook, successor_codebook;   // BF16 [vocab, rank]
+};
+
 // The optimized proposal head (--lm-head-draft): lm_head rows of a frequency shortlist.
 struct ProposalWeights {
     WeightId head;      // [rows, H]
@@ -112,6 +133,7 @@ struct TextWeights {
     HyperConnectionWeights final_mixer;
     std::vector<BlockWeights> layers;
     std::optional<MtpWeights> mtp;
+    std::optional<DFlash2Weights> dflash2; // bound from the companion artifact
     std::optional<ProposalWeights> proposal;
     std::optional<VisionWeights> vision;
 };

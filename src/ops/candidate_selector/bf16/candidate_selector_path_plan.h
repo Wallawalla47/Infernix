@@ -31,6 +31,6 @@ void candidate_selector_path_dispatch(const Tensor& candidate_ids, const Tensor&
                                       const Tensor& predecessor_codebook,
                                       const Tensor& successor_codebook,
                                       const Tensor& base_positions, const SamplingConfig* configs,
-                                      Tensor& drafts, Tensor& proposal_q, WorkspaceArena& workspace,
-                                      cudaStream_t stream);
+                                      Tensor& drafts, Tensor& proposal_q, Tensor* confidence,
+                                      WorkspaceArena& workspace, cudaStream_t stream);
 } // namespace infernix::ops::detail

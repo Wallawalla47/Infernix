@@ -148,6 +148,7 @@ Forward::Forward(const Parameters& parameters, DeviceContext& device, WorkspaceA
         split_cpu_.assign(E, 0);
         CUDA_CHECK(cudaEventCreateWithFlags(&split_ready_, cudaEventDisableTiming | cudaEventBlockingSync));
     }
+    if (const auto& dflash2 = parameters_.model.config().dflash2) { draft_taps_ = dflash2->target_layer_ids; }
 }
 
 Forward::~Forward() {
@@ -279,6 +280,11 @@ void Forward::layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& resi
     } catch (const std::exception& error) {
         throw std::runtime_error("qwen4_exp/layers/" + std::to_string(layer) + ": " + error.what());
     }
+    if (batch.draft_features.data != nullptr) {
+        const std::int32_t n = batch.draft_features.ne[1], T = residual.ne[1];
+        if (n > T) { throw std::invalid_argument("Qwen4Exp forward: DFlash2 features exceed the call"); }
+        capture_draft_features(layer, residual.slice(1, T - n, n), batch.draft_features);
+    }
     if (tap != nullptr && tap->residuals != nullptr) {
         Tensor& copy = tap->residuals->at(layer);
         if (cudaMemcpyAsync(copy.data, residual.data, residual.bytes(), cudaMemcpyDeviceToDevice, s) !=
@@ -286,6 +292,18 @@ void Forward::layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& resi
             throw std::runtime_error("Qwen4Exp forward: residual tap copy failed");
         }
     }
+}
+
+void Forward::capture_draft_features(std::uint32_t layer, const Tensor& residual, const Tensor& features) {
+    const auto& taps = draft_taps_;
+    const auto it    = std::find(taps.begin(), taps.end(), layer);
+    if (it == taps.end()) { return; }
+    const std::int32_t H = dim(config_.hidden_size);
+    if (features.ne[1] != residual.ne[1] || features.ne[0] != H * static_cast<std::int32_t>(taps.size())) {
+        throw std::invalid_argument("Qwen4Exp forward: DFlash2 features do not match the residual");
+    }
+    Tensor out = features.slice(0, static_cast<std::int32_t>(it - taps.begin()) * H, H);
+    ops::hyper_connection_stream_mean(residual, dim(config_.hc.streams), out, device_.stream);
 }
 
 Tensor Forward::mixer(std::uint32_t layer, const ForwardBatch& batch, const Tensor& xa) {

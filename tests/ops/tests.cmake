@@ -229,6 +229,12 @@ infernix_add_op_test(infernix_hyper_connection_test
   LIBRARIES infernix_linear_test_support)
 set_tests_properties(infernix_hyper_connection_test PROPERTIES SKIP_RETURN_CODE 77)
 
+# hyper_connection_stream_mean (DFlash2's target features) against the FP64 stream mean.
+infernix_add_op_test(infernix_hyper_connection_stream_mean_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_hyper_connection_stream_mean.cpp"
+  LIBRARIES infernix_ops)
+set_tests_properties(infernix_hyper_connection_stream_mean_test PROPERTIES SKIP_RETURN_CODE 77)
+
 # Canonical W4A4 arithmetic and the CPU expert engine; host-only, needs no GPU.
 infernix_add_op_test(infernix_offloaded_moe_cpu_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_cpu.cpp"

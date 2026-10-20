@@ -704,6 +704,38 @@ def build_model(
     return model
 
 
+DFLASH2_TARGET_FIELDS = ("architectures", "hidden_size", "vocab_size", "num_hidden_layers")
+
+
+def build_dflash2_companion(base: SafetensorsSource, draft: SafetensorsSource) -> Model:
+    """A companion artifact holding only a DFlash2 drafter of a Qwen4Exp model, loaded beside any
+    artifact of that model (``--draft-model``). ``base`` supplies the target's config and tokenizer
+    (no weights are read from it); the drafter reuses the target's token embedding and output or
+    proposal head, so the companion declares its Uses of those target parameters. Its config
+    records the target identity the loader checks (``target_config``)."""
+
+    from .qwen3_5 import draft_config
+
+    target = text_config(base.config, mtp=False)
+    config = draft_config(draft.config, target, "dflash2")
+    config["target_config"] = {key: target[key] for key in DFLASH2_TARGET_FIELDS}
+    _, _, count, special = load_resources(base.root, vocab_size=target["vocab_size"])
+    if config["dflash_config"]["selector_top_k"] > count:
+        raise ValueError("DFlash2 selector_top_k exceeds public token domain")
+    model = Model(
+        {"dflash2": {"config": config, "target": "text"}},
+        token_count=count,
+        special_token_ids=special,
+        target=target,
+        external_uses=(
+            ("text/output_head", "dflash2/final_hidden"),
+            ("proposal/head", "dflash2/final_hidden"),
+        ),
+    )
+    _Qwen4ExpBuilder(model).draft(draft, config, target, "dflash2")
+    return model
+
+
 def ngram_table(base: SafetensorsSource, config: dict) -> NgramTable:
     """The n-gram table of a model built by :func:`build_model`."""
 

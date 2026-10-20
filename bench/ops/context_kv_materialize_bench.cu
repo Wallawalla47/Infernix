@@ -192,7 +192,7 @@ struct Fixture {
         Tensor pos(positions.p, DType::I32, {width, batch});
         Tensor count(counts.p, DType::I32, {batch});
         Tensor lane(slots.p, DType::I32, {batch});
-        ops::context_kv_materialize(x, pos, count, lane, layers, envelope, direct_arena, stream);
+        ops::context_kv_materialize(x, pos, count, lane, layers, 1.0e7F, envelope, direct_arena, stream);
     }
 };
 

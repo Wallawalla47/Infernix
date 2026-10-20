@@ -420,10 +420,12 @@ std::string usage_text(std::string_view program) {
         << kDefaultPrefillSplitWorkspaceMiB << ";\n"
         << "                              128-384 recommended, 0 = no splitting)\n"
         << "  --spec <mtp|dflash|dflash2> speculative backend (default: none)\n"
-        << "  --draft-tokens <n>|auto    MTP 1..7 (Qwen3.5/3.6 1..5); DFlash/DFlash2 1..15; n drafts\n"
-        << "                             n every round, auto lets MTP pick each round's length\n"
-        << "                             (0..7; Qwen3.5/3.6 1..5 by adaptive-mtp where qualified,\n"
-        << "                             else the model's fastest fixed length)\n"
+        << "  --draft-tokens <n>|auto    MTP 1..7 (Qwen3.5/3.6 1..5); DFlash/DFlash2 1..15\n"
+        << "                             (Qwen3.8-Flash-Next DFlash2 1..7); n drafts n every round,\n"
+        << "                             auto lets MTP (and Qwen3.8-Flash-Next DFlash2) pick each\n"
+        << "                             round's length (0..7; Qwen3.5/3.6 1..5 by adaptive-mtp where\n"
+        << "                             qualified, else the model's fastest fixed length)\n"
+        << "  --draft-model <path>       Qwen3.8-Flash-Next DFlash2: the drafter's companion artifact\n"
         << "  --spec-min-p <p>           Qwen3.8-Flash-Next MTP draft-confidence gate 0..1\n"
         << "                             (default 0.5 with --draft-tokens auto, else 0 (every draft))\n"
         << "  --ngram-draft-tokens <n>   copy proposals 1..63; 0 disables (default: 0)\n"
@@ -600,6 +602,8 @@ BenchOptions parse_args(int argc, char** argv) {
             options.speculative.backend = product::parse_speculative_backend(value("--spec"));
         } else if (arg == "--draft-tokens") {
             product::apply_draft_tokens(options.speculative, value("--draft-tokens"));
+        } else if (arg == "--draft-model") {
+            options.speculative.draft_model = std::filesystem::path(std::string(value("--draft-model")));
         } else if (arg == "--spec-min-p") {
             options.speculative.draft_min_p = product::parse_draft_min_p(value("--spec-min-p"));
         } else if (arg == "--ngram-draft-tokens") {

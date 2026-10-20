@@ -26,11 +26,11 @@ struct Q4TopKOutput {
     }
 };
 
-template <int Capacity>
+template <int Hidden, int Capacity>
 void launch_sliced(const Tensor& hidden, const Weight& head, const Tensor& row_to_global_ids,
                    const LinearTopKWorkspace& workspace, cudaStream_t stream) {
     using Schedule = Q4A16SlicedKMmaSchedule<16, (Capacity + 7) / 8 * 8, 8, 1, Cache::cg, Cache::ca,
-                                             6, kLinearTopKHidden, Capacity>;
+                                             6, Hidden, Capacity>;
     const Q4TopKOutput output{static_cast<std::uint64_t*>(workspace.partial_keys.data),
                               static_cast<const std::int32_t*>(row_to_global_ids.data),
                               workspace.producer_groups};
@@ -42,12 +42,14 @@ void launch_sliced(const Tensor& hidden, const Weight& head, const Tensor& row_t
 using Launch = void (*)(const Tensor&, const Weight&, const Tensor&, const LinearTopKWorkspace&,
                         cudaStream_t);
 
-template <std::size_t... I>
+template <int Hidden, std::size_t... I>
 constexpr auto make_launchers(std::index_sequence<I...>) {
-    return std::array<Launch, sizeof...(I)>{&launch_sliced<8 * (1 + I)>...};
+    return std::array<Launch, sizeof...(I)>{&launch_sliced<Hidden, 8 * (1 + I)>...};
 }
 
-constexpr auto launchers = make_launchers(std::make_index_sequence<2>{});
+// Qwen3.8-27B's proposal head (5120) and Qwen3.8-Flash-Next's (2560).
+constexpr auto k27BLaunchers       = make_launchers<5120>(std::make_index_sequence<2>{});
+constexpr auto kFlashNextLaunchers = make_launchers<2560>(std::make_index_sequence<2>{});
 
 } // namespace
 
@@ -55,6 +57,7 @@ void linear_topk_q4_launch(const Tensor& hidden, const Weight& head,
                            const Tensor& row_to_global_ids, const LinearTopKWorkspace& workspace,
                            cudaStream_t stream) {
     if (workspace.rows_per_producer == kLinearTopKDirectRows) {
+        const auto& launchers = hidden.ne[0] == 5120 ? k27BLaunchers : kFlashNextLaunchers;
         launchers[(hidden.ne[1] - 1) / 8](hidden, head, row_to_global_ids, workspace, stream);
     } else {
         linear_topk_q4_m64_launch(hidden, head, row_to_global_ids, workspace, stream);

@@ -24,6 +24,7 @@ struct DeviceArgs {
     std::int32_t* drafts;
     float* q;
     int steps;
+    float* confidence; // [K, B] or null: the selected rank's temperature-1 softmax
 };
 
 struct alignas(16) SelectorShared {
@@ -61,6 +62,16 @@ __device__ int draw_rank(float edge, float temperature, unsigned long long seed,
     }
     const unsigned hits = __ballot_sync(kFullWarpMask, lane < kCandidates && uniform < cumulative);
     return hits ? __ffs(hits) - 1 : kCandidates - 1;
+}
+
+// Lane 0 writes the temperature-1 softmax over the 16 edges at `selected` (a warp-wide call).
+__device__ __forceinline__ void write_confidence(float edge, int selected, float* out) {
+    const int lane      = threadIdx.x & 31;
+    const float maximum = warp_max(edge);
+    const float weight  = lane < kCandidates ? __expf(edge - maximum) : 0.0F;
+    const float total   = warp_sum(weight);
+    const float chosen  = __shfl_sync(kFullWarpMask, weight, selected);
+    if (lane == 0) *out = chosen / total;
 }
 
 __device__ void score_row(const DeviceArgs& a, int column, SelectorShared& shared) {
@@ -109,6 +120,7 @@ __global__ __launch_bounds__(512, 1) void selector_walk_kernel(DeviceArgs a) {
             const float edge   = lane < kCandidates ? shared.edge[lane] : -CUDART_INF_F;
             const int selected = draw_rank(edge, shared.temperature, shared.seed,
                                            shared.base_position + step, a.q + column * kCandidates);
+            if (a.confidence != nullptr) { write_confidence(edge, selected, a.confidence + column); }
             if (lane == 0) {
                 shared.predecessor = a.ids[column * kCandidates + selected];
                 a.drafts[column]   = shared.predecessor;
@@ -150,6 +162,7 @@ __global__ __launch_bounds__(32) void selector_lattice_walk_kernel(DeviceArgs a,
                 : -CUDART_INF_F;
         int selected =
             draw_rank(edge, temperature, seed, position + step, a.q + column * kCandidates);
+        if (a.confidence != nullptr) { write_confidence(edge, selected, a.confidence + column); }
         predecessor_rank = selected;
         if (lane == 0) a.drafts[column] = a.ids[column * kCandidates + selected];
     }
@@ -465,7 +478,8 @@ void candidate_selector_tree_launch(const Tensor& candidate_ids, const Tensor& u
                           configs,
                           nullptr,
                           nullptr,
-                          candidate_ids.ne[1]};
+                          candidate_ids.ne[1],
+                          nullptr};
     auto* edges = static_cast<float*>(workspace.edges.data);
     CUDA_CHECK(pdl::launch_consumer(
         {dim3(args.steps * candidate_ids.ne[2], kCandidates), dim3(512), 0, stream},
@@ -495,8 +509,8 @@ void candidate_selector_path_launch(SelectorRoute route, const Tensor& candidate
                                     const Tensor& anchors, const Tensor& predecessor_codebook,
                                     const Tensor& successor_codebook, const Tensor& base_positions,
                                     const SamplingConfig* configs, Tensor& drafts,
-                                    Tensor& proposal_q, const SelectorWorkspace& workspace,
-                                    cudaStream_t stream) {
+                                    Tensor& proposal_q, Tensor* confidence,
+                                    const SelectorWorkspace& workspace, cudaStream_t stream) {
     const DeviceArgs args{static_cast<const std::int32_t*>(candidate_ids.data),
                           static_cast<const float*>(unary_scores.data),
                           static_cast<const __nv_bfloat16*>(projected_hidden.data),
@@ -507,7 +521,8 @@ void candidate_selector_path_launch(SelectorRoute route, const Tensor& candidate
                           configs,
                           static_cast<std::int32_t*>(drafts.data),
                           static_cast<float*>(proposal_q.data),
-                          candidate_ids.ne[1]};
+                          candidate_ids.ne[1],
+                          confidence != nullptr ? static_cast<float*>(confidence->data) : nullptr};
     if (route == SelectorRoute::Direct) {
         CUDA_CHECK(pdl::launch_consumer({dim3(candidate_ids.ne[2]), dim3(512), 0, stream},
                                         selector_walk_kernel, args));

@@ -118,6 +118,27 @@ as `--source dflash=PATH` or `--source dflash2=PATH`. An artifact may contain se
 components; the Engine loads only the ones selected at startup, including at most one speculative
 backend. Component availability and startup selection are independent.
 
+A Qwen3.8-Flash-Next DFlash2 drafter is converted on its own, into a companion artifact that runs
+beside any Flash-Next artifact (`--spec dflash2 --draft-model FILE`): `--components dflash2` alone,
+with `--model` naming any Flash-Next checkpoint for its config and tokenizer (no weights are read
+from it):
+
+```bash
+python3 -m tools.convert \
+  --model /path/to/Qwen3.8-Flash-Next-FP8 \
+  --source dflash2=/path/to/Qwen3.8-Flash-Next-DFlash2 \
+  --components dflash2 \
+  --recipe qwen3_8_flash_next_dflash2 \
+  --name Qwen3.8-Flash-Next-DFlash2-Infernix \
+  --out models/Qwen3.8-Flash-Next-DFlash2-Infernix.infernix
+```
+
+The recipe stores the drafter as NInfer's official Qwen3.8-27B artifact stores its DFlash2:
+`q8_g32_fp16` projections (absmax scales; the context K/V projections share the block's K/V words),
+BF16 dynamic-convolution kernel projections, selector projection and codebooks, norms and base
+kernels. The drafter reuses the main artifact's token embedding and its text or proposal head, so
+the companion holds none of them (776 MB). See [container §4.3](maintainer/artifact-container.md#43-companion-artifacts).
+
 ## Change part of a recipe
 
 Save the following as `my_recipe.py`:

@@ -159,11 +159,17 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
             }
         }
     }
-    if (options.draft_min_p && options.backend != SpeculativeBackend::Mtp) {
-        throw std::invalid_argument("--spec-min-p requires --spec mtp");
+    if (options.draft_min_p && options.backend != SpeculativeBackend::Mtp &&
+        options.backend != SpeculativeBackend::DFlash2) {
+        throw std::invalid_argument("--spec-min-p requires --spec mtp or dflash2");
     }
-    if (options.draft_tokens_auto && options.backend != SpeculativeBackend::Mtp) {
-        throw std::invalid_argument("--draft-tokens auto requires --spec mtp");
+    // auto with dflash2: Qwen3.8-Flash-Next's per-round policy (the Engine refuses it elsewhere).
+    if (options.draft_tokens_auto && options.backend != SpeculativeBackend::Mtp &&
+        options.backend != SpeculativeBackend::DFlash2) {
+        throw std::invalid_argument("--draft-tokens auto requires --spec mtp or dflash2");
+    }
+    if (!options.draft_model.empty() && options.backend != SpeculativeBackend::DFlash2) {
+        throw std::invalid_argument("--draft-model is a DFlash2 drafter: it requires --spec dflash2");
     }
     if (options.draft_tree_paths < 2 || options.draft_tree_paths > 8) {
         throw std::invalid_argument("--draft-tree-paths must be in [2,8]");
@@ -189,8 +195,9 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
         }
         return;
     case SpeculativeBackend::DFlash2:
+        if (options.draft_tokens_auto) { return; }
         if (options.draft_tokens == 0 || options.draft_tokens > 15) {
-            throw std::invalid_argument("--spec dflash2 requires --draft-tokens in [1,15]");
+            throw std::invalid_argument("--spec dflash2 requires --draft-tokens in [1,15] (auto: Qwen3.8-Flash-Next)");
         }
         return;
     }

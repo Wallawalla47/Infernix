@@ -122,7 +122,7 @@ int main(int argc, char** argv) {
                                          8 * sizeof(std::uint16_t));
         bench::L2FlushBuffer flush(options.flush_bytes);
         const std::size_t workspace_bytes =
-            ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(2, 16, 1, 8);
+            ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(kHidden, 2, 16, 1, 8);
         WorkspaceArena workspace(workspace_bytes);
         Tensor norm_weight(norm.p, DType::BF16, {kHidden});
         Tensor base_kernel(base.p, DType::BF16, {kHidden, kTaps, kSides});

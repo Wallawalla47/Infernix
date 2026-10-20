@@ -290,7 +290,7 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_value_weight, Tens
     const std::int32_t hidden      = x.ne[0];
     const std::int32_t cols        = x.ne[1];
     if (cols <= 0) { throw std::invalid_argument("attn_input_proj: T must be positive"); }
-    if (hidden != 2048 && hidden != 5120) {
+    if (hidden != 2048 && hidden != 2560 && hidden != 5120) {
         throw std::invalid_argument("attn_input_proj: unsupported Q8 Q/K/V profile");
     }
     require_matrix(x, hidden, cols, "x");

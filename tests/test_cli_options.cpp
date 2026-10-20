@@ -165,7 +165,7 @@ int run_tests() {
                                   "--draft-tokens", "7"});
     failures += check(!mtp_fixed.speculative.draft_tokens_auto && mtp_fixed.speculative.draft_tokens == 7,
                       "CLI did not keep a fixed MTP draft length of 7");
-    for (const auto* rejected : {"dflash2", "Auto"}) {
+    for (const auto* rejected : {"dflash", "Auto"}) {
         const std::string backend = std::string(rejected) == "Auto" ? "mtp" : rejected;
         const std::string tokens  = std::string(rejected) == "Auto" ? "Auto" : "auto";
         failures += check(rejects([&] {
@@ -174,6 +174,20 @@ int run_tests() {
                           }),
                           ("CLI admitted --draft-tokens " + tokens + " with --spec " + backend).c_str());
     }
+    // Qwen3.8-Flash-Next's DFlash2 drafter: a companion artifact by path, and the automatic length.
+    const auto companion = parse({"infernix-cli", "model.infernix", "--prompt", "x", "--spec", "dflash2",
+                                  "--draft-tokens", "auto", "--draft-model", "drafter.infernix", "--lm-head-draft"});
+    failures += check(companion.speculative.draft_model == std::filesystem::path("drafter.infernix") &&
+                          companion.speculative.draft_tokens_auto &&
+                          companion.speculative.proposal_head == infernix::ProposalHead::Optimized,
+                      "CLI did not keep --draft-model, --draft-tokens auto and --lm-head-draft with dflash2");
+    failures += check(rejects([] {
+                          (void)parse({"infernix-cli", "model.infernix", "--prompt", "x", "--spec", "mtp",
+                                       "--draft-tokens", "3", "--draft-model", "drafter.infernix"});
+                      }),
+                      "CLI admitted --draft-model without --spec dflash2");
+    failures += check(infernix::cli::usage_text("infernix-cli").find("--draft-model FILE") != std::string::npos,
+                      "CLI help omits --draft-model");
     const infernix::cli::Options configured =
         parse({"infernix-cli", "model.ninfer", "--prompt", "hello", "--thinking-budget", "37"});
     failures += check(configured.thinking_budget == 37,

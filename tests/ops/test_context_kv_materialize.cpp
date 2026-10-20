@@ -23,7 +23,8 @@ using namespace infernix::test;
 namespace {
 
 constexpr int kLayers             = static_cast<int>(ops::kContextKVMaterializeLayers);
-constexpr int kHidden             = 5120;
+// The drafter geometry under test (run_geometry): context width H and the rotation's theta.
+int g_hidden                      = 0;
 constexpr int kRows               = 1024;
 constexpr int kHeadDim            = 128;
 constexpr int kHeads              = 8;
@@ -32,7 +33,7 @@ constexpr int kLaneCapacity       = 8;
 constexpr int kPaddedCapacity     = 2056;
 constexpr std::uint16_t kSentinel = 0xa5a5U;
 constexpr double kEpsilon         = 1.0e-6;
-constexpr double kTheta           = 1.0e7;
+double g_theta                    = 0.0;
 
 constexpr ReductionCriterion kKeyCriterion{
     3.0e-3,
@@ -59,13 +60,13 @@ std::size_t cache_index(int lane, int head, int slot, int dim) {
 }
 
 std::vector<float> make_context(int columns, std::uint32_t seed) {
-    std::vector<float> result(static_cast<std::size_t>(kHidden) * columns);
+    std::vector<float> result(static_cast<std::size_t>(g_hidden) * columns);
     for (int column = 0; column < columns; ++column) {
-        for (int row = 0; row < kHidden; ++row) {
+        for (int row = 0; row < g_hidden; ++row) {
             const std::uint32_t coordinate = static_cast<std::uint32_t>(row) * 29U +
                                              static_cast<std::uint32_t>(column) * 47U + seed * 13U;
             const int centered = static_cast<int>(coordinate % 257U) - 128;
-            result[static_cast<std::size_t>(column) * kHidden + row] =
+            result[static_cast<std::size_t>(column) * g_hidden + row] =
                 bf16_to_f32(f32_to_bf16(static_cast<float>(centered) * (1.0F / 192.0F)));
         }
     }
@@ -83,13 +84,13 @@ std::vector<float> make_norm(int layer) {
 }
 
 // A projection's stored codes decoded once to FP64 by the independent fixture decoder, row-major
-// [kRows, kHidden], so every oracle dot reads the same logical weights without decoding them again.
+// [kRows, g_hidden], so every oracle dot reads the same logical weights without decoding them again.
 std::vector<double> logical_weights(const quantized_weight::PackedWeight& weight) {
-    std::vector<double> logical(static_cast<std::size_t>(kRows) * kHidden);
+    std::vector<double> logical(static_cast<std::size_t>(kRows) * g_hidden);
     parallel_ranges(kRows, host_thread_count(), [&](std::int64_t begin, std::int64_t end) {
         for (auto row = static_cast<int>(begin); row < end; ++row)
-            for (int column = 0; column < kHidden; ++column)
-                logical[static_cast<std::size_t>(row) * kHidden + column] =
+            for (int column = 0; column < g_hidden; ++column)
+                logical[static_cast<std::size_t>(row) * g_hidden + column] =
                     quantized_weight::logical_weight_fp64(weight, row, column);
     });
     return logical;
@@ -97,9 +98,9 @@ std::vector<double> logical_weights(const quantized_weight::PackedWeight& weight
 
 // quantized_weight::dot_fp64 over the decoded weights, in the same column order.
 double logical_dot(const std::vector<double>& logical, int row, const float* input) {
-    const double* weights = logical.data() + static_cast<std::size_t>(row) * kHidden;
+    const double* weights = logical.data() + static_cast<std::size_t>(row) * g_hidden;
     double acc            = 0.0;
-    for (int column = 0; column < kHidden; ++column)
+    for (int column = 0; column < g_hidden; ++column)
         acc += weights[column] * static_cast<double>(input[column]);
     return acc;
 }
@@ -128,19 +129,19 @@ struct Fixture {
         for (int layer = 0; layer < kLayers; ++layer) {
             LayerStorage& target = storage[static_cast<std::size_t>(layer)];
             target.key_host      = quantized_weight::make_patterned_weight(
-                QType::Q8_G32_FP16, kRows, kHidden, 0x310U + 2U * layer, weight_options);
+                QType::Q8_G32_FP16, kRows, g_hidden, 0x310U + 2U * layer, weight_options);
             target.value_host = quantized_weight::make_patterned_weight(
-                QType::Q8_G32_FP16, kRows, kHidden, 0x311U + 2U * layer, weight_options);
+                QType::Q8_G32_FP16, kRows, g_hidden, 0x311U + 2U * layer, weight_options);
             target.key_logical                 = logical_weights(target.key_host);
             target.value_logical               = logical_weights(target.value_host);
-            constexpr std::size_t parent_codes = 6144ULL * kHidden;
-            target.parent_host.resize(parent_codes + 6144ULL * (kHidden / 32) * 2, 0x63);
+            const std::size_t parent_codes = 6144ULL * g_hidden;
+            target.parent_host.resize(parent_codes + 6144ULL * (g_hidden / 32) * 2, 0x63);
             const auto put = [&](const quantized_weight::PackedWeight& weight, int row) {
                 std::copy_n(weight.payload.data(), weight.code_plane_bytes,
-                            target.parent_host.data() + row * kHidden);
+                            target.parent_host.data() + row * g_hidden);
                 std::copy_n(weight.payload.data() + weight.scale_plane_offset,
                             weight.scale_plane_bytes,
-                            target.parent_host.data() + parent_codes + row * (kHidden / 32) * 2);
+                            target.parent_host.data() + parent_codes + row * (g_hidden / 32) * 2);
             };
             put(target.key_host, 4096);
             put(target.value_host, 5120);
@@ -148,9 +149,9 @@ struct Fixture {
             const auto row_view  = [&](const quantized_weight::PackedWeight& weight, int row) {
                 auto result = weight.device_weight(target.parent_device.p);
                 result.qdata =
-                    static_cast<const std::uint8_t*>(target.parent_device.p) + row * kHidden;
+                    static_cast<const std::uint8_t*>(target.parent_device.p) + row * g_hidden;
                 result.scales = static_cast<const std::uint8_t*>(target.parent_device.p) +
-                                parent_codes + row * (kHidden / 32) * 2;
+                                parent_codes + row * (g_hidden / 32) * 2;
                 result.payload_bytes = target.parent_host.size();
                 return result;
             };
@@ -212,7 +213,7 @@ void append_key_oracle(const LayerStorage& layer, const float* input, int head, 
         const double second = raw[static_cast<std::size_t>(pair + kHeadDim / 2)] * inverse *
                               layer.norm_host[static_cast<std::size_t>(pair + kHeadDim / 2)];
         const double angle = static_cast<double>(position) *
-                             std::pow(kTheta, -2.0 * static_cast<double>(pair) / kHeadDim);
+                             std::pow(g_theta, -2.0 * static_cast<double>(pair) / kHeadDim);
         const double cosine = std::cos(angle);
         const double sine   = std::sin(angle);
         expected.push_back(first * cosine - second * sine);
@@ -328,7 +329,7 @@ int verify_numeric_samples(const std::string& label, const Fixture& fixture,
                 const auto [batch, local] = samples[sample];
                 const int column          = batch * width + local;
                 append_key_oracle(fixture.storage[layer],
-                                  context.data() + static_cast<std::size_t>(column) * kHidden,
+                                  context.data() + static_cast<std::size_t>(column) * g_hidden,
                                   heads[head_index], positions[static_cast<std::size_t>(column)],
                                   key_oracles[static_cast<std::size_t>(item)]);
             }
@@ -349,7 +350,7 @@ int verify_numeric_samples(const std::string& label, const Fixture& fixture,
             const int position        = positions[static_cast<std::size_t>(column)];
             const int slot            = position & (kCapacity - 1);
             const int lane            = state_slots[static_cast<std::size_t>(batch)];
-            const float* input = context.data() + static_cast<std::size_t>(column) * kHidden;
+            const float* input = context.data() + static_cast<std::size_t>(column) * g_hidden;
             for (std::size_t head_index = 0; head_index < heads.size(); ++head_index) {
                 const int head = heads[head_index];
                 const std::vector<double>& head_expected =
@@ -399,7 +400,7 @@ int run_case(Fixture& fixture, const std::string& label, int width, int batch,
         ops::context_kv_materialize_workspace_capacity_bytes(batch, width, width);
     GuardedDeviceBuffer scratch(std::max<std::size_t>(workspace_bytes, 1));
     WorkspaceArena workspace(DeviceSpan{scratch.data(), scratch.bytes()});
-    Tensor context_tensor(context_device.p, DType::BF16, {kHidden, width, batch});
+    Tensor context_tensor(context_device.p, DType::BF16, {g_hidden, width, batch});
     Tensor positions_tensor(positions_device.p, DType::I32, {width, batch});
     Tensor counts_tensor(counts_device.p, DType::I32, {batch});
     Tensor slots_tensor(slots_device.p, DType::I32, {batch});
@@ -409,7 +410,8 @@ int run_case(Fixture& fixture, const std::string& label, int width, int batch,
                : static_cast<std::uint32_t>(width)};
     const auto launch = [&](cudaStream_t stream) {
         ops::context_kv_materialize(context_tensor, positions_tensor, counts_tensor, slots_tensor,
-                                    fixture.views, envelope, workspace, stream);
+                                    fixture.views, static_cast<float>(g_theta), envelope, workspace,
+                                    stream);
     };
     launch(nullptr);
     cuda_synchronize();
@@ -479,6 +481,83 @@ int run_case(Fixture& fixture, const std::string& label, int width, int batch,
     return failures;
 }
 
+int run_geometry(int hidden, double theta) {
+    g_hidden = hidden;
+    g_theta  = theta;
+    Fixture fixture;
+    int failures = 0;
+    const std::vector<int> widths{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+    // Batched ngram copy rounds append up to 64 columns per request; with the per-request
+    // count pattern below they reach every route's largest scratch for each batch size.
+    std::vector<int> batched_widths = widths;
+    batched_widths.insert(batched_widths.end(), {17, 24, 32, 48, 64});
+    for (int width : batched_widths)
+        for (int batch = 1; batch <= 8; ++batch) {
+            std::vector<int> counts(batch), slots(batch), positions(width * batch, -12345);
+            for (int b = 0; b < batch; ++b) {
+                counts[b] = b == batch - 1 || b % 3 == 2 ? width
+                            : b % 3 == 1                 ? std::max(1, width / 2)
+                                                         : 0;
+                slots[b]  = counts[b] ? (b * 3 + 2) % 8 : -1;
+                for (int i = 0; i < counts[b]; ++i)
+                    positions[b * width + i] = 2046 + b * 4096 + i;
+            }
+            fixture.reset_cache();
+            failures +=
+                run_case(fixture, "W=" + std::to_string(width) + " B=" + std::to_string(batch),
+                         width, batch, counts, slots, positions, 0x701U + width);
+        }
+    for (int width : widths)
+        for (int count : {0, 1, std::max(1, width / 2)}) {
+            fixture.reset_cache();
+            std::vector<int> positions(width * 8, -1), counts(8, count), slots(8, -1);
+            for (int b = 0; b < 8; ++b) {
+                if (count) slots[b] = 7 - b;
+                for (int i = 0; i < count; ++i)
+                    positions[b * width + i] = 262140 + b * 4096 + i;
+            }
+            failures += run_case(fixture,
+                                 "narrow W=" + std::to_string(width) +
+                                     " count=" + std::to_string(count),
+                                 width, 8, counts, slots, positions, 0x704U, true);
+        }
+    for (int width : {17, 81, 85, 86, 97, 128, 129, 256, 257, 2048}) {
+        fixture.reset_cache();
+        std::vector<int> positions(width);
+        for (int i = 0; i < width; ++i) positions[i] = 262140 + i;
+        failures += run_case(fixture, "prefill W=" + std::to_string(width), width, 1, {width},
+                             {7}, positions, 0x702U);
+    }
+    for (int count : {0, 1, 96, 128, 257}) {
+        fixture.reset_cache();
+        std::vector<int> positions(2048, -1);
+        for (int i = 0; i < count; ++i) positions[i] = 262140 + i;
+        failures += run_case(fixture, "wide narrow count=" + std::to_string(count), 2048, 1,
+                             {count}, {count ? 3 : -1}, positions, 0x705U, true);
+    }
+    fixture.reset_cache();
+    failures += run_case(fixture, "zero projection", 3, 3, {0, 1, 3}, {-1, 7, 2},
+                         {-1, -1, -1, 2047, -1, -1, 262142, 262143, 262144}, 0, true, true);
+    for (int batch = 1; batch <= 8; ++batch) {
+        const auto capacity = ops::context_kv_materialize_workspace_capacity_bytes(
+            batch, 1, batch == 1 ? 2048 : 64);
+        if (capacity != fixture.observed_peak[batch]) {
+            std::cerr << "workspace interval peak mismatch B=" << batch << "\n";
+            ++failures;
+        }
+    }
+    for (const auto& layer : fixture.storage) {
+        failures += verify_exact(
+            "QKV parent readonly",
+            from_device<std::uint8_t>(layer.parent_device, layer.parent_host.size()),
+            layer.parent_host);
+        failures +=
+            verify_exact("norm readonly", from_device_bf16(layer.norm_device, kHeadDim),
+                         std::vector<double>(layer.norm_host.begin(), layer.norm_host.end()));
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -487,79 +566,8 @@ int main() {
             std::cout << "context_kv_materialize: SKIP (CUDA unavailable)\n";
             return 77;
         }
-
-        Fixture fixture;
-        int failures = 0;
-        const std::vector<int> widths{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
-        // Batched ngram copy rounds append up to 64 columns per request; with the per-request
-        // count pattern below they reach every route's largest scratch for each batch size.
-        std::vector<int> batched_widths = widths;
-        batched_widths.insert(batched_widths.end(), {17, 24, 32, 48, 64});
-        for (int width : batched_widths)
-            for (int batch = 1; batch <= 8; ++batch) {
-                std::vector<int> counts(batch), slots(batch), positions(width * batch, -12345);
-                for (int b = 0; b < batch; ++b) {
-                    counts[b] = b == batch - 1 || b % 3 == 2 ? width
-                                : b % 3 == 1                 ? std::max(1, width / 2)
-                                                             : 0;
-                    slots[b]  = counts[b] ? (b * 3 + 2) % 8 : -1;
-                    for (int i = 0; i < counts[b]; ++i)
-                        positions[b * width + i] = 2046 + b * 4096 + i;
-                }
-                fixture.reset_cache();
-                failures +=
-                    run_case(fixture, "W=" + std::to_string(width) + " B=" + std::to_string(batch),
-                             width, batch, counts, slots, positions, 0x701U + width);
-            }
-        for (int width : widths)
-            for (int count : {0, 1, std::max(1, width / 2)}) {
-                fixture.reset_cache();
-                std::vector<int> positions(width * 8, -1), counts(8, count), slots(8, -1);
-                for (int b = 0; b < 8; ++b) {
-                    if (count) slots[b] = 7 - b;
-                    for (int i = 0; i < count; ++i)
-                        positions[b * width + i] = 262140 + b * 4096 + i;
-                }
-                failures += run_case(fixture,
-                                     "narrow W=" + std::to_string(width) +
-                                         " count=" + std::to_string(count),
-                                     width, 8, counts, slots, positions, 0x704U, true);
-            }
-        for (int width : {17, 81, 85, 86, 97, 128, 129, 256, 257, 2048}) {
-            fixture.reset_cache();
-            std::vector<int> positions(width);
-            for (int i = 0; i < width; ++i) positions[i] = 262140 + i;
-            failures += run_case(fixture, "prefill W=" + std::to_string(width), width, 1, {width},
-                                 {7}, positions, 0x702U);
-        }
-        for (int count : {0, 1, 96, 128, 257}) {
-            fixture.reset_cache();
-            std::vector<int> positions(2048, -1);
-            for (int i = 0; i < count; ++i) positions[i] = 262140 + i;
-            failures += run_case(fixture, "wide narrow count=" + std::to_string(count), 2048, 1,
-                                 {count}, {count ? 3 : -1}, positions, 0x705U, true);
-        }
-        fixture.reset_cache();
-        failures += run_case(fixture, "zero projection", 3, 3, {0, 1, 3}, {-1, 7, 2},
-                             {-1, -1, -1, 2047, -1, -1, 262142, 262143, 262144}, 0, true, true);
-        for (int batch = 1; batch <= 8; ++batch) {
-            const auto capacity = ops::context_kv_materialize_workspace_capacity_bytes(
-                batch, 1, batch == 1 ? 2048 : 64);
-            if (capacity != fixture.observed_peak[batch]) {
-                std::cerr << "workspace interval peak mismatch B=" << batch << "\n";
-                ++failures;
-            }
-        }
-        for (const auto& layer : fixture.storage) {
-            failures += verify_exact(
-                "QKV parent readonly",
-                from_device<std::uint8_t>(layer.parent_device, layer.parent_host.size()),
-                layer.parent_host);
-            failures +=
-                verify_exact("norm readonly", from_device_bf16(layer.norm_device, kHeadDim),
-                             std::vector<double>(layer.norm_host.begin(), layer.norm_host.end()));
-        }
-
+        // Qwen3.8-27B's drafter (H 5120, theta 1e7) and Qwen3.8-Flash-Next's (H 2560, theta 1e4).
+        const int failures = run_geometry(5120, 1.0e7) + run_geometry(2560, 1.0e4);
         if (failures != 0) {
             std::cerr << "context_kv_materialize failures=" << failures << '\n';
             return 1;

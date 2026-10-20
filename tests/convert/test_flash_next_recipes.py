@@ -10,6 +10,7 @@ import torch
 from tools.convert.methods import cast_direct, grouped_absmax, grouped_mse
 from tools.convert.model import Model, Parameter
 from tools.convert.official_recipes import (
+    qwen3_8_flash_next_dflash2,
     qwen3_8_flash_next_fp8,
     qwen3_8_flash_next_nvfp4,
     qwen3_8_flash_next_nvfp4_dense8,
@@ -244,3 +245,63 @@ def test_fp8_bank_import_writes_each_expert_verbatim(tmp_path) -> None:
         out = Output(g.payload_bytes)
         with pytest.raises(ValueError, match="BF16"):
             import_fp8_expert_bank(PrepareRequest(spec, (MethodInput("experts", bank, ()),), {}, {})).produce(out)
+
+
+# ---------------------------------------------------------------- DFlash2 companion (--draft-model)
+
+D2 = "dflash2/layers/0"
+D2_Q8 = (
+    "dflash2/feature_projection",
+    f"{D2}/attention/query", f"{D2}/attention/key", f"{D2}/attention/value", f"{D2}/attention/output",
+    f"{D2}/mlp/gate", f"{D2}/mlp/up", f"{D2}/mlp/down",
+)
+D2_BF16_PROJECTIONS = (
+    f"{D2}/attention_conv/kernel_projection", f"{D2}/mlp_conv/kernel_projection",
+    "dflash2/candidate_selector/hidden_projection",
+)
+D2_DIRECT = ("dflash2/final_norm", f"{D2}/input_norm", "dflash2/candidate_selector/predecessor_codebook")
+TARGET_HEADS = (("text/output_head", "dflash2/final_hidden"), ("proposal/head", "dflash2/final_hidden"))
+
+
+def _companion(external_uses=TARGET_HEADS) -> Model:
+    model = Model(
+        {"dflash2": {"config": {"num_hidden_layers": 1}, "target": "text"}},
+        target={"architectures": ["Qwen4ExpForCausalLM"]},
+        external_uses=external_uses,
+    )
+    for name in (*D2_Q8, *D2_BF16_PROJECTIONS, f"{D2}/attention/context_key", f"{D2}/attention/context_value"):
+        model.add(Parameter(name, (4, 64), array_source(torch.ones((4, 64), dtype=torch.bfloat16), name), inputs=("x",)))
+    for name in D2_DIRECT:
+        model.add(Parameter(name, (64,), array_source(torch.ones((64,), dtype=torch.bfloat16), name)))
+    return model
+
+
+def test_dflash2_companion_takes_the_official_27b_drafter_quantization() -> None:
+    model = _companion()
+    recipe = Recipe(model)
+    qwen3_8_flash_next_dflash2(model, recipe, {})
+    for name in D2_Q8:
+        chosen = _only(recipe.selections, name)
+        assert (chosen.format, chosen.method) == (Q8, grouped_absmax), name
+    for name in (*D2_BF16_PROJECTIONS, *D2_DIRECT):
+        assert _only(recipe.selections, name).format == "bf16", name
+    # The context K/V projections share the block's K/V words.
+    assert recipe.aliases[f"{D2}/attention/context_key"] == f"{D2}/attention/key"
+    assert recipe.aliases[f"{D2}/attention/context_value"] == f"{D2}/attention/value"
+    # Its Uses of the target's heads are declared (16-bit activations), with no binding of their own.
+    for key in TARGET_HEADS:
+        assert recipe.policies[key] == "A16Only"
+        assert key[0] not in recipe.selections
+
+
+def test_dflash2_companion_recipe_refuses_other_models() -> None:
+    model = _model()
+    with pytest.raises(ValueError, match="companion"):
+        qwen3_8_flash_next_dflash2(model, Recipe(model), {})
+    other = _companion()
+    other.target = {"architectures": ["Qwen3_5ForCausalLM"]}
+    with pytest.raises(ValueError, match="companion"):
+        qwen3_8_flash_next_dflash2(other, Recipe(other), {})
+    # An external Use names a parameter of the target, never one of the companion's own.
+    with pytest.raises(ValueError, match="external Use"):
+        Recipe(_companion(external_uses=(("dflash2/feature_projection", "dflash2/final_hidden"),)))

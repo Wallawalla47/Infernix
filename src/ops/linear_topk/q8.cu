@@ -17,13 +17,13 @@
 namespace infernix::ops::detail {
 namespace {
 
-template <int Capacity, class Schedule>
+template <int Hidden, int Capacity, class Schedule>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q8_grouped_ksplit_topk_kernel(
     const __nv_bfloat16* __restrict__ hidden, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ scales, std::int32_t valid_rows,
     std::uint64_t* __restrict__ partial_keys, std::int32_t producer_groups, int columns) {
-    using Geometry           = Q8LinearGeometry<248320, 5120>;
+    using Geometry           = Q8LinearGeometry<248320, Hidden>;
     constexpr int kHidden    = Geometry::kInputRows;
     constexpr int kTileK     = Schedule::kWarpK;
     constexpr int kWarps     = Schedule::kKWarps;
@@ -267,11 +267,11 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q8_grouped
 using Launch = void (*)(const Tensor&, const Weight&, std::int32_t, const LinearTopKWorkspace&,
                         cudaStream_t);
 
-template <int Capacity>
+template <int Hidden, int Capacity>
 void launch_tile(const Tensor& hidden, const Weight& head, std::int32_t valid_rows,
                  const LinearTopKWorkspace& workspace, cudaStream_t stream) {
     using Schedule = Q8A16SlicedKMmaSchedule<Capacity, 8, 1, 2, Q8ScaleAccess::Shared>;
-    q8_grouped_ksplit_topk_kernel<Capacity, Schedule>
+    q8_grouped_ksplit_topk_kernel<Hidden, Capacity, Schedule>
         <<<workspace.producer_groups, Schedule::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(hidden.data),
             static_cast<const std::uint8_t*>(head.qdata),
@@ -281,19 +281,22 @@ void launch_tile(const Tensor& hidden, const Weight& head, std::int32_t valid_ro
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <std::size_t... Indices>
+template <int Hidden, std::size_t... Indices>
 constexpr auto make_launchers(std::index_sequence<Indices...>) {
-    return std::array<Launch, sizeof...(Indices)>{&launch_tile<8 * (1 + Indices)>...};
+    return std::array<Launch, sizeof...(Indices)>{&launch_tile<Hidden, 8 * (1 + Indices)>...};
 }
 
-constexpr auto kLaunchers = make_launchers(std::make_index_sequence<3>{});
+// Qwen3.8-27B's heads (5120) and Qwen3.8-Flash-Next's (2560).
+constexpr auto k27BLaunchers       = make_launchers<5120>(std::make_index_sequence<3>{});
+constexpr auto kFlashNextLaunchers = make_launchers<2560>(std::make_index_sequence<3>{});
 
 } // namespace
 
 void linear_topk_q8_launch(const Tensor& hidden, const Weight& head, std::int32_t valid_rows,
                            const LinearTopKWorkspace& workspace, cudaStream_t stream) {
     if (workspace.tile_columns == 0) {
-        kLaunchers[(hidden.ne[1] - 1) / 8](hidden, head, valid_rows, workspace, stream);
+        const auto& launchers = hidden.ne[0] == 5120 ? k27BLaunchers : kFlashNextLaunchers;
+        launchers[(hidden.ne[1] - 1) / 8](hidden, head, valid_rows, workspace, stream);
     } else {
         linear_topk_q8_m64_launch(hidden, head, valid_rows, workspace, stream);
     }

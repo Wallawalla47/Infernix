@@ -81,8 +81,11 @@ bool is_companion_shape(const Q8LinearSwiGluProblem& problem) noexcept {
 }
 
 bool is_dflash2_shape(const Q8LinearSwiGluProblem& problem) noexcept {
-    return problem.gate_up_rows == 34816 && problem.output_rows == 17408 && problem.k == 5120 &&
-           problem.padded_k == 5120;
+    // Qwen3.8-27B's drafter and Qwen3.8-Flash-Next's.
+    return (problem.gate_up_rows == 34816 && problem.output_rows == 17408 && problem.k == 5120 &&
+            problem.padded_k == 5120) ||
+           (problem.gate_up_rows == 15360 && problem.output_rows == 7680 && problem.k == 2560 &&
+            problem.padded_k == 2560);
 }
 
 bool is_flash_next_shared_shape(const Q8LinearSwiGluProblem& problem) noexcept {

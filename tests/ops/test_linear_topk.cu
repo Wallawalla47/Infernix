@@ -19,7 +19,8 @@ namespace {
 using namespace infernix;
 using namespace infernix::test;
 
-constexpr std::int32_t kHidden    = 5120;
+// The head width under test (main): Qwen3.8-27B's 5120 or Qwen3.8-Flash-Next's 2560.
+std::int32_t g_hidden = 5120;
 constexpr std::int32_t kFullRows  = 248320;
 constexpr std::int32_t kValidRows = 248077;
 constexpr std::int32_t kShortRows = 131072;
@@ -44,10 +45,10 @@ std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment) {
 
 FixtureWeight make_rowsplit(QType qtype, std::int32_t rows) {
     const std::int32_t group         = qtype == QType::Q8_G32_FP16 ? 32 : 64;
-    const std::uint64_t groups       = static_cast<std::uint64_t>(rows) * (kHidden / group);
+    const std::uint64_t groups       = static_cast<std::uint64_t>(rows) * (g_hidden / group);
     const std::uint64_t code_bytes   = qtype == QType::Q8_G32_FP16
-                                           ? static_cast<std::uint64_t>(rows) * kHidden
-                                           : static_cast<std::uint64_t>(rows) * kHidden / 2;
+                                           ? static_cast<std::uint64_t>(rows) * g_hidden
+                                           : static_cast<std::uint64_t>(rows) * g_hidden / 2;
     const std::uint64_t scale_offset = align_up(code_bytes, 256);
     const std::uint64_t scale_bytes  = groups * sizeof(std::uint16_t);
     FixtureWeight result{
@@ -59,15 +60,15 @@ FixtureWeight make_rowsplit(QType qtype, std::int32_t rows) {
     result.weight.qtype            = qtype;
     result.weight.group_size       = group;
     result.weight.shape[0]         = rows;
-    result.weight.shape[1]         = kHidden;
+    result.weight.shape[1]         = g_hidden;
     result.weight.padded_shape[0]  = rows;
-    result.weight.padded_shape[1]  = kHidden;
+    result.weight.padded_shape[1]  = g_hidden;
     result.weight.ndim             = 2;
     result.weight.qdata            = result.payload.p;
     result.weight.qhigh            = nullptr;
     result.weight.scales           = static_cast<std::uint8_t*>(result.payload.p) + scale_offset;
     result.weight.n                = rows;
-    result.weight.k                = kHidden;
+    result.weight.k                = g_hidden;
     result.weight.group            = group;
     result.weight.layout           = QuantLayout::RowSplit;
     result.weight.scale_dtype      = DType::FP16;
@@ -75,7 +76,7 @@ FixtureWeight make_rowsplit(QType qtype, std::int32_t rows) {
 }
 
 FixtureWeight make_fp8() {
-    const std::uint64_t code_bytes   = static_cast<std::uint64_t>(kFullRows) * kHidden;
+    const std::uint64_t code_bytes   = static_cast<std::uint64_t>(kFullRows) * g_hidden;
     const std::uint64_t scale_offset = align_up(code_bytes, 256);
     const std::uint64_t scale_bytes  = static_cast<std::uint64_t>(kFullRows) * 2;
     FixtureWeight result{
@@ -85,18 +86,18 @@ FixtureWeight make_fp8() {
     result.weight.payload_bytes    = result.payload.bytes;
     result.weight.high_plane_bytes = 0;
     result.weight.qtype            = QType::FP8_E4M3FN_ROW_BF16;
-    result.weight.group_size       = kHidden;
+    result.weight.group_size       = g_hidden;
     result.weight.shape[0]         = kFullRows;
-    result.weight.shape[1]         = kHidden;
+    result.weight.shape[1]         = g_hidden;
     result.weight.padded_shape[0]  = kFullRows;
-    result.weight.padded_shape[1]  = kHidden;
+    result.weight.padded_shape[1]  = g_hidden;
     result.weight.ndim             = 2;
     result.weight.qdata            = result.payload.p;
     result.weight.qhigh            = nullptr;
     result.weight.scales           = static_cast<std::uint8_t*>(result.payload.p) + scale_offset;
     result.weight.n                = kFullRows;
-    result.weight.k                = kHidden;
-    result.weight.group            = kHidden;
+    result.weight.k                = g_hidden;
+    result.weight.group            = g_hidden;
     result.weight.layout           = QuantLayout::RowScale;
     result.weight.scale_dtype      = DType::BF16;
     result.weight.scale_ne[0]      = kFullRows;
@@ -134,14 +135,14 @@ std::uint8_t fp8_code(std::int32_t k) {
 }
 
 void patch_rowsplit_row(FixtureWeight& fixture, QType qtype, std::int32_t row, float factor) {
-    const std::size_t code_row_bytes = qtype == QType::Q8_G32_FP16 ? kHidden : kHidden / 2;
+    const std::size_t code_row_bytes = qtype == QType::Q8_G32_FP16 ? g_hidden : g_hidden / 2;
     std::vector<std::uint8_t> codes(code_row_bytes);
     if (qtype == QType::Q8_G32_FP16) {
-        for (std::int32_t k = 0; k < kHidden; ++k) {
+        for (std::int32_t k = 0; k < g_hidden; ++k) {
             codes[static_cast<std::size_t>(k)] = static_cast<std::uint8_t>(rowsplit_code(qtype, k));
         }
     } else {
-        for (std::int32_t pair = 0; pair < kHidden / 2; ++pair) {
+        for (std::int32_t pair = 0; pair < g_hidden / 2; ++pair) {
             const std::uint8_t low  = static_cast<std::uint8_t>(rowsplit_code(qtype, pair * 2));
             const std::uint8_t high = static_cast<std::uint8_t>(rowsplit_code(qtype, pair * 2 + 1));
             codes[static_cast<std::size_t>(pair)] =
@@ -150,7 +151,7 @@ void patch_rowsplit_row(FixtureWeight& fixture, QType qtype, std::int32_t row, f
     }
     fixture.payload.copy_from_host(codes.data(), codes.size(),
                                    static_cast<std::size_t>(row) * code_row_bytes);
-    const std::int32_t groups = kHidden / (qtype == QType::Q8_G32_FP16 ? 32 : 64);
+    const std::int32_t groups = g_hidden / (qtype == QType::Q8_G32_FP16 ? 32 : 64);
     std::vector<std::uint16_t> scales(static_cast<std::size_t>(groups));
     for (std::int32_t group = 0; group < groups; ++group) {
         scales[static_cast<std::size_t>(group)] =
@@ -163,10 +164,10 @@ void patch_rowsplit_row(FixtureWeight& fixture, QType qtype, std::int32_t row, f
 }
 
 void patch_fp8_row(FixtureWeight& fixture, std::int32_t row, float factor) {
-    std::vector<std::uint8_t> codes(kHidden);
-    for (std::int32_t k = 0; k < kHidden; ++k) { codes[static_cast<std::size_t>(k)] = fp8_code(k); }
+    std::vector<std::uint8_t> codes(g_hidden);
+    for (std::int32_t k = 0; k < g_hidden; ++k) { codes[static_cast<std::size_t>(k)] = fp8_code(k); }
     fixture.payload.copy_from_host(codes.data(), codes.size(),
-                                   static_cast<std::size_t>(row) * kHidden);
+                                   static_cast<std::size_t>(row) * g_hidden);
     const std::uint16_t scale = f32_to_bf16(factor);
     fixture.payload.copy_from_host(&scale, sizeof(scale),
                                    static_cast<std::size_t>(fixture.scale_offset) +
@@ -174,13 +175,13 @@ void patch_fp8_row(FixtureWeight& fixture, std::int32_t row, float factor) {
 }
 
 std::vector<std::uint16_t> make_hidden() {
-    std::vector<std::uint16_t> hidden(static_cast<std::size_t>(kHidden) * kMaxColumns);
+    std::vector<std::uint16_t> hidden(static_cast<std::size_t>(g_hidden) * kMaxColumns);
     for (std::int32_t column = 0; column < kMaxColumns; ++column) {
-        for (std::int32_t k = 0; k < kHidden; ++k) {
+        for (std::int32_t k = 0; k < g_hidden; ++k) {
             const float source = 0.25F + static_cast<float>(k & 7) * 0.125F +
                                  static_cast<float>(column % 17) * 0.0625F;
             const std::uint16_t bits                               = f32_to_bf16(source);
-            hidden[static_cast<std::size_t>(column) * kHidden + k] = bits;
+            hidden[static_cast<std::size_t>(column) * g_hidden + k] = bits;
         }
     }
     return hidden;
@@ -192,7 +193,7 @@ std::vector<double> base_scores(QType qtype, const std::vector<std::uint16_t>& h
     for (int factor = 1; factor <= 17; ++factor)
         for (int column = 0; column < kMaxColumns; ++column) {
             double sum = 0;
-            for (int k = 0; k < kHidden; ++k) {
+            for (int k = 0; k < g_hidden; ++k) {
                 double weight;
                 if (qtype == QType::FP8_E4M3FN_ROW_BF16) {
                     weight =
@@ -205,7 +206,7 @@ std::vector<double> base_scores(QType qtype, const std::vector<std::uint16_t>& h
                     weight = static_cast<double>(rowsplit_code(qtype, k)) *
                              quantized_weight::detail::f16_to_f32(scale);
                 }
-                sum += weight * bf16_to_f32(hidden[static_cast<std::size_t>(column) * kHidden + k]);
+                sum += weight * bf16_to_f32(hidden[static_cast<std::size_t>(column) * g_hidden + k]);
             }
             scores[factor * kMaxColumns + column] = sum;
         }
@@ -283,14 +284,14 @@ std::vector<int> test_columns() {
 int verify_zero_ties(const FixtureWeight& fixture, const Tensor* id_map,
                      const std::vector<std::int32_t>* host_map) {
     constexpr int columns = 3;
-    DeviceBuffer hidden(static_cast<std::size_t>(kHidden) * columns * 2);
+    DeviceBuffer hidden(static_cast<std::size_t>(g_hidden) * columns * 2);
     hidden.fill(0);
     GuardedDeviceBuffer ids(kTopK * columns * 4), scores(kTopK * columns * 4);
-    Tensor x(hidden.p, DType::BF16, {kHidden, columns});
+    Tensor x(hidden.p, DType::BF16, {g_hidden, columns});
     Tensor out_ids(ids.data(), DType::I32, {kTopK, columns});
     Tensor out_scores(scores.data(), DType::FP32, {kTopK, columns});
     WorkspaceArena workspace(ops::linear_topk_workspace_capacity_bytes(
-        fixture.weight.qtype, fixture.weight.n, kHidden, columns, columns));
+        fixture.weight.qtype, fixture.weight.n, g_hidden, columns, columns));
     if (id_map)
         ops::linear_topk(x, fixture.weight, *id_map, out_ids, out_scores, workspace, nullptr);
     else
@@ -331,24 +332,24 @@ int run_full(QType qtype, const char* profile, const DeviceBuffer& hidden,
 
     const auto expected = expected_order(kFullWinnerRows, nullptr);
     const std::size_t capacity =
-        ops::linear_topk_workspace_capacity_bytes(qtype, kFullRows, kHidden, 1, kMaxColumns);
+        ops::linear_topk_workspace_capacity_bytes(qtype, kFullRows, g_hidden, 1, kMaxColumns);
     GuardedDeviceBuffer graph_scratch(capacity);
     WorkspaceArena workspace(DeviceSpan{graph_scratch.data(), graph_scratch.bytes()});
     DeviceBuffer ids(static_cast<std::size_t>(kTopK) * kMaxColumns * sizeof(std::int32_t));
     DeviceBuffer scores(static_cast<std::size_t>(kTopK) * kMaxColumns * sizeof(float));
     int failures = 0;
     for (int columns : test_columns()) {
-        GuardedDeviceBuffer x(static_cast<std::size_t>(kHidden) * columns * 2);
+        GuardedDeviceBuffer x(static_cast<std::size_t>(g_hidden) * columns * 2);
         GuardedDeviceBuffer out_ids(static_cast<std::size_t>(kTopK) * columns * 4);
         GuardedDeviceBuffer out_scores(static_cast<std::size_t>(kTopK) * columns * 4);
         cuda_check(cudaMemcpy(x.data(), hidden.p, x.bytes(), cudaMemcpyDeviceToDevice),
                    "copy input fixture");
         const auto before = from_device<std::uint16_t>(x.data(), x.bytes() / 2);
         const auto exact  = ops::linear_topk_workspace_capacity_bytes(
-            fixture.weight.qtype, fixture.weight.n, kHidden, columns, columns);
+            fixture.weight.qtype, fixture.weight.n, g_hidden, columns, columns);
         GuardedDeviceBuffer scratch(exact);
         WorkspaceArena point_workspace(DeviceSpan{scratch.data(), exact});
-        Tensor hidden_tensor(x.data(), DType::BF16, {kHidden, columns});
+        Tensor hidden_tensor(x.data(), DType::BF16, {g_hidden, columns});
         Tensor ids_tensor(out_ids.data(), DType::I32, {kTopK, columns});
         Tensor scores_tensor(out_scores.data(), DType::FP32, {kTopK, columns});
         out_ids.fill(0xcd);
@@ -374,7 +375,7 @@ int run_full(QType qtype, const char* profile, const DeviceBuffer& hidden,
 
     for (int graph_columns : {1,  8,  9,  16, 17, 24, 25, 32,  33,  48,  49, 64,
                               65, 80, 81, 88, 89, 96, 97, 112, 113, 120, 129}) {
-        Tensor graph_hidden(hidden.p, DType::BF16, {kHidden, graph_columns});
+        Tensor graph_hidden(hidden.p, DType::BF16, {g_hidden, graph_columns});
         Tensor graph_ids(ids.p, DType::I32, {kTopK, graph_columns});
         Tensor graph_scores(scores.p, DType::FP32, {kTopK, graph_columns});
         cudaStream_t stream = nullptr;
@@ -406,7 +407,7 @@ int run_q4(const DeviceBuffer& hidden, const std::vector<double>& base_score) {
     const auto expected = expected_order(kShortWinnerRows, &host_map);
 
     const std::size_t capacity = ops::linear_topk_workspace_capacity_bytes(
-        QType::Q4_G64_FP16, kShortRows, kHidden, 1, kMaxColumns);
+        QType::Q4_G64_FP16, kShortRows, g_hidden, 1, kMaxColumns);
     GuardedDeviceBuffer graph_scratch(capacity);
     WorkspaceArena workspace(DeviceSpan{graph_scratch.data(), graph_scratch.bytes()});
     DeviceBuffer ids(static_cast<std::size_t>(kTopK) * kMaxColumns * sizeof(std::int32_t));
@@ -414,17 +415,17 @@ int run_q4(const DeviceBuffer& hidden, const std::vector<double>& base_score) {
     Tensor map_tensor(map.p, DType::I32, {kShortRows});
     int failures = 0;
     for (int columns : test_columns()) {
-        GuardedDeviceBuffer x(static_cast<std::size_t>(kHidden) * columns * 2);
+        GuardedDeviceBuffer x(static_cast<std::size_t>(g_hidden) * columns * 2);
         GuardedDeviceBuffer out_ids(static_cast<std::size_t>(kTopK) * columns * 4);
         GuardedDeviceBuffer out_scores(static_cast<std::size_t>(kTopK) * columns * 4);
         cuda_check(cudaMemcpy(x.data(), hidden.p, x.bytes(), cudaMemcpyDeviceToDevice),
                    "copy input fixture");
         const auto before = from_device<std::uint16_t>(x.data(), x.bytes() / 2);
         const auto exact  = ops::linear_topk_workspace_capacity_bytes(
-            fixture.weight.qtype, fixture.weight.n, kHidden, columns, columns);
+            fixture.weight.qtype, fixture.weight.n, g_hidden, columns, columns);
         GuardedDeviceBuffer scratch(exact);
         WorkspaceArena point_workspace(DeviceSpan{scratch.data(), exact});
-        Tensor hidden_tensor(x.data(), DType::BF16, {kHidden, columns});
+        Tensor hidden_tensor(x.data(), DType::BF16, {g_hidden, columns});
         Tensor ids_tensor(out_ids.data(), DType::I32, {kTopK, columns});
         Tensor scores_tensor(out_scores.data(), DType::FP32, {kTopK, columns});
         out_ids.fill(0xcd);
@@ -450,7 +451,7 @@ int run_q4(const DeviceBuffer& hidden, const std::vector<double>& base_score) {
 
     for (int graph_columns : {1,  8,  9,  16, 17, 24, 25, 32,  33,  48,  49, 64,
                               65, 80, 81, 88, 89, 96, 97, 112, 113, 120, 129}) {
-        Tensor graph_hidden(hidden.p, DType::BF16, {kHidden, graph_columns});
+        Tensor graph_hidden(hidden.p, DType::BF16, {g_hidden, graph_columns});
         Tensor graph_ids(ids.p, DType::I32, {kTopK, graph_columns});
         Tensor graph_scores(scores.p, DType::FP32, {kTopK, graph_columns});
         cudaStream_t stream = nullptr;
@@ -492,6 +493,14 @@ int main() {
         failures += run_full(QType::FP8_E4M3FN_ROW_BF16, "fp8-full", hidden,
                              base_scores(QType::FP8_E4M3FN_ROW_BF16, host_hidden));
         failures += run_q4(hidden, base_scores(QType::Q4_G64_FP16, host_hidden));
+        // Qwen3.8-Flash-Next's heads: the Q8 full head and the Q4 proposal head (--lm-head-draft).
+        g_hidden = 2560;
+        const std::vector<std::uint16_t> narrow_hidden = make_hidden();
+        DeviceBuffer narrow(narrow_hidden.size() * sizeof(std::uint16_t));
+        narrow.copy_from_host(narrow_hidden.data(), narrow.bytes);
+        failures += run_full(QType::Q8_G32_FP16, "q8-full H=2560", narrow,
+                             base_scores(QType::Q8_G32_FP16, narrow_hidden));
+        failures += run_q4(narrow, base_scores(QType::Q4_G64_FP16, narrow_hidden));
         std::cout << (failures == 0 ? "OK" : "FAIL") << " linear_topk\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

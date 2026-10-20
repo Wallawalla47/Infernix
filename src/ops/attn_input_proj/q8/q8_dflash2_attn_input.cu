@@ -19,7 +19,8 @@
 namespace infernix::ops::detail {
 namespace {
 
-using Geometry                          = Q8LinearGeometry<6144, 5120>;
+// The DFlash2 drafters' Q/K/V parent [6144, H]: H = 5120 (Qwen3.8-27B) or 2560
+// (Qwen3.8-Flash-Next).
 constexpr std::int32_t kQueryRows       = 4096;
 constexpr std::int32_t kKvRows          = 1024;
 constexpr std::int32_t kLastSmallTokens = 48;
@@ -27,12 +28,15 @@ using Output                            = LinearBf16SegmentedOutput<kQueryRows, 
 using Launch = void (*)(const Tensor&, const Weight&, Tensor&, Tensor&, Tensor&, cudaStream_t);
 
 // Exact input-load unrolling matters in the first two MMA column tiles. Wider blocks use
-// runtime live columns with one specialization per accumulator capacity.
-template <int Columns, bool Exact>
+// runtime live columns with one specialization per accumulator capacity. The narrowest columns
+// split K across 16 warps where H divides into 1024-wide blocks (5120), 8 otherwise (2560).
+template <int Hidden, int Columns, bool Exact>
 void launch_small(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k, Tensor& v,
                   cudaStream_t stream) {
+    using Geometry         = Q8LinearGeometry<6144, Hidden>;
     constexpr int Capacity = (Columns + 7) / 8 * 8;
-    constexpr int Warps    = Columns <= 4 ? 16 : Columns <= 16 ? 8 : 4;
+    constexpr int Wide     = Hidden % 1024 == 0 ? 16 : 8;
+    constexpr int Warps    = Columns <= 4 ? Wide : Columns <= 16 ? 8 : 4;
     constexpr auto Scales  = Columns <= 4 || (Columns > 8 && Columns <= 16) ? Q8ScaleAccess::Direct
                                                                             : Q8ScaleAccess::Shared;
     using Schedule         = Q8A16SlicedKMmaSchedule<Capacity, Warps, 1, 2, Scales>;
@@ -49,15 +53,27 @@ void launch_small(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k, T
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <bool Exact, std::size_t... I>
+template <int Hidden, bool Exact, std::size_t... I>
 constexpr auto make_small_launchers(std::index_sequence<I...>) {
-    return std::array<Launch, sizeof...(I)>{&launch_small < Exact ? 1 + static_cast<int>(I)
-                                                                  : 24 + 8 * static_cast<int>(I),
-                                            Exact > ...};
+    return std::array<Launch, sizeof...(I)>{
+        &launch_small<Hidden,
+                      Exact ? 1 + static_cast<int>(I) : 24 + 8 * static_cast<int>(I), Exact>...};
 }
 
-constexpr auto kExactLaunchers = make_small_launchers<true>(std::make_index_sequence<16>{});
-constexpr auto kTileLaunchers  = make_small_launchers<false>(std::make_index_sequence<4>{});
+template <int Hidden>
+struct SmallLaunchers {
+    static constexpr auto exact = make_small_launchers<Hidden, true>(std::make_index_sequence<16>{});
+    static constexpr auto tile  = make_small_launchers<Hidden, false>(std::make_index_sequence<4>{});
+};
+
+template <int Hidden>
+void small_t(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k, Tensor& v,
+             cudaStream_t stream) {
+    if (x.ne[1] <= 16)
+        SmallLaunchers<Hidden>::exact[x.ne[1] - 1](x, weight, q, k, v, stream);
+    else
+        SmallLaunchers<Hidden>::tile[(x.ne[1] - 17) / 8](x, weight, q, k, v, stream);
+}
 
 template <class Schedule>
 void launch_mma(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k, Tensor& v,
@@ -75,10 +91,13 @@ void q8_dflash2_attn_input_small_t_launch(const Tensor& x, const Weight& weight,
     if (x.ne[1] < 1 || x.ne[1] > kLastSmallTokens) {
         throw std::invalid_argument("Q8 DFlash2 attention input small-T: unsupported T");
     }
-    if (x.ne[1] <= 16)
-        kExactLaunchers[x.ne[1] - 1](x, weight, q, k, v, stream);
-    else
-        kTileLaunchers[(x.ne[1] - 17) / 8](x, weight, q, k, v, stream);
+    switch (x.ne[0]) {
+    case 5120:
+        return small_t<5120>(x, weight, q, k, v, stream);
+    case 2560:
+        return small_t<2560>(x, weight, q, k, v, stream);
+    }
+    throw std::invalid_argument("Q8 DFlash2 attention input small-T: unsupported H");
 }
 
 void q8_dflash2_attn_input_mma_r32_c64_launch(const Tensor& x, const Weight& weight, Tensor& q,

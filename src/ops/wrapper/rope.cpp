@@ -216,7 +216,14 @@ PreparedRope prepare_rope(int rotary_dim, float theta, const RopeScaling& scalin
     prepared.rotary_dim = rotary_dim;
     prepared.theta = theta;
     prepared.factor = scaling.factor;
-    if (scaling.factor == 1.0F) { return prepared; }
+    if (scaling.factor == 1.0F) {
+        // Unscaled coefficients, for the consumers that read them (rmsnorm_rope's prepared forms
+        // at a theta other than 1e7; rope() itself delegates an unscaled call to its own formula).
+        for (int pair = 0; pair < rotary_dim / 2; ++pair) {
+            prepared.inverse[pair] = std::pow(static_cast<double>(theta), -2.0 * pair / rotary_dim);
+        }
+        return prepared;
+    }
     constexpr double two_pi = 6.283185307179586476925286766559;
     const auto correction = [&](double beta) {
         return rotary_dim * std::log(scaling.original_max_positions / (two_pi * beta)) /

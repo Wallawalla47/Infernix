@@ -260,7 +260,7 @@ void PrefixCache::copy_capture_group(std::uint32_t group, std::uint32_t lane, co
     for (std::uint32_t g = 0; g < group && g < layout.spec.layer_types.size(); ++g) {
         if (layout.spec.layer_types[g] == MixerKind::Attention) { ++attention; }
     }
-    if (group == layout.mtp_group()) {
+    if (group == layout.drafter_group()) {
         if (geometry_.kv_layers > attention) { kv_layer = attention; }
     } else if (layout.spec.layer_types[group] == MixerKind::Attention) {
         kv_layer = attention;
@@ -542,8 +542,7 @@ RestoreTicket PrefixCache::submit_restore() {
     const HostImageConst image{segments, host_.slab_bytes};
     std::uint32_t attention = 0;
     for (std::uint32_t g = 0; g < layout.groups(); ++g) {
-        const bool mtp_group = g == layout.mtp_group();
-        if (mtp_group) {
+        if (g == layout.drafter_group()) {
             if (geometry_.kv_layers > attention) {
                 const PlaneRange planes = kv_layer_planes(geometry_, attention);
                 copy_pages_from_host(restore_.pages, planes.begin, planes.end, restore_stream_);

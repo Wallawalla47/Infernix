@@ -14,8 +14,9 @@ DynamicConvPrepareRoute resolve_route(int tokens) {
     return {32, tokens <= 96 ? 32 : 64, 4};
 }
 
-std::size_t capacity(DynamicConvPrepareRoute route, int tokens) {
-    return static_cast<std::size_t>(1280) * tokens * route.split_k * sizeof(float);
+// The split partials of every coefficient row (H / 4 of them).
+std::size_t capacity(int hidden, DynamicConvPrepareRoute route, int tokens) {
+    return static_cast<std::size_t>(hidden / 4) * tokens * route.split_k * sizeof(float);
 }
 
 void execute(DynamicConvPrepareRoute route, const Tensor& residual, const Tensor& norm, float eps,
@@ -23,23 +24,27 @@ void execute(DynamicConvPrepareRoute route, const Tensor& residual, const Tensor
              WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope       = workspace.scope();
     const int tokens = residual.ne[1] * residual.ne[2];
-    float* partial   = static_cast<float*>(workspace.alloc_bytes(capacity(route, tokens)).data);
+    float* partial   = static_cast<float*>(
+        workspace.alloc_bytes(capacity(residual.ne[0], route, tokens)).data);
     rmsnorm(residual, norm, eps, false, prepared, stream);
     bf16_dynamic_grouped_conv_prepare_partial_launch(route, prepared, weight, partial, stream);
     bf16_dynamic_grouped_conv_prepare_reduce_launch(route, base, partial, prepared, finish, stream);
 }
 } // namespace
 
-std::size_t bf16_dynamic_grouped_conv_prepare_workspace_capacity_bytes(int min_width, int max_width,
+std::size_t bf16_dynamic_grouped_conv_prepare_workspace_capacity_bytes(int hidden, int min_width,
+                                                                       int max_width,
                                                                        int min_batch,
                                                                        int max_batch) {
+    if (hidden != 5120 && hidden != 2560)
+        throw std::invalid_argument("dynamic grouped conv prepare workspace: H must be 5120 or 2560");
     if (min_width < 2 || max_width > 16 || min_width > max_width || min_batch < 1 ||
         max_batch > 8 || min_batch > max_batch)
         throw std::invalid_argument("dynamic grouped conv prepare workspace: invalid W/B interval");
     std::size_t maximum = 0;
     for (int w = min_width; w <= max_width; ++w)
         for (int b = min_batch; b <= max_batch; ++b)
-            maximum = std::max(maximum, capacity(resolve_route(w * b), w * b));
+            maximum = std::max(maximum, capacity(hidden, resolve_route(w * b), w * b));
     return maximum;
 }
 

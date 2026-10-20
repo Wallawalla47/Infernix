@@ -42,7 +42,9 @@
 namespace infernix::models::qwen4_exp {
 
 enum class RouteTraceKind : std::uint32_t { PrefillChunk = 0, ForcedTokens = 1, Decode = 2, Verify = 3, Graph = 4 };
-enum class RouteTraceGraph : std::uint32_t { Decode = 0, Verify = 1, MtpDraft = 2, MtpCatchUp = 3 };
+enum class RouteTraceGraph : std::uint32_t {
+    Decode = 0, Verify = 1, MtpDraft = 2, MtpCatchUp = 3, DFlashPropose = 4, DFlashCatchUp = 5
+};
 
 struct RouteTraceSetup {
     std::uint32_t layers = 0, experts = 0, top_k = 0, frames = 0, max_columns = 0;

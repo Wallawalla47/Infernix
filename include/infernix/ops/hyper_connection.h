@@ -64,4 +64,11 @@ void hyper_connection_inject(const Tensor& y, const Tensor& inject, Tensor& resi
 void hyper_connection_expand(const Tensor& x, std::int32_t streams, Tensor& residual,
                              cudaStream_t stream);
 
+/// out[d,t] = bf16((sum_{s=0}^{S-1} residual[s*H+d,t]) / S), the sum in FP32 in stream order: a
+/// residual's plain stream mean (a DFlash2 drafter's target feature, docs/maintainer/dflash.md).
+/// residual: contiguous BF16 [S*H, T]; out: BF16 [H, T] with contiguous columns of any even
+/// pitch of at least H elements (a row slice of a wider feature matrix).
+void hyper_connection_stream_mean(const Tensor& residual, std::int32_t streams, Tensor& out,
+                                  cudaStream_t stream);
+
 } // namespace infernix::ops

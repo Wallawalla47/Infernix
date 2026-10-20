@@ -128,7 +128,8 @@ def main(argv=None):
     parser.add_argument(
         "--components",
         default="text",
-        help="comma-separated text,vision,mtp,dflash,dflash2",
+        help="comma-separated text,vision,mtp,dflash,dflash2; dflash2 alone writes a Qwen4Exp "
+        "DFlash2 companion artifact (--model: the target checkpoint)",
     )
     parser.add_argument(
         "--resource",
@@ -193,6 +194,22 @@ def main(argv=None):
         base = stack.enter_context(SafetensorsSource(args.model))
         sources = SourceInputs(base, paths, stack)
         qwen4 = qwen4_exp.is_qwen4_exp(base.config)
+        companion = "text" not in components
+        if companion and (
+            components != ("dflash2",)
+            or not qwen4
+            or args.gguf
+            or args.mmproj
+            or args.proposal
+            or args.ngram_out
+            or args.ngram_reuse
+            or overrides
+        ):
+            raise ValueError(
+                "without text, --components dflash2 writes a Qwen4Exp DFlash2 companion: --model is "
+                "the target checkpoint and --source dflash2=PATH the drafter; no GGUF, proposal, "
+                "n-gram or resource options apply"
+            )
         gguf_store = None
         if args.gguf:
             if not qwen4:
@@ -208,7 +225,10 @@ def main(argv=None):
             from .sources.gguf import GGUFSource
 
             mmproj = stack.enter_context(GGUFSource(args.mmproj))
-        if qwen4:
+        ngram_out = None
+        if companion:
+            model = qwen4_exp.build_dflash2_companion(base, sources["dflash2"])
+        elif qwen4:
             # A BF16 volume (tools/flash_next/ngram_bf16.py) binds the table as its unquantized rows.
             ngram_format = "fp8_e4m3fn"
             if args.ngram_reuse is not None:

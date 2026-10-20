@@ -9,8 +9,9 @@ CPU computes part of each layer's misses. The 52 GB PLE n-gram table lives on an
 design, measurements and open work are in the
 [design document](maintainer/qwen3_8-flash-next-design.md) (§16.5, §19.2).
 
-Generation works through `infernix`, `infernix-serve` and `infernix_bench`, with the model's MTP
-drafter (`--spec mtp`), n-gram copy proposals, images and video (`--vision`), and in
+Generation works through `infernix`, `infernix-serve` and `infernix_bench`, with Inco AI's DFlash2
+drafter (`--spec dflash2 --draft-model FILE`, [recommended](#run)) or the model's MTP drafter
+(`--spec mtp`), n-gram copy proposals, images and video (`--vision`), and in
 `infernix-serve` the hybrid prefix cache. Causal scoring (`infernix-perplexity`, the
 decode-quality judge) runs teacher-forced through the generation path; `--a16-activations` scores
 with 16-bit activations in every linear and every expert bank (the exact W4A16 expert
@@ -296,6 +297,26 @@ infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8
   never lend (more than three quarters of its frames, e.g. 65,536 tokens under the SSD tier, ~27
   GiB) is halved at startup until it can, with a warning, since the output does not depend on the
   chunk.
+- **`--spec dflash2 --draft-model Qwen3.8-Flash-Next-DFlash2-Infernix.infernix --draft-tokens auto
+  --lm-head-draft` (recommended)** drafts with Inco AI's DFlash2 drafter, a separate 776 MB
+  companion artifact ([Qwen3.8-Flash-Next-DFlash2-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-DFlash2-Infernix)) that runs beside any Flash-Next
+  conversion.
+  - Each round drafts a block of seven tokens in one pass. With `auto` it verifies the number of
+    them that pays for its verification columns: each draft's acceptance is read from the
+    drafter's own probability for it, calibrated per request.
+  - One request, 384-token continuations of code and Markdown docs on an RTX 5090 (INT8 KV,
+    2026-10-20): Dense8 213 / 204 / 179 / 161 tok/s (code / code sampled at temperature 1 / docs /
+    docs sampled) against MTP's 198 / 162 / 164 / 145; IQ3_S 258 / 210 / 183 (code / docs / docs
+    sampled) against 233 / 192 / 167.
+  - `--draft-tokens N` (1-7) verifies N every round, which on this offloaded model was slower than
+    MTP: a verified column costs about a third of a plain round in expert-cache misses.
+    `--spec-min-p P` then verifies only the drafts up to the first whose probability is below P
+    (0.6 was the best fixed cut, still below `auto` on docs).
+  - The drafter takes less VRAM than MTP's: 9,070 cached experts against 8,740 on Dense8 (IQ3_S:
+    12,432 against 12,288), plus its 40 MiB context ring per lane.
+  - Greedy output is the same as without it when one request runs at a time; sampling keeps the
+    sampler's distribution. With two or more requests decoding together, rounds decode without
+    drafts (as MTP's do without `adaptive-speculation`).
 - `--spec mtp --draft-tokens auto --lm-head-draft` drafts with the model's MTP layer.
   - `auto`: each round drafts the number of tokens, 0 to 7, the request's recent acceptance makes
     worthwhile (down to none on text it predicts poorly), and verifies them up to the first the

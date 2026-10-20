@@ -114,6 +114,10 @@ class Recipe:
         self.explicit_groups: list[tuple[tuple[str, ...], tuple[int, ...] | None]] = []
         for parameter in model.parameters.values():
             self.add_parameter(parameter.name)
+        for key in model.external_uses:
+            if key[0] in model.parameters or key in self.policies:
+                raise ValueError(f"{key[0]}@{key[1]}: an external Use names a parameter of the target")
+            self.policies[key] = "A16Only"
 
     def add_parameter(self, name: str) -> None:
         parameter = self.model.parameters[name]

@@ -482,6 +482,19 @@ def qwen3_8_flash_next_gsq_rco_iq3s(model, recipe, sources):
     _flash_next_drafter(model, recipe, experts=Q2)
 
 
+def qwen3_8_flash_next_dflash2(model, recipe, sources):
+    """A Qwen3.8-Flash-Next DFlash2 drafter as a companion artifact (``tools.convert --components
+    dflash2``), quantized as NInfer's official Qwen3.8-27B artifact stores its DFlash2: every
+    projection in ``q8_g32_fp16`` (absmax group scales; the context K/V roles share the query
+    block's K/V words) except the dynamic-convolution kernel projections and the selector's hidden
+    projection, which stay BF16 with the norms, base kernels and codebooks. The drafter only
+    proposes tokens the main model verifies, so its precision changes acceptance, never output."""
+
+    if set(model.components) != {"dflash2"} or model.config.get("architectures") != ["Qwen4ExpForCausalLM"]:
+        raise ValueError("this recipe converts a Qwen4Exp DFlash2 companion (--components dflash2)")
+    _optional(model, recipe)
+
+
 RECIPES = {
     "qwen3_6_27b": qwen3_6_27b,
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
@@ -496,4 +509,5 @@ RECIPES = {
     "qwen3_8_flash_next_nvfp4_orcarouter": qwen3_8_flash_next_nvfp4_orcarouter,
     "qwen3_8_flash_next_fp8": qwen3_8_flash_next_fp8,
     "qwen3_8_flash_next_gsq_rco_iq3s": qwen3_8_flash_next_gsq_rco_iq3s,
+    "qwen3_8_flash_next_dflash2": qwen3_8_flash_next_dflash2,
 }

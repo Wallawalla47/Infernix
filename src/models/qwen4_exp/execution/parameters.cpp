@@ -203,6 +203,43 @@ public:
         return out;
     }
 
+    // The DFlash2 drafter (docs/maintainer/dflash.md): native Q8 projections, the query block's
+    // fused Q/K/V parent, BF16 convolution and selector parameters.
+    DFlash2Parameters dflash2(const DFlash2Weights& w, const DFlash2Config& d) const {
+        DFlash2Parameters out;
+        // Full-head 1-D RoPE at absolute positions (no YaRN: the drafter's own unscaled rotation).
+        out.rope               = ops::prepare_rope(static_cast<int>(d.attention.head_dim), d.rope_theta);
+        out.feature_projection = linear({w.feature_projection});
+        out.context_norm       = tensor(w.context_norm);
+        out.final_norm         = tensor(w.final_norm);
+        for (std::size_t i = 0; i < w.layers.size(); ++i) {
+            out.layers.push_back(with_context("layers/" + std::to_string(i), [&] {
+                const auto& l = w.layers[i];
+                DFlash2LayerParameters layer;
+                layer.input_norm           = tensor(l.input_norm);
+                layer.post_attention_norm  = tensor(l.post_attention_norm);
+                layer.query_key_value      = ops::prepare_attn_input_proj_weights(input(l.query), input(l.key),
+                                                                                  input(l.value)).weight;
+                layer.context_key          = linear({l.context_key});
+                layer.context_value        = linear({l.context_value});
+                layer.query_norm           = tensor(l.query_norm);
+                layer.key_norm             = tensor(l.key_norm);
+                layer.output               = linear({l.output});
+                layer.gate_up              = linear({l.gate, l.up});
+                layer.down                 = linear({l.down});
+                layer.attention_base       = tensor(l.attention_base);
+                layer.attention_projection = linear({l.attention_projection});
+                layer.mlp_base             = tensor(l.mlp_base);
+                layer.mlp_projection       = linear({l.mlp_projection});
+                return layer;
+            }));
+        }
+        out.selector_hidden      = linear({w.selector_hidden});
+        out.predecessor_codebook = tensor(w.predecessor_codebook);
+        out.successor_codebook   = tensor(w.successor_codebook);
+        return out;
+    }
+
 private:
     // One BF16 vector over three consecutive bias parameters (the converter stores them adjacent).
     Tensor joined_bias(const std::array<WeightId, 3>& ids) const {
@@ -328,6 +365,9 @@ Parameters::Parameters(const Model& source) : model(source) {
         out.experts_gate_up      = prepare.linear(m.expert_gate_up).weight;
         out.experts_down         = prepare.linear(m.expert_down).weight;
         mtp = std::move(out);
+    }
+    if (w.dflash2) {
+        dflash2 = with_context("dflash2", [&] { return prepare.dflash2(*w.dflash2, *model.config().dflash2); });
     }
     if (w.proposal) {
         draft_head.rows      = prepare.linear({w.proposal->head});

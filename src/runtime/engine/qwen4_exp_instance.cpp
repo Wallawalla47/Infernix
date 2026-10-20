@@ -69,10 +69,20 @@ void validate(const EngineOptions& options) {
     if (options.purpose != EnginePurpose::Generation && options.purpose != EnginePurpose::CausalScoring) {
         throw std::invalid_argument("Qwen3.8-Flash-Next serves generation and causal scoring");
     }
-    if ((options.speculative.backend != SpeculativeBackend::None &&
-         options.speculative.backend != SpeculativeBackend::Mtp) ||
-        options.speculative.ngram_archive_bytes != 0) {
-        throw std::invalid_argument("Qwen3.8-Flash-Next speculates with its MTP drafter and n-gram copy proposals");
+    if (options.speculative.backend == SpeculativeBackend::DFlash || options.speculative.ngram_archive_bytes != 0) {
+        throw std::invalid_argument("Qwen3.8-Flash-Next speculates with its MTP drafter, a DFlash2 drafter "
+                                    "(--spec dflash2 --draft-model FILE) and n-gram copy proposals");
+    }
+    // Verification widths up to 8 keep its dense routes column-invariant (design 11.3); its rounds
+    // verify chains.
+    if (options.speculative.backend == SpeculativeBackend::DFlash2 &&
+        (options.speculative.draft_tokens == 0 || options.speculative.draft_tokens > 7)) {
+        throw std::invalid_argument("Qwen3.8-Flash-Next DFlash2 drafts 1-7 tokens per round (--draft-tokens)");
+    }
+    if (options.speculative.draft_tree_auto ||
+        std::any_of(options.speculative.draft_tree_nodes.begin(), options.speculative.draft_tree_nodes.end(),
+                    [](std::uint32_t nodes) { return nodes != 0; })) {
+        throw std::invalid_argument("Qwen3.8-Flash-Next verifies chains: --draft-tree-nodes is not supported");
     }
     // 16-bit activations run every linear A16 and every expert bank W4A16 (the exact W4A16
     // arithmetic of design §16.2.1): the quality reference, so causal scoring only, on the exact
@@ -231,10 +241,14 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.mtp_draft_tokens   = options.speculative.backend == SpeculativeBackend::Mtp
                                              ? options.speculative.draft_tokens
                                              : 0U;
+    program_options.dflash2_draft_tokens = options.speculative.backend == SpeculativeBackend::DFlash2
+                                               ? options.speculative.draft_tokens
+                                               : 0U;
     // A fixed draft length verifies every draft unless --spec-min-p asks for the cut.
     program_options.auto_draft_length = options.speculative.draft_tokens_auto;
-    program_options.mtp_draft_min_p =
-        options.speculative.draft_min_p.value_or(options.speculative.draft_tokens_auto ? 0.5F : 0.0F);
+    // MTP's automatic length cuts at 0.5 by default; DFlash2's calibrated length needs no cut.
+    program_options.draft_min_p = options.speculative.draft_min_p.value_or(
+        options.speculative.draft_tokens_auto && options.speculative.backend == SpeculativeBackend::Mtp ? 0.5F : 0.0F);
     if (!options.expert_state_path.empty()) {
         // The state belongs to the artifact: its experts and their records, not the build or KV format.
         std::error_code error;
@@ -426,6 +440,15 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
             signature += kHex[byte & 15U];
         }
         if (table.fp8_scale) { signature += ";scale=" + std::to_string(*table.fp8_scale); }
+        // A DFlash2 drafter's ring rides in every snapshot: it belongs to that companion artifact.
+        if (const auto& draft = instance->model->info().draft_artifact_id) {
+            signature += ";draft=";
+            for (const std::byte byte : *draft) {
+                constexpr char kHex[] = "0123456789abcdef";
+                signature += kHex[std::to_integer<unsigned>(byte) >> 4U];
+                signature += kHex[std::to_integer<unsigned>(byte) & 15U];
+            }
+        }
         const models::qwen4_exp::PrefixCachePersistence loaded = instance->program->attach_prefix_cache_file(
             file, hybrid_cache_fingerprint(options, signature), options.startup_observer);
         restore = LoadSummary::PrefixCacheRestore{

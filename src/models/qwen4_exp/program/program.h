@@ -377,15 +377,21 @@ struct ProgramOptions {
     // MTP drafts per round when the drafter is loaded (design section 11, at most 7). A longer
     // n-gram proposal, when enabled, replaces a round's MTP drafts.
     std::uint32_t mtp_draft_tokens = 0;
+    // DFlash2 (--spec dflash2 --draft-model, docs/maintainer/dflash.md): the drafter proposes this
+    // many tokens per round (1..7) in one block of dflash2_draft_tokens + 1 columns; a round verifies
+    // them all, or with auto_draft_length the prefix its draft-length policy chooses. A longer n-gram
+    // proposal, when enabled, replaces a round's drafts as it replaces MTP's.
+    std::uint32_t dflash2_draft_tokens = 0;
     // The automatic draft length (--draft-tokens auto, design 11.3): each one-row round drafts the
     // length in 0..mtp_draft_tokens that maximizes its expected tokens per round time, and a pair
     // round one length in 0..min(mtp_draft_tokens, 2) from both rows' acceptance. False: one-row
     // rounds draft mtp_draft_tokens and pair rounds min(mtp_draft_tokens, 2).
     bool auto_draft_length = false;
-    // A one-row MTP round verifies its drafts up to the first whose draft-head probability is below
-    // this value (design §19.3.5; --spec-min-p); 0 verifies every draft. 0.5 is the measured value
-    // the Engine passes with the automatic draft length, 0 with a fixed one.
-    double mtp_draft_min_p = 0.5;
+    // A one-row round verifies its neural drafts up to the first whose drafter probability is below
+    // this value (design §19.3.5; --spec-min-p): MTP's draft-head probability, DFlash2's
+    // candidate-selector probability (temperature 1); 0 verifies every draft. 0.5 is the measured MTP
+    // value the Engine passes with the automatic draft length, 0 with a fixed one.
+    double draft_min_p = 0.5;
     // The request-coupling fast paths (FastPath; docs/maintainer/model-quality.md section 6.7). Each
     // is off unless selected, and with all three off a request's output does not depend on the other
     // requests (concurrency, cache contents, KV pressure):
@@ -403,7 +409,7 @@ struct ProgramOptions {
     bool preemption        = false;
     // sampled-mtp-drafts (FastPath::SampledMtpDrafts): a sampled row's MTP drafts are drawn from the
     // draft head's top tokens under its sampler and verified by sparse rejection sampling, and its
-    // one-row rounds verify every draft (no mtp_draft_min_p cut). Greedy rows are unchanged.
+    // one-row rounds verify every draft (no draft_min_p cut). Greedy rows are unchanged.
     bool sampled_mtp_drafts = false;
     // CPU-served misses (design section 10): host expert-engine workers (0 disables), the most
     // experts one layer call hands to them, and the share kept on the PCIe stage (misses / divisor;

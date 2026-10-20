@@ -31,19 +31,21 @@ void rmsnorm_pack_tail(const Tensor& input, const Tensor& weight, Tensor& output
     require_bf16_contiguous_aligned(weight, "weight");
     require_bf16_contiguous_aligned(output, "output");
 
+    // The hidden width: 5120 (Qwen3.8-27B's DFlash2) or 2560 (Qwen3.8-Flash-Next's).
+    const std::int32_t rows  = input.ne[0];
     const std::int32_t batch = input.ne[2];
     const std::int32_t width = input.ne[1];
-    if (input.ne[0] != 5120 || (width < 2 || width > 16) || batch < 1 || batch > 8 ||
+    if ((rows != 5120 && rows != 2560) || (width < 2 || width > 16) || batch < 1 || batch > 8 ||
         input.ne[3] != 1) {
         throw std::invalid_argument(
-            "rmsnorm_pack_tail: input must have shape [5120,W,B], W=2..16, B=1..8");
+            "rmsnorm_pack_tail: input must have shape [H,W,B], H=5120|2560, W=2..16, B=1..8");
     }
-    if (weight.ne[0] != 5120 || weight.ne[1] != 1 || weight.ne[2] != 1 || weight.ne[3] != 1) {
-        throw std::invalid_argument("rmsnorm_pack_tail: weight must have shape [5120]");
+    if (weight.ne[0] != rows || weight.ne[1] != 1 || weight.ne[2] != 1 || weight.ne[3] != 1) {
+        throw std::invalid_argument("rmsnorm_pack_tail: weight must have shape [H]");
     }
-    if (output.ne[0] != 5120 || output.ne[1] != (width - 1) * batch || output.ne[2] != 1 ||
+    if (output.ne[0] != rows || output.ne[1] != (width - 1) * batch || output.ne[2] != 1 ||
         output.ne[3] != 1) {
-        throw std::invalid_argument("rmsnorm_pack_tail: output must have shape [5120,(W-1)B]");
+        throw std::invalid_argument("rmsnorm_pack_tail: output must have shape [H,(W-1)B]");
     }
     if (overlaps(input, weight) || overlaps(input, output) || overlaps(weight, output)) {
         throw std::invalid_argument("rmsnorm_pack_tail: tensors must not overlap");

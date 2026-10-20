@@ -43,6 +43,12 @@ table from an NVMe drive.
   Strata prefills 20-30 % faster and Infernix decodes up to 25 % faster
   ([benchmarks](#qwen38-flash-next-iq3_s-infernix-vs-strata)).
 - **At least Strata's quality**: perplexity 4.654 against 4.844 on the same token ids.
+- **DFlash2 drafting**: Inco AI's DFlash2 drafter, a separate 776 MB download
+  ([Qwen3.8-Flash-Next-DFlash2-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-DFlash2-Infernix)) that runs beside any Flash-Next conversion,
+  decodes 8-11 % faster than the model's own MTP drafter with `--draft-tokens auto` (26 % on
+  sampled code), and leaves
+  VRAM for 330 more cached experts on NVIDIA Dense8
+  ([benchmarks](#qwen38-flash-next-dflash2-against-mtp)).
 - **Long context**: 262K tokens natively and up to 1M with YaRN; a 250K-token prompt prefills in
   about 25 s.
 - **Less RAM than the model needs?** An SSD expert tier keeps what fits in RAM and reads the rest
@@ -216,6 +222,38 @@ tail skip at all (its documentation: a window then mixes requests), and neither 
 tail-skip line, so the two Strata columns of this table ran the same computation and differ only by
 run-to-run spread.
 
+### Qwen3.8-Flash-Next: DFlash2 against MTP
+
+Decode speed of one request with each drafter, both with `--draft-tokens auto` and the proposal
+head (`--lm-head-draft`): the model's MTP drafter (`--spec mtp`) and Inco AI's DFlash2 drafter
+([Qwen3.8-Flash-Next-DFlash2-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-DFlash2-Infernix), `--spec dflash2 --draft-model FILE`). The prompts
+are 24 slices of 1,280 tokens, each continued for 384 tokens, from Infernix's own C++/CUDA/Python
+sources (code) and its Markdown documentation (docs) at commit `e59fa1c7`; greedy, or sampled at
+temperature 1.0 with top-k 20 and top-p 0.95; INT8 KV; `infernix_decode_quality_gen`, on the
+machine above (2026-10-20). Cells are decode tok/s, the mean of every run where there were
+several: Dense8 code had four DFlash2 runs (209-217) and eight MTP runs (186-203), docs one and
+three, sampled docs three each; repeats otherwise agreed within 4 %.
+
+| Conversion | Text | Plain | MTP | **DFlash2** | DFlash2 vs MTP |
+|---|---|---:|---:|---:|---:|
+| NVIDIA Dense8 | code, greedy | 120 | 198 | **213** | +8 % |
+| NVIDIA Dense8 | code, sampled | | 162 | **204** | +26 % |
+| NVIDIA Dense8 | docs, greedy | 121 | 164 | **179** | +9 % |
+| NVIDIA Dense8 | docs, sampled | 122 | 145 | **161** | +11 % |
+| GSQ-RCO IQ3_S | code, greedy | 121 | 233 | **258** | +11 % |
+| GSQ-RCO IQ3_S | docs, greedy | | 192 | **210** | +9 % |
+| GSQ-RCO IQ3_S | docs, sampled | | 167 | **183** | +10 % |
+
+DFlash2 drafts a whole block of seven tokens in one pass, where MTP runs one step per token, and its
+candidate selector reports how likely each draft is; with `--draft-tokens auto` a round verifies the
+number of drafts that pays for its verification columns, read from those probabilities. On this
+offloaded model each verified column costs about a third of a plain round in expert-cache misses,
+so verifying only likely drafts matters more than drafting many: verifying all seven every round
+(`--draft-tokens 7`) was slower than MTP. The drafter also takes less VRAM than MTP's: the
+Dense8 model's resident weights shrink from 6.27 to 5.66 GiB, leaving 9,070 cached experts against
+8,740 (IQ3_S, whose MTP experts are already 2-bit: 12,432 against 12,288). Greedy output is the same
+with either drafter; sampled output keeps the sampler's distribution.
+
 ### Qwen3.8-27B: Infernix vs NInfer
 
 Both serve NInfer's official
@@ -347,13 +385,18 @@ The server is `build-windows\apps\Release\infernix-serve.exe`, with the FFmpeg, 
 next to it. Qwen3.8-Flash-Next (see the [guide](docs/qwen3_8-flash-next.md#run)):
 
 ```bat
-infernix-serve.exe Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix-00001-of-00003.infernix --ngram-volume Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram --kv-dtype int8 --max-context 262144 --spec mtp --draft-tokens auto --lm-head-draft --max-concurrency 2
+infernix-serve.exe Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix-00001-of-00003.infernix --ngram-volume Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram --kv-dtype int8 --max-context 262144 --spec dflash2 --draft-model Qwen3.8-Flash-Next-DFlash2-Infernix.infernix --draft-tokens auto --lm-head-draft --max-concurrency 2
 ```
 
-The uncensored Flash-Next takes the same options and the same n-gram volume:
+`Qwen3.8-Flash-Next-DFlash2-Infernix.infernix` is the DFlash2 drafter
+([Qwen3.8-Flash-Next-DFlash2-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-DFlash2-Infernix)); without it, `--spec mtp --draft-tokens auto
+--lm-head-draft` drafts with the model's own MTP drafter, about 10 % slower
+([benchmarks](#qwen38-flash-next-dflash2-against-mtp)).
+
+The uncensored Flash-Next takes the same options, the same n-gram volume and the same drafter:
 
 ```bat
-infernix-serve.exe Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix-00001-of-00003.infernix --ngram-volume Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram --kv-dtype int8 --max-context 262144 --spec mtp --draft-tokens auto --lm-head-draft --max-concurrency 2
+infernix-serve.exe Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix-00001-of-00003.infernix --ngram-volume Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram --kv-dtype int8 --max-context 262144 --spec dflash2 --draft-model Qwen3.8-Flash-Next-DFlash2-Infernix.infernix --draft-tokens auto --lm-head-draft --max-concurrency 2
 ```
 
 Qwen3.8-27B on a 32 GB RTX 5090:
@@ -407,6 +450,13 @@ repository's model card gives its files, requirements, recommended command, qual
 | [Qwen3.8-Flash-Next-FP8-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-FP8-Infernix) | [Qwen/Qwen3.8-Flash-Next-FP8](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8) | Qwen's FP8 checkpoint bit-exact, with Qwen's BF16 n-gram table: the most accurate conversion and the slowest (about 44 tok/s plain), since its 112.6 GiB of experts exceed what a 96 GB machine can pin and the SSD tier reads the rest. |
 | [Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix) | [orcarouter/Qwen3.8-Flash-Next-Uncensored-NVFP4](https://huggingface.co/orcarouter/Qwen3.8-Flash-Next-Uncensored-NVFP4) | An abliterated build whose refusal behaviour has been removed (see its model card). Its weight-only NVFP4 experts and FP8 dense projections are kept bit-exact and run with BF16 activations; the other dense classes are stored in 8 bits as in Dense8. Perplexity 4.772 (Strata's base-model GGUF 4.844, NVIDIA Dense8 4.653: abliteration changes the weights). Needs Infernix `windows-2026.10.09.2` or later. |
 | [Swift-1.5-Qwen3.8-Flash-Next-NVFP4-Dense8-Infernix](https://huggingface.co/Wallawalla47/Swift-1.5-Qwen3.8-Flash-Next-NVFP4-Dense8-Infernix) | [ukisai/Swift-1.5-Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-NVFP4) | UkisAI's fine-tune that thinks with fewer tokens (see its model card), converted like NVIDIA Dense8: experts bit-exact, dense projections in 8 bits. Smoke-tested; its quality and speed are not yet measured. |
+
+Every Flash-Next conversion can draft with **[Qwen3.8-Flash-Next-DFlash2-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-DFlash2-Infernix)**
+(**recommended**, 776 MB), Inco AI's
+[DFlash2 drafter](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2) with its projections in
+8 bits: pass it with `--spec dflash2 --draft-model FILE --draft-tokens auto`. It decodes 8-11 % faster
+than the conversions' own MTP drafter (26 % on sampled code) ([benchmarks](#qwen38-flash-next-dflash2-against-mtp)) and
+needs an Infernix build whose `--help` lists `--draft-model`.
 
 On the 1M-token perplexity corpus (4,096-token context, INT8 KV) the FP8 conversion scores 3.487,
 NVIDIA Dense8 3.508 and IQ3_S 3.522. The IQ3_S and FP8 conversions need Infernix

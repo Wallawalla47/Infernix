@@ -10,6 +10,7 @@
 #include "models/qwen4_exp/model.h"
 #include "infernix/ops/ggml_linear.h"
 #include "infernix/ops/offloaded_sparse_moe.h"
+#include "infernix/ops/rope.h"
 #include "infernix/ops/weight_input.h"
 
 #include <memory>
@@ -84,6 +85,28 @@ struct MtpParameters {
     Weight experts_down;    // [E * H, I]
 };
 
+// One DFlash2 layer (docs/maintainer/dflash.md "DFlash2 dynamic convolution").
+struct DFlash2LayerParameters {
+    Tensor input_norm, post_attention_norm; // BF16 [H]
+    Weight query_key_value;                 // Q8 [q | k | v, H] for ops::attn_input_proj
+    LinearParameters context_key, context_value; // [kv, H] (the K/V words, shared)
+    Tensor query_norm, key_norm;                 // BF16 [head_dim]
+    LinearParameters output;                     // [H, q]
+    LinearParameters gate_up, down;              // [2I, H], [H, I]
+    Tensor attention_base, mlp_base;             // BF16 [H, taps, sides]
+    LinearParameters attention_projection, mlp_projection; // BF16 [2 * taps * H / group, H]
+};
+
+// The DFlash2 drafter of a companion artifact (--draft-model).
+struct DFlash2Parameters {
+    ops::PreparedRope rope;              // full-head 1-D, the drafter's theta
+    LinearParameters feature_projection; // [H, taps * H]
+    Tensor context_norm, final_norm;     // BF16 [H]
+    std::vector<DFlash2LayerParameters> layers;
+    LinearParameters selector_hidden;                 // [rank, H]
+    Tensor predecessor_codebook, successor_codebook;  // BF16 [rank, vocab]
+};
+
 // The draft head: the text head, or the proposal head's rows and their token ids.
 struct DraftHeadParameters {
     std::optional<LinearParameters> rows; // the proposal head (q4/q8 [rows, H]); empty = text head
@@ -113,6 +136,7 @@ public:
     HyperConnectionParameters final_mixer;
     std::vector<BlockParameters> layers;
     std::optional<MtpParameters> mtp;
+    std::optional<DFlash2Parameters> dflash2;
     DraftHeadParameters draft_head;
     std::optional<qwen3_5::execution::VisionParameters> vision; // --vision (shared tower types)
 

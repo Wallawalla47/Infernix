@@ -17,14 +17,16 @@
 namespace infernix::ops::detail {
 namespace {
 
-using Geometry                       = Q8LinearGeometry<34816, 5120>;
-constexpr std::int32_t kIntermediate = Geometry::kOutputRows / 2;
-constexpr std::int32_t kFirstSmallT  = 1;
-constexpr std::int32_t kLastSmallT   = 40;
+// The DFlash2 drafters' gate/up parents: [34816, 5120] (Qwen3.8-27B) and [15360, 2560]
+// (Qwen3.8-Flash-Next).
+constexpr std::int32_t kFirstSmallT = 1;
+constexpr std::int32_t kLastSmallT  = 40;
 using Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
-template <int Capacity>
+template <int GateUpRows, int Hidden, int Capacity>
 void launch_tile(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+    using Geometry                       = Q8LinearGeometry<GateUpRows, Hidden>;
+    constexpr std::int32_t kIntermediate = Geometry::kOutputRows / 2;
     using Schedule =
         Q8A16SlicedKMmaSchedule<Capacity, Capacity == 24 ? 8 : 4, 1, 2, Q8ScaleAccess::Shared>;
     using RowPolicy = Q8SwiGluPairedRows<kIntermediate>;
@@ -41,13 +43,16 @@ void launch_tile(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <std::size_t... Offsets>
+template <int GateUpRows, int Hidden, std::size_t... Offsets>
 constexpr auto make_launchers(std::index_sequence<Offsets...>) {
     return std::array<Launch, sizeof...(Offsets)>{
-        &launch_tile<8 * (1 + static_cast<int>(Offsets))>...};
+        &launch_tile<GateUpRows, Hidden, 8 * (1 + static_cast<int>(Offsets))>...};
 }
 
-constexpr auto kLaunchers = make_launchers(std::make_index_sequence<kLastSmallT / 8>{});
+constexpr auto k27BLaunchers =
+    make_launchers<34816, 5120>(std::make_index_sequence<kLastSmallT / 8>{});
+constexpr auto kFlashNextLaunchers =
+    make_launchers<15360, 2560>(std::make_index_sequence<kLastSmallT / 8>{});
 
 } // namespace
 
@@ -57,7 +62,13 @@ void q8_dflash2_linear_swiglu_small_t_launch(const Tensor& x, const Weight& weig
         throw std::invalid_argument("Q8 DFlash2 LinearSwiGLU small-T: unsupported T");
     }
     const std::size_t index = static_cast<std::size_t>((x.ne[1] - 1) / 8);
-    kLaunchers[index](x, weight, out, stream);
+    if (x.ne[0] == 5120) {
+        k27BLaunchers[index](x, weight, out, stream);
+    } else if (x.ne[0] == 2560) {
+        kFlashNextLaunchers[index](x, weight, out, stream);
+    } else {
+        throw std::invalid_argument("Q8 DFlash2 LinearSwiGLU small-T: unsupported H");
+    }
 }
 
 } // namespace infernix::ops::detail

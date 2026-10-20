@@ -4,7 +4,11 @@
 // drafter with 4 drafts and the optimized proposal head; with `plain`, no speculation (one token per
 // round, the single-column decode kernels). Fast paths run as in infernix-serve; `exact` runs the
 // exact route (EngineOptions::fast_paths off) and `path=NAME` also runs that fast path whether or
-// not it is qualified (qualification).
+// not it is qualified (qualification). Qwen3.8-Flash-Next's DFlash2 drafter is a companion artifact:
+// `draft-model=FILE` selects it (`drafts=N`, 1-7, its draft count, also MTP's; `auto` its per-round length;
+// `full-head` drafts with the text head instead of the proposal head). `temperature=T` samples
+// instead (top-k 20, top-p 0.95, segment s seeded s + 1: a speed workload; the judge scores greedy
+// output only).
 // infernix_decode_quality_judge scores the output of any number of builds against one reference.
 //
 // This file uses only Engine API that NInfer also has, so the same source builds in an
@@ -14,6 +18,8 @@
 //
 // Usage: infernix_decode_quality_gen <artifact> <corpus.txt> <out.txt> <segments> <prompt_tokens>
 //                                  <new_tokens> [ngram] [mtp [auto] [min-p=P]] [plain] [exact] [path=NAME]...
+//                                  [draft-model=FILE [drafts=N] [auto] [full-head]] (Qwen3.8-Flash-Next DFlash2)
+//                                  [temperature=T]
 //                                  [ngram-volume=FILE] (Qwen3.8-Flash-Next; default <artifact>.ngram)
 //                                  [route-trace=FILE] (Qwen3.8-Flash-Next's route trace, route_trace.h)
 // Output, one line per segment: <corpus token offset> <prompt_tokens> <generated ids...>
@@ -41,9 +47,12 @@ int main(int argc, char** argv) {
         const auto segments      = static_cast<std::uint32_t>(std::stoul(argv[4]));
         const auto prompt_tokens = static_cast<std::uint32_t>(std::stoul(argv[5]));
         const auto new_tokens    = static_cast<std::uint32_t>(std::stoul(argv[6]));
-        bool ngram = false, mtp = false, plain = false, exact = false, draft_auto = false;
+        bool ngram = false, mtp = false, plain = false, exact = false, draft_auto = false, full_head = false;
         std::vector<std::string> paths;
-        std::string ngram_volume, route_trace;
+        std::string ngram_volume, route_trace, draft_model;
+        std::uint32_t drafts = 7;
+        bool drafts_set      = false;
+        float temperature    = 0.0F;
         std::optional<float> min_p;
         infernix::KvCacheStorage kv = infernix::KvCacheStorage::Int8Group64;
         for (int i = 7; i < argc; ++i) {
@@ -64,6 +73,15 @@ int main(int argc, char** argv) {
                 ngram_volume = flag.substr(13);
             } else if (flag.starts_with("route-trace=")) {
                 route_trace = flag.substr(12);
+            } else if (flag.starts_with("draft-model=")) {
+                draft_model = flag.substr(12);
+            } else if (flag.starts_with("drafts=")) {
+                drafts     = static_cast<std::uint32_t>(std::stoul(flag.substr(7)));
+                drafts_set = true;
+            } else if (flag == "full-head") {
+                full_head = true;
+            } else if (flag.starts_with("temperature=")) {
+                temperature = std::stof(flag.substr(12));
             } else if (flag.starts_with("path=")) {
                 paths.push_back(flag.substr(5));
             } else if (flag.starts_with("kv=")) {
@@ -88,7 +106,8 @@ int main(int argc, char** argv) {
                 }
             } else {
                 std::cerr << "unknown option " << flag
-                          << " (ngram, mtp, auto, min-p=P, plain, exact, path=NAME, ngram-volume=FILE, route-trace=FILE, kv=NAME)\n";
+                          << " (ngram, mtp, auto, min-p=P, plain, exact, path=NAME, draft-model=FILE, drafts=N, "
+                             "full-head, temperature=T, ngram-volume=FILE, route-trace=FILE, kv=NAME)\n";
                 return 2;
             }
         }
@@ -108,16 +127,24 @@ int main(int argc, char** argv) {
         options.max_concurrency                   = 1;
         options.prefill_chunk                     = 4096;
         options.speculative.backend               = infernix::SpeculativeBackend::DFlash2;
-        options.speculative.draft_tokens          = 7;
-        options.speculative.proposal_head         = infernix::ProposalHead::Optimized;
+        options.speculative.draft_tokens          = drafts;
+        options.speculative.proposal_head         = full_head ? infernix::ProposalHead::Full : infernix::ProposalHead::Optimized;
+#if !defined(INFERNIX_DECODE_QUALITY_NINFER)
+        // Qwen3.8-Flash-Next's DFlash2 companion artifact (--draft-model) and --draft-tokens auto.
+        options.speculative.draft_model       = draft_model;
+        options.speculative.draft_tokens_auto = !mtp && draft_auto;
+        // `min-p=P`: --spec-min-p P, the selector-probability cut of a one-row round.
+        options.speculative.draft_min_p = min_p;
+#endif
         if (mtp) {
 #if defined(INFERNIX_DECODE_QUALITY_NINFER)
             std::cerr << "MTP drafting is not available in NInfer\n";
             return 2;
 #else
-            // infernix-serve's production Qwen3.8-Flash-Next drafting (--spec mtp --draft-tokens 4).
+            // infernix-serve's production Qwen3.8-Flash-Next drafting (--spec mtp --draft-tokens 4);
+            // `drafts=N` another count (with `auto`, its ceiling).
             options.speculative.backend      = infernix::SpeculativeBackend::Mtp;
-            options.speculative.draft_tokens = 4;
+            options.speculative.draft_tokens = drafts_set ? drafts : 4;
             // `auto`: --draft-tokens auto, each round's own length up to 4 and the --spec-min-p 0.5 cut.
             options.speculative.draft_tokens_auto = draft_auto;
             // `min-p=P`: --spec-min-p P, the draft-confidence cut (a fixed length's default is none).
@@ -174,6 +201,7 @@ int main(int argc, char** argv) {
         std::ofstream out(argv[3]);
         const auto started      = std::chrono::steady_clock::now();
         std::uint64_t generated = 0;
+        infernix::SpeculativeStats speculative;
         double prefill_seconds = 0.0, decode_seconds = 0.0;
         for (std::uint32_t segment = 0; segment < segments; ++segment) {
             const std::size_t offset =
@@ -183,7 +211,12 @@ int main(int argc, char** argv) {
                 tokens.begin() + static_cast<std::ptrdiff_t>(offset + prompt_tokens));
             infernix::RequestOptions request;
             request.execution.requested_output_tokens = new_tokens;
-            request.execution.sampling.temperature    = 0.0F;
+            request.execution.sampling.temperature    = temperature;
+            if (temperature > 0.0F) {
+                request.execution.sampling.top_k = 20;
+                request.execution.sampling.top_p = 0.95F;
+                request.execution.sampling.seed  = segment + 1ULL;
+            }
             request.execution.allow_prefix_reuse      = false;
             request.stop.include_model_defaults       = false;
 #if defined(INFERNIX_DECODE_QUALITY_NINFER)
@@ -202,12 +235,28 @@ int main(int argc, char** argv) {
             for (const infernix::TokenId id : result.generated_token_ids) { out << ' ' << id; }
             out << '\n';
             generated += result.generated_token_ids.size();
+            speculative.rounds += result.speculative.rounds;
+            speculative.drafted_tokens += result.speculative.drafted_tokens;
+            speculative.accepted_tokens += result.speculative.accepted_tokens;
+            speculative.fallback_steps += result.speculative.fallback_steps;
+            const auto& per_position = result.speculative.accepted_per_position;
+            if (speculative.accepted_per_position.size() < per_position.size()) {
+                speculative.accepted_per_position.resize(per_position.size(), 0);
+            }
+            for (std::size_t j = 0; j < per_position.size(); ++j) {
+                speculative.accepted_per_position[j] += per_position[j];
+            }
             std::cerr << "segment " << segment + 1 << "/" << segments << ": "
                       << result.generated_token_ids.size() << " tokens\n";
         }
         const double seconds =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
         std::cerr << "generated " << generated << " tokens in " << seconds << " s\n";
+        std::cerr << "speculative: " << speculative.rounds << " rounds, " << speculative.fallback_steps
+                  << " plain steps, accepted " << speculative.accepted_tokens << " of " << speculative.drafted_tokens
+                  << " drafts; rounds accepting position 1..:";
+        for (const std::uint64_t n : speculative.accepted_per_position) { std::cerr << ' ' << n; }
+        std::cerr << '\n';
 #if !defined(INFERNIX_DECODE_QUALITY_NINFER)
         std::cerr << "phases: prefill " << prefill_seconds << " s, decode " << decode_seconds << " s\n";
 #endif

@@ -40,16 +40,19 @@ namespace infernix::ops {
  * SamplingConfig fields and never updates token_counts.
  *
  * drafts is contiguous I32 [K,B] and proposal_q is contiguous FP32 [16,K,B]. Both outputs are
- * completely overwritten. Inputs, outputs, codebooks, and the config array must be pairwise
- * non-overlapping. The Op has no persistent state or internal allocation. Caller workspace is
- * transient and must not overlap any input or output.
+ * completely overwritten. When `confidence` is non-null (contiguous FP32 [K,B]), it receives each
+ * draft's FP32 temperature-1 softmax over that position's 16 edges at the selected rank, for greedy
+ * and sampled rows alike: the drafter's own probability of draft i given the path before it, a
+ * draft-length signal that changes neither drafts nor proposal_q. Inputs, outputs, codebooks, and
+ * the config array must be pairwise non-overlapping. The Op has no persistent state or internal
+ * allocation. Caller workspace is transient and must not overlap any input or output.
  */
 void candidate_selector_path(const Tensor& candidate_ids, const Tensor& unary_scores,
                              const Tensor& projected_hidden, const Tensor& anchors,
                              const Tensor& predecessor_codebook, const Tensor& successor_codebook,
                              const Tensor& base_positions, const SamplingConfig* configs,
-                             Tensor& drafts, Tensor& proposal_q, WorkspaceArena& workspace,
-                             cudaStream_t stream);
+                             Tensor& drafts, Tensor& proposal_q, Tensor* confidence,
+                             WorkspaceArena& workspace, cudaStream_t stream);
 
 /**
  * Op: candidate_selector_tree

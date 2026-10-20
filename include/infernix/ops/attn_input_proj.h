@@ -112,7 +112,8 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight,
 /**
  * Three-output Q8 specialization. The Q8_G32_FP16 RowSplit parent stores rows in order
  * [query 4096, key 1024, value 1024]. Registered parent forms are [6144,2048] with BF16
- * x [2048,T] for the Qwen3.6 companion and [6144,5120] with BF16 x [5120,T] for DFlash2.
+ * x [2048,T] for the Qwen3.6 companion, [6144,5120] with BF16 x [5120,T] for Qwen3.8-27B's
+ * DFlash2, and [6144,2560] with BF16 x [2560,T] for Qwen3.8-Flash-Next's DFlash2.
  * q is contiguous BF16 [4096,T], and k/v are contiguous BF16 [1024,T]. Every route writes the
  * three independent final allocations directly; no parent output or transient workspace is
  * materialized. T may be any positive value. Q and K remain raw projection outputs: this Op does

@@ -39,7 +39,20 @@ PrefixCachePersistence public_result(const prefix::PersistResult& result) {
 void ProgramImpl::create_prefix_cache() {
     if (!options_.prefix_cache) { return; }
     const auto lanes = static_cast<std::uint32_t>(options_.max_concurrency);
-    image_layout_    = prefix::plan_state_image(prefix::state_image_spec(c_, mtp_, options_.kv_cache));
+    // A DFlash2 drafter's context ring: per layer, one lane's K and V (the lane is outermost).
+    prefix::DraftRingGeometry ring;
+    std::vector<std::byte*> ring_k, ring_v;
+    if (dflash2_) {
+        ring.layers = dflash_ring_->layer_count();
+        for (std::uint32_t l = 0; l < ring.layers; ++l) {
+            const CyclicKVCacheLayerView view = dflash_ring_->layer_view(l);
+            ring.k_bytes                      = view.k.bytes() / lanes;
+            ring.v_bytes                      = view.v.bytes() / lanes;
+            ring_k.push_back(static_cast<std::byte*>(view.k.data));
+            ring_v.push_back(static_cast<std::byte*>(view.v.data));
+        }
+    }
+    image_layout_    = prefix::plan_state_image(prefix::state_image_spec(c_, mtp_, options_.kv_cache, ring));
     lane_image_      = std::make_unique<prefix::LaneStateImage>(
         image_layout_,
         prefix::LaneStateBuffers{.gdn       = gdn_.get(),
@@ -48,7 +61,9 @@ void ProgramImpl::create_prefix_cache() {
                                  .tails     = static_cast<std::byte*>(tails_backing_.p),
                                  .mtp_saved = mtp_ ? static_cast<std::byte*>(mtp_saved_.p) : nullptr,
                                  .window    = static_cast<std::byte*>(window_backing_.p),
-                                 .window_geometry = window_geometry_});
+                                 .window_geometry = window_geometry_,
+                                 .ring_k    = std::move(ring_k),
+                                 .ring_v    = std::move(ring_v)});
     prefix::PrefixCacheConfig config;
     config.index.cost = options_.prefix_cost;
     config.taps       = options_.prefix_taps;
@@ -602,6 +617,7 @@ void ProgramImpl::prefix_activate(Lane& lane, std::uint32_t index, const PrefixS
         }
         if (mtp_ && lane.mtp_cells != s.frontier) { ++prefix_->counters().mtp_continuation_mismatches; }
         lane.mtp_live = mtp_;
+        lane.dflash_frontier = std::min(meta.draft_frontier, s.frontier);
         // Penalty counts restart with the request; the lane's state came from the snapshot.
         CUDA_CHECK(cudaMemsetAsync(static_cast<std::int32_t*>(token_counts_.p) + index * static_cast<std::size_t>(token_domain_),
                                    0, 4ULL * token_domain_, stream));
@@ -817,6 +833,7 @@ prefix::PrefixCache::Capture ProgramImpl::prefix_capture_at(Lane& lane, std::uin
                         return hint.kind == pc::TapHintKind::GenerationOpener && hint.position == F;
                     });
     c.meta.mtp_accept = lane.mtp_accept;
+    c.meta.draft_frontier = std::min(lane.dflash_frontier, F);
     // The request's first capture supersedes the snapshot it resumed from, which then serves only
     // requests diverging before this one. Its own earlier captures stay retained: its ladder taps and
     // its system-block boundary are where edits and side calls over the history diverge (§19.3.1).

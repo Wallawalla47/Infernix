@@ -25,12 +25,13 @@ namespace infernix::ops {
  * @brief Projects independent matrix columns through a full vocabulary head and returns
  * the stable top sixteen scores and global token ids per column.
  *
- * @details For any positive column count `U`, `hidden` is contiguous BF16 `[5120,U]`, `head` is
- * either Q8_G32_FP16 or FP8_E4M3FN_ROW_BF16 `[248320,5120]`, and `valid_rows` is 248077. For every
- * `t in [0,U)` and valid vocabulary row `v`, the ideal score is
+ * @details For any positive column count `U`, `hidden` is contiguous BF16 `[H,U]` and `head` is
+ * Q8_G32_FP16 `[248320,H]` with H = 5120 (Qwen3.8-27B) or 2560 (Qwen3.8-Flash-Next), or
+ * FP8_E4M3FN_ROW_BF16 `[248320,5120]`; `valid_rows` is 248077. For every `t in [0,U)` and valid
+ * vocabulary row `v`, the ideal score is
  *
  * @f[
- *   s_{v,t}=\sum_{k=0}^{5119}\mathrm{FP32Dequant}(head)_{v,k}
+ *   s_{v,t}=\sum_{k=0}^{H-1}\mathrm{FP32Dequant}(head)_{v,k}
  *                              \mathrm{FP32}(hidden_{k,t}).
  * @f]
  *
@@ -54,7 +55,7 @@ void linear_topk(const Tensor& hidden, const Weight& head, std::int32_t valid_ro
  * scores with shortlist rows mapped to global token ids.
  *
  * @details The tensor contract is the same as the full-head overload except that `head` is
- * Q4_G64_FP16 `[131072,5120]` and every head row participates. `row_to_global_ids` is contiguous
+ * Q4_G64_FP16 `[131072,H]` (H = 5120 or 2560, the hidden's width) and every head row participates. `row_to_global_ids` is contiguous
  * I32 `[131072]`; it contains distinct ids in `[0,248077)` and maps each local head row to the id
  * used for output and tie-breaking. Artifact binding establishes the map's range and uniqueness.
  */

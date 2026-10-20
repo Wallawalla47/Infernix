@@ -213,3 +213,38 @@ def test_default_file_limit_accounts_for_framing():
     assert same_start == start and len(directory.files) == 1
     with pytest.raises(ArtifactError):
         layout_directory("small.ninfer", description, 1 << 64)
+
+
+def _companion_directory(path: Path, *, target: str | None = "text", uses=None) -> dict:
+    component = {"config": {"architectures": ["Qwen4ExpDFlash2"]}}
+    if target is not None:
+        component["target"] = target
+    uses = [{"parameter": "text/output_head", "input": "dflash2/final_hidden"}] if uses is None else uses
+    with ArtifactWriter(
+        path,
+        [TensorSpec("w", (2, 2), "bf16", "contiguous_le_v1")],
+        components={"dflash2": component},
+        bindings={"dflash2/feature_projection": {"object": "w"}},
+        uses=uses,
+    ) as writer:
+        writer.write_object("w", struct.pack("<4H", 0, 0x8000, 0x3F80, 0x7FC1))
+        return writer.directory.to_json()
+
+
+def test_companion_artifact_targets_the_text_it_is_loaded_beside(tmp_path):
+    # No text component: its component targets the main artifact's text, and its Uses may name the
+    # target's parameters (the loader checks them against that artifact).
+    directory = _companion_directory(tmp_path / "drafter.infernix")
+    parse_directory(directory)
+    with Artifact(tmp_path / "drafter.infernix") as reader:
+        assert reader.read_object("w") == struct.pack("<4H", 0, 0x8000, 0x3F80, 0x7FC1)
+    without_target = dict(directory, components={"dflash2": {"config": {}}})
+    with pytest.raises(ArtifactError, match="companion"):
+        parse_directory(without_target)
+
+
+def test_main_artifact_uses_name_only_its_own_parameters(tmp_path):
+    directory = _small(tmp_path / "base.ninfer")
+    directory["uses"].append({"parameter": "text/output_head", "input": "dflash2/final_hidden"})
+    with pytest.raises(ArtifactError, match="missing parameter"):
+        parse_directory(directory)

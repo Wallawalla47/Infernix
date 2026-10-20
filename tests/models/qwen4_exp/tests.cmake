@@ -117,6 +117,18 @@ infernix_add_test(infernix_qwen4_exp_sampled_drafts_real_test
   LIBRARIES infernix_engine)
 set_tests_properties(infernix_qwen4_exp_sampled_drafts_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
+# The DFlash2 draft-length policy (--draft-tokens auto): the calibrated length and its calibration.
+infernix_add_test(infernix_qwen4_exp_draft_length_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_draft_length.cpp"
+  LIBRARIES infernix_engine)
+
+# A DFlash2 companion drafter (--draft-model): greedy tokens, concurrency, the ring through a prefix
+# resume and the sampler's output distribution.
+infernix_add_test(infernix_qwen4_exp_dflash2_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_dflash2_real.cpp"
+  LIBRARIES infernix_engine)
+set_tests_properties(infernix_qwen4_exp_dflash2_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
+
 infernix_add_test(infernix_qwen4_exp_decide_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_decide_real.cpp"
   LIBRARIES infernix_engine)

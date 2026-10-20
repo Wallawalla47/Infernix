@@ -11,9 +11,9 @@ namespace infernix::models::qwen4_exp::prefix {
 namespace {
 
 constexpr std::uint64_t kHeaderMagic   = 0x31474D4934515751ULL; // "QWQ4IMG1"
-constexpr std::uint32_t kHeaderVersion = 1;
+constexpr std::uint32_t kHeaderVersion = 2;
 
-// Header bytes: magic, version, fingerprint, frontier, mtp_next, flags, mtp_accept.
+// Header bytes: magic, version, fingerprint, frontier, mtp_next, flags, mtp_accept, draft_frontier.
 struct PackedHeader {
     std::uint64_t magic       = 0;
     std::uint32_t version     = 0;
@@ -23,6 +23,7 @@ struct PackedHeader {
     std::uint32_t frontier    = 0;
     std::int32_t mtp_next     = -1;
     std::array<double, 8> mtp_accept{};
+    std::uint32_t draft_frontier = 0;
 };
 static_assert(sizeof(PackedHeader) <= kStateImageHeaderBytes);
 
@@ -100,7 +101,7 @@ PagedKVWindowView kv_window_view(const KvWindowGeometry& g, void* base, std::uin
                              .slots    = {}};
 }
 
-StateImageSpec state_image_spec(const TextConfig& c, bool mtp, KvCacheStorage storage) {
+StateImageSpec state_image_spec(const TextConfig& c, bool mtp, KvCacheStorage storage, DraftRingGeometry draft_ring) {
     StateImageSpec spec;
     spec.layer_types         = c.layer_types;
     spec.ple_layer           = c.ple.layer;
@@ -110,6 +111,8 @@ StateImageSpec state_image_spec(const TextConfig& c, bool mtp, KvCacheStorage st
     spec.ple_bytes      = static_cast<std::size_t>(c.residual_width()) * c.ple.conv_span() * 2U;
     spec.qsa_tail_bytes = static_cast<std::size_t>(c.qsa.index_head_dim) * (c.qsa.compress_ratio - 1U) * 2U;
     spec.mtp            = mtp;
+    spec.draft_ring     = draft_ring;
+    if (mtp && draft_ring.layers != 0) { throw std::invalid_argument("Qwen4Exp state image: one drafter"); }
     if (mtp) {
         spec.mtp_saved_bytes = static_cast<std::size_t>(c.residual_width()) * 2U;
         spec.mtp_tail_bytes  = spec.qsa_tail_bytes;
@@ -161,6 +164,10 @@ StateImageLayout plan_state_image(const StateImageSpec& spec) {
         add_part(StateImagePart::Kind::MtpTail, 0, spec.mtp_tail_bytes);
         add_window(attention);
     }
+    for (std::uint32_t layer = 0; layer < spec.draft_ring.layers; ++layer) {
+        add_part(StateImagePart::Kind::DraftRingK, layer, spec.draft_ring.k_bytes);
+        add_part(StateImagePart::Kind::DraftRingV, layer, spec.draft_ring.v_bytes);
+    }
     layout.group_begin.push_back(static_cast<std::uint32_t>(layout.parts.size()));
     layout.image_bytes = offset;
     std::uint64_t hash = 0xCBF29CE484222325ULL;
@@ -185,6 +192,7 @@ void write_state_image_header(const StateImageLayout& layout, const StateImageHe
     packed.frontier    = header.frontier;
     packed.mtp_next    = header.mtp_next;
     packed.mtp_accept  = header.mtp_accept;
+    packed.draft_frontier = header.draft_frontier;
     std::memset(image_begin, 0, kStateImageHeaderBytes);
     std::memcpy(image_begin, &packed, sizeof(packed));
 }
@@ -205,6 +213,7 @@ std::optional<StateImageHeader> read_state_image_header(const StateImageLayout& 
     header.opener       = (packed.flags & 4U) != 0;
     header.mtp_next     = packed.mtp_next;
     header.mtp_accept   = packed.mtp_accept;
+    header.draft_frontier = packed.draft_frontier;
     return header;
 }
 
@@ -223,6 +232,11 @@ LaneStateImage::LaneStateImage(const StateImageLayout& layout, const LaneStateBu
                     w.kv_layers == attention_layers + (spec.mtp ? 1U : 0U);
         for (int p = 0; same && p < KvWindowGeometry::kPlanes; ++p) { same = w.lane_bytes(p) == spec.window_bytes[p]; }
         if (!same) { throw std::invalid_argument("Qwen4Exp state image: the exact window does not match the layout"); }
+    }
+    if (buffers.ring_k.size() != spec.draft_ring.layers || buffers.ring_v.size() != spec.draft_ring.layers ||
+        std::any_of(buffers.ring_k.begin(), buffers.ring_k.end(), [](const std::byte* p) { return p == nullptr; }) ||
+        std::any_of(buffers.ring_v.begin(), buffers.ring_v.end(), [](const std::byte* p) { return p == nullptr; })) {
+        throw std::invalid_argument("Qwen4Exp state image: the DFlash2 ring does not match the layout");
     }
     if (gdn_layers > 0) {
         if (buffers.gdn == nullptr || buffers.gdn->layer_count() != gdn_layers ||
@@ -258,6 +272,10 @@ std::byte* LaneStateImage::device_part(const StateImagePart& part, std::uint32_t
         return buffers_.window + w.plane_offset(part.index / KvWindowGeometry::kPlanes, plane) +
                static_cast<std::size_t>(lane) * w.lane_bytes(plane);
     }
+    case StateImagePart::Kind::DraftRingK:
+        return buffers_.ring_k.at(part.index) + static_cast<std::size_t>(lane) * spec.draft_ring.k_bytes;
+    case StateImagePart::Kind::DraftRingV:
+        return buffers_.ring_v.at(part.index) + static_cast<std::size_t>(lane) * spec.draft_ring.v_bytes;
     }
     throw std::logic_error("Qwen4Exp state image: the header has no Device bytes");
 }

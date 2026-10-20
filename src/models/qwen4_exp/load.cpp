@@ -41,9 +41,10 @@ struct PendingWeight {
 // Logical demands of the selected model; each parameter is declared exactly once.
 class Bindings {
 public:
-    // a16_activations binds every Use A16Only (LoadOptions::a16_activations).
-    Bindings(artifact::Binder& binder, bool a16_activations)
-        : binder_(binder), a16_activations_(a16_activations) {}
+    // a16_activations binds every Use A16Only (LoadOptions::a16_activations). first_id: the
+    // WeightId of this binder's first parameter (a companion artifact's follow the main artifact's).
+    Bindings(artifact::Binder& binder, bool a16_activations, std::size_t first_id = 0)
+        : binder_(binder), a16_activations_(a16_activations), first_id_(first_id) {}
 
     WeightId parameter(std::string name, Shape shape, std::string_view input = {},
                        std::optional<QType> exact_format = {},
@@ -62,7 +63,7 @@ public:
             pending.policy = a16_activations_ ? ops::LinearPolicy::A16Only
                                               : linear_policy(*use.activation_policy);
         }
-        const WeightId id{weights.size()};
+        const WeightId id{first_id_ + weights.size()};
         ids_.emplace(std::move(name), id);
         weights.push_back(std::move(pending));
         return id;
@@ -77,6 +78,7 @@ public:
 private:
     artifact::Binder& binder_;
     bool a16_activations_ = false;
+    std::size_t first_id_ = 0;
     std::map<std::string, WeightId, std::less<>> ids_;
 };
 
@@ -222,6 +224,46 @@ MtpWeights bind_mtp(Bindings& b, const TextConfig& c) {
     return out;
 }
 
+// The DFlash2 drafter of a companion artifact (tools/convert/qwen3_5.py _Builder.draft names); the
+// context K/V roles share the query block's K/V words.
+DFlash2Weights bind_dflash2(Bindings& b, const DFlash2Config& d, const TextConfig& c) {
+    const std::uint64_t h = c.hidden_size, q = d.attention.query_width(), k = d.attention.key_width(),
+                        i = d.intermediate, rows = 2ULL * d.conv_kernel * (h / d.conv_group);
+    DFlash2Weights out;
+    out.feature_projection = b.parameter("dflash2/feature_projection", {h, d.feature_width(c.hidden_size)},
+                                         "dflash2/target_features");
+    out.context_norm       = b.direct("dflash2/context_norm", {h});
+    out.final_norm         = b.direct("dflash2/final_norm", {h});
+    for (std::uint32_t l = 0; l < d.layers; ++l) {
+        const std::string p = "dflash2/layers/" + std::to_string(l) + "/", a = p + "attention/";
+        DFlash2LayerWeights layer;
+        layer.input_norm           = b.direct(p + "input_norm", {h});
+        layer.post_attention_norm  = b.direct(p + "post_attention_norm", {h});
+        layer.query                = b.parameter(a + "query", {q, h}, p + "query_projection_input");
+        layer.key                  = b.parameter(a + "key", {k, h}, p + "query_projection_input");
+        layer.value                = b.parameter(a + "value", {k, h}, p + "query_projection_input");
+        layer.context_key          = b.parameter(a + "context_key", {k, h}, "dflash2/context_input");
+        layer.context_value        = b.parameter(a + "context_value", {k, h}, "dflash2/context_input");
+        layer.query_norm           = b.direct(a + "query_norm", {d.attention.head_dim});
+        layer.key_norm             = b.direct(a + "key_norm", {d.attention.head_dim});
+        layer.output               = b.parameter(a + "output", {h, q}, p + "attention_output");
+        layer.gate                 = b.parameter(p + "mlp/gate", {i, h}, p + "mlp_input");
+        layer.up                   = b.parameter(p + "mlp/up", {i, h}, p + "mlp_input");
+        layer.down                 = b.parameter(p + "mlp/down", {h, i}, p + "mlp_product");
+        layer.attention_base       = b.direct(p + "attention_conv/base_kernel", {2, d.conv_kernel, h});
+        layer.attention_projection = b.parameter(p + "attention_conv/kernel_projection", {rows, h},
+                                                 p + "attention_conv_input");
+        layer.mlp_base             = b.direct(p + "mlp_conv/base_kernel", {2, d.conv_kernel, h});
+        layer.mlp_projection       = b.parameter(p + "mlp_conv/kernel_projection", {rows, h}, p + "mlp_conv_input");
+        out.layers.push_back(layer);
+    }
+    out.selector_hidden      = b.parameter("dflash2/candidate_selector/hidden_projection", {d.selector_rank, h},
+                                           "dflash2/final_hidden");
+    out.predecessor_codebook = b.direct("dflash2/candidate_selector/predecessor_codebook", {c.vocab_size, d.selector_rank});
+    out.successor_codebook   = b.direct("dflash2/candidate_selector/successor_codebook", {c.vocab_size, d.selector_rank});
+    return out;
+}
+
 // Qwen3.5's tower binding (qwen3_5/load/vision.cpp) with the same parameter names; the merger's
 // output width is the text hidden size.
 VisionWeights bind_vision(Bindings& b, const qwen3_5::VisionConfig& config, const TextConfig& target,
@@ -358,6 +400,11 @@ struct LoadPlan::Impl {
     InstanceInfo info;
     std::optional<qwen3_5::VisionOverlayLayout> vision_overlay; // vision offload
     std::uint64_t embedding_bytes = 0; // the token embedding's stored bytes (pinned)
+    // The DFlash2 companion (--draft-model): its Reader, its plan, and the first of its weights in
+    // `pending` (the main artifact's come first).
+    std::unique_ptr<artifact::Reader> draft_reader;
+    std::optional<artifact::MaterializationPlan> draft_materialization;
+    std::size_t draft_first = 0;
 };
 
 LoadPlan::LoadPlan(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -382,7 +429,10 @@ std::uint64_t LoadPlan::pinned_other_bytes() const {
     return bytes;
 }
 
-std::uint64_t LoadPlan::device_bytes() const { return impl_->materialization.device_capacity_bytes; }
+std::uint64_t LoadPlan::device_bytes() const {
+    return impl_->materialization.device_capacity_bytes +
+           (impl_->draft_materialization ? impl_->draft_materialization->device_capacity_bytes : 0);
+}
 
 std::uint32_t LoadPlan::public_token_count() const {
     return static_cast<std::uint32_t>(impl_->resources.public_token_count);
@@ -420,6 +470,10 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     auto out     = std::make_unique<LoadPlan::Impl>();
     out->options = options;
     out->config  = parse_config(reader.directory(), options);
+    if (options.dflash2() && options.purpose == EnginePurpose::Generation) {
+        out->draft_reader   = std::make_unique<artifact::Reader>(options.draft_model);
+        out->config.dflash2 = parse_dflash2_config(out->draft_reader->directory(), out->config.text);
+    }
     artifact::Binder binder(reader);
     out->resources = bind_resources(binder, out->config);
     Bindings bindings(binder, options.a16_activations);
@@ -429,13 +483,14 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
         out->weights.vision = bind_vision(bindings, *out->config.vision, out->config.text,
                                           options.overlay_vision() ? Residency::HostPinned : Residency::Device);
     }
-    if (out->config.mtp) {
-        out->weights.mtp = bind_mtp(bindings, out->config.text);
+    if (out->config.mtp) { out->weights.mtp = bind_mtp(bindings, out->config.text); }
+    if (out->config.mtp || out->config.dflash2) {
         if (out->config.proposal_rows != 0) {
             const std::uint64_t rows = out->config.proposal_rows;
             ProposalWeights proposal;
+            // A DFlash2 companion records its own Use of the proposal head (checked below).
             proposal.head      = bindings.parameter("proposal/head", {rows, out->config.text.hidden_size},
-                                                    "mtp/final_hidden");
+                                                    out->config.mtp ? "mtp/final_hidden" : "");
             proposal.token_ids = bindings.direct("proposal/token_ids", {rows}, QType::INT32);
             const auto ids = binder.values(bindings.weights.at(proposal.token_ids.index).reference.binding,
                                            QType::INT32)
@@ -510,7 +565,32 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
         }
         for (const auto object : objects) { out->embedding_bytes += artifact::object_bytes(reader.directory().object(object)); }
     }
-    out->pending         = std::move(bindings.weights);
+    out->pending = std::move(bindings.weights);
+    if (out->config.dflash2) {
+        // The companion's weights, after every main-artifact weight; it declares its Use of the target
+        // head its drafts read (the proposal head with --lm-head-draft, else the text head).
+        artifact::Binder draft_binder(*out->draft_reader);
+        (void)draft_binder.use(out->config.proposal_rows != 0 ? "proposal/head" : "text/output_head",
+                               "dflash2/final_hidden");
+        {
+            // The head the drafts read, as DFlash2 runs it (execution/dflash2.cpp head_candidates).
+            const bool proposal   = out->config.proposal_rows != 0;
+            const WeightId head   = proposal ? out->weights.proposal->head : out->weights.output_head;
+            const auto& binding   = out->pending.at(head.index).reference.binding;
+            const auto& tensor    = reader.directory().tensor(binding.parts.front().object);
+            const auto layout     = artifact::parse_layout(tensor.layout);
+            auto& d               = *out->config.dflash2;
+            d.head_rows           = proposal ? out->config.proposal_rows : out->config.text.vocab_size;
+            d.ggml_head           = is_ggml_matrix_layout(layout);
+            d.fused_head          = !d.ggml_head && (proposal ? tensor.format == "q4_g64_fp16" && d.head_rows == 131072U
+                                                              : tensor.format == "q8_g32_fp16");
+        }
+        Bindings draft(draft_binder, options.a16_activations, out->pending.size());
+        out->draft_first     = out->pending.size();
+        out->weights.dflash2 = bind_dflash2(draft, *out->config.dflash2, out->config.text);
+        for (auto& weight : draft.weights) { out->pending.push_back(std::move(weight)); }
+        out->draft_materialization = std::move(draft_binder).finish();
+    }
     out->materialization = std::move(binder).finish();
     if (out->weights.vision && options.overlay_vision()) {
         out->vision_overlay = vision_overlay_layout(*out->weights.vision, out->pending, out->materialization);
@@ -520,14 +600,16 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     out->info.metadata_json   = reader.directory().metadata.dump();
     out->info.provenance_json = reader.directory().provenance.dump();
     out->info.artifact_id     = reader.artifact_id();
+    if (out->draft_reader) { out->info.draft_artifact_id = out->draft_reader->artifact_id(); }
     return LoadPlan(std::move(out));
 }
 
 Model::Model(Config config, LoadOptions options, TextWeights weights, std::vector<BoundWeight> bound,
              std::vector<ExpertBank> banks, FrontendResources resources, InstanceInfo info,
              std::optional<qwen3_5::VisionOverlayAssets> overlay_vision, artifact::MaterializedArtifact backing,
-             std::optional<ExpertStore> expert_store)
-    : backing_(std::move(backing)), expert_store_(std::move(expert_store)), config_(std::move(config)), options_(options),
+             std::optional<ExpertStore> expert_store, std::optional<artifact::MaterializedArtifact> draft_backing)
+    : backing_(std::move(backing)), draft_backing_(std::move(draft_backing)), expert_store_(std::move(expert_store)),
+      config_(std::move(config)), options_(options),
       weights_(std::move(weights)), bound_(std::move(bound)), banks_(std::move(banks)),
       resources_(std::move(resources)), info_(std::move(info)), overlay_vision_(std::move(overlay_vision)) {}
 
@@ -539,14 +621,19 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
     auto data    = std::move(plan.impl_);
     const artifact::Reader& reader = *data->materialization.source;
     auto backing = artifact::materialize(reader, std::move(data->materialization), device, observer);
+    std::optional<artifact::MaterializedArtifact> draft_backing;
+    if (data->draft_materialization) {
+        draft_backing = artifact::materialize(*data->draft_reader, std::move(*data->draft_materialization), device, observer);
+    }
     std::vector<BoundWeight> bound;
     bound.reserve(data->pending.size());
-    for (auto& item : data->pending) {
+    for (std::size_t i = 0; i < data->pending.size(); ++i) {
+        auto& item = data->pending[i];
         BoundWeight weight;
         weight.name   = item.reference.name;
         weight.policy = item.policy;
         if (item.reference.residency != Residency::Values) {
-            weight.view = artifact::bind_view(item.reference, backing);
+            weight.view = artifact::bind_view(item.reference, draft_backing && i >= data->draft_first ? *draft_backing : backing);
         } else {
             weight.view.shape = item.reference.shape;
         }
@@ -628,7 +715,7 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
                                             std::move(data->weights), std::move(bound),
                                             std::move(banks), std::move(data->resources),
                                             std::move(data->info), std::move(overlay), std::move(backing),
-                                            std::move(store)));
+                                            std::move(store), std::move(draft_backing)));
 }
 
 std::unique_ptr<Model> load_model(const std::filesystem::path& path, LoadOptions options,

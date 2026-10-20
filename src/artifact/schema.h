@@ -100,6 +100,9 @@ struct Directory {
     std::uint64_t payload_bytes = 0;
     Json metadata               = Json::object();
     Json provenance             = Json::object();
+    // No text component: the components target the text of a main artifact loaded beside it,
+    // and Uses may name parameters that artifact binds.
+    bool companion = false;
 
     [[nodiscard]] const Object& object(ObjectHandle handle) const;
     [[nodiscard]] const TensorObject& tensor(ObjectHandle handle) const;

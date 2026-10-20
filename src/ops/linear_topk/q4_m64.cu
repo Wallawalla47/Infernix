@@ -16,8 +16,6 @@
 namespace infernix::ops::detail {
 namespace {
 
-constexpr int kGroupsPerRow = kLinearTopKHidden / 64;
-constexpr int kCodeRowBytes = kLinearTopKHidden / 2;
 
 using M64WarpSort              = cub::WarpMergeSort<std::uint64_t, 2, 32>;
 constexpr int kRowsPerProducer = 64;
@@ -62,14 +60,16 @@ __device__ __forceinline__ int swizzle_128(int row, int column) {
     return (((column >> 3) ^ (row & 7)) << 3) | (column & 7);
 }
 
-template <int TileColumns, int kBlockK = 128>
+template <int Hidden, int TileColumns, int kBlockK = 128>
 __global__
 __launch_bounds__(M64Schedule<TileColumns, kBlockK>::kThreads, 2) void q4_m64_linear_topk_kernel(
     const __nv_bfloat16* __restrict__ hidden, const std::uint8_t* __restrict__ weight_codes,
     const std::uint8_t* __restrict__ weight_scales,
     const std::int32_t* __restrict__ row_to_global_ids, std::uint64_t* __restrict__ partial_keys,
     std::int32_t producer_groups, std::int32_t columns) {
-    constexpr int kKTiles       = kLinearTopKHidden / kBlockK;
+    constexpr int kGroupsPerRow = Hidden / 64;
+    constexpr int kCodeRowBytes = Hidden / 2;
+    constexpr int kKTiles       = Hidden / kBlockK;
     constexpr int kBlockRows    = 64;
     constexpr int kSortItems    = 2;
     constexpr int kWarps        = M64Schedule<TileColumns, kBlockK>::kWarps;
@@ -83,7 +83,7 @@ __launch_bounds__(M64Schedule<TileColumns, kBlockK>::kThreads, 2) void q4_m64_li
     auto& reusable = *reinterpret_cast<Q4M64ReusableStorage<TileColumns, kBlockK>*>(shared_bytes);
     const int column_begin = static_cast<int>(blockIdx.y) * TileColumns;
     const int live_columns = min(TileColumns, columns - column_begin);
-    hidden += static_cast<std::int64_t>(column_begin) * kLinearTopKHidden;
+    hidden += static_cast<std::int64_t>(column_begin) * Hidden;
 
     auto& mainloop = reusable.mainloop;
 
@@ -116,7 +116,7 @@ __launch_bounds__(M64Schedule<TileColumns, kBlockK>::kThreads, 2) void q4_m64_li
                 if (column < live_columns) {
                     cp_async<16, Cache::ca>(destination, hidden +
                                                              static_cast<std::int64_t>(column) *
-                                                                 kLinearTopKHidden +
+                                                                 Hidden +
                                                              k_begin + k8 * 8);
                 } else {
                     cp_async_zfill<16, Cache::ca>(destination, hidden + k_begin + k8 * 8, 0);
@@ -280,15 +280,15 @@ __launch_bounds__(M64Schedule<TileColumns, kBlockK>::kThreads, 2) void q4_m64_li
     __syncthreads();
 }
 
-template <int TileColumns, int kBlockK = 128>
+template <int Hidden, int TileColumns, int kBlockK = 128>
 void launch_tile(const Tensor& hidden, const Weight& head, const Tensor& row_to_global_ids,
                  const LinearTopKWorkspace& workspace, cudaStream_t stream) {
     constexpr int shared_bytes = sizeof(Q4M64ReusableStorage<TileColumns, kBlockK>);
     if constexpr (shared_bytes > 48 * 1024) {
-        CUDA_CHECK(cudaFuncSetAttribute(q4_m64_linear_topk_kernel<TileColumns, kBlockK>,
+        CUDA_CHECK(cudaFuncSetAttribute(q4_m64_linear_topk_kernel<Hidden, TileColumns, kBlockK>,
                                         cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes));
     }
-    q4_m64_linear_topk_kernel<TileColumns, kBlockK>
+    q4_m64_linear_topk_kernel<Hidden, TileColumns, kBlockK>
         <<<dim3(workspace.producer_groups, div_up(hidden.ne[1], TileColumns)),
            M64Schedule<TileColumns, kBlockK>::kThreads, shared_bytes, stream>>>(
             static_cast<const __nv_bfloat16*>(hidden.data),
@@ -300,29 +300,39 @@ void launch_tile(const Tensor& hidden, const Weight& head, const Tensor& row_to_
     CUDA_CHECK(cudaGetLastError());
 }
 
+template <int Hidden>
+void launch_hidden(const Tensor& hidden, const Weight& head,
+                               const Tensor& row_to_global_ids,
+                               const LinearTopKWorkspace& workspace, cudaStream_t stream) {
+    switch (workspace.tile_columns) {
+    case 32:
+        return launch_tile<Hidden, 32, 128>(hidden, head, row_to_global_ids, workspace, stream);
+    case 48:
+        return launch_tile<Hidden, 48, 128>(hidden, head, row_to_global_ids, workspace, stream);
+    case 64:
+        return launch_tile<Hidden, 64, 128>(hidden, head, row_to_global_ids, workspace, stream);
+    case 80:
+        return launch_tile<Hidden, 80, 128>(hidden, head, row_to_global_ids, workspace, stream);
+    case 112:
+        return launch_tile<Hidden, 112, 64>(hidden, head, row_to_global_ids, workspace, stream);
+    case 96:
+        return launch_tile<Hidden, 96, 128>(hidden, head, row_to_global_ids, workspace, stream);
+    case 120:
+        return launch_tile<Hidden, 120, 64>(hidden, head, row_to_global_ids, workspace, stream);
+    case 128:
+        return launch_tile<Hidden, 128, 64>(hidden, head, row_to_global_ids, workspace, stream);
+    }
+    throw std::invalid_argument("invalid linear_topk MMA tile");
+}
+
 } // namespace
 
 void linear_topk_q4_m64_launch(const Tensor& hidden, const Weight& head,
                                const Tensor& row_to_global_ids,
                                const LinearTopKWorkspace& workspace, cudaStream_t stream) {
-    switch (workspace.tile_columns) {
-    case 32:
-        return launch_tile<32, 128>(hidden, head, row_to_global_ids, workspace, stream);
-    case 48:
-        return launch_tile<48, 128>(hidden, head, row_to_global_ids, workspace, stream);
-    case 64:
-        return launch_tile<64, 128>(hidden, head, row_to_global_ids, workspace, stream);
-    case 80:
-        return launch_tile<80, 128>(hidden, head, row_to_global_ids, workspace, stream);
-    case 112:
-        return launch_tile<112, 64>(hidden, head, row_to_global_ids, workspace, stream);
-    case 96:
-        return launch_tile<96, 128>(hidden, head, row_to_global_ids, workspace, stream);
-    case 120:
-        return launch_tile<120, 64>(hidden, head, row_to_global_ids, workspace, stream);
-    case 128:
-        return launch_tile<128, 64>(hidden, head, row_to_global_ids, workspace, stream);
-    }
-    throw std::invalid_argument("invalid linear_topk MMA tile");
+    // Qwen3.8-27B's heads (5120) and Qwen3.8-Flash-Next's (2560).
+    if (hidden.ne[0] == 5120) { return launch_hidden<5120>(hidden, head, row_to_global_ids, workspace, stream); }
+    if (hidden.ne[0] == 2560) { return launch_hidden<2560>(hidden, head, row_to_global_ids, workspace, stream); }
+    throw std::invalid_argument("linear_topk: unregistered hidden width");
 }
 } // namespace infernix::ops::detail

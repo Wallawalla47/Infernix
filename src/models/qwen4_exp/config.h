@@ -172,9 +172,39 @@ struct TextConfig {
     [[nodiscard]] std::uint32_t residual_width() const noexcept { return hc.streams * hidden_size; }
 };
 
+// A DFlash2 drafter (docs/maintainer/dflash.md) from a companion artifact (--draft-model): its own
+// block geometry; the hidden width, vocabulary, token embedding and head are the target's. Every
+// layer is a sliding-window layer (the drafter of Qwen3.8-Flash-Next has five).
+struct DFlash2Config {
+    std::uint32_t layers       = 0;
+    AttentionConfig attention;
+    std::uint32_t intermediate = 0;
+    std::uint32_t window       = 0; // the sliding window and context ring capacity
+    float rms_norm_eps         = 0;
+    float rope_theta           = 0; // full-head 1-D RoPE at absolute positions
+    std::vector<std::uint32_t> target_layer_ids; // the completed target layers whose stream means are the features
+    std::uint32_t mask_token_id  = 0;
+    std::uint32_t conv_kernel    = 0; // dynamic convolution taps
+    std::uint32_t conv_group     = 0; // channels sharing one dynamic coefficient
+    std::uint32_t selector_rank  = 0;
+    std::uint32_t selector_top_k = 0;
+    // Set by the loader from the bound head the drafts read (the proposal head with --lm-head-draft,
+    // else the text head): its rows, whether its top-16 runs the fused ops::linear_topk (a Q4
+    // proposal head or a Q8 text head), and whether it is a GGUF import's (ggml blocks).
+    std::uint32_t head_rows = 0;
+    bool fused_head         = false;
+    bool ggml_head          = false;
+
+    // The feature width: the target hidden width per tapped layer.
+    [[nodiscard]] std::uint32_t feature_width(std::uint32_t hidden) const noexcept {
+        return hidden * static_cast<std::uint32_t>(target_layer_ids.size());
+    }
+};
+
 struct Config {
     TextConfig text;
     bool mtp = false;                // the MTP drafter is bound (--spec mtp)
+    std::optional<DFlash2Config> dflash2; // the DFlash2 drafter is bound (--spec dflash2 --draft-model)
     std::uint32_t proposal_rows = 0; // rows of the bound proposal head (--lm-head-draft), else 0
     // The Vision tower (--vision): Qwen3.5's tower except its output width, which the merger's
     // bound fc2 gives (design §19.3.2).
@@ -182,5 +212,10 @@ struct Config {
 };
 
 [[nodiscard]] Config parse_config(const artifact::Directory& directory, const LoadOptions& options);
+
+// The DFlash2 drafter of a companion artifact (a directory without text whose dflash2 component
+// records the target identity it was converted for, tools/convert/qwen4_exp.py), checked against
+// the target's text config.
+[[nodiscard]] DFlash2Config parse_dflash2_config(const artifact::Directory& companion, const TextConfig& target);
 
 } // namespace infernix::models::qwen4_exp

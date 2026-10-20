@@ -2,9 +2,12 @@
 #include "infernix/ops/context_kv_materialize.h"
 
 #include "core/layout.h"
+#include "ops/common/dflash_rope_table.h"
 #include "ops/context_kv_materialize/launch.h"
 
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -14,7 +17,8 @@
 namespace infernix::ops {
 namespace {
 
-constexpr std::int32_t kHidden     = 5120;
+// The registered context widths: Qwen3.8-27B's DFlash2 (5120) and Qwen3.8-Flash-Next's (2560).
+bool registered_hidden(std::int32_t hidden) { return hidden == 5120 || hidden == 2560; }
 constexpr std::int32_t kKVSize     = 1024;
 constexpr std::int32_t kHeadDim    = 128;
 constexpr std::int32_t kKVHeads    = 8;
@@ -35,18 +39,18 @@ void require_tensor(const Tensor& tensor, DType dtype, std::int32_t n0, std::int
     }
 }
 
-void require_weight(const Weight& weight, const char* name) {
-    constexpr std::uint64_t kCodeBytes =
-        static_cast<std::uint64_t>(kKVSize) * static_cast<std::uint64_t>(kHidden);
-    constexpr std::uint64_t kScaleBytes =
-        static_cast<std::uint64_t>(kKVSize) * static_cast<std::uint64_t>(kHidden / 32) * 2U;
+void require_weight(const Weight& weight, std::int32_t hidden, const char* name) {
+    const std::uint64_t code_bytes =
+        static_cast<std::uint64_t>(kKVSize) * static_cast<std::uint64_t>(hidden);
+    const std::uint64_t scale_bytes =
+        static_cast<std::uint64_t>(kKVSize) * static_cast<std::uint64_t>(hidden / 32) * 2U;
     if (weight.qtype != QType::Q8_G32_FP16 || weight.layout != QuantLayout::RowSplit ||
         weight.scale_dtype != DType::FP16 || weight.group != 32 || weight.group_size != 32 ||
-        weight.ndim != 2 || weight.n != kKVSize || weight.k != kHidden ||
-        weight.shape[0] != kKVSize || weight.shape[1] != kHidden ||
-        weight.padded_shape[0] != kKVSize || weight.padded_shape[1] != kHidden ||
+        weight.ndim != 2 || weight.n != kKVSize || weight.k != hidden ||
+        weight.shape[0] != kKVSize || weight.shape[1] != hidden ||
+        weight.padded_shape[0] != kKVSize || weight.padded_shape[1] != hidden ||
         weight.qhigh != nullptr || weight.high_plane_bytes != 0 ||
-        weight.payload_bytes < kCodeBytes + kScaleBytes || !aligned_to(weight.qdata, 16) ||
+        weight.payload_bytes < code_bytes + scale_bytes || !aligned_to(weight.qdata, 16) ||
         !aligned_to(weight.scales, 4)) {
         throw std::invalid_argument(std::string(kOp) + ": invalid " + name);
     }
@@ -121,12 +125,19 @@ std::size_t context_kv_materialize_workspace_capacity_bytes(std::int32_t batch_s
 void context_kv_materialize(
     const Tensor& context, const Tensor& positions, const Tensor& counts, const Tensor& state_slots,
     const std::array<ContextKVMaterializeLayerView, kContextKVMaterializeLayers>& layers,
-    ContextKVMaterializeExecutionEnvelope envelope, WorkspaceArena& workspace,
+    float rope_theta, ContextKVMaterializeExecutionEnvelope envelope, WorkspaceArena& workspace,
     cudaStream_t stream) {
-    const std::int32_t width = context.ne[1];
-    const std::int32_t batch = context.ne[2];
+    const std::int32_t hidden = context.ne[0];
+    const std::int32_t width  = context.ne[1];
+    const std::int32_t batch  = context.ne[2];
+    if (!registered_hidden(hidden)) {
+        throw std::invalid_argument("context_kv_materialize: H must be 5120 or 2560");
+    }
+    if (!(rope_theta > 1.0F) || !std::isfinite(rope_theta)) {
+        throw std::invalid_argument("context_kv_materialize: theta must be finite and above 1");
+    }
     require_profile(width, batch);
-    require_tensor(context, DType::BF16, kHidden, width, batch, 1, 16, "context");
+    require_tensor(context, DType::BF16, hidden, width, batch, 1, 16, "context");
     require_tensor(positions, DType::I32, width, batch, 1, 1, alignof(std::int32_t), "positions");
     require_tensor(counts, DType::I32, batch, 1, 1, 1, alignof(std::int32_t), "counts");
     require_tensor(state_slots, DType::I32, batch, 1, 1, 1, alignof(std::int32_t), "state slots");
@@ -144,8 +155,8 @@ void context_kv_materialize(
     const std::int32_t lane_capacity = layers.front().cache.lane_capacity;
     for (std::size_t index = 0; index < layers.size(); ++index) {
         const ContextKVMaterializeLayerView& layer = layers[index];
-        require_weight(layer.key_weight, "key weight");
-        require_weight(layer.value_weight, "value weight");
+        require_weight(layer.key_weight, hidden, "key weight");
+        require_weight(layer.value_weight, hidden, "value weight");
         require_tensor(layer.key_norm_weight, DType::BF16, kHeadDim, 1, 1, 1, 4, "key norm weight");
         validate_cache(layer.cache, padded, lane_capacity);
     }
@@ -157,8 +168,18 @@ void context_kv_materialize(
     Tensor key_scratch;
     if (detail::context_kv_materialize_uses_scratch(route))
         key_scratch = allocate_key_scratch(workspace, columns);
-    detail::context_kv_materialize_launch(context, positions, counts, state_slots, layers, envelope,
-                                          route, key_scratch, stream);
+    // theta^(-2j/128): the stored words of the 1e7 table, else prepare_rope's (so these keys rotate
+    // exactly as a prepared rmsnorm_rope rotates the query block's).
+    static constexpr std::array<double, 64> k1e7{INFERNIX_DFLASH_ROPE_1E7_INV_FREQUENCY};
+    std::array<double, 64> inv_frequency = k1e7;
+    if (rope_theta != 1.0e7F) {
+        for (int pair = 0; pair < 64; ++pair) {
+            inv_frequency[static_cast<std::size_t>(pair)] =
+                std::pow(static_cast<double>(rope_theta), -2.0 * pair / kHeadDim);
+        }
+    }
+    detail::context_kv_materialize_launch(context, positions, counts, state_slots, layers,
+                                          inv_frequency, envelope, route, key_scratch, stream);
 }
 
 } // namespace infernix::ops

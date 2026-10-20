@@ -70,8 +70,10 @@ bool is_companion_shape(const Q8AttnInputProblem& problem) noexcept {
 }
 
 bool is_dflash2_shape(const Q8AttnInputProblem& problem) noexcept {
-    return problem.input_rows == 5120 && problem.query_rows == 4096 && problem.kv_rows == 1024 &&
-           problem.parent_rows == 6144 && problem.padded_k == 5120;
+    // Qwen3.8-27B's drafter (H 5120) and Qwen3.8-Flash-Next's (H 2560).
+    return (problem.input_rows == 5120 || problem.input_rows == 2560) && problem.query_rows == 4096 &&
+           problem.kv_rows == 1024 &&
+           problem.parent_rows == 6144 && problem.padded_k == problem.input_rows;
 }
 
 bool supported_shape(const Q8AttnInputProblem& problem) noexcept {

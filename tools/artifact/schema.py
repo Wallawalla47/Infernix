@@ -311,16 +311,21 @@ def parse_directory(value: object, *, entry_name: str | None = None) -> Director
         index[obj.id] = obj
 
     components = root["components"]
-    if not isinstance(components, dict) or "text" not in components:
-        raise ArtifactError("components must contain text")
+    if not isinstance(components, dict) or not components:
+        raise ArtifactError("components must be a nonempty object")
+    # A companion artifact has no text: each of its components targets the text of the main
+    # artifact it is loaded beside.
+    companion = "text" not in components
     for name, component in components.items():
         identifier(name, "component id")
         members(component, {"config"}, {"target", "resources", "proposal"}, name)
         if not isinstance(component["config"], dict):
             raise ArtifactError(f"{name}: config must be an object")
+        if companion and component.get("target") != "text":
+            raise ArtifactError(f"{name}: a companion component must target text")
         if "target" in component:
             target = identifier(component["target"], f"{name} target")
-            if target not in components:
+            if target not in components and not companion:
                 raise ArtifactError(f"{name}: missing target {target!r}")
         resources = component.get("resources", {})
         if not isinstance(resources, dict):
@@ -360,7 +365,8 @@ def parse_directory(value: object, *, entry_name: str | None = None) -> Director
         )
         name = identifier(use["parameter"], "Use parameter")
         source = identifier(use["input"], f"{name} Use input")
-        if name not in bindings or (name, source) in seen_uses:
+        # A companion's Use may name a parameter its target binds (checked when loaded beside it).
+        if (name not in bindings and not companion) or (name, source) in seen_uses:
             raise ArtifactError(f"{name}@{source}: missing parameter or duplicate Use")
         seen_uses.add((name, source))
         if "activation_policy" in use:

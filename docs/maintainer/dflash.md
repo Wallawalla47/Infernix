@@ -3,8 +3,10 @@
 DFlash backends propose several tokens with one masked-block forward, conditioned on committed
 target hidden features. The target verifies the proposal causally and remains the output authority.
 Infernix implements DFlash and DFlash2 as optional components of the
-[Qwen3.5 model](qwen3_5-model.md). Their private config and bindings select the stored weights;
-startup chooses one backend, draft width and proposal head.
+[Qwen3.5 model](qwen3_5-model.md), and DFlash2 for Qwen3.8-Flash-Next (`Qwen4ExpForCausalLM`) as a
+companion artifact loaded beside the main one ([Qwen3.8-Flash-Next](#qwen38-flash-next)). Their
+private config and bindings select the stored weights; startup chooses one backend, draft width
+and proposal head.
 
 This reference owns model mathematics, proposal distributions and backend state. Scheduling,
 publication and common transactions are defined by [Engine architecture](engine-architecture.md).
@@ -18,18 +20,19 @@ convolution tap/group dimensions and selector rank/top-k. The hidden width and e
 semantics come from the target. Exact fields are parsed in
 [`config.cpp`](../../src/models/qwen3_5/config.cpp).
 
-| Quantity | Official 35B-A3B DFlash | Official 27B DFlash2 |
-|---|---:|---:|
-| Hidden width H | 2048 | 5120 |
-| Draft layers | 6 | 5 |
-| Intermediate width | 6144 | 17408 |
-| Q heads / KV heads / head dimension | 32 / 8 / 128 | 32 / 8 / 128 |
-| Target block IDs | `[1,6,11,16,22,27,32,37]` | `[5,19,33,47,61]` |
-| Attention pattern | Five local layers, then one full layer | Five local layers |
-| Sliding-window scalar S | 4096 | 2048 |
-| Norm epsilon / RoPE theta | `1e-6` / `1e7` | `1e-6` / `1e7` |
-| Dynamic convolution | — | Two taps, group width 16 |
-| Candidate selector | Per-position argmax | Top-16 conditional path, rank 256 |
+| Quantity | Official 35B-A3B DFlash | Official 27B DFlash2 | Flash-Next DFlash2 (incoai) |
+|---|---:|---:|---:|
+| Hidden width H | 2048 | 5120 | 2560 |
+| Draft layers | 6 | 5 | 5 |
+| Intermediate width | 6144 | 17408 | 7680 |
+| Q heads / KV heads / head dimension | 32 / 8 / 128 | 32 / 8 / 128 | 32 / 8 / 128 |
+| Target block IDs | `[1,6,11,16,22,27,32,37]` | `[5,19,33,47,61]` | `[5,15,25,35,45]` |
+| Attention pattern | Five local layers, then one full layer | Five local layers | Five local layers |
+| Sliding-window scalar S | 4096 | 2048 | 2048 |
+| Norm epsilon / RoPE theta | `1e-6` / `1e7` | `1e-6` / `1e7` | `1e-6` / `1e4` |
+| Dynamic convolution | — | Two taps, group width 16 | Two taps, group width 16 |
+| Candidate selector | Per-position argmax | Top-16 conditional path, rank 256 | Top-16 conditional path, rank 256 |
+| Training block (anchor + masks) | — | — | 8 |
 
 The current Engine accepts startup draft count K in `1..15` and concurrency B in `1..8`. The
 physical block width is `W=K+1`, containing one anchor and K masks. K is a runtime choice, not a
@@ -294,6 +297,58 @@ Device fork, prefix-cache snapshots, their Host copies and restore carry the bac
 together with target state and continuation metadata. Their coverage must agree. These rules are
 shared with the [hybrid prefix cache](hybrid-prefix-cache-spec.md),
 [resource scheduling](resource-scheduling-and-context-cache.md) and [ReplaySSM](replayssm-gdn.md).
+
+## Qwen3.8-Flash-Next
+
+The Flash-Next drafter ([incoai/Qwen3.8-Flash-Next-DFlash2](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2))
+has the 27B drafter's mathematics at the geometry above; the fused Ops register both geometries
+(hidden 5120 and 2560, RoPE theta any value through the prepared tables).
+
+- **Companion artifact.** `tools.convert --components dflash2 --recipe qwen3_8_flash_next_dflash2`
+  writes the drafter alone ([weight conversion](../weight-conversion.md)): no text component, its
+  `dflash2` component targets the main artifact's text, and its Uses name the target heads it reads
+  ([container §4.3](artifact-container.md#43-companion-artifacts)). `--spec dflash2 --draft-model
+  FILE` loads it beside any Flash-Next artifact; the loader checks its `target_config`, binds its
+  parameters after the main artifact's and materializes it in its own allocation
+  ([`load.cpp`](../../src/models/qwen4_exp/load.cpp)). The drafter embeds with the main artifact's
+  token embedding (BF16, or a GGUF import's IQ4_XS rows decoded exactly) and reads the text head
+  (fused `linear_topk` for a Q8 head, else FP32 logits and `top_logprobs`) or, with
+  `--lm-head-draft`, the proposal head (fused `linear_topk` for the 131,072-row Q4 head).
+- **Features.** The target's feature of block l is the mean of the four hyper-connection streams of
+  its completed residual (`ops::hyper_connection_stream_mean`), as the drafter was trained; the five
+  taps form `s_t` (12,800 values). A decode or verification round captures every column, a prefill
+  call or forced tokens their last S columns, and a layer walk its span's last S columns, layer by
+  layer ([`forward.cpp`](../../src/models/qwen4_exp/execution/forward.cpp),
+  [`prefill_walk.cpp`](../../src/models/qwen4_exp/program/prefill_walk.cpp)).
+- **Context ring.** Each lane has five cyclic rings (BF16 K, FP16 V, 2,048 slots, 40 MiB). A prefill
+  call, forced tokens or a walk span write their last window's context eagerly; a round's commit
+  writes the committed columns' (one CUDA Graph per batch size and width). The ring is part of the
+  prefix cache's state image (the drafter group), with its frontier in the image header; a tap
+  inside a layer walk copies the ring as it stood before the span, which only costs acceptance after
+  a resume from it.
+- **Rounds.** One-row rounds speculate (two-row rounds only with the `adaptive-speculation` fast
+  path, which applies to MTP today). The drafter always proposes its configured block of K + 1
+  columns (one CUDA Graph per batch size) and the round verifies a prefix of its drafts. K is at
+  most 7, the block the drafter was trained with and the widest column-invariant verification.
+- **Draft length.** The selector also writes each draft's temperature-1 probability at its
+  selected rank (`candidate_selector_path`'s optional `confidence`), read back with the drafts.
+  A fixed `--draft-tokens N` verifies all N, or with `--spec-min-p P` those before the first below
+  P. `--draft-tokens auto` verifies the k maximizing (1 + sum of products of the drafts'
+  calibrated acceptances) / (1 + 0.1 + 0.31 k) plain rounds, each draft's acceptance read from its
+  probability's decile and learned per request, one draft more every 8 rounds
+  ([`draft_length.h`](../../src/models/qwen4_exp/program/draft_length.h)). Measured on the 5090
+  (Dense8 and IQ3_S, 2026-10-20): verifying all seven was 18-24 % slower than MTP `auto`, a fixed
+  cut at 0.6 3-15 % faster, the calibrated length 8-11 % faster on code, docs and sampled docs
+  (26 % on sampled code; the means of every run, Dense8 code from four runs against eight);
+  the same policy with the online round-cost fit of MTP's chose shorter lengths and was 6 % slower
+  on code. A round with a sampled row
+  verifies by sparse rejection sampling with the selector's laws (one-hot for its greedy rows and
+  at an n-gram row's copies); a round of greedy rows, whose drafts are deterministic, takes the
+  greedy acceptance. Greedy output equals plain decoding either way.
+- **Implementation.** [`execution/dflash2.cpp`](../../src/models/qwen4_exp/execution/dflash2.cpp)
+  (the drafter's Op sequence, no state) and
+  [`program/dflash2_program.cpp`](../../src/models/qwen4_exp/program/dflash2_program.cpp) (ring,
+  features, io, graphs).
 
 ## Execution flow
 

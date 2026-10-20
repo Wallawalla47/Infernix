@@ -22,20 +22,23 @@ void candidate_selector_path_dispatch(const Tensor& candidate_ids, const Tensor&
                                       const Tensor& predecessor_codebook,
                                       const Tensor& successor_codebook,
                                       const Tensor& base_positions, const SamplingConfig* configs,
-                                      Tensor& drafts, Tensor& proposal_q, WorkspaceArena& workspace,
-                                      cudaStream_t stream) {
+                                      Tensor& drafts, Tensor& proposal_q, Tensor* confidence,
+                                      WorkspaceArena& workspace, cudaStream_t stream) {
     const auto route = candidate_selector_path_route(candidate_ids.ne[1], candidate_ids.ne[2]);
     auto scope       = workspace.scope();
     const auto scratch =
         allocate_selector_workspace(workspace, route, candidate_ids.ne[1], candidate_ids.ne[2]);
+    const Tensor none{};
     const Tensor* live[]{
         &candidate_ids,      &unary_scores,   &projected_hidden, &anchors,   &predecessor_codebook,
-        &successor_codebook, &base_positions, &drafts,           &proposal_q};
+        &successor_codebook, &base_positions, &drafts,           &proposal_q,
+        confidence != nullptr ? confidence : &none};
     for (const auto* work : {&scratch.edges}) {
         if (!work->data) continue;
         const auto begin = reinterpret_cast<std::uintptr_t>(work->data),
                    end   = begin + work->bytes();
         for (const auto* tensor : live) {
+            if (tensor->data == nullptr) continue;
             const auto tb = reinterpret_cast<std::uintptr_t>(tensor->data);
             if (begin < tb + tensor->bytes() && tb < end)
                 throw std::invalid_argument("selector workspace overlaps operand");
@@ -46,6 +49,6 @@ void candidate_selector_path_dispatch(const Tensor& candidate_ids, const Tensor&
     }
     candidate_selector_path_launch(route, candidate_ids, unary_scores, projected_hidden, anchors,
                                    predecessor_codebook, successor_codebook, base_positions,
-                                   configs, drafts, proposal_q, scratch, stream);
+                                   configs, drafts, proposal_q, confidence, scratch, stream);
 }
 } // namespace infernix::ops::detail

@@ -129,6 +129,7 @@ void ProgramImpl::walk_begin(Lane& lane, std::uint32_t index, std::size_t end) {
     walk_.vision.assign(n, std::nullopt);
     walk_.mtp_vision.assign(n, {});
     walk_plan_taps(lane);
+    walk_dflash_frontier_ = lane.dflash_frontier;
     walk_.host_slot = host_lanes_[0] = static_cast<std::int32_t>(index);
     if (walk_host_.size() < n * walk_.io_stride) {
         walk_host_     = PinnedHostBuffer(n * walk_.io_stride);
@@ -331,6 +332,7 @@ void ProgramImpl::walk_moe(std::size_t g, std::uint32_t l) {
     const execution::ForwardBatch fb = walk_batch(end - 1);
     forward_->begin_call(fb, nullptr);
     forward_->layer_moe(l, fb, xm, inject, residual, walk_.widths[end - 1]);
+    if (dflash2_) { dflash2_walk_features(first, end, l, residual); }
     if (l + 1 < L) { return; }
     const bool prompt_end = walk_.end_call == lanes_[walk_.lane].calls.size();
     for (std::size_t c = first; c < end; ++c) {
@@ -386,6 +388,8 @@ void ProgramImpl::walk_commit_taps(Lane& lane) {
         }
         // Every cell up to the span's end is written (the prompt continues past each inner chunk).
         prefix::PrefixCache::Capture capture = prefix_capture_at(lane, tap.frontier, tap.kind, false, lane.mtp_live);
+        // Its DFlash2 ring was copied during the span, before the span's context reached the ring.
+        capture.meta.draft_frontier = std::min(capture.meta.draft_frontier, walk_dflash_frontier_);
         const std::uint64_t id               = capture.id;
         prefix_->commit_staged_capture(staged, std::move(capture));
         prefix_captured(lane, id, tap.frontier);
@@ -456,6 +460,7 @@ PrefillProgress ProgramImpl::walk_step(Lane& lane, std::uint32_t index, Clock::t
     lane.next_call    = walk_.end_call;
     residency_->enqueue_route_download(device_.stream, width);
     expert_stream_->end();
+    if (dflash2_) { dflash2_walk_context(lane, index); }
     walk_.active   = false;
     host_lanes_[0] = static_cast<std::int32_t>(index);
     if (last && !prefilling_besides(index)) {

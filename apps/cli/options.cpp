@@ -105,6 +105,7 @@ constexpr std::array kCliOptions{
     CliOption{"--kv-dtype"},
     CliOption{"--spec"},
     CliOption{"--draft-tokens"},
+    CliOption{"--draft-model"},
     CliOption{"--spec-min-p"},
     CliOption{"--ngram-draft-tokens"},
     CliOption{"--ngram-min-match"},
@@ -174,6 +175,7 @@ std::string usage_text(const char* argv0) {
            "       [--device N]\n"
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2] [--spec mtp|dflash|dflash2 --draft-tokens "
            "N|auto]\n"
+           "       [--draft-model FILE]\n"
            "       [--lm-head-draft] [--spec-min-p P] [--draft-tree-nodes auto|N] [--draft-tree-paths N]\n"
            "       [--ngram-draft-tokens 1..63] [--ngram-min-match 4..64]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
@@ -274,11 +276,14 @@ std::string usage_text(const char* argv0) {
            "SPECULATIVE DECODING (off by default)\n"
            "  --spec mtp|dflash|dflash2 speculative backend\n"
            "  --draft-tokens N|auto    drafts per round: mtp 1-7 (Qwen3.5/3.6 1-5),\n"
-           "                           dflash/dflash2 1-15\n"
+           "                           dflash/dflash2 1-15 (Qwen3.8-Flash-Next dflash2 1-7)\n"
            "                             N     every round drafts and verifies N\n"
            "                             auto  mtp: each round picks 0-7 from recent\n"
            "                                   acceptance (Qwen3.5/3.6: 1-5 where qualified,\n"
-           "                                   else the model's fastest fixed length)\n"
+           "                                   else the model's fastest fixed length);\n"
+           "                                   Qwen3.8-Flash-Next dflash2 likewise\n"
+           "  --draft-model FILE       Qwen3.8-Flash-Next dflash2: the DFlash2 drafter's\n"
+           "                           companion artifact (Qwen3.5/3.6 artifacts bundle theirs)\n"
            "  --lm-head-draft          use the optimized proposal head\n"
            "  --spec-min-p P           Qwen3.8-Flash-Next mtp: verify drafts only up to the\n"
            "                           first below probability P, 0-1 (default 0.5 with\n"
@@ -449,6 +454,8 @@ Options parse_options(int argc, char** argv) {
             options.speculative.backend = product::parse_speculative_backend(value(arg));
         } else if (arg == "--draft-tokens") {
             product::apply_draft_tokens(options.speculative, value(arg));
+        } else if (arg == "--draft-model") {
+            options.speculative.draft_model = std::filesystem::path(std::string(value(arg)));
         } else if (arg == "--spec-min-p") {
             options.speculative.draft_min_p = product::parse_draft_min_p(value(arg));
         } else if (arg == "--ngram-draft-tokens") {

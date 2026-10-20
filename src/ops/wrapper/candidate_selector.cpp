@@ -171,8 +171,8 @@ void candidate_selector_path(const Tensor& candidate_ids, const Tensor& unary_sc
                              const Tensor& projected_hidden, const Tensor& anchors,
                              const Tensor& predecessor_codebook, const Tensor& successor_codebook,
                              const Tensor& base_positions, const SamplingConfig* configs,
-                             Tensor& drafts, Tensor& proposal_q, WorkspaceArena& workspace,
-                             cudaStream_t stream) {
+                             Tensor& drafts, Tensor& proposal_q, Tensor* confidence,
+                             WorkspaceArena& workspace, cudaStream_t stream) {
     const std::int32_t batch_size = candidate_ids.ne[2];
     const std::int32_t kSteps     = candidate_ids.ne[1];
     if (kSteps < 1 || kSteps > 15)
@@ -196,10 +196,24 @@ void candidate_selector_path(const Tensor& candidate_ids, const Tensor& unary_sc
     }
     require_nonoverlap(candidate_ids, unary_scores, projected_hidden, anchors, predecessor_codebook,
                        successor_codebook, base_positions, configs, drafts, proposal_q);
+    if (confidence != nullptr) {
+        require_tensor(*confidence, DType::FP32, kSteps, batch_size, 1, 1, "confidence");
+        const Range range{confidence->data, confidence->bytes(), "confidence"};
+        for (const Tensor* other : std::initializer_list<const Tensor*>{
+                 &candidate_ids, &unary_scores, &projected_hidden, &anchors, &predecessor_codebook,
+                 &successor_codebook, &base_positions, &drafts, &proposal_q}) {
+            if (overlaps(range, Range{other->data, other->bytes(), "operand"})) {
+                throw std::invalid_argument("candidate_selector_path: confidence overlaps an operand");
+            }
+        }
+        if (overlaps(range, Range{configs, static_cast<std::size_t>(batch_size) * sizeof(SamplingConfig), "configs"})) {
+            throw std::invalid_argument("candidate_selector_path: confidence overlaps configs");
+        }
+    }
 
     detail::candidate_selector_path_dispatch(
         candidate_ids, unary_scores, projected_hidden, anchors, predecessor_codebook,
-        successor_codebook, base_positions, configs, drafts, proposal_q, workspace, stream);
+        successor_codebook, base_positions, configs, drafts, proposal_q, confidence, workspace, stream);
 }
 
 } // namespace infernix::ops

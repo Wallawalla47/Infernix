@@ -640,17 +640,20 @@ int run_q8_companion() {
     return failures;
 }
 
+// Qwen3.8-27B's drafter (H 5120) and Qwen3.8-Flash-Next's (H 2560).
 int run_q8_dflash2() {
-    constexpr int kHidden = 5120;
-    DevicePackedWeight parent(
-        quantized_weight::make_patterned_weight(QType::Q8_G32_FP16, 6144, kHidden, 313U));
     int failures = 0;
-    for (int tokens = 1; tokens <= 128; ++tokens)
-        failures += run_q8_qkv_case(parent, kHidden, "DFlash2", tokens);
-    for (int tokens : {129, 192, 193, 1024})
-        failures += run_q8_qkv_case(parent, kHidden, "DFlash2", tokens);
-    for (int tokens : {1, 8, 16, 48, 49, 53, 54, 63, 64, 65, 96, 97, 112, 127, 128, 129})
-        failures += run_q8_qkv_case(parent, kHidden, "DFlash2", tokens, true, 31);
+    for (const int hidden : {5120, 2560}) {
+        DevicePackedWeight parent(
+            quantized_weight::make_patterned_weight(QType::Q8_G32_FP16, 6144, hidden, 313U));
+        const std::string label = "DFlash2 H=" + std::to_string(hidden);
+        for (int tokens = 1; tokens <= 128; ++tokens)
+            failures += run_q8_qkv_case(parent, hidden, label.c_str(), tokens);
+        for (int tokens : {129, 192, 193, 1024})
+            failures += run_q8_qkv_case(parent, hidden, label.c_str(), tokens);
+        for (int tokens : {1, 8, 16, 48, 49, 53, 54, 63, 64, 65, 96, 97, 112, 127, 128, 129})
+            failures += run_q8_qkv_case(parent, hidden, label.c_str(), tokens, true, 31);
+    }
     return failures;
 }
 
@@ -695,15 +698,21 @@ int main(int argc, char** argv) {
 
     int failures = 0;
     if (inputs_only) { return run_weight_inputs() == 0 ? 0 : 1; }
-    if (!dflash2_only) {
-        failures += run_q4_q5();
-        failures += run_bf16_target();
-        failures += run_nvfp4_target();
-        failures += run_fp8_target();
-        failures += run_q8_target();
-        failures += run_q8_companion();
+    try {
+        if (!dflash2_only) {
+            failures += run_q4_q5();
+            failures += run_bf16_target();
+            failures += run_nvfp4_target();
+            failures += run_fp8_target();
+            failures += run_q8_target();
+            failures += run_q8_companion();
+        }
+        failures += run_q8_dflash2();
+    } catch (const std::exception& error) {
+        std::cout << std::flush;
+        std::cerr << "FAIL attn_input_proj: " << error.what() << '\n';
+        return 1;
     }
-    failures += run_q8_dflash2();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " attn_input_proj\n";
     return failures == 0 ? 0 : 1;
 }

@@ -983,7 +983,7 @@ int selector_case(int width, int max_paths) {
         Tensor drafts(path_drafts.data(), DType::I32, {kSteps, batch});
         Tensor q(path_q.data(), DType::FP32, {kCandidates, kSteps, batch});
         ops::candidate_selector_path(tids, tunary, thidden, tanchors, tpred, tsucc, tpositions, cfg,
-                                     drafts, q, workspace, nullptr);
+                                     drafts, q, nullptr, workspace, nullptr);
         cuda_synchronize();
     }
     const auto ref_drafts = read_buffer<int>(path_drafts, static_cast<std::size_t>(kSteps) * batch);

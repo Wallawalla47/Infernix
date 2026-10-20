@@ -274,6 +274,10 @@ struct SpeculativeOptions {
     // (fewer only near the output limit; draft_min_p defaults to 0).
     bool draft_tokens_auto = false;
     ProposalHead proposal_head = ProposalHead::Full;
+    // Qwen3.8-Flash-Next DFlash2 (--draft-model): the companion artifact holding the drafter
+    // (tools.convert --components dflash2), loaded beside the main artifact. Qwen3.5/3.6 artifacts
+    // bundle their DFlash and DFlash2 drafters and refuse it.
+    std::filesystem::path draft_model;
     // Optional target-verified copy proposals with MTP, DFlash or DFlash2, C1 only.
     // Zero disables the proposer; enabled draft width is 1..63 and minimum match 4..64.
     std::uint32_t ngram_draft_tokens = 0;

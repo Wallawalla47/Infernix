@@ -10,7 +10,11 @@
 
 namespace infernix::ops::detail {
 namespace {
-constexpr int kHidden = 5120, kCoefficientRows = 1280, kBlockK = 64, kStages = 2;
+constexpr int kBlockK = 64, kStages = 2;
+
+// The coefficient rows of hidden width H: 2 sides x 2 taps x H / 16 groups.
+template <int Hidden>
+constexpr int kCoefficientRows = Hidden / 4;
 
 __device__ __forceinline__ int shared_col(int row, int col) { return gemm_swz64(row, col); }
 
@@ -21,7 +25,7 @@ struct Tile {
     static constexpr int mmas         = Columns / column_warps / 8;
 };
 
-template <int Rows, int Columns, int SplitK>
+template <int Hidden, int Rows, int Columns, int SplitK>
 __global__
 __launch_bounds__(Tile<Rows, Columns>::threads, 1) void dynamic_grouped_conv_prepare_partial_kernel(
     const __nv_bfloat16* __restrict__ input, const __nv_bfloat16* __restrict__ weight,
@@ -29,7 +33,7 @@ __launch_bounds__(Tile<Rows, Columns>::threads, 1) void dynamic_grouped_conv_pre
     pdl::enter_streaming();
     constexpr int threads         = Tile<Rows, Columns>::threads;
     constexpr int mmas            = Tile<Rows, Columns>::mmas;
-    constexpr int tiles_per_split = kHidden / kBlockK / SplitK;
+    constexpr int tiles_per_split = Hidden / kBlockK / SplitK;
     __shared__ __align__(16) __nv_bfloat16 ws[kStages][Rows * kBlockK];
     __shared__ __align__(16) __nv_bfloat16 xs[kStages][Columns * kBlockK];
     const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32, gid = lane / 4, lid = lane % 4;
@@ -42,14 +46,14 @@ __launch_bounds__(Tile<Rows, Columns>::threads, 1) void dynamic_grouped_conv_pre
         for (int item = tid; item < Rows * (kBlockK / 8); item += threads) {
             int row = item / (kBlockK / 8), kk = item % (kBlockK / 8) * 8;
             cp_async<16, Cache::cg>(&ws[stage][row * kBlockK + shared_col(row, kk)],
-                                     weight + static_cast<std::int64_t>(row0 + row) * kHidden +
+                                     weight + static_cast<std::int64_t>(row0 + row) * Hidden +
                                          kt * kBlockK + kk);
         }
         for (int item = tid; item < Columns * (kBlockK / 8); item += threads) {
             int col = item / (kBlockK / 8), kk = item % (kBlockK / 8) * 8;
             const int safe_col = col0 + col < tokens ? col0 + col : 0;
             cp_async_zfill<16, Cache::cg>(&xs[stage][col * kBlockK + shared_col(col, kk)],
-                                           input + static_cast<std::int64_t>(safe_col) * kHidden +
+                                           input + static_cast<std::int64_t>(safe_col) * Hidden +
                                                kt * kBlockK + kk,
                                           col0 + col < tokens ? 16 : 0);
         }
@@ -94,7 +98,7 @@ __launch_bounds__(Tile<Rows, Columns>::threads, 1) void dynamic_grouped_conv_pre
                   col = col0 + (warp_col * mmas + m) * 8 + 2 * lid;
         auto put      = [&](int r, int c, float value) {
             if (c < tokens)
-                partial[(static_cast<std::int64_t>(split) * tokens + c) * kCoefficientRows + r] =
+                partial[(static_cast<std::int64_t>(split) * tokens + c) * kCoefficientRows<Hidden> + r] =
                     value;
         };
         put(row, col, acc[m][0]);
@@ -104,27 +108,27 @@ __launch_bounds__(Tile<Rows, Columns>::threads, 1) void dynamic_grouped_conv_pre
     }
 }
 
-template <int R, int C, int S>
+template <int H, int R, int C, int S>
 void launch(const Tensor& input, const Weight& weight, float* partial, cudaStream_t stream) {
+    static_assert(H % (kBlockK * S) == 0 && kCoefficientRows<H> % R == 0);
     const int tokens = input.ne[1] * input.ne[2];
-    const dim3 grid(kCoefficientRows / R, (tokens + C - 1) / C, S);
+    const dim3 grid(kCoefficientRows<H> / R, (tokens + C - 1) / C, S);
     CUDA_CHECK(pdl::launch_consumer({dim3(grid), dim3(Tile<R, C>::threads), 0, stream},
-                                    dynamic_grouped_conv_prepare_partial_kernel<R, C, S>,
+                                    dynamic_grouped_conv_prepare_partial_kernel<H, R, C, S>,
                                     static_cast<const __nv_bfloat16*>(input.data),
                                     static_cast<const __nv_bfloat16*>(weight.qdata), partial,
                                     tokens));
     CUDA_CHECK(cudaGetLastError());
 }
-} // namespace
 
-void bf16_dynamic_grouped_conv_prepare_partial_launch(DynamicConvPrepareRoute route,
-                                                      const Tensor& input, const Weight& weight,
-                                                      float* partial, cudaStream_t stream) {
+template <int H>
+void launch_route(DynamicConvPrepareRoute route, const Tensor& input, const Weight& weight,
+                  float* partial, cudaStream_t stream) {
     if (route.rows == 16 && route.split_k == 8) {
         switch (route.columns) {
 #define COL(C)                                                                                     \
     case C:                                                                                        \
-        return launch<16, C, 8>(input, weight, partial, stream)
+        return launch<H, 16, C, 8>(input, weight, partial, stream)
             COL(8);
             COL(16);
             COL(32);
@@ -133,9 +137,22 @@ void bf16_dynamic_grouped_conv_prepare_partial_launch(DynamicConvPrepareRoute ro
         }
     }
     if (route.rows == 32 && route.split_k == 4) {
-        if (route.columns == 32) return launch<32, 32, 4>(input, weight, partial, stream);
-        if (route.columns == 64) return launch<32, 64, 4>(input, weight, partial, stream);
+        if (route.columns == 32) return launch<H, 32, 32, 4>(input, weight, partial, stream);
+        if (route.columns == 64) return launch<H, 32, 64, 4>(input, weight, partial, stream);
     }
     throw std::logic_error("dynamic grouped conv prepare: invalid production tile");
+}
+} // namespace
+
+void bf16_dynamic_grouped_conv_prepare_partial_launch(DynamicConvPrepareRoute route,
+                                                      const Tensor& input, const Weight& weight,
+                                                      float* partial, cudaStream_t stream) {
+    switch (input.ne[0]) {
+    case 5120:
+        return launch_route<5120>(route, input, weight, partial, stream);
+    case 2560:
+        return launch_route<2560>(route, input, weight, partial, stream);
+    }
+    throw std::logic_error("dynamic grouped conv prepare: unregistered hidden width");
 }
 } // namespace infernix::ops::detail

@@ -327,6 +327,10 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
             (options.vision || options.speculative != SpeculativeBackend::None)) {
             throw ArtifactError("CausalScoring loads the Text backbone only");
         }
+        if (!options.draft_model.empty()) {
+            throw ArtifactError("--draft-model loads a Qwen3.8-Flash-Next DFlash2 companion; Qwen3.5/3.6 "
+                                "artifacts bundle their DFlash and DFlash2 drafters");
+        }
         if (options.speculative != SpeculativeBackend::None &&
             options.speculative_component().empty()) {
             throw ArtifactError("unknown speculative backend");

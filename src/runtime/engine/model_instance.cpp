@@ -223,9 +223,11 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
     }
     // An automatic MTP draft length chooses up to the model's most drafts unless given a ceiling:
     // Qwen3.8-Flash-Next verifies 8 columns column-invariantly, the Qwen3.5 planner captures 5.
+    // Qwen3.8-Flash-Next's DFlash2 drafter takes the same per-round policy.
     if (options.speculative.draft_tokens_auto) {
-        if (options.speculative.backend != SpeculativeBackend::Mtp) {
-            throw std::invalid_argument("--draft-tokens auto requires --spec mtp");
+        if (options.speculative.backend != SpeculativeBackend::Mtp &&
+            !(qwen4_exp && options.speculative.backend == SpeculativeBackend::DFlash2)) {
+            throw std::invalid_argument("--draft-tokens auto requires --spec mtp (Qwen3.8-Flash-Next: also dflash2)");
         }
         if (options.speculative.draft_tokens == 0) { options.speculative.draft_tokens = qwen4_exp ? 7U : 5U; }
     } else if (std::find(options.fast_path_candidates.begin(), options.fast_path_candidates.end(),
@@ -239,9 +241,10 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
         if (!(*p >= 0.0F && *p <= 1.0F)) {
             throw std::invalid_argument("speculative draft_min_p (--spec-min-p) must be in [0,1]");
         }
-        if (!qwen4_exp || options.speculative.backend != SpeculativeBackend::Mtp) {
+        if (!qwen4_exp || (options.speculative.backend != SpeculativeBackend::Mtp &&
+                           options.speculative.backend != SpeculativeBackend::DFlash2)) {
             throw std::invalid_argument(
-                "--spec-min-p applies to Qwen3.8-Flash-Next with --spec mtp only");
+                "--spec-min-p applies to Qwen3.8-Flash-Next with --spec mtp or dflash2 only");
         }
     }
     if (cache.enabled) {

@@ -2,9 +2,11 @@
 // pools of the real Qwen3.8-Flash-Next geometry with no model: random lane state is captured to
 // packed Device slots and to Host images split over shuffled slabs, restored into other lanes group
 // by group, and must come back byte for byte without touching any other lane. A KV page moved to a
-// Host record and back into a different page per KV layer must also be byte-exact.
+// Host record and back into a different page per KV layer must also be byte-exact. A DFlash2
+// drafter's context ring (five layers of one lane's K and V) rides in the drafter group.
 
 #include "core/arena.h"
+#include "core/cyclic_kv_cache.h"
 #include "core/device.h"
 #include "core/host_kv_arena.h"
 #include "core/layout.h"
@@ -150,12 +152,12 @@ void test_layout(const TextConfig& c) {
             ++attention;
         }
     }
-    const std::uint32_t m = layout.group_begin[layout.mtp_group()];
-    require(layout.group_begin[layout.mtp_group() + 1] - m == 2 && layout.parts[m].kind == StateImagePart::Kind::MtpSaved &&
+    const std::uint32_t m = layout.group_begin[layout.drafter_group()];
+    require(layout.group_begin[layout.drafter_group() + 1] - m == 2 && layout.parts[m].kind == StateImagePart::Kind::MtpSaved &&
                 layout.parts[m + 1].kind == StateImagePart::Kind::MtpTail,
             "the MTP group is the saved residual then the MTP tail");
     const StateImageLayout plain = plan_state_image(state_image_spec(c, false, KvCacheStorage::Int8Group64));
-    require(plain.group_begin[plain.mtp_group()] == plain.group_begin[plain.mtp_group() + 1] &&
+    require(plain.group_begin[plain.drafter_group()] == plain.group_begin[plain.drafter_group() + 1] &&
                 plain.fingerprint != layout.fingerprint && plain.image_bytes < layout.image_bytes,
             "without MTP the MTP group is empty and the layout differs");
 }
@@ -258,6 +260,112 @@ void test_round_trips(const TextConfig& c) {
                 layout.image_bytes, layout.parts.size(), layout.groups(), used);
 }
 
+// Qwen3.8-Flash-Next's DFlash2 drafter: five sliding layers of 8 KV heads x 128 over a 2,048 ring.
+CyclicKVCacheLayout draft_ring_layout(LayoutBuilder& builder, std::uint32_t lanes) {
+    return plan_cyclic_kv_cache(builder, 5, 2048, 8, 128, static_cast<std::int32_t>(lanes));
+}
+
+DraftRingGeometry draft_ring_geometry(const CyclicKVCacheLayout& ring, std::uint32_t lanes) {
+    return {.layers  = static_cast<std::uint32_t>(ring.k.size()),
+            .k_bytes = ring.k.front().region.bytes / lanes,
+            .v_bytes = ring.v.front().region.bytes / lanes};
+}
+
+void test_draft_ring_layout(const TextConfig& c) {
+    LayoutBuilder builder;
+    const DraftRingGeometry ring = draft_ring_geometry(draft_ring_layout(builder, 1), 1);
+    require(ring.k_bytes == 128ULL * 2048 * 8 * 2 && ring.v_bytes == ring.k_bytes, "4 MiB of K and of V per layer");
+    const StateImageLayout layout = plan_state_image(state_image_spec(c, false, KvCacheStorage::Int8Group64, ring));
+    const StateImageLayout plain  = plan_state_image(state_image_spec(c, false, KvCacheStorage::Int8Group64));
+    const std::uint32_t d         = layout.group_begin[layout.drafter_group()];
+    require(layout.groups() == c.num_hidden_layers + 1U && layout.group_begin[layout.drafter_group() + 1] - d == 10,
+            "the drafter group holds the ring's ten planes");
+    for (std::uint32_t l = 0; l < 5; ++l) {
+        const StateImagePart& k = layout.parts[d + 2 * l];
+        const StateImagePart& v = layout.parts[d + 2 * l + 1];
+        require(k.kind == StateImagePart::Kind::DraftRingK && v.kind == StateImagePart::Kind::DraftRingV && k.index == l &&
+                    v.index == l && k.bytes == ring.k_bytes && v.bytes == ring.v_bytes,
+                "each drafter layer contributes its K then its V");
+    }
+    require(layout.image_bytes >= plain.image_bytes + 10 * ring.k_bytes && layout.fingerprint != plain.fingerprint,
+            "the ring grows the image by its 40 MiB and changes the layout");
+    require_throws([&] { (void)state_image_spec(c, true, KvCacheStorage::Int8Group64, ring); }, "MTP and DFlash2 together");
+}
+
+// A lane's ring through a Host image into another lane, byte for byte, with the rest of its state.
+void test_draft_ring_round_trip(const TextConfig& c) {
+    constexpr std::uint32_t kLanes = 3;
+    LayoutBuilder ring_builder;
+    const CyclicKVCacheLayout ring_layout = draft_ring_layout(ring_builder, kLanes);
+    DeviceBuffer ring_backing(ring_builder.finish(256));
+    const CyclicKVCache ring(DeviceSpan{ring_backing.p, ring_backing.bytes}, ring_layout);
+    const StateImageLayout layout =
+        plan_state_image(state_image_spec(c, false, KvCacheStorage::Int8Group64, draft_ring_geometry(ring_layout, kLanes)));
+    const StateImageSpec& spec = layout.spec;
+    LayoutBuilder builder;
+    const LinearAttentionStatePoolSpec gdn_spec{.layers         = c.gdn_layers,
+                                                .conv_channels  = static_cast<std::int32_t>(c.gdn.conv_channels()),
+                                                .conv_width     = static_cast<std::int32_t>(c.gdn.conv_kernel - 1),
+                                                .value_heads    = static_cast<std::int32_t>(c.gdn.value_heads),
+                                                .value_head_dim = static_cast<std::int32_t>(c.gdn.value_head_dim),
+                                                .key_head_dim   = static_cast<std::int32_t>(c.gdn.key_head_dim),
+                                                .slot_count     = static_cast<std::int32_t>(kLanes)};
+    const auto gdn_layout = plan_linear_attention_state_pool(builder, gdn_spec);
+    DeviceBuffer state(builder.finish(256));
+    LinearAttentionStatePool gdn(DeviceSpan{state.p, state.bytes}, gdn_layout);
+    DeviceBuffer ple(spec.ple_bytes * kLanes);
+    DeviceBuffer tails(spec.qsa_tail_bytes * kLanes * c.attention_layers);
+    fill_random(state.p, state.bytes, 200);
+    fill_random(ple.p, ple.bytes, 201);
+    fill_random(tails.p, tails.bytes, 202);
+    fill_random(ring_backing.p, ring_backing.bytes, 203);
+    std::vector<std::byte*> ring_k, ring_v;
+    for (std::uint32_t l = 0; l < ring.layer_count(); ++l) {
+        ring_k.push_back(static_cast<std::byte*>(ring.layer_view(l).k.data));
+        ring_v.push_back(static_cast<std::byte*>(ring.layer_view(l).v.data));
+    }
+    require_throws(
+        [&] {
+            (void)LaneStateImage(layout, LaneStateBuffers{.gdn   = &gdn,
+                                                          .lanes = kLanes,
+                                                          .ple   = static_cast<std::byte*>(ple.p),
+                                                          .tails = static_cast<std::byte*>(tails.p)});
+        },
+        "a ring layout without the ring's buffers");
+    const LaneStateImage image(layout, LaneStateBuffers{.gdn    = &gdn,
+                                                        .lanes  = kLanes,
+                                                        .ple    = static_cast<std::byte*>(ple.p),
+                                                        .tails  = static_cast<std::byte*>(tails.p),
+                                                        .ring_k = ring_k,
+                                                        .ring_v = ring_v});
+    // Each ring part is that lane's own slice of its layer's plane.
+    const std::uint32_t d = layout.group_begin[layout.drafter_group()];
+    require(image.device_part(layout.parts[d + 2], 2) ==
+                static_cast<std::byte*>(ring.layer_view(1).k.data) + 2 * spec.draft_ring.k_bytes,
+            "lane 2's layer-1 K is its slice of the plane");
+    cudaStream_t stream = nullptr;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    constexpr std::size_t kSlab = 933'888;
+    const std::size_t used      = (layout.image_bytes + kSlab - 1) / kSlab;
+    const auto want             = lane_bytes(image, 0);
+    const auto lane2            = lane_bytes(image, 2);
+    HostSlabs host(used + 5, kSlab, used, 13);
+    image.copy_lane_to_host(0, host.image(), stream);
+    StateImageHeader header;
+    header.frontier       = 9000;
+    header.draft_frontier = 8192;
+    write_state_image_header(layout, header, host.segments[0]);
+    for (std::uint32_t g = 0; g < layout.groups(); ++g) { image.copy_group_from_host(g, host.const_image(), 1, stream); }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    require(lane_bytes(image, 1) == want, "the ring and the lane state restore byte for byte");
+    require(lane_bytes(image, 2) == lane2, "a ring restore touches no other lane");
+    const auto read = read_state_image_header(layout, host.segments[0]);
+    require(read && read->frontier == 9000 && read->draft_frontier == 8192, "the DFlash2 frontier round-trips");
+    CUDA_CHECK(cudaStreamDestroy(stream));
+    std::printf("DFlash2 ring: %zu-byte image, %zu ring bytes per lane, Host round trip byte-exact\n",
+                layout.image_bytes, 5 * (spec.draft_ring.k_bytes + spec.draft_ring.v_bytes));
+}
+
 void test_page_records(const TextConfig& c, KvCacheStorage storage, std::size_t expected_stride) {
     const KvPageGeometry geometry = kv_page_geometry(c, storage, true);
     require(geometry.kv_layers == c.attention_layers + 1U &&
@@ -308,11 +416,13 @@ int main() {
     try {
         const TextConfig c = flash_next();
         test_layout(c);
+        test_draft_ring_layout(c);
         if (cuda_unavailable()) {
             std::printf("SKIP: no usable CUDA device\n");
             return 77;
         }
         test_round_trips(c);
+        test_draft_ring_round_trip(c);
         // 13 KV layers x 64 positions: INT8 K/V with FP16 group scales, pooled BF16 index keys.
         test_page_records(c, KvCacheStorage::Int8Group64, 931'840);
         // BF16 K and FP16 V: 2 x 2 heads x 256 x 2 bytes, plus 64 bytes of pooled keys, per position.

@@ -34,7 +34,8 @@ constexpr bool context_kv_materialize_uses_scratch(ContextKVMaterializeRoute rou
 void context_kv_materialize_launch(
     const Tensor& context, const Tensor& positions, const Tensor& counts, const Tensor& state_slots,
     const std::array<ContextKVMaterializeLayerView, kContextKVMaterializeLayers>& layers,
-    ContextKVMaterializeExecutionEnvelope envelope, ContextKVMaterializeRoute route,
+    const std::array<double, 64>& inv_frequency, ContextKVMaterializeExecutionEnvelope envelope,
+    ContextKVMaterializeRoute route,
     const Tensor& key_scratch, cudaStream_t stream);
 
 } // namespace infernix::ops::detail

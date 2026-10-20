@@ -35,14 +35,21 @@ bool overlaps(const Tensor& lhs, const Tensor& rhs) {
     return overlaps(lhs.data, lhs.bytes(), rhs.data, rhs.bytes());
 }
 
+// The heads' hidden widths: Qwen3.8-27B's (5120; Q8, FP8 and Q4 heads) and Qwen3.8-Flash-Next's
+// (2560; Q8 and Q4 heads).
+bool registered_hidden(std::int32_t input_rows) {
+    return input_rows == detail::kLinearTopKHidden || input_rows == detail::kLinearTopKFlashNextHidden;
+}
+
 HeadProfile resolve_profile(QType qtype, std::int32_t head_rows, std::int32_t input_rows) {
-    if (input_rows != detail::kLinearTopKHidden) {
+    if (!registered_hidden(input_rows)) {
         throw std::invalid_argument("linear_topk: unsupported head profile");
     }
     if (head_rows == detail::kLinearTopKFullRows && qtype == QType::Q8_G32_FP16) {
         return HeadProfile::Q8Full;
     }
-    if (head_rows == detail::kLinearTopKFullRows && qtype == QType::FP8_E4M3FN_ROW_BF16) {
+    if (head_rows == detail::kLinearTopKFullRows && qtype == QType::FP8_E4M3FN_ROW_BF16 &&
+        input_rows == detail::kLinearTopKHidden) {
         return HeadProfile::Fp8Full;
     }
     if (head_rows == detail::kLinearTopKOptimizedRows && qtype == QType::Q4_G64_FP16) {
@@ -87,7 +94,7 @@ void require_matrix(const Tensor& tensor, DType dtype, std::int32_t rows, std::i
 
 void validate_io(const Tensor& hidden, const Tensor& candidate_ids,
                  const Tensor& candidate_scores) {
-    if (hidden.dtype != DType::BF16 || hidden.ne[0] != detail::kLinearTopKHidden ||
+    if (hidden.dtype != DType::BF16 || !registered_hidden(hidden.ne[0]) ||
         hidden.ne[1] <= 0 || hidden.ne[2] != 1 || hidden.ne[3] != 1 || !hidden.is_contiguous() ||
         !aligned_to(hidden.data, 16)) {
         throw std::invalid_argument("linear_topk: invalid hidden");
@@ -113,7 +120,7 @@ void require_q8(const Weight& head) {
         head.qtype == QType::Q8_G32_FP16 && head.layout == QuantLayout::RowSplit &&
         head.scale_dtype == DType::FP16 && head.group_size == 32 && head.group == 32 &&
         head.ndim == 2 && head.n == detail::kLinearTopKFullRows &&
-        head.k == detail::kLinearTopKHidden && head.shape[0] == head.n && head.shape[1] == head.k &&
+        registered_hidden(head.k) && head.shape[0] == head.n && head.shape[1] == head.k &&
         head.padded_shape[0] == head.n && head.padded_shape[1] == head.k && head.qhigh == nullptr &&
         head.high_plane_bytes == 0 && aligned_to(head.qdata, 16) && aligned_to(head.scales, 16);
     if (!common) { throw std::invalid_argument("linear_topk: invalid Q8 full head"); }
@@ -124,7 +131,7 @@ void require_q4(const Weight& head) {
         head.qtype == QType::Q4_G64_FP16 && head.layout == QuantLayout::RowSplit &&
         head.scale_dtype == DType::FP16 && head.group_size == 64 && head.group == 64 &&
         head.ndim == 2 && head.n == detail::kLinearTopKOptimizedRows &&
-        head.k == detail::kLinearTopKHidden && head.shape[0] == head.n && head.shape[1] == head.k &&
+        registered_hidden(head.k) && head.shape[0] == head.n && head.shape[1] == head.k &&
         head.padded_shape[0] == head.n && head.padded_shape[1] == head.k && head.qhigh == nullptr &&
         head.high_plane_bytes == 0 && aligned_to(head.qdata, 16) && aligned_to(head.scales, 16);
     if (!common) { throw std::invalid_argument("linear_topk: invalid Q4 optimized head"); }
@@ -242,6 +249,7 @@ void linear_topk(const Tensor& hidden, const Weight& head, std::int32_t valid_ro
                  Tensor& candidate_ids, Tensor& candidate_scores, WorkspaceArena& workspace,
                  cudaStream_t stream) {
     validate_io(hidden, candidate_ids, candidate_scores);
+    if (head.k != hidden.ne[0]) { throw std::invalid_argument("linear_topk: head and hidden widths differ"); }
     const HeadProfile profile = resolve_profile(head.qtype, head.n, head.k);
     if (profile == HeadProfile::Q4Optimized || valid_rows != detail::kLinearTopKFullValidRows) {
         throw std::invalid_argument("linear_topk: invalid full-head profile or valid_rows");
@@ -259,6 +267,7 @@ void linear_topk(const Tensor& hidden, const Weight& head, const Tensor& row_to_
                  Tensor& candidate_ids, Tensor& candidate_scores, WorkspaceArena& workspace,
                  cudaStream_t stream) {
     validate_io(hidden, candidate_ids, candidate_scores);
+    if (head.k != hidden.ne[0]) { throw std::invalid_argument("linear_topk: head and hidden widths differ"); }
     if (resolve_profile(head.qtype, head.n, head.k) != HeadProfile::Q4Optimized) {
         throw std::invalid_argument("linear_topk: invalid optimized-head profile");
     }

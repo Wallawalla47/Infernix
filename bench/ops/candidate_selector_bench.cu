@@ -179,7 +179,7 @@ void run(std::int32_t batch_size, Mode mode, const Options& options, Fixture& fi
     TimedGraph graph;
     graph.capture(stream, [&](cudaStream_t s) {
         ops::candidate_selector_path(ids, unary, hidden, anchor, predecessor, successor, positions,
-                                     configs, draft, q, workspace, s);
+                                     configs, draft, q, nullptr, workspace, s);
     });
     const auto timing = measure_cold_graph(graph, flush, stream, options.warmup, options.repeat);
     std::printf("%d,%d,%s,%s,%.3f,%.3f,%.3f,%zu,%zu\n", fixture.kSteps, batch_size, mode_name(mode),

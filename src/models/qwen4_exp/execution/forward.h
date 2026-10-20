@@ -179,6 +179,10 @@ struct ForwardBatch {
     // position: the only calls ForwardExperts::tail_skip_rank applies to.
     bool decode_round = false;
     Tensor residual_out;                   // when set: BF16 [S*H, T] copy of the final residual
+    // DFlash2 target features (docs/maintainer/dflash.md): when set, BF16 [taps * H, n] receives,
+    // for the call's last n columns, the stream mean of each tapped layer's completed residual
+    // (tap i at rows [i * H, (i + 1) * H)). n <= T.
+    Tensor draft_features;
     const MtpChunk* mtp_chunk = nullptr;   // when set: the chunk's MTP cells (one sequence)
     // Prefix-cache copies of the call's lane in flight (a restore into it, a copy-out of it): each
     // empty or one event per decoder layer, then one for the MTP block. Layer l waits for entry l
@@ -279,6 +283,10 @@ public:
     void layer_moe(std::uint32_t layer, const ForwardBatch& batch, const Tensor& xm, const Tensor& inject,
                    Tensor& residual, std::int32_t route_columns);
     void finish(const ForwardBatch& batch, Tensor& residual, Tensor* logits);
+    // DFlash2: when `layer` is one of the drafter's target layers, the stream mean of its completed
+    // residual columns (BF16 [S*H, n]) into that tap's rows of `features` (BF16 [taps * H, n], any
+    // column pitch); layer() applies it to ForwardBatch::draft_features, a layer walk to its spans.
+    void capture_draft_features(std::uint32_t layer, const Tensor& residual, const Tensor& features);
     // Workspace of one layer_moe call over `columns` columns, with the W4A16 experts' wide route
     // `wide_a16` (the expert-a4-residual layout is larger: Forward::moe carves it when selected).
     [[nodiscard]] static std::size_t moe_workspace_bytes(const TextConfig& config, std::int32_t columns,
@@ -349,6 +357,7 @@ private:
     // The selected fast paths (program/fast_paths.h); all off on the exact route.
     ForwardFastPaths fast_;
     ops::PreparedRope rope_; // the text rotation (YaRN-scaled when the factor is above 1)
+    std::vector<std::uint32_t> draft_taps_; // the DFlash2 drafter's target layers (empty without it)
     bool eager_chunk_ = false;
     // A gated call's layer routing on the host: the dispatch offsets (pinned I32 [E + 1]), the
     // event that lands them, and the per-expert columns and CPU marks derived from them.

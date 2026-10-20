@@ -198,6 +198,7 @@ float oracle_uniform(std::uint64_t seed, std::int32_t position) {
 struct WalkResult {
     std::vector<std::int32_t> drafts;
     std::vector<double> probabilities;
+    std::vector<double> confidence; // [K, B]: the selected rank's temperature-1 softmax
     std::array<double, kMaxBatch> minimum_decision_margin;
 };
 
@@ -208,6 +209,7 @@ WalkResult walk_oracle(const std::vector<std::int32_t>& candidate_ids,
     WalkResult result;
     result.drafts.resize(static_cast<std::size_t>(kMaxBatch) * kSteps);
     result.probabilities.resize(static_cast<std::size_t>(kMaxBatch) * kSteps * kCandidates);
+    result.confidence.resize(static_cast<std::size_t>(kMaxBatch) * kSteps);
     result.minimum_decision_margin.fill(std::numeric_limits<double>::infinity());
     for (std::int32_t batch = 0; batch < kMaxBatch; ++batch) {
         std::int32_t predecessor_rank = 0;
@@ -267,6 +269,14 @@ WalkResult walk_oracle(const std::vector<std::int32_t>& candidate_ids,
             }
             result.drafts[static_cast<std::size_t>(batch) * kSteps + step] =
                 candidate_ids[candidate_offset(batch, step, selected)];
+            {
+                double maximum = lattice[edge_base];
+                for (std::int32_t c = 1; c < kCandidates; ++c) { maximum = std::max(maximum, lattice[edge_base + c]); }
+                double sum = 0.0;
+                for (std::int32_t c = 0; c < kCandidates; ++c) { sum += std::exp(lattice[edge_base + c] - maximum); }
+                result.confidence[static_cast<std::size_t>(batch) * kSteps + step] =
+                    std::exp(lattice[edge_base + selected] - maximum) / sum;
+            }
             predecessor_rank = selected;
         }
     }
@@ -447,8 +457,10 @@ int run(bool ties = false, bool dependent = false) {
         const std::size_t q_count     = draft_count * kCandidates;
         GuardedDeviceBuffer draft_device(draft_count * sizeof(std::int32_t));
         GuardedDeviceBuffer q_device(q_count * sizeof(float));
+        GuardedDeviceBuffer confidence_device(draft_count * sizeof(float));
         draft_device.fill(0xff);
         q_device.fill(0xff);
+        confidence_device.fill(0xff);
         Tensor ids(candidate_device.p, DType::I32, {kCandidates, kSteps, batch_size});
         Tensor unary(unary_device.p, DType::FP32, {kCandidates, kSteps, batch_size});
         Tensor hidden(hidden_device.p, DType::BF16, {kRank, kSteps, batch_size});
@@ -456,6 +468,7 @@ int run(bool ties = false, bool dependent = false) {
         Tensor positions(position_device.p, DType::I32, {batch_size});
         Tensor drafts(draft_device.data(), DType::I32, {kSteps, batch_size});
         Tensor q(q_device.data(), DType::FP32, {kCandidates, kSteps, batch_size});
+        Tensor confidence(confidence_device.data(), DType::FP32, {kSteps, batch_size});
         const auto capacity = ops::candidate_selector_path_workspace_capacity_bytes(
             kSteps, kSteps, batch_size, batch_size);
         GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 1));
@@ -464,7 +477,7 @@ int run(bool ties = false, bool dependent = false) {
             ops::candidate_selector_path(ids, unary, hidden, anchor, predecessor, successor,
                                          positions,
                                          static_cast<const ops::SamplingConfig*>(config_device.p),
-                                         drafts, q, workspace, stream);
+                                         drafts, q, &confidence, workspace, stream);
         };
         launch(nullptr);
         cuda_synchronize();
@@ -482,8 +495,17 @@ int run(bool ties = false, bool dependent = false) {
             std::span<const double>(expected.probabilities.data(), q_count), kProbabilityCriterion);
         failures += verify_draws(label, batch_size, candidate_ids, configs, base_positions,
                                  from_device<int>(draft_device.data(), draft_count), actual_q);
+        {
+            // The selected rank's temperature-1 softmax, as proposal_q's softmax is checked.
+            const std::vector<float> actual = from_device<float>(confidence_device.data(), draft_count);
+            const std::vector<double> actual_double(actual.begin(), actual.end());
+            failures += verify_pointwise(label + " confidence", actual_double,
+                                         std::span<const double>(expected.confidence.data(), draft_count),
+                                         kProbabilityCriterion);
+        }
         failures += draft_device.verify_guards(label + " drafts");
         failures += q_device.verify_guards(label + " proposal_q");
+        failures += confidence_device.verify_guards(label + " confidence");
         failures += scratch.verify_guards(label + " workspace");
         if (workspace.used() != 0 || workspace.peak_used() != capacity) {
             std::cerr << label << " workspace scope/peak\n";
@@ -582,7 +604,7 @@ int run(bool ties = false, bool dependent = false) {
             tq(dq.data(), DType::FP32, {kCandidates, kSteps, 3});
         ops::candidate_selector_path(ti, tu, th, ta, predecessor, successor, tp,
                                      static_cast<const ops::SamplingConfig*>(dc.p), td, tq,
-                                     workspace, nullptr);
+                                     nullptr, workspace, nullptr);
         cuda_synchronize();
         const auto actual_d = from_device<int>(dd.data(), 3 * kSteps);
         const auto actual_q = from_device<float>(dq.data(), 3 * kSteps * kCandidates);

@@ -5,7 +5,8 @@
 #include "ops/common/mma.cuh"
 #include "ops/linear/q8/q8_sliced_k_launch.cuh"
 #include "ops/common/warp.cuh"
-#include "ops/common/dflash_rope.cuh"
+#include <array>
+#include <stdexcept>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
@@ -32,11 +33,24 @@ struct DeviceLayerView {
 
 struct DeviceLayers {
     DeviceLayerView layer[kContextKVMaterializeLayers];
+    // The rotation's inverse frequencies theta^(-2j/128), j < 64.
+    double inv_frequency[64];
 };
 
-__device__ __forceinline__ void store_key_head(const float* input, DeviceLayerView layer,
-                                               const int* positions, const int* slots, int column,
-                                               int width, int head) {
+// dflash_rope_sincos's range reduction over the call's frequencies.
+__device__ __forceinline__ void rope_sincos(const DeviceLayers& layers, const int* positions,
+                                            int token, int pair, float* sine, float* cosine) {
+    constexpr double kInvTwoPi = 1.59154943091895336e-01;
+    constexpr double kTwoPi    = 6.28318530717958648e+00;
+    const double angle  = static_cast<double>(positions[token]) * layers.inv_frequency[pair];
+    const double turns  = angle * kInvTwoPi;
+    const float reduced = static_cast<float>(angle - nearbyint(turns) * kTwoPi);
+    sincosf(reduced, sine, cosine);
+}
+
+__device__ __forceinline__ void store_key_head(const float* input, const DeviceLayers& layers,
+                                               DeviceLayerView layer, const int* positions,
+                                               const int* slots, int column, int width, int head) {
     const int lane = threadIdx.x & 31;
     const int j    = lane * 2;
     float x0 = input[j], x1 = input[j + 1], y0 = input[j + 64], y1 = input[j + 65];
@@ -47,8 +61,8 @@ __device__ __forceinline__ void store_key_head(const float* input, DeviceLayerVi
     y0 *= inverse * __bfloat162float(layer.key_norm[j + 64]);
     y1 *= inverse * __bfloat162float(layer.key_norm[j + 65]);
     float sin0, cos0, sin1, cos1;
-    dflash_rope_sincos(positions, column, j, &sin0, &cos0);
-    dflash_rope_sincos(positions, column, j + 1, &sin1, &cos1);
+    rope_sincos(layers, positions, column, j, &sin0, &cos0);
+    rope_sincos(layers, positions, column, j + 1, &sin1, &cos1);
     const auto dst = 128LL * ((positions[column] & 2047) + (long long)layer.padded_capacity *
                                                                (head + 8 * slots[column / width]));
     auto* out      = reinterpret_cast<__nv_bfloat162*>(layer.cache_k + dst);
@@ -77,7 +91,7 @@ union alignas(16) MaterializeStorage {
     float scores[Columns][Rows];
 };
 
-template <int Rows, int Columns, int BlockK, int ColumnWarps>
+template <int Hidden, int Rows, int Columns, int BlockK, int ColumnWarps>
 __global__ __launch_bounds__(Rows / 16 * ColumnWarps * 32, 1) void context_kv_mma_kernel(
     const __nv_bfloat16* hidden, const int* positions, const int* counts, const int* slots,
     DeviceLayers layers, float* key_scratch, int width, int batch, int min_count, int max_count) {
@@ -86,9 +100,9 @@ __global__ __launch_bounds__(Rows / 16 * ColumnWarps * 32, 1) void context_kv_mm
     constexpr int kColumnWarps  = ColumnWarps;
     constexpr int kWarps = Rows / 16 * kColumnWarps, kThreads = kWarps * 32;
     constexpr int kWarpColumns = Columns / kColumnWarps, kTokenMmas = kWarpColumns / 8;
-    constexpr int kKTiles = 5120 / kBlockK;
+    constexpr int kKTiles = Hidden / kBlockK;
     static_assert((Rows == 64 || Rows == 128) && Columns % (8 * ColumnWarps) == 0);
-    static_assert(5120 % kBlockK == 0 && kThreads <= 1024);
+    static_assert(Hidden % kBlockK == 0 && kThreads <= 1024);
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int warp_row = warp / kColumnWarps, warp_col = warp % kColumnWarps;
     const int gid = lane >> 2, lid = lane & 3;
@@ -119,7 +133,7 @@ __global__ __launch_bounds__(Rows / 16 * ColumnWarps * 32, 1) void context_kv_mm
                                             hidden +
                                                 static_cast<std::int64_t>(context_column(
                                                     column_begin + column, width, max_count)) *
-                                                    5120 +
+                                                    Hidden +
                                                 k_begin + k8 * 8);
                 } else {
                     cp_async_zfill<16, Cache::ca>(destination, hidden + k_begin + k8 * 8, 0);
@@ -135,12 +149,12 @@ __global__ __launch_bounds__(Rows / 16 * ColumnWarps * 32, 1) void context_kv_mm
                 const int chunk     = item - local_row * (kBlockK / 16);
                 cp_async<16, Cache::cg>(
                     &mainloop.codes[local_row][chunk * 16],
-                    weight_codes + static_cast<std::int64_t>(row_begin + local_row) * 5120 +
+                    weight_codes + static_cast<std::int64_t>(row_begin + local_row) * Hidden +
                         k_begin + chunk * 16);
             }
             for (int local_row = tid; local_row < kBlockRows; local_row += kThreads) {
                 const std::int64_t group =
-                    static_cast<std::int64_t>(row_begin + local_row) * (5120 / 32) + k_begin / 32;
+                    static_cast<std::int64_t>(row_begin + local_row) * (Hidden / 32) + k_begin / 32;
                 cp_async<kBlockK / 32 * sizeof(std::uint16_t)>(
                     &mainloop.scales[local_row][0], weight_scales + group * sizeof(std::uint16_t));
             }
@@ -277,7 +291,7 @@ __global__ __launch_bounds__(Rows / 16 * ColumnWarps * 32, 1) void context_kv_mm
         if (count < min_count || count > max_count || column % width >= count) continue;
         if constexpr (Rows == 128) {
             if (!value) {
-                store_key_head(storage.scores[local], layer, positions, slots, column, width,
+                store_key_head(storage.scores[local], layers, layer, positions, slots, column, width,
                                row_begin / 128);
                 continue;
             }
@@ -298,15 +312,15 @@ __global__ __launch_bounds__(Rows / 16 * ColumnWarps * 32, 1) void context_kv_mm
     }
 }
 
-template <int Rows, int Columns, int BlockK, int ColumnWarps>
+template <int Hidden, int Rows, int Columns, int BlockK, int ColumnWarps>
 void launch_mma(const Tensor& x, const Tensor& positions, const Tensor& counts, const Tensor& slots,
                 DeviceLayers layers, ContextKVMaterializeExecutionEnvelope envelope,
                 const Tensor& scratch, cudaStream_t stream) {
     constexpr int bytes = sizeof(MaterializeStorage<Rows, Columns, BlockK>);
     if constexpr (bytes > 48 * 1024)
-        CUDA_CHECK(cudaFuncSetAttribute(context_kv_mma_kernel<Rows, Columns, BlockK, ColumnWarps>,
+        CUDA_CHECK(cudaFuncSetAttribute(context_kv_mma_kernel<Hidden, Rows, Columns, BlockK, ColumnWarps>,
                                         cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
-    context_kv_mma_kernel<Rows, Columns, BlockK, ColumnWarps>
+    context_kv_mma_kernel<Hidden, Rows, Columns, BlockK, ColumnWarps>
         <<<dim3(1024 / Rows, (envelope.max_count * x.ne[2] + Columns - 1) / Columns, 10),
            Rows / 16 * ColumnWarps * 32, bytes, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data), static_cast<const int*>(positions.data),
@@ -362,12 +376,12 @@ struct ContextPrefixColumns {
     }
 };
 
-template <int Columns, int KWarps = 8>
+template <int Hidden, int Columns, int KWarps = 8>
 using GroupedSchedule =
     Q8A16SlicedKMmaSchedule<Columns, KWarps, 1, 1, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
-                            Q8ActivationStage::ActiveOnly, 5120>;
+                            Q8ActivationStage::ActiveOnly, Hidden>;
 
-template <int Columns, int KWarps = 8>
+template <int Hidden, int Columns, int KWarps = 8>
 __global__ __launch_bounds__(KWarps * 32, 1) void context_kv_grouped_kernel(
     const __nv_bfloat16* x, const int* positions, const int* counts, const int* slots,
     DeviceLayers layers, float* scratch, int width, int batch, int min_count, int max_count) {
@@ -378,19 +392,20 @@ __global__ __launch_bounds__(KWarps * 32, 1) void context_kv_grouped_kernel(
     const auto* scales = value ? layer.value_scales : layer.key_scales;
     const MaterializeProjectionEpilogue epilogue{layer, positions, counts,    slots,     scratch, l,
                                                  width, batch,     min_count, max_count, value};
-    q8_a16_sliced_k_mma<GroupedSchedule<Columns, KWarps>, true>(
-        Q8LinearOperands{x, codes, scales, 1024, 5120, max_count * batch, 5120},
+    q8_a16_sliced_k_mma<GroupedSchedule<Hidden, Columns, KWarps>, true>(
+        Q8LinearOperands{x, codes, scales, 1024, Hidden, max_count * batch, Hidden},
         LinearBf16Output{nullptr, 0}, epilogue, Q8SlicedKIdentityRows{}, 0,
         ContextPrefixColumns{width, max_count});
 }
 
-template <int Columns, int KWarps = 8>
+template <int Hidden, int Columns, int KWarps = 8>
 void launch_grouped(const Tensor& x, const Tensor& positions, const Tensor& counts,
                     const Tensor& slots, DeviceLayers layers,
                     ContextKVMaterializeExecutionEnvelope envelope, const Tensor& scratch,
                     cudaStream_t stream) {
-    constexpr auto kernel = context_kv_grouped_kernel<Columns, KWarps>;
-    const int shared = q8_prepare_shared<GroupedSchedule<Columns, KWarps>::kSharedBytes, kernel>();
+    constexpr auto kernel = context_kv_grouped_kernel<Hidden, Columns, KWarps>;
+    const int shared =
+        q8_prepare_shared<GroupedSchedule<Hidden, Columns, KWarps>::kSharedBytes, kernel>();
     CUDA_CHECK(pdl::launch_consumer(
         {dim3(64, (envelope.max_count * x.ne[2] + Columns - 1) / Columns, 10), dim3(KWarps * 32),
          static_cast<std::size_t>(shared), stream},
@@ -418,12 +433,14 @@ __global__ __launch_bounds__(256) void context_kv_key_post_kernel(
     const float* input = key_scratch +
                          kRows * (packed_column + max_count * batch_size * layer_index) +
                          head * kHeadDim;
-    store_key_head(input, layer, positions, state_slots, physical_column, width, head);
+    store_key_head(input, layers, layer, positions, state_slots, physical_column, width, head);
 }
 
 DeviceLayers make_device_layers(
-    const std::array<ContextKVMaterializeLayerView, kContextKVMaterializeLayers>& layers) {
+    const std::array<ContextKVMaterializeLayerView, kContextKVMaterializeLayers>& layers,
+    const std::array<double, 64>& inv_frequency) {
     DeviceLayers result{};
+    for (int pair = 0; pair < 64; ++pair) { result.inv_frequency[pair] = inv_frequency[pair]; }
     for (int index = 0; index < kLayers; ++index) {
         const ContextKVMaterializeLayerView& source = layers[static_cast<std::size_t>(index)];
         result.layer[index]                         = {
@@ -440,45 +457,63 @@ DeviceLayers make_device_layers(
     return result;
 }
 
+// The route's projection kernel; false when it also stored the keys (Fused64).
+template <int H>
+bool launch_projection(const Tensor& context, const Tensor& positions, const Tensor& counts,
+                       const Tensor& state_slots, const DeviceLayers& device_layers,
+                       ContextKVMaterializeExecutionEnvelope envelope,
+                       ContextKVMaterializeRoute route, const Tensor& key_scratch,
+                       cudaStream_t stream) {
+    using Route = ContextKVMaterializeRoute;
+    switch (route) {
+    case Route::KSplit16:
+        launch_grouped<H, 16>(context, positions, counts, state_slots, device_layers, envelope,
+                              key_scratch, stream);
+        return true;
+    case Route::KSplit24:
+        launch_grouped<H, 24>(context, positions, counts, state_slots, device_layers, envelope,
+                              key_scratch, stream);
+        return true;
+    case Route::Mma32:
+        launch_mma<H, 64, 32, 128, 2>(context, positions, counts, state_slots, device_layers,
+                                      envelope, key_scratch, stream);
+        return true;
+    case Route::Mma80:
+        launch_mma<H, 64, 80, 128, 5>(context, positions, counts, state_slots, device_layers,
+                                      envelope, key_scratch, stream);
+        return true;
+    case Route::Mma96:
+        launch_mma<H, 64, 96, 128, 6>(context, positions, counts, state_slots, device_layers,
+                                      envelope, key_scratch, stream);
+        return true;
+    case Route::Fused64:
+        launch_mma<H, 128, 64, 128, 2>(context, positions, counts, state_slots, device_layers,
+                                       envelope, key_scratch, stream);
+        return false;
+    case Route::Mma64:
+        launch_mma<H, 64, 64, 64, 2>(context, positions, counts, state_slots, device_layers,
+                                     envelope, key_scratch, stream);
+        return true;
+    }
+    throw std::logic_error("context_kv_materialize: invalid route");
+}
+
 } // namespace
 
 void context_kv_materialize_launch(
     const Tensor& context, const Tensor& positions, const Tensor& counts, const Tensor& state_slots,
     const std::array<ContextKVMaterializeLayerView, kContextKVMaterializeLayers>& layers,
-    ContextKVMaterializeExecutionEnvelope envelope, ContextKVMaterializeRoute route,
-    const Tensor& key_scratch, cudaStream_t stream) {
-    const DeviceLayers device_layers = make_device_layers(layers);
-    using Route                      = ContextKVMaterializeRoute;
-    switch (route) {
-    case Route::KSplit16:
-        launch_grouped<16>(context, positions, counts, state_slots, device_layers, envelope,
-                           key_scratch, stream);
-        break;
-    case Route::KSplit24:
-        launch_grouped<24>(context, positions, counts, state_slots, device_layers, envelope,
-                           key_scratch, stream);
-        break;
-    case Route::Mma32:
-        launch_mma<64, 32, 128, 2>(context, positions, counts, state_slots, device_layers, envelope,
-                                   key_scratch, stream);
-        break;
-    case Route::Mma80:
-        launch_mma<64, 80, 128, 5>(context, positions, counts, state_slots, device_layers, envelope,
-                                   key_scratch, stream);
-        break;
-    case Route::Mma96:
-        launch_mma<64, 96, 128, 6>(context, positions, counts, state_slots, device_layers, envelope,
-                                   key_scratch, stream);
-        break;
-    case Route::Fused64:
-        launch_mma<128, 64, 128, 2>(context, positions, counts, state_slots, device_layers,
-                                    envelope, key_scratch, stream);
-        return;
-    case Route::Mma64:
-        launch_mma<64, 64, 64, 2>(context, positions, counts, state_slots, device_layers, envelope,
-                                  key_scratch, stream);
-        break;
-    }
+    const std::array<double, 64>& inv_frequency, ContextKVMaterializeExecutionEnvelope envelope,
+    ContextKVMaterializeRoute route, const Tensor& key_scratch, cudaStream_t stream) {
+    const DeviceLayers device_layers = make_device_layers(layers, inv_frequency);
+    const bool post = context.ne[0] == 5120
+                          ? launch_projection<5120>(context, positions, counts, state_slots,
+                                                    device_layers, envelope, route, key_scratch,
+                                                    stream)
+                          : launch_projection<2560>(context, positions, counts, state_slots,
+                                                    device_layers, envelope, route, key_scratch,
+                                                    stream);
+    if (!post) { return; }
     CUDA_CHECK(pdl::launch_consumer(
         {dim3(envelope.max_count * context.ne[2], kLayers), dim3(256), 0, stream},
         context_kv_key_post_kernel, static_cast<const float*>(key_scratch.data),

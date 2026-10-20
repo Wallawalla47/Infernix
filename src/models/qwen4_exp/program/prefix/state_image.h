@@ -2,12 +2,13 @@
 
 // The packed state image of one Qwen4Exp lane at a frontier (docs/maintainer/qwen3_8-flash-next-design.md
 // §19.3.1): every byte of the lane's GDN recurrent and convolution state, PLE convolution history,
-// QSA raw-key tails and MTP state that its KV pages do not hold. Parts follow the forward pass, so a
-// restore lands each decoder layer's state as one group the forward pass can wait for on its own:
+// QSA raw-key tails and drafter state that its KV pages do not hold. Parts follow the forward pass, so
+// a restore lands each decoder layer's state as one group the forward pass can wait for on its own:
 //
 //   header | layer 0 .. L-1: GDN (recurrent, conv) or attention (QSA tail, and with a vector-quantized
 //          KV storage its exact window's five planes); the PLE history joins the group of the layer
-//          it precedes | MTP group: saved residual, MTP tail (and window)
+//          it precedes | drafter group: MTP's saved residual, tail (and window), or DFlash2's context
+//          ring (K and V of each drafter layer)
 //
 // Every part starts on a 256-byte boundary. All copies are byte copies; nothing is requantized. On
 // the Host the packed byte o lives at segments[o / segment_bytes] + o % segment_bytes (the slabs of
@@ -56,6 +57,14 @@ struct KvWindowGeometry {
 // KV layer k's window planes at `base` (slots unset: the forward pass sets each call's).
 [[nodiscard]] PagedKVWindowView kv_window_view(const KvWindowGeometry& geometry, void* base, std::uint32_t kv_layer);
 
+// A DFlash2 drafter's context ring (core/cyclic_kv_cache.h): per drafter layer one lane's K bytes
+// and V bytes (each contiguous: the lane is the ring planes' outermost axis).
+struct DraftRingGeometry {
+    std::uint32_t layers = 0;
+    std::size_t k_bytes  = 0;
+    std::size_t v_bytes  = 0;
+};
+
 // Byte sizes of one lane's state, per layer where it is per layer.
 struct StateImageSpec {
     std::vector<MixerKind> layer_types; // decoder layers in order
@@ -67,25 +76,29 @@ struct StateImageSpec {
     bool mtp                         = false;
     std::size_t mtp_saved_bytes      = 0;
     std::size_t mtp_tail_bytes       = 0;
+    DraftRingGeometry draft_ring; // DFlash2 (layers 0: none)
     // One lane's bytes of each exact-window plane per KV layer (zero without a window).
     std::array<std::size_t, KvWindowGeometry::kPlanes> window_bytes{};
 };
 
-[[nodiscard]] StateImageSpec state_image_spec(const TextConfig& config, bool mtp, KvCacheStorage storage);
+[[nodiscard]] StateImageSpec state_image_spec(const TextConfig& config, bool mtp, KvCacheStorage storage,
+                                              DraftRingGeometry draft_ring = {});
 
 struct StateImagePart {
-    enum class Kind : std::uint8_t { Header, Ple, GdnRecurrent, GdnConv, QsaTail, MtpSaved, MtpTail, QsaWindow };
+    enum class Kind : std::uint8_t {
+        Header, Ple, GdnRecurrent, GdnConv, QsaTail, MtpSaved, MtpTail, QsaWindow, DraftRingK, DraftRingV
+    };
 
     Kind kind           = Kind::Header;
-    // The layer's index among GDN or attention layers; for a window plane, KV layer x 5 + plane;
-    // 0 otherwise.
+    // The layer's index among GDN or attention layers; for a window plane, KV layer x 5 + plane; for
+    // a ring plane, the drafter layer; 0 otherwise.
     std::uint32_t index = 0;
     std::size_t offset  = 0; // in the packed image
     std::size_t bytes   = 0;
 };
 
-// Group g < layers is decoder layer g; group `layers` is the MTP group (empty without MTP). The
-// header (part 0) belongs to no group.
+// Group g < layers is decoder layer g; group `layers` is the drafter's group (MTP's or DFlash2's,
+// empty without a drafter). The header (part 0) belongs to no group.
 struct StateImageLayout {
     StateImageSpec spec;
     std::vector<StateImagePart> parts;
@@ -96,7 +109,7 @@ struct StateImageLayout {
     [[nodiscard]] std::uint32_t groups() const noexcept {
         return static_cast<std::uint32_t>(group_begin.size()) - 1U;
     }
-    [[nodiscard]] std::uint32_t mtp_group() const noexcept { return groups() - 1U; }
+    [[nodiscard]] std::uint32_t drafter_group() const noexcept { return groups() - 1U; }
 };
 
 [[nodiscard]] StateImageLayout plan_state_image(const StateImageSpec& spec);
@@ -112,6 +125,9 @@ struct StateImageHeader {
     // The snapshot is the generation-opener tap (an exact split before the assistant turn).
     bool opener = false;
     std::array<double, 8> mtp_accept{};
+    // DFlash2: the ring holds the context of every position below this one (the frontier, except a
+    // tap inside a prefill layer walk, which captures the ring as it was before the walk's span).
+    std::uint32_t draft_frontier = 0;
 };
 
 void write_state_image_header(const StateImageLayout& layout, const StateImageHeader& header,
@@ -132,6 +148,8 @@ struct LaneStateBuffers {
     // The exact window (vector-quantized storages): KvWindowGeometry's planes at `window`.
     std::byte* window = nullptr;
     KvWindowGeometry window_geometry;
+    // DFlash2's ring, per drafter layer: lane l's K at ring_k[layer] + l * k_bytes (V likewise).
+    std::vector<std::byte*> ring_k, ring_v;
 };
 
 // Host placement of one packed image.

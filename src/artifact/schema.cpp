@@ -247,9 +247,12 @@ void parse_objects(Directory& out, const Json& objects) {
 }
 
 void parse_components(Directory& out, const Json& values) {
-    if (!values.is_object() || !values.contains("text")) {
-        throw ArtifactError("components must contain text");
+    if (!values.is_object() || values.empty()) {
+        throw ArtifactError("components must be a nonempty object");
     }
+    // A companion artifact has no text: each of its components targets the text of the main
+    // artifact it is loaded beside.
+    out.companion = !values.contains("text");
     for (const auto& [name, value] : values.items()) {
         (void)require_id(Json(name), "component id");
         require_members(value, {"config"}, {"target", "resources", "proposal"}, name);
@@ -260,9 +263,12 @@ void parse_components(Directory& out, const Json& values) {
         }
         if (value.contains("target")) {
             component.target = require_id(value.at("target"), name + " target");
-            if (!values.contains(*component.target)) {
+            if (!out.companion && !values.contains(*component.target)) {
                 throw ArtifactError(name + ": missing target " + *component.target);
             }
+        }
+        if (out.companion && component.target != "text") {
+            throw ArtifactError(name + ": a companion component must target text");
         }
         if (value.contains("resources")) {
             const auto& resources = value.at("resources");
@@ -301,7 +307,8 @@ void parse_uses(Directory& out, const Json& values) {
         use.parameter    = require_id(value.at("parameter"), "Use parameter");
         use.input        = require_id(value.at("input"), "Use input");
         const auto label = use.parameter + "@" + use.input;
-        if (!out.bindings.contains(use.parameter)) {
+        // A companion's Use may name a parameter its target binds (checked when loaded beside it).
+        if (!out.companion && !out.bindings.contains(use.parameter)) {
             throw ArtifactError(label + ": missing parameter");
         }
         if (value.contains("activation_policy")) {

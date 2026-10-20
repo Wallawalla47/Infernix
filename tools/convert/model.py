@@ -34,10 +34,18 @@ class Model:
     packing_groups: list[tuple[str, ...]] = field(default_factory=list)
     token_count: int = 0
     special_token_ids: tuple[int, ...] = ()
+    # A companion artifact (no text component): the text config of the target its components bind
+    # to at load, and the Uses it declares for parameters the target binds.
+    target: dict | None = None
+    external_uses: tuple[tuple[str, str], ...] = ()
 
     @property
     def config(self) -> dict:
-        return self.components["text"]["config"]
+        if "text" in self.components:
+            return self.components["text"]["config"]
+        if self.target is None:
+            raise ValueError("a companion model needs its target's text config")
+        return self.target
 
     def add(self, parameter: Parameter) -> None:
         if parameter.name in self.parameters:

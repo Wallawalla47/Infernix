@@ -1,0 +1,23 @@
+Qwen3.8-Flash-Next-DFlash2-Infernix
+A conversion of incoai/Qwen3.8-Flash-Next-DFlash2 for Infernix, by Wallawalla47.
+
+The model is Qwen3.8-Flash-Next-DFlash2 (https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2,
+revision a22a1744e85c17364dcc54a6a420af7135d4c7f6), a DFlash 2 draft model by Inco AI for
+Qwen/Qwen3.8-Flash-Next, licensed under the Apache License, Version 2.0 (see LICENSE).
+
+------------------------------------------------------------------------------
+Changes made in this conversion:
+
+  - The checkpoint was converted into the Infernix v3 companion artifact
+    Qwen3.8-Flash-Next-DFlash2-Infernix.infernix (one file) with the qwen3_8_flash_next_dflash2
+    recipe of Infernix's tools.convert.
+  - The drafter's projections (target-feature projection, attention query/key/value/output, MLP
+    gate/up/down) are re-quantized to q8_g32_fp16 (8-bit integer codes with an FP16 absmax scale
+    per group of 32); the context key/value projections share the query block's key/value words,
+    as in the source, where they are the same tensors.
+  - Every other tensor (norms, dynamic-convolution base kernels and kernel projections, the
+    candidate selector's hidden projection and codebooks) keeps its BF16 values unchanged.
+  - The artifact records the target it was converted for (Qwen4ExpForCausalLM, hidden size 2560,
+    vocabulary 248,320, 48 layers) and the target parameters it reads (the output head or the
+    proposal head); it holds no tokenizer, embedding or output head of its own.
+  - README.md, config.json (metadata only) and the conversion report added.

@@ -171,7 +171,8 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
                 replace_local_window ? positions.slice(0, local_offset, local_width) : positions;
             ops::context_kv_materialize(
                 context.view({dimension(target.hidden_size), local_width, batch}), local_positions,
-                local_counts, lanes, layers, {local_envelope.min_count, local_envelope.max_count},
+                local_counts, lanes, layers, config.rope_theta,
+                {local_envelope.min_count, local_envelope.max_count},
                 state.execution.work, state.execution.device.stream);
         } else {
             for (int layer = 0; layer < dimension(config.num_hidden_layers); ++layer) {
@@ -240,7 +241,7 @@ void prepare_dynamic_branch(ExecutionCore& execution, const Tensor& residual, co
     auto scope      = execution.work.scope();
     const int width = residual.ne[1], batch = residual.ne[2];
     WorkspaceArena scratch(execution.work.alloc_bytes(
-        ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(width, width, batch,
+        ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(residual.ne[0], width, width, batch,
                                                                            batch)));
     ops::rmsnorm_dynamic_grouped_conv_prepare(
         residual, norm, eps, weights.base_kernel, weights.kernel_projection.weight, branch.prepared,
@@ -254,7 +255,7 @@ void finish_dynamic_branch(ExecutionCore& execution, const Tensor& input,
     const int width = input.ne[1], batch = input.ne[2];
     WorkspaceArena scratch(
         execution.work.alloc_bytes(ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
-            input.ne[0], width, width, batch, batch)));
+            residual.ne[0], input.ne[0], width, width, batch, batch)));
     ops::linear_dynamic_grouped_conv_add(input, projection.weight, weights.base_kernel,
                                          finish_delta, residual, scratch, execution.device.stream);
 }
@@ -430,7 +431,7 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
             candidates, scores.view({dimension(config.dflash2->selector_top_k), k, batch}),
             projected.view({dimension(config.dflash2->selector_rank), k, batch}), anchors,
             weights.selector->predecessor_codebook, weights.selector->successor_codebook, frontiers,
-            frame.sampling, drafts, proposal_q, work, stream);
+            frame.sampling, drafts, proposal_q, nullptr, work, stream);
         if (staged) {
             Tensor destination_drafts     = into->draft_tokens.slice(1, 0, batch);
             Tensor destination_candidates = into->candidate_ids.slice(2, 0, batch);

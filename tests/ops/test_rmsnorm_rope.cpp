@@ -42,6 +42,8 @@ constexpr int kQueryHeads      = 32;
 constexpr int kKeyHeads        = 8;
 constexpr double kEpsilon      = 1.0e-6;
 constexpr double kTheta        = 1.0e7;
+// The prepared (PreparedRope) forms' theta: kTheta, or Qwen3.8-Flash-Next's DFlash2 1e4.
+double g_theta = kTheta;
 constexpr double kRelativeL2   = 1.85e-3;
 constexpr double kPairRelative = 6.9e-3;
 
@@ -116,14 +118,14 @@ OracleResult fused_oracle(const std::vector<float>& input, const std::vector<flo
             }
             for (int pair = 0; pair < kHeadDim / 2; ++pair) {
                 const double exponent = -2.0 * static_cast<double>(pair) / kHeadDim;
-                double frequency = std::pow(kTheta, exponent);
+                double frequency = std::pow(g_theta, exponent);
                 double attention = 1.0;
                 if (scaling.factor != 1.0F) {
                     const double pi = std::acos(-1.0);
                     const double low = std::max(0.0, std::floor(64.0 *
-                        std::log(scaling.original_max_positions / (64.0 * pi)) / std::log(kTheta)));
+                        std::log(scaling.original_max_positions / (64.0 * pi)) / std::log(g_theta)));
                     double high = std::min(127.0, std::ceil(64.0 *
-                        std::log(scaling.original_max_positions / (2.0 * pi)) / std::log(kTheta)));
+                        std::log(scaling.original_max_positions / (2.0 * pi)) / std::log(g_theta)));
                     if (low == high) { high += 0.001; }
                     const double ramp = std::clamp((pair - low) / (high - low), 0.0, 1.0);
                     frequency = (1.0 - ramp) * frequency + ramp * frequency / scaling.factor;
@@ -251,7 +253,7 @@ int run_pair_case(int width, int batch, int first_position, std::uint32_t seed,
     Tensor q_weight_tensor(q_weight_device.p, DType::BF16, {kHeadDim});
     Tensor k_weight_tensor(k_weight_device.p, DType::BF16, {kHeadDim});
     Tensor position_tensor(position_device.p, DType::I32, {width, batch});
-    const auto prepared = ops::prepare_rope(128, static_cast<float>(kTheta), scaling);
+    const auto prepared = ops::prepare_rope(128, static_cast<float>(g_theta), scaling);
     execute(
         [&](cudaStream_t stream) {
             if (scaled_api) {
@@ -279,7 +281,7 @@ int run_pair_case(int width, int batch, int first_position, std::uint32_t seed,
         verify_profile(label + " q", from_device_bf16(q_device.data(), q_count), q_expected);
     failures +=
         verify_profile(label + " k", from_device_bf16(k_device.data(), k_count), k_expected);
-    if (scaled_api && scaling.factor == 1.0F) {
+    if (scaled_api && scaling.factor == 1.0F && g_theta == kTheta) {
         const auto prepared_q = from_device<std::uint16_t>(q_device.data(), q_count);
         const auto prepared_k = from_device<std::uint16_t>(k_device.data(), k_count);
         q_device.copy_from_host(q_bits.data(), q_device.bytes());
@@ -322,7 +324,7 @@ int run_single_case(int tokens, int first_position, std::uint32_t seed, bool gra
     Tensor input_tensor(input_device.data(), DType::BF16, {kHeadDim, kKeyHeads, tokens});
     Tensor weight_tensor(weight_device.p, DType::BF16, {kHeadDim});
     Tensor position_tensor(position_device.p, DType::I32, {tokens});
-    const auto prepared = ops::prepare_rope(128, static_cast<float>(kTheta), scaling);
+    const auto prepared = ops::prepare_rope(128, static_cast<float>(g_theta), scaling);
     execute(
         [&](cudaStream_t stream) {
             if (scaled_api) {
@@ -342,7 +344,7 @@ int run_single_case(int tokens, int first_position, std::uint32_t seed, bool gra
                               " T=" + std::to_string(tokens) +
                               " P=" + std::to_string(first_position);
     int failures = verify_profile(label, from_device_bf16(input_device.data(), count), expected);
-    if (scaled_api && scaling.factor == 1.0F) {
+    if (scaled_api && scaling.factor == 1.0F && g_theta == kTheta) {
         const auto prepared_bits = from_device<std::uint16_t>(input_device.data(), count);
         input_device.copy_from_host(input_bits.data(), input_device.bytes());
         ops::rmsnorm_rope(position_tensor, weight_tensor, input_tensor, nullptr);
@@ -585,6 +587,17 @@ int main() {
         }
     }
     failures += run_single_case(8, 131071, 0x5001U, false, {4.0F, 32768}, true);
+
+    // Qwen3.8-Flash-Next's DFlash2 rotates by theta 1e4 (prepared coefficients, unscaled).
+    g_theta = 1.0e4;
+    for (int position : {0, 2047, 262143}) {
+        failures += run_pair_case(2, 1, position, 0x6001U, false, {}, true);
+        failures += run_pair_case(8, 1, position, 0x6002U, true, {}, true);
+        failures += run_pair_case(16, 8, position, 0x6003U, true, {}, true);
+        failures += run_single_case(1, position, 0x6004U, false, {}, true);
+        failures += run_single_case(2048, position, 0x6005U, true, {}, true);
+    }
+    g_theta = kTheta;
 
     // Text profile: both registered head geometries, widths from one token to a prefill chunk,
     // and both graph modes.

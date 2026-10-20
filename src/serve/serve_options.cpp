@@ -82,6 +82,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--kv-dtype"},
     ServeOptionArity{"--spec"},
     ServeOptionArity{"--draft-tokens"},
+    ServeOptionArity{"--draft-model"},
     ServeOptionArity{"--spec-min-p"},
     ServeOptionArity{"--draft-tree-nodes"},
     ServeOptionArity{"--draft-tree-paths"},
@@ -429,12 +430,17 @@ std::string serve_usage_text(const char* argv0) {
            "SPECULATIVE DECODING (off by default)\n"
            "  --spec mtp|dflash|dflash2    speculative decoding backend\n"
            "  --draft-tokens N|auto      drafts per round: mtp 1-7 (Qwen3.5/3.6 1-5),\n"
-           "                             dflash/dflash2 1-15\n"
+           "                             dflash/dflash2 1-15 (Qwen3.8-Flash-Next\n"
+           "                             dflash2 1-7)\n"
            "                               N     every round drafts and verifies N\n"
            "                               auto  mtp: each round picks 0-7 from recent\n"
            "                                     acceptance (Qwen3.5/3.6: 1-5 where\n"
            "                                     qualified, else the model's fastest\n"
-           "                                     fixed length)\n"
+           "                                     fixed length); Qwen3.8-Flash-Next\n"
+           "                                     dflash2 likewise\n"
+           "  --draft-model FILE         Qwen3.8-Flash-Next dflash2: the DFlash2 drafter's\n"
+           "                             companion artifact (Qwen3.5/3.6 artifacts bundle\n"
+           "                             theirs)\n"
            "  --lm-head-draft            use the optimized proposal head\n"
            "  --spec-min-p P             Qwen3.8-Flash-Next mtp: verify drafts only up to\n"
            "                             the first below probability P, 0-1 (default 0.5\n"
@@ -865,6 +871,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 product::parse_speculative_backend(require_value("--spec"));
         } else if (arg == "--draft-tokens") {
             product::apply_draft_tokens(options.speculative, require_value("--draft-tokens"));
+        } else if (arg == "--draft-model") {
+            options.speculative.draft_model = std::filesystem::path(std::string(require_value("--draft-model")));
         } else if (arg == "--spec-min-p") {
             options.speculative.draft_min_p = product::parse_draft_min_p(require_value("--spec-min-p"));
         } else if (arg == "--draft-tree-nodes") {

@@ -112,10 +112,10 @@ void rmsnorm_rope(const Tensor& positions, const Tensor& norm_weight, Tensor& x,
 
 void rmsnorm_rope(const Tensor& positions, const Tensor& q_norm_weight, const Tensor& k_norm_weight,
                   const PreparedRope& prepared, Tensor& q, Tensor& k, cudaStream_t stream) {
-    if (prepared.rotary_dim != 128 || prepared.theta != 1.0e7F) {
-        throw std::invalid_argument("rmsnorm_rope: prepared RoPE must have R128 and theta=1e7");
+    if (prepared.rotary_dim != 128) {
+        throw std::invalid_argument("rmsnorm_rope: prepared RoPE must have R128");
     }
-    if (prepared.factor == 1.0F) {
+    if (prepared.factor == 1.0F && prepared.theta == 1.0e7F) {
         return rmsnorm_rope(positions, q_norm_weight, k_norm_weight, q, k, stream);
     }
     const int batch = q.ne[3];
@@ -135,10 +135,12 @@ void rmsnorm_rope(const Tensor& positions, const Tensor& q_norm_weight, const Te
 
 void rmsnorm_rope(const Tensor& positions, const Tensor& norm_weight, const PreparedRope& prepared,
                   Tensor& x, cudaStream_t stream) {
-    if (prepared.rotary_dim != 128 || prepared.theta != 1.0e7F) {
-        throw std::invalid_argument("rmsnorm_rope: prepared RoPE must have R128 and theta=1e7");
+    if (prepared.rotary_dim != 128) {
+        throw std::invalid_argument("rmsnorm_rope: prepared RoPE must have R128");
     }
-    if (prepared.factor == 1.0F) { return rmsnorm_rope(positions, norm_weight, x, stream); }
+    if (prepared.factor == 1.0F && prepared.theta == 1.0e7F) {
+        return rmsnorm_rope(positions, norm_weight, x, stream);
+    }
     const int tokens = x.ne[2];
     if (tokens < 1 || tokens > kMaximumSingle) {
         throw std::invalid_argument("rmsnorm_rope: single T must be 1..2048");
