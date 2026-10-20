@@ -108,8 +108,8 @@ inputs are independently decoded with their stored scales. Qualify production ro
 against that oracle, not another kernel or plausible model output. Private arithmetic need not
 reproduce unfused materializations unless an intermediate is an observable semantic boundary.
 [Op development](docs/maintainer/op-development.md) defines the full qualification contract.
-The exact route (`--disable-fast-paths`) stays bit-exact from release to release and, where the
-artifact's formats allow, request-invariant (other requests, concurrency, cache state and resource
+The exact route (`--disable-fast-paths`) stays bit-exact from release to release and
+request-invariant on every artifact (other requests, concurrency, cache state and resource
 pressure do not change a request's output); a change that alters it for speed ships as a fast
 path, qualified under the
 [numerical acceptance policy](docs/maintainer/model-quality.md#6-numerical-acceptance-policy-and-fast-paths)

@@ -14,6 +14,8 @@ enum class Q8GdnInputScheduleId {
     DecodeR8Direct,
     SplitKMmaDirect,
     MmaR64C128,
+    // Request-invariant exact route: one sliced-K reduction at every width.
+    ColumnInvariant,
 };
 
 enum class Q8GdnInputConvScheduleId {
@@ -42,11 +44,15 @@ struct Q8GdnInputConvPlan {
 const char* q8_gdn_input_schedule_name(Q8GdnInputScheduleId schedule) noexcept;
 const char* q8_gdn_input_conv_schedule_name(Q8GdnInputConvScheduleId schedule) noexcept;
 bool q8_gdn_input_admits(const Q8GdnInputProblem& problem) noexcept;
-Q8GdnInputPlan q8_gdn_input_resolve_plan(const Q8GdnInputProblem& problem);
+Q8GdnInputPlan q8_gdn_input_resolve_plan(const Q8GdnInputProblem& problem,
+                                          bool column_invariant = false);
+// Under the column-invariant policy every width composes the projection and the convolution, so
+// decode and verification read the same BF16 projection.
 Q8GdnInputConvPlan q8_gdn_input_conv_resolve_plan(const Q8GdnInputProblem& problem,
-                                                  std::int32_t batch_size);
+                                                  std::int32_t batch_size,
+                                                  bool column_invariant = false);
 
 void q8_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
-                           cudaStream_t stream);
+                           cudaStream_t stream, bool column_invariant = false);
 
 } // namespace infernix::ops::detail

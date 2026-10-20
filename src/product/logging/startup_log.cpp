@@ -333,11 +333,22 @@ void StartupLogRenderer::engine_ready(const LoadSummary& load) {
         if (paths.empty()) {
             paths = load.fast_paths_disabled ? "disabled (exact route)" : "none qualified";
         }
-        paths += !load.request_invariance_capable
-                     ? " | not request-invariant (this artifact's formats)"
-                 : load.request_invariant ? " | request-invariant"
-                                          : " | request-coupled";
+        paths += load.request_invariant ? " | request-invariant" : " | request-coupled";
         impl_->logger->info("fast paths | {} | {}", paths, load.fast_path_configuration);
+    }
+    // Projections whose format and shape have no column-invariant route: decode and verification
+    // stay request-invariant by running each once per column, which is much slower. Such an
+    // artifact is unsupported, so say so plainly.
+    if (!load.column_by_column_projections.empty()) {
+        std::string projections;
+        for (const std::string& projection : load.column_by_column_projections) {
+            projections += (projections.empty() ? "" : ", ") + projection;
+        }
+        impl_->logger->warn(
+            "UNSUPPORTED ARTIFACT: decode and verification will run VERY SLOWLY | these projections "
+            "have no column-invariant route, so each runs one column at a time to keep outputs "
+            "request-invariant | {} | convert with a supported recipe for full speed",
+            projections);
     }
     impl_->logger->debug("context cost | transfer {} | prefill {} | signature {}",
                          context_cost_preset_source_name(load.context_cost.transfer_source),

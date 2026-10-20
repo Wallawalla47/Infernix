@@ -119,6 +119,8 @@ const char* q8_attn_input_schedule_name(Q8AttnInputScheduleId schedule) noexcept
         return "attn_input_proj.q8.dflash2.mma.r32.c64";
     case Q8AttnInputScheduleId::DFlash2MmaR64C128:
         return "attn_input_proj.q8.dflash2.mma.r64.c128";
+    case Q8AttnInputScheduleId::ColumnInvariant:
+        return "attn_input_proj.q8.splitk.mma.column_invariant";
     }
     return "attn_input_proj.q8.unknown";
 }
@@ -127,10 +129,18 @@ bool q8_attn_input_admits(const Q8AttnInputProblem& problem) noexcept {
     return supported_shape(problem) && problem.cols > 0;
 }
 
-Q8AttnInputPlan q8_attn_input_resolve_plan(const Q8AttnInputProblem& problem) {
+Q8AttnInputPlan q8_attn_input_resolve_plan(const Q8AttnInputProblem& problem,
+                                           bool column_invariant) {
     if (!q8_attn_input_admits(problem)) {
         throw std::invalid_argument(
             "Q8 attention input: exact problem or column count is not admitted");
+    }
+    if (column_invariant) {
+        if (is_dflash2_shape(problem) || is_companion_shape(problem)) {
+            throw std::invalid_argument(
+                "Q8 attention input: the problem registers no column-invariant route");
+        }
+        return {Q8AttnInputScheduleId::ColumnInvariant};
     }
     const auto resolve_from = [&](const auto& routes) -> Q8AttnInputPlan {
         for (const RouteSpec& route : routes) {
@@ -147,16 +157,19 @@ Q8AttnInputPlan q8_attn_input_resolve_plan(const Q8AttnInputProblem& problem) {
 
 void q8_attn_input_execute_plan(const Q8AttnInputPlan& plan, const Tensor& x, const Weight& weight,
                                 Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
-                                cudaStream_t stream) {
+                                cudaStream_t stream, bool column_invariant) {
     const Q8AttnInputProblem problem{x.ne[0], q.ne[0], k.ne[0], weight.n, weight.padded_shape[1],
                                      x.ne[1]};
-    const Q8AttnInputPlan resolved = q8_attn_input_resolve_plan(problem);
+    const Q8AttnInputPlan resolved = q8_attn_input_resolve_plan(problem, column_invariant);
     if (problem.parent_rows != 9216 || problem.kv_rows != 512 ||
         resolved.schedule != plan.schedule) {
         throw std::invalid_argument(
             "Q8 attention input: plan does not match exact four-output problem");
     }
     switch (plan.schedule) {
+    case Q8AttnInputScheduleId::ColumnInvariant:
+        q8_attn_input_column_invariant_launch(x, weight, q, gate, k, v, stream);
+        return;
     case Q8AttnInputScheduleId::DecodeR8Direct:
         q8_attn_input_decode_launch(x, weight, q, gate, k, v, stream);
         return;
@@ -189,11 +202,11 @@ void q8_attn_input_execute_plan(const Q8AttnInputPlan& plan, const Tensor& x, co
 }
 
 void q8_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
-                            Tensor& k, Tensor& v, cudaStream_t stream) {
+                            Tensor& k, Tensor& v, cudaStream_t stream, bool column_invariant) {
     const Q8AttnInputProblem problem{x.ne[0], q.ne[0], k.ne[0], weight.n, weight.padded_shape[1],
                                      x.ne[1]};
-    q8_attn_input_execute_plan(q8_attn_input_resolve_plan(problem), x, weight, q, gate, k, v,
-                               stream);
+    q8_attn_input_execute_plan(q8_attn_input_resolve_plan(problem, column_invariant), x, weight, q,
+                               gate, k, v, stream, column_invariant);
 }
 
 void q8_attn_input_execute_plan(const Q8AttnInputPlan& plan, const Tensor& x, const Weight& weight,
@@ -269,6 +282,8 @@ void q8_attn_input_execute_plan(const Q8AttnInputPlan& plan, const Tensor& x, co
     case Q8AttnInputScheduleId::DFlash2MmaR32C32K128:
     case Q8AttnInputScheduleId::DFlash2MmaR32C64K128:
         throw std::logic_error("Q8 attention input: DFlash2 schedule in companion plan");
+    case Q8AttnInputScheduleId::ColumnInvariant:
+        throw std::logic_error("Q8 attention input: four-output schedule in companion plan");
     }
     throw std::logic_error("Q8 attention input: unknown schedule");
 }

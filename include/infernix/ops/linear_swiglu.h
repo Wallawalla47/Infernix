@@ -39,6 +39,13 @@ linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
                                        LinearRoutes routes = LinearRoutes::Exact);
 
 /**
+ * Whether the registered profile has a dedicated column-invariant route (Q4, NVFP4 and FP8).
+ * Without one, LinearPolicy::A16ColumnInvariant runs the exact A16 route once per column.
+ */
+[[nodiscard]] bool linear_swiglu_column_invariant_route(QType qtype, std::int32_t gate_up_rows,
+                                                        std::int32_t input_rows) noexcept;
+
+/**
  * Op: linear_swiglu
  *
  * Math / indexing:

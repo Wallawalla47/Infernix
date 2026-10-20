@@ -23,4 +23,8 @@ namespace infernix::ops::detail {
 void fp8_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPolicy policy,
                   LinearRoutes routes, WorkspaceArena* workspace, cudaStream_t stream);
 
+// Whether the problem registers a dedicated column-invariant route.
+[[nodiscard]] bool fp8_linear_column_invariant_route(std::int32_t output_rows,
+                                                     std::int32_t input_rows) noexcept;
+
 } // namespace infernix::ops::detail

@@ -50,6 +50,8 @@ const char* q8_gdn_input_schedule_name(Q8GdnInputScheduleId schedule) noexcept {
         return "gdn_input_proj.q8.mma.splitk.direct.k2048";
     case Q8GdnInputScheduleId::MmaR64C128:
         return "gdn_input_proj.q8.mma.r64.c128.split2";
+    case Q8GdnInputScheduleId::ColumnInvariant:
+        return "gdn_input_proj.q8.mma.splitk.column_invariant";
     }
     return "gdn_input_proj.q8.unknown";
 }
@@ -70,10 +72,12 @@ bool q8_gdn_input_admits(const Q8GdnInputProblem& problem) noexcept {
     return supported_shape(problem) && problem.cols > 0;
 }
 
-Q8GdnInputPlan q8_gdn_input_resolve_plan(const Q8GdnInputProblem& problem) {
+Q8GdnInputPlan q8_gdn_input_resolve_plan(const Q8GdnInputProblem& problem,
+                                          bool column_invariant) {
     if (!q8_gdn_input_admits(problem)) {
         throw std::invalid_argument("Q8 GDN input: exact problem or column count is not admitted");
     }
+    if (column_invariant) { return {Q8GdnInputScheduleId::ColumnInvariant}; }
     for (const RouteSpec& route : kRoutes) {
         if (problem.cols >= route.first && problem.cols <= route.last) { return {route.schedule}; }
     }
@@ -81,23 +85,26 @@ Q8GdnInputPlan q8_gdn_input_resolve_plan(const Q8GdnInputProblem& problem) {
 }
 
 Q8GdnInputConvPlan q8_gdn_input_conv_resolve_plan(const Q8GdnInputProblem& problem,
-                                                  std::int32_t batch_size) {
+                                                  std::int32_t batch_size, bool column_invariant) {
     if (!q8_gdn_input_admits(problem) || batch_size <= 0 || batch_size > 8) {
         throw std::invalid_argument(
             "Q8 GDN input conv: exact problem or column count is not admitted");
     }
-    if (batch_size > 1) { return {Q8GdnInputConvScheduleId::Materialized}; }
+    if (batch_size > 1 || column_invariant) { return {Q8GdnInputConvScheduleId::Materialized}; }
     if (problem.cols == 1) { return {Q8GdnInputConvScheduleId::DecodeFused}; }
     if (problem.cols <= 16) { return {Q8GdnInputConvScheduleId::SplitKMmaFused}; }
     return {Q8GdnInputConvScheduleId::Materialized};
 }
 
 void q8_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
-                           cudaStream_t stream) {
+                           cudaStream_t stream, bool column_invariant) {
     const Q8GdnInputProblem problem{x.ne[0], qkv.ne[0], z.ne[0], weight.n, weight.padded_shape[1],
                                     x.ne[1]};
-    const Q8GdnInputPlan plan = q8_gdn_input_resolve_plan(problem);
+    const Q8GdnInputPlan plan = q8_gdn_input_resolve_plan(problem, column_invariant);
     switch (plan.schedule) {
+    case Q8GdnInputScheduleId::ColumnInvariant:
+        q8_gdn_input_column_invariant_launch(x, weight, qkv, z, stream);
+        return;
     case Q8GdnInputScheduleId::DecodeR8Direct:
         q8_gdn_input_decode_launch(x, weight, qkv, z, stream);
         return;

@@ -4,6 +4,7 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/tensor.h"
+#include "infernix/ops/linear.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -16,6 +17,10 @@ struct SparseMoeWeights {
     Weight routed_down;
     Weight shared_gate_up;
     Weight shared_down;
+    // A16 at every policy. A16ColumnInvariant: a token's output does not depend on the call's
+    // width or other tokens (T=1 the decode route, wider calls the small-T route in slices of at
+    // most 46 tokens whose router reduces each token as decode does; never the prefill route).
+    LinearPolicy policy = LinearPolicy::A16Only;
 };
 
 enum class SparseMoeEpilogue : std::uint8_t {
@@ -43,6 +48,13 @@ struct SparseMoeHints {
  */
 [[nodiscard]] std::size_t sparse_moe_workspace_capacity_bytes(QType routed_gate_up,
                                                               QType routed_down,
+                                                              std::int32_t min_tokens,
+                                                              std::int32_t max_tokens);
+
+/// The same query for the weights' policy (SparseMoeWeights::policy).
+[[nodiscard]] std::size_t sparse_moe_workspace_capacity_bytes(QType routed_gate_up,
+                                                              QType routed_down,
+                                                              LinearPolicy policy,
                                                               std::int32_t min_tokens,
                                                               std::int32_t max_tokens);
 

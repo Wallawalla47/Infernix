@@ -35,6 +35,14 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
                      cudaStream_t stream);
 
 /**
+ * The paired Q4/Q5 projection under a compute policy. Every policy computes A16; under
+ * A16ColumnInvariant a column's four outputs do not depend on the call's width or other columns.
+ */
+void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
+                     const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
+                     LinearPolicy policy, cudaStream_t stream);
+
+/**
  * Computes the single-parent Q/K/output-gate/V projection.
  *
  * The parent stores rows in physical order query, key, output gate, value while the public output

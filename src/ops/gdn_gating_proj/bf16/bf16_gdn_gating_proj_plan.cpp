@@ -444,13 +444,19 @@ void bf16_gdn_norm_gating_dispatch(const Tensor& x, const Tensor& norm_weight, f
                                    Tensor& beta, DeviceExecutionView execution) {
     const Bf16GdnGatingProblem problem{g.ne[0], x.ne[0], x.ne[1]};
     if (column_invariant) {
-        if (!is_27(problem)) {
-            throw std::invalid_argument(
-                "gdn_norm_gating_proj: no column-invariant schedule for this problem");
+        if (is_27(problem)) {
+            bf16_gdn_norm_gating_proj_27_launch(x, norm_weight, eps, h, a_weight, b_weight, A_log,
+                                                dt_bias, g, beta, true, execution.stream);
+            return;
         }
-        bf16_gdn_norm_gating_proj_27_launch(x, norm_weight, eps, h, a_weight, b_weight, A_log,
-                                            dt_bias, g, beta, true, execution.stream);
-        return;
+        if (is_35(problem)) {
+            bf16_gdn_norm_gating_proj_35_invariant_launch(x, norm_weight, eps, h, a_weight,
+                                                          b_weight, A_log, dt_bias, g, beta,
+                                                          execution.stream);
+            return;
+        }
+        throw std::invalid_argument(
+            "gdn_norm_gating_proj: no column-invariant schedule for this problem");
     }
     const Bf16GdnNormGatingPlan plan = bf16_gdn_norm_gating_resolve_plan(problem);
     if (plan.schedule == Bf16GdnNormGatingScheduleId::FusedSimt27) {

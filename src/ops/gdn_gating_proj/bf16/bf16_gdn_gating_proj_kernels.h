@@ -15,6 +15,12 @@ void bf16_gdn_norm_gating_proj_27_launch(const Tensor& x, const Tensor& norm_wei
                                          const Tensor& alog, const Tensor& bias, Tensor& g,
                                          Tensor& beta, bool column_invariant,
                                          cudaStream_t stream);
+// The 35B-A3B control [64,2048] (32 heads): the column-invariant fused route, 256 threads at every T.
+void bf16_gdn_norm_gating_proj_35_invariant_launch(const Tensor& x, const Tensor& norm_weight,
+                                                   float eps, Tensor& h, const Weight& a_weight,
+                                                   const Weight& b_weight, const Tensor& alog,
+                                                   const Tensor& bias, Tensor& g, Tensor& beta,
+                                                   cudaStream_t stream);
 
 enum class Bf16GdnGatingTokenVariant {
     None,

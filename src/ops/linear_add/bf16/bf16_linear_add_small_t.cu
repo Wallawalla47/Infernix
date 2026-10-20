@@ -44,4 +44,18 @@ void bf16_linear_add_small_t_launch(const Tensor& x, const Weight& weight, Tenso
                                                                                   residual, stream);
 }
 
+// The column-invariant route: one SIMT schedule with a runtime token count, four columns per CTA
+// row. Each column has its own accumulator, reduced in the same lane and warp order whatever the
+// call's width, so a column's bits do not depend on how many columns share the call.
+void bf16_linear_add_column_invariant_launch(const Tensor& x, const Weight& weight,
+                                             Tensor& residual, cudaStream_t stream) {
+    using Schedule = Bf16A16SimtSchedule<4, 1, 4, 8, 1, 4, Bf16SimtActivationAccess::WarpPacked,
+                                         Bf16WeightCache::Default, Bf16PhaseOrder::Sequential, 1,
+                                         2, 1, 2>;
+    auto* data = static_cast<__nv_bfloat16*>(residual.data);
+    launch_bf16_a16_simt<Bf16ScheduleInstance<Schedule, 6144, 0, false>>(
+        bf16_a16_operands(x, weight), LinearBf16Output{data, weight.n},
+        LinearResidualAddEpilogue{{data, weight.n}}, stream);
+}
+
 } // namespace infernix::ops::detail

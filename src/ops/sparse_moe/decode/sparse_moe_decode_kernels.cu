@@ -27,46 +27,10 @@ constexpr int kExperts          = 256;
 constexpr int kRouterRows       = kExperts + 1;
 constexpr int kTopK             = 8;
 constexpr int kIntermediate     = 512;
-constexpr int kD1Warps          = 8;
+constexpr int kD1Warps          = kSparseMoeRouterWarps;
 constexpr int kAdaptiveD3Blocks = 5 * kIntermediate;
 constexpr int kAdaptiveD4Blocks = 5 * (kHidden / 4);
-
-__device__ __forceinline__ float dot_bf16_eight(const __nv_bfloat16* a, const __nv_bfloat16* b) {
-    const uint4 av  = load_vec<uint4>(a);
-    const uint4 bv  = load_vec<uint4>(b);
-    const float2 a0 = bf16x2_bits_to_float2(av.x);
-    const float2 a1 = bf16x2_bits_to_float2(av.y);
-    const float2 a2 = bf16x2_bits_to_float2(av.z);
-    const float2 a3 = bf16x2_bits_to_float2(av.w);
-    const float2 b0 = bf16x2_bits_to_float2(bv.x);
-    const float2 b1 = bf16x2_bits_to_float2(bv.y);
-    const float2 b2 = bf16x2_bits_to_float2(bv.z);
-    const float2 b3 = bf16x2_bits_to_float2(bv.w);
-    float sum       = 0.0f;
-    sum             = fmaf(a0.x, b0.x, sum);
-    sum             = fmaf(a0.y, b0.y, sum);
-    sum             = fmaf(a1.x, b1.x, sum);
-    sum             = fmaf(a1.y, b1.y, sum);
-    sum             = fmaf(a2.x, b2.x, sum);
-    sum             = fmaf(a2.y, b2.y, sum);
-    sum             = fmaf(a3.x, b3.x, sum);
-    sum             = fmaf(a3.y, b3.y, sum);
-    return sum;
-}
-
-__device__ __forceinline__ float router_row_dot(const __nv_bfloat16* x, const __nv_bfloat16* row) {
-    constexpr int kSlice = kHidden / kD1Warps;
-    constexpr int kVecs  = kSlice / (32 * 8);
-    const int warp       = static_cast<int>(threadIdx.x) >> 5;
-    const int lane       = static_cast<int>(threadIdx.x) & 31;
-    float sum            = 0.0f;
-#pragma unroll
-    for (int vector = 0; vector < kVecs; ++vector) {
-        const int k = warp * kSlice + vector * 32 * 8 + lane * 8;
-        sum += dot_bf16_eight(row + k, x + k);
-    }
-    return warp_reduce_sum(sum);
-}
+static_assert(kSparseMoeRouterHidden == kHidden);
 
 __global__ void sparse_moe_d1_kernel(const __nv_bfloat16* __restrict__ x,
                                      const __nv_bfloat16* __restrict__ router,
@@ -77,12 +41,12 @@ __global__ void sparse_moe_d1_kernel(const __nv_bfloat16* __restrict__ x,
     const int row   = static_cast<int>(blockIdx.x);
     const int warp  = static_cast<int>(threadIdx.x) >> 5;
     const int lane  = static_cast<int>(threadIdx.x) & 31;
-    const float dot = router_row_dot(x, router + static_cast<std::int64_t>(row) * kHidden);
+    const float dot =
+        sparse_moe_router_row_dot(x, router + static_cast<std::int64_t>(row) * kHidden);
     if (lane == 0) { partial[warp] = dot; }
     __syncthreads();
     if (warp == 0) {
-        float value = lane < kD1Warps ? partial[lane] : 0.0f;
-        value       = warp_reduce_sum<kD1Warps>(value);
+        const float value = sparse_moe_router_row_reduce(partial);
         if (lane == 0) { scores[row] = value; }
     }
     if (shared_down_codes != nullptr) {

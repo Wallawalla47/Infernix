@@ -4,7 +4,11 @@
 namespace infernix::ops::detail {
 
 void bf16_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
-                              Tensor& k, Tensor& v, cudaStream_t stream) {
+                              Tensor& k, Tensor& v, cudaStream_t stream, bool column_invariant) {
+    if (column_invariant) {
+        bf16_attn_input_column_invariant_launch(x, weight, q, gate, k, v, stream);
+        return;
+    }
     if (x.ne[1] == 1) {
         bf16_attn_input_decode_launch(x, weight, q, gate, k, v, stream);
         return;

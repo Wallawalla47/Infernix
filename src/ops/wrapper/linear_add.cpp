@@ -70,11 +70,7 @@ bool overlaps(const Tensor& lhs, const Tensor& rhs) {
     return lhs_begin < rhs_begin + rhs.bytes() && rhs_begin < lhs_begin + lhs.bytes();
 }
 
-void validate_policy(LinearPolicy policy, QType qtype) {
-    if (column_invariant(policy) && qtype != QType::NVFP4 &&
-        qtype != QType::FP8_E4M3FN_ROW_BF16) {
-        throw std::invalid_argument("linear_add: the weight format registers no column-invariant route");
-    }
+void validate_policy(LinearPolicy policy) {
     switch (policy) {
     case LinearPolicy::A16Only:
     case LinearPolicy::AllowA8:
@@ -96,12 +92,24 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
                                                LinearPolicy::A16Only, min_tokens, max_tokens);
 }
 
+bool linear_add_column_invariant_route(QType qtype, std::int32_t output_rows,
+                                       std::int32_t input_rows) noexcept {
+    if (qtype == QType::Q8_G32_FP16) { return output_rows == 2048 && input_rows == 4096; }
+    return qtype == QType::NVFP4 || qtype == QType::FP8_E4M3FN_ROW_BF16 ||
+           qtype == QType::Q5_G64_FP16 || qtype == QType::BF16;
+}
+
 std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output_rows,
                                                 std::int32_t input_rows, LinearPolicy policy,
                                                 std::int32_t min_tokens, std::int32_t max_tokens) {
-    validate_policy(policy, qtype);
+    validate_policy(policy);
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("linear_add workspace: invalid token interval");
+    }
+    if (column_invariant(policy) && !linear_add_column_invariant_route(qtype, output_rows, input_rows)) {
+        // One A16 call per column.
+        return linear_add_workspace_capacity_bytes(qtype, output_rows, input_rows,
+                                                   LinearPolicy::A16Only, 1, 1);
     }
     if (qtype == QType::BF16) {
         (void)detail::bf16_linear_add_select(output_rows, input_rows, min_tokens);
@@ -114,13 +122,16 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
         return 0;
     }
     if (qtype == QType::Q8_G32_FP16) {
-        (void)detail::q8_linear_add_resolve_plan({output_rows, input_rows, input_rows, min_tokens});
-        (void)detail::q8_linear_add_resolve_plan({output_rows, input_rows, input_rows, max_tokens});
+        (void)detail::q8_linear_add_resolve_plan({output_rows, input_rows, input_rows, min_tokens},
+                                                 column_invariant(policy));
+        (void)detail::q8_linear_add_resolve_plan({output_rows, input_rows, input_rows, max_tokens},
+                                                 column_invariant(policy));
         return 0;
     }
     if (qtype == QType::Q5_G64_FP16) {
         return detail::q5_linear_add_capacity_workspace_bytes(output_rows, input_rows, input_rows,
-                                                              min_tokens, max_tokens);
+                                                              min_tokens, max_tokens,
+                                                              column_invariant(policy));
     }
     if (qtype == QType::NVFP4) {
         const bool supported = (output_rows == detail::Nvfp4N5120K6144::kOutputRows &&
@@ -154,7 +165,7 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, Workspac
 
 void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPolicy policy,
                 WorkspaceArena& ws, cudaStream_t stream, LinearRoutes routes) {
-    validate_policy(policy, w.qtype);
+    validate_policy(policy);
     if (!valid_linear_routes(routes)) { throw std::invalid_argument("linear_add: unknown route flags"); }
     const std::int32_t t = x.ne[1];
     if (t <= 0) { throw std::invalid_argument("linear_add: T must be positive"); }
@@ -162,6 +173,15 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
     require_tensor(residual_out, DType::BF16, w.n, t, "residual_out");
     if (overlaps(x, residual_out)) {
         throw std::invalid_argument("linear_add: x and residual_out must not overlap");
+    }
+    if (column_invariant(policy) && !linear_add_column_invariant_route(w.qtype, w.n, w.k)) {
+        // No dedicated column-invariant route: the exact one-column route, once per column.
+        for (std::int32_t column = 0; column < t; ++column) {
+            const Tensor x_column = x.slice(1, column, 1);
+            Tensor residual_column = residual_out.slice(1, column, 1);
+            linear_add(x_column, w, residual_column, LinearPolicy::A16Only, ws, stream);
+        }
+        return;
     }
 
     if (w.qtype == QType::BF16) {
@@ -175,7 +195,7 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
                 "linear_add: BF16 requires 16-byte x/residual/weight alignment");
         }
         (void)ws;
-        detail::bf16_linear_add_dispatch(x, w, residual_out, stream);
+        detail::bf16_linear_add_dispatch(x, w, residual_out, stream, column_invariant(policy));
         return;
     }
 
@@ -200,7 +220,7 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
             throw std::invalid_argument(
                 "linear_add: Q5 requires 16-byte x/residual/code/high/scale alignment");
         }
-        detail::q5_linear_add_dispatch(x, w, residual_out, ws, stream);
+        detail::q5_linear_add_dispatch(x, w, residual_out, ws, stream, column_invariant(policy));
         return;
     }
 
@@ -215,7 +235,7 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
                 "linear_add: Q8 requires 16-byte x/residual/code/scale alignment");
         }
         (void)ws;
-        detail::q8_linear_add_dispatch(x, w, residual_out, stream);
+        detail::q8_linear_add_dispatch(x, w, residual_out, stream, column_invariant(policy));
         return;
     }
 

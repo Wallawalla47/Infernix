@@ -60,4 +60,10 @@ void launch_q6_a16_sliced_r32_t32_w4_s2(const Tensor& x, const Weight& weight, T
         stream);
 }
 
+// The column-invariant routes (q6_dispatch.cpp) mix these instances by width: they must share the
+// K-warp count, which sets the reduction order.
+static_assert(q6_instances::SlicedR16T8W4S2::kKWarps == 4 &&
+              q6_instances::SlicedR32T16W4S2::kKWarps == 4 &&
+              q6_instances::SlicedR32T32W4S1::kKWarps == 4);
+
 } // namespace infernix::ops::detail

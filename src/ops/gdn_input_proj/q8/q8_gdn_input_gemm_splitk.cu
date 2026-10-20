@@ -127,6 +127,19 @@ void launch_active_cols_conv_record(const Tensor& x, const Weight& weight,
         stream);
 }
 
+// The column-invariant route's calls wider than the exact instances: the T=32 schedule over every
+// 32-column slice (runtime token count, one grid row per slice).
+void launch_sliced32(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
+                     cudaStream_t stream) {
+    using Geometry = Q8LinearGeometry<kRows, kHidden>;
+    using Schedule = Q8SlicedKDefault<32, kLastProjectionExactCols>;
+    const Output output{static_cast<__nv_bfloat16*>(qkv.data), static_cast<__nv_bfloat16*>(z.data)};
+    launch_q8_a16_sliced_k_mma<typename Schedule::template with_problem<
+        Geometry::kInputRows, kLastProjectionExactCols, false>>(q8_linear_operands(x, weight),
+                                                               output, LinearIdentityEpilogue{},
+                                                               stream);
+}
+
 template <int TileCols, int KSplits, int NGroups, int MinBlocks>
 void launch_medium_cols(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                         cudaStream_t stream) {
@@ -187,6 +200,24 @@ void q8_gdn_input_splitk_mma_launch(const Tensor& x, const Weight& weight, Tenso
         launch_medium_cols<64, 4, 2, 2>(x, weight, qkv, z, stream);
     } else {
         launch_medium_cols<96, 2, 4, 3>(x, weight, qkv, z, stream);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// Every width runs the 8 K-warp sliced-K reduction of the exact route's T=2..32 instances: T=1 its
+// one-column instance, wider calls its T=32 schedule over 32-column slices. Tile, scale staging and
+// token slicing change only staging and predication, so a column's bits do not depend on the call's
+// width.
+void q8_gdn_input_column_invariant_launch(const Tensor& x, const Weight& weight, Tensor& qkv,
+                                          Tensor& z, cudaStream_t stream) {
+    const std::int32_t cols = x.ne[1];
+    if (cols < 1) { throw std::invalid_argument("Q8 GDN column-invariant route requires T >= 1"); }
+    if (cols == 1) {
+        launch_active_cols<1>(x, weight, qkv, z, stream);
+    } else if (cols <= kLastProjectionExactCols) {
+        kProjectionLaunchers[cols - kFirstExactCols](x, weight, qkv, z, stream);
+    } else {
+        launch_sliced32(x, weight, qkv, z, stream);
     }
     CUDA_CHECK(cudaGetLastError());
 }

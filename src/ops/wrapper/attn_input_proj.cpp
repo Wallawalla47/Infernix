@@ -75,11 +75,10 @@ void require_bf16_contiguous(const Weight& weight, std::int32_t rows, std::int32
     }
 }
 
+// Every registered parent (BF16, NVFP4, FP8, Q8 [9216,2048], the Q4/Q5 pair) has a dedicated
+// column-invariant route.
 void validate_policy(LinearPolicy policy, QType qtype) {
-    if (column_invariant(policy) && qtype != QType::NVFP4 &&
-        qtype != QType::FP8_E4M3FN_ROW_BF16) {
-        throw std::invalid_argument("attn_input_proj: the weight format registers no column-invariant route");
-    }
+    (void)qtype;
     switch (policy) {
     case LinearPolicy::A16Only:
     case LinearPolicy::AllowA8:
@@ -109,7 +108,7 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
         require_matrix(k, kKvRows, cols, "k");
         require_matrix(v, kKvRows, cols, "v");
         require_bf16_contiguous(weight, kRows, kHidden, "query/key/gate/value weight");
-        detail::bf16_attn_input_dispatch(x, weight, q, gate, k, v, stream);
+        detail::bf16_attn_input_dispatch(x, weight, q, gate, k, v, stream, column_invariant(policy));
         return;
     }
 
@@ -165,7 +164,7 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
     require_matrix(k, kKvRows, cols, "k");
     require_matrix(v, kKvRows, cols, "v");
     require_q8_rowsplit(weight, kRows, kHidden, "query/key/gate/value weight");
-    detail::q8_attn_input_dispatch(x, weight, q, gate, k, v, stream);
+    detail::q8_attn_input_dispatch(x, weight, q, gate, k, v, stream, column_invariant(policy));
 }
 
 } // namespace
@@ -202,9 +201,9 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
             throw std::invalid_argument("attn_input_proj workspace: unsupported Q8 profile");
         }
         (void)detail::q8_attn_input_resolve_plan(
-            {input_rows, 4096, 512, parent_rows, input_rows, min_tokens});
+            {input_rows, 4096, 512, parent_rows, input_rows, min_tokens}, column_invariant(policy));
         (void)detail::q8_attn_input_resolve_plan(
-            {input_rows, 4096, 512, parent_rows, input_rows, max_tokens});
+            {input_rows, 4096, 512, parent_rows, input_rows, max_tokens}, column_invariant(policy));
         return 0;
     case QType::Q4_G64_FP16:
     case QType::Q5_G64_FP16:
@@ -219,6 +218,16 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
 void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
                      const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
                      cudaStream_t stream) {
+    attn_input_proj(x, query_key_weight, gate_value_weight, q, gate, k, v, LinearPolicy::A16Only,
+                    stream);
+}
+
+void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
+                     const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
+                     LinearPolicy policy, cudaStream_t stream) {
+    if (!valid_linear_policy(policy)) {
+        throw std::invalid_argument("attn_input_proj: invalid compute policy");
+    }
     constexpr std::int32_t kHidden = 5120;
     constexpr std::int32_t kQRows  = 6144;
     constexpr std::int32_t kKvRows = 1024;
@@ -232,7 +241,7 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
     require_rowsplit(gate_value_weight, QType::Q5_G64_FP16, kQRows + kKvRows, "gate/value weight");
 
     detail::q4_q5_attn_input_dispatch(x, query_key_weight, gate_value_weight, q, gate, k, v,
-                                      stream);
+                                      stream, column_invariant(policy));
 }
 
 void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight, Tensor& q,

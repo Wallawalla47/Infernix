@@ -11,6 +11,7 @@
 #include "ops/linear/q4/q4_gemv_launch.cuh"
 #include "ops/linear/q5/q5_simt_launch.cuh"
 #include "ops/linear/q5/q5_gemv_launch.cuh"
+#include "ops/linear/q5/q5_sliced_k_launch.cuh"
 
 #include <cuda_bf16.h>
 
@@ -228,7 +229,54 @@ void launch_t4_pdl(const Tensor& x, const Weight& qk_weight, const Weight& value
         LinearIdentityEpilogue{}, stream);
 }
 
+// The column-invariant routes. Each parent runs one sliced-K reduction at every width: the Q4
+// parent the exact route's 8 K-warp linear schedule of T=7..12 (token capacities 1..12, then 16,
+// 24 and 32 with wider calls sliced by 32), the Q5 parent the 4 K-warp linear schedule of
+// linear_add's exact route. Capacity, block rows, stages and token slicing change only staging and
+// predication, so a column's bits do not depend on the call's width.
+void launch_q4_invariant(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+    if (weight.padded_shape[1] != kHidden) {
+        throw std::invalid_argument("Q4/Q5 GDN K-split requires padded K == hidden");
+    }
+    const std::int32_t cols = x.ne[1];
+    if (cols <= 1) return launch_q4_sliced_exact<1>(x, weight, out, stream);
+    if (cols <= 2) return launch_q4_sliced_exact<2>(x, weight, out, stream);
+    if (cols <= 4) return launch_q4_sliced_exact<4>(x, weight, out, stream);
+    if (cols <= 6) return launch_q4_sliced_exact<6>(x, weight, out, stream);
+    if (cols <= 12) return launch_q4_sliced_band(x, weight, out, stream);
+    if (cols <= 16) return launch_q4_sliced_exact<16>(x, weight, out, stream);
+    if (cols <= 24) return launch_q4_sliced_exact<24>(x, weight, out, stream);
+    launch_q4_sliced_exact<32>(x, weight, out, stream);
+}
+
+template <class Schedule>
+void launch_q5_sliced(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
+                      cudaStream_t stream) {
+    static_assert(Schedule::kKWarps == 4 && Schedule::kReduction == Q5SlicedKReduction::Linear);
+    launch_q5_a16_sliced_k_mma<Schedule>(q5_linear_operands(x, weight), q5_projection_output(value, z),
+                                         LinearIdentityEpilogue{}, stream);
+}
+
+void launch_q5_invariant(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
+                         cudaStream_t stream) {
+    const std::int32_t cols = x.ne[1];
+    if (cols <= 8) return launch_q5_sliced<q5_instances::SlicedR16T8W4S2>(x, weight, value, z, stream);
+    if (cols <= 16) return launch_q5_sliced<q5_instances::SlicedR16T16W4S2>(x, weight, value, z, stream);
+    if (cols <= 24) return launch_q5_sliced<q5_instances::SlicedR16T24W4S2>(x, weight, value, z, stream);
+    launch_q5_sliced<q5_instances::SlicedR32T32W4S2>(x, weight, value, z, stream);
+}
+
 } // namespace
+
+void q4_q5_gdn_input_column_invariant_launch(const Tensor& x, const Weight& qk_weight,
+                                             const Weight& value_z_weight, Tensor& qk,
+                                             Tensor& value, Tensor& z, cudaStream_t stream) {
+    if (x.ne[1] < 1) {
+        throw std::invalid_argument("Q4/Q5 GDN column-invariant route requires T >= 1");
+    }
+    launch_q4_invariant(x, qk_weight, qk, stream);
+    launch_q5_invariant(x, value_z_weight, value, z, stream);
+}
 
 void q4_q5_gdn_input_independent_launch(const Tensor& x, const Weight& qk_weight,
                                         const Weight& value_z_weight, Tensor& qk, Tensor& value,

@@ -22,7 +22,20 @@ constexpr std::array kShapes{
     ShapeEntry{3456, 1152, select_q4_n3456_k1152},
     ShapeEntry{4304, 1152, select_q4_n4304_k1152},
 };
+
+// The proposal heads' column-invariant route: the four-K-warp sliced family at every width (the
+// 32-column launch takes wider calls 32 at a time). Its instances differ only in token capacity
+// and staging, so a column reduces identically whatever the call's width.
+Q4Launch select_q4_invariant(std::int32_t t) {
+    if (t <= 8) return launch_q4_a16_sliced_r32_t8_w4_s2;
+    if (t <= 16) return launch_q4_a16_sliced_r32_t16_w4_s1;
+    return launch_q4_a16_sliced_r32_t32_w4_s1;
+}
 } // namespace
+
+bool q4_column_invariant_route(std::int32_t n, std::int32_t k) noexcept {
+    return n == 131072 && (k == 5120 || k == 2048);
+}
 
 Q4Launch select_q4_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     if (t <= 0) throw std::invalid_argument("q4 linear: T must be positive");
@@ -33,8 +46,13 @@ Q4Launch select_q4_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
 }
 
 Q4Launch select_q4_launch(std::int32_t n, std::int32_t k, std::int32_t t, LinearPolicy policy) {
-    if (!valid_linear_policy(policy) || column_invariant(policy))
-        throw std::invalid_argument("q4 linear: unsupported policy");
+    if (!valid_linear_policy(policy)) throw std::invalid_argument("q4 linear: unsupported policy");
+    if (column_invariant(policy)) {
+        if (t <= 0) throw std::invalid_argument("q4 linear: T must be positive");
+        if (!q4_column_invariant_route(n, k))
+            throw std::invalid_argument("q4 linear: no column-invariant route for this problem");
+        return select_q4_invariant(t);
+    }
     return select_q4_a16_launch(n, k, t);
 }
 

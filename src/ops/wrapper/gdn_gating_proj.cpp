@@ -101,8 +101,9 @@ std::size_t gdn_norm_gating_proj_workspace_capacity_bytes(std::int32_t heads,
         throw std::invalid_argument("gdn_norm_gating_proj workspace: invalid compute policy");
     }
     if (column_invariant(policy)) {
-        // The fused 27B schedule runs at every T without workspace.
-        if (heads != 48 || input_rows != 5120 || min_tokens <= 0 || max_tokens < min_tokens) {
+        // The fused 27B and 35B-A3B schedules run at every T without workspace.
+        const bool fused = (heads == 48 && input_rows == 5120) || (heads == 32 && input_rows == 2048);
+        if (!fused || min_tokens <= 0 || max_tokens < min_tokens) {
             throw std::invalid_argument(
                 "gdn_norm_gating_proj workspace: no column-invariant schedule for this problem");
         }

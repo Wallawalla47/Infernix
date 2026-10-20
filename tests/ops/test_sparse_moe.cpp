@@ -588,6 +588,68 @@ public:
         return failures;
     }
 
+    // LinearPolicy::A16ColumnInvariant: the T-token call meets the oracle criterion, and every token
+    // column is bit-identical to that token run alone (decode), whatever T is.
+    int run_invariant(DeviceExecutionView execution, std::int32_t tokens) {
+        const std::string label =
+            std::string(profile_.name) + " column-invariant T=" + std::to_string(tokens);
+        const auto execute = [&](std::int32_t count, std::int32_t first_pattern,
+                                 std::vector<double>* reference) {
+            std::vector<float> input(static_cast<std::size_t>(kHidden) * count);
+            std::vector<float> residual(static_cast<std::size_t>(kHidden) * count);
+            if (reference != nullptr) { reference->resize(input.size()); }
+            for (std::int32_t token = 0; token < count; ++token) {
+                const int pattern =
+                    (first_pattern + token) % static_cast<int>(kRoutePatterns.size());
+                const auto offset = static_cast<std::ptrdiff_t>(token) * kHidden;
+                std::copy(inputs_[pattern].begin(), inputs_[pattern].end(), input.begin() + offset);
+                std::copy(residuals_[pattern].begin(), residuals_[pattern].end(),
+                          residual.begin() + offset);
+                if (reference != nullptr) {
+                    std::copy(references_[pattern].begin(), references_[pattern].end(),
+                              reference->begin() + offset);
+                }
+            }
+            const std::vector<std::uint16_t> residual_bits = bf16_bits(residual);
+            DeviceBuffer device_input = to_device(bf16_bits(input));
+            DeviceBuffer destination  = to_device(residual_bits);
+            ops::SparseMoeWeights weights{
+                dense_bf16_weight(device_router_.p, kExperts + 1, kHidden),
+                routed_gate_.weight(),
+                routed_down_.weight(),
+                shared_gate_.weight(),
+                shared_down_device_.weight(),
+            };
+            weights.policy = ops::LinearPolicy::A16ColumnInvariant;
+            Tensor x(device_input.p, DType::BF16, {kHidden, count});
+            Tensor out(destination.p, DType::BF16, {kHidden, count});
+            WorkspaceArena workspace(ops::sparse_moe_workspace_capacity_bytes(
+                weights.routed_gate_up.qtype, weights.routed_down.qtype, weights.policy, count,
+                count));
+            ops::sparse_moe(x, weights, ops::SparseMoeEpilogue::AddResidual, out, workspace,
+                            execution);
+            cuda_synchronize();
+            return from_device<std::uint16_t>(destination, residual_bits.size());
+        };
+        std::vector<double> reference;
+        const std::vector<std::uint16_t> wide = execute(tokens, 0, &reference);
+        std::vector<double> values(wide.size());
+        for (std::size_t index = 0; index < wide.size(); ++index) {
+            values[index] = bf16_to_f32(wide[index]);
+        }
+        int failures = compare_output(label, values, reference);
+        for (std::int32_t token = 0; token < tokens; ++token) {
+            const std::vector<std::uint16_t> alone = execute(1, token, nullptr);
+            if (!std::equal(alone.begin(), alone.end(),
+                            wide.begin() + static_cast<std::ptrdiff_t>(token) * kHidden)) {
+                std::cerr << label << ": token " << token << " differs from the token run alone\n";
+                ++failures;
+                break;
+            }
+        }
+        return failures;
+    }
+
     int verify_persistent_inputs() const {
         int failures = 0;
         failures += verify_exact((std::string(profile_.name) + " router preservation").c_str(),
@@ -646,6 +708,11 @@ int run_profile(DeviceExecutionView execution, const CodecProfile& profile) {
     if (interval != witness) {
         std::cerr << profile.name << ": interval workspace capacity missed a route witness\n";
         ++failures;
+    }
+    // The column-invariant route: decode, the small-T domain's edges and its 46-token slices (a
+    // one-token remainder at 47 runs decode).
+    for (const std::int32_t tokens : {2, 9, 46, 47, 48, 93, 129}) {
+        failures += fixture.run_invariant(execution, tokens);
     }
     failures += fixture.verify_persistent_inputs();
     return failures;

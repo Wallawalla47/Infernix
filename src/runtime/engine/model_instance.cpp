@@ -499,13 +499,21 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
     }
     summary.weight_formats.assign(formats.begin(), formats.end());
     {
-        const models::qwen3_5::FastPathSelection fast = models::qwen3_5::select_fast_paths(
-            *instance->model, options, instance->parameters.invariant_text.has_value());
+        const models::qwen3_5::FastPathSelection fast =
+            models::qwen3_5::select_fast_paths(*instance->model, options);
         summary.fast_path_configuration = models::qwen3_5::describe(fast.configuration);
         for (const FastPath path : fast.paths) { summary.fast_paths.emplace_back(fast_path_name(path)); }
         summary.fast_paths_disabled = !options.fast_paths;
-        summary.request_invariant   = fast.request_invariant();
-        summary.request_invariance_capable = fast.invariant_capable;
+        summary.request_invariant = fast.request_invariant();
+        // Decode and verification run the column-invariant parameters unless batched-decode runs.
+        if (fast.invariant(FastPath::BatchedDecode)) {
+            for (const auto& entry : instance->parameters.column_by_column) {
+                summary.column_by_column_projections.push_back(
+                    entry.role + " " + std::string(artifact::format_name(entry.qtype)) + " [" +
+                    std::to_string(entry.rows) + "," + std::to_string(entry.cols) + "] x" +
+                    std::to_string(entry.count));
+            }
+        }
         summary.prefill_chunk       = planned_prefill_chunk;
         if (fast.selected(FastPath::IdleWidePrefill)) { summary.idle_prefill_width = planned_idle_width; }
     }

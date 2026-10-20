@@ -28,6 +28,8 @@ const char* q4_q5_attn_input_schedule_name(Q4Q5AttnInputScheduleId schedule) noe
         return "attn_input_proj.q4_q5.mixed.r64.c128.s2";
     case Q4Q5AttnInputScheduleId::PairR32C64S4:
         return "attn_input_proj.q4_q5.pair.r32.c64.s4";
+    case Q4Q5AttnInputScheduleId::ColumnInvariant:
+        return "attn_input_proj.q4_q5.sliced.column_invariant";
     }
     return "attn_input_proj.q4_q5.unknown";
 }
@@ -36,11 +38,13 @@ bool q4_q5_attn_input_admits(const Q4Q5AttnInputProblem& problem) noexcept {
     return supported_shape(problem) && problem.cols >= 1;
 }
 
-Q4Q5AttnInputPlan q4_q5_attn_input_resolve_plan(const Q4Q5AttnInputProblem& problem) {
+Q4Q5AttnInputPlan q4_q5_attn_input_resolve_plan(const Q4Q5AttnInputProblem& problem,
+                                                bool column_invariant) {
     if (!q4_q5_attn_input_admits(problem)) {
         throw std::invalid_argument(
             "Q4/Q5 attention input: exact problem or column count is not admitted");
     }
+    if (column_invariant) return {Q4Q5AttnInputScheduleId::ColumnInvariant};
 
     if (problem.cols <= 12) return {Q4Q5AttnInputScheduleId::ParentSplitFixed};
     if (problem.cols <= 32) return {Q4Q5AttnInputScheduleId::MixedR32C32S2};
@@ -54,10 +58,10 @@ Q4Q5AttnInputPlan q4_q5_attn_input_resolve_plan(const Q4Q5AttnInputProblem& prob
 void q4_q5_attn_input_execute_plan(const Q4Q5AttnInputPlan& plan, const Tensor& x,
                                    const Weight& query_key_weight, const Weight& gate_value_weight,
                                    Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
-                                   cudaStream_t stream) {
+                                   cudaStream_t stream, bool column_invariant) {
     const Q4Q5AttnInputProblem problem{x.ne[0], q.ne[0], k.ne[0], query_key_weight.padded_shape[1],
                                        x.ne[1]};
-    const Q4Q5AttnInputPlan resolved = q4_q5_attn_input_resolve_plan(problem);
+    const Q4Q5AttnInputPlan resolved = q4_q5_attn_input_resolve_plan(problem, column_invariant);
     if (resolved.schedule != plan.schedule) {
         throw std::invalid_argument("Q4/Q5 attention input: plan does not match exact problem");
     }
@@ -87,18 +91,22 @@ void q4_q5_attn_input_execute_plan(const Q4Q5AttnInputPlan& plan, const Tensor& 
         q4_q5_attn_input_grouped_mma_r32_c64_s4_launch(x, query_key_weight, gate_value_weight, q,
                                                        gate, k, v, stream);
         return;
+    case Q4Q5AttnInputScheduleId::ColumnInvariant:
+        q4_q5_attn_input_column_invariant_launch(x, query_key_weight, gate_value_weight, q, gate,
+                                                 k, v, stream);
+        return;
     }
     throw std::logic_error("Q4/Q5 attention input: unknown schedule");
 }
 
 void q4_q5_attn_input_dispatch(const Tensor& x, const Weight& query_key_weight,
                                const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k,
-                               Tensor& v, cudaStream_t stream) {
+                               Tensor& v, cudaStream_t stream, bool column_invariant) {
     const Q4Q5AttnInputProblem problem{x.ne[0], q.ne[0], k.ne[0], query_key_weight.padded_shape[1],
                                        x.ne[1]};
-    const Q4Q5AttnInputPlan plan = q4_q5_attn_input_resolve_plan(problem);
+    const Q4Q5AttnInputPlan plan = q4_q5_attn_input_resolve_plan(problem, column_invariant);
     q4_q5_attn_input_execute_plan(plan, x, query_key_weight, gate_value_weight, q, gate, k, v,
-                                  stream);
+                                  stream, column_invariant);
 }
 
 } // namespace infernix::ops::detail

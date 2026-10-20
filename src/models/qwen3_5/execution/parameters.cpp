@@ -1,6 +1,10 @@
 #include "models/qwen3_5/execution/parameters.h"
 
 #include "core/weight_view.h"
+#include "infernix/ops/gdn_input_proj.h"
+#include "infernix/ops/linear.h"
+#include "infernix/ops/linear_add.h"
+#include "infernix/ops/linear_swiglu.h"
 
 #include <limits>
 #include <stdexcept>
@@ -314,34 +318,27 @@ Parameters::Parameters(const Model& source) : model(source) {
             ProposalParameters{prepare.linear(w.proposal->head), std::nullopt, w.proposal->rows};
         if (w.proposal->token_ids) { proposal->token_ids = prepare.tensor(*w.proposal->token_ids); }
     }
-    if (column_invariant_text_supported(text)) {
-        invariant_text = column_invariant_text(text);
-        constexpr std::pair<bool, bool> kModes[] = {{false, false}, {true, false}, {false, true}};
-        for (const auto [a8, a8_residual] : kModes) {
-            for (const auto [a4, a4_residual] : kModes) {
-                const DecodePrecision precision{a8, a4, a8_residual, a4_residual};
-                precision_text[precision_index(precision)] =
-                    precision_decode_text(text, precision);
-            }
+    // The exact route decodes and verifies request-invariant on every artifact; a projection with
+    // no dedicated column-invariant route runs its exact route once per column.
+    invariant_text = column_invariant_text(text);
+    if (mtp) { invariant_mtp = column_invariant_mtp(*mtp); }
+    if (proposal) {
+        invariant_proposal_head         = proposal->head;
+        invariant_proposal_head->policy = ops::LinearPolicy::A16ColumnInvariant;
+    }
+    column_by_column =
+        column_by_column_projections(invariant_text, invariant_mtp ? &*invariant_mtp : nullptr,
+                                     invariant_proposal_head ? &*invariant_proposal_head : nullptr);
+    constexpr std::pair<bool, bool> kModes[] = {{false, false}, {true, false}, {false, true}};
+    for (const auto [a8, a8_residual] : kModes) {
+        for (const auto [a4, a4_residual] : kModes) {
+            const DecodePrecision precision{a8, a4, a8_residual, a4_residual};
+            precision_text[precision_index(precision)] = precision_decode_text(text, precision);
         }
     }
 }
 
 namespace {
-
-bool fp8(const LinearParameters& p) { return p.weight.qtype == QType::FP8_E4M3FN_ROW_BF16; }
-bool nvfp4_or_fp8(const LinearParameters& p) { return fp8(p) || p.weight.qtype == QType::NVFP4; }
-
-bool single_nvfp4_or_fp8(const ops::ProjectionWeights& projection) {
-    const auto* single = std::get_if<ops::SingleProjectionWeight>(&projection);
-    return single != nullptr && nvfp4_or_fp8(*single);
-}
-
-// The vocabulary head: FP8, or Q8 at the 27B's [248320, 5120].
-bool invariant_head(const LinearParameters& p) {
-    return fp8(p) || (p.weight.qtype == QType::Q8_G32_FP16 && p.weight.n == 248320 &&
-                      p.weight.k == 5120);
-}
 
 void make_invariant(LinearParameters& p) { p.policy = ops::LinearPolicy::A16ColumnInvariant; }
 
@@ -370,45 +367,102 @@ void limit_precision(ops::ProjectionWeights& projection, DecodePrecision precisi
 void make_invariant(ops::ProjectionWeights& projection) {
     if (auto* single = std::get_if<ops::SingleProjectionWeight>(&projection)) {
         make_invariant(*single);
+    } else {
+        std::get<ops::PairedProjectionWeights>(projection).policy =
+            ops::LinearPolicy::A16ColumnInvariant;
+    }
+}
+
+void make_invariant(FfnParameters& ffn) {
+    if (auto* dense = std::get_if<DenseParameters>(&ffn)) {
+        make_invariant(dense->gate_up);
+        make_invariant(dense->down);
+    } else {
+        std::get<ops::SparseMoeWeights>(ffn).policy = ops::LinearPolicy::A16ColumnInvariant;
     }
 }
 
 } // namespace
 
-bool column_invariant_text_supported(const TextParameters& text) {
-    if (!invariant_head(text.output_head)) { return false; }
-    for (const BlockParameters& block : text.layers) {
-        const auto* dense = std::get_if<DenseParameters>(&block.ffn);
-        if (dense == nullptr || !nvfp4_or_fp8(dense->gate_up) || !nvfp4_or_fp8(dense->down)) {
-            return false;
-        }
-        if (const auto* attention = std::get_if<AttentionParameters>(&block.mixer)) {
-            if (!single_nvfp4_or_fp8(attention->projection) || !nvfp4_or_fp8(attention->output)) {
-                return false;
+std::vector<ColumnByColumnProjection>
+column_by_column_projections(const TextParameters& text, const MtpParameters* mtp,
+                             const LinearParameters* proposal_head) {
+    std::vector<ColumnByColumnProjection> out;
+    const auto note = [&](const char* role, const Weight& weight) {
+        for (ColumnByColumnProjection& entry : out) {
+            if (entry.role == role && entry.qtype == weight.qtype && entry.rows == weight.n &&
+                entry.cols == weight.k) {
+                ++entry.count;
+                return;
             }
+        }
+        out.push_back({role, weight.qtype, weight.n, weight.k, 1});
+    };
+    const Weight& head = text.output_head.weight;
+    if (!ops::linear_column_invariant_route(head.qtype, head.n, head.k)) { note("output head", head); }
+    for (const BlockParameters& block : text.layers) {
+        // A sparse MoE, every attention input parent, the Q4/Q5 pairs and the GDN control have
+        // dedicated routes.
+        if (const auto* dense = std::get_if<DenseParameters>(&block.ffn)) {
+            const Weight& gate_up = dense->gate_up.weight;
+            // Q6 gate/up runs as linear (execution::ffn).
+            const bool gate_up_route =
+                gate_up.qtype == QType::Q6_G64_FP16
+                    ? ops::linear_column_invariant_route(gate_up.qtype, gate_up.n, gate_up.k)
+                    : ops::linear_swiglu_column_invariant_route(gate_up.qtype, gate_up.n, gate_up.k);
+            if (!gate_up_route) { note("MLP gate/up", gate_up); }
+            const Weight& down = dense->down.weight;
+            if (!ops::linear_add_column_invariant_route(down.qtype, down.n, down.k)) {
+                note("MLP down", down);
+            }
+        }
+        const auto output = [&](const char* role, const LinearParameters& p) {
+            if (!ops::linear_add_column_invariant_route(p.weight.qtype, p.weight.n, p.weight.k)) {
+                note(role, p.weight);
+            }
+        };
+        if (const auto* attention = std::get_if<AttentionParameters>(&block.mixer)) {
+            output("attention output", attention->output);
         } else {
             const auto& gdn = std::get<GdnParameters>(block.mixer);
-            if (!single_nvfp4_or_fp8(gdn.projection) || !nvfp4_or_fp8(gdn.output)) {
-                return false;
+            if (const auto* single = std::get_if<LinearParameters>(&gdn.projection);
+                single != nullptr && !ops::gdn_input_proj_column_invariant_route(
+                                         single->weight.qtype, single->weight.n, single->weight.k)) {
+                note("GDN input", single->weight);
             }
-            // The control's column-invariant schedule is the 27B's [96, 5120] BF16 parent.
-            const auto* control = std::get_if<LinearParameters>(&gdn.control);
-            if (control == nullptr || control->weight.qtype != QType::BF16 ||
-                control->weight.n != 96 || control->weight.k != 5120) {
-                return false;
-            }
+            output("GDN output", gdn.output);
         }
     }
-    return true;
+    // The drafter's projections run as linear, its K/V row pair as two linear calls; the packed
+    // attention input of a MoE drafter (no row views) and its sparse MoE have dedicated routes.
+    const auto linear = [&](const char* role, const LinearParameters& p) {
+        if (!ops::linear_column_invariant_route(p.weight.qtype, p.weight.n, p.weight.k)) {
+            note(role, p.weight);
+        }
+    };
+    if (mtp != nullptr) {
+        linear("MTP input", mtp->input_projection);
+        if (mtp->projection.packed && mtp->projection.rows) {
+            linear("MTP attention input", *mtp->projection.packed);
+        } else if (!mtp->projection.packed && mtp->projection.rows) {
+            for (const LinearParameters& row : *mtp->projection.rows) { linear("MTP attention input", row); }
+        }
+        linear("MTP attention output", mtp->output);
+        if (const auto* dense = std::get_if<DenseParameters>(&mtp->ffn)) {
+            linear("MTP gate/up", dense->gate_up);
+            linear("MTP down", dense->down);
+        }
+        if (proposal_head == nullptr) { linear("MTP head", mtp->output_head); }
+    }
+    if (proposal_head != nullptr) { linear("MTP proposal head", *proposal_head); }
+    return out;
 }
 
 TextParameters column_invariant_text(const TextParameters& text) {
     TextParameters out = text;
     make_invariant(out.output_head);
     for (BlockParameters& block : out.layers) {
-        auto& dense = std::get<DenseParameters>(block.ffn);
-        make_invariant(dense.gate_up);
-        make_invariant(dense.down);
+        make_invariant(block.ffn);
         if (auto* attention = std::get_if<AttentionParameters>(&block.mixer)) {
             make_invariant(attention->projection);
             make_invariant(attention->output);
@@ -416,11 +470,22 @@ TextParameters column_invariant_text(const TextParameters& text) {
             auto& gdn = std::get<GdnParameters>(block.mixer);
             make_invariant(gdn.projection);
             make_invariant(gdn.output);
-            if (auto* control = std::get_if<LinearParameters>(&gdn.control)) {
-                make_invariant(*control);
-            }
+            make_invariant(gdn.control);
         }
     }
+    return out;
+}
+
+MtpParameters column_invariant_mtp(const MtpParameters& mtp) {
+    MtpParameters out = mtp;
+    make_invariant(out.input_projection);
+    if (out.projection.packed) { make_invariant(*out.projection.packed); }
+    if (out.projection.rows) {
+        for (LinearParameters& row : *out.projection.rows) { make_invariant(row); }
+    }
+    make_invariant(out.output);
+    make_invariant(out.ffn);
+    make_invariant(out.output_head);
     return out;
 }
 
@@ -429,9 +494,11 @@ TextParameters precision_decode_text(const TextParameters& text, DecodePrecision
     // The vocabulary head keeps 16-bit activations unless its class's one-term profile is on.
     limit_precision(out.output_head, {precision.a8, precision.a4, false, false}, false);
     for (BlockParameters& block : out.layers) {
-        auto& dense = std::get<DenseParameters>(block.ffn);
-        limit_precision(dense.gate_up, precision, true);
-        limit_precision(dense.down, precision, true);
+        // A sparse MoE runs A16 at every policy.
+        if (auto* dense = std::get_if<DenseParameters>(&block.ffn)) {
+            limit_precision(dense->gate_up, precision, true);
+            limit_precision(dense->down, precision, true);
+        }
         if (auto* attention = std::get_if<AttentionParameters>(&block.mixer)) {
             limit_precision(attention->projection, precision);
             limit_precision(attention->output, precision, false);

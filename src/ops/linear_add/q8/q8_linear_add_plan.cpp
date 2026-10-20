@@ -109,6 +109,7 @@ std::int32_t schedule_rows(Q8LinearAddScheduleId schedule) {
     case Q8LinearAddScheduleId::SplitKMmaExactT:
     case Q8LinearAddScheduleId::SplitKMmaCapacity:
     case Q8LinearAddScheduleId::GroupedSplitK:
+    case Q8LinearAddScheduleId::ColumnInvariant:
         break;
     }
     throw std::logic_error("q8 linear_add: exact-T schedule has no row tile");
@@ -144,6 +145,7 @@ std::int32_t schedule_cols(Q8LinearAddScheduleId schedule) {
     case Q8LinearAddScheduleId::SplitKMmaExactT:
     case Q8LinearAddScheduleId::SplitKMmaCapacity:
     case Q8LinearAddScheduleId::GroupedSplitK:
+    case Q8LinearAddScheduleId::ColumnInvariant:
         break;
     }
     throw std::logic_error("q8 linear_add: exact-T schedule is not token-sliced");
@@ -191,6 +193,8 @@ const char* q8_linear_add_schedule_name(Q8LinearAddScheduleId schedule) noexcept
         return "linear_add.q8.mma.r128.c64.residual";
     case Q8LinearAddScheduleId::MmaR128C80:
         return "linear_add.q8.mma.r128.c80.residual";
+    case Q8LinearAddScheduleId::ColumnInvariant:
+        return "linear_add.q8.splitk16.mma.column_invariant.residual";
     }
     return "linear_add.q8.unknown";
 }
@@ -206,9 +210,16 @@ bool q8_linear_add_admits(const Q8LinearAddProblem& problem) noexcept {
     return shape && problem.padded_k == problem.k && problem.cols >= 1;
 }
 
-Q8LinearAddPlan q8_linear_add_resolve_plan(const Q8LinearAddProblem& problem) {
+Q8LinearAddPlan q8_linear_add_resolve_plan(const Q8LinearAddProblem& problem,
+                                           bool column_invariant) {
     if (!q8_linear_add_admits(problem)) {
         throw std::invalid_argument("q8 linear_add: exact problem or column count is not admitted");
+    }
+    if (column_invariant) {
+        if (problem.rows != 2048 || problem.k != 4096) {
+            throw std::invalid_argument("q8 linear_add: the problem registers no column-invariant route");
+        }
+        return {Q8LinearAddScheduleId::ColumnInvariant};
     }
     const auto resolve_from = [&](const auto& routes) -> Q8LinearAddPlan {
         for (const RouteSpec& route : routes) {
@@ -223,11 +234,15 @@ Q8LinearAddPlan q8_linear_add_resolve_plan(const Q8LinearAddProblem& problem) {
 }
 
 void q8_linear_add_execute_plan(const Q8LinearAddPlan& plan, const Tensor& x, const Weight& w,
-                                Tensor& residual_out, cudaStream_t stream) {
+                                Tensor& residual_out, cudaStream_t stream, bool column_invariant) {
     const Q8LinearAddProblem problem{residual_out.ne[0], x.ne[0], w.padded_shape[1], x.ne[1]};
-    const Q8LinearAddPlan resolved = q8_linear_add_resolve_plan(problem);
+    const Q8LinearAddPlan resolved = q8_linear_add_resolve_plan(problem, column_invariant);
     if (resolved.schedule != plan.schedule) {
         throw std::invalid_argument("q8 linear_add: plan does not match the exact problem");
+    }
+    if (plan.schedule == Q8LinearAddScheduleId::ColumnInvariant) {
+        q8_linear_add_column_invariant_launch(x, w, residual_out, stream);
+        return;
     }
     if (plan.schedule == Q8LinearAddScheduleId::GroupedSplitK) {
         q8_linear_add_grouped_launch(x, w, residual_out, stream);
@@ -302,6 +317,7 @@ void q8_linear_add_execute_plan(const Q8LinearAddPlan& plan, const Tensor& x, co
             case Q8LinearAddScheduleId::GroupedSplitK:
             case Q8LinearAddScheduleId::SplitKMmaCapacity:
             case Q8LinearAddScheduleId::SplitKMmaExactT:
+            case Q8LinearAddScheduleId::ColumnInvariant:
                 break;
             }
             throw std::logic_error("q8 linear_add: unknown tiled schedule");
@@ -309,9 +325,10 @@ void q8_linear_add_execute_plan(const Q8LinearAddPlan& plan, const Tensor& x, co
 }
 
 void q8_linear_add_dispatch(const Tensor& x, const Weight& w, Tensor& residual_out,
-                            cudaStream_t stream) {
+                            cudaStream_t stream, bool column_invariant) {
     const Q8LinearAddProblem problem{residual_out.ne[0], x.ne[0], w.padded_shape[1], x.ne[1]};
-    q8_linear_add_execute_plan(q8_linear_add_resolve_plan(problem), x, w, residual_out, stream);
+    q8_linear_add_execute_plan(q8_linear_add_resolve_plan(problem, column_invariant), x, w,
+                               residual_out, stream, column_invariant);
 }
 
 } // namespace infernix::ops::detail

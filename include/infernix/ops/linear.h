@@ -115,6 +115,13 @@ enum class LinearRoutes : std::uint8_t {
                                                           std::int32_t max_tokens);
 
 /**
+ * Whether the problem registers a dedicated column-invariant route. Without one,
+ * LinearPolicy::A16ColumnInvariant runs the exact A16 route once per column.
+ */
+[[nodiscard]] bool linear_column_invariant_route(QType qtype, std::int32_t output_rows,
+                                                 std::int32_t input_rows) noexcept;
+
+/**
  * @brief Applies a bias-free matrix projection independently to every input column.
  *
  * @details The ideal mathematical result is
@@ -173,10 +180,11 @@ enum class LinearRoutes : std::uint8_t {
  * compute under every policy at every positive T. NVFP4 uses A16 for A16Only and
  * AllowA8; AllowA4 permits the private resolver to select either a qualified A16 route or
  * activation quantization to NVFP4 at every positive T. The selected route depends only on the
- * registered problem, T and `routes`. A16ColumnInvariant selects one A16 route per registered problem for
- * every T, so each column's result is independent of the call's other columns. NVFP4 and FP8
- * register it for their text problems and Q8 for the [248320, 5120] vocabulary head; the other
- * formats and problems reject it.
+ * registered problem, T and `routes`. A16ColumnInvariant makes each column's result independent of
+ * the call's width and other columns, on every registered problem: a problem with a dedicated
+ * column-invariant route (linear_column_invariant_route: FP8's text problems, Q8 [248320, 5120],
+ * Q6 [248320, 5120], [248320, 2048] and [34816, 5120]) runs one A16 route for every T; any other
+ * runs its exact A16 route once per column (T = 1 each).
  *
  * @par Routes
  * Under LinearRoutes::Q8SlicedK, Q8 `[16384,2560]` and `[2560,6144]` (Qwen3.8-Flash-Next's GDN q/k/v/z

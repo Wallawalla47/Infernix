@@ -20,7 +20,9 @@ constexpr int kFirstExactCols = 2;
 constexpr int kLastExactCols  = 48;
 using ProjectionLauncher      = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
-template <int Hidden, int ActiveCols>
+// Exact = false runs the ActiveCols schedule over every ActiveCols-column slice of a wider call
+// (runtime token count, one grid row per slice).
+template <int Hidden, int ActiveCols, bool Exact = true>
 void launch_active_cols(const Tensor& x, const Weight& weight, Tensor& residual_out,
                         cudaStream_t stream) {
     constexpr int TileCols = ActiveCols <= 8    ? 8
@@ -43,7 +45,7 @@ void launch_active_cols(const Tensor& x, const Weight& weight, Tensor& residual_
     auto* residual = static_cast<__nv_bfloat16*>(residual_out.data);
     const LinearBf16Output output{residual, kRows};
     launch_q8_a16_sliced_k_mma<
-        typename Schedule::template with_problem<Geometry::kInputRows, ActiveCols, true>>(
+        typename Schedule::template with_problem<Geometry::kInputRows, ActiveCols, Exact>>(
         q8_linear_operands(x, weight), output,
         LinearResidualAddEpilogue{{output.data, output.rows, 0}}, stream);
 }
@@ -90,6 +92,27 @@ void q8_linear_add_splitk_mma_launch(const Tensor& x, const Weight& weight, Tens
         kK6144ProjectionLaunchers[x.ne[1] - kFirstExactCols](x, weight, residual_out, stream);
     } else {
         kK4096ProjectionLaunchers[x.ne[1] - kFirstExactCols](x, weight, residual_out, stream);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// [2048,4096]: every width runs the 16 K-warp sliced-K reduction of the exact route's T=2..12
+// instances: T=1 its one-column instance, wider calls its T=12 schedule over 12-column slices. Tile,
+// scale staging, cache hints and token slicing change only staging and predication, so a column's
+// bits do not depend on the call's width.
+void q8_linear_add_column_invariant_launch(const Tensor& x, const Weight& weight,
+                                           Tensor& residual_out, cudaStream_t stream) {
+    constexpr int kLastW16Cols = 12;
+    const std::int32_t t       = x.ne[1];
+    if (weight.k != 4096 || t < 1) {
+        throw std::invalid_argument("Q8 linear_add column-invariant route requires K=4096, T >= 1");
+    }
+    if (t == 1) {
+        launch_active_cols<4096, 1>(x, weight, residual_out, stream);
+    } else if (t <= kLastW16Cols) {
+        kK4096ProjectionLaunchers[t - kFirstExactCols](x, weight, residual_out, stream);
+    } else {
+        launch_active_cols<4096, kLastW16Cols, false>(x, weight, residual_out, stream);
     }
     CUDA_CHECK(cudaGetLastError());
 }

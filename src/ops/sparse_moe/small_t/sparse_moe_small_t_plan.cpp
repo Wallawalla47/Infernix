@@ -21,7 +21,7 @@ std::size_t sparse_moe_small_t_workspace_bytes(std::int32_t tokens) {
 }
 
 SparseMoeSmallTPlan resolve_sparse_moe_small_t_plan(std::int32_t tokens, QType routed_gate_up,
-                                                    QType routed_down) {
+                                                    QType routed_down, bool column_invariant) {
     if (!sparse_moe_uses_small_t(tokens)) {
         throw std::invalid_argument("sparse_moe small-T: unsupported token count");
     }
@@ -35,6 +35,7 @@ SparseMoeSmallTPlan resolve_sparse_moe_small_t_plan(std::int32_t tokens, QType r
     }
 
     SparseMoeSmallTPlan plan{tokens, sparse_moe_small_t_workspace_bytes(tokens)};
+    plan.column_invariant = column_invariant;
     if (mtp_profile) {
         plan.d3_schedule =
             tokens <= 5 ? SparseMoeSmallTD3Schedule::Paths1 : SparseMoeSmallTD3Schedule::Paths9;

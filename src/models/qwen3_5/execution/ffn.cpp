@@ -16,8 +16,8 @@ std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t fi
                                 ops::LinearRoutes gate_up_routes) {
     if (first <= 0 || last < first) { throw std::invalid_argument("FFN: invalid column interval"); }
     if (const auto* moe = std::get_if<ops::SparseMoeWeights>(&parameters)) {
-        return ops::sparse_moe_workspace_capacity_bytes(moe->routed_gate_up.qtype,
-                                                        moe->routed_down.qtype, first, last);
+        return ops::sparse_moe_workspace_capacity_bytes(
+            moe->routed_gate_up.qtype, moe->routed_down.qtype, moe->policy, first, last);
     }
     const auto& p    = std::get<DenseParameters>(parameters);
     const auto& gu   = p.gate_up.weight;

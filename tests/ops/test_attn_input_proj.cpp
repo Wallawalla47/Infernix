@@ -97,9 +97,11 @@ int run_target_projection_case(DevicePackedWeight& parent, DevicePackedWeight* g
         single != nullptr && use != policy) {
         single->policy = policy;
     }
+    if (auto* pair = std::get_if<ops::PairedProjectionWeights>(&prepared)) { pair->policy = policy; }
     const auto launch = [&] {
         if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&prepared)) {
-            ops::attn_input_proj(x, pair->first, pair->second, q, g, k, v, device.stream);
+            ops::attn_input_proj(x, pair->first, pair->second, q, g, k, v, pair->policy,
+                                 device.stream);
         } else {
             const auto& single = std::get<ops::SingleProjectionWeight>(prepared);
             ops::attn_input_proj(x, single.weight, q, g, k, v, single.policy, workspace,
@@ -185,6 +187,14 @@ int run_q4_q5() {
     for (int t : {1, 7, 8, 9, 12, 13, 16, 32, 63, 64, 65, 96, 104, 105, 127, 128, 129, 192, 193})
         failures +=
             run_target_projection_case(query_key, &gate_value, t, ops::LinearPolicy::A16Only, true);
+    // The column-invariant route (decode and verification of the request-invariant exact route):
+    // the Q4 capacity steps and the Q5 tile steps, and the 32-column slices of wider calls.
+    for (int t : {1, 2, 3, 5, 6, 7, 8, 9, 12, 13, 16, 17, 24, 25, 32, 33, 64, 65, 129, 512})
+        failures += run_target_projection_case(query_key, &gate_value, t,
+                                               ops::LinearPolicy::A16ColumnInvariant);
+    for (int t : {1, 9, 33})
+        failures += run_target_projection_case(query_key, &gate_value, t,
+                                               ops::LinearPolicy::A16ColumnInvariant, true);
     return failures;
 }
 
@@ -521,7 +531,8 @@ int run_fp8_target() {
     return failures;
 }
 
-int run_q8_target_case(DevicePackedWeight& parent, std::int32_t tokens) {
+int run_q8_target_case(DevicePackedWeight& parent, std::int32_t tokens,
+                       ops::LinearPolicy policy = ops::LinearPolicy::A16Only) {
     constexpr std::int32_t kHidden      = 2048;
     constexpr std::int32_t kQRows       = 4096;
     constexpr std::int32_t kKvRows      = 512;
@@ -538,10 +549,16 @@ int run_q8_target_case(DevicePackedWeight& parent, std::int32_t tokens) {
     Tensor g = gate.tensor();
     Tensor k = key.tensor();
     Tensor v = value.tensor();
-    ops::attn_input_proj(x, parent.view(), q, g, k, v, nullptr);
+    const std::size_t capacity = ops::attn_input_proj_workspace_capacity_bytes(
+        QType::Q8_G32_FP16, 9216, kHidden, policy, tokens, tokens);
+    GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 1));
+    DeviceArena workspace(DeviceSpan{scratch.data(), std::max<std::size_t>(capacity, 1)});
+    ops::attn_input_proj(x, parent.view(), q, g, k, v, policy, workspace, nullptr);
     cuda_synchronize();
 
-    const std::string suffix = " Q8 target A16 T=" + std::to_string(tokens);
+    const std::string suffix = std::string(ops::column_invariant(policy) ? " Q8 target invariant T="
+                                                                         : " Q8 target A16 T=") +
+                               std::to_string(tokens);
     int failures             = 0;
     failures += verify_output("attn q" + suffix, query, parent.host, 0, kQRows, activation, kHidden,
                               tokens);
@@ -563,6 +580,10 @@ int run_q8_target() {
     int failures = 0;
     for (const std::int32_t tokens : {1, 2, 17, 48, 64, 65, 129}) {
         failures += run_q8_target_case(parent, tokens);
+    }
+    // The column-invariant route: one column, the exact instances' range and its 48-column slices.
+    for (const std::int32_t tokens : {1, 2, 48, 49, 96, 97, 129, 512}) {
+        failures += run_q8_target_case(parent, tokens, ops::LinearPolicy::A16ColumnInvariant);
     }
     return failures;
 }

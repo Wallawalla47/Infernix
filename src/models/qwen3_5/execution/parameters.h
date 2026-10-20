@@ -9,6 +9,7 @@
 #include <limits>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <variant>
 #include <vector>
 
@@ -24,6 +25,14 @@ using LinearParameters = ops::SingleProjectionWeight;
                    !ops::column_invariant(p.policy)
                ? ops::LinearPolicy::A16Only
                : p.policy;
+}
+
+// The compute policy a projection's single parent or pair runs with.
+[[nodiscard]] inline ops::LinearPolicy projection_policy(const ops::ProjectionWeights& projection) {
+    if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&projection)) {
+        return pair->policy;
+    }
+    return std::get<LinearParameters>(projection).policy;
 }
 
 [[nodiscard]] inline std::int32_t dimension(std::uint64_t value) {
@@ -145,14 +154,27 @@ struct ProposalParameters {
 };
 
 // The exact route's request invariance runs decode and verification under
-// LinearPolicy::A16ColumnInvariant, which needs a column-invariant route for every Text
-// projection: single-parent NVFP4 or FP8 attention and GDN input projections, NVFP4 or FP8 output
-// and dense MLP projections, an FP8 or Q8 vocabulary head, and the 27B's BF16 GDN control parent.
-// Other artifacts run the exact route without request invariance.
-[[nodiscard]] bool column_invariant_text_supported(const TextParameters& text);
-// `text` with every projection's policy LinearPolicy::A16ColumnInvariant, the GDN control
-// included (its fused norm and gating keep one schedule at every width).
+// LinearPolicy::A16ColumnInvariant. A projection whose problem registers no dedicated
+// column-invariant route runs its exact one-column route once per column (slower, same guarantee).
+// One entry per role, format and shape, with the number of projections it covers.
+struct ColumnByColumnProjection {
+    std::string role;
+    QType qtype = QType::BF16;
+    std::int32_t rows = 0;
+    std::int32_t cols = 0;
+    std::int32_t count = 0;
+};
+[[nodiscard]] std::vector<ColumnByColumnProjection>
+column_by_column_projections(const TextParameters& invariant_text,
+                             const MtpParameters* invariant_mtp = nullptr,
+                             const LinearParameters* invariant_proposal_head = nullptr);
+// `text` with every projection's policy LinearPolicy::A16ColumnInvariant: paired parents, the
+// sparse MoE and the GDN control included (its fused norm and gating keep one schedule at every
+// width).
 [[nodiscard]] TextParameters column_invariant_text(const TextParameters& text);
+// `mtp` likewise: the drafter of batched decode and verification rounds, whose draft tokens decide
+// which sampled tokens a round accepts.
+[[nodiscard]] MtpParameters column_invariant_mtp(const MtpParameters& mtp);
 // The activation precision each projection class may take in batched decode and verification.
 // The one-term permission takes precedence over its residual profile.
 struct DecodePrecision {
@@ -184,10 +206,11 @@ public:
     const Model& model;
     TextParameters text;
     // `text` under LinearPolicy::A16ColumnInvariant, which the exact route's decode and
-    // verification run when the artifact supports it (column_invariant_text_supported).
-    std::optional<TextParameters> invariant_text;
+    // verification run (every artifact), and its projections that run column by column.
+    TextParameters invariant_text;
+    std::vector<ColumnByColumnProjection> column_by_column;
     // `text` for batched decode and verification under each DecodePrecision, indexed by
-    // precision_index (built with invariant_text; precision_decode_text).
+    // precision_index (precision_decode_text).
     std::array<std::optional<TextParameters>, 9> precision_text;
 
     [[nodiscard]] static constexpr std::size_t precision_index(DecodePrecision precision) noexcept {
@@ -200,7 +223,7 @@ public:
     // with the selected low-precision permissions.
     [[nodiscard]] const TextParameters& decode_text(bool column_invariant,
                                                     DecodePrecision precision) const noexcept {
-        if (column_invariant && invariant_text) { return *invariant_text; }
+        if (column_invariant) { return invariant_text; }
         const std::size_t index = precision_index(precision);
         if (precision_text[index]) { return *precision_text[index]; }
         return text;
@@ -209,6 +232,10 @@ public:
     std::optional<VisionParameters> vision;
     std::optional<DraftParameters> draft;
     std::optional<ProposalParameters> proposal;
+    // `mtp` and the proposal head under LinearPolicy::A16ColumnInvariant, which the exact route's
+    // batched draft calls run with (TextContext::mtp_forward_decode_batch, mtp_propose_batch).
+    std::optional<MtpParameters> invariant_mtp;
+    std::optional<LinearParameters> invariant_proposal_head;
 };
 
 } // namespace infernix::models::qwen3_5::execution

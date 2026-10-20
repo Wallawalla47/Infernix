@@ -441,7 +441,8 @@ int run_batched_case(std::string_view label, std::int32_t hidden, std::int32_t v
 }
 
 int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_weight,
-                   std::int32_t tokens, std::int32_t initial_slot, bool full_reference = false) {
+                   std::int32_t tokens, std::int32_t initial_slot, bool full_reference = false,
+                   ops::LinearPolicy policy = ops::LinearPolicy::A16Only) {
     constexpr std::int32_t kHidden           = 5120;
     constexpr std::int32_t kValueRows        = 6144;
     constexpr std::int32_t kZRows            = 6144;
@@ -477,11 +478,11 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_we
     Tensor v                          = value.tensor();
     Tensor z_output                   = z.tensor();
     const std::size_t workspace_bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-        kQueryRows, kKeyRows, kValueRows, 1, tokens, tokens);
+        kQueryRows, kKeyRows, kValueRows, policy, 1, tokens, tokens);
     WorkspaceArena workspace(std::max<std::size_t>(1, workspace_bytes));
 
     ops::gdn_input_proj_conv_snapshot(x, query_key.view(), value_z_weight.view(), conv, conv_state,
-                                      Tensor{}, initial, snapshot_base, q, k, v, z_output,
+                                      Tensor{}, initial, snapshot_base, q, k, v, z_output, policy,
                                       workspace, nullptr);
     cuda_synchronize();
 
@@ -502,8 +503,9 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_we
         full_reference);
     const std::int32_t sample_count              = snapshot_sample_count(tokens, full_reference);
     const std::vector<std::uint16_t> state_after = state.bits();
-    const std::string suffix                     = " Q4/Q5 A16 T=" + std::to_string(tokens) +
-                               " initial=" + std::to_string(initial_slot) +
+    const std::string suffix = std::string(ops::column_invariant(policy) ? " Q4/Q5 invariant T="
+                                                                         : " Q4/Q5 A16 T=") +
+                               std::to_string(tokens) + " initial=" + std::to_string(initial_slot) +
                                " base=" + std::to_string(kSnapshotBaseSlot);
     int failures = verify_snapshot_outputs(suffix, query, key, value, kValueRows, tokens, oracle,
                                            kGdnInputProjConvSnapshotA16Tolerance, full_reference);
@@ -570,6 +572,12 @@ int run_q4_q5() {
     // routes.
     for (const std::int32_t tokens : {32, 33, 64}) {
         failures += run_q4_q5_case(query_key, value_z_weight, tokens, tokens + 1);
+    }
+    // The column-invariant policy composes the invariant projection and the convolution at every
+    // width, including the fused widths 1..3, 5 and 6 of the default route.
+    for (const std::int32_t tokens : {1, 2, 3, 5, 6, 9, 33}) {
+        failures += run_q4_q5_case(query_key, value_z_weight, tokens, tokens + 1, tokens <= 9,
+                                   ops::LinearPolicy::A16ColumnInvariant);
     }
     constexpr std::int32_t kValueRows    = 6144;
     constexpr std::int32_t kZRows        = 6144;

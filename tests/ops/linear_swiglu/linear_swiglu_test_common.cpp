@@ -323,7 +323,8 @@ void validate_profile(const Profile& profile) {
          profile.activation_compute != ActivationCompute::A8 &&
          profile.activation_compute != ActivationCompute::A8Residual && !invariant) ||
         (q4_w4a8 && profile.activation_compute != ActivationCompute::A8Int) ||
-        (!nvfp4 && !fp8 && !q4_w4a8 && profile.activation_compute != ActivationCompute::A16) ||
+        (!nvfp4 && !fp8 && !q4_w4a8 && profile.activation_compute != ActivationCompute::A16 &&
+         !(q4 && invariant)) ||
         (profile.pattern == ActivationPattern::Int8Representable &&
          profile.activation_compute != ActivationCompute::A8Int)) {
         throw std::invalid_argument("linear_swiglu test: invalid activation-compute profile");

@@ -10,6 +10,7 @@
 #include "ops/linear/q4/q4_gemv_launch.cuh"
 #include "ops/linear/q5/q5_simt_launch.cuh"
 #include "ops/linear/q5/q5_gemv_launch.cuh"
+#include "ops/linear/q5/q5_sliced_k_launch.cuh"
 
 #include <cuda_bf16.h>
 
@@ -214,6 +215,51 @@ void launch_q5(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& valu
     throw std::invalid_argument("attention Q5 split-output requires T in [1,12]");
 }
 
+// The column-invariant routes. Each parent runs one sliced-K reduction at every width: the Q4
+// parent the exact route's 8 K-warp linear schedule of T=7..12 (token capacities 1..12, then 16,
+// 24 and 32 with wider calls sliced by 32), the Q5 parent the 4 K-warp linear schedule of
+// linear_add's exact route. Capacity, block rows, stages and token slicing change only staging and
+// predication, so a column's bits do not depend on the call's width.
+template <std::int32_t Capacity>
+void launch_q4_sliced_capacity(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key,
+                               cudaStream_t stream) {
+    launch_q4_sliced_exact<Capacity>(x, weight, q, key, stream);
+}
+
+void launch_q4_invariant(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key,
+                         cudaStream_t stream) {
+    if (weight.padded_shape[1] != kHidden) {
+        throw std::invalid_argument("attention Q4 K-split requires padded K == hidden");
+    }
+    const std::int32_t cols = x.ne[1];
+    if (cols <= 1) return launch_q4_sliced_capacity<1>(x, weight, q, key, stream);
+    if (cols <= 2) return launch_q4_sliced_capacity<2>(x, weight, q, key, stream);
+    if (cols <= 4) return launch_q4_sliced_capacity<4>(x, weight, q, key, stream);
+    if (cols <= 6) return launch_q4_sliced_capacity<6>(x, weight, q, key, stream);
+    if (cols <= 12) return launch_q4_sliced_band(x, weight, q, key, stream);
+    if (cols <= 16) return launch_q4_sliced_capacity<16>(x, weight, q, key, stream);
+    if (cols <= 24) return launch_q4_sliced_capacity<24>(x, weight, q, key, stream);
+    launch_q4_sliced_capacity<32>(x, weight, q, key, stream);
+}
+
+template <class Schedule>
+void launch_q5_sliced(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& value,
+                      cudaStream_t stream) {
+    static_assert(Schedule::kKWarps == 4 && Schedule::kReduction == Q5SlicedKReduction::Linear);
+    launch_q5_a16_sliced_k_mma<Schedule>(q5_linear_operands(x, weight),
+                                         q5_projection_output(gate, value),
+                                         LinearIdentityEpilogue{}, stream);
+}
+
+void launch_q5_invariant(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& value,
+                         cudaStream_t stream) {
+    const std::int32_t cols = x.ne[1];
+    if (cols <= 8) return launch_q5_sliced<q5_instances::SlicedR16T8W4S2>(x, weight, gate, value, stream);
+    if (cols <= 16) return launch_q5_sliced<q5_instances::SlicedR16T16W4S2>(x, weight, gate, value, stream);
+    if (cols <= 24) return launch_q5_sliced<q5_instances::SlicedR16T24W4S2>(x, weight, gate, value, stream);
+    launch_q5_sliced<q5_instances::SlicedR32T32W4S2>(x, weight, gate, value, stream);
+}
+
 } // namespace
 
 void q4_q5_attn_input_small_t_launch(const Tensor& x, const Weight& query_key_weight,
@@ -221,6 +267,17 @@ void q4_q5_attn_input_small_t_launch(const Tensor& x, const Weight& query_key_we
                                      Tensor& k, Tensor& v, cudaStream_t stream) {
     launch_q4(x, query_key_weight, q, k, stream);
     launch_q5(x, gate_value_weight, gate, v, stream);
+}
+
+void q4_q5_attn_input_column_invariant_launch(const Tensor& x, const Weight& query_key_weight,
+                                              const Weight& gate_value_weight, Tensor& q,
+                                              Tensor& gate, Tensor& k, Tensor& v,
+                                              cudaStream_t stream) {
+    if (x.ne[1] < 1) {
+        throw std::invalid_argument("attention Q4/Q5 column-invariant route requires T >= 1");
+    }
+    launch_q4_invariant(x, query_key_weight, q, k, stream);
+    launch_q5_invariant(x, gate_value_weight, gate, v, stream);
 }
 
 } // namespace infernix::ops::detail

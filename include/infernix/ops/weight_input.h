@@ -24,6 +24,8 @@ struct SingleProjectionWeight {
 
 struct PairedProjectionWeights {
     Weight first, second;
+    // A16 at every policy; A16ColumnInvariant selects the column-invariant routes.
+    LinearPolicy policy = LinearPolicy::A16Only;
 };
 
 using ProjectionWeights = std::variant<SingleProjectionWeight, PairedProjectionWeights>;

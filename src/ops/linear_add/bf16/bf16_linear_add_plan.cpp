@@ -36,7 +36,14 @@ const char* bf16_linear_add_schedule_name(Bf16LinearAddScheduleId schedule) noex
 }
 
 void bf16_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,
-                              cudaStream_t stream) {
+                              cudaStream_t stream, bool column_invariant) {
+    if (column_invariant) {
+        if (!bf16_linear_add_admits(weight.n, weight.k, x.ne[1])) {
+            throw std::invalid_argument("bf16 linear_add: unsupported exact problem");
+        }
+        bf16_linear_add_column_invariant_launch(x, weight, residual, stream);
+        return;
+    }
     switch (bf16_linear_add_select(weight.n, weight.k, x.ne[1])) {
     case Bf16LinearAddScheduleId::Decode:
         bf16_linear_add_decode_launch(x, weight, residual, stream);

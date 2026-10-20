@@ -107,6 +107,8 @@ const char* q4_linear_swiglu_schedule_name(Q4LinearSwiGluScheduleId schedule) no
         return "linear_swiglu.q4.mma.split_half_pair.r32.c128.narrow_tail";
     case Q4LinearSwiGluScheduleId::W4A8:
         return "linear_swiglu.q4.w4a8.mma_s8";
+    case Q4LinearSwiGluScheduleId::SmallTTiledColumnInvariant:
+        return "linear_swiglu.q4.mma.small_t.column_invariant";
     }
     return "linear_swiglu.q4.unknown";
 }
@@ -116,7 +118,7 @@ bool q4_linear_swiglu_admits(const Q4LinearSwiGluProblem& problem) noexcept {
 }
 
 Q4LinearSwiGluPlan q4_linear_swiglu_resolve_plan(const Q4LinearSwiGluProblem& problem,
-                                                 LinearRoutes routes) {
+                                                 LinearRoutes routes, bool column_invariant) {
     if (!q4_linear_swiglu_admits(problem)) {
         throw std::invalid_argument(
             "q4 linear_swiglu: exact problem or column count is not admitted");
@@ -124,6 +126,7 @@ Q4LinearSwiGluPlan q4_linear_swiglu_resolve_plan(const Q4LinearSwiGluProblem& pr
     if (!valid_linear_routes(routes)) {
         throw std::invalid_argument("q4 linear_swiglu: invalid route flags");
     }
+    if (column_invariant) { return {Q4LinearSwiGluScheduleId::SmallTTiledColumnInvariant, 0, routes}; }
     if (selects_w4a8(routes, problem.cols)) {
         return {Q4LinearSwiGluScheduleId::W4A8, w4a8_workspace_bytes(problem.cols, problem.k),
                 routes};
@@ -142,7 +145,8 @@ Q4LinearSwiGluPlan q4_linear_swiglu_resolve_plan(const Q4LinearSwiGluProblem& pr
             plan.workspace_bytes = materialized_workspace_bytes(problem.gate_up_rows, problem.cols);
             return plan;
         case Q4LinearSwiGluScheduleId::W4A8:
-            break; // not an exact-route catalog entry
+        case Q4LinearSwiGluScheduleId::SmallTTiledColumnInvariant:
+            break; // not exact-route catalog entries
         }
     }
     throw std::logic_error("q4 linear_swiglu: admitted problem has no covering route");
@@ -151,9 +155,14 @@ Q4LinearSwiGluPlan q4_linear_swiglu_resolve_plan(const Q4LinearSwiGluProblem& pr
 std::size_t q4_linear_swiglu_capacity_workspace_bytes(std::int32_t gate_up_rows,
                                                       std::int32_t output_rows, std::int32_t k,
                                                       std::int32_t padded_k, std::int32_t min_cols,
-                                                      std::int32_t max_cols, LinearRoutes routes) {
+                                                      std::int32_t max_cols, LinearRoutes routes,
+                                                      bool column_invariant) {
     if (min_cols <= 0 || max_cols < min_cols) {
         throw std::invalid_argument("q4 linear_swiglu: invalid column interval");
+    }
+    if (column_invariant) {
+        (void)q4_linear_swiglu_resolve_plan({gate_up_rows, output_rows, k, padded_k, max_cols}, routes, true);
+        return 0;
     }
     (void)q4_linear_swiglu_resolve_plan({gate_up_rows, output_rows, k, padded_k, min_cols}, routes);
     (void)q4_linear_swiglu_resolve_plan({gate_up_rows, output_rows, k, padded_k, max_cols}, routes);
@@ -181,9 +190,9 @@ std::size_t q4_linear_swiglu_capacity_workspace_bytes(std::int32_t gate_up_rows,
 }
 
 void q4_linear_swiglu_execute_plan(const Q4LinearSwiGluPlan& plan, const Tensor& x, const Weight& w,
-                                   Tensor& out, WorkspaceArena& ws, cudaStream_t stream) {
+                                   Tensor& out, WorkspaceArena& ws, cudaStream_t stream, bool column_invariant) {
     const Q4LinearSwiGluProblem problem{w.n, out.ne[0], x.ne[0], w.padded_shape[1], x.ne[1]};
-    const Q4LinearSwiGluPlan resolved = q4_linear_swiglu_resolve_plan(problem, plan.routes);
+    const Q4LinearSwiGluPlan resolved = q4_linear_swiglu_resolve_plan(problem, plan.routes, column_invariant);
     if (resolved.schedule != plan.schedule || resolved.workspace_bytes != plan.workspace_bytes) {
         throw std::invalid_argument("q4 linear_swiglu: plan does not match the exact problem");
     }
@@ -212,15 +221,18 @@ void q4_linear_swiglu_execute_plan(const Q4LinearSwiGluPlan& plan, const Tensor&
     case Q4LinearSwiGluScheduleId::W4A8:
         q4_linear_swiglu_w4a8_launch(x, w, out, ws, stream);
         return;
+    case Q4LinearSwiGluScheduleId::SmallTTiledColumnInvariant:
+        q4_linear_swiglu_small_t_invariant_launch(x, w, out, stream);
+        return;
     }
     throw std::logic_error("q4 linear_swiglu: unknown schedule");
 }
 
 void q4_linear_swiglu_dispatch(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
-                               cudaStream_t stream, LinearRoutes routes) {
+                               cudaStream_t stream, LinearRoutes routes, bool column_invariant) {
     const Q4LinearSwiGluProblem problem{w.n, out.ne[0], x.ne[0], w.padded_shape[1], x.ne[1]};
-    const Q4LinearSwiGluPlan plan = q4_linear_swiglu_resolve_plan(problem, routes);
-    q4_linear_swiglu_execute_plan(plan, x, w, out, ws, stream);
+    const Q4LinearSwiGluPlan plan = q4_linear_swiglu_resolve_plan(problem, routes, column_invariant);
+    q4_linear_swiglu_execute_plan(plan, x, w, out, ws, stream, column_invariant);
 }
 
 } // namespace infernix::ops::detail

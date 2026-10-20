@@ -162,10 +162,31 @@ void validate_weights(const SparseMoeWeights& weights, std::vector<AddressRange>
 
 std::size_t sparse_moe_workspace_capacity_bytes(QType routed_gate_up, QType routed_down,
                                                 std::int32_t min_tokens, std::int32_t max_tokens) {
+    return sparse_moe_workspace_capacity_bytes(routed_gate_up, routed_down, LinearPolicy::A16Only,
+                                               min_tokens, max_tokens);
+}
+
+std::size_t sparse_moe_workspace_capacity_bytes(QType routed_gate_up, QType routed_down,
+                                                LinearPolicy policy, std::int32_t min_tokens,
+                                                std::int32_t max_tokens) {
+    if (!valid_linear_policy(policy)) {
+        throw std::invalid_argument("sparse_moe workspace: invalid compute policy");
+    }
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("sparse_moe workspace: invalid token interval");
     }
     (void)detail::resolve_sparse_moe_decode_plan(routed_gate_up, routed_down);
+    if (column_invariant(policy)) {
+        // T=1 runs decode; wider calls run small-T slices of at most kSparseMoeSmallTMax tokens
+        // (a one-token remainder runs decode).
+        std::size_t required = detail::sparse_moe_decode_workspace_bytes();
+        if (max_tokens >= detail::kSparseMoeSmallTMin) {
+            const std::int32_t widest = std::min(max_tokens, detail::kSparseMoeSmallTMax);
+            (void)detail::resolve_sparse_moe_small_t_plan(widest, routed_gate_up, routed_down, true);
+            required = std::max(required, detail::sparse_moe_small_t_workspace_bytes(widest));
+        }
+        return required;
+    }
 
     const bool q8_profile =
         routed_gate_up == QType::Q8_G32_FP16 && routed_down == QType::Q8_G32_FP16;
@@ -217,6 +238,49 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
     ranges.push_back(address_range(x.data, x.bytes(), "x"));
     ranges.push_back(address_range(destination.data, destination.bytes(), "destination"));
     validate_weights(weights, ranges);
+    if (!valid_linear_policy(weights.policy)) {
+        throw std::invalid_argument("sparse_moe: invalid compute policy");
+    }
+
+    if (column_invariant(weights.policy)) {
+        // The request-invariant exact route: decode for one token, small-T slices of at most
+        // kSparseMoeSmallTMax tokens otherwise (a one-token remainder runs decode). Per token the
+        // two routes compute the same router reduction and the same expert arithmetic.
+        const std::size_t required = sparse_moe_workspace_capacity_bytes(
+            weights.routed_gate_up.qtype, weights.routed_down.qtype, weights.policy, tokens, tokens);
+        if (workspace.base() == nullptr || workspace.capacity() < required ||
+            workspace.used() > workspace.capacity() - required) {
+            throw std::invalid_argument("sparse_moe: insufficient workspace capacity");
+        }
+        ranges.push_back(address_range(workspace.base(), workspace.capacity(), "workspace"));
+        require_disjoint(ranges);
+        nvtx::ScopedRange moe_range(tokens == 1 ? nvtx::Name::SparseMoeDecode
+                                                : nvtx::Name::SparseMoeSmallT,
+                                    nvtx::Category::Moe, static_cast<std::uint64_t>(tokens));
+        for (std::int32_t offset = 0; offset < tokens;) {
+            const std::int32_t count = std::min(tokens - offset, detail::kSparseMoeSmallTMax);
+            const Tensor x_slice     = x.slice(1, offset, count);
+            Tensor destination_slice = destination.slice(1, offset, count);
+            auto scope               = workspace.scope();
+            if (count == 1) {
+                const detail::SparseMoeDecodePlan plan = detail::resolve_sparse_moe_decode_plan(
+                    weights.routed_gate_up.qtype, weights.routed_down.qtype, hints);
+                const detail::SparseMoeDecodeWorkspace views =
+                    detail::allocate_sparse_moe_decode_workspace(workspace);
+                detail::sparse_moe_decode_launch(x_slice, weights, destination_slice, plan, views,
+                                                 stream);
+            } else {
+                const detail::SparseMoeSmallTPlan plan = detail::resolve_sparse_moe_small_t_plan(
+                    count, weights.routed_gate_up.qtype, weights.routed_down.qtype, true);
+                const detail::SparseMoeSmallTWorkspace views =
+                    detail::allocate_sparse_moe_small_t_workspace(workspace, count);
+                detail::sparse_moe_small_t_launch(x_slice, weights, destination_slice, plan, views,
+                                                  stream);
+            }
+            offset += count;
+        }
+        return;
+    }
 
     const bool use_small_t = detail::sparse_moe_uses_small_t(tokens);
     const bool use_prefill = detail::sparse_moe_uses_prefill(tokens, weights.routed_gate_up.qtype,

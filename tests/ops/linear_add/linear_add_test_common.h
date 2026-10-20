@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/tensor.h"
+#include "infernix/ops/linear.h"
 
 #include <cstdint>
 #include <span>
@@ -29,6 +30,8 @@ struct ShapeCase {
     // tail that is resolved through the same route table: the harness then probes every route
     // start again one whole wave later, which is where the tail lands on it.
     std::int32_t composite_offset = 0;
+    // The policy of every call (the graph and permissive probes too, when it is column-invariant).
+    ops::LinearPolicy policy = ops::LinearPolicy::A16Only;
 };
 
 bool cuda_available();

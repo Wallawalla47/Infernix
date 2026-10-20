@@ -33,6 +33,8 @@ struct SparseMoeSmallTPlan {
     std::size_t workspace_bytes           = 0;
     SparseMoeSmallTD3Schedule d3_schedule = SparseMoeSmallTD3Schedule::Paths3;
     SparseMoeSmallTD4Schedule d4_schedule = SparseMoeSmallTD4Schedule::Rows1;
+    // The router reduces each token as the decode router does (request-invariant exact route).
+    bool column_invariant = false;
 };
 
 struct SparseMoeSmallTWorkspace {
@@ -58,7 +60,8 @@ SparseMoeSmallTWorkspace allocate_sparse_moe_small_t_workspace(Arena& arena, std
 [[nodiscard]] bool sparse_moe_uses_small_t(std::int32_t tokens) noexcept;
 [[nodiscard]] std::size_t sparse_moe_small_t_workspace_bytes(std::int32_t tokens);
 [[nodiscard]] SparseMoeSmallTPlan
-resolve_sparse_moe_small_t_plan(std::int32_t tokens, QType routed_gate_up, QType routed_down);
+resolve_sparse_moe_small_t_plan(std::int32_t tokens, QType routed_gate_up, QType routed_down,
+                                bool column_invariant = false);
 
 void sparse_moe_small_t_launch(const Tensor& x, const SparseMoeWeights& weights,
                                Tensor& destination, const SparseMoeSmallTPlan& plan,

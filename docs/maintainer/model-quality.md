@@ -330,14 +330,29 @@ different route may ship, what it is measured against, how much it may cost, and
 
 - **The exact route** is what runs with `--disable-fast-paths` (`EngineOptions::fast_paths`
   false). For a fixed artifact, Engine options (including the prefill chunk and the seed) and
-  request, its output is bit-identical from run to run and **from release to release**. Where the
-  artifact's formats support it (`LoadSummary::request_invariance_capable`: every decode
-  projection registers a column-invariant route, today NVFP4 and FP8 dense text decoders with an
-  FP8 or Q8 head, and every Qwen3.8-Flash-Next artifact) it is also **request-invariant**:
-  concurrency, the other requests, lane
-  assignment, prefix-cache
-  contents and resource pressure do not change a request's output. Elsewhere its output also
-  depends on the batch composition. Prompt and decode need not agree with each other. An option
+  request, its output is bit-identical from run to run and **from release to release**, and it is
+  **request-invariant** on every artifact: concurrency, the other requests, lane assignment,
+  prefix-cache contents and resource pressure do not change a request's output. Qwen3.5 decodes and
+  verifies every projection under `LinearPolicy::A16ColumnInvariant`: on the problem's dedicated
+  column-invariant route, or, where its format and shape register none, on its exact one-column
+  route once per column. Such an artifact is unsupported: it decodes very slowly, and startup
+  warns `UNSUPPORTED ARTIFACT: decode and verification will run VERY SLOWLY` naming the
+  projections. Every official and published 27B/35B artifact has a dedicated route for every
+  projection. The MTP drafter and its proposal head run their batched draft calls under the same
+  policy: a sampled request accepts or rejects against its drafts, so they must not depend on the
+  other rows either. The DFlash and DFlash2 drafters run their context appends and proposals one
+  row per call on the exact route (every round verifies the fixed chain and the drafter runs for
+  every row), so each row's drafts depend only on that row.
+  Qwen3.8-Flash-Next decodes rounds of up to eight rows on routes whose column results do not
+  depend on the round's width up to eight columns (dense projections, router, hyper-connections,
+  QSA attention, the narrow expert route). Recipe C's exact route diverged from run to run: its FP8
+  shared expert's A16 GEMM, refilled by TMA, released shared-memory stages without the async-proxy
+  fence, and when a forked expert call's staged pass shared the SMs a refill overwrote stages still
+  being read (op-development.md 4.3). Its producer now stages with cp.async and every TMA-fed GEMM
+  fences; its forced-decode audit then passes at one, four and eight requests, under MTP and from a
+  warm prefix (below), as IQ3_S's and the FP8 import's do at one and eight. Its real tests are still
+  to be rerun.
+  Prompt and decode need not agree with each other. An option
   whose effect depends on load (lossy Host-tier prefix state, whose use depends on eviction) is
   refused with `--disable-fast-paths` at startup, never silently overridden. A
   change that alters any exact-route output bit is a *numerics change*. It is allowed only to fix
@@ -848,13 +863,13 @@ always run and are not listed. The NVFP4 27B variants select identical paths (ea
 |---|---|---|
 | `decode-split64` | INT8 KV, 24 query heads | NVFP4 27B and groupwise 27B, INT8 KV |
 | `prompt-pv8` | INT8 KV (fast prompt kernel), NVFP4 KV (fast kernel), K8V4, VQ2, K4V2 KV | NVFP4 27B, groupwise 27B and 35B-A3B, with INT8, NVFP4, K8V4, VQ2 or K4V2 KV |
-| `batched-decode`, `batch-split-attention` | request-invariance-capable artifacts | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
+| `batched-decode`, `batch-split-attention` | every Qwen3.5 artifact | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
 | `batched-a8-decode`, `batched-a4-decode` | the same, with 8-bit (FP8) or 4-bit (NVFP4) activations | none (each fails, below) |
 | `batched-a4-residual-decode` | the same, with 4-bit (NVFP4) MLP activations | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
 | `batched-a8-residual-decode` | the same, with 8-bit (FP8) input-projection activations | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
 | `adaptive-speculation` | the same, with speculative decoding | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
 | `free-cache-resume` | the same, with the prefix cache | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
-| `preemption` | request-invariance-capable artifacts | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
+| `preemption` | every Qwen3.5 artifact | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
 | Qwen3.8-Flash-Next: `adaptive-speculation` (MTP), `free-cache-resume`, `preemption` | every Flash-Next artifact | Dense8, IQ3_S, FP8, recipe A and NVIDIA FP4-Local (16- and 4-bit expert activations), every format; not recipe C (its exact route is not request-invariant, below) |
 | Qwen3.8-Flash-Next: `q8-sliced-k`, `gdn-conv-fused`, `qsa-prepare-fused` | Q8 dense weights (`qsa-prepare-fused`: BF16, INT8, FP8, NVFP4 or K8V4 KV) | Q8 dense, 4-bit experts, every KV format (`qsa-prepare-fused`: the five it serves) |
 | `fp8-a8-pair` | row-FP8 dense weights (recipe C) | FP8 dense, 16-bit experts, with FP8, NVFP4, K8V4, VQ2 or K4V2 KV (INT8 fails its decode tail, BF16 its prefill; below) |
@@ -1135,7 +1150,40 @@ Dense8's), `preemption` IQ3_S's and FP8's, and the quality verdicts Dense8's. It
 equivalences were not run on the artifact. Recipe C fails: its real tests diverge on the exact
 route at token 29 (a resumed request against a cold one, and concurrent against solo), so its exact
 route is not request-invariant, and its joint gate fails the p99.9 KL ratio (1.33); no coupling
-path is registered on it, and the exact-route defect is open.
+path is registered on it, and the exact-route defect is open. A bisect (2026-10-20, plain decode at
+one request, INT8 KV, two identical runs of 48 forced segments per arm) found its plain decode
+nondeterministic: 5-9 segments differed while the shared expert ran beside a forked expert call's
+staged pass, and none when the shared expert waited for that pass, ran before the routed experts or
+ran with no fork, the three bit-identical to each other. Landing, promotions, the CPU-served misses
+and L1-cached job records were not the cause (each switched off left 8-33 differing). The shared
+expert first waited for the staged pass (which hid the race). The cause (found 2026-10-20 with the
+FP4-Local session and tile-ai/tilelang #3529): the shared expert's FP8 A16 GEMM refilled its
+shared-memory stages with TMA, and its consumer warps released a stage after `ldmatrix` and
+`ld.shared` reads without `fence.proxy.async`, so with the staged pass's kernels on the same SMs a
+refill could overwrite a stage still being read; `infernix_fp8_moe_overlap_test` reproduces it
+(recipe C's FP8 [1280,2560] and [2560,640] beside staged W4A16 and W4A4 calls: the old kernel
+fails, so does the TMA producer without the fence, the fenced one and a cp.async producer pass),
+and every other TMA-fed route (BF16 A16, FP8 A8, FP8 A8 pair, NVFP4 A4) now fences: in the same
+harness the unfenced FP8 A8 route differed in 7-147 of 200 overlapped calls and the fenced one in
+none (`infernix_tma_moe_overlap_test`), while the unfenced BF16 A16, pair and NVFP4 A4 routes never
+differed there. The producer now stages with
+cp.async (the consumer and every output bit unchanged), and the wait is gone. Without it (48 forced
+segments, INT8 KV) recipe C is bit-identical between two runs at one request and at eight, at one,
+four and eight requests, MTP at one and four, from a warm 3,072-token prefix at a 1,024-token
+chunk, and with the waiting build; the unfenced TMA producer differs in 6 of 48 segments between two
+identical runs, the fenced one in none. Before that, with the wait, the exact-route audit (96 forced segments, INT8 KV) finds no
+segment differing between two identical runs at one request, at four requests, under a
+16,384-token KV pool at four requests, or between MTP at one and four requests. At eight requests
+(48 segments, INT8 KV, the same ordering), two identical runs agree with each other and with one
+request on recipe C, IQ3_S and the FP8 import; on recipe C and IQ3_S so do runs with the shared expert
+on the main stream or before the routed experts. (`infernix_decode_quality_forced` now waits up to an
+hour for admission: the FP8 import's prefills read about 100 GiB from the SSD expert tier, and its
+eight-request runs had expired at the default 30 s.) The first warm-prefix arm proved nothing: the
+exact route resumes only at prefill-chunk boundaries, and with the tool's 4,096-token chunk no
+3,000- or 3,072-token prefix, nor any 512- or 2,048-token prompt, held one (`reused_prompt_tokens`
+0). At a 1,024-token chunk for both runs, a warm 3,072-token prefix is reused (49,152 tokens over the
+16 long segments) and no segment differs from the cold run, which itself equals the 4,096-token-chunk
+run. The real tests are still to be rerun.
 
 NVIDIA FP4-Local (MXFP8 dense, 2026-10-20/21): after the TMA proxy-fence fix (design §6.1.2) its exact
 route is deterministic and request-invariant alone and at eight concurrent requests (BF16 KV, 48

@@ -30,6 +30,21 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate
         bf16_a16_operands(x, weight), output, LinearIdentityEpilogue{}, stream);
 }
 
+// The column-invariant route: the small-T SIMT schedule with a runtime token count, four columns per
+// CTA row. Each column has its own accumulator, reduced in the same lane and warp order whatever the
+// call's width, so a column's bits do not depend on how many columns share the call.
+void launch_invariant(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, Tensor& k,
+                      Tensor& v, cudaStream_t stream) {
+    using Schedule = Bf16A16SimtSchedule<4, 1, 8, 8, 1, 4, Bf16SimtActivationAccess::WarpPacked,
+                                         Bf16WeightCache::Default, Bf16PhaseOrder::Sequential, 1,
+                                         1, 1, 2>;
+    const LinearBf16SegmentedOutput<6144, 1024, 6144, 1024> output{
+        {static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
+         static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(v.data)}};
+    launch_bf16_a16_simt<Bf16ScheduleInstance<Schedule, 5120, 0, false>>(
+        bf16_a16_operands(x, weight), output, LinearIdentityEpilogue{}, stream);
+}
+
 template <std::size_t... Offsets>
 constexpr auto make_launchers(std::index_sequence<Offsets...>) {
     return std::array<Launch, sizeof...(Offsets)>{
@@ -47,6 +62,15 @@ void bf16_attn_input_small_t_launch(const Tensor& x, const Weight& weight, Tenso
         throw std::invalid_argument("bf16 attn_input_proj small-T requires T in [2,4]");
     }
     kLaunchers[x.ne[1] - kBf16AttnInputSmallTMinTokens](x, weight, q, gate, k, v, stream);
+}
+
+void bf16_attn_input_column_invariant_launch(const Tensor& x, const Weight& weight, Tensor& q,
+                                             Tensor& gate, Tensor& k, Tensor& v,
+                                             cudaStream_t stream) {
+    if (x.ne[1] < 1) {
+        throw std::invalid_argument("bf16 attn_input_proj column-invariant route requires T >= 1");
+    }
+    launch_invariant(x, weight, q, gate, k, v, stream);
 }
 
 } // namespace infernix::ops::detail

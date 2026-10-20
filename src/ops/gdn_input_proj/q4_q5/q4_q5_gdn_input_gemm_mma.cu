@@ -97,6 +97,7 @@ void q4_q5_gdn_input_grouped_mma_launch(const Tensor& x, const Weight& qk_weight
             x, qk_weight, value_z_weight, qkv, z, stream);
         return;
     case Q4Q5GdnInputScheduleId::IndependentDirectFixed:
+    case Q4Q5GdnInputScheduleId::ColumnInvariant:
         break;
     }
     throw std::logic_error("Q4/Q5 GDN input: grouped MMA schedule is unknown");

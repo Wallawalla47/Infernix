@@ -19,6 +19,11 @@ int q5_a16_conformance() {
     constexpr std::array<std::int32_t, 9> graphs{13, 40, 80, 112, 192, 513, 545, 609, 705};
     constexpr std::array<std::int32_t, 0> no_starts{};
     constexpr std::array<std::int32_t, 7> full{8, 13, 32, 40, 80, 112, 192};
+    // The column-invariant route (decode and verification of the request-invariant exact route):
+    // its tile boundaries and the 32-column slices of wider calls.
+    constexpr std::array<std::int32_t, 20> invariant{2,  4,  5,  8,  9,  16, 17, 24,  25,  32,
+                                                     33, 40, 48, 49, 64, 65, 96, 97, 129, 512};
+    constexpr std::array<std::int32_t, 2> invariant_graphs{9, 40};
     int failures = 0;
     for (const auto k : {6144, 17408}) {
         failures += infernix::test::linear_add::run_shape(
@@ -27,6 +32,10 @@ int q5_a16_conformance() {
         failures += infernix::test::linear_add::run_shape(
             "Q5_A16 LinearAdd", WeightFormat::Q5G64F16S,
             ShapeCase{5120, k, 401U, no_starts, full, {}, true, 0});
+        failures += infernix::test::linear_add::run_shape(
+            "Q5_A16 LinearAdd column-invariant", WeightFormat::Q5G64F16S,
+            ShapeCase{5120, k, 407U, no_starts, invariant, invariant_graphs, false, 0,
+                      infernix::ops::LinearPolicy::A16ColumnInvariant});
     }
     return failures;
 }

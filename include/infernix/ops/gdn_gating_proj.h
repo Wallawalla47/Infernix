@@ -87,8 +87,8 @@ void gdn_gating_proj(const Tensor& x, const Weight& ab_weight, const Tensor& A_l
  *
  * `policy` A16ColumnInvariant selects one schedule for every T, so a column's outputs are
  * functions of that column alone whatever T is (LinearPolicy). The Qwen3.8-27B problem (48 heads,
- * 5120 inputs) registers it; other problems reject it. Every other valid policy selects the
- * default route.
+ * 5120 inputs) and the Qwen3.6-35B-A3B problem (32 heads, 2048 inputs) register it; other problems
+ * reject it. Every other valid policy selects the default route.
  */
 void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
                           const Weight& a_weight, const Weight& b_weight, const Tensor& A_log,

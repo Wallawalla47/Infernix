@@ -149,6 +149,8 @@ const char* q5_linear_add_schedule_name(Q5LinearAddScheduleId schedule) noexcept
         return "linear_add.q5.mma.r64.t128.cta_collective_residual";
     case Q5LinearAddScheduleId::MmaResidualR64T128Tail:
         return "linear_add.q5.mma.r64.t128.cta_collective_residual.narrow_tail";
+    case Q5LinearAddScheduleId::SlicedColumnInvariant:
+        return "linear_add.q5.sliced.w4.linear.column_invariant.residual";
     }
     return "linear_add.q5.unknown";
 }
@@ -157,10 +159,12 @@ bool q5_linear_add_admits(const Q5LinearAddProblem& problem) noexcept {
     return supported_shape(problem) && problem.cols >= 1;
 }
 
-Q5LinearAddPlan q5_linear_add_resolve_plan(const Q5LinearAddProblem& problem) {
+Q5LinearAddPlan q5_linear_add_resolve_plan(const Q5LinearAddProblem& problem,
+                                           bool column_invariant) {
     if (!q5_linear_add_admits(problem)) {
         throw std::invalid_argument("q5 linear_add: exact problem or column count is not admitted");
     }
+    if (column_invariant) { return {Q5LinearAddScheduleId::SlicedColumnInvariant, 0}; }
 
     const auto resolve_from = [&](const auto& routes) -> Q5LinearAddPlan {
         for (const RouteSpec& route : routes) {
@@ -173,20 +177,21 @@ Q5LinearAddPlan q5_linear_add_resolve_plan(const Q5LinearAddProblem& problem) {
 
 std::size_t q5_linear_add_capacity_workspace_bytes(std::int32_t rows, std::int32_t k,
                                                    std::int32_t padded_k, std::int32_t min_cols,
-                                                   std::int32_t max_cols) {
+                                                   std::int32_t max_cols, bool column_invariant) {
     if (min_cols <= 0 || max_cols < min_cols) {
         throw std::invalid_argument("q5 linear_add: invalid column interval");
     }
-    (void)q5_linear_add_resolve_plan({rows, k, padded_k, min_cols});
-    (void)q5_linear_add_resolve_plan({rows, k, padded_k, max_cols});
+    (void)q5_linear_add_resolve_plan({rows, k, padded_k, min_cols}, column_invariant);
+    (void)q5_linear_add_resolve_plan({rows, k, padded_k, max_cols}, column_invariant);
 
     return 0;
 }
 
 void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, const Weight& w,
-                                Tensor& residual_out, WorkspaceArena& ws, cudaStream_t stream) {
+                                Tensor& residual_out, WorkspaceArena& ws, cudaStream_t stream,
+                                bool column_invariant) {
     const Q5LinearAddProblem problem{residual_out.ne[0], x.ne[0], w.padded_shape[1], x.ne[1]};
-    const Q5LinearAddPlan resolved = q5_linear_add_resolve_plan(problem);
+    const Q5LinearAddPlan resolved = q5_linear_add_resolve_plan(problem, column_invariant);
     if (resolved.schedule != plan.schedule || resolved.workspace_bytes != plan.workspace_bytes) {
         throw std::invalid_argument("q5 linear_add: plan does not match the exact problem");
     }
@@ -232,15 +237,18 @@ void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, co
     case Q5LinearAddScheduleId::MmaResidualR64T128Tail:
         launch_wide_with_narrow_tail(x, w, residual_out, ws, stream);
         return;
+    case Q5LinearAddScheduleId::SlicedColumnInvariant:
+        q5_linear_add_sliced_invariant_launch(x, w, residual_out, stream);
+        return;
     }
     throw std::logic_error("q5 linear_add: unknown schedule");
 }
 
 void q5_linear_add_dispatch(const Tensor& x, const Weight& w, Tensor& residual_out,
-                            WorkspaceArena& ws, cudaStream_t stream) {
+                            WorkspaceArena& ws, cudaStream_t stream, bool column_invariant) {
     const Q5LinearAddProblem problem{residual_out.ne[0], x.ne[0], w.padded_shape[1], x.ne[1]};
-    const Q5LinearAddPlan plan = q5_linear_add_resolve_plan(problem);
-    q5_linear_add_execute_plan(plan, x, w, residual_out, ws, stream);
+    const Q5LinearAddPlan plan = q5_linear_add_resolve_plan(problem, column_invariant);
+    q5_linear_add_execute_plan(plan, x, w, residual_out, ws, stream, column_invariant);
 }
 
 } // namespace infernix::ops::detail

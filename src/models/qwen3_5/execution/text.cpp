@@ -903,6 +903,7 @@ void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidd
     ScopedValue<const Tensor*> valid_binding(active_valid_columns_, &valid_columns);
     ScopedValue<std::int32_t> batch_binding(active_sequence_batch_, batch);
     ScopedValue<std::int32_t> width_binding(active_sequence_width_, width);
+    ScopedValue<const MtpParameters*> drafter_binding(mtp_, batch_mtp());
     mtp_forward_core(ids, hidden, cache_positions, rope_positions, envelope, mtp_hidden, nullptr);
 }
 
@@ -913,7 +914,23 @@ void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor
     require_tensor_shape(logits, DType::BF16, {dimension(config_.vocab_size), batch},
                          "MTP proposal batch logits");
     require_tensor_shape(draft_tokens, DType::I32, {batch}, "MTP proposal batch tokens");
+    ScopedValue<const MtpParameters*> drafter_binding(mtp_, batch_mtp());
+    ScopedValue<const LinearParameters*> head_binding(proposal_head_, batch_proposal_head());
     proposal_argmax(hidden, logits, draft_tokens);
+}
+
+const MtpParameters* TextContext::batch_mtp() const noexcept {
+    return execution_schedule_.column_invariant_decode && parameters_.invariant_mtp
+               ? &*parameters_.invariant_mtp
+               : mtp_;
+}
+
+const LinearParameters* TextContext::batch_proposal_head() const noexcept {
+    // Only the artifact's own proposal head has an invariant copy.
+    const bool own = parameters_.proposal && proposal_head_ == &parameters_.proposal->head;
+    return execution_schedule_.column_invariant_decode && own && parameters_.invariant_proposal_head
+               ? &*parameters_.invariant_proposal_head
+               : proposal_head_;
 }
 
 void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase ph) {

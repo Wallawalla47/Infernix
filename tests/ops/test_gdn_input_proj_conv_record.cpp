@@ -296,31 +296,39 @@ int run_q4_q5() {
 
     int failures   = 0;
     const auto run = [&](std::int32_t width, std::int32_t batch, std::vector<std::int32_t> valid,
-                         std::uint32_t seed) {
+                         std::uint32_t seed, ops::LinearPolicy policy = ops::LinearPolicy::A16Only) {
         const std::size_t snapshot_bytes =
             ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-                kQueryRows, kKeyRows, kValueRows, batch, width, width);
+                kQueryRows, kKeyRows, kValueRows, policy, batch, width, width);
         const std::size_t record_bytes = ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
-            kQueryRows, kKeyRows, kValueRows, batch, width, width);
+            kQueryRows, kKeyRows, kValueRows, policy, batch, width, width);
         return run_case(
-            "Q4/Q5 B=" + std::to_string(batch) + " T=" + std::to_string(width), kHidden, kValueRows,
-            kZRows, width, batch, std::move(valid), snapshot_bytes, record_bytes,
+            std::string(ops::column_invariant(policy) ? "Q4/Q5 invariant B=" : "Q4/Q5 B=") +
+                std::to_string(batch) + " T=" + std::to_string(width),
+            kHidden, kValueRows, kZRows, width, batch, std::move(valid), snapshot_bytes,
+            record_bytes,
             [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid_columns,
                 const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
                 Tensor& z, WorkspaceArena& workspace, cudaStream_t stream) {
                 ops::gdn_input_proj_conv_snapshot(x, qk.view(), value_z.view(), conv, state,
                                                   valid_columns, initial, snapshot_base, q, k, v, z,
-                                                  workspace, stream);
+                                                  policy, workspace, stream);
             },
             [&](const Tensor& x, const Tensor& conv, const Tensor& state,
                 const Tensor& valid_columns, const Tensor& initial, Tensor& record, Tensor& q,
                 Tensor& k, Tensor& v, Tensor& z, WorkspaceArena& workspace, cudaStream_t stream) {
                 ops::gdn_input_proj_conv_record(x, qk.view(), value_z.view(), conv, state,
-                                                valid_columns, initial, record, q, k, v, z,
+                                                valid_columns, initial, record, q, k, v, z, policy,
                                                 workspace, stream);
             },
             seed);
     };
+    // The column-invariant policy: record equals snapshot at the default route's fused widths too.
+    for (int width : {2, 3, 5, 6, 9, 16}) {
+        failures += run(width, 1, {}, 1700U + width, ops::LinearPolicy::A16ColumnInvariant);
+        failures += run(width, 8, ragged(width, 8), 1750U + width, ops::LinearPolicy::A16ColumnInvariant);
+    }
+    failures += run(33, 1, {}, 1790U, ops::LinearPolicy::A16ColumnInvariant);
     for (int width = 2; width <= 16; ++width) {
         failures += run(width, 1, {}, 1400U + width);
         failures += run(width, 8, ragged(width, 8), 1450U + width);

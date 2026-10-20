@@ -2,12 +2,33 @@
 
 #include "core/layout.h"
 #include "infernix/ops/attn_input_proj.h"
+#include "infernix/ops/linear.h"
 #include "infernix/ops/linear_pair.h"
 #include "infernix/ops/mtp_pack.h"
 
 #include <algorithm>
+#include <array>
 
 namespace infernix::models::qwen3_5::execution {
+
+namespace {
+
+std::size_t row_bytes(const LinearParameters& p, std::int32_t first, std::int32_t last) {
+    return ops::linear_workspace_capacity_bytes(p.weight.qtype, p.weight.n, p.weight.k, p.policy,
+                                                first, last);
+}
+
+// The K/V rows: one linear_pair call, or under LinearPolicy::A16ColumnInvariant (which
+// linear_pair has no route for) two linear calls.
+std::size_t kv_rows_bytes(const std::array<LinearParameters, 4>& rows, std::int32_t first,
+                          std::int32_t last) {
+    if (ops::column_invariant(rows[1].policy)) {
+        return std::max(row_bytes(rows[1], first, last), row_bytes(rows[3], first, last));
+    }
+    return ops::linear_pair_workspace_capacity_bytes(rows[1].weight, rows[3].weight, first, last);
+}
+
+} // namespace
 
 std::size_t mtp_projection_workspace_bytes(const MtpProjectionParameters& parameters,
                                            std::int32_t first, std::int32_t last) {
@@ -15,14 +36,8 @@ std::size_t mtp_projection_workspace_bytes(const MtpProjectionParameters& parame
         // The fused packed path is unavailable; the row-split path projects K/V and Q/gate
         // independently. Size the peak of the two independent projections.
         const auto& rows = *parameters.rows;
-        const auto qgate = std::max(
-            ops::linear_workspace_capacity_bytes(rows[0].weight.qtype, rows[0].weight.n,
-                                                 rows[0].weight.k, rows[0].policy, first, last),
-            ops::linear_workspace_capacity_bytes(rows[2].weight.qtype, rows[2].weight.n,
-                                                 rows[2].weight.k, rows[2].policy, first, last));
-        const auto kv = ops::linear_pair_workspace_capacity_bytes(rows[1].weight, rows[3].weight,
-                                                                  first, last);
-        return std::max(qgate, kv);
+        const auto qgate = std::max(row_bytes(rows[0], first, last), row_bytes(rows[2], first, last));
+        return std::max(qgate, kv_rows_bytes(rows, first, last));
     }
     const auto& p = *parameters.packed;
     const auto& w = p.weight;
@@ -40,10 +55,7 @@ std::size_t mtp_projection_workspace_bytes(const MtpProjectionParameters& parame
 std::size_t mtp_kv_workspace_bytes(const MtpProjectionParameters& parameters,
                                    const AttentionConfig& config, std::int32_t first,
                                    std::int32_t last) {
-    if (parameters.rows) {
-        return ops::linear_pair_workspace_capacity_bytes((*parameters.rows)[1].weight,
-                                                         (*parameters.rows)[3].weight, first, last);
-    }
+    if (parameters.rows) { return kv_rows_bytes(*parameters.rows, first, last); }
     WorkspaceLayoutBuilder layout;
     (void)layout.alloc(DType::BF16, {dimension(config.query_width()), last});
     (void)layout.alloc(DType::BF16, {dimension(config.query_width()), last});
@@ -107,8 +119,17 @@ void mtp_kv_projection(const Tensor& hidden, const MtpProjectionParameters& para
                        const AttentionConfig& config, Tensor& key, Tensor& value,
                        WorkspaceArena& workspace, cudaStream_t stream) {
     if (parameters.rows) {
-        ops::linear_pair(hidden, (*parameters.rows)[1].weight, (*parameters.rows)[3].weight, key,
-                         value, stream);
+        const LinearParameters& k = (*parameters.rows)[1];
+        const LinearParameters& v = (*parameters.rows)[3];
+        if (ops::column_invariant(k.policy)) {
+            {
+                auto scope = workspace.scope();
+                ops::linear(hidden, k.weight, key, k.policy, workspace, stream);
+            }
+            ops::linear(hidden, v.weight, value, v.policy, workspace, stream);
+            return;
+        }
+        ops::linear_pair(hidden, k.weight, v.weight, key, value, stream);
         return;
     }
     auto scope   = workspace.scope();

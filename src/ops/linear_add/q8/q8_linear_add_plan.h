@@ -29,6 +29,8 @@ enum class Q8LinearAddScheduleId {
     MmaR64C128,
     MmaR128C64,
     MmaR128C80,
+    // Request-invariant exact route of [2048,4096]: one sliced-K reduction at every width.
+    ColumnInvariant,
 };
 
 struct Q8LinearAddPlan {
@@ -45,11 +47,14 @@ struct Q8LinearAddProblem {
 const char* q8_linear_add_schedule_name(Q8LinearAddScheduleId schedule) noexcept;
 bool q8_linear_add_schedule_uses_mma(Q8LinearAddScheduleId schedule) noexcept;
 bool q8_linear_add_admits(const Q8LinearAddProblem& problem) noexcept;
-Q8LinearAddPlan q8_linear_add_resolve_plan(const Q8LinearAddProblem& problem);
+// column_invariant is registered for [2048,4096] only.
+Q8LinearAddPlan q8_linear_add_resolve_plan(const Q8LinearAddProblem& problem,
+                                           bool column_invariant = false);
 
 void q8_linear_add_execute_plan(const Q8LinearAddPlan& plan, const Tensor& x, const Weight& w,
-                                Tensor& residual_out, cudaStream_t stream);
+                                Tensor& residual_out, cudaStream_t stream,
+                                bool column_invariant = false);
 void q8_linear_add_dispatch(const Tensor& x, const Weight& w, Tensor& residual_out,
-                            cudaStream_t stream);
+                            cudaStream_t stream, bool column_invariant = false);
 
 } // namespace infernix::ops::detail

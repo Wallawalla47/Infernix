@@ -9,6 +9,8 @@
 namespace infernix::ops::detail {
 
 Q8Launch select_q8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t, LinearRoutes routes);
+// Whether the problem registers a dedicated column-invariant route.
+[[nodiscard]] bool q8_column_invariant_route(std::int32_t n, std::int32_t k) noexcept;
 Q8Launch select_q8_launch(std::int32_t n, std::int32_t k, std::int32_t t, LinearPolicy policy,
                           LinearRoutes routes);
 

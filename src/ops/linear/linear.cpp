@@ -114,12 +114,28 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
 
 } // namespace
 
+bool linear_column_invariant_route(QType qtype, std::int32_t output_rows,
+                                   std::int32_t input_rows) noexcept {
+    if (qtype == QType::Q4_G64_FP16) { return detail::q4_column_invariant_route(output_rows, input_rows); }
+    if (qtype == QType::Q6_G64_FP16) { return detail::q6_column_invariant_route(output_rows, input_rows); }
+    if (qtype == QType::Q8_G32_FP16) { return detail::q8_column_invariant_route(output_rows, input_rows); }
+    if (qtype == QType::FP8_E4M3FN_ROW_BF16) {
+        return detail::fp8_linear_column_invariant_route(output_rows, input_rows);
+    }
+    return false;
+}
+
 std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_rows,
                                             std::int32_t input_rows, LinearPolicy policy,
                                             std::int32_t min_tokens, std::int32_t max_tokens) {
     validate_linear_policy(policy);
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("linear workspace: invalid token interval");
+    }
+    if (column_invariant(policy) && !linear_column_invariant_route(qtype, output_rows, input_rows)) {
+        // One A16 call per column.
+        return linear_workspace_capacity_bytes(qtype, output_rows, input_rows, LinearPolicy::A16Only,
+                                               1, 1);
     }
 
     switch (qtype) {
@@ -163,6 +179,15 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
     validate_linear_semantics(x, w, out, policy);
     if (!valid_linear_routes(routes)) {
         throw std::invalid_argument("linear: unsupported route set");
+    }
+    if (column_invariant(policy) && !linear_column_invariant_route(w.qtype, w.n, w.k)) {
+        // No dedicated column-invariant route: the exact one-column route, once per column.
+        for (std::int32_t column = 0; column < x.ne[1]; ++column) {
+            const Tensor x_column = x.slice(1, column, 1);
+            Tensor out_column     = out.slice(1, column, 1);
+            linear(x_column, w, out_column, LinearPolicy::A16Only, workspace, stream);
+        }
+        return;
     }
     dispatch_linear(x, w, out, policy, routes, &workspace, stream);
 }

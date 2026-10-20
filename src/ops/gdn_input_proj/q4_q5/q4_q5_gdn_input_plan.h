@@ -15,6 +15,8 @@ enum class Q4Q5GdnInputScheduleId {
     GroupedMixedMmaR32C32S2,
     GroupedMixedMmaR32C64S4,
     GroupedMixedMmaR64C128S2,
+    // Request-invariant exact route: one sliced-K reduction per parent at every width.
+    ColumnInvariant,
 };
 
 enum class Q4Q5GdnInputConvScheduleId {
@@ -44,15 +46,20 @@ const char* q4_q5_gdn_input_schedule_name(Q4Q5GdnInputScheduleId schedule) noexc
 const char* q4_q5_gdn_input_conv_schedule_name(Q4Q5GdnInputConvScheduleId schedule) noexcept;
 
 bool q4_q5_gdn_input_admits(const Q4Q5GdnInputProblem& problem) noexcept;
-Q4Q5GdnInputPlan q4_q5_gdn_input_resolve_plan(const Q4Q5GdnInputProblem& problem);
+Q4Q5GdnInputPlan q4_q5_gdn_input_resolve_plan(const Q4Q5GdnInputProblem& problem,
+                                              bool column_invariant = false);
+// Under the column-invariant policy every width composes the projection and the convolution, so
+// decode and verification read the same BF16 projection.
 Q4Q5GdnInputConvPlan q4_q5_gdn_input_conv_resolve_plan(const Q4Q5GdnInputProblem& problem,
-                                                       std::int32_t batch_size);
+                                                       std::int32_t batch_size,
+                                                       bool column_invariant = false);
 
 void q4_q5_gdn_input_execute_plan(const Q4Q5GdnInputPlan& plan, const Tensor& x,
                                   const Weight& qk_weight, const Weight& value_z_weight,
-                                  Tensor& qkv, Tensor& z, cudaStream_t stream);
+                                  Tensor& qkv, Tensor& z, cudaStream_t stream,
+                                  bool column_invariant = false);
 void q4_q5_gdn_input_dispatch(const Tensor& x, const Weight& qk_weight,
                               const Weight& value_z_weight, Tensor& qkv, Tensor& z,
-                              cudaStream_t stream);
+                              cudaStream_t stream, bool column_invariant = false);
 
 } // namespace infernix::ops::detail

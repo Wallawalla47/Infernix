@@ -10,6 +10,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <stdexcept>
 #include <array>
@@ -215,6 +216,16 @@ void q4_linear_swiglu_small_t_tiled_launch(const Tensor& x, const Weight& w, Ten
         throw std::invalid_argument("Q4 LinearSwiGLU exact small-T requires T=2..32");
     }
     kSmallTLaunchers[static_cast<std::size_t>((x.ne[1] - 1) / 8)](x, w, out, stream);
+}
+
+// Every instance is the same sliced-K schedule but for its token capacity (8 K-warps, pairwise
+// reduction, StaticK): capacity and the token slicing of launch_q4_a16_sliced_k_mma change only
+// staging and predication, so a column's bits do not depend on the call's width.
+void q4_linear_swiglu_small_t_invariant_launch(const Tensor& x, const Weight& w, Tensor& out,
+                                               cudaStream_t stream) {
+    if (x.ne[1] < 1) { throw std::invalid_argument("Q4 LinearSwiGLU column-invariant route requires T >= 1"); }
+    const std::size_t instance = std::min<std::size_t>(kSmallTLaunchers.size() - 1, static_cast<std::size_t>((x.ne[1] - 1) / 8));
+    kSmallTLaunchers[instance](x, w, out, stream);
 }
 
 } // namespace infernix::ops::detail

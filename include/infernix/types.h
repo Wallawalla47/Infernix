@@ -1778,10 +1778,14 @@ struct LoadSummary {
     std::vector<std::string> fast_paths;
     bool fast_paths_disabled = false;
     // Whether a request's output depends only on the request, the artifact, the options and the
-    // build: the artifact supports it (every Text projection registers a column-invariant route)
-    // and no request-coupling fast path (FastPath::BatchedDecode and after) runs.
+    // build: no request-coupling fast path (FastPath::BatchedDecode and after) runs, and no
+    // Qwen3.5 DFlash or DFlash2 drafter (whose batched draft calls are not yet column-invariant).
     bool request_invariant          = false;
-    bool request_invariance_capable = false;
+    // Text projections whose format and shape register no dedicated column-invariant route, so the
+    // request-invariant decode and verification run each once per column (much slower, same output
+    // guarantee), as "role format [rows,cols] xN" (Qwen3.5 family; empty when every one has one).
+    // A nonempty list marks an unsupported artifact; startup logs it as a warning.
+    std::vector<std::string> column_by_column_projections;
     // Effective prefill chunk (tokens), and the width a prefill step takes while no request waits
     // to decode when idle-wide-prefill runs: the widest that fit the memory plan, or the chunk when
     // none wider fit. Zero when idle-wide-prefill is not selected (Qwen3.5 family only).

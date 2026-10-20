@@ -11,6 +11,9 @@ namespace infernix::ops::detail {
 void q4_q5_gdn_input_independent_launch(const Tensor& x, const Weight& qk_weight,
                                         const Weight& value_z_weight, Tensor& qk, Tensor& value,
                                         Tensor& z, cudaStream_t stream);
+void q4_q5_gdn_input_column_invariant_launch(const Tensor& x, const Weight& qk_weight,
+                                             const Weight& value_z_weight, Tensor& qk,
+                                             Tensor& value, Tensor& z, cudaStream_t stream);
 
 void q4_q5_gdn_input_grouped_mma_launch(const Tensor& x, const Weight& qk_weight,
                                         const Weight& value_z_weight, Tensor& qkv, Tensor& z,

@@ -34,7 +34,8 @@ std::size_t gdn_snapshot_workspace_bytes(const GdnParameters& parameters, const 
         bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
             static_cast<std::int32_t>(config.key_width()),
             static_cast<std::int32_t>(config.key_width()),
-            static_cast<std::int32_t>(config.value_width()), batch, first_width, last_width);
+            static_cast<std::int32_t>(config.value_width()), projection_policy(parameters.projection),
+            batch, first_width, last_width);
     }
     // The native overlap contract takes a disjoint span even for a zero-scratch fused route.
     return std::max(std::size_t{1}, bytes);
@@ -59,7 +60,8 @@ std::size_t gdn_record_workspace_bytes(const GdnParameters& parameters, const Gd
         bytes = ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
             static_cast<std::int32_t>(config.key_width()),
             static_cast<std::int32_t>(config.key_width()),
-            static_cast<std::int32_t>(config.value_width()), batch, first_width, last_width);
+            static_cast<std::int32_t>(config.value_width()), projection_policy(parameters.projection),
+            batch, first_width, last_width);
     }
     return std::max(std::size_t{1}, bytes);
 }
@@ -67,7 +69,7 @@ std::size_t gdn_record_workspace_bytes(const GdnParameters& parameters, const Gd
 void gdn_projection(const Tensor& hidden, const GdnParameters& parameters, Tensor& qkv, Tensor& z,
                     WorkspaceArena& workspace, cudaStream_t stream) {
     if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection)) {
-        ops::gdn_input_proj(hidden, pair->first, pair->second, qkv, z, stream);
+        ops::gdn_input_proj(hidden, pair->first, pair->second, qkv, z, pair->policy, stream);
     } else {
         const auto& single = std::get<LinearParameters>(parameters.projection);
         ops::gdn_input_proj(hidden, single.weight, qkv, z, single.policy, workspace, stream);
@@ -79,8 +81,8 @@ void gdn_norm_control(const Tensor& residual, const Tensor& norm, float epsilon,
                       WorkspaceArena& workspace, DeviceExecutionView execution) {
     if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.control)) {
         ops::gdn_norm_gating_proj(residual, norm, epsilon, pair->first, pair->second,
-                                  parameters.a_log, parameters.dt_bias, ops::LinearPolicy::A16Only,
-                                  workspace, hidden, g, beta, execution);
+                                  parameters.a_log, parameters.dt_bias, pair->policy, workspace,
+                                  hidden, g, beta, execution);
     } else {
         const auto& single = std::get<LinearParameters>(parameters.control);
         ops::gdn_norm_gating_proj(residual, norm, epsilon, single.weight, parameters.a_log,
@@ -101,7 +103,8 @@ void gdn_projection_snapshot(const Tensor& hidden, const GdnParameters& paramete
     if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection)) {
         ops::gdn_input_proj_conv_snapshot(hidden, pair->first, pair->second, parameters.convolution,
                                           conv_states, valid_columns, initial_slots,
-                                          destination_slots, query, key, value, z, scratch, stream);
+                                          destination_slots, query, key, value, z, pair->policy,
+                                          scratch, stream);
     } else {
         const auto& single = std::get<LinearParameters>(parameters.projection);
         ops::gdn_input_proj_conv_snapshot(
@@ -132,7 +135,7 @@ void gdn_projection_record(const Tensor& hidden, const GdnParameters& parameters
     if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection)) {
         ops::gdn_input_proj_conv_record(hidden, pair->first, pair->second, parameters.convolution,
                                         conv_states, valid_columns, initial_slots, conv_record,
-                                        query, key, value, z, scratch, stream);
+                                        query, key, value, z, pair->policy, scratch, stream);
     } else {
         const auto& single = std::get<LinearParameters>(parameters.projection);
         ops::gdn_input_proj_conv_record(hidden, single.weight, parameters.convolution, conv_states,

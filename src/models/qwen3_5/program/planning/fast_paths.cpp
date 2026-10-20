@@ -262,20 +262,17 @@ FastPathConfiguration fast_path_configuration(const Model& model, const EngineOp
 }
 
 bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration,
-                       const EngineOptions& options, bool invariant_capable) {
+                       const EngineOptions& options) {
     switch (path) {
     case FastPath::BatchedDecode:
     case FastPath::BatchSplitAttention:
-    case FastPath::Preemption: return invariant_capable;
+    case FastPath::Preemption: return true;
     case FastPath::BatchedA8Decode:
-    case FastPath::BatchedA8ResidualDecode:
-        return invariant_capable && configuration.activations != ActivationClass::A16;
+    case FastPath::BatchedA8ResidualDecode: return configuration.activations != ActivationClass::A16;
     case FastPath::BatchedA4Decode:
-    case FastPath::BatchedA4ResidualDecode:
-        return invariant_capable && configuration.activations == ActivationClass::A4;
-    case FastPath::AdaptiveSpeculation:
-        return invariant_capable && options.speculative.backend != SpeculativeBackend::None;
-    case FastPath::FreeCacheResume: return invariant_capable && options.context_cache.enabled;
+    case FastPath::BatchedA4ResidualDecode: return configuration.activations == ActivationClass::A4;
+    case FastPath::AdaptiveSpeculation: return options.speculative.backend != SpeculativeBackend::None;
+    case FastPath::FreeCacheResume: return options.context_cache.enabled;
     case FastPath::PromptPv8:
         switch (configuration.kv) {
         case KvCacheStorage::Int8Group64: return !options.original_int8_prefill_kernel;
@@ -293,8 +290,8 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
     case FastPath::GdnConvFused:
     case FastPath::QsaPrepareFused: return false; // Qwen3.8-Flash-Next kernels only
     // It is --draft-tokens auto's policy, and runs only where speculation is adaptive
-    // (adaptive-speculation selected, or an artifact the exact route cannot make request-invariant),
-    // see ExecutionSchedule::adaptive_mtp. A fixed --draft-tokens N drafts N.
+    // (adaptive-speculation selected), see ExecutionSchedule::adaptive_mtp. A fixed --draft-tokens N
+    // drafts N.
     case FastPath::AdaptiveMtp:
         return options.speculative.backend == SpeculativeBackend::Mtp && options.speculative.draft_tokens_auto;
     // Causal scoring has no idle steps (each window's chunks are the caller's); the path is a no-op
@@ -333,16 +330,13 @@ bool FastPathSelection::selected(FastPath path) const noexcept {
 }
 
 bool FastPathSelection::request_invariant() const noexcept {
-    return invariant_capable && std::none_of(paths.begin(), paths.end(), couples_requests);
+    return std::none_of(paths.begin(), paths.end(), couples_requests);
 }
 
-FastPathSelection select_fast_paths(const Model& model, const EngineOptions& options,
-                                    bool invariant_capable) {
-    FastPathSelection out{.configuration     = fast_path_configuration(model, options),
-                          .paths             = {},
-                          .invariant_capable = invariant_capable};
+FastPathSelection select_fast_paths(const Model& model, const EngineOptions& options) {
+    FastPathSelection out{.configuration = fast_path_configuration(model, options), .paths = {}};
     for (const FastPath path : options.fast_path_candidates) {
-        if (!fast_path_applies(path, out.configuration, options, invariant_capable)) {
+        if (!fast_path_applies(path, out.configuration, options)) {
             throw std::invalid_argument(std::string("fast path ") + fast_path_name(path) +
                                         " does not apply to " + describe(out.configuration));
         }
@@ -352,8 +346,7 @@ FastPathSelection select_fast_paths(const Model& model, const EngineOptions& opt
                                          options.fast_path_candidates.end(),
                                          path) != options.fast_path_candidates.end();
         const bool qualified = options.fast_paths &&
-                               fast_path_applies(path, out.configuration, options,
-                                                 invariant_capable) &&
+                               fast_path_applies(path, out.configuration, options) &&
                                fast_path_qualified(path, out.configuration);
         if (candidate || qualified) { out.paths.push_back(path); }
     }

@@ -360,6 +360,10 @@ int main(int argc, char** argv) {
                                    : engine_options.max_context * options.concurrency);
         engine_options.kv_cache        = kv_storage(options.kv);
         engine_options.max_concurrency = options.concurrency;
+        // A group's requests are submitted together and wait behind each other's prefills, which on an
+        // artifact reading its experts from the SSD tier take minutes (Qwen3.8-Flash-Next FP8 at
+        // concurrency 8 outlasted the default 30 s).
+        engine_options.pending_timeout_ms = 3'600'000;
         engine_options.prefill_chunk   = options.prefill_chunk;
         engine_options.fast_paths            = options.fast_paths;
         engine_options.fast_path_candidates  = options.candidates;

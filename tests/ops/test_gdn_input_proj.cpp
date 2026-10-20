@@ -45,7 +45,7 @@ int verify_output_range(std::string_view label, const GuardedBf16Tensor& output,
 }
 
 int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_weight,
-                   std::int32_t tokens) {
+                   std::int32_t tokens, ops::LinearPolicy policy = ops::LinearPolicy::A16Only) {
     constexpr std::int32_t kHidden      = 5120;
     constexpr std::int32_t kQkRows      = 4096;
     constexpr std::int32_t kValueRows   = 6144;
@@ -59,10 +59,13 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_we
     Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
     Tensor output   = qkv.tensor();
     Tensor z_output = z.tensor();
-    ops::gdn_input_proj(x, query_key.view(), value_z_weight.view(), output, z_output, nullptr);
+    ops::gdn_input_proj(x, query_key.view(), value_z_weight.view(), output, z_output, policy,
+                        nullptr);
     cuda_synchronize();
 
-    const std::string suffix = " Q4/Q5 A16 T=" + std::to_string(tokens);
+    const std::string suffix = std::string(ops::column_invariant(policy) ? " Q4/Q5 invariant T="
+                                                                         : " Q4/Q5 A16 T=") +
+                               std::to_string(tokens);
     int failures             = qkv.verify_guards("gdn qkv" + suffix);
     failures += z.verify_guards("gdn z" + suffix);
     failures += qkv.verify_fully_written("gdn qkv" + suffix);
@@ -80,7 +83,8 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_we
 }
 
 int run_q4_q5_graph_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_weight,
-                         std::int32_t tokens) {
+                         std::int32_t tokens,
+                         ops::LinearPolicy policy = ops::LinearPolicy::A16Only) {
     constexpr std::int32_t kHidden    = 5120;
     constexpr std::int32_t kQkRows    = 4096;
     constexpr std::int32_t kValueRows = 6144;
@@ -99,7 +103,7 @@ int run_q4_q5_graph_case(DevicePackedWeight& query_key, DevicePackedWeight& valu
     Tensor output     = qkv.tensor();
     Tensor z_output   = z.tensor();
     const auto launch = [&](cudaStream_t launch_stream) {
-        ops::gdn_input_proj(x, query_key.view(), value_z_weight.view(), output, z_output,
+        ops::gdn_input_proj(x, query_key.view(), value_z_weight.view(), output, z_output, policy,
                             launch_stream);
     };
     launch(stream);
@@ -127,7 +131,9 @@ int run_q4_q5_graph_case(DevicePackedWeight& query_key, DevicePackedWeight& valu
                                    value_z_weight.host, kValueRows, expected, kHidden, tokens);
         return bad;
     };
-    const std::string suffix = " Q4/Q5 A16 graph T=" + std::to_string(tokens);
+    const std::string suffix = std::string(ops::column_invariant(policy) ? " Q4/Q5 invariant graph T="
+                                                                         : " Q4/Q5 A16 graph T=") +
+                               std::to_string(tokens);
     qkv.repaint(stream);
     z.repaint(stream);
     CUDA_CHECK(cudaGraphLaunch(executable, stream));
@@ -177,10 +183,20 @@ int run_q4_q5() {
     for (const std::int32_t tokens : {7, 8, 9, 10, 12, 13, 33, 65, 129}) {
         failures += run_q4_q5_graph_case(query_key, value_z_weight, tokens);
     }
+    // The column-invariant route: the Q4 capacity steps, the Q5 tile steps and the 32-column slices
+    // of wider calls.
+    constexpr auto kInvariant = ops::LinearPolicy::A16ColumnInvariant;
+    for (const std::int32_t tokens : {1, 2, 3, 5, 6, 7, 12, 13, 16, 17, 24, 25, 32, 33, 65, 129, 512}) {
+        failures += run_q4_q5_case(query_key, value_z_weight, tokens, kInvariant);
+    }
+    for (const std::int32_t tokens : {1, 9, 33}) {
+        failures += run_q4_q5_graph_case(query_key, value_z_weight, tokens, kInvariant);
+    }
     return failures;
 }
 
-int run_q8_case(DevicePackedWeight& parent, std::int32_t tokens) {
+int run_q8_case(DevicePackedWeight& parent, std::int32_t tokens,
+                ops::LinearPolicy policy = ops::LinearPolicy::A16Only) {
     constexpr std::int32_t kHidden      = 2048;
     constexpr std::int32_t kQkvRows     = 8192;
     constexpr std::int32_t kZRows       = 4096;
@@ -192,10 +208,13 @@ int run_q8_case(DevicePackedWeight& parent, std::int32_t tokens) {
     Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
     Tensor qkv_output = qkv.tensor();
     Tensor z_output   = z.tensor();
-    ops::gdn_input_proj(x, parent.view(), qkv_output, z_output, nullptr);
+    WorkspaceArena workspace(256);
+    ops::gdn_input_proj(x, parent.view(), qkv_output, z_output, policy, workspace, nullptr);
     cuda_synchronize();
 
-    const std::string suffix = " Q8 A16 T=" + std::to_string(tokens);
+    const std::string suffix = std::string(ops::column_invariant(policy) ? " Q8 invariant T="
+                                                                         : " Q8 A16 T=") +
+                               std::to_string(tokens);
     int failures             = qkv.verify_guards("gdn qkv" + suffix);
     failures += z.verify_guards("gdn z" + suffix);
     failures += qkv.verify_fully_written("gdn qkv" + suffix);
@@ -215,6 +234,10 @@ int run_q8() {
         quantized_weight::make_patterned_weight(QType::Q8_G32_FP16, 12288, kHidden, 503U));
     int failures = 0;
     for (const std::int32_t tokens : {1, 2, 97}) { failures += run_q8_case(parent, tokens); }
+    // The column-invariant route: one column, the exact instances' range and its 32-column slices.
+    for (const std::int32_t tokens : {1, 2, 32, 33, 64, 65, 512}) {
+        failures += run_q8_case(parent, tokens, ops::LinearPolicy::A16ColumnInvariant);
+    }
     return failures;
 }
 

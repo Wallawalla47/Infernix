@@ -330,7 +330,10 @@ int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shap
     const Weight weight = make_device_weight_view(host_weight, device_weight.data());
 
     const std::size_t workspace_bytes =
-        ops::linear_add_workspace_capacity_bytes(qtype, shape.n, shape.k, 1, maximum_t);
+        ops::linear_add_workspace_capacity_bytes(qtype, shape.n, shape.k, shape.policy, 1, maximum_t);
+    const bool invariant                 = shape.policy == ops::LinearPolicy::A16ColumnInvariant;
+    const ops::LinearPolicy graph_policy = invariant ? shape.policy : ops::LinearPolicy::AllowA4;
+    const ops::LinearPolicy rerun_policy = invariant ? shape.policy : ops::LinearPolicy::AllowA8;
     WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 256));
 
     int failures              = 0;
@@ -361,7 +364,7 @@ int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shap
                                                     t, "reference")));
         };
         try {
-            ops::linear_add(input, weight, residual_out, workspace, nullptr);
+            ops::linear_add(input, weight, residual_out, shape.policy, workspace, nullptr);
             test::cuda_check(cudaDeviceSynchronize(), "synchronize linear_add");
             verify_result();
             if ((t == 128 && format == WeightFormat::Q5G64F16S) ||
@@ -372,8 +375,7 @@ int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shap
                 cudaGraphExec_t executable;
                 CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
                 CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
-                ops::linear_add(input, weight, residual_out, ops::LinearPolicy::AllowA4, workspace,
-                                stream);
+                ops::linear_add(input, weight, residual_out, graph_policy, workspace, stream);
                 CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
                 CUDA_CHECK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
                 for (int replay = 0; replay < 3; ++replay) {
@@ -407,8 +409,7 @@ int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shap
                 CUDA_CHECK(cudaGraphDestroy(graph));
                 CUDA_CHECK(cudaStreamDestroy(stream));
                 output.copy_from_host(residual.data(), output.bytes());
-                ops::linear_add(input, weight, residual_out, ops::LinearPolicy::AllowA8, workspace,
-                                nullptr);
+                ops::linear_add(input, weight, residual_out, rerun_policy, workspace, nullptr);
                 test::cuda_check(cudaDeviceSynchronize(), "synchronize permissive A16 linear_add");
                 verify_result();
             }
@@ -418,7 +419,7 @@ int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shap
             continue;
         }
         const std::size_t exact_workspace =
-            ops::linear_add_workspace_capacity_bytes(qtype, shape.n, shape.k, t, t);
+            ops::linear_add_workspace_capacity_bytes(qtype, shape.n, shape.k, shape.policy, t, t);
         if (workspace.used() != 0 || workspace.peak_used() != exact_workspace) {
             std::cerr << case_label << ": exact workspace query/execution high-water mismatch\n";
             ++failures;

@@ -36,7 +36,10 @@ void bf16_linear_add_aggregate_mma_launch(const Tensor& x, const Weight& weight,
 void bf16_linear_add_mma_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                 cudaStream_t stream);
 
+void bf16_linear_add_column_invariant_launch(const Tensor& x, const Weight& weight,
+                                             Tensor& residual, cudaStream_t stream);
+
 void bf16_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,
-                              cudaStream_t stream);
+                              cudaStream_t stream, bool column_invariant = false);
 
 } // namespace infernix::ops::detail

@@ -61,7 +61,18 @@ Q8Launch select_q8_generic(std::int32_t n, std::int32_t k, std::int32_t t) {
     if (t <= 96) return launch_q8_a16_mma_r32_t96;
     return launch_q8_a16_mma_r32_t128;
 }
+
+// The column-invariant route of a problem without its own: that SIMT pair at every width (the
+// R8T8 launch takes wider calls eight columns at a time), so a column's bits are those of the
+// call computing it alone.
+Q8Launch select_q8_generic_invariant(std::int32_t t) {
+    return t <= 4 ? launch_q8_a16_simt_r8_t4 : launch_q8_a16_simt_r8_t8;
+}
 } // namespace
+
+// Every problem: the vocabulary head [248320, 5120] its own sliced family, the rest the runtime-shape
+// SIMT pair.
+bool q8_column_invariant_route(std::int32_t n, std::int32_t k) noexcept { return n > 0 && k > 0; }
 
 Q8Launch select_q8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t, LinearRoutes routes) {
     if (t <= 0) throw std::invalid_argument("q8 linear: T must be positive");
@@ -79,9 +90,10 @@ Q8Launch select_q8_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
     if (!valid_linear_policy(policy)) throw std::invalid_argument("q8 linear: unsupported policy");
     if (column_invariant(policy)) {
         if (t <= 0) throw std::invalid_argument("q8 linear: T must be positive");
+        if (n <= 0 || k <= 0) throw std::invalid_argument("q8 linear: unsupported shape");
         if (n == Q8N248320K5120::kOutputRows && k == Q8N248320K5120::kInputRows)
             return select_q8_n248320_k5120_invariant(t);
-        throw std::invalid_argument("q8 linear: no column-invariant route for this problem");
+        return select_q8_generic_invariant(t);
     }
     return select_q8_a16_launch(n, k, t, routes);
 }

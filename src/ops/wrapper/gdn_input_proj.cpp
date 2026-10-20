@@ -293,11 +293,9 @@ void require_q8_flash_next_parent(const Weight& weight, const char* operation) {
 }
 
 void validate_policy(LinearPolicy policy, QType qtype) {
-    // MXFP8's one route is column-invariant at every width.
-    if (column_invariant(policy) && qtype != QType::NVFP4 && qtype != QType::FP8_E4M3FN_ROW_BF16 &&
-        qtype != QType::FP8_E4M3FN_G32_E8M0) {
-        throw std::invalid_argument("gdn_input_proj: the weight format registers no column-invariant route");
-    }
+    // Every single-parent format serves the column-invariant policy: a dedicated route
+    // (gdn_input_proj_column_invariant_route) or its exact one-column route once per column.
+    (void)qtype;
     switch (policy) {
     case LinearPolicy::A16Only:
     case LinearPolicy::AllowA8:
@@ -380,6 +378,17 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
         require_matrix(z, kZRows, cols, "z");
         require_single_parent_nonoverlap(x, qkv, z);
         require_q8_flash_next_parent(weight, "gdn_input_proj");
+        if (column_invariant(policy)) {
+            // No dedicated column-invariant route: the exact one-column route, once per column.
+            for (std::int32_t column = 0; column < cols; ++column) {
+                const Tensor x_column = x.slice(1, column, 1);
+                Tensor qkv_column     = qkv.slice(1, column, 1);
+                Tensor z_column       = z.slice(1, column, 1);
+                detail::launch_q8_n16384_k2560_split(x_column, weight, qkv_column, z_column,
+                                                     LinearRoutes::Exact, stream);
+            }
+            return;
+        }
         detail::launch_q8_n16384_k2560_split(x, weight, qkv, z, routes, stream);
         return;
     }
@@ -393,17 +402,19 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
     require_matrix(z, kZRows, cols, "z");
     require_single_parent_nonoverlap(x, qkv, z);
     require_q8_rowsplit(weight, kRows, "query/key/value/z weight");
-    detail::q8_gdn_input_dispatch(x, weight, qkv, z, stream);
+    detail::q8_gdn_input_dispatch(x, weight, qkv, z, stream, column_invariant(policy));
 }
 
-detail::Q4Q5GdnInputConvPlan resolve_q4_q5_conv_plan(std::int32_t tokens, std::int32_t batch_size) {
+detail::Q4Q5GdnInputConvPlan resolve_q4_q5_conv_plan(std::int32_t tokens, std::int32_t batch_size,
+                                                     bool column_invariant = false) {
     return detail::q4_q5_gdn_input_conv_resolve_plan({5120, 4096, 12288, 10240, 6144, 5120, tokens},
-                                                     batch_size);
+                                                     batch_size, column_invariant);
 }
 
-detail::Q8GdnInputConvPlan resolve_q8_conv_plan(std::int32_t tokens, std::int32_t batch_size) {
+detail::Q8GdnInputConvPlan resolve_q8_conv_plan(std::int32_t tokens, std::int32_t batch_size,
+                                                bool column_invariant = false) {
     return detail::q8_gdn_input_conv_resolve_plan({2048, 8192, 4096, 12288, 2048, tokens},
-                                                  batch_size);
+                                                  batch_size, column_invariant);
 }
 
 struct ProjectedWorkspace {
@@ -578,12 +589,14 @@ void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
                         "gdn_input_proj_conv_snapshot", "value");
     require_conv_tensor(z, kZRows, geometry.width, geometry.batch, "gdn_input_proj_conv_snapshot",
                         "z");
-    if (geometry.batch > 1) {
+    // Batched rows and the column-invariant policy compose the projection and the convolution.
+    if (geometry.batch > 1 || column_invariant(policy)) {
         compose_batched_snapshot(x, conv_weight, conv_states, valid_columns, initial_state_slots,
                                  snapshot_base_slots, query, key, value, z, kQueryRows, kKeyRows,
                                  kValueRows, geometry, workspace, stream,
                                  [&](const Tensor& x_flat, Tensor& projected, Tensor& z_flat) {
-                                     gdn_input_proj(x_flat, weight, projected, z_flat, stream);
+                                     gdn_input_proj(x_flat, weight, projected, z_flat, policy,
+                                                    workspace, stream);
                                  });
         return;
     }
@@ -752,11 +765,12 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
     require_record_nonoverlap(x, conv_weight, conv_states, valid_columns, initial_state_slots,
                               conv_record, query, key, value, z, workspace);
 
-    if (geometry.batch > 1 || geometry.width > 16) {
+    if (geometry.batch > 1 || geometry.width > 16 || column_invariant(policy)) {
         compose_record(x, conv_weight, conv_states, valid_columns, initial_state_slots, conv_record,
                        query, key, value, z, geometry, workspace, stream,
                        [&](const Tensor& x_flat, Tensor& record_flat, Tensor& z_flat) {
-                           gdn_input_proj(x_flat, weight, record_flat, z_flat, stream);
+                           gdn_input_proj(x_flat, weight, record_flat, z_flat, policy, workspace,
+                                          stream);
                        });
         return;
     }
@@ -773,6 +787,14 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
 
 void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
                     Tensor& qkv, Tensor& z, cudaStream_t stream) {
+    gdn_input_proj(x, qk_weight, value_z_weight, qkv, z, LinearPolicy::A16Only, stream);
+}
+
+void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
+                    Tensor& qkv, Tensor& z, LinearPolicy policy, cudaStream_t stream) {
+    if (!valid_linear_policy(policy)) {
+        throw std::invalid_argument("gdn_input_proj: invalid compute policy");
+    }
     constexpr std::int32_t kHidden     = 5120;
     constexpr std::int32_t kQkRows     = 4096;
     constexpr std::int32_t kValueRows  = 6144;
@@ -787,7 +809,16 @@ void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& valu
     require_rowsplit(qk_weight, QType::Q4_G64_FP16, kQkRows, "qk weight");
     require_rowsplit(value_z_weight, QType::Q5_G64_FP16, kParentRows, "value/z weight");
 
-    detail::q4_q5_gdn_input_dispatch(x, qk_weight, value_z_weight, qkv, z, stream);
+    detail::q4_q5_gdn_input_dispatch(x, qk_weight, value_z_weight, qkv, z, stream,
+                                     column_invariant(policy));
+}
+
+bool gdn_input_proj_column_invariant_route(QType parent_qtype, std::int32_t parent_rows,
+                                           std::int32_t input_rows) noexcept {
+    if (parent_qtype == QType::Q8_G32_FP16) { return !(parent_rows == 16384 && input_rows == 2560); }
+    // MXFP8's one route is column-invariant at every width.
+    return parent_qtype == QType::NVFP4 || parent_qtype == QType::FP8_E4M3FN_ROW_BF16 ||
+           parent_qtype == QType::FP8_E4M3FN_G32_E8M0;
 }
 
 std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int32_t parent_rows,
@@ -814,13 +845,13 @@ std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int
     }
     if ((parent_qtype == QType::Q8_G32_FP16 || parent_qtype == QType::FP8_E4M3FN_G32_E8M0) && parent_rows == 16384 &&
         input_rows == 2560) {
-        return 0;
+        return 0; // every route, and the column-by-column one, needs no workspace
     }
     if (parent_qtype == QType::Q8_G32_FP16 && parent_rows == 12288 && input_rows == 2048) {
         (void)detail::q8_gdn_input_resolve_plan(
-            {input_rows, 8192, 4096, parent_rows, input_rows, min_tokens});
+            {input_rows, 8192, 4096, parent_rows, input_rows, min_tokens}, column_invariant(policy));
         (void)detail::q8_gdn_input_resolve_plan(
-            {input_rows, 8192, 4096, parent_rows, input_rows, max_tokens});
+            {input_rows, 8192, 4096, parent_rows, input_rows, max_tokens}, column_invariant(policy));
         return 0;
     }
     throw std::invalid_argument("gdn_input_proj workspace: unsupported parent profile");
@@ -844,6 +875,16 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
 std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows,
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {
+    return gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+        query_rows, key_rows, value_rows, LinearPolicy::A16Only, batch_size, min_width, max_width);
+}
+
+std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+    std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows, LinearPolicy policy,
+    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {
+    if (!valid_linear_policy(policy)) {
+        throw std::invalid_argument("gdn_input_proj_conv_snapshot workspace: invalid compute policy");
+    }
     const bool q4_q5 = query_rows == 2048 && key_rows == 2048 && value_rows == 6144;
     const bool q8    = query_rows == 2048 && key_rows == 2048 && value_rows == 4096;
     if (!q4_q5 && !q8) {
@@ -851,6 +892,17 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     }
     require_snapshot_capacity_domain(batch_size, min_width, max_width);
     const std::int32_t channels = query_rows + key_rows + value_rows;
+    if (column_invariant(policy)) {
+        // Every width composes the invariant projection (no workspace) and the convolution.
+        if (q4_q5) {
+            (void)resolve_q4_q5_conv_plan(min_width, batch_size, true);
+            (void)resolve_q4_q5_conv_plan(max_width, batch_size, true);
+        } else {
+            (void)resolve_q8_conv_plan(min_width, batch_size, true);
+            (void)resolve_q8_conv_plan(max_width, batch_size, true);
+        }
+        return composed_snapshot_capacity(channels, batch_size * max_width, 0);
+    }
     if (batch_size > 1) {
         if (q4_q5) {
             (void)resolve_q4_q5_conv_plan(min_width, batch_size);
@@ -915,6 +967,16 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
 std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows,
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {
+    return gdn_input_proj_conv_record_workspace_capacity_bytes(
+        query_rows, key_rows, value_rows, LinearPolicy::A16Only, batch_size, min_width, max_width);
+}
+
+std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
+    std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows, LinearPolicy policy,
+    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {
+    if (!valid_linear_policy(policy)) {
+        throw std::invalid_argument("gdn_input_proj_conv_record workspace: invalid compute policy");
+    }
     const bool q4_q5 = query_rows == 2048 && key_rows == 2048 && value_rows == 6144;
     const bool q8    = query_rows == 2048 && key_rows == 2048 && value_rows == 4096;
     if (!q4_q5 && !q8) {
@@ -922,8 +984,12 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     }
     require_record_capacity_domain(batch_size, min_width, max_width);
     if (q4_q5) {
-        (void)resolve_q4_q5_conv_plan(min_width, batch_size);
-        (void)resolve_q4_q5_conv_plan(max_width, batch_size);
+        // The materialized projection writes directly to the caller's conv_record.
+        (void)resolve_q4_q5_conv_plan(min_width, batch_size, column_invariant(policy));
+        (void)resolve_q4_q5_conv_plan(max_width, batch_size, column_invariant(policy));
+    } else if (column_invariant(policy)) {
+        (void)resolve_q8_conv_plan(min_width, batch_size, true);
+        (void)resolve_q8_conv_plan(max_width, batch_size, true);
     } else {
         (void)resolve_q8_conv_plan(min_width, batch_size);
         (void)resolve_q8_conv_plan(max_width, batch_size);
@@ -970,6 +1036,21 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
                                   const Tensor& snapshot_base_slots, Tensor& query, Tensor& key,
                                   Tensor& value, Tensor& z, WorkspaceArena& ws,
                                   cudaStream_t stream) {
+    gdn_input_proj_conv_snapshot(x, qk_weight, value_z_weight, conv_weight, conv_states,
+                                 valid_columns, initial_state_slots, snapshot_base_slots, query,
+                                 key, value, z, LinearPolicy::A16Only, ws, stream);
+}
+
+void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
+                                  const Weight& value_z_weight, const Tensor& conv_weight,
+                                  Tensor& conv_states, const Tensor& valid_columns,
+                                  const Tensor& initial_state_slots,
+                                  const Tensor& snapshot_base_slots, Tensor& query, Tensor& key,
+                                  Tensor& value, Tensor& z, LinearPolicy policy, WorkspaceArena& ws,
+                                  cudaStream_t stream) {
+    if (!valid_linear_policy(policy)) {
+        throw std::invalid_argument("gdn_input_proj_conv_snapshot: invalid compute policy");
+    }
     constexpr std::int32_t kHidden     = 5120;
     constexpr std::int32_t kQueryRows  = 2048;
     constexpr std::int32_t kKeyRows    = 2048;
@@ -991,12 +1072,15 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
     require_conv_tensor(z, kZRows, geometry.width, geometry.batch, "gdn_input_proj_conv_snapshot",
                         "z");
 
-    if (geometry.batch > 1) {
+    // Batched rows and the column-invariant policy compose the projection and the convolution, so
+    // a column reads the same BF16 projection whatever the call's width or batch.
+    if (geometry.batch > 1 || column_invariant(policy)) {
         compose_batched_snapshot(
             x, conv_weight, conv_states, valid_columns, initial_state_slots, snapshot_base_slots,
             query, key, value, z, kQueryRows, kKeyRows, kValueRows, geometry, ws, stream,
             [&](const Tensor& x_flat, Tensor& projected, Tensor& z_flat) {
-                gdn_input_proj(x_flat, qk_weight, value_z_weight, projected, z_flat, stream);
+                gdn_input_proj(x_flat, qk_weight, value_z_weight, projected, z_flat, policy,
+                               stream);
             });
         return;
     }
@@ -1024,6 +1108,21 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
                                 const Tensor& initial_state_slots, Tensor& conv_record,
                                 Tensor& query, Tensor& key, Tensor& value, Tensor& z,
                                 WorkspaceArena& workspace, cudaStream_t stream) {
+    gdn_input_proj_conv_record(x, qk_weight, value_z_weight, conv_weight, conv_states,
+                               valid_columns, initial_state_slots, conv_record, query, key, value,
+                               z, LinearPolicy::A16Only, workspace, stream);
+}
+
+void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
+                                const Weight& value_z_weight, const Tensor& conv_weight,
+                                const Tensor& conv_states, const Tensor& valid_columns,
+                                const Tensor& initial_state_slots, Tensor& conv_record,
+                                Tensor& query, Tensor& key, Tensor& value, Tensor& z,
+                                LinearPolicy policy, WorkspaceArena& workspace,
+                                cudaStream_t stream) {
+    if (!valid_linear_policy(policy)) {
+        throw std::invalid_argument("gdn_input_proj_conv_record: invalid compute policy");
+    }
     constexpr std::int32_t kHidden     = 5120;
     constexpr std::int32_t kQueryRows  = 2048;
     constexpr std::int32_t kKeyRows    = 2048;
@@ -1050,7 +1149,7 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
                               conv_record, query, key, value, z, workspace);
 
     const detail::Q4Q5GdnInputConvPlan plan =
-        resolve_q4_q5_conv_plan(geometry.width, geometry.batch);
+        resolve_q4_q5_conv_plan(geometry.width, geometry.batch, column_invariant(policy));
     if (plan.schedule == detail::Q4Q5GdnInputConvScheduleId::ProjectionEpilogueFused) {
         detail::q4_q5_gdn_input_conv_record_launch(x, qk_weight, value_z_weight, conv_weight,
                                                    conv_states, valid_columns, initial_state_slots,
@@ -1061,7 +1160,7 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
                    query, key, value, z, geometry, workspace, stream,
                    [&](const Tensor& x_flat, Tensor& record_flat, Tensor& z_flat) {
                        gdn_input_proj(x_flat, qk_weight, value_z_weight, record_flat, z_flat,
-                                      stream);
+                                      policy, stream);
                    });
 }
 

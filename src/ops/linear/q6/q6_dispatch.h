@@ -9,6 +9,8 @@
 namespace infernix::ops::detail {
 
 Q6Launch select_q6_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t);
+// Whether the problem registers a dedicated column-invariant route.
+[[nodiscard]] bool q6_column_invariant_route(std::int32_t n, std::int32_t k) noexcept;
 Q6Launch select_q6_launch(std::int32_t n, std::int32_t k, std::int32_t t, LinearPolicy policy);
 
 void q6_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,

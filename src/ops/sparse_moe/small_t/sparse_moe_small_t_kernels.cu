@@ -73,10 +73,43 @@ __global__ void sparse_moe_small_t_s1_kernel(const __nv_bfloat16* __restrict__ x
     }
 }
 
+// The column-invariant router (request-invariant exact route): one CTA per router row reduces each
+// token's score exactly as the decode router does (sparse_moe_router_row_dot and
+// sparse_moe_router_row_reduce), so a token's scores and selection do not depend on the call's
+// width. Writes [Tokens,257] complete scores.
+template <int Tokens>
+__global__ void __launch_bounds__(kSparseMoeRouterWarps * 32)
+    sparse_moe_small_t_s1_invariant_kernel(const __nv_bfloat16* __restrict__ x,
+                                           const __nv_bfloat16* __restrict__ router,
+                                           float* __restrict__ scores) {
+    static_assert(Tokens >= 1 && Tokens <= kSparseMoeSmallTMax);
+    static_assert(kSparseMoeRouterHidden == kHidden);
+    __shared__ float partial[Tokens][kSparseMoeRouterWarps];
+    if (threadIdx.x == 0) { pdl::trigger_dependents(); }
+    const int row  = static_cast<int>(blockIdx.x);
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const auto* router_row = router + static_cast<std::int64_t>(row) * kHidden;
+    for (int token = 0; token < Tokens; ++token) {
+        const float dot =
+            sparse_moe_router_row_dot(x + static_cast<std::int64_t>(token) * kHidden, router_row);
+        if (lane == 0) { partial[token][warp] = dot; }
+    }
+    __syncthreads();
+    if (warp == 0) {
+        for (int token = 0; token < Tokens; ++token) {
+            const float value = sparse_moe_router_row_reduce(partial[token]);
+            if (lane == 0) { scores[static_cast<std::int64_t>(token) * kRouterRows + row] = value; }
+        }
+    }
+}
+
 // S2 runs one CTA per token: the router scores of a single token take 1 060 B of shared
 // memory, so the block no longer has to be wide enough to hold the whole decode window.
+// Partitions is S1's K partition count (1: complete scores, read without an addition).
 constexpr int kS2Threads = 128;
 
+template <int Partitions>
 __global__ void sparse_moe_small_t_s2_kernel(const float* __restrict__ partial_scores,
                                              int* __restrict__ token_ids,
                                              float* __restrict__ token_alpha,
@@ -88,14 +121,16 @@ __global__ void sparse_moe_small_t_s2_kernel(const float* __restrict__ partial_s
     if (tid == 0) { pdl::trigger_dependents(); }
     pdl::wait_for_dependencies();
     for (int row = tid; row < kRouterRows; row += kS2Threads) {
-        float sum = 0.0f;
+        const auto* source =
+            partial_scores + (static_cast<std::int64_t>(token) * kRouterRows + row) * Partitions;
+        if constexpr (Partitions == 1) {
+            scores[row] = source[0];
+        } else {
+            float sum = 0.0f;
 #pragma unroll
-        for (int partition = 0; partition < kRouterPartitions; ++partition) {
-            sum += partial_scores[((static_cast<std::int64_t>(token) * kRouterRows + row) *
-                                   kRouterPartitions) +
-                                  partition];
+            for (int partition = 0; partition < Partitions; ++partition) { sum += source[partition]; }
+            scores[row] = sum;
         }
-        scores[row] = sum;
     }
     __syncthreads();
 
@@ -107,18 +142,26 @@ __global__ void sparse_moe_small_t_s2_kernel(const float* __restrict__ partial_s
 
 template <int Tokens>
 void launch_s1(const __nv_bfloat16* x, const __nv_bfloat16* router, float* partial_scores,
-               cudaStream_t stream) {
-    sparse_moe_small_t_s1_kernel<Tokens>
-        <<<kRouterRows * kRouterPartitions, kRouterWarps * 32, 0, stream>>>(x, router,
-                                                                            partial_scores);
+               bool column_invariant, cudaStream_t stream) {
+    if (column_invariant) {
+        sparse_moe_small_t_s1_invariant_kernel<Tokens>
+            <<<kRouterRows, kSparseMoeRouterWarps * 32, 0, stream>>>(x, router, partial_scores);
+    } else {
+        sparse_moe_small_t_s1_kernel<Tokens>
+            <<<kRouterRows * kRouterPartitions, kRouterWarps * 32, 0, stream>>>(x, router,
+                                                                                partial_scores);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
 void launch_s2(const float* partial_scores, int* token_ids, float* token_alpha, float* shared_scale,
-               std::int32_t tokens, cudaStream_t stream) {
+               std::int32_t tokens, bool column_invariant, cudaStream_t stream) {
+    using S2Kernel        = void (*)(const float*, int*, float*, float*);
+    const S2Kernel kernel = column_invariant ? &sparse_moe_small_t_s2_kernel<1>
+                                             : &sparse_moe_small_t_s2_kernel<kRouterPartitions>;
     CUDA_CHECK(pdl::launch_dependent(
-        {dim3(static_cast<unsigned int>(tokens)), dim3(kS2Threads), 0, stream},
-        sparse_moe_small_t_s2_kernel, partial_scores, token_ids, token_alpha, shared_scale));
+        {dim3(static_cast<unsigned int>(tokens)), dim3(kS2Threads), 0, stream}, kernel,
+        partial_scores, token_ids, token_alpha, shared_scale));
 }
 
 void launch_s3_tiled(const Tensor& x, const SparseMoeWeights& weights,
@@ -293,12 +336,14 @@ void sparse_moe_small_t_launch(const Tensor& x, const SparseMoeWeights& weights,
     dispatch_tokens(plan.tokens, [&]<int Tokens>() {
         launch_s1<Tokens>(static_cast<const __nv_bfloat16*>(x.data),
                           static_cast<const __nv_bfloat16*>(weights.router_shared_gate.qdata),
-                          static_cast<float*>(workspace.scratch.data), stream);
+                          static_cast<float*>(workspace.scratch.data), plan.column_invariant,
+                          stream);
     });
     launch_s2(static_cast<const float*>(workspace.scratch.data),
               static_cast<int*>(workspace.token_ids.data),
               static_cast<float*>(workspace.token_alpha.data),
-              static_cast<float*>(workspace.shared_scale.data), plan.tokens, stream);
+              static_cast<float*>(workspace.shared_scale.data), plan.tokens, plan.column_invariant,
+              stream);
     launch_s3_tiled(x, weights, plan, workspace, stream);
     launch_s4_tiled(weights, destination, plan, workspace, stream);
 }

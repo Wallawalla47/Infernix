@@ -17,10 +17,15 @@ int main() {
             40,  41,  48,  49,  96,  128, 129, 152, 153, 168,  169, 176,
             192, 224, 225, 256, 257, 384, 385, 512, 513, 640,  641, 1024,
         };
-        const int failures =
+        int failures =
             run_profile("LinearSwiGLU Q4_A16",
                         {QType::Q4_G64_FP16, 34816, 5120, 17408, 1401U, ActivationCompute::A16},
                         kTokenCases, std::array<std::int32_t, 7>{7, 25, 49, 128, 152, 168, 1024});
+        // The column-invariant route (decode and verification of the request-invariant exact route):
+        // one column, its tile boundaries and the 32-column slices of wider calls.
+        failures += run_profile("LinearSwiGLU Q4_A16 column-invariant",
+                                {QType::Q4_G64_FP16, 34816, 5120, 17408, 1407U, ActivationCompute::A16ColumnInvariant},
+                                std::array{1, 2, 8, 9, 16, 17, 24, 25, 32, 33, 40, 64, 65, 129, 512});
         std::cout << (failures == 0 ? "OK" : "FAIL") << " LinearSwiGLU Q4_A16 correctness\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

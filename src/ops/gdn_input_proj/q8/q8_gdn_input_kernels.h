@@ -15,6 +15,8 @@ void q8_gdn_input_decode_conv_snapshot_launch(
     Tensor& query, Tensor& key, Tensor& value, Tensor& z, cudaStream_t stream);
 void q8_gdn_input_splitk_mma_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                     cudaStream_t stream);
+void q8_gdn_input_column_invariant_launch(const Tensor& x, const Weight& weight, Tensor& qkv,
+                                          Tensor& z, cudaStream_t stream);
 void q8_gdn_input_splitk_conv_snapshot_launch(
     const Tensor& x, const Weight& weight, const Tensor& conv_weight, Tensor& conv_states,
     const Tensor& valid_columns, const Tensor& initial_slot, const Tensor& snapshot_base_slot,

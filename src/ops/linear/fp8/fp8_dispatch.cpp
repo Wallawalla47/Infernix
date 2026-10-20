@@ -27,6 +27,12 @@ bool uses_pair(const Fp8LinearShape& shape, LinearPolicy policy, LinearRoutes ro
 }
 } // namespace
 
+bool fp8_linear_column_invariant_route(std::int32_t n, std::int32_t k) noexcept {
+    for (const auto* shape : kShapes)
+        if (shape->n == n && shape->k == k) return shape->invariant != nullptr;
+    return false;
+}
+
 std::size_t fp8_linear_workspace_capacity_bytes(std::int32_t n, std::int32_t k, LinearPolicy policy,
                                                 std::int32_t min_tokens, std::int32_t max_tokens) {
     if (min_tokens <= 0 || max_tokens < min_tokens)

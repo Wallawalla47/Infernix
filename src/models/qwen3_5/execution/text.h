@@ -206,6 +206,11 @@ private:
         return active_sequence_batch_ != 0 ? active_sequence_width_ : columns;
     }
     void run_layers(Tensor& x, Phase phase);
+    // The drafter and proposal head a batched draft call runs with: their column-invariant copies
+    // on the exact route (Parameters::invariant_mtp), whose drafts then do not depend on the other
+    // rows; the prompt's drafts keep the drafter's own routes.
+    [[nodiscard]] const MtpParameters* batch_mtp() const noexcept;
+    [[nodiscard]] const LinearParameters* batch_proposal_head() const noexcept;
     // The parameters a phase's projections run with (Parameters::decode_text for decode and
     // verification).
     [[nodiscard]] const TextParameters& phase_text(Phase phase) const noexcept {

@@ -21,6 +21,9 @@ void q8_attn_input_simt_r8_c4_launch(const Tensor& x, const Weight& weight, Tens
                                      Tensor& v, cudaStream_t stream);
 void q8_attn_input_splitk_mma_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                      Tensor& k, Tensor& v, cudaStream_t stream);
+void q8_attn_input_column_invariant_launch(const Tensor& x, const Weight& weight, Tensor& q,
+                                           Tensor& gate, Tensor& k, Tensor& v,
+                                           cudaStream_t stream);
 void q8_attn_input_splitk_mma_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k,
                                      Tensor& v, cudaStream_t stream);
 void q8_attn_input_mma_r32_c128_launch(const Tensor& x, const Weight& weight, Tensor& q,

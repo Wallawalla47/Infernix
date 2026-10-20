@@ -487,10 +487,9 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     summary.prefix_cache         = std::move(restore);
     summary.fast_path_configuration = models::qwen4_exp::describe(fast.configuration);
     for (const FastPath path : fast.paths) { summary.fast_paths.emplace_back(fast_path_name(path)); }
-    summary.fast_paths_disabled        = !options.fast_paths;
-    summary.request_invariance_capable = true;
+    summary.fast_paths_disabled = !options.fast_paths;
     // Tail skip makes the output depend on which experts the cache holds.
-    summary.request_invariant          = fast.request_invariant() && options.expert_tail_skip == 0;
+    summary.request_invariant = fast.request_invariant() && options.expert_tail_skip == 0;
 
     ModelMetadata metadata;
     metadata.model_id       = instance->model->info().name;

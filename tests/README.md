@@ -273,7 +273,16 @@ INFERNIX_TEST_BACKEND=dflash2 \
 
 INFERNIX_TEST_ARTIFACT=$PWD/out/qwen3_8_27b_nvfp4.ninfer \
   ./build/tests/infernix_qwen3_5_native_transactions_test dflash2
+
+INFERNIX_TEST_ARTIFACT=$PWD/out/qwen3_6_35b_a3b.infernix \
+  ./build/tests/infernix_qwen3_5_invariance_real_test mtp
 ```
+
+The invariance entry checks the exact route's request invariance with sampled decoding: each
+request alone against all four at once in reverse submission order, a warm off-grid prefix against
+the cold request, and a KV pool for two extents serving four requests without preemption. Its
+positional speculation is `none`, `mtp`, `dflash` or `dflash2` (the artifact must hold that
+drafter).
 
 The agent entry checks multi-turn continuation and branching. The preemption entry exercises
 Replay recovery and cancellation while paused or replaying; `INFERNIX_PREEMPTION_REAL_SCENARIO`

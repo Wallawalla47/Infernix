@@ -60,6 +60,8 @@ const char* q4_q5_gdn_input_schedule_name(Q4Q5GdnInputScheduleId schedule) noexc
         return "gdn_input_proj.q4_q5.grouped_mixed.mma.r32.c64.s4";
     case Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128S2:
         return "gdn_input_proj.q4_q5.grouped_mixed.mma.r64.c128.s2";
+    case Q4Q5GdnInputScheduleId::ColumnInvariant:
+        return "gdn_input_proj.q4_q5.sliced.column_invariant";
     }
     return "gdn_input_proj.q4_q5.unknown";
 }
@@ -78,11 +80,13 @@ bool q4_q5_gdn_input_admits(const Q4Q5GdnInputProblem& problem) noexcept {
     return supported_shape(problem) && problem.cols >= 1;
 }
 
-Q4Q5GdnInputPlan q4_q5_gdn_input_resolve_plan(const Q4Q5GdnInputProblem& problem) {
+Q4Q5GdnInputPlan q4_q5_gdn_input_resolve_plan(const Q4Q5GdnInputProblem& problem,
+                                              bool column_invariant) {
     if (!q4_q5_gdn_input_admits(problem)) {
         throw std::invalid_argument(
             "Q4/Q5 GDN input: exact problem or column count is not admitted");
     }
+    if (column_invariant) { return {Q4Q5GdnInputScheduleId::ColumnInvariant}; }
 
     for (const RouteSpec& route : kRoutes) {
         if (!route.cols.contains(problem.cols)) { continue; }
@@ -92,12 +96,13 @@ Q4Q5GdnInputPlan q4_q5_gdn_input_resolve_plan(const Q4Q5GdnInputProblem& problem
 }
 
 Q4Q5GdnInputConvPlan q4_q5_gdn_input_conv_resolve_plan(const Q4Q5GdnInputProblem& problem,
-                                                       std::int32_t batch_size) {
+                                                       std::int32_t batch_size,
+                                                       bool column_invariant) {
     if (!q4_q5_gdn_input_admits(problem) || batch_size <= 0 || batch_size > 8) {
         throw std::invalid_argument(
             "Q4/Q5 GDN input conv: exact problem or column count is not admitted");
     }
-    if (batch_size > 1) { return {Q4Q5GdnInputConvScheduleId::Materialized}; }
+    if (batch_size > 1 || column_invariant) { return {Q4Q5GdnInputConvScheduleId::Materialized}; }
     switch (problem.cols) {
     case 1:
     case 2:
@@ -112,11 +117,12 @@ Q4Q5GdnInputConvPlan q4_q5_gdn_input_conv_resolve_plan(const Q4Q5GdnInputProblem
 
 void q4_q5_gdn_input_execute_plan(const Q4Q5GdnInputPlan& plan, const Tensor& x,
                                   const Weight& qk_weight, const Weight& value_z_weight,
-                                  Tensor& qkv, Tensor& z, cudaStream_t stream) {
+                                  Tensor& qkv, Tensor& z, cudaStream_t stream,
+                                  bool column_invariant) {
     const Q4Q5GdnInputProblem problem{x.ne[0],   qk_weight.n, value_z_weight.n,
                                       qkv.ne[0], z.ne[0],     qk_weight.padded_shape[1],
                                       x.ne[1]};
-    const Q4Q5GdnInputPlan resolved = q4_q5_gdn_input_resolve_plan(problem);
+    const Q4Q5GdnInputPlan resolved = q4_q5_gdn_input_resolve_plan(problem, column_invariant);
     if (resolved.schedule != plan.schedule) {
         throw std::invalid_argument("Q4/Q5 GDN input: plan does not match exact problem");
     }
@@ -134,18 +140,25 @@ void q4_q5_gdn_input_execute_plan(const Q4Q5GdnInputPlan& plan, const Tensor& x,
         q4_q5_gdn_input_grouped_mma_launch(x, qk_weight, value_z_weight, qkv, z, plan.schedule,
                                            stream);
         return;
+    case Q4Q5GdnInputScheduleId::ColumnInvariant: {
+        Tensor qk    = qkv.slice(0, 0, problem.qk_rows);
+        Tensor value = qkv.slice(0, problem.qk_rows, problem.z_rows);
+        q4_q5_gdn_input_column_invariant_launch(x, qk_weight, value_z_weight, qk, value, z, stream);
+        return;
+    }
     }
     throw std::logic_error("Q4/Q5 GDN input: unknown schedule");
 }
 
 void q4_q5_gdn_input_dispatch(const Tensor& x, const Weight& qk_weight,
                               const Weight& value_z_weight, Tensor& qkv, Tensor& z,
-                              cudaStream_t stream) {
+                              cudaStream_t stream, bool column_invariant) {
     const Q4Q5GdnInputProblem problem{x.ne[0],   qk_weight.n, value_z_weight.n,
                                       qkv.ne[0], z.ne[0],     qk_weight.padded_shape[1],
                                       x.ne[1]};
-    const Q4Q5GdnInputPlan plan = q4_q5_gdn_input_resolve_plan(problem);
-    q4_q5_gdn_input_execute_plan(plan, x, qk_weight, value_z_weight, qkv, z, stream);
+    const Q4Q5GdnInputPlan plan = q4_q5_gdn_input_resolve_plan(problem, column_invariant);
+    q4_q5_gdn_input_execute_plan(plan, x, qk_weight, value_z_weight, qkv, z, stream,
+                                 column_invariant);
 }
 
 } // namespace infernix::ops::detail

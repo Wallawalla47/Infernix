@@ -31,14 +31,12 @@ struct FastPathConfiguration {
 [[nodiscard]] FastPathConfiguration fast_path_configuration(const Model& model,
                                                             const EngineOptions& options);
 
-// Whether the path's kernels run in this configuration at all. The request-coupling paths that give
-// up a part of the exact route's invariance (batched-decode through preemption) apply only where the
-// exact route can be request-invariant (`invariant_capable`: every decode projection registers a
-// column-invariant route, execution::column_invariant_text_supported); elsewhere their behaviour is
-// the exact route's. adaptive-mtp and idle-wide-prefill couple requests with behaviour no exact
-// route runs, so they apply either way.
+// Whether the path's kernels run in this configuration at all. The request-coupling paths give up a
+// part of the exact route's invariance, which every artifact has (every decode projection runs a
+// column-invariant route, or its exact route once per column). adaptive-mtp and
+// idle-wide-prefill couple requests with behaviour no exact route runs.
 [[nodiscard]] bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration,
-                                     const EngineOptions& options, bool invariant_capable);
+                                     const EngineOptions& options);
 
 // A path that couples a request's arithmetic to the other requests of the Engine.
 [[nodiscard]] constexpr bool couples_requests(FastPath path) noexcept {
@@ -82,21 +80,16 @@ struct FastPathSelection {
     FastPathConfiguration configuration;
     // In kFastPaths order.
     std::vector<FastPath> paths;
-    bool invariant_capable = false;
 
     [[nodiscard]] bool selected(FastPath path) const noexcept;
-    // Request invariance holds for `path`'s concern: the Model supports it and the path is not
-    // selected.
-    [[nodiscard]] bool invariant(FastPath path) const noexcept {
-        return invariant_capable && !selected(path);
-    }
+    // Request invariance holds for `path`'s concern: the path is not selected.
+    [[nodiscard]] bool invariant(FastPath path) const noexcept { return !selected(path); }
     // A request's outputs depend only on the request, the artifact, the options and the build.
     [[nodiscard]] bool request_invariant() const noexcept;
 };
 
 // The qualified paths that apply when options.fast_paths is set, plus every
 // options.fast_path_candidates entry (qualification runs), which must apply.
-[[nodiscard]] FastPathSelection select_fast_paths(const Model& model, const EngineOptions& options,
-                                                  bool invariant_capable);
+[[nodiscard]] FastPathSelection select_fast_paths(const Model& model, const EngineOptions& options);
 
 } // namespace infernix::models::qwen3_5

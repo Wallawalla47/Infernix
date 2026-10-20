@@ -11,14 +11,17 @@
 namespace infernix::ops::detail {
 namespace {
 // Each head computes both control dots and the complete norm. RMS scaling can be
-// applied after the dots; h is independently rounded from the full normalized input.
-template <int Tile, int Threads>
-__global__ __launch_bounds__(Threads) void gdn_norm_gating_27_simt(
+// applied after the dots; h is independently rounded from the full normalized input. D is the
+// hidden size and H the head count (27B: 5120 and 48; 35B-A3B: 2048 and 32).
+template <int D, int H, int Tile, int Threads>
+__global__ __launch_bounds__(Threads) void gdn_norm_gating_simt(
     const __nv_bfloat16* x, const __nv_bfloat16* nw, const __nv_bfloat16* aw,
     const __nv_bfloat16* bw, const float* alog, const float* bias, __nv_bfloat16* h, float* g,
     float* beta, int tokens, float eps) {
+    static_assert(D % 8 == 0 && Threads % 32 == 0 && Tile <= Threads);
+    static_assert((D / 2 + H - 1) / H <= Threads, "every h pair needs a thread of its head");
     pdl::enter();
-    constexpr int D = 5120, H = 48, Warps = Threads / 32;
+    constexpr int Warps = Threads / 32;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, head = blockIdx.x,
               first = blockIdx.y * Tile;
     float aa[Tile]{}, bb[Tile]{}, ss[Tile]{};
@@ -77,7 +80,7 @@ __global__ __launch_bounds__(Threads) void gdn_norm_gating_27_simt(
         }
     }
     __syncthreads();
-    // Disjoint, pair-aligned h slices across the 48 heads avoid a separate norm kernel.
+    // Disjoint, pair-aligned h slices across the heads avoid a separate norm kernel.
     constexpr int PairsPerHead = (D / 2 + H - 1) / H;
     const int pair             = head * PairsPerHead + tid;
     if (tid < PairsPerHead && pair < D / 2) {
@@ -92,23 +95,61 @@ __global__ __launch_bounds__(Threads) void gdn_norm_gating_27_simt(
             }
     }
 }
+template <int D, int H>
+struct NormGatingLauncher {
+    const Tensor& x;
+    const Tensor& norm_weight;
+    float eps;
+    Tensor& h;
+    const Weight& a_weight;
+    const Weight& b_weight;
+    const Tensor& alog;
+    const Tensor& bias;
+    Tensor& g;
+    Tensor& beta;
+    cudaStream_t stream;
+
+    template <int T, int Threads>
+    void launch() const {
+        CUDA_CHECK(pdl::launch_consumer(
+            {dim3(H, (x.ne[1] + T - 1) / T), dim3(Threads), 0, stream},
+            gdn_norm_gating_simt<D, H, T, Threads>, static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const __nv_bfloat16*>(norm_weight.data),
+            static_cast<const __nv_bfloat16*>(a_weight.qdata),
+            static_cast<const __nv_bfloat16*>(b_weight.qdata), static_cast<const float*>(alog.data),
+            static_cast<const float*>(bias.data), static_cast<__nv_bfloat16*>(h.data),
+            static_cast<float*>(g.data), static_cast<float*>(beta.data), x.ne[1], eps));
+    }
+};
 } // namespace
+
+void bf16_gdn_norm_gating_proj_35_invariant_launch(const Tensor& x, const Tensor& norm_weight,
+                                                   float eps, Tensor& h, const Weight& a_weight,
+                                                   const Weight& b_weight, const Tensor& alog,
+                                                   const Tensor& bias, Tensor& g, Tensor& beta,
+                                                   cudaStream_t stream) {
+    const NormGatingLauncher<2048, 32> launcher{x, norm_weight, eps, h, a_weight, b_weight,
+                                                alog, bias, g, beta, stream};
+    // A column's reduction order depends on the thread count, not the tile: 256 threads at every
+    // T, one 8-element load per thread over the 2048 inputs.
+    const int tokens = x.ne[1];
+    if (tokens <= 2)
+        launcher.launch<1, 256>();
+    else if (tokens <= 14)
+        launcher.launch<2, 256>();
+    else
+        launcher.launch<4, 256>();
+    CUDA_CHECK(cudaGetLastError());
+}
 
 void bf16_gdn_norm_gating_proj_27_launch(const Tensor& x, const Tensor& norm_weight, float eps,
                                          Tensor& h, const Weight& a_weight, const Weight& b_weight,
                                          const Tensor& alog, const Tensor& bias, Tensor& g,
                                          Tensor& beta, bool column_invariant,
                                          cudaStream_t stream) {
-    const auto launch = [&]<int T, int Threads>() {
-        CUDA_CHECK(pdl::launch_consumer(
-            {dim3(48, (x.ne[1] + T - 1) / T), dim3(Threads), 0, stream},
-            gdn_norm_gating_27_simt<T, Threads>, static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const __nv_bfloat16*>(norm_weight.data),
-            static_cast<const __nv_bfloat16*>(a_weight.qdata),
-            static_cast<const __nv_bfloat16*>(b_weight.qdata), static_cast<const float*>(alog.data),
-            static_cast<const float*>(bias.data), static_cast<__nv_bfloat16*>(h.data),
-            static_cast<float*>(g.data), static_cast<float*>(beta.data), x.ne[1], eps));
-    };
+    const NormGatingLauncher<5120, 48> launcher{x, norm_weight, eps, h, a_weight, b_weight,
+                                                alog, bias, g, beta, stream};
+    const auto launch = [&]<int T, int Threads>() { launcher.launch<T, Threads>(); };
     const int tokens = x.ne[1];
     // A column's reduction order depends on the thread count, not the tile: column-invariant
     // calls keep 512 threads at every T.

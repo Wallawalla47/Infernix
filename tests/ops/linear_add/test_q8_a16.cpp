@@ -72,6 +72,15 @@ int q8_a16_conformance() {
     failures += infernix::test::linear_add::run_shape(
         "Q8_A16 LinearAdd", WeightFormat::Q8G32F16S,
         ShapeCase{2048, 4096, 419U, kK4096RouteStarts, kK4096RouteInteriors});
+    // The column-invariant route of [2048,4096] (the 35B-A3B's request-invariant exact route): one
+    // column, the 12-column slice boundary and wider sliced calls.
+    constexpr std::array<std::int32_t, 0> kNoStarts{};
+    constexpr std::array<std::int32_t, 10> kInvariantTokens{2, 12, 13, 24, 25, 48, 49, 129, 512, 1024};
+    constexpr std::array<std::int32_t, 2> kInvariantGraphs{1, 25};
+    failures += infernix::test::linear_add::run_shape(
+        "Q8_A16 LinearAdd column-invariant", WeightFormat::Q8G32F16S,
+        ShapeCase{2048, 4096, 427U, kNoStarts, kInvariantTokens, kInvariantGraphs, false, 0,
+                  infernix::ops::LinearPolicy::A16ColumnInvariant});
 
     constexpr std::array<std::int32_t, 32> kK6144RouteStarts{
         2,    49,   129,  192,  193,  257,  385,  400,  401,  448,  449,

@@ -81,6 +81,20 @@ constexpr auto kTargetLaunchers =
 constexpr auto kCompanionLaunchers = make_companion_launchers(
     std::make_index_sequence<kLastCompanionExactCols - kFirstExactCols + 1>{});
 
+// The column-invariant route's calls wider than the exact instances: the T=48 schedule over every
+// 48-column slice (runtime token count, one grid row per slice).
+void launch_target_sliced48(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
+                            Tensor& k, Tensor& v, cudaStream_t stream) {
+    using Geometry = Q8LinearGeometry<kTargetRows, kHidden>;
+    using Schedule = Q8SlicedKDefault<48, kLastTargetExactCols>;
+    const TargetOutput output{
+        static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
+        static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(v.data)};
+    launch_q8_a16_sliced_k_mma<
+        typename Schedule::template with_problem<Geometry::kInputRows, kLastTargetExactCols, false>>(
+        q8_linear_operands(x, weight), output, LinearIdentityEpilogue{}, stream);
+}
+
 template <int TileCols, int KSplits, int NGroups, int MinBlocks>
 void launch_target_medium_cols(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                Tensor& k, Tensor& v, cudaStream_t stream) {
@@ -116,6 +130,27 @@ void q8_attn_input_splitk_mma_launch(const Tensor& x, const Weight& weight, Tens
         kTargetLaunchers[x.ne[1] - kFirstExactCols](x, weight, q, gate, k, v, stream);
     } else {
         launch_target_medium_cols<64, 4, 2, 2>(x, weight, q, gate, k, v, stream);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// Every width runs the 8 K-warp sliced-K reduction of the exact route's T=2..48 instances: T=1 its
+// one-column instance, wider calls its T=48 schedule over 48-column slices. Tile, scale staging and
+// token slicing change only staging and predication, so a column's bits do not depend on the call's
+// width.
+void q8_attn_input_column_invariant_launch(const Tensor& x, const Weight& weight, Tensor& q,
+                                           Tensor& gate, Tensor& k, Tensor& v,
+                                           cudaStream_t stream) {
+    const std::int32_t cols = x.ne[1];
+    if (cols < 1) {
+        throw std::invalid_argument("Q8 attention input column-invariant route requires T >= 1");
+    }
+    if (cols == 1) {
+        launch_target_active_cols<1>(x, weight, q, gate, k, v, stream);
+    } else if (cols <= kLastTargetExactCols) {
+        kTargetLaunchers[cols - kFirstExactCols](x, weight, q, gate, k, v, stream);
+    } else {
+        launch_target_sliced48(x, weight, q, gate, k, v, stream);
     }
     CUDA_CHECK(cudaGetLastError());
 }

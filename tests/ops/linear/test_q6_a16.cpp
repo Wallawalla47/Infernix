@@ -15,6 +15,11 @@ constexpr Invocation graph(std::int32_t t) {
     return {t, CallForm::Policy, infernix::ops::LinearPolicy::A16Only, true};
 }
 
+// The column-invariant route (decode and verification of the request-invariant exact route).
+constexpr Invocation invariant(std::int32_t t, bool graph_replay = false) {
+    return {t, CallForm::Policy, infernix::ops::LinearPolicy::A16ColumnInvariant, graph_replay};
+}
+
 int q6_a16_conformance() {
     int failures = 0;
     constexpr std::array kN248320K5120{
@@ -24,6 +29,8 @@ int q6_a16_conformance() {
         a16(65),   a16(72),  a16(79),  a16(80),  a16(81),   a16(88),   a16(95),    a16(96),
         a16(97),   a16(104), a16(111), a16(112), a16(113),  a16(128),  a16(129),   a16(512),
         a16(1024), graph(2), graph(3), graph(9), graph(17), graph(48), graph(112),
+        invariant(1), invariant(2), invariant(8), invariant(9), invariant(16), invariant(17),
+        invariant(33), invariant(65), invariant(129), invariant(512), invariant(9, true),
     };
     failures += run_shape("Q6_A16", ActivationCompute::A16, make_q6_g64_fp16_weight,
                           {248320, 5120, 191U, Comparison::Sampled, false, kN248320K5120});
@@ -31,6 +38,7 @@ int q6_a16_conformance() {
     constexpr std::array kN34816K5120{
         a16(1),  a16(4),  a16(5),  a16(6),  a16(7),  a16(8),  a16(9),  a16(16),  a16(17),
         a16(24), a16(25), a16(32), a16(33), a16(48), a16(49), a16(50), a16(128), a16(129),
+        invariant(1), invariant(2), invariant(9), invariant(17), invariant(40), invariant(129),
     };
     failures += run_shape("Q6_A16", ActivationCompute::A16, make_q6_g64_fp16_weight,
                           {34816, 5120, 199U, Comparison::Sampled, false, kN34816K5120});
@@ -42,6 +50,8 @@ int q6_a16_conformance() {
         a16(71),  a16(72),   a16(73),  a16(79),  a16(80),   a16(81),   a16(95),    a16(96),
         a16(97),  a16(104),  a16(111), a16(112), a16(113),  a16(127),  a16(128),   a16(129),
         a16(512), a16(1024), graph(1), graph(2), graph(17), graph(57), graph(128),
+        invariant(1), invariant(2), invariant(16), invariant(17), invariant(33), invariant(65),
+        invariant(129), invariant(512), invariant(1, true),
     };
     failures += run_shape("Q6_A16", ActivationCompute::A16, make_q6_g64_fp16_weight,
                           {248320, 2048, 193U, Comparison::Sampled, false, kN248320K2048});
