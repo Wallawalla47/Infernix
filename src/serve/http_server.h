@@ -11,6 +11,7 @@
 #include "serve/reasoning_store.h"
 #include "serve/request_log.h"
 #include "serve/serve_options.h"
+#include "serve/slots.h"
 
 #include <httplib.h>
 
@@ -47,6 +48,8 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
 // upgrade is answered 426 with the OpenAI error envelope, which Codex's built-in provider takes as a switch to HTTP for
 // the session instead of failing the turn (candidates IJ-02; Ollama answers it so too); any other GET answers 404.
 void handle_responses_upgrade(const httplib::Request& request, httplib::Response& response);
+// A client identifier header (X-Request-Id, X-Session-Id) when it is valid_client_id, else empty.
+[[nodiscard]] std::string client_header_id(const httplib::Request& request, const char* header);
 
 [[nodiscard]] bool matches_bearer_credential(std::string_view authorization,
                                              std::string_view api_key) noexcept;
@@ -91,6 +94,7 @@ private:
     class RequestLifecycle {
     public:
         RequestLifecycle(HttpServer& owner, RequestLogContext context);
+        // Releases the request's GET /slots identity, also when no terminal state was reached.
         ~RequestLifecycle();
         RequestLifecycle(const RequestLifecycle&)            = delete;
         RequestLifecycle& operator=(const RequestLifecycle&) = delete;
@@ -135,6 +139,7 @@ private:
     void handle_response_cancel(const httplib::Request& req, httplib::Response& res);
     void handle_response_compact(const httplib::Request& req, httplib::Response& res);
     void handle_models(const httplib::Request& req, httplib::Response& res) const;
+    void handle_slots(const httplib::Request& req, httplib::Response& res);
     void handle_model(const httplib::Request& req, httplib::Response& res) const;
 
     void record_request_start(const RequestLogContext& context);
@@ -172,6 +177,8 @@ private:
     RequestHistory metrics_json_history_;
     // The generation requests in flight (GET /metrics?format=json live.active).
     LiveRequests live_requests_;
+    // GET /slots: who each Engine request is, joined with the Engine's lane view.
+    SlotRegistry slots_;
     std::unique_ptr<ConsoleStatsPanel> console_stats_;
     httplib::Server server_;
     std::atomic<std::uint64_t> request_seq_{0};

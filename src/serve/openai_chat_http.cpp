@@ -59,7 +59,9 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                                 .stream                 = request.stream,
                                 .output_tokens_explicit = request.output_tokens_explicit,
                                 .label                  = request_label(req),
-                                .reasoning              = reasoning};
+                                .reasoning              = reasoning,
+                                .client_request_id      = client_header_id(req, "X-Request-Id"),
+                                .session_id             = client_header_id(req, "X-Session-Id")};
     PreparedRequest prepared;
     try {
         infernix::GenerationObservationOptions observation{

@@ -36,6 +36,7 @@ add_library(infernix_serve STATIC
   openai_responses_http.cpp
   serve_options.cpp
   stop_control.cpp
+  slots.cpp
 )
 infernix_internal_includes(infernix_serve)
 target_link_libraries(infernix_serve

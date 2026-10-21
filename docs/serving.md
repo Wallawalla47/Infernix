@@ -184,6 +184,7 @@ What is exact and what is estimated (`estimated` is always `true`):
 | `GET /metrics` | Prometheus counters, gauges and latency histograms |
 | `GET /metrics?format=json` | JSON snapshot: engine identity, live gauges, totals, and the last 128 terminal requests (`Accept: application/json` also selects it) |
 | `GET /monitor` | each request the Engine holds now: phase, lane, service turn, recovery and progress ([Request monitor](#request-monitor)) |
+| `GET /slots` | one llama.cpp slot object per resident lane: phase, request identity, prompt, cached, computed and decoded tokens, token rates ([Slots](#slots)) |
 | `GET /v1/models` | configured OpenAI model alias, effective `max_model_len`, and llama.cpp-compatible `meta` and `chat_template_caps` objects |
 | `GET /v1/models/{id}` | lookup of the configured alias, `max_model_len`, `meta` and `chat_template_caps` |
 | `POST /v1/chat/completions` | OpenAI-style chat generation |
@@ -338,6 +339,43 @@ declared tool as JSON into the System turn, so they report `true`.
 
 `GET /v1/models/{id}` returns the same object for the single configured alias and a `404` for any
 other id.
+
+## Slots
+
+`GET /slots` returns one object per resident lane (`--max-concurrency` plus `--decision-lanes`), in
+the shape `llama.cpp`'s server and NInfer report, so slot viewers and supervisors written for them
+read Infernix unchanged. The lane facts are the Engine's own, published at every scheduling
+boundary; no prompt or output text is reported.
+
+```json
+[{"id": 0, "n_ctx": 262144, "speculative": true, "is_processing": true, "id_task": 4192,
+  "n_prompt_tokens": 12300, "n_prompt_tokens_cache": 11500, "n_prompt_tokens_processed": 500,
+  "next_token": [{"has_next_token": true, "has_new_line": false, "n_remain": -1, "n_decoded": 300}],
+  "phase": "decode", "phase_source": "engine", "activity": "decode", "is_decision": false,
+  "decode_tps": 80.0, "prefill_tps": null,
+  "request_id": "gw-1", "upstream_id": "chatcmpl-1", "session_id": "netpi-7",
+  "protocol": "openai_chat", "model": "qwen3.8-27b", "stream": true,
+  "started_at": "2026-10-14T17:46:35.000Z", "elapsed_ms": 5000},
+ {"id": 1, "n_ctx": 262144, "speculative": true, "is_processing": false, "phase": "idle"},
+ {"id": 2, "n_ctx": 262144, "speculative": true, "is_processing": false, "phase": "idle", "decision": true}]
+```
+
+| Field | Meaning |
+|---|---|
+| `id_task` | the Engine's request id |
+| `n_prompt_tokens` | occupancy, as in `llama.cpp`: the prompt plus the tokens decoded so far |
+| `n_prompt_tokens_cache` | prompt tokens reused from the prefix cache; `null` until the lane's binding chose its source |
+| `n_prompt_tokens_processed` | prompt tokens computed by prefill so far (the reused prefix and Replay excluded); `null` likewise |
+| `next_token[0].n_decoded` | committed output tokens, the first one included |
+| `phase` | `prefill` (binding, prompt or Replay), `decode` (generating or committing control tokens), `queued` (giving the lane back under resource pressure) or `idle`; `activity` names the exact Engine state |
+| `decode_tps`, `prefill_tps` | tokens per second since this request's previous sample, for its current phase; samples closer than 250 ms keep the last rate, and the first sample has none |
+| `request_id`, `session_id` | the client's `X-Request-Id` and `X-Session-Id` (1-128 characters of `[A-Za-z0-9._:-]`, else dropped); `request_id` falls back to `upstream_id`, the server's own response id |
+| `started_at`, `elapsed_ms` | since the HTTP handler submitted the request |
+| `decision`, `is_decision` | a lane reserved by `--decision-lanes`; a request that is a `/v1/decide` question |
+
+A request the server has not identified yet (the instant between submission and registration) is
+reported with `null` identity and times. `/v1/decide` questions appear as their own requests, all
+with the client's `X-Request-Id`.
 
 ## OpenAI Chat Completions
 

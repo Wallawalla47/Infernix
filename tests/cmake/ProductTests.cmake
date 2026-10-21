@@ -144,6 +144,10 @@ if(TARGET infernix-serve)
     SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 900 LABELS "gpu;real")
 endif()
 
+infernix_add_test(infernix_slots_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_slots.cpp"
+  LIBRARIES infernix_serve)
+
 infernix_add_test(infernix_http_error_handler_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_error_handler.cpp"
   LIBRARIES infernix_serve)

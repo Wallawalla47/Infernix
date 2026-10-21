@@ -264,14 +264,35 @@ HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> log
     register_routes();
 }
 
+std::string client_header_id(const httplib::Request& request, const char* header) {
+    std::string value = request.get_header_value(header);
+    return valid_client_id(value) ? value : std::string();
+}
+
 HttpServer::RequestLifecycle::RequestLifecycle(HttpServer& owner, RequestLogContext context)
     : owner_(&owner), context_(std::move(context)) {
     owner_->record_request_start(context_);
     owner_->live_requests_.begin(context_.id, context_.label, context_.protocol, context_.prompt_tokens,
                                  context_.started);
+    using SystemClock = std::chrono::system_clock;
+    owner_->slots_.begin(
+        context_.engine_request_id,
+        SlotIdentity{.request_id      = context_.client_request_id,
+                     .upstream_id     = context_.http_request_id,
+                     .session_id      = context_.session_id,
+                     .protocol        = context_.protocol,
+                     .model           = context_.model,
+                     .stream          = context_.stream,
+                     .started_unix_ms = static_cast<std::uint64_t>(
+                         std::chrono::duration_cast<std::chrono::milliseconds>(
+                             SystemClock::now().time_since_epoch())
+                             .count())});
 }
 
-HttpServer::RequestLifecycle::~RequestLifecycle() { owner_->live_requests_.end(context_.id); }
+HttpServer::RequestLifecycle::~RequestLifecycle() {
+    owner_->live_requests_.end(context_.id);
+    owner_->slots_.end(context_.engine_request_id);
+}
 
 bool HttpServer::RequestLifecycle::claim(State terminal) noexcept {
     State expected = State::Pending;
@@ -614,6 +635,9 @@ void HttpServer::register_routes() {
                 [this](const httplib::Request& req, httplib::Response& res) {
                     handle_models(req, res);
                 });
+    server_.Get("/slots", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_slots(req, res);
+    });
     server_.Get("/metrics", [this](const httplib::Request& req, httplib::Response& res) {
         const MetricsFormat format =
             select_metrics_format(req.get_param_value("format"), req.get_header_value("Accept"));
@@ -708,6 +732,21 @@ void HttpServer::require_generation() const {
 void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) const {
     res.set_content(make_models_list(public_model_id_, unix_time_now(), service_->engine_options().max_context,
                                      model_metadata_, chat_template_caps_),
+                    "application/json");
+}
+
+void HttpServer::handle_slots(const httplib::Request&, httplib::Response& res) {
+    const infernix::RuntimeStats stats  = service_->runtime_stats();
+    const infernix::EngineOptions& eng  = service_->engine_options();
+    const SlotFacts facts{.max_context = eng.max_context,
+                          .speculative = eng.speculative.backend != infernix::SpeculativeBackend::None};
+    const auto now = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+    res.set_header("Cache-Control", "no-store");
+    res.set_content(slots_.render(facts, stats, now).dump(-1, ' ', false,
+                                                          RequestJson::error_handler_t::replace),
                     "application/json");
 }
 
