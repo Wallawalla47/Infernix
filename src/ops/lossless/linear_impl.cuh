@@ -84,12 +84,8 @@ constexpr int kGridBits      = 21;
 constexpr int kLoShift       = 22; // the lo grid's unit below the hi grid's
 constexpr int kChunkColumns  = 512;
 constexpr int kTileTokens    = 64;
-constexpr int kTileRows      = 32;  // two CTAs per SM (a thread's 8 int128 accumulators fit 128 registers)
-constexpr int kThreads       = 256; // 8 warps: 4 along tokens (16 each) x 2 along rows (16 each)
-constexpr int kWarpRows      = kTileRows / 2;        // rows per warp
-constexpr int kRowTiles      = kWarpRows / 8;        // a warp's 8-row mma tiles
-constexpr int kRowParts      = kThreads / kTileRows; // threads per row in the prologue
-static_assert(kRowTiles % 2 == 0 && kRowParts <= 32, "B fragments load two 8-row tiles per ldmatrix_x4");
+constexpr int kTileRows      = 64;
+constexpr int kThreads       = 256; // 8 warps: 4 along tokens (16 each) x 2 along rows (32 each)
 constexpr int kBlockBytes    = kLimbs * kBlockK;     // 256 bytes of limbs per column and block
 constexpr int kAStride       = kBlockBytes + 16;     // padded shared row (ldmatrix without conflicts)
 constexpr int kBStride       = kBlockK + 16;         // 80
@@ -937,7 +933,7 @@ struct GemmShared {
 };
 
 template <class F>
-__global__ __launch_bounds__(kThreads, 2) void lossless_gemm_kernel(const GemmArgs args) {
+__global__ __launch_bounds__(kThreads) void lossless_gemm_kernel(const GemmArgs args) {
     constexpr int kPlanes      = F::kPlanes;
     constexpr int kGroup       = F::kGroup;
     constexpr int kGroupsBlock = kBlockK / kGroup; // scale groups per 64-element block (1, 2 or 4)
@@ -967,12 +963,12 @@ __global__ __launch_bounds__(kThreads, 2) void lossless_gemm_kernel(const GemmAr
         sh.col_flags[tid] = c < args.columns ? args.col_flags[c] : 0;
     }
     {
-        const int r = tid / kRowParts, part = tid % kRowParts;
+        const int r = tid / 4, part = tid % 4;
         int emax = 0;
         if constexpr (F::kScaled) {
             if (row0 + r < args.rows) {
                 const int used_groups = args.k / kGroup;
-                for (int g = part; g < used_groups; g += kRowParts) {
+                for (int g = part; g < used_groups; g += 4) {
                     int m = 0, e = 1;
                     F::scale(w, row_begin + row0 + r, g, m, e);
                     if (m != 0) { emax = max(emax, e); }
@@ -982,17 +978,17 @@ __global__ __launch_bounds__(kThreads, 2) void lossless_gemm_kernel(const GemmAr
                     }
                 }
             }
-#pragma unroll
-            for (int o = 1; o < kRowParts; o <<= 1) { emax = max(emax, __shfl_xor_sync(0xFFFFFFFFU, emax, o)); }
+            emax = max(emax, __shfl_xor_sync(0xFFFFFFFFU, emax, 1));
+            emax = max(emax, __shfl_xor_sync(0xFFFFFFFFU, emax, 2));
         }
         if (part == 0) { sh.row_emax[r] = emax; }
     }
 
     // Accumulators: tile j (8 rows), value v (d0..d3: tokens group / group + 8, rows 2 tig / 2 tig + 1).
-    I128 acc[kRowTiles][4];
-    bool dropped[kRowTiles][4];
+    I128 acc[4][4];
+    bool dropped[4][4];
 #pragma unroll
-    for (int j = 0; j < kRowTiles; ++j) {
+    for (int j = 0; j < 4; ++j) {
 #pragma unroll
         for (int v = 0; v < 4; ++v) {
             acc[j][v]     = I128{0ULL, 0LL};
@@ -1017,7 +1013,7 @@ __global__ __launch_bounds__(kThreads, 2) void lossless_gemm_kernel(const GemmAr
             sh.exps[tid] = tok0 + tid < args.columns ? args.exps[static_cast<std::size_t>(tok0 + tid) * blocks + b] : 1;
         }
         // B: 64 rows x 64 codes per plane (four 16-code parts per row), and each row's scales of this block.
-        if (tid < kTileRows * 4) {
+        {
             const int r = tid / 4, q = tid % 4;
             if (row0 + r < args.rows) {
                 // Plane p of the part at &sh.b[0][r][16 q] + p kTileRows kBStride.
@@ -1056,9 +1052,9 @@ __global__ __launch_bounds__(kThreads, 2) void lossless_gemm_kernel(const GemmAr
         const auto accumulate = [&](int down) {
 #pragma unroll
         for (int g = 0; g < kGroupsBlock; ++g) {
-            long long S[kRowTiles][4];
+            long long S[4][4];
 #pragma unroll
-            for (int j = 0; j < kRowTiles; ++j) {
+            for (int j = 0; j < 4; ++j) {
 #pragma unroll
                 for (int v = 0; v < 4; ++v) { S[j][v] = 0; }
             }
@@ -1068,13 +1064,13 @@ __global__ __launch_bounds__(kThreads, 2) void lossless_gemm_kernel(const GemmAr
             for (int p = 0; p < kPlanes; ++p) {
                 // B fragments of the group's K steps for the warp's four 8-row tiles.
                 constexpr int kSteps = kGroup >= 32 ? kGroup / 32 : 1;
-                unsigned bfrag[kRowTiles][kSteps][2];
+                unsigned bfrag[4][kSteps][2];
 #pragma unroll
                 for (int si = 0; si < kSteps; ++si) {
                     const int s = kGroup >= 32 ? g * kSteps + si : g / 2;
 #pragma unroll
-                    for (int jj = 0; jj < kRowTiles / 2; ++jj) {
-                        const int row  = warp_n * kWarpRows + (2 * jj + (lane >> 4)) * 8 + (lane & 7);
+                    for (int jj = 0; jj < 2; ++jj) {
+                        const int row  = warp_n * 32 + (2 * jj + (lane >> 4)) * 8 + (lane & 7);
                         const int kofs = s * 32 + ((lane >> 3) & 1) * 16;
                         ldmatrix_x4(bfrag[2 * jj][si][0], bfrag[2 * jj][si][1], bfrag[2 * jj + 1][si][0],
                                     bfrag[2 * jj + 1][si][1], smem_addr(&sh.b[p][row][kofs]));
@@ -1082,9 +1078,9 @@ __global__ __launch_bounds__(kThreads, 2) void lossless_gemm_kernel(const GemmAr
                 }
 #pragma unroll
                 for (int l = 0; l < kLimbs; ++l) {
-                    int P[kRowTiles][4];
+                    int P[4][4];
 #pragma unroll
-                    for (int j = 0; j < kRowTiles; ++j) {
+                    for (int j = 0; j < 4; ++j) {
 #pragma unroll
                         for (int v = 0; v < 4; ++v) { P[j][v] = 0; }
                     }
@@ -1096,7 +1092,7 @@ __global__ __launch_bounds__(kThreads, 2) void lossless_gemm_kernel(const GemmAr
                         unsigned a[4];
                         ldmatrix_x4(a[0], a[1], a[2], a[3], smem_addr(sh.a + token * kAStride + l * kBlockK + kofs));
 #pragma unroll
-                        for (int j = 0; j < kRowTiles; ++j) {
+                        for (int j = 0; j < 4; ++j) {
                             if constexpr (kGroup >= 32) {
                                 if (l == kLimbs - 1) {
                                     mma_s8(P[j][0], P[j][1], P[j][2], P[j][3], a[0], a[1], a[2], a[3], bfrag[j][si][0],
@@ -1119,7 +1115,7 @@ __global__ __launch_bounds__(kThreads, 2) void lossless_gemm_kernel(const GemmAr
                         }
                     }
 #pragma unroll
-                    for (int j = 0; j < kRowTiles; ++j) {
+                    for (int j = 0; j < 4; ++j) {
 #pragma unroll
                         for (int v = 0; v < 4; ++v) { S[j][v] += static_cast<long long>(P[j][v]) << (8 * l + 7 * p); }
                     }
@@ -1127,11 +1123,11 @@ __global__ __launch_bounds__(kThreads, 2) void lossless_gemm_kernel(const GemmAr
             }
             // Terms into the accumulators.
 #pragma unroll
-            for (int j = 0; j < kRowTiles; ++j) {
+            for (int j = 0; j < 4; ++j) {
 #pragma unroll
                 for (int v = 0; v < 4; ++v) {
                     const int t = warp_m * 16 + group + (v >> 1) * 8;
-                    const int r = warp_n * kWarpRows + j * 8 + 2 * tig + (v & 1);
+                    const int r = warp_n * 32 + j * 8 + 2 * tig + (v & 1);
                     const long long term = S[j][v] * static_cast<long long>(sh.scale_m[r][g]);
                     const int shift =
                         F::kShiftTop - (sh.col_emax[t] - sh.exps[t]) - (sh.row_emax[r] - sh.scale_e[r][g]) - down;
@@ -1182,7 +1178,7 @@ __global__ __launch_bounds__(kThreads, 2) void lossless_gemm_kernel(const GemmAr
                     // The rows' lo-grid weights of this block.
                     __syncthreads();
                     const int r = tid / 4, q = tid % 4;
-                    if (tid < kTileRows * 4 && row0 + r < args.rows) {
+                    if (row0 + r < args.rows) {
                         F::decode16(w, row_begin + row0 + r, b, q, &sh.b[0][r][16 * q], kTileRows * kBStride, true);
                     }
                     __syncthreads();
@@ -1198,11 +1194,11 @@ __global__ __launch_bounds__(kThreads, 2) void lossless_gemm_kernel(const GemmAr
 
     // Round, or flag for the exact fallback.
 #pragma unroll
-    for (int j = 0; j < kRowTiles; ++j) {
+    for (int j = 0; j < 4; ++j) {
 #pragma unroll
         for (int v = 0; v < 4; ++v) {
             const int t = warp_m * 16 + group + (v >> 1) * 8;
-            const int r = warp_n * kWarpRows + j * 8 + 2 * tig + (v & 1);
+            const int r = warp_n * 32 + j * 8 + 2 * tig + (v & 1);
             const int column = tok0 + t, row = row0 + r;
             if (column >= args.columns || row >= args.rows) { continue; }
             const int out_column = args.out_columns != nullptr ? args.out_columns[column] : column;
