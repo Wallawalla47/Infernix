@@ -778,6 +778,11 @@ struct EngineOptions {
     // does the same by default at rank 7 (STRATA_ROUTE_TAIL_SKIP=7).
     std::uint32_t expert_tail_skip = 0;
     std::uint32_t max_concurrency      = 1;
+    // Decision lanes: the last `decision_lanes` of the max_concurrency lanes admit only decision
+    // requests (ExecutionOptions::decision), so a decision never waits for a generating request to
+    // finish. Less than max_concurrency; 0 reserves none. Decisions are queued first and get the
+    // next prefill turn whether or not lanes are reserved (resource-scheduling §5.4).
+    std::uint32_t decision_lanes       = 0;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
     // Prompt tokens per prefill call, a multiple of 128; 0 takes the model's default: 16,384 for
@@ -1089,6 +1094,11 @@ struct ExecutionOptions {
     std::vector<TokenId> readout_tokens;
     // Restricts each output token to its step's permitted set. Empty constrains nothing.
     TokenConstraint constraint;
+    // A short decision (one /v1/decide question): queued ahead of other waiting requests, may take
+    // a decision lane (EngineOptions::decision_lanes), takes the next prefill turn, is paused under
+    // resource pressure only when no other request can be and, on the Qwen3.5 family, publishes no
+    // endpoint snapshot into the prefix cache (its prompt blocks and taps are published as usual).
+    bool decision = false;
 };
 
 struct OutputOptions {

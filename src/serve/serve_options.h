@@ -88,6 +88,9 @@ struct ServeOptions {
     bool q8_weights                = false; // EngineOptions::q8_weights
     bool embedding_host            = false; // EngineOptions::embedding_host
     std::uint32_t max_concurrency      = 1;
+    // --decision-lanes: lanes beside max_concurrency that only /v1/decide questions take
+    // (EngineOptions::decision_lanes; the Engine runs max_concurrency + decision_lanes lanes).
+    std::uint32_t decision_lanes       = 0;
     // At most kMaximumPendingRequests: the HTTP pool starts a worker for each admitted or pending request.
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;

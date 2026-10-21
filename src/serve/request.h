@@ -301,6 +301,8 @@ struct GenerationRequest {
     infernix::TokenConstraint token_constraint;
     // Tokens that end generation once committed (a scalar's closing brace).
     std::vector<infernix::TokenId> stop_token_ids;
+    // A /v1/decide question: scheduled as a decision (ExecutionOptions::decision, --decision-lanes).
+    bool decision = false;
 
     [[nodiscard]] bool uses_tools() const noexcept {
         return !tools.empty() && tool_choice.mode != ToolChoiceMode::None &&

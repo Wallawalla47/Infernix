@@ -169,6 +169,10 @@ struct RequestRecord {
         return model_state == EngineRequestState::ModelFinished;
     }
 
+    // A decision request (ExecutionOptions::decision): queued first, may take a decision lane,
+    // prefills first and is the last preemption victim (resource-scheduling §5.4).
+    [[nodiscard]] bool is_decision() const noexcept { return options.execution.decision; }
+
     // The process range follows Request ownership across submit, worker, and consumer threads.
     nvtx::ScopedAsyncRange generation_range;
     const std::uint64_t id;

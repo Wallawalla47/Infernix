@@ -421,7 +421,8 @@ infernix::EngineOptions make_engine_options(const ServeOptions& options, Startup
     engine_options.a8_activations           = options.a8_activations;
     engine_options.q8_weights               = options.q8_weights;
     engine_options.embedding_host           = options.embedding_host;
-    engine_options.max_concurrency          = options.max_concurrency;
+    engine_options.max_concurrency          = options.max_concurrency + options.decision_lanes;
+    engine_options.decision_lanes           = options.decision_lanes;
     engine_options.max_pending_requests     = options.max_pending_requests;
     engine_options.pending_timeout_ms       = options.pending_timeout_ms;
     engine_options.prefill_chunk            = options.prefill_chunk;
@@ -469,9 +470,11 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     prefix_misses_ = std::make_unique<PrefixMissTracker>(
         [engine = engine_.get()](std::span<const infernix::TokenId> ids) { return engine->detokenize_bytes(ids); });
     request_capacity_ = std::make_shared<RequestCapacity>(
-        static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
+        static_cast<std::size_t>(options_.max_concurrency) + options_.decision_lanes +
+        options_.max_pending_requests);
     count_capacity_ = std::make_shared<RequestCapacity>(
-        static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
+        static_cast<std::size_t>(options_.max_concurrency) + options_.decision_lanes +
+        options_.max_pending_requests);
     score_queue_ = std::make_shared<ScoreQueue>();
     pdf_cache_   = std::make_shared<PdfCache>(kPdfCacheBytes);
 }

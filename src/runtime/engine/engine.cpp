@@ -208,6 +208,7 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
     resolved.execution.thinking                = options.execution.thinking;
     resolved.execution.readout_tokens          = std::move(options.execution.readout_tokens);
     resolved.execution.constraint              = std::move(options.execution.constraint);
+    resolved.execution.decision                = options.execution.decision;
     resolved.stop                            = std::move(options.stop);
     resolved.output                            = options.output;
     resolved.constraint                        = options.constraint;

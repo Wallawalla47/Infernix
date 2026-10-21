@@ -648,6 +648,10 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
         logger_->info("{}", note->message);
     }
 
+    if (engine.decision_lanes != 0) {
+        logger_->info("lanes | {} general + {} decision-only (--decision-lanes)",
+                      engine.max_concurrency - engine.decision_lanes, engine.decision_lanes);
+    }
     if (cache.enabled && cache.host_growth_capacity_bytes) {
         logger_->info("prefix cache | on | {} in RAM, up to {} as RAM frees",
                       product::format_pretty_bytes(*cache.host_capacity_bytes),

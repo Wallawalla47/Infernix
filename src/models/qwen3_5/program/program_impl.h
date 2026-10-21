@@ -343,6 +343,8 @@ struct HybridPendingTap {
 struct HybridLaneState {
     bool active  = false;
     bool publish = false;
+    // False for a decision (RequestPlanSummary::publish_endpoint): its finish publishes no endpoint.
+    bool publish_endpoint = true;
     // Root path of full blocks this sequence pins, in prompt order. Blocks past the reuse
     // frontier are appended as the sequence commits them.
     std::vector<runtime::prefix_cache::NodeRef> path;

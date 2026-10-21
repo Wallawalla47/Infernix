@@ -1270,6 +1270,7 @@ void ProgramImpl::complete_hybrid_binding(ContextTransaction& tx, ContextProgres
     lane_state.path.swap(hb.path);
     lane_state.active           = true;
     lane_state.publish          = publish;
+    lane_state.publish_endpoint = base.summary.publish_endpoint;
     lane_state.path_hash        = full == 0 ? pc::kRootLookupHash : hb.path_hash;
     lane_state.trailing_extra   = all_vision_key(ranges);
     lane_state.deepest_snapshot = reuse;
@@ -1878,7 +1879,10 @@ pc::SnapshotRef ProgramImpl::hybrid_publish_endpoint(SequenceState& sequence, bo
             const bool far_enough = pausing || replaces_resume
                                         ? frontier > lane_state.deepest_snapshot
                                         : frontier >= lane_state.deepest_snapshot + pc::kMinimumTapSeparation;
-            if (endpoint && (!execution_schedule.grid_cache || grid_state) && backend_caught_up &&
+            // A decision (publish_endpoint false) publishes no endpoint: it holds no conversation, so it
+            // takes no Device snapshot slot from one; only its own pause keeps a resume point.
+            if (endpoint && (lane_state.publish_endpoint || pausing) &&
+                (!execution_schedule.grid_cache || grid_state) && backend_caught_up &&
                 frontier != 0 && far_enough &&
                 frontier <= sequence.ledger.size() && lane_state.path.size() >= anchor_blocks &&
                 sequence.state.read == sequence.state.write &&

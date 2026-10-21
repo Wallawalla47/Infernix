@@ -46,6 +46,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--vram-past-budget", false},
     ServeOptionArity{"--expert-tail-skip"},
     ServeOptionArity{"--max-concurrency"},
+    ServeOptionArity{"--decision-lanes"},
     ServeOptionArity{"--max-pending-requests"},
     ServeOptionArity{"--pending-timeout-ms"},
     ServeOptionArity{"--keep-alive-timeout-sec"},
@@ -316,6 +317,10 @@ std::string serve_usage_text(const char* argv0) {
            "                             whose experts stay in VRAM, e.g. the 27Bs), so one\n"
            "                             request may fill the KV cache\n"
            "  --max-concurrency N        max concurrent sequences, 1-8 (default 1)\n"
+           "  --decision-lanes N         N more lanes that only /v1/decide questions take, so a\n"
+           "                             decision never waits for a generating request; each\n"
+           "                             costs Device memory like any lane (logged at startup);\n"
+           "                             --max-concurrency plus N is at most 8 (default 0)\n"
            "  --prefill-chunk N          prefill chunk size in tokens, multiple of 128\n"
            "                             (default 16384 with offloaded experts, 1024 otherwise)\n"
            "  --use-original-int8-prefill-kernel\n"
@@ -893,6 +898,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             return arguments[i].c_str();
         };
         if (find_option(arg) == nullptr) { throw std::invalid_argument("unknown argument: " + arg); }
+        // Options parsed outside the chain below: MSVC refuses an if/else-if chain nested more than 128 deep (C1061).
+        if (arg == "--decision-lanes") {
+            options.decision_lanes = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--decision-lanes"), "decision-lanes"));
+            continue;
+        }
         if (arg == "--host") {
             options.host = require_value("--host");
         } else if (arg == "--port") {
@@ -1474,6 +1485,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("--max-concurrency must be in [1,8]");
+    }
+    if (options.decision_lanes > kMaximumConcurrency - options.max_concurrency) {
+        throw std::invalid_argument("--max-concurrency plus --decision-lanes must be at most 8");
     }
     // The HTTP pool starts one worker per admitted or pending request (and the Engine sizes its queue for them).
     if (options.max_pending_requests == 0 || options.max_pending_requests > kMaximumPendingRequests) {

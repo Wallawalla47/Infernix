@@ -50,8 +50,11 @@ struct Request {
 
     [[nodiscard]] bool is_model_finished() const { return phase == Phase::Finished; }
 
+    [[nodiscard]] bool is_decision() const { return decision; }
+
     std::uint64_t id                 = 0;
     std::uint32_t remaining          = 0; // prompt tokens still to prefill
+    bool decision                    = false;
     std::uint32_t admission_bypasses = 0;
     Phase phase                      = Phase::Waiting;
     bool recovery_pending            = false;
@@ -73,6 +76,12 @@ RequestPtr request(std::uint64_t id, Request::Phase phase = Request::Phase::Wait
     value->id       = id;
     value->phase    = phase;
     value->sequence = id;
+    return value;
+}
+
+RequestPtr decision(std::uint64_t id, Request::Phase phase = Request::Phase::Waiting) {
+    auto value      = request(id, phase);
+    value->decision = true;
     return value;
 }
 
@@ -513,6 +522,96 @@ void test_decode_and_control_membership() {
             "compact control membership changed committed control spans or request order");
 }
 
+void test_decisions_queue_first() {
+    std::deque<RequestPtr> fresh;
+    for (const auto& item : {request(1), decision(2), request(3), decision(4)}) {
+        Scheduler::enqueue(fresh, item);
+    }
+    std::vector<std::uint64_t> order;
+    for (const auto& item : fresh) { order.push_back(item->id); }
+    require(order == std::vector<std::uint64_t>({2, 4, 1, 3}),
+            "decisions were not queued ahead of other requests in arrival order");
+
+    // Admitting the decision at the head consumes nobody's bypass allowance.
+    Scheduler scheduler;
+    scheduler.begin_admission_scan();
+    const auto candidates = scheduler.fresh_candidates(fresh, 2);
+    require(!candidates.empty() && candidates.front()->id == 2,
+            "the queued decision was not the first admission candidate");
+    scheduler.admitted(fresh, *fresh.front(), 2);
+    require(std::all_of(fresh.begin(), fresh.end(),
+                        [](const auto& item) { return item->admission_bypasses == 0; }),
+            "admitting a queued decision counted as a FIFO bypass");
+}
+
+void test_decision_lanes() {
+    std::array<bool, 4> taken{};
+    const auto is_free = [&](std::uint32_t lane) { return !taken[lane]; };
+    // Four lanes, the last one reserved: a decision takes it first, others never do.
+    require(Scheduler::free_lane(4, 1, true, is_free) == 3u,
+            "a decision did not take the reserved lane first");
+    require(Scheduler::free_lane(4, 1, false, is_free) == 0u,
+            "an ordinary request did not take the first general lane");
+    taken = {true, true, true, false};
+    require(!Scheduler::free_lane(4, 1, false, is_free),
+            "an ordinary request took the decision lane");
+    require(Scheduler::free_lane(4, 1, true, is_free) == 3u,
+            "a decision could not take its free lane while the general lanes were busy");
+    taken = {true, false, true, true};
+    require(Scheduler::free_lane(4, 1, true, is_free) == 1u,
+            "a decision did not fall back to a general lane when the decision lane was busy");
+    taken = {false, false, false, false};
+    require(Scheduler::free_lane(4, 0, false, is_free) == 0u &&
+                Scheduler::free_lane(4, 0, true, is_free) == 0u,
+            "without decision lanes, lane choice changed");
+}
+
+void test_decision_prefill_turn() {
+    Scheduler scheduler;
+    Slots slots{};
+    slots[0] = request(1, Request::Phase::Prefill);
+    slots[1] = request(2, Request::Phase::Prefill);
+    slots[2] = decision(5, Request::Phase::Prefill);
+    slots[3] = decision(4, Request::Phase::Replay);
+    require(scheduler.next_prefill(slots, 4) == 3u,
+            "the oldest prefilling or replaying decision did not take the next prefill turn");
+    scheduler.prefill_executed(3, 4, slots, 16, true);
+    slots[3]->phase = Request::Phase::Finished;
+    require(scheduler.next_prefill(slots, 4) == 2u, "the second decision lost its turn");
+    scheduler.prefill_executed(2, 4, slots, 16, true);
+    slots[2]->phase = Request::Phase::Finished;
+    // Decisions took their turns out of order: the rotation resumes where it was (equal prompts, so
+    // the aged keys tie and the rotation decides).
+    for (const std::uint32_t expected : {0U, 1U, 0U}) {
+        const auto lane = scheduler.next_prefill(slots, 4);
+        require(lane == expected, "decision turns disturbed the prefill rotation");
+        scheduler.prefill_executed(*lane, 4, slots, 16);
+    }
+}
+
+void test_decision_is_last_victim() {
+    Scheduler scheduler;
+    Slots slots{};
+    auto a = slots[0] = request(10, Request::Phase::Decode);
+    auto b = slots[1] = request(20, Request::Phase::Decode);
+    auto c = slots[2] = decision(30, Request::Phase::Prefill);
+    auto d = slots[3] = decision(40, Request::Phase::Prefill);
+    for (const auto& value : {a, b, c, d}) { admit(scheduler, value); }
+    // a owns the turn: the younger decisions stay while an ordinary resident can be paused.
+    scheduler.require_progress(a->id);
+    require(scheduler.preemption_victim(slots, 4) == 1u,
+            "a younger decision was preempted while an ordinary resident could be");
+    const std::array excluded{1U};
+    require(scheduler.preemption_victim(slots, 4, excluded) == 3u,
+            "the youngest decision was not the victim with no other candidate");
+    slots[1].reset();
+    require(scheduler.preemption_victim(slots, 4) == 3u,
+            "a decision was never a victim, even with no other candidate");
+    slots[3].reset();
+    slots[2].reset();
+    require(!scheduler.preemption_victim(slots, 4), "the turn's owner was preempted");
+}
+
 } // namespace
 
 int main() {
@@ -527,6 +626,10 @@ int main() {
         test_blocked_owner_leaves_the_prefill_permit();
         test_finished_resident_is_a_pending_release();
         test_decode_and_control_membership();
+        test_decisions_queue_first();
+        test_decision_lanes();
+        test_decision_prefill_turn();
+        test_decision_is_last_victim();
         std::cout << "ok\n";
         return 0;
     } catch (const std::exception& error) {
