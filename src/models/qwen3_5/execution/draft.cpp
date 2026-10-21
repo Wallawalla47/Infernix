@@ -280,6 +280,33 @@ const ops::SamplingConfig* sampling_from(const qwen3_5::DFlashDecodeState& frame
     return frame.sampling != nullptr ? frame.sampling + row : nullptr;
 }
 
+// The candidate selectors take 16-byte-aligned operands, and a row slice of a per-column frame tensor
+// (anchors, frontiers, drafts, tree rows: rows drafted alone under column-invariant decode) is aligned
+// only at some rows. Such a slice is staged in the workspace: its contents copied in, and copied back
+// by finish() for the selector's outputs. An aligned slice is used in place.
+struct SelectorOperand {
+    Tensor view;     // what the selector reads or writes
+    Tensor original; // the frame slice
+    bool staged = false;
+
+    SelectorOperand(WorkspaceArena& work, const Tensor& slice, cudaStream_t stream)
+        : view(slice), original(slice) {
+        if (slice.data == nullptr || (reinterpret_cast<std::uintptr_t>(slice.data) & 15U) == 0) {
+            return;
+        }
+        view   = work.alloc(slice.dtype, {slice.ne[0], slice.ne[1], slice.ne[2], slice.ne[3]});
+        staged = true;
+        CUDA_CHECK(cudaMemcpyAsync(view.data, slice.data, slice.bytes(), cudaMemcpyDeviceToDevice,
+                                   stream));
+    }
+    void finish(cudaStream_t stream) const {
+        if (staged) {
+            CUDA_CHECK(cudaMemcpyAsync(original.data, view.data, original.bytes(),
+                                       cudaMemcpyDeviceToDevice, stream));
+        }
+    }
+};
+
 // The DFlash2 proposal of the frame's rows [row, row + batch).
 // into is the frame that receives a proposal drafted at the drafter's own width when it differs
 // from the drafter's frame: the leading min(K, frame width) drafts (and their sparse laws) are
@@ -412,34 +439,52 @@ void propose_dflash2_rows(DFlashBatchContext& state, qwen3_5::DFlashDecodeState&
             if (into == nullptr || !into->tree_rows.data || !into->tree_masks.data) {
                 throw std::logic_error("a DFlash2 tree round needs its verification frame");
             }
-            Tensor drafts            = into->draft_tokens.slice(1, row, batch);
-            Tensor column_candidates = into->candidate_ids.slice(2, row, batch);
-            Tensor proposal_q        = into->proposal_q.slice(2, row, batch);
-            Tensor tree_rows         = into->tree_rows.slice(1, row, batch);
-            Tensor tree_masks        = into->tree_masks.slice(1, row, batch);
-            Tensor extents           = into->proposal_extents.slice(0, row, batch);
-            Tensor valid             = into->target_valid_columns.slice(0, row, batch);
+            const SelectorOperand tree_anchors(work, anchors, stream);
+            const SelectorOperand tree_frontiers(work, frontiers, stream);
+            const SelectorOperand drafts(work, into->draft_tokens.slice(1, row, batch), stream);
+            const SelectorOperand column_candidates(work, into->candidate_ids.slice(2, row, batch),
+                                                    stream);
+            const SelectorOperand proposal_q(work, into->proposal_q.slice(2, row, batch), stream);
+            const SelectorOperand tree_rows(work, into->tree_rows.slice(1, row, batch), stream);
+            const SelectorOperand tree_masks(work, into->tree_masks.slice(1, row, batch), stream);
+            const SelectorOperand extents(work, into->proposal_extents.slice(0, row, batch), stream);
+            const SelectorOperand valid(work, into->target_valid_columns.slice(0, row, batch), stream);
             const ops::SpeculativeTreeShape shape{into->draft_tokens.ne[0] + 1, k,
                                                   static_cast<std::int32_t>(state.tree_paths)};
+            Tensor drafts_view            = drafts.view;
+            Tensor column_candidates_view = column_candidates.view;
+            Tensor proposal_q_view        = proposal_q.view;
+            Tensor tree_rows_view         = tree_rows.view;
+            Tensor tree_masks_view        = tree_masks.view;
+            Tensor valid_view             = valid.view;
             ops::candidate_selector_tree(
                 candidates, scores.view({dimension(config.dflash2->selector_top_k), k, batch}),
-                projected.view({dimension(config.dflash2->selector_rank), k, batch}), anchors,
-                weights.selector->predecessor_codebook, weights.selector->successor_codebook,
-                frontiers, extents, sampling, shape, drafts, column_candidates, proposal_q,
-                tree_rows, tree_masks, valid, work, stream);
+                projected.view({dimension(config.dflash2->selector_rank), k, batch}),
+                tree_anchors.view, weights.selector->predecessor_codebook,
+                weights.selector->successor_codebook, tree_frontiers.view, extents.view, sampling,
+                shape, drafts_view, column_candidates_view, proposal_q_view, tree_rows_view,
+                tree_masks_view, valid_view, work, stream);
+            for (const SelectorOperand* output :
+                 {&drafts, &column_candidates, &proposal_q, &tree_rows, &tree_masks, &valid}) {
+                output->finish(stream);
+            }
             work.reset();
             return;
         }
-        Tensor drafts =
-            staged ? work.alloc(DType::I32, {k, batch}) : frame.draft_tokens.slice(1, row, batch);
+        const SelectorOperand path_anchors(work, anchors, stream);
+        const SelectorOperand path_frontiers(work, frontiers, stream);
+        const SelectorOperand frame_drafts(work, staged ? Tensor{} : frame.draft_tokens.slice(1, row, batch),
+                                           stream);
+        Tensor drafts = staged ? work.alloc(DType::I32, {k, batch}) : frame_drafts.view;
         Tensor proposal_q =
             staged ? work.alloc(DType::FP32, {ops::kSparseSpeculativeCandidates, k, batch})
                    : frame.proposal_q.slice(2, row, batch);
         ops::candidate_selector_path(
             candidates, scores.view({dimension(config.dflash2->selector_top_k), k, batch}),
-            projected.view({dimension(config.dflash2->selector_rank), k, batch}), anchors,
-            weights.selector->predecessor_codebook, weights.selector->successor_codebook, frontiers,
-            sampling, drafts, proposal_q, nullptr, work, stream);
+            projected.view({dimension(config.dflash2->selector_rank), k, batch}), path_anchors.view,
+            weights.selector->predecessor_codebook, weights.selector->successor_codebook,
+            path_frontiers.view, sampling, drafts, proposal_q, nullptr, work, stream);
+        if (!staged) { frame_drafts.finish(stream); }
         if (staged) {
             Tensor destination_drafts     = into->draft_tokens.slice(1, row, batch);
             Tensor destination_candidates = into->candidate_ids.slice(2, row, batch);

@@ -342,7 +342,11 @@ different route may ship, what it is measured against, how much it may cost, and
   policy: a sampled request accepts or rejects against its drafts, so they must not depend on the
   other rows either. The DFlash and DFlash2 drafters run their context appends and proposals one
   row per call on the exact route (every round verifies the fixed chain and the drafter runs for
-  every row), so each row's drafts depend only on that row.
+  every row), and their attention takes the context capacity as its envelope rather than the
+  round's longest row, whose length would otherwise pick its split route; so each row's drafts
+  depend only on that row. (Before 2026-10-21 the round's envelope reached them: a sampled request
+  admitted beside a longer one drafted with another split order and diverged within five tokens,
+  while greedy requests stayed identical.)
   Qwen3.8-Flash-Next decodes rounds of up to eight rows on routes whose column results do not
   depend on the round's width up to eight columns (dense projections, router, hyper-connections,
   QSA attention, the narrow expert route). Recipe C's exact route diverged from run to run: its FP8

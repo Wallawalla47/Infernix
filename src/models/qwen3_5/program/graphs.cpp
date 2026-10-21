@@ -480,7 +480,9 @@ void ProgramImpl::prepare_graphs() {
                 } else {
                     auto state = dflash_context();
                     execution::dflash_decode_batch(
-                        state, batch, verify_drafts, dflash_envelopes(min_frontier, max_frontier),
+                        state, batch, verify_drafts,
+                        dflash_envelopes(min_frontier, max_frontier,
+                                         execution_schedule.column_invariant_decode, capacity),
                         target_envelope(max_frontier), executable, phase);
                 }
             };
@@ -496,7 +498,9 @@ void ProgramImpl::prepare_graphs() {
                 } else {
                     auto state = dflash_context();
                     execution::capture_dflash_decode_batch(
-                        state, batch, verify_drafts, dflash_envelopes(low, high),
+                        state, batch, verify_drafts,
+                        dflash_envelopes(low, high, execution_schedule.column_invariant_decode,
+                                         capacity),
                         target_envelope(high), profile.definition, phase);
                 }
             };

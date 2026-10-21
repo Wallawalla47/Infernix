@@ -98,11 +98,15 @@ execution::MtpCausalAttentionEnvelopes mtp_causal_attention_envelopes(std::uint3
 }
 
 execution::DFlashEnvelopes dflash_envelopes(std::uint32_t min_frontier,
-                                            std::uint32_t max_frontier) {
+                                            std::uint32_t max_frontier, bool column_invariant,
+                                            std::uint32_t capacity) {
     (void)min_frontier;
+    // The attention plans choose their route and split count from max_context, which here would
+    // otherwise be the round's longest row.
+    const std::uint32_t bound = column_invariant ? capacity : max_frontier;
     return execution::DFlashEnvelopes{
-        .local = {0, max_frontier},
-        .full  = {0, max_frontier},
+        .local = {0, bound},
+        .full  = {0, bound},
     };
 }
 

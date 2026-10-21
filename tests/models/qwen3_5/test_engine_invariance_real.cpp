@@ -1,5 +1,6 @@
 #include "infernix/engine.h"
 
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
@@ -8,6 +9,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 // The exact route's request invariance on a real Qwen3.5 artifact (docs/maintainer/model-quality.md,
@@ -204,6 +206,24 @@ int main(int argc, char** argv) {
             }
             require(engine.runtime_stats().preemptions == before.preemptions,
                     "the exact route preempted a request");
+        }
+
+        {
+            // 5. A request admitted while another decodes, at once and some way in: the round's other
+            //    row is longer, so anything chosen from the round (an attention envelope, a split
+            //    count) would reach the new request's arithmetic. Under DFlash2 that once changed a
+            //    sampled request's drafts within five tokens while greedy ones stayed identical.
+            infernix::Engine engine(
+                exact_options(artifact, backend, kConcurrency * kContext, false));
+            const auto alone = engine.generate(engine.prepare(prompt(texts[3])), sampled(1003));
+            for (const int delay_ms : {0, 400}) {
+                auto running = engine.submit(engine.prepare(prompt(texts[2])), sampled(1002));
+                std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+                auto admitted = engine.submit(engine.prepare(prompt(texts[3])), sampled(1003));
+                (void)running.wait();
+                require_same("request admitted " + std::to_string(delay_ms) + " ms into another",
+                             alone, admitted.wait());
+            }
         }
         std::cout << "OK request invariance\n";
         return 0;

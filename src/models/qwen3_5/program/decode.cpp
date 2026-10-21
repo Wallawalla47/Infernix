@@ -901,15 +901,17 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
                              static_cast<std::uint64_t>(lanes.size()));
         DecodeGraphExecutable* forward       = nullptr;
         DecodeGraphExecutable* finish        = nullptr;
-        execution::DFlashEnvelopes envelopes = dflash_envelopes(0, maximum_frontier);
+        const bool invariant_drafts          = execution_schedule.column_invariant_decode;
+        execution::DFlashEnvelopes envelopes =
+            dflash_envelopes(0, maximum_frontier, invariant_drafts, capacity);
         auto target_envelope                 = target_envelope_for(maximum_frontier);
         if (use_cuda_graph) {
             const auto batch = static_cast<std::uint32_t>(lanes.size());
             auto& profile    = family.forward.select(batch, maximum_frontier);
             forward          = &family.forward.install(profile);
             finish = &family.finish.install(family.finish.select(batch, maximum_frontier));
-            envelopes =
-                dflash_envelopes(profile.min_execution_frontier, profile.max_execution_frontier);
+            envelopes = dflash_envelopes(profile.min_execution_frontier,
+                                         profile.max_execution_frontier, invariant_drafts, capacity);
             target_envelope = target_envelope_for(profile.max_execution_frontier);
         }
 
