@@ -50,6 +50,12 @@ infernix::RequestOptions request(bool greedy, std::uint64_t seed, bool prefix_re
     options.execution.sampling.top_k          = 0;
     options.execution.sampling.top_p          = 1.0F;
     options.execution.sampling.seed           = seed;
+    if (greedy) {
+        // Greedy picks the scoring pass's top token only without penalties; the MoE model's thinking
+        // preset sets a presence penalty (1.5). Sampled requests keep the model's defaults.
+        options.execution.sampling.presence_penalty  = 0.0F;
+        options.execution.sampling.frequency_penalty = 0.0F;
+    }
     options.execution.allow_prefix_reuse      = prefix_reuse;
     options.stop.include_model_defaults       = false;
     options.output.raw                        = true;
