@@ -55,7 +55,8 @@ const char* kNames[] = {"rmsnorm",       "rmsnorm_gated", "add",          "silu_
                          "moe_route",     "rmsnorm_grouped", "rmsnorm_gated_sigmoid", "hc_gates",
                          "hc_mix",        "hc_inject",     "ple_gate",     "ple_conv",
                          "qsa_pool",      "qsa_select",    "attention_select", "router_bf16",
-                         "moe_combine_entries", "conv_slots", "delta_rule_slots", "attention_paged"};
+                         "moe_combine_entries", "conv_slots", "delta_rule_slots", "attention_paged",
+                         "ple_conv_slots", "qsa_cache", "qsa_select_positions", "attention_paged_select"};
 
 } // namespace
 
@@ -432,7 +433,8 @@ int main(int argc, char** argv) {
             got.insert(got.end(), fs.begin(), fs.end());
             break;
         }
-        case 27: {
+        case 27:
+        case 31: {
             const int heads = static_cast<int>(dims[0]), kv_heads = static_cast<int>(dims[1]),
                       width = static_cast<int>(dims[2]), seqs = static_cast<int>(dims[3]),
                       stride = static_cast<int>(dims[4]), pages = static_cast<int>(dims[5]),
@@ -483,9 +485,84 @@ int main(int argc, char** argv) {
             cache.storage      = KvCacheStorage::BFloat16;
             Tensor tkn(kn.p, DType::BF16, {256, kv_heads, cols}), tvn(vn.p, DType::BF16, {256, kv_heads, cols});
             ops::lossless_kv_append(tkn, tvn, tpos, seqs, trows, cache, nullptr);
-            ops::lossless_paged_attention(tq, tpos, seqs, trows, cache, max_keys, max_keys, tout, ws.p, nullptr);
+            // Case 31: with a QSA selection (U32 [T], one word per query).
+            const int ratio = op == 31 ? static_cast<int>(dims[7]) : 0;
+            DeviceBuffer sel = op == 31 ? upload32(inputs[6]) : DeviceBuffer{};
+            ops::lossless_paged_attention(tq, tpos, seqs, trows, cache, max_keys, max_keys, tout, ws.p, nullptr,
+                                          op == 31 ? static_cast<const std::uint32_t*>(sel.p) : nullptr, op == 31 ? 1 : 0,
+                                          ratio);
             CUDA_CHECK(cudaDeviceSynchronize());
             got = download16(out, static_cast<std::size_t>(256) * heads * cols);
+            break;
+        }
+        case 28: {
+            const int channels = static_cast<int>(dims[0]), width = static_cast<int>(dims[1]),
+                      seqs = static_cast<int>(dims[2]), taps = static_cast<int>(dims[3]),
+                      dilation = static_cast<int>(dims[4]), slots = static_cast<int>(dims[5]);
+            const int cols = width * seqs, span = (taps - 1) * dilation;
+            DeviceBuffer gt = upload16(inputs[0]), nz = upload16(inputs[1]), w = upload16(inputs[2]);
+            DeviceBuffer res = upload16(inputs[3]), hist = upload16(inputs[4]);
+            DeviceBuffer src = upload32(inputs[5]), dst = upload32(inputs[6]);
+            Tensor tg(gt.p, DType::BF16, {channels, cols}), tn(nz.p, DType::BF16, {channels, cols});
+            Tensor tw(w.p, DType::BF16, {channels, taps}), tr(res.p, DType::BF16, {channels, cols});
+            Tensor th(hist.p, DType::BF16, {channels, span, slots});
+            Tensor tsrc(src.p, DType::I32, {seqs}), tdst(dst.p, DType::I32, {seqs});
+            ops::lossless_ple_conv_inject_slots(tg, tn, tw, dilation, seqs, th, tsrc, tdst, tr, nullptr);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            got = download16(res, static_cast<std::size_t>(channels) * cols);
+            const auto fh = download16(hist, static_cast<std::size_t>(channels) * span * slots);
+            got.insert(got.end(), fh.begin(), fh.end());
+            break;
+        }
+        case 29: {
+            const int dim = static_cast<int>(dims[0]), ratio = static_cast<int>(dims[1]), width = static_cast<int>(dims[2]),
+                      seqs = static_cast<int>(dims[3]), slots = static_cast<int>(dims[4]), stride = static_cast<int>(dims[5]),
+                      pages = static_cast<int>(dims[6]);
+            const int cols = width * seqs, rows = static_cast<int>(inputs[7].size()) / stride;
+            DeviceBuffer keys = upload16(inputs[0]), pos = upload32(inputs[1]), tails = upload16(inputs[2]);
+            DeviceBuffer tslots = upload32(inputs[3]), rope = upload32(inputs[4]), bstart = upload32(inputs[5]);
+            DeviceBuffer plane = upload16(inputs[6]), tables = upload32(inputs[7]), trows = upload32(inputs[8]);
+            DeviceBuffer pooled(static_cast<std::size_t>(dim) * cols * 2), brope(static_cast<std::size_t>(3) * cols * 4);
+            Tensor tk(keys.p, DType::BF16, {dim, cols}), tp(pos.p, DType::I32, {cols});
+            Tensor tt(tails.p, DType::BF16, {dim, ratio - 1, slots}), ts(tslots.p, DType::I32, {seqs});
+            Tensor tro(rope.p, DType::I32, {cols, 3}), tbs(bstart.p, DType::I32, {seqs, 3});
+            Tensor tpl(plane.p, DType::BF16, {dim / ratio, 64, 1, pages}), ttab(tables.p, DType::I32, {stride, rows});
+            Tensor trw(trows.p, DType::I32, {seqs});
+            Tensor tpo(pooled.p, DType::BF16, {dim, cols}), tbr(brope.p, DType::I32, {cols, 3});
+            ops::lossless_qsa_pool_cache(tk, tp, seqs, tt, ts, tro, tbs, ratio, tpo, tbr, nullptr);
+            ops::lossless_qsa_pooled_store(tpo, tp, seqs, ttab, trw, ratio, tpl, nullptr);
+            ops::lossless_qsa_tails_store(tk, tp, seqs, tt, ts, ratio, nullptr);
+            std::vector<std::uint32_t> gathered;
+            for (int b = 0; b < seqs; ++b) {
+                const int n = (static_cast<int>(inputs[1][static_cast<std::size_t>(b) * width + width - 1]) + 1) / ratio;
+                DeviceBuffer g(static_cast<std::size_t>(dim) * n * 2);
+                Tensor tg(g.p, DType::BF16, {dim, n});
+                ops::lossless_qsa_pooled_gather(tpl, ttab, trw, tp, seqs, b, ratio, tg, nullptr);
+                CUDA_CHECK(cudaDeviceSynchronize());
+                const auto part = download16(g, static_cast<std::size_t>(dim) * n);
+                gathered.insert(gathered.end(), part.begin(), part.end());
+            }
+            CUDA_CHECK(cudaDeviceSynchronize());
+            got = download16(pooled, static_cast<std::size_t>(dim) * cols);
+            const auto br = download32(brope, static_cast<std::size_t>(3) * cols);
+            const auto pl = download16(plane, inputs[6].size());
+            const auto tl = download16(tails, inputs[2].size());
+            got.insert(got.end(), br.begin(), br.end());
+            got.insert(got.end(), pl.begin(), pl.end());
+            got.insert(got.end(), tl.begin(), tl.end());
+            got.insert(got.end(), gathered.begin(), gathered.end());
+            break;
+        }
+        case 30: {
+            const int heads = static_cast<int>(dims[0]), ratio = static_cast<int>(dims[1]), budget = static_cast<int>(dims[2]),
+                      dim = static_cast<int>(dims[3]), cols = static_cast<int>(dims[4]), blocks = static_cast<int>(dims[5]);
+            DeviceBuffer sc = upload32(inputs[0]), pos = upload32(inputs[1]), sel(static_cast<std::size_t>(cols) * 4);
+            DeviceBuffer ws(ops::lossless_qsa_select_workspace_bytes(cols, blocks));
+            Tensor tsc(sc.p, DType::FP32, {blocks, heads * cols}), tp(pos.p, DType::I32, {cols});
+            ops::lossless_qsa_select(tsc, heads, ratio, budget, dim, static_cast<std::uint32_t*>(sel.p), 1, ws.p, nullptr,
+                                     &tp);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            got = download32(sel, static_cast<std::size_t>(cols));
             break;
         }
         default: std::cerr << "FAIL unknown op " << op << "\n"; return 1;

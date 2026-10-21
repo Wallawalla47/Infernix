@@ -571,7 +571,8 @@ public:
             throw std::logic_error("Qwen4Exp: decode io must precede the n-gram rows");
         }
         d.logits32     = sizeof(float) * c.vocab_size * lanes * W;
-        d.logits16     = 2ULL * c.vocab_size * lanes * W;
+        // The sampler's copy: BF16, or on the lossless route FP32.
+        d.logits16     = (c.lossless ? 4ULL : 2ULL) * c.vocab_size * lanes * W;
         d.token_counts = 4ULL * static_cast<std::size_t>(d.token_domain) * lanes;
         if (o.causal_scoring) {
             d.score_residuals = align(2ULL * width * o.max_context);
@@ -783,9 +784,10 @@ public:
             bytes += execution::Forward::mtp_workspace_bytes(c, std::max(lanes * W, std::min(d.chunk, 512)), lanes,
                                                              d.head_rows, dim(o.max_context), o.kv_cache);
         }
-        // The lossless route's window call (TextConfig::lossless).
+        // The lossless route's calls: a scored window, or (generation) the cache form over the lanes.
         if (c.lossless) {
-            bytes = std::max(bytes, execution::Forward::lossless_workspace_bytes(c, std::max(columns, lanes * W)) +
+            bytes = std::max(bytes, execution::Forward::lossless_workspace_bytes(
+                                        c, std::max(columns, lanes * W), o.causal_scoring ? 0 : dim(o.max_context), lanes) +
                                         ops::sampling_workspace_capacity_bytes(d.token_domain, 1, lanes));
         }
         // The DFlash2 drafter runs between Forward calls, in the same arena.
@@ -936,7 +938,8 @@ public:
                                                  static_cast<std::size_t>(l) * di_ * (r_ - 1) * lanes * 2,
                                              DType::BF16, {di_, r_ - 1, lanes}));
         }
-        const auto layout   = paged_kv_storage_layout(options_.kv_cache, dim(c_.attention.head_dim));
+        const auto layout   = c_.lossless ? paged_kv_lossless_storage_layout(dim(c_.attention.head_dim))
+                                          : paged_kv_storage_layout(options_.kv_cache, dim(c_.attention.head_dim));
         const auto kv_heads = dim(c_.attention.kv_heads);
         execution::ForwardKV kv;
         kv.block_tables  = tables_->matrix();
@@ -1954,7 +1957,7 @@ public:
         const bool last          = begin + width == static_cast<std::int32_t>(lane.prefill_end);
         // The lossless route's call reads only its own keys and starts from zero state: it is the whole
         // window (TextConfig::lossless).
-        if (c_.lossless && (begin != 0 || !last)) {
+        if (c_.lossless && options_.causal_scoring && (begin != 0 || !last)) {
             throw std::logic_error("Qwen4Exp: the lossless route scores a window in one call from its first token");
         }
         // A call the CPU serves (an opener tail, a tiny suffix) promotes at the decode rate (design
@@ -3749,8 +3752,13 @@ private:
         if (cpu_service_) { cpu_service_->wake(); } // its first request comes within this round
         residency_->before_round(s, /*landing=*/true, /*walking=*/walk_.active);
         const execution::NgramRowGate gate = row_gate();
-        replay(graphs_[static_cast<std::size_t>(batch - 1)],
-               [&] { forward_call(batch, 1, batch, nullptr, nullptr, nullptr, &gate, false, /*decode_round=*/true); });
+        const auto body = [&] { forward_call(batch, 1, batch, nullptr, nullptr, nullptr, &gate, false, /*decode_round=*/true); };
+        // The lossless route runs eagerly (its experts' pass reads job counts on the host).
+        if (c_.lossless) {
+            body();
+        } else {
+            replay(graphs_[static_cast<std::size_t>(batch - 1)], body);
+        }
         residency_->enqueue_route_download(s, batch);
     }
 
@@ -3873,6 +3881,11 @@ private:
         }
         // A scored prompt's calls keep their final residuals for the LM head (causal_score).
         if (scoring_) { fb.residual_out = score_residuals(score_column_, cols); }
+        // Lossless generation runs the cache form, bounded by the call's largest position (the staged io).
+        if (c_.lossless && !options_.causal_scoring) {
+            const auto* positions = reinterpret_cast<const std::int32_t*>(host_io() + io_layout_.positions);
+            fb.lossless_keys      = *std::max_element(positions, positions + cols) + 1;
+        }
         Tensor logits(logits32_.p, DType::FP32, {vocab_, logit_columns});
         forward_->run(fb, logits);
     }
@@ -4669,8 +4682,14 @@ private:
         Tensor wide(logits32_.p, DType::FP32, {vocab_, batch});
         Tensor narrow(logits16_.p, DType::BF16, {vocab_, batch});
         // The sampler reads BF16 logits; BF16 and FP32 logits measured equal in perplexity
-        // (design §16.5).
-        ops::cast_fp32_to_bf16(wide, narrow, s);
+        // (design §16.5). The lossless route samples a copy of its FP32 logits (a constraint masks the
+        // sampler's copy in place; the prompt readout reads the logits).
+        if (c_.lossless) {
+            narrow = Tensor(logits16_.p, DType::FP32, {vocab_, batch});
+            CUDA_CHECK(cudaMemcpyAsync(narrow.data, wide.data, wide.bytes(), cudaMemcpyDeviceToDevice, s));
+        } else {
+            ops::cast_fp32_to_bf16(wide, narrow, s);
+        }
         auto* configs = static_cast<ops::SamplingConfig*>(host_configs_.data());
         auto* sample_positions = reinterpret_cast<std::int32_t*>(host_io() + io_layout_.positions);
         for (std::int32_t b = 0; b < batch; ++b) {

@@ -184,21 +184,27 @@ constexpr int kProductWords = 18;
 constexpr int kProductUnit  = -268;
 
 // conv = bf16(sum_j w[j C + c] n[c, t - (K - 1 - j) D]); out = bf16(gated + bf16(silu(conv))); R += out.
+// Columns form runs of `width` (one per sequence); with `history` (BF16 [C, span, slots], span =
+// (K - 1) dilation, oldest first) a run's taps before its first column read its source slot, else zeros.
 __global__ void ple_conv_inject_kernel(const std::uint16_t* gated, const std::uint16_t* normalized,
                                        const std::uint16_t* weight, int channels, int taps, int dilation, int columns,
-                                       std::uint16_t* residual) {
+                                       std::uint16_t* residual, int width, const std::uint16_t* history,
+                                       const std::int32_t* source_slots) {
     const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= static_cast<std::size_t>(channels) * columns) { return; }
     const int c = static_cast<int>(index % channels), t = static_cast<int>(index / channels);
+    const int b = t / width, run = t % width, span = (taps - 1) * dilation;
     Wide<kProductWords> acc;
     acc.clear();
     bool special = false;
     float fsum = 0.0F;
     for (int j = 0; j < taps; ++j) {
-        const int src = t - (taps - 1 - j) * dilation;
-        if (src < 0) { continue; }
+        const int src = run - (taps - 1 - j) * dilation;
+        if (src < 0 && history == nullptr) { continue; }
         const std::uint16_t wb = weight[static_cast<std::size_t>(j) * channels + c];
-        const std::uint16_t nb = normalized[static_cast<std::size_t>(src) * channels + c];
+        const std::uint16_t nb =
+            src >= 0 ? normalized[(static_cast<std::size_t>(b) * width + src) * channels + c]
+                     : history[(static_cast<std::size_t>(source_slots[b]) * span + span + src) * channels + c];
         if (nonfinite(wb) || nonfinite(nb)) { special = true; }
         fsum = __fadd_rn(fsum, __fmul_rn(bf16f(wb), bf16f(nb)));
         const int fw = (wb >> 7) & 0xFF, mw = wb & 0x7F, fn = (nb >> 7) & 0xFF, mn = nb & 0x7F;
@@ -220,19 +226,35 @@ __global__ void ple_conv_inject_kernel(const std::uint16_t* gated, const std::ui
     residual[index] = lossless::bf16_of_double(static_cast<double>(bf16f(residual[index])) + static_cast<double>(bf16f(out)));
 }
 
+// One thread per (channel, sequence): the destination slot's span columns become the last span of the
+// source slot's followed by the run, in ascending order (an in-place slot reads each old column before
+// it is overwritten).
+__global__ void ple_history_kernel(const std::uint16_t* normalized, std::uint16_t* history, const std::int32_t* source_slots,
+                                   const std::int32_t* destination_slots, int channels, int sequences, int width, int span) {
+    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= channels * sequences) { return; }
+    const int c = i % channels, b = i / channels;
+    const std::uint16_t* src = history + static_cast<std::size_t>(source_slots[b]) * span * channels + c;
+    std::uint16_t* dst       = history + static_cast<std::size_t>(destination_slots[b]) * span * channels + c;
+    for (int k = 0; k < span; ++k) {
+        const int s = width + k - span; // the run's column, or (negative) the old history's column k + width
+        dst[static_cast<std::size_t>(k) * channels] =
+            s >= 0 ? normalized[(static_cast<std::size_t>(b) * width + s) * channels + c]
+                   : src[static_cast<std::size_t>(k + width) * channels];
+    }
+}
+
 // --------------------------------------------------------------------------------- QSA indexer
 
-// pooled[:, b] = bf16(fp32(sum of keys [r b, r b + r) / r)), one thread per (d, b).
-__global__ void qsa_pool_kernel(const std::uint16_t* keys, int dim, int ratio, int blocks, std::uint16_t* pooled) {
-    const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (index >= static_cast<std::size_t>(dim) * blocks) { return; }
-    const int d = static_cast<int>(index % dim), b = static_cast<int>(index / dim);
+// bf16(fp32(sum of key(0..ratio-1) / ratio)) (HF's .float().mean().to(bf16); the sum exact).
+template <class Key>
+__device__ std::uint16_t pooled_mean(Key key, int ratio) {
     Wide<kBf16SumWords> acc;
     acc.clear();
     bool special = false;
     float fsum = 0.0F;
     for (int i = 0; i < ratio; ++i) {
-        const std::uint16_t k = keys[(static_cast<std::size_t>(b) * ratio + i) * dim + d];
+        const std::uint16_t k = key(i);
         special = special || nonfinite(k);
         fsum    = __fadd_rn(fsum, bf16f(k));
         add_bf16(acc, k);
@@ -252,22 +274,113 @@ __global__ void qsa_pool_kernel(const std::uint16_t* keys, int dim, int ratio, i
             mean = __uint_as_float(round_magnitude(q, kBf16Unit - 64, negative, false, sticky));
         }
     }
-    pooled[index] = bf16_rn(mean); // the binary32 mean's BF16 rounding (HF's .float().mean().to(bf16))
+    return bf16_rn(mean); // the binary32 mean's BF16 rounding
+}
+
+// pooled[:, b] = the mean of keys [r b, r b + r), one thread per (d, b).
+__global__ void qsa_pool_kernel(const std::uint16_t* keys, int dim, int ratio, int blocks, std::uint16_t* pooled) {
+    const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= static_cast<std::size_t>(dim) * blocks) { return; }
+    const int d = static_cast<int>(index % dim), b = static_cast<int>(index / dim);
+    pooled[index] = pooled_mean(
+        [&](int i) { return keys[(static_cast<std::size_t>(b) * ratio + i) * dim + d]; }, ratio);
+}
+
+// The cache form (runs of `width` consecutive positions): a column t at position P that completes a block
+// (P + 1 multiple of ratio) gets its block's mean, the keys before the run's first position P0 from its
+// tail slot (slot P mod ratio); other columns get zeros. Thread d == 0 also writes the column's block-start
+// RoPE position (axis-major [T, 3]): its own column's when the block starts in the run, else the run's
+// block_start_rope.
+__global__ void qsa_pool_cache_kernel(const std::uint16_t* keys, const std::int32_t* positions, const std::uint16_t* tails,
+                                      const std::int32_t* tail_slots, const std::int32_t* rope_positions,
+                                      const std::int32_t* block_start_rope, int dim, int ratio, int width, int sequences,
+                                      std::uint16_t* pooled, std::int32_t* block_rope) {
+    const int columns = width * sequences;
+    const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= static_cast<std::size_t>(dim) * columns) { return; }
+    const int d = static_cast<int>(index % dim), t = static_cast<int>(index / dim);
+    const int b = t / width, p = positions[t], p0 = positions[b * width];
+    const bool complete = (p + 1) % ratio == 0;
+    if (d == 0) {
+        const int start = p + 1 - ratio; // the completed block's first position
+        for (int a = 0; a < 3; ++a) {
+            block_rope[a * columns + t] = !complete      ? rope_positions[a * columns + t]
+                                          : start >= p0 ? rope_positions[a * columns + t - (p - start)]
+                                                        : block_start_rope[a * sequences + b];
+        }
+    }
+    if (!complete) {
+        pooled[index] = 0;
+        return;
+    }
+    const std::uint16_t* tail = tails + static_cast<std::size_t>(tail_slots[b]) * (ratio - 1) * dim + d;
+    pooled[index] = pooled_mean(
+        [&](int i) {
+            const int q = p + 1 - ratio + i;
+            return q >= p0 ? keys[static_cast<std::size_t>(t - (p - q)) * dim + d]
+                           : tail[static_cast<std::size_t>(q % ratio) * dim];
+        },
+        ratio);
+}
+
+// Block (P + 1) / ratio - 1 of each completing column into the pooled plane ([dim / ratio, 64, 1, pages]:
+// a block's dim values from its first token's slot of its page).
+__global__ void qsa_pooled_store_kernel(const std::uint16_t* pooled, const std::int32_t* positions,
+                                        const std::int32_t* tables, const std::int32_t* table_rows, int stride, int dim,
+                                        int ratio, int width, int columns, std::uint16_t* plane) {
+    const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= static_cast<std::size_t>(dim) * columns) { return; }
+    const int d = static_cast<int>(index % dim), t = static_cast<int>(index / dim);
+    const int p = positions[t];
+    if ((p + 1) % ratio != 0) { return; }
+    const int first = p + 1 - ratio; // the block's first position
+    const int page  = tables[static_cast<std::size_t>(table_rows[t / width]) * stride + first / 64];
+    plane[(static_cast<std::size_t>(page) * 64 + first % 64) * (dim / ratio) + d] = pooled[index];
+}
+
+// The pooled keys of blocks [0, blocks) of row table_rows[sequence] into out ([dim, blocks]); blocks past
+// the sequence's complete ones (after its run's last position) are zeros.
+__global__ void qsa_pooled_gather_kernel(const std::uint16_t* plane, const std::int32_t* tables,
+                                         const std::int32_t* table_rows, const std::int32_t* positions, int width,
+                                         int sequence, int stride, int dim, int ratio, int blocks, std::uint16_t* out) {
+    const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= static_cast<std::size_t>(dim) * blocks) { return; }
+    const int d = static_cast<int>(index % dim), blk = static_cast<int>(index / dim);
+    if (blk >= (positions[sequence * width + width - 1] + 1) / ratio) {
+        out[index] = 0;
+        return;
+    }
+    const int first = blk * ratio;
+    const int page  = tables[static_cast<std::size_t>(table_rows[sequence]) * stride + first / 64];
+    out[index]      = plane[(static_cast<std::size_t>(page) * 64 + first % 64) * (dim / ratio) + d];
+}
+
+// The open block's keys after the run (positions from R floor((P_last + 1) / R)) into the tail slots.
+__global__ void qsa_tails_store_kernel(const std::uint16_t* keys, const std::int32_t* positions, std::uint16_t* tails,
+                                       const std::int32_t* tail_slots, int dim, int ratio, int width, int columns) {
+    const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= static_cast<std::size_t>(dim) * columns) { return; }
+    const int d = static_cast<int>(index % dim), t = static_cast<int>(index / dim);
+    const int b = t / width, p = positions[t];
+    const int open = (positions[b * width + width - 1] + 1) / ratio * ratio;
+    if (p < open) { return; }
+    tails[(static_cast<std::size_t>(tail_slots[b]) * (ratio - 1) + p % ratio) * dim + d] = keys[index];
 }
 
 constexpr int kSelectThreads = 256;
+constexpr int kSelectWords   = 2048; // 65,536 blocks (262,144 keys at ratio 4)
 
 // One CTA per query t: n = floor((t + 1) / ratio) complete blocks; all when n <= budget, else the budget
 // largest of fp32(fp32(sum_h relu(score)) / divisor) (NaN largest, ties the lower block).
 __global__ void __launch_bounds__(kSelectThreads)
     qsa_select_kernel(const float* scores, int blocks, int heads, int ratio, int budget, float divisor, int columns,
-                      std::uint32_t* select, int words, std::uint32_t* keys_scratch) {
-    __shared__ std::uint32_t bits[1024];
+                      std::uint32_t* select, int words, std::uint32_t* keys_scratch, const std::int32_t* positions) {
+    __shared__ std::uint32_t bits[kSelectWords];
     __shared__ int counts[kSelectThreads];
     const int t = static_cast<int>(blockIdx.x), tid = static_cast<int>(threadIdx.x);
     for (int w = tid; w < words; w += kSelectThreads) { bits[w] = 0; }
     __syncthreads();
-    const int n = (t + 1) / ratio;
+    const int n = ((positions != nullptr ? positions[t] : t) + 1) / ratio;
     if (n <= budget) {
         for (int b = tid; b < n; b += kSelectThreads) { atomicOr(&bits[b / 32], 1U << (b % 32)); }
     } else {
@@ -439,10 +552,43 @@ void lossless_ple_conv_inject(const Tensor& gated, const Tensor& normalized, con
             "gated, normalized and residual BF16 [C, T], weight BF16 [C, K]");
     const int taps = weight.ne[1];
     const std::size_t n = static_cast<std::size_t>(channels) * columns;
+    if (n == 0) { return; }
     ple_conv_inject_kernel<<<blocks_for(n, 256), 256, 0, stream>>>(
         static_cast<const std::uint16_t*>(gated.data), static_cast<const std::uint16_t*>(normalized.data),
         static_cast<const std::uint16_t*>(weight.data), channels, taps, dilation, columns,
-        static_cast<std::uint16_t*>(residual.data));
+        static_cast<std::uint16_t*>(residual.data), columns, nullptr, nullptr);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void lossless_ple_conv_inject_slots(const Tensor& gated, const Tensor& normalized, const Tensor& weight, int dilation,
+                                    int sequences, Tensor& history, const Tensor& source_slots,
+                                    const Tensor& destination_slots, Tensor& residual, cudaStream_t stream) {
+    const int channels = gated.ne[0], columns = gated.ne[1];
+    require(contiguous(gated, DType::BF16) && contiguous(normalized, DType::BF16) && contiguous(weight, DType::BF16) &&
+                contiguous(residual, DType::BF16) && normalized.ne[0] == channels && normalized.ne[1] == columns &&
+                residual.ne[0] == channels && residual.ne[1] == columns && weight.ne[0] == channels && dilation > 0 &&
+                weight.ne[1] >= 2,
+            "gated, normalized and residual BF16 [C, T], weight BF16 [C, K >= 2]");
+    const int taps = weight.ne[1], span = (taps - 1) * dilation;
+    require(sequences >= 1 && columns % sequences == 0, "the columns are `sequences` equal runs");
+    require(contiguous(history, DType::BF16) && history.ne[0] == channels && history.ne[1] == span,
+            "history BF16 [C, (K - 1) dilation, slots]");
+    require(source_slots.dtype == DType::I32 && destination_slots.dtype == DType::I32 &&
+                source_slots.is_contiguous() && destination_slots.is_contiguous() &&
+                source_slots.numel() >= sequences && destination_slots.numel() >= sequences,
+            "source and destination slots I32 [B]");
+    if (columns == 0) { return; }
+    const std::size_t n = static_cast<std::size_t>(channels) * columns;
+    ple_conv_inject_kernel<<<blocks_for(n, 256), 256, 0, stream>>>(
+        static_cast<const std::uint16_t*>(gated.data), static_cast<const std::uint16_t*>(normalized.data),
+        static_cast<const std::uint16_t*>(weight.data), channels, taps, dilation, columns,
+        static_cast<std::uint16_t*>(residual.data), columns / sequences, static_cast<const std::uint16_t*>(history.data),
+        static_cast<const std::int32_t*>(source_slots.data));
+    CUDA_CHECK(cudaGetLastError());
+    ple_history_kernel<<<blocks_for(static_cast<std::size_t>(channels) * sequences, 256), 256, 0, stream>>>(
+        static_cast<const std::uint16_t*>(normalized.data), static_cast<std::uint16_t*>(history.data),
+        static_cast<const std::int32_t*>(source_slots.data), static_cast<const std::int32_t*>(destination_slots.data),
+        channels, sequences, columns / sequences, span);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -458,20 +604,122 @@ void lossless_qsa_pool(const Tensor& keys, int ratio, Tensor& pooled, cudaStream
     CUDA_CHECK(cudaGetLastError());
 }
 
+namespace {
+
+void require_runs(const Tensor& keys, const Tensor& positions, int sequences, int ratio) {
+    require(contiguous(keys, DType::BF16) && positions.dtype == DType::I32 && positions.is_contiguous() &&
+                positions.numel() == keys.ne[1] && sequences >= 1 && keys.ne[1] % sequences == 0 && ratio > 0 &&
+                64 % ratio == 0 && keys.ne[0] % ratio == 0,
+            "keys BF16 [D, T] in `sequences` runs of consecutive positions (I32 [T]); ratio divides 64 and D");
+}
+
+void require_tails(const Tensor& tails, const Tensor& tail_slots, int dim, int ratio, int sequences) {
+    require(contiguous(tails, DType::BF16) && tails.ne[0] == dim && tails.ne[1] == ratio - 1 &&
+                tail_slots.dtype == DType::I32 && tail_slots.is_contiguous() && tail_slots.numel() >= sequences,
+            "tails BF16 [D, ratio - 1, slots] and tail slots I32 [B]");
+}
+
+void require_plane(const Tensor& plane, const Tensor& block_tables, int dim, int ratio) {
+    require(contiguous(plane, DType::BF16) && plane.ne[0] == dim / ratio && plane.ne[1] == 64 &&
+                block_tables.dtype == DType::I32 && block_tables.is_contiguous(),
+            "pooled plane BF16 [D / ratio, 64, 1, pages] and block tables I32 [entries, rows]");
+}
+
+} // namespace
+
+void lossless_qsa_pool_cache(const Tensor& keys, const Tensor& positions, int sequences, const Tensor& tails,
+                             const Tensor& tail_slots, const Tensor& rope_positions, const Tensor& block_start_rope,
+                             int ratio, Tensor& pooled, Tensor& block_rope, cudaStream_t stream) {
+    require_runs(keys, positions, sequences, ratio);
+    const int dim = keys.ne[0], columns = keys.ne[1];
+    require_tails(tails, tail_slots, dim, ratio, sequences);
+    require(contiguous(pooled, DType::BF16) && pooled.ne[0] == dim && pooled.ne[1] == columns &&
+                rope_positions.dtype == DType::I32 && rope_positions.numel() == 3 * columns &&
+                block_start_rope.dtype == DType::I32 && block_start_rope.numel() >= 3 * sequences &&
+                block_rope.dtype == DType::I32 && block_rope.numel() == 3 * columns,
+            "pooled BF16 [D, T]; RoPE positions, block-start RoPE and block_rope I32 axis-major");
+    if (columns == 0) { return; }
+    const std::size_t n = static_cast<std::size_t>(dim) * columns;
+    qsa_pool_cache_kernel<<<blocks_for(n, 256), 256, 0, stream>>>(
+        static_cast<const std::uint16_t*>(keys.data), static_cast<const std::int32_t*>(positions.data),
+        static_cast<const std::uint16_t*>(tails.data), static_cast<const std::int32_t*>(tail_slots.data),
+        static_cast<const std::int32_t*>(rope_positions.data), static_cast<const std::int32_t*>(block_start_rope.data),
+        dim, ratio, columns / sequences, sequences, static_cast<std::uint16_t*>(pooled.data),
+        static_cast<std::int32_t*>(block_rope.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void lossless_qsa_pooled_store(const Tensor& pooled, const Tensor& positions, int sequences, const Tensor& block_tables,
+                               const Tensor& table_rows, int ratio, Tensor& plane, cudaStream_t stream) {
+    require_runs(pooled, positions, sequences, ratio);
+    const int dim = pooled.ne[0], columns = pooled.ne[1];
+    require_plane(plane, block_tables, dim, ratio);
+    require(table_rows.dtype == DType::I32 && table_rows.numel() >= sequences, "table rows I32 [B]");
+    if (columns == 0) { return; }
+    const std::size_t n = static_cast<std::size_t>(dim) * columns;
+    qsa_pooled_store_kernel<<<blocks_for(n, 256), 256, 0, stream>>>(
+        static_cast<const std::uint16_t*>(pooled.data), static_cast<const std::int32_t*>(positions.data),
+        static_cast<const std::int32_t*>(block_tables.data), static_cast<const std::int32_t*>(table_rows.data),
+        block_tables.ne[0], dim, ratio, columns / sequences, columns, static_cast<std::uint16_t*>(plane.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void lossless_qsa_pooled_gather(const Tensor& plane, const Tensor& block_tables, const Tensor& table_rows,
+                                const Tensor& positions, int sequences, int sequence, int ratio, Tensor& out,
+                                cudaStream_t stream) {
+    const int dim = out.ne[0], blocks = out.ne[1];
+    require(positions.dtype == DType::I32 && positions.is_contiguous() && sequences >= 1 &&
+                positions.numel() % sequences == 0,
+            "positions I32 [T] of `sequences` equal runs");
+    require(contiguous(out, DType::BF16) && ratio > 0 && dim % ratio == 0 && table_rows.dtype == DType::I32 &&
+                sequence >= 0 && sequence < sequences && sequence < table_rows.numel() &&
+                static_cast<std::int64_t>(blocks) * ratio <= static_cast<std::int64_t>(block_tables.ne[0]) * 64,
+            "out BF16 [D, blocks] within the block table, table rows I32 [B]");
+    require_plane(plane, block_tables, dim, ratio);
+    if (blocks == 0) { return; }
+    const std::size_t n = static_cast<std::size_t>(dim) * blocks;
+    qsa_pooled_gather_kernel<<<blocks_for(n, 256), 256, 0, stream>>>(
+        static_cast<const std::uint16_t*>(plane.data), static_cast<const std::int32_t*>(block_tables.data),
+        static_cast<const std::int32_t*>(table_rows.data), static_cast<const std::int32_t*>(positions.data),
+        static_cast<int>(positions.numel() / sequences), sequence, block_tables.ne[0], dim, ratio, blocks,
+        static_cast<std::uint16_t*>(out.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void lossless_qsa_tails_store(const Tensor& keys, const Tensor& positions, int sequences, Tensor& tails,
+                              const Tensor& tail_slots, int ratio, cudaStream_t stream) {
+    require_runs(keys, positions, sequences, ratio);
+    const int dim = keys.ne[0], columns = keys.ne[1];
+    require_tails(tails, tail_slots, dim, ratio, sequences);
+    if (columns == 0) { return; }
+    const std::size_t n = static_cast<std::size_t>(dim) * columns;
+    qsa_tails_store_kernel<<<blocks_for(n, 256), 256, 0, stream>>>(
+        static_cast<const std::uint16_t*>(keys.data), static_cast<const std::int32_t*>(positions.data),
+        static_cast<std::uint16_t*>(tails.data), static_cast<const std::int32_t*>(tail_slots.data), dim, ratio,
+        columns / sequences, columns);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 std::size_t lossless_qsa_select_workspace_bytes(int columns, int blocks) {
     return static_cast<std::size_t>(columns) * std::max(blocks, 1) * sizeof(std::uint32_t);
 }
 
 void lossless_qsa_select(const Tensor& scores, int heads, int ratio, int budget, int index_dim, std::uint32_t* select,
-                         int select_words, void* workspace, cudaStream_t stream) {
+                         int select_words, void* workspace, cudaStream_t stream, const Tensor* positions) {
     const int blocks = scores.ne[0], columns = scores.ne[1] / std::max(heads, 1);
     require(contiguous(scores, DType::FP32) && heads > 0 && scores.ne[1] == heads * columns && ratio > 0 && budget > 0 &&
-                index_dim > 0 && blocks == columns / ratio && select_words >= (blocks + 31) / 32 && select_words <= 1024,
-            "scores FP32 [T / ratio, heads * T], select U32 [T][words >= blocks / 32]");
+                index_dim > 0 && select_words >= (blocks + 31) / 32 && select_words <= kSelectWords,
+            "scores FP32 [blocks, heads * T], select U32 [T][words >= blocks / 32]");
+    require(positions != nullptr ? positions->dtype == DType::I32 && positions->is_contiguous() &&
+                                       positions->numel() == columns
+                                 : blocks == columns / ratio,
+            "positions I32 [T] (the scores then cover every query's complete blocks), else blocks = T / ratio");
+    if (columns == 0) { return; }
     const auto divisor = static_cast<float>(std::sqrt(static_cast<double>(index_dim)));
     qsa_select_kernel<<<static_cast<unsigned>(columns), kSelectThreads, 0, stream>>>(
         static_cast<const float*>(scores.data), blocks, heads, ratio, budget, divisor, columns, select, select_words,
-        static_cast<std::uint32_t*>(workspace));
+        static_cast<std::uint32_t*>(workspace),
+        positions != nullptr ? static_cast<const std::int32_t*>(positions->data) : nullptr);
     CUDA_CHECK(cudaGetLastError());
 }
 

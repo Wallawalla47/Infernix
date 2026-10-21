@@ -198,6 +198,10 @@ struct ForwardBatch {
     // With a gated stream (ExpertStream::gated): each layer's routing decides, through
     // ForwardExperts::split, which experts the stream copies and which the CPU serves.
     bool split          = false;
+    // The lossless route (TextConfig::lossless): 0 for a scored window (one sequence from zero state over
+    // its own keys); for generation, a bound on every column's position + 1, and the call runs the cache
+    // form: K/V, pooled keys and tails, PLE history and GDN state through the lanes' slots and rows.
+    std::int32_t lossless_keys = 0;
 };
 
 // One call of the MTP drafter (design §11.2). Cell c of a sequence pairs a residual at position c
@@ -304,8 +308,10 @@ public:
     [[nodiscard]] static std::size_t workspace_bytes(
         const TextConfig& config, std::int32_t columns, std::int32_t max_context, KvCacheStorage storage,
         ops::offloaded_moe::WideA16 wide_a16 = ops::offloaded_moe::WideA16::kExact);
-    // The lossless route's workspace for a call of `columns` (TextConfig::lossless: one window per call).
-    [[nodiscard]] static std::size_t lossless_workspace_bytes(const TextConfig& config, std::int32_t columns);
+    // The lossless route's workspace for a call of `columns` (TextConfig::lossless): a scored window, or with
+    // key_capacity > 0 the cache form over up to `sequences` sequences with keys up to key_capacity.
+    [[nodiscard]] static std::size_t lossless_workspace_bytes(const TextConfig& config, std::int32_t columns,
+                                                              std::int32_t key_capacity = 0, std::int32_t sequences = 1);
     // Extra workspace of the MTP drafter: K/V-only calls over up to `kv_columns` columns (chunks
     // run them inside run()) and full steps over `draft_columns` sequences.
     [[nodiscard]] static std::size_t mtp_workspace_bytes(const TextConfig& config, std::int32_t kv_columns,
@@ -319,15 +325,19 @@ private:
     // The layer's routed-expert source without a call's scheduling (frames, host records, staging, the
     // CPU channel, the SSD tier, the bank's formats).
     [[nodiscard]] ops::MoeExpertSource expert_source(const MoeParameters& p, std::uint32_t layer) const;
-    // The --lossless route (forward_lossless.cpp; docs/maintainer/lossless-route.md §2a): one call per
-    // scored window, every operation correctly rounded.
+    // The --lossless route (forward_lossless.cpp; docs/maintainer/lossless-route.md §2a, §3a): every
+    // operation correctly rounded, a scored window per call or (ForwardBatch::lossless_keys) the cache form.
     void check_lossless_call(const ForwardBatch& batch) const;
     void lossless_project(const Tensor& x, const LinearParameters& p, std::int32_t row_begin, std::int32_t rows,
                           Tensor& out, std::int32_t out_row);
     Tensor lossless_mix(const HyperConnectionParameters& p, const Tensor& residual, Tensor* inject);
     void lossless_ple(const PleParameters& p, Tensor& residual, const ForwardBatch& batch);
-    Tensor lossless_gdn(const GdnParameters& p, const Tensor& x);
-    Tensor lossless_attention_block(const AttentionParameters& p, const Tensor& x, const ForwardBatch& batch);
+    Tensor lossless_gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index, const ForwardBatch& batch);
+    Tensor lossless_attention_block(const AttentionParameters& p, const Tensor& x, std::uint32_t index,
+                                    const ForwardBatch& batch);
+    Tensor lossless_cached_attention(const AttentionParameters& p, const Tensor& qn, const Tensor& kn, const Tensor& v,
+                                     const Tensor& iqn, const Tensor& ik, const Tensor& inv_freq, std::uint32_t index,
+                                     const ForwardBatch& batch);
     Tensor lossless_moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer);
     void lossless_layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& residual);
     // The final mixer and the LM head over residuals (BF16 [S*H, n]) into FP32 logits [V, n].

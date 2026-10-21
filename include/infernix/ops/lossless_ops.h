@@ -119,9 +119,12 @@ void lossless_attention(const Tensor& q, const Tensor& k, const Tensor& v, Tenso
 /// lossless_paged_attention_workspace_bytes(Hq, Hkv, the widest run, B, key_capacity).
 [[nodiscard]] std::size_t lossless_paged_attention_workspace_bytes(int query_heads, int kv_heads, int max_width,
                                                                    int sequences, int key_capacity);
+/// With `select` (QSA), as the window form's with each query's own position: its tail is
+/// j >= floor((P_t + 1) / ratio) ratio and its blocks are the bits of its row of select.
 void lossless_paged_attention(const Tensor& q, const Tensor& positions, int sequences, const Tensor& table_rows,
                               const PagedKVBatchLayerView& cache, int max_keys, int key_capacity, Tensor& out,
-                              void* workspace, cudaStream_t stream);
+                              void* workspace, cudaStream_t stream, const std::uint32_t* select = nullptr,
+                              int select_words = 0, int ratio = 0);
 /// Stores the call's keys and values (contiguous BF16 [256, Hkv, T], `sequences` equal runs) bit for bit
 /// in the lossless profile's pages: column t at position positions[t] through table row table_rows[b] of
 /// its run b.
@@ -211,20 +214,54 @@ void lossless_ple_gate(const Tensor& key_normed, const Tensor& query_normed, con
 void lossless_ple_conv_inject(const Tensor& gated, const Tensor& normalized, const Tensor& weight, int dilation,
                               Tensor& residual, cudaStream_t stream);
 
+/// The same over `sequences` runs (equal widths) continuing their sequences, with dilated history
+/// (BF16 [C, (K - 1) dilation, slots], oldest first) from slot source_slots[b], left in slot
+/// destination_slots[b] (I32 [>= sequences]; a destination may equal its own source only).
+void lossless_ple_conv_inject_slots(const Tensor& gated, const Tensor& normalized, const Tensor& weight, int dilation,
+                                    int sequences, Tensor& history, const Tensor& source_slots,
+                                    const Tensor& destination_slots, Tensor& residual, cudaStream_t stream);
+
 /** The QSA indexer's pooled keys: pooled[:, b] = bf16(fp32(sum of keys[:, r b + i], i < r) / r)) (the sum
  * exact, then HF's binary32 mean and its BF16 cast); keys BF16 [D, T], pooled BF16 [D, floor(T / r)]. */
 void lossless_qsa_pool(const Tensor& keys, int ratio, Tensor& pooled, cudaStream_t stream);
+
+/**
+ * The QSA indexer's cache form. The call's raw index keys (BF16 [D, T]) form `sequences` runs of consecutive
+ * positions (I32 [T]); a sequence's raw keys of its open block before the run sit in its tail slot
+ * tail_slots[b] (BF16 [D, r - 1, slots], position p at slot p mod r).
+ * - lossless_qsa_pool_cache: for a column at p with p + 1 a multiple of r, pooled[:, t] = the mean (as
+ *   lossless_qsa_pool) of the keys at p - r + 1..p (from the tail before the run); other columns zeros.
+ *   block_rope (I32 [T, 3] axis-major) gets the RoPE position of the completed block's first token: the
+ *   column's when it is in the run, else the run's block_start_rope (I32 [B, 3] axis-major).
+ * - lossless_qsa_pooled_store: each completing column's (normed, rotated) key into the pooled plane (BF16
+ *   [D / r, 64, 1, pages]: block b's D values from token slot (r b) mod 64 of page table[r b / 64] of its row).
+ * - lossless_qsa_pooled_gather: blocks [0, n) of row table_rows[sequence] into out (BF16 [D, n]), zeros past
+ *   the sequence's complete blocks (those its run's last position completes).
+ * - lossless_qsa_tails_store: the run's keys from its open block (positions from r floor((p_last + 1) / r))
+ *   into its tail slot (after pooling, which reads the old ones).
+ */
+void lossless_qsa_pool_cache(const Tensor& keys, const Tensor& positions, int sequences, const Tensor& tails,
+                             const Tensor& tail_slots, const Tensor& rope_positions, const Tensor& block_start_rope,
+                             int ratio, Tensor& pooled, Tensor& block_rope, cudaStream_t stream);
+void lossless_qsa_pooled_store(const Tensor& pooled, const Tensor& positions, int sequences, const Tensor& block_tables,
+                               const Tensor& table_rows, int ratio, Tensor& plane, cudaStream_t stream);
+void lossless_qsa_pooled_gather(const Tensor& plane, const Tensor& block_tables, const Tensor& table_rows,
+                                const Tensor& positions, int sequences, int sequence, int ratio, Tensor& out,
+                                cudaStream_t stream);
+void lossless_qsa_tails_store(const Tensor& keys, const Tensor& positions, int sequences, Tensor& tails,
+                              const Tensor& tail_slots, int ratio, cudaStream_t stream);
 
 /**
  * The QSA block selection: scores FP32 [B, heads * T] with B = floor(T / ratio) (column h + heads t:
  * fp32(q_h,t . key_b), lossless_linear of the pooled keys), per query t with n = floor((t + 1) / ratio)
  * complete blocks: every block below n when n <= budget, else the budget largest of
  * fp32(fp32(sum_h relu(score)) / fp32(sqrt(index_dim))) (the sum exact; NaN largest; ties: the lower
- * block), as bits of select (U32 [T][select_words], select_words <= 1024). The workspace is
- * lossless_qsa_select_workspace_bytes(T, B).
+ * block), as bits of select (U32 [T][select_words], select_words <= 2048). The workspace is
+ * lossless_qsa_select_workspace_bytes(T, B). With positions (I32 [T], the cache form) query t has
+ * n = floor((positions[t] + 1) / ratio) complete blocks, and the scores' B rows cover every query's n.
  */
 [[nodiscard]] std::size_t lossless_qsa_select_workspace_bytes(int columns, int blocks);
 void lossless_qsa_select(const Tensor& scores, int heads, int ratio, int budget, int index_dim, std::uint32_t* select,
-                         int select_words, void* workspace, cudaStream_t stream);
+                         int select_words, void* workspace, cudaStream_t stream, const Tensor* positions = nullptr);
 
 } // namespace infernix::ops

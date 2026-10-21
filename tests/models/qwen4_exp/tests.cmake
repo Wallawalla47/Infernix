@@ -49,6 +49,11 @@ infernix_add_test(infernix_qwen4_exp_lossless_real_test
   LIBRARIES infernix_engine)
 set_tests_properties(infernix_qwen4_exp_lossless_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
+infernix_add_test(infernix_qwen4_exp_lossless_generation_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_lossless_generation_real.cpp"
+  LIBRARIES infernix_engine)
+set_tests_properties(infernix_qwen4_exp_lossless_generation_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
+
 # The SSD tier's in-place records on the real artifact (memory track R6, RT3/RT4): streamed records
 # read through DirectReadQueue equal the pinned load's bytes. Skips without INFERNIX_QWEN4_ARTIFACT.
 infernix_add_test(infernix_qwen4_exp_expert_store_real_test

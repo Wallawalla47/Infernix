@@ -119,7 +119,7 @@ struct Args {
     int heads;
     int kv_heads;
     int columns;
-    const std::uint32_t* select; // window only; null: causal; else [columns][select_words] bits of the selected blocks
+    const std::uint32_t* select; // null: causal; else [columns][select_words] bits of the selected blocks (QSA)
     int select_words;
     int ratio;
     int tiles;      // 16-row tiles per sequence and KV head
@@ -144,7 +144,7 @@ __device__ __forceinline__ std::size_t row_offset(const Args& a, int b, int j, i
 __device__ __forceinline__ bool visible(const Args& a, int c, int j) {
     if (j > position(a, c)) { return false; }
     if (a.select == nullptr) { return true; }
-    const int tail = (c + 1) / a.ratio * a.ratio;
+    const int tail = (position(a, c) + 1) / a.ratio * a.ratio; // the query's last complete block's end
     if (j >= tail) { return true; }
     const int blk = j / a.ratio;
     return ((a.select[static_cast<std::size_t>(c) * a.select_words + blk / 32] >> (blk % 32)) & 1U) != 0;
@@ -1175,7 +1175,8 @@ std::size_t lossless_paged_attention_workspace_bytes(int query_heads, int kv_hea
 
 void lossless_paged_attention(const Tensor& q, const Tensor& positions, int sequences, const Tensor& table_rows,
                               const PagedKVBatchLayerView& cache, int max_keys, int key_capacity, Tensor& out,
-                              void* workspace, cudaStream_t stream) {
+                              void* workspace, cudaStream_t stream, const std::uint32_t* select, int select_words,
+                              int ratio) {
     require(q.dtype == DType::BF16 && out.dtype == DType::BF16 && q.is_contiguous() && out.is_contiguous() &&
                 q.ne[0] == kDim && out.ne[0] == kDim && q.numel() == out.numel(),
             "q and out must be contiguous BF16 [256, heads, T]");
@@ -1189,6 +1190,8 @@ void lossless_paged_attention(const Tensor& q, const Tensor& positions, int sequ
     require(max_keys >= 1 && max_keys <= key_capacity &&
                 static_cast<std::int64_t>(key_capacity) <= static_cast<std::int64_t>(cache.block_tables.ne[0]) * kPage,
             "max_keys in [1, key_capacity], key_capacity within the block table");
+    require(select == nullptr || (ratio > 0 && select_words >= (max_keys / ratio + 31) / 32),
+            "a selection needs its ratio and a bit per complete block");
     if (columns == 0) { return; }
     Args args{};
     args.q            = static_cast<const std::uint16_t*>(q.data);
@@ -1205,6 +1208,9 @@ void lossless_paged_attention(const Tensor& q, const Tensor& positions, int sequ
     args.heads        = heads;
     args.kv_heads     = cache.num_kv_heads;
     args.columns      = columns;
+    args.select       = select;
+    args.select_words = select_words;
+    args.ratio        = ratio;
     run(args, max_keys, workspace, stream);
 }
 

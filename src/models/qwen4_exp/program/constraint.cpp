@@ -201,10 +201,15 @@ PromptReadout ProgramImpl::read_prompt_frontier(const Lane& lane) {
     if (n == 0 || n > kMaximumReadoutTokens) { throw std::invalid_argument("prompt readout names an invalid token count"); }
     const cudaStream_t s = device_.stream;
     // The sampler read these logits rounded to BF16 (and masked them for a constrained request):
-    // round the unmasked FP32 column again.
+    // round the unmasked FP32 column again. The lossless route reads its FP32 logits, which the sampler
+    // only copied.
     Tensor wide(logits32_.p, DType::FP32, {vocab_, 1});
     Tensor narrow(logits16_.p, DType::BF16, {vocab_, 1});
-    ops::cast_fp32_to_bf16(wide, narrow, s);
+    if (c_.lossless) {
+        narrow = wide;
+    } else {
+        ops::cast_fp32_to_bf16(wide, narrow, s);
+    }
     auto scope          = work_->scope();
     const auto count    = static_cast<std::int32_t>(n);
     Tensor ids          = work_->alloc(DType::I32, {count, 1});

@@ -21,7 +21,8 @@ import lossless_cr_oracle as cr  # noqa: E402
 
 (RMSNORM, RMSNORM_GATED, ADD, SILU_MUL, SIGMOID_MUL, GDN_GATES, CAUSAL_CONV, ATTENTION, DELTA_RULE, ROPE, ROUTER,
  MOE_COMBINE, MOE_ROUTE, RMSNORM_GROUPED, RMSNORM_GATED_SIGMOID, HC_GATES, HC_MIX, HC_INJECT, PLE_GATE, PLE_CONV,
- QSA_POOL, QSA_SELECT, ATTENTION_SELECT, ROUTER_BF16, MOE_COMBINE_ENTRIES, CONV_SLOTS, DELTA_RULE_SLOTS, ATTENTION_PAGED) = range(28)
+ QSA_POOL, QSA_SELECT, ATTENTION_SELECT, ROUTER_BF16, MOE_COMBINE_ENTRIES, CONV_SLOTS, DELTA_RULE_SLOTS, ATTENTION_PAGED,
+ PLE_CONV_SLOTS, QSA_CACHE, QSA_SELECT_POSITIONS, ATTENTION_PAGED_SELECT) = range(32)
 
 
 def bf16_value(bits: int) -> Fraction:
@@ -282,6 +283,153 @@ def cases(rng: random.Random):
     yield MOE_ROUTE, [256, 8, cols], [ids, x], [1]
     yield from flash_cases(rng)
     yield from state_cases(rng)
+    yield from flash_state_cases(rng)
+
+
+def bf16_add_bits(a_bits: int, b_bits: int) -> int:
+    """bf16(a + b) of two BF16 values with IEEE's zero signs."""
+    return signed_round(bf16_value(a_bits) + bf16_value(b_bits), 8,
+                        math.copysign(1.0, float_of(a_bits, 8) + float_of(b_bits, 8)) < 0)
+
+
+def flash_state_cases(rng: random.Random):
+    """Qwen3.8-Flash-Next's cache forms (generation)."""
+    # PLE convolution with history: 160 channels, 4 taps, dilation 3 (span 9); runs of 5 columns (shorter
+    # than the span) in 2 sequences and of 12 in 1; 3 slots, one updated in place.
+    channels, taps, dilation, slots = 160, 4, 3, 3
+    span = (taps - 1) * dilation
+    for width, seqs, src, dst in ((5, 2, [2, 0], [2, 1]), (12, 1, [1], [0])):
+        cols = width * seqs
+        gt = [random_bf16(rng, 4) for _ in range(channels * cols)]
+        nz = [random_bf16(rng, 20) for _ in range(channels * cols)]
+        w = [random_bf16(rng, 2) for _ in range(channels * taps)]
+        res = [random_bf16(rng, 4) for _ in range(channels * cols)]
+        hist = [random_bf16(rng, 20) for _ in range(channels * span * slots)]
+        out = [0] * (channels * cols)
+        final = list(hist)
+        for b in range(seqs):
+            for c in range(channels):
+                u = [hist[(src[b] * span + k) * channels + c] for k in range(span)]
+                u += [nz[(b * width + t) * channels + c] for t in range(width)]
+                for t in range(width):
+                    s = sum((bf16_value(w[tap * channels + c]) * bf16_value(u[span + t - (taps - 1 - tap) * dilation])
+                             for tap in range(taps)), Fraction(0))
+                    act = cr.evaluate(cr.SILU_BF16, float_of(round_fraction(s, 8), 8))
+                    i = (b * width + t) * channels + c
+                    out[i] = bf16_add_bits(res[i], bf16_add_bits(gt[i], act))
+                for k in range(span):
+                    final[(dst[b] * span + k) * channels + c] = u[width + k]
+        yield (PLE_CONV_SLOTS, [channels, width, seqs, taps, dilation, slots], [gt, nz, w, res, hist, src, dst],
+               out + final)
+    # The QSA indexer cache: dim 128, ratio 4, 2 sequences of 7 columns from positions 6 and 9 (each
+    # completes two blocks, one of them begun before the call), tails in 3 slots, one page per row.
+    dim, ratio, width, seqs, slots = 128, 4, 7, 2, 3
+    starts, tail_slots, rows = [6, 9], [2, 0], [1, 0]
+    pages, stride = 3, 1
+    page_of_row = [[2], [0]]  # row r's page table
+    cols = width * seqs
+    positions = [starts[b] + i for b in range(seqs) for i in range(width)]
+    keys = [random_bf16(rng, 30) for _ in range(dim * cols)]
+    tails = [random_bf16(rng, 30) for _ in range(dim * (ratio - 1) * slots)]
+    rope = [rng.randrange(0, 100000) for _ in range(3 * cols)]
+    block_start = [rng.randrange(0, 100000) for _ in range(3 * seqs)]
+    plane = [random_bf16(rng, 30) for _ in range((dim // ratio) * 64 * pages)]
+    tables = [page_of_row[r][0] for r in range(2)]
+
+    def raw_key(b, q, d):
+        p0 = starts[b]
+        if q >= p0:
+            return keys[(b * width + q - p0) * dim + d]
+        return tails[(tail_slots[b] * (ratio - 1) + q % ratio) * dim + d]
+
+    pooled = [0] * (dim * cols)
+    block_rope = [0] * (3 * cols)
+    plane_final = list(plane)
+    for b in range(seqs):
+        for i in range(width):
+            t, p = b * width + i, starts[b] + i
+            complete = (p + 1) % ratio == 0
+            first = p + 1 - ratio
+            for a in range(3):
+                if not complete:
+                    block_rope[a * cols + t] = rope[a * cols + t]
+                elif first >= starts[b]:
+                    block_rope[a * cols + t] = rope[a * cols + t - (p - first)]
+                else:
+                    block_rope[a * cols + t] = block_start[a * seqs + b]
+            if complete:
+                page = tables[rows[b]]
+                for d in range(dim):
+                    s = sum((bf16_value(raw_key(b, first + k, d)) for k in range(ratio)), Fraction(0))
+                    v = round_fraction(f32_of(s / ratio), 8)
+                    pooled[t * dim + d] = v
+                    plane_final[(page * 64 + first % 64) * (dim // ratio) + d] = v
+    tails_final = list(tails)
+    for b in range(seqs):
+        last = starts[b] + width - 1
+        open_from = (last + 1) // ratio * ratio
+        for p in range(open_from, last + 1):
+            for d in range(dim):
+                tails_final[(tail_slots[b] * (ratio - 1) + p % ratio) * dim + d] = keys[(b * width + p - starts[b]) * dim + d]
+    gathered = []
+    for b in range(seqs):
+        n = (starts[b] + width) // ratio
+        page = tables[rows[b]]
+        for blk in range(n):
+            for d in range(dim):
+                gathered.append(plane_final[(page * 64 + (blk * ratio) % 64) * (dim // ratio) + d])
+    yield (QSA_CACHE, [dim, ratio, width, seqs, slots, stride, pages],
+           [keys, positions, tails, tail_slots, rope, block_start, plane, tables, rows],
+           pooled + block_rope + plane_final + tails_final + gathered)
+    # Selection by position: 4 heads, ratio 4, budget 5, queries at positions 26..33 (6 to 8 blocks).
+    heads, ratio, budget, dim = 4, 4, 5, 128
+    qpos = list(range(26, 34))
+    cols, blocks = len(qpos), 8
+    sc = [f32_bits(rng.choice([0.5, 0.25, -1.0, rng.gauss(0.0, 1.0)])) for _ in range(cols * heads * blocks)]
+    words = 1
+    divisor = f32_value(f32_bits(math.sqrt(dim)))
+    expected = []
+    for t in range(cols):
+        n = (qpos[t] + 1) // ratio
+        chosen = set(range(n))
+        if n > budget:
+            vals = []
+            for b in range(n):
+                s = sum((max(f32_value(sc[(t * heads + h) * blocks + b]), Fraction(0)) for h in range(heads)), Fraction(0))
+                vals.append(f32_of(f32_of(s) / divisor))
+            chosen = set(sorted(range(n), key=lambda b: (-vals[b], b))[:budget])
+        bits = 0
+        for b in chosen:
+            bits |= 1 << b
+        expected.append(bits)
+    yield QSA_SELECT_POSITIONS, [heads, ratio, budget, dim, cols, blocks], [sc, qpos], expected
+    # Paged attention with a selection: 2 sequences of 3 columns from positions 40 and 25, ratio 4.
+    heads, kv_heads, width, ratio = 4, 2, 3, 4
+    starts = [40, 25]
+    seqs = len(starts)
+    lens = [s + width for s in starts]
+    ks = [[random_bf16(rng, 2) for _ in range(256 * kv_heads * n)] for n in lens]
+    vs = [[random_bf16(rng, 3) for _ in range(256 * kv_heads * n)] for n in lens]
+    q = [random_bf16(rng, 2) for _ in range(256 * heads * width * seqs)]
+    positions = [starts[b] + w for b in range(seqs) for w in range(width)]
+    sel = []
+    for p in positions:
+        bits = 1
+        for b in range(1, (p + 1) // ratio):
+            if rng.random() < 0.5:
+                bits |= 1 << b
+        sel.append(bits)
+    stride = max((n + 63) // 64 for n in lens)
+    pages = sum((n + 63) // 64 for n in lens) + 2
+    free = list(range(pages))
+    rng.shuffle(free)
+    tables = []
+    for n in lens:
+        row = [free.pop() for _ in range((n + 63) // 64)]
+        tables += row + [0] * (stride - len(row))
+    expected = attention_paged(q, ks, vs, heads, kv_heads, width, seqs, positions, sel, ratio)
+    yield (ATTENTION_PAGED_SELECT, [heads, kv_heads, width, seqs, stride, pages, max(lens), ratio],
+           [q, [x for kk in ks for x in kk], [x for vv in vs for x in vv], positions, lens, tables, sel], expected)
 
 
 def state_cases(rng: random.Random):
@@ -340,9 +488,9 @@ def state_cases(rng: random.Random):
                [q, [x for kk in ks for x in kk], [x for vv in vs for x in vv], positions, lens, tables], expected)
 
 
-def attention_paged(q, ks, vs, heads, kv_heads, width, seqs, positions):
+def attention_paged(q, ks, vs, heads, kv_heads, width, seqs, positions, select=None, ratio=0):
     """Query column t = b width + w at positions[t] over keys 0..positions[t] of sequence b (ks[b], vs[b]:
-    [len, kv_heads, 256])."""
+    [len, kv_heads, 256]); with a selection, the keys of its tail and its selected blocks only."""
     group = heads // kv_heads
     out = [0] * (256 * heads * width * seqs)
     for b in range(seqs):
@@ -354,15 +502,20 @@ def attention_paged(q, ks, vs, heads, kv_heads, width, seqs, positions):
             for h in range(heads):
                 kvh = h // group
                 qr = [bf16_value(q[(t * heads + h) * 256 + d]) for d in range(256)]
+                if select is None:
+                    keys = list(range(pos + 1))
+                else:
+                    tail = (pos + 1) // ratio * ratio
+                    keys = [j for j in range(pos + 1) if j >= tail or (select[t] >> (j // ratio)) & 1]
                 scores = []
-                for j in range(pos + 1):
+                for j in keys:
                     base = (j * kv_heads + kvh) * 256
                     scores.append(sum((a * kf[base + d] for d, a in enumerate(qr)), Fraction(0)) / 16)
                 m = max(scores)
                 ps = [f32_value(cr.evaluate(cr.EXP, float(f32_of(s - m)))) for s in scores]
                 den = sum(ps, Fraction(0))
                 for c in range(256):
-                    num = sum((p * vf[(j * kv_heads + kvh) * 256 + c] for j, p in enumerate(ps)), Fraction(0))
+                    num = sum((p * vf[(j * kv_heads + kvh) * 256 + c] for j, p in zip(keys, ps)), Fraction(0))
                     out[(t * heads + h) * 256 + c] = round_fraction(num / den, 8)
     return out
 

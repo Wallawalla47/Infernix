@@ -1,10 +1,14 @@
 // The --lossless route of Qwen3.8-Flash-Next (TextConfig::lossless; docs/maintainer/lossless-route.md §2a,
-// §3a): a scored window in one call (its prefill chunk), every operation of Transformers'
-// modeling_qwen4_exp.py correctly rounded: the exact projections of lossless_linear over each weight's
-// exact value, the hyper-connection mixes and injections, PLE, the gated delta rule from zero state, QSA
-// attention over the call's own keys (the indexer's pooled-key scores selecting each query's blocks), the
-// router with BF16 weights, the offloaded experts' lossless pass, and FP32 logits. Nothing is written to
-// the KV cache or the recurrent states: the call scores its window and ends.
+// §3a): every operation of Transformers' modeling_qwen4_exp.py correctly rounded: the exact projections of
+// lossless_linear over each weight's exact value, the hyper-connection mixes and injections, PLE, the gated
+// delta rule, QSA attention (the indexer's pooled-key scores selecting each query's blocks), the router with
+// BF16 weights, the offloaded experts' lossless pass, and FP32 logits. Two forms:
+//  - a scored window (ForwardBatch::lossless_keys 0): one sequence in one call from zero state over its own
+//    keys, writing nothing to the KV cache or the recurrent states;
+//  - the cache form (generation): prefill chunks and decode rounds continue their sequences, K/V and pooled
+//    keys through the paged planes (the lossless bf16 profile), the indexer's raw-key tails, the PLE history
+//    and the GDN state through the lanes' slots, so a token's logits do not depend on how its sequence was
+//    split into calls.
 
 #include "models/qwen4_exp/execution/forward.h"
 
@@ -23,6 +27,10 @@ namespace infernix::models::qwen4_exp::execution {
 namespace {
 
 std::int32_t dim(std::uint64_t v) { return static_cast<std::int32_t>(v); }
+
+// The cache form's indexer scores (FP32 [blocks, heads * columns]) are formed this many query columns at a
+// time, bounding them at long contexts.
+constexpr std::int32_t kScoreColumns = 64;
 
 void require(bool condition, const char* message) {
     if (!condition) { throw std::invalid_argument(std::string("Qwen4Exp lossless: ") + message); }
@@ -120,10 +128,16 @@ void Forward::lossless_ple(const PleParameters& p, Tensor& residual, const Forwa
     ops::lossless_ple_gate(key_normed, query_normed, value, S, scores, gated, s);
     Tensor normalized = key_normed; // reused
     ops::lossless_rmsnorm_grouped(gated, p.conv_norm, S, config_.rms_norm_eps, normalized, s);
-    ops::lossless_ple_conv_inject(gated, normalized, p.convolution, dim(config_.ple.conv_dilation), residual, s);
+    if (batch.lossless_keys != 0) {
+        // The dilated history of each lane, continued in place.
+        ops::lossless_ple_conv_inject_slots(gated, normalized, p.convolution, dim(config_.ple.conv_dilation),
+                                            batch.batch, state_.ple_conv, batch.slots, batch.slots, residual, s);
+    } else {
+        ops::lossless_ple_conv_inject(gated, normalized, p.convolution, dim(config_.ple.conv_dilation), residual, s);
+    }
 }
 
-Tensor Forward::lossless_gdn(const GdnParameters& p, const Tensor& x) {
+Tensor Forward::lossless_gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index, const ForwardBatch& batch) {
     const cudaStream_t s = device_.stream;
     const auto& g        = config_.gdn;
     const std::int32_t T = x.ne[1], H = dim(config_.hidden_size);
@@ -140,10 +154,18 @@ Tensor Forward::lossless_gdn(const GdnParameters& p, const Tensor& x) {
     Tensor gate = work_.alloc(DType::FP32, {NV, T}), beta = work_.alloc(DType::BF16, {NV, T});
     ops::lossless_gdn_gates(a, b, p.a_log, p.dt_bias, gate, beta, s, g.a_direct);
     Tensor conv = work_.alloc(DType::BF16, {C, T});
-    ops::lossless_causal_conv(qkv, p.convolution, conv, s);
     const Tensor q = conv.slice(0, 0, KW), k = conv.slice(0, KW, KW), v = conv.slice(0, 2 * KW, VW);
     Tensor o = work_.alloc(DType::BF16, {VW, T});
-    ops::lossless_gated_delta_rule(q, k, v, gate, beta, nullptr, o, s);
+    if (batch.lossless_keys != 0) {
+        // Each lane's convolution window and recurrent state, continued in place.
+        LinearAttentionStateLayerView states = state_.gdn->layer_view(index);
+        ops::lossless_causal_conv_slots(qkv, p.convolution, batch.batch, states.conv, batch.slots, batch.slots, conv, s);
+        ops::lossless_gated_delta_rule_slots(q, k, v, gate, beta, batch.batch, states.recurrent, batch.slots,
+                                             batch.slots, o, s);
+    } else {
+        ops::lossless_causal_conv(qkv, p.convolution, conv, s);
+        ops::lossless_gated_delta_rule(q, k, v, gate, beta, nullptr, o, s);
+    }
     Tensor normed = work_.alloc(DType::BF16, {VW, T});
     Tensor rows = o.view({DV, NV * T}), gates = z.view({DV, NV * T}), out_rows = normed.view({DV, NV * T});
     ops::lossless_rmsnorm_gated(rows, gates, p.norm, config_.rms_norm_eps, out_rows, s,
@@ -152,7 +174,8 @@ Tensor Forward::lossless_gdn(const GdnParameters& p, const Tensor& x) {
     return y;
 }
 
-Tensor Forward::lossless_attention_block(const AttentionParameters& p, const Tensor& x, const ForwardBatch& batch) {
+Tensor Forward::lossless_attention_block(const AttentionParameters& p, const Tensor& x, std::uint32_t index,
+                                         const ForwardBatch& batch) {
     const cudaStream_t s = device_.stream;
     const auto& a        = config_.attention;
     const std::int32_t T = x.ne[1], H = dim(config_.hidden_size);
@@ -195,6 +218,13 @@ Tensor Forward::lossless_attention_block(const AttentionParameters& p, const Ten
     ops::lossless_rope_apply(table, qn, s);
     ops::lossless_rope_apply(table, kn, s);
     ops::lossless_rope_apply(table, iqn, s);
+    if (batch.lossless_keys != 0) {
+        Tensor out = lossless_cached_attention(p, qn, kn, v, iqn, ik, inv_freq, index, batch);
+        Tensor gated = work_.alloc(DType::BF16, {QW, T});
+        ops::lossless_sigmoid_mul(out.view({QW, T}), gate, gated, s);
+        lossless_project(gated, p.output, 0, H, y, 0);
+        return y;
+    }
     // The indexer: pooled block keys (normed, rotated at their first token's position), each query's
     // scores against them, and its selection when it has more complete blocks than the budget.
     const std::int32_t blocks = T / ratio;
@@ -233,6 +263,79 @@ Tensor Forward::lossless_attention_block(const AttentionParameters& p, const Ten
     ops::lossless_sigmoid_mul(out.view({QW, T}), gate, gated, s);
     lossless_project(gated, p.output, 0, H, y, 0);
     return y;
+}
+
+// The cache form's QSA attention (rotated q, k and index query; raw index keys ik): the call's K/V into the
+// pages; the pooled key of every block the call completes (its keys from the tail before the run), normed
+// and rotated at its first token, into the pooled plane; the open block's raw keys into the tail; each
+// query's block selection from its scores against its sequence's pooled keys when it may have more complete
+// blocks than the budget; attention over the cache.
+Tensor Forward::lossless_cached_attention(const AttentionParameters& p, const Tensor& qn, const Tensor& kn, const Tensor& v,
+                                          const Tensor& iqn, const Tensor& ik, const Tensor& inv_freq, std::uint32_t index,
+                                          const ForwardBatch& batch) {
+    const cudaStream_t s = device_.stream;
+    const std::int32_t T = qn.ne[2], D = qn.ne[0], heads = qn.ne[1];
+    const std::int32_t IH = dim(config_.qsa.index_heads), ID = dim(config_.qsa.index_head_dim);
+    const std::int32_t ratio = dim(config_.qsa.compress_ratio), budget = dim(config_.qsa.block_budget());
+    const std::int32_t B = batch.batch, W = batch.width, keys = batch.lossless_keys;
+    const ops::QsaKVLayer& layer = kv_.layers.at(index);
+    Tensor& tails = state_.qsa_tails.at(index);
+    const PagedKVBatchLayerView view{.k_pages      = layer.kv.k_pages,
+                                     .v_pages      = layer.kv.v_pages,
+                                     .block_tables = kv_.block_tables,
+                                     .head_dim     = layer.kv.head_dim,
+                                     .num_kv_heads = layer.kv.num_kv_heads,
+                                     .storage      = layer.kv.storage};
+    Tensor out = work_.alloc(DType::BF16, {D, heads, T});
+    auto scope = work_.scope();
+    ops::lossless_kv_append(kn, v, batch.positions, B, batch.table_rows, view, s);
+    {
+        auto pool_scope = work_.scope();
+        Tensor pooled = work_.alloc(DType::BF16, {ID, T}), pooled_n = work_.alloc(DType::BF16, {ID, T});
+        Tensor block_rope = work_.alloc(DType::I32, {T, 3});
+        ops::lossless_qsa_pool_cache(ik, batch.positions, B, tails, batch.slots, batch.rope_positions,
+                                     batch.block_start_rope, ratio, pooled, block_rope, s);
+        ops::lossless_rmsnorm(pooled, p.index_key_norm, config_.rms_norm_eps, pooled_n, s);
+        Tensor block_table = work_.alloc(DType::BF16, {dim(config_.rope.rotary_dim) / 2, T, 2});
+        ops::lossless_rope_table(block_rope, inv_freq, block_table, s);
+        Tensor pooled_heads = pooled_n.view({ID, 1, T});
+        ops::lossless_rope_apply(block_table, pooled_heads, s);
+        Tensor plane = layer.pooled_pages;
+        ops::lossless_qsa_pooled_store(pooled_n, batch.positions, B, kv_.block_tables, batch.table_rows, ratio, plane, s);
+        ops::lossless_qsa_tails_store(ik, batch.positions, B, tails, batch.slots, ratio, s);
+    }
+    const std::int32_t blocks = keys / ratio;
+    const std::int32_t words  = std::max<std::int32_t>(1, (blocks + 31) / 32);
+    const std::uint32_t* select = nullptr;
+    Tensor bits;
+    if (blocks > budget) {
+        bits = work_.alloc(DType::I32, {words, T});
+        auto score_scope = work_.scope();
+        Tensor gathered = work_.alloc(DType::BF16, {ID, blocks});
+        Tensor scores   = work_.alloc(DType::FP32, {blocks, IH * kScoreColumns});
+        const DeviceSpan scratch = work_.alloc_bytes(ops::lossless_qsa_select_workspace_bytes(kScoreColumns, blocks));
+        for (std::int32_t b = 0; b < B; ++b) {
+            ops::lossless_qsa_pooled_gather(layer.pooled_pages, kv_.block_tables, batch.table_rows, batch.positions, B,
+                                            b, ratio, gathered, s);
+            const Weight pooled_keys = bf16_rows(gathered);
+            for (std::int32_t t0 = 0; t0 < W; t0 += kScoreColumns) {
+                const std::int32_t n = std::min(kScoreColumns, W - t0), column = b * W + t0;
+                const Tensor queries = iqn.slice(2, column, n).view({ID, IH * n});
+                Tensor tile_scores   = scores.slice(1, 0, IH * n);
+                ops::lossless_linear(queries, pooled_keys, 0, blocks, tile_scores, 0, work_, s);
+                const Tensor tile_positions = batch.positions.slice(0, column, n);
+                ops::lossless_qsa_select(tile_scores, IH, ratio, budget, ID,
+                                         static_cast<std::uint32_t*>(bits.data) + static_cast<std::size_t>(column) * words,
+                                         words, scratch.data, s, &tile_positions);
+            }
+        }
+        select = static_cast<const std::uint32_t*>(bits.data);
+    }
+    const DeviceSpan ws = work_.alloc_bytes(
+        ops::lossless_paged_attention_workspace_bytes(heads, view.num_kv_heads, W, B, max_context_));
+    ops::lossless_paged_attention(qn, batch.positions, B, batch.table_rows, view, keys, max_context_, out, ws.data, s,
+                                  select, words, ratio);
+    return out;
 }
 
 Tensor Forward::lossless_moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer) {
@@ -285,6 +388,7 @@ void Forward::lossless_layer(std::uint32_t layer, const ForwardBatch& batch, Ten
     const cudaStream_t s = device_.stream;
     const std::int32_t T = residual.ne[1];
     const auto& block    = parameters_.layers[layer];
+    const std::uint32_t compact = config_.compact_layer_indices[layer];
     auto scope           = work_.scope();
     if (block.ple) { lossless_ple(*block.ple, residual, batch); }
     Tensor inject = work_.alloc(DType::BF16, {dim(config_.hc.streams), T});
@@ -292,8 +396,8 @@ void Forward::lossless_layer(std::uint32_t layer, const ForwardBatch& batch, Ten
         auto mixer_scope = work_.scope();
         const Tensor xa  = lossless_mix(block.attn_hc, residual, &inject);
         const Tensor y   = config_.layer_types[layer] == MixerKind::Gdn
-                               ? lossless_gdn(std::get<GdnParameters>(block.mixer), xa)
-                               : lossless_attention_block(std::get<AttentionParameters>(block.mixer), xa, batch);
+                               ? lossless_gdn(std::get<GdnParameters>(block.mixer), xa, compact, batch)
+                               : lossless_attention_block(std::get<AttentionParameters>(block.mixer), xa, compact, batch);
         ops::lossless_hc_inject(y, inject, residual, s);
     }
     const Tensor xm = lossless_mix(block.mlp_hc, residual, &inject);
@@ -313,16 +417,19 @@ void Forward::lossless_head(const Tensor& residuals, Tensor& logits) {
 }
 
 void Forward::check_lossless_call(const ForwardBatch& batch) const {
-    require(batch.batch == 1 && batch.verify == nullptr && batch.mtp_chunk == nullptr && batch.vision == nullptr &&
+    require(batch.verify == nullptr && batch.mtp_chunk == nullptr && batch.vision == nullptr &&
                 batch.draft_features.data == nullptr,
-            "a call scores one text window (no verification, MTP, vision or drafter features)");
+            "a call is text without verification, MTP, vision or drafter features");
+    require(batch.lossless_keys != 0 ? batch.lossless_keys <= max_context_ : batch.batch == 1,
+            "a scored window is one sequence; the cache form's keys stay within the context");
     require(config_.rope.yarn_factor == 1.0F, "YaRN-scaled rotations are not part of the route");
     for (std::size_t i = 0; i < config_.rope.pair_axes.size(); ++i) {
         require(config_.rope.pair_axes[i] == i % 3, "the rotation's pairs must be interleaved over the three axes");
     }
 }
 
-std::size_t Forward::lossless_workspace_bytes(const TextConfig& c, std::int32_t columns) {
+std::size_t Forward::lossless_workspace_bytes(const TextConfig& c, std::int32_t columns, std::int32_t key_capacity,
+                                              std::int32_t sequences) {
     const std::size_t t = static_cast<std::size_t>(std::max(columns, 1));
     const std::size_t h = c.hidden_size, w = c.residual_width(), k = c.moe.top_k, bf = 2;
     const std::size_t S = c.hc.streams, rank = c.hc.rank;
@@ -350,13 +457,34 @@ std::size_t Forward::lossless_workspace_bytes(const TextConfig& c, std::int32_t 
                              std::size_t(c.rope.rotary_dim) * (t + blocks) * bf + blocks * c.qsa.index_heads * t * 4 +
                              ((blocks + 31) / 32 + 1) * t * 4 + ops::lossless_qsa_select_workspace_bytes(dim(t), dim(blocks)) +
                              ops::lossless_attention_workspace_bytes(dim(c.attention.heads), dim(c.attention.kv_heads), dim(t));
+    std::size_t cached = 0;
+    if (key_capacity > 0) {
+        // The cache form: the window's projections and rotations as above, the pooled-key steps, each
+        // sequence's gathered pooled keys and one tile of scores and selection, the selection bits and the
+        // paged attention.
+        const std::size_t kb = static_cast<std::size_t>(key_capacity) / std::max<std::uint32_t>(c.qsa.compress_ratio, 1);
+        const std::size_t ih = c.qsa.index_heads, id = c.qsa.index_head_dim;
+        Weight pooled{};
+        pooled.qtype  = QType::BF16;
+        pooled.layout = QuantLayout::Contiguous;
+        pooled.n      = dim(std::max<std::size_t>(kb, 1));
+        pooled.k      = dim(id);
+        cached = h * t * bf + std::size_t(c.attention.query_width()) * t * bf * 5 +
+                 std::size_t(c.attention.key_width()) * t * bf * 3 + (ih + 1) * id * t * bf * 2 +
+                 std::size_t(c.rope.rotary_dim) * t * bf + 2 * id * t * bf + t * 12 + std::size_t(c.rope.rotary_dim) * t * bf +
+                 ((kb + 31) / 32 + 1) * t * 4 + id * kb * bf + kb * ih * kScoreColumns * 4 +
+                 ops::lossless_qsa_select_workspace_bytes(kScoreColumns, dim(kb)) +
+                 ops::lossless_linear_workspace_bytes(pooled, pooled.n, dim(ih * kScoreColumns)) +
+                 ops::lossless_paged_attention_workspace_bytes(dim(c.attention.heads), dim(c.attention.kv_heads), dim(t),
+                                                               std::max(sequences, 1), key_capacity);
+    }
     const std::size_t moe = h * t * bf + c.moe.experts * t * bf + t * bf + k * t * 8 + t * 4 +
                             ops::moe_dispatch_bytes(dim(c.moe.experts), dim(k * t)) + h * k * t * bf +
                             ops::moe_experts_workspace_bytes(std::min<std::int32_t>(dim(c.moe.experts), dim(k * t)), dim(k * t),
                                                              dim(t), ops::offloaded_moe::ExpertActivation::kA16,
                                                              ops::offloaded_moe::WideA16::kLossless) +
                             std::size_t(c.moe.shared_intermediate) * t * bf * 3 + h * t * bf;
-    const std::size_t layer = S * t * bf + std::max({ple, mix + std::max(gdn, attn), mix + moe});
+    const std::size_t layer = S * t * bf + std::max({ple, mix + std::max({gdn, attn, cached}), mix + moe});
     const std::size_t head  = mix + std::size_t(c.vocab_size) * 4; // per scored column, inside the score tiles
     return w * t * bf + std::max(layer, head) + projection + (256ULL << 20);
 }

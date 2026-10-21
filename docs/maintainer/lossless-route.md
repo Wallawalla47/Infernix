@@ -1,7 +1,7 @@
 # The lossless route (`--lossless`)
 
-Status: in development (branch `feat/lossless`, 2026-10-21): Qwen3.5 and Qwen3.8-Flash-Next scoring,
-Qwen3.5 generation. The owner's decisions behind it are
+Status: in development (branch `feat/lossless`, 2026-10-21): Qwen3.5 and Qwen3.8-Flash-Next scoring and
+generation. The owner's decisions behind it are
 recorded in [model quality §6.1](model-quality.md#61-the-reproducible-route-and-the-fast-paths); this document
 is the authority for what the route computes and how it is qualified.
 
@@ -240,7 +240,7 @@ CTAs, a pass of partial maxima, a pass of partial int128 sums from the overall m
 kernel adding them; exact sums make the split invisible in the output.
 
 On Qwen3.8-Flash-Next (`Qwen4ExpForCausalLM`; `src/models/qwen4_exp/execution/forward_lossless.cpp`,
-TextConfig::lossless) the same Engine conditions hold (CausalScoring, one call per window, no fast path,
+TextConfig::lossless) causal scoring takes the same Engine conditions (one call per window, no fast path,
 drafter or vision): Forward's layers run the lossless steps of §2a over the call's own columns. The
 projections take each weight's exact value whatever its format (BF16, Q8 and Q4 row-split, row FP8,
 MXFP8, GGUF segments with the GDN output's block permutation), the QSA attention reads the window's own
@@ -248,7 +248,17 @@ keys (each query's blocks selected from the pooled-key scores once the window ho
 than the budget), GDN and the PLE convolution start from zero, the routed experts take the offloaded
 lossless pass through serial staging passes (the Program turns off the prefill stream, layer walks and
 the CPU split), and nothing is written to the KV cache or the recurrent states. Text RoPE without YaRN
-only (the interleaved pairs over the three axes). `tools/quality/fast_path_gate.py` scores every model's
+only (the interleaved pairs over the three axes). Generation (text, `--kv-dtype bf16`, no drafter, n-gram
+drafts or `--expert-tail-skip`, eager rounds) runs the cache form (ForwardBatch::lossless_keys, the call's
+largest position + 1): K/V into the pages (BF16 V), each block the call completes pooled from its raw index
+keys (those before the call from the lane's tail), normed, rotated at its first token and stored in the
+pooled plane (`lossless_qsa_pool_cache`, `lossless_qsa_pooled_store`), the open block's raw keys into the
+tail (`lossless_qsa_tails_store`); each query's selection from its scores against its sequence's gathered
+pooled keys (`lossless_qsa_pooled_gather`; `lossless_qsa_select` by position, scored 64 query columns at a
+time) once it may have more complete blocks than the budget; attention over the cache with that
+selection; the PLE history and the GDN state through the lanes' slots (`lossless_ple_conv_inject_slots`,
+the Qwen3.5 slot forms). The sampler reads an FP32 copy of the logits. `tools/quality/fast_path_gate.py`
+scores every model's
 references with `--lossless` (a decode reference's cache key records the route).
 
 **Transcendental functions** (`src/ops/lossless/cr_math.cuh`): every one takes a binary32 argument, so

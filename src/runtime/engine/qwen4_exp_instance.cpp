@@ -97,21 +97,24 @@ void validate(const EngineOptions& options) {
         throw std::invalid_argument("the reference route runs no fast path");
     }
     // The lossless route (TextConfig::lossless; docs/maintainer/lossless-route.md §2a, §3a): every
-    // operation correctly rounded, one scored window per call (its prefill chunk), causal scoring only.
+    // operation correctly rounded; causal scoring takes each window in one call (its prefill chunk),
+    // generation runs text through bf16 KV (V stored as BF16) without speculation.
     if (options.lossless) {
-        if (options.purpose != EnginePurpose::CausalScoring) {
-            throw std::invalid_argument("Qwen3.8-Flash-Next runs the lossless route for causal scoring only");
-        }
         if (options.reference) { throw std::invalid_argument("the lossless and reference routes exclude each other"); }
         if (options.fast_paths || !options.fast_path_candidates.empty() || options.expert_a4_activations) {
             throw std::invalid_argument("the lossless route runs no fast path: disable fast paths");
         }
-        if (options.prefill_chunk < options.max_context) {
+        if (options.purpose == EnginePurpose::CausalScoring && options.prefill_chunk < options.max_context) {
             throw std::invalid_argument("the lossless route scores each window in one call: --prefill-chunk must cover "
                                         "--max-context");
         }
-        if (options.enable_vision || options.speculative.backend != SpeculativeBackend::None) {
-            throw std::invalid_argument("the lossless route scores text without a drafter or the vision tower");
+        if (options.enable_vision || options.speculative.backend != SpeculativeBackend::None ||
+            options.speculative.ngram_draft_tokens != 0 || !options.speculative.draft_model.empty()) {
+            throw std::invalid_argument("the lossless route takes text without speculation or the vision tower");
+        }
+        if (options.purpose == EnginePurpose::Generation &&
+            (options.kv_cache != KvCacheStorage::BFloat16 || options.expert_tail_skip != 0)) {
+            throw std::invalid_argument("lossless generation takes bf16 KV and no --expert-tail-skip");
         }
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {

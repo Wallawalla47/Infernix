@@ -361,7 +361,9 @@ void LaneStateImage::copy_group_from_packed(std::uint32_t group, const std::byte
 }
 
 KvPageGeometry kv_page_geometry(const TextConfig& c, KvCacheStorage storage, bool mtp) {
-    const auto layout   = paged_kv_storage_layout(storage, static_cast<std::int32_t>(c.attention.head_dim));
+    // The lossless route's bf16 pages hold V as BF16 (paged_kv_lossless_storage_layout).
+    const auto head_dim = static_cast<std::int32_t>(c.attention.head_dim);
+    const auto layout   = c.lossless ? paged_kv_lossless_storage_layout(head_dim) : paged_kv_storage_layout(storage, head_dim);
     const auto kv_heads = static_cast<std::int32_t>(c.attention.kv_heads);
     KvPageGeometry out;
     out.kv_layers = c.attention_layers + (mtp ? 1U : 0U);
