@@ -178,7 +178,10 @@ int main() {
             std::vector<infernix::TokenId> other = tokens[0];
             const auto tail = engine.tokenize_text("\nHow many birds were logged in all?");
             other.insert(other.end(), tail.begin(), tail.end());
-            (void)engine.generate(engine.prepare_tokens(other), request(false, 7, true));
+            // Only its prompt is needed: it fills the prefix cache.
+            infernix::RequestOptions warming = request(false, 7, true);
+            warming.execution.requested_output_tokens = 1;
+            (void)engine.generate(engine.prepare_tokens(other), warming);
             const auto before = engine.runtime_stats();
             const auto warm   = engine.generate(engine.prepare_tokens(tokens[0]), request(false, 100, true));
             require(engine.runtime_stats().reused_prompt_tokens > before.reused_prompt_tokens,
@@ -188,8 +191,7 @@ int main() {
         {
             // Another prefill chunk and one lane.
             infernix::Engine engine(generation_options(artifact, 1024, 1, false));
-            require_same("prefill chunk 1024 (greedy)", greedy,
-                         engine.generate(engine.prepare_tokens(tokens[0]), request(true, 0)).generated_token_ids);
+            // Sampled (temperature 1) shows any arithmetic difference greedy decoding would.
             require_same("prefill chunk 1024 (sampled)", solo[0],
                          engine.generate(engine.prepare_tokens(tokens[0]), request(false, 100)).generated_token_ids);
         }

@@ -184,10 +184,24 @@ int main(int argc, char** argv) {
             require(after.reused_prompt_tokens > before.reused_prompt_tokens,
                     "the warm request reused no prefix");
             require_same("warm prefix", cold, warm);
+
+            // 4. A request admitted while another decodes, at once and some way in: the round's other
+            //    row is longer, so anything chosen from the round (an attention envelope, a split
+            //    count) would reach the new request's arithmetic. Under DFlash2 that once changed a
+            //    sampled request's drafts within five tokens while greedy ones stayed identical. The
+            //    requests do not reuse prefixes (sampled's default), so each is the cold request of 1.
+            for (const int delay_ms : {0, 400}) {
+                auto running = engine.submit(engine.prepare(prompt(texts[2])), sampled(1002));
+                std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+                auto admitted = engine.submit(engine.prepare(prompt(texts[3])), sampled(1003));
+                (void)running.wait();
+                require_same("request admitted " + std::to_string(delay_ms) + " ms into another",
+                             solo[3], admitted.wait());
+            }
         }
 
         {
-            // 4. A KV pool for two whole extents and four requests: the exact route admits a request
+            // 5. A KV pool for two whole extents and four requests: the exact route admits a request
             //    only when its whole extent fits, so none is preempted and every output is the one it
             //    gives alone. The pool and the prefix cache are Engine options, which may change
             //    outputs, so the solo outputs are this Engine's own.
@@ -208,23 +222,6 @@ int main(int argc, char** argv) {
                     "the exact route preempted a request");
         }
 
-        {
-            // 5. A request admitted while another decodes, at once and some way in: the round's other
-            //    row is longer, so anything chosen from the round (an attention envelope, a split
-            //    count) would reach the new request's arithmetic. Under DFlash2 that once changed a
-            //    sampled request's drafts within five tokens while greedy ones stayed identical.
-            infernix::Engine engine(
-                exact_options(artifact, backend, kConcurrency * kContext, false));
-            const auto alone = engine.generate(engine.prepare(prompt(texts[3])), sampled(1003));
-            for (const int delay_ms : {0, 400}) {
-                auto running = engine.submit(engine.prepare(prompt(texts[2])), sampled(1002));
-                std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
-                auto admitted = engine.submit(engine.prepare(prompt(texts[3])), sampled(1003));
-                (void)running.wait();
-                require_same("request admitted " + std::to_string(delay_ms) + " ms into another",
-                             alone, admitted.wait());
-            }
-        }
         std::cout << "OK request invariance\n";
         return 0;
     } catch (const std::exception& error) {
