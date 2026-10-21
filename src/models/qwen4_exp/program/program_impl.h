@@ -1952,6 +1952,11 @@ public:
         }
         const std::int32_t width = static_cast<std::int32_t>(lane.calls[lane.next_call++] - lane.state_tokens);
         const bool last          = begin + width == static_cast<std::int32_t>(lane.prefill_end);
+        // The lossless route's call reads only its own keys and starts from zero state: it is the whole
+        // window (TextConfig::lossless).
+        if (c_.lossless && (begin != 0 || !last)) {
+            throw std::logic_error("Qwen4Exp: the lossless route scores a window in one call from its first token");
+        }
         // A call the CPU serves (an opener tail, a tiny suffix) promotes at the decode rate (design
         // §19.3.1). Wider prefill calls promote nothing: the answer's staged misses land in free
         // frames and pick its experts, while the prompt's would displace them (16 per layer per
