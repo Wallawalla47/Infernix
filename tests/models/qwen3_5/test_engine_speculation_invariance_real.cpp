@@ -57,6 +57,7 @@ infernix::EngineOptions reproducible_options(const std::filesystem::path& artifa
     options.artifact_path   = artifact;
     options.fast_paths      = false; // the reproducible route
     options.max_context     = kContext;
+    options.kv_capacity     = infernix::KvCapacityPolicy::explicit_capacity(kContext);
     options.max_concurrency = 1;
     options.prefill_chunk   = 1024;
     options.enable_vision   = false;

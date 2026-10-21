@@ -83,6 +83,60 @@ void require_same(const std::string& label, const std::vector<infernix::TokenId>
     std::cout << label << ": " << a.size() << " tokens identical\n";
 }
 
+infernix::EngineOptions scoring_options(const char* artifact, bool lossless) {
+    infernix::EngineOptions options;
+    options.artifact_path = artifact;
+    options.purpose       = infernix::EnginePurpose::CausalScoring;
+    options.max_context   = kContext;
+    options.prefill_chunk = kContext;
+    options.kv_cache      = infernix::KvCacheStorage::BFloat16;
+    options.fast_paths    = false;
+    options.lossless      = lossless;
+    return options;
+}
+
+// When generation departs from the scoring pass at output position m: how each computation sees that
+// position, so a failure names the form that departs. The lossless and reproducible scoring passes'
+// five most probable tokens there; the lossless engine's prompt readout after a prefill (chunk 512) of
+// the prompt and the first m outputs; and its token from one decode step after a prefill of the first
+// m - 1 outputs.
+void diagnose(const char* artifact, const std::vector<infernix::TokenId>& prompt,
+              const std::vector<infernix::TokenId>& greedy, std::size_t m, infernix::TokenId scored) {
+    std::vector<infernix::TokenId> sequence = prompt;
+    sequence.insert(sequence.end(), greedy.begin(), greedy.end());
+    const auto first = static_cast<std::uint32_t>(prompt.size());
+    constexpr std::uint32_t kTop = 5;
+    for (const bool lossless : {true, false}) {
+        infernix::Engine engine(scoring_options(artifact, lossless));
+        const infernix::ScoreResult score = engine.score_tokens(sequence, first, {.top_k = kTop});
+        std::cout << (lossless ? "lossless" : "reproducible") << " scoring at output " << m << ":";
+        for (std::uint32_t j = 0; j < kTop; ++j) {
+            std::cout << " " << score.top_ids[m * kTop + j] << " (" << score.top_logprobs[m * kTop + j] << ")";
+        }
+        std::cout << "\n";
+    }
+    infernix::Engine engine(generation_options(artifact, 512, 1, false));
+    std::vector<infernix::TokenId> through = prompt;
+    through.insert(through.end(), greedy.begin(), greedy.begin() + static_cast<std::ptrdiff_t>(m));
+    infernix::RequestOptions readout = request(true, 0);
+    readout.execution.requested_output_tokens = 1;
+    readout.execution.readout_tokens          = {greedy[m], scored};
+    const auto prefilled = engine.generate(engine.prepare_tokens(through), readout);
+    if (prefilled.readout) {
+        std::cout << "lossless prefill readout at output " << m << ": token " << greedy[m] << " "
+                  << prefilled.readout->logprobs[0] << ", token " << scored << " " << prefilled.readout->logprobs[1]
+                  << ", top " << prefilled.readout->top_token << " " << prefilled.readout->top_logprob << "\n";
+    }
+    if (m > 0) {
+        std::vector<infernix::TokenId> before(through.begin(), through.end() - 1);
+        infernix::RequestOptions step = request(true, 0);
+        step.execution.requested_output_tokens = 2;
+        const auto decoded = engine.generate(engine.prepare_tokens(before), step).generated_token_ids;
+        std::cout << "lossless decode step at output " << m << ": " << (decoded.size() > 1 ? decoded[1] : -1)
+                  << " (after " << (decoded.empty() ? -1 : decoded[0]) << ")\n";
+    }
+}
+
 } // namespace
 
 int main() {
@@ -133,32 +187,25 @@ int main() {
             require_same("prefill chunk 1024 (sampled)", solo[0],
                          engine.generate(engine.prepare_tokens(tokens[0]), request(false, 100)).generated_token_ids);
         }
+        // One lossless scoring pass over the prompt and the greedy tokens: its top token at every
+        // generated position is the generated token.
+        std::vector<infernix::TokenId> scored;
         {
-            // One lossless scoring pass over the prompt and the greedy tokens: its top token at every
-            // generated position is the generated token.
-            infernix::EngineOptions options;
-            options.artifact_path = artifact;
-            options.purpose       = infernix::EnginePurpose::CausalScoring;
-            options.max_context   = kContext;
-            options.prefill_chunk = kContext;
-            options.kv_cache      = infernix::KvCacheStorage::BFloat16;
-            options.fast_paths    = false;
-            options.lossless      = true;
-            infernix::Engine engine(options);
+            infernix::Engine engine(scoring_options(artifact, true));
             std::vector<infernix::TokenId> sequence = tokens[0];
             sequence.insert(sequence.end(), greedy.begin(), greedy.end());
             const auto first = static_cast<std::uint32_t>(tokens[0].size());
-            const infernix::ScoreResult score = engine.score_tokens(sequence, first, {.top_k = 1});
-            require(score.top_ids.size() == greedy.size(), "the score has an unexpected shape");
-            for (std::size_t k = 0; k < greedy.size(); ++k) {
-                if (score.top_ids[k] != greedy[k]) {
-                    throw std::runtime_error("generated token " + std::to_string(k) + " is " +
-                                             std::to_string(greedy[k]) + ", the scoring route's top token " +
-                                             std::to_string(score.top_ids[k]));
-                }
-            }
-            std::cout << "greedy generation: " << greedy.size() << " tokens equal the scoring route's top tokens\n";
+            scored = engine.score_tokens(sequence, first, {.top_k = 1}).top_ids;
+            require(scored.size() == greedy.size(), "the score has an unexpected shape");
         }
+        for (std::size_t k = 0; k < greedy.size(); ++k) {
+            if (scored[k] != greedy[k]) {
+                diagnose(artifact, tokens[0], greedy, k, scored[k]);
+                throw std::runtime_error("generated token " + std::to_string(k) + " is " + std::to_string(greedy[k]) +
+                                         ", the scoring route's top token " + std::to_string(scored[k]));
+            }
+        }
+        std::cout << "greedy generation: " << greedy.size() << " tokens equal the scoring route's top tokens\n";
         std::cout << "OK lossless generation\n";
         return 0;
     } catch (const std::exception& error) {
