@@ -174,7 +174,8 @@ __device__ std::uint32_t round_magnitude(const std::uint32_t (&mag)[Words], int 
         if (word + 1 < Words) { two |= static_cast<std::uint64_t>(mag[word + 1]) << 32; }
         q                   = (two >> bit) & ((1ULL << prec) - 1);
         const int round_bit = shift - 1;
-        half                = ((mag[round_bit / 32] >> (round_bit % 32)) & 1U) != 0;
+        // A round bit above every word of mag (a result far below the smallest subnormal) is zero.
+        half = round_bit / 32 < Words && ((mag[round_bit / 32] >> (round_bit % 32)) & 1U) != 0;
 #pragma unroll
         for (int i = 0; i < Words; ++i) {
             const int lo = 32 * i;
