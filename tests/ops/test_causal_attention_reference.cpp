@@ -1,7 +1,12 @@
 // causal_softmax_attention_reference against an FP64 oracle (the reference route's attention,
 // docs/maintainer/model-quality.md 6.2): BF16 Q and K, V stored as FP16 from BF16, every column's causal
 // keys from the paged cache (an earlier call's prefix included), output rounded once to BF16. Its FP32
-// scores and sums leave it within one BF16 ulp of the oracle, nearly always correctly rounded. A
+// arithmetic bounds each output's error before that rounding by the FP32 errors of the scores (a dot
+// of 256 products: (D + 2) u scale sum|q k|, each score's error a relative error of its weight), of
+// the n-key sums, exp, the division and the online rescales ((2 n + 8 + 4 tiles + 64) u), times the
+// weighted mean sum p|v| / sum p; with half a BF16 ulp of
+// rounding on top, every output meets that bound, and at least 99 % are correctly rounded (an output
+// that nearly cancels, far below sum p|v|, can be many ulps from the oracle within the bound). A
 // column's bits depend only on its own query and keys: identical from run to run and whatever call
 // width carries it.
 #include "core/paged_kv_cache.h"
@@ -66,7 +71,7 @@ int run_case(const Case& c, std::uint32_t seed) {
         .num_kv_heads = c.kv_heads,
         .storage      = KvCacheStorage::BFloat16,
     };
-    const AttentionHeadGeometry geometry{kHeadDim, c.query_heads, c.kv_heads};
+    const ops::AttentionHeadGeometry geometry{kHeadDim, c.query_heads, c.kv_heads};
 
     std::vector<float> q(static_cast<std::size_t>(kHeadDim) * c.query_heads * context);
     std::vector<float> k(static_cast<std::size_t>(kHeadDim) * c.kv_heads * context);
@@ -136,8 +141,9 @@ int run_case(const Case& c, std::uint32_t seed) {
 
     // FP64 oracle.
     const std::int32_t group = c.query_heads / c.kv_heads;
+    constexpr double kUnit = 0x1p-24; // binary32 unit roundoff
     std::int64_t outputs = 0, rounded = 0;
-    double worst_ulps = 0.0;
+    double worst_ulps = 0.0, worst_ratio = 0.0;
     std::vector<double> scores(context);
     for (std::int32_t t = 0; t < c.tokens; ++t) {
         const std::int32_t position = c.prefix + t;
@@ -145,28 +151,43 @@ int run_case(const Case& c, std::uint32_t seed) {
             const std::int32_t kvh = h / group;
             const float* qv        = &q[(static_cast<std::size_t>(position) * c.query_heads + h) * kHeadDim];
             double best            = -INFINITY;
+            double score_error     = 0.0; // the largest FP32 score error
             for (std::int32_t j = 0; j <= position; ++j) {
                 const float* kv = &k[(static_cast<std::size_t>(j) * c.kv_heads + kvh) * kHeadDim];
-                double dot      = 0.0;
-                for (std::int32_t d = 0; d < kHeadDim; ++d) { dot += static_cast<double>(qv[d]) * kv[d]; }
-                scores[j] = dot * kScale;
-                best      = std::max(best, scores[j]);
+                double dot = 0.0, magnitude = 0.0;
+                for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                    dot += static_cast<double>(qv[d]) * kv[d];
+                    magnitude += std::abs(static_cast<double>(qv[d]) * kv[d]);
+                }
+                scores[j]   = dot * kScale;
+                best        = std::max(best, scores[j]);
+                score_error = std::max(score_error, (kHeadDim + 2) * kUnit * kScale * magnitude);
             }
             double sum = 0.0;
             for (std::int32_t j = 0; j <= position; ++j) {
                 scores[j] = std::exp(scores[j] - best);
                 sum += scores[j];
             }
+            // Scores (the maximum's error too), the two n-term sums, exp and the division, and the
+            // online softmax's rescale per 32-key tile; 64 u for the exponent's own rounding.
+            const double keys     = static_cast<double>(position + 1);
+            const double tiles    = std::ceil(keys / 32.0);
+            const double relative = 2.0 * score_error + (2.0 * keys + 8.0 + 4.0 * tiles + 64.0) * kUnit;
             for (std::int32_t d = 0; d < kHeadDim; ++d) {
-                double value = 0.0;
+                double value = 0.0, weighted = 0.0;
                 for (std::int32_t j = 0; j <= position; ++j) {
-                    value += scores[j] * fp16_round(v[(static_cast<std::size_t>(j) * c.kv_heads + kvh) * kHeadDim + d]);
+                    const double vj = fp16_round(v[(static_cast<std::size_t>(j) * c.kv_heads + kvh) * kHeadDim + d]);
+                    value += scores[j] * vj;
+                    weighted += scores[j] * std::abs(vj);
                 }
                 value /= sum;
+                const double fp32_error = relative * weighted / sum;
                 const double actual =
                     bf16_to_f32(got[(static_cast<std::size_t>(t) * c.query_heads + h) * kHeadDim + d]);
-                const double ulps = std::abs(actual - value) / bf16_ulp(value);
-                worst_ulps        = std::max(worst_ulps, ulps);
+                const double error = std::abs(actual - value);
+                const double ulps  = error / bf16_ulp(value);
+                worst_ulps         = std::max(worst_ulps, ulps);
+                worst_ratio = std::max(worst_ratio, error / (0.5 * bf16_ulp(std::abs(value) + fp32_error) + fp32_error));
                 rounded += ulps <= 0.5 ? 1 : 0;
                 ++outputs;
             }
@@ -174,12 +195,11 @@ int run_case(const Case& c, std::uint32_t seed) {
     }
     const double rounded_share = static_cast<double>(rounded) / static_cast<double>(outputs);
     std::printf("reference attention Hq=%d Hkv=%d prefix=%d T=%d: %lld outputs, %.4f%% correctly rounded, worst "
-                "%.3f BF16 ulps\n",
+                "%.3f BF16 ulps, worst error %.3f of its bound\n",
                 c.query_heads, c.kv_heads, c.prefix, c.tokens, static_cast<long long>(outputs), 100.0 * rounded_share,
-                worst_ulps);
-    // FP32 scores and sums: within one ulp everywhere, correctly rounded except near ties.
-    if (worst_ulps > 1.0 || rounded_share < 0.99) {
-        std::cerr << "reference attention: outside one BF16 ulp of the FP64 oracle or under 99% correctly rounded\n";
+                worst_ulps, worst_ratio);
+    if (worst_ratio > 1.0 || rounded_share < 0.99) {
+        std::cerr << "reference attention: outside the FP32 error bound or under 99% correctly rounded\n";
         ++failures;
     }
     return failures;
