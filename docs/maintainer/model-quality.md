@@ -366,8 +366,8 @@ different route may ship, what it is measured against, how much it may cost, and
   token's position and the token id), so a verify column returns the token plain decoding draws
   there and a draft is accepted exactly when it equals it. The default route keeps speculative
   rejection sampling (same distribution, other text for a seed). The real test
-  `infernix_qwen3_5_speculation_invariance_*_real_test` checks MTP, DFlash2 and DFlash2 with n-gram
-  proposals, greedy and sampled.
+  `infernix_qwen3_5_speculation_invariance_real_test` checks MTP, DFlash2 and DFlash2 with n-gram
+  proposals (or the drafters it is given) against one plain run, greedy and sampled.
   Prompt and decode need not agree with each other. An option
   whose effect depends on load (lossy Host-tier prefix state, whose use depends on eviction) is
   refused with `--reproducible` at startup, never silently overridden. A

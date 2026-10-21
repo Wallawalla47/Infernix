@@ -17,9 +17,9 @@
 // Gumbel-max keyed by (seed, position, token) (ops::SamplingConfig::gumbel_max), so a verify column
 // returns the token plain sampling draws there.
 //
-// INFERNIX_TEST_ARTIFACT names the artifact; argv[1] selects the drafter (mtp, dflash, dflash2 or
-// dflash2-ngram: DFlash2 with n-gram copy proposals); the artifact must hold it. One Engine decodes
-// plainly, then one with the drafter decodes the same requests.
+// INFERNIX_TEST_ARTIFACT names the artifact; the arguments name one or more drafters (mtp, dflash,
+// dflash2 or dflash2-ngram: DFlash2 with n-gram copy proposals); the artifact must hold them. One Engine
+// decodes plainly, then one per drafter decodes the same requests (one plain run serves every drafter).
 namespace {
 
 constexpr std::uint32_t kOutputTokens = 200;
@@ -108,29 +108,36 @@ int main(int argc, char** argv) {
         return 77;
     }
     try {
-        require(argc == 2, "usage: infernix_qwen3_5_speculation_invariance_real_test mtp|dflash|dflash2|dflash2-ngram");
-        const std::string_view drafter = argv[1];
-        const auto plain       = decode(artifact, "none");
-        const auto speculative = decode(artifact, drafter);
-        require(plain.size() == speculative.size(), "result counts differ");
-        int failures = 0;
-        for (std::size_t i = 0; i < plain.size(); ++i) {
-            const char* kind = i % 3 == 0 ? "greedy" : "sampled";
-            std::size_t same = 0;
-            while (same < plain[i].size() && same < speculative[i].size() && plain[i][same] == speculative[i][same]) {
-                ++same;
+        require(argc >= 2,
+                "usage: infernix_qwen3_5_speculation_invariance_real_test mtp|dflash|dflash2|dflash2-ngram...");
+        // Plain decoding once, then each drafter against it.
+        const auto plain = decode(artifact, "none");
+        int failed_drafters = 0;
+        for (int a = 1; a < argc; ++a) {
+            const std::string_view drafter = argv[a];
+            const auto speculative         = decode(artifact, drafter);
+            require(plain.size() == speculative.size(), "result counts differ");
+            int failures = 0;
+            for (std::size_t i = 0; i < plain.size(); ++i) {
+                const char* kind = i % 3 == 0 ? "greedy" : "sampled";
+                std::size_t same = 0;
+                while (same < plain[i].size() && same < speculative[i].size() && plain[i][same] == speculative[i][same]) {
+                    ++same;
+                }
+                const bool ok = !plain[i].empty() && plain[i] == speculative[i];
+                std::cout << drafter << " prompt " << i / 3 << " " << kind << ": " << (ok ? "identical" : "DIFFERS")
+                          << " (" << same << " of " << plain[i].size() << "/" << speculative[i].size()
+                          << " tokens agree)\n";
+                failures += ok ? 0 : 1;
             }
-            const bool ok = !plain[i].empty() && plain[i] == speculative[i];
-            std::cout << "prompt " << i / 3 << " " << kind << ": " << (ok ? "identical" : "DIFFERS") << " ("
-                      << same << " of " << plain[i].size() << "/" << speculative[i].size() << " tokens agree)\n";
-            failures += ok ? 0 : 1;
+            if (failures != 0) {
+                std::cerr << "FAIL " << drafter << ": " << failures << " requests differ from plain decoding\n";
+                ++failed_drafters;
+            } else {
+                std::cout << "PASS " << drafter << ": speculative decoding returns plain decoding's tokens\n";
+            }
         }
-        if (failures != 0) {
-            std::cerr << "FAIL " << drafter << ": " << failures << " requests differ from plain decoding\n";
-            return 1;
-        }
-        std::cout << "PASS " << drafter << ": speculative decoding returns plain decoding's tokens\n";
-        return 0;
+        return failed_drafters == 0 ? 0 : 1;
     } catch (const std::exception& error) {
         std::cerr << "FAIL " << error.what() << "\n";
         return 1;
