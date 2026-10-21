@@ -179,7 +179,8 @@ constexpr std::array kQualified{
     Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Bf16, false, KvCacheStorage::Vq2}},
     Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Bf16, false, KvCacheStorage::Q4KeyVq2Value}},
     // BF16 KV: its decode gate against the exact kernels failed (2026-10-19, TV excess bound 4.9e-3 of
-    // 4e-3); it stays registered until a gate against the precise reference fails it (6.2).
+    // 4e-3); against the precise reference its prefill gate passes (2026-10-21, KL excess -1.6e-4,
+    // bound 1.6e-4; a path acting only in chunked GDN calls is decided by its prefill gate).
     Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Bf16, false, KvCacheStorage::BFloat16}},
     Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Bf16, false, KvCacheStorage::Int8Group64}},
     Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Bf16, false, KvCacheStorage::Fp8E4M3Row256}},
@@ -247,8 +248,7 @@ constexpr std::array kQualified{
     Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Bf16, true, KvCacheStorage::Fp8KeyNvfp4Value}},
     Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Bf16, true, KvCacheStorage::Vq2}},
     Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Bf16, true, KvCacheStorage::Q4KeyVq2Value}},
-    // Recipe C (FP8-row dense): sampled drafts change no logit, so its exact-route request-invariance
-    // defect (which keeps the coupling paths off it) does not bear on them; speed from IQ3_S's and FP8's
+    // Recipe C (FP8-row dense): sampled drafts change no logit (6.1); speed from IQ3_S's and FP8's
     // timing (the gain is the drafts' acceptance, not the dense kernels).
     Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Fp8Row, false, KvCacheStorage::BFloat16}},
     Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Fp8Row, false, KvCacheStorage::Int8Group64}},
@@ -257,6 +257,34 @@ constexpr std::array kQualified{
     Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Fp8Row, false, KvCacheStorage::Fp8KeyNvfp4Value}},
     Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Fp8Row, false, KvCacheStorage::Vq2}},
     Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Fp8Row, false, KvCacheStorage::Q4KeyVq2Value}},
+    // Recipe C: the coupling paths by the kernel rule (6.1, item 2) once its exact route became
+    // request-invariant (the TMA proxy fence, 2026-10-20): the prefix-cache and preemption real tests pass
+    // with the candidates, and the INT8 joint decode gate (MTP 4 at concurrency 2, warm 3,000-token
+    // resumes, 256 segments, precise reference) passes (TV bound 1.2e-3, p99.9 KL ratio 0.81; 2026-10-21).
+    // The other formats take Dense8's verdicts. Two concurrent requests, INT8, ABBA: 114.2 -> 118.6 tok/s
+    // (+3.8 %), every run ahead; cache resume from FP8's timing and preemption from IQ3_S's and FP8's
+    // (rule 4: the same mechanisms).
+    Qualification{FastPath::AdaptiveSpeculation, {DenseKernels::Fp8Row, false, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::AdaptiveSpeculation, {DenseKernels::Fp8Row, false, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::AdaptiveSpeculation, {DenseKernels::Fp8Row, false, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::AdaptiveSpeculation, {DenseKernels::Fp8Row, false, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::AdaptiveSpeculation, {DenseKernels::Fp8Row, false, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::AdaptiveSpeculation, {DenseKernels::Fp8Row, false, KvCacheStorage::Vq2}},
+    Qualification{FastPath::AdaptiveSpeculation, {DenseKernels::Fp8Row, false, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::FreeCacheResume, {DenseKernels::Fp8Row, false, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::FreeCacheResume, {DenseKernels::Fp8Row, false, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::FreeCacheResume, {DenseKernels::Fp8Row, false, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::FreeCacheResume, {DenseKernels::Fp8Row, false, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::FreeCacheResume, {DenseKernels::Fp8Row, false, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::FreeCacheResume, {DenseKernels::Fp8Row, false, KvCacheStorage::Vq2}},
+    Qualification{FastPath::FreeCacheResume, {DenseKernels::Fp8Row, false, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::Preemption, {DenseKernels::Fp8Row, false, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::Preemption, {DenseKernels::Fp8Row, false, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::Preemption, {DenseKernels::Fp8Row, false, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::Preemption, {DenseKernels::Fp8Row, false, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::Preemption, {DenseKernels::Fp8Row, false, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::Preemption, {DenseKernels::Fp8Row, false, KvCacheStorage::Vq2}},
+    Qualification{FastPath::Preemption, {DenseKernels::Fp8Row, false, KvCacheStorage::Q4KeyVq2Value}},
     // NVIDIA FP4-Local (MXFP8 dense, 16-bit experts by default, 4-bit with --expert-a4-activations): sampled
     // drafts by the same rule (no logit changes; 6.1), with IQ3_S's and FP8's timings as the nearest.
     Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Mxfp8, false, KvCacheStorage::BFloat16}},

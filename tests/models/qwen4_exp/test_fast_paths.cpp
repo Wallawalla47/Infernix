@@ -102,8 +102,6 @@ int main() {
         for (const FastPath path : {FastPath::AdaptiveSpeculation, FastPath::FreeCacheResume, FastPath::Preemption}) {
             failures += check(q::fast_path_qualified(path, config),
                               "the request-coupling paths are qualified on every KV format");
-            failures += check(!q::fast_path_qualified(path, {DenseKernels::Fp8Row, false, kv}),
-                              "the request-coupling paths are not qualified on recipe C");
         }
     }
 
@@ -195,10 +193,10 @@ int main() {
             failures += check(q::fast_path_qualified(FastPath::SampledMtpDrafts, config),
                               "sampled-mtp-drafts is qualified on every Flash-Next configuration");
         }
-        for (const FastPathConfiguration& config : {iq3s, fp8, recipe_a}) {
+        for (const FastPathConfiguration& config : {iq3s, fp8, recipe_a, FastPathConfiguration{DenseKernels::Fp8Row, false, kv}}) {
             for (const FastPath path : {FastPath::AdaptiveSpeculation, FastPath::FreeCacheResume, FastPath::Preemption}) {
                 failures += check(q::fast_path_qualified(path, config),
-                                  "the coupling paths are qualified on IQ3_S, FP8 and recipe A");
+                                  "the coupling paths are qualified on IQ3_S, FP8, recipe A and recipe C");
             }
         }
         // NVIDIA FP4-Local, both expert activation precisions: speculation and cache resume by its joint

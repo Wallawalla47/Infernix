@@ -829,7 +829,7 @@ every exact kernel's own rounding costs; pass `--ngram-volume` to the gate when 
 perplexity matches, top-1 agrees at every position, and the RAM and SSD expert tiers give the same
 output; NVIDIA FP4-Local on 512 tokens: mean |dlogp| 3e-5 at chunk 256 and 4e-5 at 1,024, top-1
 everywhere (2026-10-20). Its qualified paths are the three request-coupling paths (every
-configuration but recipe C and FP4-Local), sampled MTP drafts, the three Q8 dense-kernel paths
+configuration), sampled MTP drafts, the three Q8 dense-kernel paths
 (Dense8), FP16 GDN (IQ3_S and FP8), the W4A16 expert path (recipe C and FP4-Local) and recipe C's
 FP8 pair path (6.7).
 
@@ -950,7 +950,7 @@ always run and are not listed. The NVFP4 27B variants select identical paths (ea
 | `adaptive-speculation` | the same, with speculative decoding | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
 | `free-cache-resume` | the same, with the prefix cache | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
 | `preemption` | every Qwen3.5 artifact | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
-| Qwen3.8-Flash-Next: `adaptive-speculation` (MTP), `free-cache-resume`, `preemption` | every Flash-Next artifact | Dense8, IQ3_S, FP8, recipe A and NVIDIA FP4-Local (16- and 4-bit expert activations), every format; not recipe C (its exact route is not request-invariant, below) |
+| Qwen3.8-Flash-Next: `adaptive-speculation` (MTP), `free-cache-resume`, `preemption` | every Flash-Next artifact | Dense8, IQ3_S, FP8, recipe A, recipe C (since 2026-10-21) and NVIDIA FP4-Local (16- and 4-bit expert activations), every format |
 | Qwen3.8-Flash-Next: `q8-sliced-k`, `gdn-conv-fused`, `qsa-prepare-fused` | Q8 dense weights (`qsa-prepare-fused`: BF16, INT8, FP8, NVFP4 or K8V4 KV) | Q8 dense, 4-bit experts, every KV format (`qsa-prepare-fused`: the five it serves) |
 | `fp8-a8-pair` | row-FP8 dense weights (recipe C) | FP8 dense, 16-bit experts, with FP8, NVFP4, K8V4, VQ2 or K4V2 KV (INT8 fails its decode tail, BF16 its prefill; below) |
 | `q4-w4a8` | groupwise Q4 MLP gate/up | none (fails, below) |
@@ -960,7 +960,7 @@ always run and are not listed. The NVFP4 27B variants select identical paths (ea
 | Qwen3.8-Flash-Next: `expert-a4-residual-3` | the same calls as `expert-a4-residual`, three NVFP4 terms per x and h row (its more precise form, design §19.3.23; it takes precedence where both are selected) | none: two terms pass on every configuration and format they run in (2026-10-21), so it stays an unregistered candidate (`--fast-path expert-a4-residual-3`) for a cell where two terms fail; three terms cost 7-8 points of prefill speed (below) |
 | Qwen3.8-Flash-Next: `sampled-mtp-drafts` | MTP rounds with a sampled request | every Flash-Next configuration, every format (distribution and greedy identity, below; no logit changes) |
 | Qwen3.8-Flash-Next: `ggml-bf16-prefill` | GGUF dense projections in prefill calls of 32+ columns, GGUF expert calls of 14,336+ columns | IQ3_S, every format (BF16 KV since 2026-10-20, against the precise reference; below) |
-| `gdn-f16-accumulate` | chunked GDN calls (16+ tokens) of every Qwen3.5-family and Flash-Next artifact | NVFP4 27B, groupwise 27B, FP8 and IQ3_S, every format (FP8 with BF16 KV pending its prefill gate against the precise reference; IQ3_S with BF16 since 2026-10-20, below); not the 35B-A3B, Dense8 or FP4-Local (no gain beyond spread, below; recipe C and recipe A are timed in the 2026-10-20 queue) |
+| `gdn-f16-accumulate` | chunked GDN calls (16+ tokens) of every Qwen3.5-family and Flash-Next artifact | NVFP4 27B, groupwise 27B, FP8 and IQ3_S, every format (FP8 with BF16 KV by its prefill gate against the precise reference, 2026-10-21; IQ3_S with BF16 since 2026-10-20, below); not the 35B-A3B, Dense8 or FP4-Local (no gain beyond spread, below; recipe C and recipe A are timed in the 2026-10-20 queue) |
 
 **`sampled-mtp-drafts`: drafts drawn from the draft head's top four tokens (Flash-Next, qualified
 2026-10-17).** It changes no logit: a sampled request's drafts are drawn from the head's four most
@@ -988,8 +988,7 @@ other three; FP8 decode is SSD-bound and its runs vary by up to 30 %). Tokens pe
 rise with it (IQ3_S math 2.84 and 2.63 exact against 2.42 and 2.78 with the path), so the gain is
 not explained by acceptance alone and was not attributed further. Recipe A, recipe C and NVIDIA
 FP4-Local (MXFP8 dense, with 16- and with 4-bit expert activations) are registered by the rule for a
-path that changes no logit (6.1), with these as the nearest timings;
-recipe C's exact-route defect (below) does not bear on such a path.
+path that changes no logit (6.1), with these as the nearest timings.
 
 **`gdn-f16-accumulate`: FP16-accumulate chunked GDN (qualified on the 27B, 2026-10-17).** See
 `ops::GdnChunkArithmetic::Fp16Accumulate`. Op: 1.20x at the 27B's shapes, and closer to the FP64
@@ -1011,7 +1010,10 @@ arithmetic does. Against the precise reference (2026-10-20) the prefill cell pas
 `ggml-bf16-prefill`); the decode cell (TV floor 0.029 against the exact kernels) is to be gated
 against it. FP8 with BF16 KV failed the same decode gate against the exact kernels (2026-10-19, plain,
 256 segments; floor KL 7.4e-3, TV 0.032; TV excess bound 4.9e-3 of 4e-3, top-1 bound 0.85 points of
-0.5); it stays registered until a gate against the precise reference fails it (6.2).
+0.5). Against the precise reference its prefill gate passes (2026-10-21, quick corpus, chunks 896
+and 7,168, floor KL 6.7e-3): KL excess -1.6e-4 (bound 1.6e-4), top-1 +0.01 points (bound 0.05), NLL
+3.1e-4, p99.9 KL ratio 0.97, both context buckets within budget; a path acting only in chunked GDN
+calls is decided by its prefill gate (as IQ3_S's), so it stays registered.
 Gates on the official 27B NVFP4, jointly with the qualified paths (the path
 touches no attention or KV: reduced prefill gate on every format, decode on INT8 and on BF16, the
 lowest floor):
@@ -1231,10 +1233,10 @@ Recipe A (BF16 dense, 4-bit experts) is registered for the three coupling paths 
 without runs of its own, at the owner's request (2026-10-18): `free-cache-resume` takes FP8's timing
 (the same dense kernels), `adaptive-speculation` Dense8's and IQ3_S's (4-bit experts streamed as
 Dense8's), `preemption` IQ3_S's and FP8's, and the quality verdicts Dense8's. Its exact-route
-equivalences were not run on the artifact. Recipe C fails: its real tests diverge on the exact
-route at token 29 (a resumed request against a cold one, and concurrent against solo), so its exact
-route is not request-invariant, and its joint gate fails the p99.9 KL ratio (1.33); no coupling
-path is registered on it, and the exact-route defect is open. A bisect (2026-10-20, plain decode at
+equivalences were not run on the artifact. Recipe C first failed (2026-10-18): its real tests
+diverged on the exact route at token 29 (a resumed request against a cold one, and concurrent
+against solo), so its exact route was not request-invariant, and its joint gate failed the p99.9 KL
+ratio (1.33) against the 16-bit reference. A bisect (2026-10-20, plain decode at
 one request, INT8 KV, two identical runs of 48 forced segments per arm) found its plain decode
 nondeterministic: 5-9 segments differed while the shared expert ran beside a forked expert call's
 staged pass, and none when the shared expert waited for that pass, ran before the routed experts or
@@ -1267,7 +1269,18 @@ exact route resumes only at prefill-chunk boundaries, and with the tool's 4,096-
 3,000- or 3,072-token prefix, nor any 512- or 2,048-token prompt, held one (`reused_prompt_tokens`
 0). At a 1,024-token chunk for both runs, a warm 3,072-token prefix is reused (49,152 tokens over the
 16 long segments) and no segment differs from the cold run, which itself equals the 4,096-token-chunk
-run. The real tests are still to be rerun.
+run. With the fence (2026-10-21) its prefix-cache and preemption real tests pass with the candidates,
+and the INT8 joint decode gate (MTP 4 at concurrency 2, every segment resuming from a warm
+3,000-token entry, 255,000 prompt tokens reused per run, 256 segments, precise reference, floor TV
+0.037) passes: TV excess 8.4e-4 (bound 1.2e-3), top-1 +0.07 points (bound 0.31), KL 3.4e-4, NLL
+3.8e-4, p99.9 KL ratio 0.81, every prompt bucket within its budget. No fast run preempted, so
+`preemption` rests on the preemption real test's Replay equivalence and the kernel rule (6.1, item 2:
+Replay runs the exact route's own prefill kernels), as on IQ3_S and FP8; no forced-preemption
+increment arm was run on recipe C. The three coupling paths are registered on every format, the other
+formats taking Dense8's verdicts. Speed, `adaptive-speculation` alone against the exact route (two
+concurrent requests, INT8 KV, MTP `auto`, 512 tokens each, `infernix-serve`, ABBA): 114.3 / 114.1 ->
+118.6 / 118.6 tok/s (+3.8 %), every run ahead; `free-cache-resume` takes FP8's timing and
+`preemption` IQ3_S's and FP8's (6.1, item 4).
 
 NVIDIA FP4-Local (MXFP8 dense, 2026-10-20/21): after the TMA proxy-fence fix (design §6.1.2) its exact
 route is deterministic and request-invariant alone and at eight concurrent requests (BF16 KV, 48
