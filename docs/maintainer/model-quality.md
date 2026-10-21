@@ -474,6 +474,32 @@ every format, though: noise the format already carries absorbs part of it (two-t
 `expert-a4-residual` showed KL 6.8e-3 against recipe C's exact route on BF16 KV, floor 0, and
 7.8e-4 on INT8 KV), which is why its decode is measured where the floor is lowest.
 
+**A failed gate** (owner, 2026-10-20) does not end a path in that configuration; what follows depends
+on how it failed:
+- A *near pass*: every failing bounded criterion's point estimate is within its budget (only the
+  sample's uncertainty fails it), and every failing point criterion (the p99.9 KL ratio, the decode
+  KL and NLL caps, a prompt bucket) is within 10 % of its cap. A decode gate of the reduced protocol
+  that near-passes goes straight to the 1,024-segment run of the same path, whose verdict replaces
+  the 256-segment one; no slower, more precise variant is tried before it decides.
+- A *clear fail*, or a 1,024-segment run that fails: the next more precise variant of the path that
+  keeps most of its speed (more residual terms, a narrower width range, the fast arithmetic only where
+  its gain is measured, a more precise reduction) is implemented, gated with the same protocol and
+  timed.
+
+The 1,024-segment run computes only segments 256-1,023. Segments lie back to back from the corpus
+start and cycle through the prompt lengths, so the first 256 segments of the 1,024 set are the 256
+set: `infernix_decode_quality_forced --first-segment 256 --segments 768` computes the rest, with every
+offset and prompt length as in the whole set, for the reference and both runs, and `fast_path_gate.py
+concat-forced` joins each with its 256-segment file (it refuses parts whose headers differ or that
+leave a gap), and the joined files are gated as one run. That is the run a fresh 1,024 set would
+make: the reference is computed per segment in one pass, the exact route is request-invariant, and a
+concurrent run's groups stay aligned because 256 is a multiple of every concurrency. Before the join
+is relied on, the tool computing the extension's reference must reproduce segments 254-255 of the
+256-segment reference bit for bit (a two-segment run from `--first-segment 254`); if it does not
+(another build of the reference route), the reference and both runs compute the 1,024 set in one
+piece. A run whose tool predates `--first-segment` also computes the 1,024 set in one piece, against
+the joined reference.
+
 **Flash-Next's forced-preemption arm judges `preemption` by its increment** (since 2026-10-16): the
 default role is a fast run with the configuration's qualified paths alone, the fast role the same
 run with `preemption` added, under the same conditions and budgets. Its workload (256 contiguous

@@ -28,6 +28,8 @@ Subcommands:
   identical        check that two builds' default routes agree bit for bit: two infernix-perplexity
                    run directories (every window's NLL and divergence), two teacher-forced decode
                    runs, or two generation files
+  concat-forced    join teacher-forced runs or references of consecutive segment ranges (the forced
+                   tool's --first-segment), so a 1,024-segment gate extends a 256-segment one
 
 Exit status: 0 every criterion passes, 1 a criterion fails, 2 the measurement is unusable.
 """
@@ -382,6 +384,48 @@ def load_forced(path: Path) -> dict:
         raise MeasurementError(f"missing teacher-forced run: {path}")
     with path.open(encoding="utf-8") as handle:
         return json.load(handle)
+
+
+# The fields every part of a joined run or reference shares (the forced tool's header).
+CONCAT_FIELDS = {"reference": ("artifact", "kind", "forced_tokens", "top_tokens"),
+                 "run": ("artifact", "mode", "kv_dtype", "fast_paths", "forced_tokens")}
+CONCAT_COUNTERS = ("underflows", "reused_prompt_tokens", "preemptions", "replayed_tokens")
+
+
+def concat_forced(parts: Sequence[Path], out: Path) -> dict:
+    """Consecutive ranges of one segment set (the forced tool's --first-segment) as one file.
+
+    Runs and references alike: each part must share the first part's header and start where the
+    previous one ended (the corpus token after its last segment's prompt and forced tokens), so the
+    result holds exactly the segments, offsets and observations of one run over the whole range; a
+    run's counters are summed. A larger gate set extends a smaller one this way (the first 256 of
+    1,024 segments are the 256-segment set) instead of computing its first part again.
+    """
+    loaded = [load_forced(path) for path in parts]
+    kind = "reference" if loaded[0].get("kind") == "reference" else "run"
+    joined = dict(loaded[0])
+    joined["segments"] = []
+    for path, part in zip(parts, loaded):
+        for name in CONCAT_FIELDS[kind]:
+            if part.get(name) != loaded[0].get(name):
+                raise MeasurementError(f"{path} differs from {parts[0]} in {name}")
+        if not part["segments"]:
+            raise MeasurementError(f"{path} holds no segments")
+        if joined["segments"]:
+            last = joined["segments"][-1]
+            expected = last["offset"] + last["prompt_tokens"] + loaded[0]["forced_tokens"]
+            if part["segments"][0]["offset"] != expected:
+                raise MeasurementError(f"{path} starts at corpus token {part['segments'][0]['offset']}, "
+                                       f"not {expected} after the previous part")
+        joined["segments"] += part["segments"]
+    if kind == "run":
+        for counter in CONCAT_COUNTERS:
+            if counter in joined:
+                joined[counter] = sum(part.get(counter, 0) for part in loaded)
+    with out.open("w", encoding="utf-8") as handle:
+        json.dump(joined, handle)
+        handle.write("\n")
+    return joined
 
 
 # infernix_decode_quality_forced --kv-dtype names.
@@ -1083,6 +1127,11 @@ def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
     same = commands.add_parser("identical", help="check two default-route runs for bit-exactness")
     same.add_argument("first")
     same.add_argument("second")
+
+    concat = commands.add_parser(
+        "concat-forced", help="join teacher-forced runs or references of consecutive segment ranges")
+    concat.add_argument("parts", nargs="+", type=Path)
+    concat.add_argument("--out", type=Path, required=True)
     args = parser.parse_args(argv)
     if getattr(args, "reference_cache", None) is not None and str(args.reference_cache) == "none":
         args.reference_cache = None
@@ -1118,6 +1167,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                                            fast_route=False)], args.json)
         if args.command == "evaluate-free-running":
             return finish([evaluate_free_running(Path(args.report))], args.json)
+        if args.command == "concat-forced":
+            joined = concat_forced(args.parts, args.out)
+            print(f"{args.out}: {len(joined['segments'])} segments from {len(args.parts)} parts")
+            return 0
         same, detail = identical(Path(args.first), Path(args.second))
         print(f"{'IDENTICAL' if same else 'DIFFERENT'}: {detail}")
         return 0 if same else 1
