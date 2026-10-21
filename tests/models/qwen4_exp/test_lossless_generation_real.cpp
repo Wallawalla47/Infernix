@@ -44,6 +44,7 @@ infernix::EngineOptions base_options(const char* artifact) {
 infernix::EngineOptions generation_options(const char* artifact, std::uint32_t chunk, std::uint32_t lanes) {
     infernix::EngineOptions options        = base_options(artifact);
     options.max_concurrency                = lanes;
+    options.kv_capacity                    = infernix::KvCapacityPolicy::explicit_capacity(lanes * kContext);
     options.max_pending_requests           = 2 * lanes;
     options.prefill_chunk                  = chunk;
     options.context_cache.enabled          = true;
