@@ -952,7 +952,7 @@ always run and are not listed. The NVFP4 27B variants select identical paths (ea
 | `preemption` | every Qwen3.5 artifact | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
 | Qwen3.8-Flash-Next: `adaptive-speculation` (MTP), `free-cache-resume`, `preemption` | every Flash-Next artifact | Dense8, IQ3_S, FP8, recipe A, recipe C (since 2026-10-21) and NVIDIA FP4-Local (16- and 4-bit expert activations), every format |
 | Qwen3.8-Flash-Next: `q8-sliced-k`, `gdn-conv-fused`, `qsa-prepare-fused` | Q8 dense weights (`qsa-prepare-fused`: BF16, INT8, FP8, NVFP4 or K8V4 KV) | Q8 dense, 4-bit experts, every KV format (`qsa-prepare-fused`: the five it serves) |
-| `fp8-a8-pair` | row-FP8 dense weights (recipe C) | FP8 dense, 16-bit experts, with FP8, NVFP4, K8V4, VQ2 or K4V2 KV (INT8 fails its decode tail, BF16 its prefill; below) |
+| `fp8-a8-pair` | row-FP8 dense weights (recipe C) | FP8 dense, 16-bit experts, with BF16, FP8, NVFP4, K8V4, VQ2 or K4V2 KV (INT8 fails its decode tail; below) |
 | `q4-w4a8` | groupwise Q4 MLP gate/up | none (fails, below) |
 | `idle-wide-prefill` | Qwen3.8-27B / Qwen3.6-35B-A3B generation engines | NVFP4 27B, groupwise 27B and 35B-A3B, every format |
 | `adaptive-mtp` | Qwen3.8-27B / Qwen3.6-35B-A3B with MTP and `--draft-tokens auto` | NVFP4 27B and 35B-A3B, every format |
@@ -1785,7 +1785,7 @@ and recomputes the previous output) or admission (whole extents held without `pr
   161.6 → 146.6 / 150.5) follow `--draft-tokens auto`, whose rounds averaged 2.29-3.02 tokens in
   identical configurations, and are not a measurement of the path.
 
-**`fp8-a8-pair`: two E4M3 activation terms in recipe C's FP8 projections (recipe C with FP8, NVFP4, K8V4, VQ2 or K4V2 KV).**
+**`fp8-a8-pair`: two E4M3 activation terms in recipe C's FP8 projections (recipe C with BF16, FP8, NVFP4, K8V4, VQ2 or K4V2 KV).**
 - **What changes:** prefill-width calls of Flash-Next's row-FP8 dense problems carry each 16-bit
   activation as two E4M3 terms on the 8-bit Tensor Core path, admitted per problem where faster
   than the exact route (cold L2, graph): [16384, 2560] from T = 33, [13312, 2560] from 97,
@@ -1839,7 +1839,11 @@ and recomputes the previous output) or admission (whole extents held without `pr
   | K4V2 | 1.8e-3 (3.3e-3) | 2.0e-3 (4.3e-3) | 7.1e-3 | 0.93 | passes |
 
   `fp8-a8-pair` is registered on FP8, NVFP4, K8V4, VQ2 and K4V2 (FP8's TV bound, 0.96 of its
-  budget, is the closest margin). Speed beside `expert-a4-residual` was measured on INT8 KV (+5.4 /
+  budget, is the closest margin), and since 2026-10-21 on BF16: against the precise reference its
+  prefill gate beside `expert-a4-residual` passes (quick corpus, 896 and 7,168 tokens: KL excess bound
+  4.5e-4, top-1 1.6e-3, p99.9 KL ratio 1.03), its decode gate (MTP at concurrency 2) was a near pass at
+  256 segments and passes at 1,024 (TV excess bound 2.7e-3, top-1 3.4e-3, KL 4.2e-3, NLL excess
+  -2.6e-3, p99.9 KL ratio 0.84; prompts 512 / 2,048 / 8,192 TV excess -1.5e-4 / 1.6e-3 / 2.7e-3). Speed beside `expert-a4-residual` was measured on INT8 KV (+5.4 /
   +6.0 % at 32K / 64K above); the other formats were not timed. It is request-coupling: a dense
   call takes the pair route from its problem's admission width, which batched rounds share.
 - **A third h term for `expert-a4-residual` (2 + 3, tried 2026-10-17, not kept).** Recipe C, INT8

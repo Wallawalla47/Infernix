@@ -90,8 +90,11 @@ constexpr std::array kQualified{
     Qualification{FastPath::ExpertA4Residual, {DenseKernels::Fp8Row, false, KvCacheStorage::Q4KeyVq2Value}},
     // Recipe C: fp8-a8-pair (power-of-two column scales) beside two-term expert-a4-residual,
     // decode gated on each format directly (MTP at concurrency 2, 2026-10-17), since INT8, the
-    // lowest floor, fails its tail. Prefill passes on every format but BF16; FP8, NVFP4 and K4V2 by
-    // their 1,024-segment decode gates, K8V4 and VQ2 by 256 (model-quality.md 6.7).
+    // lowest floor, fails its tail. Prefill passes on every format; FP8, NVFP4 and K4V2 by their
+    // 1,024-segment decode gates, K8V4 and VQ2 by 256 (model-quality.md 6.7). BF16 against the
+    // precise reference (2026-10-21): prefill passes (KL excess bound 4.5e-4), decode at 256 segments a
+    // near pass, at 1,024 a pass (TV excess bound 2.7e-3, top-1 3.4e-3, KL 4.2e-3, p99.9 KL ratio 0.84).
+    Qualification{FastPath::Fp8A8Pair, {DenseKernels::Fp8Row, false, KvCacheStorage::BFloat16}},
     Qualification{FastPath::Fp8A8Pair, {DenseKernels::Fp8Row, false, KvCacheStorage::Fp8E4M3Row256}},
     Qualification{FastPath::Fp8A8Pair, {DenseKernels::Fp8Row, false, KvCacheStorage::Nvfp4Group16}},
     Qualification{FastPath::Fp8A8Pair, {DenseKernels::Fp8Row, false, KvCacheStorage::Fp8KeyNvfp4Value}},

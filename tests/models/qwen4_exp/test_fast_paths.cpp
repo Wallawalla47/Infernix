@@ -81,15 +81,14 @@ int main() {
                           "a kernel path stays unqualified with 16-bit expert activations");
     }
     // fp8-a8-pair runs on recipe C (FP8 dense, 16-bit expert activations) where its own decode gate
-    // passed; INT8 fails its tail and BF16 its prefill gate.
-    for (const KvCacheStorage kv : {KvCacheStorage::Fp8E4M3Row256, KvCacheStorage::Nvfp4Group16,
+    // passed; INT8 fails its tail.
+    for (const KvCacheStorage kv : {KvCacheStorage::BFloat16, KvCacheStorage::Fp8E4M3Row256, KvCacheStorage::Nvfp4Group16,
                                     KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2,
                                     KvCacheStorage::Q4KeyVq2Value})
         failures += check(q::fast_path_qualified(FastPath::Fp8A8Pair, {DenseKernels::Fp8Row, false, kv}),
-                          "fp8-a8-pair is qualified on recipe C with every KV format but INT8 and BF16");
-    for (const KvCacheStorage kv : {KvCacheStorage::Int8Group64, KvCacheStorage::BFloat16})
-        failures += check(!q::fast_path_qualified(FastPath::Fp8A8Pair, {DenseKernels::Fp8Row, false, kv}),
-                          "fp8-a8-pair stays unqualified on recipe C with INT8 or BF16 KV");
+                          "fp8-a8-pair is qualified on recipe C with every KV format but INT8");
+    failures += check(!q::fast_path_qualified(FastPath::Fp8A8Pair, {DenseKernels::Fp8Row, false, KvCacheStorage::Int8Group64}),
+                      "fp8-a8-pair stays unqualified on recipe C with INT8 KV");
     failures += check(!q::fast_path_qualified(FastPath::Fp8A8Pair, {DenseKernels::Fp8Row, true, KvCacheStorage::Int8Group64}),
                       "fp8-a8-pair is not qualified with 4-bit expert activations");
 
