@@ -1,0 +1,10 @@
+# The --lossless route's ops: exact sums, correctly rounded (docs/maintainer/lossless-route.md).
+target_sources(infernix_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/lossless_linear.cu")
+target_sources(infernix_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/lossless_linear_ggml_k.cu")
+target_sources(infernix_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/lossless_linear_ggml_i.cu")
+target_sources(infernix_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/lossless_ops.cu")
+target_sources(infernix_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/lossless_attention.cu")
+target_sources(infernix_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/lossless_gdn.cu")
+target_sources(infernix_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/lossless_rope.cu")
+target_sources(infernix_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/lossless_moe.cu")
+target_sources(infernix_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/lossless_flash.cu")

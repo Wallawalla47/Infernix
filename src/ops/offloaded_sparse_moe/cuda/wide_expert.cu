@@ -168,6 +168,7 @@ struct Offsets {
     std::size_t x_terms_plane, x_row_scale, h_terms_plane, h_row_scale; // W4A16 two-term A4
     std::size_t ggml_planes;                            // GGUF banks' kGgmlBf16
     bool has_ggml_planes;
+    std::size_t lossless;                               // kLossless
     std::size_t end;
 };
 
@@ -191,7 +192,9 @@ Offsets offsets(std::int32_t max_jobs, std::int32_t entries, std::int32_t column
     o.tiles       = take(static_cast<std::size_t>(max_tiles(max_jobs, entries)) * 2 * sizeof(std::int32_t));
     o.pass_tiles  = take((j + 2) * sizeof(std::int32_t));
     const ResidualTerms terms = activation == ExpertActivation::kA16 ? residual_terms(wide_a16) : ResidualTerms{};
-    if (terms.x != 0) {
+    if (wide_a16 == WideA16::kLossless) {
+        o.lossless = take(lossless_experts_bytes(max_jobs, entries));
+    } else if (terms.x != 0) {
         // The narrow route still needs its h rows (BF16 h of every entry) and exponents.
         o.h_rows      = take(e * kA16HRowBytes);
         o.h_emax      = take(e * sizeof(std::int32_t));
@@ -529,7 +532,9 @@ ExpertsWorkspace carve_experts_workspace(void* base, std::int32_t max_jobs, std:
     w.cpu_call    = p + o.cpu_call;
     w.tiles       = reinterpret_cast<std::int32_t*>(p + o.tiles);
     w.pass_tiles  = reinterpret_cast<std::int32_t*>(p + o.pass_tiles);
-    if (activation == ExpertActivation::kA16 && residual_terms(wide_a16).x != 0) {
+    if (wide_a16 == WideA16::kLossless) {
+        w.lossless = reinterpret_cast<std::uint8_t*>(p + o.lossless);
+    } else if (activation == ExpertActivation::kA16 && residual_terms(wide_a16).x != 0) {
         w.h_rows      = reinterpret_cast<std::uint8_t*>(p + o.h_rows);
         w.h_emax      = reinterpret_cast<std::int32_t*>(p + o.h_emax);
         w.x_terms_plane = reinterpret_cast<std::uint8_t*>(p + o.x_terms_plane);

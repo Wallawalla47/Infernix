@@ -96,6 +96,24 @@ void validate(const EngineOptions& options) {
     if (options.reference && !options.fast_path_candidates.empty()) {
         throw std::invalid_argument("the reference route runs no fast path");
     }
+    // The lossless route (TextConfig::lossless; docs/maintainer/lossless-route.md §2a, §3a): every
+    // operation correctly rounded, one scored window per call (its prefill chunk), causal scoring only.
+    if (options.lossless) {
+        if (options.purpose != EnginePurpose::CausalScoring) {
+            throw std::invalid_argument("Qwen3.8-Flash-Next runs the lossless route for causal scoring only");
+        }
+        if (options.reference) { throw std::invalid_argument("the lossless and reference routes exclude each other"); }
+        if (options.fast_paths || !options.fast_path_candidates.empty() || options.expert_a4_activations) {
+            throw std::invalid_argument("the lossless route runs no fast path: disable fast paths");
+        }
+        if (options.prefill_chunk < options.max_context) {
+            throw std::invalid_argument("the lossless route scores each window in one call: --prefill-chunk must cover "
+                                        "--max-context");
+        }
+        if (options.enable_vision || options.speculative.backend != SpeculativeBackend::None) {
+            throw std::invalid_argument("the lossless route scores text without a drafter or the vision tower");
+        }
+    }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
     }
@@ -231,6 +249,12 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.max_concurrency = options.max_concurrency;
     program_options.causal_scoring  = options.purpose == EnginePurpose::CausalScoring;
     program_options.prefill_chunk   = options.prefill_chunk;
+    // The lossless route reads its experts through serial staging passes: no prefill stream, layer
+    // walk or CPU split.
+    if (options.lossless) {
+        program_options.prefill_stream    = false;
+        program_options.prefill_cpu_split = false;
+    }
     program_options.kv_cache        = options.kv_cache;
     program_options.diagnostics     = options.diagnostic_observer;
     program_options.kv_capacity_tokens =
@@ -375,6 +399,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.free_cache_resume = fast.selected(FastPath::FreeCacheResume);
     program_options.preemption        = fast.selected(FastPath::Preemption);
     program_options.sampled_mtp_drafts = fast.selected(FastPath::SampledMtpDrafts);
+    program_options.gumbel_sampling    = !options.fast_paths;
 
     StartupPhaseScope program(options.startup_observer, StartupPhase::ProgramInitialize);
     instance->program =

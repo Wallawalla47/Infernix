@@ -1528,7 +1528,7 @@ memory-bound on `wkv`.
 
 - Both rules are deterministic and request-invariant (§18.3); the rule is part of the prefix cache's
   fingerprint, the startup line and the request log.
-- The rule is a declared model mode, chosen by the owner, not a fast path: `--disable-fast-paths`
+- The rule is a declared model mode, chosen by the owner, not a fast path: `--reproducible`
   does not change it, and each rule has its own exact route.
 - **CausalScoring runs the full rule.** Replay defines the state at the end of a prompt, not a logit
   at every position; scoring each position under replay would cost a decoder replay per position.

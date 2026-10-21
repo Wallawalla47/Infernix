@@ -168,6 +168,15 @@ __global__ __launch_bounds__(256) void speculative_accept_sparse_warp_greedy_ker
                                    licensed_counts, accepted, row, extent, k);
 }
 
+// SamplingConfig::gumbel_max: the Gumbel-max token of column `column`'s stored support, the token
+// plain sampling draws at the produced position.
+__device__ __forceinline__ int speculative_gumbel_target(const SamplingWorkspace& workspace, const SamplingConfig& cfg,
+                                                         int column, int position) {
+    return sampling_gumbel_pick([&](int j) { return workspace.dist_idx[sampling_dist_offset(column, j)]; },
+                                [&](int j) { return workspace.dist_prob[sampling_dist_offset(column, j)]; },
+                                workspace.dist_support[column], cfg.seed, position);
+}
+
 __device__ __forceinline__ void speculative_sparse_warp_accept(
     SamplingWorkspace workspace, const int* drafts, const int* candidate_ids,
     const float* proposal_q, const SamplingConfig& cfg, int k, int row, int extent, bool greedy,
@@ -183,6 +192,8 @@ __device__ __forceinline__ void speculative_sparse_warp_accept(
             const int d = drafts[row * k + column];
             if (greedy)
                 reject = workspace.dist_idx[sampling_dist_offset(column, 0)] != d;
+            else if (cfg.gumbel_max)
+                reject = speculative_gumbel_target(workspace, cfg, column, old_length + column + 1) != d;
             else {
                 const int support = workspace.dist_support[column];
                 float pd          = 0.0f;
@@ -207,6 +218,8 @@ __device__ __forceinline__ void speculative_sparse_warp_accept(
     int terminal;
     if (greedy)
         terminal = workspace.dist_idx[sampling_dist_offset(a, 0)];
+    else if (cfg.gumbel_max)
+        terminal = speculative_gumbel_target(workspace, cfg, a, old_length + a + 1);
     else {
         const int n  = workspace.dist_support[a];
         int token    = 0;
@@ -377,7 +390,16 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
                                                 merge_idx, cand_val, cand_idx, prob, &n_support,
                                                 row_drafts, i);
         }
-        if (tid == 0 && done_sh == 0) {
+        if (tid == 0 && done_sh == 0 && cfg.gumbel_max) {
+            const int y = sampling_gumbel_pick([&](int j) { return cand_idx[j]; }, [&](int j) { return prob[j]; },
+                                               n_support, cfg.seed, L_sh + i + 1);
+            if (i < extent && y == row_drafts[i]) {
+                a_sh = i + 1;
+            } else {
+                tstar_sh = y;
+                done_sh  = 1;
+            }
+        } else if (tid == 0 && done_sh == 0) {
             const int L = L_sh;
             if (i < extent) {
                 const int d = row_drafts[i];
@@ -696,6 +718,15 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
                     const int n            = workspace.dist_support[i];
                     const int* dist_idx    = workspace.dist_idx + sampling_dist_offset(i, 0);
                     const float* dist_prob = workspace.dist_prob + sampling_dist_offset(i, 0);
+                    if (cfg.gumbel_max) {
+                        const int y = speculative_gumbel_target(workspace, cfg, i, L + i + 1);
+                        if (i < extent && y == row_drafts[i]) {
+                            a = i + 1;
+                            continue;
+                        }
+                        tstar = y;
+                        break;
+                    }
                     if (i < extent) {
                         const int d = row_drafts[i];
                         float pd    = 0.0f;
@@ -854,6 +885,14 @@ speculative_tree_warp_accept(SamplingWorkspace workspace, const SpeculativeTreeR
     const int lane       = threadIdx.x & 31;
     const int k          = columns - 1;
     const int old_length = lengths[row];
+    if (cfg.gumbel_max) {
+        speculative_tree_warp_greedy(
+            tree,
+            [&](int v) { return speculative_gumbel_target(workspace, cfg, v, old_length + tree.depth[v] + 1); },
+            drafts, row, columns, lengths, anchors, licensed_tokens, licensed_counts, accepted, accepted_path,
+            accepted_branch);
+        return;
+    }
     int v = 0, a = 0, path_reg = lane == 0 ? 0 : -1, terminal = 0;
     for (;;) {
         const int n = workspace.dist_support[v];

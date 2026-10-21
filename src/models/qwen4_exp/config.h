@@ -166,6 +166,9 @@ struct TextConfig {
     // projection, expert, GDN recurrence and attention computed precisely at the exact route's BF16
     // boundaries, on the GPU (no CPU-served experts).
     bool reference = false;
+    // The lossless route (LoadOptions::lossless; docs/maintainer/lossless-route.md §2a): one scored window
+    // per call, every operation correctly rounded (Forward's lossless_* steps).
+    bool lossless = false;
     // The routed experts run exact A16 arithmetic over their records' own block scales: a GGUF
     // import's ggml banks or Qwen's block-FP8 banks (fp8_expert_b128_v1). Set by the loader.
     bool exact_experts = false;

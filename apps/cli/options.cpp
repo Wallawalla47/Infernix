@@ -126,7 +126,7 @@ constexpr std::array kCliOptions{
     CliOption{"--use-original-int8-prefill-kernel", false},
     CliOption{"--prefill-split-workspace-mib"},
     CliOption{"--use-original-nvfp4-prefill-kernel", false},
-    CliOption{"--disable-fast-paths", false},
+    CliOption{"--reproducible", false},
     CliOption{"--fast-path", true, true},
     CliOption{"--expert-a4-activations", false},
     CliOption{"--stop-token-id", true, true},
@@ -241,7 +241,7 @@ std::string usage_text(const char* argv0) {
            "                           skipping a routed expert missing from VRAM that every\n"
            "                           token of a decode round routes at top-10 rank R or\n"
            "                           lower (1-9; 9 skips least). Changes the output; not\n"
-           "                           with --disable-fast-paths. Default off; Strata's\n"
+           "                           with --reproducible. Default off; Strata's\n"
            "                           default is 7\n"
            "  --vram-headroom-mib N|auto\n"
            "                           VRAM in MiB startup sizing leaves free: Qwen3.5,\n"
@@ -265,12 +265,12 @@ std::string usage_text(const char* argv0) {
            "; 128-384 recommended). Less frees KV cache but\n"
            "                           slows 1-2K-token chunks over long context (64: up\n"
            "                           to 27% slower attention; 0: no splitting)\n"
-           "  --disable-fast-paths     run the exact route: bit-exact across releases and,\n"
-           "                           for NVFP4/FP8 dense models, independent of other\n"
-           "                           requests. Without it, every path qualified and\n"
-           "                           measured faster for this artifact's kernels and KV\n"
-           "                           type runs (within Infernix's numerical quality\n"
-           "                           policy; startup lists them; docs/cli.md)\n"
+           "  --reproducible           run the reproducible route: the same bits on every\n"
+           "                           run and release, whatever else is running.\n"
+           "                           Without it, every path qualified and measured\n"
+           "                           faster for this artifact's kernels and KV type\n"
+           "                           runs (within Infernix's numerical quality policy;\n"
+           "                           startup lists them; docs/cli.md)\n"
            "  --fast-path NAME         also run this fast path, qualified or not\n"
            "                           (qualification runs; repeatable)\n"
            "  --expert-a4-activations  nvidia/Qwen3.8-Flash-Next-FP4-Local only: run its\n"
@@ -533,7 +533,7 @@ Options parse_options(int argc, char** argv) {
                 parse_u32(value(arg), "prefill-split-workspace-mib", true);
         } else if (arg == "--use-original-nvfp4-prefill-kernel") {
             options.original_nvfp4_prefill_kernel = true;
-        } else if (arg == "--disable-fast-paths") {
+        } else if (arg == "--reproducible") {
             options.fast_paths = false;
         } else if (arg == "--fast-path") {
             const std::string name(value(arg));

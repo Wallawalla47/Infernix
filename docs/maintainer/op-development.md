@@ -498,7 +498,7 @@ workspace from the same field, and qualifies it in its suite against the same or
 as the exact schedule. Without the field the exact schedule is unchanged. Its model-level approval
 follows the kernels it changes, not a model: every artifact that runs the kernel on the same
 formats shares it, and each configuration needs its own measured speedup
-([kernel-based approval](model-quality.md#61-the-exact-route-and-the-fast-paths)).
+([kernel-based approval](model-quality.md#61-the-reproducible-route-and-the-fast-paths)).
 
 ## 7. Performance evidence
 

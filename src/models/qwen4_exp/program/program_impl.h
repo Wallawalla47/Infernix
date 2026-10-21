@@ -783,6 +783,11 @@ public:
             bytes += execution::Forward::mtp_workspace_bytes(c, std::max(lanes * W, std::min(d.chunk, 512)), lanes,
                                                              d.head_rows, dim(o.max_context), o.kv_cache);
         }
+        // The lossless route's window call (TextConfig::lossless).
+        if (c.lossless) {
+            bytes = std::max(bytes, execution::Forward::lossless_workspace_bytes(c, std::max(columns, lanes * W)) +
+                                        ops::sampling_workspace_capacity_bytes(d.token_domain, 1, lanes));
+        }
         // The DFlash2 drafter runs between Forward calls, in the same arena.
         if (d.dflash2) {
             bytes = std::max(bytes, execution::DFlash2::workspace_bytes(c, *d.dflash2_config, lanes, d.dflash_k + 1,
@@ -1309,7 +1314,8 @@ public:
         base->reuse                           = prefix_ != nullptr && options.allow_prefix_reuse && data.identity.reusable;
         base->summary.publish_continuation    = base->reuse;
         base->vision   = std::move(vision);
-        base->sampling = translate(options.sampling);
+        base->sampling            = translate(options.sampling);
+        base->sampling.gumbel_max = options_.gumbel_sampling;
         const std::uint32_t positions = std::min(options_.max_context, n + base->summary.effective_output_tokens);
         base->positions = positions;
         base->pages     = (positions + kPagedKVPageSize - 1) / kPagedKVPageSize;

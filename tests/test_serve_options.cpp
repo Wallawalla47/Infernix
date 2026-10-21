@@ -1020,12 +1020,12 @@ int main() {
                           std::string::npos,
                       "serve help omits --use-original-nvfp4-prefill-kernel");
     failures += check(archive.fast_paths, "fast paths must default on");
-    failures += check(!parse({"infernix-serve", "model.ninfer", "--disable-fast-paths"}).fast_paths,
-                      "--disable-fast-paths was not preserved");
-    failures += check(serve_usage_text("infernix-serve").find("--disable-fast-paths") != std::string::npos,
-                      "serve help omits --disable-fast-paths");
+    failures += check(!parse({"infernix-serve", "model.ninfer", "--reproducible"}).fast_paths,
+                      "--reproducible was not preserved");
+    failures += check(serve_usage_text("infernix-serve").find("--reproducible") != std::string::npos,
+                      "serve help omits --reproducible");
     {
-        const auto timed = parse({"infernix-serve", "model.ninfer", "--disable-fast-paths", "--fast-path",
+        const auto timed = parse({"infernix-serve", "model.ninfer", "--reproducible", "--fast-path",
                                   "free-cache-resume", "--fast-path", "adaptive-speculation"});
         failures += check(timed.fast_path_candidates == std::vector<infernix::FastPath>{
                                                             infernix::FastPath::FreeCacheResume,

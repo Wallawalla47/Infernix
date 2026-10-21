@@ -86,7 +86,7 @@ infernix_bench --weights <artifact.ninfer>
           [--max-ctx <tokens>] [--prefill-chunk <tokens>]
           [--kv-dtype <bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2>] [--use-original-int8-prefill-kernel]
           [--use-original-nvfp4-prefill-kernel] [--prefill-split-workspace-mib <n>]
-          [--disable-fast-paths] [--fast-path <name>]...
+          [--reproducible] [--fast-path <name>]...
           [--spec <mtp|dflash|dflash2> --draft-tokens <n>] [--lm-head-draft]
           [--device <id>] [--no-cuda-graph] [--profile-measured]
           [-o, --output <table|json|csv>] [--output-file <path>]
@@ -164,7 +164,7 @@ sensitive decode measure of the [acceptance policy](../docs/maintainer/model-qua
 
 ```bat
 infernix_decode_quality_forced model.ninfer corpus.txt exact.json --segments 256 ^
-  --prompts 512,2048,8192 --mode plain --kv-dtype int8 --disable-fast-paths
+  --prompts 512,2048,8192 --mode plain --kv-dtype int8 --reproducible
 infernix_decode_quality_forced model.ninfer corpus.txt fast.json --segments 256 ^
   --prompts 512,2048,8192 --mode plain --kv-dtype int8
 ```
@@ -174,14 +174,14 @@ if the corpus is too short for them. `--first-segment N` computes the set's segm
 `--segments` - 1 with their offsets and prompt lengths as in the whole set, and
 `tools/quality/fast_path_gate.py concat-forced A.json B.json --out AB.json` joins consecutive ranges
 (references or runs), which is how a 1,024-segment gate extends a 256-segment one
-([acceptance policy](../docs/maintainer/model-quality.md#61-the-exact-route-and-the-fast-paths)). `--forced N` sets the forced tokens per segment (at most 64,
+([acceptance policy](../docs/maintainer/model-quality.md#61-the-reproducible-route-and-the-fast-paths)). `--forced N` sets the forced tokens per segment (at most 64,
 the constraint step limit); `--mode`
 is `plain`, `dflash2`, `ngram` or `mtp`. `--reference` writes the reference for the same segments
 instead (the reference route, `EngineOptions::reference`, with BF16 KV in one pass: each forced
 token's log-probability and the 64 most probable tokens there), and `--observe REFERENCE.json` makes every
 forced step also record the log-probabilities of those tokens and its own largest one
 (`TokenConstraint::observe`), from which the gate computes decode KL and top-1 agreement. Fast paths run as in `infernix-serve` unless
-`--disable-fast-paths`; `--fast-path NAME` also runs a candidate path (qualification).
+`--reproducible`; `--fast-path NAME` also runs a candidate path (qualification).
 
 The log-probabilities are printed exactly, so the same segments also measure request invariance:
 `tools/quality/fast_path_gate.py identical a.json b.json` compares two exact-route runs bit for
@@ -209,7 +209,7 @@ are in [Model-level numerical quality](../docs/maintainer/model-quality.md).
   round choose its length with the `--spec-min-p` 0.5 cut (`--draft-tokens auto`), `min-p=P` sets that
   cut for the fixed length; `plain` drafts nothing
   (one token per round through the single-column decode kernels). Fast paths run as in
-  `infernix-serve`; `exact` runs the exact route and `path=NAME` also runs a candidate fast path.
+  `infernix-serve`; `reproducible` runs the reproducible route and `path=NAME` also runs a candidate fast path.
   It writes one line per segment: the corpus token offset, the prompt length and the generated
   token ids.
 - The judge scores any number of generator outputs with one reference: a CausalScoring Engine on
@@ -717,7 +717,7 @@ so broad Graph-envelope measurements can be distinguished from exact-length meas
 `--split-workspace-mib N` sets the prompt split-workspace bound (default 256, as
 `--prefill-split-workspace-mib`). `--decode-split64` selects the decode-split64 fast path's
 schedule (INT8 KV: 64-key splits for 24-head single-column rows). In `infernix_bench`, the fast
-paths qualified for the configuration (the artifact's kernels and KV format) run unless `--disable-fast-paths`, and `--fast-path NAME`
+paths qualified for the configuration (the artifact's kernels and KV format) run unless `--reproducible`, and `--fast-path NAME`
 also runs a candidate path; the report records the paths that ran as `fast_paths`.
 
 ```bash

@@ -311,12 +311,19 @@ NInfer (measured with `master` at `81c8ce09` and the Windows port).
 
 ## Quality
 
-Infernix runs two routes:
+Infernix runs three routes:
 
-- **The exact route** (`--disable-fast-paths`) gives bit-identical output from run to run and from
-  release to release. Where an artifact's formats allow it (the NVFP4 Qwen3.8-27B and the NVFP4,
-  FP8 and GGUF Flash-Next imports, for example), it is also request-invariant: other requests, concurrency,
-  prefix-cache state and memory pressure do not change a request's output.
+- **The lossless route** (`--lossless`; Qwen3.5/3.6/3.8 and Qwen3.8-Flash-Next, causal scoring so far:
+  `infernix-perplexity` and the decode-quality tools) computes the model's own arithmetic exactly:
+  every operation of its Hugging Face forward pass correctly rounded to the dtype it has there
+  (weights decoded exactly, sums exact). Its output depends on the request and the artifact alone,
+  not on the build, the window's length or other requests
+  ([definition](docs/maintainer/lossless-route.md)).
+- **The reproducible route** (`--reproducible`) gives bit-identical output from run to run and from
+  release to release. It is also request-invariant (other requests, concurrency, prefix-cache state
+  and memory pressure do not change a request's output), and speculation does not change it: a
+  sampled request draws each token by Gumbel-max keyed by its seed, position and token, so drafts
+  are verified against the token plain decoding would draw.
 - **Fast paths** (on by default) are faster kernels and scheduling choices that change the
   arithmetic. Each one runs only for the kernels it was qualified on, only after passing the quality
   gate below, and only where it was measured faster.
@@ -325,7 +332,7 @@ Infernix runs two routes:
 
 A fast path is measured against a high-precision reference: the same model with 16-bit activations
 in every layer and a BF16 KV cache. Infernix charges a path only for the distance it adds beyond
-the exact route's own, so the quantization a model already carries is not counted against it.
+the reproducible route's own, so the quantization a model already carries is not counted against it.
 
 - **Prefill**: teacher-forced over a 1.04M-token corpus at four chunk sizes, measuring the KL
   divergence from the reference and top-1 token agreement.

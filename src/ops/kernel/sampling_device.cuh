@@ -421,6 +421,58 @@ __device__ inline void sampling_build_truncated_block_fast(
     sampling_normalize_support(cfg, cand_val, cand_idx, prob, n_support, fast_cap);
 }
 
+// Gumbel-max (SamplingConfig::gumbel_max): a support entry's score log p + g, g = -log(-log u) with u
+// from (seed, the produced token's position, kSamplePurposeGumbel, token) moved into (0, 1). Fixed
+// intrinsics, so every kernel scores an entry the same.
+__device__ __forceinline__ float sampling_gumbel_score(float p, unsigned long long seed, int position,
+                                                       int token) {
+    const float u = sampling_uniform(seed, position, kSamplePurposeGumbel, static_cast<unsigned int>(token)) +
+                    (1.0f / 33554432.0f);
+    return __fadd_rn(__logf(p), -__logf(-__logf(u)));
+}
+
+// thread-local: the Gumbel-max token over support entries 0..n-1 (idx_at(j), prob_at(j)); ties to
+// the lower entry (the higher-probability one).
+template <class IdxAt, class ProbAt>
+__device__ inline int sampling_gumbel_pick(IdxAt idx_at, ProbAt prob_at, int n, unsigned long long seed,
+                                           int position) {
+    int best       = idx_at(0);
+    float best_val = -CUDART_INF_F;
+    for (int j = 0; j < n; ++j) {
+        const int token = idx_at(j);
+        const float s   = sampling_gumbel_score(prob_at(j), seed, position, token);
+        if (s > best_val) {
+            best_val = s;
+            best     = token;
+        }
+    }
+    return best;
+}
+
+// warp-wide: lane j < n holds support entry j; every lane returns the same token as
+// sampling_gumbel_pick over those entries.
+__device__ inline int sampling_gumbel_pick_warp(int token, float p, int n, unsigned long long seed, int position) {
+    const int lane = threadIdx.x & 31;
+    float best_val = lane < n ? sampling_gumbel_score(p, seed, position, token) : -CUDART_INF_F;
+    int best_lane  = lane < n ? lane : 32;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        const float v = __shfl_xor_sync(0xffffffffU, best_val, offset);
+        const int l   = __shfl_xor_sync(0xffffffffU, best_lane, offset);
+        if (v > best_val || (v == best_val && l < best_lane)) {
+            best_val  = v;
+            best_lane = l;
+        }
+    }
+    return __shfl_sync(0xffffffffU, token, best_lane < 32 ? best_lane : 0);
+}
+
+// The produced token's position for a draw at logical_position under `purpose` (sample()'s keys:
+// prefill passes the produced position, decode the input token's).
+__device__ __forceinline__ int sampling_produced_position(int logical_position, int purpose) {
+    return purpose == kSamplePurposePrefill ? logical_position : logical_position + 1;
+}
+
 // thread-0 helper: inverse-CDF pick over a normalized `prob[0..n-1]` support,
 // optionally excluding `exclude` (a rejected draft token) and renormalizing over
 // the remainder. `u` is a uniform in [0,1). Returns the chosen vocab id.

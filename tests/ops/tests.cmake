@@ -61,6 +61,29 @@ infernix_add_op_test(infernix_ggml_linear_test
 infernix_add_op_test(infernix_precise_linear_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_precise_linear.cpp"
   LIBRARIES infernix_ops)
+# The --lossless route's projections: every output the correctly rounded exact sum (tensor-core route
+# and exact fallback), against a host wide-integer oracle.
+infernix_add_op_test(infernix_lossless_linear_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_lossless_linear.cpp"
+  LIBRARIES infernix_ops)
+# Its correctly rounded binary32/BF16 functions against an exact decimal oracle (every BF16 input and
+# random binary32 ones); the Python driver writes the vectors and runs the executable.
+add_executable(infernix_lossless_cr_math_test "${CMAKE_CURRENT_LIST_DIR}/test_lossless_cr_math.cu")
+infernix_test_includes(infernix_lossless_cr_math_test)
+target_link_libraries(infernix_lossless_cr_math_test PRIVATE infernix_ops)
+infernix_op_oracle_options(infernix_lossless_cr_math_test)
+add_test(NAME infernix_lossless_cr_math_test
+  COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_LIST_DIR}/lossless_cr_oracle.py
+          $<TARGET_FILE:infernix_lossless_cr_math_test>)
+# Its elementwise and row operations (norms, gates, the GDN convolution) against an exact oracle that
+# follows docs/maintainer/lossless-route.md §2 step by step.
+add_executable(infernix_lossless_ops_test "${CMAKE_CURRENT_LIST_DIR}/test_lossless_ops.cu")
+infernix_test_includes(infernix_lossless_ops_test)
+target_link_libraries(infernix_lossless_ops_test PRIVATE infernix_ops)
+infernix_op_oracle_options(infernix_lossless_ops_test)
+add_test(NAME infernix_lossless_ops_test
+  COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_LIST_DIR}/lossless_ops_oracle.py
+          $<TARGET_FILE:infernix_lossless_ops_test>)
 # The reference route's Qwen3.5 attention against FP64 (cached prefix, run-to-run and width bits).
 infernix_add_op_test(infernix_causal_attention_reference_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_causal_attention_reference.cpp"
@@ -150,6 +173,10 @@ infernix_add_op_test(infernix_speculative_round_test
 
 infernix_add_op_test(infernix_speculative_tree_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_speculative_tree.cpp"
+  LIBRARIES infernix_ops)
+
+infernix_add_op_test(infernix_gumbel_speculation_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gumbel_speculation.cpp"
   LIBRARIES infernix_ops)
 set_tests_properties(infernix_speculative_tree_test PROPERTIES TIMEOUT 600)
 

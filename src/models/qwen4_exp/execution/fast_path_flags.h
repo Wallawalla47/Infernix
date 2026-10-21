@@ -6,7 +6,7 @@
 namespace infernix::models::qwen4_exp::execution {
 
 // The fast paths the Forward runs (models/qwen4_exp/program/fast_paths.h selects them): each field
-// is false or Exact on the exact route (--disable-fast-paths).
+// is false or Exact on the reproducible route (--reproducible).
 struct ForwardFastPaths {
     // The dense projections' fast-route flags: q8-sliced-k (GDN q/k/v/z, GDN and QSA output) and
     // fp8-a8-pair (recipe C's FP8 rows). Each flag reaches only the problems that register it.

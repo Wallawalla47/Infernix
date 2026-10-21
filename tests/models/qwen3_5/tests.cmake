@@ -107,6 +107,20 @@ infernix_add_test(infernix_qwen3_5_score_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_score_real.cpp"
   LIBRARIES infernix_engine)
 
+infernix_add_test(infernix_qwen3_5_lossless_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_lossless_real.cpp"
+  LIBRARIES infernix_engine)
+
+# Speculation invariance of the reproducible route, one entry per drafter (the artifact must hold it).
+add_executable(infernix_qwen3_5_speculation_invariance_real_test
+  "${CMAKE_CURRENT_LIST_DIR}/test_engine_speculation_invariance_real.cpp")
+infernix_test_includes(infernix_qwen3_5_speculation_invariance_real_test)
+target_link_libraries(infernix_qwen3_5_speculation_invariance_real_test PRIVATE infernix_engine)
+foreach(drafter mtp dflash2 dflash2-ngram)
+  add_test(NAME infernix_qwen3_5_speculation_invariance_${drafter}_real_test
+    COMMAND infernix_qwen3_5_speculation_invariance_real_test ${drafter})
+endforeach()
+
 infernix_add_test(infernix_qwen3_5_readout_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_readout_real.cpp"
   LIBRARIES infernix_engine)

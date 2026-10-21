@@ -2,6 +2,7 @@
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/execution_context.h"
 #include "models/qwen3_5/execution/linear.h"
+#include "models/qwen3_5/execution/lossless.h"
 #include "core/startup.h"
 #include "core/device.h"
 #include "infernix/ops/precise_linear.h"
@@ -355,9 +356,11 @@ ScoreResult ProgramImpl::causal_score(PreparedPromptData&& prompt, std::uint32_t
             const auto columns = static_cast<std::int32_t>(staged_columns);
             // The staged columns' first scored position.
             const std::size_t first_position = output.logprobs.size();
-            // The reference route scores from FP32 logits of the precise head.
+            // The reference route scores from FP32 logits of the precise head, the lossless route from
+            // the correctly rounded FP32 logits.
             const bool reference = execution_schedule.reference;
-            Tensor logits        = work.alloc(reference ? DType::FP32 : DType::BF16,
+            const bool lossless  = execution_schedule.lossless;
+            Tensor logits        = work.alloc(reference || lossless ? DType::FP32 : DType::BF16,
                                               {dimension(parameters.model.config().text.vocab_size), columns});
             Tensor target_ids = work.alloc(DType::I32, {1, columns});
             Tensor logprobs   = work.alloc(DType::FP32, {1, columns});
@@ -370,7 +373,9 @@ ScoreResult ProgramImpl::causal_score(PreparedPromptData&& prompt, std::uint32_t
             Tensor candidate_ids      = distribution(DType::I32, per_position);
             Tensor candidate_logprobs = distribution(DType::FP32, per_position);
             Tensor hidden             = score_hidden->slice(1, 0, columns);
-            if (reference) {
+            if (lossless) {
+                execution::lossless_head(hidden, parameters.text.output_head.weight, logits, work, device.stream);
+            } else if (reference) {
                 ops::precise_linear(hidden, parameters.text.output_head.weight, logits, device.stream);
             } else {
                 execution::project(hidden, parameters.text.output_head, logits, work, device.stream);

@@ -304,7 +304,7 @@ repetitions): pp8192 3,352 and pp32768 11,299 tok/s (8,387 on the exact route; t
 `--expert-a4-activations` pp32768 11,985, tg256 135 plain and 216 with MTP. Dense8 in the same
 session: 11,531, 120 and 159.
 
-Its qualified fast paths (2026-10-21; on by default, `--disable-fast-paths` turns them off) are
+Its qualified fast paths (2026-10-21; on by default, `--reproducible` turns them off) are
 the request-coupling paths (two-row MTP rounds: two concurrent requests decode 84 -> 126 tok/s with
 16-bit and 125 -> 162 with 4-bit expert activations; free cache resume; preemption), sampled MTP
 drafts, and `expert-a4-residual` for long prefills with 16-bit expert activations, on every KV
@@ -707,7 +707,7 @@ headroom 256 (auto); expert frames 9300 (23.95 GiB); 380 free after startup
   - It saves the PCIe copies and CPU work of those misses, so it helps most when many experts miss
     VRAM (the SSD tier, small cards); with every expert in VRAM it changes nothing.
   - The output changes and is slightly worse, and it depends on which experts the cache holds at
-    the time, so it is neither the exact route nor request-invariant (`--disable-fast-paths` refuses
+    the time, so it is neither the exact route nor request-invariant (`--reproducible` refuses
     it, and the load summary reports the Engine as not request-invariant). Prefill, forced and scored
     tokens are unchanged, and a skipped expert still counts as routed for the cache, so it can be
     promoted.

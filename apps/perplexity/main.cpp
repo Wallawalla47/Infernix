@@ -63,6 +63,7 @@ struct Options {
     bool original_int8_prefill_kernel   = false;
     bool original_nvfp4_prefill_kernel  = false;
     bool reference                      = false;
+    bool lossless                       = false;
     bool expert_a4_activations          = false;
     bool fast_paths                     = true;
     std::vector<infernix::FastPath> fast_path_candidates;
@@ -83,10 +84,14 @@ std::string usage_text() {
            "       [--reference] (the quality reference's route, no fast path, BF16 KV: every\n"
            "        projection, expert, recurrence and attention computed precisely between\n"
            "        the model's BF16 boundaries; many times slower)\n"
+           "       [--lossless] (Qwen3.5/3.6/3.8 and Qwen3.8-Flash-Next: the quality reference's\n"
+           "        route, every operation of\n"
+           "        the model correctly rounded; no fast path, one pass per window: give\n"
+           "        --prefill-chunk the context; FP32 logits)\n"
            "       [--expert-a4-activations] (nvidia/Qwen3.8-Flash-Next-FP4-Local only: routed\n"
            "        experts with 4-bit activations, using the activation scales NVIDIA\n"
            "        calibrated for them; default 16-bit)\n"
-           "       [--disable-fast-paths] (score the exact route; by default the qualified fast\n"
+           "       [--reproducible] (score the reproducible route; by default the qualified fast\n"
            "        paths run, as in infernix-serve)\n"
            "       [--fast-path NAME]... (qualification: also run this fast path, qualified or\n"
            "        not: prompt-pv8, decode-split64)\n"
@@ -154,11 +159,13 @@ Options parse_options(int argc, char** argv) {
             out.original_nvfp4_prefill_kernel = true;
         } else if (option == "--reference") {
             out.reference = true;
+        } else if (option == "--lossless") {
+            out.lossless = true;
         } else if (option == "--expert-a4-activations") {
             out.expert_a4_activations = true;
         } else if (option == "--ngram-volume") {
             out.ngram_volume = std::filesystem::path(value("--ngram-volume"));
-        } else if (option == "--disable-fast-paths") {
+        } else if (option == "--reproducible") {
             out.fast_paths = false;
         } else if (option == "--fast-path") {
             const std::string_view name = value("--fast-path");
@@ -304,9 +311,10 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.original_int8_prefill_kernel = options.original_int8_prefill_kernel;
     engine_options.original_nvfp4_prefill_kernel = options.original_nvfp4_prefill_kernel;
     engine_options.reference                     = options.reference;
+    engine_options.lossless                      = options.lossless;
     engine_options.expert_a4_activations         = options.expert_a4_activations;
-    // The reference route runs no fast path.
-    engine_options.fast_paths           = options.fast_paths && !options.reference;
+    // The reference and lossless routes run no fast path.
+    engine_options.fast_paths           = options.fast_paths && !options.reference && !options.lossless;
     engine_options.fast_path_candidates = options.fast_path_candidates;
     if (options.ngram_volume) { engine_options.ngram_volume_path = *options.ngram_volume; }
     engine_options.expert_stripe_path   = options.expert_stripe;

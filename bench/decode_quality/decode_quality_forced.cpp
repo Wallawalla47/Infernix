@@ -9,9 +9,11 @@
 //
 // --reference writes the reference instead: the reference route's (EngineOptions::reference) BF16-KV
 // log-probability of every forced token and its 64 most probable tokens there (Engine::score_tokens,
-// one pass), for the same segments. --observe REFERENCE then makes each forced step also report the
-// log-probabilities of the reference's top tokens and its own largest log-probability
-// (TokenConstraint::observe), so the gate measures the decode route's KL divergence from the
+// one pass), for the same segments; --lossless writes it with the lossless route
+// (EngineOptions::lossless, Qwen3.5/3.6/3.8 and Qwen3.8-Flash-Next), the reference those models' gates use. --observe
+// REFERENCE then makes each forced step also report the log-probabilities of the reference's top
+// tokens and its own largest log-probability (TokenConstraint::observe), so the gate measures the
+// decode route's KL divergence from the
 // reference and its top-1 agreement exactly as the prefill gate does.
 //
 // Segments lie back to back from the corpus's first token, no two sharing a token, and cycle
@@ -21,7 +23,7 @@
 // runs and references of consecutive ranges. --mode selects the decode route: plain (no speculation: one
 // single-column round per token), dflash2 (DFlash2, 7 drafts, the optimized proposal head), ngram
 // (DFlash2 with n-gram drafting) or mtp (MTP, 4 drafts). Fast paths run as in infernix-serve;
-// --disable-fast-paths runs the exact route and --fast-path NAME also runs that fast path
+// --reproducible runs the reproducible route and --fast-path NAME also runs that fast path
 // whether or not it is qualified (qualification). --expert-a4-activations runs
 // nvidia/Qwen3.8-Flash-Next-FP4-Local's routed experts with 4-bit activations (not the reference).
 //
@@ -35,9 +37,10 @@
 // prefill and decode time, which shows which of the two its wall time went to.
 //
 // Usage: infernix_decode_quality_forced <artifact> <corpus.txt> <out.json> [--segments N]
-//          [--first-segment N] [--prompts L1,L2,...] [--forced N] [--reference | --observe REFERENCE.json]
+//          [--first-segment N] [--prompts L1,L2,...] [--forced N]
+//          [--reference | --lossless | --observe REFERENCE.json]
 //          [--mode plain|dflash2|ngram|mtp|mtp-ngram] [--kv-dtype int8|bf16|fp8|nvfp4]
-//          [--disable-fast-paths] [--fast-path NAME]... [--expert-a4-activations]
+//          [--reproducible] [--fast-path NAME]... [--expert-a4-activations]
 //          [--concurrency 1..8] [--prefill-chunk N] [--prefix-reuse [--warm-tokens N]]
 //          [--ngram-volume FILE] (Qwen3.8-Flash-Next; default <artifact>.ngram)
 //          [--expert-pin-mib N] (Qwen3.8-Flash-Next: page-locked expert RAM; the CPU serves the rest)
@@ -86,6 +89,7 @@ struct Options {
     bool prefix_reuse           = false;
     std::uint32_t warm_tokens   = 0; // 0: the whole prompt
     bool reference              = false;
+    bool lossless               = false; // the reference's route
     std::string observe;
     std::string ngram_volume;
     bool expert_a4_activations = false;
@@ -146,9 +150,12 @@ Options parse(int argc, char** argv) {
             out.expert_pin_mib = parse_u32(value(), "expert pin MiB");
         } else if (option == "--reference") {
             out.reference = true;
+        } else if (option == "--lossless") {
+            out.reference = true;
+            out.lossless  = true;
         } else if (option == "--observe") {
             out.observe = value();
-        } else if (option == "--disable-fast-paths") {
+        } else if (option == "--reproducible") {
             out.fast_paths = false;
         } else if (option == "--expert-a4-activations") {
             out.expert_a4_activations = true;
@@ -170,7 +177,7 @@ Options parse(int argc, char** argv) {
         throw std::invalid_argument("--warm-tokens needs --prefix-reuse");
     }
     if (out.reference && !out.observe.empty()) {
-        throw std::invalid_argument("--reference and --observe exclude each other");
+        throw std::invalid_argument("--reference (or --lossless) and --observe exclude each other");
     }
     if (out.reference && out.expert_a4_activations) {
         throw std::invalid_argument("--reference scores with 16-bit activations; drop --expert-a4-activations");
@@ -275,7 +282,8 @@ void write_reference(const Options& options, std::uint32_t longest, std::ostream
     engine_options.kv_capacity     = infernix::KvCapacityPolicy::explicit_capacity(engine_options.max_context);
     engine_options.kv_cache        = infernix::KvCacheStorage::BFloat16;
     engine_options.prefill_chunk   = engine_options.max_context;
-    engine_options.reference       = true;
+    engine_options.reference       = !options.lossless;
+    engine_options.lossless        = options.lossless;
     engine_options.fast_paths      = false;
     if (!options.ngram_volume.empty()) { engine_options.ngram_volume_path = options.ngram_volume; }
     infernix::Engine engine(engine_options);

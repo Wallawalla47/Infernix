@@ -62,6 +62,12 @@ struct ExecutionSchedule {
     // projections precise_linear's forms, attention causal_softmax_attention_reference, the FFN
     // ffn_reference, the scoring head FP32 (docs/maintainer/model-quality.md 6.2).
     bool reference = false;
+    // The lossless route (EngineOptions::lossless, a CausalScoring Program scoring each window in one
+    // pass): every layer execution::lossless_layer, the scoring head FP32 (docs/maintainer/lossless-route.md).
+    bool lossless = false;
+    // The reproducible and lossless routes: sampled requests draw by Gumbel-max
+    // (ops::SamplingConfig::gumbel_max), so speculation returns plain sampling's text.
+    bool gumbel_sampling = false;
 
     // A prefill chunk's envelope.
     [[nodiscard]] ops::CausalAttentionExecutionEnvelope

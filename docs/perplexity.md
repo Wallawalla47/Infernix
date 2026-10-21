@@ -33,9 +33,12 @@ activations, moved 15 times less (KL 0.0021). So treat a perplexity difference u
 between two NVFP4 builds or settings as noise unless it holds at several chunk sizes.
 `--reference` runs the quality reference's route, with BF16 KV and no fast path: every projection,
 expert, GDN recurrence and attention computed precisely between the model's BF16 rounding points,
-many times slower than the exact route. Saved with `--save-top-tokens`, it is the
+many times slower than the reproducible route. Saved with `--save-top-tokens`, it is the
 reference that `--kl-reference` measures other runs against. [Model-level numerical quality](maintainer/model-quality.md) has the method and
-the recorded results. Qwen3.8-Flash-Next reads its n-gram volume from `<model>.ngram` unless
+the recorded results. `--lossless` (Qwen3.5/3.6/3.8 and Qwen3.8-Flash-Next) runs the lossless route
+instead: every operation of the model's Hugging Face forward pass correctly rounded, so a score
+depends on the window's tokens alone; one pass per window (give `--prefill-chunk` the context), BF16
+KV, no fast path, FP32 logits ([definition](maintainer/lossless-route.md)). Qwen3.8-Flash-Next reads its n-gram volume from `<model>.ngram` unless
 `--ngram-volume FILE` names it, as in `infernix` (`--expert-stripe FILE` as there too). Its windows
 prefill through the generation path, the SSD expert tier included, keeping each position's final
 residual; the LM head then runs over them in tiles of 64 positions with FP32 logits. The available Main
@@ -45,7 +48,7 @@ prompt-attention kernel, and `nvfp4` with its fast kernel over more than 768 vis
 `infernix-serve` prefills them by default; `--use-original-int8-prefill-kernel` and
 `--use-original-nvfp4-prefill-kernel` score them with the original kernels and require the matching
 `--kv-dtype`. As in `infernix-serve`, the fast paths qualified for the artifact's configuration (its kernels and KV format) run
-unless `--disable-fast-paths` selects the exact route; `--reference` never runs a fast path. `report.json` records the kernels as `original_int8_prefill_kernel` and
+unless `--reproducible` selects the reproducible route; `--reference` never runs a fast path. `report.json` records the kernels as `original_int8_prefill_kernel` and
 `original_nvfp4_prefill_kernel`, and the fast paths that ran as `fast_paths`.
 
 ```bash

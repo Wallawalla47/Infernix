@@ -300,6 +300,7 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
             throw ArtifactError("--expert-a4-activations contradicts the reference route");
         }
         out.text.reference       = options.reference;
+        out.text.lossless        = options.lossless;
         out.text.moe.a16_experts = options.reference ||
                                    (out.text.moe.a4_optional ? !options.expert_a4_activations : !scales);
         if (options.rope_yarn_factor > 1.0F && out.text.rope.theta <= 1.0F) {

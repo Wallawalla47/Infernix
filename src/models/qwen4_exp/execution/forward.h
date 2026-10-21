@@ -304,6 +304,8 @@ public:
     [[nodiscard]] static std::size_t workspace_bytes(
         const TextConfig& config, std::int32_t columns, std::int32_t max_context, KvCacheStorage storage,
         ops::offloaded_moe::WideA16 wide_a16 = ops::offloaded_moe::WideA16::kExact);
+    // The lossless route's workspace for a call of `columns` (TextConfig::lossless: one window per call).
+    [[nodiscard]] static std::size_t lossless_workspace_bytes(const TextConfig& config, std::int32_t columns);
     // Extra workspace of the MTP drafter: K/V-only calls over up to `kv_columns` columns (chunks
     // run them inside run()) and full steps over `draft_columns` sequences.
     [[nodiscard]] static std::size_t mtp_workspace_bytes(const TextConfig& config, std::int32_t kv_columns,
@@ -312,6 +314,24 @@ public:
 
 private:
     void ple(const PleParameters& p, Tensor& residual, const ForwardBatch& batch);
+    // The call's PLE embedding (BF16 [embed, T]): its n-gram rows, decoded exactly and rounded to BF16.
+    Tensor ple_embedding(const PleParameters& p, const ForwardBatch& batch);
+    // The layer's routed-expert source without a call's scheduling (frames, host records, staging, the
+    // CPU channel, the SSD tier, the bank's formats).
+    [[nodiscard]] ops::MoeExpertSource expert_source(const MoeParameters& p, std::uint32_t layer) const;
+    // The --lossless route (forward_lossless.cpp; docs/maintainer/lossless-route.md §2a): one call per
+    // scored window, every operation correctly rounded.
+    void check_lossless_call(const ForwardBatch& batch) const;
+    void lossless_project(const Tensor& x, const LinearParameters& p, std::int32_t row_begin, std::int32_t rows,
+                          Tensor& out, std::int32_t out_row);
+    Tensor lossless_mix(const HyperConnectionParameters& p, const Tensor& residual, Tensor* inject);
+    void lossless_ple(const PleParameters& p, Tensor& residual, const ForwardBatch& batch);
+    Tensor lossless_gdn(const GdnParameters& p, const Tensor& x);
+    Tensor lossless_attention_block(const AttentionParameters& p, const Tensor& x, const ForwardBatch& batch);
+    Tensor lossless_moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer);
+    void lossless_layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& residual);
+    // The final mixer and the LM head over residuals (BF16 [S*H, n]) into FP32 logits [V, n].
+    void lossless_head(const Tensor& residuals, Tensor& logits);
     // The block's mixed input (into `into` when given, else the workspace).
     Tensor mix(const HyperConnectionParameters& p, const Tensor& residual, Tensor* inject, Tensor* into = nullptr);
     // The layer's token mixer (GDN or QSA attention) over its mixed input.

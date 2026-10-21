@@ -782,7 +782,7 @@ kernel completes. Whether the route costs decode time against the GEMV it replac
 
 **Decode nondeterminism: TMA stages refilled while still being read, fixed (2026-10-20).** On the real
 artifact the exact route was not deterministic: the same teacher-forced decode run twice (decode
-corpus, 24-96 segments, BF16 KV, `--disable-fast-paths`) differed in 10-38 % of segments from a
+corpus, 24-96 segments, BF16 KV, `--reproducible`) differed in 10-38 % of segments from a
 random decode step on, at rounding-level first differences (2e-5 to 0.2 in log-probability); prefill
 and the first forced step always agreed, and NVIDIA NVFP4 Dense8 and the official FP8 artifact were
 deterministic on the same build. Recipe C (FP8-row shared expert) showed the same defect, and
@@ -10702,7 +10702,7 @@ columns share the call. The GGUF expert banks take the same tiles (`WideA16::kGg
 `ggml_expert.cuh`) in calls of 14,336 or more columns: each wide job's gate/up and down rows are
 decoded into planes in the experts' workspace (32 experts, 225 MiB, `kGgmlBf16PlaneBytes`), gate/up
 tiles pair 64 gate rows with their 64 up rows and write SwiGLU's BF16 h through shared memory, and
-the down tiles scatter each entry's output. The exact route (`--disable-fast-paths`) is unchanged.
+the down tiles scatter each entry's output. The exact route (`--reproducible`) is unchanged.
 
 **One-pass walk MoE calls and 32,768-column groups (exact).** A walk MoE call whose layer has every
 non-resident expert in the ring and every record in RAM (`ExpertStream::complete`) runs as one
@@ -10762,7 +10762,7 @@ The release run repeats the README's (29.24-29.51 s at 128K). Decode after those
 release sessions; rounds per second overlap (69.3-71.8 against 70.9-73.4), the text differs from the
 release's in every request (the prefill's arithmetic moves greedy ties), no decode kernel changed and
 the decode expert-cache hit rate is the same (93.6 against 93.4 %). A same-text check settles it: the
-same workload on the exact route (`--disable-fast-paths`, four MTP drafts verified every round, so
+same workload on the exact route (`--reproducible`, four MTP drafts verified every round, so
 both builds write the same text in the same rounds), sessions ABBA: this branch (rebased on main
 dd18d403) 174.5 and 182.6 tok/s, the release 182.3 and 183.6; every request has the same text, rounds
 and decode cache hits in all four. The second branch session equals the release (rounds per second
@@ -10790,7 +10790,7 @@ of its arithmetic moves it by about KL 5.6e-3 (this path alone 5.5e-3, `gdn-f16-
 segments) passes on INT8, and on BF16 fails narrowly with either path alone (TV bounds 4.45e-3 and
 4.6e-3 of 4e-3, in the 2,048- and 8,192-token prompts). The exact items are bit-identical: `fast_path_gate identical` on the quick
 corpus in 49,152-token windows at 8,192-token chunks (MoE groups of two chunks before, four after),
-8 of 8 windows on IQ3_S and on Dense8, `--disable-fast-paths`, release-equivalent route against the new one.
+8 of 8 windows on IQ3_S and on Dense8, `--reproducible`, release-equivalent route against the new one.
 
 **Rejected or not built.**
 - A liveness-sized workspace that would let IQ3_S prefill 16K chunks (its 16,384-column chunk needs

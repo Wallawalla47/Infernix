@@ -450,7 +450,7 @@ Gated DeltaNet recurrent state is 144 of an image's 186.8 MiB (§3.2). `--cache-
   packed state (2.25 MiB for 27B `fp24`) and are planned with the StateImage pool. Conv state,
   continuation hidden, DFlash rings and the KV window stay exact.
 - Device snapshots stay exact, so the same snapshot resumes exactly from its Device slot and
-  rounded from the Host: which one a turn gets depends on eviction, so `--disable-fast-paths`
+  rounded from the Host: which one a turn gets depends on eviction, so `--reproducible`
   refuses `fp24` and `bf16` ([model quality §6.1](model-quality.md#6-numerical-acceptance-policy-and-fast-paths)).
   Each Host restore rounds once; a conversation restored from the Host every
   turn accumulates one rounding per turn on state that the GDN decay partly forgets. On 18

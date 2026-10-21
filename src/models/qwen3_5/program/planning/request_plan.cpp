@@ -134,6 +134,7 @@ RequestBasePlan ProgramImpl::plan_request(PreparedPromptData&& prompt,
                                                ? FinishReason::OutputLimit
                                                : FinishReason::ContextCapacity;
     base->sampling                       = translate_sampling(options.sampling);
+    base->sampling.gumbel_max            = execution_schedule.gumbel_sampling;
     base->readout_tokens                 = options.readout_tokens;
     if (!constraint.empty()) { constraint.serial = next_constraint_serial_++; }
     base->constraint = std::move(constraint);

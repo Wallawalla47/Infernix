@@ -90,14 +90,19 @@ __launch_bounds__(kSamplerBlock) __global__
 
     if (tid != 0) { return; }
     const int support = n_support;
-    const float u     = sampling_uniform(cfg.seed, logical_positions[row], purpose, 0u);
-    float acc         = 0.0f;
     int picked        = cand_idx[support - 1];
-    for (int j = 0; j < support; ++j) {
-        acc += prob[j]; // prob is normalized: goal == u
-        if (u < acc) {
-            picked = cand_idx[j];
-            break;
+    if (cfg.gumbel_max) {
+        picked = sampling_gumbel_pick([&](int j) { return cand_idx[j]; }, [&](int j) { return prob[j]; }, support,
+                                      cfg.seed, sampling_produced_position(logical_positions[row], purpose));
+    } else {
+        const float u = sampling_uniform(cfg.seed, logical_positions[row], purpose, 0u);
+        float acc     = 0.0f;
+        for (int j = 0; j < support; ++j) {
+            acc += prob[j]; // prob is normalized: goal == u
+            if (u < acc) {
+                picked = cand_idx[j];
+                break;
+            }
         }
     }
     out[row] = picked;
@@ -281,14 +286,20 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sa
     sampling_normalize_support(cfg, cand_val, cand_idx, prob, &n_support, cap);
     if (tid == 0) {
         const int support = n_support;
-        const float u     = sampling_uniform(cfg.seed, logical_positions[col], purpose, 0u);
-        float acc         = 0.0f;
         int picked        = cand_idx[support - 1];
-        for (int j = 0; j < support; ++j) {
-            acc += prob[j];
-            if (u < acc) {
-                picked = cand_idx[j];
-                break;
+        if (cfg.gumbel_max) {
+            picked = sampling_gumbel_pick([&](int j) { return cand_idx[j]; }, [&](int j) { return prob[j]; },
+                                          support, cfg.seed,
+                                          sampling_produced_position(logical_positions[col], purpose));
+        } else {
+            const float u = sampling_uniform(cfg.seed, logical_positions[col], purpose, 0u);
+            float acc     = 0.0f;
+            for (int j = 0; j < support; ++j) {
+                acc += prob[j];
+                if (u < acc) {
+                    picked = cand_idx[j];
+                    break;
+                }
             }
         }
         out[col] = picked;

@@ -23,6 +23,8 @@
 #include "ops/offloaded_sparse_moe/cuda/wide_expert.h"
 #include "ops/precise/precise_decode.cuh"
 #include "ops/precise/precise_dot.cuh"
+#include "infernix/ops/lossless_linear.h"
+#include "ops/lossless/cr_math.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -33,6 +35,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace infernix::ops {
 namespace {
@@ -1258,6 +1261,7 @@ void launch_expert_pass_a16(const bf16* x, const MoeDispatch& dispatch, const Mo
 #include "ops/offloaded_sparse_moe/cuda/ggml_expert.cuh"
 #include "ops/offloaded_sparse_moe/cuda/fp8_expert.cuh"
 #include "ops/offloaded_sparse_moe/cuda/precise_expert.cuh"
+#include "ops/offloaded_sparse_moe/cuda/lossless_expert.cuh"
 
 // One pass of the narrow kernels in the source's arithmetic, for a call of `columns` columns. W4A4
 // jobs of any width take the one-column kernels (one pass per column over the staged weights); W4A16
@@ -1949,6 +1953,11 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
         check_launch("fetch plan");
     }
     const std::int32_t* flags = cpu ? cpu_flags : nullptr;
+    if (source.wide_a16 == moe::WideA16::kLossless) {
+        require(!cpu && source.landing_slots == 0, "the lossless route computes every expert on the GPU, in serial passes");
+        lossless_experts(x, dispatch, source, top_k, max_jobs, layout, fetch, outputs, stream);
+        return;
+    }
     const bool precise        = source.wide_a16 == moe::WideA16::kPrecise; // reads x and h as stored
     // A ggml bank's gate/up kernels read every token's x limbs, encoded once here, before any fork.
     if (ggml && !precise) {
@@ -2031,6 +2040,19 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
     }
     if (wait_for_cpu) { moe_experts_cpu_wait(x, dispatch, source, max_jobs, workspace, outputs, stream); }
 }
+
+namespace offloaded_moe::wide {
+
+std::size_t lossless_experts_bytes(std::int32_t max_jobs, std::int32_t entries) {
+    const auto tiles = static_cast<std::size_t>(lossless_max_tiles(max_jobs, entries));
+    const auto chunk = static_cast<std::size_t>(kLosslessChunkColumns);
+    const auto r256  = [](std::size_t b) { return (b + 255) / 256 * 256; };
+    return r256((static_cast<std::size_t>(max_jobs) + 1) * 4) + r256(tiles * 12) + 2 * r256(tiles * sizeof(LosslessTile)) +
+           2 * r256(tiles * 256) + r256(2 * static_cast<std::size_t>(kIntermediate) * chunk * 2) +
+           r256(static_cast<std::size_t>(kIntermediate) * chunk * 2) + r256(lossless_linear_bytes());
+}
+
+} // namespace offloaded_moe::wide
 
 void moe_combine(const Tensor& outputs, const MoeRouting& routing, const Tensor& shared, Tensor& y,
                  cudaStream_t stream) {

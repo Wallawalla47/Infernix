@@ -1,0 +1,627 @@
+"""Exact oracle for the lossless route's elementwise and row operations (include/infernix/ops/lossless_ops.h).
+
+Writes test cases and runs the CUDA test on them: python lossless_ops_oracle.py <test executable>.
+Every expected value follows docs/maintainer/lossless-route.md §2 and §2a step by step: sums exact (fractions),
+transcendental functions correctly rounded (decimal at 60 digits, lossless_cr_oracle.py), every
+intermediate rounded to the dtype the specification gives it. Standard library only.
+"""
+from __future__ import annotations
+
+import math
+import random
+import struct
+import subprocess
+import sys
+import tempfile
+from fractions import Fraction
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import lossless_cr_oracle as cr  # noqa: E402
+
+(RMSNORM, RMSNORM_GATED, ADD, SILU_MUL, SIGMOID_MUL, GDN_GATES, CAUSAL_CONV, ATTENTION, DELTA_RULE, ROPE, ROUTER,
+ MOE_COMBINE, MOE_ROUTE, RMSNORM_GROUPED, RMSNORM_GATED_SIGMOID, HC_GATES, HC_MIX, HC_INJECT, PLE_GATE, PLE_CONV,
+ QSA_POOL, QSA_SELECT, ATTENTION_SELECT, ROUTER_BF16, MOE_COMBINE_ENTRIES) = range(25)
+
+
+def bf16_value(bits: int) -> Fraction:
+    return Fraction(struct.unpack("<f", struct.pack("<I", bits << 16))[0])
+
+
+def f32_value(bits: int) -> Fraction:
+    return Fraction(struct.unpack("<f", struct.pack("<I", bits))[0])
+
+
+def f32_bits(f: float) -> int:
+    return struct.unpack("<I", struct.pack("<f", f))[0]
+
+
+def round_fraction(a: Fraction, prec: int) -> int:
+    """Correctly rounded bits of the exact rational a (binary32: prec 24; BF16: prec 8, low 16 bits)."""
+    total = 16 if prec == 8 else 32
+    sign = 1 if a < 0 else 0
+    a = abs(a)
+    if a == 0:
+        return sign << (total - 1)
+    e = a.numerator.bit_length() - a.denominator.bit_length()
+    if Fraction(2) ** e > a:
+        e -= 1
+    while Fraction(2) ** (e + 1) <= a:
+        e += 1
+    e = max(e, -126)
+    q = a / Fraction(2) ** (e - prec + 1)
+    n = q.numerator // q.denominator
+    rem = q - n
+    if rem > Fraction(1, 2) or (rem == Fraction(1, 2) and n % 2 == 1):
+        n += 1
+    if n == 2 ** prec:
+        n //= 2
+        e += 1
+    if e > 127:
+        return (sign << (total - 1)) | (255 << (prec - 1))
+    if n < 2 ** (prec - 1):
+        return (sign << (total - 1)) | n
+    return (sign << (total - 1)) | ((e + 127) << (prec - 1)) | (n - 2 ** (prec - 1))
+
+
+def sign_bit(bits: int, prec: int) -> int:
+    return (bits >> (15 if prec == 8 else 31)) & 1
+
+
+def signed_round(a: Fraction, prec: int, zero_negative: bool) -> int:
+    """round_fraction, with an exact zero taking the sign IEEE gives it (zero_negative)."""
+    bits = round_fraction(a, prec)
+    if a == 0 and zero_negative:
+        bits |= 1 << (15 if prec == 8 else 31)
+    return bits
+
+
+def float_of(bits: int, prec: int) -> float:
+    """The signed Python float of BF16 (prec 8) or binary32 bits."""
+    return struct.unpack("<f", struct.pack("<I", bits << 16 if prec == 8 else bits))[0]
+
+
+def f32_of(v: Fraction) -> Fraction:
+    return f32_value(round_fraction(v, 24))
+
+
+def bf16_of(v: Fraction) -> Fraction:
+    return bf16_value(round_fraction(v, 8))
+
+
+def cr32(func: int, x: Fraction) -> Fraction:
+    return f32_value(cr.evaluate(func, float(x)))
+
+
+def crbf(func: int, x: Fraction) -> Fraction:
+    return bf16_value(cr.evaluate(func, float(x)))
+
+
+def random_bf16(rng: random.Random, spread: int = 8) -> int:
+    v = rng.gauss(0.0, 1.0) * 2.0 ** rng.randint(-spread, spread)
+    if rng.random() < 0.02:
+        v = 0.0
+    if rng.random() < 0.01:
+        v = rng.gauss(0.0, 1.0) * 2.0 ** -130  # subnormal
+    return f32_bits(v) >> 16
+
+
+def rmsnorm_rows(xs: list[int], ws: list[int], w_fp32: bool, eps: float, width: int, gated: bool,
+                 zs: list[int] | None, groups: int = 1, sigmoid: bool = False) -> list[int]:
+    out = []
+    eps_v = f32_value(f32_bits(eps))
+    for row in range(len(xs) // width):
+        xr = xs[row * width:(row + 1) * width]
+        s = sum((bf16_value(b) ** 2 for b in xr), Fraction(0))
+        m = f32_of(s / width)
+        t = f32_value(round_fraction(m + eps_v, 24))
+        r = cr32(cr.RSQRT, t)
+        w0 = (row % groups) * width
+        for i, b in enumerate(xr):
+            w = f32_value(ws[w0 + i]) if w_fp32 else bf16_value(ws[w0 + i])
+            ws_ = (ws[w0 + i] >> 31) & 1 if w_fp32 else (ws[w0 + i] >> 15) & 1
+            sx = (b >> 15) & 1
+            if not gated:
+                y_bits = signed_round(bf16_value(b) * r, 24, sx == 1)
+                y = f32_value(y_bits)
+                gain = f32_of(1 + w)
+                sg = 1 if gain < 0 else 0  # 1 + w is +0 when w = -1
+                prod = f32_of(y * gain)
+                out.append(signed_round(prod, 8, (sign_bit(y_bits, 24) ^ sg) == 1 or (prod == 0 and y * gain < 0)))
+            else:
+                n_bits = signed_round(f32_of(bf16_value(b) * r), 8, sx == 1)
+                n = bf16_value(n_bits)
+                sn = sign_bit(n_bits, 8)
+                if w_fp32:
+                    y_bits = signed_round(w * n, 24, (ws_ ^ sn) == 1)
+                    y, sy = f32_value(y_bits), sign_bit(y_bits, 24)
+                else:
+                    y_bits = signed_round(w * n, 8, (ws_ ^ sn) == 1)
+                    y, sy = bf16_value(y_bits), sign_bit(y_bits, 8)
+                g_bits = cr.evaluate(cr.SIGMOID if sigmoid else cr.SILU, float_of(zs[row * width + i], 8))
+                s_ = f32_value(g_bits)
+                prod = f32_of(y * s_)
+                out.append(signed_round(prod, 8, (sy ^ sign_bit(g_bits, 24)) == 1 or (prod == 0 and y * s_ < 0)))
+    return out
+
+
+def write_u32(f, values):
+    f.write(struct.pack(f"<{len(values)}I", *values))
+
+
+def cases(rng: random.Random):
+    """Yields (op, dims, inputs (lists of u32), expected u32 list)."""
+    # RMSNorm, BF16 and FP32 weights, widths 256 (q/k norms) and 5120 (hidden).
+    for width, rows, w_fp32 in ((256, 48, False), (5120, 6, False), (5120, 4, True)):
+        xs = [random_bf16(rng) for _ in range(width * rows)]
+        # A row with outliers 2^12 apart and a row of tiny values.
+        for i in range(0, width, 7):
+            xs[i] = f32_bits(4096.0 * (1 if i % 14 == 0 else -1)) >> 16
+        for i in range(width, 2 * width):
+            xs[i] = f32_bits(rng.gauss(0.0, 1.0) * 2.0 ** -120) >> 16
+        ws = [f32_bits(rng.gauss(0.0, 0.1)) if w_fp32 else f32_bits(rng.gauss(0.0, 0.1)) >> 16 for _ in range(width)]
+        yield RMSNORM, [width, rows, int(w_fp32)], [xs, ws], rmsnorm_rows(xs, ws, w_fp32, 1e-6, width, False, None)
+    # Gated RMSNorm (width 128).
+    for w_fp32 in (False, True):
+        width, rows = 128, 64
+        os_ = [random_bf16(rng) for _ in range(width * rows)]
+        zs = [random_bf16(rng, 4) for _ in range(width * rows)]
+        ws = [f32_bits(rng.gauss(1.0, 0.2)) if w_fp32 else f32_bits(rng.gauss(1.0, 0.2)) >> 16 for _ in range(width)]
+        yield (RMSNORM_GATED, [width, rows, int(w_fp32)], [os_, zs, ws],
+               rmsnorm_rows(os_, ws, w_fp32, 1e-6, width, True, zs))
+    # Elementwise pairs.
+    n = 20000
+    a = [random_bf16(rng, 40) for _ in range(n)]
+    b = [random_bf16(rng, 40) for _ in range(n)]
+    yield ADD, [n], [a, b], [round_fraction(bf16_value(x) + bf16_value(y), 8) for x, y in zip(a, b)]
+    g = [random_bf16(rng, 5) for _ in range(n)]
+    u = [random_bf16(rng, 5) for _ in range(n)]
+    silu_mul = []
+    for x, y in zip(g, u):
+        act = cr.evaluate(cr.SILU_BF16, float_of(x, 8))
+        silu_mul.append(signed_round(bf16_value(act) * bf16_value(y), 8, (sign_bit(act, 8) ^ sign_bit(y, 8)) == 1))
+    yield SILU_MUL, [n], [g, u], silu_mul
+    sigmoid_mul = []
+    for x, y in zip(u, g):
+        sig = cr.evaluate(cr.SIGMOID_BF16, float_of(y, 8))
+        sigmoid_mul.append(signed_round(bf16_value(x) * bf16_value(sig), 8, (sign_bit(x, 8) ^ sign_bit(sig, 8)) == 1))
+    yield SIGMOID_MUL, [n], [u, g], sigmoid_mul
+    # GDN gates: H heads, T columns.
+    heads, cols = 48, 64
+    av = [random_bf16(rng, 3) for _ in range(heads * cols)]
+    bv = [random_bf16(rng, 3) for _ in range(heads * cols)]
+    a_log = [f32_bits(rng.uniform(-3.0, 2.0)) for _ in range(heads)]
+    dt = [f32_bits(rng.uniform(-6.0, 2.0)) for _ in range(heads)]
+    gs, betas = [], []
+    for i in range(heads * cols):
+        h = i % heads
+        betas.append(cr.evaluate(cr.SIGMOID_BF16, float(bf16_value(bv[i]))))
+        t = f32_of(bf16_value(av[i]) + f32_value(dt[h]))
+        sp = cr32(cr.SOFTPLUS, t)
+        e = cr32(cr.EXP, f32_value(a_log[h]))
+        gs.append(round_fraction(-(e * sp), 24))
+    yield GDN_GATES, [heads, cols], [av, bv, a_log, dt], gs + betas
+    # Causal conv: C channels, T columns, 4 taps.
+    channels, cols, taps = 96, 40, 4
+    x = [random_bf16(rng, 20) for _ in range(channels * cols)]
+    w = [random_bf16(rng, 2) for _ in range(channels * taps)]
+    expected = []
+    for t in range(cols):
+        for c in range(channels):
+            s = Fraction(0)
+            for tap in range(taps):
+                src = t - taps + 1 + tap
+                if src >= 0:
+                    s += bf16_value(x[src * channels + c]) * bf16_value(w[tap * channels + c])
+            expected.append(cr.evaluate(cr.SILU_BF16, float_of(round_fraction(s, 24), 24)))
+    yield CAUSAL_CONV, [channels, cols, taps], [x, w], expected
+    # Attention: [256, heads, T] q, [256, kv heads, T] k and v. One case of ordinary values, one with
+    # products far below the largest (q and k elements 2^-80 against 2^20: the exact fallback).
+    for spread in (False, True):
+        heads, kv_heads, cols = 4, 2, 24
+        q = [random_bf16(rng, 2) for _ in range(256 * heads * cols)]
+        k = [random_bf16(rng, 2) for _ in range(256 * kv_heads * cols)]
+        v = [random_bf16(rng, 3) for _ in range(256 * kv_heads * cols)]
+        if spread:
+            for idx in range(0, len(q), 37):
+                q[idx] = f32_bits(rng.choice([1.0, -1.0]) * 2.0 ** 20) >> 16
+            for idx in range(5, len(q), 41):
+                q[idx] = f32_bits(rng.choice([1.0, -1.0]) * 2.0 ** -80) >> 16
+            for idx in range(3, len(k), 29):
+                k[idx] = f32_bits(rng.choice([1.0, -1.0]) * 2.0 ** -70) >> 16
+            # Value elements far below their channel's largest (rounded to the value grid).
+            for idx in range(7, len(v), 23):
+                v[idx] = f32_bits(rng.gauss(0.0, 1.0) * 2.0 ** -40) >> 16
+        yield ATTENTION, [heads, kv_heads, cols], [q, k, v], attention(q, k, v, heads, kv_heads, cols)
+    # Gated delta rule: Hk = 1, Hv = 2, 8 tokens; g negative (decay below one), beta in (0, 1).
+    hk, hv, cols = 1, 2, 8
+    q = [random_bf16(rng, 2) for _ in range(128 * hk * cols)]
+    k = [random_bf16(rng, 2) for _ in range(128 * hk * cols)]
+    v = [random_bf16(rng, 2) for _ in range(128 * hv * cols)]
+    g = [f32_bits(-rng.uniform(0.0, 2.0)) for _ in range(hv * cols)]
+    beta = [f32_bits(rng.uniform(0.05, 0.95)) >> 16 for _ in range(hv * cols)]
+    yield DELTA_RULE, [hk, hv, cols], [q, k, v, g, beta], delta_rule(q, k, v, g, beta, hk, hv, cols)
+    # RoPE (theta 1e7, rotary 64 of 256): 1-D positions up to 262,143 and MRoPE positions differing per
+    # axis.
+    for axes in (1, 3):
+        heads, cols = 3, 20
+        positions = [rng.randrange(0, 262144) if i % 4 else i for i in range(cols * axes)]
+        x = [random_bf16(rng, 6) for _ in range(256 * heads * cols)]
+        yield ROPE, [heads, cols, axes], [positions, x], rope(positions, x, heads, cols, axes)
+    # Router: 256 experts (logits [257, T], the last row the shared gate's), top 8; a column of equal
+    # logits (ties to the lower expert) and one of widely spread logits.
+    experts, top_k, cols = 256, 8, 12
+    logits = [random_bf16(rng, 2) for _ in range((experts + 1) * cols)]
+    for e in range(experts + 1):
+        logits[1 * (experts + 1) + e] = f32_bits(0.5) >> 16
+        logits[2 * (experts + 1) + e] = f32_bits(rng.uniform(-90.0, 30.0)) >> 16
+    yield ROUTER, [experts, top_k, cols], [logits], router(logits, experts, top_k, cols)
+    # Combine: width 64, 9 columns, top 8 slots placed at scattered gathered columns, a shared expert.
+    width, cols, top_k, gathered = 64, 9, 8, 128
+    expert_out = [random_bf16(rng, 6) for _ in range(width * gathered)]
+    ids, weights, slot_column = [], [], []
+    columns_free = list(range(gathered))
+    rng.shuffle(columns_free)
+    for t in range(cols):
+        chosen = rng.sample(range(256), top_k)
+        ids += chosen
+        weights += [f32_bits(rng.uniform(0.0, 0.4)) for _ in range(top_k)]
+        slot_column += [columns_free.pop() for _ in range(top_k)]
+    shared_out = [random_bf16(rng, 6) for _ in range(width * cols)]
+    shared_logits = [random_bf16(rng, 2) for _ in range(3 * cols)]
+    residual = [random_bf16(rng, 8) for _ in range(width * cols)]
+    yield (MOE_COMBINE, [width, cols, top_k, gathered],
+           [expert_out, weights, ids, slot_column, shared_out, shared_logits, residual],
+           moe_combine(expert_out, weights, ids, slot_column, shared_out, shared_logits, residual, width, cols, top_k))
+    # Routing (structure, checked by the test itself): 256 experts, top 8, 70 columns.
+    cols = 70
+    ids = []
+    for t in range(cols):
+        ids += rng.sample(range(256) if t % 3 else range(12), 8)
+    x = [random_bf16(rng, 4) for _ in range(64 * cols)]
+    yield MOE_ROUTE, [256, 8, cols], [ids, x], [1]
+    yield from flash_cases(rng)
+
+
+def round_sqrt(a: Fraction, prec: int) -> int:
+    """Correctly rounded bits of sqrt(a) (a >= 0)."""
+    if a == 0:
+        return 0
+    k = 120 + max(0, -(a.numerator.bit_length() - a.denominator.bit_length()))
+    scaled = a * (1 << (2 * k))
+    n = scaled.numerator // scaled.denominator
+    s = math.isqrt(n)
+    exact = s * s == n and scaled.denominator == 1
+    v = Fraction(2 * s + (0 if exact else 1), 1 << (k + 1))
+    return round_fraction(v, prec)
+
+
+def flash_cases(rng: random.Random):
+    """Qwen3.8-Flash-Next's operations (§2a)."""
+    # Grouped RMSNorm: 4 streams of 2560 (BF16 weights) and of 128 (FP32 weights).
+    for width, groups, cols, w_fp32 in ((2560, 4, 3, False), (128, 4, 9, True)):
+        xs = [random_bf16(rng) for _ in range(width * groups * cols)]
+        ws = [f32_bits(rng.gauss(0.0, 0.1)) if w_fp32 else f32_bits(rng.gauss(0.0, 0.1)) >> 16
+              for _ in range(width * groups)]
+        yield (RMSNORM_GROUPED, [width, groups, cols, int(w_fp32)], [xs, ws],
+               rmsnorm_rows(xs, ws, w_fp32, 1e-6, width, False, None, groups))
+    # Gated RMSNorm with the sigmoid gate (Flash-Next's output_gate_type).
+    width, rows = 128, 48
+    os_ = [random_bf16(rng) for _ in range(width * rows)]
+    zs = [random_bf16(rng, 4) for _ in range(width * rows)]
+    ws = [f32_bits(rng.gauss(1.0, 0.2)) >> 16 for _ in range(width)]
+    yield (RMSNORM_GATED_SIGMOID, [width, rows, 0], [os_, zs, ws],
+           rmsnorm_rows(os_, ws, False, 1e-6, width, True, zs, 1, True))
+    # Hyper-connection gates: rank 320 + 4 injection rows, 7 columns (one large, one tiny value).
+    rank, streams, cols = 320, 4, 7
+    rows = rank + streams
+    dj = [random_bf16(rng, 6) for _ in range(rows * cols)]
+    dj[3] = f32_bits(2.0 ** -133) >> 16  # d / 4 rounds (subnormal)
+    mix, inject = [0] * (rank * cols), [0] * (streams * cols)
+    for t in range(cols):
+        for r in range(rows):
+            d = dj[t * rows + r]
+            q_bits = signed_round(bf16_value(d) / streams, 8, sign_bit(d, 8) == 1)
+            if r < rank:
+                mix[t * rank + r] = cr.evaluate(cr.SILU_BF16, float_of(q_bits, 8))
+            else:
+                inject[t * streams + r - rank] = round_fraction(2 * crbf(cr.SIGMOID_BF16, bf16_value(q_bits)), 8)
+    yield HC_GATES, [rank, streams, cols], [dj], mix + inject
+    # Mix: x_i = bf16(sum_c bf16(bf16(sigmoid(u)) n) / S); width 192, 4 streams, 5 columns.
+    width, streams, cols = 192, 4, 5
+    up = [random_bf16(rng, 4) for _ in range(width * streams * cols)]
+    nm = [random_bf16(rng, 40) for _ in range(width * streams * cols)]
+    x = []
+    for t in range(cols):
+        for i in range(width):
+            s = sum((bf16_of(crbf(cr.SIGMOID_BF16, bf16_value(up[(t * streams + c) * width + i])) *
+                             bf16_value(nm[(t * streams + c) * width + i])) for c in range(streams)), Fraction(0))
+            x.append(round_fraction(s / streams, 8))
+    yield HC_MIX, [width, streams, cols], [up, nm], x
+    # Injection: R_ci = bf16(R_ci + bf16(y_i j_c)).
+    y = [random_bf16(rng, 6) for _ in range(width * cols)]
+    j = [round_fraction(2 * bf16_value(random_bf16(rng, 0)) ** 2 / (1 + bf16_value(random_bf16(rng, 0)) ** 2), 8)
+         for _ in range(streams * cols)]
+    res = [random_bf16(rng, 6) for _ in range(width * streams * cols)]
+    out = []
+    for t in range(cols):
+        for c in range(streams):
+            for i in range(width):
+                yb, jb = y[t * width + i], j[t * streams + c]
+                term = signed_round(bf16_value(yb) * bf16_value(jb), 8, (sign_bit(yb, 8) ^ sign_bit(jb, 8)) == 1)
+                rb = res[(t * streams + c) * width + i]
+                out.append(signed_round(bf16_value(rb) + bf16_value(term), 8,
+                                        math.copysign(1.0, float_of(rb, 8) + float_of(term, 8)) < 0))
+    yield HC_INJECT, [width, streams, cols], [y, j, res], out
+    # PLE gate: width 2560, 4 streams, 4 columns; a column whose scores fall below the 1e-6 clamp.
+    width, streams, cols = 2560, 4, 4
+    kn = [random_bf16(rng, 2) for _ in range(width * streams * cols)]
+    qn = [random_bf16(rng, 2) for _ in range(width * streams * cols)]
+    for i in range(width * streams * 3, width * streams * 4):
+        qn[i] = f32_bits(rng.gauss(0.0, 1.0) * 2.0 ** -40) >> 16
+    val = [random_bf16(rng, 3) for _ in range(width * cols)]
+    divisor = f32_value(f32_bits(math.sqrt(width)))
+    floor_ = bf16_of(f32_value(f32_bits(1e-6)))
+    scores, gated = [], []
+    for t in range(cols):
+        for c in range(streams):
+            base = (t * streams + c) * width
+            g = bf16_of(sum((bf16_of(bf16_value(kn[base + i]) * bf16_value(qn[base + i])) for i in range(width)),
+                            Fraction(0)))
+            g = bf16_of(g / divisor)
+            a = abs(g) if abs(g) >= f32_value(f32_bits(1e-6)) else floor_
+            root = bf16_value(round_sqrt(a, 8))
+            s = root if g > 0 else (-root if g < 0 else Fraction(0))
+            scores.append(round_fraction(s, 8))
+    for t in range(cols):
+        for c in range(streams):
+            sg = crbf(cr.SIGMOID_BF16, bf16_value(scores[t * streams + c]))  # positive
+            for i in range(width):
+                vb = val[t * width + i]
+                gated.append(signed_round(sg * bf16_value(vb), 8, sign_bit(vb, 8) == 1))
+    yield PLE_GATE, [width, streams, cols], [kn, qn, val], scores + gated
+    # PLE convolution: 160 channels, 20 columns, 4 taps, dilation 3.
+    channels, cols, taps, dilation = 160, 20, 4, 3
+    gt = [random_bf16(rng, 4) for _ in range(channels * cols)]
+    nz = [random_bf16(rng, 20) for _ in range(channels * cols)]
+    w = [random_bf16(rng, 2) for _ in range(channels * taps)]
+    res = [random_bf16(rng, 4) for _ in range(channels * cols)]
+    out = []
+    for t in range(cols):
+        for c in range(channels):
+            s = Fraction(0)
+            for tap in range(taps):
+                src = t - (taps - 1 - tap) * dilation
+                if src >= 0:
+                    s += bf16_value(w[tap * channels + c]) * bf16_value(nz[src * channels + c])
+            act_bits = cr.evaluate(cr.SILU_BF16, float_of(round_fraction(s, 8), 8))
+            g_bits = gt[t * channels + c]
+            o_bits = signed_round(bf16_value(g_bits) + bf16_value(act_bits), 8,
+                                  math.copysign(1.0, float_of(g_bits, 8) + float_of(act_bits, 8)) < 0)
+            r_bits = res[t * channels + c]
+            out.append(signed_round(bf16_value(r_bits) + bf16_value(o_bits), 8,
+                                    math.copysign(1.0, float_of(r_bits, 8) + float_of(o_bits, 8)) < 0))
+    yield PLE_CONV, [channels, cols, taps, dilation], [gt, nz, w, res], out
+    # Pooled keys: dim 128, ratio 4, 30 columns (7 blocks).
+    dim, ratio, cols = 128, 4, 30
+    keys = [random_bf16(rng, 30) for _ in range(dim * cols)]
+    pooled = []
+    for b in range(cols // ratio):
+        for d in range(dim):
+            s = sum((bf16_value(keys[(b * ratio + i) * dim + d]) for i in range(ratio)), Fraction(0))
+            pooled.append(round_fraction(f32_of(s / ratio), 8))
+    yield QSA_POOL, [dim, ratio, cols], [keys], pooled
+    # Selection: 4 heads, ratio 4, budget 5 blocks, 64 columns (16 blocks); ties and negative scores.
+    heads, ratio, budget, dim, cols = 4, 4, 5, 128, 64
+    blocks = cols // ratio
+    sc = []
+    for t in range(cols):
+        for h in range(heads):
+            for b in range(blocks):
+                v = rng.choice([0.5, 0.25, -1.0, rng.gauss(0.0, 1.0), rng.gauss(0.0, 1.0) * 2.0 ** -30])
+                sc.append(f32_bits(v))
+    words = (blocks + 31) // 32
+    divisor = f32_value(f32_bits(math.sqrt(dim)))
+    expected = []
+    for t in range(cols):
+        n = (t + 1) // ratio
+        chosen = set(range(n))
+        if n > budget:
+            vals = []
+            for b in range(n):
+                s = sum((max(f32_value(sc[(t * heads + h) * blocks + b]), Fraction(0)) for h in range(heads)), Fraction(0))
+                vals.append(f32_of(f32_of(s) / divisor))
+            chosen = set(sorted(range(n), key=lambda b: (-vals[b], b))[:budget])
+        row = [0] * words
+        for b in chosen:
+            row[b // 32] |= 1 << (b % 32)
+        expected += row
+    yield QSA_SELECT, [heads, ratio, budget, dim, cols], [sc], expected
+    # Attention with a selection: ratio 4, 28 columns, random selected blocks per query.
+    heads, kv_heads, cols, ratio = 4, 2, 28, 4
+    q = [random_bf16(rng, 2) for _ in range(256 * heads * cols)]
+    k = [random_bf16(rng, 2) for _ in range(256 * kv_heads * cols)]
+    v = [random_bf16(rng, 3) for _ in range(256 * kv_heads * cols)]
+    sel = []
+    for t in range(cols):
+        bits = 0
+        for b in range((t + 1) // ratio):
+            if rng.random() < 0.5 or b == 0:
+                bits |= 1 << b
+        sel.append(bits)
+    yield ATTENTION_SELECT, [heads, kv_heads, cols, ratio], [q, k, v, sel], attention(q, k, v, heads, kv_heads, cols, sel, ratio)
+    # Router with BF16 weights: 512 experts, top 10 (Flash-Next).
+    experts, top_k, cols = 512, 10, 6
+    logits = [random_bf16(rng, 2) for _ in range((experts + 1) * cols)]
+    ref = router(logits, experts, top_k, cols)
+    weights = [(round_fraction(f32_value(b), 8) << 16) for b in ref[:top_k * cols]]
+    yield ROUTER_BF16, [experts, top_k, cols], [logits], weights + ref[top_k * cols:]
+    # Combine by entry (the offloaded MoE's outputs at column t k + slot), BF16 weights, no residual add.
+    width, cols, top_k = 64, 7, 10
+    expert_out = [random_bf16(rng, 6) for _ in range(width * cols * top_k)]
+    ids, weights = [], []
+    for t in range(cols):
+        ids += rng.sample(range(512), top_k)
+        weights += [f32_bits(rng.uniform(0.0, 0.3)) & 0xFFFF0000 for _ in range(top_k)]
+    shared_out = [random_bf16(rng, 6) for _ in range(width * cols)]
+    shared_logits = [random_bf16(rng, 2) for _ in range(cols)]
+    out = []
+    for t in range(cols):
+        slots = sorted(range(top_k), key=lambda s: ids[t * top_k + s])
+        gate = crbf(cr.SIGMOID_BF16, bf16_value(shared_logits[t]))
+        for h in range(width):
+            s = Fraction(0)
+            for slot in slots:
+                at = t * top_k + slot
+                s = bf16_of(s + bf16_of(bf16_value(expert_out[at * width + h]) * f32_value(weights[at])))
+            out.append(round_fraction(s + bf16_of(bf16_value(shared_out[t * width + h]) * gate), 8))
+    yield MOE_COMBINE_ENTRIES, [width, cols, top_k], [expert_out, weights, ids, shared_out, shared_logits], out
+
+
+def rope(positions, x, heads, cols, axes):
+    pairs = 32
+    inv = []
+    for i in range(pairs):
+        p = cr.round_binary(cr.Decimal(10000000) ** (cr.Decimal(2 * i) / 64), 24)
+        inv.append(f32_of(1 / f32_value(p)))
+    out = list(x)
+    for t in range(cols):
+        for i in range(pairs):
+            axis = i % 3 if axes == 3 else 0
+            angle = f32_of(positions[axis * cols + t] * inv[i])
+            c = bf16_of(cr32(cr.COS, angle))
+            s = bf16_of(cr32(cr.SIN, angle))
+            c_bits = round_fraction(c, 8)
+            s_bits = round_fraction(s, 8)
+            for h in range(heads):
+                base = (t * heads + h) * 256
+                xa, xb = x[base + i], x[base + i + pairs]
+                a, b = bf16_value(xa), bf16_value(xb)
+                ac = signed_round(a * c, 8, (sign_bit(xa, 8) ^ sign_bit(c_bits, 8)) == 1)
+                bs = signed_round(b * s, 8, (sign_bit(xb, 8) ^ sign_bit(s_bits, 8)) == 1)
+                bc = signed_round(b * c, 8, (sign_bit(xb, 8) ^ sign_bit(c_bits, 8)) == 1)
+                as_ = signed_round(a * s, 8, (sign_bit(xa, 8) ^ sign_bit(s_bits, 8)) == 1)
+                d1 = float_of(ac, 8) - float_of(bs, 8)
+                d2 = float_of(bc, 8) + float_of(as_, 8)
+                out[base + i] = signed_round(bf16_value(ac) - bf16_value(bs), 8, math.copysign(1.0, d1) < 0)
+                out[base + i + pairs] = signed_round(bf16_value(bc) + bf16_value(as_), 8, math.copysign(1.0, d2) < 0)
+    return out
+
+
+def router(logits, experts, top_k, cols):
+    from decimal import Decimal
+    weights, ids = [], []
+    for t in range(cols):
+        ls = [bf16_value(logits[t * (experts + 1) + e]) for e in range(experts)]
+        m = max(ls)
+        es = [(Decimal(l.numerator) / Decimal(l.denominator) - Decimal(m.numerator) / Decimal(m.denominator)).exp()
+              for l in ls]
+        total = sum(es, Decimal(0))
+        p = [f32_value(cr.round_binary(e / total, 24)) for e in es]
+        order = sorted(range(experts), key=lambda e: (-p[e], e))[:top_k]
+        denominator = f32_of(sum((p[e] for e in order), Fraction(0)))
+        weights += [round_fraction(p[e] / denominator, 24) for e in order]
+        ids += order
+    return weights + ids
+
+
+def moe_combine(expert_out, weights, ids, slot_column, shared_out, shared_logits, residual, width, cols, top_k):
+    out = []
+    for t in range(cols):
+        slots = sorted(range(top_k), key=lambda s: ids[t * top_k + s])
+        gate = crbf(cr.SIGMOID_BF16, bf16_value(shared_logits[t * 3 + 2]))
+        for h in range(width):
+            s = Fraction(0)
+            for slot in slots:
+                at = t * top_k + slot
+                y = bf16_value(expert_out[slot_column[at] * width + h])
+                s = bf16_of(s + bf16_of(f32_of(y * f32_value(weights[at]))))
+            s = bf16_of(s + bf16_of(bf16_value(shared_out[t * width + h]) * gate))
+            out.append(round_fraction(bf16_value(residual[t * width + h]) + s, 8))
+    return out
+
+
+def delta_rule(q, k, v, g, beta, hk, hv, cols):
+    eps = f32_value(f32_bits(1e-6))
+    scale = f32_value(0x3DB504F3)
+    out = [0] * (128 * hv * cols)
+    for head in range(hv):
+        kh = head // (hv // hk)
+        S = [[Fraction(0)] * 128 for _ in range(128)]  # S[i][j]
+        for t in range(cols):
+            qv = [bf16_value(q[(t * hk + kh) * 128 + d]) for d in range(128)]
+            kv = [bf16_value(k[(t * hk + kh) * 128 + d]) for d in range(128)]
+            rq = cr32(cr.RSQRT, f32_of(f32_of(sum((x * x for x in qv), Fraction(0))) + eps))
+            rk = cr32(cr.RSQRT, f32_of(f32_of(sum((x * x for x in kv), Fraction(0))) + eps))
+            qn = [f32_of(f32_of(x * rq) * scale) for x in qv]
+            kn = [f32_of(x * rk) for x in kv]
+            decay = cr32(cr.EXP, f32_value(g[t * hv + head]))
+            b = bf16_value(beta[t * hv + head])
+            for i in range(128):
+                for j in range(128):
+                    S[i][j] = f32_of(S[i][j] * decay)
+            for j in range(128):
+                u = f32_of(sum((f32_of(S[i][j] * kn[i]) for i in range(128)), Fraction(0)))
+                delta = f32_of(f32_of(bf16_value(v[(t * hv + head) * 128 + j]) - u) * b)
+                for i in range(128):
+                    S[i][j] = f32_of(S[i][j] + f32_of(kn[i] * delta))
+                o = f32_of(sum((f32_of(S[i][j] * qn[i]) for i in range(128)), Fraction(0)))
+                out[(t * hv + head) * 128 + j] = round_fraction(o, 8)
+    return out
+
+
+def attention(q, k, v, heads, kv_heads, cols, select=None, ratio=0):
+    group = heads // kv_heads
+    out = [0] * (256 * heads * cols)
+    for t in range(cols):
+        if select is None:
+            keys = list(range(t + 1))
+        else:
+            tail = (t + 1) // ratio * ratio
+            keys = [j for j in range(t + 1) if j >= tail or (select[t] >> (j // ratio)) & 1]
+        for h in range(heads):
+            kvh = h // group
+            qr = [bf16_value(q[(t * heads + h) * 256 + d]) for d in range(256)]
+            scores = []
+            for j in keys:
+                kr = k[(j * kv_heads + kvh) * 256:(j * kv_heads + kvh + 1) * 256]
+                scores.append(sum((a * bf16_value(b) for a, b in zip(qr, kr)), Fraction(0)) / 16)
+            m = max(scores)
+            ps = [f32_value(cr.evaluate(cr.EXP, float(f32_of(s - m)))) for s in scores]
+            den = sum(ps, Fraction(0))
+            for c in range(256):
+                num = sum((p * bf16_value(v[(j * kv_heads + kvh) * 256 + c]) for j, p in zip(keys, ps)), Fraction(0))
+                out[(t * heads + h) * 256 + c] = round_fraction(num / den, 8)
+    return out
+
+
+def write_cases(path: Path) -> None:
+    rng = random.Random(20261021)
+    count = 0
+    with path.open("wb") as f:
+        for op, dims, inputs, expected in cases(rng):
+            write_u32(f, [op, len(dims)] + dims + [len(inputs)] + [len(v) for v in inputs] + [len(expected)])
+            for v in inputs:
+                write_u32(f, v)
+            write_u32(f, expected)
+            count += 1
+    print(f"{count} cases", flush=True)
+
+
+def main() -> int:
+    """lossless_ops_oracle.py <test executable> [case file]: a given case file is written once and
+    reused afterwards (the cases are deterministic)."""
+    exe = sys.argv[1]
+    if len(sys.argv) > 2:
+        path = Path(sys.argv[2])
+        if not path.is_file():
+            write_cases(path)
+        return subprocess.run([exe, str(path)], check=False).returncode
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "ops_cases.bin"
+        write_cases(path)
+        return subprocess.run([exe, str(path)], check=False).returncode
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

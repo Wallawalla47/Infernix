@@ -18,6 +18,8 @@ enum SamplePurpose : std::int32_t {
     kSamplePurposeSpeculativeCorrection = 3,
     kSamplePurposeSpeculativeBonus      = 4,
     kSamplePurposeDFlash2Proposal       = 5,
+    // SamplingConfig::gumbel_max: the Gumbel noise of a token, keyed by the produced token's position.
+    kSamplePurposeGumbel = 6,
 };
 
 // Borrowed round operand. Positions are contiguous packed vocabulary masks; null disables it.
@@ -40,6 +42,11 @@ struct SamplingConfig {
     unsigned long long seed    = 0;
     std::int32_t* token_counts = nullptr; // device [token_domain] i32, or null
     SamplingMask mask;
+    // Positive-temperature draws by Gumbel-max (the reproducible and lossless routes): the token of
+    // the truncated support maximizing log p_v + g_v, g_v a standard Gumbel variate keyed by (seed, the
+    // produced token's position, v). Speculative verification then compares each draft with that
+    // token as greedy verification does, so speculation returns plain sampling's text.
+    bool gumbel_max = false;
 };
 
 // Caller-owned transient capacity for every parallel sampling-lane count in the inclusive
@@ -78,7 +85,10 @@ struct SamplingConfig {
  *
  * Row b uses counter-based RNG key
  * (configs[b].seed,logical_positions[b],purpose), without mutable RNG state or dependence on the
- * compact row index. In every mode the selected token atomically increments
+ * compact row index. A gumbel_max row instead takes the Gumbel-max token of the support with noise
+ * keyed by (seed, P, v) for the produced token's position P: logical_positions[b] under
+ * kSamplePurposePrefill (the prompt's next position), logical_positions[b] + 1 otherwise (the
+ * input token's position). In every mode the selected token atomically increments
  * configs[b].token_counts when it is non-null. Non-null token-count arrays belonging to distinct
  * active requests must not alias. `out` must not overlap logits, configs, logical_positions, or any
  * token-count array. The Op writes all of out, uses caller-owned transient storage reported by

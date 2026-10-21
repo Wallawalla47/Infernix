@@ -2,9 +2,9 @@
 // corpus, written as token ids, through the production decode path: DFlash2 with 7 drafts and the
 // optimized proposal head, INT8 KV, CUDA Graph decode; with `mtp`, Qwen3.8-Flash-Next's: its MTP
 // drafter with 4 drafts and the optimized proposal head; with `plain`, no speculation (one token per
-// round, the single-column decode kernels). Fast paths run as in infernix-serve; `exact` runs the
-// exact route (EngineOptions::fast_paths off) and `path=NAME` also runs that fast path whether or
-// not it is qualified (qualification). Qwen3.8-Flash-Next's DFlash2 drafter is a companion artifact:
+// round, the single-column decode kernels). Fast paths run as in infernix-serve; `reproducible`
+// runs the reproducible route (EngineOptions::fast_paths off) and `path=NAME` also runs that fast
+// path whether or not it is qualified (qualification). Qwen3.8-Flash-Next's DFlash2 drafter is a companion artifact:
 // `draft-model=FILE` selects it (`drafts=N`, 1-7, its draft count, also MTP's; `auto` its per-round length;
 // `full-head` drafts with the text head instead of the proposal head). `temperature=T` samples
 // instead (top-k 20, top-p 0.95, segment s seeded s + 1: a speed workload; the judge scores greedy
@@ -17,7 +17,7 @@
 // decode with NInfer's.
 //
 // Usage: infernix_decode_quality_gen <artifact> <corpus.txt> <out.txt> <segments> <prompt_tokens>
-//                                  <new_tokens> [ngram] [mtp [auto] [min-p=P]] [plain] [exact] [path=NAME]...
+//                                  <new_tokens> [ngram] [mtp [auto] [min-p=P]] [plain] [reproducible] [path=NAME]...
 //                                  [draft-model=FILE [drafts=N] [auto] [full-head]] (Qwen3.8-Flash-Next DFlash2)
 //                                  [temperature=T]
 //                                  [ngram-volume=FILE] (Qwen3.8-Flash-Next; default <artifact>.ngram)
@@ -39,7 +39,7 @@
 int main(int argc, char** argv) {
     if (argc < 7) {
         std::cerr << "usage: infernix_decode_quality_gen <artifact> <corpus.txt> <out.txt> <segments> "
-                     "<prompt_tokens> <new_tokens> [ngram] [mtp [auto] [min-p=P]] [plain] [exact] [path=NAME]... "
+                     "<prompt_tokens> <new_tokens> [ngram] [mtp [auto] [min-p=P]] [plain] [reproducible] [path=NAME]... "
                      "[kv=bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2]\n";
         return 2;
     }
@@ -47,7 +47,7 @@ int main(int argc, char** argv) {
         const auto segments      = static_cast<std::uint32_t>(std::stoul(argv[4]));
         const auto prompt_tokens = static_cast<std::uint32_t>(std::stoul(argv[5]));
         const auto new_tokens    = static_cast<std::uint32_t>(std::stoul(argv[6]));
-        bool ngram = false, mtp = false, plain = false, exact = false, draft_auto = false, full_head = false;
+        bool ngram = false, mtp = false, plain = false, reproducible = false, draft_auto = false, full_head = false;
         std::vector<std::string> paths;
         std::string ngram_volume, route_trace, draft_model;
         std::uint32_t drafts = 7;
@@ -67,8 +67,8 @@ int main(int argc, char** argv) {
                 min_p = std::stof(flag.substr(6));
             } else if (flag == "plain") {
                 plain = true;
-            } else if (flag == "exact") {
-                exact = true;
+            } else if (flag == "reproducible") {
+                reproducible = true;
             } else if (flag.starts_with("ngram-volume=")) {
                 ngram_volume = flag.substr(13);
             } else if (flag.starts_with("route-trace=")) {
@@ -106,7 +106,7 @@ int main(int argc, char** argv) {
                 }
             } else {
                 std::cerr << "unknown option " << flag
-                          << " (ngram, mtp, auto, min-p=P, plain, exact, path=NAME, draft-model=FILE, drafts=N, "
+                          << " (ngram, mtp, auto, min-p=P, plain, reproducible, path=NAME, draft-model=FILE, drafts=N, "
                              "full-head, temperature=T, ngram-volume=FILE, route-trace=FILE, kv=NAME)\n";
                 return 2;
             }
@@ -165,14 +165,14 @@ int main(int argc, char** argv) {
         }
         if (plain) { options.speculative = {}; }
 #if defined(INFERNIX_DECODE_QUALITY_NINFER)
-        if (exact || !paths.empty() || !route_trace.empty()) {
+        if (reproducible || !paths.empty() || !route_trace.empty()) {
             std::cerr << "fast-path and route-trace options are not available in NInfer\n";
             return 2;
         }
 #else
         // Qwen3.8-Flash-Next: the per-round expert routes for tools/expert_cache_replay/host_tier.py.
         options.route_trace_path = route_trace;
-        options.fast_paths = !exact;
+        options.fast_paths = !reproducible;
         for (const std::string& name : paths) {
             const std::optional<infernix::FastPath> path = infernix::parse_fast_path(name);
             if (!path) {

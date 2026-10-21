@@ -2,7 +2,7 @@
 // INFERNIX_QWEN4_ARTIFACT names a Qwen4Exp artifact and INFERNIX_QWEN4_DFLASH2 its DFlash2 companion
 // (tools.convert --components dflash2); INFERNIX_QWEN4_NGRAM names its n-gram volume (default
 // <artifact>.ngram), INFERNIX_QWEN4_KV the KV storage (default int8). Every engine runs the exact
-// route (--disable-fast-paths).
+// route (--reproducible).
 //
 //   greedy        Two prompts, 256 greedy tokens: DFlash2 7 (text head, and the proposal head with
 //                 --lm-head-draft when the artifact has one) gives plain decoding's tokens, and its

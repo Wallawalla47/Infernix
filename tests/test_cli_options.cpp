@@ -308,11 +308,11 @@ int run_tests() {
     failures += check(help.find("--use-original-nvfp4-prefill-kernel") != std::string::npos,
                       "CLI help omits --use-original-nvfp4-prefill-kernel");
     failures += check(k8v4.fast_paths, "the CLI fast paths must default on");
-    failures += check(!parse({"infernix-cli", "model.ninfer", "--prompt", "hello", "--disable-fast-paths"})
+    failures += check(!parse({"infernix-cli", "model.ninfer", "--prompt", "hello", "--reproducible"})
                            .fast_paths,
-                      "--disable-fast-paths was not parsed");
-    failures += check(help.find("--disable-fast-paths") != std::string::npos,
-                      "CLI help omits --disable-fast-paths");
+                      "--reproducible was not parsed");
+    failures += check(help.find("--reproducible") != std::string::npos,
+                      "CLI help omits --reproducible");
     failures += check(help.find("prefill-8bit-pv") == std::string::npos,
                       "CLI help still lists the removed 8-bit prefill P*V flags");
     failures +=

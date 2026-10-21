@@ -61,8 +61,11 @@ enum class ExpertActivation : std::uint8_t { kA4, kA16 };
 // Every other bank ignores the value it does not name. kPrecise (every A16 bank, every column count,
 // GPU only) is the reference route (docs/maintainer/model-quality.md §6.2): exactly decoded weights,
 // x and h as stored, binary64 sums in ascending k, one rounding at each of the exact route's BF16
-// boundaries (y_gate, y_up, h, y).
-enum class WideA16 : std::uint8_t { kExact, kA4Residual, kA4Residual3, kGgmlBf16, kPrecise };
+// boundaries (y_gate, y_up, h, y). kLossless (every bank, A4 banks too, GPU only) is the --lossless
+// route (docs/maintainer/lossless-route.md): x as stored times each weight's exact value (an NVFP4 bank's
+// multipliers in ExpertScales::alpha_*), every projection's exact sum correctly rounded to BF16,
+// h = bf16(bf16(silu(y_gate)) y_up) (ops::lossless_linear_tiles).
+enum class WideA16 : std::uint8_t { kExact, kA4Residual, kA4Residual3, kGgmlBf16, kPrecise, kLossless };
 
 enum class CpuIsa { kScalar, kAvx2, kAvxVnni, kAvx512Vnni };
 

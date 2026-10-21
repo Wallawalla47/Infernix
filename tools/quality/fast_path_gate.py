@@ -2,7 +2,7 @@
 
 Decides whether an artifact's fast paths keep it within Infernix's numerical acceptance policy
 (docs/maintainer/model-quality.md, section 6). The policy compares two Engine routes against one
-fixed reference distribution: the exact route (--disable-fast-paths), in the default role, and the
+fixed reference distribution: the reproducible route (--reproducible), in the default role, and the
 fast-path route (every path qualified for the configuration plus any --fast-path candidates, so a
 new path is always measured together with the paths it will run beside). The fast paths of a
 configuration together may move the output away from the reference by at most one fixed budget per
@@ -758,6 +758,23 @@ def artifact_identity(artifact: str) -> dict:
     return {"path": os.path.normcase(str(path)), "bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns}
 
 
+LOSSLESS_ARCHITECTURES = ("Qwen3_5ForCausalLM", "Qwen3_5MoeForCausalLM", "Qwen4ExpForCausalLM")
+# The lossless route's definition (docs/maintainer/lossless-route.md): its bits depend on the request
+# and the artifact alone, so a lossless reference is keyed by this version instead of the build, and
+# survives rebuilds. Bump it with any change to what the route computes.
+LOSSLESS_DEFINITION = "2026-10-21"
+
+
+def reference_route(artifact: str) -> str:
+    """The reference's route option: --lossless (docs/maintainer/lossless-route.md) for every model with a
+    lossless route (the Qwen3.5 family and Qwen3.8-Flash-Next), --reference otherwise."""
+    from tools.artifact.reader import Artifact
+    with Artifact.open(artifact) as opened:
+        text = opened.directory.components.get("text", {})
+    architectures = text.get("config", {}).get("architectures", [])
+    return "--lossless" if any(a in LOSSLESS_ARCHITECTURES for a in architectures) else "--reference"
+
+
 def corpus_identity(corpus: str | None, text: str | None) -> str:
     """The content of the text a reference scores (a manifest with its streams, or one file)."""
     if text:
@@ -880,14 +897,16 @@ def run_prefill(args: argparse.Namespace) -> Path:
     if args.ngram_volume:
         workload += ["--ngram-volume", args.ngram_volume]
     common = [args.perplexity, args.artifact] + workload
-    # The reference route, BF16 KV, one pass per window.
-    one_pass = ["--kv-dtype", "bf16", "--prefill-chunk", str(args.context), "--reference"]
+    # The reference route (lossless where the model has it), BF16 KV, one pass per window.
+    one_pass = ["--kv-dtype", "bf16", "--prefill-chunk", str(args.context), reference_route(args.artifact)]
     reference = out / "reference.top"
     key = {"kind": "prefill", "artifact": artifact_identity(args.artifact),
            "corpus": corpus_identity(args.corpus, args.text), "quick": args.quick,
            "context": args.context, "stride": args.stride,
            "ngram_volume": os.path.abspath(args.ngram_volume) if args.ngram_volume else None,
            "route": one_pass}
+    if "--lossless" in one_pass:
+        key["lossless_definition"] = LOSSLESS_DEFINITION
     source = ensure_reference(
         out, ["reference.top", "reference"], key,
         lambda: run(common + one_pass + ["--save-top-tokens", str(reference), "--output",
@@ -897,7 +916,7 @@ def run_prefill(args: argparse.Namespace) -> Path:
     print(f"  reference: {source}", flush=True)
     for kv in args.kv:
         for chunk in args.chunk:
-            for route, extra in (("default", ["--disable-fast-paths"]),
+            for route, extra in (("default", ["--reproducible"]),
                                  ("fast", candidate_options(args, "--fast-path"))):
                 target = out / kv / f"{route}-c{chunk}"
                 if (target / "report.json").is_file():
@@ -954,20 +973,25 @@ def run_decode(args: argparse.Namespace) -> list[Verdict]:
         arm += ["--prefix-reuse"]
     if args.warm_tokens:
         arm += ["--warm-tokens", str(args.warm_tokens)]
-    # The reference: the 16-bit-activation, BF16-KV scoring route at the same positions.
+    # The reference: the lossless route (the reference route where the model has no lossless route) at
+    # the same positions, one pass per segment.
     reference = out / "reference.json"
+    route = reference_route(args.artifact)
     key = {"kind": "decode", "artifact": artifact_identity(args.artifact),
            "corpus": corpus_identity(None, text), "segments": args.segments,
            "prompts": list(args.prompts),
            "ngram_volume": os.path.abspath(args.ngram_volume) if args.ngram_volume else None}
+    if route == "--lossless":
+        key["route"] = "lossless"  # (the reference route's entries keep their keys)
+        key["lossless_definition"] = LOSSLESS_DEFINITION
     source = ensure_reference(
         out, ["reference.json"], key,
-        lambda: run([args.forced, args.artifact, text, str(reference), "--reference"] + segments
+        lambda: run([args.forced, args.artifact, text, str(reference), route] + segments
                     + volume, out / "reference.log"),
         args.reference_cache, args.recompute_reference,
         [p for p in (out / "default-forced.json", out / "fast-forced.json") if p.exists()])
     print(f"  reference: {source}", flush=True)
-    for route, extra in (("default", ["--disable-fast-paths"]),
+    for route, extra in (("default", ["--reproducible"]),
                          ("fast", candidate_options(args, "--fast-path"))):
         target = out / f"{route}-forced.json"
         if target.is_file():
@@ -983,7 +1007,7 @@ def run_decode(args: argparse.Namespace) -> list[Verdict]:
     verdicts = [evaluate_forced(out / "default-forced.json", out / "fast-forced.json", reference)]
     if args.free_running:
         modes = [] if args.mode == "dflash2" else [args.mode]
-        for route, extra in (("default", ["exact", f"kv={args.kv}"]),
+        for route, extra in (("default", ["reproducible", f"kv={args.kv}"]),
                              ("fast", [f"path={p}" for p in args.fast_path] + [f"kv={args.kv}"])):
             target = out / f"{route}.txt"
             if target.is_file():

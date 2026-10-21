@@ -138,7 +138,14 @@ struct ExpertsWorkspace {
     float* h_row_scale;           // [entries]
     // GGUF banks, kGgmlBf16 in calls of kGgmlBf16MinColumns or more (else null): kGgmlBf16PlaneBytes
     std::uint8_t* ggml_planes;
+    // kLossless: lossless_experts_bytes(max_jobs, entries) (moe_layer.cu's lossless_expert.cuh)
+    std::uint8_t* lossless;
 };
+
+// kLossless's region: per-job counts, the tile plan, records and column maps of every tile, and one
+// column chunk's gate/up and h planes with the projections' workspace.
+inline constexpr int kLosslessChunkColumns = 2048;
+[[nodiscard]] std::size_t lossless_experts_bytes(std::int32_t max_jobs, std::int32_t entries);
 
 // Bytes of a call's CPU bookkeeping (moe_layer.cu's CpuCall: two words and kMaxCpuJobs job indices).
 inline constexpr std::size_t kCpuCallBytes = 2304; // 2 words + 512 indices, rounded to 256

@@ -563,16 +563,23 @@ struct EngineOptions {
     // is many times slower than the exact route. Qwen3.5 keeps its exact kernels with 16-bit
     // activations. On the Qwen3.8-27B NVFP4 artifacts prefill is at least 3x slower.
     bool reference                     = false;
+    // The lossless route (--lossless; docs/maintainer/lossless-route.md), the quality gates'
+    // reference on Qwen3.5/3.6/3.8 (Qwen3_5ForCausalLM and Qwen3_5MoeForCausalLM): the model's
+    // Hugging Face forward operation by operation, each correctly rounded to the dtype it has
+    // there (weights decoded exactly, sums exact, transcendental functions correctly rounded), so
+    // every output is a function of the request and the artifact alone. A CausalScoring Engine,
+    // one pass per window (prefill_chunk covering max_context), no fast path; FP32 logits.
+    bool lossless                      = false;
     // Qwen3.8-Flash-Next artifacts whose routed experts offer 4-bit activations as an option (only
     // nvidia/Qwen3.8-Flash-Next-FP4-Local, whose experts NVIDIA calibrated for them): run the routed
     // experts W4A4 with their stored activation scales (--expert-a4-activations) instead of the
     // default 16-bit activations. Other artifacts refuse it, as does the reference route.
     bool expert_a4_activations         = false;
     // Run every fast path qualified for this configuration (model geometry, activation precision
-    // and KV format): routes whose arithmetic differs from the exact route but whose measured cost
+    // and KV format): routes whose arithmetic differs from the reproducible route but whose measured cost
     // stays within Infernix's numerical acceptance policy (docs/maintainer/model-quality.md
     // section 6; the registry is 6.7). LoadSummary::fast_paths reports the selection. False
-    // (--disable-fast-paths) runs the exact route, which is bit-exact from release to release; the
+    // (--reproducible) runs the reproducible route, which is bit-exact from release to release; the
     // reference route (`reference`) requires it.
     bool fast_paths                    = true;
     // Qualification only (the quality tools, never a product route): also run these fast paths

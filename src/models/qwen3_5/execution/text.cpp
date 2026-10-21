@@ -2,6 +2,7 @@
 #include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/execution/attention.h"
 #include "models/qwen3_5/execution/gdn.h"
+#include "models/qwen3_5/execution/lossless.h"
 #include "models/qwen3_5/execution/ffn.h"
 #include "models/qwen3_5/execution/mtp.h"
 #include "models/qwen3_5/execution/workspace.h"
@@ -1433,16 +1434,39 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                     1, visual_begin, static_cast<std::int32_t>(local_scatter_indices.size()));
                 ops::scatter(embeddings, indices_device, x, s);
             }
-            if constexpr (Tap::enabled) { tap.begin(x); }
-            run_layers(x, Phase::Prefill, tap);
-            if constexpr (requires { tap.capture_positions(positions, s); }) {
-                tap.capture_positions(positions, s);
-            }
+            Tensor xf;
+            if (execution_schedule_.lossless) {
+                // One pass over the window (the planner requires the chunk to cover it): attention over
+                // its own keys, GDN and convolution from zero state.
+                if (base != 0 || len != T || multimodal != nullptr || prefill_hidden_.data == nullptr) {
+                    throw std::logic_error("the lossless route scores a text window in one pass");
+                }
+                const Tensor rope_table = lossless_rope_window(config_, rope_positions, work_, s);
+                for (std::size_t layer = 0; layer < parameters_.text.layers.size(); ++layer) {
+                    auto scope = work_.scope();
+                    try {
+                        lossless_layer(parameters_.text.layers[layer], config_, config_.layer_types[layer],
+                                       rope_table, x, work_, s);
+                    } catch (const std::exception& error) {
+                        throw std::runtime_error("text/layers/" + std::to_string(layer) +
+                                                 " lossless columns=" + std::to_string(len) + ": " +
+                                                 error.what());
+                    }
+                }
+                xf = matrix_window(prefill_hidden_, len);
+                lossless_final_norm(x, *final_norm_, config_, xf, s);
+            } else {
+                if constexpr (Tap::enabled) { tap.begin(x); }
+                run_layers(x, Phase::Prefill, tap);
+                if constexpr (requires { tap.capture_positions(positions, s); }) {
+                    tap.capture_positions(positions, s);
+                }
 
-            Tensor xf = prefill_hidden_.data != nullptr
-                            ? matrix_window(prefill_hidden_, len)
-                            : work_.alloc(DType::BF16, {dimension(config_.hidden_size), len});
-            ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, xf, s);
+                xf = prefill_hidden_.data != nullptr
+                         ? matrix_window(prefill_hidden_, len)
+                         : work_.alloc(DType::BF16, {dimension(config_.hidden_size), len});
+                ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, xf, s);
+            }
 
             if (is_last) {
                 Tensor last_xf = xf.slice(1, len - 1, 1);

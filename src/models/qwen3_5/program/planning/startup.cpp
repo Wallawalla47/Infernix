@@ -1,6 +1,7 @@
 #include "models/qwen3_5/execution/attention.h"
 #include "models/qwen3_5/execution/ffn.h"
 #include "models/qwen3_5/execution/gdn.h"
+#include "models/qwen3_5/execution/lossless.h"
 #include "models/qwen3_5/execution/mtp.h"
 #include "models/qwen3_5/program/planning/fast_paths.h"
 #include "models/qwen3_5/program/planning/graph_profiles.h"
@@ -617,8 +618,17 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     WorkspacePlan out;
     WorkspaceLayoutBuilder text_prefill;
     text_common_root(text_prefill, chunk);
-    target_body(text_prefill, 1, chunk, qwen3_5::TextPhase::Prefill, GdnWorkspacePath::Prefill, 1,
-                1, chunk, prefill_envelope);
+    if (plan.execution_schedule.lossless) {
+        // The window's rotary table, then the widest layer (execution/lossless.cpp's own allocations).
+        (void)text_prefill.alloc_bytes(execution::lossless_rope_window_bytes(config, chunk));
+        for (std::size_t layer = 0; layer < parameters.text.layers.size(); ++layer) {
+            scratch(text_prefill, execution::lossless_layer_workspace_bytes(
+                                      parameters.text.layers[layer], config, config.layer_types[layer], chunk));
+        }
+    } else {
+        target_body(text_prefill, 1, chunk, qwen3_5::TextPhase::Prefill, GdnWorkspacePath::Prefill, 1,
+                    1, chunk, prefill_envelope);
+    }
     if (!plan.causal_scoring) {
         scratch(text_prefill,
                 ops::sampling_workspace_capacity_bytes(
@@ -628,9 +638,10 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
 
     if (plan.causal_scoring) {
         WorkspaceLayoutBuilder causal_score;
-        // The reference route's logits are FP32.
-        matrix(causal_score, plan.execution_schedule.reference ? DType::FP32 : DType::BF16,
-               dimension(config.vocab_size), static_cast<std::int32_t>(kCausalScoreTile));
+        // The reference and lossless routes' logits are FP32.
+        const bool fp32_logits = plan.execution_schedule.reference || plan.execution_schedule.lossless;
+        matrix(causal_score, fp32_logits ? DType::FP32 : DType::BF16, dimension(config.vocab_size),
+               static_cast<std::int32_t>(kCausalScoreTile));
         matrix(causal_score, DType::I32, 1, static_cast<std::int32_t>(kCausalScoreTile));
         matrix(causal_score, DType::FP32, 1, static_cast<std::int32_t>(kCausalScoreTile));
         // Top tokens and candidates: ids and log-probabilities of each.
@@ -638,7 +649,12 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             matrix(causal_score, dtype, static_cast<std::int32_t>(kMaximumScoreTopTokens),
                    static_cast<std::int32_t>(kCausalScoreTile));
         }
-        linear_scratch(causal_score, parameters.text.output_head, 1, kCausalScoreTile);
+        if (plan.execution_schedule.lossless) {
+            scratch(causal_score, execution::lossless_head_workspace_bytes(
+                                      parameters.text.output_head.weight, static_cast<std::int32_t>(kCausalScoreTile)));
+        } else {
+            linear_scratch(causal_score, parameters.text.output_head, 1, kCausalScoreTile);
+        }
         out.causal_score = finish(causal_score);
     }
 
@@ -1203,6 +1219,12 @@ ExecutionSchedule execution_schedule(const execution::Parameters& parameters,
         throw std::invalid_argument(
             "the Qwen3.5 reference route is a CausalScoring Engine with BF16 KV");
     }
+    // The lossless route scores each window in one pass: its attention reads the window's own keys.
+    if (options.lossless &&
+        (options.purpose != EnginePurpose::CausalScoring || options.prefill_chunk < options.max_context)) {
+        throw std::invalid_argument("the Qwen3.5 lossless route is a CausalScoring Engine whose prefill_chunk "
+                                    "covers max_context (one pass per window)");
+    }
     // The exact route is request-invariant (docs/maintainer/model-quality.md, 6.1); each request-coupling
     // fast path gives up one part of it, and each part holds whenever its coupling path is not selected.
     const FastPathSelection fast_paths = select_fast_paths(parameters.model, options);
@@ -1230,7 +1252,9 @@ ExecutionSchedule execution_schedule(const execution::Parameters& parameters,
                                        : fast_paths.selected(FastPath::GdnF16Accumulate)
                                            ? ops::GdnChunkArithmetic::Fp16Accumulate
                                            : ops::GdnChunkArithmetic::Exact,
-            .reference               = options.reference};
+            .reference               = options.reference,
+            .lossless                = options.lossless,
+            .gumbel_sampling         = !options.fast_paths || options.lossless};
 }
 // The fast INT8, NVFP4, VQ2 and K4V2 prompt kernels and the MXFP8 tiled kernel of FP8 and K8V4 KV
 // run one 128-row CTA of one query head per SM; BF16 KV and the original INT8 and NVFP4 kernels use

@@ -49,7 +49,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--use-original-int8-prefill-kernel", false},
     ServeOptionArity{"--prefill-split-workspace-mib"},
     ServeOptionArity{"--use-original-nvfp4-prefill-kernel", false},
-    ServeOptionArity{"--disable-fast-paths", false},
+    ServeOptionArity{"--reproducible", false},
     ServeOptionArity{"--fast-path", true, true},
     ServeOptionArity{"--expert-a4-activations", false},
     ServeOptionArity{"--context-cost-presets"},
@@ -282,11 +282,12 @@ std::string serve_usage_text(const char* argv0) {
            "; 128-384 recommended). Less frees KV cache but\n"
            "                             slows 1-2K-token chunks over long context (64: up\n"
            "                             to 27% slower attention; 0: no splitting)\n"
-           "  --disable-fast-paths       run the exact route: without it, every faster\n"
-           "                             path qualified and measured faster for this\n"
-           "                             artifact's kernels and KV type runs (within\n"
-           "                             Infernix's numerical quality policy; startup\n"
-           "                             lists them; docs/serving.md)\n"
+           "  --reproducible             run the reproducible route (the same bits on every\n"
+           "                             run and release, whatever else is running):\n"
+           "                             without it, every path qualified and measured\n"
+           "                             faster for this artifact's kernels and KV type\n"
+           "                             runs (within Infernix's numerical quality\n"
+           "                             policy; startup lists them; docs/serving.md)\n"
            "  --fast-path NAME           also run this fast path, qualified or not\n"
            "                             (qualification and timing runs; repeatable)\n"
            "  --expert-a4-activations    nvidia/Qwen3.8-Flash-Next-FP4-Local only: run its\n"
@@ -380,7 +381,7 @@ std::string serve_usage_text(const char* argv0) {
            "                             skipping a routed expert missing from VRAM that every\n"
            "                             token of a decode round routes at top-10 rank R or\n"
            "                             lower (1-9; 9 skips least). Changes the output; not\n"
-           "                             with --disable-fast-paths. Default off; Strata's\n"
+           "                             with --reproducible. Default off; Strata's\n"
            "                             default is 7\n"
            "  --kv-dtype T               KV storage: bf16 (default) | int8 | fp8 | nvfp4 | k8v4 |\n"
            "                             vq2 | k4v2\n"
@@ -683,7 +684,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 require_value("--prefill-split-workspace-mib"), "prefill-split-workspace-mib"));
         } else if (arg == "--use-original-nvfp4-prefill-kernel") {
             options.original_nvfp4_prefill_kernel = true;
-        } else if (arg == "--disable-fast-paths") {
+        } else if (arg == "--reproducible") {
             options.fast_paths = false;
         } else if (arg == "--fast-path") {
             const std::string name(require_value("--fast-path"));

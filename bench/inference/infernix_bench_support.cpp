@@ -415,7 +415,7 @@ std::string usage_text(std::string_view program) {
         << "                              chunks); requires --kv-dtype int8\n"
         << "  --use-original-nvfp4-prefill-kernel  tiled NVFP4-KV prompt kernel (default:\n"
         << "                              fast kernel); requires --kv-dtype nvfp4\n"
-        << "  --disable-fast-paths        the exact route (default: every fast path qualified\n"
+        << "  --reproducible              the reproducible route (default: every fast path qualified\n"
         << "                              for the configuration, the artifact's kernels and KV)\n"
         << "  --fast-path <name>          qualification: also run this fast path, qualified\n"
         << "                              or not (a registry name; repeatable)\n"
@@ -596,7 +596,7 @@ BenchOptions parse_args(int argc, char** argv) {
                 parse_u32(value("--prefill-split-workspace-mib"), "prefill-split-workspace-mib", true);
         } else if (arg == "--use-original-nvfp4-prefill-kernel") {
             options.original_nvfp4_prefill_kernel = true;
-        } else if (arg == "--disable-fast-paths") {
+        } else if (arg == "--reproducible") {
             options.fast_paths = false;
         } else if (arg == "--fast-path") {
             const std::string name(value("--fast-path"));

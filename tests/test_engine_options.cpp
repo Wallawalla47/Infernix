@@ -146,6 +146,20 @@ int main() {
     const std::string exact_text = construction_error(options, exact_invalid);
     failures += check(exact_text.find("fast paths") == std::string::npos,
                       "the exact route was rejected with the reference route");
+    // The lossless route runs no fast path either, and is not combined with the reference route.
+    options.lossless = true;
+    bool both_invalid = false;
+    const std::string both_text = construction_error(options, both_invalid);
+    failures += check(both_invalid && both_text.find("exclude each other") != std::string::npos,
+                      "the lossless and reference routes were accepted together");
+    options.reference = false;
+    options.fast_paths = true;
+    bool lossless_fast_invalid = false;
+    const std::string lossless_fast_text = construction_error(options, lossless_fast_invalid);
+    failures += check(lossless_fast_invalid && lossless_fast_text.find("fast paths") != std::string::npos,
+                      "fast paths were accepted with the lossless route");
+    options.fast_paths = false;
+    options.lossless   = false;
     // Every fast path round-trips through its name.
     for (const infernix::FastPath path : infernix::kFastPaths) {
         failures += check(infernix::parse_fast_path(infernix::fast_path_name(path)) == path,

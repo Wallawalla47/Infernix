@@ -411,6 +411,9 @@ struct ProgramOptions {
     // draft head's top tokens under its sampler and verified by sparse rejection sampling, and its
     // one-row rounds verify every draft (no draft_min_p cut). Greedy rows are unchanged.
     bool sampled_mtp_drafts = false;
+    // The reproducible route (EngineOptions::fast_paths off): sampled requests draw by Gumbel-max
+    // (ops::SamplingConfig::gumbel_max), so speculation returns plain sampling's text.
+    bool gumbel_sampling = false;
     // CPU-served misses (design section 10): host expert-engine workers (0 disables), the most
     // experts one layer call hands to them, and the share kept on the PCIe stage (misses / divisor;
     // 0 derives it from the measured link and CPU rates, design §19.3.12).

@@ -64,6 +64,9 @@ struct MoeParameters {
     LinearParameters shared_down;    // [H, I_shared]
     const ExpertBank* bank = nullptr;
     const ops::offloaded_moe::ExpertScales* device_scales = nullptr; // [E]
+    // The lossless route's (TextConfig::lossless): each NVFP4 matrix's weight multiplier in alpha_* (an
+    // A4 bank's alpha also folds in its input scale); [E], null without the route.
+    const ops::offloaded_moe::ExpertScales* lossless_scales = nullptr;
 };
 
 struct PleParameters {
@@ -141,8 +144,9 @@ public:
     std::optional<qwen3_5::execution::VisionParameters> vision; // --vision (shared tower types)
 
 private:
-    // Device copy of every layer's ExpertScales, [layers][E].
+    // Device copy of every layer's ExpertScales, [layers][E], and the lossless route's.
     DeviceBuffer scales_;
+    DeviceBuffer lossless_scales_;
     // A GGUF import's GDN output permutation: input block j of the output projection is value head
     // gdn_value_perm_[j] (ggml's tiled order).
     DeviceBuffer gdn_value_perm_;

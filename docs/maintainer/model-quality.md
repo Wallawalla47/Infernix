@@ -328,9 +328,10 @@ This section is the policy for every change that alters model output. It fixes w
 different route may ship, what it is measured against, how much it may cost, and how to test that.
 `tools/quality/fast_path_gate.py` implements the decisions; its constants are the ones below.
 
-### 6.1 The exact route and the fast paths
+### 6.1 The reproducible route and the fast paths
 
-- **The exact route** is what runs with `--disable-fast-paths` (`EngineOptions::fast_paths`
+- **The reproducible route** (called the exact route until 2026-10-21; the dated records below keep
+  that name) is what runs with `--reproducible` (`EngineOptions::fast_paths`
   false). For a fixed artifact, Engine options (including the prefill chunk and the seed) and
   request, its output is bit-identical from run to run and **from release to release**, and it is
   **request-invariant** on every artifact: concurrency, the other requests, lane assignment,
@@ -358,9 +359,18 @@ different route may ship, what it is measured against, how much it may cost, and
   fences; its forced-decode audit then passes at one, four and eight requests, under MTP and from a
   warm prefix (below), as IQ3_S's and the FP8 import's do at one and eight. Its real tests are still
   to be rerun.
+  **Speculation does not change its output** (the owner's decision of 2026-10-21): a greedy request
+  accepts a draft exactly when it is the verify column's argmax, which is the decode column's; a
+  sampled request draws every token by Gumbel-max (`SamplingConfig::gumbel_max`: the truncated
+  support's token maximizing log p + g, with g a Gumbel variate keyed by the seed, the produced
+  token's position and the token id), so a verify column returns the token plain decoding draws
+  there and a draft is accepted exactly when it equals it. The default route keeps speculative
+  rejection sampling (same distribution, other text for a seed). The real test
+  `infernix_qwen3_5_speculation_invariance_*_real_test` checks MTP, DFlash2 and DFlash2 with n-gram
+  proposals, greedy and sampled.
   Prompt and decode need not agree with each other. An option
   whose effect depends on load (lossy Host-tier prefix state, whose use depends on eviction) is
-  refused with `--disable-fast-paths` at startup, never silently overridden. A
+  refused with `--reproducible` at startup, never silently overridden. A
   change that alters any exact-route output bit is a *numerics change*. It is allowed only to fix
   a defect or to improve precision, and only when the gates of 6.5, with the previous exact route
   in the default role and the new one in the fast role, show the new route's estimated excess is
@@ -378,7 +388,7 @@ different route may ship, what it is measured against, how much it may cost, and
   the prompt-pv8 fast path. The fast INT8 and NVFP4 prompt kernels, measured when adopted, remain
   part of the exact route.
 - **The fast paths** (`infernix::FastPath`) are routes whose arithmetic differs from the exact
-  route's. By default (no `--disable-fast-paths`) the Engine runs every fast path qualified for the
+  route's. By default (no `--reproducible`) the Engine runs every fast path qualified for the
   loaded **configuration**, the kernels the artifact runs and its KV format. On Qwen3.5 that is the
   attention geometry, the activation class (the narrowest activation precision any text-decoder
   linear permits: 4, 8 or 16 bits), the KV format and whether the text MLP gate/up is groupwise Q4
@@ -793,7 +803,7 @@ rem Default route unchanged between two builds (perplexity runs, forced runs or 
 py -3.11 -m tools.quality.fast_path_gate identical old-run new-run
 ```
 
-The default run uses the exact route (`--disable-fast-paths`); the fast run uses every path
+The default run uses the exact route (`--reproducible`); the fast run uses every path
 already qualified for the configuration, plus each `--fast-path NAME` candidate, so a candidate is
 always measured together with the paths it will run beside. Without a candidate the gate re-checks
 the configuration's current selection. `--mode` selects the decode route a fast path touches:
@@ -1558,7 +1568,7 @@ and recomputes the previous output) or admission (whole extents held without `pr
 - **Selected by:** `--spec mtp --draft-tokens auto` on Qwen3.8-27B / Qwen3.6-35B-A3B, where it is
   registered (it is `auto`'s policy: a fixed `--draft-tokens N` refuses it); it acts where
   speculation is adaptive (`adaptive-speculation` selected, or an artifact that cannot be
-  request-invariant). Where it does not act (another configuration, or `--disable-fast-paths`),
+  request-invariant). Where it does not act (another configuration, or `--reproducible`),
   `auto` drafts the configuration's fastest single length every round: 5 on the NVFP4 27B, 3 on the
   groupwise 27B, the 35B-A3B and unmeasured configurations (`auto_fixed_draft_tokens`). The policy is
   `models/qwen3_5/program/speculative/mtp_draft_policy.h`.
@@ -2060,7 +2070,7 @@ and pass the SiLU output as a BF16 high/low pair, where the old route rounded ea
 BF16 before the MMA. Against the FP64 oracle the worst relative L2 error fell 3× (Q4/Q5) and 5× (Q8);
 prefill got 2.3-2.6 % slower, decode is unchanged. It shipped without the model-level gate 6.1 asks
 for; the gate was run on 2026-10-18 (`compare-prefill`, the build before `4f0bb18f` as base and the
-current one as candidate, both `--disable-fast-paths`; `qwen3_6_35b_a3b.ninfer`, the quick corpus,
+current one as candidate, both `--reproducible`; `qwen3_6_35b_a3b.ninfer`, the quick corpus,
 14,336-token windows at stride 7,168, chunks 896-7,168, 36 windows, 1,044,668 positions per route).
 The reference route runs the same shared-expert kernels as the route that writes it, so the gate ran
 against each build's reference:

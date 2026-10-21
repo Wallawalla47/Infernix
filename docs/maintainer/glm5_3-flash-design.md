@@ -1232,7 +1232,7 @@ reproducible outputs. The default rule is `residency`.
 cache state, so the same prompt can give different tokens on different runs, and greedy outputs are
 not reproducible. That is inherent to the mode, which is why it is opt-in and labelled. Everything else
 stays exact: an expert that is computed is computed with the canonical arithmetic, so placement still
-never changes the bits of a kept term. Like CausalScoring, the exact route (`--disable-fast-paths`)
+never changes the bits of a kept term. Like CausalScoring, the exact route (`--reproducible`)
 refuses the mode at startup, either rule: its output must not depend on the cache state or on a
 declared approximation.
 

@@ -98,6 +98,14 @@ void validate_engine_options(const EngineOptions& options, models::Architecture 
     if (options.reference && (options.fast_paths || !options.fast_path_candidates.empty())) {
         throw std::invalid_argument("the reference route runs no fast path: disable fast paths");
     }
+    if (options.lossless) {
+        if (options.reference) {
+            throw std::invalid_argument("the lossless and reference routes exclude each other");
+        }
+        if (options.fast_paths || !options.fast_path_candidates.empty() || options.expert_a4_activations) {
+            throw std::invalid_argument("the lossless route runs no fast path: disable fast paths");
+        }
+    }
 }
 
 namespace {
@@ -221,7 +229,7 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
     }
     // An approximation whose output depends on the cache state: never on the exact route.
     if (options.expert_tail_skip != 0 && !options.fast_paths) {
-        throw std::invalid_argument("--expert-tail-skip is approximate; the exact route (--disable-fast-paths) refuses it");
+        throw std::invalid_argument("--expert-tail-skip is approximate; the reproducible route (--reproducible) refuses it");
     }
     // An automatic MTP draft length chooses up to the model's most drafts unless given a ceiling:
     // Qwen3.8-Flash-Next verifies 8 columns column-invariantly, the Qwen3.5 planner captures 5.
@@ -259,7 +267,7 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
         // route's output would depend on load (model-quality 6.1).
         if (!options.fast_paths && hybrid.host_state_precision != HybridHostStatePrecision::Fp32) {
             throw std::invalid_argument(
-                "--cache-host-state fp24 and bf16 are lossy; --disable-fast-paths requires fp32");
+                "--cache-host-state fp24 and bf16 are lossy; --reproducible requires fp32");
         }
         if (qwen4_exp) {
             // Qwen3.8-Flash-Next's snapshots are born in the Host tier (design §19.3.1): it needs

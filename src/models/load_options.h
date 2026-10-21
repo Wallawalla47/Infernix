@@ -19,6 +19,9 @@ struct LoadOptions {
     // The reference route (EngineOptions::reference): every Use binds A16Only, whatever activation
     // precision the artifact permits; a model with a precise reference route selects it.
     bool reference = false;
+    // The lossless route (EngineOptions::lossless): every Use binds A16Only; the model runs its lossless
+    // route.
+    bool lossless = false;
     // Qwen4Exp: routed expert banks whose 4-bit activations are optional run them (W4A4).
     bool expert_a4_activations = false;
     // Qwen4Exp: the routed expert banks stay in the artifact and are read in place by the SSD
@@ -86,6 +89,7 @@ struct LoadOptions {
             .proposal_head            = options.speculative.proposal_head,
             .rope_yarn_factor         = options.rope_yarn_factor,
             .reference                = options.reference,
+            .lossless                 = options.lossless,
             .expert_a4_activations    = options.expert_a4_activations,
             .draft_model              = options.speculative.draft_model};
 }
