@@ -285,9 +285,12 @@ constexpr int kBlocks   = kDim / 64; // 64-element blocks of a q or k row
 constexpr int kGridBits = 21;        // grid integers M 2^(e - e_block + 21): exact within 21 binades
 constexpr int kPBits    = 48;        // p on a grid of 2^-48 (two 24-bit halves)
 
+// A q or k row in shared memory is padded by one word: a row's 16 threads read 16 rows at one element.
+constexpr int kRowStride = kDim + 1;
+
 struct Shared {
-    int xq[kQueries][kDim];  // query grid integers (0 off the grid)
-    int xk[kKeys][kDim];     // key grid integers
+    int xq[kQueries][kRowStride]; // query grid integers (0 off the grid)
+    int xk[kKeys][kRowStride];    // key grid integers
     int vg[kKeys][kDim];     // value grid integers: M 2^(e - vmax_c + 21), rounded below the grid
     float p[kQueries][kKeys];
     int ph[kQueries][kKeys]; // p 2^48 = ph 2^24 + pl
@@ -571,7 +574,7 @@ __global__ __launch_bounds__(kThreads) void attention_kernel(const Args args) {
 
     // Pass B: p, sum p (int128 at 2^-87; p <= 1) and the thread's 16 channels' sum p v (int128 at
     // 2^(vmax_c - 203): p on its 2^-48 grid, v on its channel's grid).
-    const int c0 = sub * 16;
+    // This thread's channels: sub + 16 cc (the row's 16 threads read 16 banks of a value row).
     I128 num[16];
 #pragma unroll
     for (int cc = 0; cc < 16; ++cc) { num[cc] = I128{0ULL, 0LL}; }
@@ -630,7 +633,7 @@ __global__ __launch_bounds__(kThreads) void attention_kernel(const Args args) {
                     if ((ph | pl) == 0) { continue; }
 #pragma unroll
                     for (int cc = 0; cc < 4; ++cc) {
-                        const long long v = sh.vg[jj][c0 + cg + cc];
+                        const long long v = sh.vg[jj][sub + 16 * (cg + cc)];
                         hi[cc] += ph * v; // |.| < 2^24 2^29 per key: 32 keys below 2^59
                         lo[cc] += pl * v;
                     }
@@ -660,7 +663,7 @@ __global__ __launch_bounds__(kThreads) void attention_kernel(const Args args) {
         if (active) {
             PartialSum& ps = args.psum[(static_cast<std::size_t>(split) * args.columns + c) * args.heads + h];
 #pragma unroll
-            for (int cc = 0; cc < 16; ++cc) { ps.num[c0 + cc] = num[cc]; }
+            for (int cc = 0; cc < 16; ++cc) { ps.num[sub + 16 * cc] = num[cc]; }
             if (sub == 0) {
                 ps.den     = den;
                 ps.p_err   = p_err;
@@ -676,28 +679,28 @@ __global__ __launch_bounds__(kThreads) void attention_kernel(const Args args) {
     }
     bool flag = false;
     if (active) {
-        std::uint16_t* out = args.out + (static_cast<std::size_t>(c) * args.heads + h) * kDim + c0;
+        std::uint16_t* out = args.out + (static_cast<std::size_t>(c) * args.heads + h) * kDim + sub;
         if (nan) {
 #pragma unroll
-            for (int cc = 0; cc < 16; ++cc) { out[cc] = kNaN; }
+            for (int cc = 0; cc < 16; ++cc) { out[16 * cc] = kNaN; }
         } else if (fail) {
             flag = true;
         } else {
             const double dsum = lossless::double_i128(den, -87);
 #pragma unroll
             for (int cc = 0; cc < 16; ++cc) {
-                const int vm = sh.vmax[c0 + cc];
+                const int vm = sh.vmax[sub + 16 * cc];
                 const double n = lossless::double_i128(num[cc], vm - 203);
                 const double o = n / dsum;
                 // The num error: p's dropped grid bits times the channel's largest |v| (below 2^(vm - 126)),
                 // and half a v grid unit per rounded value element times sum p.
                 const double num_err = p_err * ldexp(1.0, vm - 126) +
-                                       (sh.vinexact[c0 + cc] != 0 ? (dsum + den_err) * ldexp(1.0, vm - 156) : 0.0);
+                                       (sh.vinexact[sub + 16 * cc] != 0 ? (dsum + den_err) * ldexp(1.0, vm - 156) : 0.0);
                 // The conversions (2^-51 each), the division (2^-53), and the dropped terms.
                 const double err = fabs(o) * 0x1p-48 + (num_err + fabs(o) * den_err) / dsum * 1.01;
                 std::uint16_t r;
                 if (lossless::certain_bf16(o, err, r)) {
-                    out[cc] = r;
+                    out[16 * cc] = r;
                 } else {
                     flag = true;
                 }

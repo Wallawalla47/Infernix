@@ -23,7 +23,10 @@
 namespace infernix::ops {
 namespace {
 
+using lossless::add_i128;
 using lossless::F32Sum;
+using lossless::I128;
+using lossless::magnitude_i128;
 using lossless::round_magnitude;
 using lossless::Wide;
 
@@ -81,6 +84,80 @@ __device__ __forceinline__ float group_result(F32Sum& part) {
     part.pos_inf = (flags & 2) != 0;
     part.neg_inf = (flags & 4) != 0;
     return part.result();
+}
+
+// A column's dot product: the binary32 sum of its 8 slice threads' 16 terms each (128), exact before its
+// one rounding, as group_result(F32Sum) gives it. Fast path: every term M 2^(f - 150) (M < 2^24, f its
+// exponent field, 1 for subnormals) placed exactly in a 128-bit integer whose unit is 2^(F - 150 - kLowBits),
+// F the group's largest field: a term's shift f - F + kLowBits lies in [0, kLowBits], every shift a register
+// operation (F32Sum's chunk index is dynamic, so its words live in local memory), 128 terms below 2^(25 +
+// kLowBits + 7) fit, and the 8 threads add their integers with 4 shuffles a level. Where any lane of the warp
+// holds a non-finite term or a nonzero term more than kLowBits binades below its group's largest, the whole
+// warp takes F32Sum (group_result shuffles over the warp).
+constexpr int kLowBits = 88;
+
+__device__ __forceinline__ void add_term(I128& acc, long long m, int shift) {
+    unsigned long long lo;
+    long long hi;
+    if (shift >= 64) {
+        lo = 0;
+        hi = m * (1LL << (shift - 64)); // |m| < 2^24, shift - 64 <= 24
+    } else if (shift > 0) {
+        lo = static_cast<unsigned long long>(m) << shift;
+        hi = m >> (64 - shift);
+    } else {
+        lo = static_cast<unsigned long long>(m);
+        hi = m < 0 ? -1 : 0;
+    }
+    acc = add_i128(acc, I128{lo, hi});
+}
+
+__device__ __forceinline__ int term_field(std::uint32_t bits) {
+    const int field = static_cast<int>((bits >> 23) & 0xFF);
+    return field == 0 ? 1 : field;
+}
+
+__device__ __forceinline__ float group_sum(const float (&t)[kRowsPerThread]) {
+    int top = 1;
+    bool special = false;
+#pragma unroll
+    for (int r = 0; r < kRowsPerThread; ++r) {
+        const std::uint32_t bits = __float_as_uint(t[r]);
+        special |= ((bits >> 23) & 0xFF) == 0xFF;
+        if ((bits & 0x7FFFFFFFU) != 0) { top = max(top, term_field(bits)); }
+    }
+#pragma unroll
+    for (int o = 1; o < kSlices; o <<= 1) { top = max(top, __shfl_xor_sync(0xFFFFFFFFU, top, o)); }
+    bool low = false;
+#pragma unroll
+    for (int r = 0; r < kRowsPerThread; ++r) {
+        const std::uint32_t bits = __float_as_uint(t[r]);
+        low |= (bits & 0x7FFFFFFFU) != 0 && term_field(bits) < top - kLowBits;
+    }
+    if (__any_sync(0xFFFFFFFFU, special || low)) {
+        F32Sum exact;
+        exact.clear();
+#pragma unroll
+        for (int r = 0; r < kRowsPerThread; ++r) { exact.add(t[r]); }
+        return group_result(exact);
+    }
+    I128 acc{0ULL, 0LL};
+#pragma unroll
+    for (int r = 0; r < kRowsPerThread; ++r) {
+        const std::uint32_t bits = __float_as_uint(t[r]);
+        if ((bits & 0x7FFFFFFFU) == 0) { continue; }
+        const long long M = ((bits >> 23) & 0xFF) == 0 ? (bits & 0x7FFFFF) : (0x800000 | (bits & 0x7FFFFF));
+        add_term(acc, (bits >> 31) ? -M : M, term_field(bits) - top + kLowBits);
+    }
+#pragma unroll
+    for (int o = 1; o < kSlices; o <<= 1) {
+        const unsigned long long lo = __shfl_xor_sync(0xFFFFFFFFU, acc.lo, o);
+        const long long hi          = __shfl_xor_sync(0xFFFFFFFFU, acc.hi, o);
+        acc                         = add_i128(acc, I128{lo, hi});
+    }
+    std::uint32_t mag[4];
+    const bool negative = magnitude_i128(acc, mag);
+    return __uint_as_float(round_magnitude(mag, top - 150 - kLowBits, negative, false));
 }
 
 // The state of sequence b: FP32 [128 (k), 128 (v), Hv] at `base` (null: zeros, not kept) or, with slots,
@@ -164,22 +241,19 @@ __global__ __launch_bounds__(kThreads) void gated_delta_rule_kernel(const std::u
                 kh[4 * r] = k4.x, kh[4 * r + 1] = k4.y, kh[4 * r + 2] = k4.z, kh[4 * r + 3] = k4.w;
                 qh[4 * r] = q4.x, qh[4 * r + 1] = q4.y, qh[4 * r + 2] = q4.z, qh[4 * r + 3] = q4.w;
             }
-            F32Sum u;
-            u.clear();
+            float terms[kRowsPerThread];
 #pragma unroll
             for (int r = 0; r < kRowsPerThread; ++r) {
-                S[r] = __fmul_rn(S[r], decay);
-                u.add(__fmul_rn(S[r], kh[r]));
+                S[r]     = __fmul_rn(S[r], decay);
+                terms[r] = __fmul_rn(S[r], kh[r]);
             }
-            const float delta = __fmul_rn(__fsub_rn(vj, group_result(u)), bt);
-            F32Sum o;
-            o.clear();
+            const float delta = __fmul_rn(__fsub_rn(vj, group_sum(terms)), bt);
 #pragma unroll
             for (int r = 0; r < kRowsPerThread; ++r) {
-                S[r] = __fadd_rn(S[r], __fmul_rn(kh[r], delta));
-                o.add(__fmul_rn(S[r], qh[r]));
+                S[r]     = __fadd_rn(S[r], __fmul_rn(kh[r], delta));
+                terms[r] = __fmul_rn(S[r], qh[r]);
             }
-            const float oj = group_result(o);
+            const float oj = group_sum(terms);
             if (slice == 0) {
                 out[(static_cast<std::size_t>(b) * width + c0 + tt) * value_heads * kDv + hv * kDv + j] =
                     __bfloat16_as_ushort(__float2bfloat16_rn(oj));
