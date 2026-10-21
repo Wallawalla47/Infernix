@@ -14,8 +14,10 @@
 // operation by operation, every binary32 product and sum correctly rounded. Each value head's 128 state
 // columns are split over 4 CTAs of 32 columns; a column's 128 state rows over 8 threads of one warp (16
 // rows each, in registers), which combine their partial sums exactly before the one rounding. The CTAs
-// run the sequence token by token; the L2 norms of q and k are block reductions (binary32 squares of
-// BF16 values are exact) in a fixed-point accumulator. Sums of binary32 values go through a 320-bit
+// run the sequence in passes of kChunk tokens: a pass first stages its tokens' normalized q and k (one
+// warp per token: the L2 norms' binary32 squares of BF16 values are exact, summed in a fixed-point
+// accumulator), gates and this CTA's values in shared memory, then runs them token by token, which needs
+// no block barrier: only the state update is sequential. Sums of binary32 values go through a 320-bit
 // fixed point from 2^-150 (lossless::F32Sum) and are rounded once; a non-finite term gives IEEE's result.
 
 namespace infernix::ops {
@@ -33,6 +35,11 @@ constexpr int kColumnsPerCta = kThreads / kSlices;
 constexpr int kGroups        = kDv / kColumnsPerCta; // CTAs per value head
 constexpr int kWarps         = kThreads / 32;
 constexpr int kSumWords      = lossless::kF32SumWords;
+constexpr int kChunk         = 32;                // tokens staged per pass
+// A token's staged q or k: slice s's 16 rows at s kSliceStride, so the 8 slices of a column read their
+// rows as float4 from distinct banks.
+constexpr int kSliceStride = kRowsPerThread + 4;
+constexpr int kStagedRow   = kSlices * kSliceStride;
 
 void require(bool condition, const char* message) {
     if (!condition) { throw std::invalid_argument(std::string("lossless_gated_delta_rule: ") + message); }
@@ -42,35 +49,22 @@ __device__ __forceinline__ float bf16_bits_float(std::uint16_t bits) {
     return __uint_as_float(static_cast<std::uint32_t>(bits) << 16);
 }
 
-// Block-wide fp32(sum of squares) of up to 256 BF16 values (one per thread, zeros elsewhere), exact
-// before the rounding; every thread returns it.
-__device__ float block_sum_squares(float x, long long (&scratch)[kWarps][kSumWords]) {
-    const int tid = static_cast<int>(threadIdx.x), lane = tid & 31, warp = tid >> 5;
+// fp32(1 / sqrt(fp32(sum of squares) + 1e-6)) of one 128-element BF16 vector held four per lane
+// (element lane + 32 i), the sum exact before its rounding; every lane of the warp returns it.
+__device__ __forceinline__ float warp_inverse_norm(const float (&x)[4]) {
     F32Sum s;
     s.clear();
-    s.add(__fmul_rn(x, x)); // exact: a BF16 square has at most 16 significant bits
+#pragma unroll
+    for (int i = 0; i < 4; ++i) { s.add(__fmul_rn(x[i], x[i])); } // exact: a BF16 square has at most 16 significant bits
     s.acc.warp_sum();
-    if (lane == 0) {
-#pragma unroll
-        for (int i = 0; i < kSumWords; ++i) { scratch[warp][i] = s.acc.chunk[i]; }
-    }
     // Non-finite squares: any lane's flags.
-    const bool nan_any = __syncthreads_or(s.nan ? 1 : 0) != 0;
-    const bool inf_any = __syncthreads_or(s.pos_inf ? 1 : 0) != 0;
-    F32Sum total;
-    total.clear();
-#pragma unroll
-    for (int i = 0; i < kSumWords; ++i) {
-        long long v = 0;
-#pragma unroll
-        for (int w = 0; w < kWarps; ++w) { v += scratch[w][i]; }
-        total.acc.chunk[i] = v;
-    }
-    total.nan     = nan_any;
-    total.pos_inf = inf_any;
-    __syncthreads(); // scratch is reused
-    return total.result();
+    s.nan     = __any_sync(0xFFFFFFFFU, s.nan) != 0;
+    s.pos_inf = __any_sync(0xFFFFFFFFU, s.pos_inf) != 0;
+    return lossless::cr_rsqrt(__fadd_rn(s.result(), 1e-6F));
 }
+
+// A staged q or k element's position: element e is slice e / 16's row e % 16.
+__device__ __forceinline__ int staged(int e) { return e / kRowsPerThread * kSliceStride + e % kRowsPerThread; }
 
 // The 8 slice threads' partial sums of a column added exactly (lanes xor 1, 2, 4 stay in the group);
 // every thread of the group returns the rounded total.
@@ -103,8 +97,10 @@ __global__ __launch_bounds__(kThreads) void gated_delta_rule_kernel(const std::u
                                                                     const int* destination_slots, std::uint16_t* out,
                                                                     int key_heads, int value_heads, int width, int q_ld,
                                                                     int k_ld, int v_ld) {
-    __shared__ float qhat[kDk], khat[kDk];
-    __shared__ long long scratch[kWarps][kSumWords];
+    __shared__ __align__(16) float qhat[kChunk][kStagedRow];
+    __shared__ __align__(16) float khat[kChunk][kStagedRow];
+    __shared__ float vs[kChunk][kColumnsPerCta];
+    __shared__ float decay_s[kChunk], beta_s[kChunk];
     const int hv = static_cast<int>(blockIdx.x) / kGroups, group = static_cast<int>(blockIdx.x) % kGroups;
     const int b  = static_cast<int>(blockIdx.y);
     const int hk = hv / (value_heads / key_heads);
@@ -112,6 +108,7 @@ __global__ __launch_bounds__(kThreads) void gated_delta_rule_kernel(const std::u
     const int slice = lane % kSlices;
     const int j  = group * kColumnsPerCta + warp * (32 / kSlices) + lane / kSlices; // this thread's column
     const int i0 = slice * kRowsPerThread;                                           // its first state row
+    const int jl = j - group * kColumnsPerCta;                                       // its column in the CTA
     float S[kRowsPerThread]; // S_(i0 + r, j), stored at j 128 + i0 + r of its head
     const std::size_t head = static_cast<std::size_t>(hv) * kDk * kDv + static_cast<std::size_t>(j) * kDk + i0;
     if (state_in != nullptr) {
@@ -129,42 +126,66 @@ __global__ __launch_bounds__(kThreads) void gated_delta_rule_kernel(const std::u
         for (int r = 0; r < kRowsPerThread; ++r) { S[r] = 0.0F; }
     }
     const float scale = 0x1.6a09e6p-4F; // fp32(1 / sqrt(128)): HF's double scale rounded to binary32
-    for (int w = 0; w < width; ++w) {
-        const int t = b * width + w;
-        // L2 norms: threads 0-127 hold element tid of q and k (d_k = 128).
-        const float qe = tid < kDk ? bf16_bits_float(query[static_cast<std::size_t>(t) * q_ld + hk * kDk + tid]) : 0.0F;
-        const float ke = tid < kDk ? bf16_bits_float(key[static_cast<std::size_t>(t) * k_ld + hk * kDk + tid]) : 0.0F;
-        const float rq = lossless::cr_rsqrt(__fadd_rn(block_sum_squares(qe, scratch), 1e-6F));
-        const float rk = lossless::cr_rsqrt(__fadd_rn(block_sum_squares(ke, scratch), 1e-6F));
-        if (tid < kDk) {
-            qhat[tid] = __fmul_rn(__fmul_rn(qe, rq), scale);
-            khat[tid] = __fmul_rn(ke, rk);
+    for (int c0 = 0; c0 < width; c0 += kChunk) {
+        const int n = min(kChunk, width - c0);
+        // Stage the pass: each warp normalizes its tokens' q and k (L2 norms of the head's 128 elements).
+        for (int tt = warp; tt < n; tt += kWarps) {
+            const std::size_t t = static_cast<std::size_t>(b) * width + c0 + tt;
+            float qe[4], ke[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                qe[i] = bf16_bits_float(query[t * q_ld + hk * kDk + lane + 32 * i]);
+                ke[i] = bf16_bits_float(key[t * k_ld + hk * kDk + lane + 32 * i]);
+            }
+            const float rq = warp_inverse_norm(qe), rk = warp_inverse_norm(ke);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                qhat[tt][staged(lane + 32 * i)] = __fmul_rn(__fmul_rn(qe[i], rq), scale);
+                khat[tt][staged(lane + 32 * i)] = __fmul_rn(ke[i], rk);
+            }
+            if (lane == 0) {
+                decay_s[tt] = lossless::cr_exp(g[t * value_heads + hv]);
+                beta_s[tt]  = bf16_bits_float(beta[t * value_heads + hv]);
+            }
+        }
+        for (int e = tid; e < n * kColumnsPerCta; e += kThreads) {
+            const int tt = e / kColumnsPerCta, c = e % kColumnsPerCta;
+            const std::size_t t = static_cast<std::size_t>(b) * width + c0 + tt;
+            vs[tt][c] = bf16_bits_float(value[t * v_ld + hv * kDv + group * kColumnsPerCta + c]);
         }
         __syncthreads();
-        const float decay = lossless::cr_exp(g[static_cast<std::size_t>(t) * value_heads + hv]);
-        const float b     = bf16_bits_float(beta[static_cast<std::size_t>(t) * value_heads + hv]);
-        const float vj    = bf16_bits_float(value[static_cast<std::size_t>(t) * v_ld + hv * kDv + j]);
-        F32Sum u;
-        u.clear();
+        for (int tt = 0; tt < n; ++tt) {
+            const float decay = decay_s[tt], bt = beta_s[tt], vj = vs[tt][jl];
+            float kh[kRowsPerThread], qh[kRowsPerThread];
 #pragma unroll
-        for (int r = 0; r < kRowsPerThread; ++r) {
-            S[r] = __fmul_rn(S[r], decay);
-            u.add(__fmul_rn(S[r], khat[i0 + r]));
-        }
-        const float delta = __fmul_rn(__fsub_rn(vj, group_result(u)), b);
-        F32Sum o;
-        o.clear();
+            for (int r = 0; r < kRowsPerThread / 4; ++r) {
+                const float4 k4 = *reinterpret_cast<const float4*>(&khat[tt][slice * kSliceStride + 4 * r]);
+                const float4 q4 = *reinterpret_cast<const float4*>(&qhat[tt][slice * kSliceStride + 4 * r]);
+                kh[4 * r] = k4.x, kh[4 * r + 1] = k4.y, kh[4 * r + 2] = k4.z, kh[4 * r + 3] = k4.w;
+                qh[4 * r] = q4.x, qh[4 * r + 1] = q4.y, qh[4 * r + 2] = q4.z, qh[4 * r + 3] = q4.w;
+            }
+            F32Sum u;
+            u.clear();
 #pragma unroll
-        for (int r = 0; r < kRowsPerThread; ++r) {
-            S[r] = __fadd_rn(S[r], __fmul_rn(khat[i0 + r], delta));
-            o.add(__fmul_rn(S[r], qhat[i0 + r]));
+            for (int r = 0; r < kRowsPerThread; ++r) {
+                S[r] = __fmul_rn(S[r], decay);
+                u.add(__fmul_rn(S[r], kh[r]));
+            }
+            const float delta = __fmul_rn(__fsub_rn(vj, group_result(u)), bt);
+            F32Sum o;
+            o.clear();
+#pragma unroll
+            for (int r = 0; r < kRowsPerThread; ++r) {
+                S[r] = __fadd_rn(S[r], __fmul_rn(kh[r], delta));
+                o.add(__fmul_rn(S[r], qh[r]));
+            }
+            const float oj = group_result(o);
+            if (slice == 0) {
+                out[(static_cast<std::size_t>(b) * width + c0 + tt) * value_heads * kDv + hv * kDv + j] =
+                    __bfloat16_as_ushort(__float2bfloat16_rn(oj));
+            }
         }
-        const float oj = group_result(o);
-        if (slice == 0) {
-            out[static_cast<std::size_t>(t) * value_heads * kDv + hv * kDv + j] =
-                __bfloat16_as_ushort(__float2bfloat16_rn(oj));
-        }
-        __syncthreads(); // qhat and khat are rewritten next token
+        __syncthreads(); // the next pass overwrites the staged tokens
     }
     if (state_out != nullptr) {
         float4* so = reinterpret_cast<float4*>(state_out + state_offset(destination_slots, b, value_heads) + head);

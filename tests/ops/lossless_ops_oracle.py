@@ -234,14 +234,15 @@ def cases(rng: random.Random):
             for idx in range(7, len(v), 23):
                 v[idx] = f32_bits(rng.gauss(0.0, 1.0) * 2.0 ** -40) >> 16
         yield ATTENTION, [heads, kv_heads, cols], [q, k, v], attention(q, k, v, heads, kv_heads, cols)
-    # Gated delta rule: Hk = 1, Hv = 2, 8 tokens; g negative (decay below one), beta in (0, 1).
-    hk, hv, cols = 1, 2, 8
-    q = [random_bf16(rng, 2) for _ in range(128 * hk * cols)]
-    k = [random_bf16(rng, 2) for _ in range(128 * hk * cols)]
-    v = [random_bf16(rng, 2) for _ in range(128 * hv * cols)]
-    g = [f32_bits(-rng.uniform(0.0, 2.0)) for _ in range(hv * cols)]
-    beta = [f32_bits(rng.uniform(0.05, 0.95)) >> 16 for _ in range(hv * cols)]
-    yield DELTA_RULE, [hk, hv, cols], [q, k, v, g, beta], delta_rule(q, k, v, g, beta, hk, hv, cols)
+    # Gated delta rule: Hk = 1, Hv = 2; g negative (decay below one), beta in (0, 1). 8 tokens, and 70
+    # (Hk = 1, Hv = 2: two of the kernel's 32-token passes and a partial one).
+    for hk, hv, cols in ((1, 2, 8), (1, 2, 70)):
+        q = [random_bf16(rng, 2) for _ in range(128 * hk * cols)]
+        k = [random_bf16(rng, 2) for _ in range(128 * hk * cols)]
+        v = [random_bf16(rng, 2) for _ in range(128 * hv * cols)]
+        g = [f32_bits(-rng.uniform(0.0, 2.0)) for _ in range(hv * cols)]
+        beta = [f32_bits(rng.uniform(0.05, 0.95)) >> 16 for _ in range(hv * cols)]
+        yield DELTA_RULE, [hk, hv, cols], [q, k, v, g, beta], delta_rule(q, k, v, g, beta, hk, hv, cols)
     # RoPE (theta 1e7, rotary 64 of 256): 1-D positions up to 262,143 and MRoPE positions differing per
     # axis.
     for axes in (1, 3):
@@ -443,18 +444,19 @@ def state_cases(rng: random.Random):
         states = [random_bf16(rng, 20) for _ in range(channels * (taps - 1) * slots)]
         out, final = conv_slots(x, w, states, src, dst, channels, width, seqs, taps)
         yield CONV_SLOTS, [channels, width, seqs, taps, slots], [x, w, states, src, dst], out + final
-    # Gated delta rule: Hk = 1, Hv = 2, 2 sequences of 3 tokens from random FP32 states (4 slots).
-    hk, hv, width, seqs, slots = 1, 2, 3, 2, 4
-    cols = width * seqs
-    q = [random_bf16(rng, 2) for _ in range(128 * hk * cols)]
-    k = [random_bf16(rng, 2) for _ in range(128 * hk * cols)]
-    v = [random_bf16(rng, 2) for _ in range(128 * hv * cols)]
-    g = [f32_bits(-rng.uniform(0.0, 2.0)) for _ in range(hv * cols)]
-    beta = [f32_bits(rng.uniform(0.05, 0.95)) >> 16 for _ in range(hv * cols)]
-    states = [f32_bits(rng.gauss(0.0, 0.05)) for _ in range(128 * 128 * hv * slots)]
-    src, dst = [2, 0], [2, 3]
-    out, final = delta_rule_slots(q, k, v, g, beta, hk, hv, width, seqs, states, src, dst)
-    yield DELTA_RULE_SLOTS, [hk, hv, width, seqs, slots], [q, k, v, g, beta, states, src, dst], out + final
+    # Gated delta rule: Hk = 1, Hv = 2, 2 sequences of 3 tokens from random FP32 states (4 slots), and 2
+    # of 37 tokens (a 32-token pass and a partial one each).
+    for hk, hv, width, seqs, slots in ((1, 2, 3, 2, 4), (1, 2, 37, 2, 4)):
+        cols = width * seqs
+        q = [random_bf16(rng, 2) for _ in range(128 * hk * cols)]
+        k = [random_bf16(rng, 2) for _ in range(128 * hk * cols)]
+        v = [random_bf16(rng, 2) for _ in range(128 * hv * cols)]
+        g = [f32_bits(-rng.uniform(0.0, 2.0)) for _ in range(hv * cols)]
+        beta = [f32_bits(rng.uniform(0.05, 0.95)) >> 16 for _ in range(hv * cols)]
+        states = [f32_bits(rng.gauss(0.0, 0.05)) for _ in range(128 * 128 * hv * slots)]
+        src, dst = [2, 0], [2, 3]
+        out, final = delta_rule_slots(q, k, v, g, beta, hk, hv, width, seqs, states, src, dst)
+        yield DELTA_RULE_SLOTS, [hk, hv, width, seqs, slots], [q, k, v, g, beta, states, src, dst], out + final
     # Attention over the paged cache: (a) two sequences of 2 query columns (300 and 150 keys), with
     # key ranges split over CTAs and some elements far below their rows' largest (the exact fallback);
     # (b) one sequence of 24 columns from position 70 (one key range).

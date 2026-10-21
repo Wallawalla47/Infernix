@@ -765,7 +765,17 @@ constexpr int kScoreWords = 18; // scores from 2^-272: positions e_q + e_k in [2
 constexpr int kScoreBase  = -272;
 constexpr int kSumWords   = 15; // p and p v from 2^-300: positions in [18, 397], plus 46 bits
 constexpr int kSumBase    = -300;
-constexpr int kFallbackWarps = 64;
+// The exact fallback runs one flagged (column, head) query per warp at a time, each warp holding a
+// key_capacity row of probabilities: as many warps as kFallbackBytes of rows allow (whole blocks of
+// eight), at most kFallbackMaxWarps: 1,024 for a 14,336-key scoring window, 64 at 262,144 keys.
+constexpr std::size_t kFallbackBytes = std::size_t{64} << 20;
+constexpr int kFallbackMaxWarps      = 1024;
+
+inline int fallback_warps(int key_capacity) {
+    const std::size_t row = std::max<std::size_t>(static_cast<std::size_t>(key_capacity) * sizeof(float), 1);
+    const auto fit        = static_cast<int>(std::min<std::size_t>(kFallbackMaxWarps, kFallbackBytes / row));
+    return std::max(8, fit / 8 * 8);
+}
 
 template <int W>
 __device__ __forceinline__ int top_bit(const std::uint32_t (&m)[W]) {
@@ -854,7 +864,8 @@ __device__ void midpoint(std::uint16_t b, int dir, long long& odd, int& e2) {
 
 struct FallbackArgs {
     Args a;
-    float* p_store; // kFallbackWarps x key_capacity
+    float* p_store; // warps x key_capacity
+    int warps;
 };
 
 __global__ void attention_fallback_kernel(const FallbackArgs f) {
@@ -863,7 +874,7 @@ __global__ void attention_fallback_kernel(const FallbackArgs f) {
     const int warp = static_cast<int>((blockIdx.x * blockDim.x + threadIdx.x) >> 5);
     const int total = a.columns * a.heads;
     float* pstore   = f.p_store + static_cast<std::size_t>(warp) * a.key_capacity;
-    for (int query = warp; query < total; query += kFallbackWarps) {
+    for (int query = warp; query < total; query += f.warps) {
         if (((a.flagged[query / 32] >> (query % 32)) & 1U) == 0) { continue; }
         const int t = query / a.heads, h = query % a.heads, kvh = h / (a.heads / a.kv_heads);
         const int seq = t / a.width, last = position(a, t);
@@ -1058,7 +1069,7 @@ std::size_t call_bytes(int heads, int kv_heads, int width, int sequences, int ke
         align256(static_cast<std::size_t>(sequences) * key_capacity * kv_heads * sizeof(std::int16_t)) +
         2 * align256(static_cast<std::size_t>(sequences) * kv_heads * kDim * sizeof(int)) +
         align256((columns * heads + 31) / 32 * 4) +
-        align256(static_cast<std::size_t>(kFallbackWarps) * key_capacity * sizeof(float));
+        align256(static_cast<std::size_t>(fallback_warps(key_capacity)) * key_capacity * sizeof(float));
     if (split_route(ctas)) {
         bytes += align256(splits * columns * heads * sizeof(PartialMax)) +
                  align256(splits * columns * heads * sizeof(PartialSum));
@@ -1096,7 +1107,8 @@ void run(Args args, int max_keys, void* workspace, cudaStream_t stream) {
     args.vmax     = static_cast<int*>(take(channels));
     args.vinexact = static_cast<int*>(take(channels));
     args.flagged  = static_cast<std::uint32_t*>(take(flag_bytes));
-    auto* pstore  = static_cast<float*>(take(static_cast<std::size_t>(kFallbackWarps) * args.key_capacity * sizeof(float)));
+    const int warps = fallback_warps(args.key_capacity);
+    auto* pstore    = static_cast<float*>(take(static_cast<std::size_t>(warps) * args.key_capacity * sizeof(float)));
     const std::size_t partials = static_cast<std::size_t>(g.splits) * args.columns * args.heads;
     if (g.split) {
         args.pmax = static_cast<PartialMax*>(take(partials * sizeof(PartialMax)));
@@ -1128,7 +1140,7 @@ void run(Args args, int max_keys, void* workspace, cudaStream_t stream) {
         combine_kernel<<<dim3(static_cast<unsigned>(args.columns), static_cast<unsigned>(args.heads)), kDim, 0, stream>>>(args);
         CUDA_CHECK(cudaGetLastError());
     }
-    attention_fallback_kernel<<<kFallbackWarps / 8, 256, 0, stream>>>(FallbackArgs{args, pstore});
+    attention_fallback_kernel<<<warps / 8, 256, 0, stream>>>(FallbackArgs{args, pstore, warps});
     CUDA_CHECK(cudaGetLastError());
 }
 
