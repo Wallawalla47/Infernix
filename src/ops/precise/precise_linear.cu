@@ -209,6 +209,15 @@ void dispatch(const Input& in, const Weight& weight, Rows rows, const Epilogue& 
                                static_cast<const std::uint16_t*>(weight.scales), k},
                rows, epilogue, stream);
         return;
+    case QType::FP8_E4M3FN_G32_E8M0:
+        require(weight.layout == QuantLayout::G32ScaleRows16 && weight.scales != nullptr && weight.n % 16 == 0 &&
+                    k % 32 == 0,
+                "MXFP8 weights must be in g32_scale_rows16_v1");
+        launch(in,
+               precise::Mxfp8{static_cast<const std::uint8_t*>(weight.qdata),
+                              static_cast<const std::uint8_t*>(weight.scales), k},
+               rows, epilogue, stream);
+        return;
     case QType::NVFP4:
         require(weight.layout == QuantLayout::BlockScaleK16M128x4 && weight.scales != nullptr && weight.n % 128 == 0 &&
                     k % 64 == 0 && weight.weight_scale_divisor > 0.0F,

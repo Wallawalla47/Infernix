@@ -816,6 +816,7 @@ int main() {
             run_packed(q, 67, 520, 5, row_split, rng, false); // a partial last group
         }
         run_packed(QType::FP8_E4M3FN_ROW_BF16, 200, 2560, 9, {}, rng);
+        run_packed(QType::FP8_E4M3FN_G32_E8M0, 256, 2560, 13, {}, rng);
         qw::PatternedWeightOptions nvfp4;
         nvfp4.weight_scale_divisor = 3.0F;
         nvfp4.input_scale_divisor  = 1.0F;
@@ -829,6 +830,7 @@ int main() {
         }
         run_swiglu(QType::Q8_G32_FP16, 70, 2560, rng);
         run_swiglu(QType::Q4_G64_FP16, 70, 520, rng);
+        run_swiglu(QType::FP8_E4M3FN_G32_E8M0, 64, 2560, rng);
         run_rows(QType::NVFP4, 256, 2560, 128, 128, 3, nvfp4, rng);
         run_rows(QType::Q4_G64_FP16, 200, 2560, 37, 50, 5, row_split, rng);
         run_add(QType::Q5_G64_FP16, 200, 2560, row_split, rng);

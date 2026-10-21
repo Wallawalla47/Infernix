@@ -278,8 +278,9 @@ void hyper_connection_mix_precise(const Tensor& residual, const Tensor& norm_wei
                                   const Weight& up, std::int32_t streams, std::int32_t rank, float eps, Tensor& x,
                                   Tensor* inject, WorkspaceArena& workspace, cudaStream_t stream) {
     require(contiguous_2d(residual, DType::BF16) && contiguous_2d(x, DType::BF16) &&
-                contiguous_2d(norm_weight, DType::BF16) && streams > 0 && rank > 0,
-            "mix requires contiguous BF16 tensors");
+                (contiguous_2d(norm_weight, DType::BF16) || contiguous_2d(norm_weight, DType::FP32)) && streams > 0 &&
+                rank > 0,
+            "mix requires contiguous BF16 tensors and a BF16 or FP32 norm weight");
     const std::int32_t T = residual.ne[1];
     require(T > 0 && x.ne[1] == T && residual.ne[0] == streams * x.ne[0] && norm_weight.ne[0] == residual.ne[0] &&
                 down.k == residual.ne[0] && up.n == residual.ne[0] && up.k == rank &&

@@ -149,6 +149,27 @@ struct Fp8Row {
     }
 };
 
+// MXFP8 (fp8_e4m3fn_g32_e8m0, g32_scale_rows16_v1): E4M3FN code times its 32-element group's UE8M0
+// power of two 2^(e - 127), exact in binary32 (at most 4 significant bits; the admitted exponents
+// keep it normal, src/ops/linear/mxfp8/mxfp8_format.h). Codes [N, K] row-major; the scale of (row,
+// group) at ((row / 16) * (K / 32) + group) * 16 + row % 16.
+struct Mxfp8 {
+    INFERNIX_PRECISE_UNGROUPED
+    static constexpr Products kProducts = Products::Exact;
+    const std::uint8_t* codes;
+    const std::uint8_t* scales;
+    int k;
+    __device__ void decode(int row, int chunk, Weights8& w) const {
+        const uint2 packed = *reinterpret_cast<const uint2*>(codes + static_cast<std::size_t>(row) * k + 8 * chunk);
+        const auto* v      = reinterpret_cast<const std::uint8_t*>(&packed);
+        const std::uint32_t e =
+            scales[(static_cast<std::size_t>(row / 16) * (k / 32) + (8 * chunk) / 32) * 16 + row % 16];
+        const float scale = __uint_as_float(e << 23); // 2^(e - 127) for e in [1, 254]
+#pragma unroll
+        for (int j = 0; j < 8; ++j) { w.w[j] = __fmul_rn(e4m3_float(v[j]), scale); }
+    }
+};
+
 // NVFP4 with 16-element E4M3 scales in the K16M128x4 swizzle and a per-matrix divisor: the logical
 // weight fl32(e2m1 * scale / divisor), formed in binary64 as the fixture's logical_weight_fp64 does.
 struct Nvfp4 {

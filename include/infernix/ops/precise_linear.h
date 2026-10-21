@@ -34,7 +34,8 @@ namespace infernix::ops {
 
 /**
  * Dense weights [N, K]: BF16 (contiguous), Q2/Q4/Q5/Q6/Q8 row-split (code times its group's FP16
- * scale), row-scaled FP8 (code times its row's BF16 scale) and NVFP4 with 16-element E4M3 scales
+ * scale), row-scaled FP8 (code times its row's BF16 scale), MXFP8 in g32_scale_rows16_v1 (code times
+ * its 32-element group's UE8M0 power of two) and NVFP4 with 16-element E4M3 scales
  * (fl32(code * scale / divisor), the format's logical FP32 weight). out is [N, T].
  */
 void precise_linear(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream);
