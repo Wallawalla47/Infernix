@@ -214,3 +214,68 @@ def test_bf16_volume_needs_a_bf16_table(tmp_path):
                    for i in range(2)}
         tensors[NAME + "weight_scale"] = torch.tensor([0.001], dtype=torch.float32)
         NgramTable(_save(tmp_path, "fp8", tensors), PREFIX, CONFIG, 20, keep_bf16=True)
+
+
+def _nvfp4_table(tmp_path, label: str, seed: int, rows: tuple[int, int], multiplier: float = 1.0 / 30_000) -> NgramTable:
+    """A two-shard NVFP4 table as FP4-Local stores it: E2M1 codes [rows, 80], E4M3 block scales
+    [rows, 10] per shard, one FP32 weight_scale_2 for the table."""
+    generator = torch.Generator().manual_seed(seed)
+    tensors = {}
+    for index, count in enumerate(rows):
+        tensors[f"{NAME}shard_{index}.weight"] = torch.randint(0, 256, (count, 80), dtype=torch.uint8, generator=generator)
+        tensors[f"{NAME}shard_{index}.weight_scale"] = torch.randint(
+            0, 0x7F, (count, 10), dtype=torch.uint8, generator=generator).view(torch.float8_e4m3fn)
+    tensors[NAME + "weight_scale_2"] = torch.tensor([multiplier], dtype=torch.float32)
+    return NgramTable(_save(tmp_path, label, tensors), PREFIX, CONFIG, sum(rows))
+
+
+def test_nvfp4_volume_keeps_codes_then_scales_and_records_its_format_and_multiplier(tmp_path):
+    from tools.convert.qwen4_exp import (
+        NGRAM_FORMAT, NGRAM_FORMAT_OFFSET, NGRAM_NVFP4_SCALE, NGRAM_NVFP4_SCALE_OFFSET, read_ngram_volume_format)
+
+    table = _nvfp4_table(tmp_path, "nvfp4", 12, (50, 13))
+    assert (table.row_bytes, table.volume_format) == (90, "nvfp4")
+    volume = tmp_path / "nvfp4.ngram"
+    geometry = write_ngram_volume(table, volume, bytes(range(16)))
+    assert geometry["rows_per_block"] == 45 and geometry["blocks"] == 2  # IQ4_NL's row size
+    data = volume.read_bytes()
+    assert NGRAM_FORMAT.unpack_from(data, NGRAM_FORMAT_OFFSET)[0] == 4
+    multiplier = torch.tensor([1.0 / 30_000], dtype=torch.float32).view(torch.int32).item() & 0xFFFFFFFF
+    assert NGRAM_NVFP4_SCALE.unpack_from(data, NGRAM_NVFP4_SCALE_OFFSET)[0] == multiplier
+    assert _recorded_scale(volume) == 0  # no FP8 scale
+    assert read_ngram_volume_format(volume, ROW_BYTES) == "nvfp4"
+    with SafetensorsSource(tmp_path / "nvfp4") as store:
+        for r, (shard, local) in ((0, (0, 0)), (44, (0, 44)), (45, (0, 45)), (50, (1, 0)), (62, (1, 12))):
+            codes = store.read_flat(f"{NAME}shard_{shard}.weight").reshape(-1, 80)[local]
+            scales = store.read_flat(f"{NAME}shard_{shard}.weight_scale").view(torch.uint8).reshape(-1, 10)[local]
+            at = 4096 + (r // 45) * 4096 + (r % 45) * 90
+            assert data[at : at + 90] == codes.numpy().tobytes() + scales.numpy().tobytes()
+    # Another conversion of the same checkpoint adopts the volume; a table of another multiplier does not.
+    assert read_ngram_volume_id(table, volume) == bytes(range(16))
+    other = _nvfp4_table(tmp_path, "other", 12, (50, 13), multiplier=1.0 / 29_000)
+    with pytest.raises(ValueError, match="multiplier"):
+        read_ngram_volume_id(other, volume)
+
+
+def test_every_new_volume_records_its_format_and_old_ones_are_read_by_row_size(tmp_path):
+    from tools.convert.qwen4_exp import NGRAM_FORMAT, NGRAM_FORMAT_OFFSET, read_ngram_volume_format
+
+    shards, bf16, fp8 = _bf16_and_fp8_tables(tmp_path, 13, (30, 7))
+    fp8_volume = tmp_path / "fp8.ngram"
+    write_ngram_volume(fp8, fp8_volume, bytes(16))
+    words = _bf16_volume(tmp_path, "words", shards, bytes(16))
+    for volume, format, tag in ((fp8_volume, "fp8_e4m3fn", 1), (words, "bf16", 3)):
+        data = bytearray(volume.read_bytes())
+        assert NGRAM_FORMAT.unpack_from(data, NGRAM_FORMAT_OFFSET)[0] == tag
+        assert read_ngram_volume_format(volume, ROW_BYTES) == format
+        data[NGRAM_FORMAT_OFFSET : NGRAM_FORMAT_OFFSET + 2] = bytes(2)  # as published before the tag
+        volume.write_bytes(bytes(data))
+        assert read_ngram_volume_format(volume, ROW_BYTES) == format
+
+
+def test_an_nvfp4_table_refuses_fp8_scales_and_bf16_volumes(tmp_path):
+    table = _nvfp4_table(tmp_path, "nvfp4", 14, (20, 5))
+    with pytest.raises(ValueError, match="not an FP8 scale"):
+        table.scale()
+    with pytest.raises(ValueError, match="needs the checkpoint's BF16 table"):
+        NgramTable(SafetensorsSource(tmp_path / "nvfp4"), PREFIX, CONFIG, 25, keep_bf16=True)

@@ -34,6 +34,7 @@ from .sources.modelopt import (
     fp8_block_matrix_words,
     nvfp4_matrix_words,
     nvfp4_packed_matrix_words,
+    nvfp4_values_source,
 )
 from .sources.safetensors import SafetensorsSource, tensor_source
 
@@ -170,8 +171,9 @@ def text_config(source: dict, *, mtp: bool) -> dict:
     result["seed"] = seed
     result["split_ngram_parts"] = _positive(raw.get("split_ngram_parts", 512), "text.split_ngram_parts")
     result["eos_token_id"] = _eos(raw)
-    if raw.get("ple_embedding_dtype", "float8_e4m3fn") != "float8_e4m3fn":
-        raise ValueError("this adapter imports the FP8 n-gram table")
+    # NVIDIA's checkpoints label the table FP8 or NVFP4 (FP4-Local); an unlabelled one is BF16.
+    if raw.get("ple_embedding_dtype", "float8_e4m3fn") not in ("float8_e4m3fn", "nvfp4"):
+        raise ValueError("this adapter imports an FP8, NVFP4 or BF16 n-gram table")
 
     if mtp:
         _fixed(raw, "mtp_num_hidden_layers", 1, "text")
@@ -389,10 +391,46 @@ class _Qwen4ExpBuilder(_Builder):
         self.model.add(Parameter(name, tuple(shape), factory(store), factory, tuple(inputs), "bf16",
                                  residency=name.split("/", 1)[0]))
 
+    def add_nvfp4_values(self, name, store, leaf, shape, *, inputs=()):
+        """A weight-only ModelOpt NVFP4 matrix read through its exact values (multiplier semantics;
+        recipes cast or quantize them): the FP4-Local vision MLPs and MTP experts."""
+
+        def factory(selected, format=None):
+            self.validate_source(selected, store, name)
+            if format is not None:
+                raise ValueError(f"{name}: a weight-only NVFP4 matrix is converted through its values")
+            return nvfp4_values_source(selected, leaf, tuple(shape))
+
+        self.model.add(Parameter(name, tuple(shape), factory(store), factory, tuple(inputs), "bf16",
+                                 residency=name.split("/", 1)[0]))
+
+    def add(self, name, store, source_name, shape, **options):
+        # A vision tower stored as ModelOpt NVFP4 (FP4-Local's MLPs and merger: weight-only, a FP32
+        # multiplier) reads its exact values; every other tensor takes the shared source rules (MXFP8
+        # matrices, FP4-Local's vision attention included, are recognized there).
+        prefix = source_name.removesuffix(".weight")
+        if (
+            name.startswith("vision/")
+            and len(shape) == 2
+            and source_name.endswith(".weight")
+            and not any(options.get(key) for key in ("offset", "rows", "transpose", "source_shape"))
+            and store.has(prefix + ".weight_scale_2")
+            and store.describe(source_name).dtype == "U8"
+        ):
+            self.add_nvfp4_values(name, store, prefix, shape, inputs=options.get("inputs", ()))
+            return
+        super().add(name, store, source_name, shape, **options)
+
+    def norm(self, name, store, source_name, shape):
+        """A norm weight kept in its stored precision: BF16, or FP32 where the checkpoint trained it
+        so (NVIDIA FP4-Local's hyper-connection and PLE norms); the engine reads either."""
+
+        self.add(name, store, source_name, shape, direct="fp32" if store.describe(source_name).dtype == "F32" else "bf16")
+
     def hyper_connection(self, prefix, source_prefix, store, config, *, combine=True):
         width = config["hc_count"] * config["hidden_size"]
         rank = config["hc_lowrank"]
-        self.add(prefix + "norm", store, source_prefix + "hc_norm.weight", (width,))
+        self.norm(prefix + "norm", store, source_prefix + "hc_norm.weight", (width,))
         self.add(prefix + "down", store, source_prefix + "input_mix_weight_down.weight", (rank, width),
                  inputs=(prefix + "input",))
         self.add(prefix + "up", store, source_prefix + "input_mix_weight_up.weight", (width, rank),
@@ -452,10 +490,12 @@ class _Qwen4ExpBuilder(_Builder):
             # Each expert's matrices become row ranges of two parents (gate and up interleaved per
             # expert, then every down), so the drafter's resident-expert kernel selects them by id.
             # NVIDIA stores the MTP experts per expert in Qwen's block-scaled FP8 (E4M3FN codes, one
-            # FP32 multiplier per 128 x 128 tile; their values are the exact products); a BF16
-            # export keeps them fused, gate_up_proj [E, 2I, H] (the gate rows first) and down_proj
-            # [E, H, I].
+            # FP32 multiplier per 128 x 128 tile; their values are the exact products), or in
+            # weight-only ModelOpt NVFP4 (FP4-Local); a BF16 export keeps them fused, gate_up_proj
+            # [E, 2I, H] (the gate rows first) and down_proj [E, H, I].
             fused = store.has(sp + "experts.gate_up_proj")
+            nvfp4 = not fused and store.describe(sp + "experts.0.gate_proj.weight").dtype == "U8"
+            per_expert = self.add_nvfp4_values if nvfp4 else self.add_fp8_block
             gate_up, downs = [], []
             for expert in range(e):
                 ep, leaf = p + f"experts/{expert}/", sp + f"experts.{expert}."
@@ -464,13 +504,13 @@ class _Qwen4ExpBuilder(_Builder):
                         self.add(ep + role, store, sp + "experts.gate_up_proj", (ir, h), source_shape=(e, 2 * ir, h),
                                  offset=(2 * expert + half) * ir * h, inputs=(ffn_input,))
                     else:
-                        self.add_fp8_block(ep + role, store, leaf + role + "_proj", (ir, h), inputs=(ffn_input,))
+                        per_expert(ep + role, store, leaf + role + "_proj", (ir, h), inputs=(ffn_input,))
                     gate_up.append(ep + role)
                 if fused:
                     self.add(ep + "down", store, sp + "experts.down_proj", (h, ir), source_shape=(e, h, ir),
                              offset=expert * h * ir, inputs=(ep + "product",))
                 else:
-                    self.add_fp8_block(ep + "down", store, leaf + "down_proj", (h, ir), inputs=(ep + "product",))
+                    per_expert(ep + "down", store, leaf + "down_proj", (h, ir), inputs=(ep + "product",))
                 downs.append(ep + "down")
             self.group(*gate_up)
             self.group(*downs)
@@ -500,16 +540,20 @@ class _Qwen4ExpBuilder(_Builder):
         self.add(prefix + "ple/value_projection", store, sp + "value_proj.weight", (h, dim), inputs=(embeddings,))
         self.group(prefix + "ple/key_projection", prefix + "ple/value_projection")
         for role, field in (("key_norm", "norm_key"), ("query_norm", "norm_query"), ("conv_norm", "norm_conv")):
-            self.add(prefix + "ple/" + role, store, sp + field + ".weight", (width,))
+            self.norm(prefix + "ple/" + role, store, sp + field + ".weight", (width,))
         self.add(prefix + "ple/convolution", store, sp + "conv1d.weight", (taps, width),
                  source_shape=(width, 1, taps), transpose=(2, 0, 1))
-        # An FP8 volume's per-tensor scale: the checkpoint's own, or a BF16 table's derived one. A BF16
-        # volume's rows are the values themselves.
-        if config["ngram_table"]["format"] != "fp8_e4m3fn":
-            return
+        # An FP8 volume's per-tensor scale (the checkpoint's own, or a BF16 table's derived one, BF16)
+        # or an NVFP4 volume's FP32 multiplier. A BF16 volume's rows are the values themselves.
         table = self.ngram
-        scale = LogicalSource((1,), f"{store.path}:{table.prefix}scale", lambda begin, end: table.scale()[begin:end])
-        self.model.add(Parameter(prefix + "ple/ngram_scale", (1,), scale, None, (), "bf16", residency="text"))
+        format = config["ngram_table"]["format"]
+        if format == "fp8_e4m3fn":
+            scale = LogicalSource((1,), f"{store.path}:{table.prefix}scale", lambda begin, end: table.scale()[begin:end])
+            self.model.add(Parameter(prefix + "ple/ngram_scale", (1,), scale, None, (), "bf16", residency="text"))
+        elif format == "nvfp4":
+            scale = LogicalSource((1,), f"{store.path}:{table.prefix}weight_scale_2",
+                                  lambda begin, end: table.nvfp4_scale()[begin:end])
+            self.model.add(Parameter(prefix + "ple/ngram_scale", (1,), scale, None, (), "fp32", residency="text"))
 
     def block(self, prefix, source_prefix, store, config, mixer, *, mtp=False):
         self.hyper_connection(prefix + "attn_hc/", source_prefix + "attn_hyper_connection.", store, config)
@@ -541,7 +585,8 @@ def _check_ngram_buffers(store: SafetensorsSource, prefix: str, config: dict, pl
 
 
 class NgramTable:
-    """The PLE n-gram table as the volume stores it: E4M3FN rows with one per-tensor scale.
+    """The PLE n-gram table as the volume stores it: E4M3FN rows with one per-tensor scale, or an
+    NVFP4 table's rows verbatim.
 
     FP8 shards (NVIDIA) are the checkpoint's words and its ``weight_scale``. BF16 shards (a BF16
     export) are quantized by the per-tensor rule ModelOpt applies in the table's own dtype:
@@ -551,37 +596,82 @@ class NgramTable:
     With ``keep_bf16`` a BF16 table's words are kept as they are (rows of 2 x width bytes): the BF16
     volume any Qwen3.8-Flash-Next artifact accepts in place of its quantized table
     (tools/flash_next/ngram_bf16.py).
+
+    NVFP4 shards (NVIDIA's FP4-Local: ``shard_i.weight`` U8 ``[rows, width / 2]``, E2M1 with the even
+    element in the low nibble, ``shard_i.weight_scale`` E4M3FN ``[rows, width / 16]``, and one FP32
+    ``weight_scale_2`` multiplier for the table) keep their words: a volume row is the row's code
+    bytes, then its scale bytes (width / 2 + width / 16 = 90 bytes), and the multiplier is the
+    table's ``nvfp4_scale``. Value = e2m1(code) * e4m3fn(scale) * multiplier.
     """
 
     def __init__(self, store: SafetensorsSource, prefix: str, config: dict, rows: int, *, keep_bf16: bool = False):
         self.store = store
         self.prefix = prefix + "ple.ple_embedding.ngram_embedding."
         width = config["ple_embed_dim"] // ((config["ngram_size"] - 1) * config["heads_per_ngram"])
+        if width % 16:
+            raise ValueError("an n-gram row must be whole 16-element blocks")
         self.shards: list[tuple[str, int]] = []
         dtypes = set()
         for index in range(config["split_ngram_parts"]):
             name = f"{self.prefix}shard_{index}.weight"
             info = store.describe(name)
-            if info.dtype not in ("F8_E4M3", "BF16") or len(info.shape) != 2 or info.shape[1] != width:
-                raise ValueError(f"{name}: expected F8_E4M3 or BF16 [rows, {width}]")
+            if info.dtype == "U8":
+                scale = store.describe(f"{self.prefix}shard_{index}.weight_scale")
+                if (len(info.shape) != 2 or info.shape[1] != width // 2 or scale.dtype != "F8_E4M3"
+                        or tuple(scale.shape) != (info.shape[0], width // 16)):
+                    raise ValueError(f"{name}: expected NVFP4 U8 [rows, {width // 2}] with E4M3 scales [rows, {width // 16}]")
+            elif info.dtype not in ("F8_E4M3", "BF16") or len(info.shape) != 2 or info.shape[1] != width:
+                raise ValueError(f"{name}: expected F8_E4M3 or BF16 [rows, {width}], or NVFP4 U8 [rows, {width // 2}]")
             dtypes.add(info.dtype)
             self.shards.append((name, info.shape[0]))
         if len(dtypes) != 1:
             raise ValueError("n-gram shards mix dtypes")
         self.bf16 = dtypes == {"BF16"}
+        self.nvfp4 = dtypes == {"U8"}
         if keep_bf16 and not self.bf16:
-            raise ValueError("a BF16 n-gram volume needs the checkpoint's BF16 table (this one is FP8)")
+            raise ValueError("a BF16 n-gram volume needs the checkpoint's BF16 table (this one is quantized)")
         self.keep_bf16 = keep_bf16
         self.rows = sum(count for _, count in self.shards)
         self.width = width
-        self.row_bytes = 2 * width if keep_bf16 else width  # BF16 words, or one E4M3FN byte per element
+        # BF16 words, one E4M3FN byte per element, or NVFP4 codes then block scales.
+        if keep_bf16:
+            self.row_bytes = 2 * width
+        elif self.nvfp4:
+            self.row_bytes = width // 2 + width // 16
+        else:
+            self.row_bytes = width
         if self.rows != rows:
             raise ValueError(f"n-gram shards hold {self.rows} rows, the hash domain needs {rows}")
         self._scale: torch.Tensor | None = None
+        self._nvfp4_scale: torch.Tensor | None = None
+
+    @property
+    def volume_format(self) -> str:
+        """The artifact's ``ngram_table.format`` of the rows :meth:`codes` returns."""
+
+        return "bf16" if self.keep_bf16 else "nvfp4" if self.nvfp4 else "fp8_e4m3fn"
+
+    def nvfp4_scale(self) -> torch.Tensor:
+        """An NVFP4 table's FP32 multiplier ``[1]`` (``weight_scale_2``, positive and finite)."""
+
+        if not self.nvfp4:
+            raise ValueError("only an NVFP4 n-gram table has an FP32 multiplier")
+        if self._nvfp4_scale is None:
+            name = self.prefix + "weight_scale_2"
+            info = self.store.describe(name)
+            if info.dtype != "F32" or prod(info.shape) != 1:
+                raise ValueError(f"{name}: expected one FP32 multiplier")
+            value = self.store.read_flat(name).reshape(1).clone()
+            if not bool(torch.isfinite(value).all()) or float(value) <= 0:
+                raise ValueError(f"{name}: the multiplier must be positive and finite")
+            self._nvfp4_scale = value
+        return self._nvfp4_scale
 
     def scale(self) -> torch.Tensor:
         """The per-tensor scale, BF16 ``[1]`` (exact: NVIDIA's FP32 word is a BF16 value)."""
 
+        if self.nvfp4:
+            raise ValueError("an NVFP4 n-gram table has block scales and an FP32 multiplier, not an FP8 scale")
         if self._scale is None:
             if self.bf16:
                 amax = torch.zeros((), dtype=torch.bfloat16)
@@ -608,8 +698,20 @@ class NgramTable:
 
     def codes(self, name: str, begin: int, end: int) -> torch.Tensor:
         """The volume's bytes ``uint8 [end - begin, row_bytes]`` of rows [begin, end) of shard ``name``:
-        E4M3FN words, or with ``keep_bf16`` the BF16 words unchanged."""
+        E4M3FN words, with ``keep_bf16`` the BF16 words unchanged, or an NVFP4 row's code bytes then
+        its E4M3FN block-scale bytes."""
 
+        if self.nvfp4:
+            half, blocks = self.width // 2, self.width // 16
+            codes = self.store.read_flat(name, begin * half, end * half).reshape(end - begin, half)
+            scales = (
+                self.store.read_flat(name.removesuffix(".weight") + ".weight_scale", begin * blocks, end * blocks)
+                .view(torch.uint8)
+                .reshape(end - begin, blocks)
+            )
+            if bool((((scales & 0x80) != 0) | (scales == 0x7F)).any()):
+                raise ValueError(f"{name}: n-gram block scales must be nonnegative finite E4M3FN words")
+            return torch.cat((codes, scales), dim=1)
         values = self.store.read_flat(name, begin * self.width, end * self.width)
         if self.keep_bf16:
             return values.contiguous().view(torch.uint8).reshape(end - begin, self.row_bytes)
@@ -629,6 +731,8 @@ class NgramTable:
         shard ``name`` of this table: a BF16 table's words, or values whose per-tensor quantization is
         an FP8 table's words (the FP8 checkpoint of the same BF16 table: the rule ModelOpt applies)."""
 
+        if self.nvfp4:
+            raise ValueError("an NVFP4 table binds its own rows; give a BF16 volume at run time with --ngram-volume")
         values = rows.contiguous().view(torch.bfloat16).reshape(end - begin, self.width)
         stored = self.store.read_flat(name, begin * self.width, end * self.width).reshape(end - begin, self.width)
         if self.bf16:
@@ -641,22 +745,28 @@ def build_model(
     *,
     components: tuple[str, ...] = ("text",),
     resource_overrides: Mapping[str, str | Path] | None = None,
-    ngram_format: str = "fp8_e4m3fn",
+    ngram_format: str | None = None,
 ) -> Model:
-    """The logical model; ``ngram_format`` "bf16" binds the n-gram table as BF16 rows (a BF16 volume,
-    ``--ngram-reuse``) instead of FP8 rows with their per-tensor scale."""
+    """The logical model. The n-gram table binds as the checkpoint's own rows: FP8 rows with their
+    per-tensor scale (an FP8 or BF16 table, ``ngram_format`` "fp8_e4m3fn"), or an NVFP4 table's rows
+    with its FP32 multiplier ("nvfp4"); "bf16" binds a BF16 table's unquantized rows instead (a BF16
+    volume, ``--ngram-reuse``). None selects the checkpoint's own format."""
 
     selected = set(components)
     if "text" not in selected or selected - {"text", "vision", "mtp"}:
         raise ValueError("select text and optional vision and mtp components")
-    if ngram_format not in ("fp8_e4m3fn", "bf16"):
-        raise ValueError(f"unknown n-gram table format {ngram_format!r}")
     config = text_config(base.config, mtp="mtp" in selected)
     text_prefix = "model.language_model." if "text_config" in base.config else "model."
     (ple_layer,) = config["ple_layer_ids"]
     ple_prefix = f"{text_prefix}layers.{ple_layer - 1}."
     rows = _check_ngram_buffers(base, ple_prefix, config, 0)
     table = NgramTable(base, ple_prefix, config, rows)
+    own = table.volume_format
+    if ngram_format is None:
+        ngram_format = own
+    allowed = ("nvfp4",) if table.nvfp4 else ("fp8_e4m3fn", "bf16")
+    if ngram_format not in allowed:
+        raise ValueError(f"n-gram table format {ngram_format!r}: this checkpoint's {own} table binds as {allowed}")
     config["ngram_table"] = {
         "format": ngram_format,
         **ngram_geometry(rows, 2 * table.width if ngram_format == "bf16" else table.row_bytes),
@@ -756,6 +866,14 @@ NGRAM_HEADER = struct.Struct("<8sIIQIIIQ16s")  # magic, version, header bytes, r
 # keeps its ngram_scale; the engine knows the scale of NVIDIA's published volume by its id).
 NGRAM_SCALE = struct.Struct("<H")
 NGRAM_SCALE_OFFSET = NGRAM_HEADER.size
+# The row format, explicit (volumes written since 2026-10-19; 0 before, when the row size alone told
+# FP8, IQ4_NL and BF16 apart; NVFP4 rows have IQ4_NL's 90 bytes), and an NVFP4 volume's FP32
+# multiplier (bits; 0 for other formats). Volumes published before stay unchanged.
+NGRAM_FORMAT = struct.Struct("<H")
+NGRAM_FORMAT_OFFSET = NGRAM_SCALE_OFFSET + NGRAM_SCALE.size
+NGRAM_FORMAT_CODES = {"fp8_e4m3fn": 1, "iq4_nl": 2, "bf16": 3, "nvfp4": 4}
+NGRAM_NVFP4_SCALE = struct.Struct("<I")
+NGRAM_NVFP4_SCALE_OFFSET = NGRAM_FORMAT_OFFSET + NGRAM_FORMAT.size
 
 
 def bf16_bits(value: torch.Tensor) -> int:
@@ -783,15 +901,35 @@ def ngram_geometry(rows: int, row_bytes: int) -> dict:
 NGRAM_REUSE_SAMPLES = 512
 
 
+def read_ngram_volume_format(path: Path, width: int) -> str:
+    """A volume's row format: its header's tag, or for a volume written before the tag, the one its
+    row size implies (FP8 ``width``, BF16 ``2 x width``, IQ4_NL ``width / 32 x 18`` bytes)."""
+
+    with Path(path).open("rb") as stream:
+        header = stream.read(NGRAM_NVFP4_SCALE_OFFSET + NGRAM_NVFP4_SCALE.size)
+    row_bytes = NGRAM_HEADER.unpack_from(header)[4]
+    (tag,) = NGRAM_FORMAT.unpack_from(header, NGRAM_FORMAT_OFFSET)
+    if tag:
+        names = {code: name for name, code in NGRAM_FORMAT_CODES.items()}
+        if tag not in names:
+            raise ValueError(f"{path}: unknown n-gram row format tag {tag}")
+        return names[tag]
+    if row_bytes == 2 * width:
+        return "bf16"
+    if row_bytes == width:
+        return "fp8_e4m3fn"
+    if width % 32 == 0 and row_bytes == width // 32 * 18:
+        return "iq4_nl"
+    raise ValueError(f"{path}: n-gram rows of {row_bytes} bytes fit no table of this model")
+
+
 def ngram_volume_format(base: SafetensorsSource, path: Path) -> str:
-    """"bf16" for a volume of BF16 rows (2 x the head width), else "fp8_e4m3fn"
-    (read_ngram_volume_id checks the rest)."""
+    """The row format of an existing volume of this checkpoint's table (read_ngram_volume_id checks
+    the rest)."""
 
     config = text_config(base.config, mtp=False)
     width = config["ple_embed_dim"] // ((config["ngram_size"] - 1) * config["heads_per_ngram"])
-    with Path(path).open("rb") as stream:
-        row_bytes = NGRAM_HEADER.unpack(stream.read(NGRAM_HEADER.size))[4]
-    return "bf16" if row_bytes == 2 * width else "fp8_e4m3fn"
+    return read_ngram_volume_format(path, width)
 
 
 def read_ngram_volume_id(table: NgramTable, path: Path, *, bf16: bool = False) -> bytes:
@@ -851,6 +989,15 @@ def read_ngram_volume_id(table: NgramTable, path: Path, *, bf16: bool = False) -
             if not same:
                 raise ValueError(f"{path}: row {row} differs from this checkpoint's n-gram table "
                                  "(a volume written from another checkpoint)")
+    if getattr(table, "nvfp4", False) and not bf16:
+        # An NVFP4 volume's rows are only the table with its multiplier, which its header records.
+        expected = table.nvfp4_scale().view(torch.int32).item() & 0xFFFFFFFF
+        with path.open("rb") as stream:
+            fields = stream.read(NGRAM_NVFP4_SCALE_OFFSET + NGRAM_NVFP4_SCALE.size)
+        tag = NGRAM_FORMAT.unpack_from(fields, NGRAM_FORMAT_OFFSET)[0]
+        bits = NGRAM_NVFP4_SCALE.unpack_from(fields, NGRAM_NVFP4_SCALE_OFFSET)[0]
+        if tag != NGRAM_FORMAT_CODES["nvfp4"] or bits != expected:
+            raise ValueError(f"{path}: not this checkpoint's NVFP4 volume (format tag or multiplier differs)")
     return volume_id
 
 
@@ -875,9 +1022,14 @@ def write_ngram_volume(table: NgramTable, path: Path, volume_id: bytes, *, progr
         NGRAM_MAGIC, NGRAM_VERSION, NGRAM_BLOCK_BYTES, rows, row_bytes, per_block, NGRAM_BLOCK_BYTES,
         geometry["blocks"], volume_id,
     )
-    # FP8 rows record their scale (a BF16 or IQ4_NL volume's rows are self-contained).
-    fp8 = isinstance(table, NgramTable) and not table.keep_bf16
-    header += NGRAM_SCALE.pack(bf16_bits(table.scale()) if fp8 else 0)
+    # The explicit row format; FP8 rows record their scale and NVFP4 rows their multiplier (a BF16 or
+    # IQ4_NL volume's rows are self-contained).
+    format = table.volume_format
+    header += NGRAM_SCALE.pack(bf16_bits(table.scale()) if format == "fp8_e4m3fn" else 0)
+    header += NGRAM_FORMAT.pack(NGRAM_FORMAT_CODES[format])
+    header += NGRAM_NVFP4_SCALE.pack(
+        table.nvfp4_scale().view(torch.int32).item() & 0xFFFFFFFF if format == "nvfp4" else 0
+    )
     batch_blocks = 4096  # 16 MiB of output per write
     try:
         with temporary.open("xb") as stream:

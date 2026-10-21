@@ -68,9 +68,13 @@ struct MoeConfig {
     std::uint32_t top_k               = 0;
     std::uint32_t intermediate        = 0;
     std::uint32_t shared_intermediate = 0;
-    // The routed experts' arithmetic, from the stored representation (parse_config): W4A16 when the
-    // banks carry no activation scales (design §16.2.1), else W4A4 (§16.2).
+    // The routed experts' arithmetic (parse_config): W4A16 when the banks carry no activation scales
+    // (design §16.2.1), else W4A4 (§16.2); banks whose 4-bit activations are optional run W4A16
+    // unless LoadOptions::expert_a4_activations asks for W4A4.
     bool a16_experts = false;
+    // The text config's expert_a4_activations: optional (NVIDIA FP4-Local, design §6.1.2): the banks
+    // carry their calibrated activation scales and permit 4-bit activations, but default to 16-bit.
+    bool a4_optional = false;
 };
 
 struct HyperConnectionConfig {
@@ -92,16 +96,21 @@ struct QsaConfig {
 };
 
 // The n-gram table volume written beside the artifact (design §12.2): FP8 E4M3FN rows with one
-// per-tensor scale, a GGUF's IQ4_NL rows (design §12.5), or the unquantized table's BF16 rows (an exact
-// conversion bound to a BF16 volume). Any volume of the model's table, in any of the three formats,
-// may replace the artifact's at run time (resolve_ngram_volume).
-enum class NgramRowFormat : std::uint8_t { Fp8E4m3, Iq4Nl, Bf16 };
+// per-tensor scale, a GGUF's IQ4_NL rows (design §12.5), the unquantized table's BF16 rows (an exact
+// conversion bound to a BF16 volume), or NVIDIA FP4-Local's NVFP4 rows (E2M1 codes, then one E4M3FN
+// scale per 16 elements, with one FP32 multiplier for the table; design §12.5). Any volume of the
+// model's table, in any of the four formats, may replace the artifact's at run time
+// (resolve_ngram_volume).
+enum class NgramRowFormat : std::uint8_t { Fp8E4m3, Iq4Nl, Bf16, Nvfp4 };
 
 struct NgramTableConfig {
     NgramRowFormat format = NgramRowFormat::Fp8E4m3;
     // An FP8 volume that is not the artifact's own: its per-tensor scale (BF16 bits), from its header
     // or its known volume id. Empty for the artifact's own table (its ngram_scale parameter) and other formats.
     std::optional<std::uint16_t> fp8_scale;
+    // An NVFP4 volume that is not the artifact's own: its FP32 multiplier (bits), from its header.
+    // Empty for the artifact's own table (its FP32 ngram_scale parameter) and other formats.
+    std::optional<std::uint32_t> nvfp4_scale;
     std::uint64_t rows            = 0;
     std::uint32_t row_bytes       = 0;
     std::uint32_t rows_per_block  = 0;

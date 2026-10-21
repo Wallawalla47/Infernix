@@ -128,6 +128,7 @@ constexpr std::array kCliOptions{
     CliOption{"--use-original-nvfp4-prefill-kernel", false},
     CliOption{"--disable-fast-paths", false},
     CliOption{"--fast-path", true, true},
+    CliOption{"--expert-a4-activations", false},
     CliOption{"--stop-token-id", true, true},
     CliOption{"--stop", true, true},
     CliOption{"--reasoning-stop", true, true},
@@ -182,7 +183,7 @@ std::string usage_text(const char* argv0) {
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
            "       [--chat-template FILE] [--ngram-volume FILE] [--ngram-residency auto|ram|volume]\n"
-           "       [--expert-state FILE|off] [--expert-stripe FILE]\n"
+           "       [--expert-state FILE|off] [--expert-stripe FILE] [--expert-a4-activations]\n"
            "       [--ram-headroom-mib N] [--expert-ram-mib N|auto] [--expert-pin-mib N|auto]\n"
            "       [--grammar-file FILE | --json-object | --json-schema-file FILE |\n"
            "        --regex PATTERN | --choice TEXT ...]\n"
@@ -272,6 +273,11 @@ std::string usage_text(const char* argv0) {
            "                           policy; startup lists them; docs/cli.md)\n"
            "  --fast-path NAME         also run this fast path, qualified or not\n"
            "                           (qualification runs; repeatable)\n"
+           "  --expert-a4-activations  nvidia/Qwen3.8-Flash-Next-FP4-Local only: run its\n"
+           "                           routed experts with 4-bit (NVFP4) activations, using\n"
+           "                           the activation scales NVIDIA calibrated for them.\n"
+           "                           Changes the output. No other artifact supports it\n"
+           "                           (default: 16-bit activations, as NVIDIA serves it)\n"
            "\n"
            "SPECULATIVE DECODING (off by default)\n"
            "  --spec mtp|dflash|dflash2 speculative backend\n"
@@ -534,6 +540,8 @@ Options parse_options(int argc, char** argv) {
             const std::optional<FastPath> path = parse_fast_path(name);
             if (!path) { throw std::invalid_argument("unknown fast path: " + name); }
             options.fast_path_candidates.push_back(*path);
+        } else if (arg == "--expert-a4-activations") {
+            options.expert_a4_activations = true;
         } else if (arg == "--stop-token-id") {
             const std::uint32_t token = parse_u32(value(arg), "stop-token-id", true);
             if (token > static_cast<std::uint32_t>(std::numeric_limits<TokenId>::max())) {

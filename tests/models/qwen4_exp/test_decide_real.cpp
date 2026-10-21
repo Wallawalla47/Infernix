@@ -4,9 +4,11 @@
 //
 //   readout      A prompt's readout names its greedy first token and 15 others: the top token is the
 //                one generated, no named token outscores it, and a resumed prompt reads what its cold
-//                run reads (within rounding: their prefill calls differ). With INFERNIX_DECIDE_DUMP=DIR
-//                the prompt ids and readout are written there for the FP64 oracle of the gate, which
-//                log-softmaxes the forward test's FP32 logits of the same prompt rounded to BF16.
+//                run reads (within rounding: their prefill calls differ; with expert-a4-residual, whose
+//                expert arithmetic depends on where an expert runs, its top token). With
+//                INFERNIX_DECIDE_DUMP=DIR the prompt ids and readout are written there for the FP64
+//                oracle of the gate, which log-softmaxes the forward test's FP32 logits of the same
+//                prompt rounded to BF16.
 //   forced       One-token steps force their tokens; each draw reports probability 1.
 //   chain        Steps {other, greedy}: the constrained greedy output equals the unconstrained one,
 //                and each draw renormalizes over its step (with MTP: through draft verification).
@@ -150,8 +152,22 @@ int readout(infernix::Engine& engine, bool dump) {
             worst = std::max(worst, std::fabs(static_cast<double>(a.readout->logprobs[i] - b.readout->logprobs[i])));
         }
     }
-    failures += check(a.readout && b.readout && a.readout->top_token == b.readout->top_token && worst <= 0.05,
-                      "readout: resumed equals cold within 0.05 nats (worst " + std::to_string(worst) + ")");
+    // expert-a4-residual computes a GPU wide call's experts from A4 activation terms and a CPU-served
+    // miss exactly, so a resumed run, whose experts are placed otherwise than its cold run's, reads
+    // within the path's own error rather than rounding (NVIDIA FP4-Local, 2026-10-21: up to 0.33 nats on
+    // this prompt's flat distribution, bit-identical without the path): there the claim is its top token.
+    const std::vector<std::string>& paths = engine.load_summary().fast_paths;
+    const bool placed_arithmetic = std::any_of(paths.begin(), paths.end(), [](const std::string& path) {
+        return path == "expert-a4-residual" || path == "expert-a4-residual-3";
+    });
+    const bool same_top = a.readout && b.readout && a.readout->top_token == b.readout->top_token;
+    if (placed_arithmetic) {
+        failures += check(same_top, "readout: resumed reads cold's top token (expert-a4-residual; worst " +
+                                        std::to_string(worst) + " nats)");
+    } else {
+        failures += check(same_top && worst <= 0.05,
+                          "readout: resumed equals cold within 0.05 nats (worst " + std::to_string(worst) + ")");
+    }
     return failures;
 }
 

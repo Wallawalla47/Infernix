@@ -53,6 +53,7 @@ struct FastPathConfiguration {
     case FastPath::SampledMtpDrafts:
     case FastPath::GdnF16Accumulate: return false;
     case FastPath::ExpertA4Residual:
+    case FastPath::ExpertA4Residual3:
     case FastPath::BatchedDecode:
     case FastPath::BatchedA8Decode:
     case FastPath::BatchedA4Decode:

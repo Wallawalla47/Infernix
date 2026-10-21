@@ -92,8 +92,13 @@ NgramTableConfig ngram_table(const Json& value, std::uint64_t hash_rows, std::ui
         // The unquantized table's BF16 words (an exact conversion bound to a BF16 volume).
         out.format = NgramRowFormat::Bf16;
         head_width = 2 * head_width;
+    } else if (value.at("format") == "nvfp4") {
+        // NVIDIA FP4-Local's rows verbatim: W / 2 E2M1 code bytes, then W / 16 E4M3FN block scales.
+        out.format = NgramRowFormat::Nvfp4;
+        if (head_width % 16) { throw ArtifactError("an NVFP4 n-gram row must be whole 16-element blocks"); }
+        head_width = head_width / 2 + head_width / 16;
     } else {
-        throw ArtifactError("n-gram table must hold FP8 E4M3FN, IQ4_NL or BF16 rows");
+        throw ArtifactError("n-gram table must hold FP8 E4M3FN, IQ4_NL, BF16 or NVFP4 rows");
     }
     out.rows           = wide(value, "rows");
     out.row_bytes      = dimension(value, "row_bytes");
@@ -136,7 +141,7 @@ TextConfig text(const Json& value) {
          "ple_embed_dim", "ple_conv_kernel_size", "ngram_size", "heads_per_ngram",
          "ngram_vocab_size_base", "make_ngram_vocab_size_divisible_by", "seed",
          "split_ngram_parts", "eos_token_id", "ngram_table"},
-        {"gdn_output_order", "gdn_a"}, "text config");
+        {"gdn_output_order", "gdn_a", "expert_a4_activations"}, "text config");
     const auto& names = value.at("architectures");
     if (!names.is_array() || names.size() != 1) {
         throw ArtifactError("architectures must name one implementation");
@@ -212,6 +217,12 @@ TextConfig text(const Json& value) {
                dimension(value, "moe_intermediate_size"),
                dimension(value, "shared_expert_intermediate_size")};
     if (out.moe.top_k > out.moe.experts) { throw ArtifactError("selected experts exceed expert count"); }
+    if (value.contains("expert_a4_activations")) {
+        if (value.at("expert_a4_activations") != "optional") {
+            throw ArtifactError("expert_a4_activations must be optional");
+        }
+        out.moe.a4_optional = true;
+    }
     out.hc = {dimension(value, "hc_count"), dimension(value, "hc_lowrank")};
     if (out.hc.streams < 2) { throw ArtifactError("hc_count must exceed one"); }
     out.qsa = {dimension(value, "indexer_n_heads"), dimension(value, "indexer_head_dim"),
@@ -274,10 +285,22 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
         Config out;
         out.text = text(directory.component("text").config);
         out.text.rope.yarn_factor = options.rope_yarn_factor;
-        // A weight-only export stores its banks without activation scales (the loader checks every
-        // layer); the 16-bit-activation reference (LoadOptions::a16_activations) runs every bank W4A16.
+        // A weight-only export stores its banks without activation scales (bind_moe checks every
+        // layer); banks whose 4-bit activations are optional run them only when asked; the
+        // 16-bit-activation reference (LoadOptions::a16_activations) runs every bank W4A16.
+        const bool scales = directory.bindings.contains("text/layers/0/moe/expert_input_scales");
+        if (out.text.moe.a4_optional && !scales) {
+            throw ArtifactError("optional 4-bit expert activations need the banks' activation scales");
+        }
+        if (options.expert_a4_activations && !out.text.moe.a4_optional) {
+            throw ArtifactError("--expert-a4-activations needs an artifact whose routed experts offer 4-bit "
+                                "activations as an option (nvidia/Qwen3.8-Flash-Next-FP4-Local)");
+        }
+        if (options.expert_a4_activations && options.a16_activations) {
+            throw ArtifactError("--expert-a4-activations contradicts 16-bit activations");
+        }
         out.text.moe.a16_experts = options.a16_activations ||
-                                   !directory.bindings.contains("text/layers/0/moe/expert_input_scales");
+                                   (out.text.moe.a4_optional ? !options.expert_a4_activations : !scales);
         if (options.rope_yarn_factor > 1.0F && out.text.rope.theta <= 1.0F) {
             throw ArtifactError("YaRN needs a RoPE theta above 1");
         }

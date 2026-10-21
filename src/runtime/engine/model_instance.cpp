@@ -217,6 +217,9 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
     if (options.expert_tail_skip != 0 && !qwen4_exp) {
         throw std::invalid_argument("--expert-tail-skip applies to Qwen3.8-Flash-Next (its offloaded experts) only");
     }
+    if (options.expert_a4_activations && !qwen4_exp) {
+        throw std::invalid_argument("--expert-a4-activations applies to nvidia/Qwen3.8-Flash-Next-FP4-Local only");
+    }
     // An approximation whose output depends on the cache state: never on the exact route.
     if (options.expert_tail_skip != 0 && !options.fast_paths) {
         throw std::invalid_argument("--expert-tail-skip is approximate; the exact route (--disable-fast-paths) refuses it");

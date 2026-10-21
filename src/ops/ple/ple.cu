@@ -53,11 +53,56 @@ __global__ void embed_kernel(const std::uint8_t* __restrict__ rows, const bf16* 
     out[static_cast<std::size_t>(t) * elements + i] = __float2bfloat16_rn(v);
 }
 
-// One CTA per (stream, column).
+// bf16_rn(p * m) of the exact product: hi = fl32(p * m) and its error lo (an FMA residual, exact)
+// round together, so lo decides only a hi that lies exactly halfway between two BF16 values.
+__device__ __forceinline__ std::uint16_t bf16_rn_product(float p, float m) {
+    const float hi         = p * m;
+    const float lo         = fmaf(p, m, -hi);
+    const std::uint32_t b  = __float_as_uint(hi);
+    const std::uint32_t lo16 = b & 0xFFFFU;
+    std::uint32_t up;
+    if (lo16 == 0x8000U && lo != 0.0F) {
+        up = (lo > 0.0F) == (hi > 0.0F) ? 1U : 0U; // the exact magnitude lies above or below the tie
+    } else {
+        up = lo16 > 0x8000U || (lo16 == 0x8000U && (b & 0x10000U) != 0);
+    }
+    return static_cast<std::uint16_t>((b >> 16) + up);
+}
+
+// One CTA per column; each task decodes one 16-element block of one head's row.
+__global__ void __launch_bounds__(kThreads)
+    embed_nvfp4_kernel(const std::uint8_t* __restrict__ rows, const float* __restrict__ multiplier, int row_bytes,
+                       int heads, int width, std::uint16_t* __restrict__ out) {
+    constexpr float kE2m1[16] = {0.0F, 0.5F, 1.0F, 1.5F, 2.0F, 3.0F, 4.0F, 6.0F,
+                                 -0.0F, -0.5F, -1.0F, -1.5F, -2.0F, -3.0F, -4.0F, -6.0F};
+    const int t      = blockIdx.x;
+    const int blocks = width / 16;
+    const float m    = multiplier[0];
+    for (int task = threadIdx.x; task < heads * blocks; task += blockDim.x) {
+        const int h = task / blocks, b = task % blocks;
+        const std::uint8_t* row = rows + (static_cast<std::size_t>(t) * heads + h) * row_bytes;
+        __nv_fp8_e4m3 code;
+        code.__x       = row[width / 2 + b];
+        const float s  = static_cast<float>(code);
+        std::uint16_t* o = out + static_cast<std::size_t>(t) * heads * width + static_cast<std::size_t>(h) * width + 16 * b;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const std::uint8_t pair = row[8 * b + i];
+            o[2 * i]     = bf16_rn_product(kE2m1[pair & 15U] * s, m); // E2M1 times E4M3: exact in FP32
+            o[2 * i + 1] = bf16_rn_product(kE2m1[pair >> 4U] * s, m);
+        }
+    }
+}
+
+__device__ __forceinline__ float norm_value(bf16 w) { return __bfloat162float(w); }
+__device__ __forceinline__ float norm_value(float w) { return w; }
+
+// One CTA per (stream, column). The norm weights are BF16, or FP32 (NVIDIA FP4-Local's).
+template <class Norm>
 __global__ void __launch_bounds__(kThreads)
     gate_kernel(const bf16* __restrict__ key, const bf16* __restrict__ value,
-                const bf16* __restrict__ residual, const bf16* __restrict__ key_norm,
-                const bf16* __restrict__ query_norm, const bf16* __restrict__ conv_norm, int hidden,
+                const bf16* __restrict__ residual, const Norm* __restrict__ key_norm,
+                const Norm* __restrict__ query_norm, const Norm* __restrict__ conv_norm, int hidden,
                 int width, float eps, bf16* __restrict__ gated, bf16* __restrict__ normalized) {
     __shared__ float scratch[kThreads / 32];
     const int s = blockIdx.x, t = blockIdx.y;
@@ -74,9 +119,8 @@ __global__ void __launch_bounds__(kThreads)
     float dot = 0.0F;
     for (int d = threadIdx.x; d < hidden; d += blockDim.x) {
         const std::size_t c = static_cast<std::size_t>(s) * hidden + d;
-        const float k = __bfloat162float(key[base + d]) * key_inv * (1.0F + __bfloat162float(key_norm[c]));
-        const float q = __bfloat162float(residual[base + d]) * query_inv *
-                        (1.0F + __bfloat162float(query_norm[c]));
+        const float k = __bfloat162float(key[base + d]) * key_inv * (1.0F + norm_value(key_norm[c]));
+        const float q = __bfloat162float(residual[base + d]) * query_inv * (1.0F + norm_value(query_norm[c]));
         dot += k * q;
     }
     float g = block_sum(dot, scratch) / sqrtf(static_cast<float>(hidden));
@@ -92,7 +136,7 @@ __global__ void __launch_bounds__(kThreads)
     for (int d = threadIdx.x; d < hidden; d += blockDim.x) {
         const std::size_t c = static_cast<std::size_t>(s) * hidden + d;
         const float v = gate * __bfloat162float(value[static_cast<std::size_t>(t) * hidden + d]);
-        normalized[base + d] = __float2bfloat16_rn(v * gated_inv * (1.0F + __bfloat162float(conv_norm[c])));
+        normalized[base + d] = __float2bfloat16_rn(v * gated_inv * (1.0F + norm_value(conv_norm[c])));
     }
 }
 
@@ -183,14 +227,32 @@ void ple_embed(const Tensor& rows, const Tensor& scale, Tensor& out, cudaStream_
     check_launch("embed");
 }
 
+void ple_embed_nvfp4(const Tensor& rows, const Tensor& multiplier, Tensor& out, cudaStream_t stream) {
+    require(contiguous(rows, DType::U8) && contiguous(multiplier, DType::FP32) && contiguous(out, DType::BF16),
+            "NVFP4 embed requires contiguous U8 rows, an FP32 multiplier and BF16 output");
+    const int row_bytes = rows.ne[0], heads = rows.ne[1], columns = rows.ne[2];
+    require(row_bytes % 9 == 0 && heads > 0 && columns > 0 && multiplier.numel() == 1,
+            "NVFP4 rows must be whole 16-element blocks (8 code bytes and a scale each)");
+    const int width = row_bytes / 9 * 16;
+    require(out.ne[0] == heads * width && out.ne[1] == columns, "NVFP4 embed shapes disagree");
+    embed_nvfp4_kernel<<<columns, kThreads, 0, stream>>>(static_cast<const std::uint8_t*>(rows.data),
+                                                         static_cast<const float*>(multiplier.data), row_bytes, heads,
+                                                         width, static_cast<std::uint16_t*>(out.data));
+    check_launch("embed nvfp4");
+}
+
 void ple_gate(const Tensor& key, const Tensor& value, const Tensor& residual,
               const Tensor& key_norm, const Tensor& query_norm, const Tensor& conv_norm,
               std::int32_t streams, float eps, Tensor& gated, Tensor& normalized,
               cudaStream_t stream) {
-    for (const Tensor* t : {&key, &value, &residual, &key_norm, &query_norm, &conv_norm,
-                            static_cast<const Tensor*>(&gated), static_cast<const Tensor*>(&normalized)}) {
+    for (const Tensor* t : {&key, &value, &residual, static_cast<const Tensor*>(&gated),
+                            static_cast<const Tensor*>(&normalized)}) {
         require(contiguous(*t, DType::BF16), "gate requires contiguous BF16 tensors");
     }
+    const DType norm = key_norm.dtype;
+    require((norm == DType::BF16 || norm == DType::FP32) && contiguous(key_norm, norm) &&
+                contiguous(query_norm, norm) && contiguous(conv_norm, norm),
+            "gate norms must be contiguous, all BF16 or all FP32");
     const int width = key.ne[0], columns = key.ne[1];
     require(streams > 0 && width % streams == 0, "gate width must hold whole streams");
     const int hidden = width / streams;
@@ -199,11 +261,18 @@ void ple_gate(const Tensor& key, const Tensor& value, const Tensor& residual,
                 conv_norm.numel() == width && gated.ne[0] == width && gated.ne[1] == columns &&
                 normalized.ne[0] == width && normalized.ne[1] == columns && columns > 0 && eps > 0,
             "gate shapes disagree");
-    gate_kernel<<<dim3(streams, columns), kThreads, 0, stream>>>(
-        static_cast<const bf16*>(key.data), static_cast<const bf16*>(value.data),
-        static_cast<const bf16*>(residual.data), static_cast<const bf16*>(key_norm.data),
-        static_cast<const bf16*>(query_norm.data), static_cast<const bf16*>(conv_norm.data), hidden,
-        width, eps, static_cast<bf16*>(gated.data), static_cast<bf16*>(normalized.data));
+    const auto launch = [&]<class Norm>() {
+        gate_kernel<Norm><<<dim3(streams, columns), kThreads, 0, stream>>>(
+            static_cast<const bf16*>(key.data), static_cast<const bf16*>(value.data),
+            static_cast<const bf16*>(residual.data), static_cast<const Norm*>(key_norm.data),
+            static_cast<const Norm*>(query_norm.data), static_cast<const Norm*>(conv_norm.data), hidden, width, eps,
+            static_cast<bf16*>(gated.data), static_cast<bf16*>(normalized.data));
+    };
+    if (norm == DType::FP32) {
+        launch.template operator()<float>();
+    } else {
+        launch.template operator()<bf16>();
+    }
     check_launch("gate");
 }
 

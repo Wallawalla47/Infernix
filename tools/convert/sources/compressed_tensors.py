@@ -14,6 +14,7 @@ import torch
 from tools.artifact.codecs.fp8_row import validate_fp8_row_words
 from tools.artifact.formats import valid_positive_fp32_word
 from .logical import EncodedRows, LogicalSource
+from .modelopt import MXFP8_FORMAT, is_mxfp8_matrix, mxfp8_matrix_source
 from .safetensors import SafetensorsSource, tensor_source
 
 
@@ -200,13 +201,16 @@ def matrix_source(
                 actual = "nvfp4"
             if actual is None and store.describe(name).dtype == "U8":
                 actual = "nvfp4"
+            if actual is None and is_mxfp8_matrix(store, prefix, shape):
+                actual = MXFP8_FORMAT  # ModelOpt MXFP8: UE8M0 scales per 32 K elements
             if actual is None and store.describe(name).dtype == "F8_E4M3":
                 actual = "fp8_e4m3fn_row_bf16"
-            resolved = (
-                tensor_source(store, name, shape)
-                if actual is None
-                else compressed_matrix_source(store, prefix, shape, actual)
-            )
+            if actual is None:
+                resolved = tensor_source(store, name, shape)
+            elif actual == MXFP8_FORMAT:
+                resolved = mxfp8_matrix_source(store, prefix, shape)
+            else:
+                resolved = compressed_matrix_source(store, prefix, shape, actual)
         return resolved
 
     def encoded(begin: int, end: int) -> EncodedRows:

@@ -77,8 +77,11 @@ constexpr std::array kQualified{
     // Recipe C (FP8 dense, W4A16 experts): two-term A4 expert activations. Prefill (quick corpus,
     // 896 and 7,168 tokens) on every format, decode (MTP at concurrency 2, 256 segments) on INT8, the
     // passing format with the lowest floor; the path leaves attention and the KV cache alone, so the
-    // others are registered from the INT8 increments (model-quality.md 6.1, step 3). BF16 KV fails:
-    // there recipe C's exact route is the reference itself (floor 0) (2026-10-15).
+    // others are registered from the INT8 increments (model-quality.md 6.1, step 3). BF16 KV failed
+    // against the old reference, recipe C's exact route itself (floor 0) (2026-10-15); the same kernels'
+    // BF16 gates on NVIDIA FP4-Local against the precise reference pass (below; 6.1, item 1), and the KV
+    // format does not enter them, so recipe C's timing holds there too (2026-10-21).
+    Qualification{FastPath::ExpertA4Residual, {DenseKernels::Fp8Row, false, KvCacheStorage::BFloat16}},
     Qualification{FastPath::ExpertA4Residual, {DenseKernels::Fp8Row, false, KvCacheStorage::Int8Group64}},
     Qualification{FastPath::ExpertA4Residual, {DenseKernels::Fp8Row, false, KvCacheStorage::Fp8E4M3Row256}},
     Qualification{FastPath::ExpertA4Residual, {DenseKernels::Fp8Row, false, KvCacheStorage::Nvfp4Group16}},
@@ -248,6 +251,90 @@ constexpr std::array kQualified{
     Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Fp8Row, false, KvCacheStorage::Fp8KeyNvfp4Value}},
     Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Fp8Row, false, KvCacheStorage::Vq2}},
     Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Fp8Row, false, KvCacheStorage::Q4KeyVq2Value}},
+    // NVIDIA FP4-Local (MXFP8 dense, 16-bit experts by default, 4-bit with --expert-a4-activations): sampled
+    // drafts by the same rule (no logit changes; 6.1), with IQ3_S's and FP8's timings as the nearest.
+    Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Mxfp8, false, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Mxfp8, false, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Mxfp8, false, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Mxfp8, false, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Mxfp8, false, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Mxfp8, false, KvCacheStorage::Vq2}},
+    Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Mxfp8, false, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Mxfp8, true, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Mxfp8, true, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Mxfp8, true, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Mxfp8, true, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Mxfp8, true, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Mxfp8, true, KvCacheStorage::Vq2}},
+    Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Mxfp8, true, KvCacheStorage::Q4KeyVq2Value}},
+    // NVIDIA FP4-Local: the coupling paths by the kernel rule (6.1, item 2), at both expert
+    // activation precisions: the MXFP8 and expert kernels pass their Op criteria, the prefix-cache and
+    // preemption real tests pass with the candidates (2026-10-20), and the INT8 joint decode gate (MTP 4
+    // at concurrency 2, warm 3,072-token resumes, 256 segments) passes: 16-bit experts with
+    // expert-a4-residual against the precise reference (TV bound 8.3e-4, p99.9 KL ratio 1.16; 2026-10-21),
+    // 4-bit against the 16-bit reference (TV bound 2.0e-5; its nonzero-floor verdict stands). The other
+    // formats take Dense8's verdicts. Two concurrent requests, INT8, ABBA: 16-bit +49.8 %, 4-bit +29.3 %;
+    // cache resume from FP8's timing (rule 4: the same mechanism, prefill not repeated).
+    Qualification{FastPath::AdaptiveSpeculation, {DenseKernels::Mxfp8, false, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::AdaptiveSpeculation, {DenseKernels::Mxfp8, false, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::AdaptiveSpeculation, {DenseKernels::Mxfp8, false, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::AdaptiveSpeculation, {DenseKernels::Mxfp8, false, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::AdaptiveSpeculation, {DenseKernels::Mxfp8, false, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::AdaptiveSpeculation, {DenseKernels::Mxfp8, false, KvCacheStorage::Vq2}},
+    Qualification{FastPath::AdaptiveSpeculation, {DenseKernels::Mxfp8, false, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::AdaptiveSpeculation, {DenseKernels::Mxfp8, true, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::AdaptiveSpeculation, {DenseKernels::Mxfp8, true, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::AdaptiveSpeculation, {DenseKernels::Mxfp8, true, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::AdaptiveSpeculation, {DenseKernels::Mxfp8, true, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::AdaptiveSpeculation, {DenseKernels::Mxfp8, true, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::AdaptiveSpeculation, {DenseKernels::Mxfp8, true, KvCacheStorage::Vq2}},
+    Qualification{FastPath::AdaptiveSpeculation, {DenseKernels::Mxfp8, true, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::FreeCacheResume, {DenseKernels::Mxfp8, false, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::FreeCacheResume, {DenseKernels::Mxfp8, false, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::FreeCacheResume, {DenseKernels::Mxfp8, false, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::FreeCacheResume, {DenseKernels::Mxfp8, false, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::FreeCacheResume, {DenseKernels::Mxfp8, false, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::FreeCacheResume, {DenseKernels::Mxfp8, false, KvCacheStorage::Vq2}},
+    Qualification{FastPath::FreeCacheResume, {DenseKernels::Mxfp8, false, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::FreeCacheResume, {DenseKernels::Mxfp8, true, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::FreeCacheResume, {DenseKernels::Mxfp8, true, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::FreeCacheResume, {DenseKernels::Mxfp8, true, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::FreeCacheResume, {DenseKernels::Mxfp8, true, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::FreeCacheResume, {DenseKernels::Mxfp8, true, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::FreeCacheResume, {DenseKernels::Mxfp8, true, KvCacheStorage::Vq2}},
+    Qualification{FastPath::FreeCacheResume, {DenseKernels::Mxfp8, true, KvCacheStorage::Q4KeyVq2Value}},
+    // Preemption by its forced-preemption increment against the precise reference (2026-10-21; 8,200-token
+    // prompts, a 388-page pool at concurrency 8, INT8 KV, 96 pauses and 792,480 replayed tokens per run):
+    // 16-bit TV bound 1.5e-4, 4-bit 1.7e-4, p99.9 ratio 1.00 at both. The other formats take Dense8's
+    // increments; timing from IQ3_S's and FP8's (requests admitted under a short pool; rule 4).
+    Qualification{FastPath::Preemption, {DenseKernels::Mxfp8, false, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::Preemption, {DenseKernels::Mxfp8, false, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::Preemption, {DenseKernels::Mxfp8, false, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::Preemption, {DenseKernels::Mxfp8, false, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::Preemption, {DenseKernels::Mxfp8, false, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::Preemption, {DenseKernels::Mxfp8, false, KvCacheStorage::Vq2}},
+    Qualification{FastPath::Preemption, {DenseKernels::Mxfp8, false, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::Preemption, {DenseKernels::Mxfp8, true, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::Preemption, {DenseKernels::Mxfp8, true, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::Preemption, {DenseKernels::Mxfp8, true, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::Preemption, {DenseKernels::Mxfp8, true, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::Preemption, {DenseKernels::Mxfp8, true, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::Preemption, {DenseKernels::Mxfp8, true, KvCacheStorage::Vq2}},
+    Qualification{FastPath::Preemption, {DenseKernels::Mxfp8, true, KvCacheStorage::Q4KeyVq2Value}},
+    // NVIDIA FP4-Local at its default 16-bit expert activations: two-term A4 expert activations, the
+    // kernels recipe C's gates approved (the same NVFP4 W4A16 banks; model-quality.md 6.1, item 1), on the
+    // formats they passed. BF16 KV against the precise reference (2026-10-21): prefill (quick corpus, 896
+    // and 7,168 tokens) KL bound 4.6e-4, p99.9 ratio 1.03; decode (MTP at concurrency 2, 256 segments) TV
+    // bound 8.0e-4, p99.9 ratio 0.97. Timed on INT8 (2026-10-20, ABBA): pp32768 8,387 -> 11,299 tok/s
+    // (+34.7 %, every run ahead), pp8192 +0.2 %, decode unchanged (one request's expert calls stay at
+    // eight columns or fewer); the KV format does not enter the expert kernels.
+    Qualification{FastPath::ExpertA4Residual, {DenseKernels::Mxfp8, false, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::ExpertA4Residual, {DenseKernels::Mxfp8, false, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::ExpertA4Residual, {DenseKernels::Mxfp8, false, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::ExpertA4Residual, {DenseKernels::Mxfp8, false, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::ExpertA4Residual, {DenseKernels::Mxfp8, false, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::ExpertA4Residual, {DenseKernels::Mxfp8, false, KvCacheStorage::Vq2}},
+    Qualification{FastPath::ExpertA4Residual, {DenseKernels::Mxfp8, false, KvCacheStorage::Q4KeyVq2Value}},
 };
 
 const char* dense_name(DenseKernels dense) {
@@ -257,6 +344,7 @@ const char* dense_name(DenseKernels dense) {
     case DenseKernels::Fp8Row: return "FP8";
     case DenseKernels::Nvfp4: return "NVFP4";
     case DenseKernels::Ggml: return "GGUF";
+    case DenseKernels::Mxfp8: return "MXFP8";
     case DenseKernels::Other: return "other";
     }
     return "other";
@@ -282,6 +370,7 @@ DenseKernels dense_kernels(QType qtype) noexcept {
     case QType::Q8_G32_FP16: return DenseKernels::Q8;
     case QType::BF16: return DenseKernels::Bf16;
     case QType::FP8_E4M3FN_ROW_BF16: return DenseKernels::Fp8Row;
+    case QType::FP8_E4M3FN_G32_E8M0: return DenseKernels::Mxfp8;
     case QType::NVFP4: return DenseKernels::Nvfp4;
     case QType::GGML_Q2_0:
     case QType::GGML_Q4_K:
@@ -347,10 +436,13 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
     case FastPath::Fp8A8Pair: return configuration.dense == DenseKernels::Fp8Row;
     case FastPath::Q8SlicedK:
     case FastPath::GdnConvFused: return configuration.dense == DenseKernels::Q8;
-    // The wide route of NVFP4 W4A16 experts (weight-only exports): recipe C, the one configuration
-    // with them (FP8-row dense). GGUF and block-FP8 experts also take 16-bit activations but have no
-    // such kernel.
-    case FastPath::ExpertA4Residual: return !configuration.a4_experts && configuration.dense == DenseKernels::Fp8Row;
+    // The wide route of NVFP4 W4A16 experts: recipe C's weight-only export (FP8-row dense) and NVIDIA
+    // FP4-Local's banks at their default 16-bit activations (MXFP8 dense). GGUF and block-FP8 experts
+    // also take 16-bit activations but have no such kernel.
+    case FastPath::ExpertA4Residual:
+    case FastPath::ExpertA4Residual3:
+        return !configuration.a4_experts &&
+               (configuration.dense == DenseKernels::Fp8Row || configuration.dense == DenseKernels::Mxfp8);
     // The GGUF imports' dense projections (ops::ggml_linear's BF16 prefill tiles).
     case FastPath::GgmlBf16Prefill: return configuration.dense == DenseKernels::Ggml;
     case FastPath::QsaPrepareFused:
@@ -377,13 +469,13 @@ bool FastPathSelection::request_invariant() const noexcept {
     return std::none_of(paths.begin(), paths.end(), [](FastPath path) {
         // q8-sliced-k picks its reduction order by the round's column count, so a decode column's bits
         // depend on the other requests of its round.
-        // expert-a4-residual routes an expert, and fp8-a8-pair a dense problem, by its column count in
-        // the call, which batched rounds share between requests. ggml-bf16-prefill routes a prompt's
-        // GGUF projections by its calls' widths, whose boundaries prefix-cache resumes move.
+        // expert-a4-residual (either term count) routes an expert, and fp8-a8-pair a dense problem, by its
+        // column count in the call, which batched rounds share between requests. ggml-bf16-prefill routes
+        // a prompt's GGUF projections by its calls' widths, whose boundaries prefix-cache resumes move.
         return path == FastPath::AdaptiveSpeculation || path == FastPath::FreeCacheResume ||
                path == FastPath::Preemption || path == FastPath::Q8SlicedK ||
-               path == FastPath::ExpertA4Residual || path == FastPath::Fp8A8Pair ||
-               path == FastPath::GgmlBf16Prefill;
+               path == FastPath::ExpertA4Residual || path == FastPath::ExpertA4Residual3 ||
+               path == FastPath::Fp8A8Pair || path == FastPath::GgmlBf16Prefill;
     });
 }
 
@@ -395,7 +487,9 @@ execution::ForwardFastPaths FastPathSelection::forward() const noexcept {
     return {.dense_routes       = routes,
             .gdn_conv_fused     = selected(FastPath::GdnConvFused),
             .qsa_prepare_fused  = selected(FastPath::QsaPrepareFused),
-            .expert_a4_residual = selected(FastPath::ExpertA4Residual),
+            .expert_a4_terms    = selected(FastPath::ExpertA4Residual3) ? 3
+                                  : selected(FastPath::ExpertA4Residual) ? 2
+                                                                          : 0,
             .gdn_arithmetic     = selected(FastPath::GdnF16Accumulate) ? ops::GdnChunkArithmetic::Fp16Accumulate
                                                                        : ops::GdnChunkArithmetic::Exact};
 }

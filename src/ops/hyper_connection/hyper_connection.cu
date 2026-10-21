@@ -51,15 +51,22 @@ __device__ __forceinline__ float block_sum(float value, float* scratch) {
 // weights before any arithmetic (one memory round trip instead of two serial passes) and keeps the
 // same per-thread order and block reduction.
 constexpr int kNormPerThread = 16; // hidden <= 4096
+
+__device__ __forceinline__ float norm_value(bf16 w) { return __bfloat162float(w); }
+__device__ __forceinline__ float norm_value(float w) { return w; }
+
+// The norm weights are BF16, or FP32 (NVIDIA FP4-Local's trained norms).
+template <class Norm>
 __global__ void __launch_bounds__(kThreads) norm_kernel(const bf16* __restrict__ residual,
-                                                      const bf16* __restrict__ weight, int hidden,
+                                                      const Norm* __restrict__ weight, int hidden,
                                                       int width, float eps, bf16* __restrict__ out) {
     __shared__ float scratch[kThreads / 32];
     const int s = blockIdx.x, t = blockIdx.y;
     const bf16* x = residual + static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden;
     bf16* y       = out + static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden;
-    const bf16* w = weight + static_cast<std::size_t>(s) * hidden;
-    bf16 xs[kNormPerThread], ws[kNormPerThread];
+    const Norm* w = weight + static_cast<std::size_t>(s) * hidden;
+    bf16 xs[kNormPerThread];
+    Norm ws[kNormPerThread];
 #pragma unroll
     for (int i = 0; i < kNormPerThread; ++i) {
         const int d = threadIdx.x + i * kThreads;
@@ -80,7 +87,7 @@ __global__ void __launch_bounds__(kThreads) norm_kernel(const bf16* __restrict__
 #pragma unroll
     for (int i = 0; i < kNormPerThread; ++i) {
         const int d = threadIdx.x + i * kThreads;
-        if (d < hidden) { y[d] = __float2bfloat16_rn(__bfloat162float(xs[i]) * inv * (1.0F + __bfloat162float(ws[i]))); }
+        if (d < hidden) { y[d] = __float2bfloat16_rn(__bfloat162float(xs[i]) * inv * (1.0F + norm_value(ws[i]))); }
     }
 }
 
@@ -156,17 +163,23 @@ __global__ void stream_mean_kernel(const bf16* __restrict__ residual, int hidden
 void hyper_connection_norm(const Tensor& residual, const Tensor& weight, std::int32_t streams,
                            float eps, Tensor& out, cudaStream_t stream) {
     require(streams > 0 && contiguous_2d(residual, DType::BF16) && contiguous_2d(out, DType::BF16) &&
-                contiguous_2d(weight, DType::BF16),
-            "norm requires contiguous BF16 tensors");
+                (contiguous_2d(weight, DType::BF16) || contiguous_2d(weight, DType::FP32)),
+            "norm requires contiguous BF16 tensors and a BF16 or FP32 weight");
     const int width = residual.ne[0], columns = residual.ne[1];
     require(width % streams == 0 && (width / streams) % 8 == 0 && weight.ne[0] == width &&
                 weight.ne[1] == 1 && out.ne[0] == width && out.ne[1] == columns && columns > 0,
             "norm shapes disagree");
     require(eps > 0, "norm epsilon must be positive");
     require(width / streams <= kThreads * kNormPerThread, "norm streams are wider than 4096");
-    norm_kernel<<<dim3(streams, columns), kThreads, 0, stream>>>(
-        static_cast<const bf16*>(residual.data), static_cast<const bf16*>(weight.data),
-        width / streams, width, eps, static_cast<bf16*>(out.data));
+    if (weight.dtype == DType::FP32) {
+        norm_kernel<float><<<dim3(streams, columns), kThreads, 0, stream>>>(
+            static_cast<const bf16*>(residual.data), static_cast<const float*>(weight.data), width / streams, width,
+            eps, static_cast<bf16*>(out.data));
+    } else {
+        norm_kernel<bf16><<<dim3(streams, columns), kThreads, 0, stream>>>(
+            static_cast<const bf16*>(residual.data), static_cast<const bf16*>(weight.data), width / streams, width,
+            eps, static_cast<bf16*>(out.data));
+    }
     check_launch("norm");
 }
 
@@ -225,8 +238,9 @@ void hyper_connection_mix(const Tensor& residual, const Tensor& norm_weight, con
                           std::int32_t rank, float eps, Tensor& x, Tensor* inject,
                           WorkspaceArena& workspace, cudaStream_t stream) {
     require(contiguous_2d(residual, DType::BF16) && contiguous_2d(x, DType::BF16) &&
-                contiguous_2d(norm_weight, DType::BF16) && streams > 0 && rank > 0,
-            "mix requires contiguous BF16 tensors");
+                (contiguous_2d(norm_weight, DType::BF16) || contiguous_2d(norm_weight, DType::FP32)) && streams > 0 &&
+                rank > 0,
+            "mix requires contiguous BF16 tensors and a BF16 or FP32 norm weight");
     const std::int32_t T = residual.ne[1], hidden = x.ne[0];
     require(T > 0 && x.ne[1] == T && residual.ne[0] == streams * hidden && norm_weight.ne[0] == residual.ne[0] &&
                 down.k == residual.ne[0] && up.n == residual.ne[0] && up.k == rank &&

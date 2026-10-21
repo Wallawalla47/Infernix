@@ -1,16 +1,20 @@
-"""Independent FP64 reference forward of Qwen3.8-Flash-Next (Qwen4Exp) on the NVIDIA checkpoint.
+"""Independent FP64 reference forward of Qwen3.8-Flash-Next (Qwen4Exp) on an NVIDIA checkpoint.
 
-    python -m tools.flash_next.reference --model PATH --tokens 248045,9707,11 --out ref.npz
+    python -m tools.flash_next.reference --model PATH --tokens 248045,9707,11 --out ref.npz [--expert-a16]
 
 This is the model-level oracle for Infernix's Qwen4Exp implementation (AGENTS.md "Verification"). It
 is written from the upstream ``qwen4_exp`` definitions (transformers ``modular_qwen4_exp.py`` and
 the Qwen3.5 / Qwen3-Next blocks it reuses) and reads the checkpoint directly, never Infernix's
 artifact or converter:
 
-- every dense and BF16 tensor is widened exactly and every product is formed in binary64;
+- every dense and BF16 tensor is widened exactly and every product is formed in binary64; an MXFP8
+  matrix (nvidia/Qwen3.8-Flash-Next-FP4-Local: E4M3FN ``weight`` with a UE8M0 ``weight_scale`` per
+  32 inputs) is its exact decoded value;
 - routed experts use NVIDIA's NVFP4 words, decoded exactly, with activations quantized to A4 by the
-  ModelOpt rule (design §16.2) on BF16 inputs with each matrix's own ``input_scale``;
-- the PLE n-gram rows are the checkpoint's FP8 codes times its BF16 scale, rounded to BF16.
+  ModelOpt rule (design §16.2) on BF16 inputs with each matrix's own ``input_scale``; with
+  ``--expert-a16`` they take the BF16 inputs as they are (design §16.2.1, FP4-Local's default);
+- the PLE n-gram rows are the checkpoint's FP8 codes times its BF16 scale, or (FP4-Local) its NVFP4
+  codes times their E4M3FN block scales and the FP32 ``weight_scale_2``, rounded to BF16.
 
 ``--bf16-boundaries`` (default on) rounds the activations that deployed BF16 runtimes store in
 BF16 -- the residual streams, every block input and output -- so differences against Infernix are
@@ -51,7 +55,18 @@ class Weights:
 
     def get(self, name: str) -> torch.Tensor:
         info = self.store.describe(name)
-        return self.store.read_flat(name).reshape(info.shape).to(F64)
+        value = self.store.read_flat(name).reshape(info.shape).to(F64)
+        scale = name + "_scale"
+        if name.endswith(".weight") and info.dtype == "F8_E4M3" and self.store.has(scale):
+            # MXFP8: one UE8M0 exponent byte (2^(e - 127); 255 is NaN) per 32 inputs of a row.
+            n, k = info.shape
+            if k % 32 or tuple(self.store.describe(scale).shape) != (n, k // 32):
+                raise ValueError(f"{scale}: expected one UE8M0 byte per 32 inputs of {name}")
+            exponents = self.store.read_flat(scale).view(torch.uint8).reshape(n, k // 32).to(torch.int64)
+            if bool((exponents == 255).any()):
+                raise ValueError(f"{scale}: NaN UE8M0 scale")
+            value = value * torch.pow(2.0, (exponents - 127).to(F64)).repeat_interleave(32, dim=-1)
+        return value
 
     def text(self, name: str) -> torch.Tensor:
         return self.get(self.prefix + name)
@@ -129,8 +144,9 @@ def a4_dequantized(x_bf16: torch.Tensor, input_scale: torch.Tensor) -> torch.Ten
 class Experts:
     """Decodes each routed expert when it is used; one decoded expert is ~40 MB in binary64."""
 
-    def __init__(self, weights: Weights):
+    def __init__(self, weights: Weights, *, a4: bool = True):
         self.w = weights
+        self.a4 = a4
 
     def _matrix(self, leaf: str, shape):
         words = nvfp4_matrix_words(self.w.store, leaf, shape)
@@ -150,25 +166,27 @@ class Experts:
         )
 
     def forward(self, layer: int, expert: int, x_bf16: torch.Tensor) -> torch.Tensor:
-        """One routed expert on rows x [n, H] (BF16 values): W4A4 with BF16 at its outputs."""
+        """One routed expert on rows x [n, H] (BF16 values): W4A4 (or W4A16) with BF16 at its
+        outputs."""
         (wg, sg), (wu, su), (wd, sd) = self.get(layer, expert)
-        g = bf16(a4_dequantized(x_bf16, sg) @ wg.T)
-        u = bf16(a4_dequantized(x_bf16, su) @ wu.T)
+        act = a4_dequantized if self.a4 else (lambda x, _scale: x)
+        g = bf16(act(x_bf16, sg) @ wg.T)
+        u = bf16(act(x_bf16, su) @ wu.T)
         h = bf16(silu(g) * u)
-        return bf16(a4_dequantized(h, sd) @ wd.T)
+        return bf16(act(h, sd) @ wd.T)
 
 
 # ---------------------------------------------------------------------------- model
 
 
 class Reference:
-    def __init__(self, root: Path, *, bf16_boundaries: bool = True):
+    def __init__(self, root: Path, *, bf16_boundaries: bool = True, expert_a16: bool = False):
         self.w = Weights(root)
         self.c = self.w.config
         self.eps = float(self.c["rms_norm_eps"])
         self.hc = int(self.c["hc_count"])
         self.H = int(self.c["hidden_size"])
-        self.experts = Experts(self.w)
+        self.experts = Experts(self.w, a4=not expert_a16)
         self.round = bf16 if bf16_boundaries else (lambda x: x)
         rope = self.c["rope_parameters"]
         self.theta = float(rope["rope_theta"])
@@ -332,17 +350,27 @@ class Reference:
         _, _, padded = head_tables(spec, ple_index)
         parts = c["split_ngram_parts"]
         per = padded // parts
-        scale = w.text(p + "ple_embedding.ngram_embedding.weight_scale")
+        table = f"{w.prefix}{p}ple_embedding.ngram_embedding."
+        nvfp4 = w.store.has(table + "weight_scale_2")
+        scale = w.get(table + ("weight_scale_2" if nvfp4 else "weight_scale"))
         T = R.shape[0]
         emb = []
         for t in range(T):
             vals = []
             for r in rows[t]:
                 shard, local = divmod(r, per)
-                name = f"{w.prefix}{p}ple_embedding.ngram_embedding.shard_{shard}.weight"
+                name = f"{table}shard_{shard}.weight"
                 width = w.store.describe(name).shape[1]
-                raw = w.store.read_flat(name, local * width, (local + 1) * width).view(torch.float8_e4m3fn)
-                vals.append(bf16(raw.to(F64) * scale))
+                raw = w.store.read_flat(name, local * width, (local + 1) * width)
+                if nvfp4:
+                    # Two E2M1 codes per byte (element 2i in the low nibble), an E4M3FN scale per 16.
+                    codes = torch.stack((raw & 0xF, raw >> 4), dim=-1).reshape(-1).long()
+                    blocks = w.store.describe(name + "_scale").shape[1]
+                    block = w.store.read_flat(name + "_scale", local * blocks, (local + 1) * blocks)
+                    block = block.view(torch.float8_e4m3fn).to(F64).repeat_interleave(16)
+                    vals.append(bf16(_E2M1[codes] * block * scale))
+                else:
+                    vals.append(bf16(raw.view(torch.float8_e4m3fn).to(F64) * scale))
             emb.append(torch.cat(vals))
         e = torch.stack(emb)  # [T, 2560]
         key = rmsnorm_1p(e @ w.text(p + "key_proj.weight").T, w.text(p + "norm_key.weight"), self.eps, group=self.H)
@@ -409,13 +437,16 @@ def main() -> int:
     parser.add_argument("--tokens", required=True, help="comma-separated token ids")
     parser.add_argument("--layers", type=int, help="stop after this many layers (no logits)")
     parser.add_argument("--no-bf16-boundaries", action="store_true")
+    parser.add_argument(
+        "--expert-a16", action="store_true", help="routed experts with 16-bit activations (FP4-Local's default)"
+    )
     parser.add_argument("--threads", type=int, default=0)
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
     if args.threads:
         torch.set_num_threads(args.threads)
     ids = [int(v) for v in args.tokens.split(",") if v]
-    ref = Reference(args.model, bf16_boundaries=not args.no_bf16_boundaries)
+    ref = Reference(args.model, bf16_boundaries=not args.no_bf16_boundaries, expert_a16=args.expert_a16)
     record = ref.forward(ids, layers=args.layers)
     arrays = {"tokens": np.array(ids, dtype=np.int64), "final_residual": record["final_residual"]}
     if "logits" in record:

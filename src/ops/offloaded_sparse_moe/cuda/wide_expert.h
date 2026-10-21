@@ -84,13 +84,20 @@ static_assert(kA16HRowBytes >= kIntermediate * 2 && kA16HRowBytes % 16 == 0 && k
 // << 4), the order in which the record's row-group nibbles enter an MMA register.
 INFERNIX_WIDE_HD constexpr int plane_block(int b) { return (b & ~3) | ((b & 1) << 1) | ((b & 2) >> 1); }
 
-// Two-term A4 planes of W4A16 experts (WideA16::kA4Residual): a row holds its first term's A4 row
-// (the W4A4 plane layout above), then its second term's, both scaled by one FP32 row scale. Two terms
-// per side passed the acceptance gate under its single budgets; three cost 7-8 points of prefill
-// speed (design §19.3.23).
-inline constexpr int kResidualTerms  = 2;
-inline constexpr int kXTermsRowBytes = kResidualTerms * kXRowBytes;
-inline constexpr int kHTermsRowBytes = kResidualTerms * kHRowStride;
+// A4 residual planes of W4A16 experts (WideA16::kA4Residual: two terms per x and h row; kA4Residual3:
+// three): a row holds its first term's A4 row (the W4A4 plane layout above), then each further term's,
+// all scaled by one FP32 row scale. Two terms per side gave 33-35 % at 32K-64K prefill on recipe C; three,
+// about a quarter of their error, 26-27 % (design §19.3.23).
+inline constexpr int kMaxResidualTerms = 3;
+INFERNIX_WIDE_HD constexpr int x_terms_row_bytes(int terms) { return terms * kXRowBytes; }
+INFERNIX_WIDE_HD constexpr int h_terms_row_bytes(int terms) { return terms * kHRowStride; }
+
+// The x and h term counts of an A4 residual route (kA4Residual two each, kA4Residual3 three each);
+// {0, 0} for another route.
+struct ResidualTerms {
+    int x = 0, h = 0;
+};
+[[nodiscard]] ResidualTerms residual_terms(WideA16 route);
 
 // GGUF banks' kGgmlBf16 route (ggml_expert.cuh): every wide job's records decoded into planes
 // (ggml_tile.cuh CodeStage images: kGgmlCodeStageBytes per 64 rows x 64 elements), its gate and up
@@ -124,10 +131,10 @@ struct ExpertsWorkspace {
     std::uint8_t* h_rows;         // [entries][kA16HRowBytes]: BF16 h, rewritten as limbs for wide entries
     std::int32_t* x_emax;         // [columns]: column exponent of each token's x
     std::int32_t* h_emax;         // [entries]: column exponent of each wide entry's h
-    // W4A16, two-term A4 (h_rows holds the BF16 h)
-    std::uint8_t* x_terms_plane;  // [entries][kXTermsRowBytes]
+    // W4A16, A4 residual (h_rows holds the BF16 h)
+    std::uint8_t* x_terms_plane;  // [entries][x_terms_row_bytes(x terms)]
     float* x_row_scale;           // [columns]
-    std::uint8_t* h_terms_plane;  // [entries][kHTermsRowBytes]
+    std::uint8_t* h_terms_plane;  // [entries][h_terms_row_bytes(h terms)]
     float* h_row_scale;           // [entries]
     // GGUF banks, kGgmlBf16 in calls of kGgmlBf16MinColumns or more (else null): kGgmlBf16PlaneBytes
     std::uint8_t* ggml_planes;
@@ -163,10 +170,11 @@ struct Call {
     const std::int32_t* x_emax  = nullptr; // [T]
     std::int32_t* h_emax        = nullptr; // [entries]
     std::int32_t top_k          = 0;
-    // W4A16 two-term A4 (descriptors then name every term's plane)
+    // W4A16 A4 residual (descriptors then name every term's plane)
     bool a4_residual                = false;
+    ResidualTerms terms;
     const float* x_row_scale        = nullptr; // [T]
-    std::uint8_t* h_terms_plane     = nullptr; // [entries][kHTermsRowBytes]
+    std::uint8_t* h_terms_plane     = nullptr; // [entries][h_terms_row_bytes(terms.h)]
     float* h_row_scale              = nullptr; // [entries]
 };
 

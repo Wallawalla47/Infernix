@@ -1,14 +1,17 @@
-"""M0 tools of the Flash-Next design: the source-fact inspector and the A4 reference quantizer."""
+"""M0 tools of the Flash-Next design: the source-fact inspector, the A4 reference quantizer and the FP64
+reference's MXFP8 weight decoding."""
 
 from __future__ import annotations
 
 import json
 
+import pytest
 import torch
 from safetensors.torch import save_file
 
 from tools.flash_next.a4_reference import a4_dequantize, a4_quantize, modelopt_rule, synthetic_activations
 from tools.flash_next.inspect_checkpoint import inspect, tensor_class
+from tools.flash_next.reference import Weights
 
 
 def _checkpoint(tmp_path):
@@ -97,3 +100,26 @@ def test_a4_agrees_with_modelopt_outside_its_scale_guard():
         theirs = theirs.reshape(ours.shape)
         same = ((ours == theirs) | ((ours == 0) & (theirs == 0))).all(dim=-1)
         assert bool((same | guard).all())
+
+
+def _mxfp8_checkpoint(tmp_path, exponents):
+    codes = torch.arange(128, dtype=torch.uint8).reshape(2, 64)  # every positive E4M3FN code
+    codes[1, 63] = 0x7E  # but NaN (0x7F)
+    codes[1] |= 0x80  # the second row negated
+    save_file({"a.weight": codes.view(torch.float8_e4m3fn), "a.weight_scale": exponents}, str(tmp_path / "model.safetensors"))
+    (tmp_path / "config.json").write_text(json.dumps({"text_config": {}}))
+    return Weights(tmp_path / "model.safetensors"), codes
+
+
+def test_reference_decodes_mxfp8_matrices_exactly(tmp_path):
+    exponents = torch.tensor([[0, 127], [131, 254]], dtype=torch.uint8)
+    weights, codes = _mxfp8_checkpoint(tmp_path, exponents)
+    value = codes.view(torch.float8_e4m3fn).to(torch.float64)
+    scale = torch.tensor([[2.0**-127, 1.0], [16.0, 2.0**127]], dtype=torch.float64).repeat_interleave(32, dim=-1)
+    assert torch.equal(weights.get("a.weight"), value * scale)
+
+
+def test_reference_refuses_a_nan_mxfp8_scale(tmp_path):
+    weights, _ = _mxfp8_checkpoint(tmp_path, torch.tensor([[127, 255], [127, 127]], dtype=torch.uint8))
+    with pytest.raises(ValueError, match="NaN UE8M0"):
+        weights.get("a.weight")

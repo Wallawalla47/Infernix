@@ -149,6 +149,9 @@ int main() {
     failures += check(parse({"infernix-serve", "model.ninfer", "--expert-tail-skip", "7"}).expert_tail_skip == 7 &&
                           parse({"infernix-serve", "model.ninfer"}).expert_tail_skip == 0,
                       "--expert-tail-skip did not parse (default off)");
+    failures += check(parse({"infernix-serve", "model.ninfer", "--expert-a4-activations"}).expert_a4_activations &&
+                          !parse({"infernix-serve", "model.ninfer"}).expert_a4_activations,
+                      "--expert-a4-activations did not parse (default off)");
 
     const auto mtp_ngram = parse({"infernix-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens",
                                   "3", "--ngram-draft-tokens", "15"});

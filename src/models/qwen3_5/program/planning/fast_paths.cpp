@@ -304,7 +304,8 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
     case FastPath::Fp8A8Pair: return false;
     // The W4A8 gate/up kernel runs only on groupwise Q4 weights (the text MLP's linear_swiglu).
     case FastPath::Q4W4A8: return configuration.q4_gate_up;
-    case FastPath::ExpertA4Residual: return false; // Qwen3.8-Flash-Next's W4A16 experts only
+    case FastPath::ExpertA4Residual:
+    case FastPath::ExpertA4Residual3: return false; // Qwen3.8-Flash-Next's W4A16 experts only
     case FastPath::SampledMtpDrafts: return false; // Qwen3.8-Flash-Next's MTP drafter only
     // Every Text GDN layer normalizes Q/K, and its chunked calls serve prefill.
     case FastPath::GdnF16Accumulate: return true;

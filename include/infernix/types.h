@@ -127,6 +127,10 @@ enum class FastPath : std::uint8_t {
     // route. A column's result then depends on its expert's column count in the call, which other
     // requests' columns share in batched rounds. Without it W4A16 experts are exact on every route.
     ExpertA4Residual,
+    // The more precise form of expert-a4-residual: three NVFP4 terms per x and h row instead of two,
+    // about a quarter of the two-term activation error for roughly a quarter of its prefill gain. It
+    // takes precedence where both are selected.
+    ExpertA4Residual3,
     // Decode attention sizes each row's key partition from the round's batch. Without it a row's
     // partition depends only on its own keys.
     BatchSplitAttention,
@@ -158,7 +162,7 @@ enum class FastPath : std::uint8_t {
     GgmlBf16Prefill,
 };
 
-inline constexpr std::array<FastPath, 22> kFastPaths{
+inline constexpr std::array<FastPath, 23> kFastPaths{
     FastPath::PromptPv8,           FastPath::DecodeSplit64,
     FastPath::Q8SlicedK,           FastPath::GdnConvFused,
     FastPath::QsaPrepareFused,     FastPath::Fp8A8Pair,
@@ -167,6 +171,7 @@ inline constexpr std::array<FastPath, 22> kFastPaths{
     FastPath::BatchedDecode,       FastPath::BatchedA8Decode,
     FastPath::BatchedA4Decode,     FastPath::BatchedA4ResidualDecode,
     FastPath::BatchedA8ResidualDecode, FastPath::ExpertA4Residual,
+    FastPath::ExpertA4Residual3,
     FastPath::BatchSplitAttention, FastPath::AdaptiveSpeculation,
     FastPath::AdaptiveMtp,         FastPath::FreeCacheResume,
     FastPath::Preemption,          FastPath::IdleWidePrefill,
@@ -182,6 +187,7 @@ inline constexpr std::array<FastPath, 22> kFastPaths{
     case FastPath::BatchedA4ResidualDecode: return "batched-a4-residual-decode";
     case FastPath::BatchedA8ResidualDecode: return "batched-a8-residual-decode";
     case FastPath::ExpertA4Residual: return "expert-a4-residual";
+    case FastPath::ExpertA4Residual3: return "expert-a4-residual-3";
     case FastPath::BatchSplitAttention: return "batch-split-attention";
     case FastPath::AdaptiveSpeculation: return "adaptive-speculation";
     case FastPath::AdaptiveMtp: return "adaptive-mtp";
@@ -554,6 +560,11 @@ struct EngineOptions {
     // measuring what activation quantization costs (infernix-perplexity --a16-activations, the
     // decode-quality judge). On the Qwen3.8-27B NVFP4 artifacts prefill is at least 3x slower.
     bool a16_activations               = false;
+    // Qwen3.8-Flash-Next artifacts whose routed experts offer 4-bit activations as an option (only
+    // nvidia/Qwen3.8-Flash-Next-FP4-Local, whose experts NVIDIA calibrated for them): run the routed
+    // experts W4A4 with their stored activation scales (--expert-a4-activations) instead of the
+    // default 16-bit activations. Other artifacts refuse it, as does a16_activations.
+    bool expert_a4_activations         = false;
     // Run every fast path qualified for this configuration (model geometry, activation precision
     // and KV format): routes whose arithmetic differs from the exact route but whose measured cost
     // stays within Infernix's numerical acceptance policy (docs/maintainer/model-quality.md

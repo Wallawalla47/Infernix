@@ -229,8 +229,9 @@ def main(argv=None):
         if companion:
             model = qwen4_exp.build_dflash2_companion(base, sources["dflash2"])
         elif qwen4:
-            # A BF16 volume (tools/flash_next/ngram_bf16.py) binds the table as its unquantized rows.
-            ngram_format = "fp8_e4m3fn"
+            # The checkpoint's own table format; a BF16 volume (tools/flash_next/ngram_bf16.py) binds the
+            # table as its unquantized rows.
+            ngram_format = None
             if args.ngram_reuse is not None:
                 ngram_format = qwen4_exp.ngram_volume_format(base, args.ngram_reuse)
             if gguf_store is not None:

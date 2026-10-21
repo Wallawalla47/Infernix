@@ -12,6 +12,7 @@ from tools.artifact.layouts import encoded_size
 from tools.artifact.formats import (
     DirectFormat,
     Fp8BlockFormat,
+    Fp8GroupFormat,
     Fp8RowFormat,
     GgmlFormat,
     Nvfp4Format,
@@ -74,6 +75,8 @@ def default_layout(format: str) -> str:
         return "contiguous_le_v1"
     if isinstance(kind, Fp8RowFormat):
         return "row_scale_v1"
+    if isinstance(kind, Fp8GroupFormat):
+        return "g32_scale_rows16_v1"
     if isinstance(kind, Nvfp4Format):
         return "block_scale_k16_m128x4_v1"
     if isinstance(kind, Nvfp4MulFormat):

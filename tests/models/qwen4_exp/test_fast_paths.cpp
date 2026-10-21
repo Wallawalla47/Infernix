@@ -133,25 +133,39 @@ int main() {
         failures += check(!q::fast_path_applies(FastPath::ExpertA4Residual, {dense, false, KvCacheStorage::Int8Group64}, options),
                           "expert-a4-residual has no kernel for GGUF or block-FP8 experts");
     }
-    failures += check(!exact.expert_a4_residual, "the exact route keeps W4A16 experts exact");
+    failures += check(exact.expert_a4_terms == 0, "the exact route keeps W4A16 experts exact");
     selection.paths = {FastPath::ExpertA4Residual};
-    failures += check(selection.forward().expert_a4_residual, "expert-a4-residual sets its Forward flag");
+    failures += check(selection.forward().expert_a4_terms == 2, "expert-a4-residual takes two terms");
     failures += check(!selection.request_invariant(), "expert-a4-residual couples a request to its round");
+    // expert-a4-residual-3, its more precise form, applies where it does and takes precedence.
+    for (const auto& configuration : {recipe_c, dense8, FastPathConfiguration{DenseKernels::Mxfp8, false, KvCacheStorage::Int8Group64},
+                                      FastPathConfiguration{DenseKernels::Mxfp8, true, KvCacheStorage::Int8Group64}}) {
+        failures += check(q::fast_path_applies(FastPath::ExpertA4Residual3, configuration, options) ==
+                              q::fast_path_applies(FastPath::ExpertA4Residual, configuration, options),
+                          "expert-a4-residual-3 applies exactly where expert-a4-residual does");
+    }
+    selection.paths = {FastPath::ExpertA4Residual, FastPath::ExpertA4Residual3};
+    failures += check(selection.forward().expert_a4_terms == 3, "expert-a4-residual-3 takes three terms, first");
+    failures += check(!selection.request_invariant(), "expert-a4-residual-3 couples a request to its round");
     // fp8-a8-pair admits a dense call by its width, which batched rounds share.
     selection.paths = {FastPath::Fp8A8Pair};
     failures += check(!selection.request_invariant(), "fp8-a8-pair couples a request to its round");
     selection.paths = {FastPath::ExpertA4Residual};
-    for (const auto kv : {KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256, KvCacheStorage::Nvfp4Group16,
-                          KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2, KvCacheStorage::Q4KeyVq2Value}) {
+    // Every KV format, BF16 by its precise-reference gates on FP4-Local (the same expert kernels as recipe C).
+    for (const auto kv : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
+                          KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2,
+                          KvCacheStorage::Q4KeyVq2Value}) {
         failures += check(q::fast_path_qualified(FastPath::ExpertA4Residual, {DenseKernels::Fp8Row, false, kv}),
-                          "expert-a4-residual is qualified on recipe C with every quantized KV format");
+                          "expert-a4-residual is qualified on recipe C with every KV format");
+        failures += check(q::fast_path_qualified(FastPath::ExpertA4Residual, {DenseKernels::Mxfp8, false, kv}),
+                          "expert-a4-residual is qualified on NVIDIA FP4-Local (16-bit experts) with every KV format");
     }
-    failures += check(!q::fast_path_qualified(FastPath::ExpertA4Residual,
-                                              {DenseKernels::Fp8Row, false, KvCacheStorage::BFloat16}),
-                      "expert-a4-residual fails on BF16 KV, where recipe C's exact route is the reference");
+    failures += check(!q::fast_path_applies(FastPath::ExpertA4Residual,
+                                            {DenseKernels::Mxfp8, true, KvCacheStorage::Int8Group64}, options),
+                      "expert-a4-residual does not apply to FP4-Local's 4-bit expert activations");
     failures += check(!q::fast_path_qualified(FastPath::ExpertA4Residual,
                                               {DenseKernels::Q8, false, KvCacheStorage::Int8Group64}),
-                      "expert-a4-residual is qualified only on the dense format it was gated with");
+                      "expert-a4-residual is qualified only where its kernels were gated and timed");
 
     // sampled-mtp-drafts acts on the MTP drafter only; gdn-f16-accumulate on every artifact's GDN
     // prefill, per call, so it keeps a request invariant.
@@ -185,6 +199,14 @@ int main() {
             for (const FastPath path : {FastPath::AdaptiveSpeculation, FastPath::FreeCacheResume, FastPath::Preemption}) {
                 failures += check(q::fast_path_qualified(path, config),
                                   "the coupling paths are qualified on IQ3_S, FP8 and recipe A");
+            }
+        }
+        // NVIDIA FP4-Local, both expert activation precisions: speculation and cache resume by its joint
+        // gate, preemption by its increment.
+        for (const bool a4 : {false, true}) {
+            for (const FastPath path : {FastPath::AdaptiveSpeculation, FastPath::FreeCacheResume, FastPath::Preemption}) {
+                failures += check(q::fast_path_qualified(path, {DenseKernels::Mxfp8, a4, kv}),
+                                  "the coupling paths are qualified on NVIDIA FP4-Local");
             }
         }
         // FP16 GDN: faster on IQ3_S and FP8 prefill, not on Dense8's; IQ3_S with BF16 KV fails its gates.

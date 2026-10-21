@@ -74,8 +74,25 @@ class Fp8BlockFormat:
     block: int
 
 
+@dataclass(frozen=True, slots=True)
+class Fp8GroupFormat:
+    """E4M3FN weights with one UE8M0 power-of-two scale per ``group`` K-axis elements of a row (OCP
+    MXFP8 weights, as ModelOpt stores them; tools/artifact/codecs/fp8_g32.py holds the exact
+    decoder): ``W[n, k] = e4m3fn(c[n, k]) * 2^(e[n, k // group] - 127)``."""
+
+    name: str
+    group: int
+
+
 NumericFormat: TypeAlias = (
-    DirectFormat | QuantFormat | Nvfp4Format | Fp8RowFormat | Nvfp4MulFormat | GgmlFormat | Fp8BlockFormat
+    DirectFormat
+    | QuantFormat
+    | Nvfp4Format
+    | Fp8RowFormat
+    | Nvfp4MulFormat
+    | GgmlFormat
+    | Fp8BlockFormat
+    | Fp8GroupFormat
 )
 
 
@@ -104,6 +121,7 @@ GGML_IQ3_S = GgmlFormat("ggml_iq3_s", 256, 110)
 GGML_IQ4_XS = GgmlFormat("ggml_iq4_xs", 256, 136)
 GGML_IQ4_NL = GgmlFormat("ggml_iq4_nl", 32, 18)
 FP8_E4M3FN_B128 = Fp8BlockFormat("fp8_e4m3fn_b128", 128)
+FP8_E4M3FN_G32_E8M0 = Fp8GroupFormat("fp8_e4m3fn_g32_e8m0", 32)
 
 
 DIRECT_FORMATS = MappingProxyType({item.name: item for item in (BF16, FP32, INT32)})
@@ -123,6 +141,7 @@ GGML_FORMATS = MappingProxyType(
     }
 )
 FP8_BLOCK_FORMATS = MappingProxyType({FP8_E4M3FN_B128.name: FP8_E4M3FN_B128})
+FP8_GROUP_FORMATS = MappingProxyType({FP8_E4M3FN_G32_E8M0.name: FP8_E4M3FN_G32_E8M0})
 NUMERIC_FORMATS = MappingProxyType(
     {
         **DIRECT_FORMATS,
@@ -132,6 +151,7 @@ NUMERIC_FORMATS = MappingProxyType(
         **NVFP4_MUL_FORMATS,
         **GGML_FORMATS,
         **FP8_BLOCK_FORMATS,
+        **FP8_GROUP_FORMATS,
     }
 )
 
@@ -225,6 +245,7 @@ __all__ = [
     "FP8_E4M3FN_ROW_BF16",
     "NVFP4_MUL",
     "FP8_E4M3FN_B128",
+    "FP8_E4M3FN_G32_E8M0",
     "DIRECT_FORMATS",
     "QUANT_FORMATS",
     "NVFP4_FORMATS",
@@ -232,9 +253,11 @@ __all__ = [
     "NVFP4_MUL_FORMATS",
     "GGML_FORMATS",
     "FP8_BLOCK_FORMATS",
+    "FP8_GROUP_FORMATS",
     "NUMERIC_FORMATS",
     "GgmlFormat",
     "Fp8BlockFormat",
+    "Fp8GroupFormat",
     "DirectFormat",
     "QuantFormat",
     "Nvfp4Format",

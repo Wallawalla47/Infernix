@@ -15,7 +15,7 @@
 
 namespace infernix::bench {
 
-inline constexpr int kSchemaVersion                   = 23;
+inline constexpr int kSchemaVersion                   = 24;
 inline constexpr std::string_view kArtifactType       = "infernix_bench_report";
 inline constexpr std::string_view kDefaultCorpusPath  = "bench/fixtures/bench_corpus.ids";
 inline constexpr int kDecodeSeedTokens                = 1;
@@ -62,6 +62,7 @@ struct BenchOptions {
     std::optional<std::size_t> vram_headroom_bytes; // empty: the model's automatic headroom
     bool vram_past_budget = false;
     std::uint32_t expert_tail_skip = 0; // EngineOptions::expert_tail_skip
+    bool expert_a4_activations     = false; // EngineOptions::expert_a4_activations
     std::string corpus_path{kDefaultCorpusPath};
     std::string constraint_file;
     std::optional<OutputConstraint> constraint;
@@ -133,6 +134,7 @@ struct BenchEnvironment {
     bool original_nvfp4_prefill_kernel = false;
     bool fast_paths                    = true;
     std::uint32_t expert_tail_skip     = 0; // approximate: changes the output when set
+    bool expert_a4_activations         = false; // FP4-Local W4A4 experts (changes the output)
     // Qwen3.8-Flash-Next placement (they move its throughput): empty paths and budgets are the defaults.
     std::string ngram_volume_path;
     NgramResidency ngram_residency = NgramResidency::Auto;

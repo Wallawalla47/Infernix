@@ -31,8 +31,15 @@ namespace infernix::ops {
 /// out[h*W + j, t] = bf16(e4m3(rows[j, h, t]) * scale).
 void ple_embed(const Tensor& rows, const Tensor& scale, Tensor& out, cudaStream_t stream);
 
+/// NVFP4 rows (NVIDIA FP4-Local's table): rows U8 [W/2 + W/16, heads, T], each row its W/2 code
+/// bytes (E2M1, element 2i in the low nibble of byte i) then its W/16 E4M3FN block scales;
+/// multiplier: FP32 [1], positive and finite. out: BF16 [heads*W, T],
+/// out[h*W + j, t] = bf16(e2m1(c_j) * e4m3fn(s_{j/16}) * multiplier), the exact product rounded once
+/// to nearest even (W a multiple of 16).
+void ple_embed_nvfp4(const Tensor& rows, const Tensor& multiplier, Tensor& out, cudaStream_t stream);
+
 /// key: BF16 [S*H, T]; value: BF16 [H, T]; residual: BF16 [S*H, T]; key_norm, query_norm,
-/// conv_norm: BF16 [S*H]. gated and normalized: BF16 [S*H, T].
+/// conv_norm: [S*H], all BF16 or all FP32 (NVIDIA FP4-Local's). gated and normalized: BF16 [S*H, T].
 void ple_gate(const Tensor& key, const Tensor& value, const Tensor& residual,
               const Tensor& key_norm, const Tensor& query_norm, const Tensor& conv_norm,
               std::int32_t streams, float eps, Tensor& gated, Tensor& normalized,

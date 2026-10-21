@@ -101,9 +101,10 @@ std::uint64_t distinct_blocks(const std::vector<std::uint32_t>& rows) {
 }
 
 // A volume header alone (resolve_ngram_volume reads nothing else): rows of `row_bytes`, as the
-// converter lays them out, with `id` and an FP8 scale word (0: none recorded).
+// converter lays them out, with `id`, an FP8 scale word (0: none recorded), the row format tag (0: a
+// volume written before the tag) and an NVFP4 multiplier (FP32 bits).
 void write_header(const std::filesystem::path& path, std::uint64_t rows, std::uint32_t row_bytes, std::uint8_t id,
-                  std::uint16_t scale = 0) {
+                  std::uint16_t scale = 0, std::uint16_t tag = 0, std::uint32_t multiplier = 0) {
     std::vector<std::byte> header(4096);
     const std::uint32_t per_block = kBlockBytes / row_bytes;
     std::memcpy(header.data(), "NINFERNG", 8);
@@ -116,21 +117,30 @@ void write_header(const std::filesystem::path& path, std::uint64_t rows, std::ui
     put<std::uint64_t>(header, 36, (rows + per_block - 1) / per_block);
     std::memset(header.data() + 44, id, 16);
     put<std::uint16_t>(header, 60, scale);
+    put<std::uint16_t>(header, 62, tag);
+    put<std::uint32_t>(header, 64, multiplier);
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
     out.write(reinterpret_cast<const char*>(header.data()), static_cast<std::streamsize>(header.size()));
 }
 
 // resolve_ngram_volume: the artifact's own volume (its format and id) keeps the artifact's table; a
-// volume of the same table geometry in any of the three formats (FP8 rows of the head width, IQ4_NL
-// blocks of 18 bytes per 32, BF16 rows of twice the width) replaces any artifact's table with its own
-// geometry and id, an FP8 one only with a scale in its header; another row count or row size is refused.
+// volume of the same table geometry in any of the four formats (FP8 rows of the head width, IQ4_NL
+// blocks of 18 bytes per 32, BF16 rows of twice the width, NVFP4 codes and block scales) replaces any
+// artifact's table with its own geometry and id, an FP8 one only with a scale and an NVFP4 one only with
+// a multiplier in its header; another row count or row size is refused. The header's format tag decides
+// the format (NVFP4 rows have IQ4_NL's 90 bytes); a volume written before the tag is read by row size.
 void test_resolve(const std::filesystem::path& path) {
     constexpr std::uint64_t rows        = 100'003;
-    constexpr std::uint16_t kScale      = 0x3A83; // a positive normal BF16 value
+    constexpr std::uint16_t kScale      = 0x3A83;     // a positive normal BF16 value
+    constexpr std::uint32_t kMultiplier = 0x380B6B3CU; // a positive normal FP32 value
     const q4::NgramRowFormat formats[]  = {q4::NgramRowFormat::Fp8E4m3, q4::NgramRowFormat::Iq4Nl,
-                                           q4::NgramRowFormat::Bf16};
-    const std::uint32_t row_bytes[]     = {160, 90, 320};
-    for (int own = 0; own < 3; ++own) {
+                                           q4::NgramRowFormat::Bf16, q4::NgramRowFormat::Nvfp4};
+    const std::uint32_t row_bytes[]     = {160, 90, 320, 90};
+    const auto scale_of = [&](int format) { return formats[format] == q4::NgramRowFormat::Fp8E4m3 ? kScale : std::uint16_t{0}; };
+    const auto multiplier_of = [&](int format) {
+        return formats[format] == q4::NgramRowFormat::Nvfp4 ? kMultiplier : std::uint32_t{0};
+    };
+    for (int own = 0; own < 4; ++own) {
         q4::PleConfig ple;
         ple.embed_dim             = 2560;
         ple.ngram.ngram_size      = 3;
@@ -147,24 +157,43 @@ void test_resolve(const std::filesystem::path& path) {
             return false;
         };
 
-        write_header(path, rows, row_bytes[own], 0xAA);
+        write_header(path, rows, row_bytes[own], 0xAA, 0, static_cast<std::uint16_t>(own + 1), multiplier_of(own));
         const q4::NgramTableConfig mine = q4::resolve_ngram_volume(path, ple);
-        check(mine.format == formats[own] && mine.volume_id == ple.table.volume_id && !mine.fp8_scale,
+        check(mine.format == formats[own] && mine.volume_id == ple.table.volume_id && !mine.fp8_scale &&
+                  !mine.nvfp4_scale,
               name + "the artifact's own volume keeps its table (and its own scale)");
-        for (int other = 0; other < 3; ++other) {
-            // Another volume of any format, the artifact's own format included (another id).
-            write_header(path, rows, row_bytes[other], 0x55, formats[other] == q4::NgramRowFormat::Fp8E4m3 ? kScale : 0);
+        for (int other = 0; other < 4; ++other) {
+            // Another volume of any format, the artifact's own format included (another id), tagged as
+            // volumes are written now.
+            write_header(path, rows, row_bytes[other], 0x55, scale_of(other), static_cast<std::uint16_t>(other + 1),
+                         multiplier_of(other));
             const q4::NgramTableConfig t = q4::resolve_ngram_volume(path, ple);
             const std::uint32_t per_block = kBlockBytes / row_bytes[other];
+            const bool fp8 = formats[other] == q4::NgramRowFormat::Fp8E4m3, nvfp4 = formats[other] == q4::NgramRowFormat::Nvfp4;
             check(t.format == formats[other] && t.row_bytes == row_bytes[other] && t.rows_per_block == per_block &&
                       t.blocks == (rows + per_block - 1) / per_block && t.file_bytes == 4096 + t.blocks * 4096 &&
                       t.volume_id[0] == 0x55 &&
-                      t.fp8_scale == (formats[other] == q4::NgramRowFormat::Fp8E4m3 ? std::optional<std::uint16_t>(kScale)
-                                                                                    : std::nullopt),
+                      t.fp8_scale == (fp8 ? std::optional<std::uint16_t>(kScale) : std::nullopt) &&
+                      t.nvfp4_scale == (nvfp4 ? std::optional<std::uint32_t>(kMultiplier) : std::nullopt),
                   name + "another volume of format " + std::to_string(other) + " replaces the table");
-            write_header(path, rows + 1, row_bytes[other], 0x55, kScale);
+            if (!nvfp4) {
+                // As published before the tag: the row size tells the format.
+                write_header(path, rows, row_bytes[other], 0x55, scale_of(other));
+                check(q4::resolve_ngram_volume(path, ple).format == formats[other],
+                      name + "an untagged volume of format " + std::to_string(other) + " is read by its row size");
+            }
+            write_header(path, rows + 1, row_bytes[other], 0x55, kScale, static_cast<std::uint16_t>(other + 1),
+                         multiplier_of(other));
             check(refused(), name + "another volume of another row count is refused");
         }
+        write_header(path, rows, 90, 0x55, 0, 4, 0);
+        check(refused(), name + "an NVFP4 volume without a multiplier is refused");
+        write_header(path, rows, 90, 0x55, 0, 4, 0x80000001U);
+        check(refused(), name + "an NVFP4 volume with a negative multiplier is refused");
+        write_header(path, rows, 160, 0x55, kScale, 4, kMultiplier);
+        check(refused(), name + "a tag that disagrees with the row size is refused");
+        write_header(path, rows, 90, 0x55, 0, 9, kMultiplier);
+        check(refused(), name + "an unknown format tag is refused");
         write_header(path, rows, 160, 0x55);
         check(refused(), name + "another FP8 volume without a recorded scale is refused");
         // NVIDIA's published FP8 volume (written before volumes recorded a scale): its id names its scale.

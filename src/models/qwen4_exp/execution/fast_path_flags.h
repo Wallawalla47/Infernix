@@ -15,9 +15,10 @@ struct ForwardFastPaths {
     bool gdn_conv_fused = false;
     // qsa-prepare-fused: one QSA prepare kernel (norms, rotations, K/V and index-key appends).
     bool qsa_prepare_fused = false;
-    // expert-a4-residual: W4A16 experts' wide calls take the two-term A4 route
-    // (ops::offloaded_moe::WideA16::kA4Residual, design §19.3.23); no effect on W4A4 experts.
-    bool expert_a4_residual = false;
+    // expert-a4-residual (2) or expert-a4-residual-3 (3): W4A16 experts' wide calls take the A4
+    // residual route of that many NVFP4 terms per x and h row (ops::offloaded_moe::WideA16::kA4Residual,
+    // kA4Residual3, design §19.3.23); 0 keeps them exact. No effect on W4A4 experts.
+    int expert_a4_terms = 0;
     // gdn-f16-accumulate: the chunked GDN calls' arithmetic.
     ops::GdnChunkArithmetic gdn_arithmetic = ops::GdnChunkArithmetic::Exact;
 };

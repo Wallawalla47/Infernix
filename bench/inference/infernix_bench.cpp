@@ -211,7 +211,8 @@ int main(int argc, char** argv) {
         engine_options.vram_headroom_bytes = options.vram_headroom_bytes;
         engine_options.vram_past_budget    = options.vram_past_budget;
         engine_options.expert_tail_skip    = options.expert_tail_skip;
-        engine_options.context_cache.enabled             = false;
+        engine_options.expert_a4_activations = options.expert_a4_activations;
+        engine_options.context_cache.enabled            = false;
         engine_options.context_cache.host_capacity_bytes = 0;
         engine_options.speculative                       = options.speculative;
         engine_options.use_cuda_graph                    = options.use_cuda_graph;
@@ -227,6 +228,7 @@ int main(int argc, char** argv) {
         env.original_nvfp4_prefill_kernel = options.original_nvfp4_prefill_kernel;
         env.fast_paths                   = options.fast_paths;
         env.expert_tail_skip             = options.expert_tail_skip;
+        env.expert_a4_activations        = options.expert_a4_activations;
         env.ngram_volume_path            = options.ngram_volume_path;
         env.ngram_residency              = options.ngram_residency;
         env.expert_stripe_path           = options.expert_stripe_path;

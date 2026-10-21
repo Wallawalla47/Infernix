@@ -13,11 +13,11 @@
 //   staged : every record in the pinned host bank, staged through the slots each call
 //            (the cold-layer case, bound by the staging copy).
 // The FLOP figure counts the wide entries' gate/up and down products only. --activation a16 gives
-// the experts W4A16 arithmetic (no input scales, design §16.2.1); a16x2 runs their wide calls on the
-// two-term A4 fast path (design §19.3.23).
+// the experts W4A16 arithmetic (no input scales, design §16.2.1); a16x2 and a16x3 run their wide calls
+// on the two- and three-term A4 fast paths (design §19.3.23).
 //
 //   infernix_offloaded_moe_wide_bench [--tokens 64,256,1024,4096] [--placement frames|staged|both]
-//                                   [--activation a4|a16|a16x2] [--cold] [--warmup 3] [--repeat 10] [--seed N]
+//                                   [--activation a4|a16|a16x2|a16x3] [--cold] [--warmup 3] [--repeat 10] [--seed N]
 //                                   [--columns-per-expert C] [--split-scales]
 //
 // --columns-per-expert C routes uniformly instead (every used expert gets exactly C columns while
@@ -63,7 +63,7 @@ struct Options {
     int repeat            = 10;
     std::uint32_t seed    = 20261004U;
     bool a16              = false;
-    bool a4_residual      = false; // a16x2: W4A16 experts on the two-term A4 wide route
+    moe::WideA16 wide_a16 = moe::WideA16::kExact; // a16x2 / a16x3: W4A16 experts on an A4 residual route
     bool cold             = false;
     int columns_per_expert = 0;     // > 0: uniform routing, every used expert has exactly this many columns
     bool split_scales      = false; // distinct gate and up input scales: no expert takes the wide route
@@ -99,11 +99,13 @@ Options parse_options(int argc, char** argv) {
             options.repeat = std::stoi(value());
         } else if (arg == "--activation") {
             const std::string v = value();
-            if (v != "a4" && v != "a16" && v != "a16x2") {
-                throw std::invalid_argument("--activation takes a4, a16 or a16x2");
+            if (v != "a4" && v != "a16" && v != "a16x2" && v != "a16x3") {
+                throw std::invalid_argument("--activation takes a4, a16, a16x2 or a16x3");
             }
             options.a16      = v != "a4";
-            options.a4_residual = v == "a16x2";
+            options.wide_a16 = v == "a16x2"   ? moe::WideA16::kA4Residual
+                               : v == "a16x3" ? moe::WideA16::kA4Residual3
+                                              : moe::WideA16::kExact;
         } else if (arg == "--cold") {
             options.cold = true;
         } else if (arg == "--seed") {
@@ -282,11 +284,11 @@ void run_point(Fixture& fixture, int tokens, const Options& options, bench::L2Fl
     const int max_jobs = std::min(kExperts, entries);
     DeviceBuffer workspace(ops::moe_experts_workspace_bytes(
         max_jobs, entries, tokens, options.a16 ? moe::ExpertActivation::kA16 : moe::ExpertActivation::kA4,
-        options.a4_residual ? moe::WideA16::kA4Residual : moe::WideA16::kExact));
+        options.wide_a16));
     for (const bool staged : {false, true}) {
         if ((staged && options.placement == "frames") || (!staged && options.placement == "staged")) { continue; }
         ops::MoeExpertSource source = fixture.source(staged);
-        source.wide_a16             = options.a4_residual ? moe::WideA16::kA4Residual : moe::WideA16::kExact;
+        source.wide_a16             = options.wide_a16;
         Tensor tx(x.p, DType::BF16, {moe::kHidden, tokens});
         Tensor out(outputs.p, DType::BF16, {moe::kHidden, entries});
         const auto launch = [&](cudaStream_t s) {

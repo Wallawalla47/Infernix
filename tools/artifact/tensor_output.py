@@ -9,11 +9,13 @@ from __future__ import annotations
 import torch
 
 from .codecs.direct import encode_direct
+from .codecs.fp8_g32 import rows16_scale_plane, validate_fp8_group_words
 from .codecs.fp8_row import encode_fp8_row_scaled
 from .codecs.nvfp4 import encode_nvfp4
 from .codecs.row_split import encode_row_split, split_row_planes
 from .formats import (
     DirectFormat,
+    Fp8GroupFormat,
     Fp8RowFormat,
     Nvfp4Format,
     QuantFormat,
@@ -21,6 +23,7 @@ from .formats import (
 )
 from .layouts import (
     block_scale_geometry,
+    group_scale_geometry,
     row_scale_geometry,
     row_split_geometry,
 )
@@ -64,6 +67,9 @@ class TensorOutput:
         elif isinstance(self.format, Fp8RowFormat):
             g = row_scale_geometry(self.format, obj.shape)
             gaps = ((g.code_plane_bytes, g.scale_plane_offset),)
+        elif isinstance(self.format, Fp8GroupFormat):
+            g = group_scale_geometry(self.format, obj.shape)
+            gaps = ((g.code_plane_bytes, g.scale_plane_offset),)
         elif isinstance(self.format, Nvfp4Format):
             g = block_scale_geometry(self.format, obj.shape)
             gaps = ((g.code_plane_bytes, g.scale_plane_offset),)
@@ -104,6 +110,21 @@ class TensorOutput:
             self.write_bytes(row_begin * k, block[: local.code_plane_bytes])
             self.write_bytes(
                 g.scale_plane_offset + row_begin * 2, block[local.scale_plane_offset :]
+            )
+        elif isinstance(self.format, Fp8GroupFormat):
+            # Whole 16-row tiles: a tile's scale run is contiguous, so a block of tiles is one run.
+            if row_begin % 16 or rows % 16:
+                raise ValueError(f"{obj.id}: group-scaled FP8 output needs whole 16-row tiles")
+            g = group_scale_geometry(self.format, obj.shape)
+            if tuple(codes.shape) != (rows, k) or codes.dtype != torch.uint8:
+                raise TypeError(f"{obj.id}: group-scaled FP8 codes must be uint8 [{rows}, {k}]")
+            if tuple(scales.shape) != (rows, g.groups) or scales.dtype != torch.uint8:
+                raise TypeError(f"{obj.id}: group-scaled FP8 scales must be uint8 [{rows}, {g.groups}]")
+            codes, scales = codes.contiguous().cpu(), scales.contiguous().cpu()
+            validate_fp8_group_words(codes, scales)
+            self.write_bytes(row_begin * k, codes.numpy().tobytes())
+            self.write_bytes(
+                g.scale_plane_offset + row_begin * g.groups, rows16_scale_plane(scales).numpy().tobytes()
             )
         elif isinstance(self.format, Nvfp4Format):
             if row_begin % 128 or rows % 128 or weight_divisor is None:

@@ -18,6 +18,8 @@ struct LoadOptions {
     float rope_yarn_factor                 = 1.0F;
     // Every Use binds A16Only, whatever activation precision the artifact permits.
     bool a16_activations = false;
+    // Qwen4Exp: routed expert banks whose 4-bit activations are optional run them (W4A4).
+    bool expert_a4_activations = false;
     // Qwen4Exp: the routed expert banks stay in the artifact and are read in place by the SSD
     // expert tier (design §19.3.7) instead of being pinned in host memory.
     bool stream_experts = false;
@@ -83,6 +85,7 @@ struct LoadOptions {
             .proposal_head            = options.speculative.proposal_head,
             .rope_yarn_factor         = options.rope_yarn_factor,
             .a16_activations          = options.a16_activations,
+            .expert_a4_activations    = options.expert_a4_activations,
             .draft_model              = options.speculative.draft_model};
 }
 

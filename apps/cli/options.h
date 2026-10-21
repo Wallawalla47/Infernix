@@ -40,6 +40,7 @@ struct Options {
     std::optional<std::size_t> vram_headroom_bytes; // empty: the model's automatic headroom
     bool vram_past_budget = false;
     std::uint32_t expert_tail_skip = 0; // EngineOptions::expert_tail_skip
+    bool expert_a4_activations     = false; // EngineOptions::expert_a4_activations
     std::uint32_t prefill_chunk  = 0; // 0: the model's default (EngineOptions)
     int device                   = 0;
 

@@ -235,6 +235,13 @@ infernix_add_op_test(infernix_hyper_connection_stream_mean_test
   LIBRARIES infernix_ops)
 set_tests_properties(infernix_hyper_connection_stream_mean_test PROPERTIES SKIP_RETURN_CODE 77)
 
+# NVIDIA FP4-Local's PLE: NVFP4 n-gram rows decoded bit-exactly (one rounding of the exact product)
+# and the gate with FP32 norm weights, against FP64.
+infernix_add_op_test(infernix_ple_nvfp4_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ple_nvfp4.cpp"
+  LIBRARIES infernix_linear_test_support)
+set_tests_properties(infernix_ple_nvfp4_test PROPERTIES SKIP_RETURN_CODE 77)
+
 # Canonical W4A4 arithmetic and the CPU expert engine; host-only, needs no GPU.
 infernix_add_op_test(infernix_offloaded_moe_cpu_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_cpu.cpp"

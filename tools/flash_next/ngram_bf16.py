@@ -49,6 +49,7 @@ class DequantizedTable:
             raise ValueError("--dequantize needs a checkpoint whose n-gram table is FP8")
         self.fp8, self.shards, self.rows = fp8, fp8.shards, fp8.rows
         self.row_bytes = 2 * fp8.width
+        self.volume_format = "bf16"
         self._scale = fp8.scale().float()
 
     def codes(self, name: str, begin: int, end: int) -> torch.Tensor:

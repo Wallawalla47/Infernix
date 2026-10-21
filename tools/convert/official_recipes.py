@@ -439,6 +439,78 @@ def qwen3_8_flash_next_nvfp4_orcarouter(model, recipe, sources):
     _flash_next_drafter(model, recipe)
 
 
+MXFP8 = "fp8_e4m3fn_g32_e8m0"
+
+
+def qwen3_8_flash_next_fp4_local(model, recipe, sources):
+    """nvidia/Qwen3.8-Flash-Next-FP4-Local (design §6.1.2): NVIDIA's quantization-aware-distilled
+    checkpoint, bit-exact, run by default in the arithmetic NVIDIA serves it with: 16-bit activations
+    everywhere.
+
+    - The routed experts keep their NVFP4 codes, their block scales (stored in the checkpoint in the
+      lossless NVFP4-CSF encoding, restored exactly) and their FP32 multipliers as ``nvfp4_mul``
+      banks in ``nvfp4_expert_rg16_v1``, with their calibrated FP32 activation scales. Their Use
+      permits 4-bit activations, and the text config's ``expert_a4_activations: optional`` makes the
+      16-bit arithmetic (design §16.2.1) the default: the engine runs 4-bit expert activations
+      (§16.2) only with ``--expert-a4-activations``.
+    - The MXFP8 GDN q/k/v/z and output, QSA query/gate/key/value, indexer and output and
+      shared-expert projections keep their E4M3FN codes and UE8M0 group scales
+      (``fp8_e4m3fn_g32_e8m0``, W8A16).
+    - The GDN a/b projections (MXFP8, a parameter of their own) and the vision attention become
+      their exact BF16 values; the vision MLPs and merger (weight-only NVFP4) their BF16 rounding,
+      the conversion's only rounding of a main-model or vision weight.
+    - Every BF16 or FP32 tensor keeps its dtype; the NVFP4 n-gram table is written verbatim to its
+      own volume with its FP32 multiplier.
+    - The MTP drafter is re-quantized as recipes A-C build it (``_flash_next_drafter``) from its
+      weight-only NVFP4 experts' exact values and its BF16 dense projections.
+
+    The QSA query/gate/key/value and indexer projections form one MXFP8 parent [13952, 2560], which
+    the model runs as one projection (the builder's grouping, as recipe A's)."""
+
+    from .qwen4_exp import ExpertBankSource, import_expert_bank, weight_only_bank
+
+    if model.config.get("architectures") != ["Qwen4ExpForCausalLM"]:
+        raise ValueError("this official recipe requires Qwen4Exp mathematics")
+    banks = [name for name in model.parameters if name.startswith("text/layers/") and name.endswith("/moe/experts")]
+    if not banks or not all(
+        isinstance(model.parameters[name].source, ExpertBankSource) and not weight_only_bank(model.parameters[name].source)
+        for name in banks
+    ):
+        raise ValueError("the FP4-Local recipe imports ModelOpt NVFP4 experts (nvidia/Qwen3.8-Flash-Next-FP4-Local)")
+    if model.config["ngram_table"]["format"] != "nvfp4":
+        raise ValueError("the FP4-Local recipe binds the checkpoint's own NVFP4 n-gram table")
+    base = sources["base"]
+    mxfp8 = (
+        "/gdn/query", "/gdn/key", "/gdn/value", "/gdn/z", "/gdn/output",
+        "/attention/query", "/attention/gate", "/attention/key", "/attention/value",
+        "/attention/index_query", "/attention/index_key", "/attention/output",
+        "/moe/shared/gate", "/moe/shared/up", "/moe/shared/down",
+    )
+    for name, parameter in model.parameters.items():
+        if not name.startswith("text/layers/"):
+            continue
+        if name.endswith("/moe/experts"):
+            recipe.assign(
+                name,
+                format="nvfp4_mul",
+                layout="nvfp4_expert_rg16_v1",
+                method=import_expert_bank,
+                activation_policy="AllowA4",
+            )
+            recipe.group(name, shape=parameter.shape)
+        elif name.endswith(mxfp8):
+            recipe.assign(
+                name,
+                format=MXFP8,
+                method=import_encoded,
+                source=model.source(name, base, MXFP8),
+                activation_policy="A16Only",
+            )
+    # The banks keep their activation scales and permit 4-bit activations; 16-bit is the default.
+    model.config["expert_a4_activations"] = "optional"
+    _flash_next_drafter(model, recipe)
+
+
 def qwen3_8_flash_next_gsq_rco_iq3s(model, recipe, sources):
     """ISTA-DASLab's GSQ-RCO IQ3_S GGUF of Qwen3.8-Flash-Next, bit-exact
     (docs/maintainer/qwen3_8-flash-next-design.md §19.3.25). Every GGUF block format is stored verbatim:
@@ -508,6 +580,7 @@ RECIPES = {
     "qwen3_8_flash_next_nvfp4_dense8": qwen3_8_flash_next_nvfp4_dense8,
     "qwen3_8_flash_next_nvfp4_orcarouter": qwen3_8_flash_next_nvfp4_orcarouter,
     "qwen3_8_flash_next_fp8": qwen3_8_flash_next_fp8,
+    "qwen3_8_flash_next_fp4_local": qwen3_8_flash_next_fp4_local,
     "qwen3_8_flash_next_gsq_rco_iq3s": qwen3_8_flash_next_gsq_rco_iq3s,
     "qwen3_8_flash_next_dflash2": qwen3_8_flash_next_dflash2,
 }

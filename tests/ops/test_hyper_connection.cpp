@@ -1,6 +1,7 @@
 // hyper_connection_mix against an FP64 oracle (docs/maintainer/qwen3_8-flash-next-design.md §8.3,
-// §19.3.3 Phase 1b), for Q8_G32_FP16 weights (Dense8) and BF16 weights (the bit-exact artifact). The
-// oracle evaluates the closed formula in FP64 from the represented BF16 residual and norm weight and
+// §19.3.3 Phase 1b), for Q8_G32_FP16 weights (Dense8) and BF16 weights (the bit-exact artifact), each
+// with a BF16 norm weight and with a full-precision FP32 one (NVIDIA FP4-Local). The oracle evaluates
+// the closed formula in FP64 from the represented BF16 residual and norm weight and
 // the weights decoded independently from their payload:
 //
 //   Rn = R * (mean R^2 + eps)^-1/2 * (1 + w) per stream; z = W_down Rn; m = SiLU(z[:rank] / S);
@@ -69,7 +70,8 @@ struct Reference {
     std::vector<double> inject; // [T][S]
 };
 
-Reference oracle(const std::vector<std::uint16_t>& r, const std::vector<std::uint16_t>& w, const std::vector<float>& down,
+// `w`: the norm weight's represented values (BF16 widened, or FP32).
+Reference oracle(const std::vector<std::uint16_t>& r, const std::vector<double>& w, const std::vector<float>& down,
                  int down_rows, const std::vector<float>& up, int T) {
     Reference out;
     out.x.assign(static_cast<std::size_t>(T) * kH, 0.0);
@@ -85,7 +87,7 @@ Reference oracle(const std::vector<std::uint16_t>& r, const std::vector<std::uin
             const double inv = 1.0 / std::sqrt(ss / kH + kEps);
             for (int d = 0; d < kH; ++d) {
                 const std::size_t i = static_cast<std::size_t>(s) * kH + d;
-                rn[i] = t::bf16_to_f32(r[static_cast<std::size_t>(c) * kW + i]) * inv * (1.0 + t::bf16_to_f32(w[i]));
+                rn[i] = t::bf16_to_f32(r[static_cast<std::size_t>(c) * kW + i]) * inv * (1.0 + w[i]);
             }
         }
         for (int k = 0; k < down_rows; ++k) {
@@ -206,6 +208,15 @@ struct Problem {
     infernix::Weight down_w, up_w;
     std::vector<std::uint16_t> norm;
     std::unique_ptr<Device> norm_device;
+    // An FP32 norm weight of full precision (NVIDIA FP4-Local's trained norms).
+    std::vector<float> norm32;
+    std::unique_ptr<Device> norm32_device;
+
+    std::vector<double> norm_values(bool fp32) const {
+        std::vector<double> out(kW);
+        for (int i = 0; i < kW; ++i) { out[i] = fp32 ? norm32[i] : t::bf16_to_f32(norm[i]); }
+        return out;
+    }
 };
 
 Problem make_problem(bool inject, Codec codec) {
@@ -237,6 +248,10 @@ Problem make_problem(bool inject, Codec codec) {
     for (auto& v : p.norm) { v = t::f32_to_bf16(0.25F * uniform(state)); }
     p.norm_device = std::make_unique<Device>(kW * 2);
     t::cuda_check(cudaMemcpy(p.norm_device->p, p.norm.data(), kW * 2, cudaMemcpyHostToDevice), "norm");
+    p.norm32.resize(kW);
+    for (auto& v : p.norm32) { v = 0.25F * uniform(state) + 0x1p-20F * uniform(state); } // below BF16's resolution
+    p.norm32_device = std::make_unique<Device>(kW * 4);
+    t::cuda_check(cudaMemcpy(p.norm32_device->p, p.norm32.data(), kW * 4, cudaMemcpyHostToDevice), "norm32");
     return p;
 }
 
@@ -257,11 +272,11 @@ struct Result {
 };
 
 Result run(Problem& p, const std::vector<std::uint16_t>& r, int T, bool inject, infernix::WorkspaceArena& ws,
-           cudaStream_t stream, bool graph = false) {
+           cudaStream_t stream, bool graph = false, bool fp32_norm = false) {
     Device rd(r.size() * 2), xd(static_cast<std::size_t>(kH) * T * 2), id(static_cast<std::size_t>(kS) * T * 4);
     t::cuda_check(cudaMemcpy(rd.p, r.data(), r.size() * 2, cudaMemcpyHostToDevice), "residual");
     const Tensor R(rd.p, DType::BF16, {kW, T});
-    const Tensor w(p.norm_device->p, DType::BF16, {kW});
+    const Tensor w = fp32_norm ? Tensor(p.norm32_device->p, DType::FP32, {kW}) : Tensor(p.norm_device->p, DType::BF16, {kW});
     Tensor x(xd.p, DType::BF16, {kH, T});
     Tensor inj(id.p, DType::FP32, {kS, T});
     const auto call = [&] {
@@ -333,37 +348,41 @@ int main() {
         }
         cudaStream_t stream = nullptr;
         t::cuda_check(cudaStreamCreate(&stream), "stream");
+        // Both codecs, with a BF16 norm weight and with an FP32 one (NVIDIA FP4-Local's).
         for (const Codec codec : {Codec::Q8, Codec::Bf16})
+        for (const bool fp32_norm : {false, true})
         for (const bool inject : {true, false}) {
             Problem p = make_problem(inject, codec);
             const std::size_t capacity = infernix::ops::hyper_connection_mix_workspace_capacity_bytes(
                 p.down_w, p.up_w, infernix::ops::LinearPolicy::A16Only, kS, kRank, 193);
             infernix::WorkspaceArena ws(capacity);
-            const std::string tag = std::string(codec == Codec::Q8 ? "q8 " : "bf16 ") + (inject ? "inject" : "no inject");
+            const std::string tag = std::string(codec == Codec::Q8 ? "q8 " : "bf16 ") +
+                                    (fp32_norm ? "fp32-norm " : "") + (inject ? "inject" : "no inject");
+            const std::vector<double> norm = p.norm_values(fp32_norm);
             for (const int T : {1, 4, 5, 8, 9, 16, 17, 64, 96, 97, 129, 193}) {
                 const auto r     = residual(T, 1000U + static_cast<std::uint32_t>(T));
-                const Result got = run(p, r, T, inject, ws, stream);
-                compare(got, oracle(r, p.norm, p.down_values, p.down_rows, p.up_values, T), T <= 16, inject,
+                const Result got = run(p, r, T, inject, ws, stream, false, fp32_norm);
+                compare(got, oracle(r, norm, p.down_values, p.down_rows, p.up_values, T), T <= 16, inject,
                         tag + " T=" + std::to_string(T));
                 check(ws.peak_used() <= capacity, tag + ": the workspace capacity covers T=" + std::to_string(T));
             }
             // Column invariance of the fused route.
             const auto r16    = residual(16, 4242U);
-            const Result all  = run(p, r16, 16, inject, ws, stream);
+            const Result all  = run(p, r16, 16, inject, ws, stream, false, fp32_norm);
             bool same         = true;
             for (int c = 0; c < 16 && same; ++c) {
                 const std::vector<std::uint16_t> one(r16.begin() + static_cast<std::ptrdiff_t>(c) * kW,
                                                      r16.begin() + static_cast<std::ptrdiff_t>(c + 1) * kW);
-                const Result alone = run(p, one, 1, inject, ws, stream);
+                const Result alone = run(p, one, 1, inject, ws, stream, false, fp32_norm);
                 same = std::equal(alone.x.begin(), alone.x.end(), all.x.begin() + static_cast<std::ptrdiff_t>(c) * kH) &&
                        (!inject || std::equal(alone.inject.begin(), alone.inject.end(),
                                               all.inject.begin() + static_cast<std::ptrdiff_t>(c) * kS));
             }
             check(same, tag + ": each column of a 16-column call equals that column alone");
             const std::vector<std::uint16_t> r5(r16.begin(), r16.begin() + 5 * kW);
-            const Result five = run(p, r5, 5, inject, ws, stream);
+            const Result five = run(p, r5, 5, inject, ws, stream, false, fp32_norm);
             check(std::equal(five.x.begin(), five.x.end(), all.x.begin()), tag + ": a 5-column call equals the first five");
-            const Result captured = run(p, r5, 5, inject, ws, stream, true);
+            const Result captured = run(p, r5, 5, inject, ws, stream, true, fp32_norm);
             check(captured.x == five.x && captured.inject == five.inject, tag + ": a graph-captured call equals the eager call");
         }
         // Shapes that disagree are refused.

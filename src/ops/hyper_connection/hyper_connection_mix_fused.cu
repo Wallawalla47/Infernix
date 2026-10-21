@@ -59,6 +59,41 @@ void check_launch(cudaError_t error, const char* what) {
 
 __device__ __forceinline__ float sigmoidf(float x) { return 1.0F / (1.0F + expf(-x)); }
 
+// The norm weight w is BF16, or FP32 (NVIDIA FP4-Local's trained norms); every kernel forms 1 + w in
+// FP32 from the represented value.
+__device__ __forceinline__ float norm_value(bf16 w) { return __bfloat162float(w); }
+__device__ __forceinline__ float norm_value(float w) { return w; }
+
+__device__ __forceinline__ void bf16x8_bits_to_floats(const uint4& bits, float (&v)[8]) {
+    const float2 a = bf16x2_bits_to_float2(bits.x), b = bf16x2_bits_to_float2(bits.y);
+    const float2 c = bf16x2_bits_to_float2(bits.z), d = bf16x2_bits_to_float2(bits.w);
+    v[0] = a.x, v[1] = a.y, v[2] = b.x, v[3] = b.y, v[4] = c.x, v[5] = c.y, v[6] = d.x, v[7] = d.y;
+}
+
+// Eight consecutive norm weights as the v4 kernels stage them: one 16-byte vector of BF16 words, or
+// two of FP32 words.
+template <class Norm>
+struct NormGroup;
+
+template <>
+struct NormGroup<bf16> {
+    uint4 bits;
+    __device__ static NormGroup load(const bf16* p) { return {load_ldg<uint4>(p)}; }
+    __device__ static NormGroup zero() { return {make_uint4(0U, 0U, 0U, 0U)}; }
+    __device__ void floats(float (&w)[8]) const { bf16x8_bits_to_floats(bits, w); }
+};
+
+template <>
+struct NormGroup<float> {
+    float4 low, high;
+    __device__ static NormGroup load(const float* p) { return {load_ldg<float4>(p), load_ldg<float4>(p + 4)}; }
+    __device__ static NormGroup zero() { return {make_float4(0.F, 0.F, 0.F, 0.F), make_float4(0.F, 0.F, 0.F, 0.F)}; }
+    __device__ void floats(float (&w)[8]) const {
+        w[0] = low.x, w[1] = low.y, w[2] = low.z, w[3] = low.w, w[4] = high.x, w[5] = high.y, w[6] = high.z,
+        w[7] = high.w;
+    }
+};
+
 __device__ __forceinline__ float warp_sum(float value) {
     for (int offset = 16; offset > 0; offset >>= 1) { value += __shfl_xor_sync(0xFFFFFFFFU, value, offset); }
     return value;
@@ -111,9 +146,9 @@ struct Bf16Codec {
     }
 };
 
-template <class Codec>
+template <class Codec, class Norm>
 __global__ __launch_bounds__(kDownThreads, 1) void hc_down_partials_kernel(
-    const bf16* __restrict__ residual, const bf16* __restrict__ norm_weight, typename Codec::Params down, int rows,
+    const bf16* __restrict__ residual, const Norm* __restrict__ norm_weight, typename Codec::Params down, int rows,
     int columns, float eps, float* __restrict__ partial, float* __restrict__ inv_out) {
     extern __shared__ __align__(16) float rn[]; // [kPassColumns][kHidden]
     __shared__ float scratch[kDownThreads / 32][kPassColumns];
@@ -132,10 +167,10 @@ __global__ __launch_bounds__(kDownThreads, 1) void hc_down_partials_kernel(
     typename Codec::Chunk chunk[kChunks];
 #pragma unroll
     for (int m = 0; m < kChunks; ++m) { chunk[m] = Codec::load(down, source, s * kHidden + m * 256 + lane * 8); }
-    const bf16* w = norm_weight + static_cast<std::int64_t>(s) * kHidden;
+    const Norm* w = norm_weight + static_cast<std::int64_t>(s) * kHidden;
     float w_bias[kOwned];
 #pragma unroll
-    for (int j = 0; j < kOwned; ++j) { w_bias[j] = 1.0F + __bfloat162float(w[threadIdx.x + kDownThreads * j]); }
+    for (int j = 0; j < kOwned; ++j) { w_bias[j] = 1.0F + norm_value(w[threadIdx.x + kDownThreads * j]); }
     // Launched as a programmatic dependent: the weights load while the producer finishes. The up
     // collapse may launch beside this grid at once and fetch its own weights meanwhile; it reads the
     // partials only after this grid completes.
@@ -248,10 +283,10 @@ __global__ __launch_bounds__(kDownThreads, 1) void hc_down_partials_kernel(
     }
 }
 
-template <class Codec>
+template <class Codec, class Norm>
 __global__ __launch_bounds__(kUpThreads, 1) void hc_up_collapse_kernel(
     const float* __restrict__ partial, const float* __restrict__ inv_in, const bf16* __restrict__ residual,
-    const bf16* __restrict__ norm_weight, typename Codec::Params up, int rank, int down_rows, int columns,
+    const Norm* __restrict__ norm_weight, typename Codec::Params up, int rank, int down_rows, int columns,
     float* __restrict__ inject, bf16* __restrict__ x) {
     __shared__ __align__(16) float m[kHcMixFusedMaxColumns * kMaxRank]; // [T][rank]
     __shared__ float inv[kStreams * kHcMixFusedMaxColumns];             // [S][T]
@@ -279,7 +314,7 @@ __global__ __launch_bounds__(kUpThreads, 1) void hc_up_collapse_kernel(
     float w_bias[kStreams];
 #pragma unroll
     for (int s = 0; s < kStreams; ++s) {
-        w_bias[s] = 1.0F + __bfloat162float(norm_weight[static_cast<std::int64_t>(s) * kHidden + dl]);
+        w_bias[s] = 1.0F + norm_value(norm_weight[static_cast<std::int64_t>(s) * kHidden + dl]);
     }
     // Launched as a programmatic dependent: the weights load while the down partials finish. The next
     // projection may launch beside this grid at once and fetch its weights meanwhile.
@@ -432,17 +467,11 @@ __device__ __forceinline__ float warp_sum8_transposed(const float (&v)[8], int l
     return total;
 }
 
-__device__ __forceinline__ void bf16x8_bits_to_floats(const uint4& bits, float (&v)[8]) {
-    const float2 a = bf16x2_bits_to_float2(bits.x), b = bf16x2_bits_to_float2(bits.y);
-    const float2 c = bf16x2_bits_to_float2(bits.z), d = bf16x2_bits_to_float2(bits.w);
-    v[0] = a.x, v[1] = a.y, v[2] = b.x, v[3] = b.y, v[4] = c.x, v[5] = c.y, v[6] = d.x, v[7] = d.y;
-}
-
 // K1a with v4's staging (see above): one row of W_down per warp, 8 warps per CTA. Shared Rn:
 // [pass column][plane][kHidden / 2].
-template <class Codec>
+template <class Codec, class Norm>
 __global__ __launch_bounds__(kDownThreads, 1) void hc_down_partials_v4_kernel(
-    const bf16* __restrict__ residual, const bf16* __restrict__ norm_weight, typename Codec::Params down, int rows,
+    const bf16* __restrict__ residual, const Norm* __restrict__ norm_weight, typename Codec::Params down, int rows,
     int columns, float eps, float* __restrict__ partial, float* __restrict__ inv_out) {
     constexpr int RowsPerWarp = 1;
     extern __shared__ __align__(16) float rn[]; // [kPassColumns][2][kHidden / 2]
@@ -465,12 +494,12 @@ __global__ __launch_bounds__(kDownThreads, 1) void hc_down_partials_v4_kernel(
 #pragma unroll
         for (int m = 0; m < kChunks; ++m) { chunk[r][m] = Codec::load(down, source, s * kHidden + m * 256 + lane * 8); }
     }
-    const bf16* w = norm_weight + static_cast<std::int64_t>(s) * kHidden;
-    uint4 w_bits[kSlices];
+    const Norm* w = norm_weight + static_cast<std::int64_t>(s) * kHidden;
+    NormGroup<Norm> w_bits[kSlices];
 #pragma unroll
     for (int h = 0; h < kSlices; ++h) {
         const int i = static_cast<int>(threadIdx.x) * 8 + kDownThreads * 8 * h;
-        w_bits[h]   = i < kHidden ? load_ldg<uint4>(w + i) : make_uint4(0U, 0U, 0U, 0U);
+        w_bits[h]   = i < kHidden ? NormGroup<Norm>::load(w + i) : NormGroup<Norm>::zero();
     }
     pdl::trigger_dependents();
     pdl::wait_for_dependencies();
@@ -533,7 +562,7 @@ __global__ __launch_bounds__(kDownThreads, 1) void hc_down_partials_v4_kernel(
                     if (i < kHidden) {
                         float v[8], b[8];
                         bf16x8_bits_to_floats(values[c][h], v);
-                        bf16x8_bits_to_floats(w_bits[h], b);
+                        w_bits[h].floats(b);
 #pragma unroll
                         for (int j = 0; j < 8; ++j) { b[j] = 1.0F + b[j]; }
                         const int g       = static_cast<int>(threadIdx.x) + kDownThreads * h;
@@ -602,10 +631,10 @@ constexpr int kUpV4Warps   = 8;
 constexpr int kUpV4Threads = kUpV4Warps * 32;
 constexpr int kUpV4Rows    = 8; // a warp's rows: features warp and warp + 8, 4 streams each
 
-template <class Codec>
+template <class Codec, class Norm>
 __global__ __launch_bounds__(kUpV4Threads, 1) void hc_up_collapse_v4_kernel(
     const float* __restrict__ partial, const float* __restrict__ inv_in, const bf16* __restrict__ residual,
-    const bf16* __restrict__ norm_weight, typename Codec::Params up, int rank, int down_rows, int columns,
+    const Norm* __restrict__ norm_weight, typename Codec::Params up, int rank, int down_rows, int columns,
     float* __restrict__ inject, bf16* __restrict__ x) {
     static_assert(kUpFeatures == 2 * kUpV4Warps && kUpV4Rows == 2 * kStreams);
     static_assert(kUpFeatures * kHcMixFusedMaxColumns <= kUpV4Threads);
@@ -638,7 +667,7 @@ __global__ __launch_bounds__(kUpV4Threads, 1) void hc_up_collapse_v4_kernel(
     float w_bias[kStreams];
 #pragma unroll
     for (int s = 0; s < kStreams; ++s) {
-        w_bias[s] = 1.0F + __bfloat162float(norm_weight[static_cast<std::int64_t>(s) * kHidden + dl]);
+        w_bias[s] = 1.0F + norm_value(norm_weight[static_cast<std::int64_t>(s) * kHidden + dl]);
     }
     pdl::trigger_dependents();
     pdl::wait_for_dependencies();
@@ -740,11 +769,11 @@ Q8Codec::Params q8_params(const Weight& w) {
 Bf16Codec::Params bf16_params(const Weight& w) { return {static_cast<const bf16*>(w.qdata), bf16_stride(w)}; }
 
 // Launches hc_down_partials_v4_kernel in K1a's place.
-template <class Codec>
+template <class Codec, class Norm>
 void launch_down_v4(const Tensor& residual, const Tensor& norm_weight, typename Codec::Params down, int down_rows,
                     int streams, float eps, float* partial, float* inv, std::size_t rn_bytes, cudaStream_t stream) {
     static const bool configured = [] {
-        const cudaError_t error = cudaFuncSetAttribute(hc_down_partials_v4_kernel<Codec>,
+        const cudaError_t error = cudaFuncSetAttribute(hc_down_partials_v4_kernel<Codec, Norm>,
                                                        cudaFuncAttributeMaxDynamicSharedMemorySize,
                                                        static_cast<int>(kDownSharedBytes));
         if (error != cudaSuccess) {
@@ -755,18 +784,18 @@ void launch_down_v4(const Tensor& residual, const Tensor& norm_weight, typename 
     (void)configured;
     check_launch(pdl::launch_consumer({dim3((down_rows + kDownRows - 1) / kDownRows, streams), dim3(kDownThreads),
                                        rn_bytes, stream},
-                                      hc_down_partials_v4_kernel<Codec>,
-                                      static_cast<const bf16*>(residual.data), static_cast<const bf16*>(norm_weight.data),
+                                      hc_down_partials_v4_kernel<Codec, Norm>,
+                                      static_cast<const bf16*>(residual.data), static_cast<const Norm*>(norm_weight.data),
                                       down, down_rows, residual.ne[1], eps, partial, inv),
                  "down partials v4");
 }
 
-template <class Codec>
+template <class Codec, class Norm>
 void launch(const Tensor& residual, const Tensor& norm_weight, typename Codec::Params down,
             typename Codec::Params up, int down_rows, int rank, int streams, float eps, Tensor& x, Tensor* inject,
             void* partials, cudaStream_t stream) {
     static const bool configured = [] {
-        const cudaError_t error = cudaFuncSetAttribute(hc_down_partials_kernel<Codec>,
+        const cudaError_t error = cudaFuncSetAttribute(hc_down_partials_kernel<Codec, Norm>,
                                                        cudaFuncAttributeMaxDynamicSharedMemorySize,
                                                        static_cast<int>(kDownSharedBytes));
         if (error != cudaSuccess) {
@@ -789,32 +818,46 @@ void launch(const Tensor& residual, const Tensor& norm_weight, typename Codec::P
     // 16-byte vectors.
     const bool v4 = columns >= 2 && reinterpret_cast<std::uintptr_t>(norm_weight.data) % 16 == 0;
     if (v4) {
-        launch_down_v4<Codec>(residual, norm_weight, down, down_rows, streams, eps, partial, inv, rn_bytes, stream);
+        launch_down_v4<Codec, Norm>(residual, norm_weight, down, down_rows, streams, eps, partial, inv, rn_bytes,
+                                    stream);
     } else {
         check_launch(pdl::launch_consumer({dim3((down_rows + kDownRows - 1) / kDownRows, streams), dim3(kDownThreads),
                                            rn_bytes, stream},
-                                          hc_down_partials_kernel<Codec>, static_cast<const bf16*>(residual.data),
-                                          static_cast<const bf16*>(norm_weight.data), down, down_rows, columns, eps,
+                                          hc_down_partials_kernel<Codec, Norm>, static_cast<const bf16*>(residual.data),
+                                          static_cast<const Norm*>(norm_weight.data), down, down_rows, columns, eps,
                                           partial, inv),
                      "down partials");
     }
     if (v4) {
         check_launch(pdl::launch_consumer({dim3((kHidden + kUpFeatures - 1) / kUpFeatures), dim3(kUpV4Threads), 0, stream},
-                                          hc_up_collapse_v4_kernel<Codec>, static_cast<const float*>(partial),
+                                          hc_up_collapse_v4_kernel<Codec, Norm>, static_cast<const float*>(partial),
                                           static_cast<const float*>(inv), static_cast<const bf16*>(residual.data),
-                                          static_cast<const bf16*>(norm_weight.data), up, rank, down_rows, columns,
+                                          static_cast<const Norm*>(norm_weight.data), up, rank, down_rows, columns,
                                           inject != nullptr ? static_cast<float*>(inject->data) : nullptr,
                                           static_cast<bf16*>(x.data)),
                      "up collapse v4");
         return;
     }
     check_launch(pdl::launch_consumer({dim3((kHidden + kUpFeatures - 1) / kUpFeatures), dim3(kUpThreads), 0, stream},
-                                      hc_up_collapse_kernel<Codec>, static_cast<const float*>(partial),
+                                      hc_up_collapse_kernel<Codec, Norm>, static_cast<const float*>(partial),
                                       static_cast<const float*>(inv), static_cast<const bf16*>(residual.data),
-                                      static_cast<const bf16*>(norm_weight.data), up, rank, down_rows, columns,
+                                      static_cast<const Norm*>(norm_weight.data), up, rank, down_rows, columns,
                                       inject != nullptr ? static_cast<float*>(inject->data) : nullptr,
                                       static_cast<bf16*>(x.data)),
                  "up collapse");
+}
+
+template <class Codec>
+void launch_norm(const Tensor& residual, const Tensor& norm_weight, typename Codec::Params down,
+                 typename Codec::Params up, int down_rows, int rank, int streams, float eps, Tensor& x, Tensor* inject,
+                 void* partials, cudaStream_t stream) {
+    if (norm_weight.dtype == DType::FP32) {
+        launch<Codec, float>(residual, norm_weight, down, up, down_rows, rank, streams, eps, x, inject, partials,
+                             stream);
+    } else {
+        launch<Codec, bf16>(residual, norm_weight, down, up, down_rows, rank, streams, eps, x, inject, partials,
+                            stream);
+    }
 }
 
 } // namespace
@@ -843,11 +886,11 @@ void hc_mix_fused(const Tensor& residual, const Tensor& norm_weight, const Weigh
         throw std::invalid_argument("hyper_connection_mix: injects need the down projection's injection rows");
     }
     if (down.qtype == QType::Q8_G32_FP16) {
-        launch<Q8Codec>(residual, norm_weight, q8_params(down), q8_params(up), down.n, rank, streams, eps, x, inject,
-                        partials, stream);
+        launch_norm<Q8Codec>(residual, norm_weight, q8_params(down), q8_params(up), down.n, rank, streams, eps, x,
+                             inject, partials, stream);
     } else {
-        launch<Bf16Codec>(residual, norm_weight, bf16_params(down), bf16_params(up), down.n, rank, streams, eps, x,
-                          inject, partials, stream);
+        launch_norm<Bf16Codec>(residual, norm_weight, bf16_params(down), bf16_params(up), down.n, rank, streams, eps,
+                               x, inject, partials, stream);
     }
 }
 

@@ -18,6 +18,12 @@ infernix_add_test(infernix_qwen4_exp_ngram_hash_test
   LIBRARIES infernix_model_loading
   NEEDS_SOURCE_DIR)
 
+# The routed experts' activation precision as the config resolves it, with --expert-a4-activations
+# (host only, a synthetic directory).
+infernix_add_test(infernix_qwen4_exp_expert_activations_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_expert_activations.cpp"
+  LIBRARIES infernix_model_loading)
+
 # The n-gram volume reader on a synthetic volume (CPU and disk only).
 infernix_add_test(infernix_qwen4_exp_ngram_volume_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ngram_volume.cpp"

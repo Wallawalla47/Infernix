@@ -1,6 +1,6 @@
 # Infernix Persistent Tensor Numeric Formats
 
-This reference defines the twenty persistent numeric tensor formats accepted by current `.ninfer`
+This reference defines the twenty-two persistent numeric tensor formats accepted by current `.ninfer`
 artifacts: their logical words, quantization semantics, canonical reference encoders where
 applicable, and conformance boundaries. [Container framing](artifact-container.md),
 [physical layouts](storage-layouts.md), weight recipes and runtime-state codecs are defined
@@ -8,7 +8,7 @@ separately.
 
 ## 1. Registered formats
 
-Infernix has exactly twenty persistent numeric tensor formats in five categories.
+Infernix has exactly twenty-two persistent numeric tensor formats in five categories.
 
 Direct scalar formats preserve one logical scalar word per tensor element:
 
@@ -41,6 +41,7 @@ The scaled FP8 weight formats are:
 |---|---|---|---|
 | `fp8_e4m3fn_row_bf16` | E4M3FN, 8 bits/weight | one multiplier per logical row | BF16 |
 | `fp8_e4m3fn_b128` | E4M3FN, 8 bits/weight | one multiplier per 128 x 128 tile (Section 3.7) | BF16 |
+| `fp8_e4m3fn_g32_e8m0` | E4M3FN, 8 bits/weight | one power of two per 32 K elements of a row (Section 3.8, MXFP8) | UE8M0 |
 
 The GGUF (ggml) block formats store llama.cpp's blocks verbatim (Section 3.6):
 
@@ -387,6 +388,34 @@ per expert; the only layout is the expert-bank record `fp8_expert_b128_v1`
 arithmetic of [`src/ops/fp8_block/fp8_exact.h`](../../src/ops/fp8_block/fp8_exact.h): A16
 activations, per tile an exact int64 sum of `w = decode_e4m3fn(c) * 2^9` times X, the tiles combined
 in int128 relative to the row's smallest scale exponent, one binary32 rounding.
+
+### 3.8 `fp8_e4m3fn_g32_e8m0`
+
+OCP MXFP8 weights as NVIDIA ModelOpt stores them (`weight` E4M3FN `[N, K]`, `weight_scale` UE8M0
+bytes `[N, K/32]`; NVIDIA Qwen3.8-Flash-Next-FP4-Local's GDN, QSA and shared-expert projections),
+kept verbatim. A matrix `[N, K]` (`K` a multiple of 32) has one E4M3FN code byte per weight and one
+UE8M0 word per 32 consecutive K elements of a row:
+
+```text
+W[n,k] = decode_e4m3fn(c[n,k]) * 2^(e[n, floor(k/32)] - 127)
+```
+
+The NaN codes (`S.1111.111`) are illegal. A scale word must satisfy `3 <= e <= 246`: in that range
+every code times its scale is an exact, finite BF16 value (`2^-9 * 2^-124 = 2^-133` is BF16's least
+subnormal, `448 * 2^119` lies below its largest finite value), which the tensor-core route relies on
+when it widens a weight to BF16 (real weight scales lie near `2^-14`, words 110-130). The product is
+exact in binary64 and in binary32. [`tools/artifact/codecs/fp8_g32.py`](../../tools/artifact/codecs/fp8_g32.py)
+holds the exact decoder.
+
+The only producer is `import_encoded` from a ModelOpt MXFP8 source
+([`tools/convert/sources/modelopt.py`](../../tools/convert/sources/modelopt.py)); the only layout is
+`g32_scale_rows16_v1` ([storage layouts §5.1](storage-layouts.md#51-g32_scale_rows16_v1)). The Linear
+routes ([`src/ops/linear/mxfp8`](../../src/ops/linear/mxfp8)) compute with BF16 activations (W8A16):
+the CUDA-core GEMV and SIMT routes sum each lane's 16 products of one group from zero in FP32 and add
+that partial times the group's power of two (exact) to the row; the tensor-core routes multiply each
+widened BF16 code pair by its power of two (exact) before a BF16 MMA with FP32 accumulation. A
+small MXFP8 projection may instead be stored as its exact BF16 values (`bf16`), which no format
+change rounds.
 
 ## 4. Grouped signed-integer tensor model
 

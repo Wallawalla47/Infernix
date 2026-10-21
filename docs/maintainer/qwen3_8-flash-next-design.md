@@ -703,6 +703,128 @@ The shared expert's down (2560 × 640) runs one tensor-core tile family at every
 model, 128 teacher-forced positions as calls of 1 and of 5 columns give equal logits (they differed at
 every position before), and greedy MTP equals plain decode over 128 tokens.
 
+### 6.1.2 Recipe `qwen3_8_flash_next_fp4_local` (D)
+
+The source is [nvidia/Qwen3.8-Flash-Next-FP4-Local](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local)
+(released 2026-10-05, 102 GB in 21 shards under `tensors/`): NVIDIA's quantization-aware distillation
+(QAD) of Qwen3.8-Flash-Next with ModelOpt 0.47, `quant_algo: MIXED_PRECISION`. A BF16 teacher supplied
+token probabilities and hidden states while the NVFP4 and MXFP8 *weights* were quantized and
+reconstructed in each forward pass (2,500 trunk updates, then 1,500 joint-refinement updates that also
+trained the n-gram tables; attention stayed frozen at its MXFP8 weights). Recipe D imports every
+quantized tensor bit-exactly and by default runs the checkpoint in the arithmetic it was distilled and
+is served with: **16-bit activations everywhere** (NVIDIA's serving sets
+`VLLM_B12X_MOE_FP4_FORCE_A16=1`). The routed experts keep their calibrated activation scales, so
+`--expert-a4-activations` runs them W4A4 (§16.2) instead; only this artifact offers that choice.
+
+| Tensor class | Source form | Recipe D | Reason |
+|---|---|---|---|
+| Routed experts (48 × 512) | ModelOpt NVFP4 with FP32 `weight_scale_2` and `input_scale`; the E4M3 block scales in Local Inference Lab's lossless **NVFP4-CSF** encoding (`weight_scale.nvfp4_csf_fixed`, `.nvfp4_csf_exceptions`) | **Exact import** as an `nvfp4_mul` bank in `nvfp4_expert_rg16_v1`: codes, the CSF scales restored exactly (`csf_scale_words`), `weight_scale_2` as the multiplier with no reciprocal, and the FP32 `input_scale` words as `expert_input_scales`. The bank's Use is `AllowA4` and the text config's `expert_a4_activations: optional` makes W4A16 (§16.2.1) the default; `--expert-a4-activations` selects W4A4 (§16.2) | NVIDIA's weights and serving arithmetic by default; the calibrated A4 arithmetic from the same artifact on request |
+| GDN q/k/v (`in_proj_qkv`), z, `out_proj`; QSA q/gate (`q_proj`), k, v, indexer (`index_qk_proj`), `o_proj`; shared experts | **MXFP8**: E4M3FN codes, UE8M0 scale per 32 K | **Exact import** as `fp8_e4m3fn_g32_e8m0` in `g32_scale_rows16_v1` (tensor formats §3.8), W8A16 on the MXFP8 Linear route (`src/ops/linear/mxfp8`, width-invariant: below). The QSA query/gate/key/value and indexer form one parent (13,952 rows, as recipe A's BF16 one), the GDN q/k/v/z another (16,384) | The checkpoint's words, half the BF16 bytes per token; one QSA projection per layer instead of two |
+| GDN a/b (`in_proj_a/b`) | MXFP8 | Their **exact BF16 values** (every MXFP8 weight is a BF16 value) on the BF16 routes; a parameter of their own (the control projection), as in every recipe | Small (96 rows); no change of representation rounds |
+| HC mixer weights, router, shared-expert gate, PLE key/value projections, `lm_head`, embedding | BF16 | BF16 | As stored (recipe A's routes) |
+| HC norms (97) and PLE norms (3) | **FP32** — QAD trained them: 163,840 sampled words, only 60 BF16 values | **FP32** (`_Qwen4ExpBuilder.norm`); `hyper_connection_mix` (every route) and `ple_gate` read FP32 norm weights | Exact; rounding to BF16 would change trained weights |
+| Other norms, `A_log`, `dt_bias`, convolutions | BF16 | As recipe A | — |
+| N-gram table (128 shards) | **NVFP4**: E2M1 `[rows, 80]`, E4M3 `[rows, 10]` per shard, one FP32 `weight_scale_2` | **Exact import** into an NVFP4 volume (§12.5, 29.1 GB) with its FP32 multiplier in the header and the artifact's FP32 `ngram_scale` | Qwen's base table quantized to NVFP4 (§12.5); any of the four tables runs the model |
+| MTP routed experts (512) | Weight-only ModelOpt NVFP4 (`weight_scale` stored directly) | `q4_g64_fp16` (MSE) from their exact values (`nvfp4_values_source`, the multiplier applied, not a rounded divisor), as recipes A-C's drafter | Affects only acceptance |
+| MTP dense | BF16 | `q8_g32_fp16`; router and shared-expert gate BF16 (recipe A's drafter) | As recipes A-C |
+| Vision attention (qkv, proj) | MXFP8 | Exact BF16 values | Exact |
+| Vision MLPs and merger | Weight-only NVFP4 (`W4A16_NVFP4`) | BF16, `bf16_rn(e2m1 · e4m3 · weight_scale_2)` rounded once from binary64 (`cast_direct`'s single rounding) | The conversion's only rounding of a non-drafter weight; not on the decode path |
+
+**NVFP4-CSF.** Per matrix, the fixed stream holds `rows / 16` slabs of `16 · (1 + columns / 2)` bytes:
+the slab's 16 row bases (at most 240), then each row's `columns / 2` bytes of 4-bit offsets (the even
+column in the low nibble); a scale is its row's base plus its offset. The exception stream holds U32
+records `position | byte << 24` (position `row · columns + column`, strictly increasing) for scales
+outside a row's 16-value window. On 12 sampled real matrices 0.61 % of the scales are exceptions and
+the restored scales meet ModelOpt's `amax / (6 · weight_scale_2)` rule at the median. The decoding is
+exact by construction (every scale a stored byte, or a base plus an offset); the converter validates the
+format's invariants and the restored words as E4M3FN scales, and `verify_artifact` compares the
+stored banks with the restored words.
+
+**Why A16 by default.** The model card describes QAD as quantizing the weights in each forward pass,
+and NVIDIA's recommended vLLM serving on both RTX PRO 6000 and DGX Spark forces BF16 activations for
+the routed experts; the experts' `input_scale` words are the base PTQ's calibration. W4A16 is
+Infernix's exact placement-invariant arithmetic of recipe C (§16.2.1), so the bank reuses recipe C's
+kernels, and `expert-a4-residual` applies to it, registered by recipe C's kernel verdicts, FP4-Local's
+own timing and, on BF16 KV, its gates against the precise reference; the dense family is new
+(`DenseKernels::Mxfp8`). `sampled-mtp-drafts` and the three request-coupling paths
+(`adaptive-speculation`, `free-cache-resume`, `preemption`) are registered on it at both expert
+precisions (model-quality.md 6.7).
+
+**The MXFP8 route is width-invariant.** Without free-cache-resume the exact route's prefill calls,
+taps and resumes sit on the 16-token GDN grid but not on the chunk grid, and decode batches up to 8
+rows; a position's bits must therefore not depend on the width of the call that computes it. The
+first MXFP8 routes copied the FP8-row family's: CUDA-core GEMV/SIMT through 8 columns (one order),
+sliced-K tensor-core tiles (K split across warps) to 16-96 columns, then TMA tiles. That is three
+arithmetic classes per shape, as in recipe C, whose exact route diverges cold against resumed and
+solo against concurrent (model-quality.md 6.7; the FP8-row and BF16 Flash-Next shapes have the same
+class seams, and the exact-integer families do not). Every MXFP8 width now runs the TMA tensor-core
+route. Its schedules all accumulate a column's complete K in one ascending FP32 chain of m16n8k16
+MMAs over the exactly scaled weights, so a column has the same bits at every T
+(`infernix_linear_mxfp8_a16_test` compares every route seam bit for bit;
+`infernix_mxfp8_flash_next_sweep` re-checks every candidate schedule before timing it: on the RTX 5090,
+2026-10-20, all 14 candidates gave the same bits at T = 1 and T = 300 on all five shapes). Decode and
+verification take 16-token tiles of 32-128 rows; the sweep's selection (fastest per width, merged
+within 2 %) cut the isolated kernels' summed T = 1-16 times against the first selection by 25-32 % on
+the GDN, QSA and output projections and 13 % on the shared expert's two, and 16-row tiles, 1.2-2.5x
+slower everywhere, were dropped (end-to-end decode not yet measured). Each stage's UE8M0 scales take
+whole 128-byte lines. The producer is chosen per width (the shape selectors, `Mxfp8Tma<>`): at decode
+widths one to four producer warps fill the stages with `cp.async` 16-byte copies of the valid rows in
+the layout a 128-byte-swizzled TMA load would write (rows past T zero-filled), each producer thread's
+copies arriving on the stage's barrier; from about 192-256 columns, by shape, one thread issues TMA
+loads, with the consumers' proxy fence below. The two producers write the same bytes, so a column has
+the same bits under either (`infernix_mxfp8_moe_overlap_test` checks both against the serialized
+outputs). The selection is the combined sweep's fastest per width; against a build with `cp.async`
+throughout (INT8 KV, ABBA, 2026-10-20) pp32768 gains 1.2 % (11,164 / 11,177 -> 11,299 / 11,305 tok/s),
+pp8192 0.3 % and plain tg256 0.4 %, every run ahead; MTP tg256 read 156.9 / 146.9 -> 147.9 / 148.5,
+within the baseline's own spread under `--draft-tokens auto` (unresolved, not a measured regression).
+Programmatic launch at decode widths loads the first stages' weights and scales before the previous
+kernel completes. Whether the route costs decode time against the GEMV it replaced is unmeasured.
+
+**Decode nondeterminism: TMA stages refilled while still being read, fixed (2026-10-20).** On the real
+artifact the exact route was not deterministic: the same teacher-forced decode run twice (decode
+corpus, 24-96 segments, BF16 KV, `--disable-fast-paths`) differed in 10-38 % of segments from a
+random decode step on, at rounding-level first differences (2e-5 to 0.2 in log-probability); prefill
+and the first forced step always agreed, and NVIDIA NVFP4 Dense8 and the official FP8 artifact were
+deterministic on the same build. Recipe C (FP8-row shared expert) showed the same defect, and
+bisecting it found the condition: the shared expert running beside a forked expert call's staged
+pass (the misses computed on `MoeExpertSource::fork_stream`). Making the shared expert wait for that
+pass restored determinism and request invariance at two to six concurrent requests, but not at
+eight, where every segment departed from its solo run once seven or eight rows shared its rounds,
+while Dense8, recipe C and IQ3_S were invariant there. Moving the shared expert after the routed
+experts on the compute stream fixed it; programmatic launch, graphs, the fused HC mixer, the
+descriptor staging, the CPU expert service, the n-gram rows, the expert activation precision, a
+1,024-byte stage alignment and PCIe traffic beside the kernel were each ruled out.
+
+`infernix_mxfp8_moe_overlap_test` reproduces it on the Ops: the two MXFP8 shared-expert projections
+on one stream beside a routed call (W4A16 or W4A4 banks, T 1-8, a forked staged pass) gave corrupted
+outputs, tens of wrong elements in a few rows (a stage read wrong), eager and graph-replayed. Only the
+routed kernels trigger it (beside mapped host reads, copy kernels or copy-engine uploads no projection
+differed), and the FP8-row TMA route corrupts beside them too, while BF16 and Q8 routes did not. The
+cause is the TMA producer's stage release: a consumer warp read a stage through the generic proxy and
+released it (an mbarrier arrive), after which the producer's TMA refill, an async-proxy write, could
+land before those reads had completed; nothing ordered the two proxies. Each consumer thread now
+issues `fence.proxy.async.shared::cta` before its warp's release (mxfp8_a16_tma_mma.cuh). On one build
+(RTX 5090, 200 eager and 200 graph-replayed calls in each of 20 cases): the TMA producer without the
+fence corrupted 19 of 20 cases, up to 74 of 200 calls; with it 0 of 8,000 calls differ; the
+`cp.async` producer (generic-proxy writes, which the barriers order) 0 of 8,000; and all three give
+the serialized outputs the same hashes. At the model level (BF16 KV, plain, 48 segments) the build
+without the staged-pass wait gives the same bits twice at one request and twice at eight, equal to
+the first build's run, with either producer. The wait is gone, and the TMA producer, fenced, serves
+the prefill widths where it is faster (above). The other TMA consumers with the same
+release (BF16, FP8 A16/A8, NVFP4 A4 and the expert wide routes) need the same fence; their fix is
+the request-invariance branch's (fix/request-invariance, 2026-10-20).
+
+**Optional A4.** Every other Flash-Next artifact fixes its experts' arithmetic at conversion: a
+bank with activation scales is W4A4 and one without is W4A16. Recipe D stores the scales with an
+`AllowA4` Use and marks the text config `expert_a4_activations: optional`, so one artifact serves both:
+`parse_config` resolves `MoeConfig::a16_experts` from `LoadOptions::expert_a4_activations`, `bind_moe`
+binds the scales only for W4A4 (and checks that each layer stores them), and the W4A4 route is recipe
+A's (§16.2), with its kernels and their fast-path qualifications (the configuration reports `4-bit
+expert activations`). The option is refused by an artifact without the marker, by Qwen3.5/3.6, and
+with 16-bit activations everywhere (`--a16-activations`). The persistent prefix cache's signature
+records the experts' activation precision, so a file saved under one setting is not loaded under
+the other.
+
 ### 6.2 Expert storage layout `nvfp4_expert_rg16_v1`
 
 The pinned host bank is read by the GPU (DMA into a frame, then the expert kernels) and by the CPU
@@ -1990,30 +2112,45 @@ process-wide fault seam for the engine test; S3 only past its threshold; S4 park
 
 ### 12.5 Row formats and RAM residency (2026-10-11)
 
-Three row formats share the volume layout of §12.2 and the read paths above; the engine reads the
-format from the volume header's row size (`resolve_ngram_volume`, `config.h`):
+Four row formats share the volume layout of §12.2 and the read paths above; the engine reads the
+format from the volume header's format tag (byte 62, written since 2026-10-19: 1 FP8, 2 IQ4_NL,
+3 BF16, 4 NVFP4) or, for a volume written before the tag, from its row size (`resolve_ngram_volume`,
+`config.h`). NVFP4 rows have IQ4_NL's 90 bytes, so an NVFP4 volume always carries the tag:
 
 | Format | Row | Rows per 4 KiB block | Volume | Source |
 |---|---:|---:|---:|---|
 | FP8 (E4M3FN, one per-tensor scale) | 160 B | 25 | 52.4 GB | recipes A-C; NVIDIA's table |
 | IQ4_NL (llama.cpp blocks: fp16 d, 16 nibble bytes) | 90 B | 45 | 29.1 GB (27.1 GiB) | the GSQ-RCO GGUF's shard 2, byte for byte |
 | BF16 | 320 B | 12 | 109.2 GB | Qwen's unquantized table (`tools/flash_next/ngram_bf16.py`) |
+| NVFP4 (80 E2M1 code bytes, 10 E4M3FN block scales; one FP32 multiplier) | 90 B | 45 | 29.1 GB | NVIDIA FP4-Local's table (recipe D, §6.1.2), byte for byte |
 
 - **IQ4_NL.** `ple_embed` decodes each value as `bf16_rn(fl32(d) · kvalue)`: the product is exact in
   FP32 and rounds once at the BF16 boundary the FP8 rows have. Nibble order is llama.cpp's (elements
   0-15 low nibbles, 16-31 high). `ngram_scale` does not apply.
 - **BF16.** The PLE takes the rows as its embedding with no decode.
+- **NVFP4 (2026-10-19).** `ple_embed_nvfp4` decodes each value as `bf16_rn(e2m1 · e4m3 · m)`, the
+  exact product (at most 30 significant bits) rounded once (an FMA residual decides the FP32 product's
+  BF16 ties); element 2i is byte i's low nibble, ModelOpt's packing. The multiplier `m` (ModelOpt's
+  `weight_scale_2`, FP32) is the artifact's FP32 `ngram_scale` for its own table and the header's FP32
+  word at byte 64 for another artifact's use. NVIDIA's reference decode rounds the FP32 product to BF16
+  (a double rounding the single one replaces). The table is Qwen's base table quantized to NVFP4:
+  65,536 sampled rows lie within 0.12 relative L2 of Qwen's BF16 rows (median 0.095, the error of an
+  NVFP4 quantization of them) and 99.25 % of their block scales equal a plain re-quantization, the
+  others one E4M3 step away at rounding midpoints; no row moved beyond quantization noise.
 - **Any format for any artifact (2026-10-18).** `resolve_ngram_volume` takes a volume that is not
   the artifact's own (another format, or another id) when its geometry is the model's table, the
-  format following from the row size; the Program then hands the Forward that volume's format
+  format following from the tag or the row size; the Program then hands the Forward that volume's format
   (`ForwardBatch::ngram_format`). FP8 rows need their table's scale: the artifact's `ngram_scale`
   serves only its own volume, so another FP8 volume supplies it: the BF16 word at header byte 60,
   after the fixed fields (0 = none; `write_ngram_volume` writes it since 2026-10-18), or for an FP8
   volume published before, the scale `resolve_ngram_volume` knows for its volume id (NVIDIA's table:
   `59e5d77e…2301`, 0x3951), so published files stay byte-identical. The Program uploads it
-  (`ForwardBatch::ngram_scale`); an FP8 volume with neither is refused for other artifacts. The prefix cache's persistent-file signature names the format, the volume id and that
-  scale. The three published volumes hold one table row for row (3,002 sampled rows against the BF16
-  volume: FP8 2.7 % median relative L2, IQ4_NL 7.6 %; a one-row shift 142 %).
+  (`ForwardBatch::ngram_scale`); an FP8 volume with neither is refused for other artifacts. An NVFP4
+  volume supplies its multiplier the same way (FP32 `ForwardBatch::ngram_scale`) and is refused without
+  one. The prefix cache's persistent-file signature names the format, the volume id and that
+  scale or multiplier. The three published volumes hold one table row for row (3,002 sampled rows against the BF16
+  volume: FP8 2.7 % median relative L2, IQ4_NL 7.6 %; a one-row shift 142 %), and so does FP4-Local's
+  NVFP4 table (9.5 %).
 - **BF16 binding.** The FP8 checkpoint's artifact binds the BF16 table as its own: `--ngram-reuse`
   checks that sampled rows quantize to the checkpoint's FP8 codes (ModelOpt's rule with the
   checkpoint's scale, `NgramTable.bf16_rows_match`), and `verify_artifact --ngram-rows all` checks

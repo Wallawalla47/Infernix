@@ -10,12 +10,17 @@ Every logical parameter the recipe stores as the checkpoint has it must equal th
   ``input_scale`` words, or a weight-only compressed-tensors export's reciprocal global scale; or,
   for Qwen's official FP8 checkpoint, each ``fp8_expert_b128_v1`` record byte for byte (its E4M3FN
   codes and BF16 tile scales);
-- every FP8 row-scaled projection's E4M3FN codes and BF16 row scales;
-- every BF16 tensor bit for bit, and every FP32 widening of a BF16 tensor exactly;
+- every FP8 row-scaled projection's E4M3FN codes and BF16 row scales, and every MXFP8 projection's
+  E4M3FN codes and UE8M0 group scales (``fp8_e4m3fn_g32_e8m0``);
+- every BF16 and FP32 tensor bit for bit, and every FP32 widening of a BF16 tensor exactly;
+- every tensor stored as the BF16 rounding of exact source values (FP4-Local's small MXFP8 classes
+  and vision tower) as that one rounding; the values it does not hold exactly (the weight-only NVFP4
+  vision matrices) are counted per tensor (``rounded``), not as mismatches;
 - the n-gram volume's header, geometry and id, and its rows (all of them, or a sample): FP8 rows
   equal the checkpoint's FP8 words, or its BF16 table's per-tensor quantization; the BF16 rows of an
   artifact bound to a BF16 volume equal its BF16 table, or quantize to its FP8 table's words
-  (qwen4_exp.NgramTable).
+  (qwen4_exp.NgramTable); NVFP4 rows equal the checkpoint's codes and block scales, and the header
+  its format tag and FP32 multiplier.
 
 Parameters the recipe re-quantizes (``q8_g32_fp16``/``q4_g64_fp16``/``q2_g64_fp16``: every recipe's MTP drafter,
 recipes B and C's 8-bit classes) are listed per component, not compared. Recipe A passes with only
@@ -39,15 +44,18 @@ import torch
 import numpy as np
 
 from tools.artifact.codecs.fp8_b128 import decode_expert as decode_fp8_expert
+from tools.artifact.codecs.fp8_g32 import decode_fp8_group_scaled_words
 from tools.artifact.codecs.fp8_row import decode_fp8_row_scaled_words
 from tools.artifact.codecs.nvfp4_expert import decode_nvfp4_expert_bank_words
 from tools.artifact.layouts import fp8_expert_geometry
 from tools.artifact.reader import Artifact
 from tools.convert import qwen4_exp
+from tools.convert.methods import bf16_from_float64
 from tools.convert.sources.modelopt import fp8_block_matrix_raw, nvfp4_matrix_words, nvfp4_packed_matrix_words
 from tools.convert.sources.safetensors import SafetensorsSource
 
 _FP8_ROWS = "fp8_e4m3fn_row_bf16"
+_FP8_GROUPS = "fp8_e4m3fn_g32_e8m0"
 
 _WORD = {"bf16": (torch.bfloat16, 2), "fp32": (torch.float32, 4), "int32": (torch.int32, 4)}
 _REQUANTIZED = {"q8_g32_fp16", "q4_g64_fp16", "q2_g64_fp16"}
@@ -92,6 +100,22 @@ def verify_fp8_rows(artifact, store, binding, parameter) -> bool:
         scales.append(s[begin // k : end // k])
     return torch.equal(torch.cat(codes), expected.codes.reshape(n, k)) and torch.equal(
         torch.cat(scales).view(torch.int16), expected.scales.to(torch.bfloat16).view(torch.int16))
+
+
+def verify_fp8_groups(artifact, store, binding, parameter) -> bool:
+    """The bound rows' E4M3FN codes and UE8M0 group scales equal the source's encoded rows."""
+
+    n, k = parameter.shape
+    expected = parameter.source_factory(store, _FP8_GROUPS).read_encoded(0, n)
+    parts = binding["parts"] if "parts" in binding else [{"object": binding["object"]}]
+    codes, scales = [], []
+    for part in parts:
+        obj = artifact.object(part["object"])
+        c, s = decode_fp8_group_scaled_words(artifact.read_object(obj.id), obj.shape)
+        begin, end = part.get("range", (0, obj.shape[0] * obj.shape[1]))
+        codes.append(c[begin // k : end // k])
+        scales.append(s[begin // k : end // k])
+    return torch.equal(torch.cat(codes), expected.codes) and torch.equal(torch.cat(scales), expected.scales)
 
 
 def verify_bank(artifact, store, binding, prefix, shape, packed) -> int:
@@ -160,6 +184,15 @@ def verify_ngram(source: qwen4_exp.NgramTable, path: Path, table: dict, rows: st
             raise ValueError("n-gram volume id differs from the artifact's")
         if path.stat().st_size != table["file_bytes"]:
             raise ValueError("n-gram volume size differs from its geometry")
+        if table["format"] == "nvfp4":
+            stream.seek(0)
+            fields = stream.read(qwen4_exp.NGRAM_NVFP4_SCALE_OFFSET + qwen4_exp.NGRAM_NVFP4_SCALE.size)
+            tag = qwen4_exp.NGRAM_FORMAT.unpack_from(fields, qwen4_exp.NGRAM_FORMAT_OFFSET)[0]
+            bits = qwen4_exp.NGRAM_NVFP4_SCALE.unpack_from(fields, qwen4_exp.NGRAM_NVFP4_SCALE_OFFSET)[0]
+            if tag != qwen4_exp.NGRAM_FORMAT_CODES["nvfp4"] or bits != (
+                source.nvfp4_scale().view(torch.int32).item() & 0xFFFFFFFF
+            ):
+                raise ValueError("NVFP4 n-gram volume header differs from the table's format or multiplier")
         starts, total = [], 0
         for name, count in shards:
             starts.append(total)
@@ -202,7 +235,7 @@ def main() -> int:
     args = parser.parse_args()
     start = time.time()
     report = {"experts": 0, "expert_mismatches": 0, "tensors": 0, "tensor_mismatches": [],
-              "input_scale_mismatches": 0, "requantized": {}}
+              "input_scale_mismatches": 0, "requantized": {}, "rounded": {}}
     with SafetensorsSource(args.model) as store, Artifact(args.artifact) as artifact:
         text = artifact.directory.components["text"]["config"]
         components = tuple(artifact.directory.components)
@@ -210,7 +243,7 @@ def main() -> int:
         # The proposal head (--lm-head-draft) is built from a frequency ranking, outside the logical model.
         bindings = {k: v for k, v in artifact.directory.bindings.items() if not k.startswith("proposal/")}
         report["proposal_bindings"] = len(artifact.directory.bindings) - len(bindings)
-        if set(bindings) != set(model.parameters):
+        if set(model.parameters) != set(bindings):
             missing = sorted(set(model.parameters) - set(bindings))[:5]
             extra = sorted(set(bindings) - set(model.parameters))[:5]
             raise ValueError(f"artifact bindings differ from the logical model: {missing} {extra}")
@@ -236,16 +269,29 @@ def main() -> int:
                 if not verify_fp8_rows(artifact, store, binding, parameter):
                     report["tensor_mismatches"].append(name)
                 continue
+            if formats == {_FP8_GROUPS}:
+                report["tensors"] += 1
+                if not verify_fp8_groups(artifact, store, binding, parameter):
+                    report["tensor_mismatches"].append(name)
+                continue
             fmt, stored = _binding_values(artifact, binding)
             expected = parameter.source.values()
             if name.endswith("/moe/expert_input_scales"):
                 report["input_scale_mismatches"] += int((_bits(stored) != _bits(expected.to(torch.float32))).sum())
                 continue
             report["tensors"] += 1
-            # BF16 sources: kept bit for bit, or widened exactly to FP32.
-            if expected.dtype != torch.bfloat16 or not torch.equal(
+            if expected.dtype == torch.float64 and fmt == "bf16":
+                # Exact source values (MXFP8 or weight-only NVFP4) stored as their one BF16 rounding.
+                if not torch.equal(_bits(stored), _bits(bf16_from_float64(expected))):
+                    report["tensor_mismatches"].append(name)
+                inexact = int((stored.to(torch.float64) != expected).sum())
+                if inexact:
+                    report["rounded"][name] = inexact
+                continue
+            # BF16 and FP32 sources: kept bit for bit, or BF16 widened exactly to FP32.
+            if expected.dtype not in (torch.bfloat16, torch.float32) or not torch.equal(
                 _bits(stored), _bits(expected.to(_WORD[fmt][0]))
-            ):
+            ) or (expected.dtype == torch.float32 and fmt != "fp32"):
                 report["tensor_mismatches"].append(name)
         if args.ngram is not None:
             table = text["ngram_table"]

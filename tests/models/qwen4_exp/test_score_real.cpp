@@ -3,7 +3,10 @@
 // writes from the Forward alone (every expert in RAM, no Program, tier, layer walk or logit tiles). Per
 // position: the target's log-probability against the reference's FP64 log-softmax, top-1 agreement,
 // and the top-k ids where the reference separates them. The Engine's prefill chunks may round
-// attention differently from the dump's, so the criteria are statistical, not bit equality.
+// attention differently from the dump's, so the criteria are statistical, not bit equality. --chunk
+// must equal the dump's (both default to 256): different chunkings change a call's rounding, which
+// routing near-ties amplify beyond these criteria (2026-10-20, 512 tokens, dump 256 against Engine
+// 1,024: FP4-Local mean |dlogp| 0.024, Dense8 0.087; equal chunks: FP4-Local 3e-5 and 4e-5).
 // Skips (77) unless INFERNIX_QWEN4_ARTIFACT names a Qwen4Exp artifact.
 //
 //   INFERNIX_QWEN4_ARTIFACT=out.infernix [INFERNIX_QWEN4_NGRAM=v.ngram] [INFERNIX_EXPERT_RAM_MIB=N]
@@ -52,7 +55,7 @@ int main(int argc, char** argv) {
         std::printf("SKIP: set INFERNIX_QWEN4_ARTIFACT and pass @TOKENS REFERENCE.bin\n");
         return 77;
     }
-    std::uint32_t chunk = 1024, top_k = 8;
+    std::uint32_t chunk = 256, top_k = 8;
     for (int i = 3; i + 1 < argc; i += 2) {
         const std::string option = argv[i];
         if (option == "--chunk") { chunk = static_cast<std::uint32_t>(std::stoul(argv[i + 1])); }

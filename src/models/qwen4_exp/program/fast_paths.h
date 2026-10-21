@@ -15,7 +15,7 @@ class Parameters;
 
 // The dense kernels an artifact's GDN q/k/v/z projection runs: one family per kernel set, so every
 // GGUF block format (one exact A16 kernel family, design 19.3.25) is one configuration.
-enum class DenseKernels : std::uint8_t { Bf16, Q8, Fp8Row, Nvfp4, Ggml, Other };
+enum class DenseKernels : std::uint8_t { Bf16, Q8, Fp8Row, Nvfp4, Ggml, Mxfp8, Other };
 
 [[nodiscard]] DenseKernels dense_kernels(QType qtype) noexcept;
 

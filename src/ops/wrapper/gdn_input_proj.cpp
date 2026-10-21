@@ -14,6 +14,8 @@
 #include "ops/linear/q8/q8_shapes.h"
 #include "ops/linear/fp8/fp8_geometry.h"
 #include "ops/linear/fp8/fp8_format.h"
+#include "ops/linear/mxfp8/mxfp8_dispatch.h"
+#include "ops/linear/mxfp8/mxfp8_format.h"
 #include "ops/linear/nvfp4/nvfp4_layout.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
 
@@ -291,8 +293,9 @@ void require_q8_flash_next_parent(const Weight& weight, const char* operation) {
 }
 
 void validate_policy(LinearPolicy policy, QType qtype) {
-    if (column_invariant(policy) && qtype != QType::NVFP4 &&
-        qtype != QType::FP8_E4M3FN_ROW_BF16) {
+    // MXFP8's one route is column-invariant at every width.
+    if (column_invariant(policy) && qtype != QType::NVFP4 && qtype != QType::FP8_E4M3FN_ROW_BF16 &&
+        qtype != QType::FP8_E4M3FN_G32_E8M0) {
         throw std::invalid_argument("gdn_input_proj: the weight format registers no column-invariant route");
     }
     switch (policy) {
@@ -345,6 +348,24 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
             throw std::invalid_argument("fp8 gdn_input_proj: unsupported weight shape");
         }
         detail::fp8_gdn_input_dispatch(x, weight, qkv, z, policy, workspace, stream);
+        return;
+    }
+
+    if (weight.qtype == QType::FP8_E4M3FN_G32_E8M0) {
+        // NVIDIA FP4-Local's MXFP8 [16384,2560] parent on linear's route for that shape (16-bit
+        // activations under every policy), the q/k/v and z rows written to their own destinations.
+        constexpr std::int32_t kHidden  = 2560;
+        constexpr std::int32_t kQkvRows = 10240;
+        constexpr std::int32_t kZRows   = 6144;
+        require_matrix(x, kHidden, cols, "x");
+        require_matrix(qkv, kQkvRows, cols, "qkv");
+        require_matrix(z, kZRows, cols, "z");
+        require_single_parent_nonoverlap(x, qkv, z);
+        detail::validate_mxfp8_weight(weight, "mxfp8 gdn_input_proj");
+        if (weight.n != kQkvRows + kZRows || weight.k != kHidden) {
+            throw std::invalid_argument("mxfp8 gdn_input_proj: unsupported weight shape");
+        }
+        detail::mxfp8_gdn_input_n16384_k2560(x, weight, qkv, z, stream);
         return;
     }
 
@@ -791,7 +812,7 @@ std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int
         }
         return detail::fp8_gdn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
     }
-    if (parent_qtype == QType::Q8_G32_FP16 && parent_rows == 16384 &&
+    if ((parent_qtype == QType::Q8_G32_FP16 || parent_qtype == QType::FP8_E4M3FN_G32_E8M0) && parent_rows == 16384 &&
         input_rows == 2560) {
         return 0;
     }

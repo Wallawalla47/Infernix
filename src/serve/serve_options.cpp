@@ -51,6 +51,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--use-original-nvfp4-prefill-kernel", false},
     ServeOptionArity{"--disable-fast-paths", false},
     ServeOptionArity{"--fast-path", true, true},
+    ServeOptionArity{"--expert-a4-activations", false},
     ServeOptionArity{"--context-cost-presets"},
     ServeOptionArity{"--log-stats-interval-ms"},
     ServeOptionArity{"--log-colours"},
@@ -288,6 +289,11 @@ std::string serve_usage_text(const char* argv0) {
            "                             lists them; docs/serving.md)\n"
            "  --fast-path NAME           also run this fast path, qualified or not\n"
            "                             (qualification and timing runs; repeatable)\n"
+           "  --expert-a4-activations    nvidia/Qwen3.8-Flash-Next-FP4-Local only: run its\n"
+           "                             routed experts with 4-bit (NVFP4) activations, using\n"
+           "                             the activation scales NVIDIA calibrated for them.\n"
+           "                             Changes the output. No other artifact supports it\n"
+           "                             (default: 16-bit activations, as NVIDIA serves it)\n"
            "  --no-cuda-graph            disable CUDA-graph decode rounds (on by default)\n"
            "  --default-max-tokens N     default max_tokens when a request omits it\n"
            "                             (default " +
@@ -319,8 +325,8 @@ std::string serve_usage_text(const char* argv0) {
            "                             prompt (as-sent, default) or replace its Claude-\n"
            "                             specific parts with a short local-agent preamble\n"
            "  --ngram-volume FILE        Qwen3.8-Flash-Next n-gram embedding volume: the\n"
-           "                             artifact's, or any FP8, IQ4_NL or BF16 volume of the\n"
-           "                             table in place of its own\n"
+           "                             artifact's, or any FP8, IQ4_NL, BF16 or NVFP4 volume\n"
+           "                             of the table in place of its own\n"
            "                             (default: the artifact path + .ngram)\n"
            "  --ngram-residency auto|ram|volume\n"
            "                             where the n-gram table lives: ram reads it all into\n"
@@ -684,6 +690,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             const std::optional<FastPath> path = parse_fast_path(name);
             if (!path) { throw std::invalid_argument("unknown fast path: " + name); }
             options.fast_path_candidates.push_back(*path);
+        } else if (arg == "--expert-a4-activations") {
+            options.expert_a4_activations = true;
         } else if (arg == "--context-cost-presets") {
             options.context_cost_presets = require_value("--context-cost-presets");
             if (options.context_cost_presets.empty()) {

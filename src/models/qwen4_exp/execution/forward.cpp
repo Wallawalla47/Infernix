@@ -100,15 +100,11 @@ void shared_swiglu(const Tensor& x, const LinearParameters& gate_up, Tensor& out
         ops::silu_mul(gate, up, out, s);
         return;
     }
+    // silu_mul reads the gate and up halves of each column in place (its strided-input route), so the
+    // projection is not split into two tensors first; the arithmetic is the same.
     Tensor projected = work.alloc(DType::BF16, {2 * I, T});
     project(x, gate_up, projected, work, s, routes);
-    Tensor gate = work.alloc(DType::BF16, {I, T});
-    Tensor up   = work.alloc(DType::BF16, {I, T});
-    {
-        Tensor* parts[] = {&gate, &up};
-        ops::split_rows(projected, parts, s);
-    }
-    ops::silu_mul(gate, up, out, s);
+    ops::silu_mul(projected.slice(0, 0, I), projected.slice(0, I, I), out, s);
 }
 
 } // namespace
@@ -484,11 +480,16 @@ void Forward::ple(const PleParameters& p, Tensor& residual, const ForwardBatch& 
         if (format == NgramRowFormat::Iq4Nl) {
             ops::ple_embed_iq4_nl(batch.ngram_rows, e, s);
         } else {
+            // FP8 rows take their table's BF16 scale, NVFP4 rows their table's FP32 multiplier.
             const Tensor& scale = batch.ngram_scale.data != nullptr ? batch.ngram_scale : p.ngram_scale;
             if (scale.data == nullptr) {
-                throw std::invalid_argument("Qwen4Exp forward: FP8 n-gram rows need their table's scale");
+                throw std::invalid_argument("Qwen4Exp forward: FP8 and NVFP4 n-gram rows need their table's scale");
             }
-            ops::ple_embed(batch.ngram_rows, scale, e, s);
+            if (format == NgramRowFormat::Nvfp4) {
+                ops::ple_embed_nvfp4(batch.ngram_rows, scale, e, s);
+            } else {
+                ops::ple_embed(batch.ngram_rows, scale, e, s);
+            }
         }
     }
     Tensor kv = work_.alloc(DType::BF16, {W + H, T});
@@ -557,8 +558,10 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
             Tensor* parts[]             = {&qkv, &z};
             ops::ggml_linear(x, ops::ggml_split_segments(p.projection.ggml, x.ne[0], bounds), parts, nullptr, 0, work_, s,
                              dense_routes());
-        } else if (p.projection.weight.qtype == QType::Q8_G32_FP16) {
-            // Q8 (Dense8): the projection writes q/k/v and z to their destinations itself.
+        } else if (p.projection.weight.qtype == QType::Q8_G32_FP16 ||
+                   p.projection.weight.qtype == QType::FP8_E4M3FN_G32_E8M0) {
+            // Q8 (Dense8) and MXFP8 (FP4-Local): the projection writes q/k/v and z to their
+            // destinations itself.
             ops::gdn_input_proj(x, p.projection.weight, qkv, z, s, dense_routes());
         } else {
             Tensor projected = work_.alloc(DType::BF16, {C + VW, T});
@@ -859,6 +862,15 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
         };
         // A linear's weights, at most `cap` bytes of them.
         const auto add_linear = [&](const LinearParameters& linear, std::int32_t k, std::size_t cap) {
+            if (linear.weight.qtype == QType::FP8_E4M3FN_G32_E8M0) {
+                // MXFP8: every stage of its route reads codes and group scales together, and the scale
+                // plane follows the codes, so it warms first (1/32 of the code bytes).
+                const std::size_t scale_bytes = static_cast<std::size_t>(linear.weight.n) * (linear.weight.k / 32);
+                const std::size_t code_bytes  = static_cast<std::size_t>(linear.weight.n) * linear.weight.k;
+                add(linear.weight.scales, std::min(scale_bytes, cap));
+                add(linear.weight.qdata, std::min(code_bytes, cap - std::min(scale_bytes, cap)));
+                return;
+            }
             if (!linear.is_ggml()) {
                 add(linear.weight.payload, std::min(linear.weight.payload_bytes, cap));
                 return;
@@ -971,13 +983,14 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     }
     Tensor outputs = work_.alloc(DType::BF16, {H, K * T});
     const std::int32_t max_jobs = std::min(E, K * T);
-    // The two-term route exists for NVFP4 W4A16 banks only; its layout carries no x limbs, which the
+    // The A4 residual routes exist for NVFP4 W4A16 banks only; their layouts carry no x limbs, which the
     // GGUF and block-FP8 wide routes read, so another bank keeps the exact layout whatever the flag.
     // ggml-bf16-prefill takes a GGUF bank's wide jobs in prefill calls onto the BF16 planes.
     const bool ggml_bank = source.ggml.gate_up_format != QType::NVFP4_MUL &&
                            source.ggml.gate_up_format != QType::FP8_E4M3FN_B128;
-    source.wide_a16 = fast_.expert_a4_residual && source.ggml.gate_up_format == QType::NVFP4_MUL
-                          ? ops::offloaded_moe::WideA16::kA4Residual
+    source.wide_a16 = fast_.expert_a4_terms != 0 && source.ggml.gate_up_format == QType::NVFP4_MUL
+                          ? (fast_.expert_a4_terms == 3 ? ops::offloaded_moe::WideA16::kA4Residual3
+                                                        : ops::offloaded_moe::WideA16::kA4Residual)
                       : ggml_bank && ops::has_route(dense_routes(), ops::LinearRoutes::GgmlBf16Wide)
                           ? ops::offloaded_moe::WideA16::kGgmlBf16
                           : ops::offloaded_moe::WideA16::kExact;

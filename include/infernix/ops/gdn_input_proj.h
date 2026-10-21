@@ -51,6 +51,10 @@ void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& valu
  * - Q8_G32_FP16 [16384,2560] (Qwen3.8-Flash-Next), with stored row counts [2048,2048,6144,6144],
  *   on the routes linear selects for that shape, so qkv and z hold exactly the bits of the
  *   corresponding rows of linear's [16384,T] result;
+ * - FP8_E4M3FN_G32_E8M0 G32ScaleRows16 [16384,2560] (NVIDIA Qwen3.8-Flash-Next-FP4-Local, MXFP8),
+ *   with stored row counts [2048,2048,6144,6144], on linear's route for that shape under every
+ *   policy (16-bit activations, column-invariant at every T), so qkv and z hold exactly the bits of
+ *   the corresponding rows of linear's [16384,T] result;
  * - NVFP4 BlockScaleK16M128x4 [16384,5120], with stored row counts [2048,2048,6144,6144].
  * - FP8_E4M3FN_ROW_BF16 RowScale [16384,5120], with stored row counts
  *   [2048,2048,6144,6144].

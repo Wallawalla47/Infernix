@@ -7,12 +7,15 @@
 //   infernix_qwen4_exp_forward_real_test TOKENS --dump-logits OUT.bin [--chunk N] [--kv KV]
 //       [--dump-from P] [TOKENS --dump-logits OUT.bin [--chunk N] [--kv KV] [--dump-from P]]...
 //   infernix_qwen4_exp_forward_real_test TOKENS --cpu-columns [--kv KV]
+//   infernix_qwen4_exp_forward_real_test TOKENS --decode-widths [--kv KV]
 //
 // KV is a KV-cache storage: bf16 (default), int8, fp8, nvfp4 or k8v4.
 //
 // With --cpu-columns the test checks that calls the Program serves with the CPU expert service
 // (decode widths, and prefill calls up to 255 columns with the assist) give the GPU route's logits
-// bit for bit (check_cpu_columns).
+// bit for bit (check_cpu_columns). With --decode-widths it checks that a decode row's bits do not
+// depend on how many rows share the call, 1 to 8, in every block and the logits
+// (check_decode_widths).
 // TOKENS is a comma-separated id list, or @FILE holding ids separated by commas or whitespace; the
 // options after a TOKENS apply to it. With --dump-logits the test scores the text teacher-forced
 // instead: it prefills it in chunks of N (default 256) with FP32 logits at every position, writes
@@ -20,7 +23,8 @@
 // position) and prints the perplexity. With --dump-from P only positions from P on are written and
 // scored (long texts: the logits of every position would not fit on disk). Several such texts are
 // scored in order with one model load. --rope-yarn-factor F, anywhere, loads the model with that text
-// YaRN factor (contexts up to the native positions times F).
+// YaRN factor (contexts up to the native positions times F); --expert-a4-activations, anywhere, runs
+// nvidia/Qwen3.8-Flash-Next-FP4-Local's routed experts with 4-bit activations.
 // Otherwise the test prefills all but the last token as one chunk,
 // then decodes the last token twice in one batch (two sequences with identical histories), and
 // checks that both decode rows equal each other bit for bit and agree with a single prefill of
@@ -53,6 +57,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iterator>
 #include <memory>
@@ -403,7 +408,8 @@ bool check_cpu_columns(const q4::execution::Parameters& parameters, DeviceContex
                                              .pcie_divisor = 3,
                                              .wide_from    = moe::kMaxCpuColumns + 1,
                                              .wide_jobs    = moe::kMaxCpuJobs,
-                                             .cpus         = {}});
+                                             .cpus         = {},
+                                             .activation   = parameters.layers.front().moe.bank->activation});
         auto sources           = harness.experts_view;
         sources.staging_base   = static_cast<std::uint8_t*>(staging.p);
         sources.staging_slots  = kStagingSlots;
@@ -453,6 +459,111 @@ bool check_cpu_columns(const q4::execution::Parameters& parameters, DeviceContex
     return ok;
 }
 
+// --decode-widths: the last token decoded in batches of 1..8 identical sequences (after identical
+// prefills) must give every row the solo row's bits in every block's residual, routes, mixer and
+// MoE inputs and outputs, and logits (the Forward's share of the exact route's request invariance);
+// prints the first block and tap that differs per width.
+bool check_decode_widths(const q4::execution::Parameters& parameters, DeviceContext& device,
+                         const q4::NgramVolume& volume, const std::vector<std::int32_t>& tokens,
+                         std::int32_t context, KvCacheStorage kv) {
+    const auto& c        = parameters.model.config().text;
+    const auto n         = static_cast<std::int32_t>(tokens.size());
+    const auto blocks    = static_cast<std::size_t>(c.num_hidden_layers);
+    const auto W         = static_cast<std::int32_t>(c.residual_width());
+    const auto K         = static_cast<std::int32_t>(c.moe.top_k);
+    const auto H         = static_cast<std::int32_t>(c.hidden_size);
+    const auto vocab     = static_cast<std::size_t>(c.vocab_size);
+    constexpr int kMaxWidth = 8;
+    // Per block: residual [W], routes [K] (as 2-byte halves), four io taps [H]: one column's values.
+    const std::size_t column_words = static_cast<std::size_t>(W) + 2 * K + 4 * static_cast<std::size_t>(H);
+    std::vector<std::vector<std::uint16_t>> solo; // [block] one column
+    std::vector<float> solo_logits;
+    bool ok = true;
+    for (std::int32_t width = 1; width <= kMaxWidth; ++width) {
+        Harness harness(parameters, device, context, n, width, kv);
+        DeviceBuffer logits(vocab * width * sizeof(float));
+        for (std::int32_t slot = 0; slot < width; ++slot) {
+            auto head = make_call(c, volume, {tokens}, 0, n - 1, {slot}, {slot});
+            Tensor head_logits(logits.p, DType::FP32, {static_cast<std::int32_t>(vocab), 1});
+            harness.forward->run(head.batch, head_logits);
+        }
+        const std::size_t residual_bytes = static_cast<std::size_t>(W) * width * 2;
+        const std::size_t route_bytes    = static_cast<std::size_t>(K) * width * 4;
+        const std::size_t io_bytes       = static_cast<std::size_t>(H) * width * 2;
+        const std::size_t block_bytes    = residual_bytes + route_bytes + 4 * io_bytes;
+        DeviceBuffer taps(blocks * block_bytes);
+        std::vector<Tensor> residual_taps, route_taps, io_taps[4];
+        auto* base = static_cast<std::byte*>(taps.p);
+        for (std::size_t b = 0; b < blocks; ++b) {
+            std::byte* at = base + b * block_bytes;
+            residual_taps.emplace_back(at, DType::BF16, std::initializer_list<std::int32_t>{W, width});
+            route_taps.emplace_back(at + residual_bytes, DType::I32, std::initializer_list<std::int32_t>{K, width});
+            for (std::size_t kind = 0; kind < 4; ++kind) {
+                io_taps[kind].emplace_back(at + residual_bytes + route_bytes + kind * io_bytes, DType::BF16,
+                                           std::initializer_list<std::int32_t>{H, width});
+            }
+        }
+        q4::execution::ForwardTap tap{&residual_taps, &route_taps, &io_taps[0], &io_taps[1], &io_taps[2], &io_taps[3]};
+        std::vector<std::int32_t> slots(static_cast<std::size_t>(width));
+        std::iota(slots.begin(), slots.end(), 0);
+        auto step = make_call(c, volume, std::vector<std::vector<std::int32_t>>(static_cast<std::size_t>(width), tokens),
+                              n - 1, 1, slots, slots);
+        Tensor step_logits(logits.p, DType::FP32, {static_cast<std::int32_t>(vocab), width});
+        harness.forward->run(step.batch, step_logits, &tap);
+        device.synchronize();
+        std::vector<std::byte> host(blocks * block_bytes);
+        taps.copy_to_host(host.data(), host.size(), 0);
+        const auto all_logits = to_float(logits, vocab * width);
+        // Column `col` of block b as one word vector: residual, routes, then the four io taps.
+        const auto column = [&](std::size_t b, std::int32_t col) {
+            std::vector<std::uint16_t> out(column_words);
+            const std::byte* at = host.data() + b * block_bytes;
+            std::memcpy(out.data(), at + static_cast<std::size_t>(col) * W * 2, static_cast<std::size_t>(W) * 2);
+            std::memcpy(out.data() + W, at + residual_bytes + static_cast<std::size_t>(col) * K * 4,
+                        static_cast<std::size_t>(K) * 4);
+            for (std::size_t kind = 0; kind < 4; ++kind) {
+                std::memcpy(out.data() + W + 2 * K + kind * H,
+                            at + residual_bytes + route_bytes + kind * io_bytes + static_cast<std::size_t>(col) * H * 2,
+                            static_cast<std::size_t>(H) * 2);
+            }
+            return out;
+        };
+        if (width == 1) {
+            for (std::size_t b = 0; b < blocks; ++b) { solo.push_back(column(b, 0)); }
+            solo_logits.assign(all_logits.begin(), all_logits.begin() + static_cast<std::ptrdiff_t>(vocab));
+            std::printf("width 1: reference row recorded\n");
+            continue;
+        }
+        static const char* kTaps[] = {"residual", "routes", "mixer in", "mixer out", "moe in", "moe out"};
+        for (std::int32_t col = 0; col < width; ++col) {
+            std::string first = "none";
+            for (std::size_t b = 0; b < blocks && first == "none"; ++b) {
+                const auto got = column(b, col);
+                for (std::size_t i = 0; i < column_words; ++i) {
+                    if (got[i] != solo[b][i]) {
+                        const std::size_t part = i < static_cast<std::size_t>(W)         ? 0
+                                                 : i < static_cast<std::size_t>(W + 2 * K) ? 1
+                                                                                           : 2 + (i - W - 2 * K) / H;
+                        first = "block " + std::to_string(b) + " " + kTaps[part];
+                        break;
+                    }
+                }
+            }
+            const bool logits_same = std::equal(solo_logits.begin(), solo_logits.end(),
+                                                all_logits.begin() + static_cast<std::ptrdiff_t>(col * vocab));
+            if (first != "none" || !logits_same) {
+                std::printf("width %d row %d: first difference at %s; logits %s\n", width, col, first.c_str(),
+                            logits_same ? "equal" : "differ");
+                ok = false;
+            }
+        }
+        std::printf("width %d checked\n", width);
+    }
+    std::printf(ok ? "every decode width equals the solo row bit for bit\n"
+                   : "FAIL: a decode width changes a row's bits\n");
+    return ok;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -469,16 +580,23 @@ int main(int argc, char** argv) {
         std::int32_t dump_from = 0;
         KvCacheStorage kv      = KvCacheStorage::BFloat16;
         bool cpu_columns   = false;
+        bool decode_widths = false;
     };
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     try {
         std::vector<Job> jobs;
-        models::LoadOptions load; // --rope-yarn-factor F (anywhere): the model's YaRN factor
+        // Anywhere: --rope-yarn-factor F (the model's YaRN factor) and --expert-a4-activations
+        // (NVIDIA FP4-Local's optional 4-bit expert activations).
+        models::LoadOptions load;
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
             if (arg == "--rope-yarn-factor") {
                 if (i + 1 >= argc) { throw std::invalid_argument("--rope-yarn-factor needs a value"); }
                 load.rope_yarn_factor = std::stof(argv[++i]);
+                continue;
+            }
+            if (arg == "--expert-a4-activations") {
+                load.expert_a4_activations = true;
                 continue;
             }
             if (arg.rfind("--", 0) != 0) {
@@ -489,6 +607,11 @@ int main(int argc, char** argv) {
             if (arg == "--cpu-columns") {
                 if (jobs.empty()) { throw std::invalid_argument("--cpu-columns needs a token list before it"); }
                 jobs.back().cpu_columns = true;
+                continue;
+            }
+            if (arg == "--decode-widths") {
+                if (jobs.empty()) { throw std::invalid_argument("--decode-widths needs a token list before it"); }
+                jobs.back().decode_widths = true;
                 continue;
             }
             if (jobs.empty() || i + 1 >= argc) { throw std::invalid_argument(arg + " needs a token list before it and a value"); }
@@ -632,6 +755,7 @@ int main(int argc, char** argv) {
         if (job.cpu_columns) {
             return check_cpu_columns(parameters, device, volume, tokens, context, job.kv) ? 0 : 1;
         }
+        if (job.decode_widths) { return check_decode_widths(parameters, device, volume, tokens, context, job.kv) ? 0 : 1; }
         Harness harness(parameters, device, context, n, 3, job.kv);
         DeviceBuffer logits(vocab * 2 * sizeof(float));
         print_memory("harness");

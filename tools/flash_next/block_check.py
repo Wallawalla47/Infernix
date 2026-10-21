@@ -1,7 +1,7 @@
 """Check each Infernix Qwen4Exp block's op chains against the FP64 reference on identical inputs.
 
     python -m tools.flash_next.block_check --model CHECKPOINT --tokens 1,2,3 --blocks blocks.bin \\
-        --residuals residuals.bin [--layers 0,1,3]
+        --residuals residuals.bin [--layers 0,1,3] [--expert-a16]
 
 ``blocks.bin`` and ``residuals.bin`` are the ``--blocks`` and ``--residuals`` taps of
 infernix_qwen4_exp_forward_real_test: BF16 ``[layers][mixer in, mixer out, MoE in, MoE out][T][H]``
@@ -47,9 +47,12 @@ def main() -> int:
     parser.add_argument("--blocks", type=Path, required=True)
     parser.add_argument("--residuals", type=Path, required=True)
     parser.add_argument("--layers", help="comma-separated layer indices (default: all)")
+    parser.add_argument(
+        "--expert-a16", action="store_true", help="routed experts with 16-bit activations (FP4-Local's default)"
+    )
     args = parser.parse_args()
     ids = [int(v) for v in args.tokens.split(",") if v]
-    ref = Reference(args.model)
+    ref = Reference(args.model, expert_a16=args.expert_a16)
     layers_total, hidden, T = ref.c["num_hidden_layers"], ref.H, len(ids)
     taps = bf16_file(args.blocks, (layers_total, 4, T, hidden))
     residuals = bf16_file(args.residuals, (layers_total, T, ref.hc * hidden))

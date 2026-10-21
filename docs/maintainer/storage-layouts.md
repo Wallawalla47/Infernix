@@ -15,6 +15,7 @@ The storage registry contains exactly these identities:
 | `row_split_k128_v1` | tensor layout | `q2_g64_fp16`, `q4_g64_fp16`, `q5_g64_fp16`, `q6_g64_fp16`, `q8_g32_fp16` | rank 2 `[N,K]` | 256 bytes |
 | `block_scale_k16_m128x4_v1` | tensor layout | `nvfp4` | rank 2 `[N,K]`, `N % 128 == 0`, `K % 64 == 0` | 256 bytes |
 | `row_scale_v1` | tensor layout | `fp8_e4m3fn_row_bf16` | rank 2 `[N,K]` | 256 bytes |
+| `g32_scale_rows16_v1` | tensor layout | `fp8_e4m3fn_g32_e8m0` | rank 2 `[N,K]`, `N % 16 == 0`, `K % 32 == 0` | 256 bytes |
 | `nvfp4_expert_rg16_v1` | tensor layout | `nvfp4_mul` | rank 3 `[E,H,I]`, `H % 16 == 0`, `I % 16 == 0` | 4096 bytes |
 | `ggml_rows_v1` | tensor layout | every `ggml_*` format | rank 2 `[N,K]`, `K` whole blocks | 256 bytes |
 | `ggml_tiles16_v1` | tensor layout | `ggml_q4_k`, `ggml_q5_k`, `ggml_q6_k`, `ggml_iq4_xs` | rank 2 `[N,K]`, `K` whole blocks | 256 bytes |
@@ -334,6 +335,33 @@ spans are not one assumed-contiguous payload range. A standalone consecutive sli
 encoded by concatenating the selected code rows, recomputing the scale-plane alignment for the new
 row count, and appending the selected scale words in the same row order. It does not decode or
 requantize either plane.
+
+### 5.1 `g32_scale_rows16_v1`
+
+`g32_scale_rows16_v1` stores only rank-two `fp8_e4m3fn_g32_e8m0` matrices `[N,K]` with `N` a multiple
+of 16 and `K` a multiple of 32. It adds no padding beyond the plane alignment. Let `G = K / 32` and:
+
+```text
+code_plane_bytes   = N * K
+scale_plane_offset = align_up(code_plane_bytes, 256)
+scale_plane_bytes  = N * G
+payload_bytes      = scale_plane_offset + scale_plane_bytes
+```
+
+The code plane is `row_scale_v1`'s: coordinate `[n,k]` at offset `n * K + k`, zero bytes up to
+`scale_plane_offset`. The scale plane holds one UE8M0 byte per row and group in 16-row tiles: the
+word of row `n`, group `g` lies at
+
+```text
+scale_plane_offset + floor(n / 16) * G * 16 + g * 16 + n % 16
+```
+
+so a tile's 16 scales of one group are one aligned 16-byte run (one vector load, one row of a TMA
+box), the CUDA-core routes' 16 rows of a CTA share their runs, and a run of whole tiles is one
+contiguous span (`16 * G` bytes per tile, `G` per row). A consecutive slice of whole tiles is encoded
+by concatenating its code rows and its tiles' scale runs; other row selections re-tile the scales.
+Neither plane is decoded or requantized. [`tools/artifact/codecs/fp8_g32.py`](../../tools/artifact/codecs/fp8_g32.py)
+encodes and decodes the layout.
 
 ## 6. `nvfp4_expert_rg16_v1`
 

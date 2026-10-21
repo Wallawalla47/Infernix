@@ -65,6 +65,10 @@ int run_tests() {
     failures += check(parse({"infernix", "model.ninfer", "--prompt", "hello", "--expert-tail-skip", "8"})
                               .expert_tail_skip == 8,
                       "--expert-tail-skip did not parse");
+    failures += check(parse({"infernix", "model.ninfer", "--prompt", "hello", "--expert-a4-activations"})
+                                  .expert_a4_activations &&
+                          !parse({"infernix", "model.ninfer", "--prompt", "hello"}).expert_a4_activations,
+                      "--expert-a4-activations did not parse (default off)");
     const auto gated = parse({"infernix", "model.ninfer", "--prompt", "hello", "--spec", "mtp",
                               "--draft-tokens", "3", "--spec-min-p", "0.7"});
     failures += check(gated.speculative.draft_min_p && *gated.speculative.draft_min_p == 0.7F,

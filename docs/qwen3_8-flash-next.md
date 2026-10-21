@@ -256,6 +256,60 @@ On the 1M-token perplexity corpus (quick, 4K context, INT8 KV) it scores 3.487 a
 3.508, with a mean KL divergence of 0.050 from recipe B's distribution (the exact route, which the
 drafter does not change).
 
+### NVIDIA FP4-Local checkpoint
+
+Recipe `qwen3_8_flash_next_fp4_local` imports
+[nvidia/Qwen3.8-Flash-Next-FP4-Local](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local),
+NVIDIA's quantization-aware distillation of the model, bit-exactly
+([design §6.1.2](maintainer/qwen3_8-flash-next-design.md#612-recipe-qwen3_8_flash_next_fp4_local-d)):
+
+- The routed experts keep their NVFP4 codes, their block scales (stored by the checkpoint in a
+  lossless compressed encoding, NVFP4-CSF, which the converter restores), their FP32 multipliers
+  and their activation scales. By default they run with BF16 activations (W4A16), as NVIDIA serves
+  the checkpoint (its serving command sets `VLLM_B12X_MOE_FP4_FORCE_A16=1`);
+  `--expert-a4-activations` runs them with 4-bit NVFP4 activations (W4A4) at the activation scales
+  NVIDIA calibrated, which changes the output. Only this artifact offers the choice: the other
+  Flash-Next artifacts' experts have one fixed arithmetic, and they refuse the option.
+- The GDN, attention (indexer included) and shared-expert projections keep their MXFP8 words (E4M3
+  codes, one power-of-two scale per 32 weights) and run with BF16 activations (W8A16) on one
+  tensor-core route at every width, so the exact route stays request-invariant; the GDN a/b
+  projections and the vision attention become their exact BF16 values.
+- The trained FP32 norms stay FP32; every other tensor keeps its dtype.
+- The n-gram table is the checkpoint's NVFP4 table, written to its own 29.1 GB volume (any of the
+  [other tables](#n-gram-table-formats) also runs the model).
+- The MTP drafter is re-quantized as for the other imports (`q8_g32_fp16` projections, `q4_g64_fp16`
+  experts from the experts' exact values); the vision MLPs are rounded once to BF16.
+
+```text
+python -m tools.convert --model <dir>/Qwen3.8-Flash-Next-FP4-Local --recipe qwen3_8_flash_next_fp4_local \
+  --components text,vision,mtp --proposal --device cpu --name Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix \
+  --resource chat_template.jinja=tools/chat_templates/qwen3_8.jinja \
+  --out <dir>/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix.infernix \
+  --ngram-out <fast drive>/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix.ngram
+python -m tools.artifact.rename <dir>/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix.infernix \
+  Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix.infernix --numbered
+python -m tools.flash_next.verify_artifact --model <dir>/Qwen3.8-Flash-Next-FP4-Local \
+  --artifact <dir>/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-00001-of-0000N.infernix \
+  --ngram <fast drive>/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix.ngram --ngram-rows all
+```
+
+On the 1M-token perplexity corpus (quick, 4K context, BF16 KV, exact route; 2026-10-20) it scores
+3.4865 with its default 16-bit expert activations and 3.5024 with `--expert-a4-activations`,
+against 3.4854 for the official FP8 artifact and 3.5114 for NVIDIA's NVFP4 Dense8. Its mean KL
+divergence from the FP8 artifact's distribution is 0.042 (4-bit activations 0.057, Dense8 0.049).
+Speed on the same day (RTX 5090, INT8 KV, n-gram rows read from the volume, one request, three
+repetitions): pp8192 3,352 and pp32768 11,299 tok/s (8,387 on the exact route; the
+`expert-a4-residual` fast path), tg256 110 plain and 150-162 with MTP; with
+`--expert-a4-activations` pp32768 11,985, tg256 135 plain and 216 with MTP. Dense8 in the same
+session: 11,531, 120 and 159.
+
+Its qualified fast paths (2026-10-21; on by default, `--disable-fast-paths` turns them off) are
+the request-coupling paths (two-row MTP rounds: two concurrent requests decode 84 -> 126 tok/s with
+16-bit and 125 -> 162 with 4-bit expert activations; free cache resume; preemption), sampled MTP
+drafts, and `expert-a4-residual` for long prefills with 16-bit expert activations, on every KV
+format ([model quality §6.7](maintainer/model-quality.md#67-fast-path-registry)). Its exact route is
+deterministic and gives each request the same bits alone and with up to eight concurrent requests.
+
 ## Run
 
 ```text
@@ -410,16 +464,20 @@ The rows are the same bytes either way, so outputs do not change.
 
 ## N-gram table formats
 
-The PLE n-gram table has three volume formats: NVIDIA's FP8 rows with one scale for the whole table
-(recipes A-C bind it), the GGUF import's IQ4_NL rows (4.5 bits per value), and the BF16 rows of
-Qwen's checkpoint (the FP8 checkpoint's exact artifact binds it). Every artifact binds one of them as
-its own, and **any Qwen3.8-Flash-Next artifact runs with a volume of any of the three formats**:
-pass it with `--ngram-volume`. The engine reads the row format from the volume's header and logs
+The PLE n-gram table has four volume formats: NVIDIA's FP8 rows with one scale for the whole table
+(recipes A-C bind it), the GGUF import's IQ4_NL rows (4.5 bits per value), the BF16 rows of
+Qwen's checkpoint (the FP8 checkpoint's exact artifact binds it) and NVIDIA FP4-Local's NVFP4 rows
+(4.5 bits per value: E2M1 codes, an E4M3 scale per 16 values and one FP32 multiplier; the FP4-Local
+artifact binds it). Every artifact binds one of them as its own, and **any Qwen3.8-Flash-Next
+artifact runs with a volume of any of the four formats**: pass it with `--ngram-volume`. The engine
+reads the row format from the volume's header and logs
 `n-gram table: <format> rows from <volume> in place of the artifact's <format> table`; the PLE
-decodes the FP8 or IQ4_NL rows (or takes the BF16 rows as its embedding) as it does for the
-artifact's own table. The three volumes hold the same table row for row: on 3,002 sampled rows,
+decodes the FP8, IQ4_NL or NVFP4 rows (or takes the BF16 rows as its embedding) as it does for the
+artifact's own table. The volumes hold the same table row for row: on 3,002 sampled rows,
 the FP8 rows' relative L2 error against the BF16 rows was 2.7 % (median; 3.1 % at the 99th
-percentile) and the IQ4_NL rows' 7.6 % (8.7 %), against 142 % for rows shifted by one. With the
+percentile) and the IQ4_NL rows' 7.6 % (8.7 %), against 142 % for rows shifted by one; on 65,536
+sampled rows the NVFP4 rows' was 9.5 % (median; 11.3 % at most), an NVFP4 quantization of Qwen's
+table (QAD's joint refinement left no row beyond quantization noise). With the
 NVIDIA NVFP4 Dense8 artifact (the 1M-token corpus's quick subset, 4,096-token windows at stride
 2,048, INT8 KV; 2026-10-18) the perplexity was 3.5102 with its own FP8 table, 3.5101 with the BF16
 table and 3.5140 with the IQ4_NL table.
@@ -428,7 +486,10 @@ FP8 rows need the table's scale. An FP8 artifact stores it (`ngram_scale`), so i
 works. For any other artifact the engine reads it from the volume's header, which FP8 volumes record
 since 2026-10-18, or, for NVIDIA's published FP8 volume (written before), recognises that file by
 the volume id in its header and uses its known scale, so the downloaded file works unchanged. An
-FP8 volume with neither serves only its own artifact.
+FP8 volume with neither serves only its own artifact. NVFP4 rows need the table's FP32 multiplier,
+which the NVFP4 volume's header records, so it serves any artifact. Volumes written since 2026-10-19
+record their row format in the header (NVFP4 rows have IQ4_NL's 90 bytes); older volumes are read by
+their row size.
 
 The FP8 checkpoint's artifact, converted with the BF16 table, is bit-exact to Qwen's checkpoint
 only with its own BF16 volume; another table rounds the PLE's values as that table's artifacts do.

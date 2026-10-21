@@ -730,11 +730,13 @@ Qwen3.8-Flash-Next's reference runs every dense linear A16 and every routed expe
 placement-invariant W4A16 arithmetic of its design §16.2.1), so its floor includes what the W4A4
 experts' 4-bit activations cost; pass `--ngram-volume` to the gate when the volume is not
 `<artifact>.ngram`. Its Engine scoring is checked against the Forward's own teacher-forced logits
-(`infernix_qwen4_exp_score_real_test`): on 3,000 tokens the perplexity matches, top-1 agrees at
-every position, and the RAM and SSD expert tiers give the same output. Its qualified paths are
-the three request-coupling paths (every configuration but recipe C), sampled MTP drafts, the three
-Q8 dense-kernel paths (Dense8), FP16 GDN (IQ3_S and FP8) and recipe C's expert and FP8 pair paths
-(6.7).
+(`infernix_qwen4_exp_score_real_test`, both at the same prefill chunk): on 3,000 tokens the
+perplexity matches, top-1 agrees at every position, and the RAM and SSD expert tiers give the same
+output; NVIDIA FP4-Local on 512 tokens: mean |dlogp| 3e-5 at chunk 256 and 4e-5 at 1,024, top-1
+everywhere (2026-10-20). Its qualified paths are the three request-coupling paths (every
+configuration but recipe C and FP4-Local), sampled MTP drafts, the three Q8 dense-kernel paths
+(Dense8), FP16 GDN (IQ3_S and FP8), the W4A16 expert path (recipe C and FP4-Local) and recipe C's
+FP8 pair path (6.7).
 
 ### 6.6 Calibration and comparison with other engines
 
@@ -853,13 +855,14 @@ always run and are not listed. The NVFP4 27B variants select identical paths (ea
 | `adaptive-speculation` | the same, with speculative decoding | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
 | `free-cache-resume` | the same, with the prefix cache | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
 | `preemption` | request-invariance-capable artifacts | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
-| Qwen3.8-Flash-Next: `adaptive-speculation` (MTP), `free-cache-resume`, `preemption` | every Flash-Next artifact | Dense8, IQ3_S, FP8 and recipe A, every format; not recipe C (its exact route is not request-invariant, below) |
+| Qwen3.8-Flash-Next: `adaptive-speculation` (MTP), `free-cache-resume`, `preemption` | every Flash-Next artifact | Dense8, IQ3_S, FP8, recipe A and NVIDIA FP4-Local (16- and 4-bit expert activations), every format; not recipe C (its exact route is not request-invariant, below) |
 | Qwen3.8-Flash-Next: `q8-sliced-k`, `gdn-conv-fused`, `qsa-prepare-fused` | Q8 dense weights (`qsa-prepare-fused`: BF16, INT8, FP8, NVFP4 or K8V4 KV) | Q8 dense, 4-bit experts, every KV format (`qsa-prepare-fused`: the five it serves) |
 | `fp8-a8-pair` | row-FP8 dense weights (recipe C) | FP8 dense, 16-bit experts, with FP8, NVFP4, K8V4, VQ2 or K4V2 KV (INT8 fails its decode tail, BF16 its prefill; below) |
 | `q4-w4a8` | groupwise Q4 MLP gate/up | none (fails, below) |
 | `idle-wide-prefill` | Qwen3.8-27B / Qwen3.6-35B-A3B generation engines | NVFP4 27B, groupwise 27B and 35B-A3B, every format |
 | `adaptive-mtp` | Qwen3.8-27B / Qwen3.6-35B-A3B with MTP and `--draft-tokens auto` | NVFP4 27B and 35B-A3B, every format |
-| Qwen3.8-Flash-Next: `expert-a4-residual` | artifacts with W4A16 experts (recipe C), expert calls of more than eight columns | FP8 dense, 16-bit expert activations, with INT8, FP8, NVFP4, K8V4, VQ2 or K4V2 KV (fails on BF16 KV, below) |
+| Qwen3.8-Flash-Next: `expert-a4-residual` | artifacts with NVFP4 W4A16 experts (recipe C; NVIDIA FP4-Local at its default 16-bit expert activations), expert calls of more than eight columns | FP8 dense (recipe C) and MXFP8 dense (FP4-Local, by recipe C's kernel verdicts and its own timing), 16-bit expert activations, every KV format (BF16 by FP4-Local's gates against the precise reference, below) |
+| Qwen3.8-Flash-Next: `expert-a4-residual-3` | the same calls as `expert-a4-residual`, three NVFP4 terms per x and h row (its more precise form, design §19.3.23; it takes precedence where both are selected) | none: two terms pass on every configuration and format they run in (2026-10-21), so it stays an unregistered candidate (`--fast-path expert-a4-residual-3`) for a cell where two terms fail; three terms cost 7-8 points of prefill speed (below) |
 | Qwen3.8-Flash-Next: `sampled-mtp-drafts` | MTP rounds with a sampled request | every Flash-Next configuration, every format (distribution and greedy identity, below; no logit changes) |
 | Qwen3.8-Flash-Next: `ggml-bf16-prefill` | GGUF dense projections in prefill calls of 32+ columns, GGUF expert calls of 14,336+ columns | IQ3_S with INT8, FP8, NVFP4, K8V4, VQ2 or K4V2 KV (fails on BF16 KV, below) |
 | `gdn-f16-accumulate` | chunked GDN calls (16+ tokens) of every Qwen3.5-family and Flash-Next artifact | NVFP4 27B, groupwise 27B and FP8, every format; IQ3_S, every format but BF16 (fails there, under `ggml-bf16-prefill`); not the 35B-A3B or Dense8 (no gain beyond spread, below) |
@@ -888,8 +891,9 @@ tok/s (+4.1 %, overlapping); FP8 math 48.0 -> 57.8 (+20.4 %), story 41.7 -> 48.2
 run ahead, code 46.1 -> 40.1 (-13.0 %, overlapping: one exact run at 52.5 against 39.7-40.1 for the
 other three; FP8 decode is SSD-bound and its runs vary by up to 30 %). Tokens per round did not
 rise with it (IQ3_S math 2.84 and 2.63 exact against 2.42 and 2.78 with the path), so the gain is
-not explained by acceptance alone and was not attributed further. Recipe A and recipe C are
-registered by the rule for a path that changes no logit (6.1), with these as the nearest timings;
+not explained by acceptance alone and was not attributed further. Recipe A, recipe C and NVIDIA
+FP4-Local (MXFP8 dense, with 16- and with 4-bit expert activations) are registered by the rule for a
+path that changes no logit (6.1), with these as the nearest timings;
 recipe C's exact-route defect (below) does not bear on such a path.
 
 **`gdn-f16-accumulate`: FP16-accumulate chunked GDN (qualified on the 27B, 2026-10-17).** See
@@ -1132,6 +1136,38 @@ equivalences were not run on the artifact. Recipe C fails: its real tests diverg
 route at token 29 (a resumed request against a cold one, and concurrent against solo), so its exact
 route is not request-invariant, and its joint gate fails the p99.9 KL ratio (1.33); no coupling
 path is registered on it, and the exact-route defect is open.
+
+NVIDIA FP4-Local (MXFP8 dense, 2026-10-20/21): after the TMA proxy-fence fix (design §6.1.2) its exact
+route is deterministic and request-invariant alone and at eight concurrent requests (BF16 KV, 48
+segments), and the prefix-cache and preemption real tests pass with the candidates at both expert
+activation precisions. One INT8 joint decode gate per expert activation precision, as IQ3_S's and
+FP8's (MTP 4 at concurrency 2, every segment resuming from a warm 3,072-token entry, a 9,728-token
+pool, 256 segments; fast role the coupling paths with the configuration's qualified paths,
+`expert-a4-residual` at 16 bits):
+
+| Expert activations | Reference (6.2) | TV excess (bound) / 4.0e-3 | Top-1 excess, points (bound) / 0.50 | KL excess / 1.0e-2 | NLL excess / 1.0e-2 | p99.9 KL ratio / 1.25 | Verdict |
+|---|---|---|---|---|---|---|---|
+| 4-bit | 16-bit | 6.0e-6 (2.0e-5) | +0.01 (0.03) | -6.1e-6 | -1.3e-4 | 1.00 | pass |
+| 16-bit | 16-bit | 1.2e-3 (1.6e-3) | +0.13 (0.35) | 4.4e-4 | -9.0e-4 | **1.27** | fails |
+| 16-bit | precise | 4.8e-4 (8.3e-4) | 0.00 (0.22) | 2.2e-4 | -9.0e-4 | 1.16 | pass |
+
+The 4-bit pass, against the 16-bit reference with a nonzero floor (TV 0.070), stands. Against that
+reference the 16-bit cell failed only its tail ratio, not one outlier: each route's 24 largest KLs
+lay in 23 segments, the ratio was 1.31 and 1.19 on alternate halves of the segments, and it came from
+the 512-token prompts (1.47; 2,048: 1.12; 8,192: 0.97). Against the precise reference (floor TV
+0.033, KL 7.0e-3) it passes, so the 1,024-segment run approved for it was not needed. No fast run
+preempted (the pool left about 800 tokens beside an 8,320-token lane), so `preemption` is decided by
+its forced-preemption increment (6.1; INT8 KV, precise reference, 2026-10-21), which passes at both
+precisions: each fast run paused 96 times and replayed 792,480 tokens, the default runs never paused;
+16-bit TV excess 4.8e-5 (bound 1.5e-4), top-1 +0.02 points (0.07), KL 9.7e-5, NLL -3.2e-4, p99.9 ratio
+1.00 (floor TV 0.038); 4-bit TV -6.8e-6 (1.7e-4), top-1 -0.04 points (0.04), KL -1.8e-4, NLL -5.1e-5,
+p99.9 ratio 1.00 (floor TV 0.074). The three coupling paths are registered at both precisions on every
+format, the other formats taking Dense8's verdicts (6.1, item 2). Speed,
+`adaptive-speculation` alone against the exact route (two concurrent requests, INT8 KV, MTP `auto`,
+256 tokens, ABBA): 16-bit 84.0 / 84.1 -> 125.7 / 126.1 tok/s (+49.8 %), 4-bit 125.6 / 125.3 -> 162.1 /
+162.2 (+29.3 %), every run ahead; `free-cache-resume` takes FP8's timing and `preemption` IQ3_S's and
+FP8's (6.1, item 4: the same mechanisms, prefill not repeated and requests admitted under a short
+pool).
 
 Every prompt-length bucket and p99.9 KL ratio passes too (largest ratio 1.13, 27B K8V4 spec). The
 closest bound is 27B NVFP4 spec's top-1 at 82 % of its budget. Speed (official 27B, INT8 KV, 2,048
@@ -1578,15 +1614,31 @@ and recomputes the previous output) or admission (whole extents held without `pr
   4.6e-4, 6.6e-4 and 6.1e-4; floors 7.5e-3, 1.21e-2, 1.49e-2, 1.53e-2 and 2.17e-2, all above
   INT8's 6.11e-3); they take INT8's decode verdict (6.1), INT8 being the passing format with the
   lowest floor.
-- **BF16 KV fails, as a path of this size must there:** recipe C's exact route with BF16 KV is the
-  reference itself (16-bit activations everywhere, chunking bit-exact), so its floor is 0 and no
-  format noise absorbs any of the path's error. The fast route's whole divergence (KL 6.8e-3, top-1
-  2.9 %, about INT8 KV's own; three terms 6.35e-3) counts as excess, 4.5 times the 1.5e-3 budget,
-  probably mostly near-tie expert routing that any perturbation flips (not measured).
+- **BF16 KV failed against the 16-bit reference and passes against the precise one:** recipe C's
+  exact route with BF16 KV was that reference itself (16-bit activations everywhere, chunking
+  bit-exact), so its floor was 0 and no format noise absorbed any of the path's error. The fast
+  route's whole divergence (KL 6.8e-3, top-1 2.9 %, about INT8 KV's own; three terms 6.35e-3)
+  counted as excess, 4.5 times the 1.5e-3 budget. Against the precise reference (2026-10-21, NVIDIA
+  FP4-Local, the same expert kernels; 6.1, item 1) the exact route has a floor (prefill KL 5.2e-3,
+  decode TV 0.033) and the path passes both gates: prefill (quick corpus, 896 and 7,168 tokens, 36
+  windows) KL excess 3.6e-4 (bound 4.6e-4), top-1 8.6e-4 (1.3e-3), NLL 5.6e-4, p99.9 ratio 1.03;
+  decode (MTP at concurrency 2, 256 segments) TV excess 4.4e-4 (bound 8.0e-4), top-1 7.9e-4
+  (3.1e-3), KL 2.7e-4, p99.9 ratio 0.97. It is registered on BF16 KV for FP4-Local and recipe C; the
+  KV format does not enter the expert kernels, so each one's timing holds there.
 - **Speed:** `infernix_bench` INT8 KV, chunk 4,096, ABBA (2026-10-14/15, before main 2ec268c2,
   whose changes leave recipe C's route alone): pp4096 1,631 → 1,637 tok/s (level), pp16384 6,175 →
   6,380 (+3.3 %), pp32768 6,620 → 8,803 (+33 %), pp65536 6,730 → 9,067 (+35 %); short prompts are
   bound by the expert stream over the x8 link.
+- **NVIDIA FP4-Local (2026-10-20):** its 16-bit expert activations run the same NVFP4 W4A16 banks
+  through the same kernels, so it takes recipe C's verdicts (6.1, item 1: the gates follow the
+  kernels a path changes), on the same formats, and its own BF16 gates against the precise reference
+  (above) add BF16 KV to both. Timed on its own (`infernix_bench`, INT8 KV, n-gram rows from the volume, three
+  repetitions, the default route against it plus the path, ABBA): pp32768 8,389 / 8,385 → 11,301 /
+  11,298 tok/s (+34.7 %, every run ahead), pp8192 3,352 → 3,358 (+0.2 %, every run ahead), tg256
+  plain 109.7 / 110.0 → 109.8 / 109.9 (level). One request's expert calls stay at eight columns or
+  fewer in decode (MTP rounds: five), so the path does not act there; the MTP figures (151.4 /
+  161.6 → 146.6 / 150.5) follow `--draft-tokens auto`, whose rounds averaged 2.29-3.02 tokens in
+  identical configurations, and are not a measurement of the path.
 
 **`fp8-a8-pair`: two E4M3 activation terms in recipe C's FP8 projections (recipe C with FP8, NVFP4, K8V4, VQ2 or K4V2 KV).**
 - **What changes:** prefill-width calls of Flash-Next's row-FP8 dense problems carry each 16-bit

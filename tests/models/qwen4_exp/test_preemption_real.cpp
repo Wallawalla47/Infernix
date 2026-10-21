@@ -1,6 +1,7 @@
 // Qwen4Exp preemption on the real artifact (design §19.3.13). Skips unless INFERNIX_QWEN4_ARTIFACT
 // names a Qwen4Exp artifact (INFERNIX_QWEN4_NGRAM: its n-gram volume, default <artifact>.ngram).
-// INFERNIX_QWEN4_KV selects the KV storage (bf16, int8, fp8, nvfp4, k8v4, vq2, k4v2; default int8).
+// INFERNIX_QWEN4_KV selects the KV storage (bf16, int8, fp8, nvfp4, k8v4, vq2, k4v2; default int8);
+// INFERNIX_QWEN4_EXPERT_A4 (any value) runs NVIDIA FP4-Local's experts with 4-bit activations.
 //
 // Two lanes share a KV pool too small for both requests' full extents: each binds its prompt and
 // grows per round, so the younger request is paused when the pool runs out and resumes once the
@@ -77,6 +78,7 @@ int run_mode(const char* artifact, const char* ngram, bool mtp) {
     const char* kv               = std::getenv("INFERNIX_QWEN4_KV");
     options.kv_cache             = kv != nullptr ? infernix::test::parse_kv_cache_storage(kv)
                                                  : infernix::KvCacheStorage::Int8Group64;
+    options.expert_a4_activations = std::getenv("INFERNIX_QWEN4_EXPERT_A4") != nullptr;
     options.max_concurrency      = 2;
     options.max_pending_requests = 4;
     options.context_cache.host_capacity_bytes = 2ULL << 30;

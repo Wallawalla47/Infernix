@@ -25,6 +25,7 @@ _DTYPES = {
     "I64": (torch.int64, 8),
     "I8": (torch.int8, 1),
     "U8": (torch.uint8, 1),
+    "U32": (torch.uint32, 4),  # NVFP4-CSF exception records (sources/modelopt.py)
     "F8_E4M3": (torch.float8_e4m3fn, 1),
 }
 

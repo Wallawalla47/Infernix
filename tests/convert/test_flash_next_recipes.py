@@ -7,7 +7,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from tools.convert.methods import cast_direct, grouped_absmax, grouped_mse
+from tools.convert.methods import cast_direct, grouped_absmax, grouped_mse, import_encoded
 from tools.convert.model import Model, Parameter
 from tools.convert.official_recipes import (
     qwen3_8_flash_next_dflash2,
@@ -39,7 +39,7 @@ KEPT = (
     "text/token_embedding",
     f"{LAYER}/gdn/a_projection", f"{LAYER}/gdn/b_projection",
     f"{LAYER}/attention/query", f"{LAYER}/attention/key", f"{LAYER}/attention/value",
-    f"{LAYER}/attention/indexer_query",
+    f"{LAYER}/attention/index_query",
     f"{LAYER}/moe/router", f"{LAYER}/moe/shared_score",
 )
 DRAFTER_Q8 = (f"{MTP}/attention/query", f"{MTP}/attention/output", f"{MTP}/moe/shared/up")
@@ -156,6 +156,70 @@ def test_fp8_recipe_imports_the_block_fp8_banks_verbatim() -> None:
     model = _model()
     with pytest.raises(ValueError, match="block-FP8"):
         qwen3_8_flash_next_fp8(model, Recipe(model), {})
+
+
+def test_fp4_local_recipe_keeps_the_mxfp8_words_and_defaults_the_experts_to_a16() -> None:
+    """FP4-Local (design §6.1.2): the ModelOpt bank becomes an nvfp4_mul bank whose Use permits 4-bit
+    activations, with its FP32 activation scales, and the text config makes 16-bit expert
+    activations the default; the MXFP8 GDN, QSA (the indexer included) and shared-expert projections
+    keep their words, every other main tensor its stored dtype (GDN a/b their exact BF16 values), the
+    QSA projections and indexer form one parent, and the drafter is recipe A's. Other banks and other
+    n-gram tables are refused."""
+
+    from tools.convert.official_recipes import qwen3_8_flash_next_fp4_local
+
+    mxfp8 = tuple(n for n in DENSE8 if any(n.endswith(s) for s in ("/gdn/query", "/gdn/key", "/gdn/value", "/gdn/z",
+                                                                      "/gdn/output", "/attention/output",
+                                                                      "/moe/shared/gate", "/moe/shared/up",
+                                                                      "/moe/shared/down")))
+    mxfp8 += (f"{LAYER}/attention/query", f"{LAYER}/attention/key", f"{LAYER}/attention/value",
+              f"{LAYER}/attention/index_query")
+
+    def model(bank_source, table="nvfp4") -> Model:
+        m = Model({"text": {"config": {"architectures": ["Qwen4ExpForCausalLM"], "ngram_table": {"format": table},
+                                       "layer_types": ["linear_attention"]}}})
+        for name in (*DENSE8, *KEPT, *DRAFTER_Q8, *DRAFTER_KEPT, *DRAFTER_EXPERTS):
+            inputs = () if name == "text/token_embedding" else ("input",)
+            source = array_source(torch.ones((4, 64), dtype=torch.bfloat16), name)
+            m.add(Parameter(name, (4, 64), source, lambda store, format=None, s=source: s, inputs))
+        m.add(Parameter(BANK, (2, 4, 64), bank_source, inputs=("input",)))
+        scales = f"{LAYER}/moe/expert_input_scales"
+        m.add(Parameter(scales, (2, 3), array_source(torch.ones((2, 3)), scales), direct_format="fp32"))
+        return m
+
+    m = model(ExpertBankSource((2, 4, 64), BANK, None, "experts."))
+    recipe = Recipe(m)
+    qwen3_8_flash_next_fp4_local(m, recipe, {"base": None})
+    selections = recipe.selections
+    bank = _only(selections, BANK)
+    assert (bank.format, bank.layout, bank.method) == ("nvfp4_mul", "nvfp4_expert_rg16_v1", import_expert_bank)
+    for name in DRAFTER_EXPERTS:
+        assert (_only(selections, name).format, _only(selections, name).method) == (Q4, grouped_mse), name
+    for name in DRAFTER_Q8:
+        assert (_only(selections, name).format, _only(selections, name).method) == (Q8, grouped_absmax), name
+    for name in (*KEPT, *DRAFTER_KEPT):
+        if name not in mxfp8:  # the embedding, GDN a/b, router and shared-expert gate
+            chosen = _only(selections, name)
+            assert (chosen.format, chosen.method) == ("bf16", cast_direct), name
+    scales = _only(selections, f"{LAYER}/moe/expert_input_scales")
+    assert (scales.format, scales.method) == ("fp32", cast_direct)
+    assert all(recipe.policies[(BANK, use)] == "AllowA4" for use in m.parameters[BANK].inputs)
+    assert m.components["text"]["config"]["expert_a4_activations"] == "optional"
+    # No explicit attention groups: the builder's one QSA parent (query, gate, key, value, indexer) stands.
+    assert not any(any("/attention/" in n for n in names) for names, _ in recipe.explicit_groups)
+    for name in mxfp8:
+        chosen = _only(selections, name)
+        assert (chosen.format, chosen.method) == ("fp8_e4m3fn_g32_e8m0", import_encoded), name
+    for name in DENSE8:
+        if name not in mxfp8:  # HC mixers, PLE projections, the final mixer and lm_head: BF16 as stored
+            chosen = _only(selections, name)
+            assert (chosen.format, chosen.method) == ("bf16", cast_direct), name
+    with pytest.raises(ValueError, match="ModelOpt NVFP4 experts"):
+        weight_only = model(ExpertBankSource((2, 4, 64), BANK, None, "experts.", packed=True))
+        qwen3_8_flash_next_fp4_local(weight_only, Recipe(weight_only), {"base": None})
+    with pytest.raises(ValueError, match="NVFP4 n-gram table"):
+        fp8_table = model(ExpertBankSource((2, 4, 64), BANK, None, "experts."), table="fp8_e4m3fn")
+        qwen3_8_flash_next_fp4_local(fp8_table, Recipe(fp8_table), {"base": None})
 
 
 def test_iq3s_recipe_tiles_the_tiled_formats_and_takes_a_q2_drafter() -> None:

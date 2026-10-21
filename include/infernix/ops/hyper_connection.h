@@ -34,7 +34,8 @@ namespace infernix::ops {
  */
 
 /// The mixer of one block: x = BF16 [H, T] from the residual R (contiguous BF16 [S*H, T]), the norm
-/// weight (BF16 [S*H]), W_down [rank (+ S), S*H] and W_up [S*H, rank]; when inject is not null,
+/// weight (BF16 [S*H], or FP32 [S*H] where the checkpoint trained it in FP32: NVIDIA FP4-Local; 1 + w
+/// is formed in FP32 either way), W_down [rank (+ S), S*H] and W_up [S*H, rank]; when inject is not null,
 /// down carries the S injection rows and inject receives FP32 [S, T]. eps > 0.
 ///
 /// Routes (private, chosen from the weights and T only): Q8_G32_FP16 RowSplit weights of the

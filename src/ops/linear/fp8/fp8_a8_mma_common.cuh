@@ -182,13 +182,17 @@ fp8_finish_mma_tile(Output output, Epilogue epilogue, RowPolicy row_policy,
             const int parent_row0 = row_policy.weight_row(row_begin, local_row0, rows);
             const int parent_row1 = row_policy.weight_row(row_begin, local_row0 + 1, rows);
             const float2 weight_scale = [&] {
-                if constexpr (requires { RowPolicy::kContiguousPairs; }) {
-                    if constexpr (RowPolicy::kContiguousPairs)
-                        return bf16x2_bits_to_float2(
-                            load_ldg<std::uint32_t>(weight_scales + parent_row0));
+                if constexpr (requires { RowPolicy::kUnscaled; }) {
+                    return make_float2(1.0F, 1.0F);
+                } else {
+                    if constexpr (requires { RowPolicy::kContiguousPairs; }) {
+                        if constexpr (RowPolicy::kContiguousPairs)
+                            return bf16x2_bits_to_float2(
+                                load_ldg<std::uint32_t>(weight_scales + parent_row0));
+                    }
+                    return make_float2(__bfloat162float(weight_scales[parent_row0]),
+                                       __bfloat162float(weight_scales[parent_row1]));
                 }
-                return make_float2(__bfloat162float(weight_scales[parent_row0]),
-                                   __bfloat162float(weight_scales[parent_row1]));
             }();
             float value00 =
                 accumulators[mma_token][mma_row][0] * activation_scale0 * weight_scale.x;

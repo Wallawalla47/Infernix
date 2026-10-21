@@ -35,6 +35,9 @@ enum class QType : std::uint16_t {
     // Two-bit grouped codes {-2, -1, 0, 1}, one FP16 scale per 64 (row-split, four codes per byte):
     // draft-only weights (the Qwen4Exp MTP drafter's experts; tensor-formats.md).
     Q2_G64_FP16 = 20,
+    // MXFP8 weights (ModelOpt's, NVIDIA Qwen3.8-Flash-Next-FP4-Local): E4M3FN codes with one UE8M0
+    // power-of-two scale per 32 K elements of a row (tensor-formats.md; tools/artifact/codecs/fp8_g32.py).
+    FP8_E4M3FN_G32_E8M0 = 21,
 };
 
 enum class QuantLayout : std::uint16_t {
@@ -58,6 +61,9 @@ enum class QuantLayout : std::uint16_t {
     // 16 i row_bytes; block b of its row r at (16 b + r) * block_bytes; the last tile padded with
     // zero blocks): ggml_rows_v1's bytes, each tile's block b one contiguous run.
     GgmlTiles16 = 9,
+    // g32_scale_rows16_v1: [n, k] E4M3FN codes row-major, then (256-byte aligned) the UE8M0 group
+    // scales in 16-row tiles: row r, group g at (r / 16) * (k / 32) * 16 + g * 16 + r % 16.
+    G32ScaleRows16 = 10,
 };
 
 // Whether `layout` stores a matrix of GGUF blocks (ggml_rows_v1 or ggml_tiles16_v1).

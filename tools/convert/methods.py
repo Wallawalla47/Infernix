@@ -167,8 +167,34 @@ def _preflight(request: PrepareRequest, *, values: bool = True) -> None:
             item.source.values(0, 1)
 
 
+def bf16_from_float64(values: torch.Tensor) -> torch.Tensor:
+    """Round binary64 values to BF16 once, to nearest even. PyTorch's conversion passes through
+    binary32, a double rounding that differs at BF16 ties (1 + 2^-8 + 2^-30 becomes 1, not
+    1 + 2^-7). Results below BF16's normal range are refused: no exact source here produces them."""
+
+    bits = values.contiguous().view(torch.int64)
+    sign = (bits >> 63) & 1
+    exponent = (bits >> 52) & 0x7FF
+    mantissa = bits & ((1 << 52) - 1)
+    zero = (exponent == 0) & (mantissa == 0)
+    if bool((exponent == 0x7FF).any()):
+        raise ValueError("BF16 conversion source holds a non-finite value")
+    biased = exponent - 1023 + 127
+    if bool(((biased < 1) & ~zero).any()):
+        raise ValueError("BF16 conversion source holds a value below BF16's normal range")
+    kept = (biased << 7) | (mantissa >> 45)
+    round_bit = (mantissa >> 44) & 1
+    sticky = (mantissa & ((1 << 44) - 1)) != 0
+    kept = kept + (round_bit & (sticky | (kept & 1)).to(torch.int64))
+    if bool((kept >= 0xFF << 7).any()):
+        raise ValueError("BF16 conversion source holds a value beyond BF16's range")
+    words = torch.where(zero, 0, kept) | (sign << 15)
+    words = torch.where(words >= 0x8000, words - 0x10000, words)  # the signed 16-bit view of each word
+    return words.to(torch.int16).view(torch.bfloat16).reshape(values.shape)
+
+
 def cast_direct(request: PrepareRequest) -> PreparedMethod:
-    """Convert values at the explicit target BF16/FP32/INT32 boundary."""
+    """Convert values at the explicit target BF16/FP32/INT32 boundary (one rounding from binary64)."""
     if not isinstance(get_format(request.target.format), DirectFormat):
         raise ValueError("cast_direct requires a direct target format")
     _preflight(request)
@@ -188,7 +214,10 @@ def cast_direct(request: PrepareRequest) -> PreparedMethod:
                 raise ValueError(
                     "int32 conversion source is outside the representable range"
                 )
-            values = values.to(dtype=dtype)
+            if values.dtype == torch.float64 and dtype == torch.bfloat16:
+                values = bf16_from_float64(values)
+            else:
+                values = values.to(dtype=dtype)
             output.write_values(begin, values)
 
     return request.job(produce=produce)
@@ -270,9 +299,10 @@ def fp8_row_maxabs(request: PrepareRequest) -> PreparedMethod:
 
 def import_encoded(request: PrepareRequest) -> PreparedMethod:
     """Preserve the current FP8/NVFP4 source codes, scales and weight divisor (or a GGUF Q8_0
-    tensor's codes and scales as q8_g32_fp16, the same words)."""
+    tensor's codes and scales as q8_g32_fp16, the same words; or ModelOpt MXFP8 codes and UE8M0
+    group scales as fp8_e4m3fn_g32_e8m0)."""
     if (
-        request.target.format not in ("nvfp4", "fp8_e4m3fn_row_bf16", "q8_g32_fp16")
+        request.target.format not in ("nvfp4", "fp8_e4m3fn_row_bf16", "fp8_e4m3fn_g32_e8m0", "q8_g32_fp16")
         or len(request.target.shape) != 2
     ):
         raise ValueError("import_encoded requires a known encoded matrix target")
@@ -308,11 +338,12 @@ def import_encoded(request: PrepareRequest) -> PreparedMethod:
                         source.input_divisor()
                     )
     n = request.target.shape[0]
-    chunk = (
-        max(128, request.rows_per_chunk // 128 * 128)
-        if request.target.format == "nvfp4"
-        else request.rows_per_chunk
-    )
+    if request.target.format == "nvfp4":
+        chunk = max(128, request.rows_per_chunk // 128 * 128)
+    elif request.target.format == "fp8_e4m3fn_g32_e8m0":
+        chunk = max(16, request.rows_per_chunk // 16 * 16)  # whole 16-row scale tiles
+    else:
+        chunk = request.rows_per_chunk
 
     def produce(output):
         for begin in range(0, n, chunk):

@@ -140,6 +140,8 @@ Schema v21 adds `spec_min_p` (`--spec-min-p`; `null` keeps the default, CSV empt
 Schema v22 adds `draft_tokens_auto` (`--draft-tokens auto`; `draft_tokens` is then the resolved
 ceiling, or the fixed length a Qwen3.5/3.6 configuration without adaptive-mtp runs, with
 `draft_tokens_auto` false). Schema v23 adds `expert_tail_skip` (`--expert-tail-skip`; 0 off).
+Schema v24 adds `expert_a4_activations` (`--expert-a4-activations`, nvidia/Qwen3.8-Flash-Next-FP4-Local's
+optional 4-bit expert activations).
 
 `--ngram-draft-tokens 1..63 --ngram-min-match 4..64` enables the single-request
 [ngram copy proposer](../docs/ngram.md) alongside the selected neural backend.
@@ -157,7 +159,8 @@ corpus prompt and forces the following corpus tokens through the production deco
 constrained step per token, recording each token's log-probability from the round's full
 distribution (`ConstrainedDraw::mass`). Positions pair exactly between builds, which makes it the
 sensitive decode measure of the [acceptance policy](../docs/maintainer/model-quality.md#6-numerical-acceptance-policy-and-fast-paths)
-(`--kv-dtype` takes every KV format: `int8`, `bf16`, `fp8`, `nvfp4`, `k8v4`, `vq2`, `k4v2`):
+(`--kv-dtype` takes every KV format: `int8`, `bf16`, `fp8`, `nvfp4`, `k8v4`, `vq2`, `k4v2`;
+`--expert-a4-activations` runs nvidia/Qwen3.8-Flash-Next-FP4-Local's experts W4A4):
 
 ```bat
 infernix_decode_quality_forced model.ninfer corpus.txt exact.json --segments 256 ^

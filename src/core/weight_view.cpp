@@ -216,6 +216,16 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         out.scale_bytes_per_row = 2;
         out.code_bytes          = out.elements;
         out.scale_offset        = aligned(out.code_bytes, 256);
+    } else if (layout == QuantLayout::G32ScaleRows16) {
+        if (format != QType::FP8_E4M3FN_G32_E8M0 || n % 16 || k % 32) {
+            throw std::invalid_argument("g32_scale_rows16_v1 requires group-scaled FP8 with N%16=0 and K%32=0");
+        }
+        // A 16-row tile's scales are contiguous, so whole tiles of rows own scale_bytes_per_row each.
+        out.group_size          = 32;
+        out.code_bytes_per_row  = k;
+        out.scale_bytes_per_row = k / 32;
+        out.code_bytes          = out.elements;
+        out.scale_offset        = aligned(out.code_bytes, 256);
     } else if (layout == QuantLayout::BlockScaleK16M128x4) {
         if (format != QType::NVFP4 || n % 128 || k % 64) {
             throw std::invalid_argument("NVFP4 BlockScale requires N%128=0 and K%64=0");
@@ -351,7 +361,8 @@ Weight native_weight(const WeightView& view, float input_divisor) {
         throw std::invalid_argument("quantized native Weight requires unchanged parent K");
     }
     const auto planes = weight_row_planes(region);
-    if ((g.layout == QuantLayout::RowScale || g.layout == QuantLayout::BlockScaleK16M128x4) &&
+    if ((g.layout == QuantLayout::RowScale || g.layout == QuantLayout::BlockScaleK16M128x4 ||
+         g.layout == QuantLayout::G32ScaleRows16) &&
         !is_complete_weight(view)) {
         throw std::invalid_argument(
             "this native Weight input requires a complete FP8/NVFP4 parent");
@@ -378,6 +389,16 @@ Weight native_weight(const WeightView& view, float input_divisor) {
         out.scale_nb[1] = out.scale_nb[2] = out.scale_nb[3] = static_cast<std::int64_t>(out.n) * 2;
     } else if (g.layout == QuantLayout::BlockScaleK16M128x4) {
         out.scale_dtype = DType::FP8_E4M3FN;
+    } else if (g.layout == QuantLayout::G32ScaleRows16) {
+        // UE8M0 words: [n / 16][k / 32][16] (the layout's tile order).
+        out.scale_dtype = DType::U8;
+        out.scale_ne[0] = 16;
+        out.scale_ne[1] = out.k / 32;
+        out.scale_ne[2] = out.n / 16;
+        out.scale_nb[0] = 1;
+        out.scale_nb[1] = 16;
+        out.scale_nb[2] = static_cast<std::int64_t>(out.k / 32) * 16;
+        out.scale_nb[3] = out.scale_nb[2] * (out.n / 16);
     }
     return out;
 }

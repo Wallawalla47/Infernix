@@ -73,7 +73,7 @@ def main() -> int:
     parser.add_argument("--routes", type=Path)
     args = parser.parse_args()
     reference = np.load(args.reference)["logits"][args.position]
-    candidate = np.fromfile(args.ninfer, dtype=np.float32)
+    candidate = np.fromfile(args.infernix, dtype=np.float32)
     if candidate.shape != reference.shape:
         raise ValueError(f"shape {candidate.shape} differs from the reference {reference.shape}")
     print(json.dumps(compare(reference, candidate), indent=2))

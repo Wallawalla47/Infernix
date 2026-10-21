@@ -89,12 +89,14 @@ private:
 [[nodiscard]] std::filesystem::path default_ngram_volume(const std::filesystem::path& artifact);
 
 // The table a volume holds for this model, from its header: the artifact's own table when the volume
-// is its own (its format and volume id), else the volume's table, in any of the three formats (the
-// format follows from the row size), which any Qwen3.8-Flash-Next artifact of this geometry accepts
-// in place of its own. Such an FP8 volume needs its per-tensor scale (NgramTableConfig::fp8_scale):
-// the BF16 word after the header's fixed fields, which volumes written since record, or for a volume
-// published before, the scale known for its volume id. Throws std::runtime_error for another
-// geometry, an unknown row size or an FP8 volume whose scale is unknown.
+// is its own (its format and volume id), else the volume's table, in any of the four formats (the
+// header's format tag, or for a volume written before the tag, its row size), which any
+// Qwen3.8-Flash-Next artifact of this geometry accepts in place of its own. Such an FP8 volume needs its
+// per-tensor scale (NgramTableConfig::fp8_scale): the BF16 word after the header's fixed fields, which
+// volumes written since record, or for a volume published before, the scale known for its volume id;
+// an NVFP4 volume its FP32 multiplier (NgramTableConfig::nvfp4_scale), which its header records.
+// Throws std::runtime_error for another geometry, an unknown row size or format, or an FP8 or NVFP4
+// volume whose scale is unknown.
 [[nodiscard]] NgramTableConfig resolve_ngram_volume(const std::filesystem::path& path, const PleConfig& ple);
 
 } // namespace infernix::models::qwen4_exp

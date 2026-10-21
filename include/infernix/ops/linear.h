@@ -136,8 +136,12 @@ enum class LinearRoutes : std::uint8_t {
  *
  * @par Supported execution domain
  * Registered execution uses RowSplit Q4_G64_FP16, Q5_G64_FP16, Q6_G64_FP16, or Q8_G32_FP16 weights
- * with FP16 scales, block-scaled NVFP4 weights, row-scaled FP8_E4M3FN_ROW_BF16 weights, plus
- * registered contiguous BF16 problems. Each format owns a finite registry of exact physical
+ * with FP16 scales, block-scaled NVFP4 weights, row-scaled FP8_E4M3FN_ROW_BF16 weights, group-scaled
+ * FP8_E4M3FN_G32_E8M0 (MXFP8) weights in G32ScaleRows16, plus registered contiguous BF16 problems.
+ * MXFP8 registers Qwen3.8-Flash-Next's `[16384,2560]`, `[13952,2560]`, `[2560,6144]`, `[1280,2560]`
+ * and `[2560,640]` at every positive T, with 16-bit activations under every policy; every route
+ * gives a column the same bits at every T, so A16ColumnInvariant needs nothing more. Each format
+ * owns a finite registry of exact physical
  * weight problems and selects its kernel internally; a valid encoding and alignment do not imply
  * arbitrary N/K support. FP8 currently registers `[N,K]` in `{[14336,5120], [16384,5120],
  * [34816,5120], [248320,5120], [5120,6144], [5120,17408]}` at every positive T. The current NVFP4

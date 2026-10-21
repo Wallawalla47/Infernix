@@ -531,6 +531,8 @@ def build_model(
 class Iq4NlTable:
     """The PLE n-gram table as the volume stores it: the GGUF's IQ4_NL rows (90 B), verbatim."""
 
+    volume_format = "iq4_nl"
+
     def __init__(self, store: GgufStore, rows: int):
         self.store = store
         t = store.tensor(NGRAM_TABLE)

@@ -104,7 +104,10 @@ windows hold different tokens.
 `--fast-path NAME` (repeatable) also runs that fast path whether or not it is qualified for the
 configuration; it exists to measure a candidate. Qwen3.8-Flash-Next artifacts score through the
 same route as generation; `--ngram-volume FILE` names their n-gram volume when it is not
-`<artifact>.ngram`, and `--a16-activations` runs every expert bank W4A16. `tools/quality/fast_path_gate.py` pairs an
+`<artifact>.ngram`, and `--a16-activations` runs every expert bank W4A16.
+`--expert-a4-activations` scores nvidia/Qwen3.8-Flash-Next-FP4-Local with 4-bit expert activations
+([guide](qwen3_8-flash-next.md#nvidia-fp4-local-checkpoint)); `report.json` records it as
+`expert_a4_activations`. `tools/quality/fast_path_gate.py` pairs an
 exact-route run and a fast-path run window by window to decide the
 [numerical acceptance policy](maintainer/model-quality.md#6-numerical-acceptance-policy-and-fast-paths).
 

@@ -18,6 +18,7 @@ from .formats import (
     GGML_FORMATS,
     DirectFormat,
     Fp8BlockFormat,
+    Fp8GroupFormat,
     Fp8RowFormat,
     GgmlFormat,
     Nvfp4Format,
@@ -75,6 +76,22 @@ class BlockScaleGeometry:
 class RowScaleGeometry:
     n: int
     k: int
+    code_plane_bytes: int
+    scale_plane_offset: int
+    scale_plane_bytes: int
+    payload_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class GroupScaleGeometry:
+    """``g32_scale_rows16_v1``: the E4M3FN codes row-major ``[n][k]``, then (256-byte aligned) the
+    UE8M0 group scales in 16-row tiles: the scale of row ``r``, group ``g`` (K elements
+    ``[32 g, 32 g + 32)``) is byte ``(r // 16) * groups * 16 + g * 16 + r % 16``. A tile's scales of one
+    group are one 16-byte run, so a 16-row slice of a K step loads as one aligned vector or TMA box."""
+
+    n: int
+    k: int
+    groups: int  # k / 32 per row
     code_plane_bytes: int
     scale_plane_offset: int
     scale_plane_bytes: int
@@ -169,6 +186,11 @@ ROW_SCALE_V1 = Layout(
     256,
     frozenset(("fp8_e4m3fn_row_bf16",)),
 )
+G32_SCALE_ROWS16_V1 = Layout(
+    "g32_scale_rows16_v1",
+    256,
+    frozenset(("fp8_e4m3fn_g32_e8m0",)),
+)
 
 NVFP4_EXPERT_RG16_V1 = Layout(
     "nvfp4_expert_rg16_v1",
@@ -201,6 +223,7 @@ LAYOUTS = MappingProxyType(
             ROW_SPLIT_K128_V1,
             BLOCK_SCALE_K16_M128X4_V1,
             ROW_SCALE_V1,
+            G32_SCALE_ROWS16_V1,
             NVFP4_EXPERT_RG16_V1,
             GGML_ROWS_V1,
             GGML_TILES16_V1,
@@ -354,6 +377,29 @@ def row_scale_geometry(
     )
 
 
+def group_scale_geometry(
+    format: str | Fp8GroupFormat, shape: Sequence[int]
+) -> GroupScaleGeometry:
+    spec = _format(format)
+    if not isinstance(spec, Fp8GroupFormat):
+        raise ValueError("g32_scale_rows16_v1 requires a group-scaled FP8 format")
+    n, k = _shape(shape, rank=2)
+    if n % 16 or k % spec.group:
+        raise ValueError(f"g32_scale_rows16_v1 needs 16-row tiles and whole {spec.group}-element groups")
+    code_plane_bytes = n * k
+    scale_plane_offset = align_up(code_plane_bytes, PLANE_ALIGNMENT)
+    scale_plane_bytes = n * (k // spec.group)
+    return GroupScaleGeometry(
+        n=n,
+        k=k,
+        groups=k // spec.group,
+        code_plane_bytes=code_plane_bytes,
+        scale_plane_offset=scale_plane_offset,
+        scale_plane_bytes=scale_plane_bytes,
+        payload_bytes=scale_plane_offset + scale_plane_bytes,
+    )
+
+
 def expert_bank_geometry(
     format: str | Nvfp4MulFormat, shape: Sequence[int]
 ) -> ExpertBankGeometry:
@@ -489,6 +535,8 @@ def encoded_size(
         if not isinstance(numeric_spec, Fp8RowFormat):
             raise ValueError("row_scale_v1 requires a row-scaled FP8 format")
         return row_scale_geometry(numeric_spec, shape).payload_bytes
+    if layout_spec is G32_SCALE_ROWS16_V1:
+        return group_scale_geometry(numeric_spec, shape).payload_bytes
     if layout_spec is NVFP4_EXPERT_RG16_V1:
         return expert_bank_geometry(numeric_spec, shape).payload_bytes
     if layout_spec is GGML_ROWS_V1:

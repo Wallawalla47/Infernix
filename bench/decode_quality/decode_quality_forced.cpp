@@ -19,7 +19,8 @@
 // single-column round per token), dflash2 (DFlash2, 7 drafts, the optimized proposal head), ngram
 // (DFlash2 with n-gram drafting) or mtp (MTP, 4 drafts). Fast paths run as in infernix-serve;
 // --disable-fast-paths runs the exact route and --fast-path NAME also runs that fast path
-// whether or not it is qualified (qualification).
+// whether or not it is qualified (qualification). --expert-a4-activations runs
+// nvidia/Qwen3.8-Flash-Next-FP4-Local's routed experts with 4-bit activations (not the reference).
 //
 // The same segments also measure request invariance: their log-probabilities are printed exactly,
 // so `fast_path_gate identical` compares two runs bit for bit. --concurrency N keeps N segments in
@@ -33,7 +34,7 @@
 // Usage: infernix_decode_quality_forced <artifact> <corpus.txt> <out.json> [--segments N]
 //          [--prompts L1,L2,...] [--forced N] [--reference | --observe REFERENCE.json]
 //          [--mode plain|dflash2|ngram|mtp|mtp-ngram] [--kv-dtype int8|bf16|fp8|nvfp4]
-//          [--disable-fast-paths] [--fast-path NAME]...
+//          [--disable-fast-paths] [--fast-path NAME]... [--expert-a4-activations]
 //          [--concurrency 1..8] [--prefill-chunk N] [--prefix-reuse [--warm-tokens N]]
 //          [--ngram-volume FILE] (Qwen3.8-Flash-Next; default <artifact>.ngram)
 
@@ -82,6 +83,7 @@ struct Options {
     bool reference              = false;
     std::string observe;
     std::string ngram_volume;
+    bool expert_a4_activations = false;
 };
 
 std::uint32_t parse_u32(std::string_view text, const char* label) {
@@ -136,6 +138,8 @@ Options parse(int argc, char** argv) {
             out.observe = value();
         } else if (option == "--disable-fast-paths") {
             out.fast_paths = false;
+        } else if (option == "--expert-a4-activations") {
+            out.expert_a4_activations = true;
         } else if (option == "--fast-path") {
             const std::string_view name = value();
             const std::optional<infernix::FastPath> path = infernix::parse_fast_path(name);
@@ -155,6 +159,9 @@ Options parse(int argc, char** argv) {
     }
     if (out.reference && !out.observe.empty()) {
         throw std::invalid_argument("--reference and --observe exclude each other");
+    }
+    if (out.reference && out.expert_a4_activations) {
+        throw std::invalid_argument("--reference scores with 16-bit activations; drop --expert-a4-activations");
     }
     return out;
 }
@@ -354,8 +361,9 @@ int main(int argc, char** argv) {
         engine_options.kv_cache        = kv_storage(options.kv);
         engine_options.max_concurrency = options.concurrency;
         engine_options.prefill_chunk   = options.prefill_chunk;
-        engine_options.fast_paths           = options.fast_paths;
-        engine_options.fast_path_candidates = options.candidates;
+        engine_options.fast_paths            = options.fast_paths;
+        engine_options.fast_path_candidates  = options.candidates;
+        engine_options.expert_a4_activations = options.expert_a4_activations;
         if (!options.ngram_volume.empty()) { engine_options.ngram_volume_path = options.ngram_volume; }
         if (!options.prefix_reuse) {
             engine_options.context_cache.enabled             = false;
@@ -392,7 +400,8 @@ int main(int argc, char** argv) {
         out << "{\"artifact\": ";
         write_string(out, artifact_path(options.artifact));
         out << ", \"mode\":\"" << options.mode << "\", \"kv_dtype\": \"" << options.kv
-            << "\", \"fast_paths\": [";
+            << "\", \"expert_a4_activations\": " << (options.expert_a4_activations ? "true" : "false")
+            << ", \"fast_paths\": [";
         const infernix::LoadSummary load = engine.load_summary();
         for (std::size_t i = 0; i < load.fast_paths.size(); ++i) {
             out << (i ? ", " : "") << '"' << load.fast_paths[i] << '"';

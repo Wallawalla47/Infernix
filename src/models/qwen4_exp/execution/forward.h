@@ -162,7 +162,8 @@ struct ForwardBatch {
                              // pooled-block token (ops::QsaBatch::block_start_rope)
     Tensor ngram_rows; // U8 [row bytes, heads, T]: each column's n-gram rows
     // The rows' format when it is not the artifact's table's (another volume, resolve_ngram_volume),
-    // and an FP8 volume's scale (BF16 [1]) when it is not the artifact's ngram_scale.
+    // and an FP8 volume's scale (BF16 [1]) or an NVFP4 volume's multiplier (FP32 [1]) when it is not
+    // the artifact's ngram_scale.
     std::optional<NgramRowFormat> ngram_format;
     Tensor ngram_scale;
     const NgramRowGate* ngram_gate = nullptr; // when set: ngram_rows are written by the gate

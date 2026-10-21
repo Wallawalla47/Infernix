@@ -218,9 +218,11 @@ int run_q8() {
     return failures;
 }
 
-// Qwen3.8-Flash-Next's [16384,2560] parent: the oracle criterion, and the exact bits of the rows of
-// linear's packed [16384,T] result, which the model used before it wrote the split itself.
-int run_q8_flash_next_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearRoutes routes) {
+// Qwen3.8-Flash-Next's [16384,2560] parent (Q8, or FP4-Local's MXFP8): the oracle criterion, and the
+// exact bits of the rows of linear's packed [16384,T] result, which the model used before it wrote
+// the split itself.
+int run_flash_next_parent_case(DevicePackedWeight& parent, const char* format, std::int32_t tokens,
+                               ops::LinearRoutes routes) {
     constexpr std::int32_t kHidden  = 2560;
     constexpr std::int32_t kQkvRows = 10240;
     constexpr std::int32_t kZRows   = 6144;
@@ -240,7 +242,7 @@ int run_q8_flash_next_case(DevicePackedWeight& parent, std::int32_t tokens, ops:
     ops::linear(x, parent.view(), packed_output, ops::LinearPolicy::A16Only, workspace, nullptr, routes);
     cuda_synchronize();
 
-    const std::string suffix = " Q8 [16384,2560] T=" + std::to_string(tokens) +
+    const std::string suffix = std::string(" ") + format + " [16384,2560] T=" + std::to_string(tokens) +
                                (routes == ops::LinearRoutes::Q8SlicedK ? " fast" : "");
     int failures             = qkv.verify_guards("gdn qkv" + suffix);
     failures += z.verify_guards("gdn z" + suffix);
@@ -278,11 +280,23 @@ int run_q8_flash_next() {
     // Each route of the shape and its neighbours: register-streamed to 4 and to 8 columns, then the
     // 32x64, 32x96 and 64x128 MMA tiles.
     for (const std::int32_t tokens : {1, 2, 4, 5, 8, 9, 64, 65, 96, 97, 300}) {
-        failures += run_q8_flash_next_case(parent, tokens, ops::LinearRoutes::Exact);
+        failures += run_flash_next_parent_case(parent, "Q8", tokens, ops::LinearRoutes::Exact);
     }
     // The q8-sliced-k fast routes: GEMV, sliced-K to 8, grouped sliced-K, sliced-K to 40, the MMA tiles.
     for (const std::int32_t tokens : {1, 2, 8, 9, 16, 17, 40, 41, 64, 65, 128, 129, 300, 513}) {
-        failures += run_q8_flash_next_case(parent, tokens, ops::LinearRoutes::Q8SlicedK);
+        failures += run_flash_next_parent_case(parent, "Q8", tokens, ops::LinearRoutes::Q8SlicedK);
+    }
+    return failures;
+}
+
+int run_mxfp8_flash_next() {
+    DevicePackedWeight parent(
+        quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_G32_E8M0, 16384, 2560, 511U));
+    int failures = 0;
+    // Each schedule of the shape and its neighbours: the 16-token tiles (128 and 64 rows), then the 32-,
+    // 64- and wider tiles.
+    for (const std::int32_t tokens : {1, 2, 8, 9, 10, 16, 17, 32, 33, 64, 65, 128, 129, 256, 257, 300, 513}) {
+        failures += run_flash_next_parent_case(parent, "MXFP8", tokens, ops::LinearRoutes::Exact);
     }
     return failures;
 }
@@ -844,6 +858,7 @@ int main() {
     failures += run_q4_q5();
     failures += run_q8();
     failures += run_q8_flash_next();
+    failures += run_mxfp8_flash_next();
     failures += run_q8_flash_next_conv_snapshot();
     failures += run_nvfp4();
     failures += run_fp8();

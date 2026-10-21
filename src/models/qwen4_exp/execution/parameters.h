@@ -70,7 +70,7 @@ struct PleParameters {
     LinearParameters projection; // [key (S*H) | value (H), embed]
     Tensor key_norm, query_norm, conv_norm; // BF16 [S*H]
     Tensor convolution;                     // BF16 [S*H, K]
-    Tensor ngram_scale;                     // BF16 [1] (FP8 tables; empty for an IQ4_NL table)
+    Tensor ngram_scale; // BF16 [1] (FP8 tables) or FP32 [1] (NVFP4); empty for IQ4_NL and BF16 tables
 };
 
 // The MTP drafter (design §11.2).

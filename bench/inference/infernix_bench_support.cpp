@@ -368,7 +368,7 @@ std::string usage_text(std::string_view program) {
         << "  --weights <path>            required .ninfer artifact\n"
         << "  --corpus <path>             token-id corpus (default: " << kDefaultCorpusPath << ")\n"
         << "  --ngram-volume <path>       Qwen3.8-Flash-Next n-gram volume: the artifact's, or any FP8,\n"
-        << "                              IQ4_NL or BF16 volume of the table (default: <weights>.ngram)\n"
+        << "                              IQ4_NL, BF16 or NVFP4 volume of the table (default: <weights>.ngram)\n"
         << "  --ngram-residency <mode>    Qwen3.8-Flash-Next n-gram table: auto, ram (all of it in pinned\n"
         << "                              RAM) or volume (rows read on demand) (default: auto)\n"
         << "  --expert-stripe <path>      Qwen3.8-Flash-Next expert stripe: the SSD tier reads each record's\n"
@@ -385,7 +385,10 @@ std::string usage_text(std::string_view program) {
         << "  --expert-tail-skip <1..9>   Qwen3.8-Flash-Next: skip a VRAM-missing expert every token of a decode\n"
         << "                              round routes at top-10 rank R or lower (faster, lower quality; changes\n"
         << "                              the output; default off, Strata's default 7)\n"
-        << "  --concurrency <1..8>       simultaneous requests per repetition (default: 1)\n"
+        << "  --expert-a4-activations     nvidia/Qwen3.8-Flash-Next-FP4-Local only: routed experts with 4-bit\n"
+        << "                              (NVFP4) activations, using the activation scales NVIDIA calibrated\n"
+        << "                              for them (changes the output; default: 16-bit, as NVIDIA serves it)\n"
+        << "  --concurrency <1..8>     simultaneous requests per repetition (default: 1)\n"
         << "  --grammar-file <path>      constrain output with GBNF\n"
         << "  --json-object              constrain output to a JSON object\n"
         << "  --json-schema-file <path>  constrain output with JSON Schema\n"
@@ -491,6 +494,8 @@ BenchOptions parse_args(int argc, char** argv) {
             options.vram_past_budget = true;
         } else if (arg == "--expert-tail-skip") {
             options.expert_tail_skip = parse_u32(value("--expert-tail-skip"), "expert-tail-skip");
+        } else if (arg == "--expert-a4-activations") {
+            options.expert_a4_activations = true;
         } else if (arg == "--expert-ram-mib") {
             const std::string text = value("--expert-ram-mib");
             if (text == "auto") {
@@ -883,6 +888,7 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << " original_nvfp4_prefill_kernel=" << (env.original_nvfp4_prefill_kernel ? "on" : "off")
         << " fast_paths=" << fast_path_list(env)
         << " expert_tail_skip=" << env.expert_tail_skip
+        << " expert_a4_activations=" << (env.expert_a4_activations ? "on" : "off")
         << " ngram_volume=" << (env.ngram_volume_path.empty() ? "default" : env.ngram_volume_path)
         << " ngram_residency=" << ngram_residency_name(env.ngram_residency)
         << " expert_stripe=" << (env.expert_stripe_path.empty() ? "none" : env.expert_stripe_path)
@@ -1032,6 +1038,7 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << (env.original_nvfp4_prefill_kernel ? "true" : "false") << ",\n"
         << "    \"fast_paths\": \"" << fast_path_list(env) << "\",\n"
         << "    \"expert_tail_skip\": " << env.expert_tail_skip << ",\n"
+        << "    \"expert_a4_activations\": " << (env.expert_a4_activations ? "true" : "false") << ",\n"
         << "    \"ngram_volume\": \"" << json_escape(env.ngram_volume_path) << "\",\n"
         << "    \"ngram_residency\": \"" << ngram_residency_name(env.ngram_residency) << "\",\n"
         << "    \"expert_stripe\": \"" << json_escape(env.expert_stripe_path) << "\",\n"

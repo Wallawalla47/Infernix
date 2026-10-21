@@ -317,4 +317,10 @@ struct Fp8IdentityRows {
 
     __device__ __forceinline__ int weight_row(int begin, int row, int) const { return begin + row; }
 };
+
+// Identity rows whose weights carry their own scales (MXFP8 applies its group scales in the
+// mainloop): the epilogue reads no row scales.
+struct Fp8UnscaledRows : Fp8IdentityRows {
+    static constexpr bool kUnscaled = true;
+};
 } // namespace infernix::ops::detail

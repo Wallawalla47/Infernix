@@ -164,6 +164,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         const auto name = [](models::qwen4_exp::NgramRowFormat format) {
             return format == models::qwen4_exp::NgramRowFormat::Bf16    ? std::string("BF16")
                    : format == models::qwen4_exp::NgramRowFormat::Iq4Nl ? std::string("IQ4_NL")
+                   : format == models::qwen4_exp::NgramRowFormat::Nvfp4 ? std::string("NVFP4")
                                                                         : std::string("FP8");
         };
         report(options, DiagnosticLevel::Info,
@@ -432,7 +433,8 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     LoadSummary::PrefixCacheRestore restore;
     if (const std::filesystem::path& file = options.context_cache.hybrid.persistent_file;
         options.context_cache.enabled && !file.empty()) {
-        // Saved states depend on the n-gram rows: another volume's differ from the artifact's table.
+        // Saved states depend on the n-gram rows (another volume's differ from the artifact's table)
+        // and on the routed experts' activation precision (--expert-a4-activations).
         std::string signature = "qwen4_exp;ngram=" + std::to_string(static_cast<int>(table.format)) + ":";
         for (const std::uint8_t byte : table.volume_id) {
             constexpr char kHex[] = "0123456789abcdef";
@@ -440,6 +442,8 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
             signature += kHex[byte & 15U];
         }
         if (table.fp8_scale) { signature += ";scale=" + std::to_string(*table.fp8_scale); }
+        if (table.nvfp4_scale) { signature += ";multiplier=" + std::to_string(*table.nvfp4_scale); }
+        signature += instance->model->config().text.moe.a16_experts ? ";experts=a16" : ";experts=a4";
         // A DFlash2 drafter's ring rides in every snapshot: it belongs to that companion artifact.
         if (const auto& draft = instance->model->info().draft_artifact_id) {
             signature += ";draft=";
