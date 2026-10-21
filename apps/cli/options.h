@@ -49,8 +49,10 @@ struct Options {
     bool original_int8_prefill_kernel = false;
     std::uint32_t prefill_split_workspace_mib = kDefaultPrefillSplitWorkspaceMiB;
     bool original_nvfp4_prefill_kernel = false;
-    // Off with --reproducible (EngineOptions::fast_paths).
+    // Off with --reproducible or --lossless (EngineOptions::fast_paths).
     bool fast_paths = true;
+    // --lossless (EngineOptions::lossless).
+    bool lossless = false;
     // --fast-path NAME (repeatable): also run these, qualified or not (qualification runs;
     // EngineOptions::fast_path_candidates).
     std::vector<FastPath> fast_path_candidates;

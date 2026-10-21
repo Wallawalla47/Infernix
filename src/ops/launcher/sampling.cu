@@ -26,6 +26,13 @@ void sample_batch_launch(const Tensor& logits, Tensor& out, std::int32_t token_d
     const std::int32_t physical_rows     = logits.ne[0];
     const std::int32_t batch             = logits.ne[1];
     const auto* positions                = static_cast<const std::int32_t*>(logical_positions.data);
+    if (logits.dtype == DType::FP32) {
+        sample_row_kernel<<<static_cast<unsigned int>(batch), kSamplerBlock, 0, stream>>>(
+            static_cast<const float*>(logits.data), static_cast<std::int32_t*>(out.data), configs, positions,
+            purpose, token_domain, physical_rows);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     const SamplingWorkspaceLayout layout = make_sampling_workspace_layout(token_domain, batch);
     if (!layout.multiblock) {
         sample_row_kernel<<<static_cast<unsigned int>(batch), kSamplerBlock, 0, stream>>>(

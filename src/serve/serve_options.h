@@ -63,7 +63,8 @@ struct ServeOptions {
     bool original_int8_prefill_kernel  = false;
     std::uint32_t prefill_split_workspace_mib = kDefaultPrefillSplitWorkspaceMiB;
     bool original_nvfp4_prefill_kernel = false;
-    bool fast_paths                    = true; // off with --reproducible (EngineOptions)
+    bool fast_paths                    = true; // off with --reproducible or --lossless (EngineOptions)
+    bool lossless                      = false; // --lossless (EngineOptions)
     // --fast-path NAME (repeatable): also run these, qualified or not (qualification and timing
     // runs; EngineOptions::fast_path_candidates).
     std::vector<FastPath> fast_path_candidates;

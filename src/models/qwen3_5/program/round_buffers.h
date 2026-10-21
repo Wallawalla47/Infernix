@@ -31,6 +31,8 @@ struct RoundStateSpec {
     std::uint32_t draft_window   = 0;
     SpeculativeBackend backend   = SpeculativeBackend::None;
     bool causal_scoring          = false;
+    // The lossless route: the step and ordinary decode logits are FP32.
+    bool fp32_logits             = false;
 };
 
 struct PrefillRoundHost {

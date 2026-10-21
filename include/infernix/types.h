@@ -567,8 +567,9 @@ struct EngineOptions {
     // reference on Qwen3.5/3.6/3.8 (Qwen3_5ForCausalLM and Qwen3_5MoeForCausalLM): the model's
     // Hugging Face forward operation by operation, each correctly rounded to the dtype it has
     // there (weights decoded exactly, sums exact, transcendental functions correctly rounded), so
-    // every output is a function of the request and the artifact alone. A CausalScoring Engine,
-    // one pass per window (prefill_chunk covering max_context), no fast path; FP32 logits.
+    // every output is a function of the request and the artifact alone; FP32 logits, no fast path.
+    // CausalScoring scores each window in one pass (prefill_chunk covering max_context); Generation
+    // (Qwen3.5/3.6/3.8) takes text requests with bf16 KV (V stored as BF16) and no speculation, eagerly.
     bool lossless                      = false;
     // Qwen3.8-Flash-Next artifacts whose routed experts offer 4-bit activations as an option (only
     // nvidia/Qwen3.8-Flash-Next-FP4-Local, whose experts NVIDIA calibrated for them): run the routed

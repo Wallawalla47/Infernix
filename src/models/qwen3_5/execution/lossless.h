@@ -2,10 +2,12 @@
 
 // The --lossless route's Qwen3.5 text forward (docs/maintainer/lossless-route.md §2): Hugging Face's
 // decoder operation by operation, each correctly rounded, over one causal-scoring window in one pass
-// (attention over the window's own keys, GDN and convolution from zero state).
+// (attention over the window's own keys, GDN and convolution from zero state) or, for generation, over
+// a call's columns continuing their sequences through the KV cache and the recurrent state slots.
 
 #include "core/arena.h"
 #include "core/layout.h"
+#include "core/paged_kv_cache.h"
 #include "core/tensor.h"
 #include "models/qwen3_5/config.h"
 #include "models/qwen3_5/execution/parameters.h"
@@ -23,11 +25,32 @@ Tensor lossless_rope_window(const TextConfig& config, const Tensor& positions, W
                             cudaStream_t stream);
 [[nodiscard]] std::size_t lossless_rope_window_bytes(const TextConfig& config, std::int32_t tokens);
 
-// One decoder layer over the window's residual x (BF16 [H, T]), in place.
+// The cache form of a call (generation): its columns are `sequences` equal runs, each continuing its
+// sequence. Attention stores a run's keys and values in the paged cache (the lossless bf16 profile) and
+// reads the sequence's keys 0..position from it; the convolution and GDN continue from the run's source
+// slot and leave their state in its destination slot. The window form (no cache) scores one window from
+// zero state over its own keys.
+struct LosslessCache {
+    const Tensor* positions         = nullptr; // I32 [T]: each column's position
+    const Tensor* table_rows        = nullptr; // I32 [B]: each run's block table row
+    const Tensor* source_slots      = nullptr; // I32 [B]
+    const Tensor* destination_slots = nullptr; // I32 [B]
+    std::int32_t sequences          = 1;
+    std::int32_t max_keys           = 0;       // bounds every position + 1
+    std::int32_t key_capacity       = 0;       // the cache's context
+    PagedKVBatchLayerView kv;                  // the layer's cache (attention layers)
+    Tensor conv_states;                        // the layer's BF16 [C, K - 1, slots] (GDN layers)
+    Tensor recurrent_states;                   // the layer's FP32 [128, 128, Hv, slots] (GDN layers)
+};
+
+// One decoder layer over the call's residual x (BF16 [H, T]), in place; cache null: the window form.
 void lossless_layer(const BlockParameters& block, const TextConfig& config, MixerKind kind, const Tensor& rope_table,
-                    Tensor& x, WorkspaceArena& workspace, cudaStream_t stream);
+                    Tensor& x, WorkspaceArena& workspace, cudaStream_t stream, const LosslessCache* cache = nullptr);
+// Its workspace; for the cache form `cache` gives sequences and key_capacity (tokens / sequences the run
+// width).
 [[nodiscard]] std::size_t lossless_layer_workspace_bytes(const BlockParameters& block, const TextConfig& config,
-                                                         MixerKind kind, std::int32_t tokens);
+                                                         MixerKind kind, std::int32_t tokens,
+                                                         const LosslessCache* cache = nullptr);
 
 // The final norm (Qwen3_5RMSNorm) into out (BF16 [H, T]).
 void lossless_final_norm(const Tensor& x, const Tensor& weight, const TextConfig& config, Tensor& out,

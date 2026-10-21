@@ -160,8 +160,10 @@ std::string hybrid_cache_fingerprint(const EngineOptions& options, const std::st
     out += ";chunk=" + std::to_string(options.prefill_chunk);
     out += ";host_state=" +
            std::to_string(static_cast<int>(options.context_cache.hybrid.host_state_precision));
-    // Fast paths change the numbers cached KV and state hold.
+    // Fast paths change the numbers cached KV and state hold; the lossless route keeps its own (V as
+    // BF16, its state layout).
     out += ";fast=" + std::to_string(options.fast_paths ? 1 : 0);
+    out += ";lossless=" + std::to_string(options.lossless ? 1 : 0);
     for (const FastPath path : options.fast_path_candidates) { out += std::string(",") + fast_path_name(path); }
     out += ";build=" + options.context_cache.hybrid.persistent_identity;
     return out;
@@ -267,7 +269,7 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
         // route's output would depend on load (model-quality 6.1).
         if (!options.fast_paths && hybrid.host_state_precision != HybridHostStatePrecision::Fp32) {
             throw std::invalid_argument(
-                "--cache-host-state fp24 and bf16 are lossy; --reproducible requires fp32");
+                "--cache-host-state fp24 and bf16 are lossy; --reproducible and --lossless require fp32");
         }
         if (qwen4_exp) {
             // Qwen3.8-Flash-Next's snapshots are born in the Host tier (design §19.3.1): it needs

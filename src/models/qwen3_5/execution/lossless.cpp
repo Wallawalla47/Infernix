@@ -54,7 +54,7 @@ void grouped(A& a, const Tensor& x, const Weight& w, const Tensor& tiles, std::i
 
 template <class A>
 void attention_layer(A& a, const BlockParameters& block, const TextConfig& config, const Tensor& rope_table,
-                     Tensor& x, cudaStream_t s) {
+                     Tensor& x, cudaStream_t s, const LosslessCache* cache) {
     const auto& p    = std::get<AttentionParameters>(block.mixer);
     const auto& att  = *config.attention;
     const auto H     = dimension(config.hidden_size);
@@ -83,14 +83,23 @@ void attention_layer(A& a, const BlockParameters& block, const TextConfig& confi
     }
     Tensor q3 = q.view({D, heads, T}), k3 = k.view({D, kv_heads, T}), v3 = v.view({D, kv_heads, T});
     Tensor o = alloc(a, DType::BF16, {D, heads, T});
-    const DeviceSpan ws = a.alloc_bytes(ops::lossless_attention_workspace_bytes(heads, T));
+    const DeviceSpan ws = a.alloc_bytes(
+        cache != nullptr ? ops::lossless_paged_attention_workspace_bytes(heads, kv_heads, T / cache->sequences,
+                                                                        cache->sequences, cache->key_capacity)
+                         : ops::lossless_attention_workspace_bytes(heads, kv_heads, T));
     if constexpr (kRuns<A>) {
         Tensor qr = q.view({D, heads * T}), kr = k.view({D, kv_heads * T});
         ops::lossless_rmsnorm(qr, p.query_norm, config.rms_norm_eps, qr, s);
         ops::lossless_rmsnorm(kr, p.key_norm, config.rms_norm_eps, kr, s);
         ops::lossless_rope_apply(rope_table, q3, s);
         ops::lossless_rope_apply(rope_table, k3, s);
-        ops::lossless_attention(q3, k3, v3, o, ws.data, s);
+        if (cache != nullptr) {
+            ops::lossless_kv_append(k3, v3, *cache->positions, cache->sequences, *cache->table_rows, cache->kv, s);
+            ops::lossless_paged_attention(q3, *cache->positions, cache->sequences, *cache->table_rows, cache->kv,
+                                          cache->max_keys, cache->key_capacity, o, ws.data, s);
+        } else {
+            ops::lossless_attention(q3, k3, v3, o, ws.data, s);
+        }
         Tensor flat = o.view({Q, T});
         ops::lossless_sigmoid_mul(flat, gate, flat, s);
     }
@@ -101,7 +110,8 @@ void attention_layer(A& a, const BlockParameters& block, const TextConfig& confi
 }
 
 template <class A>
-void gdn_layer(A& a, const BlockParameters& block, const TextConfig& config, Tensor& x, cudaStream_t s) {
+void gdn_layer(A& a, const BlockParameters& block, const TextConfig& config, Tensor& x, cudaStream_t s,
+               const LosslessCache* cache) {
     const auto& p   = std::get<GdnParameters>(block.mixer);
     const auto& gdn = *config.gdn;
     const auto H    = dimension(config.hidden_size);
@@ -141,9 +151,17 @@ void gdn_layer(A& a, const BlockParameters& block, const TextConfig& config, Ten
     Tensor o = alloc(a, DType::BF16, {VW, T}), on = alloc(a, DType::BF16, {VW, T});
     if constexpr (kRuns<A>) {
         ops::lossless_gdn_gates(av, bv, p.a_log, p.dt_bias, g, beta, s);
-        ops::lossless_causal_conv(mixed, p.convolution, c, s);
         const Tensor qc = c.slice(0, 0, KW), kc = c.slice(0, KW, KW), vc = c.slice(0, 2 * KW, VW);
-        ops::lossless_gated_delta_rule(qc, kc, vc, g, beta, nullptr, o, s);
+        if (cache != nullptr) {
+            Tensor conv = cache->conv_states, recurrent = cache->recurrent_states;
+            ops::lossless_causal_conv_slots(mixed, p.convolution, cache->sequences, conv, *cache->source_slots,
+                                            *cache->destination_slots, c, s);
+            ops::lossless_gated_delta_rule_slots(qc, kc, vc, g, beta, cache->sequences, recurrent,
+                                                 *cache->source_slots, *cache->destination_slots, o, s);
+        } else {
+            ops::lossless_causal_conv(mixed, p.convolution, c, s);
+            ops::lossless_gated_delta_rule(qc, kc, vc, g, beta, nullptr, o, s);
+        }
         Tensor o2 = o.view({dv, Hv * T}), z2 = z.view({dv, Hv * T}), on2 = on.view({dv, Hv * T});
         ops::lossless_rmsnorm_gated(o2, z2, p.norm, config.rms_norm_eps, on2, s);
     }
@@ -224,11 +242,11 @@ void sparse_moe(A& a, const ops::SparseMoeWeights& p, const MoeConfig& moe, cons
 
 template <class A>
 void layer(A& a, const BlockParameters& block, const TextConfig& config, MixerKind kind, const Tensor& rope_table,
-           Tensor& x, cudaStream_t s) {
+           Tensor& x, cudaStream_t s, const LosslessCache* cache) {
     if (kind == MixerKind::FullAttention) {
-        attention_layer(a, block, config, rope_table, x, s);
+        attention_layer(a, block, config, rope_table, x, s, cache);
     } else {
-        gdn_layer(a, block, config, x, s);
+        gdn_layer(a, block, config, x, s, cache);
     }
     auto scope = a.scope();
     Tensor h = alloc(a, DType::BF16, {x.ne[0], x.ne[1]});
@@ -265,15 +283,15 @@ std::size_t lossless_rope_window_bytes(const TextConfig& config, std::int32_t to
 }
 
 void lossless_layer(const BlockParameters& block, const TextConfig& config, MixerKind kind, const Tensor& rope_table,
-                    Tensor& x, WorkspaceArena& workspace, cudaStream_t stream) {
-    layer(workspace, block, config, kind, rope_table, x, stream);
+                    Tensor& x, WorkspaceArena& workspace, cudaStream_t stream, const LosslessCache* cache) {
+    layer(workspace, block, config, kind, rope_table, x, stream, cache);
 }
 
 std::size_t lossless_layer_workspace_bytes(const BlockParameters& block, const TextConfig& config, MixerKind kind,
-                                           std::int32_t tokens) {
+                                           std::int32_t tokens, const LosslessCache* cache) {
     WorkspaceLayoutBuilder layout;
     Tensor x(nullptr, DType::BF16, {dimension(config.hidden_size), tokens});
-    layer(layout, block, config, kind, Tensor{}, x, nullptr);
+    layer(layout, block, config, kind, Tensor{}, x, nullptr, cache);
     return layout.peak_bytes(1);
 }
 

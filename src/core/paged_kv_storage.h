@@ -125,4 +125,12 @@ struct PagedKVStorageLayout {
     throw std::invalid_argument("unsupported paged KV-cache storage geometry");
 }
 
+// The bf16 storage of the lossless route (docs/maintainer/lossless-route.md): K and V both BF16, stored
+// bit for bit (paged_kv_storage_layout's bf16 stores V as FP16). Only the lossless Ops read it.
+[[nodiscard]] inline PagedKVStorageLayout paged_kv_lossless_storage_layout(std::int32_t head_dim) {
+    PagedKVStorageLayout layout = paged_kv_storage_layout(KvCacheStorage::BFloat16, head_dim);
+    layout.value.data_dtype     = DType::BF16;
+    return layout;
+}
+
 } // namespace infernix

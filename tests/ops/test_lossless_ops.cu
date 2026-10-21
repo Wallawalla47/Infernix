@@ -55,7 +55,7 @@ const char* kNames[] = {"rmsnorm",       "rmsnorm_gated", "add",          "silu_
                          "moe_route",     "rmsnorm_grouped", "rmsnorm_gated_sigmoid", "hc_gates",
                          "hc_mix",        "hc_inject",     "ple_gate",     "ple_conv",
                          "qsa_pool",      "qsa_select",    "attention_select", "router_bf16",
-                         "moe_combine_entries"};
+                         "moe_combine_entries", "conv_slots", "delta_rule_slots", "attention_paged"};
 
 } // namespace
 
@@ -147,7 +147,7 @@ int main(int argc, char** argv) {
             const int heads = static_cast<int>(dims[0]), kv_heads = static_cast<int>(dims[1]), cols = static_cast<int>(dims[2]);
             DeviceBuffer q = upload16(inputs[0]), k = upload16(inputs[1]), v = upload16(inputs[2]);
             DeviceBuffer out(static_cast<std::size_t>(256) * heads * cols * 2);
-            DeviceBuffer ws(ops::lossless_attention_workspace_bytes(heads, cols));
+            DeviceBuffer ws(ops::lossless_attention_workspace_bytes(heads, kv_heads, cols));
             Tensor tq(q.p, DType::BF16, {256, heads, cols}), tk(k.p, DType::BF16, {256, kv_heads, cols});
             Tensor tv(v.p, DType::BF16, {256, kv_heads, cols}), tout(out.p, DType::BF16, {256, heads, cols});
             ops::lossless_attention(tq, tk, tv, tout, ws.p, nullptr);
@@ -362,7 +362,7 @@ int main(int argc, char** argv) {
                       ratio = static_cast<int>(dims[3]);
             DeviceBuffer q = upload16(inputs[0]), k = upload16(inputs[1]), v = upload16(inputs[2]), sel = upload32(inputs[3]);
             DeviceBuffer out(static_cast<std::size_t>(256) * heads * cols * 2);
-            DeviceBuffer ws(ops::lossless_attention_workspace_bytes(heads, cols));
+            DeviceBuffer ws(ops::lossless_attention_workspace_bytes(heads, kv_heads, cols));
             Tensor tq(q.p, DType::BF16, {256, heads, cols}), tk(k.p, DType::BF16, {256, kv_heads, cols});
             Tensor tv(v.p, DType::BF16, {256, kv_heads, cols}), tout(out.p, DType::BF16, {256, heads, cols});
             ops::lossless_attention(tq, tk, tv, tout, ws.p, nullptr, static_cast<const std::uint32_t*>(sel.p), 1, ratio);
@@ -393,6 +393,99 @@ int main(int argc, char** argv) {
             ops::lossless_moe_combine(teo, tw, tids, Tensor{}, &tso, &tsl, 0, tout, nullptr, /*add=*/false);
             CUDA_CHECK(cudaDeviceSynchronize());
             got = download16(out, static_cast<std::size_t>(width) * cols);
+            break;
+        }
+        case 25: {
+            const int channels = static_cast<int>(dims[0]), width = static_cast<int>(dims[1]),
+                      seqs = static_cast<int>(dims[2]), taps = static_cast<int>(dims[3]), slots = static_cast<int>(dims[4]);
+            const int cols = width * seqs;
+            DeviceBuffer x = upload16(inputs[0]), w = upload16(inputs[1]), st = upload16(inputs[2]);
+            DeviceBuffer src = upload32(inputs[3]), dst = upload32(inputs[4]);
+            DeviceBuffer out(static_cast<std::size_t>(channels) * cols * 2);
+            Tensor tx(x.p, DType::BF16, {channels, cols}), tw(w.p, DType::BF16, {channels, taps});
+            Tensor tst(st.p, DType::BF16, {channels, taps - 1, slots}), tout(out.p, DType::BF16, {channels, cols});
+            Tensor tsrc(src.p, DType::I32, {seqs}), tdst(dst.p, DType::I32, {seqs});
+            ops::lossless_causal_conv_slots(tx, tw, seqs, tst, tsrc, tdst, tout, nullptr);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            got = download16(out, static_cast<std::size_t>(channels) * cols);
+            const auto fs = download16(st, static_cast<std::size_t>(channels) * (taps - 1) * slots);
+            got.insert(got.end(), fs.begin(), fs.end());
+            break;
+        }
+        case 26: {
+            const int hk = static_cast<int>(dims[0]), hv = static_cast<int>(dims[1]), width = static_cast<int>(dims[2]),
+                      seqs = static_cast<int>(dims[3]), slots = static_cast<int>(dims[4]);
+            const int cols = width * seqs;
+            DeviceBuffer q = upload16(inputs[0]), k = upload16(inputs[1]), v = upload16(inputs[2]);
+            DeviceBuffer g = upload32(inputs[3]), beta = upload16(inputs[4]), st = upload32(inputs[5]);
+            DeviceBuffer src = upload32(inputs[6]), dst = upload32(inputs[7]);
+            DeviceBuffer out(static_cast<std::size_t>(128) * hv * cols * 2);
+            Tensor tq(q.p, DType::BF16, {128 * hk, cols}), tk(k.p, DType::BF16, {128 * hk, cols});
+            Tensor tv(v.p, DType::BF16, {128 * hv, cols}), tout(out.p, DType::BF16, {128 * hv, cols});
+            Tensor tg(g.p, DType::FP32, {hv, cols}), tbeta(beta.p, DType::BF16, {hv, cols});
+            Tensor tst(st.p, DType::FP32, {128, 128, hv, slots});
+            Tensor tsrc(src.p, DType::I32, {seqs}), tdst(dst.p, DType::I32, {seqs});
+            ops::lossless_gated_delta_rule_slots(tq, tk, tv, tg, tbeta, seqs, tst, tsrc, tdst, tout, nullptr);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            got = download16(out, static_cast<std::size_t>(128) * hv * cols);
+            const auto fs = download32(st, static_cast<std::size_t>(128) * 128 * hv * slots);
+            got.insert(got.end(), fs.begin(), fs.end());
+            break;
+        }
+        case 27: {
+            const int heads = static_cast<int>(dims[0]), kv_heads = static_cast<int>(dims[1]),
+                      width = static_cast<int>(dims[2]), seqs = static_cast<int>(dims[3]),
+                      stride = static_cast<int>(dims[4]), pages = static_cast<int>(dims[5]),
+                      max_keys = static_cast<int>(dims[6]);
+            const int cols = width * seqs;
+            const auto& lens = inputs[4];
+            const auto& tables = inputs[5];
+            // The sequences' earlier keys and values into their pages ([256, 64, Hkv, pages]); the query
+            // columns' own through lossless_kv_append.
+            const std::size_t page_elems = static_cast<std::size_t>(256) * 64 * kv_heads;
+            std::vector<std::uint32_t> kp(page_elems * pages, 0), vp(page_elems * pages, 0);
+            std::vector<std::uint32_t> knew, vnew;
+            std::size_t base = 0;
+            for (int b = 0; b < seqs; ++b) {
+                for (std::uint32_t j = lens[b] - width; j < lens[b]; ++j) {
+                    const std::size_t src = base + static_cast<std::size_t>(j) * kv_heads * 256;
+                    knew.insert(knew.end(), inputs[1].begin() + src, inputs[1].begin() + src + kv_heads * 256);
+                    vnew.insert(vnew.end(), inputs[2].begin() + src, inputs[2].begin() + src + kv_heads * 256);
+                }
+                for (std::uint32_t j = 0; j + width < lens[b]; ++j) {
+                    const std::uint32_t page = tables[static_cast<std::size_t>(b) * stride + j / 64];
+                    for (int h = 0; h < kv_heads; ++h) {
+                        for (int d = 0; d < 256; ++d) {
+                            const std::size_t dst = ((static_cast<std::size_t>(page) * kv_heads + h) * 64 + j % 64) * 256 + d;
+                            const std::size_t src = base + (static_cast<std::size_t>(j) * kv_heads + h) * 256 + d;
+                            kp[dst] = inputs[1][src];
+                            vp[dst] = inputs[2][src];
+                        }
+                    }
+                }
+                base += static_cast<std::size_t>(lens[b]) * kv_heads * 256;
+            }
+            std::vector<std::uint32_t> rows(seqs);
+            for (int b = 0; b < seqs; ++b) { rows[b] = static_cast<std::uint32_t>(b); }
+            DeviceBuffer q = upload16(inputs[0]), kpg = upload16(kp), vpg = upload16(vp);
+            DeviceBuffer kn = upload16(knew), vn = upload16(vnew);
+            DeviceBuffer pos = upload32(inputs[3]), tab = upload32(tables), trow = upload32(rows);
+            DeviceBuffer out(static_cast<std::size_t>(256) * heads * cols * 2);
+            DeviceBuffer ws(ops::lossless_paged_attention_workspace_bytes(heads, kv_heads, width, seqs, max_keys));
+            Tensor tq(q.p, DType::BF16, {256, heads, cols}), tout(out.p, DType::BF16, {256, heads, cols});
+            Tensor tpos(pos.p, DType::I32, {cols}), trows(trow.p, DType::I32, {seqs});
+            PagedKVBatchLayerView cache{};
+            cache.k_pages      = Tensor(kpg.p, DType::BF16, {256, 64, kv_heads, pages});
+            cache.v_pages      = Tensor(vpg.p, DType::BF16, {256, 64, kv_heads, pages});
+            cache.block_tables = Tensor(tab.p, DType::I32, {stride, seqs});
+            cache.head_dim     = 256;
+            cache.num_kv_heads = kv_heads;
+            cache.storage      = KvCacheStorage::BFloat16;
+            Tensor tkn(kn.p, DType::BF16, {256, kv_heads, cols}), tvn(vn.p, DType::BF16, {256, kv_heads, cols});
+            ops::lossless_kv_append(tkn, tvn, tpos, seqs, trows, cache, nullptr);
+            ops::lossless_paged_attention(tq, tpos, seqs, trows, cache, max_keys, max_keys, tout, ws.p, nullptr);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            got = download16(out, static_cast<std::size_t>(256) * heads * cols);
             break;
         }
         default: std::cerr << "FAIL unknown op " << op << "\n"; return 1;

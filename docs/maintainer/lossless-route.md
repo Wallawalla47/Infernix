@@ -1,6 +1,7 @@
 # The lossless route (`--lossless`)
 
-Status: in development (branch `feat/lossless`, 2026-10-21): Qwen3.5 and Qwen3.8-Flash-Next scoring. The owner's decisions behind it are
+Status: in development (branch `feat/lossless`, 2026-10-21): Qwen3.5 and Qwen3.8-Flash-Next scoring,
+Qwen3.5 generation. The owner's decisions behind it are
 recorded in [model quality §6.1](model-quality.md#61-the-reproducible-route-and-the-fast-paths); this document
 is the authority for what the route computes and how it is qualified.
 
@@ -23,7 +24,9 @@ is the authority for what the route computes and how it is qualified.
 - **Weights decoded exactly.** A quantized weight is its format's value as a real number (a row-split
   code times its FP16 group scale; NVFP4 an E2M1 code times its E4M3 block scale and the global scale;
   row FP8 an E4M3 code times its BF16 row scale). No weight is rounded to BF16 first.
-- **BF16 KV with V stored losslessly**, the only KV format of the route.
+- **BF16 KV with V stored losslessly**, the only KV format of the route: `--kv-dtype bf16`, whose
+  pages on this route hold K and V as BF16 bit for bit (elsewhere `bf16` stores V as FP16, which holds
+  every BF16 value with 2^-17 <= |v| < 2^16 exactly but rounds the rest).
 
 So the output is a function of the request and the artifact alone: no batch, chunk, prefill/decode,
 speculative, placement or build dependence, and anyone can check any value with exact arithmetic.
@@ -83,8 +86,12 @@ Notation: `bf16(v)` and `fp32(v)` are the correctly rounded value of the exact r
 **Decoder layer.** `h = bf16(residual + mixer(norm(residual)))`, then the same for the MLP or MoE.
 
 **Head.** `norm(h)`, then logits `fp32(h W_head)` (each an exact sum rounded to binary32: the scoring
-and sampling inputs; Transformers rounds them to BF16 first, which the route does not, so a logit is
-the exact sum rounded once).
+and sampling inputs). Transformers returns the head's output in BF16, and training's loss upcasts
+those values; the route keeps the exact sum rounded once to FP32 instead (owner's decision,
+2026-10-21). The logits feed nothing inside the model, so no layer is calibrated to their rounding,
+and a BF16 rounding of logits of magnitude 8-32 (rms error 0.02-0.04) would add a KL of roughly
+1.5e-4 to 6.5e-4 per position (an estimate) to every gate measured against the route. llama.cpp's
+KL baselines also use FP32 logits.
 
 ## 2a. Qwen3.8-Flash-Next operations (`Qwen4ExpForCausalLM`)
 
@@ -212,8 +219,25 @@ selects it on Qwen3.5/3.6/3.8 (`Qwen3_5ForCausalLM`, `Qwen3_5MoeForCausalLM`;
 `src/models/qwen3_5/execution/lossless.cpp`): a CausalScoring Engine that scores each window in one pass
 (its prefill chunk covers max_context), no fast path, FP32 logits. Its attention reads the window's own
 keys, so the KV cache plays no part; GDN and the convolution start from zero state. MLP and MoE passes
-split the columns 4,096 at a time (column-independent, so the split changes nothing). Generation on the
-lossless route needs BF16 KV with V stored as BF16 and is not built yet.
+split the columns 4,096 at a time (column-independent, so the split changes nothing).
+
+Generation (`infernix --lossless`, `infernix-serve --lossless`; text requests, `--kv-dtype bf16`, no
+speculation, no CUDA Graphs) runs the same layers in their cache form
+(`execution::LosslessCache`): a prefill chunk or a decode round's columns continue their sequences.
+Attention stores each column's K and V bit for bit in the paged cache (`lossless_kv_append`; the
+Program allocates the bf16 pages with BF16 V, `paged_kv_lossless_storage_layout`) and reads the
+sequence's keys 0..position through its block table (`lossless_paged_attention`); the convolution and
+the gated delta rule continue from the lane's source state slot and leave their state in its
+destination slot (`lossless_causal_conv_slots`, `lossless_gated_delta_rule_slots`, the state pool's own
+layouts). Every operation is the window form's operation on the same values, so a token's logits do not
+depend on the prefill chunk, on prefill or decode, on the other requests, on the prefix cache (a resumed
+state is an exact copy; the Host tier must keep FP32 state) or on preemption and replay. Sampling and
+the grammar constraints read the FP32 logits; sampled requests draw by Gumbel-max. The prefix cache's
+file records the route, so a lossless Engine never resumes another route's state.
+
+Attention's key ranges: a call with few CTAs (decode) splits each query's keys into ranges over more
+CTAs, a pass of partial maxima, a pass of partial int128 sums from the overall maximum, and a combine
+kernel adding them; exact sums make the split invisible in the output.
 
 On Qwen3.8-Flash-Next (`Qwen4ExpForCausalLM`; `src/models/qwen4_exp/execution/forward_lossless.cpp`,
 TextConfig::lossless) the same Engine conditions hold (CausalScoring, one call per window, no fast path,

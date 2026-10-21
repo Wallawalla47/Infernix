@@ -2,17 +2,21 @@
 
 // Implements: include/infernix/ops/sampling.h
 // Match: contiguous BF16 logits, physical stride >= token domain, and at most
-// sixteen columns on the multi-block route.
+// sixteen columns on the multi-block route; FP32 logits (the lossless route's) take the
+// single-block route.
 // Algorithm assumptions: 256-thread/2-item partial tiles feed bounded top-20
 // group merges through caller-owned workspace; unsupported finite geometries
 // use the semantically identical single-block fallback.
 
 #include "ops/kernel/sampling_device.cuh"
 
+#include <type_traits>
+
 namespace infernix::ops {
 
+template <class Logit>
 __launch_bounds__(kSamplerBlock) __global__
-    void sample_row_kernel(const __nv_bfloat16* logits, std::int32_t* out,
+    void sample_row_kernel(const Logit* logits, std::int32_t* out,
                            const SamplingConfig* configs, const std::int32_t* logical_positions,
                            std::int32_t purpose, std::int32_t token_domain,
                            std::int32_t physical_rows) {
@@ -31,7 +35,7 @@ __launch_bounds__(kSamplerBlock) __global__
         const bool penalties = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
         if (!penalties && cfg.mask.words == nullptr) {
             for (int v = tid; v < token_domain; v += blockDim.x) {
-                const float x = __bfloat162float(logits[base + v]);
+                const float x = sampling_logit(logits[base + v]);
                 if (sampling_better(x, v, bv, bi)) {
                     bv = x;
                     bi = v;
@@ -39,7 +43,7 @@ __launch_bounds__(kSamplerBlock) __global__
             }
         } else {
             for (int v = tid; v < token_domain; v += blockDim.x) {
-                const float x = sampling_adjusted_logit(__bfloat162float(logits[base + v]), v, cfg);
+                const float x = sampling_adjusted_logit(sampling_logit(logits[base + v]), v, cfg);
                 if (sampling_better(x, v, bv, bi)) {
                     bv = x;
                     bi = v;
@@ -67,10 +71,12 @@ __launch_bounds__(kSamplerBlock) __global__
 
     const int partial_blocks = div_up(token_domain, kSamplerPartialTileItems);
     const int group_count    = sampler_group_count(partial_blocks);
-    // No-op when the scratch/group path owns this shape (see sample_batch_launch).
-    if (sampler_multiblock_ok(token_domain, static_cast<int>(gridDim.x), partial_blocks,
-                              group_count)) {
-        return;
+    // No-op when the scratch/group path owns this shape (see sample_batch_launch; BF16 only).
+    if constexpr (!std::is_same_v<Logit, float>) {
+        if (sampler_multiblock_ok(token_domain, static_cast<int>(gridDim.x), partial_blocks,
+                                  group_count)) {
+            return;
+        }
     }
 
     __shared__ float cand_val[kSamplerCandidateCap];

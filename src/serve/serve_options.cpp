@@ -50,6 +50,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--prefill-split-workspace-mib"},
     ServeOptionArity{"--use-original-nvfp4-prefill-kernel", false},
     ServeOptionArity{"--reproducible", false},
+    ServeOptionArity{"--lossless", false},
     ServeOptionArity{"--fast-path", true, true},
     ServeOptionArity{"--expert-a4-activations", false},
     ServeOptionArity{"--context-cost-presets"},
@@ -288,6 +289,12 @@ std::string serve_usage_text(const char* argv0) {
            "                             faster for this artifact's kernels and KV type\n"
            "                             runs (within Infernix's numerical quality\n"
            "                             policy; startup lists them; docs/serving.md)\n"
+           "  --lossless                 run the lossless route: every operation of the\n"
+           "                             model correctly rounded at its own BF16 points\n"
+           "                             (FP32 logits), so the output depends on the\n"
+           "                             request and the artifact alone; Qwen3.5/3.6/3.8\n"
+           "                             text with --kv-dtype bf16, no speculation; slower\n"
+           "                             (docs/maintainer/lossless-route.md)\n"
            "  --fast-path NAME           also run this fast path, qualified or not\n"
            "                             (qualification and timing runs; repeatable)\n"
            "  --expert-a4-activations    nvidia/Qwen3.8-Flash-Next-FP4-Local only: run its\n"
@@ -384,7 +391,8 @@ std::string serve_usage_text(const char* argv0) {
            "                             with --reproducible. Default off; Strata's\n"
            "                             default is 7\n"
            "  --kv-dtype T               KV storage: bf16 (default) | int8 | fp8 | nvfp4 | k8v4 |\n"
-           "                             vq2 | k4v2\n"
+           "                             vq2 | k4v2; bf16 stores K as BF16 and V as FP16 (exact\n"
+           "                             for 2^-17 <= |v| < 2^16), with --lossless V as BF16\n"
            "  --no-prefix-reuse          disable the prefix cache: every request starts from\n"
            "                             the root and a preempted request recovers by\n"
            "                             replay; cannot be combined with any option below\n"
@@ -686,6 +694,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.original_nvfp4_prefill_kernel = true;
         } else if (arg == "--reproducible") {
             options.fast_paths = false;
+        } else if (arg == "--lossless") {
+            options.lossless = true;
         } else if (arg == "--fast-path") {
             const std::string name(require_value("--fast-path"));
             const std::optional<FastPath> path = parse_fast_path(name);

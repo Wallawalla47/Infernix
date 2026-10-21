@@ -111,6 +111,10 @@ infernix_add_test(infernix_qwen3_5_lossless_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_lossless_real.cpp"
   LIBRARIES infernix_engine)
 
+infernix_add_test(infernix_qwen3_5_lossless_generation_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_lossless_generation_real.cpp"
+  LIBRARIES infernix_engine)
+
 # Speculation invariance of the reproducible route, one entry per drafter (the artifact must hold it).
 add_executable(infernix_qwen3_5_speculation_invariance_real_test
   "${CMAKE_CURRENT_LIST_DIR}/test_engine_speculation_invariance_real.cpp")

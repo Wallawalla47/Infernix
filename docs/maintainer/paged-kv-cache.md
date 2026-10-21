@@ -85,7 +85,9 @@ Main growing pool, and its draft context uses cyclic storage.
 
 Main Text and MTP use the KV profile the Engine selects: BF16, INT8-G64, FP8-E4M3FN-row256, NVFP4-G16,
 K8V4, VQ2 or K4V2; Draft Full uses its own BF16 profile. The physical layout under the `BFloat16` name is
-BF16 K and FP16 V, and the writer converts BF16 V to FP16 once. K8V4 is a closed asymmetric profile, not
+BF16 K and FP16 V, and the writer converts BF16 V to FP16 once; on the lossless route
+(`paged_kv_lossless_storage_layout`, [lossless route](lossless-route.md)) V is BF16 too, written bit for bit
+by `lossless_kv_append` and read only by the lossless attention. K8V4 is a closed asymmetric profile, not
 a runtime bit-width combination: K is fixed to FP8-E4M3FN-row256 and V to NVFP4-G16.
 
 VQ2 and K4V2 are vector-quantized profiles: a row is first rotated by a fixed normalized Hadamard H256;

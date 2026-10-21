@@ -227,7 +227,7 @@ Tensor Forward::lossless_attention_block(const AttentionParameters& p, const Ten
         select = static_cast<const std::uint32_t*>(bits.data);
     }
     Tensor out = work_.alloc(DType::BF16, {D, heads, T});
-    const DeviceSpan attention_ws = work_.alloc_bytes(ops::lossless_attention_workspace_bytes(heads, T));
+    const DeviceSpan attention_ws = work_.alloc_bytes(ops::lossless_attention_workspace_bytes(heads, kv_heads, T));
     ops::lossless_attention(qn, kn, v, out, attention_ws.data, s, select, words, ratio);
     Tensor gated = work_.alloc(DType::BF16, {QW, T});
     ops::lossless_sigmoid_mul(out.view({QW, T}), gate, gated, s);
@@ -349,7 +349,7 @@ std::size_t Forward::lossless_workspace_bytes(const TextConfig& c, std::int32_t 
                              std::size_t(c.qsa.index_head_dim) * blocks * bf * 2 + blocks * 12 +
                              std::size_t(c.rope.rotary_dim) * (t + blocks) * bf + blocks * c.qsa.index_heads * t * 4 +
                              ((blocks + 31) / 32 + 1) * t * 4 + ops::lossless_qsa_select_workspace_bytes(dim(t), dim(blocks)) +
-                             ops::lossless_attention_workspace_bytes(dim(c.attention.heads), dim(t));
+                             ops::lossless_attention_workspace_bytes(dim(c.attention.heads), dim(c.attention.kv_heads), dim(t));
     const std::size_t moe = h * t * bf + c.moe.experts * t * bf + t * bf + k * t * 8 + t * 4 +
                             ops::moe_dispatch_bytes(dim(c.moe.experts), dim(k * t)) + h * k * t * bf +
                             ops::moe_experts_workspace_bytes(std::min<std::int32_t>(dim(c.moe.experts), dim(k * t)), dim(k * t),

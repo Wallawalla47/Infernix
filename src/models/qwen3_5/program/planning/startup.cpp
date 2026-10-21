@@ -237,6 +237,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .kv_heads                  = dimension(config.attention->num_key_value_heads),
                      .attention_head_dim        = dimension(config.attention->head_dim),
                      .kv_storage                = plan.kv_storage,
+                     .lossless                  = plan.execution_schedule.lossless,
                      .enable_mtp                = plan.features.mtp(),
                      .kv_table_rows             = static_cast<std::int32_t>(plan.max_concurrency),
                      .text_physical_page_groups = physical_pages,
@@ -365,7 +366,8 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                                          .batch_capacity = plan.max_concurrency,
                                          .draft_window   = plan.draft_window,
                                          .backend        = plan.speculative_backend,
-                                         .causal_scoring = plan.causal_scoring});
+                                         .causal_scoring = plan.causal_scoring,
+                                         .fp32_logits    = plan.execution_schedule.lossless});
     out.prefill_hidden =
         add_tensor(builder, DType::BF16, {dimension(config.hidden_size), effective_prefill_chunk},
                    "step prefill hidden");
@@ -618,13 +620,23 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     WorkspacePlan out;
     WorkspaceLayoutBuilder text_prefill;
     text_common_root(text_prefill, chunk);
+    // The lossless route's cache form (generation): its sequences and key capacity size the attention.
+    execution::LosslessCache lossless_shape{.sequences    = 1,
+                                            .key_capacity = plan.execution_schedule.lossless_keys};
+    const execution::LosslessCache* lossless_cache =
+        plan.execution_schedule.lossless_keys != 0 ? &lossless_shape : nullptr;
     if (plan.execution_schedule.lossless) {
-        // The window's rotary table, then the widest layer (execution/lossless.cpp's own allocations).
+        // The chunk's rotary table and (cache form) state slots, then the widest layer
+        // (execution/lossless.cpp's own allocations), the hidden output and the head's FP32 logits.
         (void)text_prefill.alloc_bytes(execution::lossless_rope_window_bytes(config, chunk));
+        if (lossless_cache != nullptr) { matrix(text_prefill, DType::I32, 2, 1); }
         for (std::size_t layer = 0; layer < parameters.text.layers.size(); ++layer) {
-            scratch(text_prefill, execution::lossless_layer_workspace_bytes(
-                                      parameters.text.layers[layer], config, config.layer_types[layer], chunk));
+            scratch(text_prefill,
+                    execution::lossless_layer_workspace_bytes(parameters.text.layers[layer], config,
+                                                              config.layer_types[layer], chunk, lossless_cache));
         }
+        matrix(text_prefill, DType::BF16, dimension(config.hidden_size), chunk);
+        scratch(text_prefill, execution::lossless_head_workspace_bytes(parameters.text.output_head.weight, 1));
     } else {
         target_body(text_prefill, 1, chunk, qwen3_5::TextPhase::Prefill, GdnWorkspacePath::Prefill, 1,
                     1, chunk, prefill_envelope);
@@ -663,8 +675,23 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
              ++batch) {
             WorkspaceLayoutBuilder ordinary;
             matrix(ordinary, DType::BF16, dimension(config.hidden_size), batch);
-            target_body(ordinary, batch, batch, qwen3_5::TextPhase::Verify,
-                        GdnWorkspacePath::Snapshot, batch, 1, 1, text_envelope);
+            if (plan.execution_schedule.lossless) {
+                // TextContext::ordinary_decode_batch's lossless allocations: the rotary table, the widest
+                // layer of the cache form over `batch` sequences, the head.
+                (void)ordinary.alloc_bytes(execution::lossless_rope_window_bytes(config, batch));
+                const execution::LosslessCache shape{.sequences    = batch,
+                                                     .key_capacity = plan.execution_schedule.lossless_keys};
+                for (std::size_t layer = 0; layer < parameters.text.layers.size(); ++layer) {
+                    scratch(ordinary, execution::lossless_layer_workspace_bytes(
+                                          parameters.text.layers[layer], config, config.layer_types[layer], batch,
+                                          &shape));
+                }
+                scratch(ordinary,
+                        execution::lossless_head_workspace_bytes(parameters.text.output_head.weight, batch));
+            } else {
+                target_body(ordinary, batch, batch, qwen3_5::TextPhase::Verify,
+                            GdnWorkspacePath::Snapshot, batch, 1, 1, text_envelope);
+            }
             scratch(ordinary,
                     ops::sampling_workspace_capacity_bytes(
                         dimension(parameters.model.resources().public_token_count), batch, batch));
@@ -1219,11 +1246,19 @@ ExecutionSchedule execution_schedule(const execution::Parameters& parameters,
         throw std::invalid_argument(
             "the Qwen3.5 reference route is a CausalScoring Engine with BF16 KV");
     }
-    // The lossless route scores each window in one pass: its attention reads the window's own keys.
-    if (options.lossless &&
-        (options.purpose != EnginePurpose::CausalScoring || options.prefill_chunk < options.max_context)) {
-        throw std::invalid_argument("the Qwen3.5 lossless route is a CausalScoring Engine whose prefill_chunk "
-                                    "covers max_context (one pass per window)");
+    // The lossless route: causal scoring takes each window in one pass (its attention reads the window's
+    // own keys); generation runs text through bf16 KV (V stored as BF16), without speculation.
+    if (options.lossless) {
+        if (options.purpose == EnginePurpose::CausalScoring && options.prefill_chunk < options.max_context) {
+            throw std::invalid_argument("the Qwen3.5 lossless route scores a window in one pass: its prefill_chunk "
+                                        "must cover max_context");
+        }
+        if (options.purpose == EnginePurpose::Generation &&
+            (options.kv_cache != KvCacheStorage::BFloat16 ||
+             options.speculative.backend != SpeculativeBackend::None || options.enable_vision)) {
+            throw std::invalid_argument("Qwen3.5 lossless generation takes text requests with bf16 KV and no "
+                                        "speculation");
+        }
     }
     // The exact route is request-invariant (docs/maintainer/model-quality.md, 6.1); each request-coupling
     // fast path gives up one part of it, and each part holds whenever its coupling path is not selected.
@@ -1254,6 +1289,9 @@ ExecutionSchedule execution_schedule(const execution::Parameters& parameters,
                                            : ops::GdnChunkArithmetic::Exact,
             .reference               = options.reference,
             .lossless                = options.lossless,
+            .lossless_keys           = options.lossless && options.purpose == EnginePurpose::Generation
+                                           ? static_cast<std::int32_t>(options.max_context)
+                                           : 0,
             .gumbel_sampling         = !options.fast_paths || options.lossless};
 }
 // The fast INT8, NVFP4, VQ2 and K4V2 prompt kernels and the MXFP8 tiled kernel of FP8 and K8V4 KV
@@ -1375,7 +1413,8 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .kv_storage           = options.kv_cache,
         .proposal_head        = options.speculative.proposal_head,
         .features             = models::load_options(options, Architecture::Qwen3_5),
-        .use_cuda_graph       = options.use_cuda_graph,
+        // The lossless route runs eagerly.
+        .use_cuda_graph       = options.use_cuda_graph && !options.lossless,
         .causal_scoring       = options.purpose == EnginePurpose::CausalScoring,
         .device               = options.device,
         .multiprocessor_count = device.multiprocessor_count(),

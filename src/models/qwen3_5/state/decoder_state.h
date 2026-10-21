@@ -19,6 +19,8 @@ struct DecoderStateSpec {
     std::int32_t kv_heads                   = 0;
     std::int32_t attention_head_dim         = 0;
     KvCacheStorage kv_storage               = KvCacheStorage::BFloat16;
+    // The lossless route's bf16 pages (V stored as BF16, paged_kv_lossless_storage_layout).
+    bool lossless                           = false;
     bool enable_mtp                         = false;
     std::int32_t kv_table_rows              = 1;
     std::uint32_t text_physical_page_groups = 0;

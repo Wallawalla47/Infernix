@@ -127,6 +127,7 @@ constexpr std::array kCliOptions{
     CliOption{"--prefill-split-workspace-mib"},
     CliOption{"--use-original-nvfp4-prefill-kernel", false},
     CliOption{"--reproducible", false},
+    CliOption{"--lossless", false},
     CliOption{"--fast-path", true, true},
     CliOption{"--expert-a4-activations", false},
     CliOption{"--stop-token-id", true, true},
@@ -251,7 +252,9 @@ std::string usage_text(const char* argv0) {
            "                           Flash-Next, after the expert cache, for the display\n"
            "                           and other programs (auto: 1024 with a display on\n"
            "                           the GPU, else 256)\n"
-           "  --kv-dtype T             bf16 (default) | int8 | fp8 | nvfp4 | k8v4 | vq2 | k4v2\n"
+           "  --kv-dtype T             bf16 (default) | int8 | fp8 | nvfp4 | k8v4 | vq2 | k4v2;\n"
+           "                           bf16 stores K as BF16 and V as FP16 (exact for\n"
+           "                           2^-17 <= |v| < 2^16), with --lossless V as BF16\n"
            "  --use-original-int8-prefill-kernel\n"
            "                           prefill INT8 KV with the original prompt kernel\n"
            "                           (default: the fast kernel)\n"
@@ -271,6 +274,12 @@ std::string usage_text(const char* argv0) {
            "                           faster for this artifact's kernels and KV type\n"
            "                           runs (within Infernix's numerical quality policy;\n"
            "                           startup lists them; docs/cli.md)\n"
+           "  --lossless               run the lossless route: every operation of the\n"
+           "                           model correctly rounded at its own BF16 points\n"
+           "                           (FP32 logits), so the output depends on the\n"
+           "                           request and the artifact alone; Qwen3.5/3.6/3.8\n"
+           "                           text with --kv-dtype bf16, no speculation; slower\n"
+           "                           (docs/maintainer/lossless-route.md)\n"
            "  --fast-path NAME         also run this fast path, qualified or not\n"
            "                           (qualification runs; repeatable)\n"
            "  --expert-a4-activations  nvidia/Qwen3.8-Flash-Next-FP4-Local only: run its\n"
@@ -535,6 +544,8 @@ Options parse_options(int argc, char** argv) {
             options.original_nvfp4_prefill_kernel = true;
         } else if (arg == "--reproducible") {
             options.fast_paths = false;
+        } else if (arg == "--lossless") {
+            options.lossless = true;
         } else if (arg == "--fast-path") {
             const std::string name(value(arg));
             const std::optional<FastPath> path = parse_fast_path(name);

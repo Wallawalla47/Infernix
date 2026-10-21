@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/paged_kv_cache.h"
 #include "core/tensor.h"
 
 #include <cuda_runtime.h>
@@ -66,14 +67,15 @@ void lossless_permute_blocks(const Tensor& x, const std::int32_t* perm, int bloc
  * (tap i at i C + c, the last tap on the current column), the K-term sum exact.
  */
 void lossless_causal_conv(const Tensor& x, const Tensor& weight, Tensor& out, cudaStream_t stream);
+/// The same convolution over `sequences` independent sequences, each a run of T / sequences columns whose
+/// K - 1 columns before its first come from slot source_slots[b] of `states` (BF16 [C, K - 1, slots], oldest
+/// first, the causal_conv1d_silu state layout); afterwards slot destination_slots[b] holds the run's last
+/// K - 1 columns (of the source state followed by the run). Slots I32 [>= sequences], device; a destination
+/// may equal its own source but no other sequence's source or destination.
+void lossless_causal_conv_slots(const Tensor& x, const Tensor& weight, int sequences, Tensor& states,
+                                const Tensor& source_slots, const Tensor& destination_slots, Tensor& out,
+                                cudaStream_t stream);
 
-/**
- * Causal softmax attention over one window, one operation (flash attention's): for query column t and head
- * h (key/value head h / (Hq / Hkv)), s_j = (q . k_j) 2^-4 exact for j <= t (head dim 256), m = max_j s_j,
- * p_j = fp32(exp(fp32(s_j - m))), out = bf16(sum_j p_j v_j / sum_j p_j) with both sums exact.
- * q BF16 [256, Hq, T], k and v BF16 [256, Hkv, T], out BF16 [256, Hq, T]. The workspace is
- * lossless_attention_workspace_bytes(Hq, T).
- */
 /**
  * The gated delta rule over one sequence (FLA's kernel, HF's recurrence operation by operation; key and
  * value head dims 128): per value head, with its key head h_v / (Hv / Hk),
@@ -82,19 +84,49 @@ void lossless_causal_conv(const Tensor& x, const Tensor& weight, Tensor& out, cu
  * S_ij = fp32(S_ij + fp32(k̂_i δ_j)), out_j = bf16(fp32(sum_i fp32(S_ij q̂_i))), every sum exact.
  * query and key BF16 [128 Hk, T], value BF16 [128 Hv, T] (each may be a row range of a larger tensor: its
  * columns strided), out BF16 [128 Hv, T], g FP32 and beta BF16 [Hv, T] contiguous;
- * state FP32 [Hv, 128 (k), 128 (v)] is the initial state and receives the final one (nullptr: zeros, not
- * kept).
+ * state FP32 [128 (k), 128 (v), Hv] (the LinearAttentionStatePool layout: S_ij at (h 128 + j) 128 + i,
+ * 16-byte aligned) is the initial state and receives the final one (nullptr: zeros, not kept).
  */
 void lossless_gated_delta_rule(const Tensor& query, const Tensor& key, const Tensor& value, const Tensor& g,
                                const Tensor& beta, float* state, Tensor& out, cudaStream_t stream);
+/// The same rule over `sequences` independent sequences, each a run of T / sequences columns: sequence b
+/// starts from slot source_slots[b] of `states` (FP32 [128, 128, Hv, slots]) and leaves its final state in
+/// slot destination_slots[b] (I32 [>= sequences], device); a destination may equal its own source but no
+/// other sequence's source or destination.
+void lossless_gated_delta_rule_slots(const Tensor& query, const Tensor& key, const Tensor& value, const Tensor& g,
+                                     const Tensor& beta, int sequences, Tensor& states, const Tensor& source_slots,
+                                     const Tensor& destination_slots, Tensor& out, cudaStream_t stream);
 
-[[nodiscard]] std::size_t lossless_attention_workspace_bytes(int query_heads, int columns);
-/// With `select` (QSA, docs/maintainer/lossless-route.md §2a), query t's keys are those j <= t in its
-/// tail (j >= floor((t + 1) / ratio) ratio) or in a block b = j / ratio whose bit b of
-/// select[t * select_words + b / 32] is set (U32 [T][select_words]); otherwise every j <= t.
+/**
+ * Causal softmax attention, one operation (flash attention's): for query column t at position P_t and head
+ * h (key/value head h / (Hq / Hkv)), s_j = (q . k_j) 2^-4 exact for j <= P_t (head dim 256),
+ * m = max_j s_j, p_j = fp32(exp(fp32(s_j - m))), out = bf16(sum_j p_j v_j / sum_j p_j) with both sums
+ * exact. q and out BF16 [256, Hq, T].
+ *
+ * Over one window: k and v BF16 [256, Hkv, T], P_t = t; the workspace is
+ * lossless_attention_workspace_bytes(Hq, Hkv, T). With `select` (QSA, docs/maintainer/lossless-route.md
+ * §2a), query t's keys are those j <= t in its tail (j >= floor((t + 1) / ratio) ratio) or in a block
+ * b = j / ratio whose bit b of select[t * select_words + b / 32] is set (U32 [T][select_words]).
+ */
+[[nodiscard]] std::size_t lossless_attention_workspace_bytes(int query_heads, int kv_heads, int columns);
 void lossless_attention(const Tensor& q, const Tensor& k, const Tensor& v, Tensor& out, void* workspace,
                         cudaStream_t stream, const std::uint32_t* select = nullptr, int select_words = 0,
                         int ratio = 0);
+/// Over the paged cache: the columns are `sequences` equal runs; column t's position is positions[t]
+/// (I32 [T], increasing within a run) and its keys and values are rows 0..P_t of the cache (bf16 storage
+/// with BF16 K and V pages, the lossless profile) through block table row table_rows[b] (I32 [B]) of its
+/// run b. max_keys bounds every P_t + 1 and is at most key_capacity, which sizes the workspace:
+/// lossless_paged_attention_workspace_bytes(Hq, Hkv, the widest run, B, key_capacity).
+[[nodiscard]] std::size_t lossless_paged_attention_workspace_bytes(int query_heads, int kv_heads, int max_width,
+                                                                   int sequences, int key_capacity);
+void lossless_paged_attention(const Tensor& q, const Tensor& positions, int sequences, const Tensor& table_rows,
+                              const PagedKVBatchLayerView& cache, int max_keys, int key_capacity, Tensor& out,
+                              void* workspace, cudaStream_t stream);
+/// Stores the call's keys and values (contiguous BF16 [256, Hkv, T], `sequences` equal runs) bit for bit
+/// in the lossless profile's pages: column t at position positions[t] through table row table_rows[b] of
+/// its run b.
+void lossless_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions, int sequences,
+                        const Tensor& table_rows, const PagedKVBatchLayerView& cache, cudaStream_t stream);
 
 /**
  * RoPE (Hugging Face's rotary module and apply_rotary_pos_emb, rotary dims R of each head, pairs P = R/2):

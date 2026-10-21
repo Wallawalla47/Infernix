@@ -21,7 +21,7 @@ import lossless_cr_oracle as cr  # noqa: E402
 
 (RMSNORM, RMSNORM_GATED, ADD, SILU_MUL, SIGMOID_MUL, GDN_GATES, CAUSAL_CONV, ATTENTION, DELTA_RULE, ROPE, ROUTER,
  MOE_COMBINE, MOE_ROUTE, RMSNORM_GROUPED, RMSNORM_GATED_SIGMOID, HC_GATES, HC_MIX, HC_INJECT, PLE_GATE, PLE_CONV,
- QSA_POOL, QSA_SELECT, ATTENTION_SELECT, ROUTER_BF16, MOE_COMBINE_ENTRIES) = range(25)
+ QSA_POOL, QSA_SELECT, ATTENTION_SELECT, ROUTER_BF16, MOE_COMBINE_ENTRIES, CONV_SLOTS, DELTA_RULE_SLOTS, ATTENTION_PAGED) = range(28)
 
 
 def bf16_value(bits: int) -> Fraction:
@@ -281,6 +281,145 @@ def cases(rng: random.Random):
     x = [random_bf16(rng, 4) for _ in range(64 * cols)]
     yield MOE_ROUTE, [256, 8, cols], [ids, x], [1]
     yield from flash_cases(rng)
+    yield from state_cases(rng)
+
+
+def state_cases(rng: random.Random):
+    """The slot forms (generation): runs of columns continuing from and leaving recurrent states."""
+    # Causal conv: 3 sequences of 5 columns (and of 2, shorter than the state), 4 taps, 5 slots; one
+    # sequence updates its slot in place.
+    channels, taps, slots = 96, 4, 5
+    for width, seqs, src, dst in ((5, 3, [1, 4, 0], [2, 4, 3]), (2, 2, [3, 1], [3, 0])):
+        x = [random_bf16(rng, 20) for _ in range(channels * width * seqs)]
+        w = [random_bf16(rng, 2) for _ in range(channels * taps)]
+        states = [random_bf16(rng, 20) for _ in range(channels * (taps - 1) * slots)]
+        out, final = conv_slots(x, w, states, src, dst, channels, width, seqs, taps)
+        yield CONV_SLOTS, [channels, width, seqs, taps, slots], [x, w, states, src, dst], out + final
+    # Gated delta rule: Hk = 1, Hv = 2, 2 sequences of 3 tokens from random FP32 states (4 slots).
+    hk, hv, width, seqs, slots = 1, 2, 3, 2, 4
+    cols = width * seqs
+    q = [random_bf16(rng, 2) for _ in range(128 * hk * cols)]
+    k = [random_bf16(rng, 2) for _ in range(128 * hk * cols)]
+    v = [random_bf16(rng, 2) for _ in range(128 * hv * cols)]
+    g = [f32_bits(-rng.uniform(0.0, 2.0)) for _ in range(hv * cols)]
+    beta = [f32_bits(rng.uniform(0.05, 0.95)) >> 16 for _ in range(hv * cols)]
+    states = [f32_bits(rng.gauss(0.0, 0.05)) for _ in range(128 * 128 * hv * slots)]
+    src, dst = [2, 0], [2, 3]
+    out, final = delta_rule_slots(q, k, v, g, beta, hk, hv, width, seqs, states, src, dst)
+    yield DELTA_RULE_SLOTS, [hk, hv, width, seqs, slots], [q, k, v, g, beta, states, src, dst], out + final
+    # Attention over the paged cache: (a) two sequences of 2 query columns (300 and 150 keys), with
+    # key ranges split over CTAs and some elements far below their rows' largest (the exact fallback);
+    # (b) one sequence of 24 columns from position 70 (one key range).
+    for heads, kv_heads, width, starts, spread in ((4, 2, 2, [298, 148], True), (4, 1, 24, [70], False)):
+        seqs = len(starts)
+        lens = [s + width for s in starts]
+        ks = [[random_bf16(rng, 2) for _ in range(256 * kv_heads * n)] for n in lens]
+        vs = [[random_bf16(rng, 3) for _ in range(256 * kv_heads * n)] for n in lens]
+        q = [random_bf16(rng, 2) for _ in range(256 * heads * width * seqs)]
+        if spread:
+            for idx in range(5, len(q), 41):
+                q[idx] = f32_bits(rng.choice([1.0, -1.0]) * 2.0 ** -80) >> 16
+            for kk in ks:
+                for idx in range(3, len(kk), 97):
+                    kk[idx] = f32_bits(rng.choice([1.0, -1.0]) * 2.0 ** -70) >> 16
+            for vv in vs:
+                for idx in range(7, len(vv), 89):
+                    vv[idx] = f32_bits(rng.gauss(0.0, 1.0) * 2.0 ** -40) >> 16
+        positions = [starts[b] + w for b in range(seqs) for w in range(width)]
+        stride = max((n + 63) // 64 for n in lens)
+        pages = sum((n + 63) // 64 for n in lens) + 3
+        free = list(range(pages))
+        rng.shuffle(free)
+        tables = []
+        for n in lens:
+            row = [free.pop() for _ in range((n + 63) // 64)]
+            tables += row + [0] * (stride - len(row))
+        max_keys = max(lens)
+        expected = attention_paged(q, ks, vs, heads, kv_heads, width, seqs, positions)
+        yield (ATTENTION_PAGED, [heads, kv_heads, width, seqs, stride, pages, max_keys],
+               [q, [x for kk in ks for x in kk], [x for vv in vs for x in vv], positions, lens, tables], expected)
+
+
+def attention_paged(q, ks, vs, heads, kv_heads, width, seqs, positions):
+    """Query column t = b width + w at positions[t] over keys 0..positions[t] of sequence b (ks[b], vs[b]:
+    [len, kv_heads, 256])."""
+    group = heads // kv_heads
+    out = [0] * (256 * heads * width * seqs)
+    for b in range(seqs):
+        kf = [bf16_value(x) for x in ks[b]]
+        vf = [bf16_value(x) for x in vs[b]]
+        for w in range(width):
+            t = b * width + w
+            pos = positions[t]
+            for h in range(heads):
+                kvh = h // group
+                qr = [bf16_value(q[(t * heads + h) * 256 + d]) for d in range(256)]
+                scores = []
+                for j in range(pos + 1):
+                    base = (j * kv_heads + kvh) * 256
+                    scores.append(sum((a * kf[base + d] for d, a in enumerate(qr)), Fraction(0)) / 16)
+                m = max(scores)
+                ps = [f32_value(cr.evaluate(cr.EXP, float(f32_of(s - m)))) for s in scores]
+                den = sum(ps, Fraction(0))
+                for c in range(256):
+                    num = sum((p * vf[(j * kv_heads + kvh) * 256 + c] for j, p in enumerate(ps)), Fraction(0))
+                    out[(t * heads + h) * 256 + c] = round_fraction(num / den, 8)
+    return out
+
+
+def conv_slots(x, w, states, src, dst, channels, width, seqs, taps):
+    keep = taps - 1
+    out = [0] * (channels * width * seqs)
+    final = list(states)
+    for b in range(seqs):
+        for c in range(channels):
+            hist = [states[(src[b] * keep + h) * channels + c] for h in range(keep)]
+            run = hist + [x[(b * width + t) * channels + c] for t in range(width)]
+            for t in range(width):
+                s = sum((bf16_value(run[t + tap]) * bf16_value(w[tap * channels + c]) for tap in range(taps)),
+                        Fraction(0))
+                out[(b * width + t) * channels + c] = cr.evaluate(cr.SILU_BF16, float_of(round_fraction(s, 24), 24))
+            for h in range(keep):
+                final[(dst[b] * keep + h) * channels + c] = run[width + h]
+    return out, final
+
+
+def delta_rule_slots(q, k, v, g, beta, hk, hv, width, seqs, states, src, dst):
+    """The rule per sequence from its source slot; states FP32 [128 (k), 128 (v), Hv, slots]."""
+    eps = f32_value(f32_bits(1e-6))
+    scale = f32_value(0x3DB504F3)
+    out = [0] * (128 * hv * width * seqs)
+    final = list(states)
+    for b in range(seqs):
+        for head in range(hv):
+            kh = head // (hv // hk)
+            base = (src[b] * hv + head) * 128 * 128
+            S = [[f32_value(states[base + j * 128 + i]) for j in range(128)] for i in range(128)]  # S[i][j]
+            for w_ in range(width):
+                t = b * width + w_
+                qv = [bf16_value(q[(t * hk + kh) * 128 + d]) for d in range(128)]
+                kv = [bf16_value(k[(t * hk + kh) * 128 + d]) for d in range(128)]
+                rq = cr32(cr.RSQRT, f32_of(f32_of(sum((x * x for x in qv), Fraction(0))) + eps))
+                rk = cr32(cr.RSQRT, f32_of(f32_of(sum((x * x for x in kv), Fraction(0))) + eps))
+                qn = [f32_of(f32_of(x * rq) * scale) for x in qv]
+                kn = [f32_of(x * rk) for x in kv]
+                decay = cr32(cr.EXP, f32_value(g[t * hv + head]))
+                bt = bf16_value(beta[t * hv + head])
+                for i in range(128):
+                    for j in range(128):
+                        S[i][j] = f32_of(S[i][j] * decay)
+                for j in range(128):
+                    u = f32_of(sum((f32_of(S[i][j] * kn[i]) for i in range(128)), Fraction(0)))
+                    delta = f32_of(f32_of(bf16_value(v[(t * hv + head) * 128 + j]) - u) * bt)
+                    for i in range(128):
+                        S[i][j] = f32_of(S[i][j] + f32_of(kn[i] * delta))
+                    o = f32_of(sum((f32_of(S[i][j] * qn[i]) for i in range(128)), Fraction(0)))
+                    out[(t * hv + head) * 128 + j] = round_fraction(o, 8)
+            dbase = (dst[b] * hv + head) * 128 * 128
+            for i in range(128):
+                for j in range(128):
+                    final[dbase + j * 128 + i] = round_fraction(S[i][j], 24)
+    return out, final
 
 
 def round_sqrt(a: Fraction, prec: int) -> int:

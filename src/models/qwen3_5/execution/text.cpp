@@ -751,11 +751,29 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
                          "ordinary decode Linear Attention destination slots");
     require_tensor_shape(hidden, DType::BF16, {dimension(config_.hidden_size), batch},
                          "ordinary decode hidden");
-    require_tensor_shape(logits, DType::BF16, {dimension(config_.vocab_size), batch},
-                         "ordinary decode logits");
+    require_tensor_shape(logits, execution_schedule_.lossless ? DType::FP32 : DType::BF16,
+                         {dimension(config_.vocab_size), batch}, "ordinary decode logits");
 
     cudaStream_t stream = ctx_.stream;
     work_.reset();
+    if (execution_schedule_.lossless) {
+        // The cache form, one column per lane; FP32 logits.
+        Tensor x = work_.alloc(DType::BF16, {dimension(config_.hidden_size), batch});
+        ops::embedding(ids, *embed_, x, stream);
+        const Tensor rope_table = lossless_rope_window(config_, rope_positions, work_, stream);
+        LosslessCache cache{.positions         = &cache_positions,
+                            .table_rows        = &kv_table_rows,
+                            .source_slots      = &linear_state_source_slots,
+                            .destination_slots = &linear_state_destination_slots,
+                            .sequences         = batch,
+                            .max_keys          = static_cast<std::int32_t>(envelope.max_visible_keys),
+                            .key_capacity      = execution_schedule_.lossless_keys};
+        run_lossless_layers(x, rope_table, &cache);
+        lossless_final_norm(x, *final_norm_, config_, hidden, stream);
+        lossless_head(hidden, lm_head_->weight, logits, work_, stream);
+        work_.reset();
+        return;
+    }
     {
         ScopedPositions cache_binding(active_cache_positions_, cache_positions);
         ScopedPositions rope_binding(active_rope_positions_, rope_positions);
@@ -1297,6 +1315,33 @@ void TextContext::run_layers(Tensor& x, Phase ph) {
     run_layers(x, ph, tap);
 }
 
+void TextContext::run_lossless_layers(Tensor& x, const Tensor& rope_table, LosslessCache* cache) {
+    cudaStream_t s = ctx_.stream;
+    for (std::size_t layer = 0; layer < parameters_.text.layers.size(); ++layer) {
+        const bool full    = config_.layer_types[layer] == MixerKind::FullAttention;
+        const auto compact = dimension(config_.compact_layer_indices[layer]);
+        if (layer < layer_ready_.size()) { CUDA_CHECK(cudaStreamWaitEvent(s, layer_ready_[layer], 0)); }
+        if (cache != nullptr) {
+            if (full) {
+                cache->kv = text_kv_layer(static_cast<std::uint32_t>(compact));
+            } else {
+                const LinearAttentionStateLayerView states = state_.layer_view(static_cast<std::uint32_t>(compact));
+                cache->conv_states      = states.conv;
+                cache->recurrent_states = states.recurrent;
+            }
+        }
+        auto scope = work_.scope();
+        try {
+            lossless_layer(parameters_.text.layers[layer], config_, config_.layer_types[layer], rope_table, x, work_,
+                           s, cache);
+        } catch (const std::exception& error) {
+            throw std::runtime_error("text/layers/" + std::to_string(layer) +
+                                     " lossless columns=" + std::to_string(x.ne[1]) + ": " + error.what());
+        }
+    }
+    layer_ready_ = {};
+}
+
 template <class Tap>
 PrefillChunkResult
 TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_prefill,
@@ -1436,24 +1481,35 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             }
             Tensor xf;
             if (execution_schedule_.lossless) {
-                // One pass over the window (the planner requires the chunk to cover it): attention over
-                // its own keys, GDN and convolution from zero state.
-                if (base != 0 || len != T || multimodal != nullptr || prefill_hidden_.data == nullptr) {
-                    throw std::logic_error("the lossless route scores a text window in one pass");
-                }
+                if (multimodal != nullptr) { throw std::logic_error("the lossless route takes text prompts"); }
                 const Tensor rope_table = lossless_rope_window(config_, rope_positions, work_, s);
-                for (std::size_t layer = 0; layer < parameters_.text.layers.size(); ++layer) {
-                    auto scope = work_.scope();
-                    try {
-                        lossless_layer(parameters_.text.layers[layer], config_, config_.layer_types[layer],
-                                       rope_table, x, work_, s);
-                    } catch (const std::exception& error) {
-                        throw std::runtime_error("text/layers/" + std::to_string(layer) +
-                                                 " lossless columns=" + std::to_string(len) + ": " +
-                                                 error.what());
+                if (execution_schedule_.lossless_keys == 0) {
+                    // The window form, one pass over the window (the planner requires the chunk to cover
+                    // it): attention over its own keys, GDN and convolution from zero state.
+                    if (base != 0 || len != T || prefill_hidden_.data == nullptr) {
+                        throw std::logic_error("the lossless route scores a text window in one pass");
                     }
+                    run_lossless_layers(x, rope_table, nullptr);
+                } else {
+                    // The cache form: the chunk continues the sequence from the lane's state slots.
+                    Tensor slots = work_.alloc(DType::I32, {2});
+                    Tensor source = slots.slice(0, 0, 1), destination = slots.slice(0, 1, 1);
+                    ops::set_i32_scalar(source, linear_state_source_slot_, s);
+                    ops::set_i32_scalar(destination, linear_state_destination_slot_, s);
+                    const Tensor& rows =
+                        active_kv_table_rows_ != nullptr ? *active_kv_table_rows_ : io_.text_kv_table_row;
+                    LosslessCache cache{.positions         = &positions,
+                                        .table_rows        = &rows,
+                                        .source_slots      = &source,
+                                        .destination_slots = &destination,
+                                        .sequences         = 1,
+                                        .max_keys          = base_i + t0 + len,
+                                        .key_capacity      = execution_schedule_.lossless_keys};
+                    run_lossless_layers(x, rope_table, &cache);
                 }
-                xf = matrix_window(prefill_hidden_, len);
+                xf = prefill_hidden_.data != nullptr
+                         ? matrix_window(prefill_hidden_, len)
+                         : work_.alloc(DType::BF16, {dimension(config_.hidden_size), len});
                 lossless_final_norm(x, *final_norm_, config_, xf, s);
             } else {
                 if constexpr (Tap::enabled) { tap.begin(x); }
@@ -1471,7 +1527,11 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             if (is_last) {
                 Tensor last_xf = xf.slice(1, len - 1, 1);
                 Tensor logits  = matrix_window(io_.logits, 1);
-                project(last_xf, *lm_head_, logits, work_, s);
+                if (execution_schedule_.lossless) {
+                    lossless_head(last_xf, lm_head_->weight, logits, work_, s); // FP32 logits
+                } else {
+                    project(last_xf, *lm_head_, logits, work_, s);
+                }
                 // Set io_.pos to the bonus token's absolute position (base + T) before picking so
                 // the sampler RNG is keyed by it (prefill purpose keeps it distinct from the first
                 // decode step, which reuses the same io_.pos).

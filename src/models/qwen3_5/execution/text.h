@@ -26,6 +26,8 @@
 
 namespace infernix::models::qwen3_5::execution {
 
+struct LosslessCache;
+
 using Phase = qwen3_5::TextPhase;
 
 enum class GdnStateAction : std::uint8_t {
@@ -206,6 +208,10 @@ private:
         return active_sequence_batch_ != 0 ? active_sequence_width_ : columns;
     }
     void run_layers(Tensor& x, Phase phase);
+    // The lossless route's layers (execution/lossless.h) over x, the window form for a null cache, else
+    // the cache form with each layer's KV cache and state pools filled in; each layer first waits for its
+    // restored state (set_layer_ready).
+    void run_lossless_layers(Tensor& x, const Tensor& rope_table, LosslessCache* cache);
     // The drafter and proposal head a batched draft call runs with: their column-invariant copies
     // on the exact route (Parameters::invariant_mtp), whose drafts then do not depend on the other
     // rows; the prompt's drafts keep the drafter's own routes.

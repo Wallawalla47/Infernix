@@ -313,11 +313,12 @@ NInfer (measured with `master` at `81c8ce09` and the Windows port).
 
 Infernix runs three routes:
 
-- **The lossless route** (`--lossless`; Qwen3.5/3.6/3.8 and Qwen3.8-Flash-Next, causal scoring so far:
-  `infernix-perplexity` and the decode-quality tools) computes the model's own arithmetic exactly:
+- **The lossless route** (`--lossless`; Qwen3.5/3.6/3.8 generation and scoring, Qwen3.8-Flash-Next
+  scoring so far) computes the model's own arithmetic exactly:
   every operation of its Hugging Face forward pass correctly rounded to the dtype it has there
   (weights decoded exactly, sums exact). Its output depends on the request and the artifact alone,
-  not on the build, the window's length or other requests
+  not on the build, the prefill chunk, prefill or decode, other requests or the prefix cache; it is slower
+  than the other routes
   ([definition](docs/maintainer/lossless-route.md)).
 - **The reproducible route** (`--reproducible`) gives bit-identical output from run to run and from
   release to release. It is also request-invariant (other requests, concurrency, prefix-cache state

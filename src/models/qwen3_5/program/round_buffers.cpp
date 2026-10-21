@@ -62,7 +62,7 @@ RoundStateLayout begin_round_state_layout(LayoutBuilder& builder, const RoundSta
             builder.add(sizeof(OrdinaryDecodeIngress), 256, "ordinary decode ingress");
         ordinary.egress = builder.add(sizeof(OrdinaryDecodeEgress), 256, "ordinary decode egress");
         ordinary.logits = add_tensor(
-            builder, DType::BF16,
+            builder, spec.fp32_logits ? DType::FP32 : DType::BF16,
             {spec.output_rows, checked_i32(spec.batch_capacity, "RoundState batch capacity")},
             "ordinary decode logits");
         ordinary.hidden =
@@ -77,7 +77,8 @@ RoundStateLayout begin_round_state_layout(LayoutBuilder& builder, const RoundSta
     }
     layout.rope_delta = add_tensor(builder, DType::I32, {1}, "step rope delta");
     if (!spec.causal_scoring) {
-        layout.logits = add_tensor(builder, DType::BF16, {spec.output_rows, 1}, "step logits");
+        layout.logits = add_tensor(builder, spec.fp32_logits ? DType::FP32 : DType::BF16, {spec.output_rows, 1},
+                                   "step logits");
     }
     layout.text_kv_table_row = add_tensor(builder, DType::I32, {1}, "step Text KV table row");
     if (!spec.causal_scoring) {
@@ -496,7 +497,7 @@ void constrain_round_logits(const RoundState& io, const Tensor& logits, const Te
         throw std::logic_error("constrained logits are wider than the descriptor table");
     }
     const auto count = static_cast<std::int32_t>(columns);
-    Tensor matrix(logits.data, DType::BF16, {rows, count});
+    Tensor matrix(logits.data, logits.dtype, {rows, count});
     Tensor descriptors = io.constraint->descriptor_view(count);
     Tensor records     = io.constraint->record_view(count);
     // Observation is always on: its staged lists are -1 for columns nothing observes.

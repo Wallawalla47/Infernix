@@ -370,7 +370,9 @@ int main(int argc, char** argv) {
         engine_options.original_int8_prefill_kernel = cli.original_int8_prefill_kernel;
         engine_options.prefill_split_workspace_mib  = cli.prefill_split_workspace_mib;
         engine_options.original_nvfp4_prefill_kernel = cli.original_nvfp4_prefill_kernel;
-        engine_options.fast_paths                    = cli.fast_paths;
+        // The lossless route runs no fast path.
+        engine_options.fast_paths                    = cli.fast_paths && !cli.lossless;
+        engine_options.lossless                      = cli.lossless;
         engine_options.fast_path_candidates          = cli.fast_path_candidates;
         engine_options.speculative              = cli.speculative;
         engine_options.enable_vision            = cli.enable_vision;

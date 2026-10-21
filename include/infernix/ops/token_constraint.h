@@ -55,14 +55,14 @@ inline constexpr std::int32_t kTokenObserveRecord = kTokenObserveTokens + 1;
  *   [kTokenObserveRecord,C].
  *
  * Supported domain:
- *   logits is contiguous finite BF16; descriptors, choices, choice_counts and argmax are
+ *   logits is contiguous finite BF16 or FP32; descriptors, choices, choice_counts and argmax are
  *   contiguous I32; records is contiguous FP32. Every descriptor is -1, below -1 naming a token in
  *   [0,V), or a set index in [0,S); every used count is in [1,16] and its tokens are distinct
  *   members of [0,V). A column whose descriptor or set breaks this is left untouched. observe is
  *   contiguous I32 with every entry -1 or in [0,V); observed is contiguous FP32.
  *
  * Numeric:
- *   records and observed are FP32 approximations of the formulas above from the represented BF16
+ *   records and observed are FP32 approximations of the formulas above from the represented
  *   logits; the independent oracle evaluates them in FP64. argmax and the masked logits are exact.
  *
  * Effects:

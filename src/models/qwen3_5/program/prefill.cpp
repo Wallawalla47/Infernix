@@ -2,6 +2,7 @@
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/execution_context.h"
 #include "models/qwen3_5/execution/linear.h"
+#include "models/qwen3_5/execution/lossless.h"
 #include "models/qwen3_5/execution/vision_overlay.h"
 #include "core/device.h"
 #include "infernix/ops/gdn_replay.h"
@@ -167,8 +168,13 @@ void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_
     }
     state.execution.work.reset();
     Tensor logits = state.execution.io.logits.slice(1, 0, 1);
-    project(hidden, state.execution.parameters.text.output_head, logits, state.execution.work,
-            state.execution.device.stream);
+    if (state.execution.execution_schedule.lossless) {
+        lossless_head(hidden, state.execution.parameters.text.output_head.weight, logits, state.execution.work,
+                      state.execution.device.stream);
+    } else {
+        project(hidden, state.execution.parameters.text.output_head, logits, state.execution.work,
+                state.execution.device.stream);
+    }
     qwen3_5::constrain_round_logits(
         state.execution.io, logits, nullptr,
         dimension(state.execution.parameters.model.resources().public_token_count),
@@ -542,7 +548,11 @@ PromptReadout ProgramImpl::read_prompt_frontier(const Tensor& hidden,
         execution::dimension(parameters.model.resources().public_token_count);
     work.reset();
     Tensor logits = io.logits.slice(1, 0, 1);
-    execution::project(hidden, parameters.text.output_head, logits, work, device.stream);
+    if (execution_schedule.lossless) {
+        execution::lossless_head(hidden, parameters.text.output_head.weight, logits, work, device.stream);
+    } else {
+        execution::project(hidden, parameters.text.output_head, logits, work, device.stream);
+    }
     Tensor ids         = work.alloc(DType::I32, {count, 1});
     Tensor logprobs    = work.alloc(DType::FP32, {count, 1});
     Tensor top_id      = work.alloc(DType::I32, {1, 1});

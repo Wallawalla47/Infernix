@@ -565,6 +565,7 @@ std::string format_server_start_json(
              {"prefill_split_workspace_mib", engine_options.prefill_split_workspace_mib},
              {"original_nvfp4_prefill_kernel", engine_options.original_nvfp4_prefill_kernel},
              {"fast_paths", engine_options.fast_paths},
+             {"lossless", engine_options.lossless},
              {"log_stats_interval_ms", options.log_stats_interval_ms},
              {"kv_cache", kv_cache_name(engine_options.kv_cache)},
              {"vision", engine_options.enable_vision},

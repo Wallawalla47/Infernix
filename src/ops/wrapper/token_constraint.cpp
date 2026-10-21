@@ -46,7 +46,7 @@ void constrain_logits(Tensor& logits, Tensor* argmax, const Tensor& descriptors,
     }
     const std::int32_t columns = logits.ne[1];
     const std::int32_t sets    = choice_counts.ne[0];
-    require(logits, DType::BF16, logits.ne[0], columns, "logits");
+    require(logits, logits.dtype == DType::FP32 ? DType::FP32 : DType::BF16, logits.ne[0], columns, "logits");
     require(descriptors, DType::I32, columns, 1, "descriptors");
     if (sets <= 0) { throw std::invalid_argument("constrain_logits: choice table is empty"); }
     require(choice_counts, DType::I32, sets, 1, "choice_counts");

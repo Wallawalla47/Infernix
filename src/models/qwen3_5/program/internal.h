@@ -62,9 +62,13 @@ struct ExecutionSchedule {
     // projections precise_linear's forms, attention causal_softmax_attention_reference, the FFN
     // ffn_reference, the scoring head FP32 (docs/maintainer/model-quality.md 6.2).
     bool reference = false;
-    // The lossless route (EngineOptions::lossless, a CausalScoring Program scoring each window in one
-    // pass): every layer execution::lossless_layer, the scoring head FP32 (docs/maintainer/lossless-route.md).
-    bool lossless = false;
+    // The lossless route (EngineOptions::lossless, docs/maintainer/lossless-route.md): every layer
+    // execution::lossless_layer, FP32 logits. A CausalScoring Program scores each window in one pass (the
+    // window form, lossless_keys 0); a Generation Program runs prefill chunks and decode rounds through
+    // the KV cache (the lossless bf16 profile) and the recurrent state slots (the cache form, keys up to
+    // lossless_keys, max_context), eagerly (no CUDA Graphs) and without speculation.
+    bool lossless              = false;
+    std::int32_t lossless_keys = 0;
     // The reproducible and lossless routes: sampled requests draw by Gumbel-max
     // (ops::SamplingConfig::gumbel_max), so speculation returns plain sampling's text.
     bool gumbel_sampling = false;

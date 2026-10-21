@@ -55,16 +55,21 @@ __device__ __forceinline__ void argmax_block_reduce(float& value, std::int32_t& 
     if (warp == 0) { argmax_warp_reduce(value, index); }
 }
 
+__device__ __forceinline__ float argmax_logit(__nv_bfloat16 value) { return __bfloat162float(value); }
+__device__ __forceinline__ float argmax_logit(float value) { return value; }
+
+// One CTA per column (BF16 or FP32 logits).
+template <class Logit>
 __launch_bounds__(kArgmaxBlock) __global__
-    void argmax_kernel(const __nv_bfloat16* logits, std::int32_t* out, std::int32_t valid_rows,
+    void argmax_kernel(const Logit* logits, std::int32_t* out, std::int32_t valid_rows,
                        std::int32_t physical_rows) {
     const std::int32_t t    = static_cast<std::int32_t>(blockIdx.x);
     const std::int64_t base = static_cast<std::int64_t>(t) * physical_rows;
 
-    float best_value        = __bfloat162float(logits[base]);
+    float best_value        = argmax_logit(logits[base]);
     std::int32_t best_index = 0;
     for (std::int32_t v = static_cast<std::int32_t>(threadIdx.x); v < valid_rows; v += blockDim.x) {
-        const float value = __bfloat162float(logits[base + v]);
+        const float value = argmax_logit(logits[base + v]);
         if (argmax_better(value, v, best_value, best_index)) {
             best_value = value;
             best_index = v;

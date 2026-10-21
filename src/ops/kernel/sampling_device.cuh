@@ -342,11 +342,16 @@ __device__ inline void sampling_normalize_support(const SamplingConfig& cfg, flo
     __syncthreads();
 }
 
+// A logit as FP32 (exact for both storage types; FP32 logits are the lossless route's).
+__device__ __forceinline__ float sampling_logit(__nv_bfloat16 value) { return __bfloat162float(value); }
+__device__ __forceinline__ float sampling_logit(float value) { return value; }
+
 // All threads of the block must call. Small-column exact truncated support
 // builder used by unit tests and any <=256-token column. It sorts one shared
 // tile and then applies the same top-p/min-p renormalization as the large path.
+template <class Logit>
 __device__ inline void
-sampling_build_truncated_small(const __nv_bfloat16* logits, std::int64_t base, std::int32_t vocab,
+sampling_build_truncated_small(const Logit* logits, std::int64_t base, std::int32_t vocab,
                                const SamplingConfig& cfg, float* tile_val, int* tile_idx,
                                float* cand_val, int* cand_idx, float* prob, int* n_support,
                                const std::int32_t* overlay = nullptr, int overlay_len = 0) {
@@ -354,7 +359,7 @@ sampling_build_truncated_small(const __nv_bfloat16* logits, std::int64_t base, s
     const int cap = sampling_candidate_cap(cfg, vocab);
     if (tid < kSamplerTileItems) {
         if (tid < vocab) {
-            const float x = sampling_adjusted_logit(__bfloat162float(logits[base + tid]), tid, cfg,
+            const float x = sampling_adjusted_logit(sampling_logit(logits[base + tid]), tid, cfg,
                                                     overlay, overlay_len);
             tile_val[tid] = x;
             tile_idx[tid] = tid;
@@ -376,8 +381,9 @@ sampling_build_truncated_small(const __nv_bfloat16* logits, std::int64_t base, s
 // Single-block fallback for large columns when the finite multi-block workspace
 // route cannot represent the launch. It still reads each vocab entry once and
 // keeps a bounded per-thread top-20, so it avoids a top_k*vocab global reread.
+template <class Logit>
 __device__ inline void sampling_build_truncated_block_fast(
-    const __nv_bfloat16* logits, std::int64_t base, std::int32_t vocab, const SamplingConfig& cfg,
+    const Logit* logits, std::int64_t base, std::int32_t vocab, const SamplingConfig& cfg,
     float* merge_val, int* merge_idx, float* cand_val, int* cand_idx, float* prob, int* n_support,
     const std::int32_t* overlay = nullptr, int overlay_len = 0) {
     const int tid = threadIdx.x;
@@ -393,7 +399,7 @@ __device__ inline void sampling_build_truncated_block_fast(
 
     const int fast_cap = cap;
     for (int v = tid; v < vocab; v += blockDim.x) {
-        const float x = sampling_adjusted_logit(__bfloat162float(logits[base + v]), v, cfg, overlay,
+        const float x = sampling_adjusted_logit(sampling_logit(logits[base + v]), v, cfg, overlay,
                                                 overlay_len);
         sampling_insert_candidate(local_val, local_idx, fast_cap, x, v);
     }

@@ -184,18 +184,24 @@ __global__ void gdn_gates_kernel(const std::uint16_t* a, const std::uint16_t* b,
 
 // One thread per (channel, column): the K-term sum exact, rounded once to binary32, then SiLU to BF16.
 constexpr int kConvWords = 18; // products M_w M_x 2^(e_w + e_x - 268): positions e_w + e_x in [2, 508] + 16 bits
+// Columns form runs of `width` (one per sequence); a run's taps before its first column read its source
+// slot of `states` (BF16 [C, K - 1, slots]; null: zeros).
 __global__ void causal_conv_kernel(const std::uint16_t* x, const std::uint16_t* w, std::uint16_t* out, int channels,
-                                   int columns, int taps) {
+                                   int columns, int taps, int width, const std::uint16_t* states,
+                                   const int* source_slots) {
     const std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= static_cast<std::size_t>(channels) * columns) { return; }
     const int c = static_cast<int>(i % channels), t = static_cast<int>(i / channels);
+    const int b = t / width, run = t % width;
     Wide<kConvWords> acc;
     acc.clear();
     bool nan = false, pos_inf = false, neg_inf = false;
     for (int tap = 0; tap < taps; ++tap) {
-        const int src = t - taps + 1 + tap;
-        if (src < 0) { continue; }
-        const std::uint16_t xb = x[static_cast<std::size_t>(src) * channels + c];
+        const int src = run - taps + 1 + tap;
+        if (src < 0 && states == nullptr) { continue; }
+        const std::uint16_t xb =
+            src >= 0 ? x[(static_cast<std::size_t>(b) * width + src) * channels + c]
+                     : states[(static_cast<std::size_t>(source_slots[b]) * (taps - 1) + (taps - 1 + src)) * channels + c];
         const std::uint16_t wb = w[static_cast<std::size_t>(tap) * channels + c];
         const int xf = (xb >> 7) & 0xFF, wf = (wb >> 7) & 0xFF;
         const int xm = xb & 0x7F, wm = wb & 0x7F;
@@ -227,6 +233,23 @@ __global__ void causal_conv_kernel(const std::uint16_t* x, const std::uint16_t* 
         sum = __uint_as_float(round_magnitude(mag, -268, negative, false));
     }
     out[i] = lossless::cr_silu_bf16(sum);
+}
+
+// One thread per (channel, sequence): the destination slot's K - 1 columns become the last K - 1 of the
+// source slot's followed by the run, in ascending order (an in-place slot reads each old column before
+// it is overwritten).
+__global__ void conv_state_kernel(const std::uint16_t* x, std::uint16_t* states, const int* source_slots,
+                                  const int* destination_slots, int channels, int sequences, int width, int taps) {
+    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= channels * sequences) { return; }
+    const int c = i % channels, b = i / channels, keep = taps - 1;
+    const std::uint16_t* src = states + static_cast<std::size_t>(source_slots[b]) * keep * channels + c;
+    std::uint16_t* dst       = states + static_cast<std::size_t>(destination_slots[b]) * keep * channels + c;
+    for (int h = 0; h < keep; ++h) {
+        const int s = width + h - keep; // the run's column, or (negative) the old state's column h + width
+        dst[static_cast<std::size_t>(h) * channels] =
+            s >= 0 ? x[(static_cast<std::size_t>(b) * width + s) * channels + c] : src[static_cast<std::size_t>(h + width) * channels];
+    }
 }
 
 int blocks_for(std::size_t n, int threads) { return static_cast<int>((n + threads - 1) / threads); }
@@ -321,10 +344,38 @@ void lossless_causal_conv(const Tensor& x, const Tensor& weight, Tensor& out, cu
             "causal conv needs BF16 x and out [C, T] and a BF16 weight [C, K] (tap-major)");
     const int channels = x.ne[0], columns = static_cast<int>(x.numel() / channels), taps = weight.ne[1];
     const std::size_t n = static_cast<std::size_t>(channels) * columns;
-    causal_conv_kernel<<<blocks_for(n, 256), 256, 0, stream>>>(static_cast<const std::uint16_t*>(x.data),
-                                                                static_cast<const std::uint16_t*>(weight.data),
-                                                                static_cast<std::uint16_t*>(out.data), channels,
-                                                                columns, taps);
+    if (n == 0) { return; }
+    causal_conv_kernel<<<blocks_for(n, 256), 256, 0, stream>>>(
+        static_cast<const std::uint16_t*>(x.data), static_cast<const std::uint16_t*>(weight.data),
+        static_cast<std::uint16_t*>(out.data), channels, columns, taps, columns, nullptr, nullptr);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void lossless_causal_conv_slots(const Tensor& x, const Tensor& weight, int sequences, Tensor& states,
+                                const Tensor& source_slots, const Tensor& destination_slots, Tensor& out,
+                                cudaStream_t stream) {
+    require(contiguous(x, DType::BF16) && contiguous(weight, DType::BF16) && contiguous(out, DType::BF16) &&
+                weight.ne[0] == x.ne[0] && x.numel() == out.numel() && weight.ne[1] >= 2 && weight.ne[1] <= 8,
+            "causal conv needs BF16 x and out [C, T] and a BF16 weight [C, K] (tap-major), K >= 2");
+    const int channels = x.ne[0], columns = static_cast<int>(x.numel() / channels), taps = weight.ne[1];
+    require(sequences >= 1 && columns % sequences == 0, "the columns are `sequences` equal runs");
+    require(contiguous(states, DType::BF16) && states.ne[0] == channels && states.ne[1] == taps - 1,
+            "states BF16 [C, K - 1, slots]");
+    require(source_slots.dtype == DType::I32 && destination_slots.dtype == DType::I32 &&
+                source_slots.is_contiguous() && destination_slots.is_contiguous() &&
+                source_slots.numel() >= sequences && destination_slots.numel() >= sequences,
+            "source and destination slots I32 [B]");
+    if (columns == 0) { return; }
+    const std::size_t n = static_cast<std::size_t>(channels) * columns;
+    causal_conv_kernel<<<blocks_for(n, 256), 256, 0, stream>>>(
+        static_cast<const std::uint16_t*>(x.data), static_cast<const std::uint16_t*>(weight.data),
+        static_cast<std::uint16_t*>(out.data), channels, columns, taps, columns / sequences,
+        static_cast<const std::uint16_t*>(states.data), static_cast<const int*>(source_slots.data));
+    CUDA_CHECK(cudaGetLastError());
+    conv_state_kernel<<<blocks_for(static_cast<std::size_t>(channels) * sequences, 256), 256, 0, stream>>>(
+        static_cast<const std::uint16_t*>(x.data), static_cast<std::uint16_t*>(states.data),
+        static_cast<const int*>(source_slots.data), static_cast<const int*>(destination_slots.data), channels,
+        sequences, columns / sequences, taps);
     CUDA_CHECK(cudaGetLastError());
 }
 

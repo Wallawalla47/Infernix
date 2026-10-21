@@ -22,7 +22,9 @@ std::size_t sampling_workspace_capacity_bytes(std::int32_t token_domain, std::in
 void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
             const SamplingConfig* configs, const Tensor& logical_positions, std::int32_t purpose,
             WorkspaceArena& workspace, cudaStream_t stream) {
-    if (logits.dtype != DType::BF16) { throw std::invalid_argument("sample: logits must be BF16"); }
+    if (logits.dtype != DType::BF16 && logits.dtype != DType::FP32) {
+        throw std::invalid_argument("sample: logits must be BF16 or FP32");
+    }
     if (out.dtype != DType::I32) { throw std::invalid_argument("sample: out must be I32"); }
     if (logits.ne[2] != 1 || logits.ne[3] != 1) {
         throw std::invalid_argument("sample: logits must be rank-2 [physical_rows,B]");
