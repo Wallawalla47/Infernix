@@ -258,6 +258,10 @@ public:
         Submission(const Submission&)            = delete;
         Submission& operator=(const Submission&) = delete;
 
+        [[nodiscard]] std::uint64_t request_id() const noexcept {
+            return request_ != nullptr ? request_->id : 0;
+        }
+
         GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) {
             if (owner_ == nullptr || request_ == nullptr) {
                 throw std::logic_error("concurrent submission is empty");

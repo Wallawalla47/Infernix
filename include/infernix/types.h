@@ -2392,6 +2392,34 @@ struct RuntimeHostWorkStats {
     std::uint64_t stats_publication_invocations = 0;
 };
 
+// What one resident lane holds (RuntimeStats::lanes): the lane view a server reports per slot
+// (infernix-serve GET /slots). Counters are exact at the published boundary.
+enum class LaneActivity : std::uint8_t {
+    Idle,          // no request
+    Materializing, // binding its context (restoring or copying a cached prefix)
+    Prefill,       // computing its prompt
+    Replay,        // recomputing its history after a pause
+    Decode,        // generating
+    Control,       // committing forced control tokens
+    Pausing,       // giving its lane back under resource pressure
+    Finished,      // its model work ended; the response is being released
+};
+
+struct LaneStats {
+    std::uint64_t engine_request_id = 0; // 0 while Idle (GenerationHandle::request_id)
+    LaneActivity activity           = LaneActivity::Idle;
+    bool decision_lane              = false; // one of EngineOptions::decision_lanes
+    bool decision                   = false; // the request is a decision (ExecutionOptions::decision)
+    std::uint32_t prompt_tokens     = 0;     // the whole prompt
+    // Known once the binding chose its source: prompt tokens reused from the prefix cache.
+    std::uint32_t reused_prompt_tokens = 0;
+    bool binding_known                 = false;
+    // Prompt tokens computed by prefill so far (past the reused prefix; replay excluded).
+    std::uint32_t computed_prompt_tokens = 0;
+    // Committed output tokens so far, the first one included.
+    std::uint32_t generated_tokens = 0;
+};
+
 // Monotonic execution counters, boundary-consistent current gauges, and explicitly named last
 // decision observations. Consumers derive interval counters by subtracting two snapshots.
 struct RuntimeStats {
@@ -2568,6 +2596,9 @@ struct RuntimeStats {
     std::uint64_t next_turn_prefills_skipped          = 0;
     std::uint64_t next_turn_prefills_dropped          = 0;
     std::uint64_t next_turn_prefill_tokens            = 0;
+    // Every resident lane at the published boundary, lanes [0, lane_count) of max_concurrency.
+    std::array<LaneStats, kMaximumConcurrency> lanes{};
+    std::uint32_t lane_count = 0;
 };
 
 // Where a request the Engine holds stands (Engine::request_monitor).

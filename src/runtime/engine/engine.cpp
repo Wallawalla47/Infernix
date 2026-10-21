@@ -267,6 +267,7 @@ public:
         virtual GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) = 0;
         virtual bool await_admission(const CancellationView& cancellation,
                                      std::chrono::steady_clock::time_point until) = 0;
+        [[nodiscard]] virtual std::uint64_t request_id() const noexcept = 0;
     };
 
     template <class Submission>
@@ -282,6 +283,9 @@ public:
         bool await_admission(const CancellationView& cancellation,
                              std::chrono::steady_clock::time_point until) override {
             return submission_.await_admission(cancellation, until);
+        }
+        [[nodiscard]] std::uint64_t request_id() const noexcept override {
+            return submission_.request_id();
         }
 
     private:
@@ -302,6 +306,7 @@ public:
     bool await_admission(const CancellationView& cancellation, std::chrono::steady_clock::time_point until) {
         return state_->await_admission(cancellation, until);
     }
+    [[nodiscard]] std::uint64_t request_id() const noexcept { return state_->request_id(); }
 
     [[nodiscard]] const ResolvedSamplingParameters& resolved_sampling() const noexcept {
         return sampling_;
@@ -324,6 +329,10 @@ GenerationHandle::operator bool() const noexcept { return impl_ != nullptr; }
 const ResolvedSamplingParameters& GenerationHandle::resolved_sampling() const noexcept {
     static const ResolvedSamplingParameters empty;
     return impl_ != nullptr ? impl_->resolved_sampling() : empty;
+}
+
+std::uint64_t GenerationHandle::request_id() const noexcept {
+    return impl_ != nullptr ? impl_->request_id() : 0;
 }
 
 GenerationResult GenerationHandle::wait(OutputSink* sink, const CancellationView& cancellation) {
@@ -843,6 +852,8 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
         struct ImmediateSubmission {
             GenerationResult result;
             OutputConsumerMode consumer_mode = OutputConsumerMode::Aggregate;
+
+            [[nodiscard]] std::uint64_t request_id() const noexcept { return 0; }
 
             GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) {
                 const bool streaming = consumer_mode == OutputConsumerMode::Streaming;

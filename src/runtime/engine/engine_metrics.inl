@@ -268,7 +268,42 @@ void EngineCore<Instance>::publish_runtime_stats() {
         no_progress_since_ ? std::chrono::duration<double>(Clock::now() - *no_progress_since_).count() : 0.0;
     snapshot.no_progress_recoveries   = no_progress_recoveries_;
     snapshot.device_memory_recoveries = memory_exhausted_recoveries_;
+    snapshot.lane_count               = max_concurrency_;
     for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+        LaneStats& view    = snapshot.lanes[lane];
+        view               = LaneStats{};
+        view.decision_lane = lane + decision_lanes_ >= max_concurrency_;
+        const Request* held = slots_[lane].get();
+        if (held == nullptr && materializing_ && materializing_->destination.value == lane) {
+            held          = materializing_->request.get();
+            view.activity = LaneActivity::Materializing;
+        }
+        if (held != nullptr) {
+            view.engine_request_id = held->id;
+            view.decision          = held->is_decision();
+            view.prompt_tokens     = held->prompt_summary.prompt_tokens;
+            if (held->admitted_begin) {
+                view.binding_known        = true;
+                view.reused_prompt_tokens = held->admitted_begin->reused_prompt_tokens;
+            }
+            view.computed_prompt_tokens = held->computed_prompt_tokens;
+            view.generated_tokens       = static_cast<std::uint32_t>(
+                std::min<std::size_t>(held->generated.size(),
+                                      std::numeric_limits<std::uint32_t>::max()));
+            if (view.activity != LaneActivity::Materializing) {
+                switch (held->model_state) {
+                case EngineRequestState::Prefill:       view.activity = LaneActivity::Prefill; break;
+                case EngineRequestState::Replay:        view.activity = LaneActivity::Replay; break;
+                case EngineRequestState::DecodeReady:   view.activity = LaneActivity::Decode; break;
+                case EngineRequestState::ControlReady:  view.activity = LaneActivity::Control; break;
+                case EngineRequestState::Pausing:       view.activity = LaneActivity::Pausing; break;
+                case EngineRequestState::ModelFinished: view.activity = LaneActivity::Finished; break;
+                case EngineRequestState::Materializing: view.activity = LaneActivity::Materializing; break;
+                case EngineRequestState::Waiting:
+                case EngineRequestState::Paused:        view.activity = LaneActivity::Idle; break;
+                }
+            }
+        }
         if (slots_[lane] == nullptr) { continue; }
         ++snapshot.running_requests;
         if (slots_[lane]->is_prefilling()) { ++snapshot.prefilling_requests; }

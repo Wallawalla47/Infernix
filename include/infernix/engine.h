@@ -49,6 +49,10 @@ public:
 
     [[nodiscard]] explicit operator bool() const noexcept;
     [[nodiscard]] const ResolvedSamplingParameters& resolved_sampling() const noexcept;
+    // The Engine's id for this request (GenerationResult::engine_request_id and
+    // RuntimeStats::lanes[].engine_request_id), known from submission on; 0 for a request that
+    // never reached the Engine (no output requested) or an empty handle.
+    [[nodiscard]] std::uint64_t request_id() const noexcept;
 
     GenerationResult wait(OutputSink* sink = nullptr, const CancellationView& cancellation = {});
 
