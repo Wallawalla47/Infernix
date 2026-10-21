@@ -1413,8 +1413,9 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .kv_storage           = options.kv_cache,
         .proposal_head        = options.speculative.proposal_head,
         .features             = models::load_options(options, Architecture::Qwen3_5),
-        // The lossless route runs eagerly.
-        .use_cuda_graph       = options.use_cuda_graph && !options.lossless,
+        // Lossless decode rounds are captured too: nothing on their path waits for the host, and the
+        // attention's launches depend on the round's shape, not on its key bound.
+        .use_cuda_graph       = options.use_cuda_graph,
         .causal_scoring       = options.purpose == EnginePurpose::CausalScoring,
         .device               = options.device,
         .multiprocessor_count = device.multiprocessor_count(),

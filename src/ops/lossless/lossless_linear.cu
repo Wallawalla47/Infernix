@@ -2,6 +2,9 @@
 
 #include "ops/lossless/linear_impl.cuh"
 
+#include <span>
+#include <vector>
+
 // The --lossless route's projections: the API and the non-GGUF formats' instantiations
 // (ops/lossless/linear_impl.cuh holds the arithmetic).
 
@@ -11,65 +14,112 @@ using namespace lossless_linear_impl;
 
 namespace {
 
-void run(const Call& call, Route route, WorkspaceArena& workspace, cudaStream_t stream) {
-    const int k = call.x->ne[0], columns = call.columns;
-    const Layout l = layout_of(k, call.rows, columns, route == Route::Bf16);
+// A BF16 weight's per-row block data (bf16_weight_scan_kernel) for rows of a call: its bytes, and the scan.
+std::size_t bf16_meta_bytes(std::int32_t k, std::int32_t rows) {
+    const std::size_t blocks = static_cast<std::size_t>(k) / kBlockK, r = static_cast<std::size_t>(rows);
+    return align256(r * blocks * sizeof(std::int16_t)) + align256((r + kTileRows - 1) / kTileRows * blocks) +
+           align256(r * sizeof(std::int32_t));
+}
+
+void scan_bf16(Call& c, std::uint8_t* meta, cudaStream_t stream) {
+    const int k = c.x->ne[0], blocks = k / kBlockK;
+    const std::size_t r = static_cast<std::size_t>(c.rows);
+    auto* block_exp   = reinterpret_cast<std::int16_t*>(meta);
+    auto* tile_lo_w   = meta + align256(r * blocks * sizeof(std::int16_t));
+    auto* row_inexact = reinterpret_cast<std::int32_t*>(tile_lo_w + align256((r + kTileRows - 1) / kTileRows * blocks));
+    CUDA_CHECK(cudaMemsetAsync(tile_lo_w, 0, bf16_meta_bytes(k, c.rows) - align256(r * blocks * sizeof(std::int16_t)),
+                               stream));
+    const std::size_t warps = r * blocks;
+    const int threads       = 256;
+    bf16_weight_scan_kernel<<<static_cast<unsigned>((warps * 32 + threads - 1) / threads), threads, 0, stream>>>(
+        reinterpret_cast<const std::uint16_t*>(c.w.codes), k, c.row_begin, c.rows, block_exp, tile_lo_w, row_inexact);
+    CUDA_CHECK(cudaGetLastError());
+    c.w.block_exp   = block_exp;
+    c.w.tile_lo_w   = tile_lo_w;
+    c.w.row_inexact = row_inexact;
+    c.w.blocks      = blocks;
+    c.w.row_base    = c.row_begin;
+}
+
+bool reads_xsum(const Call& c, Route route) { return route == Route::Ggml && ggml_reads_xsum(c.qtype); }
+
+void launch_route(const Call& c, Route route, int first, int count, std::uint8_t* base, const Layout& l,
+                  cudaStream_t stream, const ChunkStage* stage) {
+    switch (route) {
+    case Route::Q2: launch_chunk_stage<RowSplitFormat<2>>(c, first, count, base, l, stream, stage); break;
+    case Route::Q4: launch_chunk_stage<RowSplitFormat<4>>(c, first, count, base, l, stream, stage); break;
+    case Route::Q5: launch_chunk_stage<RowSplitFormat<5>>(c, first, count, base, l, stream, stage); break;
+    case Route::Q6: launch_chunk_stage<RowSplitFormat<6>>(c, first, count, base, l, stream, stage); break;
+    case Route::Q8: launch_chunk_stage<RowSplitFormat<8>>(c, first, count, base, l, stream, stage); break;
+    case Route::Nvfp4: launch_chunk_stage<Nvfp4Format>(c, first, count, base, l, stream, stage); break;
+    case Route::Fp8Row: launch_chunk_stage<Fp8RowFormat>(c, first, count, base, l, stream, stage); break;
+    case Route::Bf16: launch_chunk_stage<Bf16GridFormat>(c, first, count, base, l, stream, stage); break;
+    case Route::Mxfp8: launch_chunk_stage<Mxfp8Format>(c, first, count, base, l, stream, stage); break;
+    case Route::Rg16: launch_chunk_stage<Rg16Format>(c, first, count, base, l, stream, stage); break;
+    case Route::Fp8B128: launch_chunk_stage<Fp8B128Format>(c, first, count, base, l, stream, stage); break;
+    case Route::Ggml:
+        require(launch_ggml_k(c.qtype, c, first, count, base, l, stream, stage) ||
+                    launch_ggml_i(c.qtype, c, first, count, base, l, stream, stage),
+                "unsupported GGUF format");
+        break;
+    default: require(false, "unsupported weight format");
+    }
+}
+
+struct Projection {
+    Call call;
+    Route route;
+};
+
+// The workspace of projections of one input over `columns`: the encode's buffers and one bitmap for the
+// widest projection (shared, the projections run in turn), then each BF16 weight's block data.
+std::size_t projections_bytes(std::int32_t k, std::span<const Projection> ps, std::int32_t columns) {
+    std::int32_t rows = 0;
+    std::size_t meta  = 0;
+    for (const Projection& p : ps) {
+        rows = std::max(rows, p.call.rows);
+        if (p.route == Route::Bf16) { meta += bf16_meta_bytes(k, p.call.rows); }
+    }
+    return layout_of(k, rows, columns, false).total + meta;
+}
+
+// Projections of one input (the same x, columns and column maps): each chunk's activation columns are encoded
+// once, then every projection's product and fallback run on that encoding.
+void run(std::span<Projection> ps, WorkspaceArena& workspace, cudaStream_t stream) {
+    const int k = ps[0].call.x->ne[0], columns = ps[0].call.columns;
+    std::int32_t rows = 0;
+    bool xsum         = false;
+    for (const Projection& p : ps) {
+        rows = std::max(rows, p.call.rows);
+        xsum = xsum || reads_xsum(p.call, p.route);
+    }
+    const Layout l = layout_of(k, rows, columns, false);
     auto scope     = workspace.scope();
-    auto* base     = static_cast<std::uint8_t*>(workspace.alloc_bytes(l.total).data);
-    Call c         = call;
-    if (route == Route::Bf16) {
-        const int blocks  = k / kBlockK;
-        auto* block_exp   = reinterpret_cast<std::int16_t*>(base + l.block_exp);
-        auto* tile_lo_w   = base + l.tile_lo_w;
-        auto* row_inexact = reinterpret_cast<std::int32_t*>(base + l.row_inexact);
-        CUDA_CHECK(cudaMemsetAsync(base + l.tile_lo_w, 0, l.total - l.tile_lo_w, stream));
-        const std::size_t warps = static_cast<std::size_t>(c.rows) * blocks;
-        const int threads       = 256;
-        bf16_weight_scan_kernel<<<static_cast<unsigned>((warps * 32 + threads - 1) / threads), threads, 0, stream>>>(
-            reinterpret_cast<const std::uint16_t*>(c.w.codes), k, c.row_begin, c.rows, block_exp, tile_lo_w, row_inexact);
-        CUDA_CHECK(cudaGetLastError());
-        c.w.block_exp   = block_exp;
-        c.w.tile_lo_w   = tile_lo_w;
-        c.w.row_inexact = row_inexact;
-        c.w.blocks      = blocks;
-        c.w.row_base    = c.row_begin;
+    auto* base     = static_cast<std::uint8_t*>(workspace.alloc_bytes(projections_bytes(k, ps, columns)).data);
+    std::uint8_t* meta = base + l.total;
+    for (Projection& p : ps) {
+        if (p.route != Route::Bf16) { continue; }
+        scan_bf16(p.call, meta, stream);
+        meta += bf16_meta_bytes(k, p.call.rows);
     }
     for (int first = 0; first < columns; first += kChunkColumns) {
         const int count = std::min(kChunkColumns, columns - first);
-        switch (route) {
-        case Route::Q2: launch_chunk<RowSplitFormat<2>>(c, first, count, base, l, stream); break;
-        case Route::Q4: launch_chunk<RowSplitFormat<4>>(c, first, count, base, l, stream); break;
-        case Route::Q5: launch_chunk<RowSplitFormat<5>>(c, first, count, base, l, stream); break;
-        case Route::Q6: launch_chunk<RowSplitFormat<6>>(c, first, count, base, l, stream); break;
-        case Route::Q8: launch_chunk<RowSplitFormat<8>>(c, first, count, base, l, stream); break;
-        case Route::Nvfp4: launch_chunk<Nvfp4Format>(c, first, count, base, l, stream); break;
-        case Route::Fp8Row: launch_chunk<Fp8RowFormat>(c, first, count, base, l, stream); break;
-        case Route::Bf16: launch_chunk<Bf16GridFormat>(c, first, count, base, l, stream); break;
-        case Route::Mxfp8: launch_chunk<Mxfp8Format>(c, first, count, base, l, stream); break;
-        case Route::Rg16: launch_chunk<Rg16Format>(c, first, count, base, l, stream); break;
-        case Route::Fp8B128: launch_chunk<Fp8B128Format>(c, first, count, base, l, stream); break;
-        case Route::Ggml:
-            require(launch_ggml_k(c.qtype, c, first, count, base, l, stream) ||
-                        launch_ggml_i(c.qtype, c, first, count, base, l, stream),
-                    "unsupported GGUF format");
-            break;
-        default: require(false, "unsupported weight format");
+        for (std::size_t i = 0; i < ps.size(); ++i) {
+            const ChunkStage stage{i == 0, xsum};
+            launch_route(ps[i].call, ps[i].route, first, count, base, l, stream, &stage);
         }
     }
 }
 
-} // namespace
-
-bool lossless_linear_supports(const Weight& weight) noexcept { return route_of(weight) != Route::None; }
-
-std::size_t lossless_linear_workspace_bytes(const Weight& weight, std::int32_t rows, std::int32_t columns) {
-    require(weight.k > 0 && weight.k % kBlockK == 0 && rows > 0 && columns > 0, "K must be a positive multiple of 64");
-    return layout_of(weight.k, rows, columns, route_of(weight) == Route::Bf16).total;
+void run(const Call& call, Route route, WorkspaceArena& workspace, cudaStream_t stream) {
+    Projection p{call, route};
+    run(std::span<Projection>(&p, 1), workspace, stream);
 }
 
-void lossless_linear(const Tensor& x, const Weight& weight, std::int32_t row_begin, std::int32_t rows, Tensor& out,
-                     std::int32_t out_row, WorkspaceArena& workspace, cudaStream_t stream) {
-    const Route route = route_of(weight);
+// The checked Call of one projection (lossless_linear's contract).
+Call projection_call(const Tensor& x, const Weight& weight, std::int32_t row_begin, std::int32_t rows, Tensor& out,
+                     std::int32_t out_row, Route& route) {
+    route = route_of(weight);
     require(route != Route::None, "unsupported weight format");
     check_x(x, weight);
     const int columns = x.ne[1];
@@ -81,8 +131,51 @@ void lossless_linear(const Tensor& x, const Weight& weight, std::int32_t row_beg
     if (route == Route::Q2 || route == Route::Q4 || route == Route::Q5 || route == Route::Q6 || route == Route::Q8) {
         require(weight.padded_shape[1] >= x.ne[0], "the row-split weight's padded K must cover K");
     }
-    run(Call{&x, view_of(weight, route), row_begin, nullptr, 0, rows, &out, out_row, columns, weight.qtype}, route,
-        workspace, stream);
+    return Call{&x, view_of(weight, route), row_begin, nullptr, 0, rows, &out, out_row, columns, weight.qtype};
+}
+
+} // namespace
+
+bool lossless_linear_supports(const Weight& weight) noexcept { return route_of(weight) != Route::None; }
+
+std::size_t lossless_linear_workspace_bytes(const Weight& weight, std::int32_t rows, std::int32_t columns) {
+    require(weight.k > 0 && weight.k % kBlockK == 0 && rows > 0 && columns > 0, "K must be a positive multiple of 64");
+    return layout_of(weight.k, rows, columns, route_of(weight) == Route::Bf16).total;
+}
+
+std::size_t lossless_linear_shared_workspace_bytes(std::span<const LosslessProjection> projections, std::int32_t columns) {
+    require(!projections.empty() && columns > 0, "at least one projection over positive columns");
+    std::vector<Projection> ps;
+    const std::int32_t k = projections[0].weight->k;
+    for (const LosslessProjection& p : projections) {
+        require(p.weight != nullptr && p.weight->k == k && k > 0 && k % kBlockK == 0 && p.rows > 0,
+                "the projections share K, a positive multiple of 64");
+        Call c{};
+        c.rows = p.rows;
+        ps.push_back(Projection{c, route_of(*p.weight)});
+    }
+    return projections_bytes(k, ps, columns);
+}
+
+void lossless_linear_shared(const Tensor& x, std::span<const LosslessProjection> projections, WorkspaceArena& workspace,
+                            cudaStream_t stream) {
+    require(!projections.empty(), "at least one projection");
+    std::vector<Projection> ps;
+    ps.reserve(projections.size());
+    for (const LosslessProjection& p : projections) {
+        require(p.weight != nullptr && p.out != nullptr, "each projection names its weight and output");
+        Route route = Route::None;
+        const Call c = projection_call(x, *p.weight, p.row_begin, p.rows, *p.out, p.out_row, route);
+        ps.push_back(Projection{c, route});
+    }
+    run(std::span<Projection>(ps), workspace, stream);
+}
+
+void lossless_linear(const Tensor& x, const Weight& weight, std::int32_t row_begin, std::int32_t rows, Tensor& out,
+                     std::int32_t out_row, WorkspaceArena& workspace, cudaStream_t stream) {
+    Route route  = Route::None;
+    const Call c = projection_call(x, weight, row_begin, rows, out, out_row, route);
+    run(c, route, workspace, stream);
 }
 
 void lossless_linear_grouped(const Tensor& x, const Weight& weight, const Tensor& tile_experts, std::int32_t expert_stride,

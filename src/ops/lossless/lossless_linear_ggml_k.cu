@@ -5,13 +5,13 @@
 namespace infernix::ops::lossless_linear_impl {
 
 bool launch_ggml_k(QType q, const Call& c, std::int32_t first, std::int32_t count, std::uint8_t* base, const Layout& l,
-            cudaStream_t stream) {
+            cudaStream_t stream, const ChunkStage* stage) {
     switch (q) {
-    case QType::GGML_Q4_K: launch_chunk<GgmlFormat<QType::GGML_Q4_K>>(c, first, count, base, l, stream); break;
-    case QType::GGML_Q5_K: launch_chunk<GgmlFormat<QType::GGML_Q5_K>>(c, first, count, base, l, stream); break;
-    case QType::GGML_Q6_K: launch_chunk<GgmlFormat<QType::GGML_Q6_K>>(c, first, count, base, l, stream); break;
-    case QType::GGML_IQ4_XS: launch_chunk<GgmlFormat<QType::GGML_IQ4_XS>>(c, first, count, base, l, stream); break;
-    case QType::GGML_IQ4_NL: launch_chunk<GgmlFormat<QType::GGML_IQ4_NL>>(c, first, count, base, l, stream); break;
+    case QType::GGML_Q4_K: launch_chunk_stage<GgmlFormat<QType::GGML_Q4_K>>(c, first, count, base, l, stream, stage); break;
+    case QType::GGML_Q5_K: launch_chunk_stage<GgmlFormat<QType::GGML_Q5_K>>(c, first, count, base, l, stream, stage); break;
+    case QType::GGML_Q6_K: launch_chunk_stage<GgmlFormat<QType::GGML_Q6_K>>(c, first, count, base, l, stream, stage); break;
+    case QType::GGML_IQ4_XS: launch_chunk_stage<GgmlFormat<QType::GGML_IQ4_XS>>(c, first, count, base, l, stream, stage); break;
+    case QType::GGML_IQ4_NL: launch_chunk_stage<GgmlFormat<QType::GGML_IQ4_NL>>(c, first, count, base, l, stream, stage); break;
     default: return false;
     }
     return true;

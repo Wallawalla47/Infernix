@@ -8,6 +8,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
 
 namespace infernix::ops {
 
@@ -47,6 +48,21 @@ namespace infernix::ops {
 
 void lossless_linear(const Tensor& x, const Weight& weight, std::int32_t row_begin, std::int32_t rows, Tensor& out,
                      std::int32_t out_row, WorkspaceArena& workspace, cudaStream_t stream);
+
+/// Several projections of one input (each exactly lossless_linear's result): rows [row_begin, row_begin +
+/// rows) of `weight` into rows [out_row, ...) of `out`. They share the input's encode (one per 512-column
+/// chunk), so a layer's projections of one normalized input launch fewer kernels. The weights share K.
+struct LosslessProjection {
+    const Weight* weight   = nullptr;
+    std::int32_t row_begin = 0;
+    std::int32_t rows      = 0;
+    Tensor* out            = nullptr;
+    std::int32_t out_row   = 0;
+};
+[[nodiscard]] std::size_t lossless_linear_shared_workspace_bytes(std::span<const LosslessProjection> projections,
+                                                                 std::int32_t columns);
+void lossless_linear_shared(const Tensor& x, std::span<const LosslessProjection> projections, WorkspaceArena& workspace,
+                            cudaStream_t stream);
 
 /**
  * The grouped form (routed experts in a bank): x's columns are whole 64-column tiles, tile i multiplied

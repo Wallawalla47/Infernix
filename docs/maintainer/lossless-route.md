@@ -222,7 +222,7 @@ keys, so the KV cache plays no part; GDN and the convolution start from zero sta
 split the columns 4,096 at a time (column-independent, so the split changes nothing).
 
 Generation (`infernix --lossless`, `infernix-serve --lossless`; text requests, `--kv-dtype bf16`, no
-speculation, no CUDA Graphs) runs the same layers in their cache form
+speculation; decode rounds as CUDA Graphs) runs the same layers in their cache form
 (`execution::LosslessCache`): a prefill chunk or a decode round's columns continue their sequences.
 Attention stores each column's K and V bit for bit in the paged cache (`lossless_kv_append`; the
 Program allocates the bf16 pages with BF16 V, `paged_kv_lossless_storage_layout`) and reads the

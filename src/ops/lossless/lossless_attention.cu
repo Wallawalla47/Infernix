@@ -1024,7 +1024,12 @@ struct Geometry {
     int tiles;      // 16-row tiles per sequence and KV head
     int splits;     // key ranges
     int split_keys; // keys per range
+    bool split;     // the split route (partial maxima, partial sums, combine), even for one range
 };
+
+// A call with fewer CTAs than kTargetCtas takes the split route whatever its keys, so the launches of a
+// shape (a captured decode round) do not depend on the key bound.
+bool split_route(long long ctas) { return ctas < kTargetCtas; }
 
 // Key ranges until the call has about kTargetCtas CTAs, each of at least kMinSplitKeys keys (an upper
 // bound of the range count, non-decreasing in max_keys).
@@ -1036,23 +1041,25 @@ long long split_bound(long long ctas, int max_keys) {
 
 Geometry geometry(int heads, int kv_heads, int width, int sequences, int max_keys) {
     const int tiles       = (width * (heads / kv_heads) + kQueries - 1) / kQueries;
-    const long long bound = split_bound(static_cast<long long>(sequences) * tiles * kv_heads, max_keys);
+    const long long ctas  = static_cast<long long>(sequences) * tiles * kv_heads;
+    const long long bound = split_bound(ctas, max_keys);
     int split_keys        = static_cast<int>((max_keys + bound - 1) / bound);
     split_keys            = (split_keys + kKeys - 1) / kKeys * kKeys;
-    return {tiles, (max_keys + split_keys - 1) / split_keys, split_keys};
+    return {tiles, (max_keys + split_keys - 1) / split_keys, split_keys, split_route(ctas)};
 }
 
 // The workspace of a call of these dimensions with at most key_capacity keys per sequence.
 std::size_t call_bytes(int heads, int kv_heads, int width, int sequences, int key_capacity) {
     const std::size_t columns = static_cast<std::size_t>(width) * sequences;
     const int tiles           = (width * (heads / kv_heads) + kQueries - 1) / kQueries;
-    const auto splits = static_cast<std::size_t>(split_bound(static_cast<long long>(sequences) * tiles * kv_heads, key_capacity));
+    const long long ctas      = static_cast<long long>(sequences) * tiles * kv_heads;
+    const auto splits         = static_cast<std::size_t>(split_bound(ctas, key_capacity));
     std::size_t bytes =
         align256(static_cast<std::size_t>(sequences) * key_capacity * kv_heads * sizeof(std::int16_t)) +
         2 * align256(static_cast<std::size_t>(sequences) * kv_heads * kDim * sizeof(int)) +
         align256((columns * heads + 31) / 32 * 4) +
         align256(static_cast<std::size_t>(kFallbackWarps) * key_capacity * sizeof(float));
-    if (splits > 1) {
+    if (split_route(ctas)) {
         bytes += align256(splits * columns * heads * sizeof(PartialMax)) +
                  align256(splits * columns * heads * sizeof(PartialSum));
     }
@@ -1091,13 +1098,15 @@ void run(Args args, int max_keys, void* workspace, cudaStream_t stream) {
     args.flagged  = static_cast<std::uint32_t*>(take(flag_bytes));
     auto* pstore  = static_cast<float*>(take(static_cast<std::size_t>(kFallbackWarps) * args.key_capacity * sizeof(float)));
     const std::size_t partials = static_cast<std::size_t>(g.splits) * args.columns * args.heads;
-    if (g.splits > 1) {
+    if (g.split) {
         args.pmax = static_cast<PartialMax*>(take(partials * sizeof(PartialMax)));
         args.psum = static_cast<PartialSum*>(take(partials * sizeof(PartialSum)));
     }
-    CUDA_CHECK(cudaMemsetAsync(args.vmax, 0, channels, stream));
-    CUDA_CHECK(cudaMemsetAsync(args.vinexact, 0, channels, stream));
-    CUDA_CHECK(cudaMemsetAsync(args.flagged, 0, flag_bytes, stream));
+    // vmax, vinexact and flagged lie together: one memset zeroes them.
+    CUDA_CHECK(cudaMemsetAsync(args.vmax, 0,
+                               static_cast<std::size_t>(reinterpret_cast<std::uint8_t*>(args.flagged) + flag_bytes -
+                                                        reinterpret_cast<std::uint8_t*>(args.vmax)),
+                               stream));
     const long long items =
         static_cast<long long>(args.sequences) * args.kv_heads * ((max_keys + kMaximaKeys - 1) / kMaximaKeys);
     maxima_kernel<<<static_cast<int>(std::min<long long>((items + 7) / 8, 4096)), 256, 0, stream>>>(args, max_keys);
@@ -1105,7 +1114,7 @@ void run(Args args, int max_keys, void* workspace, cudaStream_t stream) {
     constexpr int kSmem = static_cast<int>(sizeof(Shared));
     const dim3 grid(static_cast<unsigned>(args.sequences * g.tiles), static_cast<unsigned>(args.kv_heads),
                     static_cast<unsigned>(g.splits));
-    if (g.splits == 1) {
+    if (!g.split) {
         configure<kFull>();
         attention_kernel<kFull><<<grid, kThreads, kSmem, stream>>>(args);
         CUDA_CHECK(cudaGetLastError());
@@ -1161,7 +1170,7 @@ void lossless_attention(const Tensor& q, const Tensor& k, const Tensor& v, Tenso
 
 std::size_t lossless_paged_attention_workspace_bytes(int query_heads, int kv_heads, int max_width, int sequences,
                                                      int key_capacity) {
-    // Key ranges (partials) need sequences * tiles * kv_heads < kTargetCtas, so a run narrower than
+    // The split route (partials) needs sequences * tiles * kv_heads < kTargetCtas, so a run narrower than
     // kTargetCtas * 16 / query_heads columns; wider runs differ only in their flag bits.
     const int split_widths = std::min(max_width, kTargetCtas * kQueries / query_heads + kQueries);
     std::size_t bytes      = call_bytes(query_heads, kv_heads, max_width, sequences, key_capacity);

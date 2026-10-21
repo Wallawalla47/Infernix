@@ -1358,9 +1358,18 @@ struct Call {
     const std::int32_t* out_columns = nullptr;
 };
 
+// The parts of a chunk a launch runs: `encode` encodes the chunk's activation columns (after zeroing the
+// buffers the encode accumulates into); `xsum` makes that encode also form the half-block sums a K-quant
+// offset format reads. Projections of one input share one encode: the first encodes (with xsum when any
+// of them reads it), the others reuse the workspace's encoding.
+struct ChunkStage {
+    bool encode = true;
+    bool xsum   = false;
+};
+
 template <class F>
 void launch_chunk(const Call& c, std::int32_t first, std::int32_t columns, std::uint8_t* base, const Layout& l,
-                  cudaStream_t stream) {
+                  cudaStream_t stream, ChunkStage stage = ChunkStage{true, F::kOffset}) {
     const int k      = c.x->ne[0];
     const int blocks = k / kBlockK;
     auto* limbs      = base + l.limbs;
@@ -1375,20 +1384,19 @@ void launch_chunk(const Call& c, std::int32_t first, std::int32_t columns, std::
     const std::int32_t* in_map  = c.in_columns != nullptr ? c.in_columns + first : nullptr;
     const std::int32_t* out_map = c.out_columns != nullptr ? c.out_columns + first : nullptr;
     long long* xsum             = F::kOffset ? reinterpret_cast<long long*>(base + l.xsum) : nullptr;
-    CUDA_CHECK(cudaMemsetAsync(tile_lo, 0, static_cast<std::size_t>((columns + kTileTokens - 1) / kTileTokens) * blocks,
-                               stream));
-    CUDA_CHECK(cudaMemsetAsync(col_emax, 0, static_cast<std::size_t>(columns) * sizeof(std::int32_t), stream));
-    CUDA_CHECK(cudaMemsetAsync(col_flags, 0, static_cast<std::size_t>(columns) * sizeof(std::int32_t), stream));
-    CUDA_CHECK(cudaMemsetAsync(bitmap, 0, (static_cast<std::size_t>(c.rows) * columns + 31) / 32 * sizeof(std::uint32_t),
-                               stream));
-    {
+    if (stage.encode) {
+        // tile_lo, exps, col_emax and col_flags lie together: one memset zeroes them.
+        CUDA_CHECK(cudaMemsetAsync(tile_lo, 0, l.bitmap - l.tile_lo, stream));
         const int warps_total = blocks * columns;
         const int threads     = 256;
         const int grid        = (warps_total * 32 + threads - 1) / threads;
-        lossless_encode_kernel<<<grid, threads, 0, stream>>>(xs, in_map, k, columns, limbs, lo_limbs, tile_lo, exps,
-                                                             col_emax, col_flags, xsum);
+        lossless_encode_kernel<<<grid, threads, 0, stream>>>(
+            xs, in_map, k, columns, limbs, lo_limbs, tile_lo, exps, col_emax, col_flags,
+            stage.xsum ? reinterpret_cast<long long*>(base + l.xsum) : nullptr);
         CUDA_CHECK(cudaGetLastError());
     }
+    CUDA_CHECK(cudaMemsetAsync(bitmap, 0, (static_cast<std::size_t>(c.rows) * columns + 31) / 32 * sizeof(std::uint32_t),
+                               stream));
     const bool bf16 = c.out->dtype == DType::BF16;
     void* out_data  = out_map != nullptr ? c.out->data
                                          : static_cast<std::uint8_t*>(c.out->data) +
@@ -1452,10 +1460,20 @@ enum class Route { None, Q2, Q4, Q5, Q6, Q8, Nvfp4, Fp8Row, Bf16, Mxfp8, Ggml, R
 
 // The GGUF formats' launches (lossless_linear_ggml_k.cu: the K-quants and IQ4; lossless_linear_ggml_i.cu:
 // IQ2/IQ3 and Q2_0).
+// `stage` null: the format's own (encode, with xsum when it reads it).
 bool launch_ggml_k(QType q, const Call& c, std::int32_t first, std::int32_t count, std::uint8_t* base,
-                   const Layout& l, cudaStream_t stream);
+                   const Layout& l, cudaStream_t stream, const ChunkStage* stage = nullptr);
 bool launch_ggml_i(QType q, const Call& c, std::int32_t first, std::int32_t count, std::uint8_t* base,
-                   const Layout& l, cudaStream_t stream);
+                   const Layout& l, cudaStream_t stream, const ChunkStage* stage = nullptr);
+
+template <class F>
+void launch_chunk_stage(const Call& c, std::int32_t first, std::int32_t count, std::uint8_t* base, const Layout& l,
+                        cudaStream_t stream, const ChunkStage* stage) {
+    launch_chunk<F>(c, first, count, base, l, stream, stage != nullptr ? *stage : ChunkStage{true, F::kOffset});
+}
+
+// Whether a GGUF block format's projection reads the half-block activation sums (GgmlFormat::kOffset).
+inline bool ggml_reads_xsum(QType q) noexcept { return q == QType::GGML_Q4_K || q == QType::GGML_Q5_K; }
 
 inline bool is_ggml_format(QType q) noexcept {
     return q == QType::GGML_Q2_0 || q == QType::GGML_Q4_K || q == QType::GGML_Q5_K || q == QType::GGML_Q6_K ||

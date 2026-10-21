@@ -93,6 +93,48 @@ void Forward::lossless_project(const Tensor& x, const LinearParameters& p, std::
     }
 }
 
+void Forward::lossless_project_shared(const Tensor& x, std::span<const LosslessPart> parts) {
+    const cudaStream_t s = device_.stream;
+    std::vector<bool> done(parts.size(), false);
+    for (std::size_t i = 0; i < parts.size(); ++i) {
+        if (done[i]) { continue; }
+        const std::int32_t* perm = parts[i].p != nullptr ? parts[i].p->input_perm : nullptr;
+        const std::int32_t block = parts[i].p != nullptr ? parts[i].p->perm_block : 0;
+        auto scope   = work_.scope();
+        Tensor input = x;
+        if (perm != nullptr) {
+            input = work_.alloc(DType::BF16, {x.ne[0], x.ne[1]});
+            ops::lossless_permute_blocks(x, perm, block, input, s);
+        }
+        std::size_t segments = 0;
+        for (const LosslessPart& part : parts) { segments += part.p != nullptr ? part.p->ggml.size() : 0; }
+        std::vector<Weight> weights;
+        weights.reserve(segments); // stable addresses for the projections below
+        std::vector<ops::LosslessProjection> list;
+        for (std::size_t j = i; j < parts.size(); ++j) {
+            const LosslessPart& part = parts[j];
+            const std::int32_t* part_perm = part.p != nullptr ? part.p->input_perm : nullptr;
+            if (done[j] || part_perm != perm || (perm != nullptr && part.p->perm_block != block)) { continue; }
+            done[j] = true;
+            if (part.p == nullptr || !part.p->is_ggml()) {
+                const Weight* w = part.p != nullptr ? &part.p->weight : part.weight;
+                list.push_back({w, part.row_begin, part.rows, part.out, part.out_row});
+                continue;
+            }
+            for (const ops::GgmlSegment& segment : part.p->ggml) {
+                if (segment.output != 0) { throw std::invalid_argument("Qwen4Exp lossless: a one-output projection's segments"); }
+                const std::int32_t first = std::max(part.row_begin, segment.out_offset);
+                const std::int32_t last  = std::min(part.row_begin + part.rows, segment.out_offset + segment.rows);
+                if (first >= last) { continue; }
+                weights.push_back(segment_weight(segment, input.ne[0]));
+                list.push_back({&weights.back(), first - segment.out_offset, last - first, part.out,
+                                part.out_row + (first - part.row_begin)});
+            }
+        }
+        ops::lossless_linear_shared(input, list, work_, s);
+    }
+}
+
 Tensor Forward::lossless_mix(const HyperConnectionParameters& p, const Tensor& residual, Tensor* inject) {
     const cudaStream_t s = device_.stream;
     const std::int32_t T = residual.ne[1], H = dim(config_.hidden_size);
@@ -119,8 +161,8 @@ void Forward::lossless_ple(const PleParameters& p, Tensor& residual, const Forwa
     auto scope = work_.scope();
     const Tensor e = ple_embedding(p, batch); // the n-gram rows decoded exactly, rounded to BF16
     Tensor key = work_.alloc(DType::BF16, {W, T}), value = work_.alloc(DType::BF16, {H, T});
-    lossless_project(e, p.projection, 0, W, key, 0);
-    lossless_project(e, p.projection, W, H, value, 0);
+    const LosslessPart ple_parts[] = {{&p.projection, nullptr, 0, W, &key, 0}, {&p.projection, nullptr, W, H, &value, 0}};
+    lossless_project_shared(e, ple_parts);
     Tensor key_normed = work_.alloc(DType::BF16, {W, T}), query_normed = work_.alloc(DType::BF16, {W, T});
     ops::lossless_rmsnorm_grouped(key, p.key_norm, S, config_.rms_norm_eps, key_normed, s);
     ops::lossless_rmsnorm_grouped(residual, p.query_norm, S, config_.rms_norm_eps, query_normed, s);
@@ -146,11 +188,10 @@ Tensor Forward::lossless_gdn(const GdnParameters& p, const Tensor& x, std::uint3
     Tensor y   = work_.alloc(DType::BF16, {H, T});
     auto scope = work_.scope();
     Tensor qkv = work_.alloc(DType::BF16, {C, T}), z = work_.alloc(DType::BF16, {VW, T});
-    lossless_project(x, p.projection, 0, C, qkv, 0);
-    lossless_project(x, p.projection, C, VW, z, 0);
     Tensor a = work_.alloc(DType::BF16, {NV, T}), b = work_.alloc(DType::BF16, {NV, T});
-    lossless_project(x, p.control, 0, NV, a, 0);
-    lossless_project(x, p.control, NV, NV, b, 0);
+    const LosslessPart gdn_parts[] = {{&p.projection, nullptr, 0, C, &qkv, 0}, {&p.projection, nullptr, C, VW, &z, 0},
+                                      {&p.control, nullptr, 0, NV, &a, 0}, {&p.control, nullptr, NV, NV, &b, 0}};
+    lossless_project_shared(x, gdn_parts);
     Tensor gate = work_.alloc(DType::FP32, {NV, T}), beta = work_.alloc(DType::BF16, {NV, T});
     ops::lossless_gdn_gates(a, b, p.a_log, p.dt_bias, gate, beta, s, g.a_direct);
     Tensor conv = work_.alloc(DType::BF16, {C, T});
@@ -190,14 +231,15 @@ Tensor Forward::lossless_attention_block(const AttentionParameters& p, const Ten
     Tensor iq = work_.alloc(DType::BF16, {ID, IH, T}), ik = work_.alloc(DType::BF16, {ID, T});
     {
         Tensor qf = q.view({QW, T}), kf = k.view({KW, T}), vf = v.view({KW, T}), iqf = iq.view({IH * ID, T});
-        lossless_project(x, p.projection, 0, QW, qf, 0);
-        lossless_project(x, p.projection, QW, QW, gate, 0);
-        lossless_project(x, p.projection, 2 * QW, KW, kf, 0);
-        lossless_project(x, p.projection, 2 * QW + KW, KW, vf, 0);
         const LinearParameters& index = p.index_projection ? *p.index_projection : p.projection;
         const std::int32_t index_row  = p.index_projection ? 0 : 2 * QW + 2 * KW;
-        lossless_project(x, index, index_row, IH * ID, iqf, 0);
-        lossless_project(x, index, index_row + IH * ID, ID, ik, 0);
+        const LosslessPart parts[] = {{&p.projection, nullptr, 0, QW, &qf, 0},
+                                      {&p.projection, nullptr, QW, QW, &gate, 0},
+                                      {&p.projection, nullptr, 2 * QW, KW, &kf, 0},
+                                      {&p.projection, nullptr, 2 * QW + KW, KW, &vf, 0},
+                                      {&index, nullptr, index_row, IH * ID, &iqf, 0},
+                                      {&index, nullptr, index_row + IH * ID, ID, &ik, 0}};
+        lossless_project_shared(x, parts);
     }
     // q_norm, k_norm and the index query's norm per head; RoPE at the call's positions.
     Tensor qn = work_.alloc(DType::BF16, {D, heads, T}), kn = work_.alloc(DType::BF16, {D, kv_heads, T});
@@ -347,9 +389,17 @@ Tensor Forward::lossless_moe(const MoeParameters& p, const Tensor& x, std::uint3
     auto scope = work_.scope();
     // Router: l = bf16(x W_router), w = bf16(fp32(p / fp32(sum of the top k))); the shared gate's logit.
     Tensor logits = work_.alloc(DType::BF16, {E, T});
-    ops::lossless_linear(x, bf16_rows(p.router), 0, E, logits, 0, work_, s);
     Tensor shared_logit = work_.alloc(DType::BF16, {1, T});
-    ops::lossless_linear(x, bf16_rows(p.shared_score), 0, 1, shared_logit, 0, work_, s);
+    // The router, the shared gate's logit and the shared expert's gate and up: one encode of x.
+    Tensor gate = work_.alloc(DType::BF16, {I, T}), up = work_.alloc(DType::BF16, {I, T});
+    {
+        const Weight router = bf16_rows(p.router), shared_score = bf16_rows(p.shared_score);
+        const LosslessPart parts[] = {{nullptr, &router, 0, E, &logits, 0},
+                                      {nullptr, &shared_score, 0, 1, &shared_logit, 0},
+                                      {&p.shared_gate_up, nullptr, 0, I, &gate, 0},
+                                      {&p.shared_gate_up, nullptr, I, I, &up, 0}};
+        lossless_project_shared(x, parts);
+    }
     ops::MoeRouting routing{work_.alloc(DType::I32, {K, T}), work_.alloc(DType::FP32, {K, T}),
                             work_.alloc(DType::FP32, {T})};
     ops::lossless_router(logits, E, K, routing.weights, routing.ids, s, /*bf16_weights=*/true);
@@ -370,10 +420,7 @@ Tensor Forward::lossless_moe(const MoeParameters& p, const Tensor& x, std::uint3
     const DeviceSpan expert_ws  = work_.alloc_bytes(ops::moe_experts_workspace_bytes(
         max_jobs, K * T, T, source.activation, ops::offloaded_moe::WideA16::kLossless));
     ops::moe_experts(x, dispatch, source, K, max_jobs, expert_ws.data, outputs, s, /*wait_for_cpu=*/false, false);
-    // The shared expert and its gate.
-    Tensor gate = work_.alloc(DType::BF16, {I, T}), up = work_.alloc(DType::BF16, {I, T});
-    lossless_project(x, p.shared_gate_up, 0, I, gate, 0);
-    lossless_project(x, p.shared_gate_up, I, I, up, 0);
+    // The shared expert (its gate and up projected with the router above) and its gate.
     Tensor product = work_.alloc(DType::BF16, {I, T});
     ops::lossless_silu_mul(gate, up, product, s);
     Tensor shared = work_.alloc(DType::BF16, {H, T});

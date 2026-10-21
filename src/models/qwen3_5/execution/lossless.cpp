@@ -4,6 +4,8 @@
 #include "infernix/ops/lossless_ops.h"
 
 #include <algorithm>
+#include <initializer_list>
+#include <span>
 #include <stdexcept>
 #include <type_traits>
 #include <variant>
@@ -41,6 +43,18 @@ void linear(A& a, const Tensor& x, const Weight& w, std::int32_t row_begin, std:
     }
 }
 
+// Projections of one input sharing its encode (ops::lossless_linear_shared).
+template <class A>
+void shared(A& a, const Tensor& x, std::initializer_list<ops::LosslessProjection> projections, cudaStream_t s) {
+    const std::span<const ops::LosslessProjection> list(projections.begin(), projections.size());
+    if constexpr (kRuns<A>) {
+        ops::lossless_linear_shared(x, list, a, s);
+    } else {
+        auto scope = a.scope();
+        (void)a.alloc_bytes(ops::lossless_linear_shared_workspace_bytes(list, x.ne[1]));
+    }
+}
+
 template <class A>
 void grouped(A& a, const Tensor& x, const Weight& w, const Tensor& tiles, std::int32_t stride, std::int32_t offset,
              std::int32_t rows, Tensor& out, cudaStream_t s) {
@@ -70,16 +84,13 @@ void attention_layer(A& a, const BlockParameters& block, const TextConfig& confi
     Tensor k = alloc(a, DType::BF16, {K, T}), v = alloc(a, DType::BF16, {K, T});
     if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&p.projection)) {
         // [query, key] and [output gate, value].
-        linear(a, h, pair->first, 0, Q, q, 0, s);
-        linear(a, h, pair->first, Q, K, k, 0, s);
-        linear(a, h, pair->second, 0, Q, gate, 0, s);
-        linear(a, h, pair->second, Q, K, v, 0, s);
+        shared(a, h,
+               {{&pair->first, 0, Q, &q, 0}, {&pair->first, Q, K, &k, 0}, {&pair->second, 0, Q, &gate, 0},
+                {&pair->second, Q, K, &v, 0}},
+               s);
     } else {
         const Weight& w = std::get<LinearParameters>(p.projection).weight;
-        linear(a, h, w, 0, Q, q, 0, s);
-        linear(a, h, w, Q, K, k, 0, s);
-        linear(a, h, w, Q + K, Q, gate, 0, s);
-        linear(a, h, w, 2 * Q + K, K, v, 0, s);
+        shared(a, h, {{&w, 0, Q, &q, 0}, {&w, Q, K, &k, 0}, {&w, Q + K, Q, &gate, 0}, {&w, 2 * Q + K, K, &v, 0}}, s);
     }
     Tensor q3 = q.view({D, heads, T}), k3 = k.view({D, kv_heads, T}), v3 = v.view({D, kv_heads, T});
     Tensor o = alloc(a, DType::BF16, {D, heads, T});
@@ -127,24 +138,23 @@ void gdn_layer(A& a, const BlockParameters& block, const TextConfig& config, Ten
     if constexpr (kRuns<A>) { ops::lossless_rmsnorm(x, block.input_norm, config.rms_norm_eps, h, s); }
     Tensor mixed = alloc(a, DType::BF16, {C, T}), z = alloc(a, DType::BF16, {VW, T});
     Tensor av = alloc(a, DType::BF16, {Hv, T}), bv = alloc(a, DType::BF16, {Hv, T});
-    if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&p.projection)) {
-        // qkv = [query-key rows; value rows], z = the value/z parent's z rows.
-        const std::int32_t qk = pair->first.n;
-        linear(a, h, pair->first, 0, qk, mixed, 0, s);
-        linear(a, h, pair->second, 0, C - qk, mixed, qk, s);
-        linear(a, h, pair->second, C - qk, VW, z, 0, s);
+    // qkv = [query-key rows; value rows], z = the value/z parent's z rows; the control's a then b rows; all
+    // from h.
+    const auto* proj_pair    = std::get_if<ops::PairedProjectionWeights>(&p.projection);
+    const auto* control_pair = std::get_if<ops::PairedProjectionWeights>(&p.control);
+    const Weight* qk_w   = proj_pair ? &proj_pair->first : &std::get<LinearParameters>(p.projection).weight;
+    const Weight* vz_w   = proj_pair ? &proj_pair->second : qk_w;
+    const std::int32_t qk = proj_pair ? proj_pair->first.n : C;
+    const Weight* a_w    = control_pair ? &control_pair->first : &std::get<LinearParameters>(p.control).weight;
+    const Weight* b_w    = control_pair ? &control_pair->second : a_w;
+    const std::int32_t b_row = control_pair ? 0 : Hv;
+    if (proj_pair) {
+        shared(a, h,
+               {{qk_w, 0, qk, &mixed, 0}, {vz_w, 0, C - qk, &mixed, qk}, {vz_w, C - qk, VW, &z, 0},
+                {a_w, 0, Hv, &av, 0}, {b_w, b_row, Hv, &bv, 0}},
+               s);
     } else {
-        const Weight& w = std::get<LinearParameters>(p.projection).weight;
-        linear(a, h, w, 0, C, mixed, 0, s);
-        linear(a, h, w, C, VW, z, 0, s);
-    }
-    if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&p.control)) {
-        linear(a, h, pair->first, 0, Hv, av, 0, s);
-        linear(a, h, pair->second, 0, Hv, bv, 0, s);
-    } else {
-        const Weight& w = std::get<LinearParameters>(p.control).weight;
-        linear(a, h, w, 0, Hv, av, 0, s);
-        linear(a, h, w, Hv, Hv, bv, 0, s);
+        shared(a, h, {{qk_w, 0, C, &mixed, 0}, {qk_w, C, VW, &z, 0}, {a_w, 0, Hv, &av, 0}, {b_w, b_row, Hv, &bv, 0}}, s);
     }
     Tensor g = alloc(a, DType::FP32, {Hv, T}), beta = alloc(a, DType::BF16, {Hv, T});
     Tensor c = alloc(a, DType::BF16, {C, T});
@@ -178,8 +188,7 @@ void dense_mlp(A& a, const DenseParameters& p, const Tensor& h, Tensor& x, cudaS
         auto scope = a.scope();
         const Tensor hc = h.slice(1, c0, n);
         Tensor g = alloc(a, DType::BF16, {I, n}), u = alloc(a, DType::BF16, {I, n});
-        linear(a, hc, p.gate_up.weight, 0, I, g, 0, s);
-        linear(a, hc, p.gate_up.weight, I, I, u, 0, s);
+        shared(a, hc, {{&p.gate_up.weight, 0, I, &g, 0}, {&p.gate_up.weight, I, I, &u, 0}}, s);
         if constexpr (kRuns<A>) { ops::lossless_silu_mul(g, u, g, s); }
         Tensor d = alloc(a, DType::BF16, {H, n});
         linear(a, g, p.down.weight, 0, H, d, 0, s);
@@ -207,7 +216,13 @@ void sparse_moe(A& a, const ops::SparseMoeWeights& p, const MoeConfig& moe, cons
         const Tensor hc = h.slice(1, c0, n);
         // Router logits and the shared expert's gate logit (row E).
         Tensor logits = alloc(a, DType::BF16, {E + 1, n});
-        linear(a, hc, p.router_shared_gate, 0, E + 1, logits, 0, s);
+        // The router's logits (and the shared expert's gate logit) and the shared expert's gate and up: one
+        // encode of hc.
+        Tensor sg = alloc(a, DType::BF16, {Is, n}), su = alloc(a, DType::BF16, {Is, n});
+        shared(a, hc,
+               {{&p.router_shared_gate, 0, E + 1, &logits, 0}, {&p.shared_gate_up, 0, Is, &sg, 0},
+                {&p.shared_gate_up, Is, Is, &su, 0}},
+               s);
         Tensor weights = alloc(a, DType::FP32, {k, n}), ids = alloc(a, DType::I32, {k, n});
         const std::int32_t C = ops::lossless_moe_columns(n, k, E);
         Tensor counts = alloc(a, DType::I32, {E}), tiles = alloc(a, DType::I32, {C / 64});
@@ -226,9 +241,6 @@ void sparse_moe(A& a, const ops::SparseMoeWeights& p, const MoeConfig& moe, cons
         Tensor ed = alloc(a, DType::BF16, {H, C});
         grouped(a, eg, p.routed_down, tiles, H, 0, H, ed, s);
         // The shared expert.
-        Tensor sg = alloc(a, DType::BF16, {Is, n}), su = alloc(a, DType::BF16, {Is, n});
-        linear(a, hc, p.shared_gate_up, 0, Is, sg, 0, s);
-        linear(a, hc, p.shared_gate_up, Is, Is, su, 0, s);
         if constexpr (kRuns<A>) { ops::lossless_silu_mul(sg, su, sg, s); }
         Tensor sd = alloc(a, DType::BF16, {H, n});
         linear(a, sg, p.shared_down, 0, H, sd, 0, s);

@@ -66,7 +66,8 @@ struct ExecutionSchedule {
     // execution::lossless_layer, FP32 logits. A CausalScoring Program scores each window in one pass (the
     // window form, lossless_keys 0); a Generation Program runs prefill chunks and decode rounds through
     // the KV cache (the lossless bf16 profile) and the recurrent state slots (the cache form, keys up to
-    // lossless_keys, max_context), eagerly (no CUDA Graphs) and without speculation.
+    // lossless_keys, max_context) without speculation; decode rounds run as the CUDA Graphs of the
+    // ordinary rounds (their attention key bound the graph profile's).
     bool lossless              = false;
     std::int32_t lossless_keys = 0;
     // The reproducible and lossless routes: sampled requests draw by Gumbel-max

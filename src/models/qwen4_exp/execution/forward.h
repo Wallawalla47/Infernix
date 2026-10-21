@@ -330,6 +330,17 @@ private:
     void check_lossless_call(const ForwardBatch& batch) const;
     void lossless_project(const Tensor& x, const LinearParameters& p, std::int32_t row_begin, std::int32_t rows,
                           Tensor& out, std::int32_t out_row);
+    // Projections of one input (rows of a LinearParameters, or of a plain Weight) that share its encode:
+    // those with the same input permutation run as one ops::lossless_linear_shared call.
+    struct LosslessPart {
+        const LinearParameters* p = nullptr; // or
+        const Weight* weight      = nullptr;
+        std::int32_t row_begin    = 0;
+        std::int32_t rows         = 0;
+        Tensor* out               = nullptr;
+        std::int32_t out_row      = 0;
+    };
+    void lossless_project_shared(const Tensor& x, std::span<const LosslessPart> parts);
     Tensor lossless_mix(const HyperConnectionParameters& p, const Tensor& residual, Tensor* inject);
     void lossless_ple(const PleParameters& p, Tensor& residual, const ForwardBatch& batch);
     Tensor lossless_gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index, const ForwardBatch& batch);

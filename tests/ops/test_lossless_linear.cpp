@@ -32,6 +32,7 @@
 #include <limits>
 #include <random>
 #include <string>
+#include <memory>
 #include <vector>
 
 using namespace infernix;
@@ -978,6 +979,59 @@ void run_tiles(const std::string& label, const HostBank& b, int tiles, int sourc
     });
 }
 
+// Projections of one input through one shared-encode call (ops::lossless_linear_shared), each against the
+// oracle: row ranges into offset outputs, BF16 and FP32 outputs, the first projection's format not reading
+// the half-block sums that a later one (Q4_K) reads, a BF16 weight's block scan, across the 512-column chunk.
+void run_shared(const std::string& label, const std::vector<const HostWeight*>& weights, int columns, std::mt19937& rng) {
+    const int k  = weights[0]->k;
+    const auto x = make_columns(k, columns, rng, 8);
+    DeviceBuffer dx(x.size() * 2);
+    dx.copy_from_host(x.data(), x.size() * 2, 0);
+    Tensor tx(dx.p, DType::BF16, {k, columns});
+    struct Slot {
+        std::unique_ptr<DeviceBuffer> buffer;
+        Tensor tensor;
+        int begin, rows, out_rows, out_row;
+        bool bf16;
+    };
+    std::vector<Slot> slots(weights.size());
+    std::vector<ops::LosslessProjection> projections;
+    for (std::size_t i = 0; i < weights.size(); ++i) {
+        const HostWeight& w = *weights[i];
+        Slot& slot          = slots[i];
+        slot.begin    = i % 2 == 1 ? std::min(7, w.n / 4) : 0;
+        slot.rows     = w.n - slot.begin;
+        slot.out_row  = static_cast<int>(3 * i);
+        slot.out_rows = slot.rows + slot.out_row + 5;
+        slot.bf16     = i % 2 == 0;
+        const int esize = slot.bf16 ? 2 : 4;
+        slot.buffer = std::make_unique<DeviceBuffer>(static_cast<std::size_t>(slot.out_rows) * columns * esize);
+        CUDA_CHECK(cudaMemset(slot.buffer->p, 0xCD, static_cast<std::size_t>(slot.out_rows) * columns * esize));
+        slot.tensor = Tensor(slot.buffer->p, slot.bf16 ? DType::BF16 : DType::FP32, {slot.out_rows, columns});
+    }
+    for (std::size_t i = 0; i < weights.size(); ++i) {
+        projections.push_back({&weights[i]->weight, slots[i].begin, slots[i].rows, &slots[i].tensor, slots[i].out_row});
+    }
+    DeviceBuffer ws(ops::lossless_linear_shared_workspace_bytes(projections, columns));
+    WorkspaceArena arena(DeviceSpan{ws.p, ws.bytes});
+    ops::lossless_linear_shared(tx, projections, arena, nullptr);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    for (std::size_t i = 0; i < weights.size(); ++i) {
+        const HostWeight& w = *weights[i];
+        const Slot& slot    = slots[i];
+        const int esize     = slot.bf16 ? 2 : 4;
+        std::vector<std::uint8_t> got(static_cast<std::size_t>(slot.out_rows) * columns * esize);
+        slot.buffer->copy_to_host(got.data(), got.size(), 0);
+        compare(label + " " + w.name, slot.rows, columns, [&](int t, int r, std::uint32_t& g, std::uint32_t& want) {
+            const std::size_t j = static_cast<std::size_t>(t) * slot.out_rows + slot.out_row + r;
+            g = 0;
+            std::memcpy(&g, got.data() + j * esize, esize);
+            want = oracle(w, slot.begin + r, x.data() + static_cast<std::size_t>(t) * w.k, slot.bf16);
+            return true;
+        });
+    }
+}
+
 void suite(const HostWeight& w, std::mt19937& rng) {
     for (const int columns : {1, 9, 37}) {
         const auto x = make_columns(w.k, columns, rng, columns);
@@ -1095,6 +1149,14 @@ int main() {
         run_grouped("q4 grouped up k=640", make_row_split(QType::Q4_G64_FP16, 1024, 640, rng, false), 256, 128, 128, 11,
                     rng);
         run_grouped("q5 grouped k=512", make_row_split(QType::Q5_G64_FP16, 1024, 512, rng, false), 192, 0, 64, 9, rng);
+        // Projections sharing one encode.
+        {
+            const HostWeight a = make_row_split(QType::Q4_G64_FP16, 96, 512, rng, false);
+            const HostWeight b = make_ggml(QType::GGML_Q4_K, 72, 512, rng, false, "q4_k");
+            const HostWeight c = make_bf16(64, 512, rng, true);
+            const HostWeight d = make_ggml(QType::GGML_Q6_K, 72, 512, rng, true, "q6_k tiles16");
+            for (const int columns : {1, 600}) { run_shared("shared T=" + std::to_string(columns), {&a, &b, &c, &d}, columns, rng); }
+        }
     } catch (const std::exception& e) {
         std::cerr << "FAIL exception: " << e.what() << "\n";
         return 1;
