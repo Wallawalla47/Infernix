@@ -127,6 +127,13 @@ struct Args {
     int split_keys; // keys per range (a multiple of kKeys)
     PartialMax* pmax; // [splits][columns][heads]
     PartialSum* psum;
+    // The window form's keys and values on their grids, once per call (pack_kernel; null: each CTA encodes
+    // the rows it reads): row (key j, KV head h) = j kv_heads + h.
+    const std::int16_t* kpack;  // [rows][256] (M << 5) | s, M 2^s the grid integer (0 off the grid)
+    const std::int16_t* kblk;   // [rows][4] the 64-blocks' exponents
+    const std::uint8_t* koff;   // [rows] an element off its block's grid
+    const std::int16_t* vpack;  // [rows][256] the value grid integers, packed alike
+    const std::uint32_t* vround; // [rows][8] elements rounded to their channel's grid
 };
 
 __device__ __forceinline__ int position(const Args& a, int c) { return a.positions != nullptr ? a.positions[c] : c; }
@@ -347,20 +354,91 @@ __device__ __forceinline__ void encode_block(const std::uint16_t* src, int lane,
     }
 }
 
-// v 2^(155 - vmax): the value's grid integer for its channel (rounded to nearest even below the grid).
-__device__ __forceinline__ int value_grid(std::uint16_t bits, int vmax, bool& rounded) {
+// A grid integer M 2^s (|M| <= 255, 0 <= s <= 21) packed in 16 bits as (M << 5) | s.
+__device__ __forceinline__ std::int16_t pack_grid(int m, int shift) { return static_cast<std::int16_t>(m * 32 + shift); }
+__device__ __forceinline__ int unpack_grid(std::int16_t p) {
+    const int v = p;
+    return (v >> 5) * (1 << (v & 31));
+}
+
+// v 2^(155 - vmax), packed: the value's grid integer for its channel (rounded to nearest even below the grid).
+__device__ __forceinline__ std::int16_t value_pack(std::uint16_t bits, int vmax, bool& rounded) {
     int m = 0, e = 1;
     bf16_parts(bits, m, e);
     if (m == 0) { return 0; }
     const int shift = e - vmax + kGridBits;
-    if (shift >= 0) { return m * (1 << shift); }
+    if (shift >= 0) { return pack_grid(m, shift); }
     rounded         = true;
     const int down  = -shift;
     const int mag   = m < 0 ? -m : m;
     if (down >= 9) { return 0; }
     const int q = mag >> down, r = mag & ((1 << down) - 1), half = 1 << (down - 1);
     const int v = q + ((r > half || (r == half && (q & 1) != 0)) ? 1 : 0);
-    return m < 0 ? -v : v;
+    return pack_grid(m < 0 ? -v : v, 0);
+}
+
+__device__ __forceinline__ int value_grid(std::uint16_t bits, int vmax, bool& rounded) {
+    return unpack_grid(value_pack(bits, vmax, rounded));
+}
+
+// One warp packs key row `row` (window form) as encode_block encodes it: its blocks' grid integers (0 off
+// the grid), exponents and off-grid flag; and its values with their rounded-element mask. A row whose k or
+// v holds an Inf or NaN (kmax kNonFinite) is zeros, as load_keys encodes it.
+__global__ void pack_kernel(const Args a, std::int16_t* kpack, std::int16_t* kblk, std::uint8_t* koff,
+                            std::int16_t* vpack, std::uint32_t* vround) {
+    const int lane        = static_cast<int>(threadIdx.x) & 31;
+    const long long items = static_cast<long long>(a.columns) * a.kv_heads;
+    const long long warps = static_cast<long long>(gridDim.x) * (blockDim.x / 32);
+    for (long long it = (static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x) / 32; it < items; it += warps) {
+        const std::size_t row = static_cast<std::size_t>(it);
+        const int kvh         = static_cast<int>(it % a.kv_heads);
+        const bool valid      = a.kmax[row] != kNonFinite;
+        bool lost             = false;
+#pragma unroll
+        for (int blk = 0; blk < kDim / 64; ++blk) {
+            int m[2] = {0, 0}, e[2] = {0, 0};
+            if (valid) {
+#pragma unroll
+                for (int i = 0; i < 2; ++i) {
+                    const std::uint16_t bits = a.k[row * kDim + 64 * blk + 2 * lane + i];
+                    if (!bf16_nonfinite(bits)) {
+                        bf16_parts(bits, m[i], e[i]);
+                        if (m[i] == 0) { e[i] = 0; }
+                    }
+                }
+            }
+            int eb = max(e[0], e[1]);
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) { eb = max(eb, __shfl_xor_sync(0xFFFFFFFFU, eb, o)); }
+            if (eb == 0) { eb = 1; }
+#pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                const int shift = e[i] - eb + kGridBits;
+                std::int16_t x  = 0;
+                if (m[i] != 0) {
+                    if (shift >= 0) {
+                        x = pack_grid(m[i], shift);
+                    } else {
+                        lost = true;
+                    }
+                }
+                kpack[row * kDim + 64 * blk + 2 * lane + i] = x;
+            }
+            if (lane == 0) { kblk[row * (kDim / 64) + blk] = static_cast<std::int16_t>(eb); }
+        }
+        lost = __any_sync(0xFFFFFFFFU, lost);
+        if (lane == 0) { koff[row] = lost ? 1 : 0; }
+#pragma unroll
+        for (int i = 0; i < kDim / 32; ++i) {
+            const int d       = lane + 32 * i;
+            bool rounded      = false;
+            std::int16_t x    = 0;
+            if (valid) { x = value_pack(a.v[row * kDim + d], max(a.vmax[kvh * kDim + d], 1), rounded); }
+            vpack[row * kDim + d] = x;
+            const unsigned mask   = __ballot_sync(0xFFFFFFFFU, rounded);
+            if (lane == 0) { vround[row * (kDim / 32) + i] = mask; }
+        }
+    }
 }
 
 // A signed 128-bit B (two int64 partial sums) times 2^shift (shift <= 60) into acc; bits below 2^0 set
@@ -422,6 +500,36 @@ __device__ __forceinline__ Score tile_score(const Shared& sh, const Args& a, int
         add_block(acc, s0, s1, shift, dropped);
     }
     return {acc, sh.qmax[i] + sh.kmax[jj] - 374};
+}
+
+// The scores of query row i with key rows jj and jj + 16 where wanted, as tile_score gives them: when both
+// rows are on their grids, one pass over the q row serves both keys.
+__device__ __forceinline__ void tile_scores(const Shared& sh, const Args& a, int seq, int c, int h, int kvh, int j0,
+                                            int i, int jj, const bool (&want)[2], Score (&s)[2], bool& dropped) {
+    const int k0 = jj, k1 = jj + 16;
+    if (!want[0] || !want[1] || sh.qoff[i] != 0 || sh.koff[k0] != 0 || sh.koff[k1] != 0) {
+        if (want[0]) { s[0] = tile_score(sh, a, seq, c, h, kvh, j0, i, k0, dropped); }
+        if (want[1]) { s[1] = tile_score(sh, a, seq, c, h, kvh, j0, i, k1, dropped); }
+        return;
+    }
+    I128 acc0{0ULL, 0LL}, acc1{0ULL, 0LL};
+#pragma unroll
+    for (int b = 0; b < kBlocks; ++b) {
+        long long s00 = 0, s01 = 0, s10 = 0, s11 = 0;
+#pragma unroll 8
+        for (int d = 0; d < 32; ++d) {
+            const long long qa = sh.xq[i][64 * b + d], qb = sh.xq[i][64 * b + 32 + d];
+            s00 += qa * sh.xk[k0][64 * b + d];
+            s01 += qb * sh.xk[k0][64 * b + 32 + d];
+            s10 += qa * sh.xk[k1][64 * b + d];
+            s11 += qb * sh.xk[k1][64 * b + 32 + d];
+        }
+        const int qshift = 60 - (sh.qmax[i] - sh.qb[i][b]);
+        add_block(acc0, s00, s01, qshift - (sh.kmax[k0] - sh.kb[k0][b]), dropped);
+        add_block(acc1, s10, s11, qshift - (sh.kmax[k1] - sh.kb[k1][b]), dropped);
+    }
+    s[0] = {acc0, sh.qmax[i] + sh.kmax[k0] - 374};
+    s[1] = {acc1, sh.qmax[i] + sh.kmax[k1] - 374};
 }
 
 // blockIdx: x = sequence b's 16-row tile, y = KV head, z = key range. Row r of the tile is the sequence's
@@ -487,6 +595,31 @@ __global__ __launch_bounds__(kThreads) void attention_kernel(const Args args) {
             sh.koff[r]  = 0;
         }
         __syncthreads();
+        if (args.kpack != nullptr) {
+            // The window form's rows, packed once per call (pack_kernel): copied and unpacked.
+            for (int idx = tid; idx < kKeys * kDim; idx += kThreads) {
+                const int r = idx / kDim, d = idx % kDim, j = j0 + r;
+                const bool ok         = j < key_end && sh.kmax[r] != kNonFinite;
+                const std::size_t row = static_cast<std::size_t>(j) * args.kv_heads + kvh;
+                sh.xk[r][d]           = ok ? unpack_grid(args.kpack[row * kDim + d]) : 0;
+                if (values) {
+                    int x = 0;
+                    if (ok) {
+                        x = unpack_grid(args.vpack[row * kDim + d]);
+                        if (((args.vround[row * (kDim / 32) + d / 32] >> (d % 32)) & 1U) != 0) { sh.vinexact[d] = 1; }
+                    }
+                    sh.vg[r][d] = x;
+                }
+            }
+            for (int idx = tid; idx < kKeys * kBlocks; idx += kThreads) {
+                const int r = idx / kBlocks, blk = idx % kBlocks, j = j0 + r;
+                const bool ok = j < key_end && sh.kmax[r] != kNonFinite;
+                sh.kb[r][blk] = ok ? args.kblk[(static_cast<std::size_t>(j) * args.kv_heads + kvh) * kBlocks + blk] : 1;
+                if (blk == 0 && ok && args.koff[static_cast<std::size_t>(j) * args.kv_heads + kvh] != 0) { sh.koff[r] = 1; }
+            }
+            __syncthreads();
+            return;
+        }
         for (int unit = warp; unit < kKeys * kBlocks; unit += kThreads / 32) {
             const int r = unit / kBlocks, blk = unit % kBlocks, j = j0 + r;
             const std::uint16_t* src =
@@ -515,17 +648,22 @@ __global__ __launch_bounds__(kThreads) void attention_kernel(const Args args) {
         for (int j0 = key_begin; j0 < key_end; j0 += kKeys) {
             load_keys(j0, false);
             if (active) {
+                bool want[2];
 #pragma unroll
                 for (int half = 0; half < 2; ++half) {
                     const int jj = sub + 16 * half, j = j0 + jj;
-                    if (j >= key_end || !visible(args, c, j)) { continue; }
-                    if (sh.kmax[jj] == kNonFinite) {
-                        nan = true;
-                        continue;
+                    want[half]   = j < key_end && visible(args, c, j);
+                    if (want[half] && sh.kmax[jj] == kNonFinite) {
+                        nan        = true;
+                        want[half] = false;
                     }
-                    const Score s = tile_score(sh, args, b, c, h, kvh, j0, i, jj, fail);
-                    if (!have || score_greater(s, best)) {
-                        best = s;
+                }
+                Score sc[2];
+                tile_scores(sh, args, b, c, h, kvh, j0, i, sub, want, sc, fail);
+#pragma unroll
+                for (int half = 0; half < 2; ++half) {
+                    if (want[half] && (!have || score_greater(sc[half], best))) {
+                        best = sc[half];
                         have = true;
                     }
                 }
@@ -585,13 +723,21 @@ __global__ __launch_bounds__(kThreads) void attention_kernel(const Args args) {
     for (int j0 = key_begin; j0 < key_end; j0 += kKeys) {
         load_keys(j0, true);
         if (work) {
+            bool want[2];
 #pragma unroll
             for (int half = 0; half < 2; ++half) {
-                const int jj = sub + 16 * half, j = j0 + jj;
+                const int j = j0 + sub + 16 * half;
+                want[half]  = j < key_end && visible(args, c, j);
+            }
+            Score sc[2];
+            tile_scores(sh, args, b, c, h, kvh, j0, i, sub, want, sc, fail);
+#pragma unroll
+            for (int half = 0; half < 2; ++half) {
+                const int jj = sub + 16 * half;
                 float p = 0.0F;
-                if (j < key_end && visible(args, c, j)) {
+                if (want[half]) {
                     bool ok       = true;
-                    const Score s = tile_score(sh, args, b, c, h, kvh, j0, i, jj, fail);
+                    const Score s = sc[half];
                     const float d = score_difference(s, best, ok);
                     if (!ok) { fail = true; }
                     p = lossless::cr_exp(d);
@@ -1092,7 +1238,13 @@ void configure() {
 
 // Carves the workspace (call_bytes' order) and runs the kernels; args holds everything but the geometry
 // and the workspace pointers.
-void run(Args args, int max_keys, void* workspace, cudaStream_t stream) {
+std::size_t pack_bytes(int kv_heads, int columns) {
+    const std::size_t rows = static_cast<std::size_t>(columns) * kv_heads;
+    return 2 * align256(rows * kDim * sizeof(std::int16_t)) + align256(rows * (kDim / 64) * sizeof(std::int16_t)) +
+           align256(rows) + align256(rows * (kDim / 32) * sizeof(std::uint32_t));
+}
+
+void run(Args args, int max_keys, void* workspace, cudaStream_t stream, bool pack = false) {
     const Geometry g = geometry(args.heads, args.kv_heads, args.width, args.sequences, max_keys);
     args.tiles       = g.tiles;
     args.splits      = g.splits;
@@ -1117,6 +1269,17 @@ void run(Args args, int max_keys, void* workspace, cudaStream_t stream) {
         args.pmax = static_cast<PartialMax*>(take(partials * sizeof(PartialMax)));
         args.psum = static_cast<PartialSum*>(take(partials * sizeof(PartialSum)));
     }
+    std::int16_t *kpack = nullptr, *kblk = nullptr, *vpack = nullptr;
+    std::uint8_t* koff  = nullptr;
+    std::uint32_t* vround = nullptr;
+    if (pack) {
+        const std::size_t rows = static_cast<std::size_t>(args.columns) * args.kv_heads;
+        kpack  = static_cast<std::int16_t*>(take(rows * kDim * sizeof(std::int16_t)));
+        vpack  = static_cast<std::int16_t*>(take(rows * kDim * sizeof(std::int16_t)));
+        kblk   = static_cast<std::int16_t*>(take(rows * (kDim / 64) * sizeof(std::int16_t)));
+        koff   = static_cast<std::uint8_t*>(take(rows));
+        vround = static_cast<std::uint32_t*>(take(rows * (kDim / 32) * sizeof(std::uint32_t)));
+    }
     // vmax, vinexact and flagged lie together: one memset zeroes them.
     CUDA_CHECK(cudaMemsetAsync(args.vmax, 0,
                                static_cast<std::size_t>(reinterpret_cast<std::uint8_t*>(args.flagged) + flag_bytes -
@@ -1126,6 +1289,17 @@ void run(Args args, int max_keys, void* workspace, cudaStream_t stream) {
         static_cast<long long>(args.sequences) * args.kv_heads * ((max_keys + kMaximaKeys - 1) / kMaximaKeys);
     maxima_kernel<<<static_cast<int>(std::min<long long>((items + 7) / 8, 4096)), 256, 0, stream>>>(args, max_keys);
     CUDA_CHECK(cudaGetLastError());
+    if (pack) {
+        const long long rows = static_cast<long long>(args.columns) * args.kv_heads;
+        pack_kernel<<<static_cast<int>(std::min<long long>((rows + 7) / 8, 4096)), 256, 0, stream>>>(args, kpack, kblk, koff,
+                                                                                                    vpack, vround);
+        CUDA_CHECK(cudaGetLastError());
+        args.kpack  = kpack;
+        args.kblk   = kblk;
+        args.koff   = koff;
+        args.vpack  = vpack;
+        args.vround = vround;
+    }
     constexpr int kSmem = static_cast<int>(sizeof(Shared));
     const dim3 grid(static_cast<unsigned>(args.sequences * g.tiles), static_cast<unsigned>(args.kv_heads),
                     static_cast<unsigned>(g.splits));
@@ -1150,7 +1324,7 @@ void run(Args args, int max_keys, void* workspace, cudaStream_t stream) {
 } // namespace
 
 std::size_t lossless_attention_workspace_bytes(int query_heads, int kv_heads, int columns) {
-    return call_bytes(query_heads, kv_heads, columns, 1, columns);
+    return call_bytes(query_heads, kv_heads, columns, 1, columns) + pack_bytes(kv_heads, columns);
 }
 
 void lossless_attention(const Tensor& q, const Tensor& k, const Tensor& v, Tensor& out, void* workspace,
@@ -1180,7 +1354,7 @@ void lossless_attention(const Tensor& q, const Tensor& k, const Tensor& v, Tenso
     args.select       = select;
     args.select_words = select_words;
     args.ratio        = ratio;
-    run(args, columns, workspace, stream);
+    run(args, columns, workspace, stream, true);
 }
 
 std::size_t lossless_paged_attention_workspace_bytes(int query_heads, int kv_heads, int max_width, int sequences,
