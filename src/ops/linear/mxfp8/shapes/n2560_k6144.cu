@@ -15,14 +15,14 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t
     if (tokens <= 8) return mxfp8_linear_a16_tma<Geometry, Mxfp8TmaT16R16>(x, weight, out, stream);
     if (tokens <= 32) return mxfp8_linear_a16_tma<Geometry, Mxfp8Tma<Mxfp8TmaT16R32>>(x, weight, out, stream);
     if (tokens <= 64) return mxfp8_linear_a16_tma<Geometry, Mxfp8Tma<Mxfp8TmaT16R64>>(x, weight, out, stream);
-    if (tokens <= 128) return mxfp8_linear_a16_tma<Geometry, Mxfp8Tma<Fp8A16TmaT32R64S3>>(x, weight, out, stream);
-    if (tokens <= 192) return mxfp8_linear_a16_tma<Geometry, Mxfp8Tma<Fp8A16TmaT32R128>>(x, weight, out, stream);
+    if (tokens <= 128) return mxfp8_linear_a16_tma<Geometry, Mxfp8Tma<Fp8A16RingT32R64S3>>(x, weight, out, stream);
+    if (tokens <= 192) return mxfp8_linear_a16_tma<Geometry, Mxfp8Tma<Fp8A16RingT32R128>>(x, weight, out, stream);
     if (tokens <= 256) return mxfp8_linear_a16_tma<Geometry, Mxfp8Tma<Mxfp8TmaT64R64>>(x, weight, out, stream);
-    if (tokens <= 384) return mxfp8_linear_a16_tma<Geometry, Mxfp8Tma<Fp8A16TmaT32R64S3>>(x, weight, out, stream);
-    if (tokens <= 512) return mxfp8_linear_a16_tma<Geometry, Mxfp8Tma<Fp8A16TmaT64R128>>(x, weight, out, stream);
+    if (tokens <= 384) return mxfp8_linear_a16_tma<Geometry, Mxfp8Tma<Fp8A16RingT32R64S3>>(x, weight, out, stream);
+    if (tokens <= 512) return mxfp8_linear_a16_tma<Geometry, Mxfp8Tma<Fp8A16RingT64R128>>(x, weight, out, stream);
     if (tokens <= 768) return mxfp8_linear_a16_tma<Geometry, Mxfp8Tma<Mxfp8TmaT64R64>>(x, weight, out, stream);
     if (tokens <= 1024) return mxfp8_linear_a16_tma<Geometry, Mxfp8Tma<Mxfp8TmaT128R128>>(x, weight, out, stream);
-    if (tokens <= 1536) return mxfp8_linear_a16_tma<Geometry, Mxfp8Tma<Fp8A16TmaT64R128>>(x, weight, out, stream);
+    if (tokens <= 1536) return mxfp8_linear_a16_tma<Geometry, Mxfp8Tma<Fp8A16RingT64R128>>(x, weight, out, stream);
     mxfp8_linear_a16_tma<Geometry, Mxfp8Tma<Mxfp8TmaT128R128>>(x, weight, out, stream);
 }
 } // namespace

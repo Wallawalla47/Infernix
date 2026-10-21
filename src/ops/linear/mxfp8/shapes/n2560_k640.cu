@@ -13,7 +13,7 @@ using Geometry = Fp8Geometry<2560, 640>;
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     const int tokens = x.ne[1];
     if (tokens <= 64) return mxfp8_linear_a16_tma<Geometry, Mxfp8P2<Mxfp8TmaT16R64>>(x, weight, out, stream);
-    if (tokens <= 128) return mxfp8_linear_a16_tma<Geometry, Fp8A16TmaT32R64>(x, weight, out, stream);
+    if (tokens <= 128) return mxfp8_linear_a16_tma<Geometry, Fp8A16RingT32R64>(x, weight, out, stream);
     mxfp8_linear_a16_tma<Geometry, Mxfp8P2<Mxfp8TmaT64R64>>(x, weight, out, stream);
 }
 } // namespace

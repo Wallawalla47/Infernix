@@ -56,8 +56,8 @@ using G = Fp8Geometry<16, K>; // only the static K enters the launch
 
 // Candidates no shape selects (2026-10-20). A cp_ candidate's stages are filled by cp.async (_p2 / _p4:
 // spread over two or four producer warps), a tma_ candidate's by TMA tensor loads (Mxfp8Tma).
-using T32R16   = Fp8A16TmaMmaSchedule<32, 16, 1, 2, 4, 2>;
-using T32R32S3 = Fp8A16TmaMmaSchedule<32, 32, 1, 4, 3, 2>;
+using T32R16   = Fp8A16RingMmaSchedule<32, 16, 1, 2, 4, 2>;
+using T32R32S3 = Fp8A16RingMmaSchedule<32, 32, 1, 4, 3, 2>;
 
 #define INFERNIX_C(name, rows, ...) Candidate{name, #__VA_ARGS__, mxfp8_linear_a16_tma<G<K>, __VA_ARGS__>, rows}
 
@@ -71,11 +71,11 @@ const std::vector<Candidate>& candidates() {
         INFERNIX_C("cp_t32r16s4b2", 16, T32R16),
         INFERNIX_C("cp_t32r32s4b2", 32, Mxfp8TmaT32R32),
         INFERNIX_C("cp_t32r32s3b2", 32, T32R32S3),
-        INFERNIX_C("cp_t32r64s6", 64, Fp8A16TmaT32R64),
-        INFERNIX_C("cp_t32r64s3b2", 64, Fp8A16TmaT32R64S3),
-        INFERNIX_C("cp_t32r128s4", 128, Fp8A16TmaT32R128),
+        INFERNIX_C("cp_t32r64s6", 64, Fp8A16RingT32R64),
+        INFERNIX_C("cp_t32r64s3b2", 64, Fp8A16RingT32R64S3),
+        INFERNIX_C("cp_t32r128s4", 128, Fp8A16RingT32R128),
         INFERNIX_C("cp_t64r64s2b2", 64, Mxfp8TmaT64R64),
-        INFERNIX_C("cp_t64r128s3", 128, Fp8A16TmaT64R128),
+        INFERNIX_C("cp_t64r128s3", 128, Fp8A16RingT64R128),
         INFERNIX_C("cp_t64r256s2", 256, Mxfp8TmaT64R256),
         INFERNIX_C("cp_t128r128s2", 128, Mxfp8TmaT128R128),
         INFERNIX_C("cp_t16r32s3b3_p2", 32, Mxfp8P2<Mxfp8TmaT16R32>),
@@ -83,10 +83,10 @@ const std::vector<Candidate>& candidates() {
         INFERNIX_C("cp_t16r128s3_p2", 128, Mxfp8P2<Mxfp8TmaT16R128>),
         INFERNIX_C("cp_t16r128s3_p4", 128, Mxfp8P4<Mxfp8TmaT16R128>),
         INFERNIX_C("cp_t32r32s4b2_p2", 32, Mxfp8P2<Mxfp8TmaT32R32>),
-        INFERNIX_C("cp_t32r64s3b2_p2", 64, Mxfp8P2<Fp8A16TmaT32R64S3>),
+        INFERNIX_C("cp_t32r64s3b2_p2", 64, Mxfp8P2<Fp8A16RingT32R64S3>),
         INFERNIX_C("cp_t64r64s2b2_p2", 64, Mxfp8P2<Mxfp8TmaT64R64>),
-        INFERNIX_C("cp_t64r128s3_p2", 128, Mxfp8P2<Fp8A16TmaT64R128>),
-        INFERNIX_C("cp_t64r128s3_p4", 128, Mxfp8P4<Fp8A16TmaT64R128>),
+        INFERNIX_C("cp_t64r128s3_p2", 128, Mxfp8P2<Fp8A16RingT64R128>),
+        INFERNIX_C("cp_t64r128s3_p4", 128, Mxfp8P4<Fp8A16RingT64R128>),
         INFERNIX_C("cp_t64r256s2_p2", 256, Mxfp8P2<Mxfp8TmaT64R256>),
         INFERNIX_C("cp_t64r256s2_p4", 256, Mxfp8P4<Mxfp8TmaT64R256>),
         INFERNIX_C("cp_t128r128s2_p2", 128, Mxfp8P2<Mxfp8TmaT128R128>),
@@ -98,11 +98,11 @@ const std::vector<Candidate>& candidates() {
         INFERNIX_C("tma_t32r16s4b2", 16, Mxfp8Tma<T32R16>),
         INFERNIX_C("tma_t32r32s4b2", 32, Mxfp8Tma<Mxfp8TmaT32R32>),
         INFERNIX_C("tma_t32r32s3b2", 32, Mxfp8Tma<T32R32S3>),
-        INFERNIX_C("tma_t32r64s6", 64, Mxfp8Tma<Fp8A16TmaT32R64>),
-        INFERNIX_C("tma_t32r64s3b2", 64, Mxfp8Tma<Fp8A16TmaT32R64S3>),
-        INFERNIX_C("tma_t32r128s4", 128, Mxfp8Tma<Fp8A16TmaT32R128>),
+        INFERNIX_C("tma_t32r64s6", 64, Mxfp8Tma<Fp8A16RingT32R64>),
+        INFERNIX_C("tma_t32r64s3b2", 64, Mxfp8Tma<Fp8A16RingT32R64S3>),
+        INFERNIX_C("tma_t32r128s4", 128, Mxfp8Tma<Fp8A16RingT32R128>),
         INFERNIX_C("tma_t64r64s2b2", 64, Mxfp8Tma<Mxfp8TmaT64R64>),
-        INFERNIX_C("tma_t64r128s3", 128, Mxfp8Tma<Fp8A16TmaT64R128>),
+        INFERNIX_C("tma_t64r128s3", 128, Mxfp8Tma<Fp8A16RingT64R128>),
         INFERNIX_C("tma_t64r256s2", 256, Mxfp8Tma<Mxfp8TmaT64R256>),
         INFERNIX_C("tma_t128r128s2", 128, Mxfp8Tma<Mxfp8TmaT128R128>),
     };

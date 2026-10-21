@@ -16,13 +16,13 @@ template <class Output>
 void select(const Mxfp8Operands& p, Output output, cudaStream_t stream) {
     const int tokens = p.tokens;
     if (tokens <= 16) return mxfp8_tma<Geometry, Mxfp8TmaT16R64>(p, output, stream);
-    if (tokens <= 32) return mxfp8_tma<Geometry, Mxfp8P2<Fp8A16TmaT32R64S3>>(p, output, stream);
-    if (tokens <= 64) return mxfp8_tma<Geometry, Fp8A16TmaT64R128>(p, output, stream);
+    if (tokens <= 32) return mxfp8_tma<Geometry, Mxfp8P2<Fp8A16RingT32R64S3>>(p, output, stream);
+    if (tokens <= 64) return mxfp8_tma<Geometry, Fp8A16RingT64R128>(p, output, stream);
     if (tokens <= 192) return mxfp8_tma<Geometry, Mxfp8P4<Mxfp8TmaT64R256>>(p, output, stream);
     if (tokens <= 256) return mxfp8_tma<Geometry, Mxfp8Tma<Mxfp8TmaT64R64>>(p, output, stream);
-    if (tokens <= 512) return mxfp8_tma<Geometry, Mxfp8Tma<Fp8A16TmaT64R128>>(p, output, stream);
+    if (tokens <= 512) return mxfp8_tma<Geometry, Mxfp8Tma<Fp8A16RingT64R128>>(p, output, stream);
     if (tokens <= 768) return mxfp8_tma<Geometry, Mxfp8Tma<Mxfp8TmaT128R128>>(p, output, stream);
-    if (tokens <= 3072) return mxfp8_tma<Geometry, Mxfp8Tma<Fp8A16TmaT64R128>>(p, output, stream);
+    if (tokens <= 3072) return mxfp8_tma<Geometry, Mxfp8Tma<Fp8A16RingT64R128>>(p, output, stream);
     mxfp8_tma<Geometry, Mxfp8Tma<Mxfp8TmaT128R128>>(p, output, stream);
 }
 

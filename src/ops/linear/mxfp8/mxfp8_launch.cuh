@@ -19,14 +19,14 @@ namespace infernix::ops::detail {
 // grid's size against its re-reads of the activation tile. With the cp.async producer the 16-row
 // tile is the output projection's fastest to 12 columns (bench/ops/mxfp8_flash_next_sweep.cu,
 // 2026-10-20; under the TMA producer it was 1.2-2.5x slower everywhere).
-using Mxfp8TmaT16R16  = Fp8A16TmaMmaSchedule<16, 16, 1, 2, 4, 3>;
-using Mxfp8TmaT16R32  = Fp8A16TmaMmaSchedule<16, 32, 1, 4, 3, 3>;
-using Mxfp8TmaT16R64  = Fp8A16TmaMmaSchedule<16, 64, 1, 4, 3, 2>;
-using Mxfp8TmaT16R128 = Fp8A16TmaMmaSchedule<16, 128, 1, 8, 3, 1>;
-using Mxfp8TmaT32R32  = Fp8A16TmaMmaSchedule<32, 32, 1, 4, 4, 2>;
-using Mxfp8TmaT64R64  = Fp8A16TmaMmaSchedule<64, 64, 2, 4, 2, 2>;
-using Mxfp8TmaT64R256 = Fp8A16TmaMmaSchedule<64, 256, 2, 8, 2, 1>;
-using Mxfp8TmaT128R128 = Fp8A16TmaMmaSchedule<128, 128, 4, 4, 2, 1>;
+using Mxfp8TmaT16R16  = Fp8A16RingMmaSchedule<16, 16, 1, 2, 4, 3>;
+using Mxfp8TmaT16R32  = Fp8A16RingMmaSchedule<16, 32, 1, 4, 3, 3>;
+using Mxfp8TmaT16R64  = Fp8A16RingMmaSchedule<16, 64, 1, 4, 3, 2>;
+using Mxfp8TmaT16R128 = Fp8A16RingMmaSchedule<16, 128, 1, 8, 3, 1>;
+using Mxfp8TmaT32R32  = Fp8A16RingMmaSchedule<32, 32, 1, 4, 4, 2>;
+using Mxfp8TmaT64R64  = Fp8A16RingMmaSchedule<64, 64, 2, 4, 2, 2>;
+using Mxfp8TmaT64R256 = Fp8A16RingMmaSchedule<64, 256, 2, 8, 2, 1>;
+using Mxfp8TmaT128R128 = Fp8A16RingMmaSchedule<128, 128, 4, 4, 2, 1>;
 
 // A schedule's cp.async producer spread over two or four warps (Mxfp8ProducerWarps): a full 16-token
 // tile and the prefill tiles issue more copies per stage than one warp keeps in flight.
