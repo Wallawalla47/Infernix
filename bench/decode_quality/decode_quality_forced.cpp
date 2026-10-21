@@ -15,7 +15,10 @@
 // reference and its top-1 agreement exactly as the prefill gate does.
 //
 // Segments lie back to back from the corpus's first token, no two sharing a token, and cycle
-// through the prompt lengths, so the forced steps read short and long contexts. --mode selects the decode route: plain (no speculation: one
+// through the prompt lengths, so the forced steps read short and long contexts. --first-segment N
+// runs the set's segments N to N + --segments - 1 (their offsets and prompt lengths as in the whole
+// set), so a larger set extends a smaller one: tools/quality/fast_path_gate.py concat-forced joins the
+// runs and references of consecutive ranges. --mode selects the decode route: plain (no speculation: one
 // single-column round per token), dflash2 (DFlash2, 7 drafts, the optimized proposal head), ngram
 // (DFlash2 with n-gram drafting) or mtp (MTP, 4 drafts). Fast paths run as in infernix-serve;
 // --disable-fast-paths runs the exact route and --fast-path NAME also runs that fast path
@@ -32,7 +35,7 @@
 // prefill and decode time, which shows which of the two its wall time went to.
 //
 // Usage: infernix_decode_quality_forced <artifact> <corpus.txt> <out.json> [--segments N]
-//          [--prompts L1,L2,...] [--forced N] [--reference | --observe REFERENCE.json]
+//          [--first-segment N] [--prompts L1,L2,...] [--forced N] [--reference | --observe REFERENCE.json]
 //          [--mode plain|dflash2|ngram|mtp|mtp-ngram] [--kv-dtype int8|bf16|fp8|nvfp4]
 //          [--disable-fast-paths] [--fast-path NAME]... [--expert-a4-activations]
 //          [--concurrency 1..8] [--prefill-chunk N] [--prefix-reuse [--warm-tokens N]]
@@ -67,7 +70,8 @@ struct Options {
     std::string artifact;
     std::string corpus;
     std::string output;
-    std::uint32_t segments = 256;
+    std::uint32_t segments      = 256;
+    std::uint32_t first_segment = 0; // the set's first segment this run computes
     std::vector<std::uint32_t> prompts{512, 2048, 8192};
     std::uint32_t forced  = infernix::kMaximumConstraintSteps;
     std::string mode      = "plain";
@@ -106,6 +110,8 @@ Options parse(int argc, char** argv) {
         };
         if (option == "--segments") {
             out.segments = parse_u32(value(), "segments");
+        } else if (option == "--first-segment") {
+            out.first_segment = parse_u32(value(), "first segment");
         } else if (option == "--prompts") {
             out.prompts.clear();
             std::string_view list = value();
@@ -203,29 +209,35 @@ void write_list(std::ostream& out, const Values& values) {
 }
 
 // The segments: back to back from the corpus's first token, cycling through the prompt lengths, so
-// no two segments share a token and each is its own text.
+// no two segments share a token and each is its own text. Segment i of a run is the set's segment
+// --first-segment + i.
 struct Segments {
     const std::vector<infernix::TokenId>& tokens;
     const Options& options;
-    std::vector<std::size_t> offsets;
+    std::vector<std::size_t> offsets; // the set's segments 0 .. first + segments - 1
 
     Segments(const std::vector<infernix::TokenId>& corpus, const Options& run)
         : tokens(corpus), options(run) {
         std::size_t next = 0;
-        for (std::uint32_t segment = 0; segment < options.segments; ++segment) {
+        for (std::uint32_t segment = 0; segment < options.first_segment + options.segments; ++segment) {
             offsets.push_back(next);
-            next += prompt_tokens(segment) + options.forced;
+            next += set_prompt_tokens(segment) + options.forced;
         }
         if (next > tokens.size()) {
             throw std::runtime_error("the corpus holds " + std::to_string(tokens.size()) + " tokens; " +
-                                     std::to_string(options.segments) + " segments need " +
-                                     std::to_string(next));
+                                     std::to_string(options.first_segment + options.segments) +
+                                     " segments need " + std::to_string(next));
         }
     }
 
-    [[nodiscard]] std::size_t offset(std::uint32_t segment) const { return offsets[segment]; }
+    [[nodiscard]] std::size_t offset(std::uint32_t segment) const {
+        return offsets[options.first_segment + segment];
+    }
     [[nodiscard]] std::uint32_t prompt_tokens(std::uint32_t segment) const {
-        return options.prompts[segment % options.prompts.size()];
+        return set_prompt_tokens(options.first_segment + segment);
+    }
+    [[nodiscard]] std::uint32_t set_prompt_tokens(std::uint32_t set_segment) const {
+        return options.prompts[set_segment % options.prompts.size()];
     }
     [[nodiscard]] std::vector<infernix::TokenId> prompt(std::uint32_t segment) const {
         const auto begin = tokens.begin() + static_cast<std::ptrdiff_t>(offset(segment));
