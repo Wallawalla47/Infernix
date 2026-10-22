@@ -259,6 +259,9 @@ drafter does not change).
 
 ### NVIDIA FP4-Local checkpoint
 
+> **Preliminary support:** this checkpoint runs and its quality gates passed, but optimisation is still in
+> progress, so its speeds will change.
+
 Recipe `qwen3_8_flash_next_fp4_local` imports
 [nvidia/Qwen3.8-Flash-Next-FP4-Local](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local),
 NVIDIA's quantization-aware distillation of the model, bit-exactly

@@ -7,6 +7,8 @@
 #include "models/qwen3_5/load/vision_overlay.h"
 #include "models/qwen3_5/weights.h"
 #include "infernix/ops/weight_input.h"
+#include "runtime/expert_offload/expert_bank.h"
+#include "runtime/expert_offload/expert_store.h"
 
 #include <memory>
 #include <optional>
@@ -59,13 +61,34 @@ public:
         return overlay_vision_;
     }
 
+    // The offloaded MoE layers (weights.h OffloadedMoeWeights), indexed by text layer: each one's
+    // routed bank (pinned host memory, or with LoadOptions::stream_experts its layout over records
+    // left in the artifact) and its shared expert's bank (device memory). Both are empty when no
+    // layer offloads its experts.
+    [[nodiscard]] std::span<const runtime::expert_offload::ExpertBank> expert_banks() const noexcept {
+        return expert_banks_;
+    }
+    [[nodiscard]] std::span<const runtime::expert_offload::ExpertBank> shared_expert_banks() const noexcept {
+        return shared_expert_banks_;
+    }
+    [[nodiscard]] bool offloaded_experts() const noexcept { return !expert_banks_.empty(); }
+    // With LoadOptions::stream_experts: where each routed record lies in the artifact (the SSD tier
+    // reads them in place); null otherwise.
+    [[nodiscard]] const runtime::expert_offload::ExpertStore* expert_store() const noexcept {
+        return expert_store_ ? &*expert_store_ : nullptr;
+    }
+
 private:
     friend std::unique_ptr<Model> materialize_model(LoadPlan&&, DeviceContext&,
                                                     const StartupObserver*);
     Model(Config config, LoadOptions options, ModelWeights weights, std::vector<BoundWeight> bound,
           FrontendResources resources, InstanceInfo info,
           std::optional<VisionOverlayAssets> overlay_vision,
-          artifact::MaterializedArtifact backing);
+          artifact::MaterializedArtifact backing,
+          std::vector<runtime::expert_offload::ExpertBank> expert_banks,
+          std::vector<runtime::expert_offload::ExpertBank> shared_expert_banks,
+          std::vector<std::vector<float>> shared_expert_multipliers,
+          std::optional<runtime::expert_offload::ExpertStore> expert_store);
 
     // Destroy all borrowers before backing. The caller keeps DeviceContext alive through cleanup.
     std::optional<VisionOverlayAssets> overlay_vision_;
@@ -76,6 +99,12 @@ private:
     std::vector<BoundWeight> bound_;
     FrontendResources resources_;
     InstanceInfo info_;
+    std::vector<runtime::expert_offload::ExpertBank> expert_banks_;        // views into backing_
+    std::vector<runtime::expert_offload::ExpertBank> shared_expert_banks_; // views into backing_
+    // The shared banks' scale tails (their records are in device memory only; their planes point here).
+    std::vector<std::vector<float>> shared_expert_multipliers_;
+    // Owns the streamed banks' multipliers (their planes point into it).
+    std::optional<runtime::expert_offload::ExpertStore> expert_store_;
 };
 
 } // namespace infernix::models::qwen3_5

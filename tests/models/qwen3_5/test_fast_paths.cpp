@@ -244,6 +244,18 @@ int main() {
                           q::auto_fixed_draft_tokens({16, ActivationClass::A16, KvCacheStorage::Int8Group64},
                                                      SpeculativeBackend::DFlash) == 3,
                       "auto verifies the block drafter's fastest fixed length where adaptive-dflash does not run");
+    // Offloaded experts (the 122B-A10B) price a verified draft by its expert misses, keyed on the
+    // offload, not on its 32 query heads.
+    {
+        const q::FastPathConfiguration offloaded{32, ActivationClass::A16, KvCacheStorage::BFloat16, false, true};
+        const q::FastPathConfiguration resident32{32, ActivationClass::A16, KvCacheStorage::BFloat16};
+        failures += check(q::auto_fixed_draft_tokens(offloaded, SpeculativeBackend::DFlash2) == 1 &&
+                              q::auto_fixed_draft_tokens(resident32, SpeculativeBackend::DFlash2) == 3,
+                          "offloaded experts draft one under a forced fixed length");
+        failures += check(q::dflash_width_costs(offloaded, SpeculativeBackend::DFlash2).per_draft == 0.72 &&
+                              q::dflash_width_costs(resident32, SpeculativeBackend::DFlash2).per_draft == 0.15,
+                          "offloaded experts price a draft column at 0.72 of a plain round");
+    }
     failures += check(q::dflash_auto_ceiling(int8_24, SpeculativeBackend::DFlash2) == 15 &&
                           q::dflash_auto_ceiling({16, ActivationClass::A16, KvCacheStorage::Int8Group64},
                                                  SpeculativeBackend::DFlash) == 7,

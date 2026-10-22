@@ -52,9 +52,12 @@ struct FrontendResources {
 Frontend make_frontend(const FrontendResources& source,
                        infernix::models::qwen3_5::FrontendOptions options) {
     infernix::models::qwen3_5::FrontendResources parsed{
-        source.tokenizer_json,           source.tokenizer_config_json,
-        source.chat_template_jinja,      source.generation_config_json,
-        source.preprocessor_config_json, source.video_preprocessor_config_json};
+        .tokenizer_json                 = source.tokenizer_json,
+        .tokenizer_config_json          = source.tokenizer_config_json,
+        .chat_template_jinja            = source.chat_template_jinja,
+        .generation_config_json         = source.generation_config_json,
+        .preprocessor_config_json       = source.preprocessor_config_json,
+        .video_preprocessor_config_json = source.video_preprocessor_config_json};
     parsed.tokenizer = std::make_shared<const infernix::models::qwen3_5::frontend::Tokenizer>(
         infernix::models::qwen3_5::frontend::TokenizerResources{
             source.tokenizer_json, source.tokenizer_config_json, source.generation_config_json});

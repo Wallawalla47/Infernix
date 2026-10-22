@@ -1,3 +1,4 @@
+#include "models/qwen3_5/proposal_head.h"
 #include "infernix/engine.h"
 #include "graph_prepare_probe.h"
 #include "kv_cache_storage.h"
@@ -22,7 +23,7 @@ infernix::EngineOptions engine_options(const char* artifact) {
     options.prefill_chunk                    = 1024;
     options.speculative.backend              = infernix::SpeculativeBackend::Mtp;
     options.speculative.draft_tokens         = 3;
-    options.speculative.proposal_head        = infernix::ProposalHead::Optimized;
+    options.speculative.proposal_head        = infernix::test::available_proposal_head(artifact);
     options.enable_vision                    = true;
     options.max_concurrency                  = 1;
     options.max_pending_requests             = 1;
@@ -41,7 +42,7 @@ infernix::EngineOptions anthropic_prefix_regression_engine_options(const char* a
     options.prefill_chunk                    = 512;
     options.speculative.backend              = infernix::SpeculativeBackend::Mtp;
     options.speculative.draft_tokens         = 3;
-    options.speculative.proposal_head        = infernix::ProposalHead::Optimized;
+    options.speculative.proposal_head        = infernix::test::available_proposal_head(artifact);
     options.max_concurrency                  = 1;
     options.max_pending_requests             = 1;
     options.context_cache.hybrid.device_snapshot_slots = 1;
@@ -61,7 +62,7 @@ infernix::EngineOptions shared_rewrite_materialization_engine_options(const char
     options.kv_cache                          = infernix::KvCacheStorage::Fp8E4M3Row256;
     options.speculative.backend               = infernix::SpeculativeBackend::Mtp;
     options.speculative.draft_tokens          = 3;
-    options.speculative.proposal_head         = infernix::ProposalHead::Optimized;
+    options.speculative.proposal_head         = infernix::test::available_proposal_head(artifact);
     options.max_concurrency                   = 1;
     options.max_pending_requests              = 1;
     options.context_cache.hybrid.device_snapshot_slots  = 2;
@@ -93,7 +94,7 @@ infernix::EngineOptions concurrent_engine_options(const char* artifact) {
     options.prefill_chunk                     = 256;
     options.speculative.backend               = infernix::SpeculativeBackend::Mtp;
     options.speculative.draft_tokens          = 3;
-    options.speculative.proposal_head         = infernix::ProposalHead::Optimized;
+    options.speculative.proposal_head         = infernix::test::available_proposal_head(artifact);
     options.max_concurrency                   = 8;
     options.max_pending_requests              = 8;
     options.context_cache.hybrid.device_snapshot_slots  = 16;

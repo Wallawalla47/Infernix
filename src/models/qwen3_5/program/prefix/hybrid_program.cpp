@@ -270,7 +270,8 @@ std::vector<SourceCandidate> ProgramImpl::hybrid_sources(const RequestBasePlan& 
             return static_cast<std::uint64_t>(kv_pages_for_frontier(first)) - reuse / kBlock +
                    restored;
         };
-        if (need(frontier) > text_kv_pages->physical_pool().available_pages() + evictable) {
+        // An elastic text pool may also grow into the expert frames (the binding reclaims, then grows).
+        if (need(frontier) > text_kv_pages->physical_pool().available_pages() + evictable + kv_growable_pages()) {
             return false;
         }
         return !backend_pool || need(hybrid_backend_frontier(frontier)) <=
@@ -1482,8 +1483,6 @@ pc::SnapshotRef ProgramImpl::hybrid_publish_endpoint(SequenceState& sequence,
 // ---- Device pressure and statistics ------------------------------------------------------------
 
 bool ProgramImpl::hybrid_reclaim(runtime::ContextResourceUsage shortage) {
-    if (!hybrid_) { return false; }
-    hybrid_->poll();
     const DeviceKVPagePool& text_pool = text_kv_pages->physical_pool();
     const DeviceKVPagePool* backend_pool =
         backend_kv_pages ? &backend_kv_pages->physical_pool() : nullptr;
@@ -1491,17 +1490,23 @@ bool ProgramImpl::hybrid_reclaim(runtime::ContextResourceUsage shortage) {
     const std::uint32_t backend_target =
         backend_pool != nullptr ? backend_pool->available_pages() + shortage.backend_kv_pages : 0U;
     std::uint32_t released = 0;
-    while (text_pool.available_pages() < text_target ||
-           (backend_pool != nullptr && backend_pool->available_pages() < backend_target)) {
-        const std::uint32_t count = hybrid_->index().evict_device_blocks(1);
-        if (count == 0) {
-            // Blocks pinned only by their in-flight Host writes become evictable once those land.
-            if (!hybrid_->transfers_pending()) { break; }
-            hybrid_->drain();
-            continue;
+    if (hybrid_) {
+        hybrid_->poll();
+        while (text_pool.available_pages() < text_target ||
+               (backend_pool != nullptr && backend_pool->available_pages() < backend_target)) {
+            const std::uint32_t count = hybrid_->index().evict_device_blocks(1);
+            if (count == 0) {
+                // Blocks pinned only by their in-flight Host writes become evictable once those land.
+                if (!hybrid_->transfers_pending()) { break; }
+                hybrid_->drain();
+                continue;
+            }
+            released += count;
         }
-        released += count;
     }
+    // An elastic text pool grows by what eviction could not free, from the expert frames, so idle
+    // cache blocks never hold memory the experts could use (elastic_kv.cpp).
+    if (text_pool.available_pages() < text_target && kv_vmm && grow_kv(text_target)) { return true; }
     return released != 0;
 }
 

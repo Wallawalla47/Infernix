@@ -24,8 +24,9 @@ struct LoadOptions {
     bool reference = false;
     // Qwen4Exp: routed expert banks whose 4-bit activations are optional run them (W4A4).
     bool expert_a4_activations = false;
-    // Qwen4Exp: the routed expert banks stay in the artifact and are read in place by the SSD
-    // expert tier (design §19.3.7) instead of being pinned in host memory.
+    // Offloaded routed expert banks (Qwen4Exp, Qwen3.5 with offloaded experts) stay in the artifact
+    // and are read in place by the SSD expert tier (Flash-Next design §19.3.7) instead of being
+    // pinned in host memory.
     bool stream_experts = false;
     // Qwen4Exp DFlash2: the companion artifact of the drafter (SpeculativeOptions::draft_model).
     std::filesystem::path draft_model;

@@ -57,8 +57,10 @@ struct DFlashWidthCosts {
 };
 
 // The widths, ascending, a ceiling of `drafts` gives rounds of one row (batch == false) or of
-// several rows.
-[[nodiscard]] std::vector<std::uint32_t> dflash_policy_widths(std::uint32_t drafts, bool batch);
+// several rows; with `zero`, also width 1: no draft verified (the round runs the narrowest family
+// with every row's drafts masked, which only pays where a masked column costs nothing: offloaded
+// experts, ops::MoeColumnMask).
+[[nodiscard]] std::vector<std::uint32_t> dflash_policy_widths(std::uint32_t drafts, bool batch, bool zero = false);
 
 // A request's memory of the policy: its drafts' calibration and its probe schedule. It lives with
 // the request's sequence, so a request paused for preemption resumes (after Replay) with it.
@@ -87,8 +89,9 @@ public:
 
     // batches == false: rounds of several rows are not the policy's (they run the configuration's
     // plain batch round, ProgramImpl::dflash_batch_drafts) and have no widths.
+    // zero_drafts: width 1 (no draft verified) is a candidate (dflash_policy_widths).
     DFlashWidthPolicy(std::uint32_t ceiling, std::uint32_t max_batch, DFlashWidthCosts costs,
-                      bool batches = true);
+                      bool batches = true, bool zero_drafts = false);
 
     [[nodiscard]] std::uint32_t ceiling() const noexcept { return ceiling_; }
     [[nodiscard]] const DFlashWidthCosts& costs() const noexcept { return costs_; }

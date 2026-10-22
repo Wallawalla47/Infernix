@@ -124,6 +124,12 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
         Tensor ar_rope_positions  = frame.ar_rope_positions.slice(0, 0, batch_size);
         Tensor ar_valid_columns   = frame.ar_valid_columns.slice(0, 0, batch_size);
         Tensor next_drafts        = frame.next_drafts.slice(0, 0, batch_size);
+        Tensor next_probabilities = frame.next_probabilities.slice(0, 0, batch_size);
+        // The confidence policy's input: each proposal step's drafter probability.
+        const bool confidence = state.execution.execution_schedule.mtp_draft_confidence;
+        const auto step_probability = [&](std::uint32_t step) {
+            return next_probabilities.slice(1, static_cast<std::int32_t>(step), 1).view({batch_size});
+        };
 
         TargetVerifyFrameView verify{
             .ids                     = verify_ids,
@@ -174,7 +180,8 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
 
             Tensor proposal_logits = frame.proposal_logits.slice(1, 0, batch_size);
             Tensor draft0          = next_drafts.slice(1, 0, 1).view({batch_size});
-            card.mtp_propose_batch(ar_hidden, proposal_logits, draft0);
+            Tensor probability0    = confidence ? step_probability(0) : Tensor{};
+            card.mtp_propose_batch(ar_hidden, proposal_logits, draft0, confidence ? &probability0 : nullptr);
             for (std::uint32_t step = 0; step + 1 < next_k; ++step) {
                 Tensor previous =
                     next_drafts.slice(1, static_cast<std::int32_t>(step), 1).view({batch_size});
@@ -196,7 +203,8 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                 card.mtp_forward_decode_batch(previous_batch, hidden_batch, position, rope, valid,
                                               mtp_rows, state_destinations, envelopes.ar[step],
                                               next_hidden_batch);
-                card.mtp_propose_batch(next_hidden, proposal_logits, next);
+                Tensor probability = confidence ? step_probability(step + 1) : Tensor{};
+                card.mtp_propose_batch(next_hidden, proposal_logits, next, confidence ? &probability : nullptr);
                 CUDA_CHECK(cudaMemcpyAsync(ar_hidden.data, next_hidden.data, ar_hidden.bytes(),
                                            cudaMemcpyDeviceToDevice,
                                            state.execution.device.stream));

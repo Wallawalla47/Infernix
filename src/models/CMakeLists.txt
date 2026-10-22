@@ -13,6 +13,7 @@ target_include_directories(infernix_model_runtime PRIVATE
 target_include_directories(infernix_model_runtime SYSTEM PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/xgrammar/3rdparty/picojson)
 
+include(${PROJECT_SOURCE_DIR}/src/runtime/expert_offload/sources.cmake)
 include(qwen3_5/loading_sources.cmake)
 include(qwen3_5/frontend_sources.cmake)
 include(qwen3_5/execution_sources.cmake)

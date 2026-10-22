@@ -3,6 +3,7 @@
 #include "models/qwen3_5/execution/gdn.h"
 #include "models/qwen3_5/execution/lossless.h"
 #include "models/qwen3_5/execution/mtp.h"
+#include "models/qwen3_5/execution/offloaded_moe.h"
 #include "models/qwen3_5/program/planning/fast_paths.h"
 #include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "models/qwen3_5/program/planning/idle_prefill.h"
@@ -83,7 +84,7 @@ bool tree_verification_supported(const execution::Parameters& parameters) {
         if (gdn == nullptr) { continue; }
         const auto* single = std::get_if<ops::SingleProjectionWeight>(&gdn->projection);
         if (single == nullptr || (single->weight.qtype != QType::NVFP4 &&
-                                  single->weight.qtype != QType::FP8_E4M3FN_ROW_BF16)) {
+                                  !is_fp8_row(single->weight.qtype))) {
             return false;
         }
     }
@@ -274,6 +275,11 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                     "MTP Paged KV physical pages exceed int32"));
     LayoutBuilder builder;
     PersistentLayout out;
+    // Offloaded experts take the VRAM the Program leaves, so a generation Program's text KV pages grow
+    // from them on demand (elastic KV): planned in their own region, backed beyond kElasticKvBaseTokens
+    // as requests need. (Every capacity plans the region the same way, so the plan stays affine in it.)
+    const bool elastic_kv = parameters.model.offloaded_experts() && !plan.causal_scoring;
+    LayoutBuilder text_pages;
     out.decoder = qwen3_5::plan_decoder_state(
         builder, qwen3_5::DecoderStateSpec{
                      .full_attention_layers     = config.full_attention_layers,
@@ -287,7 +293,12 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .kv_table_rows             = static_cast<std::int32_t>(plan.max_concurrency),
                      .text_physical_page_groups = physical_pages,
                      .mtp_physical_page_groups  = mtp_physical_pages,
-                 });
+                 },
+        elastic_kv ? &text_pages : nullptr);
+    if (elastic_kv) {
+        out.text_kv_region_bytes = text_pages.finish(kArenaAlign, "elastic text KV pages");
+        out.text_kv_base_pages   = std::min(physical_pages, page_count(kElasticKvBaseTokens));
+    }
     qwen3_5::StateImageSpec state_image_spec{
         .linear =
             {
@@ -462,6 +473,14 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto chunk  = static_cast<std::int32_t>(chunk_u32);
     const auto drafts = static_cast<std::int32_t>(plan.draft_window);
     const auto verify = drafts + 1;
+    // Offloaded experts (122B design §10): a pass wider than kOffloadedMoeStaticColumns runs on a
+    // workspace the expert cache lends for the whole pass (ProgramOffload::begin_pass), so the
+    // Program's own workspace plans prefill to that width and *_prefill_wide records a full pass's.
+    // The lossless route's layers keep their own path (execution/lossless.cpp) and lend nothing.
+    const bool lent_prefill =
+        !plan.execution_schedule.lossless && chunk > execution::kOffloadedMoeStaticColumns &&
+        std::holds_alternative<execution::OffloadedMoeParameters>(parameters.text.layers.front().ffn);
+    const std::int32_t prefill_width = lent_prefill ? execution::kOffloadedMoeStaticColumns : chunk;
     // Every launch takes the schedule's fast-path permission, which sizes partials (see
     // execution/text.cpp).
     const ops::CausalAttentionExecutionEnvelope text_envelope =
@@ -678,35 +697,40 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     };
 
     WorkspacePlan out;
-    WorkspaceLayoutBuilder text_prefill;
-    text_common_root(text_prefill, chunk);
-    // The lossless route's cache form (generation): its sequences and key capacity size the attention.
-    execution::LosslessCache lossless_shape{.sequences    = 1,
-                                            .key_capacity = plan.execution_schedule.lossless_keys};
-    const execution::LosslessCache* lossless_cache =
-        plan.execution_schedule.lossless_keys != 0 ? &lossless_shape : nullptr;
-    if (plan.execution_schedule.lossless) {
-        // The chunk's rotary table and (cache form) state slots, then the widest layer
-        // (execution/lossless.cpp's own allocations), the hidden output and the head's FP32 logits.
-        (void)text_prefill.alloc_bytes(execution::lossless_rope_window_bytes(config, chunk));
-        if (lossless_cache != nullptr) { matrix(text_prefill, DType::I32, 2, 1); }
-        for (std::size_t layer = 0; layer < parameters.text.layers.size(); ++layer) {
-            scratch(text_prefill, execution::lossless_layer_workspace_bytes(
-                                      parameters.text.layers[layer], config, config.layer_types[layer], chunk,
-                                      lossless_cache, plan.execution_schedule.lossless_design));
+    // A text prefill pass of `width` columns (its roots, layers, head and first-token sampling).
+    const auto plan_text_prefill = [&](std::int32_t width) {
+        WorkspaceLayoutBuilder text_prefill;
+        text_common_root(text_prefill, width);
+        // The lossless route's cache form (generation): its sequences and key capacity size the attention.
+        execution::LosslessCache lossless_shape{.sequences    = 1,
+                                                .key_capacity = plan.execution_schedule.lossless_keys};
+        const execution::LosslessCache* lossless_cache =
+            plan.execution_schedule.lossless_keys != 0 ? &lossless_shape : nullptr;
+        if (plan.execution_schedule.lossless) {
+            // The chunk's rotary table and (cache form) state slots, then the widest layer
+            // (execution/lossless.cpp's own allocations), the hidden output and the head's FP32 logits.
+            (void)text_prefill.alloc_bytes(execution::lossless_rope_window_bytes(config, width));
+            if (lossless_cache != nullptr) { matrix(text_prefill, DType::I32, 2, 1); }
+            for (std::size_t layer = 0; layer < parameters.text.layers.size(); ++layer) {
+                scratch(text_prefill, execution::lossless_layer_workspace_bytes(
+                                          parameters.text.layers[layer], config, config.layer_types[layer], width,
+                                          lossless_cache, plan.execution_schedule.lossless_design));
+            }
+            matrix(text_prefill, DType::BF16, dimension(config.hidden_size), width);
+            scratch(text_prefill, execution::lossless_head_workspace_bytes(parameters.text.output_head.weight, 1));
+        } else {
+            target_body(text_prefill, 1, width, qwen3_5::TextPhase::Prefill, GdnWorkspacePath::Prefill, 1,
+                        1, width, prefill_envelope);
         }
-        matrix(text_prefill, DType::BF16, dimension(config.hidden_size), chunk);
-        scratch(text_prefill, execution::lossless_head_workspace_bytes(parameters.text.output_head.weight, 1));
-    } else {
-        target_body(text_prefill, 1, chunk, qwen3_5::TextPhase::Prefill, GdnWorkspacePath::Prefill, 1,
-                    1, chunk, prefill_envelope);
-    }
-    if (!plan.causal_scoring) {
-        scratch(text_prefill,
-                ops::sampling_workspace_capacity_bytes(
-                    dimension(parameters.model.resources().public_token_count), 1, 1));
-    }
-    out.text_prefill = finish(text_prefill);
+        if (!plan.causal_scoring) {
+            scratch(text_prefill,
+                    ops::sampling_workspace_capacity_bytes(
+                        dimension(parameters.model.resources().public_token_count), 1, 1));
+        }
+        return finish(text_prefill);
+    };
+    out.text_prefill      = plan_text_prefill(prefill_width);
+    out.text_prefill_wide = lent_prefill ? plan_text_prefill(chunk) : 0;
 
     if (plan.causal_scoring) {
         WorkspaceLayoutBuilder causal_score;
@@ -759,21 +783,25 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     }
 
     if (plan.features.mtp()) {
-        WorkspaceLayoutBuilder mtp_prefill;
-        text_common_root(mtp_prefill, chunk);
-        target_body(mtp_prefill, 1, chunk, qwen3_5::TextPhase::Prefill, GdnWorkspacePath::Prefill,
-                    1, 1, chunk, prefill_envelope);
-        matrix(mtp_prefill, DType::I32, 1, chunk);
-        if (plan.features.vision) {
-            matrix(mtp_prefill, DType::BF16, dimension(config.hidden_size), chunk);
-            (void)workspace::visual_scatter_indices(mtp_prefill, chunk);
-        }
-        mtp_prefill_chunk(mtp_prefill, 1, chunk, plan.features.vision);
-        for (std::int32_t i = 1; i < drafts; ++i) {
-            matrix(mtp_prefill, DType::BF16, dimension(config.hidden_size), 1);
-            mtp_full_call(mtp_prefill, 1, text_envelope, true);
-        }
-        out.mtp_prefill = finish(mtp_prefill);
+        const auto plan_mtp_prefill = [&](std::int32_t width) {
+            WorkspaceLayoutBuilder mtp_prefill;
+            text_common_root(mtp_prefill, width);
+            target_body(mtp_prefill, 1, width, qwen3_5::TextPhase::Prefill, GdnWorkspacePath::Prefill,
+                        1, 1, width, prefill_envelope);
+            matrix(mtp_prefill, DType::I32, 1, width);
+            if (plan.features.vision) {
+                matrix(mtp_prefill, DType::BF16, dimension(config.hidden_size), width);
+                (void)workspace::visual_scatter_indices(mtp_prefill, width);
+            }
+            mtp_prefill_chunk(mtp_prefill, 1, width, plan.features.vision);
+            for (std::int32_t i = 1; i < drafts; ++i) {
+                matrix(mtp_prefill, DType::BF16, dimension(config.hidden_size), 1);
+                mtp_full_call(mtp_prefill, 1, text_envelope, true);
+            }
+            return finish(mtp_prefill);
+        };
+        out.mtp_prefill      = plan_mtp_prefill(prefill_width);
+        out.mtp_prefill_wide = lent_prefill ? plan_mtp_prefill(chunk) : 0;
 
         // A round's draft calls run either drafter copy: each is sized.
         std::vector<std::pair<const execution::MtpParameters*, const execution::LinearParameters*>>
@@ -870,7 +898,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     linear_scratch(layout, parameters.draft->feature_projection,
                                    local_width * batch, local_width * batch);
                     scratch(layout, ops::context_kv_materialize_workspace_capacity_bytes(
-                                        batch, local_width, local_width));
+                                        static_cast<std::int32_t>(draft->num_hidden_layers), batch,
+                                        local_width, local_width));
                     return finish(layout);
                 }
                 (void)workspace::dflash_context(layout, config, *draft, tokens);
@@ -1072,7 +1101,11 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         parameters.model.config().text.full_attention_layers == 0) {
         throw std::invalid_argument("Qwen3.5 Program requires at least one full-attention layer");
     }
-    if (parameters.model.options() != models::load_options(options, Architecture::Qwen3_5)) {
+    // The RAM ledger, not the options, decides whether offloaded banks stay in the artifact (the SSD
+    // tier): the loaded model's choice stands.
+    auto expected           = models::load_options(options, Architecture::Qwen3_5);
+    expected.stream_experts = parameters.model.options().stream_experts;
+    if (parameters.model.options() != expected) {
         throw std::invalid_argument(
             "loaded components do not match the requested execution options");
     }
@@ -1294,8 +1327,10 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             "CUDA Graph allowance");
     }
 
+    // An elastic text KV region counts whole: the frames give it back as it grows.
     impl->device_reservation_bytes = checked_add(
-        checked_add(impl->persistent.bytes, impl->workspace.capacity, "sequence memory plan"),
+        checked_add(checked_add(impl->persistent.bytes, impl->persistent.text_kv_region_bytes, "elastic KV region"),
+                    impl->workspace.capacity, "sequence memory plan"),
         impl->graph_allowance_bytes, "sequence graph allowance");
     return impl;
 }
@@ -1358,7 +1393,11 @@ ExecutionSchedule execution_schedule(const execution::Parameters& parameters,
                                        fast_paths.selected(FastPath::AdaptiveSpeculation),
             .adaptive_dflash         = fast_paths.selected(FastPath::AdaptiveDFlash) &&
                                        fast_paths.selected(FastPath::AdaptiveSpeculation),
-            .linear_routes           = fast_paths.selected(FastPath::Q4W4A8) ? ops::LinearRoutes::Q4W4A8
+            // Only offloaded experts make an unverified draft column free (the verification's
+            // masked padding routes no expert); elsewhere trimming drafts saves nothing.
+            .mtp_draft_confidence    = options.speculative.backend == SpeculativeBackend::Mtp &&
+                                       parameters.model.offloaded_experts(),
+            .linear_routes         = fast_paths.selected(FastPath::Q4W4A8) ? ops::LinearRoutes::Q4W4A8
                                                                              : ops::LinearRoutes::Exact,
             .gdn_arithmetic          = fast_paths.selected(FastPath::GdnF16Accumulate)
                                            ? ops::GdnChunkArithmetic::Fp16Accumulate
@@ -1393,7 +1432,9 @@ bool prefill_attention_runs_waves(const EngineOptions& options) {
 std::uint32_t prefill_step_width(const execution::Parameters& parameters,
                                  const EngineOptions& options, std::uint32_t requested) {
     requested = std::min(requested, options.max_context);
-    if (!prefill_attention_runs_waves(options)) { return requested; }
+    // The lossless route's attention is its own (no prompt waves): its window form needs the whole
+    // window in one pass.
+    if (options.lossless || !prefill_attention_runs_waves(options)) { return requested; }
     const auto& attention = *parameters.model.config().text.attention;
     const auto wave = static_cast<std::uint32_t>(ops::causal_softmax_attention_prompt_wave_tokens(
         {static_cast<std::int32_t>(attention.head_dim),
@@ -1539,7 +1580,9 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .speculative_backend  = options.speculative.backend,
         .kv_storage           = options.kv_cache,
         .proposal_head        = options.speculative.proposal_head,
-        .features             = models::load_options(options, Architecture::Qwen3_5),
+        // The loaded model's options (validate_target_options checked them against these options): they
+        // carry the RAM ledger's tier choice.
+        .features             = parameters.model.options(),
         // Lossless decode rounds are captured too: nothing on their path waits for the host, and the
         // attention's launches depend on the round's shape, not on its key bound.
         .use_cuda_graph       = options.use_cuda_graph,

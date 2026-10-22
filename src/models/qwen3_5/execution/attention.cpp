@@ -39,7 +39,8 @@ bool fused_text_qk_norm_rope(const Tensor& positions, const RopeConfig& rope,
            rms_norm_eps == kFusedTextNormEpsilon && positions.ne[1] == 1 &&
            attention.head_dim == 256 && rope.rotary_dim == 64 &&
            ((attention.num_attention_heads == 16 && attention.num_key_value_heads == 2) ||
-            (attention.num_attention_heads == 24 && attention.num_key_value_heads == 4));
+            (attention.num_attention_heads == 24 && attention.num_key_value_heads == 4) ||
+            (attention.num_attention_heads == 32 && attention.num_key_value_heads == 2));
 }
 
 } // namespace

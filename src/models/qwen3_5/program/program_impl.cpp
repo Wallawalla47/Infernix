@@ -25,7 +25,8 @@ namespace infernix::models::qwen3_5::detail {
 static_assert(std::is_nothrow_move_assignable_v<SpeculativeStats>);
 
 ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const SequencePlanImpl& plan,
-                         DeviceContext& device_in, const StartupObserver& startup_observer)
+                         DeviceContext& device_in, const StartupObserver& startup_observer,
+                         const ProgramOffloadOptions* offload_options)
     : parameters(parameters_in), device(device_in), capacity(plan.capacity),
       kv_capacity(plan.kv_capacity), max_concurrency(plan.max_concurrency),
       context_cache(plan.context_cache), prefill_chunk(plan.prefill_chunk),
@@ -77,6 +78,13 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
          workspace_plan.vision->general_capacity_bytes != workspace_plan.general_capacity)) {
         throw std::invalid_argument("Qwen3.5 workspace plan does not match startup features");
     }
+    if (execution_schedule.mtp_draft_confidence) {
+        // A verified draft column's prior cost against a round without drafts: with experts held
+        // outside device memory (the only configuration the schedule enables this for) its misses,
+        // Qwen3.5-122B design §0: ~10 ms a column against 13.8 ms a plain token on the 5090. The fit
+        // replaces it.
+        mtp_confidence.emplace(0.7);
+    }
     if (tree_widths.automatic_mode()) {
         std::array<std::vector<std::uint32_t>, kMaximumConcurrency> trees;
         for (std::uint32_t b = 1; b <= max_concurrency; ++b) {
@@ -115,10 +123,13 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         for (const SpeculativeRoundShape& shape : plan.round_shapes) {
             if (shape.batch_only) { dflash_batch_drafts = shape.verify_drafts; }
         }
+        // With offloaded experts a round may verify no draft (width 1: the narrowest family with
+        // every row's drafts masked, which routes no expert for them).
         dflash_width_policy.emplace(neural_draft_window, max_concurrency, plan.dflash_width_costs,
-                                    dflash_batch_drafts == 0);
+                                    dflash_batch_drafts == 0, offload_options != nullptr);
         for (std::uint32_t batch = 1; batch <= max_concurrency; ++batch) {
             for (const std::uint32_t width : dflash_width_policy->widths(batch)) {
+                if (width == 1U) { continue; } // the narrowest family serves it
                 const bool planned = std::any_of(
                     plan.round_shapes.begin(), plan.round_shapes.end(), [&](const SpeculativeRoundShape& shape) {
                         return shape.split && shape.verify_drafts + 1U == width && (!shape.single_row || batch == 1U);
@@ -130,7 +141,20 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         }
     }
     const DeviceSpan backing = persistent.alloc_bytes(plan.persistent.bytes, 256);
-    decoder      = std::make_unique<qwen3_5::DecoderState>(backing, plan.persistent.decoder);
+    // Elastic text KV: the page planes over a reserved region, its base backed now (elastic_kv.cpp).
+    DeviceSpan text_pages{};
+    if (plan.persistent.text_kv_region_bytes != 0) {
+        kv_layout     = plan.persistent.decoder.text_kv.pages;
+        kv_base_pages = plan.persistent.text_kv_base_pages;
+        kv_vmm        = std::make_unique<VmmRange>(device.device, plan.persistent.text_kv_region_bytes, kKvChunkBytes);
+        if (!map_kv(kv_base_pages)) {
+            throw std::runtime_error("the text KV's first " + std::to_string(kv_base_pages) +
+                                     " pages do not fit in device memory");
+        }
+        text_pages = DeviceSpan{kv_vmm->base(), plan.persistent.text_kv_region_bytes};
+    }
+    decoder      = std::make_unique<qwen3_5::DecoderState>(backing, plan.persistent.decoder, text_pages);
+    if (kv_vmm) { decoder->text_kv.page_pool().set_backed_pages(kv_base_pages); }
     state_images = std::make_unique<StateImageDevicePool>(backing, plan.persistent.state_images);
     if (plan.persistent.replay_records) {
         replay_records.emplace(backing, *plan.persistent.replay_records);
@@ -272,11 +296,47 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             cudaMemsetAsync(sampling_config.data, 0, sampling_config.bytes(), device.stream));
     }
     device.synchronize();
+    if (offload_options != nullptr) {
+        // Offloaded experts (design §9.2): the engine after every fixed allocation, its frames sized
+        // from what they leave less the graphs' allowance, started before the graphs capture the
+        // experts' sources.
+        const OffloadGeometry geometry{
+            .lanes       = static_cast<std::int32_t>(max_concurrency),
+            .max_width   = static_cast<std::int32_t>(draft_window + 1U),
+            .columns     = static_cast<std::int32_t>(std::max<std::uint32_t>(
+                std::max(idle_prefill_width, prefill_chunk), max_concurrency * (draft_window + 1U))),
+            .chunk       = static_cast<std::int32_t>(prefill_chunk),
+            .speculative = speculative_backend != SpeculativeBackend::None || ngram_draft_window != 0,
+            .graph_bound = static_cast<std::uint32_t>(
+                (graph_allowance_bytes + runtime::expert_offload::kGraphExecutableBytes - 1) /
+                runtime::expert_offload::kGraphExecutableBytes),
+            .wide_pass_bytes = std::max(workspace_plan.text_prefill_wide, workspace_plan.mtp_prefill_wide),
+            .device      = device.device};
+        offload = std::make_unique<ProgramOffload>(parameters, geometry, offload_options->engine,
+                                                   offload_options->diagnostic);
+        offload->start(device.stream);
+        io.offloaded_experts = &offload->experts();
+        // The elastic text KV's evicting shrink runs in an idle engine's maintenance, which the cache's
+        // monitor requests once the pool has been idle long enough (elastic_kv.cpp).
+        if (kv_vmm) {
+            offload->engine().set_maintenance_due([this] { return kv_idle_due(); });
+            offload->engine().report("elastic text KV: " + std::to_string(kv_base_pages) + " of " +
+                                     std::to_string(decoder->text_kv.page_pool().capacity_pages()) +
+                                     " pages backed at startup (" + std::to_string(kv_vmm->mapped_bytes() >> 20) +
+                                     " MiB); the rest grows from the expert frames as requests need it");
+        }
+        device.synchronize();
+    }
     if (use_cuda_graph) {
         StartupPhaseScope graph_phase(startup_observer, StartupPhase::CudaGraphPrepare);
         const std::size_t free_before = device.free_bytes();
+        // Offloaded experts: each executable's warm launch runs the MoE (its CPU-served misses and
+        // landings included), so a round is open; an expert the warm launches could not serve fails
+        // the startup.
+        if (offload) { offload->begin_round(device.stream); }
         prepare_graphs();
         device.synchronize();
+        if (offload) { offload->engine().check_error(parameters.model.info().name + " (graph preparation)"); }
         const std::size_t free_after = device.free_bytes();
         graph_measured_bytes         = free_before > free_after ? free_before - free_after : 0;
         graph_phase.complete();
@@ -465,9 +525,27 @@ ScoreResult ProgramImpl::causal_score(PreparedPromptData&& prompt, std::uint32_t
                 0,
                 nullptr};
             mark_workspace_usage(workspace_plan.text_prefill);
-            const execution::PrefillChunkResult result = execution::prefill_text_chunk(
-                schedule_state, std::span<const TokenId>(prompt.token_ids), nominal, std::nullopt,
-                false);
+            // Offloaded experts: each scored pass is a prompt pass of lane 0.
+            execution::OffloadedCall offload_call;
+            if (offload) {
+                offload_call = offload->begin_pass(device.stream, static_cast<std::int32_t>(nominal));
+                schedule_state.offloaded_call = offload_call;
+            }
+            execution::PrefillChunkResult result;
+            try {
+                result = execution::prefill_text_chunk(schedule_state, std::span<const TokenId>(prompt.token_ids),
+                                                       nominal, std::nullopt, false);
+            } catch (...) {
+                if (offload) { offload->abandon_pass(offload_call); }
+                throw;
+            }
+            if (offload) {
+                const bool last = cursor + result.processed_tokens == predictor_count;
+                offload->end_pass(device.stream, offload_call, ProgramOffload::PassKind::Prompt, 0,
+                                  static_cast<std::int32_t>(result.processed_tokens), cursor, last,
+                                  parameters.model.info().name);
+                if (last) { offload->return_stream(device.stream); }
+            }
             if (result.finalized || result.processed_tokens == 0 ||
                 result.processed_tokens > nominal) {
                 throw std::logic_error("causal score Prefill made invalid progress");
@@ -561,6 +639,15 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
     out.cuda_graph_allowance_bytes   = graph_allowance_bytes;
     out.cuda_graph_measured_bytes    = graph_measured_bytes;
     out.kv_payload_bytes             = kv_payload_bytes;
+    if (offload) {
+        out.expert_cache = offload->engine().memory_summary();
+        if (kv_vmm) {
+            const DeviceKVPagePool& pool        = decoder->text_kv.page_pool();
+            out.expert_cache->kv_backed_pages   = pool.backed_pages();
+            out.expert_cache->kv_capacity_pages = pool.capacity_pages();
+            out.expert_cache->kv_backed_bytes   = kv_vmm->mapped_bytes();
+        }
+    }
     return out;
 }
 

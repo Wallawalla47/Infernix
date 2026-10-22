@@ -182,6 +182,21 @@ void Program::fail_all_cleanup() noexcept { impl_->fail_all_cleanup(); }
 
 void Program::shutdown_cleanup() noexcept { impl_->shutdown_cleanup(); }
 
+void Program::maintain() {
+    if (!impl_->offload) { return; }
+    // An elastic text KV idle for kKvIdleShrink gives back what the prefix cache's idle blocks with
+    // host copies hold (one attempt per idle period: blocks without host copies may still hold the top).
+    if (impl_->kv_idle_due()) {
+        impl_->kv_busy();
+        impl_->shrink_kv(true);
+    }
+    impl_->offload->engine().maintain(impl_->device.stream);
+}
+
+void Program::set_maintenance_waker(std::function<void()> waker) {
+    if (impl_->offload) { impl_->offload->engine().set_maintenance_waker(std::move(waker)); }
+}
+
 std::vector<SourceCandidate> Program::hybrid_sources(const RequestBasePlan& base,
                                                      std::uint32_t maximum_frontier) {
     return impl_->hybrid_sources(base, maximum_frontier);
@@ -271,7 +286,11 @@ std::uint32_t resolve_auto_ngram(const Model& model, EngineOptions& options) {
 
 std::unique_ptr<Program> create_program(const execution::Parameters& parameters,
                                         SequencePlan&& plan, DeviceContext& device,
-                                        const StartupObserver& startup_observer) {
+                                        const StartupObserver& startup_observer,
+                                        const detail::ProgramOffloadOptions* offload) {
+    if (parameters.model.offloaded_experts() != (offload != nullptr)) {
+        throw std::invalid_argument("offloaded experts need the instance's offload options, and only they do");
+    }
     if (plan.impl_ == nullptr) { throw std::invalid_argument("sequence plan is empty"); }
     if (plan.impl_->parameters != &parameters) {
         throw std::invalid_argument("sequence plan belongs to another model instance");
@@ -279,8 +298,7 @@ std::unique_ptr<Program> create_program(const execution::Parameters& parameters,
     if (plan.impl_->multiprocessor_count != device.multiprocessor_count()) {
         throw std::invalid_argument("sequence plan device capacity does not match execution");
     }
-    auto impl =
-        std::make_unique<detail::ProgramImpl>(parameters, *plan.impl_, device, startup_observer);
+    auto impl = std::make_unique<detail::ProgramImpl>(parameters, *plan.impl_, device, startup_observer, offload);
     plan.impl_.reset();
     return std::unique_ptr<Program>(new Program(std::move(impl)));
 }

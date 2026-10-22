@@ -141,6 +141,26 @@ int main() {
         const std::uint32_t expected = exhaustive(policy.widths(rows), p, states, limits, c);
         check(policy.choose(view) == expected, "the choice equals the exhaustive one (trial " + std::to_string(trial) + ")");
     }
+    // With width 1 allowed (offloaded experts: a masked column routes no expert), doubtful drafts
+    // verify nothing when a draft column costs most of a round (the 122B's 0.72), confident ones still
+    // verify; the exhaustive choice over the ladder with 1 agrees.
+    {
+        check(dflash_policy_widths(7, false, true) == std::vector<std::uint32_t>{1, 2, 3, 4, 5, 6, 7, 8},
+              "the zero-draft ladder starts at width 1");
+        const DFlashWidthCosts dear{.proposal = 0.12, .per_draft = 0.72, .per_draft_wide = 0.72};
+        DFlashWidthPolicy policy(15, 2, dear, true, true);
+        DFlashLaneDraftState state;
+        state.rounds = 1;
+        const std::vector<float> doubtful(15, 0.05F), sure(15, 0.995F);
+        DFlashPolicyRow row{doubtful, &state, 15};
+        check(policy.choose(std::span<const DFlashPolicyRow>(&row, 1)) == 1, "doubtful drafts verify none");
+        row.probabilities = sure;
+        const std::uint32_t confident = policy.choose(std::span<const DFlashPolicyRow>(&row, 1));
+        check(confident >= 2, "confident drafts still verify at a dear column cost");
+        const std::vector<std::vector<float>> p{sure};
+        const std::vector<DFlashLaneDraftState> states{state};
+        check(confident == exhaustive(policy.widths(1), p, states, {15}, dear), "the zero-draft choice is exhaustive's");
+    }
     // A knee keeps confident drafts narrow when the columns past it are dear: 15 drafts at 0.97
     // verify the knee's width (8 columns) at a cheap-then-dear cost, the whole block when flat.
     {

@@ -31,8 +31,9 @@ void ProgramImpl::preencode_overlay_vision(execution::VisionPrefillSession& sess
     execution::VisionOverlayWindowStats window_stats;
     std::vector<execution::PinnedVisionResult> preencoded;
     if (first_needed < item_end) {
-        preencoded = execution::encode_items_overlay(device, parameters, prompt, plan,
-                                                     first_needed, &window_stats);
+        // With offloaded experts the window runs in lent expert frames.
+        preencoded = execution::encode_items_overlay(device, parameters, prompt, plan, first_needed, &window_stats,
+                                                     offload ? &offload->vision_window() : nullptr);
     } else {
         preencoded.resize(item_end);
     }
@@ -40,6 +41,8 @@ void ProgramImpl::preencode_overlay_vision(execution::VisionPrefillSession& sess
 }
 
 void ProgramImpl::initialize_prefill(std::uint32_t lane, std::uint32_t base) {
+    // Offloaded experts: the new prompt's routes credit the cache from zero.
+    if (offload) { offload->engine().clear_prompt_uses(lane); }
     auto& request    = requests[lane];
     const auto& plan = *request.base;
     auto& staged     = request.prefill.emplace();
@@ -157,6 +160,7 @@ BindingReservation ProgramImpl::start_binding(const RequestBasePlan& base, runti
         requests[lane].lifecycle != Lifecycle::Empty || !base.impl_) {
         throw std::logic_error("binding requires a free lane and context transaction slot");
     }
+    kv_busy(); // an elastic text KV's idle period ends (elastic_kv.cpp)
     return start_hybrid_binding(base, lane, candidate, resume, resume_kind, resume_tokens);
 }
 

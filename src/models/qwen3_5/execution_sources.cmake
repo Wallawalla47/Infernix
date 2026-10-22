@@ -5,6 +5,7 @@ target_sources(infernix_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/execution/lossless.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/gdn.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/mtp.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/execution/offloaded_moe.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/text.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/vision.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/vision_overlay.cpp"

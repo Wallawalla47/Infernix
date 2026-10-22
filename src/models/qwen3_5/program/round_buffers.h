@@ -24,6 +24,10 @@ inline constexpr std::uint32_t kDFlashDecodeMaximumWidth  = kDFlashDecodeMaximum
 inline constexpr std::uint32_t kDFlashVerifyMaximumDrafts = 63;
 inline constexpr std::uint32_t kDFlashVerifyMaximumWidth  = kDFlashVerifyMaximumDrafts + 1;
 
+namespace execution {
+struct OffloadedExperts;
+} // namespace execution
+
 struct RoundStateSpec {
     std::int32_t hidden          = 0;
     std::int32_t output_rows     = 0;
@@ -84,6 +88,9 @@ struct MtpDecodeEgress {
     // Step-major: all B rows for proposal step 0, followed by all B rows for step 1, etc.
     std::array<TokenId, kMaximumConcurrency * kMtpDecodeMaximumDrafts> next_drafts{};
     std::array<std::int32_t, kMaximumConcurrency> next_extents{};
+    // The drafter's probability of each next draft, as next_drafts (written only with
+    // ExecutionSchedule::mtp_draft_confidence).
+    std::array<float, kMaximumConcurrency * kMtpDecodeMaximumDrafts> next_probabilities{};
 };
 
 // Prefill binds the current chunk independently of the compact decode batch.
@@ -311,6 +318,7 @@ struct MtpDecodeState {
     Tensor accepted_drafts;
     Tensor next_drafts;
     Tensor next_extents;
+    Tensor next_probabilities; // FP32, as next_drafts
     Tensor verify_ids;
     Tensor target_positions;
     Tensor target_argmax;
@@ -416,6 +424,9 @@ struct TokenConstraintState {
 };
 
 struct RoundState {
+    // An artifact with offloaded experts: the Program's experts (ProgramOffload::experts), which every
+    // forward's offloaded MoE layers read; null otherwise.
+    execution::OffloadedExperts* offloaded_experts = nullptr;
     std::optional<OrdinaryDecodeState> ordinary;
     std::optional<TokenConstraintState> constraint;
     Tensor token;

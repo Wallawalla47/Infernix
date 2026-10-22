@@ -4,6 +4,7 @@
 #include "infernix/ops/lossless_linear.h"
 #include "infernix/ops/lossless_ops.h"
 #include "infernix/ops/lossless_quantize.h"
+#include "infernix/ops/offloaded_sparse_moe.h"
 
 #include <algorithm>
 #include <initializer_list>
@@ -60,13 +61,15 @@ void shared(A& a, const Tensor& x, std::initializer_list<ops::LosslessProjection
 
 // The design reference's quantization of one projection input (lossless-route.md §3b): the step its
 // weight's Use declares (NVFP4 weights permitted A4: Qwen3.5's NVFP4 rule with the input's divisor; FP8 row
-// weights permitted A8: the per-token E4M3 rule), or none.
-enum class Step { None, Nvfp4, Fp8Token };
+// weights permitted A8: the per-token E4M3 rule, or with a static input scale (fp8_e4m3fn_row_f32,
+// ModelOpt's calibrated W8A8) the static rule), or none.
+enum class Step { None, Nvfp4, Fp8Token, Fp8Static };
 
 Step design_step(const LosslessDesign& design, const LinearParameters& p) {
     if (!design.active) { return Step::None; }
     if (p.weight.qtype == QType::NVFP4 && ops::allows_a4(p.policy)) { return Step::Nvfp4; }
     if (p.weight.qtype == QType::FP8_E4M3FN_ROW_BF16 && ops::allows_a8(p.policy)) { return Step::Fp8Token; }
+    if (p.weight.qtype == QType::FP8_E4M3FN_ROW_F32 && ops::allows_a8(p.policy)) { return Step::Fp8Static; }
     return Step::None;
 }
 
@@ -90,7 +93,13 @@ Quantized quantize(A& a, Step step, const Tensor& x, const Weight& w, cudaStream
         return {q, {w.input_scale_divisor, nullptr}};
     }
     Tensor scales = alloc(a, DType::FP32, {x.ne[1]});
-    if constexpr (kRuns<A>) { ops::lossless_quantize_fp8_token(x, q, scales, s); }
+    if constexpr (kRuns<A>) {
+        if (step == Step::Fp8Static) {
+            ops::lossless_quantize_fp8_static(x, w.input_scale, q, scales, s);
+        } else {
+            ops::lossless_quantize_fp8_token(x, q, scales, s);
+        }
+    }
     return {q, {0.0F, static_cast<const float*>(scales.data)}};
 }
 
@@ -315,9 +324,92 @@ void sparse_moe(A& a, const ops::SparseMoeWeights& p, const MoeConfig& moe, cons
     }
 }
 
+// BF16 rows [K, N] as a contiguous BF16 Weight [N, K].
+Weight bf16_rows(const Tensor& t) {
+    Weight w{};
+    w.qtype    = QType::BF16;
+    w.layout   = QuantLayout::Contiguous;
+    w.ndim     = 2;
+    w.n        = t.ne[1];
+    w.k        = t.ne[0];
+    w.shape[0] = w.padded_shape[0] = w.n;
+    w.shape[1] = w.padded_shape[1] = w.k;
+    w.qdata    = t.data;
+    w.payload  = t.data;
+    return w;
+}
+
+// An offloaded MoE layer (Qwen3_5MoeSparseMoeBlock over the 122B's offloaded banks): the router and the
+// shared expert's gate logit in BF16, the router's top-k and weights, the routed experts and the shared
+// expert (the dispatch's last job) through the offloaded op's lossless pass, which computes every expert
+// on the GPU in serial staging passes (its records from frames, staging or the host), and the combine
+// into the residual. The routes go to the Program's route log, so generation keeps the cache warm.
+template <class A>
+void offloaded_moe(A& a, const OffloadedMoeParameters& p, const Tensor& h, Tensor& x, OffloadedExperts* experts,
+                   const OffloadedCall* call, cudaStream_t s) {
+    const std::int32_t H = h.ne[0], T = h.ne[1];
+    const auto E = static_cast<std::int32_t>(p.experts), k = static_cast<std::int32_t>(p.top_k);
+    const ops::offloaded_moe::ExpertShape shape = p.bank->shape();
+    if constexpr (kRuns<A>) {
+        if (experts == nullptr) { throw std::logic_error("lossless: an offloaded MoE layer needs the Program's experts"); }
+    }
+    const Weight router = bf16_rows(p.router), score = bf16_rows(p.shared_score);
+    // A streamed pass (ungated: no CPU split on this route): the stream copied every expert missing
+    // when the pass began into its ring, so every column slice reads them there.
+    runtime::expert_offload::ExpertStream* streaming = nullptr;
+    if constexpr (kRuns<A>) {
+        if (call != nullptr && call->streamed && experts->stream != nullptr && experts->stream->active() &&
+            !experts->stream->gated()) {
+            streaming = experts->stream;
+            streaming->before_experts(p.layer, s);
+        }
+    }
+    for (std::int32_t c0 = 0; c0 < T; c0 += kFfnColumns) {
+        const std::int32_t n = std::min(kFfnColumns, T - c0);
+        auto scope = a.scope();
+        const Tensor hc = h.slice(1, c0, n);
+        // Router logits and the shared expert's gate logit (row E): one encode of hc.
+        Tensor logits = alloc(a, DType::BF16, {E + 1, n});
+        shared(a, hc, {{&router, 0, E, &logits, 0}, {&score, 0, 1, &logits, E}}, s);
+        Tensor weights = alloc(a, DType::FP32, {k, n}), ids = alloc(a, DType::I32, {k, n});
+        Tensor gate    = alloc(a, DType::FP32, {n});
+        const std::int32_t entries = (k + 1) * n, max_jobs = std::min(E, k * n) + 1;
+        const DeviceSpan dispatch_bytes = a.alloc_bytes(ops::moe_dispatch_bytes(E + 1, entries));
+        Tensor outputs = alloc(a, DType::BF16, {H, entries});
+        const DeviceSpan expert_ws = a.alloc_bytes(ops::moe_experts_workspace_bytes(
+            shape, max_jobs, entries, n, ops::offloaded_moe::ExpertActivation::kA16, ops::offloaded_moe::WideA16::kLossless));
+        if constexpr (kRuns<A>) {
+            ops::lossless_router(logits, E, k, weights, ids, s);
+            ops::MoeRouting routing{ids, weights, gate};
+            ops::MoeDispatch dispatch = ops::carve_moe_dispatch(dispatch_bytes.data, E + 1, entries);
+            std::int32_t* route_log   = experts->route_log != nullptr && static_cast<std::size_t>(k) * n <= experts->route_stride
+                                            ? experts->route_log + static_cast<std::size_t>(p.layer) * experts->route_stride
+                                            : nullptr;
+            ops::moe_dispatch(routing, E, dispatch, route_log, s, /*shared_job=*/true);
+            ops::MoeExpertSource source = experts->sources.at(p.layer);
+            source.cpu      = ops::MoeCpuChannel{}; // the lossless pass computes every expert on the GPU
+            source.wide_a16 = ops::offloaded_moe::WideA16::kLossless;
+            if (streaming != nullptr) {
+                source.prefetched      = streaming->slots(p.layer);
+                source.prefetch_base   = streaming->base();
+                source.prefetch_stride = streaming->pitch();
+            }
+            ops::moe_experts(hc, dispatch, source, k, max_jobs, expert_ws.data, outputs, s, /*wait_for_cpu=*/false, false);
+            // Over the experts in ascending id s = bf16(s + bf16(y_e w_e)), then the gated shared expert, then
+            // the residual.
+            const Tensor routed = outputs.slice(1, 0, k * n), shared_out = outputs.slice(1, k * n, n);
+            Tensor xc = x.slice(1, c0, n);
+            ops::lossless_moe_combine(routed, weights, ids, Tensor{}, &shared_out, &logits, E, xc, s);
+        }
+        if constexpr (!kRuns<A>) { break; } // every pass has the first one's allocations or fewer
+    }
+    if (streaming != nullptr && call->release_stream) { streaming->after_experts(p.layer, s); }
+}
+
 template <class A>
 void layer(A& a, const BlockParameters& block, const TextConfig& config, MixerKind kind, const Tensor& rope_table,
-           Tensor& x, cudaStream_t s, const LosslessCache* cache, const LosslessDesign& design) {
+           Tensor& x, cudaStream_t s, const LosslessCache* cache, const LosslessDesign& design,
+           OffloadedExperts* experts, const OffloadedCall* call) {
     if (design.active && (cache != nullptr || design.kv != KvCacheStorage::BFloat16)) {
         throw std::invalid_argument("the design reference scores windows with bf16 KV");
     }
@@ -332,6 +424,9 @@ void layer(A& a, const BlockParameters& block, const TextConfig& config, MixerKi
     if (const auto* moe = std::get_if<ops::SparseMoeWeights>(&block.ffn)) {
         // The sparse MoE banks are 16-bit only (no declared quantization).
         sparse_moe(a, *moe, std::get<MoeConfig>(config.ffn), h, x, s);
+    } else if (const auto* offloaded = std::get_if<OffloadedMoeParameters>(&block.ffn)) {
+        // W4A16 experts (no declared activation step: the design reference computes them as --lossless).
+        offloaded_moe(a, *offloaded, h, x, experts, call, s);
     } else {
         dense_mlp(a, std::get<DenseParameters>(block.ffn), h, x, s, design);
     }
@@ -363,8 +458,8 @@ std::size_t lossless_rope_window_bytes(const TextConfig& config, std::int32_t to
 
 void lossless_layer(const BlockParameters& block, const TextConfig& config, MixerKind kind, const Tensor& rope_table,
                     Tensor& x, WorkspaceArena& workspace, cudaStream_t stream, const LosslessCache* cache,
-                    const LosslessDesign& design) {
-    layer(workspace, block, config, kind, rope_table, x, stream, cache, design);
+                    const LosslessDesign& design, OffloadedExperts* experts, const OffloadedCall* call) {
+    layer(workspace, block, config, kind, rope_table, x, stream, cache, design, experts, call);
 }
 
 std::size_t lossless_layer_workspace_bytes(const BlockParameters& block, const TextConfig& config, MixerKind kind,
@@ -372,7 +467,7 @@ std::size_t lossless_layer_workspace_bytes(const BlockParameters& block, const T
                                            const LosslessDesign& design) {
     WorkspaceLayoutBuilder layout;
     Tensor x(nullptr, DType::BF16, {dimension(config.hidden_size), tokens});
-    layer(layout, block, config, kind, Tensor{}, x, nullptr, cache, design);
+    layer(layout, block, config, kind, Tensor{}, x, nullptr, cache, design, nullptr, nullptr);
     return layout.peak_bytes(1);
 }
 

@@ -34,6 +34,9 @@ DFlashFeatureSink make_dflash_prefill_sink(PrefillContext& state) {
     }
     return dflash_feature_sink(
         state, [&state](const Tensor& features, const Tensor& positions, bool rewrite_checkpoint) {
+            // The append's temporaries live on the Program's workspace, which the pass resets only when
+            // it runs there: a pass on a lent workspace (offloaded experts) leaves it untouched.
+            auto scope  = state.execution.work.scope();
             auto& frame = *state.execution.io.dflash_prefill;
             // Target execution and draft append use the same chunk bindings. Decode may have
             // used another compact row, or a checkpoint may have forked the destination slot.
@@ -76,7 +79,11 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
                                       std::uint32_t nominal_length,
                                       std::optional<std::uint32_t> split_frontier,
                                       bool finalize_at_end) {
-    TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
+    // A pass wider than kOffloadedMoeStaticColumns runs on the workspace the expert cache lent it
+    // (ProgramOffload::begin_pass), every other pass on the Program's.
+    std::optional<WorkspaceArena> lent;
+    if (state.offloaded_call.workspace.data != nullptr) { lent.emplace(state.offloaded_call.workspace); }
+    TextContext card(state.execution.device, state.execution.parameters, lent ? *lent : state.execution.work,
                      state.text_kv, state.execution.state_images, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
                      state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
@@ -88,6 +95,7 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);
     if (state.take_layer_ready) { card.set_layer_ready(state.take_layer_ready()); }
+    card.set_offloaded_experts(state.execution.io.offloaded_experts, state.offloaded_call);
     const std::span<const int> prompt(ids.data(), ids.size());
     if (state.dflash != nullptr) {
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);
@@ -102,7 +110,11 @@ PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const Prepare
                                             std::uint32_t nominal_length,
                                             std::optional<std::uint32_t> split_frontier,
                                             bool finalize_at_end) {
-    TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
+    // A pass wider than kOffloadedMoeStaticColumns runs on the workspace the expert cache lent it
+    // (ProgramOffload::begin_pass), every other pass on the Program's.
+    std::optional<WorkspaceArena> lent;
+    if (state.offloaded_call.workspace.data != nullptr) { lent.emplace(state.offloaded_call.workspace); }
+    TextContext card(state.execution.device, state.execution.parameters, lent ? *lent : state.execution.work,
                      state.text_kv, state.execution.state_images, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
                      state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
@@ -114,6 +126,7 @@ PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const Prepare
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);
     if (state.take_layer_ready) { card.set_layer_ready(state.take_layer_ready()); }
+    card.set_offloaded_experts(state.execution.io.offloaded_experts, state.offloaded_call);
     if (state.dflash != nullptr) {
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);
         return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, vision,
@@ -321,6 +334,8 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                 timing.resume_post();
             }
         }
+        // Offloaded experts: the round's cache update, once its commit is enqueued.
+        if (offload) { offload->settle(device.stream); }
         return timing.finish();
     }
 
@@ -513,6 +528,11 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                     for (std::uint32_t step = 0; step < sequence.mtp_draft_count; ++step) {
                         sequence.mtp_drafts[step] =
                             mtp_host_egress->next_drafts[step * max_concurrency + row];
+                        // Without the confidence policy the round writes no probabilities.
+                        sequence.mtp_draft_probabilities[step] =
+                            execution_schedule.mtp_draft_confidence
+                                ? mtp_host_egress->next_probabilities[step * max_concurrency + row]
+                                : 1.0F;
                     }
                 }
             } else {
@@ -535,6 +555,8 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
         clear_execution_failure_lanes(lanes);
         throw;
     }
+    // Offloaded experts: the round's cache update, once its commit is enqueued.
+    if (offload) { offload->settle(device.stream); }
     return timing.finish();
 }
 
@@ -738,18 +760,45 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 }
                 execution::PrefillChunkResult result;
                 timing.pause();
-                if (staged.vision) {
-                    if (!workspace_plan.vision) {
-                        throw std::logic_error("active Vision prefill lost its workspace plan");
+                // Offloaded experts: the pass's route (streamed, split) from its expected width, the
+                // one TextContext::prefill_impl takes (the chunk, cut at the split frontier).
+                execution::OffloadedCall offload_call;
+                const std::uint32_t pass_begin = staged.cursor;
+                if (offload) {
+                    std::uint32_t expected = std::min(idle_prefill_width, remaining);
+                    if (split_frontier && *split_frontier > pass_begin) {
+                        expected = std::min(expected, *split_frontier - pass_begin);
                     }
-                    mark_workspace_usage(workspace_plan.vision->capacity_bytes);
-                    result = execution::prefill_multimodal_chunk(schedule_state, staged.prompt,
-                                                                 *staged.vision, remaining,
-                                                                 split_frontier, final_candidate);
-                } else {
-                    result = execution::prefill_text_chunk(
-                        schedule_state, std::span<const TokenId>(staged.prompt.token_ids),
-                        remaining, split_frontier, final_candidate);
+                    offload_call = offload->begin_pass(device.stream, static_cast<std::int32_t>(expected));
+                    schedule_state.offloaded_call = offload_call;
+                }
+                try {
+                    if (staged.vision) {
+                        if (!workspace_plan.vision) {
+                            throw std::logic_error("active Vision prefill lost its workspace plan");
+                        }
+                        mark_workspace_usage(workspace_plan.vision->capacity_bytes);
+                        result = execution::prefill_multimodal_chunk(schedule_state, staged.prompt,
+                                                                     *staged.vision, remaining,
+                                                                     split_frontier, final_candidate);
+                    } else {
+                        result = execution::prefill_text_chunk(
+                            schedule_state, std::span<const TokenId>(staged.prompt.token_ids),
+                            remaining, split_frontier, final_candidate);
+                    }
+                } catch (...) {
+                    if (offload) { offload->abandon_pass(offload_call); }
+                    throw;
+                }
+                if (offload) {
+                    // Synchronized: the expert error word, the lane's prompt routes and the cache.
+                    offload->end_pass(device.stream, offload_call, ProgramOffload::PassKind::Prompt, sequence.lane,
+                                      static_cast<std::int32_t>(result.processed_tokens), pass_begin,
+                                      result.finalized, parameters.model.info().name);
+                    // The prompt's last pass returns the stream's leases unless another lane prefills.
+                    if (result.finalized && !other_lane_prefilling(sequence.lane)) {
+                        offload->return_stream(device.stream);
+                    }
                 }
                 timing.include(result.timing);
                 timing.resume_post();
@@ -862,6 +911,8 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             sequence.mtp_draft_count = staged.initial_mtp_extent;
             std::copy_n(initial_drafts.begin(), staged.initial_mtp_extent,
                         sequence.mtp_drafts.begin());
+            // The prompt's drafts carry no probability: the confidence policy verifies them.
+            sequence.mtp_draft_probabilities.fill(1.0F);
         } else if (is_masked_draft_backend(speculative_backend) &&
                    sequence.dflash_context_frontier != prompt_tokens) {
             throw std::logic_error("staged DFlash prefill did not reach the prompt frontier");

@@ -27,8 +27,15 @@ public:
     [[nodiscard]] const ModelWeights& weights() const;
     [[nodiscard]] const FrontendResources& resources() const;
     [[nodiscard]] const artifact::MaterializationPlan& materialization() const;
-    // The Host memory the pinned block (an offloaded vision tower) must leave free.
-    void set_host_reserve(std::uint64_t reserve_bytes);
+    // The Host memory the pinned block (an offloaded vision tower, offloaded experts) must leave
+    // free, and the pinned bytes Infernix's later allocations need (the RAM ledger's).
+    void set_host_reserve(std::uint64_t reserve_bytes, std::uint64_t later_pinned_bytes = 0);
+    // An artifact with offloaded experts: the RAM ledger's pinned terms (design §11.2), the routed
+    // banks' (zero with LoadOptions::stream_experts) and everything else pinned (the token
+    // embedding and, with vision offload, the tower).
+    [[nodiscard]] bool offloaded_experts() const;
+    [[nodiscard]] std::uint64_t pinned_expert_bytes() const;
+    [[nodiscard]] std::uint64_t pinned_other_bytes() const;
     [[nodiscard]] const std::optional<VisionOverlayLayout>& vision_overlay_layout() const;
     [[nodiscard]] const artifact::ParameterReference& parameter(WeightId id) const;
     [[nodiscard]] std::span<const WeightUse> uses(WeightId id) const;

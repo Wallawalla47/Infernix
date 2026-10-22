@@ -533,6 +533,67 @@ ModelSamplingDefaults default_sampling(Architecture architecture) {
     return sampling;
 }
 
+ModelSamplingDefaults sampling_presets(std::string_view json) {
+    nlohmann::json value;
+    try {
+        value = nlohmann::json::parse(json);
+    } catch (const nlohmann::json::exception& error) {
+        throw std::invalid_argument(std::string("sampling.json: ") + error.what());
+    }
+    if (!value.is_object()) { throw std::invalid_argument("sampling.json must contain a JSON object"); }
+    for (const auto& [key, member] : value.items()) {
+        if (key != "thinking" && key != "non_thinking" && key != "source") {
+            throw std::invalid_argument("sampling.json: unknown member " + key);
+        }
+        if (key == "source" && !member.is_string()) {
+            throw std::invalid_argument("sampling.json: source must be a string");
+        }
+    }
+    // Every preset names all six values, in the domains the request resolution accepts.
+    const auto preset = [&](const char* mode) {
+        if (!value.contains(mode) || !value.at(mode).is_object()) {
+            throw std::invalid_argument(std::string("sampling.json: missing preset ") + mode);
+        }
+        const auto& p = value.at(mode);
+        const auto number = [&](const char* field, double low, double high) {
+            if (!p.contains(field) || !p.at(field).is_number()) {
+                throw std::invalid_argument(std::string("sampling.json: ") + mode + "." + field + " must be a number");
+            }
+            const double x = p.at(field).get<double>();
+            if (!(x >= low && x <= high)) {
+                throw std::invalid_argument(std::string("sampling.json: ") + mode + "." + field + " is out of range");
+            }
+            return static_cast<float>(x);
+        };
+        for (const auto& [field, member] : p.items()) {
+            static constexpr std::array kFields{"temperature",      "top_k",
+                                                "top_p",            "min_p",
+                                                "presence_penalty", "frequency_penalty",
+                                                "repetition_penalty"};
+            if (std::find(kFields.begin(), kFields.end(), field) == kFields.end()) {
+                throw std::invalid_argument("sampling.json: unknown field " + std::string(mode) + "." + field);
+            }
+            (void)member;
+        }
+        // The sampler has no repetition penalty: a card's neutral 1.0 is accepted, nothing else.
+        if (p.contains("repetition_penalty")) { (void)number("repetition_penalty", 1.0, 1.0); }
+        if (!p.contains("top_k") || !p.at("top_k").is_number_integer()) {
+            throw std::invalid_argument(std::string("sampling.json: ") + mode + ".top_k must be an integer");
+        }
+        const auto top_k = p.at("top_k").get<std::int64_t>();
+        if (top_k < 1 || top_k > 20) {
+            throw std::invalid_argument(std::string("sampling.json: ") + mode + ".top_k must be in [1,20]");
+        }
+        return SamplingPreset{.temperature       = number("temperature", 0.0, 2.0),
+                              .top_k             = static_cast<std::int32_t>(top_k),
+                              .top_p             = number("top_p", 0.0, 1.0),
+                              .min_p             = number("min_p", 0.0, 1.0),
+                              .presence_penalty  = number("presence_penalty", -2.0, 2.0),
+                              .frequency_penalty = number("frequency_penalty", -2.0, 2.0)};
+    };
+    return ModelSamplingDefaults{.thinking = preset("thinking"), .non_thinking = preset("non_thinking")};
+}
+
 class Frontend::Impl {
 public:
     Impl(const FrontendResources& resources, FrontendOptions options)
@@ -581,7 +642,9 @@ public:
                 if (tokenizer->is_special_token(id)) { ngram_boundaries.push_back(id); }
             }
         }
-        sampling            = default_sampling(options.architecture);
+        // The checkpoint's recommended presets when the artifact carries them (sampling.json).
+        sampling = resources.sampling_json.empty() ? default_sampling(options.architecture)
+                                                   : sampling_presets(resources.sampling_json);
         grammar_cache_bytes = options.grammar_cache_bytes;
         for (const int token : tokenizer->default_stop_token_ids()) {
             if (!tokenizer->is_valid_token(token)) {

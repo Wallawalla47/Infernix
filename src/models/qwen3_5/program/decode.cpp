@@ -97,6 +97,13 @@ void ProgramImpl::install_sampling(SequenceState& sequence, RequestControl& requ
     Tensor counts = token_counts.slice(1, static_cast<std::int32_t>(sequence.lane), 1)
                         .view({dimension(parameters.model.resources().public_token_count)});
     request.sampling_host     = config;
+    if (offload) {
+        auto& engine                    = offload->engine();
+        request.cache_at_admission      = engine.residency().stats();
+        request.cpu_served_at_admission = engine.cpu_served();
+        request.tier_at_admission.reset();
+        if (const auto* tier = engine.tier()) { request.tier_at_admission = tier->stats(); }
+    }
     request.speculative_stats = SpeculativeStats{
         .backend               = speculative_backend,
         .enabled               = speculative_backend != SpeculativeBackend::None,
@@ -352,8 +359,10 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
             std::span<const ConstraintRow>(constraint_rows.data(), lanes.size()), 1);
 
         mark_workspace_usage(workspace_plan.ordinary_round);
+        if (offload) { offload->begin_round(device.stream); }
         execution::ordinary_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                          envelope, executable);
+        if (offload) { offload->enqueue_routes(device.stream, static_cast<std::int32_t>(lanes.size())); }
         submit_range.reset();
         timing.begin_wait();
         {
@@ -362,6 +371,8 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
             device.synchronize();
         }
         timing.end_wait();
+        // Offloaded experts: the error check, then the cache update deferred past the commit.
+        if (offload) { offload->end_round(lanes, 1, 1, {}, parameters.model.info().name); }
 
         const double seconds = std::chrono::duration<double>(Clock::now() - start).count();
         const double share   = seconds / static_cast<double>(lanes.size());
@@ -405,9 +416,30 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
             device.synchronize();
         } catch (...) {}
         timing.end_wait();
+        if (offload) { offload->drop_round(); }
         clear_execution_failure_lanes(lanes);
         throw;
     }
+}
+
+void ProgramImpl::end_offloaded_round(std::span<const std::uint32_t> lanes, std::uint32_t width,
+                                      std::span<const std::int32_t> counts, std::span<const std::int32_t> live_counts) {
+    std::array<std::uint8_t, kMaximumConcurrency * kDFlashVerifyMaximumWidth> live{};
+    if (lanes.size() * width > live.size() || counts.size() != lanes.size() ||
+        (!live_counts.empty() && live_counts.size() != lanes.size())) {
+        throw std::logic_error("offloaded round wider than its live mask");
+    }
+    const auto clamp_width = [width](std::int32_t count) {
+        return static_cast<std::uint32_t>(std::clamp<std::int32_t>(count, 0, static_cast<std::int32_t>(width)));
+    };
+    std::uint32_t tokens = 1;
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        tokens                  = std::max(tokens, clamp_width(counts[row]));
+        const std::uint32_t used = clamp_width(live_counts.empty() ? counts[row] : live_counts[row]);
+        for (std::uint32_t column = 0; column < width; ++column) { live[row * width + column] = column < used ? 1U : 0U; }
+    }
+    offload->end_round(lanes, static_cast<std::int32_t>(width), tokens,
+                       std::span<const std::uint8_t>(live.data(), lanes.size() * width), parameters.model.info().name);
 }
 
 std::vector<NgramProposer::Match>
@@ -543,6 +575,15 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
         }
         mtp_cost_round = {.start = started, .drafts = 0, .batch = batch};
     }
+    if (mtp_confidence) {
+        // The previous round's start-to-start cycle at its verified draft columns teaches the cost.
+        const auto batch = static_cast<std::uint32_t>(lanes.size());
+        if (mtp_confidence_round.batch == batch) {
+            mtp_confidence->observe_round(batch, mtp_confidence_round.columns,
+                                          std::chrono::duration<double>(started - mtp_confidence_round.start).count());
+        }
+        mtp_confidence_round = {.start = started, .batch = batch, .columns = 0};
+    }
     if (policy_round) {
         if (lanes.size() == 1) {
             neural_drafts = mtp_draft_policy->choose(active_sequence(lanes.front()).mtp_draft);
@@ -615,10 +656,18 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
                                                     ? budgets[row].generated_tokens_remaining - 1
                                                     : 0;
             const bool row_ngram              = !matches[row].tokens.empty();
-            const std::uint32_t extent        = std::min(
+            std::uint32_t extent              = std::min(
                 {row_ngram ? static_cast<std::uint32_t>(matches[row].tokens.size())
                            : sequence.mtp_draft_count,
                  verify_drafts, max_by_budget, capacity - sequence.execution_frontier - 1});
+            // Confidence-gated MTP: the prefix of the row's own drafts worth verifying; the columns past
+            // it are padding, which the offloaded experts' route masks.
+            if (mtp_confidence && !row_ngram && extent > 0) {
+                extent = mtp_confidence->extent(
+                    std::span<const float>(sequence.mtp_draft_probabilities.data(), extent), extent,
+                    static_cast<std::uint32_t>(lanes.size()));
+            }
+            if (mtp_confidence) { mtp_confidence_round.columns += extent; }
             mtp_host_ingress->anchors[row]        = sequence.ledger.back();
             mtp_host_ingress->base_frontiers[row] = checked_i32(frontier, "MTP batch frontier");
             mtp_host_ingress->remaining_budgets[row] =
@@ -668,6 +717,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
         schedule_state.neural_proposal_drafts = mtp_ar_depth;
         mark_workspace_usage(workspace_plan.mtp_round);
         const auto batch = static_cast<std::int32_t>(lanes.size());
+        if (offload) { offload->begin_round(device.stream); }
         execution::mtp_decode_batch(schedule_state, batch, verify_drafts, envelopes, forward,
                                     execution::SpeculativePhase::Forward);
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -678,6 +728,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
         }
         execution::mtp_decode_batch(schedule_state, batch, verify_drafts, envelopes, finish,
                                     execution::SpeculativePhase::Finish);
+        if (offload) { offload->enqueue_routes(device.stream, batch * static_cast<std::int32_t>(width)); }
         submit_range.reset();
         timing.begin_wait();
         {
@@ -686,6 +737,11 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
             device.synchronize();
         }
         timing.end_wait();
+        // Offloaded experts: the committed columns of each row are the round's uses.
+        if (offload) {
+            end_offloaded_round(lanes, width,
+                                std::span<const std::int32_t>(mtp_host_egress->licensed_counts.data(), lanes.size()));
+        }
 
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
         const double share   = seconds / static_cast<double>(lanes.size());
@@ -737,6 +793,12 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
                     sequence.mtp_draft.acceptance.observe(pcur,
                                                           static_cast<std::uint32_t>(accepted_i));
                 }
+                // The verified drafts' probabilities (still this round's: the commit follows).
+                if (mtp_confidence && matches[row].tokens.empty()) {
+                    mtp_confidence->observe(
+                        std::span<const float>(sequence.mtp_draft_probabilities.data(), pcur), pcur,
+                        static_cast<std::uint32_t>(accepted_i));
+                }
             }
             if (!matches[row].tokens.empty()) {
                 request.speculative_stats.ngram_rounds += 1;
@@ -776,6 +838,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
             device.synchronize();
         } catch (...) {}
         timing.end_wait();
+        if (offload) { offload->drop_round(); }
         clear_execution_failure_lanes(lanes);
         throw;
     }
@@ -1035,6 +1098,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
         };
         mark_workspace_usage(workspace_plan.dflash_round);
         const auto batch = static_cast<std::int32_t>(lanes.size());
+        if (offload) { offload->begin_round(device.stream); }
         // A block round's drafts and their probabilities under the drafter, row-major at the block.
         std::array<std::array<float, kDFlashDecodeMaximumDrafts>, kMaximumConcurrency> probabilities{};
         if (block_round) {
@@ -1065,8 +1129,10 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
             }
             const std::uint32_t chosen = dflash_width_policy->choose(
                 std::span<const DFlashPolicyRow>(policy_rows.data(), lanes.size()));
-            verify_drafts = chosen - 1U;
-            width         = chosen;
+            // Width 1 (offloaded experts): the narrowest family, every row's drafts masked.
+            const std::uint32_t verified = chosen - 1U;
+            verify_drafts = std::max(verified, 1U);
+            width         = verify_drafts + 1U;
             family        = &round_family(SpeculativeRoundKind::Neural, verify_drafts, true);
             if (family->shape.verify_drafts != verify_drafts || !family->shape.split) {
                 throw std::logic_error("adaptive DFlash width has no split family");
@@ -1075,7 +1141,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
             for (std::size_t row = 0; row < lanes.size(); ++row) {
                 const SequenceState& sequence = active_sequence(lanes[row]);
                 write_verify_controls(row, sequence.execution_frontier,
-                                      std::min(verify_drafts, limits[row]), false, sequence.rope_delta);
+                                      std::min(verified, limits[row]), false, sequence.rope_delta);
             }
         }
 
@@ -1112,6 +1178,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
         execution::dflash_decode_batch(schedule_state, batch, verify_drafts, envelopes,
                                        target_envelope, finish,
                                        execution::SpeculativePhase::Finish);
+        if (offload) { offload->enqueue_routes(device.stream, batch * static_cast<std::int32_t>(width)); }
         submit_range.reset();
         timing.begin_wait();
         {
@@ -1120,6 +1187,16 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
             device.synchronize();
         }
         timing.end_wait();
+        // Offloaded experts: a chain row's committed columns are its uses; in a tree round a row's
+        // every verified column (its accepted path is not a prefix of the round's columns), not the
+        // masked padding past them, which routed no expert.
+        if (offload) {
+            const std::span<const std::int32_t> committed(dflash_host_egress->licensed_counts.data(), lanes.size());
+            end_offloaded_round(lanes, width, committed,
+                                tree_round ? std::span<const std::int32_t>(
+                                                 dflash_host_ingress->target_valid_columns.data(), lanes.size())
+                                           : std::span<const std::int32_t>{});
+        }
 
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
         const double share   = seconds / static_cast<double>(lanes.size());
@@ -1236,6 +1313,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
             device.synchronize();
         } catch (...) {}
         timing.end_wait();
+        if (offload) { offload->drop_round(); }
         clear_execution_failure_lanes(lanes);
         throw;
     }

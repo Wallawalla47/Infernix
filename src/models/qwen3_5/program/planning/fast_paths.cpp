@@ -297,7 +297,8 @@ const char* activation_name(ActivationClass activations) {
 std::string describe(const FastPathConfiguration& configuration) {
     return std::to_string(configuration.query_heads) + " heads, " +
            activation_name(configuration.activations) + " activations, " +
-           kv_name(configuration.kv) + " KV" + (configuration.q4_gate_up ? ", Q4 gate/up" : "");
+           kv_name(configuration.kv) + " KV" + (configuration.q4_gate_up ? ", Q4 gate/up" : "") +
+           (configuration.offloaded_experts ? ", offloaded experts" : "");
 }
 
 FastPathConfiguration fast_path_configuration(const Model& model, const EngineOptions& options) {
@@ -331,10 +332,11 @@ FastPathConfiguration fast_path_configuration(const Model& model, const EngineOp
         }
     }
     const auto& attention = model.config().text.attention;
-    return {.query_heads = attention ? static_cast<std::uint32_t>(attention->num_attention_heads) : 0U,
-            .activations = activations,
-            .kv          = options.kv_cache,
-            .q4_gate_up  = q4_gate_up};
+    return {.query_heads       = attention ? static_cast<std::uint32_t>(attention->num_attention_heads) : 0U,
+            .activations       = activations,
+            .kv                = options.kv_cache,
+            .q4_gate_up        = q4_gate_up,
+            .offloaded_experts = model.offloaded_experts()};
 }
 
 bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration,
@@ -400,8 +402,21 @@ bool fast_path_qualified(FastPath path, const FastPathConfiguration& configurati
     });
 }
 
+bool auto_drafts_nothing(bool offloaded_experts) noexcept {
+    // Qwen3.5-122B-A10B (the Qwen3.5 artifact with offloaded experts): each verify column brings its
+    // own expert misses, about 10 ms a column against 13.8 ms a plain token (2026-10-22, one request,
+    // bf16 KV, warm cache, 256 tokens of one prompt): MTP 1/2/3 drafts 71.6/66.8/52.9 tok/s and DFlash2
+    // 1/2/4/7/15 65.8/61.3/57.1/35.2/19.2 tok/s against plain 72.5 with the drafter loaded; without one
+    // the expert cache also keeps the drafter's VRAM.
+    return offloaded_experts;
+}
+
 std::uint32_t auto_fixed_draft_tokens(const FastPathConfiguration& configuration,
                                       SpeculativeBackend backend) noexcept {
+    // Offloaded experts (Qwen3.5-122B-A10B) decode without a drafter under --draft-tokens auto
+    // (auto_drafts_nothing); a fixed length is reached only with a forced policy: one draft, the
+    // fastest of either drafter's fixed lengths there.
+    if (configuration.offloaded_experts) { return 1; }
     // The block drafters' fastest single fixed lengths overall (code and sampled docs; 2026-10-20 at
     // one request, the NVFP4 27B 2026-10-21/22 also at two and four): the 27B's DFlash2 7 (15 is
     // 12.4 % faster than 7 on code at one request but 1-19 % slower batched, a geometric mean 6.1 %
@@ -434,6 +449,11 @@ detail::DFlashWidthCosts dflash_width_costs(const FastPathConfiguration& configu
         return {.proposal = 0.18, .per_draft = 0.02, .per_draft_wide = 0.02};
     }
     if (configuration.query_heads == 24) { return {.proposal = 0.69, .per_draft = 0.003, .per_draft_wide = 0.05}; }
+    // Offloaded experts (Qwen3.5-122B-A10B; 2026-10-22, one request, bf16 KV): a verified draft
+    // brings its own expert misses, ~10 ms against a 13.8 ms plain round (0.72), and DFlash2's block
+    // proposal ~0.12 (its one-draft rounds at 25.4 ms). Not registered there: these serve a forced
+    // adaptive-dflash (the A/B of design §12.2).
+    if (configuration.offloaded_experts) { return {.proposal = 0.12, .per_draft = 0.72, .per_draft_wide = 0.72}; }
     return {.proposal = 0.2, .per_draft = 0.15, .per_draft_wide = 0.15};
 }
 

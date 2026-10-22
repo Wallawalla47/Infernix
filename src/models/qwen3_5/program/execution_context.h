@@ -63,6 +63,8 @@ struct PrefillContext {
     // the landing batch, which the cache's next poll() frees, so each chunk function calls this
     // immediately before its pass and nothing outside the chunk call can hold the view.
     std::function<std::span<const cudaEvent_t>()> take_layer_ready;
+    // Offloaded experts (RoundState::offloaded_experts): this pass's route through them.
+    OffloadedCall offloaded_call;
 };
 
 struct OrdinaryBatchContext {

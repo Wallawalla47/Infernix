@@ -44,15 +44,19 @@ WeightId Bindings::parameter(std::string name, artifact::Shape shape,
         }
         if (a16_only) { result.policy = ops::LinearPolicy::A16Only; }
         for (const auto& [role, binding] : use.auxiliaries) {
-            if (role != "activation_input_divisor") {
+            if (role != "activation_input_divisor" && role != "activation_input_scale") {
                 throw artifact::ArtifactError(name + "@" + input + ": unknown auxiliary " + role);
             }
             const auto value = binder.values(binding, QType::FP32).scalar_f32();
             if (!std::isfinite(value) || value <= 0) {
-                throw artifact::ArtifactError(name + "@" + input +
-                                              ": activation divisor must be positive finite FP32");
+                throw artifact::ArtifactError(name + "@" + input + ": " + role +
+                                              " must be positive finite FP32");
             }
-            result.activation_input_divisor = value;
+            if (role == "activation_input_divisor") {
+                result.activation_input_divisor = value;
+            } else {
+                result.activation_input_scale = value;
+            }
         }
         pending.uses.push_back(std::move(result));
     }

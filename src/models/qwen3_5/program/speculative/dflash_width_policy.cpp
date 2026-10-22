@@ -5,8 +5,9 @@
 
 namespace infernix::models::qwen3_5::detail {
 
-std::vector<std::uint32_t> dflash_policy_widths(std::uint32_t drafts, bool batch) {
+std::vector<std::uint32_t> dflash_policy_widths(std::uint32_t drafts, bool batch, bool zero) {
     std::vector<std::uint32_t> out;
+    if (zero) { out.push_back(1U); }
     const auto add = [&](std::uint32_t width) {
         if (width >= 2U && width <= drafts + 1U && std::find(out.begin(), out.end(), width) == out.end()) {
             out.push_back(width);
@@ -23,14 +24,14 @@ std::vector<std::uint32_t> dflash_policy_widths(std::uint32_t drafts, bool batch
 }
 
 DFlashWidthPolicy::DFlashWidthPolicy(std::uint32_t ceiling, std::uint32_t max_batch, DFlashWidthCosts costs,
-                                     bool batches)
+                                     bool batches, bool zero_drafts)
     : ceiling_(ceiling), max_batch_(max_batch), costs_(costs) {
     if (ceiling == 0 || max_batch == 0 || max_batch > kMaximumConcurrency || !(costs.proposal >= 0.0) ||
         !(costs.per_draft > 0.0) || !(costs.per_draft_wide > 0.0)) {
         throw std::invalid_argument("DFlash width policy dimensions are outside their domain");
     }
-    row_widths_   = dflash_policy_widths(ceiling, false);
-    if (batches) { batch_widths_ = dflash_policy_widths(ceiling, true); }
+    row_widths_   = dflash_policy_widths(ceiling, false, zero_drafts);
+    if (batches) { batch_widths_ = dflash_policy_widths(ceiling, true, zero_drafts); }
 }
 
 const std::vector<std::uint32_t>& DFlashWidthPolicy::widths(std::uint32_t batch_size) const {

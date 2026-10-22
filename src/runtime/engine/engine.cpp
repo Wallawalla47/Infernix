@@ -275,13 +275,16 @@ public:
     // hybrid prefix cache's) need the artifact's architecture, read once here. An unreadable
     // artifact is reported by the (Qwen3.5) model construction, after option validation.
     EngineOptions normalize(EngineOptions engine_options) {
+        bool offloaded_experts = false;
         try {
             if (runtime::artifact_is_qwen4_exp(engine_options.artifact_path)) {
                 architecture = models::Architecture::Qwen4Exp;
+            } else {
+                offloaded_experts = runtime::artifact_offloads_experts(engine_options.artifact_path);
             }
         } catch (const std::exception&) {}
-        runtime::validate_engine_options(engine_options, architecture);
-        return runtime::normalize_engine_options(std::move(engine_options), architecture);
+        runtime::validate_engine_options(engine_options, architecture, offloaded_experts);
+        return runtime::normalize_engine_options(std::move(engine_options), architecture, offloaded_experts);
     }
 
     ~Impl() noexcept {

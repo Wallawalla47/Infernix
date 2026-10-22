@@ -167,8 +167,9 @@ RequestBasePlan ProgramImpl::plan_request(PreparedPromptData&& prompt,
             previous_end = item.token_end;
         }
         if (parameters.model.overlay_vision()) {
-            // The overlay window borrows staging + encode lease from the evictable weight tail;
-            // admit only requests whose borrow fits the ladder.
+            // The overlay window borrows staging + encode lease from the evictable weight tail, or
+            // with offloaded experts from the expert frames; admit only requests whose borrow fits
+            // the ladder, or what the cache lends with no other lease out.
             const auto& overlay = *parameters.model.overlay_vision();
             std::size_t max_patches = 0;
             std::uint32_t max_merged = 0;
@@ -181,7 +182,11 @@ RequestBasePlan ProgramImpl::plan_request(PreparedPromptData&& prompt,
                 *parameters.model.config().vision, *parameters.vision, max_patches, max_merged);
             const std::size_t borrow =
                 (overlay.layout.staging_bytes + 255) / 256 * 256 + window.capacity_bytes;
-            if (borrow > overlay.ladder_bytes) {
+            if (offload) {
+                if (borrow > offload->engine().residency().lend_capacity_bytes()) {
+                    throw std::invalid_argument("vision overlay window exceeds what the expert cache can lend");
+                }
+            } else if (borrow > overlay.ladder_bytes) {
                 throw std::invalid_argument(
                     "vision overlay window exceeds the evictable weight ladder");
             }
@@ -263,6 +268,13 @@ bool ProgramImpl::other_lane_generating(std::uint32_t lane) const noexcept {
         if (other != lane && (lifecycle == Lifecycle::Active || lifecycle == Lifecycle::Pending)) {
             return true;
         }
+    }
+    return false;
+}
+
+bool ProgramImpl::other_lane_prefilling(std::uint32_t lane) const noexcept {
+    for (std::uint32_t other = 0; other < max_concurrency; ++other) {
+        if (other != lane && requests[other].lifecycle == Lifecycle::Prefilling) { return true; }
     }
     return false;
 }

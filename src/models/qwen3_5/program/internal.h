@@ -59,6 +59,9 @@ struct ExecutionSchedule {
     // adaptive-dflash: DFlash and DFlash2 all-neural rounds propose, then choose their verify
     // width (only where speculation is adaptive).
     bool adaptive_dflash              = false;
+    // MTP rounds write each next draft's drafter probability (MtpConfidencePolicy's input; MTP with
+    // offloaded experts).
+    bool mtp_draft_confidence         = false;
     ops::LinearRoutes linear_routes   = ops::LinearRoutes::Exact;
     // gdn-f16-accumulate: the chunked GDN calls' arithmetic.
     ops::GdnChunkArithmetic gdn_arithmetic = ops::GdnChunkArithmetic::Exact;

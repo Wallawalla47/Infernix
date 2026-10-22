@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -26,6 +27,7 @@ class Parameters;
 }
 
 namespace detail {
+struct ProgramOffloadOptions;
 struct SequencePlanImpl;
 struct SequencePlannerImpl;
 struct RequestBasePlanImpl;
@@ -74,7 +76,8 @@ private:
     friend class SequencePlanner;
 
     friend std::unique_ptr<Program> create_program(const execution::Parameters&, SequencePlan&&,
-                                                   DeviceContext&, const StartupObserver&);
+                                                   DeviceContext&, const StartupObserver&,
+                                                   const detail::ProgramOffloadOptions*);
 };
 
 class SequencePlanner {
@@ -324,6 +327,8 @@ struct FinishResult {
     GenerationTimings timings;
     SpeculativeStats speculative;
     std::vector<ConstrainedDraw> constrained_draws;
+    // An artifact with offloaded experts: the request's routed-expert lookups and VRAM hits.
+    std::optional<ExpertCacheStats> expert_cache;
 };
 
 struct AbortResult {
@@ -419,6 +424,11 @@ public:
     // tier is saved once every lane has written its blocks through and before the cleanup drops
     // it; hybrid_shutdown_save() reports the result.
     void shutdown_cleanup() noexcept;
+    // Offloaded experts (a no-op otherwise): between requests, the expert cache follows free VRAM
+    // and the expert state is saved every ten minutes of rounds; the cache's monitor asks for this
+    // through the waker, from its own thread, and the Engine calls maintain() under its execution lock.
+    void maintain();
+    void set_maintenance_waker(std::function<void()> waker);
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
 
     // The prefix cache, when the context cache is enabled. Admission binds a lane through a
@@ -471,7 +481,8 @@ private:
     explicit Program(std::unique_ptr<detail::ProgramImpl> impl) noexcept;
     std::unique_ptr<detail::ProgramImpl> impl_;
     friend std::unique_ptr<Program> create_program(const execution::Parameters&, SequencePlan&&,
-                                                   DeviceContext&, const StartupObserver&);
+                                                   DeviceContext&, const StartupObserver&,
+                                                   const detail::ProgramOffloadOptions*);
 };
 
 [[nodiscard]] SequencePlanner make_sequence_planner(const execution::Parameters&, DeviceContext&,
@@ -486,8 +497,10 @@ private:
 // path is selected and some width is wider than the effective chunk.
 [[nodiscard]] std::vector<std::uint32_t> idle_prefill_widths(const execution::Parameters&,
                                                              const EngineOptions&);
+// `offload`: an artifact with offloaded experts needs the Engine instance's resolved offload options.
 [[nodiscard]] std::unique_ptr<Program> create_program(const execution::Parameters&, SequencePlan&&,
-                                                      DeviceContext&, const StartupObserver&);
+                                                      DeviceContext&, const StartupObserver&,
+                                                      const detail::ProgramOffloadOptions* offload = nullptr);
 // --draft-tokens auto runs its policy (adaptive-mtp for MTP, adaptive-dflash for DFlash and DFlash2)
 // where it is selected and acts. Elsewhere (it is not qualified for the artifact's configuration, or
 // fast paths are disabled) this makes the options a fixed draft length, auto_fixed_draft_tokens()

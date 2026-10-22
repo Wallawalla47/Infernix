@@ -344,6 +344,8 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
     next_drafts =
         egress_tensor(offsetof(MtpDecodeEgress, next_drafts), DType::I32, {batch, neural_drafts});
     next_extents     = egress_tensor(offsetof(MtpDecodeEgress, next_extents), DType::I32, {batch});
+    next_probabilities = egress_tensor(offsetof(MtpDecodeEgress, next_probabilities), DType::FP32,
+                                       {batch, neural_drafts});
     verify_ids       = layout.verify_ids.bind(backing);
     target_positions = layout.target_positions.bind(backing);
     target_argmax    = layout.target_argmax.bind(backing);
@@ -390,7 +392,8 @@ MtpDecodeState MtpDecodeState::narrowed(std::uint32_t k, std::uint32_t next_k) c
          {&result.ar_positions, &result.ar_rope_positions, &result.ar_valid_columns}) {
         *tensor = tensor->slice(1, 0, steps);
     }
-    result.next_drafts = next_drafts.slice(1, 0, static_cast<std::int32_t>(next_k));
+    result.next_drafts        = next_drafts.slice(1, 0, static_cast<std::int32_t>(next_k));
+    result.next_probabilities = next_probabilities.slice(1, 0, static_cast<std::int32_t>(next_k));
     return result;
 }
 

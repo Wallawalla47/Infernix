@@ -7,6 +7,7 @@
 #include "runtime/engine/context_cache/context_cost.h"
 #include "runtime/engine/kv_capacity.h"
 
+#include <filesystem>
 #include <memory>
 
 namespace infernix::runtime {
@@ -17,8 +18,15 @@ namespace infernix::runtime {
 // file records itself); a different value makes a saved file meaningless.
 [[nodiscard]] std::string hybrid_cache_fingerprint(const EngineOptions& options, const std::string& signature);
 
+// `offloaded_experts`: a Qwen3.5 artifact whose MoE layers offload their routed experts
+// (artifact_offloads_experts), whose defaults follow Qwen3.8-Flash-Next's.
 [[nodiscard]] EngineOptions normalize_engine_options(
-    EngineOptions options, models::Architecture architecture = models::Architecture::Qwen3_5);
+    EngineOptions options, models::Architecture architecture = models::Architecture::Qwen3_5,
+    bool offloaded_experts = false);
+
+// Whether a Qwen3.5 artifact stores its routed experts as offloaded banks (Qwen3.5-122B-A10B,
+// docs/maintainer/qwen3_5-122b-offload-design.md). Throws when the artifact cannot be read.
+[[nodiscard]] bool artifact_offloads_experts(const std::filesystem::path& artifact);
 
 struct ModelInstance {
     using ModelContract = models::qwen3_5::RuntimeTypes;
@@ -43,9 +51,10 @@ struct ConstructedModel {
 };
 
 // The option checks that need no artifact (shared by every architecture, and the Qwen3.5-only
-// pairing of --vram-headroom-mib with automatic KV capacity); the Engine runs them before it opens
-// the artifact.
-void validate_engine_options(const EngineOptions& options, models::Architecture architecture);
+// pairing of --vram-headroom-mib with automatic KV capacity unless the artifact offloads its
+// experts); the Engine runs them before it opens the artifact.
+void validate_engine_options(const EngineOptions& options, models::Architecture architecture,
+                             bool offloaded_experts = false);
 
 [[nodiscard]] ConstructedModel construct_model(EngineOptions& options, DeviceContext& device);
 

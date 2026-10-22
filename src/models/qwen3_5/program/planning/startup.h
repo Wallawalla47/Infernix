@@ -116,7 +116,17 @@ struct PersistentLayout {
     std::optional<TensorLayout> grammar_masks;
     std::size_t bytes            = 0;
     std::size_t kv_payload_bytes = 0;
+    // Elastic text KV (offloaded experts; Qwen3.5-122B design §11.1): the text KV page planes in their
+    // own region of text_kv_region_bytes, reserved as virtual memory, its pages [0, text_kv_base_pages)
+    // backed at startup and the rest taken from the expert frames as requests need them (ProgramImpl::
+    // grow_kv). 0: the planes are in this layout (`bytes`). The plan's device reservation counts the
+    // whole region, so the KV can always grow to its capacity by taking frames back.
+    std::size_t text_kv_region_bytes = 0;
+    std::uint32_t text_kv_base_pages = 0;
 };
+
+// The text KV pages an elastic pool backs at startup: 32,768 tokens (Qwen3.8-Flash-Next's base).
+inline constexpr std::uint32_t kElasticKvBaseTokens = 32768;
 
 struct VisionWorkspacePlan {
     std::int32_t output_hidden         = 0;
@@ -130,6 +140,11 @@ struct VisionWorkspacePlan {
 
 struct WorkspacePlan {
     std::size_t text_prefill     = 0;
+    // With offloaded experts: a full-width text (MTP) prefill pass, lent by the expert cache for each
+    // pass wider than kOffloadedMoeStaticColumns (text_prefill and mtp_prefill then plan that width);
+    // 0 otherwise.
+    std::size_t text_prefill_wide = 0;
+    std::size_t mtp_prefill_wide  = 0;
     std::size_t ordinary_round   = 0;
     std::size_t mtp_prefill      = 0;
     std::size_t mtp_round        = 0;

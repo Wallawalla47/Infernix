@@ -5,9 +5,14 @@
 #include "models/qwen3_5/load/vision_overlay.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <optional>
+#include <span>
+#include <stdexcept>
 #include <string_view>
 #include <utility>
+#include <variant>
+#include <vector>
 
 namespace infernix::models::qwen3_5 {
 
@@ -36,6 +41,7 @@ struct LoadPlan::Impl {
     std::optional<VisionOverlayLayout> vision_overlay;
     FrontendResources resources;
     InstanceInfo info;
+    std::uint64_t embedding_bytes = 0; // offloaded experts: the token embedding's stored bytes (pinned)
 };
 
 LoadPlan::LoadPlan(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -50,8 +56,27 @@ const ModelWeights& LoadPlan::weights() const { return impl_->weights; }
 
 const FrontendResources& LoadPlan::resources() const { return impl_->resources; }
 
-void LoadPlan::set_host_reserve(std::uint64_t reserve_bytes) {
+void LoadPlan::set_host_reserve(std::uint64_t reserve_bytes, std::uint64_t later_pinned_bytes) {
     impl_->materialization.host_reserve_bytes = reserve_bytes;
+    impl_->materialization.later_pinned_bytes = later_pinned_bytes;
+}
+
+bool LoadPlan::offloaded_experts() const { return impl_->config.text.offloaded_experts; }
+
+std::uint64_t LoadPlan::pinned_other_bytes() const {
+    std::uint64_t bytes = impl_->embedding_bytes;
+    if (impl_->vision_overlay) {
+        const auto& v = *impl_->vision_overlay;
+        bytes += v.prelude.bytes + v.merger.bytes;
+        for (const auto& layer : v.layers) { bytes += layer.bytes; }
+    }
+    return bytes;
+}
+
+std::uint64_t LoadPlan::pinned_expert_bytes() const {
+    const std::uint64_t pinned = impl_->materialization.pinned_capacity_bytes;
+    const std::uint64_t other  = pinned_other_bytes();
+    return pinned > other ? pinned - other : 0;
 }
 
 const artifact::MaterializationPlan& LoadPlan::materialization() const {
@@ -80,6 +105,29 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     loading::Bindings bindings(binder, options.lossless && !options.reference);
     const auto& text  = out->config.text;
     out->weights.text = loading::bind_text(bindings, text, options);
+    // Offloaded experts are all or nothing: every text block binds the bank form, or none does.
+    {
+        std::size_t offloaded = 0;
+        for (const auto& layer : out->weights.text.layers) {
+            offloaded += std::holds_alternative<OffloadedMoeWeights>(layer.ffn) ? 1 : 0;
+        }
+        if (offloaded != 0 && offloaded != out->weights.text.layers.size()) {
+            throw artifact::ArtifactError("Qwen3.5: every text MoE layer must store its experts as one bank, or none");
+        }
+        out->config.text.offloaded_experts = offloaded != 0;
+        if (offloaded != 0) {
+            // The embedding is pinned beside the banks (bind_text): a term of the RAM ledger.
+            std::vector<artifact::ObjectHandle> objects;
+            for (const auto& part : bindings.weights.at(out->weights.text.token_embedding.index).reference.binding.parts) {
+                if (std::find(objects.begin(), objects.end(), part.object) == objects.end()) {
+                    objects.push_back(part.object);
+                }
+            }
+            for (const auto object : objects) {
+                out->embedding_bytes += artifact::object_bytes(reader.directory().object(object));
+            }
+        }
+    }
     if (out->config.vision) {
         out->weights.vision = loading::bind_vision(bindings, *out->config.vision, text, options);
     }
@@ -121,7 +169,10 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
                          std::string(options.speculative_component()) + "/final_hidden");
     }
     out->pending = std::move(bindings.weights);
-    if (options.overlay_vision()) {
+    // The overlay window borrows the evictable tail of the device weights, or with offloaded experts
+    // expert frames (design D8), which needs no ladder.
+    const bool ladder = options.overlay_vision() && !out->config.text.offloaded_experts;
+    if (ladder) {
         for (auto& pending : out->pending) {
             const auto rank = overlay_evict_rank(pending.reference.name);
             if (rank == 0) { continue; }
@@ -130,8 +181,7 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
             }
         }
     }
-    out->materialization = std::move(binder).finish(
-        options.overlay_vision() ? EvictableWeightPool::kChunkBytes : 1);
+    out->materialization = std::move(binder).finish(ladder ? EvictableWeightPool::kChunkBytes : 1);
     if (options.overlay_vision()) {
         out->vision_overlay =
             compute_vision_overlay_layout(out->weights, out->pending, out->materialization);
@@ -149,7 +199,8 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
     if (!plan.impl_) { throw artifact::ArtifactError("load plan was already consumed"); }
     auto data = std::move(plan.impl_);
     std::unique_ptr<EvictableWeightPool> pool;
-    if (data->options.overlay_vision()) {
+    const bool ladder = data->options.overlay_vision() && !data->config.text.offloaded_experts;
+    if (ladder) {
         const auto& layout = *data->vision_overlay;
         if (layout.staging_bytes == 0) {
             throw std::logic_error("overlay vision requires a staged overlay window");
@@ -168,11 +219,22 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
             .overlay_bytes        = layout.staging_bytes,
             .device               = device.device});
     }
-    auto backing = artifact::materialize(*data->materialization.source,
-                                         std::move(data->materialization), device, observer,
+    const artifact::Reader& reader = *data->materialization.source;
+    auto backing = artifact::materialize(reader, std::move(data->materialization), device, observer,
                                          std::move(pool));
     std::optional<VisionOverlayAssets> overlay;
-    if (data->options.overlay_vision()) {
+    if (data->options.overlay_vision() && !ladder) {
+        if (data->vision_overlay->staging_bytes == 0) {
+            throw std::logic_error("overlay vision requires a staged overlay window");
+        }
+        const auto pinned = backing.pinned_bytes_range();
+        if (pinned.empty()) { throw std::logic_error("overlay vision requires a pinned materialization"); }
+        overlay = VisionOverlayAssets{.pool         = nullptr,
+                                      .pinned_block = pinned.data(),
+                                      .pinned_bytes = pinned.size(),
+                                      .ladder_bytes = 0,
+                                      .layout       = std::move(*data->vision_overlay)};
+    } else if (data->options.overlay_vision()) {
         EvictableWeightPool* eviction = backing.eviction_pool();
         if (eviction == nullptr) {
             throw std::logic_error("overlay vision lost its evictable pool");
@@ -189,11 +251,72 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
             .ladder_bytes = eviction->evictable_tail_bytes(),
             .layout       = std::move(*data->vision_overlay)};
     }
+    // Streamed banks (the SSD tier, LoadOptions::stream_experts): their objects, before the pending
+    // weights resolve.
+    const bool streamed = data->config.text.offloaded_experts && data->options.stream_experts;
+    std::vector<artifact::ObjectHandle> bank_objects, shared_objects;
+    if (data->config.text.offloaded_experts) {
+        for (const auto& layer : data->weights.text.layers) {
+            const auto& w = std::get<OffloadedMoeWeights>(layer.ffn);
+            if (streamed) {
+                bank_objects.push_back(data->pending.at(w.experts.index).reference.binding.parts.front().object);
+            }
+            shared_objects.push_back(data->pending.at(w.shared_expert.index).reference.binding.parts.front().object);
+        }
+    }
     auto bound = loading::resolve_weights(std::move(data->pending), backing);
+    // Offloaded MoE layers: the banks' planes and scalars. A pinned routed bank's multipliers (its scale
+    // tail) are read in place; a streamed bank's records stay in the artifact and a shared expert's are in
+    // device memory only, so their scale tails are read from the artifact into Model memory.
+    std::vector<runtime::expert_offload::ExpertBank> banks, shared_banks;
+    std::vector<std::uint64_t> bank_strides;
+    std::vector<std::vector<float>> multipliers, shared_multipliers;
+    const auto read_scale_tail = [&](const artifact::ObjectHandle& object, const WeightView& view) {
+        const auto& geometry = view.parts.front().parent->geometry;
+        std::vector<float> words(geometry.scale_bytes / sizeof(float));
+        reader.read_into(artifact::object_offset(reader.directory().object(object)) + geometry.scale_offset,
+                         std::as_writable_bytes(std::span(words)));
+        return words;
+    };
+    if (data->config.text.offloaded_experts) {
+        const auto& moe = std::get<MoeConfig>(data->config.text.ffn);
+        for (std::size_t i = 0; i < data->weights.text.layers.size(); ++i) {
+            const auto& w = std::get<OffloadedMoeWeights>(data->weights.text.layers[i].ffn);
+            const auto& routed = bound.at(w.experts.index);
+            const auto& shared = bound.at(w.shared_expert.index);
+            try {
+                if (streamed) {
+                    std::vector<float> words = read_scale_tail(bank_objects[i], routed.view);
+                    banks.push_back(runtime::expert_offload::a16_nvfp4_streamed_bank(
+                        routed.view, words.data(), moe.num_experts, data->config.text.hidden_size,
+                        moe.moe_intermediate_size, routed.name));
+                    bank_strides.push_back(banks.back().planes.record_stride);
+                    multipliers.push_back(std::move(words)); // the buffer moves: the planes' pointer holds
+                } else {
+                    banks.push_back(runtime::expert_offload::a16_nvfp4_bank(
+                        routed.view, moe.num_experts, data->config.text.hidden_size,
+                        moe.moe_intermediate_size, routed.name));
+                }
+                std::vector<float> words = read_scale_tail(shared_objects[i], shared.view);
+                shared_banks.push_back(runtime::expert_offload::a16_nvfp4_device_bank(
+                    shared.view, words.data(), 1, data->config.text.hidden_size,
+                    moe.shared_expert_intermediate_size, shared.name));
+                shared_multipliers.push_back(std::move(words));
+            } catch (const std::invalid_argument& error) {
+                throw artifact::ArtifactError(error.what());
+            }
+        }
+    }
+    std::optional<runtime::expert_offload::ExpertStore> store;
+    if (streamed) {
+        store.emplace(backing.stream_source(), bank_objects, std::move(bank_strides),
+                      std::get<MoeConfig>(data->config.text.ffn).num_experts, std::move(multipliers));
+    }
     return std::unique_ptr<Model>(new Model(
         std::move(data->config), data->options, std::move(data->weights), std::move(bound),
         std::move(data->resources), std::move(data->info), std::move(overlay),
-        std::move(backing)));
+        std::move(backing), std::move(banks), std::move(shared_banks), std::move(shared_multipliers),
+        std::move(store)));
 }
 
 std::unique_ptr<Model> load_model(const std::filesystem::path& path, LoadOptions options,

@@ -60,6 +60,9 @@ private:
 class PagedKVCache {
 public:
     PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout);
+    // The page planes in their own region (`pages`, the layout's pages planned against it) and the
+    // execution tables in `tables`.
+    PagedKVCache(DeviceSpan pages, DeviceSpan tables, const PagedKVCacheLayout& layout);
 
     PagedKVCache(const PagedKVCache&)            = delete;
     PagedKVCache& operator=(const PagedKVCache&) = delete;
@@ -103,14 +106,18 @@ struct DecoderStateLayout {
     [[nodiscard]] std::size_t kv_payload_bytes() const noexcept;
 };
 
+// `text_pages`: where the text KV's page planes are planned (their own region: the elastic KV of
+// offloaded experts); null: `builder`, as everything else.
 [[nodiscard]] DecoderStateLayout plan_decoder_state(LayoutBuilder& builder,
-                                                    const DecoderStateSpec& spec);
+                                                    const DecoderStateSpec& spec,
+                                                    LayoutBuilder* text_pages = nullptr);
 
 struct DecoderState {
     PagedKVCache text_kv;
     std::optional<PagedKVCache> mtp_kv;
 
-    DecoderState(DeviceSpan backing, const DecoderStateLayout& layout);
+    // `text_pages`: the text KV page planes' own region when plan_decoder_state planned them there.
+    DecoderState(DeviceSpan backing, const DecoderStateLayout& layout, DeviceSpan text_pages = {});
 
     [[nodiscard]] PagedKVCache* mtp_cache() noexcept;
     [[nodiscard]] const PagedKVCache* mtp_cache() const noexcept;

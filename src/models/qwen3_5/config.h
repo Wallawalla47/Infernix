@@ -88,6 +88,9 @@ struct TextConfig {
     std::optional<RopeConfig> rope_parameters;
     std::optional<GdnConfig> gdn;
     std::variant<DenseConfig, MoeConfig> ffn;
+    // Set by the load plan: the text blocks store their routed experts as one bank each
+    // (weights.h OffloadedMoeWeights), which the Program serves through its expert cache.
+    bool offloaded_experts = false;
 };
 
 struct VisionConfig {

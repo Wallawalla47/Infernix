@@ -3,6 +3,7 @@
 
 #include "core/arena.h"
 #include "core/gdn_replay_records.h"
+#include "core/vmm_arena.h"
 #include "infernix/ops/gdn_replay.h"
 #include "infernix/ops/sampling.h"
 #include "infernix/ops/speculative_tree.h"
@@ -11,6 +12,7 @@
 
 #include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/program/speculative/dflash_width_policy.h"
+#include "models/qwen3_5/program/speculative/mtp_confidence_policy.h"
 #include "models/qwen3_5/program/speculative/mtp_draft_policy.h"
 #include "models/qwen3_5/program/speculative/tree_width_controller.h"
 #include "models/qwen3_5/program/storage/draft_context.h"
@@ -21,6 +23,7 @@
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/program/vision_prefill.h"
 #include "models/qwen3_5/program/ngram_proposer.h"
+#include "models/qwen3_5/program/offload.h"
 #include "models/qwen3_5/program/prefix/hybrid_cache.h"
 #include "runtime/prefix_cache/cost.h"
 #include "runtime/prefix_cache/prefix_index.h"
@@ -29,6 +32,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <limits>
@@ -204,6 +208,9 @@ struct SequenceState {
     std::uint32_t mtp_kv_valid            = 0;
     std::uint32_t dflash_context_frontier = 0;
     std::array<TokenId, qwen3_5::kMtpDecodeMaximumDrafts> mtp_drafts{};
+    // The drafter's probability of each draft (ops::argmax_probability; 1 where none was computed),
+    // the confidence policy's input (MtpConfidencePolicy).
+    std::array<float, qwen3_5::kMtpDecodeMaximumDrafts> mtp_draft_probabilities{};
     std::uint32_t mtp_draft_count = 0;
     // adaptive-mtp: the request's learned draft acceptance and draft-length memory. It moves with
     // the sequence into a paused request's ResumeState and back at its resume binding.
@@ -226,6 +233,11 @@ struct RequestControl {
     ops::SamplingConfig sampling_host;
     GenerationTimings timings;
     SpeculativeStats speculative_stats;
+    // Offloaded experts: the residency's, CPU service's and SSD tier's counters when the request was
+    // admitted.
+    runtime::expert_offload::ExpertResidency::Stats cache_at_admission;
+    std::uint64_t cpu_served_at_admission = 0;
+    std::optional<runtime::expert_offload::HostExpertTier::Stats> tier_at_admission;
     std::shared_ptr<const RequestBasePlanImpl> base;
     std::optional<UnitDemand> permit;
     std::optional<RecoveryPermit> recovery;
@@ -349,8 +361,9 @@ struct HybridLaneState {
 
 class ProgramImpl {
 public:
+    // `offload`: with offloaded experts, the instance's resolved options (null otherwise).
     ProgramImpl(const execution::Parameters&, const SequencePlanImpl&, DeviceContext&,
-                const StartupObserver&);
+                const StartupObserver&, const ProgramOffloadOptions* offload = nullptr);
     ~ProgramImpl() noexcept;
     [[nodiscard]] RequestBasePlan plan_request(PreparedPromptData&&,
                                                const runtime::ResolvedExecutionOptions&);
@@ -460,6 +473,15 @@ public:
         std::uint32_t drafts = 0;
         std::uint32_t batch  = 0;
     } mtp_cost_round;
+    // Confidence-gated MTP extents (ExecutionSchedule::mtp_draft_confidence): each row verifies the
+    // prefix of its drafts the policy picks from their drafter probabilities; the last MTP round's
+    // start, batch size and verified draft columns close its cycle for the policy's cost fit.
+    std::optional<MtpConfidencePolicy> mtp_confidence;
+    struct MtpConfidenceRound {
+        std::chrono::steady_clock::time_point start{};
+        std::uint32_t batch   = 0; // 0: none yet
+        std::uint32_t columns = 0;
+    } mtp_confidence_round;
     const std::uint32_t ngram_draft_window;
     // Rounds of several rows propose copies of at most this many drafts.
     const std::uint32_t ngram_batch_window;
@@ -480,6 +502,34 @@ public:
     DeviceArena persistent;
     DeviceArena workspace_storage;
     WorkspaceArena work;
+    // Elastic text KV (PersistentLayout::text_kv_region_bytes; elastic_kv.cpp): the text KV page planes'
+    // reserved region, mapped from kv_base_pages up as requests need pages, with memory taken from the
+    // expert frames; null when the planes are in the persistent arena. Declared before `decoder`, which
+    // points into it.
+    static constexpr std::size_t kKvChunkBytes   = 2ULL << 20; // mapping unit
+    static constexpr std::uint32_t kKvGrowPages  = 64;         // growth unit (4,096 tokens)
+    static constexpr std::chrono::seconds kKvIdleShrink{60};
+    std::unique_ptr<VmmRange> kv_vmm;
+    DeviceKVPagePoolLayout kv_layout;
+    std::uint32_t kv_base_pages = 0;
+    // The last binding, growth, release or idle shrink (steady-clock ticks), and whether the pool backs
+    // more than its base: the expert cache's monitor thread reads both (kv_idle_due) to wake an idle
+    // engine for the evicting shrink.
+    std::atomic<std::int64_t> kv_busy_ticks{0};
+    std::atomic<bool> kv_grown{false};
+    void kv_busy() noexcept { kv_busy_ticks.store(std::chrono::steady_clock::now().time_since_epoch().count()); }
+    // Pages the elastic text pool could still back (0 without one).
+    [[nodiscard]] std::uint32_t kv_growable_pages() const noexcept;
+    // Maps (and zeroes) the region's chunks pages [0, pages) need; false when the device has none.
+    [[nodiscard]] bool map_kv(std::uint32_t pages);
+    // Raises the text pool's backed pages so `need` pages are free, taking the memory from the expert
+    // frames (between a prompt's calls, its stream and wide leases go back first if they hold them).
+    [[nodiscard]] bool grow_kv(std::uint32_t need);
+    // Between requests: lowers the backed pages to the free top (not below the base) and returns the
+    // memory to the frames; `evict` (idle for kKvIdleShrink) first releases the prefix cache's idle
+    // device blocks that have host copies.
+    void shrink_kv(bool evict);
+    [[nodiscard]] bool kv_idle_due() const noexcept;
     std::unique_ptr<qwen3_5::DecoderState> decoder;
     std::unique_ptr<LogicalKVPageStore> text_kv_pages;
     std::unique_ptr<KVAddressSpaceStore> text_kv_addresses;
@@ -493,6 +543,9 @@ public:
     // their own width for every batch size and record/fold through the dense view of that width.
     std::vector<NarrowReplayView> narrow_replay_views;
     std::optional<DFlashPersistentState> dflash;
+    // An artifact with offloaded experts: the Program's experts and their engine (offload.h); null
+    // otherwise.
+    std::unique_ptr<ProgramOffload> offload;
     qwen3_5::RoundState io;
     Tensor prefill_hidden;
     std::optional<Tensor> score_hidden;
@@ -607,6 +660,14 @@ public:
     // Whether a lane other than `lane` is generating (Active or Pending): its next decode or
     // control round waits behind any prefill step.
     [[nodiscard]] bool other_lane_generating(std::uint32_t lane) const noexcept;
+    // Whether a lane other than `lane` is prefilling (its next pass may stream over the lent ring).
+    [[nodiscard]] bool other_lane_prefilling(std::uint32_t lane) const noexcept;
+    // Offloaded experts, after a verification round's synchronization (ProgramOffload::end_round):
+    // row r committed counts[r] tokens (the longest row advances the round), and its first
+    // live_counts[r] columns count as expert uses (empty: counts; a tree round's: every verified
+    // column, its accepted path not being a prefix of them).
+    void end_offloaded_round(std::span<const std::uint32_t> lanes, std::uint32_t width,
+                             std::span<const std::int32_t> counts, std::span<const std::int32_t> live_counts = {});
     [[nodiscard]] UnitDemand next_unit(const SequenceState&, const RequestControl&,
                                        ExecutionUnitKind, std::uint32_t tokens) const;
     void require_unit(std::uint32_t lane, ExecutionUnitKind, std::uint32_t tokens = 0) const;

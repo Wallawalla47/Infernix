@@ -18,6 +18,10 @@
 namespace infernix::models::qwen3_5 {
 
 [[nodiscard]] ModelSamplingDefaults default_sampling(Architecture architecture);
+// The presets of a text resource sampling.json: {"thinking": {...}, "non_thinking": {...}, "source": "..."}
+// with temperature, top_k, top_p, min_p, presence_penalty and frequency_penalty each (repetition_penalty 1
+// accepted). Throws std::invalid_argument on a missing, unknown or out-of-domain value.
+[[nodiscard]] ModelSamplingDefaults sampling_presets(std::string_view json);
 
 struct FrontendOptions {
     std::filesystem::path chat_template_path;

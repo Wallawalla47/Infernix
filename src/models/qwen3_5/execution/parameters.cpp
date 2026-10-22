@@ -6,10 +6,12 @@
 #include "infernix/ops/linear_add.h"
 #include "infernix/ops/linear_swiglu.h"
 
+#include <algorithm>
 #include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace infernix::models::qwen3_5::execution {
 namespace {
@@ -25,7 +27,9 @@ auto with_context(const std::string& context, Function&& function) {
 
 class Prepare {
 public:
-    explicit Prepare(const Model& model) : model_(model) {}
+    // `expert_scales`: the Parameters' device scales of the offloaded layers (null without them).
+    explicit Prepare(const Model& model, const ops::offloaded_moe::ExpertScales* expert_scales = nullptr)
+        : model_(model), expert_scales_(expert_scales) {}
 
     LinearParameters linear(WeightId id) const {
         return with_context(model_.weight(id).name,
@@ -65,8 +69,32 @@ public:
                 linear(w.down)};
     }
 
-    FfnParameters ffn(const BlockWeights& w) const {
+    // `layer` is the block's text layer (the expert cache's index of an offloaded layer).
+    FfnParameters ffn(const BlockWeights& w, std::size_t layer = 0) const {
         if (const auto* d = std::get_if<DenseWeights>(&w.ffn)) { return dense(*d); }
+        if (const auto* offloaded = std::get_if<OffloadedMoeWeights>(&w.ffn)) {
+            const auto& config = std::get<MoeConfig>(model_.config().text.ffn);
+            OffloadedMoeParameters out;
+            out.router       = tensor(offloaded->router);
+            out.shared_score = tensor(offloaded->shared_score);
+            out.bank         = &model_.expert_banks()[layer];
+            out.shared_bank  = &model_.shared_expert_banks()[layer];
+            out.layer        = static_cast<std::uint32_t>(layer);
+            out.experts      = config.num_experts;
+            out.top_k        = config.num_experts_per_tok;
+            if (expert_scales_ == nullptr) { throw std::logic_error("offloaded MoE: the device scales are missing"); }
+            out.device_scales = expert_scales_ + layer * (static_cast<std::size_t>(config.num_experts) + 1);
+            const auto h     = static_cast<std::int32_t>(model_.config().text.hidden_size);
+            if (out.router.dtype != DType::BF16 || out.router.ne[0] != h ||
+                out.router.ne[1] != static_cast<std::int32_t>(config.num_experts) ||
+                out.shared_score.dtype != DType::BF16 || out.shared_score.ne[0] != h || out.shared_score.ne[1] != 1) {
+                throw std::invalid_argument("offloaded MoE: the router and shared gate must be BF16 rows of H");
+            }
+            if (config.num_experts > 512 || config.num_experts_per_tok > 16) {
+                throw std::invalid_argument("offloaded MoE routes up to 512 experts and top-16");
+            }
+            return out;
+        }
         const auto& moe = std::get<MoeWeights>(w.ffn);
         if (std::get<MoeConfig>(model_.config().text.ffn).num_experts_per_tok != 8) {
             throw std::invalid_argument("SparseMoe implements top-8 routing");
@@ -79,19 +107,25 @@ public:
             gate_up.push_back(model_.input(expert.up));
             down.push_back(model_.input(expert.down));
         }
+        // The closed SparseMoe Op takes the 35B-A3B geometry; another (the 122B-A10B's drafter) runs
+        // its routed banks through resident_moe_experts (ffn.cpp).
+        const auto& text   = model_.config().text;
+        const auto& config = std::get<MoeConfig>(text.ffn);
+        const bool closed  = text.hidden_size == 2048 && config.num_experts == 256 &&
+                            config.moe_intermediate_size == 512 && config.shared_expert_intermediate_size == 512;
         return with_context(model_.weight(moe.router).name, [&] {
-            return ops::prepare_sparse_moe_weights(
-                model_.input(moe.router), model_.input(moe.shared_score), gate_up, down,
-                model_.input(moe.shared.gate), model_.input(moe.shared.up),
-                model_.input(moe.shared.down));
+            const auto prepare = closed ? &ops::prepare_sparse_moe_weights : &ops::prepare_resident_moe_weights;
+            return prepare(model_.input(moe.router), model_.input(moe.shared_score), gate_up, down,
+                           model_.input(moe.shared.gate), model_.input(moe.shared.up),
+                           model_.input(moe.shared.down));
         });
     }
 
-    BlockParameters block(const BlockWeights& w) const {
+    BlockParameters block(const BlockWeights& w, std::size_t layer = 0) const {
         BlockParameters out;
         out.input_norm          = tensor(w.input_norm);
         out.post_attention_norm = tensor(w.post_attention_norm);
-        out.ffn                 = ffn(w);
+        out.ffn                 = ffn(w, layer);
         if (const auto* a = std::get_if<AttentionWeights>(&w.mixer)) {
             out.mixer = AttentionParameters{
                 ops::prepare_attn_input_proj_weights(model_.input(a->query), model_.input(a->key),
@@ -282,12 +316,34 @@ public:
 
 private:
     const Model& model_;
+    const ops::offloaded_moe::ExpertScales* expert_scales_;
 };
+
+// Every offloaded layer's scales on the device, [layers][experts + 1]: the routed bank's, then the
+// shared expert's (its bank holds one expert).
+DeviceBuffer offloaded_expert_scales(const Model& model) {
+    if (!model.offloaded_experts()) { return {}; }
+    const auto banks  = model.expert_banks();
+    const auto shared = model.shared_expert_banks();
+    const auto& moe   = std::get<MoeConfig>(model.config().text.ffn);
+    const std::size_t entries = static_cast<std::size_t>(moe.num_experts) + 1;
+    std::vector<ops::offloaded_moe::ExpertScales> host(banks.size() * entries);
+    for (std::size_t layer = 0; layer < banks.size(); ++layer) {
+        if (banks[layer].scales.size() != moe.num_experts || shared[layer].scales.size() != 1) {
+            throw std::logic_error("offloaded MoE: a bank's scales differ from its experts");
+        }
+        std::copy(banks[layer].scales.begin(), banks[layer].scales.end(), host.begin() + layer * entries);
+        host[layer * entries + moe.num_experts] = shared[layer].scales.front();
+    }
+    DeviceBuffer out(host.size() * sizeof(ops::offloaded_moe::ExpertScales));
+    out.copy_from_host(host.data(), host.size() * sizeof(ops::offloaded_moe::ExpertScales));
+    return out;
+}
 
 } // namespace
 
-Parameters::Parameters(const Model& source) : model(source) {
-    const Prepare prepare(model);
+Parameters::Parameters(const Model& source) : model(source), expert_scales(offloaded_expert_scales(source)) {
+    const Prepare prepare(model, static_cast<const ops::offloaded_moe::ExpertScales*>(expert_scales.p));
     const auto& w        = model.weights();
     const auto& config   = model.config().text;
     if (config.rope_parameters) {
@@ -295,13 +351,15 @@ Parameters::Parameters(const Model& source) : model(source) {
         text.rope = ops::prepare_rope(dimension(rope.rotary_dim), rope.rope_theta,
                                      {rope.yarn_factor, config.max_position_embeddings});
     }
-    text.token_embedding = native_weight(model.weight(w.text.token_embedding).view);
+    // Device memory, or (an artifact with offloaded experts) pinned host memory gathered zero-copy:
+    // the rows at the parent's device address either way.
+    text.token_embedding = device_native_weight(model.weight(w.text.token_embedding).view);
     text.output_head     = prepare.linear(w.text.output_head_use);
     text.final_norm      = prepare.tensor(w.text.final_norm);
     text.layers.reserve(w.text.layers.size());
     for (std::size_t i = 0; i < w.text.layers.size(); ++i) {
         text.layers.push_back(with_context("text/layers/" + std::to_string(i),
-                                           [&] { return prepare.block(w.text.layers[i]); }));
+                                           [&] { return prepare.block(w.text.layers[i], i); }));
     }
     if (w.mtp) {
         mtp = with_context("mtp", [&] { return prepare.mtp(*w.mtp); });
@@ -346,10 +404,13 @@ void make_invariant(LinearParameters& p) { p.policy = ops::LinearPolicy::A16Colu
 // projection permitted its class's one-term activations may take its residual profile instead
 // (the NVFP4 one, `a4_residual_here`, is registered for the MLP only).
 void limit_precision(LinearParameters& p, DecodePrecision precision, bool a4_residual_here) {
-    const bool fp8   = p.weight.qtype == QType::FP8_E4M3FN_ROW_BF16;
+    const bool fp8   = is_fp8_row(p.weight.qtype);
     const bool nvfp4 = p.weight.qtype == QType::NVFP4;
     if ((fp8 && precision.a8) || (nvfp4 && precision.a4)) { return; }
-    if (fp8 && precision.a8_residual && ops::allows_a8(p.policy)) {
+    // A static-scale parent (fp8_e4m3fn_row_f32) encodes with its calibrated scale and has no
+    // residual profile.
+    if (fp8 && p.weight.qtype == QType::FP8_E4M3FN_ROW_BF16 && precision.a8_residual &&
+        ops::allows_a8(p.policy)) {
         p.policy = ops::LinearPolicy::AllowA8Residual;
     } else if (nvfp4 && a4_residual_here && precision.a4_residual && ops::allows_a4(p.policy)) {
         p.policy = ops::LinearPolicy::AllowA4Residual;
@@ -377,9 +438,10 @@ void make_invariant(FfnParameters& ffn) {
     if (auto* dense = std::get_if<DenseParameters>(&ffn)) {
         make_invariant(dense->gate_up);
         make_invariant(dense->down);
-    } else {
-        std::get<ops::SparseMoeWeights>(ffn).policy = ops::LinearPolicy::A16ColumnInvariant;
+    } else if (auto* moe = std::get_if<ops::SparseMoeWeights>(&ffn)) {
+        moe->policy = ops::LinearPolicy::A16ColumnInvariant;
     }
+    // An offloaded MoE's expert routes are exact at every width (OffloadedMoeParameters).
 }
 
 } // namespace
@@ -399,7 +461,9 @@ column_by_column_projections(const TextParameters& text, const MtpParameters* mt
         out.push_back({role, weight.qtype, weight.n, weight.k, 1});
     };
     const Weight& head = text.output_head.weight;
-    if (!ops::linear_column_invariant_route(head.qtype, head.n, head.k)) { note("output head", head); }
+    if (!ops::linear_column_invariant_route(head.qtype, head.n, head.k)) {
+        note("output head", head);
+    }
     for (const BlockParameters& block : text.layers) {
         // A sparse MoE, every attention input parent, the Q4/Q5 pairs and the GDN control have
         // dedicated routes.

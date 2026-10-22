@@ -291,17 +291,38 @@ ReplayProgress ProgramImpl::advance_replay(SequenceHandle handle,
 
         execution::PrefillChunkResult result;
         timing.pause();
-        if (multimodal) {
-            if (!request.replay->vision) {
-                throw std::logic_error("Vision replay session is unavailable");
+        // Offloaded experts: a replay pass is a prompt pass (its routes credit the lane; the replay's
+        // end seeds the cache), its width the one prefill_impl takes.
+        execution::OffloadedCall offload_call;
+        if (offload) {
+            std::uint32_t expected = std::min(prefill_chunk, count);
+            if (split && *split > cursor) { expected = std::min(expected, *split - cursor); }
+            offload_call = offload->begin_pass(device.stream, static_cast<std::int32_t>(expected));
+            context.offloaded_call = offload_call;
+        }
+        try {
+            if (multimodal) {
+                if (!request.replay->vision) {
+                    throw std::logic_error("Vision replay session is unavailable");
+                }
+                mark_workspace_usage(workspace_plan.vision->capacity_bytes);
+                result = execution::prefill_multimodal_chunk(
+                    context, request.replay->prompt, *request.replay->vision, count, split, false);
+            } else {
+                // Pass the complete ledger: MTP alignment consumes the next already committed token
+                // after the replayed frontier, rather than io.token from another request's round.
+                result = execution::prefill_text_chunk(context, sequence.ledger, count, split, false);
             }
-            mark_workspace_usage(workspace_plan.vision->capacity_bytes);
-            result = execution::prefill_multimodal_chunk(
-                context, request.replay->prompt, *request.replay->vision, count, split, false);
-        } else {
-            // Pass the complete ledger: MTP alignment consumes the next already committed token
-            // after the replayed frontier, rather than io.token from another request's round.
-            result = execution::prefill_text_chunk(context, sequence.ledger, count, split, false);
+        } catch (...) {
+            if (offload) { offload->abandon_pass(offload_call); }
+            throw;
+        }
+        if (offload) {
+            const bool replay_end = cursor + result.processed_tokens == request.replay_target;
+            offload->end_pass(device.stream, offload_call, ProgramOffload::PassKind::Prompt, lane,
+                              static_cast<std::int32_t>(result.processed_tokens), cursor, replay_end,
+                              parameters.model.info().name);
+            if (replay_end && !other_lane_prefilling(lane)) { offload->return_stream(device.stream); }
         }
         timing.include(result.timing);
         timing.resume_post();

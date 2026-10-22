@@ -16,6 +16,7 @@
 #include "models/qwen3_5/state/state_image.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/program/round_buffers.h"
+#include "models/qwen3_5/execution/offloaded_moe.h"
 
 #include <array>
 #include <cstddef>
@@ -113,6 +114,13 @@ public:
     // before that layer's work (the layer's cached state is still being copied in).
     void set_layer_ready(std::span<const cudaEvent_t> events) noexcept { layer_ready_ = events; }
 
+    // The Program's offloaded experts (an artifact with offloaded MoE layers; null otherwise) and a
+    // prefill chunk's route through them: decode and verification rounds take the graphed route.
+    void set_offloaded_experts(OffloadedExperts* experts, OffloadedCall prefill = {}) noexcept {
+        offloaded_experts_ = experts;
+        offloaded_prefill_ = prefill;
+    }
+
     void set_mtp_proposal_extent(std::uint32_t extent) noexcept { mtp_proposal_extent_ = extent; }
 
     void set_linear_state_slots(std::int32_t source_slot, std::int32_t destination_slot);
@@ -176,7 +184,9 @@ public:
                                   const Tensor& state_destination_slots,
                                   ops::CausalAttentionExecutionEnvelope envelope,
                                   Tensor& mtp_hidden);
-    void mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens);
+    // `probabilities` (FP32 [batch], optional): each draft's drafter probability (ops::argmax_probability).
+    void mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens,
+                           Tensor* probabilities = nullptr);
     void mtp_forward_batch(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
                            ops::CausalAttentionExecutionEnvelope envelope, Tensor& mtp_hidden,
                            int logits_column, Tensor* logits, Tensor* draft_token,
@@ -201,7 +211,7 @@ private:
     void attn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
     void gdn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
     void mlp_tail(const BlockParameters& weights, Tensor& x, Phase phase,
-                  const ops::SparseMoeHints& hints);
+                  const ops::SparseMoeHints& hints, std::size_t layer);
     [[nodiscard]] ops::SparseMoeHints next_projection_hints(int layer) const;
     // Per-request width of a bound sequence batch; an unbatched call is one row of all columns.
     [[nodiscard]] std::int32_t row_width(std::int32_t columns) const noexcept {
@@ -252,7 +262,8 @@ private:
                            const Tensor& positions, const Tensor& rope_positions,
                            ops::CausalAttentionExecutionEnvelope envelope, bool final_chunk,
                            Tensor* final_hidden, Tensor* logits, Tensor* draft_token);
-    void proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& proposal_tokens);
+    void proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& proposal_tokens,
+                         Tensor* probabilities = nullptr);
 
     struct MultimodalPrefill {
         std::span<const int> token_ids;
@@ -309,6 +320,8 @@ private:
     Tensor* rewrite_checkpoint_hidden_output_ = nullptr;
     std::uint32_t mtp_proposal_extent_        = 0;
     std::span<const cudaEvent_t> layer_ready_;
+    OffloadedExperts* offloaded_experts_ = nullptr;
+    OffloadedCall offloaded_prefill_;
 
     const Weight* embed_                        = nullptr;
     const Tensor* final_norm_                   = nullptr;

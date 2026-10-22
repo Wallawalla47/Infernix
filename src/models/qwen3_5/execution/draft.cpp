@@ -156,9 +156,9 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
                      false, context, state.execution.device.stream);
 
         if (config.dflash2) {
-            std::array<ops::ContextKVMaterializeLayerView, ops::kContextKVMaterializeLayers> layers;
-            if (config.num_hidden_layers != layers.size() ||
-                config.local_layer_count() != layers.size() || config.rms_norm_eps != 1e-6F ||
+            std::array<ops::ContextKVMaterializeLayerView, ops::kContextKVMaterializeMaxLayers> layers;
+            if (!ops::context_kv_materialize_layer_count(config.num_hidden_layers) ||
+                config.local_layer_count() != config.num_hidden_layers || config.rms_norm_eps != 1e-6F ||
                 config.rope_theta != 1e7F) {
                 throw std::invalid_argument(
                     "masked draft context: config is outside the fused materialization contract");
@@ -172,7 +172,7 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
                 replace_local_window ? positions.slice(0, local_offset, local_width) : positions;
             ops::context_kv_materialize(
                 context.view({dimension(target.hidden_size), local_width, batch}), local_positions,
-                local_counts, lanes, layers, config.rope_theta,
+                local_counts, lanes, std::span(layers.data(), config.num_hidden_layers), config.rope_theta,
                 {local_envelope.min_count, local_envelope.max_count},
                 state.execution.work, state.execution.device.stream);
         } else {

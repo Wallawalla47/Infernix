@@ -77,10 +77,34 @@ MoeWeights bind_moe(Bindings& b, const TextConfig& config, const std::string& pr
     return out;
 }
 
+// The offloaded form (weights.h OffloadedMoeWeights): the routed bank stays in pinned host memory, or
+// in the artifact for the SSD tier (`stream`; the experts' frames in VRAM are the Program's), the
+// shared expert's one-record bank is in device memory.
+OffloadedMoeWeights bind_offloaded_moe(Bindings& b, const TextConfig& config, const std::string& prefix,
+                                       bool stream) {
+    const auto& moe  = std::get<MoeConfig>(config.ffn);
+    const auto p     = prefix + "moe/";
+    const auto input = prefix + "ffn_input";
+    const auto h     = config.hidden_size;
+    OffloadedMoeWeights out;
+    out.router        = b.parameter(p + "router", {moe.num_experts, h}, {input});
+    out.shared_score  = b.parameter(p + "shared_score", {1, h}, {input});
+    out.experts       = b.parameter(p + "experts", {moe.num_experts, h, moe.moe_intermediate_size}, {input},
+                                    QType::NVFP4_MUL,
+                                    stream ? artifact::Residency::Streamed : artifact::Residency::HostPinned);
+    out.shared_expert = b.parameter(p + "shared_expert", {1, h, moe.shared_expert_intermediate_size}, {input},
+                                    QType::NVFP4_MUL);
+    return out;
+}
+
 } // namespace
 
+bool offloaded_expert_bank(const Bindings& b, const std::string& prefix) {
+    return b.binder.reader().directory().bindings.contains(prefix + "moe/experts");
+}
+
 BlockWeights bind_block(Bindings& b, const TextConfig& config, const std::string& p,
-                        MixerKind mixer) {
+                        MixerKind mixer, bool stream_experts) {
     BlockWeights out;
     out.input_norm          = b.direct(p + "input_norm", {config.hidden_size});
     out.post_attention_norm = b.direct(p + "post_attention_norm", {config.hidden_size});
@@ -91,6 +115,8 @@ BlockWeights bind_block(Bindings& b, const TextConfig& config, const std::string
     }
     if (const auto* dense = std::get_if<DenseConfig>(&config.ffn)) {
         out.ffn = bind_dense(b, config.hidden_size, dense->intermediate_size, p);
+    } else if (offloaded_expert_bank(b, p)) {
+        out.ffn = bind_offloaded_moe(b, config, p, stream_experts);
     } else {
         out.ffn = bind_moe(b, config, p);
     }
@@ -99,8 +125,12 @@ BlockWeights bind_block(Bindings& b, const TextConfig& config, const std::string
 
 TextWeights bind_text(Bindings& b, const TextConfig& config, const LoadOptions& options) {
     TextWeights out;
-    out.token_embedding =
-        b.parameter("text/token_embedding", {config.vocab_size, config.hidden_size});
+    // With offloaded experts the embedding stays in pinned host memory too (design D8): one row per
+    // token is read zero-copy, and its 1.4 GiB become expert frames.
+    const bool offloaded = std::holds_alternative<MoeConfig>(config.ffn) && offloaded_expert_bank(b, "text/layers/0/");
+    out.token_embedding  = b.parameter("text/token_embedding", {config.vocab_size, config.hidden_size}, {},
+                                       std::nullopt,
+                                       offloaded ? artifact::Residency::HostPinned : artifact::Residency::Device);
     std::vector<std::string> head_inputs{"text/final_hidden"};
     if (options.speculative != SpeculativeBackend::None && !options.proposal_enabled()) {
         head_inputs.push_back(std::string(options.speculative_component()) + "/final_hidden");
@@ -111,7 +141,8 @@ TextWeights bind_text(Bindings& b, const TextConfig& config, const LoadOptions& 
     out.layers.reserve(config.num_hidden_layers);
     for (std::uint32_t i = 0; i < config.num_hidden_layers; ++i) {
         out.layers.push_back(
-            bind_block(b, config, "text/layers/" + std::to_string(i) + "/", config.layer_types[i]));
+            bind_block(b, config, "text/layers/" + std::to_string(i) + "/", config.layer_types[i],
+                       options.stream_experts));
     }
     return out;
 }

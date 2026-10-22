@@ -119,6 +119,40 @@ int main() {
                       }),
                       "non-finite sampling override was accepted");
 
+    // An artifact's sampling.json (the converter's --resource sampling.json=PATH, e.g. Ornith-1.5-122B's
+    // card set for both modes) replaces the architecture's presets; a malformed one is refused.
+    {
+        using infernix::models::qwen3_5::sampling_presets;
+        const char* card = R"({"source": "card",
+            "thinking": {"temperature": 1.0, "top_k": 20, "top_p": 0.95, "min_p": 0.0,
+                         "presence_penalty": 1.5, "frequency_penalty": 0.0, "repetition_penalty": 1.0},
+            "non_thinking": {"temperature": 0.6, "top_k": 20, "top_p": 0.95, "min_p": 0.0,
+                             "presence_penalty": 0.0, "frequency_penalty": 0.0}})";
+        const auto presets = sampling_presets(card);
+        failures += check(same_preset(presets.thinking, moe_thinking), "sampling.json thinking preset mismatch");
+        failures += check(same_preset(presets.non_thinking, {.temperature = 0.6F, .top_k = 20, .top_p = 0.95F}),
+                          "sampling.json non-thinking preset mismatch");
+        const auto resolved = infernix::runtime::resolve_sampling(presets, infernix::SamplingMode::NonThinking,
+                                                                  infernix::SamplingOverrides{}, false);
+        failures += check(resolved.temperature == 0.6F && resolved.presence_penalty == 0.0F,
+                          "sampling.json presets did not resolve as request defaults");
+        const char* missing    = R"({"thinking": {"temperature": 1.0, "top_k": 20, "top_p": 0.95, "min_p": 0.0,
+                                     "presence_penalty": 1.5, "frequency_penalty": 0.0}})";
+        const char* wide_k     = R"({"thinking": {"temperature": 1.0, "top_k": 21, "top_p": 0.95, "min_p": 0.0,
+                                     "presence_penalty": 1.5, "frequency_penalty": 0.0},
+                                     "non_thinking": {"temperature": 1.0, "top_k": 20, "top_p": 0.95, "min_p": 0.0,
+                                     "presence_penalty": 1.5, "frequency_penalty": 0.0}})";
+        const char* repetition = R"({"thinking": {"temperature": 1.0, "top_k": 20, "top_p": 0.95, "min_p": 0.0,
+                                     "presence_penalty": 1.5, "frequency_penalty": 0.0, "repetition_penalty": 1.1},
+                                     "non_thinking": {"temperature": 1.0, "top_k": 20, "top_p": 0.95, "min_p": 0.0,
+                                     "presence_penalty": 1.5, "frequency_penalty": 0.0}})";
+        const char* unknown    = R"({"thinking": {}, "non_thinking": {}, "greedy": true})";
+        for (const char* bad : {missing, wide_k, repetition, unknown}) {
+            failures += check(throws_invalid([&] { (void)sampling_presets(bad); }),
+                              "a malformed sampling.json was accepted");
+        }
+    }
+
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

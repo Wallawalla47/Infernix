@@ -301,6 +301,40 @@ int main() {
         failures += check(rejected == (variant == 1 || variant == 2 || variant == 3),
                           "--spec-min-p was misjudged for its model, backend or range");
     }
+    // --vram-headroom-mib with an explicit KV capacity: refused for Qwen3.5 (the headroom is what
+    // automatic KV leaves), accepted with offloaded experts (what the expert cache leaves).
+    {
+        EngineOptions options;
+        options.artifact_path       = "model.infernix";
+        options.kv_capacity         = infernix::KvCapacityPolicy::explicit_capacity(8192);
+        options.vram_headroom_bytes = std::size_t{1} << 30;
+        bool rejected               = false;
+        try {
+            infernix::runtime::validate_engine_options(options, infernix::models::Architecture::Qwen3_5);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "--vram-headroom-mib with an explicit KV capacity was accepted on Qwen3.5");
+        rejected = false;
+        try {
+            infernix::runtime::validate_engine_options(options, infernix::models::Architecture::Qwen3_5, true);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(!rejected, "--vram-headroom-mib was refused with offloaded experts");
+    }
+    // --draft-tokens auto on a Qwen3.5 artifact with offloaded experts decodes without a drafter (no
+    // length was faster than plain decode there); a fixed length keeps its drafter.
+    {
+        EngineOptions options;
+        options.speculative.backend           = infernix::SpeculativeBackend::Mtp;
+        options.speculative.draft_tokens_auto = true;
+        const EngineOptions out = normalize_engine_options(options, infernix::models::Architecture::Qwen3_5, true);
+        failures += check(out.speculative.backend == infernix::SpeculativeBackend::None &&
+                              !out.speculative.draft_tokens_auto && out.speculative.draft_tokens == 0,
+                          "--draft-tokens auto kept a drafter with offloaded experts");
+        options.speculative.draft_tokens_auto = false;
+        options.speculative.draft_tokens      = 1;
+        failures += check(normalize_engine_options(options, infernix::models::Architecture::Qwen3_5, true)
+                                  .speculative.backend == infernix::SpeculativeBackend::Mtp,
+                          "a fixed draft length lost its drafter with offloaded experts");
+    }
 
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

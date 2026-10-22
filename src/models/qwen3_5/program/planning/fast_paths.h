@@ -22,6 +22,9 @@ struct FastPathConfiguration {
     ActivationClass activations = ActivationClass::A16;
     KvCacheStorage kv           = KvCacheStorage::BFloat16;
     bool q4_gate_up             = false;
+    // Routed experts held outside device memory (Qwen3.5-122B-A10B): a verified draft column brings
+    // its own expert misses, which prices speculation differently.
+    bool offloaded_experts = false;
 
     bool operator==(const FastPathConfiguration&) const = default;
 };
@@ -73,6 +76,11 @@ struct FastPathConfiguration {
 
 // Whether the path passed the acceptance gate in this configuration (the registry, section 6.7).
 [[nodiscard]] bool fast_path_qualified(FastPath path, const FastPathConfiguration& configuration);
+
+// Whether --draft-tokens auto decodes without a drafter: where no draft length was measured faster
+// than plain decode for either drafter. The engine then turns speculation off before it binds the
+// drafter (normalize_engine_options), so the drafter's VRAM stays with the expert cache.
+[[nodiscard]] bool auto_drafts_nothing(bool offloaded_experts) noexcept;
 
 // The fixed draft length --draft-tokens auto runs where its policy (adaptive-mtp, adaptive-dflash)
 // does not (not qualified for the configuration, or fast paths disabled): the single length

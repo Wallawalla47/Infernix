@@ -26,7 +26,7 @@ using OverlayClock = std::chrono::steady_clock;
 std::vector<PinnedVisionResult>
 encode_items_overlay(DeviceContext& device, const Parameters& parameters,
                      const qwen3_5::PreparedPromptData& prompt, const detail::VisionPrefillPlan& plan,
-                     std::size_t first_item, VisionOverlayWindowStats* stats) {
+                     std::size_t first_item, VisionOverlayWindowStats* stats, VisionWindowSource* window) {
     const Model& model = parameters.model;
     if (!model.weights().vision) {
         throw std::logic_error("overlay window requires vision weights");
@@ -35,7 +35,11 @@ encode_items_overlay(DeviceContext& device, const Parameters& parameters,
         throw std::logic_error("overlay window requires overlay assets");
     }
     const VisionOverlayAssets& assets = *model.overlay_vision();
-    EvictableWeightPool& pool         = *assets.pool;
+    // No evictable tail (offloaded experts): the window borrows from `window`.
+    EvictableWeightPool* const pool   = assets.pool;
+    if ((pool == nullptr) == (window == nullptr)) {
+        throw std::logic_error("overlay window needs exactly one of the evictable tail and a window source");
+    }
     if (plan.control == nullptr || plan.uses.empty()) {
         throw std::invalid_argument("overlay window has no vision items");
     }
@@ -62,23 +66,42 @@ encode_items_overlay(DeviceContext& device, const Parameters& parameters,
     const auto window_plan =
         VisionContext::plan_overlay_window(config, params, max_patches, max_merged);
 
-    const auto window_start = OverlayClock::now();
-    std::size_t mapped      = 0;
-    std::byte* staging      =
-        pool.evict(vision_staging_align(assets.layout.staging_bytes) + window_plan.capacity_bytes,
-                   &mapped);
+    const auto window_start  = OverlayClock::now();
+    const std::size_t bytes  = vision_staging_align(assets.layout.staging_bytes) + window_plan.capacity_bytes;
+    std::size_t mapped       = 0;
+    std::byte* staging       = nullptr;
+    if (pool != nullptr) {
+        staging = pool->evict(bytes, &mapped);
+    } else {
+        staging = static_cast<std::byte*>(window->lend(bytes, device.stream, device.transfer_stream).data);
+        mapped  = bytes;
+    }
     std::byte* lease = staging + vision_staging_align(assets.layout.staging_bytes);
 
     struct RestoreGuard {
-        EvictableWeightPool& pool;
+        EvictableWeightPool* pool;
+        VisionWindowSource* window;
         cudaStream_t stream;
-        ~RestoreGuard() {
-            // On the failure path in-flight work may still reference the overlay range;
-            // quiesce before remapping so restore stays safe.
-            (void)cudaDeviceSynchronize();
-            pool.restore(stream);
+        bool done = false;
+        void release() {
+            if (done) { return; }
+            done = true;
+            if (pool != nullptr) {
+                pool->restore(stream);
+            } else {
+                window->give_back(stream);
+            }
         }
-    } restore_guard{pool, device.stream};
+        ~RestoreGuard() {
+            if (done) { return; }
+            // On the failure path in-flight work may still reference the overlay range;
+            // quiesce before remapping (or giving the frames back) so the release stays safe.
+            (void)cudaDeviceSynchronize();
+            try {
+                release();
+            } catch (...) {}
+        }
+    } restore_guard{pool, window, device.stream};
 
     const DeviceSpan lease_span{lease, window_plan.capacity_bytes};
 
@@ -121,13 +144,13 @@ encode_items_overlay(DeviceContext& device, const Parameters& parameters,
         staged_bytes = stream.uploaded_bytes();
     }
 
-    pool.restore(device.stream);  // the guard's later call becomes a no-op
+    restore_guard.release(); // the guard's later call becomes a no-op
 
     if (stats != nullptr) {
         stats->window_seconds  =
             std::chrono::duration<double>(OverlayClock::now() - window_start).count();
-        stats->evict_seconds   = pool.last_evict_seconds();
-        stats->restore_seconds = pool.last_restore_seconds();
+        stats->evict_seconds   = pool != nullptr ? pool->last_evict_seconds() : 0.0;
+        stats->restore_seconds = pool != nullptr ? pool->last_restore_seconds() : 0.0;
         stats->evicted_bytes   = mapped;
         stats->staged_bytes    = staged_bytes;
     }

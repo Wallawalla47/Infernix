@@ -8,7 +8,7 @@ infernix_add_test(infernix_ngram_archive_test SOURCES
 # Fast-path selection rules: where each path applies and which configurations qualify it.
 infernix_add_test(infernix_qwen3_5_fast_paths_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_fast_paths.cpp"
-  LIBRARIES infernix_engine infernix::json)
+  LIBRARIES infernix_engine infernix_model_runtime infernix::json)
 
 # idle-wide-prefill planning rules: the idle width ladder and the flexible-tap step limit.
 infernix_add_test(infernix_qwen3_5_idle_prefill_test
@@ -22,6 +22,11 @@ infernix_add_test(infernix_qwen3_5_tree_width_controller_test SOURCES
 infernix_add_test(infernix_qwen3_5_mtp_draft_policy_test SOURCES
   "${CMAKE_CURRENT_LIST_DIR}/test_mtp_draft_policy.cpp"
   "${PROJECT_SOURCE_DIR}/src/models/qwen3_5/program/speculative/mtp_draft_policy.cpp")
+
+# Confidence-gated MTP extents (host logic only).
+infernix_add_test(infernix_qwen3_5_mtp_confidence_policy_test SOURCES
+  "${CMAKE_CURRENT_LIST_DIR}/test_mtp_confidence_policy.cpp"
+  "${PROJECT_SOURCE_DIR}/src/models/qwen3_5/program/speculative/mtp_confidence_policy.cpp")
 
 # The adaptive-dflash verify-width policy: its width ladders, the rate-maximizing choice against an
 # exhaustive evaluation, row limits, probes and calibration updates.
@@ -83,19 +88,19 @@ infernix_add_test(infernix_qwen3_5_native_transactions_test
 
 infernix_add_test(infernix_qwen3_5_prefix_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_prefix_real.cpp"
-  LIBRARIES infernix_engine)
+  LIBRARIES infernix_engine infernix_model_runtime)
 
 infernix_add_test(infernix_qwen3_5_preemption_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_preemption_real.cpp"
-  LIBRARIES infernix_engine infernix::json)
+  LIBRARIES infernix_engine infernix_model_runtime infernix::json)
 
 infernix_add_test(infernix_qwen3_5_grammar_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_grammar_real.cpp"
-  LIBRARIES infernix_engine infernix::json)
+  LIBRARIES infernix_engine infernix_model_runtime infernix::json)
 
 infernix_add_test(infernix_qwen3_5_tools_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_tools_real.cpp"
-  LIBRARIES infernix_engine infernix::json)
+  LIBRARIES infernix_engine infernix_model_runtime infernix::json)
 
 infernix_add_test(infernix_qwen3_5_hybrid_prefix_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_hybrid_prefix_real.cpp"
@@ -202,7 +207,7 @@ infernix_add_test(infernix_qwen3_5_dflash_prefill_real_test
 
 infernix_add_test(infernix_qwen3_5_moe_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_moe_real.cpp"
-  LIBRARIES infernix_engine)
+  LIBRARIES infernix_engine infernix_model_runtime)
 
 infernix_add_test(infernix_qwen3_5_dflash_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_dflash_real.cpp"
@@ -210,7 +215,7 @@ infernix_add_test(infernix_qwen3_5_dflash_real_test
 
 infernix_add_test(infernix_tool_call_parser_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../../test_tool_call_parser.cpp"
-  LIBRARIES infernix_engine infernix::json)
+  LIBRARIES infernix_engine infernix_model_runtime infernix::json)
 
 infernix_add_test(infernix_qwen3_5_visual_scatter_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_visual_scatter.cpp"

@@ -631,8 +631,9 @@ struct EngineOptions {
     std::uint32_t media_preprocess_threads = 0;
     bool enable_vision                     = false;
     // Vision offload keeps the vision tower in pinned system RAM instead of device memory and
-    // streams it through borrowed device memory per encode window. Auto: on for
-    // Qwen3.8-Flash-Next (its expert cache lends the window's memory), off for Qwen3.5.
+    // streams it through borrowed device memory per encode window. Auto: on with offloaded experts
+    // (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B: the expert cache lends the window's memory), off for
+    // the other Qwen3.5 artifacts.
     VisionOffload vision_offload = VisionOffload::Auto;
     // Upper bound on merged tokens per vision item; zero leaves the compiled limit.
     std::uint32_t vision_max_merged_tokens = 32768;
@@ -1508,7 +1509,8 @@ struct PromptReadout {
     float top_logprob = 0.0F;
 };
 
-// Qwen3.8-Flash-Next: one request's routed-expert lookups and those its VRAM expert cache served.
+// Offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B): one request's routed-expert lookups and
+// those its VRAM expert cache served.
 struct ExpertCacheStats {
     std::uint64_t routed = 0;
     std::uint64_t hits   = 0;
@@ -1541,8 +1543,8 @@ struct GenerationResult {
     SpeculativeStats speculative;
     NgramArchiveStats ngram_archive;
     ThinkingBudgetStats thinking;
-    // Present for models that cache routed experts in VRAM (Qwen3.8-Flash-Next) and requests that
-    // finished normally.
+    // Present for models that cache routed experts in VRAM (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B)
+    // and requests that finished normally.
     std::optional<ExpertCacheStats> expert_cache;
     // Present exactly when the request named readout tokens and its prompt completed.
     std::optional<PromptReadout> readout;
@@ -1595,6 +1597,24 @@ struct ScoreResult {
     std::vector<float> candidate_logprobs;
 };
 
+// Offloaded routed experts (Qwen3.5-122B-A10B): the VRAM expert cache's frames now and at startup,
+// the staging slots misses are copied through, and the host RAM holding expert records (with the SSD
+// tier the rest are read from the artifact on use).
+struct ExpertCacheMemorySummary {
+    std::uint32_t frames         = 0;
+    std::uint32_t startup_frames = 0;
+    std::uint64_t routed_experts = 0; // layers x experts
+    std::uint64_t frame_bytes    = 0; // one frame
+    std::uint64_t staging_bytes  = 0;
+    bool ssd_tier                = false;
+    std::uint64_t host_ram_bytes = 0;
+    // An elastic text KV (it grows from the frames): its backed and total pages and the device bytes
+    // mapped for them now; 0 pages when the KV is a fixed part of the sequence memory.
+    std::uint32_t kv_backed_pages   = 0;
+    std::uint32_t kv_capacity_pages = 0;
+    std::uint64_t kv_backed_bytes   = 0;
+};
+
 struct MemorySummary {
     int device                                = 0;
     std::uint32_t max_context                 = 0;
@@ -1622,6 +1642,8 @@ struct MemorySummary {
     // held (StartupPhase::CudaGraphPrepare reports the preparation itself).
     std::size_t cuda_graph_measured_bytes         = 0;
     std::size_t kv_payload_bytes                  = 0;
+    // With offloaded experts (beside runtime_reservation_bytes, which excludes them).
+    std::optional<ExpertCacheMemorySummary> expert_cache;
 };
 
 // Worker-owned monotonic nanosecond counters. Top-level Host phases are mutually exclusive;

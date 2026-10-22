@@ -15,6 +15,9 @@ struct FrontendResources {
     std::string_view tokenizer_config_json;
     std::string_view chat_template_jinja;
     std::string_view generation_config_json;
+    // Optional: the checkpoint's recommended sampling presets (text resource sampling.json, packed by
+    // the converter from the model card); empty uses the architecture's defaults.
+    std::string_view sampling_json;
     std::string_view preprocessor_config_json;
     std::string_view video_preprocessor_config_json;
     std::shared_ptr<const frontend::Tokenizer> tokenizer;

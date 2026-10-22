@@ -122,6 +122,13 @@ void ProgramImpl::clear_lane(SequenceState& sequence, RequestControl& request) n
     // The caller settles real GPU readers before reaching this destruction boundary.
     const auto lane = sequence.lane;
     hybrid_release_lane(lane);
+    // Offloaded experts: a prompt cleared while it prefilled returns the stream's leases unless
+    // another lane still prefills over them.
+    if (offload && request.lifecycle == Lifecycle::Prefilling && !other_lane_prefilling(lane)) {
+        try {
+            offload->return_stream(device.stream);
+        } catch (...) {}
+    }
     request.prefill.reset();
     release_sequence_kv(sequence);
     release_sequence_state(sequence);
@@ -129,6 +136,13 @@ void ProgramImpl::clear_lane(SequenceState& sequence, RequestControl& request) n
     sequence.lane = lane;
     request       = {};
     invalidate_lane(lane);
+    // Elastic text KV: the pool's free top goes back to the expert frames (elastic_kv.cpp).
+    if (kv_vmm) {
+        kv_busy();
+        try {
+            shrink_kv(false);
+        } catch (...) {}
+    }
 }
 
 void ProgramImpl::clear_execution_failure_lanes(std::span<const std::uint32_t> lanes) noexcept {

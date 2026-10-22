@@ -459,6 +459,7 @@ repository's model card gives its files, requirements, recommended command, qual
 | [Qwen3.8-Flash-Next-FP8-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-FP8-Infernix) | [Qwen/Qwen3.8-Flash-Next-FP8](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8) | Qwen's FP8 checkpoint bit-exact, with Qwen's BF16 n-gram table: the most accurate conversion and the slowest (about 44 tok/s plain), since its 112.6 GiB of experts exceed what a 96 GB machine can pin and the SSD tier reads the rest. |
 | [Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix) | [orcarouter/Qwen3.8-Flash-Next-Uncensored-NVFP4](https://huggingface.co/orcarouter/Qwen3.8-Flash-Next-Uncensored-NVFP4) | An abliterated build whose refusal behaviour has been removed (see its model card). Its weight-only NVFP4 experts and FP8 dense projections are kept bit-exact and run with BF16 activations; the other dense classes are stored in 8 bits as in Dense8. Perplexity 4.772 (Strata's base-model GGUF 4.844, NVIDIA Dense8 4.653: abliteration changes the weights). Needs Infernix `windows-2026.10.09.2` or later. |
 | [Swift-1.5-Qwen3.8-Flash-Next-NVFP4-Dense8-Infernix](https://huggingface.co/Wallawalla47/Swift-1.5-Qwen3.8-Flash-Next-NVFP4-Dense8-Infernix) | [ukisai/Swift-1.5-Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-NVFP4) | UkisAI's fine-tune that thinks with fewer tokens (see its model card), converted like NVIDIA Dense8: experts bit-exact, dense projections in 8 bits. Smoke-tested; its quality and speed are not yet measured. |
+| [Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix) | [nvidia/Qwen3.8-Flash-Next-FP4-Local](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local) | NVIDIA's quantization-aware-distilled FP4 checkpoint, bit-exact: NVFP4 routed experts, MXFP8 dense projections and an NVFP4 n-gram table, which ships with the model as its own volume. Experts run with 16-bit activations as NVIDIA serves them; `--expert-a4-activations` opts into 4-bit activations with NVIDIA's calibrated scales (changes the output). Perplexity 3.4865 against 3.4854 for the FP8 conversion on the quick corpus. **Support is preliminary: optimisation is still in progress.** |
 
 Every Flash-Next conversion can draft with **[Qwen3.8-Flash-Next-DFlash2-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-DFlash2-Infernix)**
 (**recommended**, 776 MB), Inco AI's
@@ -509,10 +510,19 @@ the formats.
 The `neroued` artifacts are NInfer's (Infernix loads `.ninfer` files unchanged); their model cards
 are versioned in [`model-cards/`](model-cards/) beside those of the other repositories.
 
+### Qwen3.5-122B-A10B
+
+A 122B-parameter mixture-of-experts model on one 32 GB GPU: the routed experts (60.75 GiB) live in host
+RAM behind a VRAM expert cache, as for Flash-Next ([guide](docs/qwen3_5-122b.md)). **Support is preliminary: it runs and is verified, but optimisation is still in progress, so expect speeds to change.**
+
+| Repository | Converted from | What it is |
+|---|---|---|
+| **[Ornith-1.5-122B-NVFP4-Infernix](https://huggingface.co/Wallawalla47/Ornith-1.5-122B-NVFP4-Infernix)** | [ornith-ai/Ornith-1.5-122B-NVFP4](https://huggingface.co/ornith-ai/Ornith-1.5-122B-NVFP4) | Every weight the model computes with exactly as the checkpoint stores it (NVFP4 experts, FP8 projections), plus the MTP drafter, the [DFlash2 drafter](https://huggingface.co/incoai/Ornith-1.5-122B-DFlash2) re-quantized, the vision tower, a Q4 proposal head for `--lm-head-draft` and the model card's sampling defaults. About 90-96 tok/s plain decode, 6,500 tok/s prefill at 32K, and MTP with 2 drafts about 5 % faster than plain decode on sampled requests ([performance](docs/qwen3_5-122b.md#performance-rtx-5090-one-request-bf16-kv-default-route)). |
+
 ## Documentation
 
 [CLI](docs/cli.md), [serving](docs/serving.md), [Qwen3.8-Flash-Next](docs/qwen3_8-flash-next.md),
-[perplexity](docs/perplexity.md), [performance](docs/performance.md) and the
+[Qwen3.5-122B-A10B](docs/qwen3_5-122b.md), [perplexity](docs/perplexity.md), [performance](docs/performance.md) and the
 [documentation map](docs/README.md).
 
 ## Contributing

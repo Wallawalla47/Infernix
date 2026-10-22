@@ -31,15 +31,30 @@ struct VisionOverlayWindowStats {
     std::size_t staged_bytes  = 0;
 };
 
+// The device memory an overlay window runs in when the model has no evictable weight tail: an
+// artifact with offloaded experts lends expert frames for it (docs/maintainer/qwen3_5-122b-offload-
+// design.md D8).
+class VisionWindowSource {
+public:
+    virtual ~VisionWindowSource() = default;
+    // `bytes` of device memory; the window's copies are issued on `writer` as well as `compute`.
+    // Throws when they cannot be lent.
+    [[nodiscard]] virtual DeviceSpan lend(std::size_t bytes, cudaStream_t compute, cudaStream_t writer) = 0;
+    // Once the window's work on `compute` has completed.
+    virtual void give_back(cudaStream_t compute) noexcept = 0;
+};
+
 // Encode the vision items a request will consume inside a single overlay window: evict the
-// staging extent from the weight pool tail, stream the vision tower through it, land each
-// item's merged embeddings in pinned host memory, and restore the evicted text weights before
-// returning. `first_item` is an absolute prepared-item index; the returned vector covers
-// every prepared item (null entries for prefix-reused items).
+// staging extent from the weight pool tail (or borrow it from `window`, with offloaded experts),
+// stream the vision tower through it, land each item's merged embeddings in pinned host memory,
+// and restore the evicted text weights (give the memory back) before returning. `first_item` is
+// an absolute prepared-item index; the returned vector covers every prepared item (null entries
+// for prefix-reused items).
 [[nodiscard]] std::vector<PinnedVisionResult>
 encode_items_overlay(DeviceContext& device, const Parameters& parameters,
                      const qwen3_5::PreparedPromptData& prompt, const detail::VisionPrefillPlan& plan,
-                     std::size_t first_item, VisionOverlayWindowStats* stats);
+                     std::size_t first_item, VisionOverlayWindowStats* stats,
+                     VisionWindowSource* window = nullptr);
 
 class VisionPrefillSession;
 

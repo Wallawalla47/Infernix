@@ -11,6 +11,7 @@
 #include "core/tensor.h"
 #include "infernix/types.h"
 #include "models/qwen3_5/config.h"
+#include "models/qwen3_5/execution/offloaded_moe.h"
 #include "models/qwen3_5/execution/parameters.h"
 
 #include <cuda_runtime.h>
@@ -51,10 +52,14 @@ struct LosslessDesign {
     KvCacheStorage kv = KvCacheStorage::BFloat16; // the KV format whose codec K and V cross
 };
 
-// One decoder layer over the call's residual x (BF16 [H, T]), in place; cache null: the window form.
+// One decoder layer over the call's residual x (BF16 [H, T]), in place; cache null: the window form. An
+// offloaded MoE layer (OffloadedMoeParameters) reads its routed and shared experts from `experts` (the
+// Program's), every expert on the GPU through the offloaded op's lossless pass; in a streamed pass
+// (call->streamed) the expert stream's ring holds the layer's missing experts, copied once for the pass.
 void lossless_layer(const BlockParameters& block, const TextConfig& config, MixerKind kind, const Tensor& rope_table,
                     Tensor& x, WorkspaceArena& workspace, cudaStream_t stream, const LosslessCache* cache = nullptr,
-                    const LosslessDesign& design = {});
+                    const LosslessDesign& design = {}, OffloadedExperts* experts = nullptr,
+                    const OffloadedCall* call = nullptr);
 // Its workspace; for the cache form `cache` gives sequences and key_capacity (tokens / sequences the run
 // width).
 [[nodiscard]] std::size_t lossless_layer_workspace_bytes(const BlockParameters& block, const TextConfig& config,

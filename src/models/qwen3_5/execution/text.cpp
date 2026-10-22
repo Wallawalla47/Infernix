@@ -254,6 +254,9 @@ TextContext::TextContext(DeviceContext& ctx, const execution::Parameters& weight
         throw std::invalid_argument("MTP TextContext requires MTP round state");
     }
     set_linear_state_slots(0, 0);
+    // Offloaded experts: decode and verification rounds take their graphed route; a prefill pass sets
+    // its own (set_offloaded_experts).
+    offloaded_experts_ = io_.offloaded_experts;
     embed_      = &parameters_.text.token_embedding;
     final_norm_ = &parameters_.text.final_norm;
     lm_head_    = &parameters_.text.output_head;
@@ -629,23 +632,28 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
     }
 }
 
-void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& proposal_tokens) {
+void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& proposal_tokens,
+                                  Tensor* probabilities) {
     auto proposal_scope = work_.scope();
     const int T         = hidden.ne[1];
     require_tensor_shape(hidden, DType::BF16, {dimension(config_.hidden_size), T},
                          "proposal hidden");
     require_tensor_shape(proposal_tokens, DType::I32, {T}, "proposal tokens");
     require_tensor_window(logits, DType::BF16, dimension(config_.vocab_size), T, "proposal logits");
+    if (probabilities != nullptr) { require_tensor_shape(*probabilities, DType::FP32, {T}, "proposal probabilities"); }
     nvtx::ScopedRange proposal_range(nvtx::Name::MtpProposal, nvtx::Category::Mtp,
                                      static_cast<std::uint64_t>(T));
+    // The drafter's probability of each selected row, over the head's rows (a shortlist head: its
+    // own rows), before the row ids map to token ids.
     if (proposal_head_ != nullptr) {
         Tensor proposal_logits = work_.alloc(DType::BF16, {proposal_head_n_, T});
         project(hidden, *proposal_head_, proposal_logits, work_, ctx_.stream);
-        ops::argmax(proposal_logits, proposal_tokens,
-                    proposal_head_ids_
-                        ? proposal_head_n_
-                        : dimension(parameters_.model.resources().public_token_count),
-                    ctx_.stream);
+        const std::int32_t valid_rows =
+            proposal_head_ids_ ? proposal_head_n_ : dimension(parameters_.model.resources().public_token_count);
+        ops::argmax(proposal_logits, proposal_tokens, valid_rows, ctx_.stream);
+        if (probabilities != nullptr) {
+            ops::argmax_probability(proposal_logits, proposal_tokens, *probabilities, valid_rows, ctx_.stream);
+        }
         if (proposal_head_ids_ != nullptr) {
             ops::proposal_remap_token_ids(proposal_tokens, proposal_head_ids_, proposal_head_n_,
                                           ctx_.stream);
@@ -653,8 +661,11 @@ void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& 
     } else {
         Tensor output_logits = matrix_window(logits, T);
         project(hidden, mtp_->output_head, output_logits, work_, ctx_.stream);
-        ops::argmax(output_logits, proposal_tokens,
-                    dimension(parameters_.model.resources().public_token_count), ctx_.stream);
+        const std::int32_t valid_rows = dimension(parameters_.model.resources().public_token_count);
+        ops::argmax(output_logits, proposal_tokens, valid_rows, ctx_.stream);
+        if (probabilities != nullptr) {
+            ops::argmax_probability(output_logits, proposal_tokens, *probabilities, valid_rows, ctx_.stream);
+        }
     }
 }
 
@@ -926,7 +937,8 @@ void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidd
     mtp_forward_core(ids, hidden, cache_positions, rope_positions, envelope, mtp_hidden, nullptr);
 }
 
-void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens) {
+void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens,
+                                    Tensor* probabilities) {
     const std::int32_t batch = hidden.ne[1];
     require_tensor_shape(hidden, DType::BF16, {dimension(config_.hidden_size), batch},
                          "MTP proposal batch hidden");
@@ -935,7 +947,7 @@ void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor
     require_tensor_shape(draft_tokens, DType::I32, {batch}, "MTP proposal batch tokens");
     ScopedValue<const MtpParameters*> drafter_binding(mtp_, batch_mtp());
     ScopedValue<const LinearParameters*> head_binding(proposal_head_, batch_proposal_head());
-    proposal_argmax(hidden, logits, draft_tokens);
+    proposal_argmax(hidden, logits, draft_tokens, probabilities);
 }
 
 const MtpParameters* TextContext::batch_mtp() const noexcept {
@@ -1208,14 +1220,28 @@ ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {
 }
 
 void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase ph,
-                           const ops::SparseMoeHints& hints) {
+                           const ops::SparseMoeHints& hints, std::size_t layer) {
     Tensor h = workspace::post_mixer_hidden(work_, config_, x.ne[1]);
     ops::rmsnorm(x, weights.post_attention_norm, config_.rms_norm_eps, true, h, ctx_.stream);
     const std::int32_t width = row_width(x.ne[1]);
+    // An offloaded MoE layer: decode and verification rounds (graphed) take the fork and the
+    // landings; a prefill chunk the route the Program chose for it (streamed, split).
+    OffloadedMoeContext offloaded;
+    if (std::holds_alternative<OffloadedMoeParameters>(weights.ffn)) {
+        const TextParameters& text = phase_text(ph, x.ne[1]);
+        offloaded.experts          = offloaded_experts_;
+        offloaded.call             = ph == Phase::Verify ? OffloadedCall{.graphed = true} : offloaded_prefill_;
+        offloaded.next             = layer + 1 < text.layers.size() ? &text.layers[layer + 1] : nullptr;
+        // A verification round's padding past each row's drafts routes no expert.
+        if (ph == Phase::Verify && offloaded_experts_ != nullptr && active_valid_columns_ != nullptr && active_sequence_batch_ != 0 && width > 1) {
+            offloaded.call.mask = {static_cast<const std::int32_t*>(active_valid_columns_->data), width};
+        }
+    }
     ffn(h, weights.ffn, x, hints, work_, ctx_.execution_view(), false,
         wide_residual_verification(ph, width, width), execution_schedule_.linear_routes,
         ph == Phase::Verify && execution_schedule_.batched_columns(x.ne[1]) ? ops::LinearRoutes::WideDownTile
-                                                                             : ops::LinearRoutes::Exact);
+                                                                             : ops::LinearRoutes::Exact,
+        offloaded.experts != nullptr ? &offloaded : nullptr);
 }
 
 template <class Tap>
@@ -1251,7 +1277,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                                                 : nvtx::Name::VerifyPostMixer,
                                         nvtx::Category::PostMixer, layer);
                 auto scope = work_.scope();
-                mlp_tail(block, x, ph, next_projection_hints(static_cast<int>(layer)));
+                mlp_tail(block, x, ph, next_projection_hints(static_cast<int>(layer)), layer);
             }
             if constexpr (Tap::enabled) {
                 tap.capture_layer(static_cast<int>(layer), x, ctx_.stream);
@@ -1289,7 +1315,8 @@ void TextContext::run_lossless_layers(Tensor& x, const Tensor& rope_table, Lossl
         auto scope = work_.scope();
         try {
             lossless_layer(parameters_.text.layers[layer], config_, config_.layer_types[layer], rope_table, x, work_,
-                           s, cache, execution_schedule_.lossless_design);
+                           s, cache, execution_schedule_.lossless_design, offloaded_experts_,
+                           &offloaded_prefill_);
         } catch (const std::exception& error) {
             throw std::runtime_error("text/layers/" + std::to_string(layer) +
                                      " lossless columns=" + std::to_string(x.ne[1]) + ": " + error.what());
@@ -1478,6 +1505,11 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                          ? matrix_window(prefill_hidden_, len)
                          : work_.alloc(DType::BF16, {dimension(config_.hidden_size), len});
                 ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, xf, s);
+            }
+            // Offloaded experts: the pass's routes reach the host for the cache update the Program
+            // applies after the pass's synchronization (ProgramOffload::end_prefill_pass).
+            if (offloaded_experts_ != nullptr && offloaded_experts_->engine != nullptr) {
+                offloaded_experts_->engine->enqueue_route_download(s, len);
             }
 
             if (is_last) {

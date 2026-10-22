@@ -1,3 +1,4 @@
+#include "models/qwen3_5/proposal_head.h"
 #include "infernix/engine.h"
 #include "graph_prepare_probe.h"
 
@@ -20,7 +21,7 @@ infernix::EngineOptions engine_options(const char* artifact) {
     options.kv_cache                  = infernix::KvCacheStorage::Int8Group64;
     options.speculative.backend       = infernix::SpeculativeBackend::Mtp;
     options.speculative.draft_tokens  = 3;
-    options.speculative.proposal_head = infernix::ProposalHead::Optimized;
+    options.speculative.proposal_head = infernix::test::available_proposal_head(artifact);
     options.enable_vision             = true;
     options.use_cuda_graph            = true;
     // The append check resumes from the decode-computed endpoint, which only free-cache-resume
@@ -35,7 +36,7 @@ infernix::EngineOptions maximum_engine_options(const char* artifact) {
     options.kv_capacity               = infernix::KvCapacityPolicy::explicit_capacity(262144);
     options.speculative.backend       = infernix::SpeculativeBackend::Mtp;
     options.speculative.draft_tokens  = 5;
-    options.speculative.proposal_head = infernix::ProposalHead::Optimized;
+    options.speculative.proposal_head = infernix::test::available_proposal_head(artifact);
     return options;
 }
 
@@ -270,6 +271,41 @@ int exercise_maximum_configuration(const char* artifact) {
         std::cerr << "35B maximum configuration did not report its executed workspace phase\n";
         return 1;
     }
+
+    // Offloaded experts (122B-A10B): the text KV is elastic. Its first 32,768 tokens are backed at
+    // startup, so a 40,960-token prompt runs only if the pool grows from the expert frames; run twice
+    // (the second after the first's pages were released), the greedy outputs must agree.
+    if (const auto& cache = memory.expert_cache; cache && cache->kv_capacity_pages != 0) {
+        if (cache->kv_backed_pages != 512 || cache->kv_capacity_pages < 4096 || cache->kv_backed_bytes == 0) {
+            std::cerr << "122B elastic KV did not start at its 32,768-token base: " << cache->kv_backed_pages << " of "
+                      << cache->kv_capacity_pages << " pages backed\n";
+            return 1;
+        }
+        const std::vector<infernix::TokenId> sentence = engine.tokenize_text(
+            "The tide tables of the harbour list every high and low water of the year, and the keeper "
+            "checks them against the marks on the pier each morning. ");
+        std::vector<infernix::TokenId> long_prompt{248045, 846, 198};
+        while (long_prompt.size() < 40960 - 2) {
+            long_prompt.insert(long_prompt.end(), sentence.begin(), sentence.end());
+        }
+        long_prompt.resize(40960 - 2);
+        long_prompt.insert(long_prompt.end(), {248046, 198});
+        const auto run = [&] {
+            return engine.generate(engine.prepare_tokens(long_prompt), greedy_options(4, false)).generated_token_ids;
+        };
+        const std::vector<infernix::TokenId> grown = run();
+        const auto between                          = engine.memory_summary().expert_cache;
+        const std::vector<infernix::TokenId> again = run();
+        const auto final_cache                      = engine.memory_summary().expert_cache;
+        std::cout << "elastic KV: " << between->kv_backed_pages << " pages backed after the first long request, "
+                  << final_cache->kv_backed_pages << " after the second (base 512, capacity "
+                  << final_cache->kv_capacity_pages << "); expert frames " << final_cache->frames << '\n';
+        if (grown.size() != 4 || grown != again || final_cache->kv_backed_pages > final_cache->kv_capacity_pages) {
+            std::cerr << "122B elastic KV: the long prompt's outputs differ between the grown pool and the regrown "
+                         "one, or the summary is inconsistent\n";
+            return 1;
+        }
+    }
     return 0;
 }
 
@@ -282,14 +318,19 @@ int main() {
         return 77;
     }
 
-    {
-        const infernix::test::GraphPrepareProbe graphs;
-        infernix::Engine engine(graphs.attached(engine_options(artifact)));
-        if (const int result = verify_loaded_product(engine, graphs.prepared()); result != 0) { return result; }
-        if (const int result = exercise_text_mtp_and_prefix(engine); result != 0) { return result; }
-        if (const int result = exercise_vision(engine); result != 0) { return result; }
+    try {
+        {
+            const infernix::test::GraphPrepareProbe graphs;
+            infernix::Engine engine(graphs.attached(engine_options(artifact)));
+            if (const int result = verify_loaded_product(engine, graphs.prepared()); result != 0) { return result; }
+            if (const int result = exercise_text_mtp_and_prefix(engine); result != 0) { return result; }
+            if (const int result = exercise_vision(engine); result != 0) { return result; }
+        }
+        if (const int result = exercise_maximum_configuration(artifact); result != 0) { return result; }
+    } catch (const std::exception& error) {
+        std::cerr << "real MoE Engine test failed: " << error.what() << '\n';
+        return 1;
     }
-    if (const int result = exercise_maximum_configuration(artifact); result != 0) { return result; }
     std::cout << "ok\n";
     return 0;
 }

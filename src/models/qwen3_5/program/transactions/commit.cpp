@@ -301,8 +301,26 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
                     mark_workspace_usage(workspace_plan.dflash_context);
                 }
                 timing.pause();
-                const execution::PrefillChunkResult result = execution::prefill_text_chunk(
-                    schedule_state, sequence.ledger, count, std::nullopt, false);
+                // Offloaded experts: a forced pass promotes at the decode rate (ProgramOffload::end_pass).
+                execution::OffloadedCall offload_call;
+                if (offload) {
+                    offload_call = offload->begin_pass(device.stream, static_cast<std::int32_t>(count));
+                    schedule_state.offloaded_call = offload_call;
+                }
+                execution::PrefillChunkResult result;
+                try {
+                    result = execution::prefill_text_chunk(schedule_state, sequence.ledger, count, std::nullopt,
+                                                           false);
+                } catch (...) {
+                    if (offload) { offload->abandon_pass(offload_call); }
+                    throw;
+                }
+                if (offload) {
+                    offload->end_pass(device.stream, offload_call, ProgramOffload::PassKind::Forced, lane,
+                                      static_cast<std::int32_t>(result.processed_tokens), cursor, false,
+                                      parameters.model.info().name);
+                    if (!other_lane_prefilling(lane)) { offload->return_stream(device.stream); }
+                }
                 timing.include(result.timing);
                 timing.resume_submit();
                 if (result.finalized || result.processed_tokens == 0 ||
@@ -513,6 +531,16 @@ FinishResult ProgramImpl::finish(SequenceHandle handle) noexcept {
     out.timings           = request.timings;
     out.speculative       = std::move(request.speculative_stats);
     out.constrained_draws = std::move(request.constraint_trace);
+    if (offload) {
+        const auto& s = offload->engine().residency().stats();
+        const auto& a = request.cache_at_admission;
+        out.expert_cache = ExpertCacheStats{.routed        = s.routed - a.routed,
+                                            .hits          = s.hits - a.hits,
+                                            .decode_routed = s.decode_routed - a.decode_routed,
+                                            .decode_hits   = s.decode_hits - a.decode_hits};
+        offload->engine().report_request(a, request.cpu_served_at_admission,
+                                         request.tier_at_admission ? &*request.tier_at_admission : nullptr);
+    }
     try {
         device.synchronize();
         // The prefix cache retains the finished context: its blocks and an endpoint snapshot.
@@ -551,6 +579,15 @@ bool ProgramImpl::recover_after_failure() noexcept {
         device.synchronize();
     } catch (...) { return false; }
     abort_context();
+    // Offloaded experts: a round that failed an expert read left undefined outputs, which prefix
+    // entries it published may hold.
+    if (offload) {
+        offload->drop_round();
+        if (offload->engine().take_failed_round() && hybrid_) {
+            if (device.transfer_stream != nullptr) { (void)cudaStreamSynchronize(device.transfer_stream); }
+            hybrid_->clear();
+        }
+    }
     for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
         if (requests[lane].lifecycle == Lifecycle::Empty) { continue; }
         hybrid_finish_lane(sequences[lane], endpoint_consistent(requests[lane], sequences[lane]));
@@ -569,6 +606,12 @@ void ProgramImpl::fail_all_cleanup() noexcept {
         if (requests[lane].lifecycle != Lifecycle::Empty) {
             clear_lane(sequences[lane], requests[lane]);
         }
+    }
+    if (offload) {
+        offload->drop_round();
+        try {
+            offload->return_stream(device.stream);
+        } catch (...) {}
     }
     if (hybrid_) {
         if (device.transfer_stream != nullptr) {
@@ -595,5 +638,9 @@ void ProgramImpl::shutdown_cleanup() noexcept {
         save_hybrid_cache_for_shutdown();
     }
     fail_all_cleanup();
+    if (offload) {
+        offload->engine().report_layers();
+        offload->engine().save_state();
+    }
 }
 } // namespace infernix::models::qwen3_5::detail

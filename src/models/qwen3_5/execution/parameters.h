@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/arena.h"
 #include "models/qwen3_5/model.h"
 #include "infernix/ops/rope.h"
 #include "infernix/ops/weight_input.h"
@@ -21,7 +22,7 @@ using LinearParameters = ops::SingleProjectionWeight;
                                                                   bool wide_verification) {
     // Keep the neural path's residual activation precision in wide copy verification. A
     // column-invariant projection already runs 16-bit activations at every width.
-    return wide_verification && p.weight.qtype == QType::FP8_E4M3FN_ROW_BF16 &&
+    return wide_verification && is_fp8_row(p.weight.qtype) &&
                    !ops::column_invariant(p.policy)
                ? ops::LinearPolicy::A16Only
                : p.policy;
@@ -47,7 +48,26 @@ struct DenseParameters {
     LinearParameters down;
 };
 
-using FfnParameters = std::variant<DenseParameters, ops::SparseMoeWeights>;
+// An offloaded MoE layer (weights.h OffloadedMoeWeights; ops/offloaded_sparse_moe.h): the router
+// rows and the shared-expert gate row as BF16 [H, E] and [H, 1] tensors (projection_fp32's form),
+// the Model's routed bank (pinned host memory) and its shared expert's bank (device memory), and the
+// layer's index in the expert cache. The Program supplies each call's mutable expert source (VRAM
+// frames, staging slots, CPU channel). Every expert route is exact W4A16 at every width, so the
+// layer has no compute policy and is column-invariant as it is.
+struct OffloadedMoeParameters {
+    Tensor router, shared_score;
+    const runtime::expert_offload::ExpertBank* bank        = nullptr;
+    const runtime::expert_offload::ExpertBank* shared_bank = nullptr;
+    // Device [experts + 1]: the routed experts' multipliers, then the shared expert's (the call's
+    // last job, MoeExpertSource::scales). Every route reads these (the lossless one too: W4A16
+    // banks store no input scales).
+    const ops::offloaded_moe::ExpertScales* device_scales = nullptr;
+    std::uint32_t layer   = 0;
+    std::uint32_t experts = 0;
+    std::uint32_t top_k   = 0;
+};
+
+using FfnParameters = std::variant<DenseParameters, ops::SparseMoeWeights, OffloadedMoeParameters>;
 
 struct AttentionParameters {
     ops::ProjectionWeights projection;
@@ -204,6 +224,9 @@ public:
     Parameters& operator=(Parameters&&)      = delete;
 
     const Model& model;
+    // With offloaded experts: every offloaded layer's device scales, [layers][experts + 1]
+    // (OffloadedMoeParameters::device_scales points into it).
+    DeviceBuffer expert_scales;
     TextParameters text;
     // `text` under LinearPolicy::A16ColumnInvariant, which the exact route's decode and
     // verification run (every artifact), and its projections that run column by column.

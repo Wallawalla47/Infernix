@@ -1,3 +1,4 @@
+#include "models/qwen3_5/proposal_head.h"
 #include "infernix/engine.h"
 #include <nlohmann/json.hpp>
 
@@ -103,7 +104,7 @@ infernix::EngineOptions engine_options(const std::filesystem::path& artifact,
     options.speculative.backend  = selected;
     if (selected != infernix::SpeculativeBackend::None) {
         options.speculative.draft_tokens  = 3;
-        options.speculative.proposal_head = infernix::ProposalHead::Optimized;
+        options.speculative.proposal_head = infernix::test::available_proposal_head(artifact);
     }
     // History is deliberately disabled: the cases exercise only the requests' own recovery. With
     // the cache that recovery resumes from a snapshot of the request's own prompt: a 64-token

@@ -27,6 +27,7 @@ struct WeightUse {
     std::string input;
     ops::LinearPolicy policy = ops::LinearPolicy::A16Only;
     std::optional<float> activation_input_divisor;
+    std::optional<float> activation_input_scale;
 };
 
 struct BoundWeight {
@@ -57,10 +58,20 @@ struct MoeWeights {
     DenseWeights shared;
 };
 
+// Routed experts held in pinned host memory as one exact bank per layer (nvfp4_expert_rg16_v1
+// [E, H, I], W4A16) and served through the expert cache (docs/maintainer/qwen3_5-122b-offload-
+// design.md), and the NVFP4 shared expert as a one-record bank in device memory. The artifact
+// decides the form: a block whose `moe/experts` parameter is a bank binds this one.
+struct OffloadedMoeWeights {
+    WeightId router, shared_score;
+    WeightId experts;       // host-pinned bank [E, H, I]
+    WeightId shared_expert; // device bank [1, H, I_shared]
+};
+
 struct BlockWeights {
     WeightId input_norm, post_attention_norm;
     std::variant<AttentionWeights, GdnWeights> mixer;
-    std::variant<DenseWeights, MoeWeights> ffn;
+    std::variant<DenseWeights, MoeWeights, OffloadedMoeWeights> ffn;
 };
 
 struct TextWeights {
