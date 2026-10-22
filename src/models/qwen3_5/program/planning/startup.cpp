@@ -1365,10 +1365,6 @@ ExecutionSchedule execution_schedule(const execution::Parameters& parameters,
             throw std::invalid_argument("Qwen3.5 lossless generation takes text requests with bf16 KV and no "
                                         "speculation");
         }
-        if (options.reference && options.kv_cache != KvCacheStorage::BFloat16) {
-            throw std::invalid_argument("the Qwen3.5 design reference scores with bf16 KV (its other KV codecs are "
-                                        "not implemented yet)");
-        }
     }
     // The exact route is request-invariant (docs/maintainer/model-quality.md, 6.1); each request-coupling
     // fast path gives up one part of it, and each part holds whenever its coupling path is not selected.

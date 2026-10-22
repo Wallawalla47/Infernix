@@ -89,10 +89,6 @@ void validate(const EngineOptions& options) {
             (options.kv_cache != KvCacheStorage::BFloat16 || options.expert_tail_skip != 0)) {
             throw std::invalid_argument("lossless generation takes bf16 KV and no --expert-tail-skip");
         }
-        if (options.reference && options.kv_cache != KvCacheStorage::BFloat16) {
-            throw std::invalid_argument("the Qwen3.8-Flash-Next design reference scores with bf16 KV (its other KV "
-                                        "codecs are not implemented yet)");
-        }
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("Engine max_concurrency must be in [1,8]");

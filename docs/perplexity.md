@@ -33,8 +33,8 @@ activations, moved 15 times less (KL 0.0021). So treat a perplexity difference u
 between two NVFP4 builds or settings as noise unless it holds at several chunk sizes.
 `--reference` runs the design reference, the quality gate's base arm: the lossless route with the
 configuration's declared lossy steps applied exactly (the activation quantization the artifact permits,
-FP4-Local's 4-bit experts with `--expert-a4-activations`, and the `--kv-dtype` codec: `bf16`, V stored as
-FP16, while the other codecs are built); it implies `--lossless`, and `report.json` records it as
+FP4-Local's 4-bit experts with `--expert-a4-activations`, and the `--kv-dtype` codec: `bf16` stores V as
+FP16, every other format its production codes, read exactly); it implies `--lossless`, and `report.json` records it as
 `execution.reference` ([definition](maintainer/lossless-route.md#3b-the-design-reference---reference)).
 `--lossless` (Qwen3.5/3.6/3.8 and Qwen3.8-Flash-Next) runs the lossless route, the quality
 reference's: every operation of the model's Hugging Face forward pass correctly rounded, so a score

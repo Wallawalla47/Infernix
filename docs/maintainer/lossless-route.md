@@ -307,11 +307,17 @@ keys, which no KV format changes.
 
 **Scope.** Every artifact and KV format of the reproducible route, in CausalScoring and in the forced
 decode tool's observed runs (`infernix_decode_quality_forced --reference --observe`, one scoring pass per
-segment); generation is not a use of the route. Status (2026-10-22): the activation steps and `bf16` KV
-(V as FP16, `lossless_round_fp16`) are built; the other codecs need an attention over the stored codes
-(their decoded values are rotated and wider than BF16) and are next, so the route refuses them until then. On a 16-bit artifact with `bf16` KV
-the design reference differs from `--lossless` only by V's FP16 storage. Its bits are a function of the
-request, the artifact and the declared steps, so a reference survives rebuilds like `--lossless`'s.
+segment); generation is not a use of the route. `bf16` KV rounds V to FP16 (`lossless_round_fp16`); every
+other format stores the window's K and V through the production `kv_cache_append` (`lossless_kv_encode`: an
+identity block table, so the planes hold production's bytes; the VQ formats' window rows for every key by the
+append's own window-copy steps) and `lossless_codec_attention` reads them: a pack kernel decodes each row
+exactly (codes times scales; for a rotated plane the exact H_256 / 16 in 128-bit integers) onto
+`lossless_attention`'s grid integers (int32, one exponent per row), and the attention's scores, exponentials,
+sums and rounding are `lossless_attention`'s own; a query against a row whose exact value needs more than
+29 bits (only rows whose scales span more than about five binades), and every query the error interval leaves
+undecided, takes an exact fallback that decodes each key row once. On a 16-bit artifact with `bf16` KV the
+design reference differs from `--lossless` only by V's FP16 storage. Its bits are a function of the request,
+the artifact and the declared steps, so a reference survives rebuilds like `--lossless`'s.
 
 ## 4. Qualification
 

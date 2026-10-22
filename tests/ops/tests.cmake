@@ -90,6 +90,10 @@ infernix_op_oracle_options(infernix_lossless_ops_test)
 add_test(NAME infernix_lossless_ops_test
   COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_LIST_DIR}/lossless_ops_oracle.py
           $<TARGET_FILE:infernix_lossless_ops_test>)
+# The design reference's KV storage: the production append's planes and window rows, byte for byte.
+infernix_add_op_test(infernix_lossless_kv_encode_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_lossless_kv_encode.cu"
+  LIBRARIES infernix_ops)
 infernix_add_op_test(infernix_linear_topk_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_linear_topk.cu"
   LIBRARIES infernix_ops)

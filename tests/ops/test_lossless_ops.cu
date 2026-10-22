@@ -60,7 +60,55 @@ const char* kNames[] = {"rmsnorm",       "rmsnorm_gated", "add",          "silu_
                          "moe_combine_entries", "conv_slots", "delta_rule_slots", "attention_paged",
                          "ple_conv_slots", "qsa_cache", "qsa_select_positions", "attention_paged_select",
                          "quantize_nvfp4", "quantize_nvfp4_scaled", "quantize_fp8_token", "round_fp16",
-                         "quantize_fp8_static"};
+                         "quantize_fp8_static", "codec_attention"};
+
+// One codec plane of the oracle's rows (key j, KV head h at j Hkv + h; per row its code units and scale units,
+// each one u32) packed into lossless_codec_attention's page order: per row the code bytes (VQ2: 16-bit words)
+// and the scale bytes (FP16, or NVFP4's E4M3 bytes).
+struct PackedPlane {
+    DeviceBuffer codes, scales;
+};
+
+PackedPlane pack_plane(int codec, const std::vector<std::uint32_t>& codes, const std::vector<std::uint32_t>& scales,
+                       int kv_heads, int cols) {
+    const auto c = static_cast<ops::LosslessKvCodec>(codec);
+    const int code_units  = c == ops::LosslessKvCodec::Int8G64 || c == ops::LosslessKvCodec::Fp8Row ? 256
+                            : c == ops::LosslessKvCodec::Vq2                                     ? 32
+                                                                                                 : 128;
+    const int code_bytes  = c == ops::LosslessKvCodec::Vq2 ? 64 : code_units;
+    const int scale_units = c == ops::LosslessKvCodec::Int8G64 ? 4 : (c == ops::LosslessKvCodec::Nvfp4G16 ? 16 : 1);
+    const int scale_bytes = c == ops::LosslessKvCodec::Nvfp4G16 ? 16 : 2 * scale_units;
+    const std::size_t rows = static_cast<std::size_t>((cols + 63) / 64) * 64 * kv_heads;
+    std::vector<std::uint8_t> hc(rows * code_bytes, 0), hs(rows * scale_bytes, 0);
+    for (int j = 0; j < cols; ++j) {
+        for (int h = 0; h < kv_heads; ++h) {
+            const std::size_t src = static_cast<std::size_t>(j) * kv_heads + h;
+            const std::size_t dst = (static_cast<std::size_t>(j / 64) * kv_heads + h) * 64 + j % 64;
+            for (int u = 0; u < code_units; ++u) {
+                const std::uint32_t value = codes[src * code_units + u];
+                if (c == ops::LosslessKvCodec::Vq2) {
+                    hc[dst * code_bytes + 2 * u]     = static_cast<std::uint8_t>(value);
+                    hc[dst * code_bytes + 2 * u + 1] = static_cast<std::uint8_t>(value >> 8);
+                } else {
+                    hc[dst * code_bytes + u] = static_cast<std::uint8_t>(value);
+                }
+            }
+            for (int u = 0; u < scale_units; ++u) {
+                const std::uint32_t value = scales[src * scale_units + u];
+                if (c == ops::LosslessKvCodec::Nvfp4G16) {
+                    hs[dst * scale_bytes + u] = static_cast<std::uint8_t>(value);
+                } else {
+                    hs[dst * scale_bytes + 2 * u]     = static_cast<std::uint8_t>(value);
+                    hs[dst * scale_bytes + 2 * u + 1] = static_cast<std::uint8_t>(value >> 8);
+                }
+            }
+        }
+    }
+    PackedPlane p{DeviceBuffer(hc.size()), DeviceBuffer(hs.size())};
+    p.codes.copy_from_host(hc.data(), hc.size());
+    p.scales.copy_from_host(hs.data(), hs.size());
+    return p;
+}
 
 } // namespace
 
@@ -626,6 +674,42 @@ int main(int argc, char** argv) {
             got = download16(out, static_cast<std::size_t>(k) * cols);
             const auto s = download32(scales, static_cast<std::size_t>(cols));
             got.insert(got.end(), s.begin(), s.end());
+            break;
+        }
+        case 37: { // lossless_codec_attention: dims (K codec, K rotated, V codec, V rotated, window, Hq, Hkv, T,
+                   // sinks, recent, ratio); q, K codes, K scales, V codes, V scales[, the window's four][, select]
+            const int kc = static_cast<int>(dims[0]), vc = static_cast<int>(dims[2]);
+            const bool window = dims[4] != 0;
+            const int heads = static_cast<int>(dims[5]), kv_heads = static_cast<int>(dims[6]), cols = static_cast<int>(dims[7]);
+            const int ratio = static_cast<int>(dims[10]);
+            DeviceBuffer q = upload16(inputs[0]), out(static_cast<std::size_t>(256) * heads * cols * 2);
+            PackedPlane k = pack_plane(kc, inputs[1], inputs[2], kv_heads, cols);
+            PackedPlane v = pack_plane(vc, inputs[3], inputs[4], kv_heads, cols);
+            ops::LosslessKvCodes kv{};
+            kv.k = {static_cast<ops::LosslessKvCodec>(kc), dims[1] != 0, static_cast<const std::uint8_t*>(k.codes.p),
+                    static_cast<const std::uint8_t*>(k.scales.p)};
+            kv.v = {static_cast<ops::LosslessKvCodec>(vc), dims[3] != 0, static_cast<const std::uint8_t*>(v.codes.p),
+                    static_cast<const std::uint8_t*>(v.scales.p)};
+            const int int8 = static_cast<int>(ops::LosslessKvCodec::Int8G64);
+            PackedPlane wk{DeviceBuffer(1), DeviceBuffer(1)}, wv{DeviceBuffer(1), DeviceBuffer(1)};
+            if (window) {
+                wk = pack_plane(int8, inputs[5], inputs[6], kv_heads, cols);
+                wv = pack_plane(int8, inputs[7], inputs[8], kv_heads, cols);
+                kv.window_k = {ops::LosslessKvCodec::Int8G64, true, static_cast<const std::uint8_t*>(wk.codes.p),
+                               static_cast<const std::uint8_t*>(wk.scales.p)};
+                kv.window_v = {ops::LosslessKvCodec::Int8G64, true, static_cast<const std::uint8_t*>(wv.codes.p),
+                               static_cast<const std::uint8_t*>(wv.scales.p)};
+                kv.window_sinks  = static_cast<int>(dims[8]);
+                kv.window_recent = static_cast<int>(dims[9]);
+            }
+            DeviceBuffer sel = ratio > 0 ? upload32(inputs.back()) : DeviceBuffer(4);
+            DeviceBuffer ws(ops::lossless_codec_attention_workspace_bytes(heads, kv_heads, cols));
+            Tensor tq(q.p, DType::BF16, {256, heads, cols}), tout(out.p, DType::BF16, {256, heads, cols});
+            ops::lossless_codec_attention(tq, kv, kv_heads, tout, ws.p, nullptr,
+                                          ratio > 0 ? static_cast<const std::uint32_t*>(sel.p) : nullptr, ratio > 0 ? 1 : 0,
+                                          ratio);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            got = download16(out, static_cast<std::size_t>(256) * heads * cols);
             break;
         }
         default: std::cerr << "FAIL unknown op " << op << "\n"; return 1;

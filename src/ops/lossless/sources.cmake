@@ -9,3 +9,4 @@ target_sources(infernix_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/lossless_rope.cu"
 target_sources(infernix_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/lossless_moe.cu")
 target_sources(infernix_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/lossless_flash.cu")
 target_sources(infernix_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/lossless_quantize.cu")
+target_sources(infernix_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/lossless_kv_encode.cu")

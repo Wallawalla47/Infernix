@@ -166,8 +166,9 @@ struct TextConfig {
     // per call, every operation correctly rounded (Forward's lossless_* steps).
     bool lossless = false;
     // The design reference (LoadOptions::reference, with lossless; lossless-route.md §3b): the lossless window
-    // with a W4A4 bank's declared expert activations and the KV format's codec.
-    bool design_reference = false;
+    // with a W4A4 bank's declared expert activations and the KV format's codec (design_kv).
+    bool design_reference   = false;
+    KvCacheStorage design_kv = KvCacheStorage::BFloat16;
     // The routed experts run exact A16 arithmetic over their records' own block scales: a GGUF
     // import's ggml banks or Qwen's block-FP8 banks (fp8_expert_b128_v1). Set by the loader.
     bool exact_experts = false;

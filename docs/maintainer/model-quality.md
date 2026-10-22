@@ -593,7 +593,7 @@ joint gates; this arm decides only what preemption adds.
   chunk sizes alone move the 4-bit noise by KL 0.025-0.033, about twice each run's distance from the
   16-bit reference, so any implementation differs from one exact draw of it by about that much
   however precise it is; the 16-bit reference is the stable centre of that noise. The design reference
-  takes `--kv-dtype bf16` (V stored as FP16) while its other codecs are built. The gates keep 6.3's
+  takes every `--kv-dtype` (`bf16` stores V as FP16; the others their production codes, read exactly). The gates keep 6.3's
   budgets as excess over the reproducible route (owner, 2026-10-22: no reproducible route fails by
   default); every gate also records the processing cost of both of its routes against the design
   reference, and every run keeps its per-window and per-position data against `--lossless`, so other

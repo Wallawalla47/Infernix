@@ -20,8 +20,10 @@ struct LoadOptions {
     // route.
     bool lossless = false;
     // The design reference (EngineOptions::reference, with lossless): every Use keeps its declared
-    // activation permission, which the lossless route applies as the design (lossless-route.md §3b).
-    bool reference = false;
+    // activation permission, which the lossless route applies as the design (lossless-route.md §3b), and
+    // K and V cross the KV format reference_kv's codec (bf16 without the reference).
+    bool reference              = false;
+    KvCacheStorage reference_kv = KvCacheStorage::BFloat16;
     // Qwen4Exp: routed expert banks whose 4-bit activations are optional run them (W4A4).
     bool expert_a4_activations = false;
     // Offloaded routed expert banks (Qwen4Exp, Qwen3.5 with offloaded experts) stay in the artifact
@@ -91,6 +93,7 @@ struct LoadOptions {
             .rope_yarn_factor         = options.rope_yarn_factor,
             .lossless                 = options.lossless,
             .reference                = options.reference,
+            .reference_kv             = options.reference ? options.kv_cache : KvCacheStorage::BFloat16,
             .expert_a4_activations    = options.expert_a4_activations,
             .draft_model              = options.speculative.draft_model};
 }

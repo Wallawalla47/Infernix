@@ -297,6 +297,7 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
         }
         out.text.lossless         = options.lossless;
         out.text.design_reference = options.lossless && options.reference;
+        out.text.design_kv        = out.text.design_reference ? options.reference_kv : KvCacheStorage::BFloat16;
         out.text.moe.a16_experts = out.text.moe.a4_optional ? !options.expert_a4_activations : !scales;
         if (options.rope_yarn_factor > 1.0F && out.text.rope.theta <= 1.0F) {
             throw ArtifactError("YaRN needs a RoPE theta above 1");

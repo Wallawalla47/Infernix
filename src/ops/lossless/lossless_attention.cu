@@ -1,6 +1,8 @@
 #include "infernix/ops/lossless_ops.h"
 
 #include "core/device.h"
+#include "ops/kv_cache/q4_lloyd_codec.cuh"
+#include "ops/kv_cache/vq2_codec.cuh"
 #include "ops/lossless/cr_math.cuh"
 #include "ops/lossless/wide.cuh"
 
@@ -100,6 +102,15 @@ struct PartialSum { // one key range's sums of a query row
 
 constexpr int kHave = 1, kNan = 2, kFail = 4;
 
+// One plane of the design reference's stored KV rows (lossless_codec_attention, LosslessKvPlane): row r's
+// codes at codes + r code_bytes(codec) and scales at scales + r scale_bytes(codec).
+struct CodecPlane {
+    const std::uint8_t* codes;
+    const std::uint8_t* scales;
+    int codec; // LosslessKvCodec
+    int rotated;
+};
+
 struct Args {
     const std::uint16_t* q;   // [256, heads, columns]
     std::uint16_t* out;       // [256, heads, columns]
@@ -134,9 +145,37 @@ struct Args {
     const std::uint8_t* koff;   // [rows] an element off its block's grid
     const std::int16_t* vpack;  // [rows][256] the value grid integers, packed alike
     const std::uint32_t* vround; // [rows][8] elements rounded to their channel's grid
+    // The design reference's codec rows (lossless_codec_attention; kpack32 null: BF16 rows). Representation
+    // rep 0 is the code planes, rep 1 the VQ formats' window rows (reps 2); a (rep, key, KV head) row is
+    // rep codec_rows(columns, kv_heads) + codec_row(j, kvh). Its grid integers (int32, below 2^29) in kpack32 and vpack32,
+    // its block exponents (the row's one exponent four times) in kblk, its off-grid flag in koff, its
+    // rounded value elements in vround; kmax per (rep, key, KV head).
+    const std::int32_t* kpack32;
+    const std::int32_t* vpack32;
+    CodecPlane kplane[2];
+    CodecPlane vplane[2];
+    int reps;
+    int window_sinks;
+    int window_recent;
 };
 
 __device__ __forceinline__ int position(const Args& a, int c) { return a.positions != nullptr ? a.positions[c] : c; }
+
+// A codec plane's row of key j and KV head h: the production page order (64-key pages, heads within a page),
+// as lossless_kv_encode stores the rows through an identity block table; a representation holds
+// codec_rows(columns, kv_heads) rows (whole pages).
+__host__ __device__ __forceinline__ std::size_t codec_row(int kv_heads, int j, int kvh) {
+    return (static_cast<std::size_t>(j / kPage) * kv_heads + kvh) * kPage + j % kPage;
+}
+__host__ __device__ __forceinline__ std::size_t codec_rows(int columns, int kv_heads) {
+    return static_cast<std::size_t>((columns + kPage - 1) / kPage) * kPage * kv_heads;
+}
+
+// The representation the pair (query column c, key j) reads: 0 its code rows, 1 its window rows (a VQ format's
+// exact window: j < window_sinks or j >= the query's position - window_recent).
+__device__ __forceinline__ int pair_rep(const Args& a, int c, int j) {
+    return a.reps == 2 && (j < a.window_sinks || j >= position(a, c) - a.window_recent) ? 1 : 0;
+}
 
 // The last key of sequence b: its last column's position.
 __device__ __forceinline__ int last_position(const Args& a, int b) { return position(a, b * a.width + a.width - 1); }
@@ -479,11 +518,36 @@ __device__ Score exact_pair_score(const Args& a, int b, int c, int h, int kvh, i
     return {acc, qmax + kmax - kScoreShift - 64};
 }
 
+// The exact score of a pair whose query row has an element off its grid, against an on-grid codec row (its
+// grid integers are exact: k_d = X_d 2^(kmax - 155), a BF16-like element of significand X_d, below 2^29, and
+// field kmax - 21).
+__device__ Score codec_pair_score(const Args& a, int c, int h, int kvh, int j, int qmax, int kmax, bool& dropped) {
+    const std::uint16_t* qr = a.q + (static_cast<std::size_t>(c) * a.heads + h) * kDim;
+    const std::size_t row   = static_cast<std::size_t>(pair_rep(a, c, j)) * codec_rows(a.columns, a.kv_heads) +
+                            codec_row(a.kv_heads, j, kvh);
+    const std::int32_t* kr = a.kpack32 + row * kDim;
+    I128 acc{0ULL, 0LL};
+    for (int d = 0; d < kDim; ++d) {
+        int mq, eq;
+        bf16_parts(qr[d], mq, eq);
+        if (mq == 0 || kr[d] == 0) { continue; }
+        add_shifted(acc, static_cast<long long>(mq) * kr[d], 64 + (eq - qmax), dropped);
+    }
+    return {acc, qmax + (kmax - 21) - kScoreShift - 64};
+}
+
 // The score of query row i and key row jj: per 64-block, the grid integers' products summed exactly in
 // int64 halves, placed at the block's exponents relative to the rows' largest.
 __device__ __forceinline__ Score tile_score(const Shared& sh, const Args& a, int seq, int c, int h, int kvh, int j0,
                                             int i, int jj, bool& dropped) {
     if (sh.qoff[i] != 0 || sh.koff[jj] != 0) {
+        if (a.kpack32 != nullptr) {
+            if (sh.koff[jj] != 0) { // a codec row off its grid: the pair's query takes the exact fallback
+                dropped = true;
+                return {I128{0ULL, 0LL}, 0};
+            }
+            return codec_pair_score(a, c, h, kvh, j0 + jj, sh.qmax[i], sh.kmax[jj], dropped);
+        }
         return exact_pair_score(a, seq, c, h, kvh, j0 + jj, sh.qmax[i], sh.kmax[jj], dropped);
     }
     I128 acc{0ULL, 0LL};
@@ -588,7 +652,38 @@ __global__ __launch_bounds__(kThreads) void attention_kernel(const Args args) {
     const int key_begin = split * args.split_keys;
     const int key_end   = min(key_begin + args.split_keys, last_key + 1);
     bool nan = active && sh.qbad[i] != 0;
-    auto load_keys = [&](int j0, bool values) {
+    auto load_keys = [&](int j0, bool values, int rep) {
+        if (args.kpack32 != nullptr) {
+            // Codec rows (representation rep), packed once per call (codec_pack_kernel): copied.
+            const std::size_t base = static_cast<std::size_t>(rep) * codec_rows(args.columns, args.kv_heads);
+            for (int r = tid; r < kKeys; r += kThreads) {
+                const int j = j0 + r;
+                sh.kmax[r]  = j < key_end ? args.kmax[(static_cast<std::size_t>(rep) * args.key_capacity + j) * args.kv_heads + kvh] : 1;
+                sh.koff[r]  = j < key_end && args.koff[base + codec_row(args.kv_heads, j, kvh)] != 0 ? 1 : 0;
+            }
+            __syncthreads();
+            for (int idx = tid; idx < kKeys * kDim; idx += kThreads) {
+                const int r = idx / kDim, d = idx % kDim, j = j0 + r;
+                const bool ok         = j < key_end && sh.kmax[r] != kNonFinite;
+                const std::size_t row = ok ? base + codec_row(args.kv_heads, j, kvh) : 0;
+                sh.xk[r][d]           = ok ? args.kpack32[row * kDim + d] : 0;
+                if (values) {
+                    int x = 0;
+                    if (ok) {
+                        x = args.vpack32[row * kDim + d];
+                        if (((args.vround[row * (kDim / 32) + d / 32] >> (d % 32)) & 1U) != 0) { sh.vinexact[d] = 1; }
+                    }
+                    sh.vg[r][d] = x;
+                }
+            }
+            for (int idx = tid; idx < kKeys * kBlocks; idx += kThreads) {
+                const int r = idx / kBlocks, blk = idx % kBlocks, j = j0 + r;
+                const bool ok = j < key_end && sh.kmax[r] != kNonFinite;
+                sh.kb[r][blk] = ok ? args.kblk[(base + codec_row(args.kv_heads, j, kvh)) * kBlocks + blk] : 1;
+            }
+            __syncthreads();
+            return;
+        }
         for (int r = tid; r < kKeys; r += kThreads) {
             const int j = j0 + r;
             sh.kmax[r]  = j < key_end ? args.kmax[(static_cast<std::size_t>(b) * args.key_capacity + j) * args.kv_heads + kvh] : 1;
@@ -643,32 +738,40 @@ __global__ __launch_bounds__(kThreads) void attention_kernel(const Args args) {
 
     Score best{{0ULL, 0LL}, 0};
     bool have = false, fail = false;
+    // Codec rows with a window read each tile in up to two representations (a pair reads one of them); a
+    // representation no pair of the tile reads is skipped.
+    const int reps = args.reps > 1 ? 2 : 1;
+    auto pair_wanted = [&](int j0, int half, int rep) {
+        const int j = j0 + sub + 16 * half;
+        return active && j < key_end && visible(args, c, j) && pair_rep(args, c, j) == rep;
+    };
     if constexpr (M != kSums) {
         // Pass A: each query's exact maximum (each thread: keys sub and sub + 16 of every tile).
         for (int j0 = key_begin; j0 < key_end; j0 += kKeys) {
-            load_keys(j0, false);
-            if (active) {
-                bool want[2];
+            for (int rep = 0; rep < reps; ++rep) {
+                bool want[2] = {pair_wanted(j0, 0, rep), pair_wanted(j0, 1, rep)};
+                if (reps > 1 && __syncthreads_or(want[0] || want[1] ? 1 : 0) == 0) { continue; }
+                load_keys(j0, false, rep);
+                if (active) {
 #pragma unroll
-                for (int half = 0; half < 2; ++half) {
-                    const int jj = sub + 16 * half, j = j0 + jj;
-                    want[half]   = j < key_end && visible(args, c, j);
-                    if (want[half] && sh.kmax[jj] == kNonFinite) {
-                        nan        = true;
-                        want[half] = false;
+                    for (int half = 0; half < 2; ++half) {
+                        if (want[half] && sh.kmax[sub + 16 * half] == kNonFinite) {
+                            nan        = true;
+                            want[half] = false;
+                        }
+                    }
+                    Score sc[2];
+                    tile_scores(sh, args, b, c, h, kvh, j0, i, sub, want, sc, fail);
+#pragma unroll
+                    for (int half = 0; half < 2; ++half) {
+                        if (want[half] && (!have || score_greater(sc[half], best))) {
+                            best = sc[half];
+                            have = true;
+                        }
                     }
                 }
-                Score sc[2];
-                tile_scores(sh, args, b, c, h, kvh, j0, i, sub, want, sc, fail);
-#pragma unroll
-                for (int half = 0; half < 2; ++half) {
-                    if (want[half] && (!have || score_greater(sc[half], best))) {
-                        best = sc[half];
-                        have = true;
-                    }
-                }
+                __syncthreads();
             }
-            __syncthreads();
         }
 #pragma unroll
         for (int o = 8; o > 0; o >>= 1) {
@@ -721,78 +824,76 @@ __global__ __launch_bounds__(kThreads) void attention_kernel(const Args args) {
     double p_err  = 0.0; // the p grid's dropped bits (each below 2^-49), summed over this thread's keys
     const bool work = active && !nan && (M == kFull || !fail);
     for (int j0 = key_begin; j0 < key_end; j0 += kKeys) {
-        load_keys(j0, true);
-        if (work) {
-            bool want[2];
-#pragma unroll
-            for (int half = 0; half < 2; ++half) {
-                const int j = j0 + sub + 16 * half;
-                want[half]  = j < key_end && visible(args, c, j);
-            }
-            Score sc[2];
-            tile_scores(sh, args, b, c, h, kvh, j0, i, sub, want, sc, fail);
-#pragma unroll
-            for (int half = 0; half < 2; ++half) {
-                const int jj = sub + 16 * half;
-                float p = 0.0F;
-                if (want[half]) {
-                    bool ok       = true;
-                    const Score s = sc[half];
-                    const float d = score_difference(s, best, ok);
-                    if (!ok) { fail = true; }
-                    p = lossless::cr_exp(d);
-                    const std::uint32_t bits = __float_as_uint(p);
-                    const int field = static_cast<int>(bits >> 23), mant = static_cast<int>(bits & 0x7FFFFF);
+        for (int rep = 0; rep < reps; ++rep) {
+            bool want[2] = {work && pair_wanted(j0, 0, rep), work && pair_wanted(j0, 1, rep)};
+            if (reps > 1 && __syncthreads_or(want[0] || want[1] ? 1 : 0) == 0) { continue; }
+            load_keys(j0, true, rep);
+            if (work) {
+                Score sc[2];
+                tile_scores(sh, args, b, c, h, kvh, j0, i, sub, want, sc, fail);
+    #pragma unroll
+                for (int half = 0; half < 2; ++half) {
+                    const int jj = sub + 16 * half;
+                    float p = 0.0F;
+                    if (want[half]) {
+                        bool ok       = true;
+                        const Score s = sc[half];
+                        const float d = score_difference(s, best, ok);
+                        if (!ok) { fail = true; }
+                        p = lossless::cr_exp(d);
+                        const std::uint32_t bits = __float_as_uint(p);
+                        const int field = static_cast<int>(bits >> 23), mant = static_cast<int>(bits & 0x7FFFFF);
+                        if (p != 0.0F) {
+                            // p = M 2^(e - 150) at position e - 63 above 2^-87.
+                            bool lost = false;
+                            add_shifted(den, field == 0 ? mant : (0x800000 | mant), (field == 0 ? 1 : field) - 63, lost);
+                            if (lost) { den_err += p; }
+                        }
+                    }
+                    // p 2^48 = M 2^(e - 102), rounded to nearest below the grid (p < 2^-25).
+                    long long P = 0;
                     if (p != 0.0F) {
-                        // p = M 2^(e - 150) at position e - 63 above 2^-87.
-                        bool lost = false;
-                        add_shifted(den, field == 0 ? mant : (0x800000 | mant), (field == 0 ? 1 : field) - 63, lost);
-                        if (lost) { den_err += p; }
+                        const std::uint32_t bits = __float_as_uint(p);
+                        const int field = static_cast<int>(bits >> 23), mant = static_cast<int>(bits & 0x7FFFFF);
+                        const long long Mp = field == 0 ? mant : (0x800000 | mant);
+                        const int shift = (field == 0 ? 1 : field) - 150 + kPBits;
+                        if (shift >= 0) {
+                            P = Mp << shift;
+                        } else {
+                            P = shift > -64 ? ((Mp + (1LL << (-shift - 1))) >> -shift) : 0;
+                            p_err += 0x1p-49;
+                        }
                     }
+                    sh.p[i][jj]  = p;
+                    sh.ph[i][jj] = static_cast<int>(P >> 24);
+                    sh.pl[i][jj] = static_cast<int>(P & 0xFFFFFF);
                 }
-                // p 2^48 = M 2^(e - 102), rounded to nearest below the grid (p < 2^-25).
-                long long P = 0;
-                if (p != 0.0F) {
-                    const std::uint32_t bits = __float_as_uint(p);
-                    const int field = static_cast<int>(bits >> 23), mant = static_cast<int>(bits & 0x7FFFFF);
-                    const long long Mp = field == 0 ? mant : (0x800000 | mant);
-                    const int shift = (field == 0 ? 1 : field) - 150 + kPBits;
-                    if (shift >= 0) {
-                        P = Mp << shift;
-                    } else {
-                        P = shift > -64 ? ((Mp + (1LL << (-shift - 1))) >> -shift) : 0;
-                        p_err += 0x1p-49;
-                    }
-                }
-                sh.p[i][jj]  = p;
-                sh.ph[i][jj] = static_cast<int>(P >> 24);
-                sh.pl[i][jj] = static_cast<int>(P & 0xFFFFFF);
             }
-        }
-        __syncthreads();
-        if (work) {
-#pragma unroll
-            for (int cg = 0; cg < 16; cg += 4) {
-                long long hi[4] = {0, 0, 0, 0}, lo[4] = {0, 0, 0, 0};
-                for (int jj = 0; jj < kKeys; ++jj) {
-                    const long long ph = sh.ph[i][jj], pl = sh.pl[i][jj];
-                    if ((ph | pl) == 0) { continue; }
-#pragma unroll
+            __syncthreads();
+            if (work) {
+    #pragma unroll
+                for (int cg = 0; cg < 16; cg += 4) {
+                    long long hi[4] = {0, 0, 0, 0}, lo[4] = {0, 0, 0, 0};
+                    for (int jj = 0; jj < kKeys; ++jj) {
+                        const long long ph = sh.ph[i][jj], pl = sh.pl[i][jj];
+                        if ((ph | pl) == 0) { continue; }
+    #pragma unroll
+                        for (int cc = 0; cc < 4; ++cc) {
+                            const long long v = sh.vg[jj][sub + 16 * (cg + cc)];
+                            hi[cc] += ph * v; // |.| < 2^24 2^29 per key: 32 keys below 2^59
+                            lo[cc] += pl * v;
+                        }
+                    }
+    #pragma unroll
                     for (int cc = 0; cc < 4; ++cc) {
-                        const long long v = sh.vg[jj][sub + 16 * (cg + cc)];
-                        hi[cc] += ph * v; // |.| < 2^24 2^29 per key: 32 keys below 2^59
-                        lo[cc] += pl * v;
+                        bool unused = false;
+                        add_shifted(num[cg + cc], hi[cc], 24, unused);
+                        add_shifted(num[cg + cc], lo[cc], 0, unused);
                     }
                 }
-#pragma unroll
-                for (int cc = 0; cc < 4; ++cc) {
-                    bool unused = false;
-                    add_shifted(num[cg + cc], hi[cc], 24, unused);
-                    add_shifted(num[cg + cc], lo[cc], 0, unused);
-                }
             }
+            __syncthreads();
         }
-        __syncthreads();
     }
 
 #pragma unroll
@@ -1148,6 +1249,466 @@ __global__ void attention_fallback_kernel(const FallbackArgs f) {
     }
 }
 
+// ------------------------------------------------------------------------- codec rows (the design reference)
+
+constexpr int kCodecInt8 = static_cast<int>(LosslessKvCodec::Int8G64);
+constexpr int kCodecFp8  = static_cast<int>(LosslessKvCodec::Fp8Row);
+constexpr int kCodecFp4  = static_cast<int>(LosslessKvCodec::Nvfp4G16);
+constexpr int kCodecQ4   = static_cast<int>(LosslessKvCodec::Q4Lloyd);
+
+// Bytes of a row's codes and of its scales.
+__host__ __device__ constexpr int codec_code_bytes(int codec) {
+    return codec == kCodecInt8 || codec == kCodecFp8 ? 256 : (codec == kCodecFp4 || codec == kCodecQ4 ? 128 : 64);
+}
+__host__ __device__ constexpr int codec_scale_bytes(int codec) {
+    return codec == kCodecInt8 ? 8 : (codec == kCodecFp4 ? 16 : 2);
+}
+
+// A scale's value m 2^f (m = 0 for a zero scale); false for a non-finite one.
+__device__ __forceinline__ bool fp16_scale(std::uint16_t bits, int& m, int& f) {
+    const int e = (bits >> 10) & 0x1F, man = bits & 0x3FF;
+    if (e == 0x1F) { return false; }
+    m = e == 0 ? man : (1024 | man);
+    f = e == 0 ? -24 : e - 25;
+    if ((bits & 0x8000U) != 0) { m = -m; }
+    return true;
+}
+__device__ __forceinline__ bool e4m3_scale(std::uint8_t bits, int& m, int& f) {
+    if ((bits & 0x7F) == 0x7F) { return false; }
+    const int e = (bits >> 3) & 0xF, man = bits & 7;
+    m = e == 0 ? man : (8 | man);
+    f = e == 0 ? -9 : e - 10;
+    if ((bits & 0x80U) != 0) { m = -m; }
+    return true;
+}
+
+// Element i's code value C: the element is C 2^code_exp times its group's scale (code_exp -9 for FP8's E4M3,
+// -1 for NVFP4's E2M1, else 0); `bad` for a non-finite code.
+__device__ __forceinline__ int codec_code(int codec, const std::uint8_t* codes, int i, bool& bad) {
+    if (codec == kCodecInt8) { return static_cast<std::int8_t>(codes[i]); }
+    if (codec == kCodecFp8) {
+        const int b = codes[i];
+        if ((b & 0x7F) == 0x7F) {
+            bad = true;
+            return 0;
+        }
+        const int e = (b >> 3) & 0xF, man = b & 7;
+        const int mag = e == 0 ? man : (8 | man) << (e - 1);
+        return (b & 0x80) != 0 ? -mag : mag;
+    }
+    if (codec == kCodecFp4 || codec == kCodecQ4) {
+        const int n = (codes[i >> 1] >> (4 * (i & 1))) & 0xF;
+        if (codec == kCodecQ4) { return n >= 8 ? kv_cache_q4_level(n ^ 8) : -kv_cache_q4_level(n ^ 7); }
+        const int a = n & 7, mag = a < 4 ? a : ((a & 1) != 0 ? 3 : 2) << ((a >> 1) - 1); // twice E2M1
+        return (n & 8) != 0 ? -mag : mag;
+    }
+    const std::uint32_t word = reinterpret_cast<const std::uint16_t*>(codes)[i >> 3];
+    const int mag            = g_kv_cache_vq2_codebook[8 * (word & kKVCacheVq2PatternMask) + (i & 7)];
+    return ((kv_cache_vq2_sign_mask(word) >> (i & 7)) & 1U) != 0 ? -mag : mag;
+}
+
+__device__ __forceinline__ I128 i128_of(long long v) { return {static_cast<unsigned long long>(v), v < 0 ? -1LL : 0LL}; }
+__device__ __forceinline__ I128 neg_i128(I128 a) {
+    const unsigned long long lo = ~a.lo + 1ULL;
+    return {lo, ~a.hi + (lo == 0 ? 1LL : 0LL)};
+}
+__device__ __forceinline__ I128 sub_i128(I128 a, I128 b) { return add_i128(a, neg_i128(b)); }
+// v 2^s exactly (0 <= s < 64, |v| 2^s < 2^127).
+__device__ __forceinline__ I128 shl_i128(long long v, int s) {
+    if (s == 0) { return i128_of(v); }
+    return {static_cast<unsigned long long>(v) << s, v >> (64 - s)};
+}
+// The top bit of |v| (-1 for zero).
+__device__ __forceinline__ int i128_top_bit(const I128& v) {
+    std::uint32_t mag[4];
+    (void)lossless::magnitude_i128(v, mag);
+#pragma unroll
+    for (int i = 3; i >= 0; --i) {
+        if (mag[i] != 0) { return 32 * i + 31 - __clz(mag[i]); }
+    }
+    return -1;
+}
+
+// H_256 (Sylvester's order, unnormalized) applied exactly to a row whose element lane + 32 r is X[r].
+__device__ __forceinline__ void hadamard_i128(I128 (&X)[8], int lane) {
+#pragma unroll
+    for (int stride = 1; stride <= 16; stride <<= 1) {
+#pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            I128 peer;
+            peer.lo = __shfl_xor_sync(0xFFFFFFFFU, X[r].lo, stride);
+            peer.hi = __shfl_xor_sync(0xFFFFFFFFU, X[r].hi, stride);
+            X[r]    = (lane & stride) == 0 ? add_i128(X[r], peer) : sub_i128(peer, X[r]);
+        }
+    }
+#pragma unroll
+    for (int span = 1; span < 8; span <<= 1) {
+#pragma unroll
+        for (int base = 0; base < 8; base += 2 * span) {
+#pragma unroll
+            for (int off = 0; off < span; ++off) {
+                const I128 lo = X[base + off], hi = X[base + off + span];
+                X[base + off]        = add_i128(lo, hi);
+                X[base + off + span] = sub_i128(lo, hi);
+            }
+        }
+    }
+}
+
+// The exact values of row `row` of a codec plane, one warp (lane: elements lane + 32 r): x = X[r] 2^unit. Each
+// element's code times its group scale on the row's smallest scale exponent (below 2^58), then for a rotated
+// plane x = R y = H y / 16 (below 2^66). False for a row holding a non-finite code or scale (the encoders store
+// none).
+__device__ bool decode_codec_row(const CodecPlane& p, std::size_t row, int lane, I128 (&X)[8], int& unit) {
+    const int codec            = p.codec;
+    const std::uint8_t* codes  = p.codes + row * codec_code_bytes(codec);
+    const std::uint8_t* scales = p.scales + row * codec_scale_bytes(codec);
+    const int groups           = codec == kCodecInt8 ? 4 : (codec == kCodecFp4 ? 16 : 1);
+    int sm[16], sf[16];
+    bool bad  = false;
+    int fmin  = INT_MAX;
+    for (int g = 0; g < groups; ++g) {
+        const bool ok = codec == kCodecFp4 ? e4m3_scale(scales[g], sm[g], sf[g])
+                                           : fp16_scale(reinterpret_cast<const std::uint16_t*>(scales)[g], sm[g], sf[g]);
+        if (!ok) {
+            bad   = true;
+            sm[g] = 0;
+            sf[g] = 0;
+        }
+        if (sm[g] != 0) { fmin = min(fmin, sf[g]); }
+    }
+    if (fmin == INT_MAX) { fmin = 0; } // every scale zero: a zero row
+#pragma unroll
+    for (int r = 0; r < 8; ++r) {
+        const int i = lane + 32 * r;
+        const int g = codec == kCodecInt8 ? i >> 6 : (codec == kCodecFp4 ? i >> 4 : 0);
+        const long long cm = static_cast<long long>(codec_code(codec, codes, i, bad)) * sm[g]; // below 2^29
+        X[r] = shl_i128(cm, sm[g] != 0 ? sf[g] - fmin : 0);
+    }
+    const int code_exp = codec == kCodecFp8 ? -9 : (codec == kCodecFp4 ? -1 : 0);
+    unit               = fmin + code_exp;
+    if (p.rotated != 0) {
+        hadamard_i128(X, lane);
+        unit -= 4;
+    }
+    return !__any_sync(0xFFFFFFFFU, bad);
+}
+
+// One warp per (rep, row) of the call's codec planes. Mode 0: the key row's grid integers M 2^s with the row's
+// top below 2^29 (a row whose exact bits a right shift would lose is off its grid: its pairs take the exact
+// fallback), its one block exponent e_b (x = X_grid 2^(e_b - 155), so e_b is the BF16 exponent field of its
+// largest element) into kblk and kmax (kNonFinite when its k or v holds a non-finite code), and the value row's
+// element exponents into vmax. Mode 1 (after mode 0): the value row's grid integers on each channel's grid
+// (v 2^(155 - vmax_c), below 2^29), rounded to nearest even below it (vround).
+__global__ void codec_pack_kernel(const Args a, int mode, std::int32_t* kpack, std::int16_t* kblk, std::uint8_t* koff,
+                                  std::int32_t* vpack, std::uint32_t* vround) {
+    const int lane        = static_cast<int>(threadIdx.x) & 31;
+    const long long rows  = static_cast<long long>(a.columns) * a.kv_heads;
+    const long long items = rows * (a.reps > 1 ? 2 : 1);
+    const long long warps = static_cast<long long>(gridDim.x) * (blockDim.x / 32);
+    for (long long it = (static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x) / 32; it < items; it += warps) {
+        const int rep          = static_cast<int>(it / rows);
+        const long long rr     = it % rows;
+        const int kvh          = static_cast<int>(rr % a.kv_heads), j = static_cast<int>(rr / a.kv_heads);
+        const std::size_t prow = codec_row(a.kv_heads, j, kvh);
+        const std::size_t out  = static_cast<std::size_t>(rep) * codec_rows(a.columns, a.kv_heads) + prow;
+        I128 X[8];
+        int unit = 0;
+        if (mode == 0) {
+            const bool kok = decode_codec_row(a.kplane[rep], prow, lane, X, unit);
+            int top        = -1;
+#pragma unroll
+            for (int r = 0; r < 8; ++r) { top = max(top, i128_top_bit(X[r])); }
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) { top = max(top, __shfl_xor_sync(0xFFFFFFFFU, top, o)); }
+            const int s = top < 0 ? 0 : 28 - top; // |X| 2^s < 2^29
+            bool lost   = false;
+#pragma unroll
+            for (int r = 0; r < 8; ++r) {
+                std::int32_t x;
+                if (s >= 0) {
+                    x = static_cast<std::int32_t>(static_cast<long long>(X[r].lo) << s);
+                } else {
+                    // An arithmetic shift right by -s (at most 38: |X| < 2^67), exact only when the dropped
+                    // bits are zero (two's complement keeps a magnitude's trailing zeros).
+                    const int down = -s;
+                    if ((X[r].lo & ((1ULL << down) - 1)) != 0) { lost = true; }
+                    x = static_cast<std::int32_t>(static_cast<long long>(
+                        (X[r].lo >> down) | (static_cast<unsigned long long>(X[r].hi) << (64 - down))));
+                }
+                kpack[out * kDim + lane + 32 * r] = x;
+            }
+            lost         = __any_sync(0xFFFFFFFFU, lost);
+            const int eb = unit + 155 - s;
+            const bool vok = decode_codec_row(a.vplane[rep], prow, lane, X, unit);
+            if (lane < kBlocks) { kblk[out * kBlocks + lane] = static_cast<std::int16_t>(eb); }
+            if (lane == 0) {
+                koff[out] = lost ? 1 : 0;
+                a.kmax[(static_cast<std::size_t>(rep) * a.key_capacity + j) * a.kv_heads + kvh] =
+                    static_cast<std::int16_t>(kok && vok ? eb : kNonFinite);
+            }
+            if (vok) {
+#pragma unroll
+                for (int r = 0; r < 8; ++r) {
+                    const int t = i128_top_bit(X[r]);
+                    if (t >= 0) { atomicMax(a.vmax + static_cast<std::size_t>(kvh) * kDim + lane + 32 * r, t + unit + 127); }
+                }
+            }
+        } else {
+            const bool vok = decode_codec_row(a.vplane[rep], prow, lane, X, unit);
+#pragma unroll
+            for (int r = 0; r < 8; ++r) {
+                const int d    = lane + 32 * r;
+                const int vm   = max(a.vmax[static_cast<std::size_t>(kvh) * kDim + d], 1);
+                const int sh   = unit + 155 - vm;
+                std::int32_t x = 0;
+                bool rounded   = false;
+                if (vok) {
+                    if (sh >= 0) {
+                        x = static_cast<std::int32_t>(static_cast<long long>(X[r].lo) << sh);
+                    } else {
+                        // Round to nearest even below the grid: |X| 2^sh < 2^29.
+                        const int down = -sh;
+                        std::uint32_t mag[4];
+                        const bool neg = lossless::magnitude_i128(X[r], mag);
+                        unsigned long long lo = (static_cast<unsigned long long>(mag[1]) << 32) | mag[0];
+                        unsigned long long hi = (static_cast<unsigned long long>(mag[3]) << 32) | mag[2];
+                        unsigned long long q, rem_hi_bit, rem_low;
+                        if (down >= 128) {
+                            q = 0;
+                            rem_hi_bit = 0;
+                            rem_low    = lo | hi;
+                        } else if (down >= 64) {
+                            const int dd = down - 64;
+                            q          = dd == 0 ? hi : hi >> dd;
+                            rem_hi_bit = dd == 0 ? (lo >> 63) : ((hi >> (dd - 1)) & 1ULL);
+                            rem_low    = dd == 0 ? (lo & ~(1ULL << 63)) : ((hi & ((1ULL << (dd - 1)) - 1)) | lo);
+                        } else {
+                            q          = (lo >> down) | (down == 0 ? 0ULL : hi << (64 - down));
+                            rem_hi_bit = (lo >> (down - 1)) & 1ULL;
+                            rem_low    = lo & ((1ULL << (down - 1)) - 1);
+                        }
+                        rounded = rem_hi_bit != 0 || rem_low != 0;
+                        if (rem_hi_bit != 0 && (rem_low != 0 || (q & 1ULL) != 0)) { ++q; }
+                        x = neg ? -static_cast<std::int32_t>(q) : static_cast<std::int32_t>(q);
+                    }
+                }
+                vpack[out * kDim + d] = x;
+                const unsigned mask   = __ballot_sync(0xFFFFFFFFU, rounded);
+                if (lane == 0) { vround[out * (kDim / 32) + r] = mask; }
+            }
+        }
+    }
+}
+
+// The codec exact fallback: scores from 2^-176 (q 2^-133 at least, k 2^-37 at least, the 2^-4 scale) to beyond
+// 2^330 (|q| < 2^129, |X| < 2^67, units to 2^5, 256 terms); p and p v from 2^-188 (p 2^-149, v 2^-37) to beyond
+// 2^92 (|v| < 2^72, 2^20 keys).
+constexpr int kCodecScoreWords = 16;
+constexpr int kCodecScoreBase  = -176;
+constexpr int kCodecSumWords   = 12;
+constexpr int kCodecSumBase    = -188;
+
+// compare_quotient for W-word magnitudes.
+template <int W>
+__device__ int compare_quotient_w(const std::uint32_t (&n)[W], const std::uint32_t (&d)[W], long long odd, int e2) {
+    constexpr int W2 = 2 * W + 8;
+    std::uint32_t lhs[W2] = {}, rhs[W2] = {};
+    std::uint32_t prod[W + 1];
+    unsigned long long carry = 0;
+    for (int i = 0; i < W; ++i) {
+        const unsigned long long v = static_cast<unsigned long long>(d[i]) * static_cast<unsigned long long>(odd) + carry;
+        prod[i]                    = static_cast<std::uint32_t>(v);
+        carry                      = v >> 32;
+    }
+    prod[W] = static_cast<std::uint32_t>(carry);
+    auto place = [](std::uint32_t (&dst)[W2], const std::uint32_t* src, int count, int bits) {
+        const int w = bits / 32, b = bits % 32;
+        for (int i = 0; i < count; ++i) {
+            const unsigned long long v = static_cast<unsigned long long>(src[i]) << b;
+            if (i + w >= 0 && i + w < W2) { dst[i + w] |= static_cast<std::uint32_t>(v); }
+            if (i + w + 1 >= 0 && i + w + 1 < W2) { dst[i + w + 1] |= static_cast<std::uint32_t>(v >> 32); }
+        }
+    };
+    constexpr int kOffset = 160;
+    place(lhs, n, W, kOffset);
+    place(rhs, prod, W + 1, kOffset + e2);
+    for (int i = W2 - 1; i >= 0; --i) {
+        if (lhs[i] != rhs[i]) { return lhs[i] > rhs[i] ? 1 : -1; }
+    }
+    return 0;
+}
+
+// The BF16 rounding of N / D (magnitudes on one unit, D nonzero), by the quotient's leading words and exact
+// steps across the neighbouring midpoints (ties to even).
+template <int W>
+__device__ std::uint16_t quotient_bf16(const std::uint32_t (&n)[W], const std::uint32_t (&d)[W]) {
+    if (top_bit(n) < 0) { return 0; }
+    auto lead = [](const std::uint32_t (&m)[W]) {
+        const int tb = top_bit(m), w = tb / 32;
+        double v = 0.0;
+        for (int k = w; k >= 0 && k >= w - 2; --k) { v += ldexp(static_cast<double>(m[k]), 32 * k); }
+        return v;
+    };
+    std::uint16_t r = lossless::bf16_of_double(lead(n) / lead(d));
+    for (int step = 0; step < 4; ++step) {
+        long long odd;
+        int e2;
+        midpoint(r, 1, odd, e2);
+        const int up = compare_quotient_w(n, d, odd, e2);
+        if (up > 0) {
+            ++r;
+            continue;
+        }
+        if (up == 0) {
+            if ((r & 1) != 0) { ++r; }
+            break;
+        }
+        if ((r & 0x7FFF) == 0) { break; }
+        midpoint(r, -1, odd, e2);
+        const int down = compare_quotient_w(n, d, odd, e2);
+        if (down < 0) {
+            --r;
+            continue;
+        }
+        if (down == 0 && (r & 1) != 0) { --r; }
+        break;
+    }
+    return r;
+}
+
+// The exact score of query (column t, head h; each lane's eight elements qm 2^(qe - 134)) against key j of its
+// pair's representation, summed over the warp into every lane's acc. False for a non-finite key row.
+__device__ bool codec_exact_score(const Args& a, int t, int j, int kvh, const int (&qm)[8], const int (&qe)[8], int lane,
+                                  Wide<kCodecScoreWords>& acc) {
+    I128 X[8];
+    int unit      = 0;
+    const bool ok = decode_codec_row(a.kplane[pair_rep(a, t, j)], codec_row(a.kv_heads, j, kvh), lane, X, unit);
+    acc.clear();
+#pragma unroll
+    for (int r = 0; r < 8; ++r) {
+        if (qm[r] == 0) { continue; }
+        std::uint32_t mag[4];
+        const bool neg = lossless::magnitude_i128(X[r], mag);
+        const int sign = neg ? -1 : 1;
+#pragma unroll
+        for (int c = 0; c < 5; ++c) { // |X| < 2^67: five 16-bit pieces
+            const long long piece = (mag[c / 2] >> (16 * (c % 2))) & 0xFFFF;
+            if (piece != 0) { acc.add(sign * qm[r] * piece, qe[r] - 134 + unit - 4 + 16 * c - kCodecScoreBase); }
+        }
+    }
+    acc.warp_sum();
+    return ok;
+}
+
+// One warp per flagged query of a codec call: lossless_attention's exact fallback over the codec rows, each
+// key row decoded exactly once per pass.
+__global__ void codec_fallback_kernel(const Args a, int warps) {
+    const int lane  = static_cast<int>(threadIdx.x) & 31;
+    const int warp  = static_cast<int>((blockIdx.x * blockDim.x + threadIdx.x) >> 5);
+    const int total = a.columns * a.heads;
+    for (int query = warp; query < total; query += warps) {
+        if (((a.flagged[query / 32] >> (query % 32)) & 1U) == 0) { continue; }
+        const int t = query / a.heads, h = query % a.heads, kvh = h / (a.heads / a.kv_heads);
+        const int last = position(a, t);
+        int qm[8], qe[8];
+        bool nan = false;
+#pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            const std::uint16_t bits = a.q[(static_cast<std::size_t>(t) * a.heads + h) * kDim + lane + 32 * r];
+            if (bf16_nonfinite(bits)) { nan = true; }
+            bf16_parts(bits, qm[r], qe[r]);
+        }
+        nan = __any_sync(0xFFFFFFFFU, nan);
+        // The maximum.
+        std::uint32_t best[kCodecScoreWords] = {};
+        bool best_neg = false, have = false;
+        for (int j = 0; j <= last && !nan; ++j) {
+            if (!visible(a, t, j)) { continue; }
+            Wide<kCodecScoreWords> acc;
+            if (!codec_exact_score(a, t, j, kvh, qm, qe, lane, acc)) {
+                nan = true;
+                break;
+            }
+            std::uint32_t m[kCodecScoreWords];
+            const bool neg = acc.finish(m);
+            bool greater   = !have;
+            if (have) {
+                const int cmp = compare_mag(m, best);
+                greater       = neg != best_neg ? best_neg : (neg ? cmp < 0 : cmp > 0);
+            }
+            if (greater) {
+                for (int w = 0; w < kCodecScoreWords; ++w) { best[w] = m[w]; }
+                best_neg = neg;
+                have     = true;
+            }
+        }
+        // p_j = cr_exp(fp32(s_j - m)); sum p (lane 0) and each lane's channels' sum p v, exact.
+        Wide<kCodecSumWords> den, num[8];
+        den.clear();
+#pragma unroll
+        for (int r = 0; r < 8; ++r) { num[r].clear(); }
+        for (int j = 0; j <= last && !nan; ++j) {
+            if (!visible(a, t, j)) { continue; }
+            Wide<kCodecScoreWords> acc;
+            (void)codec_exact_score(a, t, j, kvh, qm, qe, lane, acc);
+            for (int w = 0; w + 1 < kCodecScoreWords; ++w) { // subtract the maximum in 16-bit pieces
+                const long long lo = best[w] & 0xFFFFU, hi = best[w] >> 16;
+                if (lo != 0) { acc.add(best_neg ? lo : -lo, 32 * w); }
+                if (hi != 0) { acc.add(best_neg ? hi : -hi, 32 * w + 16); }
+            }
+            std::uint32_t m[kCodecScoreWords];
+            const bool neg = acc.finish(m);
+            const float p  = lossless::cr_exp(__uint_as_float(round_magnitude(m, kCodecScoreBase, neg, false)));
+            if (p == 0.0F) { continue; }
+            const std::uint32_t bits = __float_as_uint(p);
+            const int pf = static_cast<int>(bits >> 23), pm = static_cast<int>(bits & 0x7FFFFF);
+            const long long Mp = pf == 0 ? pm : (0x800000 | pm);
+            const int pe       = (pf == 0 ? 1 : pf) - 150; // p = Mp 2^pe
+            if (lane == 0) {
+                den.add(Mp & 0xFFFF, pe - kCodecSumBase);
+                den.add(Mp >> 16, pe + 16 - kCodecSumBase);
+            }
+            I128 X[8];
+            int unit = 0;
+            if (!decode_codec_row(a.vplane[pair_rep(a, t, j)], codec_row(a.kv_heads, j, kvh), lane, X, unit)) {
+                nan = true;
+                break;
+            }
+#pragma unroll
+            for (int r = 0; r < 8; ++r) {
+                std::uint32_t mag[4];
+                const bool vneg = lossless::magnitude_i128(X[r], mag);
+                const int sign  = vneg ? -1 : 1;
+#pragma unroll
+                for (int c = 0; c < 5; ++c) {
+                    const long long piece = (mag[c / 2] >> (16 * (c % 2))) & 0xFFFF;
+                    if (piece == 0) { continue; }
+                    num[r].add(sign * (Mp & 0xFFF) * piece, pe + unit + 16 * c - kCodecSumBase);
+                    num[r].add(sign * (Mp >> 12) * piece, pe + unit + 12 + 16 * c - kCodecSumBase);
+                }
+            }
+        }
+        std::uint16_t* out = a.out + (static_cast<std::size_t>(t) * a.heads + h) * kDim;
+        if (nan) {
+#pragma unroll
+            for (int r = 0; r < 8; ++r) { out[lane + 32 * r] = kNaN; }
+            continue;
+        }
+        den.warp_sum();
+        std::uint32_t dmag[kCodecSumWords];
+        (void)den.finish(dmag);
+#pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            std::uint32_t nmag[kCodecSumWords];
+            const bool nneg   = num[r].finish(nmag);
+            std::uint16_t res = quotient_bf16(nmag, dmag);
+            if (nneg) { res |= 0x8000U; } // a negative quotient rounding to zero is -0
+            out[lane + 32 * r] = res;
+        }
+    }
+}
+
 // ------------------------------------------------------------------------- cache append
 
 // One thread per 16 bytes of a K or V row: row (t, h) of the call stored bit for bit at position
@@ -1321,6 +1882,92 @@ void run(Args args, int max_keys, void* workspace, cudaStream_t stream, bool pac
     CUDA_CHECK(cudaGetLastError());
 }
 
+// The codec form (one window, sequences 1): kmax per representation, vmax, vinexact, flags, the partials of the
+// split route, then each representation's packed rows (whole pages).
+constexpr int kCodecFallbackWarps = 512;
+
+std::size_t codec_call_bytes(int heads, int kv_heads, int columns, int reps) {
+    const int tiles         = (columns * (heads / kv_heads) + kQueries - 1) / kQueries;
+    const long long ctas    = static_cast<long long>(tiles) * kv_heads;
+    const auto splits       = static_cast<std::size_t>(split_bound(ctas, columns));
+    const std::size_t rows  = static_cast<std::size_t>(reps) * codec_rows(columns, kv_heads);
+    const std::size_t calls = static_cast<std::size_t>(columns) * heads;
+    std::size_t bytes = align256(static_cast<std::size_t>(reps) * columns * kv_heads * sizeof(std::int16_t)) +
+                        2 * align256(static_cast<std::size_t>(kv_heads) * kDim * sizeof(int)) + align256((calls + 31) / 32 * 4) +
+                        2 * align256(rows * kDim * sizeof(std::int32_t)) + align256(rows * kBlocks * sizeof(std::int16_t)) +
+                        align256(rows) + align256(rows * (kDim / 32) * sizeof(std::uint32_t));
+    if (split_route(ctas)) {
+        bytes += align256(splits * calls * sizeof(PartialMax)) + align256(splits * calls * sizeof(PartialSum));
+    }
+    return bytes;
+}
+
+void run_codec(Args args, void* workspace, cudaStream_t stream) {
+    const int reps   = args.reps > 1 ? 2 : 1;
+    const Geometry g = geometry(args.heads, args.kv_heads, args.width, 1, args.columns);
+    args.tiles       = g.tiles;
+    args.splits      = g.splits;
+    args.split_keys  = g.split_keys;
+    auto* base       = static_cast<std::uint8_t*>(workspace);
+    auto take        = [&](std::size_t bytes) {
+        void* p = base;
+        base += align256(bytes);
+        return p;
+    };
+    const std::size_t channels   = static_cast<std::size_t>(args.kv_heads) * kDim * sizeof(int);
+    const std::size_t flag_bytes = (static_cast<std::size_t>(args.columns) * args.heads + 31) / 32 * 4;
+    args.kmax     = static_cast<std::int16_t*>(
+        take(static_cast<std::size_t>(reps) * args.columns * args.kv_heads * sizeof(std::int16_t)));
+    args.vmax     = static_cast<int*>(take(channels));
+    args.vinexact = static_cast<int*>(take(channels));
+    args.flagged  = static_cast<std::uint32_t*>(take(flag_bytes));
+    const std::size_t partials = static_cast<std::size_t>(g.splits) * args.columns * args.heads;
+    if (g.split) {
+        args.pmax = static_cast<PartialMax*>(take(partials * sizeof(PartialMax)));
+        args.psum = static_cast<PartialSum*>(take(partials * sizeof(PartialSum)));
+    }
+    const std::size_t rows = static_cast<std::size_t>(reps) * codec_rows(args.columns, args.kv_heads);
+    auto* kpack  = static_cast<std::int32_t*>(take(rows * kDim * sizeof(std::int32_t)));
+    auto* vpack  = static_cast<std::int32_t*>(take(rows * kDim * sizeof(std::int32_t)));
+    auto* kblk   = static_cast<std::int16_t*>(take(rows * kBlocks * sizeof(std::int16_t)));
+    auto* koff   = static_cast<std::uint8_t*>(take(rows));
+    auto* vround = static_cast<std::uint32_t*>(take(rows * (kDim / 32) * sizeof(std::uint32_t)));
+    // vmax, vinexact and flagged lie together: one memset zeroes them.
+    CUDA_CHECK(cudaMemsetAsync(args.vmax, 0,
+                               static_cast<std::size_t>(reinterpret_cast<std::uint8_t*>(args.flagged) + flag_bytes -
+                                                        reinterpret_cast<std::uint8_t*>(args.vmax)),
+                               stream));
+    const long long items = static_cast<long long>(reps) * args.columns * args.kv_heads;
+    const int blocks      = static_cast<int>(std::min<long long>((items + 7) / 8, 4096));
+    codec_pack_kernel<<<blocks, 256, 0, stream>>>(args, 0, kpack, kblk, koff, vpack, vround);
+    CUDA_CHECK(cudaGetLastError());
+    codec_pack_kernel<<<blocks, 256, 0, stream>>>(args, 1, kpack, kblk, koff, vpack, vround);
+    CUDA_CHECK(cudaGetLastError());
+    args.kpack32 = kpack;
+    args.vpack32 = vpack;
+    args.kblk    = kblk;
+    args.koff    = koff;
+    args.vround  = vround;
+    constexpr int kSmem = static_cast<int>(sizeof(Shared));
+    const dim3 grid(static_cast<unsigned>(g.tiles), static_cast<unsigned>(args.kv_heads), static_cast<unsigned>(g.splits));
+    if (!g.split) {
+        configure<kFull>();
+        attention_kernel<kFull><<<grid, kThreads, kSmem, stream>>>(args);
+        CUDA_CHECK(cudaGetLastError());
+    } else {
+        configure<kMaxima>();
+        configure<kSums>();
+        attention_kernel<kMaxima><<<grid, kThreads, kSmem, stream>>>(args);
+        CUDA_CHECK(cudaGetLastError());
+        attention_kernel<kSums><<<grid, kThreads, kSmem, stream>>>(args);
+        CUDA_CHECK(cudaGetLastError());
+        combine_kernel<<<dim3(static_cast<unsigned>(args.columns), static_cast<unsigned>(args.heads)), kDim, 0, stream>>>(args);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    codec_fallback_kernel<<<kCodecFallbackWarps / 8, 256, 0, stream>>>(args, kCodecFallbackWarps);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace
 
 std::size_t lossless_attention_workspace_bytes(int query_heads, int kv_heads, int columns) {
@@ -1431,6 +2078,54 @@ void lossless_kv_append(const Tensor& k, const Tensor& v, const Tensor& position
         static_cast<const std::int32_t*>(table_rows.data), cache.block_tables.ne[0], columns / sequences,
         cache.num_kv_heads, columns, static_cast<uint4*>(cache.k_pages.data), static_cast<uint4*>(cache.v_pages.data));
     CUDA_CHECK(cudaGetLastError());
+}
+
+std::size_t lossless_codec_attention_workspace_bytes(int query_heads, int kv_heads, int columns) {
+    return codec_call_bytes(query_heads, kv_heads, columns, 2);
+}
+
+void lossless_codec_attention(const Tensor& q, const LosslessKvCodes& kv, int kv_heads, Tensor& out, void* workspace,
+                              cudaStream_t stream, const std::uint32_t* select, int select_words, int ratio) {
+    require(q.dtype == DType::BF16 && out.dtype == DType::BF16 && q.is_contiguous() && out.is_contiguous() &&
+                q.ne[0] == kDim && out.ne[0] == kDim && q.numel() == out.numel(),
+            "q and out must be contiguous BF16 [256, heads, T]");
+    const int heads = q.ne[1], columns = q.ne[2];
+    require(kv_heads >= 1 && kv_heads <= 8 && heads % kv_heads == 0, "Hq a multiple of Hkv (at most 8)");
+    const auto valid = [](const LosslessKvPlane& p) {
+        return p.codes != nullptr && p.scales != nullptr && static_cast<int>(p.codec) <= static_cast<int>(LosslessKvCodec::Vq2);
+    };
+    const bool window = kv.window_k.codes != nullptr;
+    require(valid(kv.k) && valid(kv.v) && (!window || (valid(kv.window_k) && valid(kv.window_v) && kv.window_sinks >= 0 &&
+                                                       kv.window_recent >= 0)),
+            "the K and V planes (and a window's both) need codes and scales");
+    require(select == nullptr || (ratio > 0 && select_words >= (columns / ratio + 31) / 32),
+            "a selection needs its ratio and a bit per complete block");
+    if (columns == 0) { return; }
+    auto plane = [](const LosslessKvPlane& p) {
+        return CodecPlane{p.codes, p.scales, static_cast<int>(p.codec), p.rotated ? 1 : 0};
+    };
+    Args args{};
+    args.q             = static_cast<const std::uint16_t*>(q.data);
+    args.out           = static_cast<std::uint16_t*>(out.data);
+    args.width         = columns;
+    args.sequences     = 1;
+    args.key_capacity  = columns;
+    args.heads         = heads;
+    args.kv_heads      = kv_heads;
+    args.columns       = columns;
+    args.select        = select;
+    args.select_words  = select_words;
+    args.ratio         = ratio;
+    args.kplane[0]     = plane(kv.k);
+    args.vplane[0]     = plane(kv.v);
+    args.reps          = window ? 2 : 1;
+    args.window_sinks  = kv.window_sinks;
+    args.window_recent = kv.window_recent;
+    if (window) {
+        args.kplane[1] = plane(kv.window_k);
+        args.vplane[1] = plane(kv.window_v);
+    }
+    run_codec(args, workspace, stream);
 }
 
 } // namespace infernix::ops

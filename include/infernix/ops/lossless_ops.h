@@ -132,6 +132,46 @@ void lossless_kv_append(const Tensor& k, const Tensor& v, const Tensor& position
                         const Tensor& table_rows, const PagedKVBatchLayerView& cache, cudaStream_t stream);
 
 /**
+ * The design reference's KV storage (docs/maintainer/lossless-route.md §3b): one plane of a window's stored
+ * rows, row t Hkv + h for key t and KV head h, per row `codes` (256 bytes for INT8 and FP8, 128 for NVFP4
+ * and Q4, 64 for VQ2: 32 16-bit words) and `scales` (four FP16 group scales for INT8, one FP16 scale for FP8,
+ * Q4 and VQ2, sixteen E4M3 group scales for NVFP4). A row's value is exact: each code times its scale
+ * (src/ops/kv_cache's codecs), and for a rotated plane x = R y with y those values and R = H_256 / 16
+ * (Sylvester's order, R^T = R).
+ */
+enum class LosslessKvCodec : std::uint8_t { Int8G64, Fp8Row, Nvfp4G16, Q4Lloyd, Vq2 };
+struct LosslessKvPlane {
+    LosslessKvCodec codec      = LosslessKvCodec::Int8G64;
+    bool rotated               = false;
+    const std::uint8_t* codes  = nullptr;
+    const std::uint8_t* scales = nullptr;
+};
+/// A KV format's planes for one window: K and V, and for the VQ formats the exact window's INT8 rows of
+/// the rotated K and V (window_k.codes null: none), which serve key j of query t when j < window_sinks or
+/// j >= t - window_recent (the production read rule, kKVWindowSinkTokens and kKVWindowRecentTokens); the
+/// code planes serve every other key.
+struct LosslessKvCodes {
+    LosslessKvPlane k, v, window_k, window_v;
+    int window_sinks  = 0;
+    int window_recent = 0;
+};
+/// The bytes lossless_kv_encode writes for a window of `columns` keys of `storage` (not BFloat16).
+[[nodiscard]] std::size_t lossless_kv_encode_bytes(KvCacheStorage storage, int kv_heads, int columns);
+/// Encodes K and V (contiguous BF16 [256, Hkv, T]) with `storage`'s production encoder, bit for bit as
+/// kv_cache_append stores them, into `buffer` (and for the VQ formats every key's window rows, as the
+/// append's window copy encodes them); returns the planes.
+[[nodiscard]] LosslessKvCodes lossless_kv_encode(const Tensor& k, const Tensor& v, KvCacheStorage storage,
+                                                 void* buffer, cudaStream_t stream);
+/// lossless_attention's window form over stored KV rows: key j's k and v the exact values of its rows
+/// (the code planes, or the window's under its rule); scores, exponentials, sums and rounding as
+/// lossless_attention's, `select` and `ratio` likewise. q and out BF16 [256, Hq, T]; the workspace is
+/// lossless_codec_attention_workspace_bytes(Hq, Hkv, T).
+[[nodiscard]] std::size_t lossless_codec_attention_workspace_bytes(int query_heads, int kv_heads, int columns);
+void lossless_codec_attention(const Tensor& q, const LosslessKvCodes& kv, int kv_heads, Tensor& out, void* workspace,
+                              cudaStream_t stream, const std::uint32_t* select = nullptr, int select_words = 0,
+                              int ratio = 0);
+
+/**
  * RoPE (Hugging Face's rotary module and apply_rotary_pos_emb, rotary dims R of each head, pairs P = R/2):
  * lossless_rope_frequencies writes inv_freq_i = fp32(1 / fp32(theta^(2i / R))) (FP32 [P]);
  * lossless_rope_table writes, per column t and pair i, cos and sin of fp32(position inv_freq_i), each

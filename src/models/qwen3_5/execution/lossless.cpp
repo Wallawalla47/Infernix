@@ -145,10 +145,16 @@ void attention_layer(A& a, const BlockParameters& block, const TextConfig& confi
     }
     Tensor q3 = q.view({D, heads, T}), k3 = k.view({D, kv_heads, T}), v3 = v.view({D, kv_heads, T});
     Tensor o = alloc(a, DType::BF16, {D, heads, T});
+    // The design reference with a coded KV format: K and V through its production encoder, attention over the
+    // stored rows (lossless-route.md §3b).
+    const bool codes    = design.active && design.kv != KvCacheStorage::BFloat16;
     const DeviceSpan ws = a.alloc_bytes(
         cache != nullptr ? ops::lossless_paged_attention_workspace_bytes(heads, kv_heads, T / cache->sequences,
                                                                         cache->sequences, cache->key_capacity)
+        : codes          ? ops::lossless_codec_attention_workspace_bytes(heads, kv_heads, T)
                          : ops::lossless_attention_workspace_bytes(heads, kv_heads, T));
+    const DeviceSpan stored_rows =
+        codes ? a.alloc_bytes(ops::lossless_kv_encode_bytes(design.kv, kv_heads, T)) : DeviceSpan{};
     if constexpr (kRuns<A>) {
         Tensor qr = q.view({D, heads * T}), kr = k.view({D, kv_heads * T});
         ops::lossless_rmsnorm(qr, p.query_norm, config.rms_norm_eps, qr, s);
@@ -159,6 +165,9 @@ void attention_layer(A& a, const BlockParameters& block, const TextConfig& confi
             ops::lossless_kv_append(k3, v3, *cache->positions, cache->sequences, *cache->table_rows, cache->kv, s);
             ops::lossless_paged_attention(q3, *cache->positions, cache->sequences, *cache->table_rows, cache->kv,
                                           cache->max_keys, cache->key_capacity, o, ws.data, s);
+        } else if (codes) {
+            const ops::LosslessKvCodes stored = ops::lossless_kv_encode(k3, v3, design.kv, stored_rows.data, s);
+            ops::lossless_codec_attention(q3, stored, kv_heads, o, ws.data, s);
         } else {
             // The design's bf16 KV stores V as FP16 (exact in BF16 again).
             if (design.active) { ops::lossless_round_fp16(v3, s); }
@@ -410,9 +419,7 @@ template <class A>
 void layer(A& a, const BlockParameters& block, const TextConfig& config, MixerKind kind, const Tensor& rope_table,
            Tensor& x, cudaStream_t s, const LosslessCache* cache, const LosslessDesign& design,
            OffloadedExperts* experts, const OffloadedCall* call) {
-    if (design.active && (cache != nullptr || design.kv != KvCacheStorage::BFloat16)) {
-        throw std::invalid_argument("the design reference scores windows with bf16 KV");
-    }
+    if (design.active && cache != nullptr) { throw std::invalid_argument("the design reference scores whole windows"); }
     if (kind == MixerKind::FullAttention) {
         attention_layer(a, block, config, rope_table, x, s, cache, design);
     } else {
