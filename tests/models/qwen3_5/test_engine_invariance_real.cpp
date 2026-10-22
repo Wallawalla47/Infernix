@@ -16,7 +16,9 @@
 // 6.1): with fast paths disabled a request's tokens do not depend on concurrency, submission order,
 // the other requests, the prefix cache's contents or KV pressure. Sampled decoding (temperature 1,
 // a fixed seed per request) makes any arithmetic difference visible as a token difference within a
-// few hundred tokens, where greedy decoding would hide most of them.
+// few hundred tokens, where greedy decoding would hide most of them. A negative control repeats the
+// concurrency comparison on the default route, which must show a difference wherever that route runs
+// a request-coupling fast path.
 //
 // INFERNIX_TEST_ARTIFACT names the artifact; argv[1] selects speculation (none, mtp, dflash or
 // dflash2, default none; the artifact must hold that drafter). Under speculation a sampled request
@@ -220,6 +222,39 @@ int main(int argc, char** argv) {
             }
             require(engine.runtime_stats().preemptions == before.preemptions,
                     "the exact route preempted a request");
+        }
+
+        {
+            // 6. Negative control (IQS-1 G4): comparison 2 on the default route. Where it runs a
+            //    request-coupling fast path (LoadSummary::request_invariant false), a request's tokens
+            //    may depend on its round's other rows, and over four sampled 256-token outputs they do:
+            //    the comparison must see that, or it could not see a broken exact route either.
+            infernix::EngineOptions options =
+                exact_options(artifact, backend, kConcurrency * kContext, false);
+            options.fast_paths = true;
+            infernix::Engine engine(options);
+            if (engine.load_summary().request_invariant) {
+                std::cout << "negative control skipped: the default route runs no request-coupling fast "
+                             "path on this artifact\n";
+            } else {
+                std::vector<infernix::GenerationResult> alone;
+                for (std::size_t i = 0; i < texts.size(); ++i) {
+                    alone.push_back(
+                        engine.generate(engine.prepare(prompt(texts[i])), sampled(1000 + i)));
+                }
+                std::vector<infernix::GenerationHandle> handles;
+                for (std::size_t i = 0; i < texts.size(); ++i) {
+                    handles.push_back(engine.submit(engine.prepare(prompt(texts[i])), sampled(1000 + i)));
+                }
+                std::size_t differ = 0;
+                for (std::size_t i = 0; i < handles.size(); ++i) {
+                    differ += handles[i].wait().generated_token_ids != alone[i].generated_token_ids ? 1U : 0U;
+                }
+                require(differ > 0, "negative control: the default route's concurrent requests gave their "
+                                    "solo tokens, so the comparison shows no difference it could detect");
+                std::cout << "negative control: " << differ << " of " << texts.size()
+                          << " concurrent requests differ on the default route\n";
+            }
         }
 
         std::cout << "OK request invariance\n";
