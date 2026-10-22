@@ -1,4 +1,5 @@
 #include "infernix/engine.h"
+#include "graph_prepare_probe.h"
 #include "kv_cache_storage.h"
 
 #include <cstdint>
@@ -1606,7 +1607,7 @@ int exercise_concurrent_resource_settlement(const char* artifact) {
     return 0;
 }
 
-int verify_loaded_product(const infernix::Engine& engine) {
+int verify_loaded_product(const infernix::Engine& engine, bool graphs_prepared) {
     const infernix::LoadSummary load = engine.load_summary();
     if (load.architecture != "Qwen3_5ForCausalLM" || load.model_name.empty() ||
         load.weight_formats.empty() || load.host_to_device_bytes == 0 ||
@@ -1632,11 +1633,10 @@ int verify_loaded_product(const infernix::Engine& engine) {
         std::cerr << "Engine construction has incomplete materialized backing\n";
         return 1;
     }
-    if (memory.cuda_graph_measured_bytes == 0 ||
-        memory.cuda_graph_measured_bytes > memory.cuda_graph_allowance_bytes) {
-        std::cerr << "Engine CUDA Graphs used " << memory.cuda_graph_measured_bytes
-                  << " bytes against an allowance of " << memory.cuda_graph_allowance_bytes
-                  << '\n';
+    if (!graphs_prepared || memory.cuda_graph_measured_bytes > memory.cuda_graph_allowance_bytes) {
+        std::cerr << "Engine CUDA Graphs " << (graphs_prepared ? "prepared" : "not prepared") << ", used "
+                  << memory.cuda_graph_measured_bytes << " bytes against an allowance of "
+                  << memory.cuda_graph_allowance_bytes << '\n';
         return 1;
     }
     return 0;
@@ -1648,8 +1648,9 @@ int exercise_artifact(const char* artifact) {
     {
         infernix::EngineOptions options            = engine_options(artifact);
         options.context_cache.hybrid.device_snapshot_slots = 2;
-        infernix::Engine engine(std::move(options));
-        if (const int result = verify_loaded_product(engine); result != 0) { return result; }
+        const infernix::test::GraphPrepareProbe graphs;
+        infernix::Engine engine(graphs.attached(std::move(options)));
+        if (const int result = verify_loaded_product(engine, graphs.prepared()); result != 0) { return result; }
         if (const int result = exercise_artifact_frontend(engine); result != 0) { return result; }
         if (const int result = exercise_stream_observations(engine); result != 0) { return result; }
         if (const int result = exercise_full_prefill_chunk(engine); result != 0) { return result; }

@@ -1,4 +1,5 @@
 #include "infernix/engine.h"
+#include "graph_prepare_probe.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -60,7 +61,7 @@ std::vector<std::uint8_t> gradient_ppm() {
     return ppm;
 }
 
-int verify_loaded_product(const infernix::Engine& engine) {
+int verify_loaded_product(const infernix::Engine& engine, bool graphs_prepared) {
     const infernix::LoadSummary load = engine.load_summary();
     if (load.architecture != "Qwen3_5MoeForCausalLM" || load.model_name.empty() ||
         load.host_to_device_bytes == 0 || load.artifact_bytes_read < load.host_to_device_bytes) {
@@ -87,11 +88,10 @@ int verify_loaded_product(const infernix::Engine& engine) {
         std::cerr << "35B Engine construction has an invalid memory summary\n";
         return 1;
     }
-    if (memory.cuda_graph_measured_bytes == 0 ||
-        memory.cuda_graph_measured_bytes > memory.cuda_graph_allowance_bytes) {
-        std::cerr << "35B Engine CUDA Graphs used " << memory.cuda_graph_measured_bytes
-                  << " bytes against an allowance of " << memory.cuda_graph_allowance_bytes
-                  << '\n';
+    if (!graphs_prepared || memory.cuda_graph_measured_bytes > memory.cuda_graph_allowance_bytes) {
+        std::cerr << "35B Engine CUDA Graphs " << (graphs_prepared ? "prepared" : "not prepared")
+                  << ", used " << memory.cuda_graph_measured_bytes << " bytes against an allowance of "
+                  << memory.cuda_graph_allowance_bytes << '\n';
         return 1;
     }
     return 0;
@@ -283,8 +283,9 @@ int main() {
     }
 
     {
-        infernix::Engine engine(engine_options(artifact));
-        if (const int result = verify_loaded_product(engine); result != 0) { return result; }
+        const infernix::test::GraphPrepareProbe graphs;
+        infernix::Engine engine(graphs.attached(engine_options(artifact)));
+        if (const int result = verify_loaded_product(engine, graphs.prepared()); result != 0) { return result; }
         if (const int result = exercise_text_mtp_and_prefix(engine); result != 0) { return result; }
         if (const int result = exercise_vision(engine); result != 0) { return result; }
     }

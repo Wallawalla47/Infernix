@@ -1617,7 +1617,9 @@ struct MemorySummary {
     std::size_t workspace_logical_peak_bytes      = 0;
     std::size_t cuda_graph_allowance_bytes        = 0;
     // Device memory CUDA Graph preparation actually took at startup (free memory before minus
-    // after instantiating, uploading and launching every executable); 0 without CUDA Graphs.
+    // after instantiating, uploading and launching every executable), in the driver's allocation
+    // granularity: 0 without CUDA Graphs, and also when the graphs fit in memory the driver already
+    // held (StartupPhase::CudaGraphPrepare reports the preparation itself).
     std::size_t cuda_graph_measured_bytes         = 0;
     std::size_t kv_payload_bytes                  = 0;
 };

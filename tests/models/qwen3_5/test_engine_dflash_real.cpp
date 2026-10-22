@@ -1,4 +1,5 @@
 #include "infernix/engine.h"
+#include "graph_prepare_probe.h"
 #include "speculative_page_boundary.h"
 
 #include <algorithm>
@@ -158,7 +159,7 @@ infernix::PromptInput altered_history_after_boundary() {
     return input;
 }
 
-int verify_dflash_load(const infernix::Engine& engine) {
+int verify_dflash_load(const infernix::Engine& engine, bool graphs_prepared) {
     const infernix::LoadSummary load = engine.load_summary();
     if (load.architecture != "Qwen3_5MoeForCausalLM" || load.model_name.empty() ||
         load.host_to_device_bytes == 0 || load.artifact_bytes_read < load.host_to_device_bytes) {
@@ -178,11 +179,10 @@ int verify_dflash_load(const infernix::Engine& engine) {
         std::cerr << "DFlash Engine has an invalid frozen memory layout\n";
         return 1;
     }
-    if (memory.cuda_graph_measured_bytes == 0 ||
-        memory.cuda_graph_measured_bytes > memory.cuda_graph_allowance_bytes) {
-        std::cerr << "DFlash Engine CUDA Graphs used " << memory.cuda_graph_measured_bytes
-                  << " bytes against an allowance of " << memory.cuda_graph_allowance_bytes
-                  << '\n';
+    if (!graphs_prepared || memory.cuda_graph_measured_bytes > memory.cuda_graph_allowance_bytes) {
+        std::cerr << "DFlash Engine CUDA Graphs " << (graphs_prepared ? "prepared" : "not prepared")
+                  << ", used " << memory.cuda_graph_measured_bytes << " bytes against an allowance of "
+                  << memory.cuda_graph_allowance_bytes << '\n';
         return 1;
     }
     return 0;
@@ -404,8 +404,9 @@ int run(const char* artifact) {
         }
     }
 
-    infernix::Engine engine(dflash_engine_options(artifact, infernix::ProposalHead::Optimized, 4352));
-    if (const int result = verify_dflash_load(engine); result != 0) { return result; }
+    const infernix::test::GraphPrepareProbe graphs;
+    infernix::Engine engine(graphs.attached(dflash_engine_options(artifact, infernix::ProposalHead::Optimized, 4352)));
+    if (const int result = verify_dflash_load(engine, graphs.prepared()); result != 0) { return result; }
     infernix::test::speculative_page_boundary(engine);
     engine.reset_memory_peaks();
     const infernix::GenerationResult dflash =
