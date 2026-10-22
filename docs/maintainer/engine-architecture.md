@@ -431,6 +431,7 @@ no cached prefix that external requests could hit.
 | Instance construction | `src/runtime/engine/model_instance.*` |
 | Engine connection to the prefix cache | `src/runtime/engine/context_cache/` |
 | Model-agnostic prefix index, tap planner and cost model | `src/runtime/prefix_cache/` |
+| Model-agnostic speculative policies (the block drafters' calibrated draft length) | `src/runtime/speculative/` |
 | Public request, execution and resource contracts | `src/runtime/contract/` |
 | Model config, binding and read-only data | `src/models/qwen3_5/config.*`, `load/`, `model.*` |
 | Native parameters and fixed model calls | `src/models/qwen3_5/execution/` |

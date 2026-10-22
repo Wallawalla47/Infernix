@@ -199,7 +199,7 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
 
     ContextCacheOptions& cache = options.context_cache;
     if (options.speculative.ngram_archive_bytes != 0 &&
-        options.speculative.ngram_draft_tokens == 0) {
+        options.speculative.ngram_draft_tokens == 0 && !options.speculative.ngram_draft_tokens_auto) {
         throw std::invalid_argument(
             "the cross-request ngram archive requires ngram drafting; enable --ngram-draft-tokens");
     }
@@ -211,6 +211,11 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
     }
     const std::uint32_t concurrency = options.max_concurrency;
     const bool qwen4_exp            = architecture == models::Architecture::Qwen4Exp;
+    // The automatic copy window is measured on the Qwen3.5 family's drafters only.
+    if (options.speculative.ngram_draft_tokens_auto && qwen4_exp) {
+        throw std::invalid_argument("--ngram-draft-tokens auto applies to Qwen3.8-27B / Qwen3.6-35B-A3B; "
+                                    "give Qwen3.8-Flash-Next a window (docs/qwen3_8-flash-next.md)");
+    }
     // The model's default prefill chunk. Qwen3.8-Flash-Next's exact route split at 1,024, 4,096
     // and 12,288 tokens gave identical bits (36 perplexity windows of 14,336 tokens; its calls
     // split on the 16-token GDN grid and its routes are column-invariant), and wide chunks prefill
@@ -230,19 +235,28 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
     if (options.expert_tail_skip != 0 && !options.fast_paths) {
         throw std::invalid_argument("--expert-tail-skip is approximate; the reproducible route (--reproducible) refuses it");
     }
-    // An automatic MTP draft length chooses up to the model's most drafts unless given a ceiling:
-    // Qwen3.8-Flash-Next verifies 8 columns column-invariantly, the Qwen3.5 planner captures 5.
-    // Qwen3.8-Flash-Next's DFlash2 drafter takes the same per-round policy.
+    // An automatic draft length chooses up to the model's most drafts unless given a ceiling: MTP on
+    // Qwen3.8-Flash-Next verifies 8 columns column-invariantly, the Qwen3.5 planner captures 5. The
+    // block drafters propose their whole block: Qwen3.8-Flash-Next's DFlash2 7; the Qwen3.5 planner
+    // resolves its DFlash and DFlash2 blocks per configuration (resolve_auto_draft_length).
+    const bool block_drafter = options.speculative.backend == SpeculativeBackend::DFlash ||
+                               options.speculative.backend == SpeculativeBackend::DFlash2;
     if (options.speculative.draft_tokens_auto) {
-        if (options.speculative.backend != SpeculativeBackend::Mtp &&
-            !(qwen4_exp && options.speculative.backend == SpeculativeBackend::DFlash2)) {
-            throw std::invalid_argument("--draft-tokens auto requires --spec mtp (Qwen3.8-Flash-Next: also dflash2)");
+        if (options.speculative.backend != SpeculativeBackend::Mtp && !block_drafter) {
+            throw std::invalid_argument("--draft-tokens auto requires --spec mtp, dflash or dflash2");
         }
-        if (options.speculative.draft_tokens == 0) { options.speculative.draft_tokens = qwen4_exp ? 7U : 5U; }
-    } else if (std::find(options.fast_path_candidates.begin(), options.fast_path_candidates.end(),
-                         FastPath::AdaptiveMtp) != options.fast_path_candidates.end()) {
-        throw std::invalid_argument("--fast-path adaptive-mtp is the policy of --draft-tokens auto; "
-                                    "a fixed --draft-tokens N drafts N");
+        if (options.speculative.draft_tokens == 0 && (qwen4_exp || !block_drafter)) {
+            options.speculative.draft_tokens = qwen4_exp ? 7U : 5U;
+        }
+    } else {
+        for (const FastPath policy : {FastPath::AdaptiveMtp, FastPath::AdaptiveDFlash}) {
+            if (std::find(options.fast_path_candidates.begin(), options.fast_path_candidates.end(), policy) !=
+                options.fast_path_candidates.end()) {
+                throw std::invalid_argument(std::string("--fast-path ") + fast_path_name(policy) +
+                                            " is the policy of --draft-tokens auto; a fixed --draft-tokens N "
+                                            "drafts N");
+            }
+        }
     }
     // The draft-confidence gate exists only on Qwen3.8-Flash-Next's one-row MTP rounds; another
     // model refuses it rather than ignoring a tuning value.
@@ -381,15 +395,33 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
         models::qwen3_5::materialize_model(std::move(plan), device, &options.startup_observer);
     device.synchronize();
     StartupPhaseScope frontend(options.startup_observer, StartupPhase::FrontendInitialize);
+    // --ngram-draft-tokens auto: the configuration's copy window, before the frontend decides
+    // whether prompts build copy sources.
+    if (options.speculative.ngram_draft_tokens_auto) {
+        if (const std::uint32_t window = models::qwen3_5::resolve_auto_ngram(*model, options); window != 0) {
+            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                               "--ngram-draft-tokens auto: copy proposals of up to %u drafts, minimum match %u",
+                               window, options.speculative.ngram_min_match);
+        } else {
+            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                               "--ngram-draft-tokens auto: no copy window was measured faster for this "
+                               "artifact, drafter and route, so copy proposals are off");
+            if (options.speculative.ngram_archive_bytes != 0) {
+                throw std::invalid_argument("--ngram-archive-mib needs copy proposals, which "
+                                            "--ngram-draft-tokens auto leaves off here");
+            }
+        }
+    }
     auto instance = std::make_unique<ModelInstance>(std::move(model), options);
     frontend.complete();
     std::optional<StartupPhaseScope> planning;
     planning.emplace(options.startup_observer, StartupPhase::TargetFinalize);
-    // --draft-tokens auto where adaptive-mtp does not run: the configuration's fastest fixed length.
+    // --draft-tokens auto where its policy does not run: the configuration's fastest fixed length.
     if (const std::uint32_t fixed = models::qwen3_5::resolve_auto_draft_length(instance->parameters, options)) {
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
-                           "--draft-tokens auto: adaptive-mtp is not selected for this artifact (or fast paths "
-                           "are disabled), so every round drafts %u, its fastest fixed length",
+                           "--draft-tokens auto: %s is not selected for this artifact (or fast paths are "
+                           "disabled), so every round drafts %u, its fastest fixed length",
+                           options.speculative.backend == SpeculativeBackend::Mtp ? "adaptive-mtp" : "adaptive-dflash",
                            fixed);
     }
     const auto signature = models::qwen3_5::prefill_signature(*instance->model);

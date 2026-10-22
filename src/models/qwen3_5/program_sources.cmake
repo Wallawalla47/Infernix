@@ -32,6 +32,7 @@ target_sources(infernix_model_runtime PRIVATE
 
   "${CMAKE_CURRENT_LIST_DIR}/program/speculative/mtp.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/speculative/mtp_draft_policy.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/speculative/dflash_width_policy.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/speculative/target_verification.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/speculative/tree_width_controller.cpp"
 

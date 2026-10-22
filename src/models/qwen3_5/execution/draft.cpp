@@ -12,6 +12,7 @@
 #include "infernix/ops/rmsnorm_rope.h"
 #include "infernix/ops/rmsnorm_pack_tail.h"
 #include "infernix/ops/linear_topk.h"
+#include "infernix/ops/target_logprobs.h"
 #include "infernix/ops/candidate_selector.h"
 #include "infernix/ops/attn_input_proj.h"
 #include "infernix/ops/embedding.h"
@@ -312,10 +313,12 @@ struct SelectorOperand {
 // from the drafter's frame: the leading min(K, frame width) drafts (and their sparse laws) are
 // staged, then copied into it. nullptr keeps the proposal in the drafter's frame. A tree round
 // instead builds each row's draft tree from the lattice directly into `into` (its verification
-// frame), with its tree rows, ancestor masks and live column counts.
+// frame), with its tree rows, ancestor masks and live column counts. `confidence` (FP32 [k,B], an
+// adaptive-dflash proposal) receives the rows' selector probability of each draft (the
+// temperature-1 softmax at its rank).
 void propose_dflash2_rows(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& frame, int row,
                           int batch, int k, DFlashEnvelopes envelopes,
-                          qwen3_5::DFlashDecodeState* into) {
+                          qwen3_5::DFlashDecodeState* into, Tensor* confidence) {
     {
         const auto& target = state.execution.parameters.model.config().text;
         const auto& config = *state.execution.parameters.model.config().draft;
@@ -479,12 +482,17 @@ void propose_dflash2_rows(DFlashBatchContext& state, qwen3_5::DFlashDecodeState&
         Tensor proposal_q =
             staged ? work.alloc(DType::FP32, {ops::kSparseSpeculativeCandidates, k, batch})
                    : frame.proposal_q.slice(2, row, batch);
+        const SelectorOperand path_confidence(
+            work, confidence != nullptr ? confidence->slice(1, row, batch) : Tensor{}, stream);
+        Tensor confidence_view = path_confidence.view;
         ops::candidate_selector_path(
             candidates, scores.view({dimension(config.dflash2->selector_top_k), k, batch}),
             projected.view({dimension(config.dflash2->selector_rank), k, batch}), path_anchors.view,
             weights.selector->predecessor_codebook, weights.selector->successor_codebook,
-            path_frontiers.view, sampling, drafts, proposal_q, nullptr, work, stream);
+            path_frontiers.view, sampling, drafts, proposal_q,
+            confidence != nullptr ? &confidence_view : nullptr, work, stream);
         if (!staged) { frame_drafts.finish(stream); }
+        path_confidence.finish(stream);
         if (staged) {
             Tensor destination_drafts     = into->draft_tokens.slice(1, row, batch);
             Tensor destination_candidates = into->candidate_ids.slice(2, row, batch);
@@ -500,9 +508,12 @@ void propose_dflash2_rows(DFlashBatchContext& state, qwen3_5::DFlashDecodeState&
 }
 
 // The DFlash proposal of the frame's rows [row, row + batch_size); into as for DFlash2.
+// `confidence` (FP32 [k,B], an adaptive-dflash proposal) receives the rows' head log-probability of
+// each draft at its argmax.
 void propose_dflash_rows(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& frame,
                          std::int32_t row, std::int32_t batch_size, std::uint32_t k,
-                         DFlashEnvelopes envelopes, qwen3_5::DFlashDecodeState* into) {
+                         DFlashEnvelopes envelopes, qwen3_5::DFlashDecodeState* into,
+                         Tensor* confidence) {
     {
         const auto& target         = state.execution.parameters.model.config().text;
         const auto& config         = *state.execution.parameters.model.config().draft;
@@ -651,9 +662,15 @@ void propose_dflash_rows(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& 
                 {dimension(target.vocab_size), static_cast<std::int32_t>(k) * batch_size});
             project(proposal_hidden, state.execution.parameters.draft->output_head, logits,
                     state.execution.work, state.execution.device.stream);
-            ops::argmax(logits, flat_drafts,
-                        dimension(state.execution.parameters.model.resources().public_token_count),
-                        state.execution.device.stream);
+            const std::int32_t valid =
+                dimension(state.execution.parameters.model.resources().public_token_count);
+            ops::argmax(logits, flat_drafts, valid, state.execution.device.stream);
+            if (confidence != nullptr) {
+                Tensor targets  = flat_drafts.view({1, static_cast<std::int32_t>(k) * batch_size});
+                Tensor logprobs = confidence->slice(1, row, batch_size)
+                                      .view({1, static_cast<std::int32_t>(k) * batch_size});
+                ops::target_logprobs(logits, targets, valid, logprobs, state.execution.device.stream);
+            }
         } else {
             if (!state.execution.parameters.proposal.has_value()) {
                 throw std::logic_error("optimized DFlash proposal head is unavailable");
@@ -663,12 +680,18 @@ void propose_dflash_rows(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& 
                 DType::BF16, {dimension(proposal.rows), static_cast<std::int32_t>(k) * batch_size});
             project(proposal_hidden, proposal.head, logits, state.execution.work,
                     state.execution.device.stream);
-            ops::argmax(
-                logits, flat_drafts,
+            const std::int32_t valid =
                 proposal.token_ids
                     ? dimension(proposal.rows)
-                    : dimension(state.execution.parameters.model.resources().public_token_count),
-                state.execution.device.stream);
+                    : dimension(state.execution.parameters.model.resources().public_token_count);
+            ops::argmax(logits, flat_drafts, valid, state.execution.device.stream);
+            if (confidence != nullptr) {
+                // The rows are the head's own until the remap below.
+                Tensor targets  = flat_drafts.view({1, static_cast<std::int32_t>(k) * batch_size});
+                Tensor logprobs = confidence->slice(1, row, batch_size)
+                                      .view({1, static_cast<std::int32_t>(k) * batch_size});
+                ops::target_logprobs(logits, targets, valid, logprobs, state.execution.device.stream);
+            }
             if (proposal.token_ids)
                 ops::proposal_remap_token_ids(
                     flat_drafts, static_cast<const std::int32_t*>(proposal.token_ids->data),
@@ -692,18 +715,21 @@ template <class Context> bool rows_draft_alone(const Context& state) {
     return state.execution.execution_schedule.column_invariant_decode;
 }
 
+// `confidence` (FP32 [k,B], an adaptive-dflash proposal; nullptr otherwise) receives each draft's
+// probability under the drafter: DFlash2's selector probability, DFlash's head log-probability at
+// its argmax.
 void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& frame,
                         std::int32_t batch_size, std::uint32_t k, DFlashEnvelopes envelopes,
-                        qwen3_5::DFlashDecodeState* into = nullptr) {
+                        qwen3_5::DFlashDecodeState* into = nullptr, Tensor* confidence = nullptr) {
     const bool dflash2 = state.execution.parameters.model.config().draft->dflash2.has_value();
     nvtx::ScopedRange proposal_range(nvtx::Name::DFlashProposal, nvtx::Category::DFlash,
                                      static_cast<std::uint64_t>(k + 1U) * batch_size);
     const std::int32_t rows = rows_draft_alone(state) ? 1 : batch_size;
     for (std::int32_t row = 0; row < batch_size; row += rows) {
         if (dflash2) {
-            propose_dflash2_rows(state, frame, row, rows, static_cast<int>(k), envelopes, into);
+            propose_dflash2_rows(state, frame, row, rows, static_cast<int>(k), envelopes, into, confidence);
         } else {
-            propose_dflash_rows(state, frame, row, rows, k, envelopes, into);
+            propose_dflash_rows(state, frame, row, rows, k, envelopes, into, confidence);
         }
     }
 }
@@ -718,10 +744,21 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
             throw std::logic_error("DFlash decode batch state is incomplete");
         }
         state.execution.work.reset();
-        // Forward and Finish derive the same frame view, so Finish reads what Forward wrote.
+        // Forward and Finish derive the same frame view, so Finish reads what Forward wrote. A
+        // Propose phase drafts the whole block (k is the block) and a Verify phase reads the
+        // round's leading k drafts of it.
         auto frame               = state.frame.narrowed(k);
         const std::int32_t width = static_cast<std::int32_t>(k) + 1;
-        if (phase == SpeculativePhase::Forward) {
+        const bool forward       = phase == SpeculativePhase::Forward;
+        const bool propose       = phase == SpeculativePhase::Propose;
+        const bool verify        = phase == SpeculativePhase::Verify;
+        if ((propose || verify) && (state.ngram || state.tree || !frame.block_drafts.data ||
+                                    k > static_cast<std::uint32_t>(frame.block_drafts.ne[0]))) {
+            throw std::logic_error("an adaptive-dflash phase needs a neural round and its block");
+        }
+        // Verify uploads the controls again: the host wrote the round's extents, valid columns and
+        // target positions for its chosen width after the proposal.
+        if (forward || propose || verify) {
             const std::size_t ingress_bytes =
                 state.ngram ? sizeof(qwen3_5::DFlashDecodeIngress)
                             : offsetof(qwen3_5::DFlashDecodeIngress, ngram_tokens);
@@ -753,7 +790,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         Tensor licensed_counts    = frame.licensed_counts.slice(0, 0, batch_size);
         Tensor accepted           = frame.accepted_drafts.slice(0, 0, batch_size);
 
-        if (phase == SpeculativePhase::Forward) {
+        if (forward || propose) {
             state.execution.work.reset();
             Tensor compact_features = state.execution.work.alloc(
                 DType::BF16,
@@ -777,7 +814,53 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                 append_context_impl(state, compact_features, append_positions, append_counts,
                                     state_destinations, dflash_rows, append_envelope);
             }
-
+        }
+        if (propose) {
+            // The whole block lands in the block region with each draft's probability, then the
+            // host reads both and chooses the round's width.
+            if (k != state.neural_proposal_drafts ||
+                state.host_confidence.size() < static_cast<std::size_t>(k) * batch_size ||
+                state.host_drafts.size() < static_cast<std::size_t>(k) * batch_size) {
+                throw std::logic_error("an adaptive-dflash proposal is outside its block");
+            }
+            auto block          = frame;
+            block.draft_tokens  = frame.block_drafts;
+            block.candidate_ids = frame.block_candidates;
+            block.proposal_q    = frame.block_q;
+            Tensor confidence   = frame.block_confidence;
+            propose_batch_impl(state, block, batch_size, k, envelopes, nullptr, &confidence);
+            const auto count = static_cast<std::size_t>(k) * batch_size;
+            CUDA_CHECK(cudaMemcpyAsync(state.host_drafts.data(), frame.block_drafts.data,
+                                       count * sizeof(TokenId), cudaMemcpyDeviceToHost,
+                                       state.execution.device.stream));
+            CUDA_CHECK(cudaMemcpyAsync(state.host_confidence.data(), frame.block_confidence.data,
+                                       count * sizeof(float), cudaMemcpyDeviceToHost,
+                                       state.execution.device.stream));
+            if (capturing) {
+                state.drafts_ready.record_external(state.execution.device.stream);
+            } else {
+                state.drafts_ready.record(state.execution.device.stream);
+            }
+            return;
+        }
+        if (verify) {
+            // The round's leading k drafts of the block (and their laws), at its own width.
+            copy_leading_columns(frame.block_drafts.slice(1, 0, batch_size)
+                                     .view({1, frame.block_drafts.ne[0], batch_size}),
+                                 drafts.view({1, static_cast<std::int32_t>(k), batch_size}), batch_size,
+                                 state.execution.device.stream);
+            if (frame.block_candidates.data) {
+                copy_leading_columns(frame.block_candidates.slice(2, 0, batch_size),
+                                     frame.candidate_ids.slice(2, 0, batch_size), batch_size,
+                                     state.execution.device.stream);
+                copy_leading_columns(frame.block_q.slice(2, 0, batch_size),
+                                     frame.proposal_q.slice(2, 0, batch_size), batch_size,
+                                     state.execution.device.stream);
+            }
+            ops::speculative_prepare_verify_inputs(anchors, drafts, frontiers, extents, verify_ids,
+                                                   target_positions, state.execution.device.stream);
+        }
+        if (forward) {
             const auto proposal_k = state.neural_proposal_drafts;
             // A tree round drafts its main chain at the drafter's width and verifies every tree
             // node.
@@ -871,7 +954,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
             nvtx::ScopedRange target_range(nvtx::Name::DecodeDFlashTarget, nvtx::Category::DFlash,
                                            static_cast<std::uint64_t>(width) * batch_size);
             const bool tree_round = state.tree;
-            TargetVerifyFrameView verify{
+            TargetVerifyFrameView verify_view{
                 .ids                     = verify_ids,
                 .cache_positions         = target_positions,
                 .rope_positions          = target_rope,
@@ -905,11 +988,11 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                 .active_lanes     = active_lanes,
                 .pending_features = dflash_state(state).pending_features,
             };
-            if (phase == SpeculativePhase::Forward) {
-                target_verify_forward(state.execution, card, verify, target_envelope);
+            if (forward || verify) {
+                target_verify_forward(state.execution, card, verify_view, target_envelope);
                 return;
             }
-            target_accept(state.execution, state.continuation_hidden_store, card, verify);
+            target_accept(state.execution, state.continuation_hidden_store, card, verify_view);
         }
         CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, frame.egress.data,
                                    sizeof(qwen3_5::DFlashDecodeEgress), cudaMemcpyDeviceToHost,

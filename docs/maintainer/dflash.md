@@ -336,7 +336,7 @@ has the 27B drafter's mathematics at the geometry above; the fused Ops register 
   P. `--draft-tokens auto` verifies the k maximizing (1 + sum of products of the drafts'
   calibrated acceptances) / (1 + 0.1 + 0.31 k) plain rounds, each draft's acceptance read from its
   probability's decile and learned per request, one draft more every 8 rounds
-  ([`draft_length.h`](../../src/models/qwen4_exp/program/draft_length.h)). Measured on the 5090
+  ([`draft_length.h`](../../src/runtime/speculative/draft_length.h)). Measured on the 5090
   (Dense8 and IQ3_S, 2026-10-20): verifying all seven was 18-24 % slower than MTP `auto`, a fixed
   cut at 0.6 3-15 % faster, the calibrated length 8-11 % faster on code, docs and sampled docs
   (26 % on sampled code; the means of every run, Dense8 code from four runs against eight);
@@ -364,6 +364,53 @@ flowchart TD
     H --> I["Publish N outputs"]
     I --> B
 ```
+
+### Automatic verify width (Qwen3.8-27B / Qwen3.6-35B-A3B)
+
+With `--draft-tokens auto` and the `adaptive-dflash` fast path, an all-neural chain round (no
+n-gram copy, no tree) splits its Forward graph in two:
+
+1. A proposal graph per batch size and drafter profile appends the pending context and drafts the
+   whole block of K drafts (the ceiling unless given: the 27B's DFlash2 15, the 35B-A3B's DFlash
+   7) into a block region of the round frame, with each draft's probability under the drafter:
+   DFlash2 the candidate selector's temperature-1 softmax at the drafted rank
+   (`candidate_selector_path`'s confidence), DFlash the head's log-probability at its argmax
+   (`target_logprobs` on the proposal logits). Drafts and probabilities reach the host with one
+   event.
+2. The host picks the round's width W among the captured widths (one row: 2-8, 10, 12, 14, 16;
+   several rows: 2, 4, 8, 16; each up to K + 1), maximizing the rows' expected tokens per round
+   time: each row's expected tokens follow from its drafts' probabilities through its request's
+   calibration ([`draft_length.h`](../../src/runtime/speculative/draft_length.h), the deciles of
+   Qwen3.8-Flash-Next's policy), and a round of B rows costs
+   1 + proposal + B (per_draft min(W - 1, knee) + per_draft_wide max(W - 1 - knee, 0)) plain rounds
+   of its batch size, with the configuration's measured costs (`dflash_width_costs`). Every eighth
+   choice of a row runs the next wider width. The policy is
+   [`dflash_width_policy.h`](../../src/models/qwen3_5/program/speculative/dflash_width_policy.h).
+3. A verify graph of that width copies each row's leading min(W - 1, limit) drafts (and DFlash2's
+   laws) from the block into the round's frame and runs target verification; the round's Finish
+   accepts as usual.
+
+Each width is a split round family (one verify executable per batch size: target verification has
+no context-dependent topology) and its Finish; the proposal graphs keep the drafter's profiles.
+Because the choice reads the round's own proposal and never the target's draws, acceptance and
+sampling stay exact for any width; only the verification width varies, which is why the policy is
+a fast path.
+
+A configuration with a batch length (`dflash_batch_drafts`: the NVFP4 27B's 7) runs its rounds of
+several rows without the split: one plain neural family of that length, serving batch sizes 2 and
+up, drafts and verifies it in one graph, since the block proposal and the host wait cost a batched
+round more than any width saves there. The policy then chooses for one row only, and the proposal
+graphs serve one row. A copy round's batched rows without a copy propose the batch length too, and
+a copy replaces the neural proposal of a batch when it offers more drafts than that length (of one
+row, more than the block); the narrower copy families lie above the lower of the two. Rounds with
+a copy proposal keep their families. Automatic DFlash2 trees (`--draft-tree-nodes auto`) resolve to
+chains beside the policy: trees of K + 5 and K + 9 columns on the 15-draft block verified slower
+than its chains, and the tree controller would time the chain only when the policy verifies the
+whole block; a fixed tree table still runs. The 35B-A3B (no batch length) chooses its batched
+widths too. Where the path does not run (the groupwise 27B, `--reproducible`), `auto` verifies the
+configuration's fastest single fixed length every round (`auto_fixed_draft_tokens`: 7 on the 27B,
+3 on the 35B-A3B). Measurements and the registration are in
+[model quality 6.7](model-quality.md#67-fast-path-registry).
 
 The finite model implementation is in
 [`execution/draft.cpp`](../../src/models/qwen3_5/execution/draft.cpp); storage is in

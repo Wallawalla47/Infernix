@@ -57,6 +57,15 @@ std::vector<GraphExecutionProfile> mtp_graph_profiles(std::uint32_t capacity,
     return profiles;
 }
 
+std::vector<GraphExecutionProfile> dflash_verify_graph_profiles(std::uint32_t capacity,
+                                                                std::uint32_t verify_drafts) {
+    if (capacity == 0 || verify_drafts == 0 || verify_drafts > 63) {
+        throw std::invalid_argument("invalid DFlash verification graph dimensions");
+    }
+    // Target verification alone: E+K+1 visible keys, every tier one topology per exact B.
+    return causal_resource_profiles(capacity, verify_drafts + 1U);
+}
+
 std::vector<GraphExecutionProfile> dflash_graph_profiles(SpeculativeBackend backend,
                                                          std::uint32_t capacity,
                                                          std::uint32_t draft_window) {

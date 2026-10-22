@@ -33,6 +33,9 @@ struct RoundStateSpec {
     bool causal_scoring          = false;
     // The lossless route: the step and ordinary decode logits are FP32.
     bool fp32_logits             = false;
+    // adaptive-dflash: the drafter's whole block (its draft count K), which a round's proposal graph
+    // drafts before the round's width is chosen; 0 without it.
+    std::uint32_t block_drafts = 0;
 };
 
 struct PrefillRoundHost {
@@ -195,6 +198,13 @@ struct DFlashDecodeStateLayout {
     // [W,B] ancestor masks.
     std::optional<TensorRegion> tree_rows;
     std::optional<TensorRegion> tree_masks;
+    // adaptive-dflash: the proposal of the whole block (I32 [K,B] drafts, DFlash2 I32/FP32
+    // [16,K,B] candidates and laws) and each draft's FP32 [K,B] probability (DFlash2) or
+    // log-probability (DFlash) under the drafter, kept from the proposal graph to the verify graph.
+    std::optional<TensorRegion> block_drafts;
+    std::optional<TensorRegion> block_candidates;
+    std::optional<TensorRegion> block_q;
+    std::optional<TensorRegion> block_confidence;
 };
 
 // Constrained-generation controls (TokenConstraint): each lane's permitted sets, the per-column
@@ -361,6 +371,12 @@ struct DFlashDecodeState {
     Tensor target_logits;
     Tensor target_hidden;
     Tensor target_continuation_hidden;
+    // adaptive-dflash's block proposal (DFlashDecodeStateLayout::block_*); empty without it. A
+    // narrowed view keeps them at the block's width.
+    Tensor block_drafts;
+    Tensor block_candidates;
+    Tensor block_q;
+    Tensor block_confidence;
 
     DFlashDecodeState() = default;
     DFlashDecodeState(DeviceSpan backing, const DFlashDecodeStateLayout& layout,

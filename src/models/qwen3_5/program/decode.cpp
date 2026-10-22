@@ -2,6 +2,7 @@
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/execution_context.h"
 #include "models/qwen3_5/program/graph_execution.h"
+#include "models/qwen3_5/program/planning/fast_paths.h"
 #include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "core/nvtx.h"
 #include "core/device.h"
@@ -11,6 +12,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -102,7 +104,7 @@ void ProgramImpl::install_sampling(SequenceState& sequence, RequestControl& requ
         .accepted_per_position = std::vector<std::uint64_t>(draft_window, 0),
         .rounds_by_draft_length =
             std::vector<std::uint64_t>(
-                speculative_backend == SpeculativeBackend::Mtp ? neural_draft_window : 0U, 0),
+                speculative_backend != SpeculativeBackend::None ? neural_draft_window : 0U, 0),
     };
     const bool penalties = request.sampling_host.presence_penalty != 0.0F ||
                            request.sampling_host.frequency_penalty != 0.0F;
@@ -157,10 +159,14 @@ const ops::GdnReplayFoldPlan& ProgramImpl::round_replay_fold(std::uint32_t verif
     throw std::logic_error("speculative round width has no ReplaySSM fold");
 }
 
-SpeculativeRoundFamily& ProgramImpl::round_family(SpeculativeRoundKind kind, std::uint32_t drafts) {
+SpeculativeRoundFamily& ProgramImpl::round_family(SpeculativeRoundKind kind, std::uint32_t drafts,
+                                                  bool split) {
     SpeculativeRoundFamily* best = nullptr;
     for (SpeculativeRoundFamily& family : round_families) {
-        if (family.shape.kind != kind || family.shape.verify_drafts < drafts) { continue; }
+        if (family.shape.kind != kind || family.shape.split != split ||
+            family.shape.verify_drafts < drafts) {
+            continue;
+        }
         if (best == nullptr || family.shape.verify_drafts < best->shape.verify_drafts) {
             best = &family;
         }
@@ -412,13 +418,22 @@ ProgramImpl::propose_ngram(std::span<const std::uint32_t> lanes,
     if (budgets.size() != lanes.size()) {
         throw std::invalid_argument("ngram budget count does not match lane count");
     }
+    const std::uint32_t neural_drafts = ngram_copy_floor(static_cast<std::uint32_t>(lanes.size()));
+    const std::uint32_t window        = lanes.size() > 1 ? ngram_batch_window : ngram_draft_window;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         if (lanes[row] >= max_concurrency) {
             throw std::invalid_argument("ngram lane is out of range");
         }
-        matches[row] = propose_ngram_one(lanes[row], budgets[row]);
+        matches[row] = propose_ngram_one(lanes[row], budgets[row], neural_drafts, window);
     }
     return matches;
+}
+
+std::uint32_t ProgramImpl::ngram_copy_floor(std::uint32_t batch_rows) const noexcept {
+    // A one-row block round's copy must exceed the block (a floor of 7 there changed no round on
+    // the copy-heavy rename workload, 2026-10-22).
+    if (batch_rows > 1U && dflash_batch_drafts != 0) { return dflash_batch_drafts; }
+    return neural_draft_window;
 }
 
 void ProgramImpl::take_ngram_index(RequestControl& request, const RequestBasePlanImpl& base) {
@@ -431,7 +446,9 @@ void ProgramImpl::take_ngram_index(RequestControl& request, const RequestBasePla
 }
 
 NgramProposer::Match ProgramImpl::propose_ngram_one(std::uint32_t lane,
-                                                    const runtime::RoundBudget& budget) {
+                                                    const runtime::RoundBudget& budget,
+                                                    std::uint32_t neural_drafts,
+                                                    std::uint32_t window) {
     auto& request        = requests[lane];
     const auto& sequence = active_sequence(lane);
     const auto& ledger   = sequence.ledger;
@@ -440,7 +457,7 @@ NgramProposer::Match ProgramImpl::propose_ngram_one(std::uint32_t lane,
     // The output budget does not size the copy: the round's kind and width follow from the copy
     // alone, and the round verifies only the drafts the budget admits. A budget-limited final
     // round therefore has the arithmetic of an unlimited one.
-    const auto maximum = std::min(ngram_draft_window, room);
+    const auto maximum = std::min(window, room);
     // The neural path still validates decode readiness. No draft fits an anchor-only tail.
     if (maximum == 0 || budget.generated_tokens_remaining <= 1) { return {}; }
     if (!request.ngram || request.ngram_indexed > ledger.size()) {
@@ -474,7 +491,7 @@ NgramProposer::Match ProgramImpl::propose_ngram_one(std::uint32_t lane,
             }
         }
     }
-    match = NgramProposer::finish_round(std::move(match), maximum, neural_draft_window);
+    match = NgramProposer::finish_round(std::move(match), maximum, neural_drafts);
     // A cursor is only a candidate. Next round rechecks it against committed ledger
     // tokens, including correction/bonus/control tokens, before skipping lookup.
     request.ngram_copy_source = !match.tokens.empty() && match.archived ? match.source : 0;
@@ -841,15 +858,36 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
         tree_nodes = tree_widths.fixed[batch_rows - 1U];
     }
     const bool tree_round = tree_nodes != 0U;
-    SpeculativeRoundFamily& family =
-        fixed_width  ? (ngram_draft_window != 0
-                            ? round_family(SpeculativeRoundKind::Ngram, ngram_draft_window)
-                            : round_family(SpeculativeRoundKind::Neural, neural_draft_window))
-        : any_ngram  ? round_family(SpeculativeRoundKind::Ngram, longest_copy)
-        : tree_round ? round_family(SpeculativeRoundKind::Tree, tree_nodes - 1U)
-                     : round_family(SpeculativeRoundKind::Neural, neural_draft_window);
-    const std::uint32_t verify_drafts = family.shape.verify_drafts;
-    const bool drafter_runs           = fixed_width || !any_ngram || lanes.size() > 1;
+    // adaptive-dflash: an all-neural chain round proposes the whole block, then verifies the width
+    // the policy picks from its drafts' probabilities; its family is chosen after the proposal.
+    // With a batch length, a chain round of several rows (neural or copy) instead drafts that
+    // length in one plain graph, and only rounds of one row are block rounds.
+    const bool plain_batch = dflash_batch_drafts != 0 && !fixed_width && batch_rows > 1U && !tree_round;
+    const bool block_round =
+        dflash_width_policy.has_value() && !fixed_width && !any_ngram && !tree_round && !plain_batch;
+    // The drafts the drafter proposes for a row that runs it this round.
+    const std::uint32_t proposal_drafts = plain_batch ? dflash_batch_drafts : neural_draft_window;
+    SpeculativeRoundFamily* family = nullptr;
+    if (fixed_width) {
+        family = &(ngram_draft_window != 0
+                       ? round_family(SpeculativeRoundKind::Ngram, ngram_draft_window)
+                       : round_family(SpeculativeRoundKind::Neural, neural_draft_window));
+    } else if (any_ngram) {
+        // Rows of a batch without a copy keep their neural proposal, which the family must hold.
+        family = &round_family(SpeculativeRoundKind::Ngram,
+                               batch_rows > 1U ? std::max(longest_copy, proposal_drafts) : longest_copy);
+    } else if (tree_round) {
+        family = &round_family(SpeculativeRoundKind::Tree, tree_nodes - 1U);
+    } else if (!block_round) {
+        family = &round_family(SpeculativeRoundKind::Neural, proposal_drafts);
+        if (plain_batch && (family->shape.verify_drafts != proposal_drafts || !family->shape.batch_only)) {
+            throw std::logic_error("adaptive DFlash batch length has no plain family");
+        }
+    }
+    // A block round's controls are written first for its proposal (the whole block), then again
+    // for the width it verifies.
+    std::uint32_t verify_drafts = family != nullptr ? family->shape.verify_drafts : neural_draft_window;
+    const bool drafter_runs     = fixed_width || !any_ngram || lanes.size() > 1;
     const bool dflash2_backend        = speculative_backend == SpeculativeBackend::DFlash2;
     qwen3_5::DFlashDecodeState& frame = *io.dflash_decode;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -870,15 +908,15 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
             }
         }
     }
-    const std::uint32_t width = verify_drafts + 1U;
-    const auto row_extent     = [&](std::size_t row, std::uint32_t frontier) {
+    std::uint32_t width   = verify_drafts + 1U;
+    const auto row_extent = [&](std::size_t row, std::uint32_t frontier) {
         const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
                                                 ? budgets[row].generated_tokens_remaining - 1U
                                                 : 0U;
         const bool row_copy               = any_ngram && !matches[row].tokens.empty();
         const std::uint32_t extent =
             std::min({row_copy ? static_cast<std::uint32_t>(matches[row].tokens.size())
-                               : (drafter_runs ? neural_draft_window : 0U),
+                               : (drafter_runs ? proposal_drafts : 0U),
                       max_by_budget, capacity - frontier - 1U});
         // A constrained row verifies its chain: the constraint names one step per chain column.
         if (tree_round && extent == neural_draft_window &&
@@ -901,19 +939,47 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
                              static_cast<std::uint64_t>(lanes.size()));
         DecodeGraphExecutable* forward       = nullptr;
         DecodeGraphExecutable* finish        = nullptr;
+        DecodeGraphExecutable* propose       = nullptr;
         const bool invariant_drafts          = execution_schedule.column_invariant_decode;
         execution::DFlashEnvelopes envelopes =
             dflash_envelopes(0, maximum_frontier, invariant_drafts, capacity);
         auto target_envelope                 = target_envelope_for(maximum_frontier);
-        if (use_cuda_graph) {
-            const auto batch = static_cast<std::uint32_t>(lanes.size());
-            auto& profile    = family.forward.select(batch, maximum_frontier);
-            forward          = &family.forward.install(profile);
-            finish = &family.finish.install(family.finish.select(batch, maximum_frontier));
-            envelopes = dflash_envelopes(profile.min_execution_frontier,
-                                         profile.max_execution_frontier, invariant_drafts, capacity);
+        const auto batch_rows_u              = static_cast<std::uint32_t>(lanes.size());
+        // The round family's graphs; a block round's drafter envelopes are its proposal graph's.
+        const auto install_family = [&] {
+            if (!use_cuda_graph) { return; }
+            auto& profile = family->forward.select(batch_rows_u, maximum_frontier);
+            forward       = &family->forward.install(profile);
+            finish = &family->finish.install(family->finish.select(batch_rows_u, maximum_frontier));
+            if (!block_round) {
+                envelopes = dflash_envelopes(profile.min_execution_frontier,
+                                             profile.max_execution_frontier, invariant_drafts, capacity);
+            }
             target_envelope = target_envelope_for(profile.max_execution_frontier);
+        };
+        if (!block_round) {
+            install_family();
+        } else if (use_cuda_graph) {
+            auto& profile = dflash_propose_graphs.select(batch_rows_u, maximum_frontier);
+            propose       = &dflash_propose_graphs.install(profile);
+            envelopes = dflash_envelopes(profile.min_execution_frontier, profile.max_execution_frontier,
+                                         invariant_drafts, capacity);
         }
+        // The controls of a row's verification at the round's width.
+        const auto write_verify_controls = [&](std::size_t row, std::uint32_t frontier,
+                                               std::uint32_t extent, bool tree_row,
+                                               std::int32_t rope_delta) {
+            dflash_host_ingress->proposal_extents[row]     = static_cast<std::int32_t>(extent);
+            dflash_host_ingress->target_valid_columns[row] = static_cast<std::int32_t>(extent + 1U);
+            for (std::uint32_t column = 0; column < width; ++column) {
+                // A tree row's columns take the anchor's position plus their depth, which the
+                // device adds once the round's tree is built.
+                const std::uint32_t position = frontier + (tree_row ? 0U : std::min(column, extent));
+                dflash_host_ingress->target_rope_positions[row * width + column] =
+                    checked_i32(position, "DFlash target RoPE position") + rope_delta;
+            }
+        };
+        std::array<std::uint32_t, kMaximumConcurrency> limits{};
 
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence           = active_sequence(lanes[row]);
@@ -926,20 +992,14 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
                 checked_i32(frontier, "DFlash batch frontier");
             dflash_host_ingress->context_frontiers[row] =
                 checked_i32(sequence.dflash_context_frontier, "DFlash context frontier");
-            // DFlash2 drafts its whole block; DFlash drafts the columns the row verifies.
+            // DFlash2 drafts its whole block, as does a block round; DFlash drafts the columns the
+            // row verifies.
             dflash_host_ingress->proposal_valid_columns[row] = static_cast<std::int32_t>(
-                (dflash2_backend ? neural_draft_window : std::min(extent, neural_draft_window)) +
+                (dflash2_backend || block_round ? proposal_drafts
+                                                : std::min(extent, proposal_drafts)) +
                 1U);
-            dflash_host_ingress->proposal_extents[row]     = static_cast<std::int32_t>(extent);
-            dflash_host_ingress->target_valid_columns[row] = static_cast<std::int32_t>(extent + 1U);
-            for (std::uint32_t column = 0; column < width; ++column) {
-                // A tree row's columns take the anchor's position plus their depth, which the
-                // device adds once the round's tree is built.
-                const std::uint32_t position =
-                    frontier + (tree_row ? 0U : std::min(column, extent));
-                dflash_host_ingress->target_rope_positions[row * width + column] =
-                    checked_i32(position, "DFlash target RoPE position") + sequence.rope_delta;
-            }
+            limits[row] = extent;
+            write_verify_controls(row, frontier, extent, tree_row, sequence.rope_delta);
             dflash_host_ingress->text_kv_table_rows[row] =
                 text_kv_addresses->bound_row(sequence.kv->text);
             dflash_host_ingress->dflash_kv_table_rows[row] =
@@ -954,6 +1014,71 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
                                       backend_kv_cache() ? frontier : 0U);
         }
 
+        const auto round_state = [&](std::uint32_t drafts) {
+            execution::DFlashBatchContext state{
+                {device, parameters, work, *state_images, round_replay_records(drafts), io,
+                 prefill_hidden, prefill_chunk, proposal_head, execution_schedule},
+                decoder->text_kv,
+                *dflash,
+                frame,
+                *dflash_host_ingress,
+                *dflash_host_egress,
+                state_images->continuation_hidden_store(),
+                dflash_draft_handoff->tokens(),
+                dflash_draft_handoff->ready};
+            state.host_confidence        = dflash_draft_handoff->confidence();
+            state.ngram                  = any_ngram;
+            state.neural_proposal_drafts = proposal_drafts;
+            state.tree                   = tree_round;
+            state.tree_paths             = draft_tree_paths;
+            return state;
+        };
+        mark_workspace_usage(workspace_plan.dflash_round);
+        const auto batch = static_cast<std::int32_t>(lanes.size());
+        // A block round's drafts and their probabilities under the drafter, row-major at the block.
+        std::array<std::array<float, kDFlashDecodeMaximumDrafts>, kMaximumConcurrency> probabilities{};
+        if (block_round) {
+            auto proposal = round_state(neural_draft_window);
+            execution::dflash_decode_batch(proposal, batch, neural_draft_window, envelopes,
+                                           target_envelope, propose,
+                                           execution::SpeculativePhase::Propose);
+            timing.begin_wait();
+            {
+                nvtx::ScopedRange wait_range(nvtx::Name::DecodeDFlashWait, nvtx::Category::Control,
+                                             static_cast<std::uint64_t>(lanes.size()));
+                dflash_draft_handoff->ready.synchronize();
+            }
+            timing.end_wait();
+            timing.resume_submit();
+            const std::span<const float> published = dflash_draft_handoff->confidence();
+            std::array<DFlashPolicyRow, kMaximumConcurrency> policy_rows{};
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                for (std::uint32_t j = 0; j < neural_draft_window; ++j) {
+                    const float value = published[row * neural_draft_window + j];
+                    // DFlash publishes the head's log-probability, DFlash2 the selector's probability.
+                    probabilities[row][j] = dflash2_backend ? value : std::exp(value);
+                }
+                policy_rows[row] = DFlashPolicyRow{
+                    .probabilities = std::span<const float>(probabilities[row].data(), neural_draft_window),
+                    .state         = &active_sequence(lanes[row]).dflash_draft,
+                    .limit         = limits[row]};
+            }
+            const std::uint32_t chosen = dflash_width_policy->choose(
+                std::span<const DFlashPolicyRow>(policy_rows.data(), lanes.size()));
+            verify_drafts = chosen - 1U;
+            width         = chosen;
+            family        = &round_family(SpeculativeRoundKind::Neural, verify_drafts, true);
+            if (family->shape.verify_drafts != verify_drafts || !family->shape.split) {
+                throw std::logic_error("adaptive DFlash width has no split family");
+            }
+            install_family();
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                const SequenceState& sequence = active_sequence(lanes[row]);
+                write_verify_controls(row, sequence.execution_frontier,
+                                      std::min(verify_drafts, limits[row]), false, sequence.rope_delta);
+            }
+        }
+
         std::array<ConstraintRow, kMaximumConcurrency> constraint_rows{};
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             constraint_rows[row] = constraint_row(lanes[row]);
@@ -961,41 +1086,27 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
         stage_constraint_columns(
             std::span<const ConstraintRow>(constraint_rows.data(), lanes.size()), width);
 
-        execution::DFlashBatchContext schedule_state{
-            {device, parameters, work, *state_images,
-             round_replay_records(verify_drafts), io, prefill_hidden, prefill_chunk,
-             proposal_head, execution_schedule},
-            decoder->text_kv,
-            *dflash,
-            frame,
-            *dflash_host_ingress,
-            *dflash_host_egress,
-            state_images->continuation_hidden_store(),
-            dflash_draft_handoff->tokens(),
-            dflash_draft_handoff->ready};
-
-        schedule_state.ngram                  = any_ngram;
-        schedule_state.neural_proposal_drafts = neural_draft_window;
-        schedule_state.tree                   = tree_round;
-        schedule_state.tree_paths             = draft_tree_paths;
-        mark_workspace_usage(workspace_plan.dflash_round);
-        const auto batch = static_cast<std::int32_t>(lanes.size());
+        auto schedule_state = round_state(verify_drafts);
         execution::dflash_decode_batch(schedule_state, batch, verify_drafts, envelopes,
                                        target_envelope, forward,
-                                       execution::SpeculativePhase::Forward);
+                                       block_round ? execution::SpeculativePhase::Verify
+                                                   : execution::SpeculativePhase::Forward);
         if (constrained) {
-            // The forward graph signals draft readiness before running the target model. The
-            // handoff carries the verified drafts of every row, copy or neural, at the round's
-            // width.
-            timing.begin_constraint_wait();
-            dflash_draft_handoff->ready.synchronize();
-            timing.end_constraint_wait();
-            timing.resume_submit();
+            // The forward graph signals draft readiness before running the target model; a block
+            // round's proposal already did. The handoff carries the verified drafts of every row,
+            // copy or neural, at the round's width (a block round's at the block).
+            if (!block_round) {
+                timing.begin_constraint_wait();
+                dflash_draft_handoff->ready.synchronize();
+                timing.end_constraint_wait();
+                timing.resume_submit();
+            }
+            const std::size_t stride = block_round ? neural_draft_window : verify_drafts;
             for (std::size_t row = 0; row < lanes.size(); ++row) {
                 const auto extent =
                     static_cast<std::size_t>(dflash_host_ingress->proposal_extents[row]);
-                (void)fill_grammar_mask(
-                    masks, row, schedule_state.host_drafts.subspan(row * verify_drafts, extent));
+                (void)fill_grammar_mask(masks, row,
+                                        schedule_state.host_drafts.subspan(row * stride, extent));
             }
         }
         execution::dflash_decode_batch(schedule_state, batch, verify_drafts, envelopes,
@@ -1048,6 +1159,18 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
                     request.speculative_stats.accepted_per_position[static_cast<std::size_t>(i)] +=
                         1;
                 }
+                // A neural chain row's verified length.
+                const bool copy_row = any_ngram && !matches[row].tokens.empty();
+                if (!copy_row && !(tree_round && extent == verify_drafts) &&
+                    extent <= request.speculative_stats.rounds_by_draft_length.size()) {
+                    request.speculative_stats.rounds_by_draft_length[extent - 1U] += 1;
+                }
+            }
+            if (block_round) {
+                DFlashWidthPolicy::observe(
+                    sequence.dflash_draft,
+                    std::span<const float>(probabilities[row].data(), neural_draft_window), extent,
+                    static_cast<std::uint32_t>(accepted_i));
             }
             if (any_ngram && !matches[row].tokens.empty()) {
                 request.speculative_stats.ngram_rounds += 1;
@@ -1091,7 +1214,10 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
             request.timings.decode_seconds += seconds;
             request.timings.decode_share_seconds += share;
         }
-        if (tree_controller && !any_ngram) {
+        // A block round's time is the chain's only at the chain's width; a plain batch round's
+        // never is (its chain is the batch length).
+        if (tree_controller && !any_ngram && !plain_batch &&
+            (!block_round || width == neural_draft_window + 1U)) {
             tree_controller->observe_round(batch_rows, maximum_frontier, width, seconds);
         }
         return runtime::BatchedGeneratedRound{

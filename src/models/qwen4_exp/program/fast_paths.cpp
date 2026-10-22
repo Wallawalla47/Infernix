@@ -463,6 +463,7 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
     case FastPath::DecodeSplit64: return false; // Qwen3.8-27B attention kernels only
     // Flash-Next chooses its draft lengths and prefill widths itself; groupwise Q4 is not a dense format.
     case FastPath::AdaptiveMtp:
+    case FastPath::AdaptiveDFlash:
     case FastPath::IdleWidePrefill:
     case FastPath::Q4W4A8: return false;
     // The drafter's sampled proposals (the program checks the sparse acceptance's token domain).

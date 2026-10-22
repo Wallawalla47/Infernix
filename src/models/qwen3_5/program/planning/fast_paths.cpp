@@ -238,6 +238,26 @@ constexpr std::array kQualified{
     Qualification{FastPath::AdaptiveMtp, {16, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value}},
     Qualification{FastPath::AdaptiveMtp, {16, ActivationClass::A16, KvCacheStorage::Vq2}},
     Qualification{FastPath::AdaptiveMtp, {16, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value}},
+    // --draft-tokens auto's policy for the block drafters (2026-10-22, INT8 KV). Like adaptive-mtp it
+    // changes no kernel: each round verifies leading drafts of a block a fixed --draft-tokens K
+    // proposes, at widths a fixed K verifies (6.1, item 3). Against the configuration's best single
+    // fixed length (NVFP4 27B DFlash2 7, 35B-A3B DFlash 3) at concurrency 1, 2 and 4 on code and
+    // sampled docs, geometric means +1.6 % and +6.1 % (model-quality.md 6.7, with the exceptions).
+    // The KV format changes only the round's absolute time, so every format takes the INT8 timing.
+    Qualification{FastPath::AdaptiveDFlash, {24, ActivationClass::A4, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::AdaptiveDFlash, {24, ActivationClass::A4, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::AdaptiveDFlash, {24, ActivationClass::A4, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::AdaptiveDFlash, {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::AdaptiveDFlash, {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::AdaptiveDFlash, {24, ActivationClass::A4, KvCacheStorage::Vq2}},
+    Qualification{FastPath::AdaptiveDFlash, {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::AdaptiveDFlash, {16, ActivationClass::A16, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::AdaptiveDFlash, {16, ActivationClass::A16, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::AdaptiveDFlash, {16, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::AdaptiveDFlash, {16, ActivationClass::A16, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::AdaptiveDFlash, {16, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::AdaptiveDFlash, {16, ActivationClass::A16, KvCacheStorage::Vq2}},
+    Qualification{FastPath::AdaptiveDFlash, {16, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value}},
 };
 
 const char* kv_name(KvCacheStorage kv) {
@@ -340,6 +360,12 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
     // drafts N.
     case FastPath::AdaptiveMtp:
         return options.speculative.backend == SpeculativeBackend::Mtp && options.speculative.draft_tokens_auto;
+    // The same for the block drafters: --draft-tokens auto's DFlash and DFlash2 policy, acting only
+    // where speculation is adaptive (ExecutionSchedule::adaptive_dflash).
+    case FastPath::AdaptiveDFlash:
+        return (options.speculative.backend == SpeculativeBackend::DFlash ||
+                options.speculative.backend == SpeculativeBackend::DFlash2) &&
+               options.speculative.draft_tokens_auto;
     // Causal scoring has no idle steps (each window's chunks are the caller's); the path is a no-op
     // there, which lets the gate name it while its fast run prefills at --fast-chunk.
     case FastPath::IdleWidePrefill: return true;
@@ -363,12 +389,70 @@ bool fast_path_qualified(FastPath path, const FastPathConfiguration& configurati
     });
 }
 
-std::uint32_t auto_fixed_draft_tokens(const FastPathConfiguration& configuration) noexcept {
+std::uint32_t auto_fixed_draft_tokens(const FastPathConfiguration& configuration,
+                                      SpeculativeBackend backend) noexcept {
+    // The block drafters' fastest single fixed lengths overall (code and sampled docs; 2026-10-20 at
+    // one request, the NVFP4 27B 2026-10-21/22 also at two and four): the 27B's DFlash2 7 (15 is
+    // 12.4 % faster than 7 on code at one request but 1-19 % slower batched, a geometric mean 6.1 %
+    // behind), the 35B-A3B's DFlash 3.
+    if (backend == SpeculativeBackend::DFlash || backend == SpeculativeBackend::DFlash2) {
+        return configuration.query_heads == 24 ? 7 : 3;
+    }
     // 2026-10-18 sweeps (INT8 KV; tg512 at concurrency 1, 2 and 4 and sampled text, model-quality.md
     // 6.7): the NVFP4 27B is fastest overall at 5, the groupwise 27B and the 35B-A3B at 3. The KV
     // format changes the round cost only slightly, so every format takes these.
     if (configuration.query_heads == 24 && configuration.activations == ActivationClass::A4) { return 5; }
     return 3;
+}
+
+std::uint32_t dflash_auto_ceiling(const FastPathConfiguration& configuration, SpeculativeBackend backend) noexcept {
+    (void)backend;
+    return configuration.query_heads == 24 ? 15U : 7U;
+}
+
+detail::DFlashWidthCosts dflash_width_costs(const FastPathConfiguration& configuration,
+                                    SpeculativeBackend backend) noexcept {
+    (void)backend;
+    // Measured 2026-10-20 (RTX 5090, INT8 KV, one request; fixed lengths 3, 7 and 15 against plain
+    // decoding, then the policy's cost tried around the fit on code and sampled docs): the NVFP4
+    // 27B verifies a draft at about 0.01 of a plain round (0.02 chose best), the 35B-A3B's experts
+    // make a draft 0.13-0.15. The groupwise 27B's (nearly free to 7 drafts and 0.05 past them after
+    // a block proposal of 0.69) serve a forced --fast-path adaptive-dflash only: it is not
+    // registered there.
+    if (configuration.query_heads == 24 && configuration.activations == ActivationClass::A4) {
+        return {.proposal = 0.18, .per_draft = 0.02, .per_draft_wide = 0.02};
+    }
+    if (configuration.query_heads == 24) { return {.proposal = 0.69, .per_draft = 0.003, .per_draft_wide = 0.05}; }
+    return {.proposal = 0.2, .per_draft = 0.15, .per_draft_wide = 0.15};
+}
+
+std::uint32_t dflash_batch_drafts(const FastPathConfiguration& configuration, SpeculativeBackend backend) noexcept {
+    (void)backend;
+    // Measured 2026-10-21/22 (RTX 5090, INT8 KV, two and four requests, code and sampled docs): the
+    // NVFP4 27B's split rounds (a 15-draft proposal, a host wait, then the chosen width) ran 1-8 %
+    // slower than fixed 7-draft rounds whatever widths they chose, the proposal and the wait costing
+    // 0.5-0.9 ms a batched round, so its batched rounds run plain at 7. The 35B-A3B's chosen batch
+    // widths ran -1.2 to +11.2 % against plain rounds of 3 (+3.8 % geometric mean) and 3-36 % ahead
+    // of plain rounds of 5, so it keeps them.
+    if (configuration.query_heads == 24 && configuration.activations == ActivationClass::A4) { return 7; }
+    return 0;
+}
+
+NgramSettings auto_ngram_settings(const FastPathConfiguration& configuration, SpeculativeBackend backend,
+                                  bool adaptive_drafts) noexcept {
+    // Measured 2026-10-22 (RTX 5090, INT8 KV; 24 repository files rewritten with one identifier
+    // renamed, 512 greedy tokens each, against code and sampled docs): beside the NVFP4 27B's
+    // adaptive DFlash2 rounds, copies of up to 63 drafts lifted one request from 612 to 1,304 tok/s
+    // (31 drafts: 1,088), within the spread on code and docs; with two requests 63 and 31 copied
+    // alike (1,405 and 1,396 against 776) but 63-draft copy rounds cost the batch's other rows 6.3 %
+    // on code (31: 1.6 %), so batched copies stop at 31. Minimum matches 8 and 16 moved the copy
+    // workload +4.1 % and -3.5 % with the opposite effect on code's wrong copies, so it stays 12.
+    // The 35B-A3B's DFlash copies did not pay (15 drafts +0.5 %, 31 drafts -4.1 %).
+    if (configuration.query_heads == 24 && configuration.activations == ActivationClass::A4 &&
+        backend == SpeculativeBackend::DFlash2 && adaptive_drafts) {
+        return {.window = 63, .batch_window = 31, .min_match = 12};
+    }
+    return {};
 }
 
 bool FastPathSelection::selected(FastPath path) const noexcept {

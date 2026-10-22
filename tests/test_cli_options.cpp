@@ -150,6 +150,17 @@ int run_tests() {
     failures +=
         check(ngram.speculative.ngram_draft_tokens == 15 && ngram.speculative.draft_tokens == 5,
               "CLI ngram widths changed");
+    // auto leaves the copy window to the Engine; it needs a neural drafter.
+    const auto ngram_auto = parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--spec", "dflash2",
+                                   "--draft-tokens", "auto", "--ngram-draft-tokens", "auto"});
+    failures += check(ngram_auto.speculative.ngram_draft_tokens_auto &&
+                          ngram_auto.speculative.ngram_draft_tokens == 0,
+                      "CLI did not select the automatic ngram window");
+    failures += check(rejects([] {
+                          (void)parse({"infernix-cli", "model.ninfer", "--prompt", "x",
+                                       "--ngram-draft-tokens", "auto"});
+                      }),
+                      "CLI admitted an automatic ngram window without a neural drafter");
     const auto mtp_ngram = parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--spec", "mtp",
                                   "--draft-tokens", "5", "--ngram-draft-tokens", "1"});
     failures += check(mtp_ngram.speculative.draft_tokens == 5 &&
@@ -169,15 +180,20 @@ int run_tests() {
                                   "--draft-tokens", "7"});
     failures += check(!mtp_fixed.speculative.draft_tokens_auto && mtp_fixed.speculative.draft_tokens == 7,
                       "CLI did not keep a fixed MTP draft length of 7");
-    for (const auto* rejected : {"dflash", "Auto"}) {
-        const std::string backend = std::string(rejected) == "Auto" ? "mtp" : rejected;
-        const std::string tokens  = std::string(rejected) == "Auto" ? "Auto" : "auto";
-        failures += check(rejects([&] {
-                              (void)parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--spec",
-                                           backend, "--draft-tokens", tokens});
-                          }),
-                          ("CLI admitted --draft-tokens " + tokens + " with --spec " + backend).c_str());
-    }
+    // The block drafters' automatic verify width (DFlash and DFlash2), the ceiling left to the Engine.
+    const auto dflash_auto = parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--spec", "dflash",
+                                    "--draft-tokens", "auto"});
+    failures += check(dflash_auto.speculative.draft_tokens_auto && dflash_auto.speculative.draft_tokens == 0,
+                      "CLI did not select the automatic DFlash draft length");
+    failures += check(rejects([&] {
+                          (void)parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--spec", "mtp",
+                                       "--draft-tokens", "Auto"});
+                      }),
+                      "CLI admitted --draft-tokens Auto");
+    failures += check(rejects([&] {
+                          (void)parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--draft-tokens", "auto"});
+                      }),
+                      "CLI admitted --draft-tokens auto without --spec");
     // Qwen3.8-Flash-Next's DFlash2 drafter: a companion artifact by path, and the automatic length.
     const auto companion = parse({"infernix-cli", "model.infernix", "--prompt", "x", "--spec", "dflash2",
                                   "--draft-tokens", "auto", "--draft-model", "drafter.infernix", "--lm-head-draft"});

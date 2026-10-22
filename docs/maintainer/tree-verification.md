@@ -70,7 +70,12 @@ family serves every batch size (a constrained round verifies the chain).
 `--draft-tree-nodes auto` captures, for rounds of up to four rows, the chain family and tree
 families of K+5 and K+9 columns (12 and 16 at K=7, the best two widths at short context), and
 `TreeWidthController` (`program/speculative/tree_width_controller.h`) picks each all-neural round's
-width on the host before the round is submitted:
+width on the host before the round is submitted (beside `--draft-tokens auto`'s `adaptive-dflash`
+widths automatic trees resolve to chains: on the NVFP4 27B's 15-draft block, 20- and 24-column
+trees ran 1.0-1.9 % slower than the 16-column chain by the same-text estimate, 2026-10-22, one
+request, code and sampled docs, and the controller would time the chain only in the rounds the
+width policy verifies the whole block; at 7 drafts automatic trees still gained +11.5 % on code
+and +6.1 % on sampled docs against the 7-draft chain that day):
 
 - **Gain, measured on the generated text.** The builder adds columns best first, so a tree of w
   columns is the first w columns of any wider tree built for the same row, and its acceptance walk

@@ -449,10 +449,12 @@ std::string serve_usage_text(const char* argv0) {
            "                             dflash2 1-7)\n"
            "                               N     every round drafts and verifies N\n"
            "                               auto  mtp: each round picks 0-7 from recent\n"
-           "                                     acceptance (Qwen3.5/3.6: 1-5 where\n"
-           "                                     qualified, else the model's fastest\n"
-           "                                     fixed length); Qwen3.8-Flash-Next\n"
-           "                                     dflash2 likewise\n"
+           "                                     acceptance; dflash/dflash2: each round\n"
+           "                                     drafts its whole block (Qwen3.5/3.6 15,\n"
+           "                                     Flash-Next 7) and verifies as many as the\n"
+           "                                     drafts' probabilities favour (Qwen3.5/3.6:\n"
+           "                                     where qualified, else the fastest fixed\n"
+           "                                     length)\n"
            "  --draft-model FILE         Qwen3.8-Flash-Next dflash2: the DFlash2 drafter's\n"
            "                             companion artifact (Qwen3.5/3.6 artifacts bundle\n"
            "                             theirs)\n"
@@ -476,7 +478,9 @@ std::string serve_usage_text(const char* argv0) {
            "                             draft tokens + 2 to 32, 0 = single draft (draft\n"
            "                             tokens + 1)\n"
            "  --draft-tree-paths N       most branches per tree, 2-8 (default 8)\n"
-           "  --ngram-draft-tokens N     propose N verified ngram copies per round, 1-63 (0 off)\n"
+           "  --ngram-draft-tokens N     propose N verified ngram copies per round, 1-63 (0 off);\n"
+           "                             auto: the configuration's measured window and minimum\n"
+           "                             match (Qwen3.8-27B / Qwen3.6-35B-A3B)\n"
            "  --ngram-min-match N        minimum ngram match length, 4-64\n"
            "  --ngram-archive-mib N      MiB of retained source archive for ngram proposals\n"
            "  --ngram-session-mib N      MiB session-scoped ngram source budget (default 128);\n"
@@ -901,8 +905,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.speculative.draft_tree_paths = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--draft-tree-paths"), "draft-tree-paths"));
         } else if (arg == "--ngram-draft-tokens") {
-            options.speculative.ngram_draft_tokens = static_cast<std::uint32_t>(
-                parse_nonnegative_int(require_value("--ngram-draft-tokens"), "ngram-draft-tokens"));
+            product::apply_ngram_draft_tokens(options.speculative, require_value("--ngram-draft-tokens"));
         } else if (arg == "--ngram-min-match") {
             options.speculative.ngram_min_match = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--ngram-min-match"), "ngram-min-match"));

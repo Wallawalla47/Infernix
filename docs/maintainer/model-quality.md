@@ -996,6 +996,7 @@ their request-coupling paths are listed like the others (since 2026-10-22). The 
 | `q4-w4a8` | groupwise Q4 MLP gate/up | none (fails, below) |
 | `idle-wide-prefill` | Qwen3.8-27B / Qwen3.6-35B-A3B generation engines | NVFP4 27B, groupwise 27B and 35B-A3B, every format |
 | `adaptive-mtp` | Qwen3.8-27B / Qwen3.6-35B-A3B with MTP and `--draft-tokens auto` | NVFP4 27B and 35B-A3B, every format |
+| `adaptive-dflash` | Qwen3.8-27B / Qwen3.6-35B-A3B with DFlash or DFlash2 and `--draft-tokens auto` | NVFP4 27B and 35B-A3B, every format (2026-10-22, below); not the groupwise 27B |
 | Qwen3.8-Flash-Next: `expert-a4-residual` | artifacts with NVFP4 W4A16 experts (recipe C; NVIDIA FP4-Local at its default 16-bit expert activations), expert calls of more than eight columns | FP8 dense (recipe C) and MXFP8 dense (FP4-Local, by recipe C's kernel verdicts and its own timing), 16-bit expert activations, every KV format (BF16 by FP4-Local's gates against the precise reference, below) |
 | Qwen3.8-Flash-Next: `expert-a4-residual-3` | the same calls as `expert-a4-residual`, three NVFP4 terms per x and h row (its more precise form, design §19.3.23; it takes precedence where both are selected) | none: two terms pass on every configuration and format they run in (2026-10-21), so it stays an unregistered candidate (`--fast-path expert-a4-residual-3`) for a cell where two terms fail; three terms cost 7-8 points of prefill speed (below) |
 | Qwen3.8-Flash-Next: `sampled-mtp-drafts` | MTP rounds with a sampled request | every Flash-Next configuration, every format (distribution and greedy identity, below; no logit changes) |
@@ -1664,6 +1665,96 @@ and recomputes the previous output) or admission (whole extents held without `pr
   one-request runs show the learned cost can settle on a worse length in one run than another (also
   the 27B's 152.0 and 139.4 above). Earlier (2026-10-15, the fixed cost model, bench corpus at 5.9 of
   6 accepted): 1.0-4.1 % slower than five fixed drafts, from its probe rounds.
+
+**`adaptive-dflash`: the block drafters' verify width chosen per round from the proposal (qualified
+2026-10-22 on the NVFP4 27B and the 35B-A3B).**
+- **Selected by:** `--spec dflash|dflash2 --draft-tokens auto` on Qwen3.8-27B / Qwen3.6-35B-A3B, where
+  it is registered (it is `auto`'s policy: a fixed `--draft-tokens N` refuses it); it acts where
+  speculation is adaptive (`adaptive-speculation` selected). Where it does not act (the groupwise
+  27B, `--reproducible`), `auto` verifies the configuration's fastest single fixed length every
+  round: 7 on the 27B, 3 on the 35B-A3B (`auto_fixed_draft_tokens`). The policy is
+  `models/qwen3_5/program/speculative/dflash_width_policy.h`
+  ([DFlash](dflash.md#automatic-verify-width-qwen38-27b--qwen36-35b-a3b)).
+- **What changes:** an all-neural chain round of one row proposes the whole block (15 drafts on the
+  27B, 7 on the 35B-A3B) with each draft's probability under the drafter, then verifies the width
+  with the most expected tokens per round time among 2-8, 10, 12, 14 and 16 columns (up to the
+  block's), its leading min(W - 1, limit) drafts. Expected tokens come from the request's
+  calibration of its drafts' probability deciles (Qwen3.8-Flash-Next's policy,
+  `runtime/speculative/draft_length.h`), a round's time from the configuration's measured costs in
+  plain rounds: NVFP4 27B 1 + 0.18 + 0.02 per draft, 35B-A3B 1 + 0.2 + 0.15 per draft per row
+  (the groupwise 27B's 0.69 and 0.003 per draft to 7, 0.05 past them, serve a forced
+  `--fast-path adaptive-dflash`). Every eighth choice of a row runs the next wider width. Rounds of
+  several rows: the NVFP4 27B runs them as plain 7-draft rounds (one graph, `dflash_batch_drafts`),
+  the 35B-A3B chooses among 2, 4 and 8 columns with each draft costed once per row. A choice reads the
+  round's own proposal, never the target's draws, so acceptance and sampling are unchanged; every
+  width is one a fixed `--draft-tokens K` verifies, through routes qualified at that width, so the
+  path changes no kernel arithmetic and is decided by speed (6.1 item 3). The choices depend only on
+  the proposals and the request's own rounds, not on measured time, so a workload repeats run to
+  run. Automatic DFlash2 trees resolve to chains beside it (below).
+- **Cost:** a one-row round's proposal and verification are two graphs with a host wait between;
+  one proposal graph per drafter profile for the batch sizes that split, one verify/finish pair per
+  width and batch size it serves (about 2.5 MiB of graph allowance each).
+- **Correctness:** greedy streams against the target's own greedy choice at every position
+  (`infernix_qwen3_5_dflash{2,}_block*_greedy_real_test`, six prompts of 160 tokens): NVFP4 27B
+  one request 17 of 960 positions disagree (worst margin 0.50 nats; fixed chains 3.0-3.3 % on this
+  test), two streams with `--ngram-draft-tokens auto` 20 of 960 (worst 0.50), six copy-heavy
+  rewrite prompts at two streams 0 of 960 (27 copy rounds); 35B-A3B one request 55 of 960 against 48
+  for fixed 7-draft chains (2026-10-21), two streams with plain 3-draft batches 54 of 960 (worst
+  1.63).
+- **Speed** (RTX 5090, INT8 KV, main 0e91f862, `infernix_decode_quality_gen` with N workers keeping
+  N requests decoding: 1,280-token slices of Infernix's code continued greedily and of its Markdown
+  docs sampled at temperature 1 with top-k 20 and top-p 0.95, 384 tokens each; 24 slices on the
+  27B, 48 on the 35B-A3B; wall-clock tok/s):
+
+  | Artifact | Requests | Text | Fixed 3 | Fixed 7 | Fixed 15 | MTP `auto` | `auto` |
+  |---|---|---|---:|---:|---:|---:|---:|
+  | NVFP4 27B | 1 | code | | 280.8 | 315.6 | | **329.5** |
+  | NVFP4 27B | 1 | docs, sampled | | 176.3 | **178.9** | | 178.3 |
+  | NVFP4 27B | 2 | code | | 507.6 | 504.4 | | **513.7** |
+  | NVFP4 27B | 2 | docs, sampled | | **321.1** | 282.3 | | 314.7 |
+  | NVFP4 27B | 4 | code | | **775.1** | 662.7 | | 725.1 |
+  | NVFP4 27B | 4 | docs, sampled | | 508.0 | 409.8 | | **508.3** |
+  | 35B-A3B | 1 | code | 615.0 | | | 655.4 | **686.4** |
+  | 35B-A3B | 1 | docs, sampled | 391.2 | | | **441.3** | 428.6 |
+  | 35B-A3B | 2 | code | 818.6 | | | **898.8** | 833.2 |
+  | 35B-A3B | 2 | docs, sampled | 529.5 | | | **654.9** | 554.0 |
+  | 35B-A3B | 4 | code | 940.4 | | | **1,070.5** | 926.6 |
+  | 35B-A3B | 4 | docs, sampled | 611.9 | | | **872.1** | 679.3 |
+
+  Against the configuration's best single fixed length overall (the 27B's 7, the 35B-A3B's 3) the
+  geometric mean over these settings is +1.6 % and +6.1 % (against the 27B's 15: +8.2 %). It is not
+  the fastest everywhere. The 27B's batched rounds are fixed 7's rounds (equal time per row-round
+  within 0.5 %), so its batched differences are the texts the streams diverge into: four requests on
+  code -6.5 % over these 24 slices, -0.5 % over 72 (791.7 against 795.9); two requests on sampled
+  docs -2.0 %. The 35B-A3B is 1.5 % behind fixed 3 with four requests on code. MTP `auto` is the
+  35B-A3B's faster drafter with several requests (+8-28 %) and on sampled docs. Long context, one
+  request on code (four 64K and 128K-token prompts, decode tok/s): the 27B's `auto` 279.3 and 214.8
+  against fixed 7's 269.9 and 216.0 and fixed 15's 261.1 and 204.6 (the policy narrows its widths
+  as the context grows). The other KV formats take the INT8 timing: a format changes only the
+  absolute round time, not the widths' order.
+
+  Rejected: the 27B's split batched rounds (2026-10-21: a 15-draft proposal and a host wait cost
+  0.5-0.9 ms a batched round, 1-8 % behind fixed 7 whatever widths they verified, also with a fixed
+  8-column batch width); plain batched rounds of 3 or 5 drafts on the 35B-A3B (its chosen widths are
+  -1.2 to +11.2 % against plain 3, geometric mean +3.8 %, and 3-36 % ahead of plain 5); the
+  35B-A3B's 15-draft block (756.4 / 448.7 at one request: its 16-column proposal costs more than its
+  drafts add); costs 0.01 and 0.005 per draft on the 27B (334.0 and 344.3 on code against 361.4 at
+  0.02, decode tok/s); registering the groupwise 27B (one request: `auto` 300.0 / 171.3 against
+  fixed 7's 300.8 / 184.6); a lower copy floor (one-row copies of 8-15 drafts replacing the block:
+  no round changed on the copy workload); DFlash2 trees on the block: 15 drafts with 20- and
+  24-column trees ran 1.3 / 2.5 % and 1.3 % behind the chain (same-text estimate -1.3 / -1.9 % and
+  -1.0 %), and `auto` with automatic trees chose trees in 704 of 1,547 code rounds and 122 of 3,119
+  docs rounds (-1.2 % / +2.2 %) because the tree controller sees a chain round only when the policy
+  verifies the whole block, so automatic trees resolve to chains beside the policy. At 7 drafts
+  automatic trees gain +11.5 % on code and +6.1 % on sampled docs against the 7-draft chain, and
+  on sampled docs 7 drafts with trees (187.1) beat `auto` (178.3): trees chosen by the width policy
+  on a short main chain are the open follow-up. A fixed MTP draft cost in place of `adaptive-mtp`'s
+  learned fit did not help (NVFP4 27B at 0.06: 263.1 / 144.2 against 263.2 / 150.5 decode tok/s;
+  35B-A3B at 0.19: 729.2 / 466.3 against 735.5 / 470.0), so `adaptive-mtp` keeps its fit.
+  Measurement note: the earlier in-order gen tool let finished requests keep their lanes until the
+  oldest one completed, so batched occupancy followed the finishing order (four requests on sampled
+  docs: 3.40 rows a round for `auto` against 3.60 for fixed 7, 464 against 478 tok/s); every batched
+  number above is from the worker tool.
 
 **`idle-wide-prefill`: wider prefill steps while no request waits to decode (qualified
 2026-10-15).**

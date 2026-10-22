@@ -53,6 +53,9 @@ struct ExecutionSchedule {
     bool held_extent                  = false;
     // adaptive-mtp: MTP rounds choose their draft length (only where speculation is adaptive).
     bool adaptive_mtp                 = false;
+    // adaptive-dflash: DFlash and DFlash2 all-neural rounds propose, then choose their verify
+    // width (only where speculation is adaptive).
+    bool adaptive_dflash              = false;
     ops::LinearRoutes linear_routes   = ops::LinearRoutes::Exact;
     // batched-decode: the decode and verification rounds' MLP down projections take its tiles
     // (ops::LinearRoutes::WideDownTile).

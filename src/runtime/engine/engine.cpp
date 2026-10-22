@@ -257,8 +257,9 @@ public:
         if (tree_auto_requested && !options.speculative.draft_tree_auto) {
             runtime::publish_diagnostic(
                 options.diagnostic_observer, DiagnosticLevel::Warning,
-                "automatic DFlash2 tree verification is unavailable for this artifact (its GDN "
-                "input projections are not single FP8 or NVFP4 parents); rounds verify chains");
+                "automatic DFlash2 tree verification does not run here (an artifact whose GDN input "
+                "projections are not single FP8 or NVFP4 parents, fixed speculation, or --draft-tokens "
+                "auto's adaptive-dflash widths, which verify chains faster); rounds verify chains");
         }
         sampling_defaults = active->frontend.sampling_defaults();
         StartupPhaseScope finalize_phase(options.startup_observer, StartupPhase::EngineFinalize);

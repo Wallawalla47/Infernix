@@ -265,6 +265,10 @@ std::uint32_t resolve_auto_draft_length(const execution::Parameters& parameters,
     return detail::resolve_auto_draft_length_impl(parameters, options);
 }
 
+std::uint32_t resolve_auto_ngram(const Model& model, EngineOptions& options) {
+    return detail::resolve_auto_ngram_impl(model, options);
+}
+
 std::unique_ptr<Program> create_program(const execution::Parameters& parameters,
                                         SequencePlan&& plan, DeviceContext& device,
                                         const StartupObserver& startup_observer) {

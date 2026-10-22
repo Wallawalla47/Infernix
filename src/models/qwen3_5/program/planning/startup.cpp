@@ -9,6 +9,7 @@
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/program/prefix/hybrid_host_layout.h"
+#include "models/qwen3_5/program/speculative/dflash_width_policy.h"
 #include "models/qwen3_5/program/speculative/mtp_draft_policy.h"
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/execution/workspace.h"
@@ -103,6 +104,11 @@ TreeWidthPlan resolve_tree_widths(const execution::Parameters& parameters,
     return plan;
 }
 
+bool plan_has_split(const SequencePlanImpl& plan) {
+    return std::any_of(plan.round_shapes.begin(), plan.round_shapes.end(),
+                       [](const SpeculativeRoundShape& shape) { return shape.split; });
+}
+
 bool plan_has_tree(const SequencePlanImpl& plan) {
     return std::any_of(plan.round_shapes.begin(), plan.round_shapes.end(),
                        [](const SpeculativeRoundShape& shape) {
@@ -112,14 +118,37 @@ bool plan_has_tree(const SequencePlanImpl& plan) {
 
 // The speculative round families an engine captures. Neural rounds verify at the drafter's window
 // and n-gram copy rounds at the n-gram window, for every backend. With adaptive-mtp every shorter
-// MTP draft length has its own neural family; lengths outside the batch lengths serve one row.
+// MTP draft length has its own neural family; lengths outside the batch lengths serve one row. With
+// adaptive-dflash the neural rounds instead verify, after a proposal of the whole block, one of the
+// policy's widths (dflash_width_policy.h), each a split family; widths outside the batch widths
+// serve one row. With a batch length (batch_drafts) there are no batch widths: rounds of several
+// rows run a plain neural family of that length.
 std::vector<SpeculativeRoundShape> speculative_round_shapes(const EngineOptions& options,
                                                             const TreeWidthPlan& tree_widths,
-                                                            bool adaptive_mtp) {
+                                                            bool adaptive_mtp, bool adaptive_dflash,
+                                                            std::uint32_t batch_drafts) {
     const SpeculativeOptions& spec = options.speculative;
     std::vector<SpeculativeRoundShape> shapes;
     if (spec.backend == SpeculativeBackend::None) { return shapes; }
-    shapes.push_back({SpeculativeRoundKind::Neural, spec.draft_tokens});
+    if (adaptive_dflash && is_masked_draft_backend(spec.backend)) {
+        const bool plain_batches = batch_drafts != 0 && options.max_concurrency > 1;
+        const std::vector<std::uint32_t> batch =
+            plain_batches ? std::vector<std::uint32_t>{} : dflash_policy_widths(spec.draft_tokens, true);
+        for (const std::uint32_t width : dflash_policy_widths(spec.draft_tokens, false)) {
+            const bool batches = std::find(batch.begin(), batch.end(), width) != batch.end();
+            shapes.push_back({.kind          = SpeculativeRoundKind::Neural,
+                              .verify_drafts = width - 1U,
+                              .single_row    = options.max_concurrency > 1 && !batches,
+                              .split         = true});
+        }
+        if (plain_batches) {
+            shapes.push_back({.kind          = SpeculativeRoundKind::Neural,
+                              .verify_drafts = std::min(batch_drafts, spec.draft_tokens),
+                              .batch_only    = true});
+        }
+    } else {
+        shapes.push_back({SpeculativeRoundKind::Neural, spec.draft_tokens});
+    }
     if (adaptive_mtp && spec.backend == SpeculativeBackend::Mtp) {
         for (std::uint32_t k = 1; k < spec.draft_tokens; ++k) {
             shapes.push_back({SpeculativeRoundKind::Neural, k,
@@ -130,13 +159,29 @@ std::vector<SpeculativeRoundShape> speculative_round_shapes(const EngineOptions&
     if (spec.ngram_draft_tokens != 0) {
         // Copy rounds take the narrowest n-gram family that holds their longest copy, so short
         // copies do not pay for the whole window. Narrower families lie strictly between the
-        // neural window (rows without a copy keep their neural proposal) and the n-gram window.
+        // neural proposal a copy must exceed (ProgramImpl::ngram_copy_floor: the neural window,
+        // or adaptive-dflash's batch length) and the n-gram window.
+        std::uint32_t copy_floor = spec.draft_tokens;
+        if (adaptive_dflash && is_masked_draft_backend(spec.backend) && batch_drafts != 0 &&
+            options.max_concurrency > 1) {
+            copy_floor = std::min(copy_floor, batch_drafts);
+        }
         for (const std::uint32_t narrow : {7U, 15U, 31U}) {
-            if (narrow > spec.draft_tokens && narrow < spec.ngram_draft_tokens) {
+            if (narrow > copy_floor && narrow < spec.ngram_draft_tokens) {
                 shapes.push_back({SpeculativeRoundKind::Ngram, narrow});
             }
         }
-        shapes.push_back({SpeculativeRoundKind::Ngram, spec.ngram_draft_tokens});
+        // Where batched copies stop at a narrower window, the widest family serves one row.
+        const bool narrow_batches = spec.ngram_batch_draft_tokens != 0 &&
+                                    spec.ngram_batch_draft_tokens < spec.ngram_draft_tokens;
+        if (narrow_batches && std::none_of(shapes.begin(), shapes.end(), [&](const SpeculativeRoundShape& s) {
+                return s.kind == SpeculativeRoundKind::Ngram && s.verify_drafts == spec.ngram_batch_draft_tokens;
+            })) {
+            shapes.push_back({SpeculativeRoundKind::Ngram, spec.ngram_batch_draft_tokens});
+        }
+        shapes.push_back({.kind          = SpeculativeRoundKind::Ngram,
+                          .verify_drafts = spec.ngram_draft_tokens,
+                          .single_row    = narrow_batches && options.max_concurrency > 1});
     }
     // One tree family per distinct tree width.
     for (const std::uint32_t nodes : tree_widths.widths()) {
@@ -367,7 +412,8 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                                          .draft_window   = plan.draft_window,
                                          .backend        = plan.speculative_backend,
                                          .causal_scoring = plan.causal_scoring,
-                                         .fp32_logits    = plan.execution_schedule.lossless});
+                                         .fp32_logits    = plan.execution_schedule.lossless,
+                                         .block_drafts   = plan_has_split(plan) ? plan.neural_draft_window : 0U});
     out.prefill_hidden =
         add_tensor(builder, DType::BF16, {dimension(config.hidden_size), effective_prefill_chunk},
                    "step prefill hidden");
@@ -1114,6 +1160,9 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
          options.speculative.ngram_min_match > 64)) {
         throw std::invalid_argument("ngram requires MTP/DFlash/DFlash2, K1..63 and match 4..64");
     }
+    if (options.speculative.ngram_batch_draft_tokens > options.speculative.ngram_draft_tokens) {
+        throw std::invalid_argument("the batched ngram window must lie within the ngram window");
+    }
 }
 
 std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlanningInputs& inputs,
@@ -1135,9 +1184,11 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->draft_window         = inputs.draft_window;
     impl->neural_draft_window  = inputs.neural_draft_window;
     impl->round_shapes         = inputs.round_shapes;
+    impl->dflash_width_costs   = inputs.dflash_width_costs;
     impl->tree_widths          = inputs.tree_widths;
     impl->draft_tree_paths     = inputs.draft_tree_paths;
     impl->ngram_draft_window   = inputs.ngram_draft_window;
+    impl->ngram_batch_window   = inputs.ngram_batch_window;
     impl->ngram_min_match      = inputs.ngram_min_match;
     impl->speculative_backend  = inputs.speculative_backend;
     impl->proposal_head        = inputs.proposal_head;
@@ -1187,24 +1238,37 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             // MTP Finish keeps the Forward profiles; DFlash Finish has one executable per exact B.
             // Every MTP round proposes the next round's drafts at its neural family's draft length
             // (copy rounds at the configured neural depth).
-            const bool mtp = impl->speculative_backend == SpeculativeBackend::Mtp;
+            const bool mtp      = impl->speculative_backend == SpeculativeBackend::Mtp;
+            bool split          = false;
+            bool split_batches  = false;
             for (const SpeculativeRoundShape& shape : impl->round_shapes) {
                 const std::uint32_t ar_depth = mtp_proposal_drafts(shape, impl->neural_draft_window);
+                split                        = split || shape.split;
+                split_batches                = split_batches || (shape.split && !shape.single_row);
                 const auto profiles =
-                    mtp ? mtp_graph_profiles(impl->capacity, shape.verify_drafts, ar_depth)
-                        : dflash_graph_profiles(impl->speculative_backend, impl->capacity,
-                                                shape.verify_drafts);
+                    mtp           ? mtp_graph_profiles(impl->capacity, shape.verify_drafts, ar_depth)
+                    : shape.split ? dflash_verify_graph_profiles(impl->capacity, shape.verify_drafts)
+                                  : dflash_graph_profiles(impl->speculative_backend, impl->capacity,
+                                                          shape.verify_drafts);
                 // A tree family serves only the batch sizes that may verify its width. Chain
                 // families serve every batch size: a round with a constrained row verifies the
-                // chain whatever the tree table selects. A single-row family serves one row.
+                // chain whatever the tree table selects. A single-row family serves one row, a
+                // batch-only family every other batch size.
                 std::uint32_t batch_sizes = 0;
                 for (std::uint32_t b = 1; b <= impl->max_concurrency; ++b) {
                     batch_sizes += (shape.kind != SpeculativeRoundKind::Tree ||
                                     impl->tree_widths.tree(b, shape.verify_drafts + 1U)) &&
-                                   (!shape.single_row || b == 1U);
+                                   (!shape.single_row || b == 1U) && (!shape.batch_only || b > 1U);
                 }
                 const std::uint64_t forward = graph_topology_classes(profiles);
                 executables += (forward + (mtp ? forward : 1U)) * batch_sizes;
+            }
+            // adaptive-dflash's proposal graphs: the drafter's profiles at the whole block, for every
+            // batch size a split family serves.
+            if (split) {
+                executables += static_cast<std::uint64_t>(graph_topology_classes(dflash_graph_profiles(
+                                   impl->speculative_backend, impl->capacity, impl->neural_draft_window))) *
+                               (split_batches ? impl->max_concurrency : 1U);
             }
         }
         impl->graph_allowance_bytes = checked_add(
@@ -1274,6 +1338,8 @@ ExecutionSchedule execution_schedule(const execution::Parameters& parameters,
             .held_extent             = !fast_paths.selected(FastPath::Preemption),
             .adaptive_mtp            = fast_paths.selected(FastPath::AdaptiveMtp) &&
                                        fast_paths.selected(FastPath::AdaptiveSpeculation),
+            .adaptive_dflash         = fast_paths.selected(FastPath::AdaptiveDFlash) &&
+                                       fast_paths.selected(FastPath::AdaptiveSpeculation),
             .linear_routes           = fast_paths.selected(FastPath::Q4W4A8) ? ops::LinearRoutes::Q4W4A8
                                                                              : ops::LinearRoutes::Exact,
             .wide_down_tile          = fast_paths.selected(FastPath::BatchedDecode),
@@ -1341,21 +1407,51 @@ std::vector<std::uint32_t> idle_prefill_widths_impl(const execution::Parameters&
 
 std::uint32_t resolve_auto_draft_length_impl(const execution::Parameters& parameters,
                                              EngineOptions& options) {
-    if (!options.speculative.draft_tokens_auto || execution_schedule(parameters, options).adaptive_mtp) {
+    // A block drafter's automatic ceiling, unless given: the configuration's block.
+    if (options.speculative.draft_tokens_auto && is_masked_draft_backend(options.speculative.backend) &&
+        options.speculative.draft_tokens == 0) {
+        options.speculative.draft_tokens = dflash_auto_ceiling(
+            select_fast_paths(parameters.model, options).configuration, options.speculative.backend);
+    }
+    const ExecutionSchedule schedule = execution_schedule(parameters, options);
+    if (!options.speculative.draft_tokens_auto || schedule.adaptive_mtp || schedule.adaptive_dflash) {
         return 0;
     }
-    // adaptive-mtp acts only where speculation is adaptive; a qualification run that names it must
+    // The policies act only where speculation is adaptive; a qualification run that names one must
     // also name adaptive-speculation.
-    if (std::find(options.fast_path_candidates.begin(), options.fast_path_candidates.end(),
-                  FastPath::AdaptiveMtp) != options.fast_path_candidates.end()) {
-        throw std::invalid_argument("--fast-path adaptive-mtp acts only where speculation is adaptive: "
-                                    "add --fast-path adaptive-speculation");
+    for (const FastPath policy : {FastPath::AdaptiveMtp, FastPath::AdaptiveDFlash}) {
+        if (std::find(options.fast_path_candidates.begin(), options.fast_path_candidates.end(), policy) !=
+            options.fast_path_candidates.end()) {
+            throw std::invalid_argument(std::string("--fast-path ") + fast_path_name(policy) +
+                                        " acts only where speculation is adaptive: add --fast-path "
+                                        "adaptive-speculation");
+        }
     }
     const FastPathSelection fast =
         select_fast_paths(parameters.model, options);
     options.speculative.draft_tokens_auto = false;
-    options.speculative.draft_tokens      = auto_fixed_draft_tokens(fast.configuration);
+    options.speculative.draft_tokens =
+        std::min(options.speculative.draft_tokens,
+                 auto_fixed_draft_tokens(fast.configuration, options.speculative.backend));
     return options.speculative.draft_tokens;
+}
+
+std::uint32_t resolve_auto_ngram_impl(const Model& model, EngineOptions& options) {
+    SpeculativeOptions& spec = options.speculative;
+    if (!spec.ngram_draft_tokens_auto) { return spec.ngram_draft_tokens; }
+    const FastPathSelection fast = select_fast_paths(model, options);
+    // Fixed speculation verifies every round at the n-gram window (decode_dflash_batch,
+    // decode_mtp_batch): auto keeps copies off there.
+    const bool adaptive        = fast.selected(FastPath::AdaptiveSpeculation);
+    const bool adaptive_drafts = spec.draft_tokens_auto && (fast.selected(FastPath::AdaptiveMtp) ||
+                                                            fast.selected(FastPath::AdaptiveDFlash));
+    const NgramSettings settings =
+        adaptive ? auto_ngram_settings(fast.configuration, spec.backend, adaptive_drafts) : NgramSettings{};
+    spec.ngram_draft_tokens_auto  = false;
+    spec.ngram_draft_tokens       = settings.window;
+    spec.ngram_batch_draft_tokens = settings.window != 0 ? settings.batch_window : 0U;
+    if (settings.window != 0) { spec.ngram_min_match = settings.min_match; }
+    return settings.window;
 }
 
 std::unique_ptr<qwen3_5::detail::SequencePlannerImpl>
@@ -1374,15 +1470,34 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
     // fixed width every round and never picks a tree (decode_mtp/dflash rounds), so no tree family is
     // planned or captured: its column-invariant attention workspace does not hold the tree route.
     if (execution_schedule(parameters, options).fixed_speculation) { tree_widths = TreeWidthPlan{}; }
-    const bool adaptive_mtp = execution_schedule(parameters, options).adaptive_mtp;
-    // resolve_auto_draft_length made --draft-tokens auto a fixed length wherever adaptive-mtp does
+    // Fixed speculation verifies every copy round at the n-gram window, which a narrower batched
+    // window would leave without a family for its batches.
+    if (execution_schedule(parameters, options).fixed_speculation &&
+        options.speculative.ngram_batch_draft_tokens != 0 &&
+        options.speculative.ngram_batch_draft_tokens != options.speculative.ngram_draft_tokens) {
+        throw std::invalid_argument("a batched ngram window needs adaptive speculation");
+    }
+    const bool adaptive_mtp    = execution_schedule(parameters, options).adaptive_mtp;
+    const bool adaptive_dflash = execution_schedule(parameters, options).adaptive_dflash;
+    // adaptive-dflash verifies its policy's chain widths. Automatic trees of K + 5 and K + 9 columns
+    // on its 15-draft block ran slower than the chain they replace (2026-10-22, NVFP4 27B, one
+    // request: 20 and 24 columns -1.0 to -1.9 % by the same-text estimate), and the tree controller
+    // times the chain only when the policy verifies the whole block, so automatic widths resolve to
+    // chains there.
+    if (adaptive_dflash) {
+        tree_widths.automatic.clear();
+        tree_widths.automatic_max_batch = 0;
+    }
+    // resolve_auto_draft_length made --draft-tokens auto a fixed length wherever its policy does
     // not act; without it the rounds would silently draft the ceiling.
-    if (options.speculative.draft_tokens_auto && !adaptive_mtp) {
-        throw std::logic_error("--draft-tokens auto reached planning without adaptive-mtp; "
+    if (options.speculative.draft_tokens_auto && !adaptive_mtp && !adaptive_dflash) {
+        throw std::logic_error("--draft-tokens auto reached planning without its policy; "
                                "resolve_auto_draft_length was not applied");
     }
-    const std::vector<SpeculativeRoundShape> round_shapes =
-        speculative_round_shapes(options, tree_widths, adaptive_mtp);
+    const FastPathConfiguration configuration = select_fast_paths(parameters.model, options).configuration;
+    const std::vector<SpeculativeRoundShape> round_shapes = speculative_round_shapes(
+        options, tree_widths, adaptive_mtp, adaptive_dflash,
+        dflash_batch_drafts(configuration, options.speculative.backend));
     std::uint32_t draft_window = 0;
     for (const SpeculativeRoundShape& shape : round_shapes) {
         draft_window = std::max(draft_window, shape.verify_drafts);
@@ -1391,9 +1506,11 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .parameters          = &parameters,
         .neural_draft_window = options.speculative.draft_tokens,
         .round_shapes        = round_shapes,
+        .dflash_width_costs  = dflash_width_costs(configuration, options.speculative.backend),
         .tree_widths         = std::move(tree_widths),
         .draft_tree_paths    = options.speculative.draft_tree_paths,
         .ngram_draft_window  = options.speculative.ngram_draft_tokens,
+        .ngram_batch_window  = options.speculative.ngram_batch_draft_tokens,
         .ngram_min_match     = options.speculative.ngram_min_match,
         .capacity            = options.max_context,
         .max_concurrency     = options.max_concurrency,

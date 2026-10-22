@@ -14,6 +14,10 @@ mtp_graph_profiles(std::uint32_t capacity, std::uint32_t draft_window, std::uint
 [[nodiscard]] std::vector<GraphExecutionProfile> dflash_graph_profiles(SpeculativeBackend backend,
                                                                        std::uint32_t capacity,
                                                                        std::uint32_t draft_window);
+// An adaptive-dflash verify-only family (SpeculativeRoundShape::split): the target alone, one
+// topology per exact B across its resource tiers.
+[[nodiscard]] std::vector<GraphExecutionProfile> dflash_verify_graph_profiles(std::uint32_t capacity,
+                                                                              std::uint32_t verify_drafts);
 
 // `k` drafts are verified; the following MTP proposal runs `next_k` autoregressive steps.
 [[nodiscard]] execution::MtpCausalAttentionEnvelopes

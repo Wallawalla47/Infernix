@@ -179,7 +179,7 @@ std::string usage_text(const char* argv0) {
            "N|auto]\n"
            "       [--draft-model FILE]\n"
            "       [--lm-head-draft] [--spec-min-p P] [--draft-tree-nodes auto|N] [--draft-tree-paths N]\n"
-           "       [--ngram-draft-tokens 1..63] [--ngram-min-match 4..64]\n"
+           "       [--ngram-draft-tokens 1..63|auto] [--ngram-min-match 4..64]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
@@ -294,9 +294,11 @@ std::string usage_text(const char* argv0) {
            "                           dflash/dflash2 1-15 (Qwen3.8-Flash-Next dflash2 1-7)\n"
            "                             N     every round drafts and verifies N\n"
            "                             auto  mtp: each round picks 0-7 from recent\n"
-           "                                   acceptance (Qwen3.5/3.6: 1-5 where qualified,\n"
-           "                                   else the model's fastest fixed length);\n"
-           "                                   Qwen3.8-Flash-Next dflash2 likewise\n"
+           "                                   acceptance; dflash/dflash2: each round drafts\n"
+           "                                   its whole block (Qwen3.5/3.6 15, Flash-Next 7)\n"
+           "                                   and verifies as many as the drafts'\n"
+           "                                   probabilities favour (Qwen3.5/3.6: where\n"
+           "                                   qualified, else the fastest fixed length)\n"
            "  --draft-model FILE       Qwen3.8-Flash-Next dflash2: the DFlash2 drafter's\n"
            "                           companion artifact (Qwen3.5/3.6 artifacts bundle theirs)\n"
            "  --lm-head-draft          use the optimized proposal head\n"
@@ -474,8 +476,7 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--spec-min-p") {
             options.speculative.draft_min_p = product::parse_draft_min_p(value(arg));
         } else if (arg == "--ngram-draft-tokens") {
-            options.speculative.ngram_draft_tokens =
-                parse_u32(value(arg), "ngram-draft-tokens", true);
+            product::apply_ngram_draft_tokens(options.speculative, value(arg));
         } else if (arg == "--ngram-min-match") {
             options.speculative.ngram_min_match = parse_u32(value(arg), "ngram-min-match");
         } else if (arg == "--draft-tree-nodes") {

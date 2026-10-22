@@ -1,7 +1,8 @@
-// Qwen4Exp's DFlash2 draft-length policy (program/draft_length.h): the calibrated length against a
-// direct evaluation of expected tokens per round time, and the calibration's updates.
+// The block drafters' calibrated draft length (runtime/speculative/draft_length.h): the calibrated
+// length against a direct evaluation of expected tokens per round time, the expected tokens of a
+// prefix, and the calibration's updates.
 
-#include "models/qwen4_exp/program/draft_length.h"
+#include "runtime/speculative/draft_length.h"
 
 #include <array>
 #include <cmath>
@@ -10,8 +11,9 @@
 #include <string>
 #include <vector>
 
-using infernix::models::qwen4_exp::detail::calibrated_draft_length;
-using infernix::models::qwen4_exp::detail::SelectorCalibration;
+using infernix::runtime::speculative::calibrated_draft_length;
+using infernix::runtime::speculative::DraftCalibration;
+using infernix::runtime::speculative::expected_draft_tokens;
 
 namespace {
 
@@ -20,14 +22,14 @@ void require(bool ok, const std::string& what) {
 }
 
 // The k in [0, most] with the highest expected tokens per round time, by exhaustive evaluation.
-int brute_force(const SelectorCalibration& c, const std::vector<float>& p, int most, double w, double f) {
+int brute_force(const DraftCalibration& c, const std::vector<float>& p, int most, double w, double f) {
     int best = 0;
     double best_score = 1.0 / (1.0 + f);
     for (int k = 1; k <= most; ++k) {
         double tokens = 1.0;
         for (int j = 1; j <= k; ++j) {
             double reach = 1.0;
-            for (int i = 0; i < j; ++i) { reach *= c.accept[SelectorCalibration::bin(p[static_cast<std::size_t>(i)])]; }
+            for (int i = 0; i < j; ++i) { reach *= c.accept[DraftCalibration::bin(p[static_cast<std::size_t>(i)])]; }
             tokens += reach;
         }
         const double score = tokens / (1.0 + f + w * k);
@@ -43,11 +45,11 @@ int brute_force(const SelectorCalibration& c, const std::vector<float>& p, int m
 
 int main() {
     try {
-        SelectorCalibration c;
+        DraftCalibration c;
         c.reset();
         require(std::abs(c.accept[0] - 0.05) < 1e-12 && std::abs(c.accept[9] - 0.95) < 1e-12, "decile centres");
-        require(SelectorCalibration::bin(0.0F) == 0 && SelectorCalibration::bin(0.999F) == 9 &&
-                    SelectorCalibration::bin(1.0F) == 9 && SelectorCalibration::bin(-1.0F) == 0,
+        require(DraftCalibration::bin(0.0F) == 0 && DraftCalibration::bin(0.999F) == 9 &&
+                    DraftCalibration::bin(1.0F) == 9 && DraftCalibration::bin(-1.0F) == 0,
                 "probabilities map to deciles 0..9");
         // Confident drafts are all verified; unlikely ones are not; a low draft ends the run.
         const std::vector<float> sure(7, 0.97F), doubtful(7, 0.05F);
@@ -68,10 +70,21 @@ int main() {
             const int most = 1 + trial % 7;
             require(calibrated_draft_length(c, p, most, w, f) == brute_force(c, p, most, w, f),
                     "the policy's choice equals the exhaustive one (trial " + std::to_string(trial) + ")");
+            // The expected tokens of every prefix, against the direct sum of products.
+            for (int k = 0; k <= 9; ++k) {
+                double direct = 1.0;
+                for (int j = 1; j <= std::min(k, 7); ++j) {
+                    double reach = 1.0;
+                    for (int i = 0; i < j; ++i) { reach *= c.accept[DraftCalibration::bin(p[static_cast<std::size_t>(i)])]; }
+                    direct += reach;
+                }
+                require(std::abs(expected_draft_tokens(c, p, k) - direct) < 1e-12,
+                        "expected tokens of a prefix (trial " + std::to_string(trial) + ", k " + std::to_string(k) + ")");
+            }
         }
         // Updates: an accepted draft raises its decile, the first rejected lowers its own, later
         // drafts are untouched.
-        SelectorCalibration u;
+        DraftCalibration u;
         u.reset();
         const std::array<float, 4> probabilities{0.92F, 0.71F, 0.55F, 0.33F};
         u.observe(probabilities, 4, 1, 0.5);
@@ -86,6 +99,6 @@ int main() {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;
     }
-    std::printf("qwen4_exp draft length policy checks passed\n");
+    std::printf("draft length policy checks passed\n");
     return 0;
 }

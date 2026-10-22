@@ -8,6 +8,7 @@
 #include "core/tensor.h"
 #include "models/qwen3_5/state/decoder_state.h"
 #include "models/qwen3_5/program/round_buffers.h"
+#include "models/qwen3_5/program/speculative/dflash_width_policy.h"
 #include "models/qwen3_5/state/state_image.h"
 #include "models/load_options.h"
 
@@ -34,9 +35,15 @@ enum class SpeculativeRoundKind : std::uint8_t { Neural, Ngram, Tree };
 struct SpeculativeRoundShape {
     SpeculativeRoundKind kind   = SpeculativeRoundKind::Neural;
     std::uint32_t verify_drafts = 0;
-    // The family serves only rounds of one row (adaptive-mtp draft lengths outside the batch
-    // lengths, mtp_draft_policy.h).
+    // The family serves only rounds of one row (adaptive-mtp draft lengths, adaptive-dflash widths
+    // outside the batch lengths: mtp_draft_policy.h, dflash_width_policy.h).
     bool single_row = false;
+    // adaptive-dflash: the family's Forward only verifies; the round's proposal graph drafted the
+    // whole block first (ProgramImpl::dflash_propose_graphs) and its width was chosen from it.
+    bool split = false;
+    // adaptive-dflash with a batch length (fast_paths.h, dflash_batch_drafts): the plain neural
+    // family rounds of several rows run, drafting and verifying that length; it serves no one row.
+    bool batch_only = false;
 };
 
 // The drafts an MTP round of `shape` proposes for the next round. A neural round proposes at its
@@ -139,11 +146,15 @@ struct SequencePlanningInputs {
     std::uint32_t neural_draft_window       = 0;
     // Every speculative round family the engine captures; draft_window is their widest width.
     std::vector<SpeculativeRoundShape> round_shapes;
+    // adaptive-dflash: the configuration's measured round costs (with split round shapes).
+    DFlashWidthCosts dflash_width_costs;
     // DFlash2 tree verification: the tree widths of each batch size and the most root-to-leaf
     // paths a tree row may hold.
     TreeWidthPlan tree_widths;
     std::uint32_t draft_tree_paths          = 0;
     std::uint32_t ngram_draft_window        = 0;
+    // The copy window of rounds of several rows (0: ngram_draft_window).
+    std::uint32_t ngram_batch_window        = 0;
     std::uint32_t ngram_min_match           = 12;
     std::uint32_t capacity                  = 0;
     std::uint32_t max_concurrency           = 1;
@@ -168,11 +179,13 @@ struct SequencePlanImpl {
     const execution::Parameters* parameters = nullptr;
     std::uint32_t neural_draft_window       = 0;
     std::vector<SpeculativeRoundShape> round_shapes;
+    DFlashWidthCosts dflash_width_costs;
     // DFlash2 tree verification: the tree widths of each batch size and the most root-to-leaf
     // paths a tree row may hold.
     TreeWidthPlan tree_widths;
     std::uint32_t draft_tree_paths          = 0;
     std::uint32_t ngram_draft_window        = 0;
+    std::uint32_t ngram_batch_window        = 0;
     std::uint32_t ngram_min_match           = 12;
     std::uint32_t capacity                  = 0;
     std::uint32_t kv_capacity               = 0;
@@ -215,6 +228,8 @@ idle_prefill_widths_impl(const execution::Parameters& parameters, const EngineOp
 // qwen3_5::resolve_auto_draft_length (program.h).
 [[nodiscard]] std::uint32_t resolve_auto_draft_length_impl(const execution::Parameters& parameters,
                                                            EngineOptions& options);
+// qwen3_5::resolve_auto_ngram (program.h).
+[[nodiscard]] std::uint32_t resolve_auto_ngram_impl(const Model& model, EngineOptions& options);
 [[nodiscard]] std::unique_ptr<SequencePlanImpl>
 finalize_sequence_plan_impl(std::unique_ptr<qwen3_5::detail::SequencePlannerImpl> planner,
                             std::uint32_t main_page_groups);

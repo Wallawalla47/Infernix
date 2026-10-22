@@ -22,7 +22,7 @@
 #include "models/qwen3_5/program/ngram_proposer.h"
 #include "models/qwen4_exp/execution/dflash2.h"
 #include "models/qwen4_exp/execution/forward.h"
-#include "models/qwen4_exp/program/draft_length.h"
+#include "runtime/speculative/draft_length.h"
 #include "models/qwen4_exp/execution/parameters.h"
 #include "models/qwen4_exp/frontend/ngram_hash.h"
 #include "models/qwen4_exp/memory_plan.h"
@@ -378,7 +378,7 @@ struct ResumeStateImpl {
     SpeculativeStats speculative;
     std::array<double, 8> mtp_accept{};
     std::uint64_t mtp_policy_rounds = 0;
-    SelectorCalibration dflash_calibration; // DFlash2: acceptance by selector-probability decile
+    runtime::speculative::DraftCalibration dflash_calibration; // DFlash2: acceptance by selector-probability decile
     std::array<double, 4> ngram_accept{}; // the n-gram copies' acceptance per match-length bucket
     std::vector<ConstrainedDraw> constraint_trace;
     ExpertResidency::Stats cache_at_admission;
@@ -446,7 +446,7 @@ public:
         std::uint64_t mtp_policy_rounds = 0;
         // DFlash2 (--draft-tokens auto): a draft's acceptance (given the earlier ones') by its
         // selector probability's decile.
-        SelectorCalibration dflash_calibration;
+        runtime::speculative::DraftCalibration dflash_calibration;
         // Conditional acceptance of an n-gram copy
         // position by the proposal's match length (kNgramBuckets).
         std::array<double, 4> ngram_accept{};
@@ -5481,7 +5481,7 @@ private:
     // --draft-tokens auto: the calibrated length of row 0's proposal (draft_length.h), one draft more
     // every kProbeInterval rounds, so the deciles of longer drafts keep being measured.
     std::int32_t dflash2_auto_length(Lane& lane, std::int32_t most) {
-        std::int32_t best = calibrated_draft_length(
+        std::int32_t best = runtime::speculative::calibrated_draft_length(
             lane.dflash_calibration, std::span<const float>(dflash_confidence_[0].data(), static_cast<std::size_t>(most)),
             most, kDFlashDraftCost, kDFlashProposalCost);
         if (++lane.mtp_policy_rounds % kProbeInterval == 0) { best = std::min(best + 1, most); }

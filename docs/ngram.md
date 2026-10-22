@@ -35,6 +35,38 @@ This example is not a memory-sizing recommendation.
 Qwen3.8-Flash-Next verifies copy proposals without a neural drafter. Each verified column routes its
 own experts, so wide rounds pay off only at high acceptance (repeated code or text).
 
+## Automatic window
+
+`--ngram-draft-tokens auto` (Qwen3.8-27B and Qwen3.6-35B-A3B) lets startup choose the window and
+the minimum match the configuration was measured fastest with, and logs the result. Beside the
+NVFP4 27B's `--spec dflash2 --draft-tokens auto` it copies up to 63 drafts, up to 31 in rounds of
+several requests, at a minimum match of 12. Everywhere else it leaves copy proposals off: the
+35B-A3B's DFlash rounds gained nothing from them, and with fixed speculation (`--reproducible`, or
+a configuration without `adaptive-speculation`) every round would verify the whole window.
+`Engine::options()` and the request log's `server_start` record report the resolved window.
+
+Measured 2026-10-22 on an RTX 5090 (INT8 KV, `infernix_decode_quality_gen`). The copy workload is
+24 of this repository's source files at a4a50233, each followed by the header of the same file with one
+identifier renamed (`bench/decode_quality/copy_prompts.py`), continued greedily for 512 tokens. The
+other workloads are 1,280-token slices of code continued greedily and of Markdown docs sampled at
+temperature 1, 384 tokens each. Wall-clock tok/s:
+
+| NVFP4 27B, DFlash2 | One request: copies | Code | Two requests: copies | Code |
+|---|---:|---:|---:|---:|
+| `--draft-tokens auto`, no copies | 612.0 | 329.5 | 776.2 | 513.7 |
+| the same with a 31-draft window | 1,088.3 | 319.6 | 1,396.2 | 505.4 |
+| the same with a 63-draft window | 1,304.2 | 333.9 | 1,404.5 | 481.4 |
+| `--ngram-draft-tokens auto` (63, batched 31) | 1,298.5 | 334.4 | 1,426.6 | 498.1 |
+| `--draft-tokens 7 --ngram-draft-tokens 15` | 781.7 | | 1,141.9 | |
+
+A 63-draft copy round of several requests makes every row verify 64 columns, which cost the code
+workload 6.3 % at two requests against 1.6 % with 31 drafts, while copying as fast, hence the
+batched window of 31. Minimum matches of 8 and 16 moved the copy workload +4.1 % and -3.5 % and the
+code workload's wrong copies the other way (code -3.6 % and +1.1 %), so the default 12 stays. On
+the sampled docs, copies changed the one-request rate by -0.2 % (31 drafts) and -3.4 % (63
+drafts; 14 copy rounds in 3,297, so most of that is the different sampled text). The 35B-A3B's
+DFlash on the copy workload: 792.7 tok/s without copies, 796.9 with 15 drafts, 760.1 with 31.
+
 The artifact must contain the selected drafter. Qwen3.6-35B-A3B uses original DFlash;
 that is distinct from the DFlash2 companion in supported Qwen3.8-27B artifacts.
 Ngram does not convert one drafter into another. `--ngram-draft-tokens 0` disables the
@@ -51,7 +83,11 @@ all-neural round runs at the neural window, and a round in which at least one ro
 proposal runs at the ngram window. The decode frame is allocated at the wider of the two windows
 and viewed densely at the round's width. In a multi-request ngram round the neural drafter also
 runs, at its own width, and each row with a copy proposal takes it, so a row without a match keeps
-its neural proposal for that round. The narrower window records GDN replay transitions through a narrowed
+its neural proposal for that round. With `--draft-tokens auto` on a configuration whose batched
+rounds run plain at a batch length (the NVFP4 27B's 7 drafts,
+[automatic verify width](maintainer/dflash.md#automatic-verify-width-qwen38-27b--qwen36-35b-a3b)),
+that length is the drafter's width in rounds of several requests, and a copy replaces it when it
+offers more drafts. The narrower window records GDN replay transitions through a narrowed
 view of the same record storage. DFlash and DFlash2 retain an append buffer sized for the widest
 provider: a narrow neural round must catch up target features from a preceding wide copy round.
 
@@ -67,8 +103,10 @@ its verified drafts to the Host after the copy overlay, before the target model 
 Larger widths can reduce target rounds on long copy spans but increase per-round attention,
 projection, replay and workspace costs, so measure both short and long contexts; the longest
 supported width need not be fastest. Copy rounds therefore verify at the narrowest captured
-width that holds their longest copy: besides `--ngram-draft-tokens`, the Engine captures copy
-families at 7, 15 and 31 drafts when those lie strictly between the neural and ngram windows.
+width that holds their longest copy (and, in a round of several requests, the rows' neural
+proposals): besides `--ngram-draft-tokens`, the Engine captures copy families at 7, 15 and 31
+drafts when those lie strictly between the neural proposal a copy must exceed (the neural window,
+or the batch length above) and the ngram window.
 Output budgets do not select a different ngram arithmetic shape: a copy is sized by the window and context room only, and the output budget limits the
 drafts the round then verifies.
 

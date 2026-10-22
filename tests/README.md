@@ -434,5 +434,10 @@ INFERNIX_TEST_ARTIFACT=out/qwen3_8_27b_nvfp4.ninfer \
 ```
 
 Arguments are the target KV, the tree table (`auto` for automatic widths, `0` runs chain decoding
-against the same oracle), output tokens per prompt and K; defaults are `int8 16 160 7`. CTest
-runs it on INT8, K8V4, NVFP4, VQ2 and K4V2.
+against the same oracle, `block` `--draft-tokens auto`'s `adaptive-dflash` rounds), output tokens
+per prompt and K; defaults are `int8 16 160 7`. Optional further arguments: the drafter (`dflash2`,
+or `dflash` for the 35B-A3B), n-gram copy drafts (`auto` for `--ngram-draft-tokens auto`), the
+streams decoded at once, and a prompt file replacing the six short prompts (whole prompts, each
+ended by a line `<<<END>>>`, such as `bench/decode_quality/copy_prompts.py`'s copy-heavy rewrites).
+CTest runs it on INT8, K8V4, NVFP4, VQ2 and K4V2, and the block rounds of both drafters, beside
+15-draft copies and at two streams with the automatic window.

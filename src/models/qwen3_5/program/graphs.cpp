@@ -391,6 +391,70 @@ void ProgramImpl::prepare_graphs() {
     if (speculative_backend != SpeculativeBackend::None) {
         using execution::SpeculativePhase;
         const bool mtp = speculative_backend == SpeculativeBackend::Mtp;
+        // adaptive-dflash: one proposal graph per batch size and drafter profile drafts the whole
+        // block; each split family's Verify reads its leading drafts. Captured first so the split
+        // families' warm-ups run on a real proposal.
+        const bool split_rounds =
+            std::any_of(round_families.begin(), round_families.end(),
+                        [](const SpeculativeRoundFamily& round) { return round.shape.split; });
+        // Only one row splits its rounds where a batch length runs the others plain.
+        const std::uint32_t split_batches =
+            std::any_of(round_families.begin(), round_families.end(),
+                        [](const SpeculativeRoundFamily& round) {
+                            return round.shape.split && !round.shape.single_row;
+                        })
+                ? max_concurrency
+                : 1U;
+        const auto propose_context = [&] {
+            execution::DFlashBatchContext state{execution_core(),
+                                                decoder->text_kv,
+                                                *dflash,
+                                                *io.dflash_decode,
+                                                *dflash_host_ingress,
+                                                *dflash_host_egress,
+                                                state_images->continuation_hidden_store(),
+                                                dflash_draft_handoff->tokens(),
+                                                dflash_draft_handoff->ready};
+            state.host_confidence        = dflash_draft_handoff->confidence();
+            state.neural_proposal_drafts = neural_draft_window;
+            return state;
+        };
+        const auto propose_envelope = [&](std::uint32_t frontier) {
+            return ops::CausalAttentionExecutionEnvelope{
+                1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                       capacity, static_cast<std::uint64_t>(frontier) + neural_draft_window + 1ULL))};
+        };
+        if (split_rounds) {
+            const auto profiles = dflash_graph_profiles(speculative_backend, capacity, neural_draft_window);
+            validate_graph_profiles(profiles, capacity - 1, "dflash proposal");
+            prepare_representative(profiles.front().min, 1, neural_draft_window, neural_draft_window);
+            device.synchronize();
+            {
+                auto state = propose_context();
+                execution::dflash_decode_batch(state, 1, neural_draft_window,
+                                               dflash_envelopes(profiles.front().min, profiles.front().max, execution_schedule.column_invariant_decode, capacity),
+                                               propose_envelope(profiles.front().max), nullptr,
+                                               SpeculativePhase::Propose);
+            }
+            device.synchronize();
+            dflash_propose_graphs.profiles.reserve(profiles.size() * split_batches);
+            for (std::uint32_t batch = 1; batch <= split_batches; ++batch) {
+                for (const auto planned : profiles) {
+                    dflash_propose_graphs.profiles.emplace_back();
+                    auto& profile                  = dflash_propose_graphs.profiles.back();
+                    profile.batch_size             = batch;
+                    profile.min_execution_frontier = planned.min;
+                    profile.max_execution_frontier = planned.max;
+                    profile.topology_class         = planned.topology_class * max_concurrency + batch - 1U;
+                    auto state                     = propose_context();
+                    execution::capture_dflash_decode_batch(
+                        state, static_cast<std::int32_t>(batch), neural_draft_window,
+                        dflash_envelopes(planned.min, planned.max, execution_schedule.column_invariant_decode, capacity), propose_envelope(planned.max),
+                        profile.definition, SpeculativePhase::Propose);
+                }
+            }
+            instantiate_graph_family(dflash_propose_graphs, "dflash proposal", device);
+        }
         // Every planned round family captures a Forward/Finish pair at its own width for every
         // batch size, on the one frame viewed at that width, and records ReplaySSM transitions
         // through the record view of the same width. Every MTP round proposes the next round's
@@ -406,17 +470,26 @@ void ProgramImpl::prepare_graphs() {
             const std::uint32_t verify_drafts = round.shape.verify_drafts;
             const std::uint32_t ar_depth = mtp_proposal_drafts(round.shape, neural_draft_window);
             const bool single_row        = round.shape.single_row;
+            const bool batch_only        = round.shape.batch_only;
             const auto serves            = [&](std::uint32_t batch) {
                 return (!tree || tree_widths.tree(batch, verify_drafts + 1U)) &&
-                       (!single_row || batch == 1U);
+                       (!single_row || batch == 1U) && (!batch_only || batch > 1U);
             };
             bool used = false;
             for (std::uint32_t batch = 1; batch <= max_concurrency; ++batch) {
                 used = used || serves(batch);
             }
             if (!used) { continue; }
-            // The DFlash drafter always proposes at its own width.
-            const std::uint32_t proposal_drafts = mtp ? verify_drafts : neural_draft_window;
+            // The DFlash drafter proposes at its own width, a neural family (the configured one or
+            // adaptive-dflash's batch-only one) at the family's, and a copy family's batched rows
+            // without a copy at the batch length where one is set; a split family's representative
+            // verifies its own width of the proposal graph's block.
+            const bool split                    = round.shape.split;
+            const std::uint32_t proposal_drafts =
+                mtp || split || round.shape.kind == SpeculativeRoundKind::Neural ? verify_drafts
+                : ngram && dflash_batch_drafts != 0                             ? dflash_batch_drafts
+                                                                                : neural_draft_window;
+            const auto forward_phase            = split ? SpeculativePhase::Verify : SpeculativePhase::Forward;
             const auto prepare = [&, verify_drafts, proposal_drafts, tree](std::uint32_t frontier,
                                                                            std::uint32_t batch) {
                 prepare_representative(frontier, batch, verify_drafts, proposal_drafts, tree);
@@ -424,8 +497,9 @@ void ProgramImpl::prepare_graphs() {
             auto& forward_family = round.forward;
             auto& finish_family  = round.finish;
             const auto forward_profiles =
-                mtp ? mtp_graph_profiles(capacity, verify_drafts, ar_depth)
-                    : dflash_graph_profiles(speculative_backend, capacity, verify_drafts);
+                mtp     ? mtp_graph_profiles(capacity, verify_drafts, ar_depth)
+                : split ? dflash_verify_graph_profiles(capacity, verify_drafts)
+                        : dflash_graph_profiles(speculative_backend, capacity, verify_drafts);
             // DFlash acceptance has no context-dependent nodes or resource envelope.
             const auto finish_profiles =
                 mtp ? forward_profiles : std::vector<GraphExecutionProfile>{{0, capacity - 1}};
@@ -456,11 +530,19 @@ void ProgramImpl::prepare_graphs() {
                                                     state_images->continuation_hidden_store(),
                                                     dflash_draft_handoff->tokens(),
                                                     dflash_draft_handoff->ready};
+                state.host_confidence        = dflash_draft_handoff->confidence();
                 state.ngram                  = ngram;
-                state.neural_proposal_drafts = neural_draft_window;
+                state.neural_proposal_drafts = split ? neural_draft_window : proposal_drafts;
                 state.tree                   = tree;
                 state.tree_paths             = draft_tree_paths;
                 return state;
+            };
+            // A split family's Verify reads the block the proposal graph of its batch size and
+            // frontier drafted.
+            const auto propose_first = [&](std::uint32_t frontier, std::uint32_t batch) {
+                if (!split) { return; }
+                auto& profile = dflash_propose_graphs.select(batch, frontier);
+                dflash_propose_graphs.install(profile).launch(device.stream);
             };
             const auto target_envelope = [&](std::uint32_t frontier) {
                 return ops::CausalAttentionExecutionEnvelope{
@@ -510,14 +592,15 @@ void ProgramImpl::prepare_graphs() {
             const auto code_warm = forward_profiles.front();
             prepare(code_warm.min, warm_batch);
             device.synchronize();
-            run(SpeculativePhase::Forward, static_cast<std::int32_t>(warm_batch), code_warm.min,
-                code_warm.max, nullptr);
+            propose_first(code_warm.min, warm_batch);
+            run(forward_phase, static_cast<std::int32_t>(warm_batch), code_warm.min, code_warm.max,
+                nullptr);
             run(SpeculativePhase::Finish, static_cast<std::int32_t>(warm_batch), code_warm.min,
                 code_warm.max, nullptr);
             device.synchronize();
 
-            for (const auto phase : {SpeculativePhase::Forward, SpeculativePhase::Finish}) {
-                const bool forward           = phase == SpeculativePhase::Forward;
+            for (const auto phase : {forward_phase, SpeculativePhase::Finish}) {
+                const bool forward           = phase != SpeculativePhase::Finish;
                 auto& family                 = forward ? forward_family : finish_family;
                 const auto& planned_profiles = forward ? forward_profiles : finish_profiles;
                 family.profiles.reserve(planned_profiles.size() * max_concurrency);
@@ -534,9 +617,10 @@ void ProgramImpl::prepare_graphs() {
                         capture(phase, profile);
                     }
                 }
-                const char* label = forward ? (ngram  ? "ngram forward"
-                                               : tree ? "tree forward"
-                                                      : "speculative forward")
+                const char* label = forward ? (ngram   ? "ngram forward"
+                                               : tree  ? "tree forward"
+                                               : split ? "dflash verify"
+                                                       : "speculative forward")
                                             : (ngram  ? "ngram finish"
                                                : tree ? "tree finish"
                                                       : "speculative finish");
@@ -551,6 +635,7 @@ void ProgramImpl::prepare_graphs() {
                 auto& finish_exec = finish_family.install(finish);
                 prepare(forward.min_execution_frontier, forward.batch_size);
                 device.synchronize();
+                propose_first(forward.min_execution_frontier, forward.batch_size);
                 topology.executable.launch(device.stream);
                 finish_exec.launch(device.stream);
                 device.synchronize();

@@ -33,6 +33,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       execution_schedule(plan.execution_schedule), draft_window(plan.draft_window),
       neural_draft_window(plan.neural_draft_window), tree_widths(plan.tree_widths),
       draft_tree_paths(plan.draft_tree_paths), ngram_draft_window(plan.ngram_draft_window),
+      ngram_batch_window(plan.ngram_batch_window != 0 ? plan.ngram_batch_window : plan.ngram_draft_window),
       ngram_min_match(plan.ngram_min_match), speculative_backend(plan.speculative_backend),
       kv_storage(plan.kv_storage), proposal_head(plan.proposal_head),
       vision_enabled(plan.features.vision), use_cuda_graph(plan.use_cuda_graph),
@@ -103,6 +104,28 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
                 });
             if (!planned) {
                 throw std::logic_error("adaptive MTP draft lengths do not match the planned families");
+            }
+        }
+    }
+    if (std::any_of(plan.round_shapes.begin(), plan.round_shapes.end(),
+                    [](const SpeculativeRoundShape& shape) { return shape.split; })) {
+        // adaptive-dflash: one split family per width the policy may choose, serving the batch
+        // sizes it may run that width at. With a batch-only plain family, rounds of several rows
+        // run it and the policy chooses for one row only.
+        for (const SpeculativeRoundShape& shape : plan.round_shapes) {
+            if (shape.batch_only) { dflash_batch_drafts = shape.verify_drafts; }
+        }
+        dflash_width_policy.emplace(neural_draft_window, max_concurrency, plan.dflash_width_costs,
+                                    dflash_batch_drafts == 0);
+        for (std::uint32_t batch = 1; batch <= max_concurrency; ++batch) {
+            for (const std::uint32_t width : dflash_width_policy->widths(batch)) {
+                const bool planned = std::any_of(
+                    plan.round_shapes.begin(), plan.round_shapes.end(), [&](const SpeculativeRoundShape& shape) {
+                        return shape.split && shape.verify_drafts + 1U == width && (!shape.single_row || batch == 1U);
+                    });
+                if (!planned) {
+                    throw std::logic_error("adaptive DFlash widths do not match the planned families");
+                }
             }
         }
     }

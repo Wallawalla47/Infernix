@@ -142,6 +142,11 @@ enum class FastPath : std::uint8_t {
     // rounds choose their draft length from the rows' learned acceptance and the round costs (one
     // common length for several rows). Without it they draft the configured length.
     AdaptiveMtp,
+    // With adaptive-speculation and --draft-tokens auto, Qwen3.8-27B / 35B DFlash and DFlash2
+    // all-neural rounds propose the whole block, then verify the width the drafts' calibrated
+    // probabilities make fastest (one width for several rows, each row its own extent). Without it
+    // they verify the configured length.
+    AdaptiveDFlash,
     // The prefix cache resumes from any tap or endpoint and splits prefill at taps and sibling
     // boundaries. Without it prefill splits and the cache publishes and resumes only on the
     // prefill chunk grid, and decode-computed endpoints are not published.
@@ -162,7 +167,7 @@ enum class FastPath : std::uint8_t {
     GgmlBf16Prefill,
 };
 
-inline constexpr std::array<FastPath, 23> kFastPaths{
+inline constexpr std::array<FastPath, 24> kFastPaths{
     FastPath::PromptPv8,           FastPath::DecodeSplit64,
     FastPath::Q8SlicedK,           FastPath::GdnConvFused,
     FastPath::QsaPrepareFused,     FastPath::Fp8A8Pair,
@@ -173,9 +178,9 @@ inline constexpr std::array<FastPath, 23> kFastPaths{
     FastPath::BatchedA8ResidualDecode, FastPath::ExpertA4Residual,
     FastPath::ExpertA4Residual3,
     FastPath::BatchSplitAttention, FastPath::AdaptiveSpeculation,
-    FastPath::AdaptiveMtp,         FastPath::FreeCacheResume,
-    FastPath::Preemption,          FastPath::IdleWidePrefill,
-    FastPath::GgmlBf16Prefill};
+    FastPath::AdaptiveMtp,         FastPath::AdaptiveDFlash,
+    FastPath::FreeCacheResume,     FastPath::Preemption,
+    FastPath::IdleWidePrefill,     FastPath::GgmlBf16Prefill};
 
 [[nodiscard]] constexpr const char* fast_path_name(FastPath path) noexcept {
     switch (path) {
@@ -191,6 +196,7 @@ inline constexpr std::array<FastPath, 23> kFastPaths{
     case FastPath::BatchSplitAttention: return "batch-split-attention";
     case FastPath::AdaptiveSpeculation: return "adaptive-speculation";
     case FastPath::AdaptiveMtp: return "adaptive-mtp";
+    case FastPath::AdaptiveDFlash: return "adaptive-dflash";
     case FastPath::FreeCacheResume: return "free-cache-resume";
     case FastPath::Preemption: return "preemption";
     case FastPath::Q8SlicedK: return "q8-sliced-k";
@@ -274,8 +280,10 @@ struct SpeculativeOptions {
     std::uint32_t draft_tokens = 0;
     // MTP (--draft-tokens auto): each round chooses its draft length, 0..draft_tokens, from the
     // request's learned acceptance; Qwen3.8-Flash-Next's one-row rounds also verify only the drafts
-    // above draft_min_p (default 0.5). On Qwen3.5/3.6 it is the adaptive-mtp fast path; where that
-    // path does not run, startup makes it the configuration's fastest fixed length (Engine::options()
+    // above draft_min_p (default 0.5). DFlash and DFlash2: each all-neural round proposes the whole
+    // block of draft_tokens and verifies as many as the drafts' calibrated probabilities make
+    // fastest. On Qwen3.5/3.6 these are the adaptive-mtp and adaptive-dflash fast paths; where
+    // they do not run, startup makes it the configuration's fastest fixed length (Engine::options()
     // then reports false and that length). False: every round drafts and verifies draft_tokens
     // (fewer only near the output limit; draft_min_p defaults to 0).
     bool draft_tokens_auto = false;
@@ -284,10 +292,20 @@ struct SpeculativeOptions {
     // (tools.convert --components dflash2), loaded beside the main artifact. Qwen3.5/3.6 artifacts
     // bundle their DFlash and DFlash2 drafters and refuse it.
     std::filesystem::path draft_model;
-    // Optional target-verified copy proposals with MTP, DFlash or DFlash2, C1 only.
+    // Optional target-verified copy proposals with MTP, DFlash or DFlash2.
     // Zero disables the proposer; enabled draft width is 1..63 and minimum match 4..64.
     std::uint32_t ngram_draft_tokens = 0;
     std::uint32_t ngram_min_match    = 12;
+    // Copy proposals of rounds of several requests hold at most this many drafts (0: up to
+    // ngram_draft_tokens); --ngram-draft-tokens auto sets it where a wide copy costs a batch's other
+    // rows more than it saves. Qwen3.5 family only.
+    std::uint32_t ngram_batch_draft_tokens = 0;
+    // --ngram-draft-tokens auto (Qwen3.8-27B / Qwen3.6-35B-A3B): startup sets ngram_draft_tokens
+    // and ngram_min_match to the configuration's measured copy window and minimum match for its
+    // drafter, or 0 (no copies) where none was measured faster, including wherever speculation is
+    // fixed (every round would verify the n-gram window). Engine::options() then reports false and
+    // the resolved values.
+    bool ngram_draft_tokens_auto = false;
     // Qwen3.8-Flash-Next MTP (--spec-min-p): a one-row round verifies its drafts up to the first
     // whose draft-head probability is below this value; 0 verifies every draft. In [0, 1]; unset
     // is the measured 0.5 with draft_tokens_auto and 0 with a fixed draft length. Other models
@@ -1389,9 +1407,10 @@ struct SpeculativeStats {
     std::uint64_t accepted_tokens = 0;
     std::uint64_t fallback_steps  = 0;
     std::vector<std::uint64_t> accepted_per_position;
-    // Qwen3.5-family MTP: entry k-1 counts the all-neural rounds (fallback steps excluded) that ran
-    // draft length k. Every one runs the configured window unless adaptive-mtp chooses the length
-    // per round. Empty for other backends.
+    // Qwen3.5-family MTP, DFlash and DFlash2: entry k-1 counts the all-neural rounds (fallback
+    // steps excluded) that verified k drafts. Every one verifies the configured window (fewer near
+    // the output limit) unless adaptive-mtp or adaptive-dflash chooses it per round. Empty for other
+    // models.
     std::vector<std::uint64_t> rounds_by_draft_length;
     std::uint64_t ngram_rounds                  = 0;
     std::uint64_t ngram_drafted_tokens          = 0;

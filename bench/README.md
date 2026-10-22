@@ -234,7 +234,15 @@ infernix_decode_quality_judge --ngram-volume v.ngram flash-next.infernix corpus.
 ```
 
 The generator runs INT8 KV unless `kv=NAME` selects another format (`bf16`, `fp8`, `nvfp4`, `k8v4`,
-`vq2`, `k4v2`); the judge scores against the BF16-KV reference whatever the run used.
+`vq2`, `k4v2`); the judge scores against the BF16-KV reference whatever the run used. As a speed
+workload it also takes `concurrency=N` (N workers keep N requests decoding; it reports wall-clock
+throughput), `ngram=N|auto` and `min-match=M`, `tree=auto|N`, and `prompts` with a file of whole
+prompts such as `copy_prompts.py`'s copy-heavy rewrites:
+
+```bat
+py -3.11 bench/decode_quality/copy_prompts.py . HEAD copy.txt
+infernix_decode_quality_gen model.ninfer copy.txt copy-out.txt 24 2048 512 prompts auto ngram=auto concurrency=2
+```
 
 Use the same artifact and corpus for every build. The generator uses only Engine API that NInfer
 also has, so for an Infernix-versus-NInfer comparison copy `decode_quality_gen.cpp` into an

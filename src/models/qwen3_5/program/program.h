@@ -34,6 +34,7 @@ class ProgramImpl;
 struct ContractAccess;
 struct HybridQuoteImpl;
 } // namespace detail
+class Model;
 class SequencePlanner;
 class Program;
 
@@ -487,9 +488,14 @@ private:
                                                              const EngineOptions&);
 [[nodiscard]] std::unique_ptr<Program> create_program(const execution::Parameters&, SequencePlan&&,
                                                       DeviceContext&, const StartupObserver&);
-// --draft-tokens auto runs the adaptive-mtp policy where it is selected and acts. Elsewhere (it is
-// not qualified for the artifact's configuration, or fast paths are disabled) this makes the options
-// a fixed draft length, auto_fixed_draft_tokens(), and returns it; otherwise it returns 0. Call it
-// before planning. A requested --fast-path adaptive-mtp that cannot act is refused.
+// --draft-tokens auto runs its policy (adaptive-mtp for MTP, adaptive-dflash for DFlash and DFlash2)
+// where it is selected and acts. Elsewhere (it is not qualified for the artifact's configuration, or
+// fast paths are disabled) this makes the options a fixed draft length, auto_fixed_draft_tokens()
+// up to the ceiling, and returns it; otherwise it returns 0. Call it before planning. A requested
+// --fast-path adaptive-mtp or adaptive-dflash that cannot act is refused.
 [[nodiscard]] std::uint32_t resolve_auto_draft_length(const execution::Parameters&, EngineOptions&);
+// --ngram-draft-tokens auto: sets the copy window and minimum match to the configuration's measured
+// ones for its drafter (auto_ngram_settings), 0 where none was measured faster, and returns the
+// window. Call it before the frontend is made (whether prompts build copy sources follows the window).
+[[nodiscard]] std::uint32_t resolve_auto_ngram(const Model&, EngineOptions&);
 } // namespace infernix::models::qwen3_5

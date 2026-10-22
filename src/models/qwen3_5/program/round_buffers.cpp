@@ -248,6 +248,22 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
             builder, DType::BF16, {layout.spec.hidden, columns, batch}, "DFlash target hidden");
         decode.target_continuation_hidden = add_tensor(
             builder, DType::BF16, {layout.spec.hidden, batch}, "DFlash target continuation hidden");
+        if (layout.spec.block_drafts != 0) {
+            if (layout.spec.block_drafts > layout.spec.draft_window) {
+                throw std::invalid_argument("RoundState DFlash block exceeds the draft window");
+            }
+            const auto block = static_cast<std::int32_t>(layout.spec.block_drafts);
+            decode.block_drafts =
+                add_tensor(builder, DType::I32, {block, batch}, "DFlash block proposal drafts");
+            decode.block_confidence = add_tensor(builder, DType::FP32, {block, batch},
+                                                 "DFlash block proposal confidence");
+            if (layout.spec.backend == SpeculativeBackend::DFlash2) {
+                decode.block_candidates = add_tensor(builder, DType::I32, {16, block, batch},
+                                                     "DFlash2 block proposal candidate ids");
+                decode.block_q = add_tensor(builder, DType::FP32, {16, block, batch},
+                                            "DFlash2 block proposal q");
+            }
+        }
     }
     layout.complete = true;
 }
@@ -485,6 +501,10 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
     target_logits              = layout.target_logits.bind(backing);
     target_hidden              = layout.target_hidden.bind(backing);
     target_continuation_hidden = layout.target_continuation_hidden.bind(backing);
+    if (layout.block_drafts) { block_drafts = layout.block_drafts->bind(backing); }
+    if (layout.block_candidates) { block_candidates = layout.block_candidates->bind(backing); }
+    if (layout.block_q) { block_q = layout.block_q->bind(backing); }
+    if (layout.block_confidence) { block_confidence = layout.block_confidence->bind(backing); }
 }
 
 void constrain_round_logits(const RoundState& io, const Tensor& logits, const Tensor* argmax,

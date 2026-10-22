@@ -203,12 +203,54 @@ int main() {
     failures += check(!q::fast_path_applies(FastPath::AdaptiveMtp, int8_24, options),
                       "adaptive-mtp needs the MTP backend");
     // Where adaptive-mtp does not run, auto drafts the configuration's fastest fixed length.
-    failures += check(q::auto_fixed_draft_tokens(int8_24) == 5 &&
-                          q::auto_fixed_draft_tokens({24, ActivationClass::A4, KvCacheStorage::Vq2}) == 5,
+    using infernix::SpeculativeBackend;
+    failures += check(q::auto_fixed_draft_tokens(int8_24, SpeculativeBackend::Mtp) == 5 &&
+                          q::auto_fixed_draft_tokens({24, ActivationClass::A4, KvCacheStorage::Vq2},
+                                                     SpeculativeBackend::Mtp) == 5,
                       "auto drafts five on the NVFP4 27B");
-    failures += check(q::auto_fixed_draft_tokens({24, ActivationClass::A16, KvCacheStorage::Int8Group64, true}) == 3 &&
-                          q::auto_fixed_draft_tokens({16, ActivationClass::A16, KvCacheStorage::Int8Group64}) == 3,
+    failures += check(q::auto_fixed_draft_tokens({24, ActivationClass::A16, KvCacheStorage::Int8Group64, true},
+                                                 SpeculativeBackend::Mtp) == 3 &&
+                          q::auto_fixed_draft_tokens({16, ActivationClass::A16, KvCacheStorage::Int8Group64},
+                                                     SpeculativeBackend::Mtp) == 3,
                       "auto drafts three on the groupwise 27B and the 35B-A3B");
+    // adaptive-dflash: --draft-tokens auto's DFlash and DFlash2 policy; where it does not run, auto
+    // verifies the block drafter's fastest fixed length, and a block round proposes the
+    // configuration's block.
+    auto block                          = options;
+    block.speculative.backend           = SpeculativeBackend::DFlash2;
+    failures += check(!q::fast_path_applies(FastPath::AdaptiveDFlash, int8_24, block),
+                      "adaptive-dflash must not apply to a fixed --draft-tokens N");
+    block.speculative.draft_tokens_auto = true;
+    failures += check(q::fast_path_applies(FastPath::AdaptiveDFlash, int8_24, block),
+                      "adaptive-dflash applies to DFlash2 --draft-tokens auto");
+    block.speculative.backend = SpeculativeBackend::DFlash;
+    failures += check(q::fast_path_applies(FastPath::AdaptiveDFlash, int8_24, block),
+                      "adaptive-dflash applies to DFlash --draft-tokens auto");
+    failures += check(!q::fast_path_applies(FastPath::AdaptiveDFlash, int8_24, mtp),
+                      "adaptive-dflash needs a block drafter");
+    failures += check(q::auto_fixed_draft_tokens(int8_24, SpeculativeBackend::DFlash2) == 7 &&
+                          q::auto_fixed_draft_tokens({24, ActivationClass::A16, KvCacheStorage::Int8Group64, true},
+                                                     SpeculativeBackend::DFlash2) == 7 &&
+                          q::auto_fixed_draft_tokens({16, ActivationClass::A16, KvCacheStorage::Int8Group64},
+                                                     SpeculativeBackend::DFlash) == 3,
+                      "auto verifies the block drafter's fastest fixed length where adaptive-dflash does not run");
+    failures += check(q::dflash_auto_ceiling(int8_24, SpeculativeBackend::DFlash2) == 15 &&
+                          q::dflash_auto_ceiling({16, ActivationClass::A16, KvCacheStorage::Int8Group64},
+                                                 SpeculativeBackend::DFlash) == 7,
+                      "a block round proposes the configuration's block");
+    failures += check(q::dflash_batch_drafts(int8_24, SpeculativeBackend::DFlash2) == 7 &&
+                          q::dflash_batch_drafts({16, ActivationClass::A16, KvCacheStorage::Int8Group64},
+                                                 SpeculativeBackend::DFlash) == 0,
+                      "the NVFP4 27B's batched rounds run plain at 7 drafts");
+    // --ngram-draft-tokens auto: copies beside the NVFP4 27B's adaptive DFlash2 rounds only; the
+    // 35B-A3B's were not faster, and nothing else was measured.
+    failures += check(q::auto_ngram_settings(int8_24, SpeculativeBackend::DFlash2, true).window != 0 &&
+                          q::auto_ngram_settings(int8_24, SpeculativeBackend::DFlash2, false).window == 0 &&
+                          q::auto_ngram_settings(int8_24, SpeculativeBackend::Mtp, true).window == 0 &&
+                          q::auto_ngram_settings({16, ActivationClass::A16, KvCacheStorage::Int8Group64},
+                                                 SpeculativeBackend::DFlash, true)
+                                  .window == 0,
+                      "the automatic n-gram window is the NVFP4 27B's beside adaptive DFlash2");
 
     // The groupwise 27B takes prompt-pv8 by composition (model-quality.md 6.1): the NVFP4 27B's
     // kernels, shapes and clear gain, on the same KV formats.
@@ -238,6 +280,11 @@ int main() {
         failures += check(q::fast_path_qualified(FastPath::AdaptiveMtp, {24, ActivationClass::A4, kv}) &&
                               q::fast_path_qualified(FastPath::AdaptiveMtp, {16, ActivationClass::A16, kv}),
                           "adaptive-mtp on the NVFP4 27B and the 35B");
+        failures += check(q::fast_path_qualified(FastPath::AdaptiveDFlash, {24, ActivationClass::A4, kv}) &&
+                              q::fast_path_qualified(FastPath::AdaptiveDFlash, {16, ActivationClass::A16, kv}) &&
+                              !q::fast_path_qualified(FastPath::AdaptiveDFlash,
+                                                      {24, ActivationClass::A16, kv, true}),
+                          "adaptive-dflash on the NVFP4 27B and the 35B, not the groupwise 27B");
     }
     failures += check(q::fast_path_qualified(FastPath::DecodeSplit64, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, true}) &&
                           q::fast_path_qualified(FastPath::PromptPv8, {16, ActivationClass::A16, KvCacheStorage::Int8Group64}),

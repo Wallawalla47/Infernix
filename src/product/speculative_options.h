@@ -65,6 +65,18 @@ inline void apply_draft_tokens(SpeculativeOptions& options, std::string_view val
     options.draft_tokens = static_cast<std::uint32_t>(std::stoul(std::string(value)));
 }
 
+// Applies a --ngram-draft-tokens value: "auto" lets the Engine choose the copy window and minimum
+// match (ngram_draft_tokens 0 until it resolves them), anything else a fixed window (0: off).
+inline void apply_ngram_draft_tokens(SpeculativeOptions& options, std::string_view value) {
+    options.ngram_draft_tokens_auto = value == "auto";
+    options.ngram_draft_tokens      = 0;
+    if (options.ngram_draft_tokens_auto) { return; }
+    if (value.empty() || value.size() > 3 || value.find_first_not_of("0123456789") != std::string_view::npos) {
+        throw std::invalid_argument("--ngram-draft-tokens takes a count or auto: " + std::string(value));
+    }
+    options.ngram_draft_tokens = static_cast<std::uint32_t>(std::stoul(std::string(value)));
+}
+
 // Parses --draft-tree-nodes: one to eight comma-separated column counts, entry c-1 applying to
 // rounds of c rows and the last entry to every larger batch; 0 keeps a batch size on chain
 // verification.
@@ -131,7 +143,8 @@ speculative_verify_drafts(const SpeculativeOptions& options) noexcept {
 
 inline void validate_speculative_cli_options(const SpeculativeOptions& options) {
     if (options.ngram_archive_bytes != 0 &&
-        (options.ngram_draft_tokens == 0 || options.ngram_session_bytes < (1ULL << 20) ||
+        ((options.ngram_draft_tokens == 0 && !options.ngram_draft_tokens_auto) ||
+         options.ngram_session_bytes < (1ULL << 20) ||
          options.ngram_session_bytes > options.ngram_archive_bytes)) {
         throw std::invalid_argument("ngram archive requires ngram drafting and session capacity "
                                     "between 1 MiB and total archive capacity");
@@ -142,6 +155,9 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
         (options.ngram_draft_tokens > 63 || options.ngram_min_match < 4 ||
          options.ngram_min_match > 64)) {
         throw std::invalid_argument("ngram drafts must be 1..63 with a minimum match of 4..64");
+    }
+    if (options.ngram_draft_tokens_auto && options.backend == SpeculativeBackend::None) {
+        throw std::invalid_argument("--ngram-draft-tokens auto requires --spec mtp, dflash or dflash2");
     }
     if (draft_tree_enabled(options)) {
         if (options.backend != SpeculativeBackend::DFlash2) {
@@ -163,10 +179,9 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
         options.backend != SpeculativeBackend::DFlash2) {
         throw std::invalid_argument("--spec-min-p requires --spec mtp or dflash2");
     }
-    // auto with dflash2: Qwen3.8-Flash-Next's per-round policy (the Engine refuses it elsewhere).
-    if (options.draft_tokens_auto && options.backend != SpeculativeBackend::Mtp &&
-        options.backend != SpeculativeBackend::DFlash2) {
-        throw std::invalid_argument("--draft-tokens auto requires --spec mtp or dflash2");
+    // auto with dflash or dflash2: the block drafters' per-round verify width.
+    if (options.draft_tokens_auto && options.backend == SpeculativeBackend::None) {
+        throw std::invalid_argument("--draft-tokens auto requires --spec mtp, dflash or dflash2");
     }
     if (!options.draft_model.empty() && options.backend != SpeculativeBackend::DFlash2) {
         throw std::invalid_argument("--draft-model is a DFlash2 drafter: it requires --spec dflash2");
@@ -190,14 +205,15 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
         }
         return;
     case SpeculativeBackend::DFlash:
+        if (options.draft_tokens_auto) { return; }
         if (options.draft_tokens == 0 || options.draft_tokens > 15) {
-            throw std::invalid_argument("--spec dflash requires --draft-tokens in [1,15]");
+            throw std::invalid_argument("--spec dflash requires --draft-tokens in [1,15] or auto");
         }
         return;
     case SpeculativeBackend::DFlash2:
         if (options.draft_tokens_auto) { return; }
         if (options.draft_tokens == 0 || options.draft_tokens > 15) {
-            throw std::invalid_argument("--spec dflash2 requires --draft-tokens in [1,15] (auto: Qwen3.8-Flash-Next)");
+            throw std::invalid_argument("--spec dflash2 requires --draft-tokens in [1,15] or auto");
         }
         return;
     }

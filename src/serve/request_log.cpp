@@ -583,6 +583,7 @@ std::string format_server_start_json(
              {"draft_tree_auto", engine_options.speculative.draft_tree_auto},
              {"draft_tree_paths", engine_options.speculative.draft_tree_paths},
              {"ngram_draft_window", engine_options.speculative.ngram_draft_tokens},
+             {"ngram_batch_draft_window", engine_options.speculative.ngram_batch_draft_tokens},
              {"ngram_min_match", engine_options.speculative.ngram_min_match},
              {"ngram_archive_bytes", engine_options.speculative.ngram_archive_bytes},
              {"ngram_session_bytes", engine_options.speculative.ngram_session_bytes},
