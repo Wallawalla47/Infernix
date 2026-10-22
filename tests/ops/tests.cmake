@@ -90,7 +90,8 @@ infernix_add_op_test(infernix_softmax_attention_test
   LIBRARIES infernix_ops
   ARGS --non-causal-only)
 # The causal cases, one entry per KV format: together they run exactly the cases of a run without
-# --kv-dtype, and `ctest -j` can run them concurrently.
+# --kv-dtype, and `ctest -j` runs them beside the other tests, one attention entry at a time
+# (infernix_attention_oracle below).
 foreach(kv_dtype bf16 int8 fp8 nvfp4 k8v4)
   add_test(NAME infernix_softmax_attention_${kv_dtype}_test
     COMMAND infernix_softmax_attention_test --kv-dtype ${kv_dtype})
@@ -219,6 +220,17 @@ foreach(kv_dtype bf16 int8 fp8 nvfp4 k8v4)
   set_tests_properties(infernix_softmax_attention_wide_${kv_dtype}_test
     PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
 endforeach()
+
+# Every softmax attention entry's oracle runs on all host threads (ops/host_parallel.h) and its
+# kernels fill the GPU, so entries started together only oversubscribe both: the bf16 entry, 62 s
+# alone, timed out at 900 s beside five others (2026-10-22). They take turns; other tests still run
+# beside them.
+set(infernix_attention_oracle_tests infernix_softmax_attention_test infernix_softmax_attention_extended_test)
+foreach(kv_dtype bf16 int8 fp8 nvfp4 k8v4)
+  list(APPEND infernix_attention_oracle_tests infernix_softmax_attention_${kv_dtype}_test
+    infernix_softmax_attention_wide_${kv_dtype}_test)
+endforeach()
+set_tests_properties(${infernix_attention_oracle_tests} PROPERTIES RESOURCE_LOCK infernix_attention_oracle)
 
 add_test(NAME infernix_sparse_moe_wide_test
   COMMAND infernix_sparse_moe_test --wide-only)
