@@ -984,6 +984,7 @@ their request-coupling paths are listed like the others (since 2026-10-22). The 
 | `decode-split64` | INT8 KV, 24 query heads | NVFP4 27B and groupwise 27B, INT8 KV |
 | `prompt-pv8` | INT8 KV (fast prompt kernel), NVFP4 KV (fast kernel), K8V4, VQ2, K4V2 KV | NVFP4 27B, groupwise 27B and 35B-A3B, with INT8, NVFP4, K8V4, VQ2 or K4V2 KV |
 | `batched-decode`, `batch-split-attention` | every Qwen3.5 artifact | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
+| `single-column-decode` | Qwen3.5 artifacts without `batched-decode`: decode and verify calls of one column | groupwise 27B, every format (2026-10-22, below); not the 35B-A3B (1 % slower at four requests) |
 | `batched-a8-decode`, `batched-a4-decode` | the same, with 8-bit (FP8) or 4-bit (NVFP4) activations | none (each fails, below) |
 | `batched-a4-residual-decode` | the same, with 4-bit (NVFP4) MLP activations | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
 | `batched-a8-residual-decode` | the same, with 8-bit (FP8) input-projection activations | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
@@ -1118,6 +1119,10 @@ the Engine, and each acts only where the artifact can be request-invariant
   none), on the FP4 Tensor Cores (design §19.3.23). Without it W4A16 experts run the exact integer
   limb route. An expert's route depends on its column count in the call, which other requests'
   columns share in batched rounds.
+- `single-column-decode` (Qwen3.5, without `batched-decode`): decode and verify calls of one column
+  (a request's plain decode step alone in its round) run `batched-decode`'s single-column routes and
+  down-projection tiles; every wider round keeps the column-invariant route, and the drafters keep
+  their column-invariant copies. A step's route depends on whether another request shares its round.
 - `batch-split-attention`: decode attention sizes a row's key partition from the batch.
 - `adaptive-speculation`: DFlash2 tree tables and controller, and a round's longest n-gram copy,
   set every row's verify width.
@@ -1378,6 +1383,23 @@ formats both pass (`.local/gpu-queue/stage2a`): the largest TV excess bound 5.7e
 most 1.4e-4), the largest top-1 bound 0.24 points (35B BF16; groupwise 0.22, VQ2), p99.9 ratios 0.87-1.12;
 every fast run preempted (21-28 times) and resumed 192,000 prompt tokens from the prefix cache. The three
 paths are registered for both artifacts on every format.
+
+**`single-column-decode`** (2026-10-22, RTX 5090, CUDA 13): `batched-decode`'s routes in one-column rounds
+only, since `batched-decode` itself was +12.8 % at one request but -19.1 % at four on the groupwise 27B.
+`batched-decode`'s apparent -7.1 % prefill was no prefill work: nsys traces show the same 747 prefill
+kernels in both routes, with the three compute-bound weight GEMMs uniformly slower after the faster decode.
+Timed alone against the default route (ABBA, INT8 KV, pp512 + tg512, three repetitions): groupwise 27B
+decode +14.5 % at one request and +0.05 % at four, end to end +13.9 % and +0.06 % (ahead in both pairs).
+Its prefill (-6.4 % at one request, -0.4 % at four) follows the board's power limit (517.5 W): sampled
+clocks put the faster decode at 513-515 W with the SM clock power-capped near 2,470 MHz (the default route
+decodes at ~480 W near 2,880 MHz), and the next prefill starts at that clock. 35B-A3B: +0.55 % at one
+request but -1.0 % at four (both pairs, unexplained; its decode never reached the power cap), so it is not
+registered there. Gated on the groupwise 27B per KV format on plain one-request decode (every round one
+column, the path's whole effect), 256 segments, against the lossless decode reference, with the
+reproducible route as the base arm (INT8 the stored plain arm; the other six new plain runs, each
+bit-identical to step 2a's n-gram joint base runs): all seven pass, the largest TV excess bound 1.65e-4
+(NVFP4), the largest top-1 bound 0.16 points (VQ2), p99.9 ratios 0.84-1.13 (K4V2 the highest). Registered
+for the groupwise 27B on every format.
 
 **`batched-a4-residual-decode`** (2026-10-14, the same artifact, corpus and arms): two NVFP4 terms
 per column, from 9 columns in the MLP. Its op error against the 16-bit oracle is 0.9 % relative L2

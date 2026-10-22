@@ -503,20 +503,13 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         };
         scratch(layout, wide_verification ? std::max(bytes(true), bytes(false)) : bytes(false));
     };
-    const auto target_body = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
-                                 std::int32_t last, TextPhase phase, GdnWorkspacePath path,
-                                 std::int32_t batch_size, std::int32_t min_width,
-                                 std::int32_t max_width,
-                                 ops::CausalAttentionExecutionEnvelope envelope) {
+    const auto target_layers = [&](WorkspaceLayoutBuilder& layout,
+                                   const execution::TextParameters& text, std::int32_t first,
+                                   std::int32_t last, TextPhase phase, GdnWorkspacePath path,
+                                   std::int32_t batch_size, std::int32_t min_width,
+                                   std::int32_t max_width,
+                                   ops::CausalAttentionExecutionEnvelope envelope) {
         const bool wide_verification = wide_residual_verification(phase, min_width, max_width);
-        const execution::TextParameters& text =
-            phase == TextPhase::Verify
-                ? parameters.decode_text(plan.execution_schedule.column_invariant_decode,
-                                         {plan.execution_schedule.a8_decode,
-                                          plan.execution_schedule.a4_decode,
-                                          plan.execution_schedule.a8_residual_decode,
-                                          plan.execution_schedule.a4_residual_decode})
-                : parameters.text;
         for (const auto& block : text.layers) {
             {
                 auto stage = layout.scope();
@@ -577,6 +570,30 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                                             ffn_routes)));
         }
         if (!plan.causal_scoring) { linear_scratch(layout, text.output_head, first, last); }
+    };
+    // Decode and verification calls run Parameters::decode_text: the column-invariant copy unless
+    // batched_columns, which single-column-decode grants to one-column calls only, so a family that
+    // can run one column also sizes the batched route there.
+    const auto target_body = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
+                                 std::int32_t last, TextPhase phase, GdnWorkspacePath path,
+                                 std::int32_t batch_size, std::int32_t min_width,
+                                 std::int32_t max_width,
+                                 ops::CausalAttentionExecutionEnvelope envelope) {
+        if (phase != TextPhase::Verify) {
+            target_layers(layout, parameters.text, first, last, phase, path, batch_size, min_width,
+                          max_width, envelope);
+            return;
+        }
+        const auto& schedule = plan.execution_schedule;
+        const execution::DecodePrecision precision{schedule.a8_decode, schedule.a4_decode,
+                                                   schedule.a8_residual_decode,
+                                                   schedule.a4_residual_decode};
+        target_layers(layout, parameters.decode_text(!schedule.batched_columns(last), precision), first,
+                      last, phase, path, batch_size, min_width, max_width, envelope);
+        if (first == 1 && schedule.batched_columns(1) != schedule.batched_columns(last)) {
+            target_layers(layout, parameters.decode_text(false, precision), 1, 1, phase, path,
+                          batch_size, min_width, max_width, envelope);
+        }
     };
     // The drafter the MTP sizing below plans: its own routes (the prompt's drafts), or its
     // column-invariant copy (Parameters::invariant_mtp), which the exact route's batched draft
@@ -1328,6 +1345,7 @@ ExecutionSchedule execution_schedule(const execution::Parameters& parameters,
             .split_workspace_bytes   = std::size_t{options.prefill_split_workspace_mib} << 20,
             .decode_split64          = fast_paths.selected(FastPath::DecodeSplit64),
             .column_invariant_decode = fast_paths.invariant(FastPath::BatchedDecode),
+            .single_column_decode    = fast_paths.selected(FastPath::SingleColumnDecode),
             .a8_decode               = fast_paths.selected(FastPath::BatchedA8Decode),
             .a4_decode               = fast_paths.selected(FastPath::BatchedA4Decode),
             .a8_residual_decode      = fast_paths.selected(FastPath::BatchedA8ResidualDecode),
@@ -1342,7 +1360,6 @@ ExecutionSchedule execution_schedule(const execution::Parameters& parameters,
                                        fast_paths.selected(FastPath::AdaptiveSpeculation),
             .linear_routes           = fast_paths.selected(FastPath::Q4W4A8) ? ops::LinearRoutes::Q4W4A8
                                                                              : ops::LinearRoutes::Exact,
-            .wide_down_tile          = fast_paths.selected(FastPath::BatchedDecode),
             .gdn_arithmetic          = fast_paths.selected(FastPath::GdnF16Accumulate)
                                            ? ops::GdnChunkArithmetic::Fp16Accumulate
                                            : ops::GdnChunkArithmetic::Exact,

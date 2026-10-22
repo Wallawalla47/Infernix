@@ -458,6 +458,7 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
     case FastPath::BatchedA4Decode:
     case FastPath::BatchedA4ResidualDecode:
     case FastPath::BatchedA8ResidualDecode:
+    case FastPath::SingleColumnDecode:
     case FastPath::BatchSplitAttention: return false;
     case FastPath::PromptPv8:
     case FastPath::DecodeSplit64: return false; // Qwen3.8-27B attention kernels only

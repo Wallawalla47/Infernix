@@ -111,9 +111,9 @@ def policy_with(overrides: Sequence[str]) -> Policy:
 # fast_path_name of every infernix::FastPath.
 FAST_PATHS = ("prompt-pv8", "decode-split64", "batched-decode", "batched-a8-decode",
               "batched-a4-decode", "batched-a4-residual-decode", "batched-a8-residual-decode",
-              "expert-a4-residual", "expert-a4-residual-3", "batch-split-attention", "adaptive-speculation",
-              "free-cache-resume", "preemption", "q8-sliced-k", "gdn-conv-fused",
-              "qsa-prepare-fused", "adaptive-mtp", "idle-wide-prefill", "fp8-a8-pair", "q4-w4a8",
+              "single-column-decode", "expert-a4-residual", "expert-a4-residual-3", "batch-split-attention",
+              "adaptive-speculation", "free-cache-resume", "preemption", "q8-sliced-k", "gdn-conv-fused",
+              "qsa-prepare-fused", "adaptive-mtp", "adaptive-dflash", "idle-wide-prefill", "fp8-a8-pair", "q4-w4a8",
               "sampled-mtp-drafts", "gdn-f16-accumulate", "ggml-bf16-prefill")
 
 

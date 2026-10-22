@@ -67,8 +67,8 @@ int main() {
     infernix::EngineOptions serving       = options;
     serving.speculative.backend           = infernix::SpeculativeBackend::Mtp;
     serving.context_cache.enabled         = true;
-    for (const FastPath path : {FastPath::BatchedDecode, FastPath::BatchSplitAttention, FastPath::Preemption,
-                                FastPath::AdaptiveSpeculation, FastPath::FreeCacheResume}) {
+    for (const FastPath path : {FastPath::BatchedDecode, FastPath::SingleColumnDecode, FastPath::BatchSplitAttention,
+                                FastPath::Preemption, FastPath::AdaptiveSpeculation, FastPath::FreeCacheResume}) {
         failures += check(q::fast_path_applies(path, int8_24, serving),
                           std::string(infernix::fast_path_name(path)) + " must apply on every artifact");
     }
@@ -107,6 +107,11 @@ int main() {
     failures += check(!q::couples_requests(FastPath::PromptPv8) &&
                           !q::couples_requests(FastPath::DecodeSplit64),
                       "prompt-pv8 and decode-split64 do not couple requests");
+    // single-column-decode: a step's route depends on whether another request shares its round.
+    failures += check(q::couples_requests(FastPath::SingleColumnDecode),
+                      "single-column-decode couples requests");
+    failures += check(infernix::parse_fast_path("single-column-decode") == FastPath::SingleColumnDecode,
+                      "single-column-decode is parsed by name");
 
     // The request-coupling paths and both residual routes are qualified on every KV format
     // (4-bit activations); the one-term 4- and 8-bit paths failed the decode gate.
@@ -146,6 +151,11 @@ int main() {
                                   std::string(infernix::fast_path_name(path)) + " is not qualified for " + q::describe(config));
             }
         }
+        // single-column-decode: the groupwise 27B only (the 35B-A3B was 1 % slower at four requests).
+        failures += check(q::fast_path_qualified(FastPath::SingleColumnDecode, {24, ActivationClass::A16, kv, true}) &&
+                              !q::fast_path_qualified(FastPath::SingleColumnDecode, {16, ActivationClass::A16, kv}) &&
+                              !q::fast_path_qualified(FastPath::SingleColumnDecode, {24, ActivationClass::A4, kv}),
+                          "single-column-decode is qualified for the groupwise 27B only");
     }
 
     // Request invariance needs no coupling path.

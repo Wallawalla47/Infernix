@@ -790,7 +790,7 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
         NullTap tap;
         run_layers(x, Phase::Verify, tap);
         ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, hidden, stream);
-        project(hidden, phase_text(Phase::Verify).output_head, logits, work_, stream);
+        project(hidden, phase_text(Phase::Verify, batch).output_head, logits, work_, stream);
     }
     work_.reset();
 }
@@ -855,7 +855,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         Tensor flat_logits = logits.view({dimension(config_.vocab_size), columns});
         Tensor flat_tokens = target_tokens.view({columns});
         ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, flat_hidden, stream);
-        project(flat_hidden, phase_text(Phase::Verify).output_head, flat_logits, work_, stream);
+        project(flat_hidden, phase_text(Phase::Verify, columns).output_head, flat_logits, work_, stream);
         ops::argmax(flat_logits, flat_tokens,
                     dimension(parameters_.model.resources().public_token_count), stream);
     }
@@ -1214,14 +1214,14 @@ void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase ph,
     const std::int32_t width = row_width(x.ne[1]);
     ffn(h, weights.ffn, x, hints, work_, ctx_.execution_view(), false,
         wide_residual_verification(ph, width, width), execution_schedule_.linear_routes,
-        ph == Phase::Verify && execution_schedule_.wide_down_tile ? ops::LinearRoutes::WideDownTile
-                                                                   : ops::LinearRoutes::Exact);
+        ph == Phase::Verify && execution_schedule_.batched_columns(x.ne[1]) ? ops::LinearRoutes::WideDownTile
+                                                                             : ops::LinearRoutes::Exact);
 }
 
 template <class Tap>
 void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
     const bool prefill = ph == Phase::Prefill;
-    const TextParameters& text = phase_text(ph);
+    const TextParameters& text = phase_text(ph, x.ne[1]);
     for (std::size_t layer = 0; layer < text.layers.size(); ++layer) {
         const auto& block  = text.layers[layer];
         const bool full    = config_.layer_types[layer] == MixerKind::FullAttention;

@@ -27,7 +27,8 @@ inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 15;
 // LinearPolicy::A16ColumnInvariant (without it, a8_decode and a4_decode let wide rounds of FP8 and
 // NVFP4 projections take the artifact's 8- or 4-bit activations, a8_residual_decode the FP8
 // projections the A8 residual profile and a4_residual_decode the NVFP4 MLP projections the A4
-// residual profile, else they stay at 16 bits);
+// residual profile, else they stay at 16 bits), except calls of one column under
+// single_column_decode (batched_columns);
 // row_invariant_partition sizes
 // every attention row's key partition by that row alone; fixed_speculation verifies the
 // configured chain at a fixed width;
@@ -43,6 +44,8 @@ struct ExecutionSchedule {
     std::size_t split_workspace_bytes = ops::kCausalPromptSplitWorkspaceDefaultBytes;
     bool decode_split64               = false;
     bool column_invariant_decode      = false;
+    // single-column-decode: decode and verification calls of one column run the batched route.
+    bool single_column_decode         = false;
     bool a8_decode                    = true;
     bool a4_decode                    = true;
     bool a8_residual_decode           = false;
@@ -57,9 +60,6 @@ struct ExecutionSchedule {
     // width (only where speculation is adaptive).
     bool adaptive_dflash              = false;
     ops::LinearRoutes linear_routes   = ops::LinearRoutes::Exact;
-    // batched-decode: the decode and verification rounds' MLP down projections take its tiles
-    // (ops::LinearRoutes::WideDownTile).
-    bool wide_down_tile               = false;
     // gdn-f16-accumulate: the chunked GDN calls' arithmetic.
     ops::GdnChunkArithmetic gdn_arithmetic = ops::GdnChunkArithmetic::Exact;
     // The lossless route (EngineOptions::lossless, docs/maintainer/lossless-route.md): every layer
@@ -76,6 +76,13 @@ struct ExecutionSchedule {
     // The reproducible and lossless routes: sampled requests draw by Gumbel-max
     // (ops::SamplingConfig::gumbel_max), so speculation returns plain sampling's text.
     bool gumbel_sampling = false;
+
+    // Whether a decode or verification call of `columns` columns runs batched-decode's route: its
+    // projections' column-count routes (Parameters::decode_text without column invariance) and the
+    // MLP down projections' tiles (ops::LinearRoutes::WideDownTile).
+    [[nodiscard]] bool batched_columns(std::int64_t columns) const noexcept {
+        return !column_invariant_decode || (single_column_decode && columns == 1);
+    }
 
     // A prefill chunk's envelope.
     [[nodiscard]] ops::CausalAttentionExecutionEnvelope

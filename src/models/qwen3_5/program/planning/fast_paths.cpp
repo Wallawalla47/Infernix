@@ -196,6 +196,16 @@ constexpr std::array kQualified{
     Qualification{FastPath::Preemption, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value, true}},
     Qualification{FastPath::Preemption, {24, ActivationClass::A16, KvCacheStorage::Vq2, true}},
     Qualification{FastPath::Preemption, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value, true}},
+    // The groupwise 27B's one-column rounds on batched-decode's routes (2026-10-22): one request decodes
+    // +14.5 % (end to end +13.9 %), four +0.05 % (ABBA, INT8, pp512 + tg512), gated per KV format on plain
+    // one-request decode (every round one column), 256 segments against the lossless decode reference.
+    Qualification{FastPath::SingleColumnDecode, {24, ActivationClass::A16, KvCacheStorage::BFloat16, true}},
+    Qualification{FastPath::SingleColumnDecode, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, true}},
+    Qualification{FastPath::SingleColumnDecode, {24, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256, true}},
+    Qualification{FastPath::SingleColumnDecode, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16, true}},
+    Qualification{FastPath::SingleColumnDecode, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value, true}},
+    Qualification{FastPath::SingleColumnDecode, {24, ActivationClass::A16, KvCacheStorage::Vq2, true}},
+    Qualification{FastPath::SingleColumnDecode, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value, true}},
     Qualification{FastPath::AdaptiveSpeculation, {16, ActivationClass::A16, KvCacheStorage::BFloat16}},
     Qualification{FastPath::AdaptiveSpeculation, {16, ActivationClass::A16, KvCacheStorage::Int8Group64}},
     Qualification{FastPath::AdaptiveSpeculation, {16, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256}},
@@ -331,6 +341,7 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
                        const EngineOptions& options) {
     switch (path) {
     case FastPath::BatchedDecode:
+    case FastPath::SingleColumnDecode:
     case FastPath::BatchSplitAttention:
     case FastPath::Preemption: return true;
     case FastPath::BatchedA8Decode:

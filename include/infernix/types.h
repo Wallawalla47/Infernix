@@ -121,6 +121,12 @@ enum class FastPath : std::uint8_t {
     // (ops::LinearPolicy::AllowA8Residual); output and down projections stay at 16 bits.
     // batched-a8-decode takes precedence. Without either they stay at 16 bits.
     BatchedA8ResidualDecode,
+    // Without batched-decode: decode and verify calls of a single column (one request's plain
+    // decode step alone in its round) run batched-decode's single-column routes, while every wider
+    // round keeps the column-invariant route. A request's step then depends on whether another
+    // request shares its round. The drafters keep their column-invariant copies. Where
+    // batched-decode is selected it changes nothing.
+    SingleColumnDecode,
     // Qwen3.8-Flash-Next W4A16 experts (weight-only exports): calls of more than eight columns per
     // expert (prefill, wide verification) take each x and h row as the A4 residual profile of two
     // NVFP4 terms with an FP32 row scale, on the FP4 Tensor Cores, instead of the exact integer limb
@@ -167,7 +173,7 @@ enum class FastPath : std::uint8_t {
     GgmlBf16Prefill,
 };
 
-inline constexpr std::array<FastPath, 24> kFastPaths{
+inline constexpr std::array<FastPath, 25> kFastPaths{
     FastPath::PromptPv8,           FastPath::DecodeSplit64,
     FastPath::Q8SlicedK,           FastPath::GdnConvFused,
     FastPath::QsaPrepareFused,     FastPath::Fp8A8Pair,
@@ -175,8 +181,8 @@ inline constexpr std::array<FastPath, 24> kFastPaths{
     FastPath::GdnF16Accumulate,
     FastPath::BatchedDecode,       FastPath::BatchedA8Decode,
     FastPath::BatchedA4Decode,     FastPath::BatchedA4ResidualDecode,
-    FastPath::BatchedA8ResidualDecode, FastPath::ExpertA4Residual,
-    FastPath::ExpertA4Residual3,
+    FastPath::BatchedA8ResidualDecode, FastPath::SingleColumnDecode,
+    FastPath::ExpertA4Residual,    FastPath::ExpertA4Residual3,
     FastPath::BatchSplitAttention, FastPath::AdaptiveSpeculation,
     FastPath::AdaptiveMtp,         FastPath::AdaptiveDFlash,
     FastPath::FreeCacheResume,     FastPath::Preemption,
@@ -191,6 +197,7 @@ inline constexpr std::array<FastPath, 24> kFastPaths{
     case FastPath::BatchedA4Decode: return "batched-a4-decode";
     case FastPath::BatchedA4ResidualDecode: return "batched-a4-residual-decode";
     case FastPath::BatchedA8ResidualDecode: return "batched-a8-residual-decode";
+    case FastPath::SingleColumnDecode: return "single-column-decode";
     case FastPath::ExpertA4Residual: return "expert-a4-residual";
     case FastPath::ExpertA4Residual3: return "expert-a4-residual-3";
     case FastPath::BatchSplitAttention: return "batch-split-attention";

@@ -217,11 +217,11 @@ private:
     // rows; the prompt's drafts keep the drafter's own routes.
     [[nodiscard]] const MtpParameters* batch_mtp() const noexcept;
     [[nodiscard]] const LinearParameters* batch_proposal_head() const noexcept;
-    // The parameters a phase's projections run with (Parameters::decode_text for decode and
-    // verification).
-    [[nodiscard]] const TextParameters& phase_text(Phase phase) const noexcept {
+    // The parameters a phase's projections run with over `columns` columns (Parameters::decode_text
+    // for decode and verification).
+    [[nodiscard]] const TextParameters& phase_text(Phase phase, std::int64_t columns) const noexcept {
         return phase == Phase::Verify
-                   ? parameters_.decode_text(execution_schedule_.column_invariant_decode,
+                   ? parameters_.decode_text(!execution_schedule_.batched_columns(columns),
                                              {execution_schedule_.a8_decode,
                                               execution_schedule_.a4_decode,
                                               execution_schedule_.a8_residual_decode,
