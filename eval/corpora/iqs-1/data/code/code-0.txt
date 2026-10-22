@@ -1,0 +1,1053 @@
+#pragma once
+
+// Implements: include/ninfer/ops/residual_add.h
+// Match: contiguous BF16 inputs. Registered aligned/eight-element domains use
+// one 16-byte pack per thread; BF16x2 and scalar routes preserve correctness for
+// smaller alignments and odd tails.
+
+#include "ops/common/bf16_vector.cuh"
+#include "ops/common/memory.cuh"
+
+#include <cuda_bf16.h>
+
+#include <cstdint>
+
+namespace ninfer::ops {
+
+inline constexpr int kResidualAddPairsPerThread = 4;
+
+__device__ __forceinline__ __nv_bfloat162 residual_add_pair(__nv_bfloat162 y, __nv_bfloat162 x) {
+    const float r0 = __low2float(x) + __low2float(y);
+    const float r1 = __high2float(x) + __high2float(y);
+    return __floats2bfloat162_rn(r0, r1);
+}
+
+__global__ void residual_add_scalar_kernel(const __nv_bfloat16* y, __nv_bfloat16* x,
+                                           std::int64_t n) {
+    const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
+    const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+    for (std::int64_t i = start; i < n; i += stride) {
+        x[i] = __float2bfloat16_rn(__bfloat162float(x[i]) + __bfloat162float(y[i]));
+    }
+}
+
+__launch_bounds__(256) __global__
+    void residual_add_bf16x8_kernel(const Bf16x8Pack* y, Bf16x8Pack* x, std::int64_t packs) {
+    const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
+    const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+    for (std::int64_t i = start; i < packs; i += stride) {
+        const Bf16x8Pack yv = load_vec<Bf16x8Pack>(y + i);
+        Bf16x8Pack xv       = load_vec<Bf16x8Pack>(x + i);
+#pragma unroll
+        for (int pair = 0; pair < 4; ++pair) {
+            xv.pair[pair] = residual_add_pair(yv.pair[pair], xv.pair[pair]);
+        }
+        store_vec(x + i, xv);
+    }
+}
+
+__launch_bounds__(256) __global__
+    void residual_add_bf16x2_kernel(const __nv_bfloat16* y, __nv_bfloat16* x, std::int64_t n) {
+    const std::int64_t tid = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
+    const std::int64_t stride =
+        static_cast<std::int64_t>(gridDim.x) * blockDim.x * kResidualAddPairsPerThread;
+    const std::int64_t n2 = n / 2;
+
+    const auto* y2 = reinterpret_cast<const __nv_bfloat162*>(y);
+    auto* x2       = reinterpret_cast<__nv_bfloat162*>(x);
+    for (std::int64_t j = tid * kResidualAddPairsPerThread; j < n2; j += stride) {
+        const __nv_bfloat162 y0 = y2[j];
+        const __nv_bfloat162 x0 = x2[j];
+        if (j + 3 < n2) {
+            const __nv_bfloat162 y1  = y2[j + 1];
+            const __nv_bfloat162 x1  = x2[j + 1];
+            const __nv_bfloat162 y2v = y2[j + 2];
+            const __nv_bfloat162 x2v = x2[j + 2];
+            const __nv_bfloat162 y3  = y2[j + 3];
+            const __nv_bfloat162 x3  = x2[j + 3];
+            x2[j]                    = residual_add_pair(y0, x0);
+            x2[j + 1]                = residual_add_pair(y1, x1);
+            x2[j + 2]                = residual_add_pair(y2v, x2v);
+            x2[j + 3]                = residual_add_pair(y3, x3);
+        } else {
+            x2[j] = residual_add_pair(y0, x0);
+            if (j + 1 < n2) { x2[j + 1] = residual_add_pair(y2[j + 1], x2[j + 1]); }
+            if (j + 2 < n2) { x2[j + 2] = residual_add_pair(y2[j + 2], x2[j + 2]); }
+        }
+    }
+
+    if (tid == 0 && (n & 1) != 0) {
+        const std::int64_t i = n - 1;
+        x[i]                 = __float2bfloat16_rn(__bfloat162float(x[i]) + __bfloat162float(y[i]));
+    }
+}
+
+} // namespace ninfer::ops
+#pragma once
+
+#include <ninfer/targets/qwen3_6_27b/package.h>
+#include <ninfer/targets/qwen3_6/frontend_resources.h>
+#include <ninfer/targets/qwen3_6/model_view.h>
+#include <ninfer/targets/qwen3_6/startup_features.h>
+#include <ninfer/targets/qwen3_6/vision.h>
+
+#include "artifact/binder.h"
+#include "artifact/materializer.h"
+#include "core/tensor.h"
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <utility>
+#include <variant>
+
+namespace ninfer::targets::qwen3_6_27b::detail {
+
+inline constexpr std::size_t kTextLayers          = 64;
+inline constexpr std::size_t kFullAttentionLayers = 16;
+inline constexpr std::size_t kGdnLayers           = 48;
+
+struct WeightPlan {
+    artifact::ObjectHandle object;
+    artifact::NumericFormat format          = artifact::NumericFormat::BF16;
+    std::uint32_t weight_scale_divisor_bits = 0;
+    std::uint32_t input_scale_divisor_bits  = 0;
+};
+
+struct MlpPlan {
+    WeightPlan gate_up;
+    WeightPlan down;
+};
+
+struct SplitAttentionProjectionPlan {
+    WeightPlan query_key;
+    WeightPlan gate_value;
+};
+
+struct FusedAttentionProjectionPlan {
+    WeightPlan query_key_gate_value;
+};
+
+struct FullAttentionPlan {
+    std::variant<SplitAttentionProjectionPlan, FusedAttentionProjectionPlan> projection;
+    artifact::ObjectHandle query_norm;
+    artifact::ObjectHandle key_norm;
+    WeightPlan output;
+};
+
+struct SplitGdnInputProjectionPlan {
+    WeightPlan query_key;
+    WeightPlan value_z;
+};
+
+struct FusedGdnInputProjectionPlan {
+    WeightPlan query_key_value_z;
+};
+
+struct SplitGdnControlProjectionPlan {
+    WeightPlan a_projection;
+    WeightPlan b_projection;
+};
+
+struct FusedGdnControlProjectionPlan {
+    WeightPlan a_b_projection;
+};
+
+using GdnControlProjectionPlan =
+    std::variant<SplitGdnControlProjectionPlan, FusedGdnControlProjectionPlan>;
+
+struct GdnPlan {
+    artifact::ObjectHandle a_log;
+    artifact::ObjectHandle dt_bias;
+    artifact::ObjectHandle convolution;
+    GdnControlProjectionPlan control_projection;
+    std::variant<SplitGdnInputProjectionPlan, FusedGdnInputProjectionPlan> input_projection;
+    artifact::ObjectHandle norm;
+    WeightPlan output;
+};
+
+struct TextLayerPlan {
+    artifact::ObjectHandle input_norm;
+    FullAttentionPlan attention{};
+    GdnPlan gdn{};
+    bool is_full_attention = false;
+    artifact::ObjectHandle post_attention_norm;
+    MlpPlan mlp;
+};
+
+struct MtpPlan {
+    artifact::ObjectHandle input_projection;
+    artifact::ObjectHandle embedding_norm;
+    artifact::ObjectHandle hidden_norm;
+    artifact::ObjectHandle input_norm;
+    artifact::ObjectHandle query_key_gate_value;
+    artifact::ObjectHandle query_norm;
+    artifact::ObjectHandle key_norm;
+    artifact::ObjectHandle output;
+    artifact::ObjectHandle post_attention_norm;
+    MlpPlan mlp;
+    artifact::ObjectHandle final_norm;
+};
+
+struct BindingPlan {
+    qwen3_6::FrontendResourcePlan frontend;
+    qwen3_6::StartupFeatures features;
+
+    WeightPlan token_embedding;
+    std::array<TextLayerPlan, kTextLayers> text_layers;
+    artifact::ObjectHandle final_norm;
+    WeightPlan output_head;
+    artifact::ObjectHandle draft_head;
+    artifact::ObjectHandle draft_head_token_ids;
+    MtpPlan mtp;
+
+    qwen3_6::VisionBackbonePlan vision_backbone;
+    qwen3_6::VisionMergerInputPlan vision_merger_input;
+    artifact::ObjectHandle vision_merger_fc2;
+    artifact::ObjectHandle vision_merger_fc2_bias;
+    qwen3_6::VisionMergerNormPlan vision_merger_norm;
+};
+
+struct ArtifactLoadPlan {
+    BindingPlan bindings;
+    artifact::MaterializationPlan materialization;
+};
+
+ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
+                               qwen3_6::StartupFeatures features);
+
+struct DensePostMixerPayload {
+    Weight gate_up;
+    Weight down;
+};
+
+struct SplitAttentionProjectionPayload {
+    Weight query_key;
+    Weight gate_value;
+};
+
+struct FusedAttentionProjectionPayload {
+    Weight query_key_gate_value;
+};
+
+using FullAttentionProjectionPayload =
+    std::variant<SplitAttentionProjectionPayload, FusedAttentionProjectionPayload>;
+
+struct SplitGdnInputProjectionPayload {
+    Weight query_key;
+    Weight value_z;
+};
+
+struct FusedGdnInputProjectionPayload {
+    Weight query_key_value_z;
+};
+
+using GdnInputProjectionPayload =
+    std::variant<SplitGdnInputProjectionPayload, FusedGdnInputProjectionPayload>;
+
+struct SplitGdnControlProjectionPayload {
+    Weight a_projection;
+    Weight b_projection;
+};
+
+struct FusedGdnControlProjectionPayload {
+    Weight a_b_projection;
+};
+
+using GdnControlProjectionPayload =
+    std::variant<SplitGdnControlProjectionPayload, FusedGdnControlProjectionPayload>;
+
+struct GdnProjectionPayload {
+    Tensor a_log;
+    Tensor dt_bias;
+    GdnControlProjectionPayload control_projection;
+    GdnInputProjectionPayload input_projection;
+};
+
+struct MtpAttentionPayload {
+    Weight packed;
+    Weight query;
+    Weight key;
+    Weight output_gate;
+    Weight value;
+};
+
+using RuntimeModelView =
+    qwen3_6::ModelView<FullAttentionProjectionPayload, GdnProjectionPayload, DensePostMixerPayload,
+                       MtpAttentionPayload, DensePostMixerPayload, qwen3_6::DFlashWeights<6>,
+                       kFullAttentionLayers, kGdnLayers>;
+using FullAttentionWeights = RuntimeModelView::FullLayer;
+using GdnWeights           = RuntimeModelView::GdnLayer;
+using MtpWeights           = RuntimeModelView::MtpLayer;
+
+class LoadedModelData {
+public:
+    LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized);
+
+    LoadedModelData(const LoadedModelData&)            = delete;
+    LoadedModelData& operator=(const LoadedModelData&) = delete;
+    LoadedModelData(LoadedModelData&&)                 = delete;
+    LoadedModelData& operator=(LoadedModelData&&)      = delete;
+
+    artifact::MaterializedArtifact backing;
+    qwen3_6::FrontendResources frontend;
+    RuntimeModelView runtime;
+};
+
+class LoadedModel::Impl {
+public:
+    Impl(WeightsProfile weights_profile_in, BindingPlan plan,
+         artifact::MaterializedArtifact materialized)
+        : weights_profile(weights_profile_in), data(std::move(plan), std::move(materialized)) {}
+
+    WeightsProfile weights_profile;
+    LoadedModelData data;
+};
+
+} // namespace ninfer::targets::qwen3_6_27b::detail
+#include "ops/attn_input_proj/bf16/bf16_attn_input_plan.h"
+
+#include "core/device.h"
+#include "ops/linear/bf16/bf16_config.h"
+#include "ops/linear/bf16/bf16_small_t.cuh"
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <stdexcept>
+#include <utility>
+
+namespace ninfer::ops::detail {
+namespace {
+
+using Launch = void (*)(const Tensor&, const Weight&, Tensor&, Tensor&, Tensor&, Tensor&,
+                        cudaStream_t);
+
+struct Bf16AttentionInputSmallTOutput {
+    __nv_bfloat16* query;
+    __nv_bfloat16* key;
+    __nv_bfloat16* gate;
+    __nv_bfloat16* value;
+
+    __device__ __forceinline__ void store(std::int32_t parent_row, std::int32_t token,
+                                          float result) const {
+        constexpr std::int32_t kQueryRows  = 6144;
+        constexpr std::int32_t kKeyRows    = 1024;
+        constexpr std::int32_t kGateRows   = 6144;
+        constexpr std::int32_t kKeyBegin   = kQueryRows;
+        constexpr std::int32_t kGateBegin  = kKeyBegin + kKeyRows;
+        constexpr std::int32_t kValueBegin = kGateBegin + kGateRows;
+        const __nv_bfloat16 value_bf16     = __float2bfloat16_rn(result);
+
+        if (parent_row < kKeyBegin) {
+            query[static_cast<std::int64_t>(token) * kQueryRows + parent_row] = value_bf16;
+        } else if (parent_row < kGateBegin) {
+            key[static_cast<std::int64_t>(token) * kKeyRows + parent_row - kKeyBegin] = value_bf16;
+        } else if (parent_row < kValueBegin) {
+            gate[static_cast<std::int64_t>(token) * kGateRows + parent_row - kGateBegin] =
+                value_bf16;
+        } else {
+            value[static_cast<std::int64_t>(token) * kKeyRows + parent_row - kValueBegin] =
+                value_bf16;
+        }
+    }
+};
+
+template <int ActiveTokens>
+struct Bf16AttentionSmallTProductionSchedule {
+    static_assert(ActiveTokens >= 2 && ActiveTokens <= 32);
+    // The Attention epilogue is measured separately from Linear, so it owns its exact-T winner
+    // mapping while sharing the Linear computation body.
+    static constexpr int kRowsPerWarp = ActiveTokens <= 4 ? 8 : (ActiveTokens <= 8 ? 4 : 2);
+    static constexpr Bf16SmallTActivationAccess kActivationAccess =
+        ActiveTokens <= 8 ? Bf16SmallTActivationAccess::WarpPacked
+                          : Bf16SmallTActivationAccess::DirectStream;
+    static constexpr bool kSequential = ActiveTokens <= 9 || ActiveTokens >= 17;
+    static constexpr bool kUnroll2 = ActiveTokens == 4 || ActiveTokens == 5 || ActiveTokens == 8 ||
+                                     (ActiveTokens >= 10 && ActiveTokens <= 18) ||
+                                     ActiveTokens >= 23;
+    static constexpr Bf16WeightCache kWeightCache =
+        ActiveTokens == 7 ? Bf16WeightCache::Streaming : Bf16WeightCache::Default;
+    static constexpr Bf16PhaseOrder kPhaseOrder =
+        kSequential ? Bf16PhaseOrder::Sequential : Bf16PhaseOrder::RowSwizzled;
+    using Type = Bf16SmallTInnerSchedule<4, 1, kRowsPerWarp, 8, 1, 4, kActivationAccess,
+                                         kWeightCache, kPhaseOrder, 1, kUnroll2 ? 2 : 1, 1, 2>;
+};
+
+template <int ActiveTokens>
+void launch_exact(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, Tensor& k,
+                  Tensor& v, cudaStream_t stream) {
+    using Geometry = Bf16GemvGeometry<14336, 5120>;
+    using Schedule = typename Bf16AttentionSmallTProductionSchedule<ActiveTokens>::Type;
+    static_assert((Geometry::kOutputRows % Schedule::kRowsPerCta) == 0);
+    static_assert((6144 % Schedule::kRowsPerCta) == 0);
+    static_assert((1024 % Schedule::kRowsPerCta) == 0);
+
+    const Bf16AttentionInputSmallTOutput output{
+        static_cast<__nv_bfloat16*>(q.data),
+        static_cast<__nv_bfloat16*>(k.data),
+        static_cast<__nv_bfloat16*>(gate.data),
+        static_cast<__nv_bfloat16*>(v.data),
+    };
+    constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
+    bf16_small_t_inner_kernel<Geometry, ActiveTokens, Schedule>
+        <<<kBlocks, Schedule::kThreads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const __nv_bfloat16*>(weight.qdata), output);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <std::size_t... Offsets>
+constexpr auto make_launchers(std::index_sequence<Offsets...>) {
+    return std::array<Launch, sizeof...(Offsets)>{
+        &launch_exact<kBf16AttnInputSmallTMinTokens + static_cast<int>(Offsets)>...};
+}
+
+constexpr auto kLaunchers = make_launchers(
+    std::make_index_sequence<kBf16AttnInputSmallTMaxTokens - kBf16AttnInputSmallTMinTokens + 1>{});
+
+} // namespace
+
+void bf16_attn_input_small_t_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
+                                    Tensor& k, Tensor& v, cudaStream_t stream) {
+    if (x.ne[1] < kBf16AttnInputSmallTMinTokens || x.ne[1] > kBf16AttnInputSmallTMaxTokens) {
+        throw std::invalid_argument("bf16 attn_input_proj small-T requires T in [2,32]");
+    }
+    kLaunchers[x.ne[1] - kBf16AttnInputSmallTMinTokens](x, weight, q, gate, k, v, stream);
+}
+
+} // namespace ninfer::ops::detail
+#include "ops/attn_input_proj/w8/w8_attn_input_kernels.h"
+
+#include "core/device.h"
+#include "ops/linear/w8/w8_k2048_decode.cuh"
+
+namespace ninfer::ops::detail {
+
+namespace {
+
+template <int RowsPerCta>
+void launch_companion_decode(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k, Tensor& v,
+                             cudaStream_t stream) {
+    constexpr int kRows = 6144;
+    static_assert((4096 % RowsPerCta) == 0 && (1024 % RowsPerCta) == 0);
+    using Output = W8SplitOutput3<4096, 1024, 1024>;
+    const Output output{static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
+                        static_cast<__nv_bfloat16*>(v.data)};
+    w8_k2048_decode_kernel<kRows, RowsPerCta><<<kRows / RowsPerCta, RowsPerCta * 32, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
+        static_cast<const std::uint8_t*>(weight.scales), output);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+} // namespace
+
+void w8_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
+                                 Tensor& k, Tensor& v, cudaStream_t stream) {
+    constexpr int kRows       = 9216;
+    constexpr int kRowsPerCta = 8;
+    static_assert((4096 % kRowsPerCta) == 0 && (512 % kRowsPerCta) == 0);
+    using Output = W8SplitOutput4<4096, 512, 4096, 512>;
+    const Output output{static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
+                        static_cast<__nv_bfloat16*>(gate.data),
+                        static_cast<__nv_bfloat16*>(v.data)};
+    w8_k2048_decode_kernel<kRows, kRowsPerCta>
+        <<<kRows / kRowsPerCta, kRowsPerCta * 32, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const std::uint8_t*>(weight.qdata),
+            static_cast<const std::uint8_t*>(weight.scales), output);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void w8_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k,
+                                 Tensor& v, cudaStream_t stream) {
+    launch_companion_decode<8>(x, weight, q, k, v, stream);
+}
+
+void w8_companion_attn_input_decode_r4_launch(const Tensor& x, const Weight& weight, Tensor& q,
+                                              Tensor& k, Tensor& v, cudaStream_t stream) {
+    launch_companion_decode<4>(x, weight, q, k, v, stream);
+}
+
+void w8_companion_attn_input_decode_r16_launch(const Tensor& x, const Weight& weight, Tensor& q,
+                                               Tensor& k, Tensor& v, cudaStream_t stream) {
+    launch_companion_decode<16>(x, weight, q, k, v, stream);
+}
+
+} // namespace ninfer::ops::detail
+#include "ninfer/ops/vision_pos_embed.h"
+
+#include "ops/launcher/vision_pos_embed.h"
+
+#include <stdexcept>
+
+namespace ninfer::ops {
+
+void vision_pos_embed_add(const Tensor& table, const Tensor& indices, const Tensor& weights,
+                          Tensor& x, cudaStream_t stream) {
+    if (table.dtype != DType::BF16 || x.dtype != DType::BF16 || indices.dtype != DType::I32 ||
+        weights.dtype != DType::FP32) {
+        throw std::invalid_argument(
+            "vision_pos_embed_add: table/x must be BF16, indices I32, weights FP32");
+    }
+    if (table.ne[2] != 1 || table.ne[3] != 1 || x.ne[2] != 1 || x.ne[3] != 1 ||
+        indices.ne[0] != 4 || indices.ne[1] != x.ne[1] || indices.ne[2] != 1 ||
+        indices.ne[3] != 1 || weights.ne[0] != 4 || weights.ne[1] != x.ne[1] ||
+        weights.ne[2] != 1 || weights.ne[3] != 1 || table.ne[0] != x.ne[0]) {
+        throw std::invalid_argument(
+            "vision_pos_embed_add: expected table [D,R], controls [4,P], x [D,P]");
+    }
+    if (x.ne[0] < 0 || x.ne[1] < 0 || table.ne[1] <= 0) {
+        throw std::invalid_argument("vision_pos_embed_add: invalid dimensions");
+    }
+    if (x.ne[0] == 0 || x.ne[1] == 0) { return; }
+    if (!table.is_contiguous() || !indices.is_contiguous() || !weights.is_contiguous() ||
+        !x.is_contiguous()) {
+        throw std::invalid_argument("vision_pos_embed_add: tensors must be contiguous");
+    }
+    if (table.data == nullptr || indices.data == nullptr || weights.data == nullptr ||
+        x.data == nullptr) {
+        throw std::invalid_argument("vision_pos_embed_add: tensor data must be non-null");
+    }
+    detail::vision_pos_embed_add_launch(table, indices, weights, x, stream);
+}
+
+} // namespace ninfer::ops
+#pragma once
+
+// ninfer::ops::detail - private launch prototype for residual_add. Included by the wrapper
+// (host) and defined by the launcher (.cu). Not part of the public api.
+// See docs/op-development.md §2.
+
+#include "core/tensor.h"
+
+#include <cuda_runtime.h>
+
+namespace ninfer::ops::detail {
+
+// Host entry; assumes inputs already validated by the wrapper.
+void residual_add_launch(const Tensor& y, Tensor& x, cudaStream_t stream);
+
+} // namespace ninfer::ops::detail
+#pragma once
+
+#include "core/dtype.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <initializer_list>
+
+namespace ninfer {
+
+struct Tensor {
+    void* data         = nullptr;
+    DType dtype        = DType::BF16;
+    std::int32_t ne[4] = {1, 1, 1, 1};
+    std::int64_t nb[4] = {0, 0, 0, 0};
+
+    Tensor() noexcept = default;
+    Tensor(void* data, DType dtype, std::initializer_list<std::int32_t> shape);
+
+    std::int64_t numel() const;
+    std::size_t bytes() const;
+    bool is_contiguous() const;
+
+    Tensor view(std::initializer_list<std::int32_t> shape) const;
+    Tensor reshape(std::initializer_list<std::int32_t> shape) const;
+    Tensor slice(int dim, std::int32_t start, std::int32_t len) const;
+    Tensor permute(std::initializer_list<int> order) const;
+};
+
+enum class QType : std::uint16_t {
+    Q4G64_F16S           = 0,
+    Q5G64_F16S           = 1,
+    Q6G64_F16S           = 2,
+    W8G32_F16S           = 3,
+    BF16_CTRL            = 4,
+    FP32_CTRL            = 5,
+    I32_CTRL             = 6,
+    NVFP4                = 7,
+    FP8_E4M3FN_ROW_BF16S = 8,
+};
+
+enum class QuantLayout : std::uint16_t {
+    RowSplit            = 0,
+    Contiguous          = 1,
+    BlockScaleK16M128x4 = 2,
+    RowScale            = 3,
+};
+
+struct Weight {
+    const void* payload            = nullptr;
+    std::uint64_t payload_bytes    = 0;
+    std::uint64_t high_plane_bytes = 0;
+    QType qtype                    = QType::Q4G64_F16S;
+    std::uint32_t group_size       = 0;
+    std::int32_t shape[4]          = {1, 1, 1, 1};
+    std::int32_t padded_shape[4]   = {1, 1, 1, 1};
+    std::uint32_t ndim             = 0;
+
+    const void* qdata          = nullptr;
+    const void* qhigh          = nullptr;
+    const void* scales         = nullptr;
+    std::int32_t n             = 0;
+    std::int32_t k             = 0;
+    std::int32_t group         = 0;
+    QuantLayout layout         = QuantLayout::RowSplit;
+    DType scale_dtype          = DType::FP32;
+    std::int32_t scale_ne[4]   = {1, 1, 1, 1};
+    std::int64_t scale_nb[4]   = {0, 0, 0, 0};
+    float weight_scale_divisor = 0.0F;
+    float input_scale_divisor  = 0.0F;
+};
+
+} // namespace ninfer
+#include "ninfer/ops/prepare_masked_block.h"
+
+#include "ops/launcher/prepare_masked_block.h"
+
+#include <cstdint>
+#include <stdexcept>
+#include <string>
+
+namespace ninfer::ops {
+namespace {
+
+void require_i32_vector(const Tensor& tensor, std::int32_t size, const char* name) {
+    if (tensor.dtype != DType::I32 || tensor.ne[0] != size || tensor.ne[1] != 1 ||
+        tensor.ne[2] != 1 || tensor.ne[3] != 1 || !tensor.is_contiguous() ||
+        tensor.data == nullptr) {
+        throw std::invalid_argument("prepare_masked_block: " + std::string(name) +
+                                    " must be a contiguous I32 vector");
+    }
+}
+
+void require_i32_matrix(const Tensor& tensor, std::int32_t width, std::int32_t batch,
+                        const char* name) {
+    if (tensor.dtype != DType::I32 || tensor.ne[0] != width || tensor.ne[1] != batch ||
+        tensor.ne[2] != 1 || tensor.ne[3] != 1 || !tensor.is_contiguous() ||
+        tensor.data == nullptr) {
+        throw std::invalid_argument("prepare_masked_block: " + std::string(name) +
+                                    " must be a contiguous I32 matrix");
+    }
+}
+
+bool overlaps(const Tensor& lhs, const Tensor& rhs) {
+    const auto lhs_begin = reinterpret_cast<std::uintptr_t>(lhs.data);
+    const auto rhs_begin = reinterpret_cast<std::uintptr_t>(rhs.data);
+    return lhs_begin < rhs_begin + rhs.bytes() && rhs_begin < lhs_begin + lhs.bytes();
+}
+
+} // namespace
+
+void prepare_masked_block(const Tensor& anchors, const Tensor& lengths, const Tensor& valid_columns,
+                          std::int32_t mask_id, Tensor& ids, Tensor& positions,
+                          cudaStream_t stream) {
+    const std::int32_t block_size = ids.ne[0];
+    const std::int32_t batch_size = ids.ne[1];
+    if (block_size < 1 || block_size > 16) {
+        throw std::invalid_argument("prepare_masked_block: W must be 1..16");
+    }
+    if (batch_size < 1 || batch_size > 8) {
+        throw std::invalid_argument("prepare_masked_block: B must be 1..8");
+    }
+    if (mask_id < 0) {
+        throw std::invalid_argument("prepare_masked_block: mask_id must be nonnegative");
+    }
+    require_i32_vector(anchors, batch_size, "anchors");
+    require_i32_vector(lengths, batch_size, "lengths");
+    require_i32_vector(valid_columns, batch_size, "valid_columns");
+    require_i32_matrix(ids, block_size, batch_size, "ids");
+    require_i32_matrix(positions, block_size, batch_size, "positions");
+    if (overlaps(ids, positions) || overlaps(anchors, ids) || overlaps(anchors, positions) ||
+        overlaps(lengths, ids) || overlaps(lengths, positions) || overlaps(valid_columns, ids) ||
+        overlaps(valid_columns, positions)) {
+        throw std::invalid_argument("prepare_masked_block: inputs and outputs must not overlap");
+    }
+    detail::prepare_masked_block_launch(anchors, lengths, valid_columns, mask_id, ids, positions,
+                                        block_size, stream);
+}
+
+} // namespace ninfer::ops
+#pragma once
+
+#include "core/layout.h"
+#include "ops/linear_attention/gated_delta_net/common.h"
+
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
+
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+
+#define NINFER_GATED_DELTA_NET_PROPAGATE(expr)                                                     \
+    do {                                                                                           \
+        const cudaError_t ninfer_gated_delta_net_error = (expr);                                   \
+        if (ninfer_gated_delta_net_error != cudaSuccess) { return ninfer_gated_delta_net_error; }  \
+    } while (0)
+
+namespace ninfer::ops::detail::gated_delta_net::chunked {
+
+inline constexpr std::size_t kWorkspaceAlign = 256;
+
+struct workspace_layout {
+    TensorRegion g_cumsum;
+    TensorRegion W;
+    TensorRegion U;
+    TensorRegion v_new;
+    TensorRegion h_chunk;
+    std::size_t total_bytes = 0;
+};
+
+inline workspace_layout compute_workspace_layout(std::int32_t value_heads, std::int32_t tokens) {
+    const std::int32_t chunks = tokens / kChunkSize;
+    LayoutBuilder builder;
+    workspace_layout w{};
+    w.g_cumsum =
+        builder.add_tensor(DType::FP32, {value_heads, tokens}, kWorkspaceAlign, "g_cumsum");
+    w.W = builder.add_tensor(DType::BF16, {kStateDim, value_heads, tokens}, kWorkspaceAlign, "W");
+    w.U = builder.add_tensor(DType::BF16, {kStateDim, value_heads, tokens}, kWorkspaceAlign, "U");
+    w.v_new =
+        builder.add_tensor(DType::BF16, {kStateDim, value_heads, tokens}, kWorkspaceAlign, "v_new");
+    w.h_chunk     = builder.add_tensor(DType::BF16, {kStateDim, kStateDim, value_heads, chunks},
+                                       kWorkspaceAlign, "h_chunk");
+    w.total_bytes = builder.finish(kWorkspaceAlign, "Gated DeltaNet chunk workspace");
+    return w;
+}
+
+inline std::size_t workspace_bytes(std::int32_t value_heads, std::int32_t tokens) {
+    return compute_workspace_layout(value_heads, tokens).total_bytes;
+}
+
+struct prepare_wy_wu_config {
+    std::int32_t H_qk = 0;
+    std::int32_t H_v  = 0;
+    std::int32_t L    = 0;
+
+    const __nv_bfloat16* k = nullptr;
+    const __nv_bfloat16* v = nullptr;
+    const float* g_in      = nullptr;
+    const float* beta      = nullptr;
+
+    __nv_bfloat16* W    = nullptr;
+    __nv_bfloat16* U    = nullptr;
+    float* g_cumsum_out = nullptr;
+
+    cudaStream_t stream = nullptr;
+};
+
+struct state_passing_config {
+    std::int32_t H_qk = 0;
+    std::int32_t H_v  = 0;
+    std::int32_t L    = 0;
+
+    const __nv_bfloat16* W = nullptr;
+    const __nv_bfloat16* U = nullptr;
+    const __nv_bfloat16* k = nullptr;
+    const float* g_cumsum  = nullptr;
+    const float* state_in  = nullptr;
+
+    __nv_bfloat16* v_new   = nullptr;
+    __nv_bfloat16* h_chunk = nullptr;
+    float* state_out       = nullptr;
+
+    cudaStream_t stream = nullptr;
+};
+
+struct chunk_output_config {
+    std::int32_t H_qk = 0;
+    std::int32_t H_v  = 0;
+    std::int32_t L    = 0;
+
+    const __nv_bfloat16* q       = nullptr;
+    const __nv_bfloat16* k       = nullptr;
+    const __nv_bfloat16* v_new   = nullptr;
+    const float* g_cumsum        = nullptr;
+    const __nv_bfloat16* h_chunk = nullptr;
+
+    __nv_bfloat16* attn_out = nullptr;
+
+    float scale = 0.0f;
+
+    cudaStream_t stream = nullptr;
+};
+
+struct stage_validator {
+    const char* name;
+    std::int32_t H_qk;
+    std::int32_t H_v;
+    std::int32_t T;
+
+    cudaError_t check_shape() const {
+        if (T <= 0 || !are_head_counts_valid(H_qk, H_v)) {
+            std::fprintf(stderr, "%s: invalid shape (H_qk=%d H_v=%d T=%d)\n", name, H_qk, H_v, T);
+            return cudaErrorInvalidValue;
+        }
+        return cudaSuccess;
+    }
+
+    cudaError_t check_full_chunks() const {
+        if ((T % kChunkSize) != 0) {
+            std::fprintf(stderr,
+                         "%s: Gated DeltaNet chunked path requires T to be a multiple of %d; "
+                         "route tail tokens through AR instead (T=%lld)\n",
+                         name, kChunkSize, static_cast<long long>(T));
+            return cudaErrorInvalidValue;
+        }
+        return cudaSuccess;
+    }
+
+    cudaError_t check_grid(std::int64_t grid_x, std::int64_t grid_y,
+                           std::int64_t grid_z = 1) const {
+        if (grid_x > static_cast<std::int64_t>(0xffffffff)) {
+            std::fprintf(stderr, "%s: grid.x too large (%lld)\n", name,
+                         static_cast<long long>(grid_x));
+            return cudaErrorInvalidConfiguration;
+        }
+        if (grid_y > static_cast<std::int64_t>(0xffff)) {
+            std::fprintf(stderr, "%s: grid.y too large (%lld)\n", name,
+                         static_cast<long long>(grid_y));
+            return cudaErrorInvalidConfiguration;
+        }
+        if (grid_z > static_cast<std::int64_t>(0xffff)) {
+            std::fprintf(stderr, "%s: grid.z too large (%lld)\n", name,
+                         static_cast<long long>(grid_z));
+            return cudaErrorInvalidConfiguration;
+        }
+        return cudaSuccess;
+    }
+};
+
+cudaError_t launch_prepare_wy_wu(const prepare_wy_wu_config& cfg);
+cudaError_t launch_state_passing(const state_passing_config& cfg);
+cudaError_t launch_output(const chunk_output_config& cfg);
+
+} // namespace ninfer::ops::detail::gated_delta_net::chunked
+// ninfer::ops - embedding wrapper: public api validation and qtype dispatch.
+#include "ninfer/ops/embedding.h"
+
+#include "ops/common/math.h"
+#include "ops/linear/fp8/fp8_format.h"
+#include "ops/launcher/embed_gather.h" // detail::embed_gather_*_launch
+#include "core/weight.h"
+
+#include <cstdint>
+#include <limits>
+#include <stdexcept>
+#include <string>
+
+namespace ninfer::ops {
+namespace {
+
+std::int64_t numel_allow_zero(const Tensor& t, const char* label) {
+    bool has_zero = false;
+    for (int d = 0; d < 4; ++d) {
+        if (t.ne[d] < 0) {
+            throw std::invalid_argument(std::string("embedding: ") + label +
+                                        " dimensions must be nonnegative");
+        }
+        if (t.ne[d] == 0) { has_zero = true; }
+    }
+    if (has_zero) { return 0; }
+
+    std::int64_t total = 1;
+    for (int d = 0; d < 4; ++d) {
+        if (total > std::numeric_limits<std::int64_t>::max() / t.ne[d]) {
+            throw std::overflow_error("embedding: tensor size overflows int64");
+        }
+        total *= t.ne[d];
+    }
+    return total;
+}
+
+std::uint64_t checked_mul_u64(std::uint64_t a, std::uint64_t b) {
+    if (b != 0 && a > std::numeric_limits<std::uint64_t>::max() / b) {
+        throw std::overflow_error("embedding: weight payload size overflows uint64");
+    }
+    return a * b;
+}
+
+std::int32_t align_up_i32(std::int32_t x, std::int32_t m) {
+    const std::int64_t y = round_up(static_cast<std::int64_t>(x), static_cast<std::int64_t>(m));
+    if (y > std::numeric_limits<std::int32_t>::max()) {
+        throw std::overflow_error("embedding: padded shape overflows int32");
+    }
+    return static_cast<std::int32_t>(y);
+}
+
+void require_ids_shape(const Tensor& ids) {
+    if (ids.ne[1] != 1 || ids.ne[2] != 1 || ids.ne[3] != 1) {
+        throw std::invalid_argument("embedding: ids must have shape [T]");
+    }
+}
+
+void require_out_shape(const Tensor& ids, const Tensor& out) {
+    if (out.ne[2] != 1 || out.ne[3] != 1) {
+        throw std::invalid_argument("embedding: out must have shape [d,T]");
+    }
+    if (out.ne[1] != ids.ne[0]) {
+        throw std::invalid_argument("embedding: out T dimension must match ids");
+    }
+}
+
+void require_weight_2d(const Weight& table) {
+    if (table.ndim != 2) { throw std::invalid_argument("embedding: table must be 2-D [vocab,d]"); }
+    if (table.shape[0] <= 0 || table.shape[1] <= 0) {
+        throw std::invalid_argument("embedding: table shape must be positive");
+    }
+}
+
+void require_dense_metadata(const Weight& table, const Tensor& out) {
+    if (table.layout != QuantLayout::Contiguous) {
+        throw std::invalid_argument("embedding: BF16_CTRL table must be Contiguous");
+    }
+    require_weight_2d(table);
+    if (table.shape[1] != out.ne[0]) {
+        throw std::invalid_argument("embedding: dense table d must match out.ne[0]");
+    }
+    if (table.qhigh != nullptr || table.high_plane_bytes != 0) {
+        throw std::invalid_argument("embedding: dense table high plane must be null");
+    }
+    const std::uint64_t expected =
+        checked_mul_u64(checked_mul_u64(static_cast<std::uint64_t>(table.shape[0]),
+                                        static_cast<std::uint64_t>(table.shape[1])),
+                        2);
+    if (table.payload_bytes != 0 && table.payload_bytes < expected) {
+        throw std::invalid_argument("embedding: dense payload is too small");
+    }
+}
+
+void require_q6_metadata(const Weight& table, const Tensor& out) {
+    if (table.layout != QuantLayout::RowSplit) {
+        throw std::invalid_argument("embedding: Q6G64_F16S table must be RowSplit");
+    }
+    require_weight_2d(table);
+    if (table.group_size != 64 || table.group != 64) {
+        throw std::invalid_argument("embedding: Q6G64_F16S table group must be 64");
+    }
+    if (table.scale_dtype != DType::FP16) {
+        throw std::invalid_argument("embedding: Q6G64_F16S table scale dtype must be FP16");
+    }
+    if (table.padded_shape[0] != table.shape[0] ||
+        table.padded_shape[1] != align_up_i32(table.shape[1], 128)) {
+        throw std::invalid_argument("embedding: Q6G64_F16S padded shape is invalid");
+    }
+    if (table.shape[1] != out.ne[0]) {
+        throw std::invalid_argument("embedding: Q6G64_F16S table d must match out.ne[0]");
+    }
+    const std::uint64_t kg = static_cast<std::uint64_t>(table.padded_shape[1] / 64);
+    const std::uint64_t nibble_plane_bytes =
+        checked_mul_u64(checked_mul_u64(static_cast<std::uint64_t>(table.shape[0]), kg), 32);
+    const std::uint64_t high_plane_bytes =
+        checked_mul_u64(checked_mul_u64(static_cast<std::uint64_t>(table.shape[0]), kg), 16);
+    const std::uint64_t scale_plane_bytes =
+        checked_mul_u64(checked_mul_u64(static_cast<std::uint64_t>(table.shape[0]), kg), 2);
+    const std::uint64_t high_plane_off = ((nibble_plane_bytes + 255u) / 256u) * 256u;
+    const std::uint64_t scale_plane_off =
+        high_plane_off + ((high_plane_bytes + 255u) / 256u) * 256u;
+    const std::uint64_t expected = scale_plane_off + scale_plane_bytes;
+    if (table.payload_bytes != 0 && table.payload_bytes < expected) {
+        throw std::invalid_argument("embedding: Q6G64_F16S payload is too small");
+    }
+    if (table.qdata == nullptr || table.qhigh == nullptr || table.scales == nullptr) {
+        throw std::invalid_argument("embedding: Q6G64_F16S planes must be non-null");
+    }
+    if (table.high_plane_bytes < high_plane_bytes) {
+        throw std::invalid_argument("embedding: Q6G64_F16S high plane is too small");
+    }
+}
+
+void require_w8_metadata(const Weight& table, const Tensor& out) {
+    if (table.layout != QuantLayout::RowSplit) {
+        throw std::invalid_argument("embedding: W8G32_F16S table must be RowSplit");
+    }
+    require_weight_2d(table);
+    if (table.group_size != 32 || table.group != 32) {
+        throw std::invalid_argument("embedding: W8G32_F16S table group must be 32");
+    }
+    if (table.scale_dtype != DType::FP16) {
+        throw std::invalid_argument("embedding: W8G32_F16S table scale dtype must be FP16");
+    }
+    if (table.padded_shape[0] != table.shape[0] ||
+        table.padded_shape[1] != align_up_i32(table.shape[1], 128)) {
+        throw std::invalid_argument("embedding: W8G32_F16S padded shape is invalid");
+    }
+    if (table.shape[1] != out.ne[0]) {
+        throw std::invalid_argument("embedding: W8G32_F16S table d must match out.ne[0]");
+    }
+    const std::uint64_t kg = static_cast<std::uint64_t>(table.padded_shape[1] / 32);
+    const std::uint64_t code_plane_bytes =
+        checked_mul_u64(checked_mul_u64(static_cast<std::uint64_t>(table.shape[0]), kg), 32);
+    const std::uint64_t scale_plane_bytes =
+        checked_mul_u64(checked_mul_u64(static_cast<std::uint64_t>(table.shape[0]), kg), 2);
+    const std::uint64_t scale_plane_off = ((code_plane_bytes + 255u) / 256u) * 256u;
+    const std::uint64_t expected        = scale_plane_off + scale_plane_bytes;
+    if (table.payload_bytes != 0 && table.payload_bytes < expected) {
+        throw std::invalid_argument("embedding: W8G32_F16S payload is too small");
+    }
+    if (table.qdata == nullptr || table.scales == nullptr) {
+        throw std::invalid_argument("embedding: W8G32_F16S planes must be non-null");
+    }
+    if (table.qhigh != nullptr || table.high_plane_bytes != 0) {
+        throw std::invalid_argument("embedding: W8G32_F16S high plane must be empty");
+    }
+}
+
+void require_fp8_metadata(const Weight& table, const Tensor& out) {
+    constexpr std::int32_t kVocabulary = 248320;
+    constexpr std::int32_t kHidden     = 5120;
+    if (table.n != kVocabulary || table.k != kHidden || out.ne[0] != kHidden) {
+        throw std::invalid_argument("embedding: unsupported FP8 table shape");
+    }
+    if ((reinterpret_cast<std::uintptr_t>(out.data) &
+         (static_cast<std::uintptr_t>(alignof(std::uint32_t)) - 1)) != 0) {
+        throw std::invalid_argument("embedding: FP8 output must be 4-byte aligned");
+    }
+    (void)detail::validate_fp8_weight(table, "embedding");
+}
+
+bool is_empty_T(const Tensor& ids, const Tensor& out) { return ids.ne[0] == 0 || out.ne[1] == 0; }
+
+void require_non_empty_tensors(const Tensor& ids, const Tensor& out) {
+    if (!ids.is_contiguous() || !out.is_contiguous()) {
+        throw std::invalid_argument("embedding: ids/out must be contiguous");
+    }
+    if (ids.data == nullptr || out.data == nullptr) {
+        throw std::invalid_argument("embedding: ids/out data must be non-null");
+    }
+}
+
+} // namespace
+
+void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t stream) {
+    if (ids.dtype != DType::I32) { throw std::invalid_argument("embedding: ids must be I32"); }
+    if (out.dtype != DType::BF16) { throw std::invalid_argument("embedding: out must be BF16"); }
+
+    (void)numel_allow_zero(ids, "ids");
+    (void)numel_allow_zero(out, "out");
+    require_ids_shape(ids);
+    require_out_shape(ids, out);
+
+    switch (table.qtype) {
+    case QType::BF16_CTRL: {
+        require_dense_metadata(table, out);
+        if (is_empty_T(ids, out)) { return; }
+        require_non_empty_tensors(ids, out);
+        if (table.qdata == nullptr) {
+            throw std::invalid_argument("embedding: dense table data must be non-null");
+        }
+        const Tensor dense = as_dense(table);
+        detail::embed_gather_dense_launch(ids, dense, out, stream);
+    } break;
+    case QType::Q6G64_F16S:
+        require_q6_metadata(table, out);
+        if (is_empty_T(ids, out)) { return; }
+        require_non_empty_tensors(ids, out);
+        detail::embed_gather_q6_launch(ids, table, out, stream);
+        break;
+    case QType::W8G32_F16S:
+        require_w8_metadata(table, out);
+        if (is_empty_T(ids, out)) { return; }
+        require_non_empty_tensors(ids, out);
+        detail::embed_gather_w8_launch(ids, table, out, stream);

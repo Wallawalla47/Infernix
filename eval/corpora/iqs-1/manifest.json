@@ -1,0 +1,246 @@
+{
+ "corpus_id": "iqs-1",
+ "version": 1,
+ "sets": {
+  "main": {
+   "window_tokens": 4096,
+   "decode_tokens": 64,
+   "decode_starts": [
+    256,
+    1024,
+    2048,
+    3840
+   ],
+   "documents": [
+    {
+     "id": "en-ref-0",
+     "domain": "english_reference",
+     "kind": "text",
+     "path": "data/english_reference/en-ref-0.txt"
+    },
+    {
+     "id": "en-ref-1",
+     "domain": "english_reference",
+     "kind": "text",
+     "path": "data/english_reference/en-ref-1.txt"
+    },
+    {
+     "id": "en-ref-2",
+     "domain": "english_reference",
+     "kind": "text",
+     "path": "data/english_reference/en-ref-2.txt"
+    },
+    {
+     "id": "en-ref-3",
+     "domain": "english_reference",
+     "kind": "text",
+     "path": "data/english_reference/en-ref-3.txt"
+    },
+    {
+     "id": "en-long-0",
+     "domain": "english_long_form",
+     "kind": "text",
+     "path": "data/english_long_form/en-long-0.txt"
+    },
+    {
+     "id": "en-long-1",
+     "domain": "english_long_form",
+     "kind": "text",
+     "path": "data/english_long_form/en-long-1.txt"
+    },
+    {
+     "id": "en-long-2",
+     "domain": "english_long_form",
+     "kind": "text",
+     "path": "data/english_long_form/en-long-2.txt"
+    },
+    {
+     "id": "en-long-3",
+     "domain": "english_long_form",
+     "kind": "text",
+     "path": "data/english_long_form/en-long-3.txt"
+    },
+    {
+     "id": "zh-0",
+     "domain": "chinese",
+     "kind": "text",
+     "path": "data/chinese/zh-0.txt"
+    },
+    {
+     "id": "zh-1",
+     "domain": "chinese",
+     "kind": "text",
+     "path": "data/chinese/zh-1.txt"
+    },
+    {
+     "id": "zh-2",
+     "domain": "chinese",
+     "kind": "text",
+     "path": "data/chinese/zh-2.txt"
+    },
+    {
+     "id": "zh-3",
+     "domain": "chinese",
+     "kind": "text",
+     "path": "data/chinese/zh-3.txt"
+    },
+    {
+     "id": "de-0",
+     "domain": "german",
+     "kind": "text",
+     "path": "data/german/de-0.txt"
+    },
+    {
+     "id": "de-1",
+     "domain": "german",
+     "kind": "text",
+     "path": "data/german/de-1.txt"
+    },
+    {
+     "id": "de-2",
+     "domain": "german",
+     "kind": "text",
+     "path": "data/german/de-2.txt"
+    },
+    {
+     "id": "de-3",
+     "domain": "german",
+     "kind": "text",
+     "path": "data/german/de-3.txt"
+    },
+    {
+     "id": "code-0",
+     "domain": "code",
+     "kind": "text",
+     "path": "data/code/code-0.txt"
+    },
+    {
+     "id": "code-1",
+     "domain": "code",
+     "kind": "text",
+     "path": "data/code/code-1.txt"
+    },
+    {
+     "id": "code-2",
+     "domain": "code",
+     "kind": "text",
+     "path": "data/code/code-2.txt"
+    },
+    {
+     "id": "code-3",
+     "domain": "code",
+     "kind": "text",
+     "path": "data/code/code-3.txt"
+    },
+    {
+     "id": "math-0",
+     "domain": "mathematics",
+     "kind": "text",
+     "path": "data/mathematics/math-0.txt"
+    },
+    {
+     "id": "math-1",
+     "domain": "mathematics",
+     "kind": "text",
+     "path": "data/mathematics/math-1.txt"
+    },
+    {
+     "id": "math-2",
+     "domain": "mathematics",
+     "kind": "text",
+     "path": "data/mathematics/math-2.txt"
+    },
+    {
+     "id": "math-3",
+     "domain": "mathematics",
+     "kind": "text",
+     "path": "data/mathematics/math-3.txt"
+    },
+    {
+     "id": "chat-0",
+     "domain": "chat",
+     "kind": "chat",
+     "path": "data/chat/chat-0.json"
+    },
+    {
+     "id": "chat-1",
+     "domain": "chat",
+     "kind": "chat",
+     "path": "data/chat/chat-1.json"
+    },
+    {
+     "id": "chat-2",
+     "domain": "chat",
+     "kind": "chat",
+     "path": "data/chat/chat-2.json"
+    },
+    {
+     "id": "chat-3",
+     "domain": "chat",
+     "kind": "chat",
+     "path": "data/chat/chat-3.json"
+    },
+    {
+     "id": "tools-0",
+     "domain": "tool_calls",
+     "kind": "chat",
+     "path": "data/tool_calls/tools-0.json"
+    },
+    {
+     "id": "tools-1",
+     "domain": "tool_calls",
+     "kind": "chat",
+     "path": "data/tool_calls/tools-1.json"
+    },
+    {
+     "id": "tools-2",
+     "domain": "tool_calls",
+     "kind": "chat",
+     "path": "data/tool_calls/tools-2.json"
+    },
+    {
+     "id": "tools-3",
+     "domain": "tool_calls",
+     "kind": "chat",
+     "path": "data/tool_calls/tools-3.json"
+    }
+   ]
+  },
+  "long": {
+   "window_tokens": 32768,
+   "decode_tokens": 64,
+   "decode_starts": [
+    8192,
+    16384,
+    24576,
+    32640
+   ],
+   "documents": [
+    {
+     "id": "long-en-book",
+     "domain": "english_long_form",
+     "kind": "text",
+     "path": "data/english_long_form/long-en-book.txt"
+    },
+    {
+     "id": "long-en-ref",
+     "domain": "english_reference",
+     "kind": "text",
+     "path": "data/english_reference/long-en-ref.txt"
+    },
+    {
+     "id": "long-zh",
+     "domain": "chinese",
+     "kind": "text",
+     "path": "data/chinese/long-zh.txt"
+    },
+    {
+     "id": "long-code",
+     "domain": "code",
+     "kind": "text",
+     "path": "data/code/long-code.txt"
+    }
+   ]
+  }
+ }
+}

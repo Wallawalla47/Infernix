@@ -1,0 +1,368 @@
+[
+ {
+  "id": "en-ref-0",
+  "domain": "english_reference",
+  "kind": "text",
+  "chars": 40479,
+  "source": "eval/corpora/perplexity-1m/data/wikitext/00.txt",
+  "license": "CC-BY-SA-4.0 (WikiText)"
+ },
+ {
+  "id": "en-ref-1",
+  "domain": "english_reference",
+  "kind": "text",
+  "chars": 40587,
+  "source": "eval/corpora/perplexity-1m/data/wikitext/01.txt",
+  "license": "CC-BY-SA-4.0 (WikiText)"
+ },
+ {
+  "id": "en-ref-2",
+  "domain": "english_reference",
+  "kind": "text",
+  "chars": 40399,
+  "source": "eval/corpora/perplexity-1m/data/wikitext/02.txt",
+  "license": "CC-BY-SA-4.0 (WikiText)"
+ },
+ {
+  "id": "en-ref-3",
+  "domain": "english_reference",
+  "kind": "text",
+  "chars": 40229,
+  "source": "eval/corpora/perplexity-1m/data/wikitext/03.txt",
+  "license": "CC-BY-SA-4.0 (WikiText)"
+ },
+ {
+  "id": "en-long-0",
+  "domain": "english_long_form",
+  "kind": "text",
+  "chars": 40029,
+  "source": "eval/corpora/perplexity-1m/data/pg19/00.txt",
+  "license": "Apache-2.0 (PG-19)"
+ },
+ {
+  "id": "en-long-1",
+  "domain": "english_long_form",
+  "kind": "text",
+  "chars": 40001,
+  "source": "eval/corpora/perplexity-1m/data/pg19/01.txt",
+  "license": "Apache-2.0 (PG-19)"
+ },
+ {
+  "id": "en-long-2",
+  "domain": "english_long_form",
+  "kind": "text",
+  "chars": 40043,
+  "source": "eval/corpora/perplexity-1m/data/pg19/02.txt",
+  "license": "Apache-2.0 (PG-19)"
+ },
+ {
+  "id": "en-long-3",
+  "domain": "english_long_form",
+  "kind": "text",
+  "chars": 40033,
+  "source": "eval/corpora/perplexity-1m/data/pg19/03.txt",
+  "license": "Apache-2.0 (PG-19)"
+ },
+ {
+  "id": "zh-0",
+  "domain": "chinese",
+  "kind": "text",
+  "chars": 16109,
+  "source": "eval/corpora/perplexity-1m/data/zhwiki/00.txt",
+  "license": "CC-BY-SA-3.0 (Wikipedia)"
+ },
+ {
+  "id": "zh-1",
+  "domain": "chinese",
+  "kind": "text",
+  "chars": 16007,
+  "source": "eval/corpora/perplexity-1m/data/zhwiki/01.txt",
+  "license": "CC-BY-SA-3.0 (Wikipedia)"
+ },
+ {
+  "id": "zh-2",
+  "domain": "chinese",
+  "kind": "text",
+  "chars": 16039,
+  "source": "eval/corpora/perplexity-1m/data/zhwiki/02.txt",
+  "license": "CC-BY-SA-3.0 (Wikipedia)"
+ },
+ {
+  "id": "zh-3",
+  "domain": "chinese",
+  "kind": "text",
+  "chars": 16002,
+  "source": "eval/corpora/perplexity-1m/data/zhwiki/03.txt",
+  "license": "CC-BY-SA-3.0 (Wikipedia)"
+ },
+ {
+  "id": "de-0",
+  "domain": "german",
+  "kind": "text",
+  "chars": 40024,
+  "source": "https://www.gutenberg.org/ebooks/22367",
+  "title": "Die Verwandlung",
+  "author": "Franz Kafka",
+  "license": "Public domain in the US (Project Gutenberg)"
+ },
+ {
+  "id": "de-1",
+  "domain": "german",
+  "kind": "text",
+  "chars": 40027,
+  "source": "https://www.gutenberg.org/ebooks/12108",
+  "title": "Der Tod in Venedig",
+  "author": "Thomas Mann",
+  "license": "Public domain in the US (Project Gutenberg)"
+ },
+ {
+  "id": "de-2",
+  "domain": "german",
+  "kind": "text",
+  "chars": 40006,
+  "source": "https://www.gutenberg.org/ebooks/2499",
+  "title": "Siddhartha: eine indische Dichtung",
+  "author": "Hermann Hesse",
+  "license": "Public domain in the US (Project Gutenberg)"
+ },
+ {
+  "id": "de-3",
+  "domain": "german",
+  "kind": "text",
+  "chars": 40011,
+  "source": "https://www.gutenberg.org/ebooks/5323",
+  "title": "Effi Briest",
+  "author": "Theodor Fontane",
+  "license": "Public domain in the US (Project Gutenberg)"
+ },
+ {
+  "id": "code-0",
+  "domain": "code",
+  "kind": "text",
+  "chars": 40064,
+  "source": "eval/corpora/perplexity-1m/data/ninfer/00.txt",
+  "offset": 0,
+  "license": "Apache-2.0 (NInfer)"
+ },
+ {
+  "id": "code-1",
+  "domain": "code",
+  "kind": "text",
+  "chars": 40015,
+  "source": "eval/corpora/perplexity-1m/data/ninfer/01.txt",
+  "offset": 0,
+  "license": "Apache-2.0 (NInfer)"
+ },
+ {
+  "id": "code-2",
+  "domain": "code",
+  "kind": "text",
+  "chars": 40033,
+  "source": "eval/corpora/decode-4m/data/sglang/00.txt",
+  "offset": 0,
+  "license": "Apache-2.0 (SGLang)"
+ },
+ {
+  "id": "code-3",
+  "domain": "code",
+  "kind": "text",
+  "chars": 40041,
+  "source": "eval/corpora/decode-4m/data/sglang/00.txt",
+  "offset": 1000000,
+  "license": "Apache-2.0 (SGLang)"
+ },
+ {
+  "id": "math-0",
+  "domain": "mathematics",
+  "kind": "text",
+  "chars": 40093,
+  "source": "openai/gsm8k test",
+  "items": [
+   0,
+   79
+  ],
+  "license": "MIT"
+ },
+ {
+  "id": "math-1",
+  "domain": "mathematics",
+  "kind": "text",
+  "chars": 40267,
+  "source": "openai/gsm8k test",
+  "items": [
+   79,
+   157
+  ],
+  "license": "MIT"
+ },
+ {
+  "id": "math-2",
+  "domain": "mathematics",
+  "kind": "text",
+  "chars": 40349,
+  "source": "HuggingFaceH4/MATH-500 (OpenAI prm800k)",
+  "items": [
+   0,
+   60
+  ],
+  "license": "MIT"
+ },
+ {
+  "id": "math-3",
+  "domain": "mathematics",
+  "kind": "text",
+  "chars": 40139,
+  "source": "HuggingFaceH4/MATH-500 (OpenAI prm800k)",
+  "items": [
+   60,
+   110
+  ],
+  "license": "MIT"
+ },
+ {
+  "id": "chat-0",
+  "domain": "chat",
+  "kind": "chat",
+  "chars": 43337,
+  "source": "OpenAssistant/oasst2 validation (English threads)",
+  "threads": [
+   0,
+   18
+  ],
+  "license": "Apache-2.0"
+ },
+ {
+  "id": "chat-1",
+  "domain": "chat",
+  "kind": "chat",
+  "chars": 44867,
+  "source": "OpenAssistant/oasst2 validation (English threads)",
+  "threads": [
+   18,
+   36
+  ],
+  "license": "Apache-2.0"
+ },
+ {
+  "id": "chat-2",
+  "domain": "chat",
+  "kind": "chat",
+  "chars": 51739,
+  "source": "openai/gsm8k test as a reasoning chat",
+  "items": [
+   157,
+   240
+  ],
+  "license": "MIT"
+ },
+ {
+  "id": "chat-3",
+  "domain": "chat",
+  "kind": "chat",
+  "chars": 48865,
+  "source": "HuggingFaceH4/MATH-500 as a reasoning chat",
+  "items": [
+   110,
+   163
+  ],
+  "license": "MIT"
+ },
+ {
+  "id": "tools-0",
+  "domain": "tool_calls",
+  "kind": "chat",
+  "chars": 45298,
+  "source": "NousResearch/hermes-function-calling-v1 func-calling.json",
+  "items": [
+   0,
+   9
+  ],
+  "license": "Apache-2.0"
+ },
+ {
+  "id": "tools-1",
+  "domain": "tool_calls",
+  "kind": "chat",
+  "chars": 44874,
+  "source": "NousResearch/hermes-function-calling-v1 func-calling.json",
+  "items": [
+   9,
+   18
+  ],
+  "license": "Apache-2.0"
+ },
+ {
+  "id": "tools-2",
+  "domain": "tool_calls",
+  "kind": "chat",
+  "chars": 43106,
+  "source": "NousResearch/hermes-function-calling-v1 json-mode-agentic.json",
+  "items": [
+   0,
+   15
+  ],
+  "license": "Apache-2.0"
+ },
+ {
+  "id": "tools-3",
+  "domain": "tool_calls",
+  "kind": "chat",
+  "chars": 43885,
+  "source": "NousResearch/hermes-function-calling-v1 json-mode-agentic.json",
+  "items": [
+   15,
+   31
+  ],
+  "license": "Apache-2.0"
+ },
+ {
+  "id": "long-en-book",
+  "domain": "english_long_form",
+  "kind": "text",
+  "chars": 240004,
+  "source": "eval/corpora/decode-4m/data/pg19/00.txt",
+  "offset": 0,
+  "license": "Apache-2.0 (PG-19)",
+  "set": "long"
+ },
+ {
+  "id": "long-en-ref",
+  "domain": "english_reference",
+  "kind": "text",
+  "chars": 240218,
+  "source": "eval/corpora/decode-4m/data/wikitext/00.txt",
+  "offset": 0,
+  "license": "CC-BY-SA-4.0 (WikiText)",
+  "set": "long"
+ },
+ {
+  "id": "long-zh",
+  "domain": "chinese",
+  "kind": "text",
+  "chars": 110001,
+  "source": "eval/corpora/decode-4m/data/zhwiki/00.txt",
+  "offset": 0,
+  "license": "CC-BY-SA-3.0 (Wikipedia)",
+  "set": "long"
+ },
+ {
+  "id": "long-code",
+  "domain": "code",
+  "kind": "text",
+  "chars": 240005,
+  "source": "eval/corpora/decode-4m/data/sglang/00.txt",
+  "offset": 2000000,
+  "license": "Apache-2.0 (SGLang)",
+  "set": "long"
+ },
+ {
+  "id": "tasks/gsm8k-250",
+  "source": "openai/gsm8k test, last 250 items",
+  "license": "MIT"
+ },
+ {
+  "id": "tasks/mmlu-500",
+  "source": "cais/mmlu all/test, round-robin over subjects",
+  "license": "MIT"
+ }
+]
