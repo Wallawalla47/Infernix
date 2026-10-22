@@ -46,8 +46,21 @@ namespace infernix::ops {
 [[nodiscard]] std::size_t lossless_linear_workspace_bytes(const Weight& weight, std::int32_t rows,
                                                           std::int32_t columns);
 
+/**
+ * A quantized activation's scale (the design reference, docs/maintainer/lossless-route.md §3b): x holds
+ * the quantized values without it (each exact in BF16: an NVFP4 code times its block scale, an E4M3
+ * value), and the scale applies to the exact sum together with the weight's own factor before the one
+ * rounding: out = round(sum_k w x / divisor * column_scales[t]). divisor 0 and a null column_scales
+ * (FP32 [T], x's columns) are none; with neither, the product is lossless_linear's.
+ */
+struct LosslessActivationScale {
+    float divisor              = 0.0F; // the NVFP4 activation divisor D (positive finite)
+    const float* column_scales = nullptr;
+};
+
 void lossless_linear(const Tensor& x, const Weight& weight, std::int32_t row_begin, std::int32_t rows, Tensor& out,
-                     std::int32_t out_row, WorkspaceArena& workspace, cudaStream_t stream);
+                     std::int32_t out_row, WorkspaceArena& workspace, cudaStream_t stream,
+                     const LosslessActivationScale& scale = {});
 
 /// Several projections of one input (each exactly lossless_linear's result): rows [row_begin, row_begin +
 /// rows) of `weight` into rows [out_row, ...) of `out`. They share the input's encode (one per 512-column
@@ -62,7 +75,7 @@ struct LosslessProjection {
 [[nodiscard]] std::size_t lossless_linear_shared_workspace_bytes(std::span<const LosslessProjection> projections,
                                                                  std::int32_t columns);
 void lossless_linear_shared(const Tensor& x, std::span<const LosslessProjection> projections, WorkspaceArena& workspace,
-                            cudaStream_t stream);
+                            cudaStream_t stream, const LosslessActivationScale& scale = {});
 
 /**
  * The grouped form (routed experts in a bank): x's columns are whole 64-column tiles, tile i multiplied
@@ -75,11 +88,14 @@ void lossless_linear_grouped(const Tensor& x, const Weight& weight, const Tensor
                              std::int32_t expert_stride, std::int32_t row_offset, std::int32_t rows, Tensor& out,
                              WorkspaceArena& workspace, cudaStream_t stream);
 
-/** One 64-column tile of lossless_linear_tiles: its expert's record (null: the tile is skipped) and the
- * matrix's FP32 multipliers of even and odd rows (NVFP4 records; bits). */
+/** One 64-column tile of lossless_linear_tiles: its expert's record (null: the tile is skipped), the
+ * matrix's FP32 multipliers of even and odd rows (NVFP4 records; bits), and the design reference's
+ * activation scales of even and odd rows (the expert's FP32 input scales g, applied to the exact sum
+ * like LosslessActivationScale; bits, 0: none). */
 struct LosslessTile {
     const std::uint8_t* record;
     std::uint32_t alpha[2];
+    std::uint32_t act[2] = {0U, 0U};
 };
 
 /** A matrix inside routed-expert records: its format (NVFP4_MUL in nvfp4_expert_rg16_v1 units,
@@ -99,7 +115,8 @@ struct LosslessBankMatrix {
  * for c in [0, columns) (columns a multiple of 64), column c's weights from tiles[c / 64]'s record. A
  * null map is the identity; a negative in_columns entry reads a zero column, a negative out_columns
  * entry writes nothing. Every output as lossless_linear's (NVFP4 records: the sum times the row
- * parity's multiplier, exactly). x is contiguous BF16 [K, *]; out contiguous BF16 or FP32 [rows, *].
+ * parity's multiplier, exactly; a tile's act scales multiply it too). x is contiguous BF16 [K, *]; out
+ * contiguous BF16 or FP32 [rows, *].
  * The workspace is lossless_linear_tiles_workspace_bytes(matrix, columns).
  */
 [[nodiscard]] std::size_t lossless_linear_tiles_workspace_bytes(const LosslessBankMatrix& matrix, std::int32_t columns);

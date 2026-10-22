@@ -260,6 +260,10 @@ struct WeightView {
     int row_base;
     int tiles16;            // GGUF: ggml_tiles16_v1
     std::uint32_t alpha[2]; // NVFP4 expert records: the FP32 multipliers of even and odd rows (bits)
+    // The design reference's activation scales (LosslessActivationScale, LosslessTile::act): FP32 bits,
+    // 0 none: a divisor of the call, multipliers of even and odd rows.
+    std::uint32_t act_div;
+    std::uint32_t act_mul[2];
 };
 
 // The tile mode: a view whose codes and scales pointers are offsets into each tile's record.
@@ -269,6 +273,8 @@ __device__ __forceinline__ WeightView tile_view(const WeightView& w, const Lossl
     v.scales     = t.record + reinterpret_cast<std::uintptr_t>(w.scales);
     v.alpha[0]   = t.alpha[0];
     v.alpha[1]   = t.alpha[1];
+    v.act_mul[0] = t.act[0];
+    v.act_mul[1] = t.act[1];
     return v;
 }
 
@@ -863,6 +869,84 @@ __device__ std::uint32_t round_with_factor(const std::uint32_t (&mag)[Words], in
     }
 }
 
+// An FP32 scale as m 2^e (subnormals: field 1).
+__device__ __forceinline__ void fp32_parts(std::uint32_t bits, std::uint32_t& m, int& e) {
+    const int field = static_cast<int>((bits >> 23) & 0xFF), mantissa = static_cast<int>(bits & 0x7FFFFF);
+    m = static_cast<std::uint32_t>(field == 0 ? mantissa : ((1 << 23) | mantissa));
+    e = (field == 0 ? 1 : field) - 150;
+}
+
+template <int Words>
+__device__ __forceinline__ void multiply_small(std::uint32_t (&mag)[Words], std::uint32_t factor) {
+    unsigned long long carry = 0;
+#pragma unroll
+    for (int i = 0; i < Words; ++i) {
+        const unsigned long long v = static_cast<unsigned long long>(mag[i]) * factor + carry;
+        mag[i]                     = static_cast<std::uint32_t>(v);
+        carry                      = v >> 32;
+    }
+}
+
+// round_with_factor with the design reference's activation scales (lossless-route.md §3b): mag 2^unit
+// times the row factor and the activation multipliers (act: the row's; column: the column's), divided by
+// the row divisor and the activation divisor, all exact, then rounded once. Below mag lie four padding
+// words, so each division by a significand under 2^24 keeps 80 or more quotient bits beyond any nonzero
+// magnitude, and a remainder in either leaves the sticky bit (floor(floor(x / a) / b) = floor(x / ab),
+// exact exactly when both are); above it, three words take the multipliers' growth.
+template <class F, int Words>
+__device__ std::uint32_t round_scaled(const std::uint32_t (&mag)[Words], int unit, bool negative, bool bf16,
+                                      const WeightView& w, int row, std::uint32_t act, std::uint32_t column) {
+    constexpr int N = Words + 7;
+    std::uint32_t q[N];
+#pragma unroll
+    for (int i = 0; i < N; ++i) { q[i] = i >= 4 && i < 4 + Words ? mag[i - 4] : 0U; }
+    int e    = unit - 128;
+    bool neg = negative;
+    std::uint32_t fm = 0;
+    int fe           = 0;
+    bool fneg        = false;
+    row_factor<F>(w, row, fm, fe, fneg);
+    if constexpr (F::kFactor == Factor::RowScale || F::kFactor == Factor::Multiplier) {
+        multiply_small(q, fm);
+        e += fe;
+        neg = neg != fneg;
+    }
+    const std::uint32_t factors[2] = {act, column};
+#pragma unroll
+    for (int f = 0; f < 2; ++f) {
+        const std::uint32_t bits = factors[f];
+        if (bits == 0) { continue; }
+        std::uint32_t m = 0;
+        int me          = 0;
+        fp32_parts(bits, m, me);
+        multiply_small(q, m);
+        e += me;
+        neg = neg != ((bits >> 31) != 0);
+    }
+    bool sticky = false;
+    if constexpr (F::kFactor == Factor::Divisor) {
+        sticky = lossless::divide_small<N>(q, fm);
+        e -= fe;
+    }
+    if (w.act_div != 0) {
+        std::uint32_t m = 0;
+        int me          = 0;
+        fp32_parts(w.act_div, m, me);
+        const bool rest = lossless::divide_small<N>(q, m);
+        sticky          = sticky || rest;
+        e -= me;
+    }
+    bool zero = !sticky;
+#pragma unroll
+    for (int i = 0; i < N; ++i) { zero = zero && q[i] == 0; }
+    return round_magnitude<N>(q, e, neg && !zero, bf16, sticky);
+}
+
+// Whether a design-reference activation scale applies to this output.
+__device__ __forceinline__ bool scaled_output(const WeightView& w, std::uint32_t act, std::uint32_t column) {
+    return (w.act_div | act | column) != 0;
+}
+
 __device__ __forceinline__ void store_output(void* out, int ld, int out_row, int row, int column, bool bf16,
                                              std::uint32_t bits) {
     const std::size_t i = static_cast<std::size_t>(column) * ld + out_row + row;
@@ -911,6 +995,7 @@ struct GemmArgs {
     const LosslessTile* tiles;       // the tile mode: each tile's record (tile_base + blockIdx.y)
     const std::int32_t* out_columns; // the chunk's output columns (null: the column itself; -1: none)
     const long long* xsum;           // the min term's activation sums (Q4_K/Q5_K)
+    const float* act_column;         // the chunk's columns' activation scales (null: none)
 };
 
 template <bool Offset>
@@ -1217,8 +1302,12 @@ __global__ __launch_bounds__(kThreads, 2) void lossless_gemm_kernel(const GemmAr
             const int unit = sh.col_emax[t] + sh.row_emax[r] - F::kUnitBias;
             std::uint32_t mag[4];
             const bool negative = lossless::magnitude_i128(acc[j][v], mag);
+            const std::uint32_t act = w.act_mul[(row_begin + row) & 1];
+            const std::uint32_t col = args.act_column != nullptr ? __float_as_uint(args.act_column[column]) : 0U;
             store_output(args.out, args.ld, args.out_row, row, out_column, args.bf16,
-                         round_with_factor<F, 4>(mag, unit, negative, args.bf16, w, row_begin + row));
+                         scaled_output(w, act, col)
+                             ? round_scaled<F, 4>(mag, unit, negative, args.bf16, w, row_begin + row, act, col)
+                             : round_with_factor<F, 4>(mag, unit, negative, args.bf16, w, row_begin + row));
         }
     }
 }
@@ -1243,6 +1332,7 @@ struct FallbackArgs {
     bool bf16;
     const LosslessTile* tiles;
     const std::int32_t* out_columns;
+    const float* act_column;
 };
 
 __device__ __forceinline__ std::uint32_t non_finite_result(bool nan, bool pos_inf, bool neg_inf, bool bf16) {
@@ -1336,8 +1426,12 @@ __global__ void lossless_fallback_kernel(const FallbackArgs args) {
                 result = non_finite_result(nan, pos_inf, neg_inf, args.bf16);
             } else {
                 std::uint32_t mag[F::kWide];
-                const bool negative = acc.finish(mag);
-                result = round_with_factor<F, F::kWide>(mag, -F::kWideBase, negative, args.bf16, w, wrow);
+                const bool negative     = acc.finish(mag);
+                const std::uint32_t act = w.act_mul[wrow & 1];
+                const std::uint32_t col = args.act_column != nullptr ? __float_as_uint(args.act_column[column]) : 0U;
+                result = scaled_output(w, act, col)
+                             ? round_scaled<F, F::kWide>(mag, -F::kWideBase, negative, args.bf16, w, wrow, act, col)
+                             : round_with_factor<F, F::kWide>(mag, -F::kWideBase, negative, args.bf16, w, wrow);
             }
             store_output(args.out, args.ld, args.out_row, row, out_column, args.bf16, result);
         }
@@ -1360,6 +1454,7 @@ struct Call {
     const LosslessTile* tiles       = nullptr; // the tile mode
     const std::int32_t* in_columns  = nullptr;
     const std::int32_t* out_columns = nullptr;
+    const float* act_column         = nullptr; // the activation scales of x's columns (w.act_div: the divisor)
 };
 
 // The parts of a chunk a launch runs: `encode` encodes the chunk's activation columns (after zeroing the
@@ -1429,6 +1524,7 @@ void launch_chunk(const Call& c, std::int32_t first, std::int32_t columns, std::
         a.tiles       = c.tiles;
         a.out_columns = out_map;
         a.xsum        = xsum;
+        a.act_column  = c.act_column != nullptr ? c.act_column + first : nullptr;
         const dim3 grid((c.rows + kTileRows - 1) / kTileRows, (columns + kTileTokens - 1) / kTileTokens);
         lossless_gemm_kernel<F><<<grid, kThreads, 0, stream>>>(a);
         CUDA_CHECK(cudaGetLastError());
@@ -1447,6 +1543,7 @@ void launch_chunk(const Call& c, std::int32_t first, std::int32_t columns, std::
         f.in_columns  = in_map;
         f.tiles       = c.tiles;
         f.out_columns = out_map;
+        f.act_column  = c.act_column != nullptr ? c.act_column + first : nullptr;
         f.bitmap      = bitmap;
         f.out       = out_data;
         f.ld        = c.out->ne[0];

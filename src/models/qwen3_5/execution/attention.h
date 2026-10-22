@@ -11,11 +11,6 @@ attention_projection_workspace_bytes(const AttentionParameters& parameters, std:
 void attention_projection(const Tensor& hidden, const AttentionParameters& parameters,
                           Tensor& query, Tensor& gate, Tensor& key, Tensor& value,
                           WorkspaceArena& workspace, cudaStream_t stream);
-// The reference route's Q/gate/K/V (ExecutionSchedule::reference): attn_input_proj's row maps, each
-// output from its rows of the parent(s) by ops::precise_linear_rows.
-void attention_projection_reference(const Tensor& hidden, const AttentionParameters& parameters,
-                                    const AttentionConfig& config, Tensor& query, Tensor& gate,
-                                    Tensor& key, Tensor& value, cudaStream_t stream);
 
 void text_rope(const Tensor& positions, const RopeConfig& config, const ops::PreparedRope& prepared,
                Tensor& query, DeviceExecutionView execution);

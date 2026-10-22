@@ -176,8 +176,8 @@ if the corpus is too short for them. `--first-segment N` computes the set's segm
 (references or runs), which is how a 1,024-segment gate extends a 256-segment one
 ([acceptance policy](../docs/maintainer/model-quality.md#61-the-reproducible-route-and-the-fast-paths)). `--forced N` sets the forced tokens per segment (at most 64,
 the constraint step limit); `--mode`
-is `plain`, `dflash2`, `ngram` or `mtp`. `--reference` writes the reference for the same segments
-instead (the reference route, `EngineOptions::reference`, with BF16 KV in one pass: each forced
+is `plain`, `dflash2`, `ngram` or `mtp`. `--lossless` writes the reference for the same segments
+instead (the lossless route, `EngineOptions::lossless`, with BF16 KV in one pass: each forced
 token's log-probability and the 64 most probable tokens there), and `--observe REFERENCE.json` makes every
 forced step also record the log-probabilities of those tokens and its own largest one
 (`TokenConstraint::observe`), from which the gate computes decode KL and top-1 agreement. Fast paths run as in `infernix-serve` unless
@@ -213,7 +213,7 @@ are in [Model-level numerical quality](../docs/maintainer/model-quality.md).
   It writes one line per segment: the corpus token offset, the prompt length and the generated
   token ids.
 - The judge scores any number of generator outputs with one reference: a CausalScoring Engine on
-  the reference route (`EngineOptions::reference`), BF16 KV, each sequence in one pass. For each build it reports how often the generated token is the reference's most
+  the lossless route (`EngineOptions::lossless`), BF16 KV, each sequence in one pass. For each build it reports how often the generated token is the reference's most
   probable token given that build's own prefix, the mean reference log-probability and the mean
   regret (top log-probability minus the generated token's); for each pair, the generated prefix
   they share exactly. `--report FILE` also writes each build's per-segment counts as JSON, which
@@ -221,9 +221,8 @@ are in [Model-level numerical quality](../docs/maintainer/model-quality.md).
   ([acceptance policy](../docs/maintainer/model-quality.md#6-numerical-acceptance-policy-and-fast-paths)).
 - `--stored-activations` judges with the artifact's recorded activations instead (BF16 KV, one
   pass): it measures what decoding changes (KV format, chunking, speculation, batching), not the
-  cost of the stored activation precision. Qwen3.8-Flash-Next's 16-bit-activation reference runs
-  every expert bank W4A16; `--ngram-volume FILE` (judge) and `ngram-volume=FILE` (generator) name
-  its n-gram volume when it is not `<artifact>.ngram`. The generator's `route-trace=FILE` writes
+  cost of the stored activation precision. `--ngram-volume FILE` (judge) and `ngram-volume=FILE`
+  (generator) name Qwen3.8-Flash-Next's n-gram volume when it is not `<artifact>.ngram`. The generator's `route-trace=FILE` writes
   Qwen3.8-Flash-Next's per-round expert routes for `tools/expert_cache_replay/host_tier.py`.
 
 ```bat

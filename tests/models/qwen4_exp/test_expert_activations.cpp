@@ -1,8 +1,8 @@
 // Qwen3.8-Flash-Next's routed-expert arithmetic as parse_config resolves it (design §6.1.2): W4A4 for
 // banks that carry activation scales, W4A16 for banks without; banks whose 4-bit activations are
 // optional (NVIDIA FP4-Local's `expert_a4_activations: optional`) run W4A16 unless
-// --expert-a4-activations asks for W4A4. Every other artifact refuses the option, as do 16-bit
-// activations everywhere. Host only, on a synthetic directory.
+// --expert-a4-activations asks for W4A4. Every other artifact refuses the option. Host only, on a
+// synthetic directory.
 
 #include "artifact/schema.h"
 #include "models/qwen4_exp/config.h"
@@ -55,8 +55,7 @@ struct Case {
     std::optional<std::string> marker; // the text config's expert_a4_activations
     bool scales;                       // the banks store their activation scales
     bool expert_a4;                    // LoadOptions::expert_a4_activations
-    bool reference;                    // LoadOptions::reference
-    int expected;                      // 1: W4A16, 0: W4A4, -1: refused
+    int expected;                     // 1: W4A16, 0: W4A4, -1: refused
     const char* refusal = "";          // a fragment of the refusal
 };
 
@@ -64,17 +63,14 @@ struct Case {
 
 int main() {
     const Case cases[] = {
-        {"W4A4 bank", std::nullopt, true, false, false, 0},
-        {"weight-only bank", std::nullopt, false, false, false, 1},
-        {"W4A4 bank, reference route", std::nullopt, true, false, true, 1},
-        {"W4A4 bank, option", std::nullopt, true, true, false, -1, "--expert-a4-activations"},
-        {"weight-only bank, option", std::nullopt, false, true, false, -1, "--expert-a4-activations"},
-        {"optional bank", "optional", true, false, false, 1},
-        {"optional bank, option", "optional", true, true, false, 0},
-        {"optional bank, reference route", "optional", true, false, true, 1},
-        {"optional bank, option and reference route", "optional", true, true, true, -1, "contradicts"},
-        {"optional bank without scales", "optional", false, false, false, -1, "activation scales"},
-        {"unknown marker", "required", true, false, false, -1, "must be optional"},
+        {"W4A4 bank", std::nullopt, true, false, 0},
+        {"weight-only bank", std::nullopt, false, false, 1},
+        {"W4A4 bank, option", std::nullopt, true, true, -1, "--expert-a4-activations"},
+        {"weight-only bank, option", std::nullopt, false, true, -1, "--expert-a4-activations"},
+        {"optional bank", "optional", true, false, 1},
+        {"optional bank, option", "optional", true, true, 0},
+        {"optional bank without scales", "optional", false, false, -1, "activation scales"},
+        {"unknown marker", "required", true, false, -1, "must be optional"},
     };
     int failures = 0;
     for (const Case& c : cases) {
@@ -85,7 +81,6 @@ int main() {
         if (c.scales) { directory.bindings[kScales] = artifact::Binding{}; }
         models::LoadOptions options;
         options.expert_a4_activations = c.expert_a4;
-        options.reference             = c.reference;
         try {
             const models::qwen4_exp::Config parsed = parse_config(directory, options);
             const int got       = parsed.text.moe.a16_experts ? 1 : 0;

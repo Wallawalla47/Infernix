@@ -1,10 +1,16 @@
 // The --lossless route's experts (offloaded_moe::WideA16::kLossless; docs/maintainer/lossless-route.md),
-// included by moe_layer.cu after precise_expert.cuh. Every bank (NVFP4 records with their multipliers,
+// included by moe_layer.cu after fp8_expert.cuh. Every bank (NVFP4 records with their multipliers,
 // block FP8, GGUF) on the GPU: the call's per-job column counts are read back once, then each pass of
 // staged jobs is cut into 64-column tiles of one job each, and column chunks run the gate/up projection
 // (x's columns through the tile's input map), h = bf16(bf16(silu(y_gate)) y_up) and the down projection
 // (written to each column's entry) through ops::lossless_linear_tiles. An output depends only on its
 // expert's record and its token's x.
+//
+// The design reference (source.lossless_design, lossless-route.md §3b): a W4A4 bank's experts quantize their
+// inputs as the bank declares, each column with its expert's input scale g (ModelOpt's rule,
+// lossless_quantize_nvfp4_scaled): x for the gate and up rows (once, or once per scale where an expert's gate
+// and up scales differ) and h for the down rows; each tile's act scales carry the g its rows' sums are
+// multiplied by, exactly.
 
 // (Its includes are at the top of moe_layer.cu: this file lies inside its anonymous namespace.)
 
@@ -22,8 +28,15 @@ struct LosslessRegion {
     std::int32_t* out_columns; // [max_tiles * 64]: the column's entry (-1: padding)
     std::uint16_t* gate_up;    // BF16 [2I, chunk]
     std::uint16_t* h;          // BF16 [I, chunk]
+    // The design reference's A4 inputs: each column's input scales (gate, up, down; [3][max_tiles * 64]),
+    // the chunk's quantized gate/up input (and, gate and up scales differing, the up input and its plane).
+    float* column_scales;
+    std::uint16_t* x_gate;     // BF16 [H, chunk]
+    std::uint16_t* x_up;       // BF16 [H, chunk]
+    std::uint16_t* gate_up_up; // BF16 [2I, chunk]
     std::uint8_t* linear;
     std::size_t linear_bytes;
+    std::size_t bytes; // the whole region
 };
 
 LosslessBankMatrix lossless_gate_up_matrix(QType q) {
@@ -44,12 +57,14 @@ std::size_t lossless_linear_bytes() {
                     lossless_linear_tiles_workspace_bytes(down, moe::wide::kLosslessChunkColumns));
 }
 
+// The region's parts from base (null: only its size, LosslessRegion::bytes).
 LosslessRegion carve_lossless(std::uint8_t* base, std::int32_t max_jobs, std::int32_t entries) {
     const auto tiles = static_cast<std::size_t>(lossless_max_tiles(max_jobs, entries));
     const auto chunk = static_cast<std::size_t>(moe::wide::kLosslessChunkColumns);
+    const auto I = static_cast<std::size_t>(moe::kIntermediate), H = static_cast<std::size_t>(moe::kHidden);
     std::size_t at = 0;
     const auto take = [&](std::size_t bytes) {
-        std::uint8_t* p = base + at;
+        std::uint8_t* p = base == nullptr ? nullptr : base + at;
         at += (bytes + 255) / 256 * 256;
         return p;
     };
@@ -60,10 +75,15 @@ LosslessRegion carve_lossless(std::uint8_t* base, std::int32_t max_jobs, std::in
     r.tiles_down    = reinterpret_cast<LosslessTile*>(take(tiles * sizeof(LosslessTile)));
     r.in_columns    = reinterpret_cast<std::int32_t*>(take(tiles * 64 * 4));
     r.out_columns   = reinterpret_cast<std::int32_t*>(take(tiles * 64 * 4));
-    r.gate_up       = reinterpret_cast<std::uint16_t*>(take(2 * static_cast<std::size_t>(moe::kIntermediate) * chunk * 2));
-    r.h             = reinterpret_cast<std::uint16_t*>(take(static_cast<std::size_t>(moe::kIntermediate) * chunk * 2));
+    r.gate_up       = reinterpret_cast<std::uint16_t*>(take(2 * I * chunk * 2));
+    r.h             = reinterpret_cast<std::uint16_t*>(take(I * chunk * 2));
+    r.column_scales = reinterpret_cast<float*>(take(3 * tiles * 64 * sizeof(float)));
+    r.x_gate        = reinterpret_cast<std::uint16_t*>(take(H * chunk * 2));
+    r.x_up          = reinterpret_cast<std::uint16_t*>(take(H * chunk * 2));
+    r.gate_up_up    = reinterpret_cast<std::uint16_t*>(take(2 * I * chunk * 2));
     r.linear_bytes  = lossless_linear_bytes();
     r.linear        = take(r.linear_bytes);
+    r.bytes         = at;
     return r;
 }
 
@@ -78,24 +98,44 @@ __global__ void lossless_counts_kernel(MoeDispatch dispatch, int max_jobs, std::
 }
 
 // One CTA (64 threads) per planned tile: its records (the multipliers of an NVFP4 bank: gate rows even,
-// up rows odd) and its columns' token and entry.
+// up rows odd) and its columns' token and entry; for the design reference's A4 inputs (design), the tiles'
+// act scales and each column's input scales (gate, up, down planes `stride` apart).
 __global__ void lossless_tiles_kernel(MoeDispatch dispatch, MoeExpertSource source, int top_k,
                                       const std::uint8_t* const* __restrict__ job_records, const std::int32_t* __restrict__ plan,
                                       LosslessTile* tiles_gate_up, LosslessTile* tiles_down, std::int32_t* in_columns,
-                                      std::int32_t* out_columns) {
+                                      std::int32_t* out_columns, bool design, float* __restrict__ column_scales,
+                                      std::size_t stride) {
     const int t = static_cast<int>(blockIdx.x), c = static_cast<int>(threadIdx.x);
     const int job = plan[3 * t], c0 = plan[3 * t + 1], n = plan[3 * t + 2];
     const int expert = dispatch.jobs[job];
+    moe::ExpertScales s{};
+    if (source.scales != nullptr) { s = source.scales[expert]; }
     if (c == 0) {
         const std::uint8_t* record = pass_record(PassPhase::All, source, expert, job_records, job);
-        moe::ExpertScales s{};
-        if (source.scales != nullptr) { s = source.scales[expert]; }
-        tiles_gate_up[t] = LosslessTile{record, {__float_as_uint(s.alpha_gate), __float_as_uint(s.alpha_up)}};
-        tiles_down[t]    = LosslessTile{record, {__float_as_uint(s.alpha_down), __float_as_uint(s.alpha_down)}};
+        const std::uint32_t act_gate = design ? __float_as_uint(s.input_gate) : 0U;
+        const std::uint32_t act_up   = design ? __float_as_uint(s.input_up) : 0U;
+        const std::uint32_t act_down = design ? __float_as_uint(s.input_down) : 0U;
+        tiles_gate_up[t] = LosslessTile{record, {__float_as_uint(s.alpha_gate), __float_as_uint(s.alpha_up)}, {act_gate, act_up}};
+        tiles_down[t]    = LosslessTile{record, {__float_as_uint(s.alpha_down), __float_as_uint(s.alpha_down)}, {act_down, act_down}};
     }
     const int entry = c < n ? dispatch.entries[dispatch.offsets[expert] + c0 + c] : -1;
     in_columns[64 * t + c]  = entry < 0 ? -1 : entry / top_k;
     out_columns[64 * t + c] = entry;
+    if (design) {
+        // Every column of the tile (padding too) takes its expert's scales.
+        column_scales[64 * t + c]              = s.input_gate;
+        column_scales[stride + 64 * t + c]     = s.input_up;
+        column_scales[2 * stride + 64 * t + c] = s.input_down;
+    }
+}
+
+// The up rows (odd: interleaved) of `up` into `gate_up` (BF16 [2I, columns] each).
+__global__ void lossless_up_rows_kernel(const std::uint16_t* __restrict__ up, int columns, std::uint16_t* __restrict__ gate_up) {
+    constexpr int I = moe::kIntermediate;
+    const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= static_cast<std::size_t>(I) * columns) { return; }
+    const std::size_t c = index / I, i = index % I;
+    gate_up[c * 2 * I + 2 * i + 1] = up[c * 2 * I + 2 * i + 1];
 }
 
 // h[i, c] = bf16(bf16(silu(g)) u) of the gate/up plane's column c (gate row 2 i and up row 2 i + 1 when
@@ -141,6 +181,13 @@ void lossless_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExp
         down.codes_offset = 2ULL * I * source.ggml.gate_row_bytes;
         down.row_bytes    = static_cast<std::int32_t>(source.ggml.down_row_bytes);
     }
+    // The design reference's A4 inputs (an NVFP4 bank's interleaved gate and up rows).
+    const bool design         = source.lossless_design != offloaded_moe::LosslessExpertDesign::kNone;
+    const bool separate_up    = source.lossless_design == offloaded_moe::LosslessExpertDesign::kA4SeparateUp;
+    const std::size_t stride  = static_cast<std::size_t>(lossless_max_tiles(max_jobs, entries)) * 64;
+    if (design && gu != QType::NVFP4_MUL) {
+        throw std::invalid_argument("lossless experts: the design reference's A4 inputs need an NVFP4 bank");
+    }
     // Each job's columns, on the host (the route is eager).
     lossless_counts_kernel<<<(max_jobs + 255) / 256, 256, 0, stream>>>(dispatch, max_jobs, r.counts);
     check_launch("lossless counts");
@@ -168,21 +215,50 @@ void lossless_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExp
         if (tiles == 0) { continue; }
         CUDA_CHECK(cudaMemcpyAsync(r.plan, plan.data(), plan.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice, stream));
         lossless_tiles_kernel<<<tiles, 64, 0, stream>>>(dispatch, source, top_k, layout.job_records, r.plan,
-                                                        r.tiles_gate_up, r.tiles_down, r.in_columns, r.out_columns);
+                                                        r.tiles_gate_up, r.tiles_down, r.in_columns, r.out_columns,
+                                                        design, r.column_scales, stride);
         check_launch("lossless tiles");
         for (int t0 = 0; t0 < tiles; t0 += kLosslessChunkTiles) {
             const int columns = 64 * std::min(kLosslessChunkTiles, tiles - t0);
             Tensor gate_up_plane(r.gate_up, DType::BF16, {2 * I, columns});
             Tensor h_plane(r.h, DType::BF16, {I, columns});
             WorkspaceArena arena(DeviceSpan{r.linear, r.linear_bytes});
-            lossless_linear_tiles(x, r.in_columns + 64 * t0, columns, gate_up, r.tiles_gate_up + t0, gate_up_plane,
-                                  nullptr, arena, stream);
             const std::size_t elements = static_cast<std::size_t>(I) * columns;
-            lossless_swiglu_kernel<<<static_cast<unsigned>((elements + 255) / 256), 256, 0, stream>>>(
-                r.gate_up, columns, interleaved, r.h);
+            const unsigned blocks      = static_cast<unsigned>((elements + 255) / 256);
+            if (!design) {
+                lossless_linear_tiles(x, r.in_columns + 64 * t0, columns, gate_up, r.tiles_gate_up + t0, gate_up_plane,
+                                      nullptr, arena, stream);
+            } else {
+                // Each column's x quantized with its expert's gate scale (and, scales differing, its up scale for
+                // the up rows); the tiles' act scales multiply the sums by them.
+                Tensor x_gate(r.x_gate, DType::BF16, {H, columns});
+                lossless_quantize_nvfp4_scaled(x, r.in_columns + 64 * t0, r.column_scales + 64 * t0, x_gate, stream);
+                lossless_linear_tiles(x_gate, nullptr, columns, gate_up, r.tiles_gate_up + t0, gate_up_plane, nullptr,
+                                      arena, stream);
+                if (separate_up) {
+                    Tensor x_up(r.x_up, DType::BF16, {H, columns});
+                    Tensor up_plane(r.gate_up_up, DType::BF16, {2 * I, columns});
+                    lossless_quantize_nvfp4_scaled(x, r.in_columns + 64 * t0, r.column_scales + stride + 64 * t0, x_up,
+                                                   stream);
+                    lossless_linear_tiles(x_up, nullptr, columns, gate_up, r.tiles_gate_up + t0, up_plane, nullptr,
+                                          arena, stream);
+                    lossless_up_rows_kernel<<<blocks, 256, 0, stream>>>(r.gate_up_up, columns, r.gate_up);
+                    check_launch("lossless up rows");
+                }
+            }
+            lossless_swiglu_kernel<<<blocks, 256, 0, stream>>>(r.gate_up, columns, interleaved, r.h);
             check_launch("lossless swiglu");
-            lossless_linear_tiles(h_plane, nullptr, columns, down, r.tiles_down + t0, outputs, r.out_columns + 64 * t0,
-                                  arena, stream);
+            if (!design) {
+                lossless_linear_tiles(h_plane, nullptr, columns, down, r.tiles_down + t0, outputs,
+                                      r.out_columns + 64 * t0, arena, stream);
+            } else {
+                // h quantized with each column's down scale (into the gate input's buffer, free again).
+                Tensor h_quantized(r.x_gate, DType::BF16, {I, columns});
+                lossless_quantize_nvfp4_scaled(h_plane, nullptr, r.column_scales + 2 * stride + 64 * t0, h_quantized,
+                                               stream);
+                lossless_linear_tiles(h_quantized, nullptr, columns, down, r.tiles_down + t0, outputs,
+                                      r.out_columns + 64 * t0, arena, stream);
+            }
         }
     }
 }

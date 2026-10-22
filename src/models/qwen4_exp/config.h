@@ -162,13 +162,12 @@ struct TextConfig {
     // Weights imported from a GGUF (tools/convert/qwen4_exp_gguf.py; the converter writes the gdn_a and
     // gdn_output_order keys): ggml block formats, an IQ4_XS embedding and ggml expert banks.
     bool ggml_weights = false;
-    // The reference route (LoadOptions::reference; docs/maintainer/model-quality.md §6.2): every
-    // projection, expert, GDN recurrence and attention computed precisely at the exact route's BF16
-    // boundaries, on the GPU (no CPU-served experts).
-    bool reference = false;
     // The lossless route (LoadOptions::lossless; docs/maintainer/lossless-route.md §2a): one scored window
     // per call, every operation correctly rounded (Forward's lossless_* steps).
     bool lossless = false;
+    // The design reference (LoadOptions::reference, with lossless; lossless-route.md §3b): the lossless window
+    // with a W4A4 bank's declared expert activations and the KV format's codec.
+    bool design_reference = false;
     // The routed experts run exact A16 arithmetic over their records' own block scales: a GGUF
     // import's ggml banks or Qwen's block-FP8 banks (fp8_expert_b128_v1). Set by the loader.
     bool exact_experts = false;

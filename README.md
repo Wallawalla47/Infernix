@@ -331,9 +331,10 @@ Infernix runs three routes:
 
 ### The quality gate
 
-A fast path is measured against a high-precision reference: the same model with 16-bit activations
-in every layer and a BF16 KV cache. Infernix charges a path only for the distance it adds beyond
-the reproducible route's own, so the quantization a model already carries is not counted against it.
+A fast path is measured against a high-precision reference: the lossless route (`--lossless`, every
+operation of the model's Hugging Face forward pass correctly rounded) with a BF16 KV cache. Infernix
+charges a path only for the distance it adds beyond the reproducible route's own, so the
+quantization a model already carries is not counted against it.
 
 - **Prefill**: teacher-forced over a 1.04M-token corpus at four chunk sizes, measuring the KL
   divergence from the reference and top-1 token agreement.

@@ -31,6 +31,9 @@ Subcommands:
   concat-forced    join teacher-forced runs or references of consecutive segment ranges (the forced
                    tool's --first-segment), so a 1,024-segment gate extends a 256-segment one
 
+Every deciding subcommand takes --policy NAME=VALUE (any Policy constant, repeatable) to decide under
+another budget; runs found on disk are reused, so stored runs are decided again without measuring.
+
 Exit status: 0 every criterion passes, 1 a criterion fails, 2 the measurement is unusable.
 """
 
@@ -44,7 +47,7 @@ import os
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
@@ -87,6 +90,23 @@ class Policy:
 
 
 POLICY = Policy()
+
+
+def policy_with(overrides: Sequence[str]) -> Policy:
+    """POLICY with --policy NAME=VALUE overrides, so stored runs are decided again under other
+    budgets without being measured again."""
+    kinds = {f.name: f.type for f in fields(Policy)}
+    changes: dict[str, float | int] = {}
+    for item in overrides:
+        name, separator, value = item.partition("=")
+        if not separator or name not in kinds:
+            raise MeasurementError(f"--policy {item}: expected NAME=VALUE, NAME one of "
+                                   f"{', '.join(kinds)}")
+        try:
+            changes[name] = int(value) if kinds[name] == "int" else float(value)
+        except ValueError as error:
+            raise MeasurementError(f"--policy {item}: {error}") from error
+    return replace(POLICY, **changes)
 
 # fast_path_name of every infernix::FastPath.
 FAST_PATHS = ("prompt-pv8", "decode-split64", "batched-decode", "batched-a8-decode",
@@ -758,21 +778,10 @@ def artifact_identity(artifact: str) -> dict:
     return {"path": os.path.normcase(str(path)), "bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns}
 
 
-LOSSLESS_ARCHITECTURES = ("Qwen3_5ForCausalLM", "Qwen3_5MoeForCausalLM", "Qwen4ExpForCausalLM")
-# The lossless route's definition (docs/maintainer/lossless-route.md): its bits depend on the request
-# and the artifact alone, so a lossless reference is keyed by this version instead of the build, and
-# survives rebuilds. Bump it with any change to what the route computes.
+# The lossless route's definition (docs/maintainer/lossless-route.md), every reference's route: its bits
+# depend on the request and the artifact alone, so a reference is keyed by this version instead of the
+# build, and survives rebuilds. Bump it with any change to what the route computes.
 LOSSLESS_DEFINITION = "2026-10-21"
-
-
-def reference_route(artifact: str) -> str:
-    """The reference's route option: --lossless (docs/maintainer/lossless-route.md) for every model with a
-    lossless route (the Qwen3.5 family and Qwen3.8-Flash-Next), --reference otherwise."""
-    from tools.artifact.reader import Artifact
-    with Artifact.open(artifact) as opened:
-        text = opened.directory.components.get("text", {})
-    architectures = text.get("config", {}).get("architectures", [])
-    return "--lossless" if any(a in LOSSLESS_ARCHITECTURES for a in architectures) else "--reference"
 
 
 def corpus_identity(corpus: str | None, text: str | None) -> str:
@@ -792,7 +801,7 @@ def ensure_reference(out: Path, names: Sequence[str], key: dict, produce: Callab
     that shapes it, never the KV format, mode or candidate), so a run directory takes it from the
     shared cache when an entry for the key exists, linked (or copied) in, and stores what it
     computes there. recompute (--recompute-reference) recomputes it and replaces the cache entry,
-    for a change to the reference route itself, which the key does not see; it refuses while
+    for a change to the lossless route that the key's definition does not record; it refuses while
     `dependents` (runs already scored against the directory's reference) exist.
     """
     present = all((out / name).exists() for name in names)
@@ -897,16 +906,14 @@ def run_prefill(args: argparse.Namespace) -> Path:
     if args.ngram_volume:
         workload += ["--ngram-volume", args.ngram_volume]
     common = [args.perplexity, args.artifact] + workload
-    # The reference route (lossless where the model has it), BF16 KV, one pass per window.
-    one_pass = ["--kv-dtype", "bf16", "--prefill-chunk", str(args.context), reference_route(args.artifact)]
+    # The lossless route, BF16 KV, one pass per window.
+    one_pass = ["--kv-dtype", "bf16", "--prefill-chunk", str(args.context), "--lossless"]
     reference = out / "reference.top"
     key = {"kind": "prefill", "artifact": artifact_identity(args.artifact),
            "corpus": corpus_identity(args.corpus, args.text), "quick": args.quick,
            "context": args.context, "stride": args.stride,
            "ngram_volume": os.path.abspath(args.ngram_volume) if args.ngram_volume else None,
-           "route": one_pass}
-    if "--lossless" in one_pass:
-        key["lossless_definition"] = LOSSLESS_DEFINITION
+           "route": one_pass, "lossless_definition": LOSSLESS_DEFINITION}
     source = ensure_reference(
         out, ["reference.top", "reference"], key,
         lambda: run(common + one_pass + ["--save-top-tokens", str(reference), "--output",
@@ -973,20 +980,16 @@ def run_decode(args: argparse.Namespace) -> list[Verdict]:
         arm += ["--prefix-reuse"]
     if args.warm_tokens:
         arm += ["--warm-tokens", str(args.warm_tokens)]
-    # The reference: the lossless route (the reference route where the model has no lossless route) at
-    # the same positions, one pass per segment.
+    # The reference: the lossless route at the same positions, one pass per segment.
     reference = out / "reference.json"
-    route = reference_route(args.artifact)
     key = {"kind": "decode", "artifact": artifact_identity(args.artifact),
            "corpus": corpus_identity(None, text), "segments": args.segments,
            "prompts": list(args.prompts),
-           "ngram_volume": os.path.abspath(args.ngram_volume) if args.ngram_volume else None}
-    if route == "--lossless":
-        key["route"] = "lossless"  # (the reference route's entries keep their keys)
-        key["lossless_definition"] = LOSSLESS_DEFINITION
+           "ngram_volume": os.path.abspath(args.ngram_volume) if args.ngram_volume else None,
+           "route": "lossless", "lossless_definition": LOSSLESS_DEFINITION}
     source = ensure_reference(
         out, ["reference.json"], key,
-        lambda: run([args.forced, args.artifact, text, str(reference), route] + segments
+        lambda: run([args.forced, args.artifact, text, str(reference), "--lossless"] + segments
                     + volume, out / "reference.log"),
         args.reference_cache, args.recompute_reference,
         [p for p in (out / "default-forced.json", out / "fast-forced.json") if p.exists()])
@@ -1004,7 +1007,8 @@ def run_decode(args: argparse.Namespace) -> list[Verdict]:
     if "preemption" in args.fast_path and load_forced(out / "fast-forced.json")["preemptions"] == 0:
         raise MeasurementError("the fast run never preempted; lower --kv-tokens or raise "
                                "--concurrency so the preemption candidate acts")
-    verdicts = [evaluate_forced(out / "default-forced.json", out / "fast-forced.json", reference)]
+    verdicts = [evaluate_forced(out / "default-forced.json", out / "fast-forced.json", reference,
+                                args.policy)]
     if args.free_running:
         modes = [] if args.mode == "dflash2" else [args.mode]
         for route, extra in (("default", ["reproducible", f"kv={args.kv}"]),
@@ -1022,7 +1026,7 @@ def run_decode(args: argparse.Namespace) -> list[Verdict]:
             run([args.judge, "--report", str(report)] + volume + [args.artifact, text,
                  str(out / "default.txt"), str(out / "fast.txt")],
                 out / "judge.log")
-        verdicts.append(evaluate_free_running(report))
+        verdicts.append(evaluate_free_running(report, args.policy))
     return verdicts
 
 
@@ -1057,7 +1061,8 @@ def add_reference_options(command: argparse.ArgumentParser) -> None:
                               f"{DEFAULT_REFERENCE_CACHE}; 'none' disables it)")
     command.add_argument("--recompute-reference", action="store_true",
                          help="recompute the reference and replace its cache entry (after a "
-                              "change to the reference route, which the key does not see)")
+                              "change to the lossless route that the key's definition does not "
+                              "record)")
 
 
 def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
@@ -1134,7 +1139,7 @@ def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
     forced.add_argument("default", type=Path)
     forced.add_argument("fast", type=Path)
     forced.add_argument("--reference", type=Path, required=True,
-                        help="the reference both runs observed (--reference of the forced tool)")
+                        help="the reference both runs observed (--lossless of the forced tool)")
 
     compare_forced = commands.add_parser(
         "compare-decode", help="decide any two teacher-forced runs of one reference (controls)")
@@ -1147,6 +1152,9 @@ def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
 
     for sub in (prefill, decode, evaluate, compare, forced, compare_forced, judged):
         sub.add_argument("--json", type=Path, help="also write the verdicts as JSON")
+        sub.add_argument("--policy", action="append", default=[], metavar="NAME=VALUE",
+                         help="decide under another value of a Policy constant (e.g. "
+                              "kl_budget=1e-2), repeatable; stored runs are reused as they are")
 
     same = commands.add_parser("identical", help="check two default-route runs for bit-exactness")
     same.add_argument("first")
@@ -1162,35 +1170,41 @@ def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
     return args
 
 
-def prefill_verdicts(directory: Path, fast_chunk: int = 0) -> list[Verdict]:
+def prefill_verdicts(directory: Path, policy: Policy, fast_chunk: int = 0) -> list[Verdict]:
     if any(d.is_dir() for d in directory.glob("default-c*")):
-        return [evaluate_prefill(directory, fast_chunk=fast_chunk)]
+        return [evaluate_prefill(directory, policy, fast_chunk)]
     kv_dirs = sorted(d for d in directory.iterdir()
                      if d.is_dir() and any(c.is_dir() for c in d.glob("default-c*")))
     if not kv_dirs:
         raise MeasurementError(f"no prefill runs under {directory}")
-    return [evaluate_prefill(d, fast_chunk=fast_chunk) for d in kv_dirs]
+    return [evaluate_prefill(d, policy, fast_chunk) for d in kv_dirs]
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_arguments(sys.argv[1:] if argv is None else argv)
     try:
+        if hasattr(args, "policy"):
+            args.policy = policy_with(args.policy)
         if args.command == "prefill":
-            return finish(prefill_verdicts(run_prefill(args), args.fast_chunk), args.json)
+            return finish(prefill_verdicts(run_prefill(args), args.policy, args.fast_chunk),
+                          args.json)
         if args.command == "decode":
             return finish(run_decode(args), args.json)
         if args.command == "evaluate-prefill":
-            return finish(prefill_verdicts(Path(args.directory), args.fast_chunk), args.json)
+            return finish(prefill_verdicts(Path(args.directory), args.policy, args.fast_chunk),
+                          args.json)
         if args.command == "compare-prefill":
             pairs = compared_pairs(args.base, args.candidate)
-            return finish([evaluate_prefill_pairs(pairs, "compare-prefill")], args.json)
+            return finish([evaluate_prefill_pairs(pairs, "compare-prefill", args.policy)],
+                          args.json)
         if args.command == "evaluate-decode":
-            return finish([evaluate_forced(args.default, args.fast, args.reference)], args.json)
+            return finish([evaluate_forced(args.default, args.fast, args.reference, args.policy)],
+                          args.json)
         if args.command == "compare-decode":
-            return finish([evaluate_forced(args.base, args.candidate, args.reference,
+            return finish([evaluate_forced(args.base, args.candidate, args.reference, args.policy,
                                            fast_route=False)], args.json)
         if args.command == "evaluate-free-running":
-            return finish([evaluate_free_running(Path(args.report))], args.json)
+            return finish([evaluate_free_running(Path(args.report), args.policy)], args.json)
         if args.command == "concat-forced":
             joined = concat_forced(args.parts, args.out)
             print(f"{args.out}: {len(joined['segments'])} segments from {len(args.parts)} parts")

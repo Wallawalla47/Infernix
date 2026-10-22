@@ -193,6 +193,8 @@ struct MoeExpertSource {
     // W4A16 experts' wide route: exact (default) or the two-term A4 fast path (design §19.3.23); the
     // workspace must be sized for the same choice. Narrow routes and W4A4 experts ignore it.
     offloaded_moe::WideA16 wide_a16 = offloaded_moe::WideA16::kExact;
+    // With kLossless: the design reference's expert activations (offloaded_moe::LosslessExpertDesign).
+    offloaded_moe::LosslessExpertDesign lossless_design = offloaded_moe::LosslessExpertDesign::kNone;
     std::uint8_t* staging_base  = nullptr;
     std::int32_t staging_slots  = 0;
     MoeCpuChannel cpu;

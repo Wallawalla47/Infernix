@@ -2,6 +2,8 @@
 
 #include "ops/lossless/linear_impl.cuh"
 
+#include <cmath>
+#include <cstring>
 #include <span>
 #include <vector>
 
@@ -116,9 +118,9 @@ void run(const Call& call, Route route, WorkspaceArena& workspace, cudaStream_t 
     run(std::span<Projection>(&p, 1), workspace, stream);
 }
 
-// The checked Call of one projection (lossless_linear's contract).
+// The checked Call of one projection (lossless_linear's contract), with an activation scale.
 Call projection_call(const Tensor& x, const Weight& weight, std::int32_t row_begin, std::int32_t rows, Tensor& out,
-                     std::int32_t out_row, Route& route) {
+                     std::int32_t out_row, const LosslessActivationScale& scale, Route& route) {
     route = route_of(weight);
     require(route != Route::None, "unsupported weight format");
     check_x(x, weight);
@@ -131,7 +133,12 @@ Call projection_call(const Tensor& x, const Weight& weight, std::int32_t row_beg
     if (route == Route::Q2 || route == Route::Q4 || route == Route::Q5 || route == Route::Q6 || route == Route::Q8) {
         require(weight.padded_shape[1] >= x.ne[0], "the row-split weight's padded K must cover K");
     }
-    return Call{&x, view_of(weight, route), row_begin, nullptr, 0, rows, &out, out_row, columns, weight.qtype};
+    require(scale.divisor == 0.0F || (std::isfinite(scale.divisor) && scale.divisor > 0.0F),
+            "an activation divisor is positive and finite");
+    Call c{&x, view_of(weight, route), row_begin, nullptr, 0, rows, &out, out_row, columns, weight.qtype};
+    std::memcpy(&c.w.act_div, &scale.divisor, sizeof(c.w.act_div));
+    c.act_column = scale.column_scales;
+    return c;
 }
 
 } // namespace
@@ -158,23 +165,24 @@ std::size_t lossless_linear_shared_workspace_bytes(std::span<const LosslessProje
 }
 
 void lossless_linear_shared(const Tensor& x, std::span<const LosslessProjection> projections, WorkspaceArena& workspace,
-                            cudaStream_t stream) {
+                            cudaStream_t stream, const LosslessActivationScale& scale) {
     require(!projections.empty(), "at least one projection");
     std::vector<Projection> ps;
     ps.reserve(projections.size());
     for (const LosslessProjection& p : projections) {
         require(p.weight != nullptr && p.out != nullptr, "each projection names its weight and output");
         Route route = Route::None;
-        const Call c = projection_call(x, *p.weight, p.row_begin, p.rows, *p.out, p.out_row, route);
+        const Call c = projection_call(x, *p.weight, p.row_begin, p.rows, *p.out, p.out_row, scale, route);
         ps.push_back(Projection{c, route});
     }
     run(std::span<Projection>(ps), workspace, stream);
 }
 
 void lossless_linear(const Tensor& x, const Weight& weight, std::int32_t row_begin, std::int32_t rows, Tensor& out,
-                     std::int32_t out_row, WorkspaceArena& workspace, cudaStream_t stream) {
+                     std::int32_t out_row, WorkspaceArena& workspace, cudaStream_t stream,
+                     const LosslessActivationScale& scale) {
     Route route  = Route::None;
-    const Call c = projection_call(x, weight, row_begin, rows, out, out_row, route);
+    const Call c = projection_call(x, weight, row_begin, rows, out, out_row, scale, route);
     run(c, route, workspace, stream);
 }
 

@@ -268,6 +268,51 @@ double-double arithmetic (relative error below 2^-94), far closer than any binar
 value lies to a rounding midpoint (binary32 worst cases are within about 2^-60), and rounded from it.
 rsqrt decides a near-midpoint case exactly instead (y > m exactly when 1 > m^2 v).
 
+## 3b. The design reference (`--reference`)
+
+`--lossless` computes the model at its trained precision. A configuration can also declare lossy steps
+of its own: activation quantization that its artifact permits, and the KV-cache format the user
+selects. `--reference` (`EngineOptions::reference`) is `--lossless` with each declared lossy step
+applied exactly where the configuration declares it, and nothing else changed: the exact computation of
+the configuration as designed. It is the second reference of the quality gate (model quality §6.2):
+a fast path's processing cost is its distance from `--lossless` minus the design reference's distance
+from `--lossless`, so neither the declared quantization's own cost nor any route's arbitrary rounding
+enters a verdict.
+
+**Activation quantization.** Every input whose artifact Use permits a lower precision takes it, at every
+width and phase (the reproducible route chooses by call width and runs Qwen3.5 decode at 16 bits; the
+design does not depend on either):
+
+| Weight, Use | Activation step | Value of the quantized activation |
+|---|---|---|
+| NVFP4 dense (Qwen3.5), `AllowA4`, activation divisor D | each 16 consecutive K elements of a token: `amax` = max abs value; `sf = fp32(fp32(D amax) / 6)`; `w = e4m3_rn_satfinite(sf)` (0 makes the block's codes 0); `d = e4m3(w)`; each code `c = e2m1_rn_satfinite(fp32(fp32(v D) / d))` (the reproducible route's divisor rule, `quantize_nvfp4_k16`) | `c d / D`, exactly |
+| NVFP4 routed experts (Qwen3.8-Flash-Next W4A4: recipe A, Dense8; FP4-Local with `--expert-a4-activations`), the expert's FP32 `input_scale` g per gate, up and down | `s = e4m3_rn_satfinite(fp32(amax / fp32(6 g)))`, `d = fp32(e4m3(s) g)`, `c = e2m1_rn_satfinite(fp32(v / d))` (NVIDIA ModelOpt's rule, `quantize_a4_block`) | `c e4m3(s) g`, exactly |
+| FP8 dense (Qwen3.5), `AllowA8` or `AllowA4` | per token over the projection's whole K: `s = fp32(amax / 448)` (0 for a zero column), `c = e4m3_rn_satfinite(fp32(v fp32(1 / s)))` (`fp8_a8.cu`) | `c s`, exactly |
+
+An NVFP4 weight under `AllowA8`, the paired Q4/Q5 projections, the Qwen3.5 sparse MoE banks and the output
+head stay 16-bit, as their only arithmetic (no route quantizes the head's input). The quantizer reads the exact route's BF16 input and the product is the
+exact sum of the quantized values times the weights' exact values: the scale factors (`1 / D`, `g`, `s`)
+are applied exactly, not as the FP32 products the fast kernels multiply by, and the result is rounded once
+to the operation's dtype. Where the gate and up inputs of an expert carry different scales they are
+quantized separately; the down projection quantizes its input h with its own scale.
+
+**KV cache.** The route stores K and V through the selected `--kv-dtype`'s own encoder (the production
+`kv_cache_append` codecs: each row's codes depend on that row alone), applied to the exactly computed
+BF16 K and V, and attention reads the stored codes exactly: each row's decoded values (code times scale,
+exact) are taken back from the codec's rotated basis exactly (`k = R^T y`, `R = H_256 / 16`), and the
+scores, the softmax and the value sums are the lossless route's (`bf16` stores V as FP16, as the format
+defines). The VQ formats keep their exact-window rule (a query reads a key's exact INT8 row inside the
+window and its VQ value outside it, by position alone). Flash-Next's QSA selection reads its BF16 pooled
+keys, which no KV format changes.
+
+**Scope.** Every artifact and KV format of the reproducible route, in CausalScoring and in the forced
+decode tool's observed runs (`infernix_decode_quality_forced --reference --observe`, one scoring pass per
+segment); generation is not a use of the route. Status (2026-10-22): the activation steps and `bf16` KV
+(V as FP16, `lossless_round_fp16`) are built; the other codecs need an attention over the stored codes
+(their decoded values are rotated and wider than BF16) and are next, so the route refuses them until then. On a 16-bit artifact with `bf16` KV
+the design reference differs from `--lossless` only by V's FP16 storage. Its bits are a function of the
+request, the artifact and the declared steps, so a reference survives rebuilds like `--lossless`'s.
+
 ## 4. Qualification
 
 - Every operation bit-equal to an exact oracle (host big-integer or rational arithmetic, independent of

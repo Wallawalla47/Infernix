@@ -4,7 +4,6 @@
 #include "infernix/ops/linear.h"
 #include "infernix/ops/linear_add.h"
 #include "infernix/ops/linear_swiglu.h"
-#include "infernix/ops/precise_linear.h"
 #include "infernix/ops/residual_add.h"
 #include "infernix/ops/silu_mul.h"
 
@@ -103,29 +102,6 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
     ops::linear_add(activation, down, residual,
                     residual_projection_policy(p.down, wide_verification), workspace, stream,
                     down_routes);
-}
-
-std::size_t ffn_reference_workspace_bytes(const FfnParameters& parameters, std::int32_t columns) {
-    if (std::holds_alternative<ops::SparseMoeWeights>(parameters)) {
-        return ops::precise_sparse_moe_workspace_bytes(columns);
-    }
-    const auto& gu = std::get<DenseParameters>(parameters).gate_up.weight;
-    WorkspaceLayoutBuilder layout;
-    (void)layout.alloc(DType::BF16, {gu.n / 2, columns});
-    return layout.peak_bytes(1);
-}
-
-void ffn_reference(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual,
-                   WorkspaceArena& workspace, cudaStream_t stream) {
-    auto scope = workspace.scope();
-    if (const auto* moe = std::get_if<ops::SparseMoeWeights>(&parameters)) {
-        ops::precise_sparse_moe(hidden, *moe, residual, workspace, stream);
-        return;
-    }
-    const auto& p     = std::get<DenseParameters>(parameters);
-    Tensor activation = workspace.alloc(DType::BF16, {p.gate_up.weight.n / 2, hidden.ne[1]});
-    ops::precise_swiglu(hidden, p.gate_up.weight, activation, stream);
-    ops::precise_linear_add(activation, p.down.weight, residual, stream);
 }
 
 } // namespace infernix::models::qwen3_5::execution

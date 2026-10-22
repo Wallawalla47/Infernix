@@ -640,7 +640,15 @@ std::uint32_t round_exact(const std::vector<std::uint32_t>& mag, int unit, bool 
            static_cast<std::uint32_t>(q - (1ULL << (prec - 1)));
 }
 
-std::uint32_t oracle(const HostWeight& w, int row, const std::uint16_t* x, bool bf16) {
+// The design reference's activation scales (FP32 bits, 0: none): a multiplier of the row (tiles: its
+// parity's), a multiplier of the column, and a divisor.
+struct ActScales {
+    std::uint32_t row_multiplier = 0;
+    std::uint32_t column_multiplier = 0;
+    std::uint32_t divisor = 0;
+};
+
+std::uint32_t oracle(const HostWeight& w, int row, const std::uint16_t* x, bool bf16, const ActScales& act = {}) {
     std::vector<long long> chunks(kOracleWords + 1, 0);
     bool nan = false, pos_inf = false, neg_inf = false;
     for (int k = 0; k < w.k; ++k) {
@@ -715,35 +723,61 @@ std::uint32_t oracle(const HostWeight& w, int row, const std::uint16_t* x, bool 
     } else {
         for (std::size_t i = 0; i < v.size(); ++i) { mag[i] = static_cast<std::uint32_t>(v[i]); }
     }
+    // The factors, exactly: every multiplier first (the product stays an integer), then each division of
+    // the product padded by 2^64 (floor(floor(x / a) / b) = floor(x / ab), exact exactly when both are).
     int unit = -kOracleBias;
     bool sticky = false;
-    if (w.factor == Factor::Multiply) {
-        const std::uint64_t f = w.fm[static_cast<std::size_t>(row)];
+    const auto multiply = [&](std::uint64_t f) {
         std::uint64_t carry = 0;
-        bool zero = true;
         for (auto& d : mag) {
             const std::uint64_t t = static_cast<std::uint64_t>(d) * f + carry;
             d = static_cast<std::uint32_t>(t);
             carry = t >> 32;
-            zero = zero && d == 0;
         }
         mag.push_back(static_cast<std::uint32_t>(carry));
-        zero = zero && carry == 0;
-        negative = negative && !zero;
-        unit += w.fe[static_cast<std::size_t>(row)];
-    } else if (w.factor == Factor::Divide) {
+    };
+    const auto divide = [&](std::uint64_t d) {
         mag.insert(mag.begin(), 2, 0U); // times 2^64
-        const std::uint64_t d = w.fm[static_cast<std::size_t>(row)];
+        unit -= 64;
         std::uint64_t rem = 0;
         for (int i = static_cast<int>(mag.size()) - 1; i >= 0; --i) {
             const std::uint64_t cur = (rem << 32) | mag[static_cast<std::size_t>(i)];
             mag[static_cast<std::size_t>(i)] = static_cast<std::uint32_t>(cur / d);
             rem = cur % d;
         }
-        sticky = rem != 0;
-        unit += -64 - w.fe[static_cast<std::size_t>(row)];
+        sticky = sticky || rem != 0;
+    };
+    const auto fp32_factor = [](std::uint32_t bits, std::uint64_t& m, int& e) {
+        const int field = static_cast<int>((bits >> 23) & 0xFF), mantissa = static_cast<int>(bits & 0x7FFFFF);
+        m = static_cast<std::uint64_t>(field == 0 ? mantissa : ((1 << 23) | mantissa));
+        e = (field == 0 ? 1 : field) - 150;
+    };
+    if (w.factor == Factor::Multiply) {
+        multiply(w.fm[static_cast<std::size_t>(row)]);
+        unit += w.fe[static_cast<std::size_t>(row)];
     }
-    return round_exact(mag, unit, negative, bf16, sticky);
+    for (const std::uint32_t bits : {act.row_multiplier, act.column_multiplier}) {
+        if (bits == 0) { continue; }
+        std::uint64_t m = 0;
+        int e = 0;
+        fp32_factor(bits, m, e);
+        multiply(m);
+        unit += e;
+    }
+    if (w.factor == Factor::Divide) {
+        divide(w.fm[static_cast<std::size_t>(row)]);
+        unit -= w.fe[static_cast<std::size_t>(row)];
+    }
+    if (act.divisor != 0) {
+        std::uint64_t m = 0;
+        int e = 0;
+        fp32_factor(act.divisor, m, e);
+        divide(m);
+        unit -= e;
+    }
+    bool zero = !sticky;
+    for (const auto d : mag) { zero = zero && d == 0; }
+    return round_exact(mag, unit, negative && !zero, bf16, sticky);
 }
 
 // ------------------------------------------------------------------------------- activations
@@ -913,7 +947,40 @@ HostBank make_bank(const std::string& name, QType q, int rows, int k, int expert
     return b;
 }
 
-void run_tiles(const std::string& label, const HostBank& b, int tiles, int source_columns, bool bf16, std::mt19937& rng) {
+// lossless_linear with a design-reference activation scale: a divisor (0: none) and per-column multipliers
+// (empty: none).
+void run_scaled(const std::string& label, const HostWeight& w, const std::vector<std::uint16_t>& x, int columns, bool bf16,
+                float divisor, const std::vector<float>& column_scales) {
+    DeviceBuffer dx(x.size() * 2);
+    dx.copy_from_host(x.data(), x.size() * 2, 0);
+    DeviceBuffer dscales(std::max<std::size_t>(column_scales.size(), 1) * 4);
+    if (!column_scales.empty()) { dscales.copy_from_host(column_scales.data(), column_scales.size() * 4, 0); }
+    const int esize = bf16 ? 2 : 4;
+    DeviceBuffer dout(static_cast<std::size_t>(w.n) * columns * esize);
+    Tensor tx(dx.p, DType::BF16, {w.k, columns});
+    Tensor tout(dout.p, bf16 ? DType::BF16 : DType::FP32, {w.n, columns});
+    DeviceBuffer ws(ops::lossless_linear_workspace_bytes(w.weight, w.n, columns));
+    WorkspaceArena arena(DeviceSpan{ws.p, ws.bytes});
+    const ops::LosslessActivationScale scale{divisor,
+                                             column_scales.empty() ? nullptr : static_cast<const float*>(dscales.p)};
+    ops::lossless_linear(tx, w.weight, 0, w.n, tout, 0, arena, nullptr, scale);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector<std::uint8_t> got(static_cast<std::size_t>(w.n) * columns * esize);
+    dout.copy_to_host(got.data(), got.size(), 0);
+    compare(label, w.n, columns, [&](int t, int r, std::uint32_t& g, std::uint32_t& want) {
+        g = 0;
+        std::memcpy(&g, got.data() + (static_cast<std::size_t>(t) * w.n + r) * esize, esize);
+        ActScales act;
+        act.divisor           = f32_bits(divisor);
+        act.column_multiplier = column_scales.empty() ? 0U : f32_bits(column_scales[static_cast<std::size_t>(t)]);
+        want = oracle(w, r, x.data() + static_cast<std::size_t>(t) * w.k, bf16, act);
+        return true;
+    });
+}
+
+// act: each expert's activation scales of even and odd rows (LosslessTile::act; null: none).
+void run_tiles(const std::string& label, const HostBank& b, int tiles, int source_columns, bool bf16, std::mt19937& rng,
+               const std::vector<std::array<std::uint32_t, 2>>* act = nullptr) {
     const int k = b.matrix.k, rows = b.matrix.rows, columns = 64 * tiles, out_columns = columns + 7;
     const auto x = make_columns(k, source_columns, rng, 4);
     std::vector<std::int32_t> in(static_cast<std::size_t>(columns)), out(static_cast<std::size_t>(columns));
@@ -935,6 +1002,9 @@ void run_tiles(const std::string& label, const HostBank& b, int tiles, int sourc
         const auto a = e < 0 || b.alpha.empty() ? std::array<std::uint32_t, 2>{0U, 0U} : b.alpha[static_cast<std::size_t>(e)];
         host_tiles[static_cast<std::size_t>(t)].alpha[0] = a[0];
         host_tiles[static_cast<std::size_t>(t)].alpha[1] = a[1];
+        const auto g = e < 0 || act == nullptr ? std::array<std::uint32_t, 2>{0U, 0U} : (*act)[static_cast<std::size_t>(e)];
+        host_tiles[static_cast<std::size_t>(t)].act[0] = g[0];
+        host_tiles[static_cast<std::size_t>(t)].act[1] = g[1];
     }
     DeviceBuffer dx(x.size() * 2), din(in.size() * 4), dout_map(out.size() * 4),
         dtiles(host_tiles.size() * sizeof(ops::LosslessTile));
@@ -973,8 +1043,10 @@ void run_tiles(const std::string& label, const HostBank& b, int tiles, int sourc
         }
         const int e = tile_expert[static_cast<std::size_t>(c / 64)];
         const int src = in[static_cast<std::size_t>(c)];
+        ActScales scales;
+        if (act != nullptr) { scales.row_multiplier = (*act)[static_cast<std::size_t>(e)][static_cast<std::size_t>(r & 1)]; }
         want = oracle(b.experts[static_cast<std::size_t>(e)], r,
-                      src < 0 ? zeros.data() : x.data() + static_cast<std::size_t>(src) * k, bf16);
+                      src < 0 ? zeros.data() : x.data() + static_cast<std::size_t>(src) * k, bf16, scales);
         return true;
     });
 }
@@ -1131,6 +1203,14 @@ int main() {
             }
             run_tiles("nvfp4 rg16 bank tiles bf16", rg, 9, 40, true, rng);
             run_tiles("nvfp4 rg16 bank tiles fp32", rg, 3, 70, false, rng);
+            // The design reference's expert input scales g (gate rows even, up rows odd), exactly with the
+            // weights' multipliers.
+            std::vector<std::array<std::uint32_t, 2>> g;
+            for (int e = 0; e < 4; ++e) {
+                g.push_back({f32_bits(std::ldexp(1.0F + 0.29F * e, -9 + e)), f32_bits(std::ldexp(1.71F, -3 - 2 * e))});
+            }
+            run_tiles("nvfp4 rg16 bank tiles with act scales bf16", rg, 9, 40, true, rng, &g);
+            run_tiles("nvfp4 rg16 bank tiles with act scales fp32", rg, 3, 70, false, rng, &g);
             HostBank fp8 = make_bank("fp8 b128 bank", QType::FP8_E4M3FN_B128, 128, 640, 3, 4096,
                                      [&](int) { return gen_fp8b128(128, 640, rng); });
             run_tiles("fp8 b128 bank tiles bf16", fp8, 9, 40, true, rng);
@@ -1143,6 +1223,24 @@ int main() {
             HostBank nl = make_bank("iq4_nl bank", QType::GGML_IQ4_NL, 64, 640, 3, 0,
                                     [&](int) { return gen_ggml(QType::GGML_IQ4_NL, 64, 640, rng, false); });
             run_tiles("iq4_nl bank tiles bf16", nl, 6, 40, true, rng);
+        }
+        // The design reference's activation scales (LosslessActivationScale): an NVFP4 activation divisor with
+        // the weight's own divisor (two exact divisions), per-column multipliers with an FP8 row scale, both at
+        // once, and a divisor on a weight without a factor.
+        {
+            const HostWeight n4 = make_nvfp4(128, 640, rng, 2.75e-3F);
+            const HostWeight f8 = make_fp8_row(96, 640, rng);
+            const HostWeight q4 = make_row_split(QType::Q4_G64_FP16, 64, 640, rng, false);
+            const auto x = make_columns(640, 37, rng, 2);
+            std::vector<float> scales(37);
+            for (int t = 0; t < 37; ++t) {
+                scales[static_cast<std::size_t>(t)] = std::ldexp(1.0F + 0.37F * static_cast<float>(t % 5), (t % 11) * 7 - 40);
+            }
+            run_scaled("nvfp4 activation divisor bf16", n4, x, 37, true, 26.953125F, {});
+            run_scaled("nvfp4 activation divisor fp32", n4, x, 37, false, 2741.5F, {});
+            run_scaled("fp8row column scales bf16", f8, x, 37, true, 0.0F, scales);
+            run_scaled("nvfp4 divisor and column scales fp32", n4, x, 37, false, 0.0371F, scales);
+            run_scaled("q4 activation divisor fp32", q4, x, 37, false, 3.0e-3F, {});
         }
         // The grouped form (routed experts): Q4 gate/up banks and the Q5 down bank's depth.
         // (the 35B's layout: expert e's gate at e 1024, its up at e 1024 + 512; down at e 2048).

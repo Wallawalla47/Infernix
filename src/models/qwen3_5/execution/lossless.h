@@ -9,6 +9,7 @@
 #include "core/layout.h"
 #include "core/paged_kv_cache.h"
 #include "core/tensor.h"
+#include "infernix/types.h"
 #include "models/qwen3_5/config.h"
 #include "models/qwen3_5/execution/parameters.h"
 
@@ -43,14 +44,23 @@ struct LosslessCache {
     Tensor recurrent_states;                   // the layer's FP32 [128, 128, Hv, slots] (GDN layers)
 };
 
+// The design reference (docs/maintainer/lossless-route.md §3b): the configuration's declared lossy steps on
+// the lossless route, in the window form. Inactive, the layer is --lossless's.
+struct LosslessDesign {
+    bool active       = false;                    // each projection input takes its Use's declared quantization
+    KvCacheStorage kv = KvCacheStorage::BFloat16; // the KV format whose codec K and V cross
+};
+
 // One decoder layer over the call's residual x (BF16 [H, T]), in place; cache null: the window form.
 void lossless_layer(const BlockParameters& block, const TextConfig& config, MixerKind kind, const Tensor& rope_table,
-                    Tensor& x, WorkspaceArena& workspace, cudaStream_t stream, const LosslessCache* cache = nullptr);
+                    Tensor& x, WorkspaceArena& workspace, cudaStream_t stream, const LosslessCache* cache = nullptr,
+                    const LosslessDesign& design = {});
 // Its workspace; for the cache form `cache` gives sequences and key_capacity (tokens / sequences the run
 // width).
 [[nodiscard]] std::size_t lossless_layer_workspace_bytes(const BlockParameters& block, const TextConfig& config,
                                                          MixerKind kind, std::int32_t tokens,
-                                                         const LosslessCache* cache = nullptr);
+                                                         const LosslessCache* cache   = nullptr,
+                                                         const LosslessDesign& design = {});
 
 // The final norm (Qwen3_5RMSNorm) into out (BF16 [H, T]).
 void lossless_final_norm(const Tensor& x, const Tensor& weight, const TextConfig& config, Tensor& out,

@@ -7,14 +7,15 @@
 // diverges after the first rounding difference. tools/quality/fast_path_gate.py pairs a default and a
 // fast-path run.
 //
-// --reference writes the reference instead: the reference route's (EngineOptions::reference) BF16-KV
-// log-probability of every forced token and its 64 most probable tokens there (Engine::score_tokens,
-// one pass), for the same segments; --lossless writes it with the lossless route
-// (EngineOptions::lossless, Qwen3.5/3.6/3.8 and Qwen3.8-Flash-Next), the reference those models' gates use. --observe
+// --lossless writes the reference instead: the lossless route's (EngineOptions::lossless,
+// Qwen3.5/3.6/3.8 and Qwen3.8-Flash-Next) log-probability of every forced token and its 64 most
+// probable tokens there (Engine::score_tokens, BF16 KV, one pass), for the same segments. --observe
 // REFERENCE then makes each forced step also report the log-probabilities of the reference's top
 // tokens and its own largest log-probability (TokenConstraint::observe), so the gate measures the
-// decode route's KL divergence from the
-// reference and its top-1 agreement exactly as the prefill gate does.
+// decode route's KL divergence from the reference and its top-1 agreement exactly as the prefill
+// gate does. --reference --observe REFERENCE writes the design reference's run instead (the
+// lossless route with the configuration's declared steps, --kv-dtype's codec among them; one scoring
+// pass per segment, reported as a decode run is): the gate's base arm.
 //
 // Segments lie back to back from the corpus's first token, no two sharing a token, and cycle
 // through the prompt lengths, so the forced steps read short and long contexts. --first-segment N
@@ -38,7 +39,7 @@
 //
 // Usage: infernix_decode_quality_forced <artifact> <corpus.txt> <out.json> [--segments N]
 //          [--first-segment N] [--prompts L1,L2,...] [--forced N]
-//          [--reference | --lossless | --observe REFERENCE.json]
+//          [--lossless | --observe REFERENCE.json [--reference]]
 //          [--mode plain|dflash2|ngram|mtp|mtp-ngram] [--kv-dtype int8|bf16|fp8|nvfp4]
 //          [--reproducible] [--fast-path NAME]... [--expert-a4-activations]
 //          [--concurrency 1..8] [--prefill-chunk N] [--prefix-reuse [--warm-tokens N]]
@@ -88,8 +89,8 @@ struct Options {
     std::uint32_t kv_tokens     = 0;
     bool prefix_reuse           = false;
     std::uint32_t warm_tokens   = 0; // 0: the whole prompt
-    bool reference              = false;
-    bool lossless               = false; // the reference's route
+    bool lossless               = false; // write the reference (the lossless route)
+    bool reference              = false; // the design reference's observed run (with --observe)
     std::string observe;
     std::string ngram_volume;
     bool expert_a4_activations = false;
@@ -148,11 +149,10 @@ Options parse(int argc, char** argv) {
             out.warm_tokens = parse_u32(value(), "warm tokens");
         } else if (option == "--expert-pin-mib") {
             out.expert_pin_mib = parse_u32(value(), "expert pin MiB");
+        } else if (option == "--lossless") {
+            out.lossless = true;
         } else if (option == "--reference") {
             out.reference = true;
-        } else if (option == "--lossless") {
-            out.reference = true;
-            out.lossless  = true;
         } else if (option == "--observe") {
             out.observe = value();
         } else if (option == "--reproducible") {
@@ -176,11 +176,15 @@ Options parse(int argc, char** argv) {
     if (out.warm_tokens != 0 && !out.prefix_reuse) {
         throw std::invalid_argument("--warm-tokens needs --prefix-reuse");
     }
-    if (out.reference && !out.observe.empty()) {
-        throw std::invalid_argument("--reference (or --lossless) and --observe exclude each other");
+    if (out.lossless && !out.observe.empty()) {
+        throw std::invalid_argument("--lossless and --observe exclude each other");
     }
-    if (out.reference && out.expert_a4_activations) {
-        throw std::invalid_argument("--reference scores with 16-bit activations; drop --expert-a4-activations");
+    if (out.lossless && out.expert_a4_activations) {
+        throw std::invalid_argument("--lossless and --expert-a4-activations exclude each other");
+    }
+    if (out.reference && (out.lossless || out.observe.empty())) {
+        throw std::invalid_argument("--reference scores the design route against a reference: give --observe, not "
+                                    "--lossless");
     }
     return out;
 }
@@ -273,7 +277,7 @@ std::vector<infernix::TokenId> read_tokens(infernix::Engine& engine, const Optio
     return tokens;
 }
 
-// The reference: the reference route's BF16-KV scoring in one pass per segment.
+// The reference: the lossless route's BF16-KV scoring in one pass per segment.
 void write_reference(const Options& options, std::uint32_t longest, std::ostream& out) {
     infernix::EngineOptions engine_options;
     engine_options.artifact_path   = options.artifact;
@@ -282,8 +286,7 @@ void write_reference(const Options& options, std::uint32_t longest, std::ostream
     engine_options.kv_capacity     = infernix::KvCapacityPolicy::explicit_capacity(engine_options.max_context);
     engine_options.kv_cache        = infernix::KvCacheStorage::BFloat16;
     engine_options.prefill_chunk   = engine_options.max_context;
-    engine_options.reference       = !options.lossless;
-    engine_options.lossless        = options.lossless;
+    engine_options.lossless        = true;
     engine_options.fast_paths      = false;
     if (!options.ngram_volume.empty()) { engine_options.ngram_volume_path = options.ngram_volume; }
     infernix::Engine engine(engine_options);
@@ -317,7 +320,7 @@ void write_reference(const Options& options, std::uint32_t longest, std::ostream
     out << "]}\n";
 }
 
-// Each step's observe list from a reference (written by --reference for the same segments).
+// Each step's observe list from a reference (written by --lossless for the same segments).
 std::vector<std::vector<std::vector<infernix::TokenId>>> read_observe(const Options& options,
                                                                       const Segments& segments) {
     std::ifstream in(options.observe);
@@ -359,6 +362,65 @@ std::vector<std::vector<std::vector<infernix::TokenId>>> read_observe(const Opti
     return observe;
 }
 
+// The design reference's observed run (--reference --observe REFERENCE): the design route
+// (EngineOptions::reference; docs/maintainer/lossless-route.md §3b) scores each segment in one pass. Its
+// output depends on neither chunking nor prefill versus decode, so each forced position's log-probability,
+// the observed log-probabilities of the reference's top tokens and its own largest are those a decode run
+// reports; the gate takes the run as the base arm against which a route's processing cost is measured.
+void write_design(const Options& options, std::uint32_t longest, std::ostream& out) {
+    infernix::EngineOptions engine_options;
+    engine_options.artifact_path         = options.artifact;
+    engine_options.purpose               = infernix::EnginePurpose::CausalScoring;
+    engine_options.max_context           = (longest + options.forced + 64 + 127) / 128 * 128;
+    engine_options.kv_capacity           = infernix::KvCapacityPolicy::explicit_capacity(engine_options.max_context);
+    engine_options.kv_cache              = kv_storage(options.kv);
+    engine_options.prefill_chunk         = engine_options.max_context;
+    engine_options.lossless              = true;
+    engine_options.reference             = true;
+    engine_options.expert_a4_activations = options.expert_a4_activations;
+    engine_options.fast_paths            = false;
+    if (!options.ngram_volume.empty()) { engine_options.ngram_volume_path = options.ngram_volume; }
+    infernix::Engine engine(engine_options);
+    const std::vector<infernix::TokenId> tokens = read_tokens(engine, options);
+    const Segments segments(tokens, options);
+    const auto observe = read_observe(options, segments);
+    const std::uint32_t top = observe.empty() || observe[0].empty() ? 0U : static_cast<std::uint32_t>(observe[0][0].size());
+
+    out << "{\"artifact\": ";
+    write_string(out, artifact_path(options.artifact));
+    out << ", \"mode\":\"reference\", \"kv_dtype\": \"" << options.kv
+        << "\", \"expert_a4_activations\": " << (options.expert_a4_activations ? "true" : "false")
+        << ", \"fast_paths\": [], \"forced_tokens\": " << options.forced << ", \"segments\": [";
+    std::uint64_t underflows = 0;
+    for (std::uint32_t segment = 0; segment < options.segments; ++segment) {
+        std::vector<infernix::TokenId> input = segments.prompt(segment);
+        const std::vector<infernix::TokenId> forced = segments.forced(segment, options.forced);
+        input.insert(input.end(), forced.begin(), forced.end());
+        infernix::ScoreOptions score{.top_k = 1, .candidates_per_position = top};
+        for (const auto& step : observe[segment]) { score.candidates.insert(score.candidates.end(), step.begin(), step.end()); }
+        const infernix::ScoreResult scored =
+            engine.score_tokens(std::move(input), segments.prompt_tokens(segment), std::move(score));
+        out << (segment ? ", " : "") << "{\"offset\": " << segments.offset(segment)
+            << ", \"prompt_tokens\": " << segments.prompt_tokens(segment) << ", \"logprobs\": [";
+        for (std::size_t i = 0; i < scored.logprobs.size(); ++i) {
+            // As a decode run reports it: an FP32 probability below the smallest normal at it.
+            const double p = std::exp(static_cast<double>(scored.logprobs[i]));
+            underflows += p < 1.0e-37 ? 1U : 0U;
+            out << (i ? ", " : "") << std::log(std::max(p, 1.0e-37));
+        }
+        out << "], \"observed\": ";
+        write_list(out, scored.candidate_logprobs);
+        out << ", \"top_logprobs\": ";
+        write_list(out, scored.top_logprobs);
+        out << '}';
+        if ((segment + 1) % 16 == 0) { std::cerr << "design segment " << segment + 1 << "/" << options.segments << '\n'; }
+    }
+    out << "], \"observed_reference\": ";
+    write_string(out, options.observe);
+    out << ", \"underflows\": " << underflows << ", \"reused_prompt_tokens\": 0, \"preemptions\": 0"
+        << ", \"replayed_tokens\": 0}\n";
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -369,10 +431,15 @@ int main(int argc, char** argv) {
         if (!out) { throw std::runtime_error("cannot write " + options.output); }
         out << std::setprecision(17);
         const auto started = std::chrono::steady_clock::now();
-        if (options.reference) {
-            write_reference(options, longest, out);
+        if (options.lossless || options.reference) {
+            if (options.reference) {
+                write_design(options, longest, out);
+            } else {
+                write_reference(options, longest, out);
+            }
             if (!out) { throw std::runtime_error("cannot write " + options.output); }
-            std::cerr << "reference for " << options.segments << " segments in "
+            std::cerr << (options.reference ? "design run" : "reference") << " for " << options.segments
+                      << " segments in "
                       << std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count()
                       << " s\n";
             return 0;

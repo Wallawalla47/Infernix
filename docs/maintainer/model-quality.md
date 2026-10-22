@@ -29,9 +29,9 @@ and the chunk size only picks the scatter. So:
   chunk size, and report the spread.
 - Prefer KL divergence to a fixed reference over perplexity: it measures the distance from the
   intended distribution, not whether noise happened to favour the corpus.
-- The best reference for a given weight set is the same artifact on the reference route
-  (`EngineOptions::reference`: 16-bit activations, precise arithmetic between the model's BF16
-  rounding points, 6.2), scored in one pass with BF16 KV.
+- The best reference for a given weight set is the same artifact on the lossless route
+  (`EngineOptions::lossless`: every operation of the model correctly rounded, 6.2;
+  [definition](lossless-route.md)), scored in one pass with BF16 KV.
 - Exact outputs (for example BF16 KV prefill, where no Infernix kernel differs from NInfer) must
   still match exactly; noise tolerance applies only to paths whose arithmetic changed.
 
@@ -40,7 +40,7 @@ and the chunk size only picks the scatter. So:
 | Tool | Measures |
 |---|---|
 | `infernix-perplexity --prefill-chunk N` | perplexity at a chosen prefill pass size ([guide](../perplexity.md)) |
-| `infernix-perplexity --reference --save-top-tokens FILE` | the reference distribution (6.2) |
+| `infernix-perplexity --lossless --save-top-tokens FILE` | the reference distribution (6.2) |
 | `infernix-perplexity --kl-reference FILE` | KL divergence and top-1 agreement against a saved reference |
 | `infernix_decode_quality_forced` | the decode route's log-probability of forced corpus tokens, paired position by position between builds ([benchmarks](../../bench/README.md#decode-quality)) |
 | `infernix_decode_quality_gen` / `infernix_decode_quality_judge` | end-to-end greedy decode through the production speculative path, judged token by token against the reference (6.2) ([benchmarks](../../bench/README.md#decode-quality)) |
@@ -56,10 +56,10 @@ Measured on 2026-10-05 on an RTX 5090 (CUDA 13.4, Windows), Gold-Star-Infer at `
 NInfer `68c54356` plus the Windows port (with only a `--prefill-chunk` option added to its
 perplexity tool), official Qwen3.8-27B NVFP4 artifact unless stated. The reference in these runs
 lifted only the 4-bit (MLP) sites to 16-bit activations; sites that run 8-bit activations (FP8
-projections) kept them. The reference route (`--reference`, on Qwen3.8-27B 16-bit activations at
-every site) lifts those too, so it is a stricter reference: the KL figures in sections 1, 3.1 and
-3.4 are against the narrower one, and the decode comparison (3.3) was repeated with the reference
-route.
+projections) kept them. `a16_activations` (16-bit activations at every site; replaced on 2026-10-20
+by the precise reference route and on 2026-10-21 by the lossless route, 6.2) lifted those too, so it
+was a stricter reference: the KL figures in sections 1, 3.1 and 3.4 are against the narrower one, and
+the decode comparison (3.3) was repeated with `a16_activations`.
 
 ### 3.1 Where the activation error comes from
 
@@ -74,7 +74,7 @@ KL to the reference at one pass / 4096-token chunks, with uncached prefill time 
 | MLP down | 0.0169 / 0.0184 | 0.969 | 1.4x |
 | every 4-bit site (the reference here) | 0 | 1 | 3.0x |
 
-The reference route also lifts the 8-bit sites, so it is at least as slow as the last row.
+`a16_activations` also lifted the 8-bit sites, so it was at least as slow as the last row.
 
 ### 3.2 Infernix against NInfer, prefill
 
@@ -95,9 +95,9 @@ kernels are as accurate as NInfer's within this resolution.
 32 corpus segments of 1,536 tokens, 384 greedy tokens each (12,288 tokens per build), DFlash2 with
 7 drafts and the proposal head, INT8 KV, judged on each build's own prefixes. The same generated
 tokens were judged twice: by the study's reference (4-bit sites at 16 bits) and by the committed
-`infernix_decode_quality_judge` (the reference route, every site at 16 bits):
+`infernix_decode_quality_judge` (`a16_activations`, every site at 16 bits):
 
-| Build | Agreement, 4-bit sites lifted | Regret | Agreement, reference route | Regret |
+| Build | Agreement, 4-bit sites lifted | Regret | Agreement, `a16_activations` | Regret |
 |---|---|---|---|---|
 | NInfer | 0.9736 | 0.0080 | 0.9743 | 0.0073 |
 | Infernix | 0.9736 | 0.0086 | 0.9762 | 0.0072 |
@@ -312,7 +312,7 @@ Neither path below is built.
 ```bat
 rem the reference, one pass per window
 infernix-perplexity model.ninfer --text corpus.txt --context 14336 --stride 7168 --kv-dtype bf16 ^
-  --prefill-chunk 14336 --reference --save-top-tokens ref.top
+  --prefill-chunk 14336 --lossless --save-top-tokens ref.top
 rem a build or setting under test, at several chunk sizes
 infernix-perplexity model.ninfer --text corpus.txt --context 14336 --stride 7168 --kv-dtype int8 ^
   --prefill-chunk 4096 --kl-reference ref.top
@@ -374,15 +374,13 @@ different route may ship, what it is measured against, how much it may cost, and
   change that alters any exact-route output bit is a *numerics change*. It is allowed only to fix
   a defect or to improve precision, and only when the gates of 6.5, with the previous exact route
   in the default role and the new one in the fast role, show the new route's estimated excess is
-  at most zero and its bound within budget (6.8 records each one). On Qwen3.8-Flash-Next the
-  reference route has its own precise kernels (6.2), so an exact-route change leaves the reference
-  unchanged; so on Qwen3.5 once its precise reference (6.2) is adopted. Until then Qwen3.5's
-  reference runs its exact kernels with 16-bit activations, and a
-  change that also alters the reference route's arithmetic makes each build's reference favour its
-  own route, so the FP64 Op oracle decides which route is more precise, and the gate above runs
-  against that route's reference. A precision fix whose Op error against the oracle is lower
-  therefore runs the gate against the new route's reference, and the corpus NLL, which no
-  reference enters, must not rise. Speed alone never justifies an exact-route numerics change: a faster route whose
+  at most zero and its bound within budget (6.8 records each one). The reference, the lossless
+  route (6.2), runs its own kernels on every model, so an exact-route change leaves the reference
+  unchanged, and the corpus NLL, which no reference enters, must not rise. (Until the lossless route
+  replaced it, Qwen3.5's reference ran its exact kernels with 16-bit activations, so a change that
+  also altered the reference's arithmetic made each build's reference favour its own route; the
+  FP64 Op oracle then decided which route was more precise, and the gate ran against that route's
+  reference.) Speed alone never justifies an exact-route numerics change: a faster route whose
   arithmetic differs is a fast path. The exact route is every gate's default run. Prompt attention there runs P×V in FP16 for every
   KV format; until 2026-10-13 NVFP4, K8V4 and VQ2 KV defaulted to their 8-bit forms, which are now
   the prompt-pv8 fast path. The fast INT8 and NVFP4 prompt kernels, measured when adopted, remain
@@ -506,7 +504,7 @@ make: the reference is computed per segment in one pass, the exact route is requ
 concurrent run's groups stay aligned because 256 is a multiple of every concurrency. Before the join
 is relied on, the tool computing the extension's reference must reproduce segments 254-255 of the
 256-segment reference bit for bit (a two-segment run from `--first-segment 254`); if it does not
-(another build of the reference route), the reference and both runs compute the 1,024 set in one
+(another definition of the reference's route), the reference and both runs compute the 1,024 set in one
 piece. A run whose tool predates `--first-segment` also computes the 1,024 set in one piece, against
 the joined reference.
 
@@ -524,55 +522,84 @@ joint gates; this arm decides only what preemption adds.
 
 ### 6.2 What is measured
 
-- **The reference** for an artifact is the same artifact on the **reference route**
-  (`EngineOptions::reference`, `--reference`), BF16 KV, each window or sequence in one pass. It
-  holds the weights fixed, so it measures what a route's arithmetic costs, not what the weight
-  format costs. It never quantizes an activation below 16 bits, and it keeps the model's BF16
-  rounding points: the places where the exact route stores a 16-bit activation (every projection's
-  output, the hyper-connection's Rn, z, m and u, a routed expert's gate and up outputs and h, the
-  residual stream, K and V). Between them it computes more precisely than any production route and
-  rounds once at each point. On Qwen3.8-Flash-Next (since 2026-10-19):
-  - every weight is decoded exactly from its stored form, and every projection, routed expert
-    matrix, router and head forms each product exactly in binary32 and sums the products in
+- **The reference** for an artifact is the same artifact on the **lossless route**
+  (`EngineOptions::lossless`, `--lossless`; [definition](lossless-route.md)), BF16 KV, each window or
+  sequence in one pass: the model's Hugging Face forward pass operation by operation, each correctly
+  rounded to the dtype it has there (weights decoded exactly, sums exact, transcendental functions
+  correctly rounded), FP32 logits. Since 2026-10-21 `tools/quality/fast_path_gate.py` scores every
+  model's references with it, keyed by the definition's version rather than the build. It holds the
+  weights fixed, so it measures what a route's arithmetic costs, not what the weight format costs.
+  It never quantizes an activation below 16 bits, and it keeps the model's BF16 rounding points.
+  **Why not the reproducible route's kernels:** a reference made of them is that route itself
+  wherever an artifact already runs 16-bit activations (the IQ3_S and FP8 imports and recipe C on
+  BF16 KV had floor 0), so any arithmetic change, more precise or not, read as cost.
+  **Why not FP32 activations throughout:** an FP32 residual stream made every op more accurate but
+  raised perplexity by 0.030 ± 0.009 nats (Flash-Next design §16.5): the checkpoint is calibrated to
+  its BF16 rounding points, so a reference without them measures a different model. A reference is
+  accepted only when three checks hold, recorded in 6.8: on a few hundred positions it is closer than
+  the reproducible route to the binary64 evaluation at the same BF16 points
+  (`tools/flash_next/reference.py --bf16-boundaries`); a known-bad change still fails the gates
+  clearly; and the reproducible route's floors against it are nonzero and small next to KV
+  quantization's. A path registered on an earlier gate stays registered; it is removed only when a
+  gate against the current reference fails it, never on the expectation that one would. A sample of
+  earlier verdicts is re-measured to confirm that they carry over, and a cell an earlier gate failed
+  (above all, floor-0 cells of 16-bit-activation artifacts with BF16 KV) is registered once a gate
+  against the current reference passes it.
+
+  The lossless route replaced the **precise reference route** (`EngineOptions::reference`,
+  `--reference`; removed on 2026-10-22 with its kernels and their tests); the verdicts recorded below
+  against the precise reference stand. It kept the exact route's BF16 rounding points, the places where that route stores a 16-bit activation (every projection's output,
+  the hyper-connection's Rn, z, m and u, a routed expert's gate and up outputs and h, the residual
+  stream, K and V), computed more precisely than any production route between them, and rounded once
+  at each point. On Qwen3.8-Flash-Next (since 2026-10-19):
+  - every weight was decoded exactly from its stored form, and every projection, routed expert
+    matrix, router and head formed each product exactly in binary32 and summed the products in
     ascending k in double-binary32 arithmetic, within (4096 + 2 K) u² of the exact sum relative to
     the terms' magnitudes (`precise_linear`, `precise_swiglu`, the experts' `WideA16::kPrecise`
     route; until 2026-10-20 binary64 sums, which the RTX 5090 runs at 1/64 of its binary32 rate);
-    its outputs are correctly rounded except within that bound of a tie, checked by
+    its outputs were correctly rounded except within that bound of a tie, checked by
     `infernix_precise_linear_test` and `infernix_offloaded_moe_precise_test` against a compensated
     exact sum;
-  - GDN runs its FP32 recurrence token by token (`GdnChunkArithmetic::Recurrent`) instead of the
-    chunked route's BF16 and TF32 products, and attention runs the FP32 kernel unsplit at every
+  - GDN ran its FP32 recurrence token by token (`GdnChunkArithmetic::Recurrent`) instead of the
+    chunked route's BF16 and TF32 products, and attention ran the FP32 kernel unsplit at every
     width (`QsaBatch::reference`) instead of the FP16 prompt route;
-  - the norms, RoPE, gates and other element-wise ops are the exact route's FP32 kernels, which
-    already round once; BF16 KV keeps V as FP16, which is exact for |v| ≥ 2^-14 and within 2^-25
-    below, far under every rounding the reference makes.
-  It runs on the GPU only (no CPU-served experts) and is many times slower than the exact route.
-  On Qwen3.5 (coded 2026-10-20; its acceptance, step 23 of that day's queue, is pending, and until
-  the owner adopts it Qwen3.5's gates keep their recorded verdicts) the same route scores prompts
-  only (a CausalScoring Engine with BF16 KV): every projection `precise_linear` with the fused
-  projections' row maps (`precise_linear_rows`), the residual projections `precise_linear_add`
-  (residual plus the sum, one rounding), the MLP `precise_swiglu`, the GDN gates `precise_gdn_gating`
-  from the normalized BF16 input, the 35B-A3B's sparse MoE `precise_sparse_moe` (FP32 router scores,
-  binary64 routing weights, BF16 expert activations, FP32 accumulation), the scoring head in FP32;
-  attention `causal_softmax_attention_reference` (FP32 scores, probabilities and P x V over the BF16
-  K and FP16 V cache, one column per query at every width); GDN `Recurrent`. Before it, Qwen3.5's
-  reference was its exact kernels with 16-bit activations. **Why precise between
-  BF16 points:** a reference made of the exact route's own kernels is the exact route itself
-  wherever an artifact already runs 16-bit activations (the IQ3_S and FP8 imports and recipe C on
-  BF16 KV had floor 0), so any arithmetic change, more precise or not, read as cost. **Why not FP32
-  activations throughout:** an FP32 residual stream made every op more accurate but raised
-  perplexity by 0.030 ± 0.009 nats (Flash-Next design §16.5): the checkpoint is calibrated to its
-  BF16 rounding points, so a reference without them measures a different model. The reference is
-  accepted only when three checks hold, recorded in 6.8: on a few hundred positions it is closer than
-  the exact route to the binary64 evaluation at the same BF16 points
-  (`tools/flash_next/reference.py --bf16-boundaries`); a known-bad change still fails the gates
-  clearly; and the exact route's floors against it are nonzero and small next to KV quantization's.
-  All three held on 2026-10-20, and since then (the owner's decision) it is the reference of every
-  Qwen3.8-Flash-Next gate. A path registered on an earlier gate against the exact kernels stays
-  registered; it is removed only when a gate against the precise reference fails it, never on the
-  expectation that one would. A sample of earlier verdicts is re-measured to confirm that they carry
-  over, and a cell an earlier gate failed (above all, floor-0 cells of 16-bit-activation artifacts with
-  BF16 KV) is registered once a gate against the precise reference passes it.
+  - the norms, RoPE, gates and other element-wise ops were the exact route's FP32 kernels, which
+    already round once; BF16 KV kept V as FP16, which is exact for |v| ≥ 2^-14 and within 2^-25
+    below, far under every rounding the reference made.
+  It ran on the GPU only (no CPU-served experts) and was many times slower than the exact route.
+  On Qwen3.5 (coded 2026-10-20; its acceptance, step 23 of that day's queue, was pending, and
+  Qwen3.5's gates kept their recorded verdicts) the same route scored prompts only (a CausalScoring
+  Engine with BF16 KV): every projection `precise_linear` with the fused projections' row maps
+  (`precise_linear_rows`), the residual projections `precise_linear_add` (residual plus the sum, one
+  rounding), the MLP `precise_swiglu`, the GDN gates `precise_gdn_gating` from the normalized BF16
+  input, the 35B-A3B's sparse MoE `precise_sparse_moe` (FP32 router scores, binary64 routing
+  weights, BF16 expert activations, FP32 accumulation), the scoring head in FP32; attention
+  `causal_softmax_attention_reference` (FP32 scores, probabilities and P x V over the BF16 K and
+  FP16 V cache, one column per query at every width); GDN `Recurrent`. Before it, Qwen3.5's
+  reference was its exact kernels with 16-bit activations. Its three acceptance checks held on
+  Qwen3.8-Flash-Next on 2026-10-20, and from then (the owner's decision) it was the reference of every Qwen3.8-Flash-Next
+  gate until the lossless route replaced it.
+- **The design reference** (`EngineOptions::reference`, `--reference`; owner 2026-10-22;
+  [definition](lossless-route.md#3b-the-design-reference---reference)) is the lossless route with the
+  configuration's declared lossy steps applied exactly: the activation quantization its artifact's Uses
+  permit (the NVFP4 27B's 4-bit MLP and 8-bit projection activations, Dense8's and recipe A's 4-bit
+  experts, FP4-Local's with `--expert-a4-activations`) and the selected KV format's codec. It is the
+  gate's base arm: a route's **processing cost** is D(lossless, route) - D(lossless, design reference),
+  measured with `compare-prefill` / `compare-decode` on an `infernix-perplexity --reference` run and an
+  `infernix_decode_quality_forced --reference --observe` run as `--base`. Both terms are exact
+  computations, so no route's own rounding sets the baseline; a declared step's own cost,
+  D(lossless, design reference), is reported, not charged. Measured against the declared steps computed
+  exactly instead of against `--lossless`, a coarse step would be a poor yardstick: on the NVFP4 27B,
+  chunk sizes alone move the 4-bit noise by KL 0.025-0.033, about twice each run's distance from the
+  16-bit reference, so any implementation differs from one exact draw of it by about that much
+  however precise it is; the 16-bit reference is the stable centre of that noise. The design reference
+  takes `--kv-dtype bf16` (V stored as FP16) while its other codecs are built. The gates keep 6.3's
+  budgets as excess over the reproducible route (owner, 2026-10-22: no reproducible route fails by
+  default); every gate also records the processing cost of both of its routes against the design
+  reference, and every run keeps its per-window and per-position data against `--lossless`, so other
+  thresholds (an absolute processing-cost bound; candidates and their sources in
+  `.local/absolute-gate-analysis-2026-10-22.md`) are applied later by deciding the stored runs again
+  (`--policy`), not by measuring them again.
 - **Cost, not difference.** Every route scatters around the reference: on the official 27B NVFP4
   artifact, two chunk sizes differ from each other by more (KL 0.025-0.033, section 1) than either
   differs from the reference (KL 0.020-0.023). The direct divergence between two routes is mostly
@@ -608,7 +635,7 @@ joint gates; this arm decides only what preemption adds.
   (`eval/corpora/decode-4m`: PG-19, WikiText-103 validation, Chinese Wikipedia and SGLang source,
   none of it in the prefill corpus), so no two share text. Every position has the same context in
   both routes, so the measures pair position by position (65,536 per route). The reference at
-  those positions is the same reference route with BF16 KV, scored in one pass (`--reference`), and each forced step also
+  those positions is the same lossless route with BF16 KV, scored in one pass (`--lossless`), and each forced step also
   reports the log-probabilities of the reference's 64 most probable tokens and its own largest one
   (`TokenConstraint::observe`). Decode therefore has the prefill measures (KL from the reference
   over its top 64 plus one bucket, top-1 disagreement, the forced tokens' NLL) and total variation
@@ -786,7 +813,8 @@ directories through `--reference-cache DIR` (default `profiles/quality/reference
 disables it). The key holds the artifact's resolved path, size and modification time, a SHA-256 of
 the corpus text (a manifest with its streams), and those settings; a directory takes an existing
 entry by hard link (a copy across volumes) and stores what it computes, and the gate prints which
-it did. The key cannot see a change to the reference route itself (6.1): after one,
+it did. The key records the lossless route's definition version (`LOSSLESS_DEFINITION`, bumped with
+any change to what the route computes), not the build; after a change the version does not record,
 `--recompute-reference` recomputes the reference into a directory without runs and replaces the
 cache entry. Sharing changes no measurement: every run directory still observes the same reference
 it would have computed.
@@ -819,7 +847,9 @@ the default run at each `--chunk` (a separate `--out`).
 `evaluate-free-running judge.json` decide existing runs. `compare-prefill --base RUN... --candidate
 RUN...` decides any two sets of runs scored against one reference, paired in order, and
 `compare-decode --base A.json --candidate B.json --reference REFERENCE.json` two teacher-forced runs
-that observed one reference: a numerics change to the exact route (6.1), or a control. On
+that observed one reference: a numerics change to the exact route (6.1), or a control. Every
+deciding subcommand takes `--policy NAME=VALUE` (repeatable; any constant of the tool's `Policy`, e.g.
+`kl_budget=1e-2`) and decides the stored runs under that value instead, measuring nothing. On
 Qwen3.8-27B on an RTX 5090 the prefill gate takes 27 minutes per KV format (eight runs) after a
 13-minute reference recorded once per artifact, and the decode gate 18 minutes per run after a
 22-minute reference (60 minutes for a first gate; a later candidate reuses the reference and,
@@ -830,9 +860,9 @@ The exact route needs no budget: `identical` compares two builds' perplexity run
 their generations token by token. Run it at the production chunk size and KV format for any change
 that could touch default arithmetic.
 
-**Coverage.** Both Engine models score teacher-forced and have a reference route (6.2).
-Qwen3.8-Flash-Next's runs every dense linear and routed expert bank with 16-bit activations and
-precise arithmetic, so its floor includes what the W4A4 experts' 4-bit activations cost and what
+**Coverage.** Both Engine models score teacher-forced and have the lossless route (6.2).
+On Qwen3.8-Flash-Next it runs every dense linear and routed expert bank with 16-bit activations,
+every operation correctly rounded, so its floor includes what the W4A4 experts' 4-bit activations cost and what
 every exact kernel's own rounding costs; pass `--ngram-volume` to the gate when the volume is not
 `<artifact>.ngram`. Its Engine scoring is checked against the Forward's own teacher-forced logits
 (`infernix_qwen4_exp_score_real_test`, both at the same prefill chunk): on 3,000 tokens the

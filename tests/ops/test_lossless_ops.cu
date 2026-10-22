@@ -5,9 +5,11 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "infernix/ops/lossless_ops.h"
+#include "infernix/ops/lossless_quantize.h"
 
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -56,7 +58,8 @@ const char* kNames[] = {"rmsnorm",       "rmsnorm_gated", "add",          "silu_
                          "hc_mix",        "hc_inject",     "ple_gate",     "ple_conv",
                          "qsa_pool",      "qsa_select",    "attention_select", "router_bf16",
                          "moe_combine_entries", "conv_slots", "delta_rule_slots", "attention_paged",
-                         "ple_conv_slots", "qsa_cache", "qsa_select_positions", "attention_paged_select"};
+                         "ple_conv_slots", "qsa_cache", "qsa_select_positions", "attention_paged_select",
+                         "quantize_nvfp4", "quantize_nvfp4_scaled", "quantize_fp8_token", "round_fp16"};
 
 } // namespace
 
@@ -563,6 +566,50 @@ int main(int argc, char** argv) {
                                      &tp);
             CUDA_CHECK(cudaDeviceSynchronize());
             got = download32(sel, static_cast<std::size_t>(cols));
+            break;
+        }
+        case 32: { // lossless_quantize_nvfp4: dims (K, T, divisor bits)
+            const int k = static_cast<int>(dims[0]), cols = static_cast<int>(dims[1]);
+            float divisor = 0.0F;
+            std::memcpy(&divisor, &dims[2], sizeof(divisor));
+            DeviceBuffer x = upload16(inputs[0]), out(static_cast<std::size_t>(k) * cols * 2);
+            Tensor tx(x.p, DType::BF16, {k, cols}), tout(out.p, DType::BF16, {k, cols});
+            ops::lossless_quantize_nvfp4(tx, divisor, tout, nullptr);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            got = download16(out, static_cast<std::size_t>(k) * cols);
+            break;
+        }
+        case 33: { // lossless_quantize_nvfp4_scaled: dims (K, source columns, T)
+            const int k = static_cast<int>(dims[0]), src = static_cast<int>(dims[1]), cols = static_cast<int>(dims[2]);
+            DeviceBuffer x = upload16(inputs[0]), map = upload32(inputs[1]), scales = upload32(inputs[2]);
+            DeviceBuffer out(static_cast<std::size_t>(k) * cols * 2);
+            Tensor tx(x.p, DType::BF16, {k, src}), tout(out.p, DType::BF16, {k, cols});
+            ops::lossless_quantize_nvfp4_scaled(tx, static_cast<const std::int32_t*>(map.p),
+                                                static_cast<const float*>(scales.p), tout, nullptr);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            got = download16(out, static_cast<std::size_t>(k) * cols);
+            break;
+        }
+        case 34: { // lossless_quantize_fp8_token: dims (K, T); the values, then the scales
+            const int k = static_cast<int>(dims[0]), cols = static_cast<int>(dims[1]);
+            DeviceBuffer x = upload16(inputs[0]), out(static_cast<std::size_t>(k) * cols * 2),
+                         scales(static_cast<std::size_t>(cols) * 4);
+            Tensor tx(x.p, DType::BF16, {k, cols}), tout(out.p, DType::BF16, {k, cols});
+            Tensor ts(scales.p, DType::FP32, {cols});
+            ops::lossless_quantize_fp8_token(tx, tout, ts, nullptr);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            got = download16(out, static_cast<std::size_t>(k) * cols);
+            const auto s = download32(scales, static_cast<std::size_t>(cols));
+            got.insert(got.end(), s.begin(), s.end());
+            break;
+        }
+        case 35: { // lossless_round_fp16, in place
+            const int n = static_cast<int>(dims[0]);
+            DeviceBuffer x = upload16(inputs[0]);
+            Tensor tx(x.p, DType::BF16, {n});
+            ops::lossless_round_fp16(tx, nullptr);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            got = download16(x, static_cast<std::size_t>(n));
             break;
         }
         default: std::cerr << "FAIL unknown op " << op << "\n"; return 1;

@@ -1,5 +1,4 @@
 #include "infernix/ops/hyper_connection.h"
-#include "infernix/ops/precise_linear.h"
 
 #include "ops/hyper_connection/hyper_connection_mix_fused.h"
 #include "ops/hyper_connection/hyper_connection_up_collapse.h"
@@ -271,35 +270,6 @@ void hyper_connection_mix(const Tensor& residual, const Tensor& norm_weight, con
     }
     Tensor u = workspace.alloc(DType::BF16, {up.n, T});
     linear(m, up, u, policy, workspace, stream);
-    hyper_connection_collapse(u, normalized, streams, x, stream);
-}
-
-void hyper_connection_mix_precise(const Tensor& residual, const Tensor& norm_weight, const Weight& down,
-                                  const Weight& up, std::int32_t streams, std::int32_t rank, float eps, Tensor& x,
-                                  Tensor* inject, WorkspaceArena& workspace, cudaStream_t stream) {
-    require(contiguous_2d(residual, DType::BF16) && contiguous_2d(x, DType::BF16) &&
-                (contiguous_2d(norm_weight, DType::BF16) || contiguous_2d(norm_weight, DType::FP32)) && streams > 0 &&
-                rank > 0,
-            "mix requires contiguous BF16 tensors and a BF16 or FP32 norm weight");
-    const std::int32_t T = residual.ne[1];
-    require(T > 0 && x.ne[1] == T && residual.ne[0] == streams * x.ne[0] && norm_weight.ne[0] == residual.ne[0] &&
-                down.k == residual.ne[0] && up.n == residual.ne[0] && up.k == rank &&
-                down.n == rank + (inject != nullptr ? streams : 0),
-            "mix shapes disagree");
-    if (inject != nullptr) {
-        require(contiguous_2d(*inject, DType::FP32) && inject->ne[0] == streams && inject->ne[1] == T,
-                "mix inject output must be FP32 [S, T]");
-    }
-    require(eps > 0, "mix epsilon must be positive");
-    auto scope        = workspace.scope();
-    Tensor normalized = workspace.alloc(DType::BF16, {residual.ne[0], T});
-    hyper_connection_norm(residual, norm_weight, streams, eps, normalized, stream);
-    Tensor z = workspace.alloc(DType::BF16, {down.n, T});
-    precise_linear(normalized, down, z, stream);
-    Tensor m = workspace.alloc(DType::BF16, {rank, T});
-    hyper_connection_gates(z, rank, streams, m, inject, stream);
-    Tensor u = workspace.alloc(DType::BF16, {up.n, T});
-    precise_linear(m, up, u, stream);
     hyper_connection_collapse(u, normalized, streams, x, stream);
 }
 

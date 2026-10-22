@@ -84,24 +84,12 @@ void validate(const EngineOptions& options) {
                     [](std::uint32_t nodes) { return nodes != 0; })) {
         throw std::invalid_argument("Qwen3.8-Flash-Next verifies chains: --draft-tree-nodes is not supported");
     }
-    // The reference route runs every linear and expert bank with 16-bit activations and computes
-    // them precisely (TextConfig::reference; docs/maintainer/model-quality.md §6.2): the quality
-    // reference, so causal scoring only, without fast paths.
-    if (options.reference && options.purpose != EnginePurpose::CausalScoring) {
-        throw std::invalid_argument("Qwen3.8-Flash-Next runs the reference route for causal scoring only");
-    }
-    if (options.reference && options.fast_paths) {
-        throw std::invalid_argument("the reference route runs no fast path: disable fast paths");
-    }
-    if (options.reference && !options.fast_path_candidates.empty()) {
-        throw std::invalid_argument("the reference route runs no fast path");
-    }
     // The lossless route (TextConfig::lossless; docs/maintainer/lossless-route.md §2a, §3a): every
     // operation correctly rounded; causal scoring takes each window in one call (its prefill chunk),
     // generation runs text through bf16 KV (V stored as BF16) without speculation.
     if (options.lossless) {
-        if (options.reference) { throw std::invalid_argument("the lossless and reference routes exclude each other"); }
-        if (options.fast_paths || !options.fast_path_candidates.empty() || options.expert_a4_activations) {
+        if (options.fast_paths || !options.fast_path_candidates.empty() ||
+            (options.expert_a4_activations && !options.reference)) {
             throw std::invalid_argument("the lossless route runs no fast path: disable fast paths");
         }
         if (options.purpose == EnginePurpose::CausalScoring && options.prefill_chunk < options.max_context) {
@@ -115,6 +103,10 @@ void validate(const EngineOptions& options) {
         if (options.purpose == EnginePurpose::Generation &&
             (options.kv_cache != KvCacheStorage::BFloat16 || options.expert_tail_skip != 0)) {
             throw std::invalid_argument("lossless generation takes bf16 KV and no --expert-tail-skip");
+        }
+        if (options.reference && options.kv_cache != KvCacheStorage::BFloat16) {
+            throw std::invalid_argument("the Qwen3.8-Flash-Next design reference scores with bf16 KV (its other KV "
+                                        "codecs are not implemented yet)");
         }
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {

@@ -28,7 +28,6 @@
 #include "infernix/ops/linear_swiglu.h"
 #include "infernix/ops/mtp_pack.h"
 #include "infernix/ops/position.h"
-#include "infernix/ops/precise_linear.h"
 #include "infernix/ops/residual_add.h"
 #include "infernix/ops/rmsnorm.h"
 #include "infernix/ops/rope.h"
@@ -976,24 +975,15 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     Tensor gate_flat = gate.view({dimension(config_.attention->query_width()), T});
     Tensor k_flat    = k.view({dimension(config_.attention->key_width()), T});
     Tensor v_flat    = v.view({dimension(config_.attention->key_width()), T});
-    const bool reference = execution_schedule_.reference;
-    if (reference && (ph != Phase::Prefill || active_sequence_batch_ != 0)) {
-        throw std::logic_error("the reference route scores prompts only");
-    }
     const auto* single = std::get_if<LinearParameters>(&p.projection);
-    if (!reference && single != nullptr &&
+    if (single != nullptr &&
         ops::attn_input_proj_fused_rmsnorm_nvfp4_eligible(single->weight, single->policy, T)) {
         ops::attn_input_proj_fused_rmsnorm_nvfp4(
             x, w.input_norm, config_.rms_norm_eps, single->weight, q_flat, gate_flat, k_flat,
             v_flat, single->policy, work_, s);
     } else {
         ops::rmsnorm(x, w.input_norm, config_.rms_norm_eps, true, h, s);
-        if (reference) {
-            attention_projection_reference(h, p, *config_.attention, q_flat, gate_flat, k_flat,
-                                           v_flat, s);
-        } else {
-            attention_projection(h, p, q_flat, gate_flat, k_flat, v_flat, work_, s);
-        }
+        attention_projection(h, p, q_flat, gate_flat, k_flat, v_flat, work_, s);
     }
 
     const auto results = workspace::text_attention_results(work_, config_, T);
@@ -1045,14 +1035,6 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
             text_kv_layer(static_cast<std::uint32_t>(fidx)),
             execution_schedule_.verify(*active_causal_attention_envelope_),
             work_, a_batch, ctx_.execution_view());
-    } else if (reference) {
-        ops::causal_softmax_attention_reference(
-            qn, kn, v, cache_positions, kv_table_rows,
-            {dimension(config_.attention->head_dim),
-             dimension(config_.attention->num_attention_heads),
-             dimension(config_.attention->num_key_value_heads)},
-            static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
-            text_kv_layer(static_cast<std::uint32_t>(fidx)), a, s);
     } else {
         ops::causal_softmax_attention(
             qn, kn, v, cache_positions, Tensor{}, kv_table_rows,
@@ -1066,11 +1048,6 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     }
     ops::sigmoid_mul(gate, a, s);
 
-    if (reference) {
-        ops::precise_linear_add(a.view({dimension(config_.attention->query_width()), T}),
-                                p.output.weight, x, s);
-        return;
-    }
     ops::linear_add(a.view({dimension(config_.attention->query_width()), T}), p.output.weight, x,
                     residual_projection_policy(
                         p.output, wide_residual_verification(ph, row_width(T), row_width(T))),
@@ -1081,21 +1058,13 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
     const auto& p  = std::get<GdnParameters>(w.mixer);
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
-    const bool reference = execution_schedule_.reference;
-    if (reference && ph != Phase::Prefill) {
-        throw std::logic_error("the reference route scores prompts only");
-    }
 
     const auto control = workspace::gdn_control(work_, config_, T);
     Tensor h           = control.hidden;
     Tensor g           = control.g;
     Tensor beta        = control.beta;
-    if (reference) {
-        gdn_norm_control_reference(x, w.input_norm, config_.rms_norm_eps, p, h, g, beta, s);
-    } else {
-        gdn_norm_control(x, w.input_norm, config_.rms_norm_eps, p, h, g, beta, work_,
-                         ctx_.execution_view());
-    }
+    gdn_norm_control(x, w.input_norm, config_.rms_norm_eps, p, h, g, beta, work_,
+                     ctx_.execution_view());
 
     const auto projection = workspace::gdn_projection(work_, config_, T);
     Tensor z  = projection.output_gate.view({dimension(config_.gdn->linear_value_head_dim),
@@ -1146,11 +1115,7 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
     } else {
         Tensor qkv    = workspace::gdn_prefill_conv(work_, config_, T);
         Tensor z_flat = z.view({dimension(config_.gdn->value_width()), T});
-        if (reference) {
-            gdn_projection_reference(h, p, qkv, z_flat, s);
-        } else {
-            gdn_projection(h, p, qkv, z_flat, work_, s);
-        }
+        gdn_projection(h, p, qkv, z_flat, work_, s);
         Tensor conv_state_in =
             state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_source_slot_);
         Tensor conv_state_out =
@@ -1230,11 +1195,6 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
                            dimension(config_.gdn->linear_num_value_heads), T});
     ops::gated_rmsnorm(o, p.norm, z, config_.rms_norm_eps, on, ctx_.execution_view());
 
-    if (reference) {
-        ops::precise_linear_add(on.view({dimension(config_.gdn->value_width()), T}), p.output.weight,
-                                x, s);
-        return;
-    }
     ops::linear_add(on.view({dimension(config_.gdn->value_width()), T}), p.output.weight, x,
                     residual_projection_policy(
                         p.output, wide_residual_verification(ph, row_width(T), row_width(T))),
@@ -1251,10 +1211,6 @@ void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase ph,
                            const ops::SparseMoeHints& hints) {
     Tensor h = workspace::post_mixer_hidden(work_, config_, x.ne[1]);
     ops::rmsnorm(x, weights.post_attention_norm, config_.rms_norm_eps, true, h, ctx_.stream);
-    if (execution_schedule_.reference) {
-        ffn_reference(h, weights.ffn, x, work_, ctx_.stream);
-        return;
-    }
     const std::int32_t width = row_width(x.ne[1]);
     ffn(h, weights.ffn, x, hints, work_, ctx_.execution_view(), false,
         wide_residual_verification(ph, width, width), execution_schedule_.linear_routes,
@@ -1333,7 +1289,7 @@ void TextContext::run_lossless_layers(Tensor& x, const Tensor& rope_table, Lossl
         auto scope = work_.scope();
         try {
             lossless_layer(parameters_.text.layers[layer], config_, config_.layer_types[layer], rope_table, x, work_,
-                           s, cache);
+                           s, cache, execution_schedule_.lossless_design);
         } catch (const std::exception& error) {
             throw std::runtime_error("text/layers/" + std::to_string(layer) +
                                      " lossless columns=" + std::to_string(x.ne[1]) + ": " + error.what());

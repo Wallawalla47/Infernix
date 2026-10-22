@@ -16,6 +16,7 @@
 #include "infernix/ops/hyper_connection.h"
 #include "infernix/ops/lossless_linear.h"
 #include "infernix/ops/lossless_ops.h"
+#include "infernix/ops/lossless_quantize.h"
 #include "infernix/ops/rows.h"
 
 #include <algorithm>
@@ -300,6 +301,8 @@ Tensor Forward::lossless_attention_block(const AttentionParameters& p, const Ten
     }
     Tensor out = work_.alloc(DType::BF16, {D, heads, T});
     const DeviceSpan attention_ws = work_.alloc_bytes(ops::lossless_attention_workspace_bytes(heads, kv_heads, T));
+    // The design reference's bf16 KV stores V as FP16 (exact in BF16 again).
+    if (config_.design_reference) { ops::lossless_round_fp16(v, s); }
     ops::lossless_attention(qn, kn, v, out, attention_ws.data, s, select, words, ratio);
     Tensor gated = work_.alloc(DType::BF16, {QW, T});
     ops::lossless_sigmoid_mul(out.view({QW, T}), gate, gated, s);
@@ -415,6 +418,9 @@ Tensor Forward::lossless_moe(const MoeParameters& p, const Tensor& x, std::uint3
     source.cpu       = ops::MoeCpuChannel{};
     source.scales    = p.lossless_scales;
     source.wide_a16  = ops::offloaded_moe::WideA16::kLossless;
+    // The design reference: a W4A4 bank's experts quantize their inputs (lossless_scales then carry the
+    // input scales beside the weights' multipliers).
+    source.lossless_design = p.lossless_design;
     Tensor outputs   = work_.alloc(DType::BF16, {H, K * T});
     const std::int32_t max_jobs = std::min(E, K * T);
     const DeviceSpan expert_ws  = work_.alloc_bytes(ops::moe_experts_workspace_bytes(

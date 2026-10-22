@@ -9,8 +9,7 @@ and the 64 most probable tokens of every target position, their log-probabilitie
 own log-probability are written in the tool's top-token reference format (version 1, the same
 header, windows and fingerprints). Scoring any route with ``--kl-reference fp64.top`` then reports
 its KL divergence from the FP64 evaluation and its top-1 agreement exactly as the gates measure
-them (docs/maintainer/model-quality.md §6.2, the reference's acceptance check: the reference route
-must be closer to this evaluation than the exact route).
+them (docs/maintainer/model-quality.md §6).
 """
 
 from __future__ import annotations

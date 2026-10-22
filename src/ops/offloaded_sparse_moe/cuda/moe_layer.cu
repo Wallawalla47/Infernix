@@ -21,9 +21,8 @@
 #include "ops/ggml/ggml_tile.cuh"
 #include "ops/fp8_block/fp8_exact.h"
 #include "ops/offloaded_sparse_moe/cuda/wide_expert.h"
-#include "ops/precise/precise_decode.cuh"
-#include "ops/precise/precise_dot.cuh"
 #include "infernix/ops/lossless_linear.h"
+#include "infernix/ops/lossless_quantize.h"
 #include "ops/lossless/cr_math.cuh"
 
 #include <cuda_bf16.h>
@@ -1260,22 +1259,16 @@ void launch_expert_pass_a16(const bf16* x, const MoeDispatch& dispatch, const Mo
 
 #include "ops/offloaded_sparse_moe/cuda/ggml_expert.cuh"
 #include "ops/offloaded_sparse_moe/cuda/fp8_expert.cuh"
-#include "ops/offloaded_sparse_moe/cuda/precise_expert.cuh"
 #include "ops/offloaded_sparse_moe/cuda/lossless_expert.cuh"
 
 // One pass of the narrow kernels in the source's arithmetic, for a call of `columns` columns. W4A4
 // jobs of any width take the one-column kernels (one pass per column over the staged weights); W4A16
 // jobs take them in calls of at most kA16OneColumnCalls columns, else the multi-column kernels. A GGUF
-// import's or block-FP8 bank runs its own exact kernels. The reference route (kPrecise) computes every
-// job of every bank and width with its own kernels.
+// import's or block-FP8 bank runs its own exact kernels.
 void launch_pass(int columns, const bf16* x, const MoeDispatch& dispatch, const MoeExpertSource& source, int top_k,
                  const std::uint8_t* const* job_records, const std::int32_t* flags, int base, int jobs,
                  const moe::wide::ExpertsWorkspace& layout, int columns_out, bf16* outputs, cudaStream_t stream,
                  PassPhase phase = PassPhase::All) {
-    if (source.wide_a16 == moe::WideA16::kPrecise) {
-        launch_pass_precise(x, dispatch, source, top_k, job_records, flags, base, jobs, layout, outputs, stream, phase);
-        return;
-    }
     // Wide calls (more than kMaxColumns columns) were planned by moe_experts.
     const bool wide = columns_out / top_k > moe::kMaxColumns;
     if (source.ggml.gate_up_format == QType::FP8_E4M3FN_B128) {
@@ -1958,9 +1951,8 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
         lossless_experts(x, dispatch, source, top_k, max_jobs, layout, fetch, outputs, stream);
         return;
     }
-    const bool precise        = source.wide_a16 == moe::WideA16::kPrecise; // reads x and h as stored
     // A ggml bank's gate/up kernels read every token's x limbs, encoded once here, before any fork.
-    if (ggml && !precise) {
+    if (ggml) {
         launch_encode_x_ggml(x, layout, stream);
         if (x.ne[1] > moe::kMaxColumns) { launch_plan_ggml(dispatch, max_jobs, layout, stream); }
     }
@@ -1969,7 +1961,7 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
     const int half      = source.staging_slots / 2;
     // In a call of more than eight columns, experts with more than eight take the wide route, pass
     // by pass once each pass's records are resolved; it is planned and x quantized before the passes.
-    const bool use_wide = !ggml && !precise && x.ne[1] > moe::kMaxColumns && !forked(source, max_jobs, x.ne[1]);
+    const bool use_wide = !ggml && x.ne[1] > moe::kMaxColumns && !forked(source, max_jobs, x.ne[1]);
     // The staging overlap is not combined with the wide route: in the Program, overlapped calls with
     // wide experts gave run-to-run differences (prefix-cache exactness failures, varying greedy ids;
     // design §19.3.8, "F1 nondeterminism") that serial passes do not; the cause is not identified.
@@ -2044,12 +2036,7 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
 namespace offloaded_moe::wide {
 
 std::size_t lossless_experts_bytes(std::int32_t max_jobs, std::int32_t entries) {
-    const auto tiles = static_cast<std::size_t>(lossless_max_tiles(max_jobs, entries));
-    const auto chunk = static_cast<std::size_t>(kLosslessChunkColumns);
-    const auto r256  = [](std::size_t b) { return (b + 255) / 256 * 256; };
-    return r256((static_cast<std::size_t>(max_jobs) + 1) * 4) + r256(tiles * 12) + 2 * r256(tiles * sizeof(LosslessTile)) +
-           2 * r256(tiles * 256) + r256(2 * static_cast<std::size_t>(kIntermediate) * chunk * 2) +
-           r256(static_cast<std::size_t>(kIntermediate) * chunk * 2) + r256(lossless_linear_bytes());
+    return carve_lossless(nullptr, max_jobs, entries).bytes;
 }
 
 } // namespace offloaded_moe::wide

@@ -1,14 +1,14 @@
 // End-to-end decode quality, judge half. Scores the greedy continuations that
 // infernix_decode_quality_gen wrote, for any number of builds, with one reference: a CausalScoring
-// Engine on the reference route (EngineOptions::reference), BF16 KV, and each sequence in one
+// Engine on the lossless route (EngineOptions::lossless), BF16 KV, and each sequence in one
 // prefill pass. Each build is judged on its own prefixes, so builds whose
 // continuations diverge are still compared fairly. Per build it reports how often the generated
 // token is the reference's most probable token, the mean reference log-probability of the
 // generated tokens, and the mean regret (top log-probability minus the generated token's); per
 // pair of builds, the generated prefix they share exactly.
 //
-// --stored-activations scores on the exact route with the activations the artifact records instead
-// (every other condition the same): it isolates what decoding changes (KV format, chunking,
+// --stored-activations scores on the reproducible route with the activations the artifact records
+// instead (every other condition the same): it isolates what decoding changes (KV format, chunking,
 // speculation, batching) but not the cost of the stored activation precision itself.
 //
 // --report FILE also writes each build's per-segment counts as JSON (segments are independent
@@ -111,8 +111,8 @@ int main(int argc, char** argv) {
         options.max_context     = context;
         options.prefill_chunk   = context;
         options.kv_cache        = infernix::KvCacheStorage::BFloat16;
-        options.reference       = !stored;
-        // The reference runs the exact route.
+        options.lossless        = !stored;
+        // Neither reference runs a fast path.
         options.fast_paths      = false;
         if (!ngram_volume.empty()) { options.ngram_volume_path = ngram_volume; }
         infernix::Engine engine(options);
@@ -192,7 +192,7 @@ int main(int argc, char** argv) {
             std::ofstream report(report_path);
             if (!report) { throw std::runtime_error("cannot write " + report_path); }
             report << std::setprecision(17) << "{\"reference\": \""
-                   << (stored ? "stored_activations" : "reference")
+                   << (stored ? "stored_activations" : "lossless")
                    << "\", \"runs\": [";
             for (std::size_t run = 0; run < runs.size(); ++run) {
                 // Generation files are paths the user chose; JSON-escape the two characters a

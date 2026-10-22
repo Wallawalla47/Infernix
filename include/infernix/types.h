@@ -555,14 +555,6 @@ struct EngineOptions {
     // (block-scaled FP4 QK). True selects the tiled NVFP4 prompt kernel; it requires the NVFP4
     // KV cache.
     bool original_nvfp4_prefill_kernel = false;
-    // The quality reference's route (docs/maintainer/model-quality.md section 6.2; infernix-perplexity
-    // --reference, the decode-quality tools). Same weights, no activation quantization: every linear
-    // computes with 16-bit activations. Qwen3.8-Flash-Next (causal scoring only) also computes every
-    // projection, expert, GDN recurrence and attention precisely between the exact route's BF16
-    // boundaries (weights decoded exactly, binary64 or FP32 sums, one rounding each), on the GPU; it
-    // is many times slower than the exact route. Qwen3.5 keeps its exact kernels with 16-bit
-    // activations. On the Qwen3.8-27B NVFP4 artifacts prefill is at least 3x slower.
-    bool reference                     = false;
     // The lossless route (--lossless; docs/maintainer/lossless-route.md), the quality gates'
     // reference on Qwen3.5/3.6/3.8 (Qwen3_5ForCausalLM and Qwen3_5MoeForCausalLM): the model's
     // Hugging Face forward operation by operation, each correctly rounded to the dtype it has
@@ -572,17 +564,24 @@ struct EngineOptions {
     // (Qwen3.5/3.6/3.8 and Qwen3.8-Flash-Next) takes text requests with bf16 KV (V stored as BF16) and
     // no speculation.
     bool lossless                      = false;
+    // The design reference (--reference; docs/maintainer/lossless-route.md §3b), the quality gate's second
+    // reference: the lossless route (it requires `lossless`) with the configuration's declared lossy steps
+    // applied exactly: each projection input's activation quantization that its artifact's Use permits (and
+    // a routed-expert bank's W4A4, FP4-Local's with expert_a4_activations), and the KV format's codec.
+    // CausalScoring only; its output is a function of the request, the artifact and those steps.
+    bool reference                     = false;
     // Qwen3.8-Flash-Next artifacts whose routed experts offer 4-bit activations as an option (only
     // nvidia/Qwen3.8-Flash-Next-FP4-Local, whose experts NVIDIA calibrated for them): run the routed
     // experts W4A4 with their stored activation scales (--expert-a4-activations) instead of the
-    // default 16-bit activations. Other artifacts refuse it, as does the reference route.
+    // default 16-bit activations. Other artifacts refuse it, as does the lossless route without the
+    // design reference.
     bool expert_a4_activations         = false;
     // Run every fast path qualified for this configuration (model geometry, activation precision
     // and KV format): routes whose arithmetic differs from the reproducible route but whose measured cost
     // stays within Infernix's numerical acceptance policy (docs/maintainer/model-quality.md
     // section 6; the registry is 6.7). LoadSummary::fast_paths reports the selection. False
     // (--reproducible) runs the reproducible route, which is bit-exact from release to release; the
-    // reference route (`reference`) requires it.
+    // lossless route (`lossless`) requires it.
     bool fast_paths                    = true;
     // Qualification only (the quality tools, never a product route): also run these fast paths
     // whether or not they are qualified for this configuration, so their cost can be measured.

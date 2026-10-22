@@ -62,8 +62,8 @@ struct Options {
     bool quick                          = false;
     bool original_int8_prefill_kernel   = false;
     bool original_nvfp4_prefill_kernel  = false;
-    bool reference                      = false;
     bool lossless                       = false;
+    bool reference                      = false; // the design reference (with lossless)
     bool expert_a4_activations          = false;
     bool fast_paths                     = true;
     std::vector<infernix::FastPath> fast_path_candidates;
@@ -81,13 +81,12 @@ std::string usage_text() {
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2] (default fp8)\n"
            "       [--use-original-int8-prefill-kernel (int8 only; default fast kernel)]\n"
            "       [--use-original-nvfp4-prefill-kernel (nvfp4 only; default fast kernel)]\n"
-           "       [--reference] (the quality reference's route, no fast path, BF16 KV: every\n"
-           "        projection, expert, recurrence and attention computed precisely between\n"
-           "        the model's BF16 boundaries; many times slower)\n"
            "       [--lossless] (Qwen3.5/3.6/3.8 and Qwen3.8-Flash-Next: the quality reference's\n"
-           "        route, every operation of\n"
-           "        the model correctly rounded; no fast path, one pass per window: give\n"
-           "        --prefill-chunk the context; FP32 logits)\n"
+           "        route, every operation of the model correctly rounded; no fast path, one\n"
+           "        pass per window: give --prefill-chunk the context; FP32 logits)\n"
+           "       [--reference] (the design reference: --lossless with the configuration's declared\n"
+           "        steps applied exactly, the activation quantization its artifact permits and\n"
+           "        the --kv-dtype's codec; implies --lossless)\n"
            "       [--expert-a4-activations] (nvidia/Qwen3.8-Flash-Next-FP4-Local only: routed\n"
            "        experts with 4-bit activations, using the activation scales NVIDIA\n"
            "        calibrated for them; default 16-bit)\n"
@@ -157,10 +156,11 @@ Options parse_options(int argc, char** argv) {
             out.original_int8_prefill_kernel = true;
         } else if (option == "--use-original-nvfp4-prefill-kernel") {
             out.original_nvfp4_prefill_kernel = true;
-        } else if (option == "--reference") {
-            out.reference = true;
         } else if (option == "--lossless") {
             out.lossless = true;
+        } else if (option == "--reference") {
+            out.lossless  = true;
+            out.reference = true;
         } else if (option == "--expert-a4-activations") {
             out.expert_a4_activations = true;
         } else if (option == "--ngram-volume") {
@@ -310,11 +310,11 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.kv_cache         = options.kv;
     engine_options.original_int8_prefill_kernel = options.original_int8_prefill_kernel;
     engine_options.original_nvfp4_prefill_kernel = options.original_nvfp4_prefill_kernel;
-    engine_options.reference                     = options.reference;
     engine_options.lossless                      = options.lossless;
+    engine_options.reference                     = options.reference;
     engine_options.expert_a4_activations         = options.expert_a4_activations;
-    // The reference and lossless routes run no fast path.
-    engine_options.fast_paths           = options.fast_paths && !options.reference && !options.lossless;
+    // The lossless route runs no fast path.
+    engine_options.fast_paths           = options.fast_paths && !options.lossless;
     engine_options.fast_path_candidates = options.fast_path_candidates;
     if (options.ngram_volume) { engine_options.ngram_volume_path = *options.ngram_volume; }
     engine_options.expert_stripe_path   = options.expert_stripe;
@@ -599,6 +599,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
           {"rope_yarn_factor", options.rope_yarn_factor},
           {"original_int8_prefill_kernel", options.original_int8_prefill_kernel},
           {"original_nvfp4_prefill_kernel", options.original_nvfp4_prefill_kernel},
+          {"lossless", options.lossless},
           {"reference", options.reference},
           {"expert_a4_activations", options.expert_a4_activations},
           {"fast_paths", load.fast_paths},

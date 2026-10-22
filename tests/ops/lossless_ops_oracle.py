@@ -7,6 +7,7 @@ intermediate rounded to the dtype the specification gives it. Standard library o
 """
 from __future__ import annotations
 
+import itertools
 import math
 import random
 import struct
@@ -22,7 +23,8 @@ import lossless_cr_oracle as cr  # noqa: E402
 (RMSNORM, RMSNORM_GATED, ADD, SILU_MUL, SIGMOID_MUL, GDN_GATES, CAUSAL_CONV, ATTENTION, DELTA_RULE, ROPE, ROUTER,
  MOE_COMBINE, MOE_ROUTE, RMSNORM_GROUPED, RMSNORM_GATED_SIGMOID, HC_GATES, HC_MIX, HC_INJECT, PLE_GATE, PLE_CONV,
  QSA_POOL, QSA_SELECT, ATTENTION_SELECT, ROUTER_BF16, MOE_COMBINE_ENTRIES, CONV_SLOTS, DELTA_RULE_SLOTS, ATTENTION_PAGED,
- PLE_CONV_SLOTS, QSA_CACHE, QSA_SELECT_POSITIONS, ATTENTION_PAGED_SELECT) = range(32)
+ PLE_CONV_SLOTS, QSA_CACHE, QSA_SELECT_POSITIONS, ATTENTION_PAGED_SELECT, QUANTIZE_NVFP4, QUANTIZE_NVFP4_SCALED,
+ QUANTIZE_FP8_TOKEN, ROUND_FP16) = range(36)
 
 
 def bf16_value(bits: int) -> Fraction:
@@ -889,11 +891,170 @@ def attention(q, k, v, heads, kv_heads, cols, select=None, ratio=0):
     return out
 
 
+# ----------------------------------------------------------------- the design reference's quantizers
+# (lossless_quantize.h; docs/maintainer/lossless-route.md §3b): the reproducible route's rules, each FP32
+# operation rounded once, E4M3 and E2M1 rounded to nearest even and saturated (cvt.rn.satfinite).
+
+
+def round_half_even(q: Fraction) -> int:
+    n = q.numerator // q.denominator
+    r = q - n
+    if r > Fraction(1, 2) or (r == Fraction(1, 2) and n % 2 == 1):
+        n += 1
+    return n
+
+
+def e4m3_magnitude(a: Fraction) -> Fraction:
+    """The E4M3FN value of a non-negative a: subnormals in steps of 2^-9, three mantissa bits, 448 at most."""
+    if a >= 448:
+        return Fraction(448)
+    if a < Fraction(1, 64):
+        return Fraction(round_half_even(a * 512), 512)
+    e = a.numerator.bit_length() - a.denominator.bit_length()
+    if Fraction(2) ** e > a:
+        e -= 1
+    while Fraction(2) ** (e + 1) <= a:
+        e += 1
+    step = Fraction(2) ** (e - 3)
+    return min(Fraction(448), round_half_even(a / step) * step)
+
+
+def e2m1_magnitude(a: Fraction) -> Fraction:
+    """The E2M1 value of a non-negative a ({0, .5, 1, 1.5, 2, 3, 4, 6}; ties to the even code, 6 at most)."""
+    for limit, value, inclusive in ((Fraction(1, 4), 0, True), (Fraction(3, 4), Fraction(1, 2), False),
+                                    (Fraction(5, 4), 1, True), (Fraction(7, 4), Fraction(3, 2), False),
+                                    (Fraction(5, 2), 2, True), (Fraction(7, 2), 3, False), (Fraction(5), 4, True)):
+        if a < limit or (inclusive and a == limit):
+            return Fraction(value)
+    return Fraction(6)
+
+
+def bf16_signed(value: Fraction, negative: bool) -> int:
+    """BF16 bits of a value exact in BF16, -0 when negative and zero."""
+    bits = round_fraction(abs(value), 8)
+    return bits | (0x8000 if negative else 0)
+
+
+def nvfp4_divisor_block(xs: list[int], divisor: Fraction) -> list[int]:
+    """quantize_nvfp4_k16 (the divisor form) on 16 BF16 values: c e4m3(w) each."""
+    vs = [bf16_value(x) for x in xs]
+    amax = max(abs(v) for v in vs)
+    w = e4m3_magnitude(f32_of(f32_of(divisor * amax) / 6))
+    if w == 0:
+        return [0] * 16
+    out = []
+    for x, v in zip(xs, vs):
+        q = f32_of(f32_of(v * divisor) / w)
+        out.append(bf16_signed(e2m1_magnitude(abs(q)) * w, (x >> 15) != 0))
+    return out
+
+
+def nvfp4_scaled_block(xs: list[int], g: Fraction) -> list[int]:
+    """quantize_a4_codes (ModelOpt's rule) on 16 BF16 values with the input scale g: c e4m3(s) each (a code
+    whose magnitude rounds to zero gives +0: the doubled-value form carries no sign for zero)."""
+    vs = [bf16_value(x) for x in xs]
+    amax = max(abs(v) for v in vs)
+    s = e4m3_magnitude(f32_of(amax / f32_of(6 * g)))
+    if s == 0:
+        return [0] * 16
+    d = f32_of(s * g)
+    out = []
+    for v in vs:
+        c = e2m1_magnitude(abs(f32_of(v / d)))
+        out.append(bf16_signed(c * s, v < 0 and c != 0))
+    return out
+
+
+def fp8_token_column(xs: list[int]) -> tuple[list[int], int]:
+    """fp8_a8's per-token rule: the E4M3 values (BF16 bits) and the scale's FP32 bits."""
+    vs = [bf16_value(x) for x in xs]
+    amax = max(abs(v) for v in vs)
+    s = f32_of(amax / 448) if amax > 0 else Fraction(0)
+    inv = f32_of(1 / s) if s > 0 else Fraction(0)
+    out = []
+    for x, v in zip(xs, vs):
+        scaled = f32_of(v * inv)
+        out.append(bf16_signed(e4m3_magnitude(abs(scaled)), (x >> 15) != 0))
+    return out, round_fraction(s, 24)
+
+
+def fp16_round_bits(x: int) -> int:
+    """BF16 -> FP16 (round to nearest even, subnormals, infinity from 65520) -> BF16 bits."""
+    v = bf16_value(x)
+    negative = (x >> 15) != 0
+    a = abs(v)
+    if a >= 65520:
+        return 0xFF80 if negative else 0x7F80
+    if a < Fraction(1, 2 ** 14):
+        r = Fraction(round_half_even(a * 2 ** 24), 2 ** 24)
+    else:
+        e = a.numerator.bit_length() - a.denominator.bit_length()
+        if Fraction(2) ** e > a:
+            e -= 1
+        while Fraction(2) ** (e + 1) <= a:
+            e += 1
+        step = Fraction(2) ** (e - 10)
+        r = round_half_even(a / step) * step
+    return bf16_signed(r, negative)
+
+
+def quantize_cases(rng: random.Random):
+    # The NVFP4 divisor rule: blocks of mixed magnitudes, a zero block, a block whose scale rounds to zero,
+    # tiny negatives, a saturating block (amax D / 6 above 448).
+    k, cols = 256, 24
+    xs = [random_bf16(rng, 10) for _ in range(k * cols)]
+    for i in range(16):
+        xs[i] = 0
+        xs[16 + i] = f32_bits(rng.gauss(0.0, 1.0) * 2.0 ** -40) >> 16
+        xs[32 + i] = f32_bits(-abs(rng.gauss(0.0, 1.0)) * 2.0 ** -12) >> 16 if i % 2 else xs[32 + i]
+        xs[48 + i] = f32_bits(rng.gauss(0.0, 1.0) * 2.0 ** 20) >> 16
+    for divisor_f in (1.0, 0.0371, 2741.5):
+        divisor = f32_value(f32_bits(divisor_f))
+        expected = []
+        for b in range(0, k * cols, 16):
+            expected += nvfp4_divisor_block(xs[b:b + 16], divisor)
+        yield QUANTIZE_NVFP4, [k, cols, f32_bits(divisor_f)], [xs], expected
+    # ModelOpt's rule, each output column with its own scale and source column (some -1: zero columns).
+    k, src, cols = 512, 20, 64
+    xs = [random_bf16(rng, 8) for _ in range(k * src)]
+    for i in range(16):
+        xs[i] = 0
+    in_columns = [(c * 7) % src if c % 9 != 4 else 0xFFFFFFFF for c in range(cols)]
+    scales_f = [abs(rng.gauss(0.0, 0.02)) + 1e-6 for _ in range(cols)]
+    scales = [f32_bits(s) for s in scales_f]
+    expected = []
+    for c in range(cols):
+        source = in_columns[c]
+        if source == 0xFFFFFFFF:
+            expected += [0] * k
+            continue
+        col = xs[source * k:(source + 1) * k]
+        g = f32_value(scales[c])
+        for b in range(0, k, 16):
+            expected += nvfp4_scaled_block(col[b:b + 16], g)
+    yield QUANTIZE_NVFP4_SCALED, [k, src, cols], [xs, in_columns, scales], expected
+    # The per-token E4M3 rule: K 5120, columns of different spreads and a zero column.
+    k, cols = 5120, 6
+    xs = [random_bf16(rng, 6 + 6 * (i // 5120)) for i in range(k * cols)]
+    for i in range(k):
+        xs[3 * k + i] = 0
+    values, scale_bits = [], []
+    for c in range(cols):
+        out, s = fp8_token_column(xs[c * k:(c + 1) * k])
+        values += out
+        scale_bits.append(s)
+    yield QUANTIZE_FP8_TOKEN, [k, cols], [xs], values + scale_bits
+    # FP16 storage of BF16 values: normal, subnormal, below the subnormals and overflowing magnitudes.
+    n = 20000
+    xs = [random_bf16(rng, 60) for _ in range(n)]
+    yield ROUND_FP16, [n], [xs], [fp16_round_bits(x) for x in xs]
+
+
 def write_cases(path: Path) -> None:
     rng = random.Random(20261021)
     count = 0
     with path.open("wb") as f:
-        for op, dims, inputs, expected in cases(rng):
+        for op, dims, inputs, expected in itertools.chain(cases(rng), quantize_cases(rng)):
             write_u32(f, [op, len(dims)] + dims + [len(inputs)] + [len(v) for v in inputs] + [len(expected)])
             for v in inputs:
                 write_u32(f, v)

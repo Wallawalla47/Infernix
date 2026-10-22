@@ -202,21 +202,6 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               Tensor& out, DeviceExecutionView execution);
 
 /**
- * The reference route's form of the append-and-attend Op above (docs/maintainer/model-quality.md
- * 6.2): one sequence (table row kv_table_rows[0]) over BF16 KV storage, D = 256, 2 or 4 KV heads;
- * q/out contiguous BF16 [256,Hq,T], k/v contiguous BF16 [256,Hkv,T], positions contiguous device I32
- * [T]. The call's k and v are appended as kv_cache_append_batch stores them (K BF16, V FP16), then
- * column t attends the cache rows [0, positions[t]] in FP32: scores q.k * scale from the exact BF16
- * products, a running-maximum softmax and P x V over the FP16 values, rounded once to BF16. A
- * column's bits depend only on its own query and keys, whatever T. It runs on CUDA cores, many
- * times slower than the production routes; no workspace.
- */
-void causal_softmax_attention_reference(const Tensor& q, const Tensor& k, const Tensor& v,
-                                        const Tensor& positions, const Tensor& kv_table_rows,
-                                        AttentionHeadGeometry geometry, float scale,
-                                        PagedKVBatchLayerView cache, Tensor& out, cudaStream_t stream);
-
-/**
  * Speculative verification-tree form of the append-and-attend Op above, for every KV storage.
  *
  * tree_masks is either empty (the causal Op above) or contiguous device I32 [W,B], 2<=W<=32,

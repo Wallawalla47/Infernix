@@ -58,14 +58,17 @@ enum class ExpertActivation : std::uint8_t { kA4, kA16 };
 // order, not only on the weights; kA4Residual3, the same with three terms (the third encodes what two
 // left: more precise, slower); kGgmlBf16 (GGUF banks, the ggml-bf16-prefill fast path), BF16 tiles over
 // each expert's decoded planes with x and h as stored and FP32 sums (ops/ggml/ggml_bf16_tile.cuh).
-// Every other bank ignores the value it does not name. kPrecise (every A16 bank, every column count,
-// GPU only) is the reference route (docs/maintainer/model-quality.md §6.2): exactly decoded weights,
-// x and h as stored, binary64 sums in ascending k, one rounding at each of the exact route's BF16
-// boundaries (y_gate, y_up, h, y). kLossless (every bank, A4 banks too, GPU only) is the --lossless
-// route (docs/maintainer/lossless-route.md): x as stored times each weight's exact value (an NVFP4 bank's
-// multipliers in ExpertScales::alpha_*), every projection's exact sum correctly rounded to BF16,
-// h = bf16(bf16(silu(y_gate)) y_up) (ops::lossless_linear_tiles).
-enum class WideA16 : std::uint8_t { kExact, kA4Residual, kA4Residual3, kGgmlBf16, kPrecise, kLossless };
+// Every other bank ignores the value it does not name. kLossless (every bank, A4 banks too, GPU only)
+// is the --lossless route (docs/maintainer/lossless-route.md): x as stored times each weight's exact
+// value (an NVFP4 bank's multipliers in ExpertScales::alpha_*), every projection's exact sum correctly
+// rounded to BF16, h = bf16(bf16(silu(y_gate)) y_up) (ops::lossless_linear_tiles).
+enum class WideA16 : std::uint8_t { kExact, kA4Residual, kA4Residual3, kGgmlBf16, kLossless };
+
+// The design reference's routed-expert activations (kLossless only; docs/maintainer/lossless-route.md §3b):
+// none (the lossless route's x as stored), or a W4A4 bank's declared A4 inputs, each column quantized with
+// its expert's input scales (ExpertScales::input_*, beside the weights' multipliers in alpha_*): one x for
+// the gate and up rows when every expert's two scales are equal, else one per scale (kA4SeparateUp).
+enum class LosslessExpertDesign : std::uint8_t { kNone, kA4, kA4SeparateUp };
 
 enum class CpuIsa { kScalar, kAvx2, kAvxVnni, kAvx512Vnni };
 

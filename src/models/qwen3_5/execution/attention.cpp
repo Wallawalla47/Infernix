@@ -1,8 +1,6 @@
 #include "models/qwen3_5/execution/attention.h"
 
-#include "core/layout.h"
 #include "infernix/ops/attn_input_proj.h"
-#include "infernix/ops/precise_linear.h"
 #include "infernix/ops/rmsnorm.h"
 #include "infernix/ops/rmsnorm_rope.h"
 #include "infernix/ops/rope.h"
@@ -70,27 +68,6 @@ void attention_projection(const Tensor& hidden, const AttentionParameters& param
         ops::attn_input_proj(hidden, single.weight, query, gate, key, value, single.policy,
                              workspace, stream);
     }
-}
-
-void attention_projection_reference(const Tensor& hidden, const AttentionParameters& parameters,
-                                    const AttentionConfig& config, Tensor& query, Tensor& gate,
-                                    Tensor& key, Tensor& value, cudaStream_t stream) {
-    const auto q = dimension(config.query_width());
-    const auto k = dimension(config.key_width());
-    if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection)) {
-        // [query, key] and [output gate, value].
-        ops::precise_linear_rows(hidden, pair->first, 0, q, query, 0, stream);
-        ops::precise_linear_rows(hidden, pair->first, q, k, key, 0, stream);
-        ops::precise_linear_rows(hidden, pair->second, 0, q, gate, 0, stream);
-        ops::precise_linear_rows(hidden, pair->second, q, k, value, 0, stream);
-        return;
-    }
-    // One parent in physical order query, key, output gate, value.
-    const Weight& w = std::get<LinearParameters>(parameters.projection).weight;
-    ops::precise_linear_rows(hidden, w, 0, q, query, 0, stream);
-    ops::precise_linear_rows(hidden, w, q, k, key, 0, stream);
-    ops::precise_linear_rows(hidden, w, q + k, q, gate, 0, stream);
-    ops::precise_linear_rows(hidden, w, 2 * q + k, k, value, 0, stream);
 }
 
 void text_rope(const Tensor& positions, const RopeConfig& config, const ops::PreparedRope& prepared,

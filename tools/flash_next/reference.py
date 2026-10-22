@@ -20,11 +20,11 @@ artifact or converter:
 ``--bf16-boundaries`` (default on) rounds the activations that deployed BF16 runtimes store in
 BF16 -- the residual streams, every block input and output -- so differences against Infernix are
 kernel arithmetic, not storage precision. ``--reference-points`` also rounds at every other point
-where Infernix's reference route (docs/maintainer/model-quality.md §6.2) stores a BF16 activation:
+where Infernix's composed (unfused) kernels store a BF16 activation:
 each projection's output, the hyper-connection's z, m and u, the GDN convolution and recurrence
 outputs and its gated norm, the QSA normalized and rotated q and k, attention output and gate, and
-the shared expert's h and output; with it, the route's remaining error against this evaluation is
-its arithmetic between those points. QSA selection is evaluated exactly; for prompts up to
+the shared expert's h and output; with it, a route that keeps those points differs from this
+evaluation only by its arithmetic between them. QSA selection is evaluated exactly; for prompts up to
 ``indexer_budget + compress_ratio - 1`` tokens every token is selected and QSA equals causal
 attention, which the script checks.
 """
@@ -202,7 +202,7 @@ class Reference:
         self.H = int(self.c["hidden_size"])
         self.experts = Experts(self.w, a16=a16_experts)
         self.round = bf16 if bf16_boundaries else (lambda x: x)
-        # The reference route's other BF16 points (see the module docstring).
+        # The composed kernels' other BF16 points (see the module docstring).
         self.point = bf16 if reference_points else (lambda x: x)
         rope = self.c["rope_parameters"]
         self.theta = float(rope["rope_theta"])
@@ -458,7 +458,7 @@ def main() -> int:
     parser.add_argument("--layers", type=int, help="stop after this many layers (no logits)")
     parser.add_argument("--no-bf16-boundaries", action="store_true")
     parser.add_argument("--reference-points", action="store_true",
-                        help="also round at the reference route's BF16 points (module docstring)")
+                        help="also round at the composed kernels' BF16 points (module docstring)")
     parser.add_argument("--a16-experts", action="store_true", help="16-bit expert activations for every bank")
     parser.add_argument("--threads", type=int, default=0)
     parser.add_argument("--out", type=Path, required=True)

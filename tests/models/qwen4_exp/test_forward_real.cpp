@@ -24,8 +24,7 @@
 // scored (long texts: the logits of every position would not fit on disk). Several such texts are
 // scored in order with one model load. --rope-yarn-factor F, anywhere, loads the model with that text
 // YaRN factor (contexts up to the native positions times F); --expert-a4-activations, anywhere, runs
-// nvidia/Qwen3.8-Flash-Next-FP4-Local's routed experts with 4-bit activations; --reference, anywhere,
-// runs the reference route (docs/maintainer/model-quality.md §6.2) with --dump-logits or --blocks; and
+// nvidia/Qwen3.8-Flash-Next-FP4-Local's routed experts with 4-bit activations; and
 // --stream-experts, anywhere, leaves the expert banks in the artifact and reads each layer's records
 // into a pinned buffer before the layer runs (artifacts whose experts exceed the pinned ceiling, such
 // as the FP8 import; not with --cpu-columns).
@@ -682,9 +681,8 @@ int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     try {
         std::vector<Job> jobs;
-        // Anywhere: --rope-yarn-factor F (the model's YaRN factor), --expert-a4-activations (NVIDIA
-        // FP4-Local's optional 4-bit expert activations) and --reference (the reference route,
-        // TextConfig::reference).
+        // Anywhere: --rope-yarn-factor F (the model's YaRN factor) and --expert-a4-activations (NVIDIA
+        // FP4-Local's optional 4-bit expert activations).
         models::LoadOptions load;
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
@@ -695,10 +693,6 @@ int main(int argc, char** argv) {
             }
             if (arg == "--expert-a4-activations") {
                 load.expert_a4_activations = true;
-                continue;
-            }
-            if (arg == "--reference") {
-                load.reference = true;
                 continue;
             }
             if (arg == "--stream-experts") {

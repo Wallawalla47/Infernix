@@ -117,8 +117,8 @@ int main() {
     failures += check(split_invalid && split_text.find("prefill_split_workspace_mib") !=
                                            std::string::npos,
                       "a prompt split workspace above 16384 MiB was accepted");
-    // Fast paths are on by default and accepted with every KV cache, but the quality reference's
-    // route refuses fast paths and qualification candidates.
+    // Fast paths are on by default and accepted with every KV cache, but the lossless route (the
+    // quality reference's) refuses fast paths and qualification candidates.
     options.prefill_split_workspace_mib = infernix::kDefaultPrefillSplitWorkspaceMiB;
     failures += check(infernix::EngineOptions{}.fast_paths, "fast paths must default to on");
     options.fast_paths = true;
@@ -128,38 +128,25 @@ int main() {
         bool fast_invalid      = false;
         const std::string text = construction_error(options, fast_invalid);
         failures += check(text.find("fast paths") == std::string::npos,
-                          "fast paths were rejected without the reference route");
+                          "fast paths were rejected without the lossless route");
     }
-    options.reference                = true;
-    bool reference_invalid           = false;
-    const std::string reference_text = construction_error(options, reference_invalid);
-    failures += check(reference_invalid && reference_text.find("fast paths") != std::string::npos,
-                      "fast paths were accepted with the reference route");
+    options.lossless                = true;
+    bool lossless_invalid           = false;
+    const std::string lossless_text = construction_error(options, lossless_invalid);
+    failures += check(lossless_invalid && lossless_text.find("fast paths") != std::string::npos,
+                      "fast paths were accepted with the lossless route");
     options.fast_paths           = false;
     options.fast_path_candidates = {infernix::FastPath::DecodeSplit64};
     bool candidate_invalid       = false;
     const std::string candidate_text = construction_error(options, candidate_invalid);
     failures += check(candidate_invalid && candidate_text.find("fast paths") != std::string::npos,
-                      "a fast-path candidate was accepted with the reference route");
+                      "a fast-path candidate was accepted with the lossless route");
     options.fast_path_candidates.clear();
     bool exact_invalid     = false;
     const std::string exact_text = construction_error(options, exact_invalid);
     failures += check(exact_text.find("fast paths") == std::string::npos,
-                      "the exact route was rejected with the reference route");
-    // The lossless route runs no fast path either, and is not combined with the reference route.
-    options.lossless = true;
-    bool both_invalid = false;
-    const std::string both_text = construction_error(options, both_invalid);
-    failures += check(both_invalid && both_text.find("exclude each other") != std::string::npos,
-                      "the lossless and reference routes were accepted together");
-    options.reference = false;
-    options.fast_paths = true;
-    bool lossless_fast_invalid = false;
-    const std::string lossless_fast_text = construction_error(options, lossless_fast_invalid);
-    failures += check(lossless_fast_invalid && lossless_fast_text.find("fast paths") != std::string::npos,
-                      "fast paths were accepted with the lossless route");
-    options.fast_paths = false;
-    options.lossless   = false;
+                      "the reproducible route was rejected with the lossless route");
+    options.lossless = false;
     // Every fast path round-trips through its name.
     for (const infernix::FastPath path : infernix::kFastPaths) {
         failures += check(infernix::parse_fast_path(infernix::fast_path_name(path)) == path,

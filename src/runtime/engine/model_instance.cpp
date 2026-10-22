@@ -94,17 +94,14 @@ void validate_engine_options(const EngineOptions& options, models::Architecture 
         throw std::invalid_argument(
             "the original NVFP4 prefill kernel requires the NVFP4 KV cache (--kv-dtype nvfp4)");
     }
-    // The reference route is what the fast paths are measured against.
-    if (options.reference && (options.fast_paths || !options.fast_path_candidates.empty())) {
-        throw std::invalid_argument("the reference route runs no fast path: disable fast paths");
+    // The lossless route is what the fast paths are measured against; the design reference is the lossless
+    // route with the configuration's declared steps (FP4-Local's optional W4A4 experts among them).
+    if (options.lossless && (options.fast_paths || !options.fast_path_candidates.empty() ||
+                             (options.expert_a4_activations && !options.reference))) {
+        throw std::invalid_argument("the lossless route runs no fast path: disable fast paths");
     }
-    if (options.lossless) {
-        if (options.reference) {
-            throw std::invalid_argument("the lossless and reference routes exclude each other");
-        }
-        if (options.fast_paths || !options.fast_path_candidates.empty() || options.expert_a4_activations) {
-            throw std::invalid_argument("the lossless route runs no fast path: disable fast paths");
-        }
+    if (options.reference && (!options.lossless || options.purpose != EnginePurpose::CausalScoring)) {
+        throw std::invalid_argument("the design reference (--reference) is the lossless route's causal scoring");
     }
 }
 

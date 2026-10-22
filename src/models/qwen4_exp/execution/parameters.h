@@ -65,8 +65,10 @@ struct MoeParameters {
     const ExpertBank* bank = nullptr;
     const ops::offloaded_moe::ExpertScales* device_scales = nullptr; // [E]
     // The lossless route's (TextConfig::lossless): each NVFP4 matrix's weight multiplier in alpha_* (an
-    // A4 bank's alpha also folds in its input scale); [E], null without the route.
+    // A4 bank's alpha also folds in its input scale); [E], null without the route. The design reference
+    // (TextConfig::design_reference) adds a W4A4 bank's input scales in input_*.
     const ops::offloaded_moe::ExpertScales* lossless_scales = nullptr;
+    ops::offloaded_moe::LosslessExpertDesign lossless_design = ops::offloaded_moe::LosslessExpertDesign::kNone;
 };
 
 struct PleParameters {

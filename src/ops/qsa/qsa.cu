@@ -1147,10 +1147,9 @@ void qsa_attention(const Tensor& q, const Tensor& index_q, const QsaKVLayer& lay
     detail::qsa_select(index_q, layer.pooled_pages, batch, geometry, max_context, ws.select, ws.select_bytes,
                        {ws.selected, ws.counts}, stream, layer.spaces);
     // Calls this kernel would run unsplit take the Tensor Core prompt route (qsa_prompt.h): the same
-    // width-invariance class, so a column's bits still do not depend on its call's width there. The
-    // reference route runs every call unsplit on this kernel.
-    const int splits = batch.reference ? 1 : attention_splits(columns, geometry);
-    if (!batch.reference && splits == 1 && detail::qsa_prompt_supported(layer, geometry)) {
+    // width-invariance class, so a column's bits still do not depend on its call's width there.
+    const int splits = attention_splits(columns, geometry);
+    if (splits == 1 && detail::qsa_prompt_supported(layer, geometry)) {
         detail::qsa_prompt_attention(q, layer, batch, geometry, scale, ws.selected, ws.counts, out, stream,
                                      vq_args);
         commit();

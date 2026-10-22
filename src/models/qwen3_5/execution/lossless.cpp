@@ -1,7 +1,9 @@
 #include "models/qwen3_5/execution/lossless.h"
 
+#include "infernix/ops/linear.h"
 #include "infernix/ops/lossless_linear.h"
 #include "infernix/ops/lossless_ops.h"
+#include "infernix/ops/lossless_quantize.h"
 
 #include <algorithm>
 #include <initializer_list>
@@ -34,9 +36,9 @@ Tensor alloc(A& a, DType dtype, std::initializer_list<std::int32_t> shape) {
 // Rows [row_begin, row_begin + rows) of w into rows [out_row, ...) of out.
 template <class A>
 void linear(A& a, const Tensor& x, const Weight& w, std::int32_t row_begin, std::int32_t rows, Tensor& out,
-            std::int32_t out_row, cudaStream_t s) {
+            std::int32_t out_row, cudaStream_t s, const ops::LosslessActivationScale& scale = {}) {
     if constexpr (kRuns<A>) {
-        ops::lossless_linear(x, w, row_begin, rows, out, out_row, a, s);
+        ops::lossless_linear(x, w, row_begin, rows, out, out_row, a, s, scale);
     } else {
         auto scope = a.scope();
         (void)a.alloc_bytes(ops::lossless_linear_workspace_bytes(w, rows, x.ne[1]));
@@ -45,14 +47,51 @@ void linear(A& a, const Tensor& x, const Weight& w, std::int32_t row_begin, std:
 
 // Projections of one input sharing its encode (ops::lossless_linear_shared).
 template <class A>
-void shared(A& a, const Tensor& x, std::initializer_list<ops::LosslessProjection> projections, cudaStream_t s) {
+void shared(A& a, const Tensor& x, std::initializer_list<ops::LosslessProjection> projections, cudaStream_t s,
+            const ops::LosslessActivationScale& scale = {}) {
     const std::span<const ops::LosslessProjection> list(projections.begin(), projections.size());
     if constexpr (kRuns<A>) {
-        ops::lossless_linear_shared(x, list, a, s);
+        ops::lossless_linear_shared(x, list, a, s, scale);
     } else {
         auto scope = a.scope();
         (void)a.alloc_bytes(ops::lossless_linear_shared_workspace_bytes(list, x.ne[1]));
     }
+}
+
+// The design reference's quantization of one projection input (lossless-route.md §3b): the step its
+// weight's Use declares (NVFP4 weights permitted A4: Qwen3.5's NVFP4 rule with the input's divisor; FP8 row
+// weights permitted A8: the per-token E4M3 rule), or none.
+enum class Step { None, Nvfp4, Fp8Token };
+
+Step design_step(const LosslessDesign& design, const LinearParameters& p) {
+    if (!design.active) { return Step::None; }
+    if (p.weight.qtype == QType::NVFP4 && ops::allows_a4(p.policy)) { return Step::Nvfp4; }
+    if (p.weight.qtype == QType::FP8_E4M3FN_ROW_BF16 && ops::allows_a8(p.policy)) { return Step::Fp8Token; }
+    return Step::None;
+}
+
+Step design_step(const LosslessDesign& design, const ops::ProjectionWeights& p) {
+    const auto* single = std::get_if<LinearParameters>(&p);
+    return single != nullptr ? design_step(design, *single) : Step::None;
+}
+
+// x quantized by `step` (x itself for none) and the activation scale lossless_linear applies to the sums.
+struct Quantized {
+    Tensor x;
+    ops::LosslessActivationScale scale;
+};
+
+template <class A>
+Quantized quantize(A& a, Step step, const Tensor& x, const Weight& w, cudaStream_t s) {
+    if (step == Step::None) { return {x, {}}; }
+    Tensor q = alloc(a, DType::BF16, {x.ne[0], x.ne[1]});
+    if (step == Step::Nvfp4) {
+        if constexpr (kRuns<A>) { ops::lossless_quantize_nvfp4(x, w.input_scale_divisor, q, s); }
+        return {q, {w.input_scale_divisor, nullptr}};
+    }
+    Tensor scales = alloc(a, DType::FP32, {x.ne[1]});
+    if constexpr (kRuns<A>) { ops::lossless_quantize_fp8_token(x, q, scales, s); }
+    return {q, {0.0F, static_cast<const float*>(scales.data)}};
 }
 
 template <class A>
@@ -68,7 +107,7 @@ void grouped(A& a, const Tensor& x, const Weight& w, const Tensor& tiles, std::i
 
 template <class A>
 void attention_layer(A& a, const BlockParameters& block, const TextConfig& config, const Tensor& rope_table,
-                     Tensor& x, cudaStream_t s, const LosslessCache* cache) {
+                     Tensor& x, cudaStream_t s, const LosslessCache* cache, const LosslessDesign& design) {
     const auto& p    = std::get<AttentionParameters>(block.mixer);
     const auto& att  = *config.attention;
     const auto H     = dimension(config.hidden_size);
@@ -89,8 +128,11 @@ void attention_layer(A& a, const BlockParameters& block, const TextConfig& confi
                 {&pair->second, Q, K, &v, 0}},
                s);
     } else {
-        const Weight& w = std::get<LinearParameters>(p.projection).weight;
-        shared(a, h, {{&w, 0, Q, &q, 0}, {&w, Q, K, &k, 0}, {&w, Q + K, Q, &gate, 0}, {&w, 2 * Q + K, K, &v, 0}}, s);
+        const LinearParameters& lp = std::get<LinearParameters>(p.projection);
+        const Weight& w            = lp.weight;
+        const Quantized hq         = quantize(a, design_step(design, lp), h, w, s);
+        shared(a, hq.x, {{&w, 0, Q, &q, 0}, {&w, Q, K, &k, 0}, {&w, Q + K, Q, &gate, 0}, {&w, 2 * Q + K, K, &v, 0}}, s,
+               hq.scale);
     }
     Tensor q3 = q.view({D, heads, T}), k3 = k.view({D, kv_heads, T}), v3 = v.view({D, kv_heads, T});
     Tensor o = alloc(a, DType::BF16, {D, heads, T});
@@ -109,6 +151,8 @@ void attention_layer(A& a, const BlockParameters& block, const TextConfig& confi
             ops::lossless_paged_attention(q3, *cache->positions, cache->sequences, *cache->table_rows, cache->kv,
                                           cache->max_keys, cache->key_capacity, o, ws.data, s);
         } else {
+            // The design's bf16 KV stores V as FP16 (exact in BF16 again).
+            if (design.active) { ops::lossless_round_fp16(v3, s); }
             ops::lossless_attention(q3, k3, v3, o, ws.data, s);
         }
         Tensor flat = o.view({Q, T});
@@ -116,13 +160,14 @@ void attention_layer(A& a, const BlockParameters& block, const TextConfig& confi
     }
     Tensor y = alloc(a, DType::BF16, {H, T});
     Tensor flat = o.view({Q, T});
-    linear(a, flat, p.output.weight, 0, H, y, 0, s);
+    const Quantized oq = quantize(a, design_step(design, p.output), flat, p.output.weight, s);
+    linear(a, oq.x, p.output.weight, 0, H, y, 0, s, oq.scale);
     if constexpr (kRuns<A>) { ops::lossless_add(x, y, x, s); }
 }
 
 template <class A>
 void gdn_layer(A& a, const BlockParameters& block, const TextConfig& config, Tensor& x, cudaStream_t s,
-               const LosslessCache* cache) {
+               const LosslessCache* cache, const LosslessDesign& design) {
     const auto& p   = std::get<GdnParameters>(block.mixer);
     const auto& gdn = *config.gdn;
     const auto H    = dimension(config.hidden_size);
@@ -148,13 +193,28 @@ void gdn_layer(A& a, const BlockParameters& block, const TextConfig& config, Ten
     const Weight* a_w    = control_pair ? &control_pair->first : &std::get<LinearParameters>(p.control).weight;
     const Weight* b_w    = control_pair ? &control_pair->second : a_w;
     const std::int32_t b_row = control_pair ? 0 : Hv;
-    if (proj_pair) {
-        shared(a, h,
-               {{qk_w, 0, qk, &mixed, 0}, {vz_w, 0, C - qk, &mixed, qk}, {vz_w, C - qk, VW, &z, 0},
-                {a_w, 0, Hv, &av, 0}, {b_w, b_row, Hv, &bv, 0}},
-               s);
+    const Step projection_step = design_step(design, p.projection), control_step = design_step(design, p.control);
+    if (projection_step == Step::None && control_step == Step::None) {
+        if (proj_pair) {
+            shared(a, h,
+                   {{qk_w, 0, qk, &mixed, 0}, {vz_w, 0, C - qk, &mixed, qk}, {vz_w, C - qk, VW, &z, 0},
+                    {a_w, 0, Hv, &av, 0}, {b_w, b_row, Hv, &bv, 0}},
+                   s);
+        } else {
+            shared(a, h, {{qk_w, 0, C, &mixed, 0}, {qk_w, C, VW, &z, 0}, {a_w, 0, Hv, &av, 0}, {b_w, b_row, Hv, &bv, 0}},
+                   s);
+        }
     } else {
-        shared(a, h, {{qk_w, 0, C, &mixed, 0}, {qk_w, C, VW, &z, 0}, {a_w, 0, Hv, &av, 0}, {b_w, b_row, Hv, &bv, 0}}, s);
+        // The design reference: the projection and the control each from h quantized as its own Use declares.
+        const Quantized hp = quantize(a, projection_step, h, *qk_w, s);
+        if (proj_pair) {
+            shared(a, hp.x, {{qk_w, 0, qk, &mixed, 0}, {vz_w, 0, C - qk, &mixed, qk}, {vz_w, C - qk, VW, &z, 0}}, s,
+                   hp.scale);
+        } else {
+            shared(a, hp.x, {{qk_w, 0, C, &mixed, 0}, {qk_w, C, VW, &z, 0}}, s, hp.scale);
+        }
+        const Quantized hc = quantize(a, control_step, h, *a_w, s);
+        shared(a, hc.x, {{a_w, 0, Hv, &av, 0}, {b_w, b_row, Hv, &bv, 0}}, s, hc.scale);
     }
     Tensor g = alloc(a, DType::FP32, {Hv, T}), beta = alloc(a, DType::BF16, {Hv, T});
     Tensor c = alloc(a, DType::BF16, {C, T});
@@ -176,22 +236,25 @@ void gdn_layer(A& a, const BlockParameters& block, const TextConfig& config, Ten
         ops::lossless_rmsnorm_gated(o2, z2, p.norm, config.rms_norm_eps, on2, s);
     }
     Tensor y = alloc(a, DType::BF16, {H, T});
-    linear(a, on, p.output.weight, 0, H, y, 0, s);
+    const Quantized oq = quantize(a, design_step(design, p.output), on, p.output.weight, s);
+    linear(a, oq.x, p.output.weight, 0, H, y, 0, s, oq.scale);
     if constexpr (kRuns<A>) { ops::lossless_add(x, y, x, s); }
 }
 
 template <class A>
-void dense_mlp(A& a, const DenseParameters& p, const Tensor& h, Tensor& x, cudaStream_t s) {
+void dense_mlp(A& a, const DenseParameters& p, const Tensor& h, Tensor& x, cudaStream_t s, const LosslessDesign& design) {
     const std::int32_t H = h.ne[0], T = h.ne[1], I = p.gate_up.weight.n / 2;
     for (std::int32_t c0 = 0; c0 < T; c0 += kFfnColumns) {
         const std::int32_t n = std::min(kFfnColumns, T - c0);
         auto scope = a.scope();
         const Tensor hc = h.slice(1, c0, n);
         Tensor g = alloc(a, DType::BF16, {I, n}), u = alloc(a, DType::BF16, {I, n});
-        shared(a, hc, {{&p.gate_up.weight, 0, I, &g, 0}, {&p.gate_up.weight, I, I, &u, 0}}, s);
+        const Quantized hq = quantize(a, design_step(design, p.gate_up), hc, p.gate_up.weight, s);
+        shared(a, hq.x, {{&p.gate_up.weight, 0, I, &g, 0}, {&p.gate_up.weight, I, I, &u, 0}}, s, hq.scale);
         if constexpr (kRuns<A>) { ops::lossless_silu_mul(g, u, g, s); }
         Tensor d = alloc(a, DType::BF16, {H, n});
-        linear(a, g, p.down.weight, 0, H, d, 0, s);
+        const Quantized gq = quantize(a, design_step(design, p.down), g, p.down.weight, s);
+        linear(a, gq.x, p.down.weight, 0, H, d, 0, s, gq.scale);
         if constexpr (kRuns<A>) {
             Tensor xc = x.slice(1, c0, n);
             ops::lossless_add(xc, d, xc, s);
@@ -254,19 +317,23 @@ void sparse_moe(A& a, const ops::SparseMoeWeights& p, const MoeConfig& moe, cons
 
 template <class A>
 void layer(A& a, const BlockParameters& block, const TextConfig& config, MixerKind kind, const Tensor& rope_table,
-           Tensor& x, cudaStream_t s, const LosslessCache* cache) {
+           Tensor& x, cudaStream_t s, const LosslessCache* cache, const LosslessDesign& design) {
+    if (design.active && (cache != nullptr || design.kv != KvCacheStorage::BFloat16)) {
+        throw std::invalid_argument("the design reference scores windows with bf16 KV");
+    }
     if (kind == MixerKind::FullAttention) {
-        attention_layer(a, block, config, rope_table, x, s, cache);
+        attention_layer(a, block, config, rope_table, x, s, cache, design);
     } else {
-        gdn_layer(a, block, config, x, s, cache);
+        gdn_layer(a, block, config, x, s, cache, design);
     }
     auto scope = a.scope();
     Tensor h = alloc(a, DType::BF16, {x.ne[0], x.ne[1]});
     if constexpr (kRuns<A>) { ops::lossless_rmsnorm(x, block.post_attention_norm, config.rms_norm_eps, h, s); }
     if (const auto* moe = std::get_if<ops::SparseMoeWeights>(&block.ffn)) {
+        // The sparse MoE banks are 16-bit only (no declared quantization).
         sparse_moe(a, *moe, std::get<MoeConfig>(config.ffn), h, x, s);
     } else {
-        dense_mlp(a, std::get<DenseParameters>(block.ffn), h, x, s);
+        dense_mlp(a, std::get<DenseParameters>(block.ffn), h, x, s, design);
     }
 }
 
@@ -295,15 +362,17 @@ std::size_t lossless_rope_window_bytes(const TextConfig& config, std::int32_t to
 }
 
 void lossless_layer(const BlockParameters& block, const TextConfig& config, MixerKind kind, const Tensor& rope_table,
-                    Tensor& x, WorkspaceArena& workspace, cudaStream_t stream, const LosslessCache* cache) {
-    layer(workspace, block, config, kind, rope_table, x, stream, cache);
+                    Tensor& x, WorkspaceArena& workspace, cudaStream_t stream, const LosslessCache* cache,
+                    const LosslessDesign& design) {
+    layer(workspace, block, config, kind, rope_table, x, stream, cache, design);
 }
 
 std::size_t lossless_layer_workspace_bytes(const BlockParameters& block, const TextConfig& config, MixerKind kind,
-                                           std::int32_t tokens, const LosslessCache* cache) {
+                                           std::int32_t tokens, const LosslessCache* cache,
+                                           const LosslessDesign& design) {
     WorkspaceLayoutBuilder layout;
     Tensor x(nullptr, DType::BF16, {dimension(config.hidden_size), tokens});
-    layer(layout, block, config, kind, Tensor{}, x, nullptr, cache);
+    layer(layout, block, config, kind, Tensor{}, x, nullptr, cache, design);
     return layout.peak_bytes(1);
 }
 

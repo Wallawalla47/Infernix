@@ -18,7 +18,7 @@ reference recomputes, from Infernix's own inputs:
 so each reported error belongs to that op chain alone rather than to accumulated drift.
 
 ``--reference-points`` and ``--a16-experts`` evaluate as reference.py does with those options (the
-reference route's BF16 points; 16-bit expert activations). ``--skip-ple`` omits the PLE injection's
+composed kernels' BF16 points; 16-bit expert activations). ``--skip-ple`` omits the PLE injection's
 layer from ``attn_mix`` and ``residual`` (for an artifact whose n-gram rows are not the checkpoint's,
 such as the FP8 import bound to the BF16 volume); its mixer and MoE are still checked. ``--summary``
 prints, per op chain, the mean and largest relative error over every checked layer and position.

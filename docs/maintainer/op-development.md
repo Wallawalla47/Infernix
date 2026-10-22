@@ -485,7 +485,7 @@ of its complete affected domain; one failing implementation is not sufficient ju
 Op qualification does not show what a change does to a whole model's output. On artifacts with
 4-bit activations even reordered arithmetic moves the output distribution measurably, so a
 model-level claim follows [Model-level numerical quality](model-quality.md): several prefill chunk
-sizes, KL divergence to the 16-bit-activation reference, and the decode-quality judge for decode
+sizes, KL divergence to the lossless-route reference, and the decode-quality judge for decode
 paths.
 
 The oracle leaves private arithmetic free, but the product does not: the exact route's output is

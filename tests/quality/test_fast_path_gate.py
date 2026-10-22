@@ -121,6 +121,21 @@ def test_one_kl_budget_for_every_configuration(tmp_path):
         assert not criterion(failing, "mean KL excess").passed
 
 
+def test_stored_runs_are_decided_again_under_another_budget(tmp_path):
+    # --policy re-decides stored runs without measuring them again: the same 1.2e-3 excess passes
+    # the KL budget, fails a tighter one and passes a looser one, with the budget recorded.
+    root = make_prefill(tmp_path / "runs", windows=60, floor=0.003, excess=0.0012, noise=1e-5)
+    for name, extra, status, budget in (("default", [], 0, gate.POLICY.kl_budget),
+                                        ("tight", ["--policy", "kl_budget=1e-3"], 1, 1e-3),
+                                        ("loose", ["--policy", "kl_budget=1e-2"], 0, 1e-2)):
+        output = tmp_path / f"{name}.json"
+        assert gate.main(["evaluate-prefill", str(root), "--json", str(output)] + extra) == status
+        kl = next(c for c in json.loads(output.read_text(encoding="utf-8"))[0]["criteria"]
+                  if c["name"] == "mean KL excess")
+        assert kl["budget"] == budget
+    assert gate.main(["evaluate-prefill", str(root), "--policy", "kl=1e-2"]) == 2
+
+
 def test_a_zero_floor_configuration_can_pass(tmp_path):
     # Floor 0 (the exact route is the reference): the default's tail is 0, so the tail cap admits
     # a fast p99.9 up to tail_minimum.
@@ -424,7 +439,7 @@ def write_judge(path: Path, default: list[tuple[int, int, float]],
         return [{"offset": 100 * i, "tokens": t, "agree": a, "logprob": -r, "regret": r}
                 for i, (t, a, r) in enumerate(values)]
 
-    path.write_text(json.dumps({"reference": "reference", "runs": [
+    path.write_text(json.dumps({"reference": "lossless", "runs": [
         {"file": "default.txt", "segments": segments(default)},
         {"file": "fast.txt", "segments": segments(fast)}]}), encoding="utf-8")
     return path

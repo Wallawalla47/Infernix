@@ -1,5 +1,6 @@
 #pragma once
 
+#include "models/qwen3_5/execution/lossless.h"
 #include "models/qwen3_5/execution/parameters.h"
 #include "models/qwen3_5/program/program.h"
 #include "infernix/ops/gated_delta_net.h"
@@ -56,12 +57,8 @@ struct ExecutionSchedule {
     // batched-decode: the decode and verification rounds' MLP down projections take its tiles
     // (ops::LinearRoutes::WideDownTile).
     bool wide_down_tile               = false;
-    // gdn-f16-accumulate: the chunked GDN calls' arithmetic (Recurrent on the reference route).
+    // gdn-f16-accumulate: the chunked GDN calls' arithmetic.
     ops::GdnChunkArithmetic gdn_arithmetic = ops::GdnChunkArithmetic::Exact;
-    // The reference route (EngineOptions::reference, a CausalScoring Program with BF16 KV): prompt
-    // projections precise_linear's forms, attention causal_softmax_attention_reference, the FFN
-    // ffn_reference, the scoring head FP32 (docs/maintainer/model-quality.md 6.2).
-    bool reference = false;
     // The lossless route (EngineOptions::lossless, docs/maintainer/lossless-route.md): every layer
     // execution::lossless_layer, FP32 logits. A CausalScoring Program scores each window in one pass (the
     // window form, lossless_keys 0); a Generation Program runs prefill chunks and decode rounds through
@@ -70,6 +67,9 @@ struct ExecutionSchedule {
     // ordinary rounds (their attention key bound the graph profile's).
     bool lossless              = false;
     std::int32_t lossless_keys = 0;
+    // The design reference (EngineOptions::reference, with lossless; lossless-route.md §3b): the window form
+    // with the declared activation quantization and the KV format's codec.
+    execution::LosslessDesign lossless_design{};
     // The reproducible and lossless routes: sampled requests draw by Gumbel-max
     // (ops::SamplingConfig::gumbel_max), so speculation returns plain sampling's text.
     bool gumbel_sampling = false;

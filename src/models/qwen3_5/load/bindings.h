@@ -22,8 +22,8 @@ struct PendingWeight {
 
 class Bindings {
 public:
-    // The reference route binds every Use A16Only (LoadOptions::reference).
-    Bindings(artifact::Binder& binder, bool reference) : binder(binder), reference(reference) {}
+    // The lossless route binds every Use A16Only (LoadOptions::lossless).
+    Bindings(artifact::Binder& binder, bool a16_only) : binder(binder), a16_only(a16_only) {}
 
     [[nodiscard]] WeightId parameter(std::string name, artifact::Shape shape,
                                      std::vector<std::string> inputs   = {},
@@ -38,7 +38,7 @@ public:
     [[nodiscard]] WeightUseId use(WeightId id, std::string_view input) const;
 
     artifact::Binder& binder;
-    bool reference = false;
+    bool a16_only = false;
     std::vector<PendingWeight> weights;
 
 private:

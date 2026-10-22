@@ -56,7 +56,7 @@ other references own narrower contracts:
 | [Paged KV context store](maintainer/paged-kv-cache.md) | typed pools, pages, replicas, address spaces, reservations and consumer views |
 | [ReplaySSM GDN](maintainer/replayssm-gdn.md) | raw transition records and faithful commitment of the verified state prefix |
 | [Op development](maintainer/op-development.md) | semantic boundaries, source ownership, numerical qualification and performance evidence |
-| [Model-level numerical quality](maintainer/model-quality.md) | rounding noise at model scale, the 16-bit-activation reference, Infernix-versus-NInfer prefill and decode results, Flash-Next NVFP4 against Unsloth UD-Q4_K_XL |
+| [Model-level numerical quality](maintainer/model-quality.md) | rounding noise at model scale, the lossless-route reference, Infernix-versus-NInfer prefill and decode results, Flash-Next NVFP4 against Unsloth UD-Q4_K_XL |
 | [Basalt port assessment](maintainer/basalt-port-assessment.md) | which mechanisms of Basalt (a Strata fork for Flash-Next) are adopted, candidates, parked or rejected, and why |
 | [NVFP4 quantization-method adoption](maintainer/nvfp4-quantization-methods.md) | evaluated converter-side 4-bit methods, what each demands of the stored representation, and the measured reason none is adopted |
 | [Operational logging](maintainer/logging.md) | log ownership, presentation, severity and data policy |

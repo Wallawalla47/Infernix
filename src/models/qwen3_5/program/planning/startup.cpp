@@ -529,9 +529,6 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                                             wide_verification, ffn_routes),
                              execution::ffn_workspace_bytes(block.ffn, first, last, false, false,
                                                             ffn_routes)));
-            if (plan.execution_schedule.reference) {
-                scratch(layout, execution::ffn_reference_workspace_bytes(block.ffn, last));
-            }
         }
         if (!plan.causal_scoring) { linear_scratch(layout, text.output_head, first, last); }
     };
@@ -631,9 +628,9 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         (void)text_prefill.alloc_bytes(execution::lossless_rope_window_bytes(config, chunk));
         if (lossless_cache != nullptr) { matrix(text_prefill, DType::I32, 2, 1); }
         for (std::size_t layer = 0; layer < parameters.text.layers.size(); ++layer) {
-            scratch(text_prefill,
-                    execution::lossless_layer_workspace_bytes(parameters.text.layers[layer], config,
-                                                              config.layer_types[layer], chunk, lossless_cache));
+            scratch(text_prefill, execution::lossless_layer_workspace_bytes(
+                                      parameters.text.layers[layer], config, config.layer_types[layer], chunk,
+                                      lossless_cache, plan.execution_schedule.lossless_design));
         }
         matrix(text_prefill, DType::BF16, dimension(config.hidden_size), chunk);
         scratch(text_prefill, execution::lossless_head_workspace_bytes(parameters.text.output_head.weight, 1));
@@ -650,10 +647,9 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
 
     if (plan.causal_scoring) {
         WorkspaceLayoutBuilder causal_score;
-        // The reference and lossless routes' logits are FP32.
-        const bool fp32_logits = plan.execution_schedule.reference || plan.execution_schedule.lossless;
-        matrix(causal_score, fp32_logits ? DType::FP32 : DType::BF16, dimension(config.vocab_size),
-               static_cast<std::int32_t>(kCausalScoreTile));
+        // The lossless route's logits are FP32.
+        matrix(causal_score, plan.execution_schedule.lossless ? DType::FP32 : DType::BF16,
+               dimension(config.vocab_size), static_cast<std::int32_t>(kCausalScoreTile));
         matrix(causal_score, DType::I32, 1, static_cast<std::int32_t>(kCausalScoreTile));
         matrix(causal_score, DType::FP32, 1, static_cast<std::int32_t>(kCausalScoreTile));
         // Top tokens and candidates: ids and log-probabilities of each.
@@ -1240,12 +1236,6 @@ static_assert(std::size_t{kDefaultPrefillSplitWorkspaceMiB} << 20 ==
 // route at prefill widths when that path is selected.
 ExecutionSchedule execution_schedule(const execution::Parameters& parameters,
                                      const EngineOptions& options) {
-    // The reference route scores prompts (causal_softmax_attention_reference reads BF16 KV).
-    if (options.reference && (options.purpose != EnginePurpose::CausalScoring ||
-                              options.kv_cache != KvCacheStorage::BFloat16)) {
-        throw std::invalid_argument(
-            "the Qwen3.5 reference route is a CausalScoring Engine with BF16 KV");
-    }
     // The lossless route: causal scoring takes each window in one pass (its attention reads the window's
     // own keys); generation runs text through bf16 KV (V stored as BF16), without speculation.
     if (options.lossless) {
@@ -1258,6 +1248,10 @@ ExecutionSchedule execution_schedule(const execution::Parameters& parameters,
              options.speculative.backend != SpeculativeBackend::None || options.enable_vision)) {
             throw std::invalid_argument("Qwen3.5 lossless generation takes text requests with bf16 KV and no "
                                         "speculation");
+        }
+        if (options.reference && options.kv_cache != KvCacheStorage::BFloat16) {
+            throw std::invalid_argument("the Qwen3.5 design reference scores with bf16 KV (its other KV codecs are "
+                                        "not implemented yet)");
         }
     }
     // The exact route is request-invariant (docs/maintainer/model-quality.md, 6.1); each request-coupling
@@ -1283,15 +1277,14 @@ ExecutionSchedule execution_schedule(const execution::Parameters& parameters,
             .linear_routes           = fast_paths.selected(FastPath::Q4W4A8) ? ops::LinearRoutes::Q4W4A8
                                                                              : ops::LinearRoutes::Exact,
             .wide_down_tile          = fast_paths.selected(FastPath::BatchedDecode),
-            .gdn_arithmetic          = options.reference ? ops::GdnChunkArithmetic::Recurrent
-                                       : fast_paths.selected(FastPath::GdnF16Accumulate)
+            .gdn_arithmetic          = fast_paths.selected(FastPath::GdnF16Accumulate)
                                            ? ops::GdnChunkArithmetic::Fp16Accumulate
                                            : ops::GdnChunkArithmetic::Exact,
-            .reference               = options.reference,
             .lossless                = options.lossless,
             .lossless_keys           = options.lossless && options.purpose == EnginePurpose::Generation
                                            ? static_cast<std::int32_t>(options.max_context)
                                            : 0,
+            .lossless_design         = {.active = options.reference, .kv = options.kv_cache},
             .gumbel_sampling         = !options.fast_paths || options.lossless};
 }
 // The fast INT8, NVFP4, VQ2 and K4V2 prompt kernels and the MXFP8 tiled kernel of FP8 and K8V4 KV

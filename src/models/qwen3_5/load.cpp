@@ -76,7 +76,8 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     out->config  = parse_config(reader.directory(), options);
     artifact::Binder binder(reader);
     out->resources = loading::bind_resources(binder, out->config);
-    loading::Bindings bindings(binder, options.reference || options.lossless);
+    // The lossless route binds every Use A16Only; the design reference keeps the declared permissions.
+    loading::Bindings bindings(binder, options.lossless && !options.reference);
     const auto& text  = out->config.text;
     out->weights.text = loading::bind_text(bindings, text, options);
     if (out->config.vision) {
