@@ -814,9 +814,17 @@ std::uint32_t oracle(const HostWeight& w, int row, const std::uint16_t* x, bool 
         if (wi != 0) { add(wi, w.wexp[at]); }
         if (two && w.W2[at] != 0) { add(w.W2[at], w.wexp2[at]); }
     }
-    if (nan || (pos_inf && neg_inf)) { return bf16 ? 0x7FC0U : 0x7FC00000U; }
+    // Non-finite results are IEEE's and take no rounding, noise twin or not.
+    if (nan || (pos_inf && neg_inf)) {
+        const std::uint32_t quiet = bf16 ? 0x7FC0U : 0x7FC00000U;
+        if (neighbours != nullptr) { *neighbours = Neighbours{quiet, quiet, 0.0}; }
+        return quiet;
+    }
     if (pos_inf || neg_inf) {
-        return (neg_inf ? (bf16 ? 0x8000U : 0x80000000U) : 0U) | (bf16 ? 0x7F80U : 0x7F800000U);
+        const std::uint32_t infinity =
+            (neg_inf ? (bf16 ? 0x8000U : 0x80000000U) : 0U) | (bf16 ? 0x7F80U : 0x7F800000U);
+        if (neighbours != nullptr) { *neighbours = Neighbours{infinity, infinity, 0.0}; }
+        return infinity;
     }
     // Normalize to a signed magnitude.
     std::vector<long long> v(chunks);
