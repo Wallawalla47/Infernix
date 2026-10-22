@@ -59,6 +59,13 @@ sparse_moe_merge_ranked_runs(SparseMoeRankedValue (&run)[kSparseMoeTopK]) {
     }
 }
 
+// A router logit as the model computes it: the router projection's output is BF16 (Transformers'
+// Qwen3_5MoeSparseMoeBlock, the lossless route), so selection, the routing weights and the shared
+// expert's gate read the FP32 score rounded once to BF16. Ties at that precision go to the lower id.
+__device__ __forceinline__ float sparse_moe_bf16_logit(float value) {
+    return __bfloat162float(__float2bfloat16_rn(value));
+}
+
 __device__ __forceinline__ void sparse_moe_select_top8_warp(const float* scores, int* ids,
                                                             float* alpha, float* shared_scale,
                                                             float* selected_logits) {
@@ -67,7 +74,7 @@ __device__ __forceinline__ void sparse_moe_select_top8_warp(const float* scores,
 #pragma unroll
     for (int item = 0; item < kSparseMoeTopK; ++item) {
         const int id = lane + item * 32;
-        local[item]  = {scores[id], id};
+        local[item]  = {sparse_moe_bf16_logit(scores[id]), id};
     }
 #pragma unroll
     for (int i = 1; i < kSparseMoeTopK; ++i) {
@@ -95,7 +102,7 @@ __device__ __forceinline__ void sparse_moe_select_top8_warp(const float* scores,
     float denominator = warp_reduce_sum(exponential);
     denominator       = __shfl_sync(kFullWarpMask, denominator, 0);
     if (lane < kSparseMoeTopK) { alpha[lane] = exponential / denominator; }
-    if (lane == 0) { *shared_scale = sigmoid(scores[kSparseMoeExperts]); }
+    if (lane == 0) { *shared_scale = sigmoid(sparse_moe_bf16_logit(scores[kSparseMoeExperts])); }
 }
 
 // The router score of one row for one token: eight warps own 256-element K slices; a lane sums its

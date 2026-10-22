@@ -377,9 +377,11 @@ std::vector<double> sparse_moe_oracle(const std::vector<float>& input,
                                       const quantized_weight::PackedWeight& shared_down,
                                       const RoutePattern& intended_route) {
     const std::vector<double> x(input.begin(), input.end());
+    // The router projection's output is BF16 (the model's logit boundary), then FP64 onward.
     std::vector<double> scores(kExperts + 1);
-    parallel_rows(kExperts + 1,
-                  [&](std::int32_t row) { scores[row] = dot_fp64(router, row, kHidden, x); });
+    parallel_rows(kExperts + 1, [&](std::int32_t row) {
+        scores[row] = bf16_to_f32(f32_to_bf16(static_cast<float>(dot_fp64(router, row, kHidden, x))));
+    });
 
     std::vector<int> ranked(kExperts);
     std::iota(ranked.begin(), ranked.end(), 0);
