@@ -18,6 +18,7 @@
 #include <atomic>
 #include <cstdio>
 #include <filesystem>
+#include <functional>
 #include <limits>
 #include <stdexcept>
 #include <string>
