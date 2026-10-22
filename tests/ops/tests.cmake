@@ -333,6 +333,9 @@ infernix_add_op_test(infernix_qsa_select_test
 infernix_add_op_test(infernix_offloaded_moe_layer_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_layer.cu"
   LIBRARIES infernix_ops)
+# Its idle-service check bounds a call's latency to 10 ms beyond the GPU's own; beside other GPU tests
+# the same call's time ranged 40-75 ms and the check failed five times (2026-10-22), so it runs alone.
+set_tests_properties(infernix_offloaded_moe_layer_test PROPERTIES RUN_SERIAL TRUE)
 
 # The wide route (experts with more than eight columns) against its FP64 W4A4 oracle.
 infernix_add_op_test(infernix_offloaded_moe_wide_test

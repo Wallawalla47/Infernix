@@ -544,9 +544,9 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
                 cuda_check(cudaDeviceSynchronize(), "moe_experts");
                 return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
             };
-            // Other processes on the machine (a parallel CTest run) can stall one measurement; a slow
-            // idle wait slows every one. The service check passes when any of three measurements meets
-            // the bound.
+            // Other processes on the machine can stall one measurement (CTest runs this entry alone:
+            // beside other GPU tests no bound of a few milliseconds holds); a slow idle wait slows every
+            // one. The service check passes when any of three measurements meets the bound.
             bool within = false;
             for (int attempt = 0; attempt < 3 && !within; ++attempt) {
                 (void)timed();
