@@ -85,8 +85,8 @@ each next-token distribution moved. First record a reference, normally with `--k
   --kv-dtype bf16 --save-top-tokens ref-bf16-64k.bin
 ```
 
-`--save-top-tokens FILE` writes each scored position's 64 most probable tokens (the most scoring
-returns) and their log-probabilities (about 540 MB for the full corpus). Then score the setting
+`--save-top-tokens FILE` writes each scored position's 256 most probable tokens (the most scoring
+returns) and their log-probabilities (about 2.1 GB for the full corpus). Then score the setting
 under test with the same corpus, mode, context and stride:
 
 ```bash
@@ -119,9 +119,9 @@ same route as generation; `--ngram-volume FILE` names their n-gram volume when i
 `<artifact>.ngram`.
 `--expert-a4-activations` scores nvidia/Qwen3.8-Flash-Next-FP4-Local with 4-bit expert activations
 ([guide](qwen3_8-flash-next.md#nvidia-fp4-local-checkpoint)); `report.json` records it as
-`expert_a4_activations`. `tools/quality/fast_path_gate.py` pairs an
-exact-route run and a fast-path run window by window to decide the
-[numerical acceptance policy](maintainer/model-quality.md#6-numerical-acceptance-policy-and-fast-paths).
+`expert_a4_activations`. The
+[numerical acceptance policy](maintainer/model-quality.md#6-numerical-acceptance-policy-and-fast-paths)
+uses its own corpus and tool (`infernix-certify`).
 
 ## Runtime YaRN override
 

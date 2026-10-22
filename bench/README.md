@@ -154,47 +154,12 @@ remains neural-only unless its cases explicitly request ngram.
 
 ## Decode quality
 
-`infernix_decode_quality_forced` measures the decode route teacher-forced: each segment prefills a
-corpus prompt and forces the following corpus tokens through the production decode path, one
-constrained step per token, recording each token's log-probability from the round's full
-distribution (`ConstrainedDraw::mass`). Positions pair exactly between builds, which makes it the
-sensitive decode measure of the [acceptance policy](../docs/maintainer/model-quality.md#6-numerical-acceptance-policy-and-fast-paths)
-(`--kv-dtype` takes every KV format: `int8`, `bf16`, `fp8`, `nvfp4`, `k8v4`, `vq2`, `k4v2`;
-`--expert-a4-activations` runs nvidia/Qwen3.8-Flash-Next-FP4-Local's experts W4A4):
-
-```bat
-infernix_decode_quality_forced model.ninfer corpus.txt exact.json --segments 256 ^
-  --prompts 512,2048,8192 --mode plain --kv-dtype int8 --reproducible
-infernix_decode_quality_forced model.ninfer corpus.txt fast.json --segments 256 ^
-  --prompts 512,2048,8192 --mode plain --kv-dtype int8
-```
-
-Segments lie back to back from the corpus's first token, so no two share text, and the tool stops
-if the corpus is too short for them. `--first-segment N` computes the set's segments N to N +
-`--segments` - 1 with their offsets and prompt lengths as in the whole set, and
-`tools/quality/fast_path_gate.py concat-forced A.json B.json --out AB.json` joins consecutive ranges
-(references or runs), which is how a 1,024-segment gate extends a 256-segment one
-([acceptance policy](../docs/maintainer/model-quality.md#61-the-reproducible-route-and-the-fast-paths)). `--forced N` sets the forced tokens per segment (at most 64,
-the constraint step limit); `--mode`
-is `plain`, `dflash2`, `ngram` or `mtp`. `--lossless` writes the reference for the same segments
-instead (the lossless route, `EngineOptions::lossless`, with BF16 KV in one pass: each forced
-token's log-probability and the 64 most probable tokens there), and `--observe REFERENCE.json` makes every
-forced step also record the log-probabilities of those tokens and its own largest one
-(`TokenConstraint::observe`), from which the gate computes decode KL and top-1 agreement. Fast paths run as in `infernix-serve` unless
-`--reproducible`; `--fast-path NAME` also runs a candidate path (qualification).
-
-The log-probabilities are printed exactly, so the same segments also measure request invariance:
-`tools/quality/fast_path_gate.py identical a.json b.json` compares two exact-route runs bit for
-bit. `--concurrency N` (1-8) keeps N segments in flight, each lane taking the next segment when
-its previous one completes (their prompt lengths differ, so prefills overlap decodes, and no lane
-idles behind a group's longest prompt), `--prefill-chunk N` sets the prompt chunk (default
-4096, rounded down to the prompt-attention wave), and `--prefix-reuse` submits groups of N instead:
-each segment's prompt runs alone first (with `--warm-tokens N`, only its first N tokens) and then
-the group's measured requests together from the prefix cache (the report's `reused_prompt_tokens`
-counts the restored tokens). The last log line sums the requests' prefill time and their share of
-the decode rounds, which shows where a run's time went. `--kv-tokens N`
-sizes the KV pool (default: every lane's whole context), so a short pool makes concurrent requests
-preempt; the report's `preemptions` and `replayed_tokens` count what happened.
+The teacher-forced decode measurement of the
+[acceptance policy](../docs/maintainer/model-quality.md#6-numerical-acceptance-policy-and-fast-paths) is
+`infernix-certify decode` (IQS-1): it forces each corpus window's continuation through the production
+decode path, one constrained step per token, every step observing the reference's 256 most probable
+tokens (`TokenConstraint::observe`), at one request, under concurrency, from a warm prefix, under a short
+KV pool and with speculation (usage at the top of `apps/certify/main.cpp`).
 
 `infernix_decode_quality_gen` and `infernix_decode_quality_judge` measure what a build's decode path
 does to output quality, end to end, free-running. Perplexity scoring runs prefill only, so this is the check for
@@ -216,9 +181,7 @@ are in [Model-level numerical quality](../docs/maintainer/model-quality.md).
   the lossless route (`EngineOptions::lossless`), BF16 KV, each sequence in one pass. For each build it reports how often the generated token is the reference's most
   probable token given that build's own prefix, the mean reference log-probability and the mean
   regret (top log-probability minus the generated token's); for each pair, the generated prefix
-  they share exactly. `--report FILE` also writes each build's per-segment counts as JSON, which
-  `tools/quality/fast_path_gate.py decode` pairs between a default and a fast-path build
-  ([acceptance policy](../docs/maintainer/model-quality.md#6-numerical-acceptance-policy-and-fast-paths)).
+  they share exactly. `--report FILE` also writes each build's per-segment counts as JSON.
 - `--stored-activations` judges with the artifact's recorded activations instead (BF16 KV, one
   pass): it measures what decoding changes (KV format, chunking, speculation, batching), not the
   cost of the stored activation precision. `--ngram-volume FILE` (judge) and `ngram-volume=FILE`

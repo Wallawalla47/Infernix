@@ -12,7 +12,7 @@
 // speculation, batching) but not the cost of the stored activation precision itself.
 //
 // --report FILE also writes each build's per-segment counts as JSON (segments are independent
-// samples: tools/quality/fast_path_gate.py pairs them between builds).
+// samples, which a comparison pairs between builds).
 //
 // --ngram-volume FILE names a Qwen3.8-Flash-Next n-gram volume (default <artifact>.ngram).
 //

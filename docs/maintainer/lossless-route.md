@@ -214,7 +214,7 @@ a selection (QSA), a query's keys are its tail and its selected blocks.
 
 ## 3a. The route
 
-`EngineOptions::lossless` (`--lossless` of `infernix-perplexity` and `infernix_decode_quality_forced`)
+`EngineOptions::lossless` (`--lossless` of `infernix-perplexity`; `infernix-certify reference`)
 selects it on Qwen3.5/3.6/3.8 (`Qwen3_5ForCausalLM`, `Qwen3_5MoeForCausalLM`;
 `src/models/qwen3_5/execution/lossless.cpp`): a CausalScoring Engine that scores each window in one pass
 (its prefill chunk covers max_context), no fast path, FP32 logits. Its attention reads the window's own
@@ -257,9 +257,9 @@ tail (`lossless_qsa_tails_store`); each query's selection from its scores agains
 pooled keys (`lossless_qsa_pooled_gather`; `lossless_qsa_select` by position, scored 64 query columns at a
 time) once it may have more complete blocks than the budget; attention over the cache with that
 selection; the PLE history and the GDN state through the lanes' slots (`lossless_ple_conv_inject_slots`,
-the Qwen3.5 slot forms). The sampler reads an FP32 copy of the logits. `tools/quality/fast_path_gate.py`
-scores every model's
-references with `--lossless` (a decode reference's cache key records the route).
+the Qwen3.5 slot forms). The sampler reads an FP32 copy of the logits. IQS-1's references are this route
+or the design reference (3b), one scoring pass per window (`infernix-certify reference`; model quality
+§6).
 
 **Transcendental functions** (`src/ops/lossless/cr_math.cuh`): every one takes a binary32 argument, so
 its correct rounding is decidable: the double evaluation is accepted when both ends of its error
@@ -274,10 +274,9 @@ rsqrt decides a near-midpoint case exactly instead (y > m exactly when 1 > m^2 v
 of its own: activation quantization that its artifact permits, and the KV-cache format the user
 selects. `--reference` (`EngineOptions::reference`) is `--lossless` with each declared lossy step
 applied exactly where the configuration declares it, and nothing else changed: the exact computation of
-the configuration as designed. It is the second reference of the quality gate (model quality §6.2):
-a fast path's processing cost is its distance from `--lossless` minus the design reference's distance
-from `--lossless`, so neither the declared quantization's own cost nor any route's arbitrary rounding
-enters a verdict.
+the configuration as designed: IQS-1's reference R(A, K) wherever the artifact declares activation
+quantization or the KV format is coded (model quality §6), so a path's engine error is its distance from
+this route and the declared steps' own cost (its distance from `--lossless`) is disclosed, never charged.
 
 **Activation quantization.** Every input whose artifact Use permits a lower precision takes it, at every
 width and phase (the reproducible route chooses by call width and runs Qwen3.5 decode at 16 bits; the
@@ -306,8 +305,8 @@ window and its VQ value outside it, by position alone). Flash-Next's QSA selecti
 keys, which no KV format changes.
 
 **Scope.** Every artifact and KV format of the reproducible route, in CausalScoring and in the forced
-decode tool's observed runs (`infernix_decode_quality_forced --reference --observe`, one scoring pass per
-segment); generation is not a use of the route. `bf16` KV rounds V to FP16 (`lossless_round_fp16`); every
+certification tool's references (`infernix-certify reference --design`, one scoring pass per window);
+generation is not a use of the route. `bf16` KV rounds V to FP16 (`lossless_round_fp16`); every
 other format stores the window's K and V through the production `kv_cache_append` (`lossless_kv_encode`: an
 identity block table, so the planes hold production's bytes; the VQ formats' window rows for every key by the
 append's own window-copy steps) and `lossless_codec_attention` reads them: a pack kernel decodes each row
@@ -326,7 +325,23 @@ the artifact and the declared steps, so a reference survives rebuilds like `--lo
   exact fallback alike).
 - Whole blocks against an FP64 evaluation at the same rounding points, to within those points'
   roundings.
-- As the gate reference, the §6.2 acceptance checks of model quality once. Its bits depend on the request
-  and the artifact alone, so `tools/quality/fast_path_gate.py` keys a lossless reference by the
-  definition's version (`LOSSLESS_DEFINITION`) rather than the build: a reference survives rebuilds, and
-  any change to what this document defines bumps the version.
+- Reference conformance (IQS-1 G1): the route's whole FP32 logits at chosen positions
+  (`infernix-certify capture`) equal, bit for bit, the publisher's transformers code evaluated in exact
+  arithmetic with each operation rounded to its dtype (`tools/quality/iqs_shadow.py`).
+- Its bits depend on the request and the artifact alone, so IQS-1 stores its references across builds
+  and releases (`tools/quality/certify.py`'s reference store) and a release run re-scores one window of
+  each to confirm that no bit changed; any change to what this document defines needs the owner's
+  approval and a full certification.
+
+## 5. The noise twin
+
+`EngineOptions::lossless_noise_seed` (`infernix-certify prefill --lossless --noise-seed N`, CausalScoring
+only) makes every correctly rounded result of the route a stochastic rounding of the same exact value:
+up with probability equal to the discarded fraction of the result's unit in the last place
+(`src/ops/lossless/noise.cuh`; the draw is keyed by the seed and the value being rounded, so a run is
+deterministic and equal exact values round alike). It is an ideal implementation of the model at its
+dtypes, off by at most one unit in the last place at every rounding and by nothing else. Its distance
+from the route is the model's own sensitivity to rounding, IQS-1's noise floor (model quality §6.3).
+`infernix_lossless_linear_test` checks it against the exact oracle: every output one of its exact
+value's two neighbours, as often away from zero as the discarded fractions predict, the same bits for
+one seed.

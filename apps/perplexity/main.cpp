@@ -495,7 +495,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
             window_report["target_end"]   = window.target_end;
             window_report["first_target"] = window.first_target;
             window_report["seconds"]      = seconds_since(window_started);
-            // Windows are independent samples: tools/quality/fast_path_gate.py pairs them.
+            // Windows are independent samples, which a comparison pairs between runs.
             if (reference) { window_report["kl_divergence"] = window_divergence.summary_json(); }
             window_reports.push_back(std::move(window_report));
 
