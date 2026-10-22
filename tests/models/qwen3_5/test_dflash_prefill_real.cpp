@@ -3,6 +3,7 @@
 #include "models/qwen3_5/program/execution_context.h"
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/planning/startup.h"
+#include "runtime/engine/model_instance.h"
 
 #include <algorithm>
 #include <array>
@@ -131,6 +132,9 @@ void run(const char* artifact, SpeculativeBackend backend) {
     options.speculative.backend               = backend;
     options.speculative.draft_tokens          = 3;
     options.speculative.proposal_head         = ProposalHead::Full;
+    // The Program reads resolved options (the hybrid prefix cache's tap budget among them), as the
+    // Engine passes it.
+    options      = runtime::normalize_engine_options(options);
     auto planner = qwen::detail::make_sequence_planner_impl(parameters, device, options);
     auto plan    = qwen::detail::finalize_sequence_plan_impl(std::move(planner), 2 * pages);
     qwen::detail::ProgramImpl program(parameters, *plan, device, {});

@@ -198,7 +198,7 @@ set_tests_properties(${infernix_qwen3_5_tree_real_tests}
   PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real")
 infernix_add_test(infernix_qwen3_5_dflash_prefill_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_dflash_prefill_real.cpp"
-  LIBRARIES infernix_model_runtime infernix_model_loading infernix_core)
+  LIBRARIES infernix_engine infernix_model_runtime infernix_model_loading infernix_core)
 
 infernix_add_test(infernix_qwen3_5_moe_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_moe_real.cpp"
