@@ -117,10 +117,17 @@ infernix::PromptInput initial_conversation() {
     infernix::PromptInput input;
     input.options.enable_thinking   = false;
 
+    // The prefix cache publishes a snapshot only 64 or more tokens past the root
+    // (prefix_cache::kMinimumTapSeparation), so the boundary restore's first turn is this long.
     infernix::ChatMessage user;
     user.role = infernix::ChatRole::User;
     user.parts.push_back(infernix::MessagePart{
-        .kind = infernix::MessagePartKind::Text, .text = "Name one prime number.", .media = {}});
+        .kind  = infernix::MessagePartKind::Text,
+        .text  = "A teacher is preparing a short exercise on number theory for a class of twelve-year-olds. "
+                 "The class has already met even and odd numbers, factors and multiples, and the idea that "
+                 "some numbers can only be divided evenly by one and by themselves. Before the lesson, she "
+                 "wants a single example to write on the board. Name one prime number.",
+        .media = {}});
     input.messages.push_back(std::move(user));
     return input;
 }
@@ -234,6 +241,11 @@ int exercise_boundary_restore(infernix::Engine& engine) {
         engine.generate(engine.prepare(initial_conversation()), greedy_options(2, true));
     if (first.generated_token_ids.size() != 2) {
         std::cerr << "DFlash boundary fixture did not establish resident state\n";
+        return 1;
+    }
+    if (first.prompt.prompt_tokens < 64) {
+        std::cerr << "DFlash boundary fixture is too short for a snapshot: " << first.prompt.prompt_tokens
+                  << " tokens\n";
         return 1;
     }
 
