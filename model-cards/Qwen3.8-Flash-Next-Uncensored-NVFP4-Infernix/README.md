@@ -88,6 +88,21 @@ conversion stores in 8 bits are stored in 8 bits here as well.
 
 Keep the three model parts in one directory and give Infernix part 1, as with a split GGUF.
 
+## DFlash2 drafting
+
+This model can draft with **[Qwen3.8-Flash-Next-DFlash2-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-DFlash2-Infernix)**
+(776 MB), Inco AI's [DFlash2 drafter](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2) packed
+for Infernix. It decodes 8-11 % faster than the model's own MTP drafter with `--draft-tokens auto`
+(26 % on sampled code). Download it next to the model and pass it with `--spec dflash2 --draft-model`:
+
+```text
+hf download Wallawalla47/Qwen3.8-Flash-Next-DFlash2-Infernix Qwen3.8-Flash-Next-DFlash2-Infernix.infernix --local-dir <dir>
+infernix-serve <this model's part 1>.infernix --spec dflash2 \
+  --draft-model <dir>/Qwen3.8-Flash-Next-DFlash2-Infernix.infernix --draft-tokens auto
+```
+
+It needs an Infernix build whose `--help` lists `--draft-model`; see the drafter's card for details.
+
 ## PLE n-gram tables
 
 Qwen3.8-Flash-Next's PLE n-gram table (320,001,536 rows) is not in the model files: it is a
