@@ -1,6 +1,6 @@
 infernix_add_test(infernix_qwen4_exp_expert_cache_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_expert_cache.cpp"
-  LIBRARIES infernix_qwen4_exp_expert_cache
+  LIBRARIES infernix_qwen4_exp_calibrated_order
   NEEDS_SOURCE_DIR)
 
 # The SSD tier's host level (design §19.3.7, R10 host part): slots, read agent, admission. CPU and disk.
@@ -11,7 +11,7 @@ infernix_add_test(infernix_qwen4_exp_host_expert_tier_test
 # The SSD tier's RAM-level controller (design §19.3.7 RT2), host only.
 infernix_add_test(infernix_qwen4_exp_host_tier_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_host_tier.cpp"
-  LIBRARIES infernix_qwen4_exp_expert_cache)
+  LIBRARIES infernix_expert_offload_cache)
 
 infernix_add_test(infernix_qwen4_exp_ngram_hash_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ngram_hash.cpp"

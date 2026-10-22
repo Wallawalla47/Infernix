@@ -1,4 +1,4 @@
-#include "models/qwen4_exp/program/expert_cache/expert_state.h"
+#include "runtime/expert_offload/expert_state.h"
 
 #include <array>
 #include <cstdint>
@@ -7,7 +7,7 @@
 #include <system_error>
 #include <vector>
 
-namespace infernix::models::qwen4_exp::expert_cache {
+namespace infernix::runtime::expert_offload::expert_cache {
 namespace {
 
 // Layout (version 1): magic, version, identity length and bytes, key count, counts[keys], ranked
@@ -115,4 +115,4 @@ ExpertStateLoad load_expert_state(const std::filesystem::path& path, std::string
     return out;
 }
 
-} // namespace infernix::models::qwen4_exp::expert_cache
+} // namespace infernix::runtime::expert_offload::expert_cache

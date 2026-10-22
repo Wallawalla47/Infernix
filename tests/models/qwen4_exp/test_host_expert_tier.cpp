@@ -13,8 +13,8 @@
 // failing on an unreadable record, and admission of fetched landings at the next boundary. An
 // expert stripe moves each record's tail to another file; records still land whole.
 #include "test_temp_path.h"
-#include "models/qwen4_exp/expert_store.h"
-#include "models/qwen4_exp/program/host_expert_tier.h"
+#include "runtime/expert_offload/expert_store.h"
+#include "runtime/expert_offload/host_expert_tier.h"
 #include "ops/offloaded_sparse_moe/cpu/fetch_channel.h"
 
 #include <algorithm>
@@ -36,9 +36,9 @@
 
 namespace {
 
-using infernix::models::qwen4_exp::ExpertStore;
-using infernix::models::qwen4_exp::HostExpertTier;
-namespace expert_cache = infernix::models::qwen4_exp::expert_cache;
+using infernix::runtime::expert_offload::ExpertStore;
+using infernix::runtime::expert_offload::HostExpertTier;
+namespace expert_cache = infernix::runtime::expert_offload::expert_cache;
 
 constexpr std::uint32_t kLayers = 3, kExperts = 40, kKeys = kLayers * kExperts;
 constexpr std::uint64_t kRecord = 8192; // two 4 KiB blocks
@@ -453,8 +453,8 @@ void write_stripe(const std::filesystem::path& path, const infernix::artifact::A
 // file, its head from the artifact (the straddling record's head is its file-A part), and the record
 // lands whole; a stripe of another artifact, of other strides, cut short or without its magic is refused.
 void test_stripe(const ExpertStore& base) {
-    using infernix::models::qwen4_exp::read_expert_stripe;
-    using infernix::models::qwen4_exp::with_stripe;
+    using infernix::runtime::expert_offload::read_expert_stripe;
+    using infernix::runtime::expert_offload::with_stripe;
     infernix::artifact::ArtifactId id{};
     for (std::size_t i = 0; i < id.size(); ++i) { id[i] = static_cast<std::byte>(i + 1); }
     const auto path = infernix::test::unique_temp_path("infernix_host_tier.stripe");

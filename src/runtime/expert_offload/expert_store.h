@@ -9,7 +9,7 @@
 #include <span>
 #include <vector>
 
-namespace infernix::models::qwen4_exp {
+namespace infernix::runtime::expert_offload {
 
 // The routed experts read in place from the artifact (design §19.3.7, the SSD tier; plan
 // memory-tiers.md §4.4): for every (layer, expert) record, its file segments (one, or two for a
@@ -103,4 +103,4 @@ struct ExpertStripe {
 [[nodiscard]] ExpertStore with_stripe(const ExpertStore& base, const ExpertStripe& stripe,
                                       const artifact::ArtifactId& artifact_id);
 
-} // namespace infernix::models::qwen4_exp
+} // namespace infernix::runtime::expert_offload

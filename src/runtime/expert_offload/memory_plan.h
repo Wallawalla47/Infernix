@@ -1,8 +1,10 @@
 #pragma once
 
-// The startup memory plans of Qwen3.8-Flash-Next (docs/maintainer/qwen3_8-flash-next-design.md
-// §19.3.7). Host RAM: what the experts may take once a reserve stays free for the system and every
-// other allocation the engine will make is planned; one reserve covers every pinned allocation.
+// The startup memory plans of an artifact with offloaded experts (Qwen3.8-Flash-Next,
+// docs/maintainer/qwen3_8-flash-next-design.md §19.3.7; Qwen3.5-122B-A10B, docs/maintainer/
+// qwen3_5-122b-offload-design.md §11). Host RAM: what the experts may take once a reserve stays
+// free for the system and every other allocation the engine will make is planned; one reserve
+// covers every pinned allocation.
 // Device memory: what the expert frames may take once the fixed allocations, a reserve for
 // Infernix's own later allocations and a headroom for the display and other programs are left.
 
@@ -14,7 +16,7 @@
 #include <optional>
 #include <string>
 
-namespace infernix::models::qwen4_exp {
+namespace infernix::runtime::expert_offload {
 
 inline constexpr std::uint64_t kLedgerGiB = 1ULL << 30;
 
@@ -113,9 +115,13 @@ struct VramDemand {
     // The frame pool shrinks at runtime when the display or another program needs memory. Without
     // that nothing absorbs their growth, so the automatic headroom and the graph reserve are larger.
     bool elastic = false;
-    // CUDA graph executables the Program may instantiate after sizing, and what each may take.
+    // CUDA graph executables the Program may instantiate after sizing, and what each may take. An
+    // elastic pool reserves for at most 32 (a lazily capturing Program instantiates a few at a time,
+    // and the pool shrinks for more) unless the Program captures every executable right after the
+    // sizing (eager_graphs: Qwen3.5's Programs).
     std::uint32_t graphs      = 0;
     std::uint64_t graph_bytes = kGraphExecutableBytes;
+    bool eager_graphs         = false;
     // Device allocations still to be made besides the frames (taken from free memory and budget).
     std::uint64_t fixed = 0;
     // One expert frame, and the most frames the residency uses.
@@ -198,4 +204,4 @@ private:
     double grow_since_ = -1.0; // when the target first stood two chunks above the pool; < 0: not now
 };
 
-} // namespace infernix::models::qwen4_exp
+} // namespace infernix::runtime::expert_offload

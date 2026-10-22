@@ -5,9 +5,9 @@
 // top and never names a frame above it.
 
 #include "test_temp_path.h"
-#include "models/qwen4_exp/program/expert_cache/calibrated_order.h"
-#include "models/qwen4_exp/program/expert_cache/expert_cache.h"
-#include "models/qwen4_exp/program/expert_cache/expert_state.h"
+#include "models/qwen4_exp/program/calibrated_order.h"
+#include "runtime/expert_offload/expert_cache.h"
+#include "runtime/expert_offload/expert_state.h"
 
 #include <algorithm>
 #include <chrono>
@@ -26,7 +26,10 @@
 #    define INFERNIX_SOURCE_DIR "."
 #endif
 
-using namespace infernix::models::qwen4_exp::expert_cache;
+using namespace infernix::runtime::expert_offload::expert_cache;
+using infernix::models::qwen4_exp::calibrated_expert_order;
+using infernix::models::qwen4_exp::kCalibratedExperts;
+using infernix::models::qwen4_exp::kCalibratedLayers;
 
 namespace {
 

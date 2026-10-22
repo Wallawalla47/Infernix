@@ -181,7 +181,7 @@ std::size_t Forward::workspace_bytes(const TextConfig& c, std::int32_t columns, 
     bytes += ops::qsa_attention_workspace_bytes(qsa_geometry(c), columns, max_context, storage);
     bytes += (c.moe.experts + 1) * t * 4 + k * t * 8 + t * 4;           // FP32 router logits, routing
     bytes += ops::moe_dispatch_bytes(dim(c.moe.experts), dim(k * t));
-    bytes += h * k * t * bf + ops::moe_experts_workspace_bytes(dim(c.moe.experts), dim(k * t), std::max(columns, 1),
+    bytes += h * k * t * bf + ops::moe_experts_workspace_bytes(ops::offloaded_moe::kFlashNextShape, dim(c.moe.experts), dim(k * t), std::max(columns, 1),
                                                                expert_activation(c), wide_a16);
     bytes += 2 * std::size_t(c.moe.shared_intermediate) * t * bf * 3;
     // Linear and GDN scratch (chunked recurrence), plus alignment slack per allocation.
@@ -378,7 +378,7 @@ std::size_t Forward::moe_workspace_bytes(const TextConfig& c, std::int32_t colum
     const std::size_t h = c.hidden_size, k = c.moe.top_k;
     std::size_t bytes = (c.moe.experts + 1) * t * 4 + k * t * 8 + t * 4; // router logits, routing
     bytes += ops::moe_dispatch_bytes(dim(c.moe.experts), dim(k * t));
-    bytes += h * k * t * 2 + ops::moe_experts_workspace_bytes(dim(c.moe.experts), dim(k * t), std::max(columns, 1),
+    bytes += h * k * t * 2 + ops::moe_experts_workspace_bytes(ops::offloaded_moe::kFlashNextShape, dim(c.moe.experts), dim(k * t), std::max(columns, 1),
                                                              expert_activation(c), wide_a16);
     bytes += 2 * std::size_t(c.moe.shared_intermediate) * t * 2 * 3 + h * t * 2 * 2; // shared expert, y
     if (c.ggml_weights) { // the shared expert's projections encode their inputs
@@ -993,7 +993,7 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
                       : ggml_bank && ops::has_route(dense_routes(), ops::LinearRoutes::GgmlBf16Wide)
                           ? ops::offloaded_moe::WideA16::kGgmlBf16
                           : ops::offloaded_moe::WideA16::kExact;
-    const DeviceSpan expert_ws  = work_.alloc_bytes(ops::moe_experts_workspace_bytes(max_jobs, K * T, T, source.activation,
+    const DeviceSpan expert_ws  = work_.alloc_bytes(ops::moe_experts_workspace_bytes(source.shape, max_jobs, K * T, T, source.activation,
                                                                                  source.wide_a16));
     const bool planned = route_plans && ops::moe_route_dispatch_plan(logits, K, routing, dispatch, route_log, x, source,
                                                                      max_jobs, expert_ws.data, outputs, s);

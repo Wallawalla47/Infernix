@@ -1,4 +1,4 @@
-#include "models/qwen4_exp/execution/expert_stream.h"
+#include "runtime/expert_offload/expert_stream.h"
 
 #include "core/copy_batch.h"
 #include "core/device.h"
@@ -6,7 +6,7 @@
 #include <algorithm>
 #include <stdexcept>
 
-namespace infernix::models::qwen4_exp::execution {
+namespace infernix::runtime::expert_offload {
 namespace {
 
 constexpr std::size_t kAlign = 256;
@@ -328,4 +328,4 @@ void ExpertStream::after_experts(std::uint32_t layer, cudaStream_t compute) {
     if (!gated_ && layer + 2 < layers_) { enqueue(layer + 2); }
 }
 
-} // namespace infernix::models::qwen4_exp::execution
+} // namespace infernix::runtime::expert_offload

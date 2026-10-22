@@ -11,7 +11,7 @@
 //   INFERNIX_QWEN4_ARTIFACT=out.ninfer [INFERNIX_QWEN4_NGRAM=out.ninfer.ngram] infernix_qwen4_exp_vram_pressure_real_test
 
 #include "core/vram_budget.h"
-#include "models/qwen4_exp/program/vram_monitor.h"
+#include "runtime/expert_offload/vram_monitor.h"
 #include "infernix/engine.h"
 
 #include <atomic>
@@ -104,7 +104,7 @@ int main() {
             if (s.has_budget) { s.local_budget = s.local_budget > t ? s.local_budget - t : 0; }
             return s;
         });
-        infernix::models::qwen4_exp::testing::set_vram_grow_delay(0.5);
+        infernix::runtime::expert_offload::testing::set_vram_grow_delay(0.5);
 
         Diagnostics diagnostics;
         infernix::EngineOptions options;

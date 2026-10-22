@@ -1,4 +1,4 @@
-#include "models/qwen4_exp/expert_store.h"
+#include "runtime/expert_offload/expert_store.h"
 
 #include "artifact/framing.h"
 
@@ -8,7 +8,7 @@
 #include <iterator>
 #include <string>
 
-namespace infernix::models::qwen4_exp {
+namespace infernix::runtime::expert_offload {
 namespace {
 
 // Every layer's pitch is a 4 KiB multiple that fits a Segment; returns the largest.
@@ -203,4 +203,4 @@ ExpertStore with_stripe(const ExpertStore& base, const ExpertStripe& stripe, con
     return ExpertStore(std::move(files), std::move(strides), base.experts(), records, std::move(multipliers));
 }
 
-} // namespace infernix::models::qwen4_exp
+} // namespace infernix::runtime::expert_offload

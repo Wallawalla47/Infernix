@@ -8,11 +8,11 @@
 // License 2.0), calibrated there on 128 tasks across nine domains (main physical columns <= 64,
 // counts normalized per request and layer). Copied verbatim; every row is a permutation of the 512
 // experts (checked when copied, and by the calibrated-order test).
-#include "models/qwen4_exp/program/expert_cache/calibrated_order.h"
+#include "models/qwen4_exp/program/calibrated_order.h"
 
 #include <array>
 
-namespace infernix::models::qwen4_exp::expert_cache {
+namespace infernix::models::qwen4_exp {
 namespace {
 
 constexpr std::array<std::array<std::uint16_t, 512>, 48> kCalibratedOrder{{
@@ -1652,10 +1652,10 @@ constexpr std::array<std::array<std::uint16_t, 512>, 48> kCalibratedOrder{{
 
 } // namespace
 
-SavedState calibrated_expert_order() {
+runtime::expert_offload::expert_cache::SavedState calibrated_expert_order() {
     // Counts are the experts' ranks reversed (a weak prior that real use soon outweighs); the ranked
     // list interleaves the layers by rank (every layer's first expert, then every layer's second).
-    SavedState out;
+    runtime::expert_offload::expert_cache::SavedState out;
     out.counts.assign(static_cast<std::size_t>(kCalibratedLayers) * kCalibratedExperts, 0);
     out.ranked.reserve(out.counts.size());
     for (std::uint32_t layer = 0; layer < kCalibratedLayers; ++layer) {
@@ -1672,4 +1672,4 @@ SavedState calibrated_expert_order() {
     return out;
 }
 
-} // namespace infernix::models::qwen4_exp::expert_cache
+} // namespace infernix::models::qwen4_exp

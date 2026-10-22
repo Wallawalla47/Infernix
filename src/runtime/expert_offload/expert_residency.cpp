@@ -1,6 +1,6 @@
-#include "models/qwen4_exp/program/expert_residency.h"
+#include "runtime/expert_offload/expert_residency.h"
 
-#include "models/qwen4_exp/program/host_expert_tier.h"
+#include "runtime/expert_offload/host_expert_tier.h"
 
 #include "core/block_copy.h"
 #include "core/copy_batch.h"
@@ -12,7 +12,7 @@
 #include <map>
 #include <stdexcept>
 
-namespace infernix::models::qwen4_exp {
+namespace infernix::runtime::expert_offload {
 namespace {
 
 using expert_cache::CacheController;
@@ -36,16 +36,16 @@ std::uint8_t* ExpertResidency::Pool::base() const noexcept {
     return static_cast<std::uint8_t*>(arena ? arena->base() : memory.p);
 }
 
-std::uint64_t ExpertResidency::table_bytes(const TextConfig& config, std::int32_t max_columns) noexcept {
-    const std::uint64_t keys = static_cast<std::uint64_t>(config.num_hidden_layers) * config.moe.experts;
+std::uint64_t ExpertResidency::table_bytes(const ExpertLayout& layout, std::int32_t max_columns) noexcept {
+    const std::uint64_t keys = static_cast<std::uint64_t>(layout.layers) * layout.experts;
     const std::uint64_t route =
-        static_cast<std::uint64_t>(config.moe.top_k) * static_cast<std::uint64_t>(max_columns) * config.num_hidden_layers;
-    const std::uint64_t landing = 2ULL * config.num_hidden_layers * kLandingSlots; // table + landed log
+        static_cast<std::uint64_t>(layout.top_k) * static_cast<std::uint64_t>(max_columns) * layout.layers;
+    const std::uint64_t landing = 2ULL * layout.layers * kLandingSlots; // table + landed log
     return (keys + route + landing) * sizeof(std::int32_t);
 }
 
-std::uint32_t ExpertResidency::max_frames(const TextConfig& config) noexcept {
-    return config.num_hidden_layers * config.moe.experts - 1;
+std::uint32_t ExpertResidency::max_frames(const ExpertLayout& layout) noexcept {
+    return layout.layers * layout.experts - 1;
 }
 
 std::uint64_t ExpertResidency::average_frame_bytes(std::span<const std::uint64_t> strides) noexcept {
@@ -55,13 +55,13 @@ std::uint64_t ExpertResidency::average_frame_bytes(std::span<const std::uint64_t
     return (sum + strides.size() - 1) / strides.size();
 }
 
-ExpertResidency::ExpertResidency(const TextConfig& config, std::vector<const std::uint8_t*> banks,
+ExpertResidency::ExpertResidency(const ExpertLayout& layout, std::vector<const std::uint8_t*> banks,
                                  std::uint64_t record_stride, std::int32_t max_columns, int device,
                                  std::vector<std::uint64_t> host_strides)
-    : c_(config), banks_(std::move(banks)), host_strides_(std::move(host_strides)), stride_(record_stride) {
-    experts_ = config.moe.experts;
-    layers_  = config.num_hidden_layers;
-    top_k_   = config.moe.top_k;
+    : layout_(layout), banks_(std::move(banks)), host_strides_(std::move(host_strides)), stride_(record_stride) {
+    experts_ = layout.experts;
+    layers_  = layout.layers;
+    top_k_   = layout.top_k;
     if (banks_.size() != layers_) { throw std::invalid_argument("expert residency: one bank per layer"); }
     if (stride_ == 0) { throw std::invalid_argument("expert residency: empty records"); }
     if (host_strides_.empty()) { host_strides_.assign(layers_, stride_); }
@@ -154,7 +154,7 @@ std::uint32_t ExpertResidency::frames() const noexcept {
 std::uint32_t ExpertResidency::frame_limit() const noexcept {
     std::uint64_t n = 0;
     for (const auto& pool : pools_) { n += pool.limit; }
-    return static_cast<std::uint32_t>(std::min<std::uint64_t>(n, max_frames(c_)));
+    return static_cast<std::uint32_t>(std::min<std::uint64_t>(n, max_frames(layout_)));
 }
 
 std::uint64_t ExpertResidency::pool_bytes() const noexcept {
@@ -961,4 +961,4 @@ void ExpertResidency::issue_loads(cudaStream_t compute) {
     }
 }
 
-} // namespace infernix::models::qwen4_exp
+} // namespace infernix::runtime::expert_offload

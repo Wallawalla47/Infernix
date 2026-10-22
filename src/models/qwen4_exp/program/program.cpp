@@ -1,7 +1,5 @@
 #include "models/qwen4_exp/program/program_impl.h"
 
-#include <atomic>
-
 namespace infernix::models::qwen4_exp {
 
 RequestBasePlan::RequestBasePlan(std::unique_ptr<detail::BasePlanImpl> impl) noexcept : impl_(std::move(impl)) {}
@@ -144,23 +142,5 @@ ScoreResult Program::causal_score(PreparedPrompt&& prompt, std::uint32_t first_t
 PhysicalUsageSnapshot Program::physical_usage() const noexcept { return impl_->usage(); }
 
 MemorySummary Program::memory_summary() const noexcept { return impl_->memory(); }
-
-namespace testing {
-
-namespace {
-std::atomic<std::uint32_t> g_expert_fault{0};
-} // namespace
-
-void set_expert_fault(std::uint32_t checks) noexcept { g_expert_fault.store(checks); }
-
-bool take_expert_fault() noexcept {
-    std::uint32_t left = g_expert_fault.load(std::memory_order_relaxed);
-    while (left != 0) {
-        if (g_expert_fault.compare_exchange_weak(left, left - 1)) { return left == 1; }
-    }
-    return false;
-}
-
-} // namespace testing
 
 } // namespace infernix::models::qwen4_exp

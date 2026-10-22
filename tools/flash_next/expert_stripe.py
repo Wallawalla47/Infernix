@@ -7,7 +7,7 @@ a second drive.
 With `--expert-stripe` the SSD expert tier reads each record's head from the artifact and its tail
 from the stripe at the same time, so a record that misses RAM crosses two drives in parallel. The
 artifact keeps every record whole; the stripe holds a copy of the tails only. The format (v1) is
-defined in src/models/qwen4_exp/expert_store.h; the stripe names the artifact's id, so it serves only
+defined in src/runtime/expert_offload/expert_store.h; the stripe names the artifact's id, so it serves only
 that artifact. A stripe is written to `<out>.partial` and renamed once complete.
 """
 

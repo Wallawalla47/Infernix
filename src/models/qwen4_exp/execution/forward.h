@@ -10,7 +10,7 @@
 #include "core/gdn_replay_records.h"
 #include "core/linear_attention_state.h"
 #include "core/tensor.h"
-#include "models/qwen4_exp/execution/expert_stream.h"
+#include "models/qwen4_exp/expert_offload.h"
 #include "models/qwen4_exp/execution/parameters.h"
 #include "models/qwen4_exp/execution/fast_path_flags.h"
 #include "infernix/ops/offloaded_sparse_moe.h"
@@ -46,16 +46,10 @@ struct ForwardKV {
     Tensor block_tables;                 // I32 [pages per row, rows]
 };
 
-// The CPU's share of a gated prefill call's experts (design §19.3.12): from the call's columns per
-// expert in one layer, marks in `cpu` the experts the CPU serves, which must be non-resident and
-// have at most ops::offloaded_moe::kMaxCpuColumns columns (the narrow route, placement-invariant),
-// and returns their number. Owned by the Program, which knows the link and the CPU's rates.
-class CpuSplitPolicy {
-public:
-    virtual ~CpuSplitPolicy() = default;
-    virtual std::uint32_t choose(std::uint32_t layer, std::span<const std::int32_t> columns,
-                                 std::span<std::uint8_t> cpu) const = 0;
-};
+// The CPU's share of a gated prefill call's experts (design §19.3.12) is the shared component's
+// CpuSplitPolicy (runtime/expert_offload/expert_offload.h): the experts it marks must be non-resident
+// and have at most ops::offloaded_moe::kMaxCpuColumns columns (the narrow route, placement-invariant).
+// Owned by the Program, which knows the link and the CPU's rates.
 
 // Where each layer's routed experts live: device frames for resident experts, the pinned host
 // bank otherwise.

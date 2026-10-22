@@ -1,4 +1,4 @@
-#include "models/qwen4_exp/memory_plan.h"
+#include "runtime/expert_offload/memory_plan.h"
 
 #include <algorithm>
 #include <cmath>
@@ -6,7 +6,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace infernix::models::qwen4_exp {
+namespace infernix::runtime::expert_offload {
 namespace {
 
 std::uint64_t with_lock_overhead(std::uint64_t pinned, double fraction) {
@@ -140,7 +140,7 @@ VramSizing size_expert_frames(const VramSnapshot& snapshot, const VramDemand& de
     out.snapshot = snapshot;
     out.demand   = demand;
     out.headroom = display_headroom(snapshot.display, demand.elastic, demand.headroom);
-    out.reserve  = internal_reserve(demand.graphs, demand.graph_bytes, demand.elastic);
+    out.reserve  = internal_reserve(demand.graphs, demand.graph_bytes, demand.elastic && !demand.eager_graphs);
     const auto signed_bytes = [](std::uint64_t v) { return static_cast<std::int64_t>(v); };
     std::int64_t room = signed_bytes(snapshot.device_free) - signed_bytes(demand.fixed) - signed_bytes(out.headroom);
     if (snapshot.has_budget) {
@@ -259,4 +259,4 @@ std::string VramSizing::describe() const {
     return line;
 }
 
-} // namespace infernix::models::qwen4_exp
+} // namespace infernix::runtime::expert_offload

@@ -12,6 +12,7 @@ target_link_libraries(infernix_runtime_support PUBLIC infernix_core PRIVATE infe
 
 # Public Engine and common contracts; model execution remains in the model layer.
 add_library(infernix_engine STATIC
+  engine/expert_memory.cpp
   engine/model_instance.cpp
   engine/qwen4_exp_instance.cpp
   contract/sampling.cpp

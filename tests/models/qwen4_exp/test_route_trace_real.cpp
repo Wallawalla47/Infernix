@@ -18,7 +18,7 @@
 // order (FIFO), so up to C run as one batch; the trace-off/on comparison then also assumes that
 // a request's ids do not depend on the rows it shares a round with.
 
-#include "models/qwen4_exp/program/route_trace.h"
+#include "runtime/expert_offload/route_trace.h"
 #include "infernix/engine.h"
 
 #include <cuda_runtime.h>
@@ -151,11 +151,11 @@ Outcome outcome_of(const infernix::GenerationResult& result) {
 std::vector<Outcome> run_pass(const infernix::EngineOptions& options, std::uint32_t concurrency,
                               const std::vector<PromptSpec>& prompts, const std::filesystem::path& trace,
                               const char* label) {
-    infernix::models::qwen4_exp::testing::set_route_trace(trace);
+    infernix::runtime::expert_offload::testing::set_route_trace(trace);
     std::vector<Outcome> out;
     {
         infernix::Engine engine(options);
-        infernix::models::qwen4_exp::testing::set_route_trace({});
+        infernix::runtime::expert_offload::testing::set_route_trace({});
         const std::size_t ready = free_vram();
         if (concurrency == 1) {
             for (const auto& spec : prompts) {

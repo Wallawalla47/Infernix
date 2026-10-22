@@ -44,7 +44,7 @@
 #include <utility>
 #include <vector>
 
-namespace infernix::models::qwen4_exp::execution {
+namespace infernix::runtime::expert_offload {
 
 class ExpertStream {
 public:
@@ -179,4 +179,4 @@ private:
     Stats stats_;
 };
 
-} // namespace infernix::models::qwen4_exp::execution
+} // namespace infernix::runtime::expert_offload

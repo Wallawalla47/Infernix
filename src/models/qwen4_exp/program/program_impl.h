@@ -25,11 +25,8 @@
 #include "runtime/speculative/draft_length.h"
 #include "models/qwen4_exp/execution/parameters.h"
 #include "models/qwen4_exp/frontend/ngram_hash.h"
-#include "models/qwen4_exp/memory_plan.h"
-#include "models/qwen4_exp/program/expert_residency.h"
-#include "models/qwen4_exp/program/host_expert_tier.h"
-#include "models/qwen4_exp/program/expert_cache/calibrated_order.h"
-#include "models/qwen4_exp/program/expert_cache/expert_state.h"
+#include "models/qwen4_exp/expert_offload.h"
+#include "models/qwen4_exp/program/calibrated_order.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
 #include "models/qwen4_exp/program/prefix/call_plan.h"
 #include "models/qwen4_exp/program/prefix/prefix_cache.h"
@@ -39,8 +36,6 @@
 #include "models/qwen3_5/execution/vision_tower.h"
 #include "models/qwen3_5/execution/vision_weight_stream.h"
 #include "models/qwen3_5/program/vision_control.h"
-#include "models/qwen4_exp/program/route_trace.h"
-#include "models/qwen4_exp/program/vram_monitor.h"
 #include "ops/offloaded_sparse_moe/cpu/fetch_channel.h"
 #include "ops/offloaded_sparse_moe/cpu/miss_service.h"
 #include "infernix/ops/argmax.h"
@@ -720,10 +715,10 @@ public:
                (o.ngram_table && o.ngram_table->fp8_scale ? sizeof(std::uint16_t) : 0) +
                (o.ngram_table && o.ngram_table->nvfp4_scale ? sizeof(std::uint32_t) : 0) + constraint_bytes(lanes, W) +
                grammar_mask_bytes(d.token_domain, lanes, W) + d.score_residuals + d.score_logits + d.score_io;
-        b.residency            = ExpertResidency::table_bytes(c, d.columns);
+        b.residency            = ExpertResidency::table_bytes(expert_layout(c), d.columns);
         b.expert_record_stride = d.record_stride;
         b.expert_frame_bytes   = d.frame_bytes;
-        b.max_frames           = ExpertResidency::max_frames(c);
+        b.max_frames           = ExpertResidency::max_frames(expert_layout(c));
         b.graph_bound          = graph_bound(o.max_concurrency, static_cast<std::uint32_t>(W),
                                              static_cast<std::uint32_t>(d.mtp_k), o.sampled_mtp_drafts && d.mtp,
                                              static_cast<std::uint32_t>(d.dflash_k));
@@ -1000,7 +995,8 @@ public:
         experts.staging_base  = static_cast<std::uint8_t*>(staging_.p);
         experts.staging_slots = plan_.staging_slots;
         // The expert cache's tables and route log; its frames come last (below).
-        residency_ = std::make_unique<ExpertResidency>(c_, std::move(banks), record_stride, columns_, device_.device,
+        residency_ = std::make_unique<ExpertResidency>(expert_layout(c_), std::move(banks), record_stride, columns_,
+                                                       device_.device,
                                                        host_strides);
         allocated += plan_.bytes.residency;
         if (allocated != plan_.bytes.fixed_bytes()) {
@@ -1056,7 +1052,7 @@ public:
                 const auto per_part = std::clamp<std::uint32_t>(
                     (static_cast<std::uint32_t>(std::ceil(share * store->experts())) + 15U) / 16U * 16U,
                     kStreamBounceMin, kStreamBounceMax);
-                tier.stream_bounce = execution::ExpertStream::kBounceParts * per_part;
+                tier.stream_bounce = ExpertStream::kBounceParts * per_part;
             }
             tier.slots    = static_cast<std::uint32_t>(std::min<std::uint64_t>(options_.expert_ram_bytes / record_stride, keys + lists));
             // The prefill stream's reads of SSD-only experts (one per layer walk span instead of one
@@ -1117,7 +1113,7 @@ public:
         // The prefill stream copies records into ring slots of the frame pitch; a GGUF import's
         // banks keep their own (smaller) strides.
         if (options_.prefill_stream && options_.expert_cache) {
-            execution::ExpertStream::RecordOf record_of;
+            ExpertStream::RecordOf record_of;
             if (tier_) {
                 record_of = [tier = tier_.get()](std::uint32_t layer, std::uint32_t expert) {
                     return tier->record(tier->key(layer, expert));
@@ -1131,8 +1127,8 @@ public:
                     return banks[layer] + static_cast<std::size_t>(expert) * host_strides[layer];
                 };
             }
-            execution::ExpertStream::Hold hold;
-            execution::ExpertStream::SsdReads ssd;
+            ExpertStream::Hold hold;
+            ExpertStream::SsdReads ssd;
             if (tier_) {
                 hold = [tier = tier_.get()](std::uint32_t layer, std::uint32_t expert) {
                     tier->stream_pin(tier->key(layer, expert));
@@ -1144,13 +1140,13 @@ public:
                 ssd.release = [tier = tier_.get()](std::int32_t slot) { tier->stream_release(slot); };
                 ssd.slots   = [tier = tier_.get()] { return tier->stream_slots(); };
             }
-            expert_stream_ = std::make_unique<execution::ExpertStream>(c_.num_hidden_layers, c_.moe.experts, record_stride,
+            expert_stream_ = std::make_unique<ExpertStream>(c_.num_hidden_layers, c_.moe.experts, record_stride,
                                                                        std::move(record_of), !tier_, std::move(hold),
                                                                        host_strides, std::move(ssd));
             if (tier_ && tier_->stream_bounce_slots() > 0) {
                 // Unpinned records stream through the tier's bounce slots, still two layers ahead.
                 HostExpertTier* tier = tier_.get();
-                expert_stream_->set_staging(execution::ExpertStream::Staging{
+                expert_stream_->set_staging(ExpertStream::Staging{
                     .unpinned = [tier](std::uint32_t layer, std::uint32_t expert) {
                         return tier->unpinned_record(tier->key(layer, expert));
                     },
@@ -1158,7 +1154,7 @@ public:
                     .copy     = [tier](std::span<const std::pair<std::uint8_t*, const std::uint8_t*>> copies) {
                         tier->copy_records(copies);
                     },
-                    .per_part = tier->stream_bounce_slots() / execution::ExpertStream::kBounceParts});
+                    .per_part = tier->stream_bounce_slots() / ExpertStream::kBounceParts});
             }
             experts.stream = expert_stream_.get();
         }
@@ -2713,7 +2709,7 @@ public:
                 source = SeedSource::Saved;
             } else if (has_calibrated_order()) {
                 diagnostic("expert cache: no saved state used: " + load.message, DiagnosticLevel::Debug);
-                load.state = expert_cache::calibrated_expert_order();
+                load.state = calibrated_expert_order();
                 source     = SeedSource::Calibrated;
             }
         }
@@ -2728,11 +2724,11 @@ private:
     // Where the warm start's ranking and counts came from.
     enum class SeedSource { None, Saved, Calibrated };
 
-    // The calibrated order (expert_cache/calibrated_order.h) ranks Qwen3.8-Flash-Next's experts: it
+    // The calibrated order (program/calibrated_order.h) ranks Qwen3.8-Flash-Next's experts: it
     // applies to every model of that shape (NInfer's guard), whatever the artifact's formats.
     [[nodiscard]] bool has_calibrated_order() const noexcept {
-        return c_.hidden_size == 2560 && c_.num_hidden_layers == expert_cache::kCalibratedLayers &&
-               c_.moe.experts == expert_cache::kCalibratedExperts && c_.moe.top_k == 10 &&
+        return c_.hidden_size == 2560 && c_.num_hidden_layers == kCalibratedLayers &&
+               c_.moe.experts == kCalibratedExperts && c_.moe.top_k == 10 &&
                c_.moe.intermediate == 640 && c_.moe.shared_intermediate == 640;
     }
 
@@ -2885,7 +2881,7 @@ public:
     void check_expert_error() {
         auto* word           = static_cast<volatile std::uint32_t*>(expert_error_.data());
         std::uint32_t value  = *word;
-        if (value == 0 && testing::take_expert_fault()) { value = EIO; } // layer 0
+        if (value == 0 && runtime::expert_offload::testing::take_expert_fault()) { value = EIO; } // layer 0
         if (value == 0) { return; }
         *word                    = 0;
         clear_prefix_on_release_ = true;
@@ -5172,7 +5168,7 @@ private:
     PinnedHostBuffer expert_error_{1}; // mapped u32: ops::MoeExpertSource::error of every call
     bool clear_prefix_on_release_ = false;
     std::unique_ptr<ExpertResidency> residency_;
-    std::unique_ptr<execution::ExpertStream> expert_stream_;
+    std::unique_ptr<ExpertStream> expert_stream_;
     // The stream's leases: the ring, the wide arena and a walk's area (each a run of one pool).
     ExpertResidency::FrameLease stream_lease_, stream_wide_lease_, stream_walk_lease_;
     std::size_t stream_ring_bytes_ = 0, stream_wide_bytes_ = 0, stream_walk_bytes_ = 0;
@@ -5180,7 +5176,7 @@ private:
     ExpertResidency::FrameLease work_lease_; // the wide arena lent alone (no stream lease)
     DeviceBuffer wide_fallback_;             // the wide arena when nothing could be lent
     std::unique_ptr<WorkspaceArena> wide_arena_; // the arena swapped with *work_ around a wide call
-    execution::ExpertStream::Stats stream_at_lease_;
+    ExpertStream::Stats stream_at_lease_;
     execution::Forward::SplitStats split_at_lease_;
 
     // ---------------------------------------------------------------- layer walk (prefill_walk.cpp)
@@ -5270,7 +5266,7 @@ private:
     // -4 to -6 % against the fitted rates, 3 workers -11 to -19 % against the measured ones). A line
     // fitted to measured layer times starved the CPU instead (the kept experts' cost is not linear).
     static constexpr double kSplitRateShare = 0.3;
-    class SplitPolicy final : public execution::CpuSplitPolicy {
+    class SplitPolicy final : public CpuSplitPolicy {
     public:
         explicit SplitPolicy(const ProgramImpl& program) : program_(program) {}
         std::uint32_t choose(std::uint32_t layer, std::span<const std::int32_t> columns,

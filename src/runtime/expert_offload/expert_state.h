@@ -5,7 +5,7 @@
 // start to fill the VRAM frames before the first request. A file is used only when its identity
 // (the artifact and the key count) matches; anything else is ignored with a reason.
 
-#include "models/qwen4_exp/program/expert_cache/expert_cache.h"
+#include "runtime/expert_offload/expert_cache.h"
 
 #include <filesystem>
 #include <optional>
@@ -13,7 +13,7 @@
 #include <cstdint>
 #include <string_view>
 
-namespace infernix::models::qwen4_exp::expert_cache {
+namespace infernix::runtime::expert_offload::expert_cache {
 
 struct ExpertStateLoad {
     std::optional<SavedState> state;
@@ -28,4 +28,4 @@ struct ExpertStateLoad {
 [[nodiscard]] ExpertStateLoad load_expert_state(const std::filesystem::path& path, std::string_view identity,
                                                 std::uint32_t keys);
 
-} // namespace infernix::models::qwen4_exp::expert_cache
+} // namespace infernix::runtime::expert_offload::expert_cache

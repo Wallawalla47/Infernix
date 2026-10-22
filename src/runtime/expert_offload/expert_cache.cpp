@@ -1,10 +1,10 @@
-#include "models/qwen4_exp/program/expert_cache/expert_cache.h"
+#include "runtime/expert_offload/expert_cache.h"
 
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
 
-namespace infernix::models::qwen4_exp::expert_cache {
+namespace infernix::runtime::expert_offload::expert_cache {
 
 // ---------------------------------------------------------------------------- residency entries
 
@@ -609,4 +609,4 @@ void CacheController::give_back(std::uint32_t first, std::uint32_t count, std::v
     if (frames_.loaned_count() == 0) { lent_victims_.clear(); }
 }
 
-} // namespace infernix::models::qwen4_exp::expert_cache
+} // namespace infernix::runtime::expert_offload::expert_cache

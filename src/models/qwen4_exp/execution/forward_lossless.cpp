@@ -424,7 +424,7 @@ Tensor Forward::lossless_moe(const MoeParameters& p, const Tensor& x, std::uint3
     Tensor outputs   = work_.alloc(DType::BF16, {H, K * T});
     const std::int32_t max_jobs = std::min(E, K * T);
     const DeviceSpan expert_ws  = work_.alloc_bytes(ops::moe_experts_workspace_bytes(
-        max_jobs, K * T, T, source.activation, ops::offloaded_moe::WideA16::kLossless));
+        source.shape, max_jobs, K * T, T, source.activation, ops::offloaded_moe::WideA16::kLossless));
     ops::moe_experts(x, dispatch, source, K, max_jobs, expert_ws.data, outputs, s, /*wait_for_cpu=*/false, false);
     // The shared expert (its gate and up projected with the router above) and its gate.
     Tensor product = work_.alloc(DType::BF16, {I, T});
@@ -533,7 +533,8 @@ std::size_t Forward::lossless_workspace_bytes(const TextConfig& c, std::int32_t 
     }
     const std::size_t moe = h * t * bf + c.moe.experts * t * bf + t * bf + k * t * 8 + t * 4 +
                             ops::moe_dispatch_bytes(dim(c.moe.experts), dim(k * t)) + h * k * t * bf +
-                            ops::moe_experts_workspace_bytes(std::min<std::int32_t>(dim(c.moe.experts), dim(k * t)), dim(k * t),
+                            ops::moe_experts_workspace_bytes(ops::offloaded_moe::kFlashNextShape,
+                                                             std::min<std::int32_t>(dim(c.moe.experts), dim(k * t)), dim(k * t),
                                                              dim(t), ops::offloaded_moe::ExpertActivation::kA16,
                                                              ops::offloaded_moe::WideA16::kLossless) +
                             std::size_t(c.moe.shared_intermediate) * t * bf * 3 + h * t * bf;

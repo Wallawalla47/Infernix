@@ -7,12 +7,13 @@
 #include "core/vram_budget.h"
 #include "models/load_options.h"
 #include "models/qwen4_exp/load.h"
-#include "models/qwen4_exp/memory_plan.h"
+#include "runtime/expert_offload/memory_plan.h"
 #include "models/qwen4_exp/program/fast_paths.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
-#include "models/qwen4_exp/program/route_trace.h"
-#include "models/qwen4_exp/program/vram_monitor.h"
+#include "runtime/expert_offload/route_trace.h"
+#include "runtime/expert_offload/vram_monitor.h"
 #include "models/registry.h"
+#include "runtime/engine/expert_memory.h"
 #include "runtime/engine/model_instance.h"
 
 #include <algorithm>
@@ -25,16 +26,6 @@
 
 namespace infernix::runtime {
 namespace {
-
-// The pinned Host tier of Qwen3.8-Flash-Next's prefix cache when --host-context-mib is not given.
-// Planning allowance for the Program's pinned and mapped buffers (I/O staging, sampling, the CPU
-// expert service's mapped records); the measured total is well below it.
-constexpr std::uint64_t kProgramPinnedAllowance = 256ULL << 20;
-// The materializer's upload slots and direct-read bounce buffer during the load.
-constexpr std::uint64_t kLoadStagingBytes = 4ULL * (64ULL << 20) + (8ULL << 20);
-// Below this many expert frames most routed experts miss the VRAM cache and decode slows down
-// markedly (design §19.2).
-constexpr std::uint32_t kFewFrames = 2048;
 
 unsigned long long mib(std::uint64_t bytes) { return static_cast<unsigned long long>(bytes >> 20); }
 
@@ -56,13 +47,7 @@ std::string device_contributors(std::uint64_t dense, const models::qwen4_exp::Pr
 }
 
 void report(const EngineOptions& options, DiagnosticLevel level, const std::string& text) {
-    if (options.diagnostic_observer.callback) {
-        try {
-            options.diagnostic_observer.callback(Diagnostic{.level = level, .message = text});
-        } catch (...) {}
-    } else if (level != DiagnosticLevel::Debug) {
-        std::fprintf(stderr, "[engine] %s\n", text.c_str());
-    }
+    report_engine(options, level, text);
 }
 
 void validate(const EngineOptions& options) {
@@ -155,15 +140,10 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     auto plan = models::qwen4_exp::plan_load(reader, models::load_options(options, models::Architecture::Qwen4Exp));
     // The RAM ledger (design §19.3.7): the experts take what the reserve and every other planned
     // allocation leave, before anything is pinned or read.
-    models::qwen4_exp::HostMemoryDemand demand;
-    demand.reserve      = options.ram_headroom_bytes;
-    demand.expert_banks = plan.pinned_expert_bytes();
-    demand.other_pinned = plan.pinned_other_bytes();
-    demand.later_pinned = kProgramPinnedAllowance;
-    // The prefix cache pins its whole Host tier at startup, beside the experts.
-    if (options.context_cache.enabled) {
-        demand.prefix_cache = options.context_cache.host_capacity_bytes.value();
-    }
+    auto vram   = open_vram_budget_source(device.device, options.vram_past_budget);
+    auto demand = expert_ram_demand(
+        options, {.expert_banks = plan.pinned_expert_bytes(), .other_pinned = plan.pinned_other_bytes()},
+        options.context_cache.enabled ? options.context_cache.host_capacity_bytes.value() : 0, vram->query());
     // The n-gram table its volume holds: the artifact's, or another volume's (any format) in its place.
     const std::filesystem::path volume = options.ngram_volume_path.empty()
                                              ? models::qwen4_exp::default_ngram_volume(options.artifact_path)
@@ -182,14 +162,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                "n-gram table: " + name(table.format) + " rows from " + volume.string() + " in place of the artifact's " +
                    name(own.format) + " table");
     }
-    demand.pageable     = models::qwen4_exp::NgramVolume::cache_bytes(table);
-    demand.load_staging = kLoadStagingBytes;
-    demand.expert_cap   = options.expert_ram_bytes;
-    // Windows page-locks memory for the GPU only up to the adapter's shared system memory; the
-    // experts past that stay in RAM unpinned (the SSD tier's unpinned records).
-    auto vram             = open_vram_budget_source(device.device, options.vram_past_budget);
-    demand.pin_room       = models::qwen4_exp::pin_room(vram->query());
-    demand.expert_pin_cap = options.expert_pin_bytes;
+    demand.pageable = models::qwen4_exp::NgramVolume::cache_bytes(table);
     // The n-gram table in RAM (design §12.5): pinned at Program start, so it is a later pin. Auto keeps it
     // only while every expert stays pinned in RAM with it; Ram keeps it whatever the experts' placement.
     const auto snapshot = host_memory_snapshot();
@@ -198,14 +171,13 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         auto with_table         = demand;
         with_table.later_pinned += models::qwen4_exp::NgramVolume::resident_bytes(table);
         with_table.pageable     = 0;
-        const auto trial        = models::qwen4_exp::plan_host_memory(snapshot, with_table);
+        const auto trial        = runtime::expert_offload::plan_host_memory(snapshot, with_table);
         if (options.ngram_residency == NgramResidency::Ram ||
-            (trial.placement == models::qwen4_exp::ExpertPlacement::Full && !trial.cap_too_large)) {
+            (trial.placement == runtime::expert_offload::ExpertPlacement::Full && !trial.cap_too_large)) {
             demand       = with_table;
             ngram_in_ram = true;
         }
     }
-    const auto ledger   = models::qwen4_exp::plan_host_memory(snapshot, demand);
     report(options, DiagnosticLevel::Info,
            std::string("n-gram table: ") +
                (ngram_in_ram ? "in RAM (" + std::to_string(models::qwen4_exp::NgramVolume::resident_bytes(table) >> 20) +
@@ -213,29 +185,14 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                              : options.ngram_residency == NgramResidency::Volume
                                    ? "read from its volume"
                                    : "read from its volume (the RAM ledger keeps the experts resident first)"));
-    report(options, DiagnosticLevel::Info, ledger.summary());
-    report(options, DiagnosticLevel::Debug, ledger.describe());
-    if (ledger.cap_too_large) {
-        throw std::runtime_error("--expert-ram-mib " + std::to_string(*options.expert_ram_bytes >> 20) +
-                                 " asks for more Host RAM than is free or pinnable now (" + ledger.describe() +
-                                 "); lower it, use auto, or free Host memory");
-    }
     // The SSD tier (design §19.3.7): the banks stay in the artifact; the Program pins RAM slots for
     // the experts the ledger leaves room for (less their lock overhead) and reads the rest on use.
-    const bool tier = ledger.placement == models::qwen4_exp::ExpertPlacement::Tier;
+    const ExpertRamPlan ram = plan_expert_ram(options, demand, snapshot);
+    const bool tier         = ram.tier;
     if (tier) {
         auto streamed           = models::load_options(options, models::Architecture::Qwen4Exp);
         streamed.stream_experts = true;
         plan                    = models::qwen4_exp::plan_load(reader, streamed);
-    }
-    // A small reserve trims other programs' working sets; keep Infernix's own pageable memory
-    // resident so its heap and driver pages never hard-fault from the page file.
-    if (const auto refused = reserve_process_working_set(demand.process_growth); !refused.empty()) {
-        report(options, DiagnosticLevel::Warning,
-               "Windows would not guarantee Infernix " + std::to_string(demand.process_growth >> 20) +
-                   " MiB of resident working memory (" + refused +
-                   "); everything still works, but if RAM runs short Windows may move some of it to the "
-                   "page file and responses slow down");
     }
     plan.set_host_reserve(options.ram_headroom_bytes, demand.later_pinned);
 
@@ -317,9 +274,9 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         program_options.prefix_coalesce_wait_seconds = static_cast<double>(options.pending_timeout_ms) / 1000.0 / 2.0;
     }
     program_options.route_trace   = options.route_trace_path.empty()
-                                        ? models::qwen4_exp::testing::route_trace()
+                                        ? runtime::expert_offload::testing::route_trace()
                                         : options.route_trace_path;
-    program_options.vram_grow_delay_seconds = models::qwen4_exp::testing::vram_grow_delay();
+    program_options.vram_grow_delay_seconds = runtime::expert_offload::testing::vram_grow_delay();
     program_options.vram_headroom = options.vram_headroom_bytes;
     program_options.vram_past_budget = options.vram_past_budget;
     program_options.expert_tail_skip = options.expert_tail_skip;
@@ -331,10 +288,9 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                    " or lower; output changes (lower quality) for faster decode");
     }
     if (tier) {
-        program_options.expert_ram_bytes =
-            static_cast<std::uint64_t>(static_cast<double>(ledger.expert_pinned) / (1.0 + demand.lock_overhead));
-        program_options.expert_unpinned_bytes = ledger.expert_pageable;
-        program_options.later_pinned_bytes    = demand.prefix_cache + demand.later_pinned + models::qwen4_exp::kPinRoomMarginBytes;
+        program_options.expert_ram_bytes      = ram.expert_ram_bytes;
+        program_options.expert_unpinned_bytes = ram.expert_unpinned_bytes;
+        program_options.later_pinned_bytes    = ram.later_pinned_bytes;
     }
 
     // The VRAM check (design §19.3.7), before the weights are read: the dense weights, the
@@ -349,27 +305,9 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         models::qwen4_exp::Program::plan_device(program_options, plan.config(), plan.public_token_count());
     const std::uint64_t dense = plan.device_bytes();
     const VramSnapshot before = vram->query();
-    models::qwen4_exp::VramDemand vram_demand;
-    vram_demand.headroom    = options.vram_headroom_bytes;
-    vram_demand.graphs      = device_plan.graph_bound;
-    vram_demand.fixed       = dense + device_plan.fixed_bytes();
-    vram_demand.frame_bytes = device_plan.expert_frame_bytes; // an average frame of the per-size pools
-    vram_demand.max_frames  = device_plan.max_frames;
-    const auto check        = models::qwen4_exp::size_expert_frames(before, vram_demand);
-    if (check.frame_bytes < 0) {
-        throw std::runtime_error(
-            "Qwen3.8-Flash-Next does not fit in device memory: " + std::to_string(mib(before.device_free)) +
-            " MiB free; " + device_contributors(dense, device_plan) + "; reserve " + std::to_string(mib(check.reserve)) +
-            "; headroom " + std::to_string(mib(check.headroom)) + " (" + check.describe() +
-            "). Lower --max-context, --max-concurrency or --prefill-chunk, use --kv-dtype int8, lower "
-            "--vram-headroom-mib, or free VRAM");
-    }
-    if (check.frames < kFewFrames) {
-        report(options, DiagnosticLevel::Warning,
-               "decode will be slow: only " + std::to_string(check.frames) + " expert frames fit in VRAM (" +
-                   std::to_string(kFewFrames) + " or more recommended); lower --max-context or --max-concurrency, "
-                   "or free VRAM");
-    }
+    (void)check_expert_vram(options, "Qwen3.8-Flash-Next", before, dense + device_plan.fixed_bytes(),
+                            device_plan.graph_bound, device_plan.expert_frame_bytes, device_plan.max_frames,
+                            device_contributors(dense, device_plan));
 
     // The dense arena must land in device memory (WDDM can place it in system memory silently).
     SpillGuard guard(*vram);

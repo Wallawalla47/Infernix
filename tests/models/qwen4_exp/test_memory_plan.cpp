@@ -7,7 +7,7 @@
 // pool: shrink on low free memory or an exceeded budget, hysteresis, the grow delay and per-boundary
 // cap, display hot-plug, and the reserve spent by Infernix's own later allocations.
 
-#include "models/qwen4_exp/memory_plan.h"
+#include "runtime/expert_offload/memory_plan.h"
 
 #include <cstdio>
 #include <deque>
@@ -15,7 +15,7 @@
 #include <string>
 
 using namespace infernix;
-using namespace infernix::models::qwen4_exp;
+using namespace infernix::runtime::expert_offload;
 
 namespace {
 
@@ -273,6 +273,16 @@ void test_sizing() {
     const VramSizing attached = size_expert_frames(card(free, DisplayState::Attached), demand(fixed, 20));
     require(attached.frame_bytes == expect - static_cast<std::int64_t>(768 * kMiB),
             "a display takes 768 MiB more with a fixed pool");
+    // A Program that captures every executable right after the sizing (Qwen3.5's) reserves for all of
+    // them, elastic or not.
+    VramDemand eager = demand(fixed, 320);
+    eager.elastic      = true;
+    eager.eager_graphs = true;
+    require(size_expert_frames(card(free, DisplayState::Headless), eager).reserve == 128 * kMiB + 320 * 4 * kMiB,
+            "eager graphs: the reserve covers every executable");
+    eager.eager_graphs = false;
+    require(size_expert_frames(card(free, DisplayState::Headless), eager).reserve == 256 * kMiB,
+            "lazy graphs on an elastic pool: at most 32 counted");
 
     // An OS budget below free memory bounds the frames with its 64 MiB margin only: the display
     // headroom is not stacked on top of it.

@@ -5,7 +5,7 @@
 #include "models/qwen3_5/frontend/resources.h"
 #include "models/qwen3_5/load/vision_overlay.h"
 #include "models/qwen4_exp/config.h"
-#include "models/qwen4_exp/expert_store.h"
+#include "models/qwen4_exp/expert_offload.h"
 #include "models/qwen4_exp/weights.h"
 #include "ops/offloaded_sparse_moe/cpu/ggml_expert.h"
 #include "ops/offloaded_sparse_moe/cpu/w4a4_expert.h"
@@ -30,25 +30,6 @@ struct InstanceInfo {
     // The DFlash2 companion artifact's id (--draft-model), when one is loaded.
     std::optional<artifact::ArtifactId> draft_artifact_id;
 };
-
-// The routed experts of one MoE layer: the pinned host bank, its arithmetic and each expert's
-// scalars. W4A4 (design §16.2): alpha is derived once here from the stored words, alpha =
-// fl32(weight_scale_2 * input_scale), so every route (GPU frame, GPU staging, CPU) reads the same
-// values. W4A16 (§16.2.1): no input scales; alpha holds the stored multipliers themselves.
-struct ExpertBank {
-    ExpertBankPlanes planes;
-    ops::offloaded_moe::ExpertActivation activation = ops::offloaded_moe::ExpertActivation::kA4;
-    std::vector<ops::offloaded_moe::ExpertScales> scales; // [experts]
-};
-
-// A GGUF import's bank: its records' ggml formats for the CPU route (invalid for an NVFP4 bank).
-[[nodiscard]] inline ops::offloaded_moe::GgmlExpertFormat ggml_format(const ExpertBank& bank) noexcept {
-    if (bank.planes.gate_up_format == QType::NVFP4_MUL) { return {}; }
-    return {.gate_up        = bank.planes.gate_up_format,
-            .down           = bank.planes.down_format,
-            .gate_row_bytes = static_cast<std::uint32_t>(bank.planes.gate_row_bytes),
-            .down_row_bytes = static_cast<std::uint32_t>(bank.planes.down_row_bytes)};
-}
 
 class LoadPlan;
 

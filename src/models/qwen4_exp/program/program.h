@@ -15,7 +15,7 @@
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/ngram.h"
 #include "models/qwen4_exp/config.h"
-#include "models/qwen4_exp/memory_plan.h"
+#include "models/qwen4_exp/expert_offload.h"
 #include "models/qwen4_exp/execution/fast_path_flags.h"
 #include "infernix/types.h"
 #include "runtime/contract/execution.h"
@@ -630,14 +630,5 @@ struct RuntimeTypes {
     using AbortResult       = qwen4_exp::AbortResult;
     using Program           = qwen4_exp::Program;
 };
-
-namespace testing {
-// Fault injection for engine-level tests: the `checks`-th later check of the expert error word (one
-// per prefill call or decode round, process-wide) reports a failed expert read, as a real one would.
-// 0 disarms.
-void set_expert_fault(std::uint32_t checks) noexcept;
-// Consumes one check; true on the armed one.
-[[nodiscard]] bool take_expert_fault() noexcept;
-} // namespace testing
 
 } // namespace infernix::models::qwen4_exp

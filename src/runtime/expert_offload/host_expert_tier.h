@@ -28,8 +28,8 @@
 
 #include "core/direct_read_queue.h"
 #include "core/host_memory.h"
-#include "models/qwen4_exp/expert_store.h"
-#include "models/qwen4_exp/program/expert_cache/host_tier.h"
+#include "runtime/expert_offload/expert_store.h"
+#include "runtime/expert_offload/host_tier.h"
 #include "ops/offloaded_sparse_moe/cpu/fetch_channel.h"
 #include "ops/offloaded_sparse_moe/cpu/record_provider.h"
 
@@ -46,7 +46,7 @@
 #include <thread>
 #include <vector>
 
-namespace infernix::models::qwen4_exp {
+namespace infernix::runtime::expert_offload {
 
 class HostExpertTier final : public ops::offloaded_moe::RecordProvider {
 public:
@@ -353,4 +353,4 @@ private:
     std::thread agent_;
 };
 
-} // namespace infernix::models::qwen4_exp
+} // namespace infernix::runtime::expert_offload

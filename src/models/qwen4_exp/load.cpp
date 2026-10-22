@@ -12,6 +12,7 @@
 #include <cstring>
 #include <algorithm>
 #include <map>
+#include <stdexcept>
 #include <utility>
 
 namespace infernix::models::qwen4_exp {
@@ -399,19 +400,6 @@ std::vector<ops::offloaded_moe::ExpertScales> expert_scales(const ExpertBankPlan
     return out;
 }
 
-// A W4A16 bank's scalars (design §16.2.1): no input scales, alpha = the stored multipliers.
-std::vector<ops::offloaded_moe::ExpertScales> a16_expert_scales(const ExpertBankPlanes& planes, const std::string& name) {
-    std::vector<ops::offloaded_moe::ExpertScales> out(planes.experts);
-    for (std::uint32_t e = 0; e < planes.experts; ++e) {
-        const float* m = planes.multipliers + 3 * std::size_t(e);
-        for (int i = 0; i < 3; ++i) {
-            if (!std::isfinite(m[i]) || m[i] <= 0) { throw ArtifactError(name + ": expert multipliers must be positive finite FP32"); }
-        }
-        out[e] = {0.0F, 0.0F, 0.0F, m[0], m[1], m[2]};
-    }
-    return out;
-}
-
 } // namespace
 
 struct LoadPlan::Impl {
@@ -708,8 +696,14 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
             bank.scales = expert_scales(bank.planes, data->input_scales.at(i),
                                         bound.at(layers[i].moe.input_scales.index).name);
         } else {
+            // A W4A16 bank's scalars (design §16.2.1): no input scales, alpha = the stored multipliers.
             bank.activation = ops::offloaded_moe::ExpertActivation::kA16;
-            bank.scales     = a16_expert_scales(bank.planes, bound.at(layers[i].moe.experts.index).name);
+            try {
+                bank.scales = runtime::expert_offload::a16_expert_scales(bank.planes,
+                                                                         bound.at(layers[i].moe.experts.index).name);
+            } catch (const std::invalid_argument& error) {
+                throw ArtifactError(error.what());
+            }
         }
         banks.push_back(std::move(bank));
     }

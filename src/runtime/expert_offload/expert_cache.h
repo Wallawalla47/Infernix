@@ -13,7 +13,7 @@
 #include <span>
 #include <vector>
 
-namespace infernix::models::qwen4_exp::expert_cache {
+namespace infernix::runtime::expert_offload::expert_cache {
 
 // ---------------------------------------------------------------------------- residency entries
 
@@ -300,4 +300,4 @@ private:
     LfruPolicy::Step step_;
 };
 
-} // namespace infernix::models::qwen4_exp::expert_cache
+} // namespace infernix::runtime::expert_offload::expert_cache

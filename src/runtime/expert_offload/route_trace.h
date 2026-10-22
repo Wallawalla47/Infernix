@@ -39,7 +39,7 @@
 #include <functional>
 #include <span>
 
-namespace infernix::models::qwen4_exp {
+namespace infernix::runtime::expert_offload {
 
 enum class RouteTraceKind : std::uint32_t { PrefillChunk = 0, ForcedTokens = 1, Decode = 2, Verify = 3, Graph = 4 };
 enum class RouteTraceGraph : std::uint32_t {
@@ -105,4 +105,4 @@ void set_route_trace(std::filesystem::path path);
 
 } // namespace testing
 
-} // namespace infernix::models::qwen4_exp
+} // namespace infernix::runtime::expert_offload

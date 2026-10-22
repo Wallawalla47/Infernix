@@ -7,7 +7,7 @@
 //
 //   INFERNIX_QWEN4_ARTIFACT=out.ninfer [INFERNIX_QWEN4_NGRAM=out.ninfer.ngram] infernix_qwen4_exp_expert_fault_real_test
 
-#include "models/qwen4_exp/program/program.h"
+#include "runtime/expert_offload/expert_offload.h"
 #include "infernix/engine.h"
 
 #include <cstdint>
@@ -81,7 +81,7 @@ int main() {
         check(baseline.size() == kTokens, "the baseline generates its tokens");
 
         // The fault lands in the first rounds the three requests run.
-        infernix::models::qwen4_exp::testing::set_expert_fault(4);
+        infernix::runtime::expert_offload::testing::set_expert_fault(4);
         std::vector<std::optional<std::vector<infernix::TokenId>>> ids(3);
         std::vector<std::string> errors(3);
         std::vector<std::thread> threads;
@@ -93,7 +93,7 @@ int main() {
             });
         }
         for (std::thread& thread : threads) { thread.join(); }
-        infernix::models::qwen4_exp::testing::set_expert_fault(0);
+        infernix::runtime::expert_offload::testing::set_expert_fault(0);
         std::size_t failed = 0;
         for (std::size_t r = 0; r < 3; ++r) {
             if (ids[r]) {

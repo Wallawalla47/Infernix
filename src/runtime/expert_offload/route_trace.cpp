@@ -1,4 +1,4 @@
-#include "models/qwen4_exp/program/route_trace.h"
+#include "runtime/expert_offload/route_trace.h"
 
 #include <array>
 #include <cstring>
@@ -8,7 +8,7 @@
 #include <utility>
 #include <vector>
 
-namespace infernix::models::qwen4_exp {
+namespace infernix::runtime::expert_offload {
 namespace {
 
 constexpr std::uint32_t kVersion = 2;
@@ -114,4 +114,4 @@ std::filesystem::path route_trace() {
 
 } // namespace testing
 
-} // namespace infernix::models::qwen4_exp
+} // namespace infernix::runtime::expert_offload

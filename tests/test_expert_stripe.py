@@ -1,6 +1,6 @@
 """Expert stripes (tools/flash_next/expert_stripe.py): the tails of every routed expert record,
 written for a second drive. Against the artifact's own bytes: the header the C++ reader parses
-(src/models/qwen4_exp/expert_store.h), every tail, records that straddle part files, the split
+(src/runtime/expert_offload/expert_store.h), every tail, records that straddle part files, the split
 fraction rounded to 4 KiB, verification of a damaged stripe, and refusal of another artifact."""
 
 from __future__ import annotations

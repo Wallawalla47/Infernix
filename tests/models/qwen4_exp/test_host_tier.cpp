@@ -2,7 +2,7 @@
 // the decayed LFU against a naive sum of decayed uses, every slot transition T1-T12, and a long
 // randomized run whose victims are checked against a naive scan, with the full audit after every
 // step. Host only.
-#include "models/qwen4_exp/program/expert_cache/host_tier.h"
+#include "runtime/expert_offload/host_tier.h"
 
 #include <algorithm>
 #include <cmath>
@@ -16,7 +16,7 @@
 
 namespace {
 
-using namespace infernix::models::qwen4_exp::expert_cache;
+using namespace infernix::runtime::expert_offload::expert_cache;
 
 int failures = 0;
 

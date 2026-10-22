@@ -3,7 +3,7 @@ slots, and the artifact on SSD read in place (memory track, docs/maintainer/qwen
 section 19.3.7, measurement RM0f). Python 3.11+ with numpy.
 
 Input: route traces written by the engine's internal route trace (ProgramOptions::route_trace; the
-format is documented in src/models/qwen4_exp/program/route_trace.h), captured with
+format is documented in src/runtime/expert_offload/route_trace.h), captured with
 infernix_qwen4_exp_route_trace_real_test, replayed in the order given as one session.
 
 Model of one round (one trace record), following the plan's boundary protocol:

@@ -1,4 +1,4 @@
-#include "models/qwen4_exp/program/expert_cache/host_tier.h"
+#include "runtime/expert_offload/host_tier.h"
 
 #include <algorithm>
 #include <cmath>
@@ -6,7 +6,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace infernix::models::qwen4_exp::expert_cache {
+namespace infernix::runtime::expert_offload::expert_cache {
 
 namespace {
 
@@ -476,4 +476,4 @@ void HostTier::check() const {
     if (held_keys != held_count_) { fail("held count"); }
 }
 
-} // namespace infernix::models::qwen4_exp::expert_cache
+} // namespace infernix::runtime::expert_offload::expert_cache

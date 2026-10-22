@@ -86,9 +86,9 @@ DFlash2::DFlash2(const Parameters& parameters, const DFlash2Config& config, Prop
         require_q8(layer.gate_up.weight, "the MLP gate/up projections");
         require_q8(layer.down.weight, "the MLP down projection");
     }
-    // The fused Ops' contract (context_kv_materialize: five local layers, eps 1e-6; the selector's
-    // 16 candidates of rank 256).
-    if (config_.layers != ops::kContextKVMaterializeLayers || config_.rms_norm_eps != 1e-6F ||
+    // The fused Ops' contract (context_kv_materialize: five or six local layers, eps 1e-6; the
+    // selector's 16 candidates of rank 256).
+    if (!ops::context_kv_materialize_layer_count(config_.layers) || config_.rms_norm_eps != 1e-6F ||
         config_.selector_top_k != static_cast<std::uint32_t>(kCandidates) || config_.conv_kernel != 2 ||
         config_.conv_group != 16) {
         throw std::invalid_argument("Qwen4Exp DFlash2: the drafter is outside the fused Ops' registered geometry");
@@ -109,12 +109,13 @@ void DFlash2::materialize(const DFlash2ContextCall& call) {
     Tensor context = work_.alloc(DType::BF16, {H, W, B});
     Tensor flat    = context.view({H, W * B});
     ops::rmsnorm(projected, p_.context_norm, config_.rms_norm_eps, false, flat, s);
-    std::array<ops::ContextKVMaterializeLayerView, ops::kContextKVMaterializeLayers> layers;
-    for (std::size_t l = 0; l < layers.size(); ++l) {
+    std::array<ops::ContextKVMaterializeLayerView, ops::kContextKVMaterializeMaxLayers> layers;
+    for (std::size_t l = 0; l < config_.layers; ++l) {
         const auto& layer = p_.layers[l];
         layers[l]         = {layer.context_key.weight, layer.context_value.weight, layer.key_norm, ring_[l]};
     }
-    ops::context_kv_materialize(context, call.positions, call.counts, call.slots, layers, config_.rope_theta,
+    ops::context_kv_materialize(context, call.positions, call.counts, call.slots,
+                                std::span(layers.data(), config_.layers), config_.rope_theta,
                                 {call.min_count, call.max_count}, work_, s);
 }
 
@@ -267,7 +268,8 @@ std::size_t DFlash2::workspace_bytes(const TextConfig& text, const DFlash2Config
         const std::size_t cells = static_cast<std::size_t>(columns) * static_cast<std::size_t>(rows);
         context = std::max(context, 2 * (H * cells * 2 + kSlack) +
                                         ops::linear_workspace_capacity_bytes(kQ8, dim(H), dim(F), kA16, 1, dim(cells)) +
-                                        ops::context_kv_materialize_workspace_capacity_bytes(rows, 1, columns));
+                                        ops::context_kv_materialize_workspace_capacity_bytes(
+                                            static_cast<std::int32_t>(config.layers), rows, 1, columns));
     }
     // propose at the widest block (every buffer grows with W and B): the residual, one branch's
     // buffers and scratch, then the head's candidates and the selector.
