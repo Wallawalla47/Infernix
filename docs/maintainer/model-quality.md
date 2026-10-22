@@ -2110,6 +2110,20 @@ paths pass on BF16 (KL excess -1.43e-4, bound 4.1e-5; top-1 -0.04 points, bound 
 1.007), INT8 (KL -7.9e-5, bound -6.0e-6) and VQ2 (KL -1.77e-4, bound 8.2e-5), as they did under the
 binary64 sums.
 
+**35B-A3B router logits in BF16 (2026-10-22, owner-approved).** The sparse MoE router rounds each
+logit (and the shared expert's gate logit) to BF16 before the top-8 choice and the softmax, as the model
+computes them (lossless-route.md §2: `l = bf16(x W_router)`); the reproducible route had kept the FP32
+sums. Gate, main's reproducible route as base, against the lossless references (quick corpus, chunk 896;
+decode at four requests, 256 segments): prefill KL excess -5.2e-4 (bound -1.6e-4) on BF16 KV and -6.1e-4
+(-3.8e-4) on INT8, top-1 -0.10 points, corpus NLL -2.6e-4 and -3.7e-6, p99.9 ratio 0.84 and 0.88; decode
+TV -9.5e-4 (bound -7.0e-4), top-1 -0.12 points, p99.9 ratio 0.73. It lowers the route's processing cost
+against the design reference from 4.24e-3 to 3.72e-3 (6.2); the MoE block's other BF16 rounding points
+gave no further gain (tested the same day). Speed (ABBA, INT8 KV, one request): plain decode -0.01 %
+(mixed), prefill +0.06 to +0.14 %, 16,384-token prompt decode +0.21 %; MTP decode -3.6 % on the bench's
+one prompt came from that text's acceptance (597 rounds against 576, time per round unchanged), and over
+16 prompts of the bench corpus the pooled acceptance length is 2.219 against 2.172 (+2.1 %; per prompt
++0.030, standard error 0.035; ahead on 9, behind on 6), so it costs nothing.
+
 **35B-A3B Q8 shared-expert prefill (`4f0bb18f`, NInfer `610f79e9d`).** The Q8 gate/up and down
 prefill kernels of `Qwen3.6-35B-A3B` apply each 32-wide group's FP16 scale to the FP32 partial sum
 and pass the SiLU output as a BF16 high/low pair, where the old route rounded each code × scale to
