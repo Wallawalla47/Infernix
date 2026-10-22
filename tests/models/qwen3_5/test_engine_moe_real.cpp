@@ -22,6 +22,9 @@ infernix::EngineOptions engine_options(const char* artifact) {
     options.speculative.proposal_head = infernix::ProposalHead::Optimized;
     options.enable_vision             = true;
     options.use_cuda_graph            = true;
+    // The append check resumes from the decode-computed endpoint, which only free-cache-resume
+    // publishes; the test asks for it, as the prefix tests do, whatever the artifact qualifies.
+    options.fast_path_candidates      = {infernix::FastPath::FreeCacheResume};
     return options;
 }
 
@@ -96,8 +99,23 @@ int verify_loaded_product(const infernix::Engine& engine) {
 
 int exercise_text_mtp_and_prefix(infernix::Engine& engine) {
     const std::vector<infernix::TokenId> prompt{248045, 846, 198, 5834, 248046, 198};
+    // The prefix cache publishes an endpoint only 64 or more tokens past the root
+    // (prefix_cache::kMinimumTapSeparation), so the append check's first turn is a longer message.
+    std::vector<infernix::TokenId> turn{248045, 846, 198};
+    for (const infernix::TokenId token : engine.tokenize_text(
+             "A lighthouse keeper writes down the weather every evening: the direction of the wind, "
+             "the height of the waves, the colour of the sky at sunset and the ships that passed the "
+             "point. After forty years the notebooks fill a shelf. Summarise what such a record could "
+             "tell a historian about the coast, and name two questions it could not answer.")) {
+        turn.push_back(token);
+    }
+    turn.insert(turn.end(), {248046, 198});
+    if (turn.size() < 64) {
+        std::cerr << "35B append fixture is too short for an endpoint: " << turn.size() << " tokens\n";
+        return 1;
+    }
     const infernix::GenerationResult first =
-        engine.generate(engine.prepare_tokens(prompt), greedy_options(5, true));
+        engine.generate(engine.prepare_tokens(turn), greedy_options(5, true));
     if (first.generated_token_ids.size() != 5 ||
         first.speculative.backend != infernix::SpeculativeBackend::Mtp ||
         first.speculative.rounds == 0) {
@@ -106,7 +124,7 @@ int exercise_text_mtp_and_prefix(infernix::Engine& engine) {
         return 1;
     }
 
-    std::vector<infernix::TokenId> continuation = prompt;
+    std::vector<infernix::TokenId> continuation = turn;
     continuation.insert(continuation.end(), first.generated_token_ids.begin(),
                         first.generated_token_ids.end());
     continuation.push_back(198);
@@ -114,7 +132,7 @@ int exercise_text_mtp_and_prefix(infernix::Engine& engine) {
     const infernix::GenerationResult reused =
         engine.generate(engine.prepare_tokens(continuation), greedy_options(2, true));
     const std::uint32_t expected_reuse =
-        static_cast<std::uint32_t>(prompt.size() + first.generated_token_ids.size() - 1);
+        static_cast<std::uint32_t>(turn.size() + first.generated_token_ids.size() - 1);
     if (reused.reused_prompt_tokens != expected_reuse || reused.generated_token_ids.size() != 2) {
         std::cerr << "35B append/prefix reuse is incorrect: reused=" << reused.reused_prompt_tokens
                   << " expected=" << expected_reuse
