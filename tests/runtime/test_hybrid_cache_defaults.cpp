@@ -164,8 +164,10 @@ int main() {
                               std::chrono::milliseconds{0},
                           "a disabled prefix cache kept a tool-call hold");
     }
-    // --draft-tokens auto takes the model's most drafts unless given a ceiling (Qwen3.8-Flash-Next 7,
-    // Qwen3.5 5); adaptive-mtp is auto's policy, so a fixed length refuses it.
+    // --draft-tokens auto takes the model's most MTP drafts unless given a ceiling (Qwen3.8-Flash-Next 7,
+    // Qwen3.5 5); the block drafters take it too (Qwen3.8-Flash-Next's DFlash2 7, the Qwen3.5 planner
+    // resolves its blocks). adaptive-mtp and adaptive-dflash are auto's policy, so a fixed length
+    // refuses them, and auto without a drafter is refused.
     {
         EngineOptions options;
         options.speculative.backend           = infernix::SpeculativeBackend::Mtp;
@@ -185,13 +187,28 @@ int main() {
             (void)normalize_engine_options(fixed);
         } catch (const std::invalid_argument&) { rejected = true; }
         failures += check(rejected, "adaptive-mtp was accepted with a fixed draft length");
-        EngineOptions dflash               = options;
-        dflash.speculative.backend         = infernix::SpeculativeBackend::DFlash2;
+        fixed.speculative.backend   = infernix::SpeculativeBackend::DFlash2;
+        fixed.fast_path_candidates  = {infernix::FastPath::AdaptiveDFlash};
         rejected = false;
         try {
-            (void)normalize_engine_options(dflash);
+            (void)normalize_engine_options(fixed);
         } catch (const std::invalid_argument&) { rejected = true; }
-        failures += check(rejected, "--draft-tokens auto was accepted without MTP");
+        failures += check(rejected, "adaptive-dflash was accepted with a fixed draft length");
+        EngineOptions dflash                  = options;
+        dflash.speculative.backend            = infernix::SpeculativeBackend::DFlash2;
+        dflash.speculative.draft_tokens       = 0;
+        failures += check(normalize_engine_options(dflash).speculative.draft_tokens == 0U &&
+                              normalize_engine_options(dflash, infernix::models::Architecture::Qwen4Exp)
+                                      .speculative.draft_tokens == 7U,
+                          "--draft-tokens auto with DFlash2 did not leave Qwen3.5's block to the planner "
+                          "or take Qwen3.8-Flash-Next's 7");
+        EngineOptions none          = options;
+        none.speculative.backend    = infernix::SpeculativeBackend::None;
+        rejected = false;
+        try {
+            (void)normalize_engine_options(none);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "--draft-tokens auto was accepted without a drafter");
     }
     // --expert-tail-skip skips offloaded experts: Qwen3.8-Flash-Next only.
     {
