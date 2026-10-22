@@ -44,7 +44,7 @@ and the chunk size only picks the scatter. So:
 | `infernix-perplexity --kl-reference FILE` | KL divergence and top-1 agreement against a saved reference |
 | `infernix_decode_quality_gen` / `infernix_decode_quality_judge` | end-to-end greedy decode through the production speculative path, judged token by token against a reference ([benchmarks](../../bench/README.md#decode-quality)) |
 | `infernix-certify` | IQS-1's references, noise twins, teacher-forced prefill and decode arms and G1 captures (6.6) |
-| `tools/quality/iqs.py`, `certify.py`, `iqs_e2e.py`, `iqs_shadow.py` | IQS-1's decisions and certificate, the certification run, its end-to-end checks and its reference conformance (6.6) |
+| `tools/quality/iqs.py`, `certify.py`, `iqs_e2e.py`, `shadow/` | IQS-1's decisions and certificate, the certification run, its end-to-end checks and its reference conformance (6.6) |
 
 Perplexity scoring runs prefill only; decode kernels, speculative verification and n-gram drafting
 need the decode tools. The generator uses only Engine API that NInfer also has, so the
@@ -603,7 +603,9 @@ the scoring pass over a window already holds the reference for every position a 
 **Tools.** `infernix-certify` measures (`reference`, `prefill`, `decode`, `verify`, `capture`;
 usage at the top of `apps/certify/main.cpp`); `tools/quality/iqs.py` decides (`decide`, `disclose`,
 `certificate`); `tools/quality/iqs_e2e.py` runs the end-to-end checks through `infernix-serve`;
-`tools/quality/iqs_shadow.py` runs G1's CPU comparison; `tools/quality/certify.py` plans and runs the
+`python -m tools.quality.shadow` runs G1's CPU comparison (on each architecture's pinned transformers:
+Qwen3.5/3.6 on 5.5.0, which needs its own directory first on `PYTHONPATH` with tokenizers 0.22,
+huggingface-hub 1.x and httpx; Flash-Next on main 3bb8b727); `tools/quality/certify.py` plans and runs the
 whole regime with a reference store reused across runs:
 
 ```bat

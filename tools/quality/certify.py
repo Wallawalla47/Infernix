@@ -19,7 +19,7 @@ LOCAL.json maps each artifact key to this machine's files:
 Keys absent from LOCAL.json (or excluded by --only) are left out of the plan, and the certificate says so.
 
 G1 (block B): the run captures the lossless route's logits (STORE/<artifact>/conformance); the CPU comparison
-  python -m tools.quality.iqs_shadow STORE/<artifact>/conformance --artifact ART --out RUN/checks/shadow-<artifact>.json
+  python -m tools.quality.shadow STORE/<artifact>/conformance --artifact ART --out RUN/checks/shadow-<artifact>.json
 runs beside or after the GPU blocks, before the certificate.
 
 Blocks (standard section 5.2): C1 references (lossless; design reference where the artifact declares activation
@@ -47,7 +47,7 @@ CORPUS = ROOT / "eval" / "corpora" / "iqs-1" / "manifest.json"
 KV_FORMATS = ("int8", "fp8", "nvfp4", "k8v4", "vq2", "k4v2")
 KV_REPRESENTATIVES = ("q27gw", "rc")          # one per attention family (Qwen3.5, Qwen3.8-Flash-Next)
 LONG_REPRESENTATIVES = ("q27gw", "q35", "rc")  # dense Qwen3.5, MoE Qwen3.5, Flash-Next
-CONFORMANCE = ("q27gw", "q35", "rc")           # G1: one artifact per architecture
+CONFORMANCE = ("q27gw", "q35", "fp8")          # G1: one artifact per architecture (Flash-Next: the official FP8)
 CAPTURE = ("--windows", "0,8,16,24", "--tokens", "512", "--every", "16")  # 4 sequences, 31 positions each
 TWIN_WINDOWS = "0,4,8,12,16,20,24,28"          # one window per domain
 TWIN_SEED = 20261022
@@ -246,7 +246,7 @@ class Planner:
                                      "kv": kv})
 
     def capture(self, c: Config) -> None:
-        """G1: the lossless route's whole logits rows, which tools/quality/iqs_shadow.py compares bit for bit
+        """G1: the lossless route's whole logits rows, which tools/quality/shadow compares bit for bit
         with the publisher's model code in exact arithmetic (on the CPU, after the GPU blocks)."""
         out = self.store / c.artifact / "conformance"
         self.certify_step("B", f"capture-{c.artifact}", "capture", c, list(CAPTURE), out, 30)

@@ -327,7 +327,7 @@ the artifact and the declared steps, so a reference survives rebuilds like `--lo
   roundings.
 - Reference conformance (IQS-1 G1): the route's whole FP32 logits at chosen positions
   (`infernix-certify capture`) equal, bit for bit, the publisher's transformers code evaluated in exact
-  arithmetic with each operation rounded to its dtype (`tools/quality/iqs_shadow.py`).
+  arithmetic with each operation rounded to its dtype (`tools/quality/shadow`).
 - Its bits depend on the request and the artifact alone, so IQS-1 stores its references across builds
   and releases (`tools/quality/certify.py`'s reference store) and a release run re-scores one window of
   each to confirm that no bit changed; any change to what this document defines needs the owner's

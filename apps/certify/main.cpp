@@ -449,7 +449,7 @@ int run_verify(Options options) {
 }
 
 // Reference conformance (IQS-1 G1): the lossless route's whole FP32 logits at every --every'th position of the
-// first --tokens tokens of the chosen windows, for tools/quality/iqs_shadow.py to compare bit for bit with the
+// first --tokens tokens of the chosen windows, for tools/quality/shadow to compare bit for bit with the
 // publisher's model code run in exact arithmetic. PREFIX.json holds the tokens and positions, PREFIX.f32 the
 // logits rows (little-endian binary32, one vocabulary-sized row per position, in order).
 int run_capture(const Options& options, std::uint32_t tokens, std::uint32_t every) {
