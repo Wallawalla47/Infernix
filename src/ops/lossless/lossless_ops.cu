@@ -380,3 +380,34 @@ void lossless_causal_conv_slots(const Tensor& x, const Tensor& weight, int seque
 }
 
 } // namespace infernix::ops
+
+// This unit's copy of the noise twin's seed (ops/lossless/noise.cuh).
+INFERNIX_LOSSLESS_NOISE_UNIT(ops)
+
+namespace infernix::ops {
+namespace lossless {
+// Each rounding unit's setter (INFERNIX_LOSSLESS_NOISE_UNIT).
+void set_noise_seed_attention(unsigned long long seed);
+void set_noise_seed_flash(unsigned long long seed);
+void set_noise_seed_gdn(unsigned long long seed);
+void set_noise_seed_moe(unsigned long long seed);
+void set_noise_seed_rope(unsigned long long seed);
+void set_noise_seed_linear(unsigned long long seed);
+void set_noise_seed_linear_ggml_i(unsigned long long seed);
+void set_noise_seed_linear_ggml_k(unsigned long long seed);
+} // namespace lossless
+
+void lossless_set_noise_seed(std::uint64_t seed) {
+    const unsigned long long value = seed;
+    lossless::set_noise_seed_ops(value);
+    lossless::set_noise_seed_attention(value);
+    lossless::set_noise_seed_flash(value);
+    lossless::set_noise_seed_gdn(value);
+    lossless::set_noise_seed_moe(value);
+    lossless::set_noise_seed_rope(value);
+    lossless::set_noise_seed_linear(value);
+    lossless::set_noise_seed_linear_ggml_i(value);
+    lossless::set_noise_seed_linear_ggml_k(value);
+}
+
+} // namespace infernix::ops

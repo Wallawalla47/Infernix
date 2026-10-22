@@ -744,6 +744,11 @@ PromptSummary PreparedPrompt::summary() const {
     return summary;
 }
 
+std::span<const TokenId> PreparedPrompt::token_ids() const noexcept {
+    if (data_ == nullptr) { return {}; }
+    return data_->token_ids;
+}
+
 PromptPreparationStats PreparedPrompt::preparation_stats() const noexcept {
     if (data_ == nullptr) { return {}; }
     const PrepareStats& stats = data_->prepare;

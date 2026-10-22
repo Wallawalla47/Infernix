@@ -254,3 +254,6 @@ void lossless_linear_tiles(const Tensor& x, const std::int32_t* in_columns, std:
 }
 
 } // namespace infernix::ops
+
+// This unit's copy of the noise twin's seed (ops/lossless/noise.cuh).
+INFERNIX_LOSSLESS_NOISE_UNIT(linear)

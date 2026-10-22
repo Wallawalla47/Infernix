@@ -347,3 +347,6 @@ void lossless_moe_combine(const Tensor& expert_out, const Tensor& weights, const
 }
 
 } // namespace infernix::ops
+
+// This unit's copy of the noise twin's seed (ops/lossless/noise.cuh).
+INFERNIX_LOSSLESS_NOISE_UNIT(moe)

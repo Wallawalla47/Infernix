@@ -16,6 +16,14 @@ namespace infernix::ops {
 // (src/ops/lossless/cr_math.cuh). Tensors are contiguous; out may alias an input of the same shape.
 
 /**
+ * The noise twin (EngineOptions::lossless_noise_seed; IQS-1's noise floor): with a nonzero seed every
+ * correctly rounded result of the lossless ops becomes a stochastic rounding of the same exact value
+ * (src/ops/lossless/noise.cuh); 0 restores round to nearest even. Process-wide device state of every
+ * lossless unit, set before the ops run.
+ */
+void lossless_set_noise_seed(std::uint64_t seed);
+
+/**
  * Qwen3_5RMSNorm over rows of x (BF16 [width, rows]) with weight w (BF16 or FP32 [width]):
  * out = bf16(fp32(y fp32(1 + w))), y = fp32(x r), r = fp32(rsqrt(fp32(m + eps))), m = fp32(mean(x^2))
  * (the sum of squares exact).

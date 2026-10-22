@@ -113,6 +113,9 @@ void validate_engine_options(const EngineOptions& options, models::Architecture 
     if (options.reference && (!options.lossless || options.purpose != EnginePurpose::CausalScoring)) {
         throw std::invalid_argument("the design reference (--reference) is the lossless route's causal scoring");
     }
+    if (options.lossless_noise_seed != 0 && (!options.lossless || options.purpose != EnginePurpose::CausalScoring)) {
+        throw std::invalid_argument("the noise twin (lossless_noise_seed) is the lossless route's causal scoring");
+    }
 }
 
 namespace {

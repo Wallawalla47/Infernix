@@ -7,6 +7,8 @@
 // rounds that, which no binary32 argument's exact value lies close enough to a midpoint to defeat
 // (binary32 worst cases are about 2^-60 away). rsqrt settles a near-midpoint case exactly instead.
 
+#include "ops/lossless/noise.cuh"
+
 #include <cuda_bf16.h>
 
 #include <cstdint>
@@ -93,11 +95,57 @@ __device__ inline DD dd_log(DD a) {
 
 // Round to nearest even of a double to BF16 (via round-to-odd binary32, so the double rounding is
 // exact).
-__device__ __forceinline__ std::uint16_t bf16_of_double(double x) {
+__device__ __forceinline__ std::uint16_t bf16_rne_of_double(double x) {
     float f         = __double2float_rz(x);
     std::uint32_t u = __float_as_uint(f);
     if (static_cast<double>(f) != x && (u & 0x7F800000U) != 0x7F800000U) { u |= 1U; }
     return __bfloat16_as_ushort(__float2bfloat16_rn(__uint_as_float(u)));
+}
+
+__device__ __forceinline__ double bf16_value(std::uint16_t b) {
+    return static_cast<double>(__bfloat162float(__ushort_as_bfloat16(b)));
+}
+
+// The BF16 neighbour of x one step up (dir > 0) or down (sign-magnitude ordered).
+__device__ __forceinline__ std::uint16_t bf16_step(std::uint16_t x, int dir) {
+    const bool neg = (x & 0x8000U) != 0;
+    int mag        = x & 0x7FFF;
+    if ((dir > 0) != neg) {
+        ++mag;
+    } else if (mag == 0) {
+        return static_cast<std::uint16_t>(dir > 0 ? 0x0001U : 0x8001U);
+    } else {
+        --mag;
+    }
+    return static_cast<std::uint16_t>((neg ? 0x8000U : 0U) | static_cast<unsigned>(mag));
+}
+
+// The noise twin (noise.cuh): r, the nearest BF16 or binary32 to a value r + diff, moved to its other
+// neighbour with probability |diff| / gap. Unchanged without a seed, for an exact value, at infinity, or
+// where the other neighbour would overflow.
+__device__ __forceinline__ std::uint16_t bf16_noise(std::uint16_t r, double diff, std::uint64_t key) {
+    if (!noise_active() || diff == 0.0 || (r & 0x7F80U) == 0x7F80U) { return r; }
+    const std::uint16_t n = bf16_step(r, diff > 0.0 ? 1 : -1);
+    if ((n & 0x7F80U) == 0x7F80U) { return r; }
+    return noise_moves(diff / (bf16_value(n) - bf16_value(r)), key) ? n : r;
+}
+
+__device__ __forceinline__ float f32_noise(float r, double diff, std::uint64_t key) {
+    if (!noise_active() || diff == 0.0 || isinf(r)) { return r; }
+    const float n = nextafterf(r, diff > 0.0 ? INFINITY : -INFINITY);
+    if (isinf(n)) { return r; }
+    return noise_moves(diff / (static_cast<double>(n) - static_cast<double>(r)), key) ? n : r;
+}
+
+__device__ __forceinline__ std::uint64_t value_key(double hi, double lo = 0.0) {
+    return noise_mix(static_cast<std::uint64_t>(__double_as_longlong(hi))) ^
+           static_cast<std::uint64_t>(__double_as_longlong(lo));
+}
+
+// A double correctly rounded to BF16 (the noise twin's stochastic rounding of it with a seed).
+__device__ __forceinline__ std::uint16_t bf16_of_double(double x) {
+    const std::uint16_t b = bf16_rne_of_double(x);
+    return bf16_noise(b, x - bf16_value(b), value_key(x));
 }
 
 // Whether hi + lo lies beyond the midpoint m (direction dir: +1 above, -1 below), with hi - m exact
@@ -110,7 +158,7 @@ __device__ __forceinline__ bool beyond(DD v, double m, int dir) {
 
 // Round to nearest even of hi + lo (|lo| <= ulp(hi) / 2) to binary32: rounds hi, then moves to a
 // neighbour when hi + lo lies beyond the midpoint toward it.
-__device__ inline float f32_of_dd(DD v) {
+__device__ inline float f32_rne_of_dd(DD v) {
     float f = __double2float_rn(v.hi);
     if (isinf(f) || v.lo == 0.0) { return f; }
     const double fd = static_cast<double>(f);
@@ -120,42 +168,44 @@ __device__ inline float f32_of_dd(DD v) {
     return f;
 }
 
-__device__ __forceinline__ std::uint16_t bf16_of_dd(DD v) {
+__device__ inline float f32_of_dd(DD v) {
+    const float f = f32_rne_of_dd(v);
+    return f32_noise(f, (v.hi - static_cast<double>(f)) + v.lo, value_key(v.hi, v.lo));
+}
+
+__device__ __forceinline__ std::uint16_t bf16_rne_of_dd(DD v) {
     // The BF16 neighbours around the rounded double, decided by hi + lo against their midpoint.
-    const std::uint16_t b = bf16_of_double(v.hi);
+    const std::uint16_t b = bf16_rne_of_double(v.hi);
     if (v.lo == 0.0) { return b; }
-    const double bd = static_cast<double>(__bfloat162float(__ushort_as_bfloat16(b)));
-    // BF16 neighbours: step the BF16 bit pattern (sign-magnitude ordered).
-    const auto step = [](std::uint16_t x, int dir) -> std::uint16_t {
-        const bool neg = (x & 0x8000U) != 0;
-        int mag        = x & 0x7FFF;
-        if ((dir > 0) != neg) {
-            ++mag;
-        } else if (mag == 0) {
-            return static_cast<std::uint16_t>(dir > 0 ? 0x0001U : 0x8001U);
-        } else {
-            --mag;
-        }
-        return static_cast<std::uint16_t>((neg ? 0x8000U : 0U) | static_cast<unsigned>(mag));
-    };
-    const std::uint16_t up = step(b, 1), down = step(b, -1);
-    const double up_d = __bfloat162float(__ushort_as_bfloat16(up)), down_d = __bfloat162float(__ushort_as_bfloat16(down));
+    const double bd = bf16_value(b);
+    const std::uint16_t up = bf16_step(b, 1), down = bf16_step(b, -1);
+    const double up_d = bf16_value(up), down_d = bf16_value(down);
     if (beyond(v, bd + (up_d - bd) / 2, 1)) { return up; }
     if (beyond(v, bd - (bd - down_d) / 2, -1)) { return down; }
     return b;
 }
 
-// Whether every value within err of y rounds to the same binary32 (and which).
+__device__ __forceinline__ std::uint16_t bf16_of_dd(DD v) {
+    const std::uint16_t b = bf16_rne_of_dd(v);
+    return bf16_noise(b, (v.hi - bf16_value(b)) + v.lo, value_key(v.hi, v.lo));
+}
+
+// Whether every value within err of y rounds to the same binary32 (and which). With a noise seed the
+// accepted value is the noise twin's rounding of y.
 __device__ __forceinline__ bool certain_f32(double y, double err, float& out) {
     const float a = __double2float_rn(y - err), b = __double2float_rn(y + err);
     out           = __double2float_rn(y);
-    return a == b && __float_as_uint(a) == __float_as_uint(out);
+    const bool certain = a == b && __float_as_uint(a) == __float_as_uint(out);
+    if (certain) { out = f32_noise(out, y - static_cast<double>(out), value_key(y)); }
+    return certain;
 }
 
 __device__ __forceinline__ bool certain_bf16(double y, double err, std::uint16_t& out) {
-    const std::uint16_t a = bf16_of_double(y - err), b = bf16_of_double(y + err);
-    out                   = bf16_of_double(y);
-    return a == b && a == out;
+    const std::uint16_t a = bf16_rne_of_double(y - err), b = bf16_rne_of_double(y + err);
+    out                   = bf16_rne_of_double(y);
+    const bool certain    = a == b && a == out;
+    if (certain) { out = bf16_noise(out, y - bf16_value(out), value_key(y)); }
+    return certain;
 }
 
 // ------------------------------------------------------------------------- functions

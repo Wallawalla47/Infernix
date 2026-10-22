@@ -333,3 +333,6 @@ void lossless_gated_delta_rule_slots(const Tensor& query, const Tensor& key, con
 }
 
 } // namespace infernix::ops
+
+// This unit's copy of the noise twin's seed (ops/lossless/noise.cuh).
+INFERNIX_LOSSLESS_NOISE_UNIT(gdn)

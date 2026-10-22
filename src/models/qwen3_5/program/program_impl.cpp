@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -490,7 +491,33 @@ ScoreResult ProgramImpl::causal_score(PreparedPromptData&& prompt, std::uint32_t
                                            candidate_logprobs.bytes(), cudaMemcpyDeviceToHost,
                                            device.stream));
             }
+            // ScoreOptions::logits_positions in this tile: the whole logits column as scoring computed it
+            // (FP32 on the lossless route; BF16 elsewhere, widened exactly).
+            const std::size_t vocab = static_cast<std::size_t>(logits.ne[0]);
+            std::vector<std::pair<std::size_t, std::vector<std::uint16_t>>> bf16_columns;
+            for (const std::uint32_t position : options.logits_positions) {
+                if (position < first_position || position >= first_position + staged_columns) { continue; }
+                const std::size_t column = position - first_position;
+                const std::size_t base   = output.logits.size();
+                output.logits.resize(base + vocab);
+                if (lossless) {
+                    CUDA_CHECK(cudaMemcpyAsync(output.logits.data() + base,
+                                               static_cast<const float*>(logits.data) + column * vocab,
+                                               vocab * sizeof(float), cudaMemcpyDeviceToHost, device.stream));
+                } else {
+                    bf16_columns.emplace_back(base, std::vector<std::uint16_t>(vocab));
+                    CUDA_CHECK(cudaMemcpyAsync(bf16_columns.back().second.data(),
+                                               static_cast<const std::uint16_t*>(logits.data) + column * vocab,
+                                               vocab * sizeof(std::uint16_t), cudaMemcpyDeviceToHost, device.stream));
+                }
+            }
             device.synchronize();
+            for (const auto& [base, raw] : bf16_columns) {
+                for (std::size_t v = 0; v < vocab; ++v) {
+                    const std::uint32_t bits = std::uint32_t{raw[v]} << 16U;
+                    std::memcpy(&output.logits[base + v], &bits, sizeof(bits));
+                }
+            }
             output.logprobs.insert(output.logprobs.end(), host_logprobs,
                                    host_logprobs + staged_columns);
             output.top_ids.insert(output.top_ids.end(), host_top_ids,

@@ -14,7 +14,7 @@ inline constexpr std::int32_t kTokenConstraintChoices = 16;
 // tokens in their declared order, padded with zeros, then the permitted tokens' total mass.
 inline constexpr std::int32_t kTokenConstraintRecord = kTokenConstraintChoices + 1;
 // Most tokens one constrained column may observe.
-inline constexpr std::int32_t kTokenObserveTokens = 64;
+inline constexpr std::int32_t kTokenObserveTokens = 256;
 // Observation record per constrained column: the observed tokens' log-probabilities in their
 // declared order, then the column's largest log-probability.
 inline constexpr std::int32_t kTokenObserveRecord = kTokenObserveTokens + 1;
@@ -43,7 +43,7 @@ inline constexpr std::int32_t kTokenObserveRecord = kTokenObserveTokens + 1;
  *
  *     observed[i,c]  = l[t] - L  for t = observe[i,c] in [0,V); entries with t == -1 are left
  *                      untouched;
- *     observed[64,c] = max_{r<V} l[r] - L.
+ *     observed[kTokenObserveTokens,c] = max_{r<V} l[r] - L.
  *
  *   So a reader can compare the column's distribution with a reference's top tokens (KL over
  *   them) and tell whether a given token is the column's most probable.

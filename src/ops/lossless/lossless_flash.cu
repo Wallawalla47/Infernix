@@ -724,3 +724,6 @@ void lossless_qsa_select(const Tensor& scores, int heads, int ratio, int budget,
 }
 
 } // namespace infernix::ops
+
+// This unit's copy of the noise twin's seed (ops/lossless/noise.cuh).
+INFERNIX_LOSSLESS_NOISE_UNIT(flash)

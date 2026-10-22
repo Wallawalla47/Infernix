@@ -12,6 +12,9 @@
 
 namespace infernix::models::qwen3_5::detail {
 
+// The Engine admits observe lists of up to kMaximumObservedTokens; each column's staged list holds that many.
+static_assert(kMaximumObservedTokens <= static_cast<std::uint32_t>(ops::kTokenObserveTokens));
+
 void ProgramImpl::bind_constraint_sets(std::uint32_t lane, const RequestConstraintPlan* plan) {
     if (!io.constraint || lane >= max_concurrency) {
         throw std::logic_error("constraint controls are unavailable for this lane");

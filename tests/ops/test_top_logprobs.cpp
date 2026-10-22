@@ -229,6 +229,22 @@ int main() {
                          make_fp32_logits(248320, 248077, 3));
     failures += run_case("top_logprobs FP32 below BF16 spacing C=129 K=8", 523, 509, 129, 8,
                          make_fp32_logits(523, 509, 129));
+    // K above kTopLogprobsSerialMaximum (16) up to kTopLogprobsSelectMaximum (1024) takes the radix
+    // selection; K=1025 the K-pass selection again.
+    failures += run_case("top_logprobs radix full vocabulary K=256", 248320, 248077, 3, 256,
+                         make_logits(248320, 248077, 3, random_value));
+    failures += run_case("top_logprobs radix FP32 full vocabulary K=256", 248320, 248077, 3, 256,
+                         make_fp32_logits(248320, 248077, 3));
+    failures += run_case("top_logprobs radix uniform logits rank by row K=256", 263, 257, 4, 256,
+                         make_logits(263, 257, 4, uniform_value));
+    failures += run_case("top_logprobs radix C=1025 K=64", 523, 509, 1025, 64,
+                         make_logits(523, 509, 1025, random_value));
+    failures += run_case("top_logprobs radix K=valid_rows=1024", 1031, 1024, 3, 1024,
+                         make_logits(1031, 1024, 3, extreme_value));
+    failures += run_case("top_logprobs radix K=1024", 4099, 4093, 5, 1024,
+                         make_logits(4099, 4093, 5, random_value));
+    failures += run_case("top_logprobs K-pass beyond the radix buffer K=1025", 1031, 1029, 2, 1025,
+                         make_logits(1031, 1029, 2, random_value));
     failures += run_validation_cases();
 
     std::cout << (failures ? "FAIL" : "OK") << " top_logprobs\n";

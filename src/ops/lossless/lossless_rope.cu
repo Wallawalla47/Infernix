@@ -109,3 +109,6 @@ void lossless_rope_apply(const Tensor& table, Tensor& x, cudaStream_t stream) {
 }
 
 } // namespace infernix::ops
+
+// This unit's copy of the noise twin's seed (ops/lossless/noise.cuh).
+INFERNIX_LOSSLESS_NOISE_UNIT(rope)

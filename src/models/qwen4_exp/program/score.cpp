@@ -110,6 +110,15 @@ ScoreResult ProgramImpl::causal_score(PreparedPrompt&& prompt, std::uint32_t fir
                 ops::target_logprobs(logits, ids, token_domain_, values, s);
             }
             CUDA_CHECK(cudaMemcpyAsync(host, io, score_io_.bytes, cudaMemcpyDeviceToHost, s));
+            // ScoreOptions::logits_positions in this tile: the whole FP32 logits column.
+            for (const std::uint32_t position : options.logits_positions) {
+                if (position < done || position >= done + static_cast<std::size_t>(columns)) { continue; }
+                const std::size_t base = output.logits.size();
+                output.logits.resize(base + static_cast<std::size_t>(vocab_));
+                CUDA_CHECK(cudaMemcpyAsync(output.logits.data() + base,
+                                           static_cast<const float*>(score_logits_.p) + (position - done) * static_cast<std::size_t>(vocab_),
+                                           static_cast<std::size_t>(vocab_) * sizeof(float), cudaMemcpyDeviceToHost, s));
+            }
             device_.synchronize();
             const auto* floats = reinterpret_cast<const float*>(host);
             output.logprobs.insert(output.logprobs.end(), floats + logprobs_at, floats + logprobs_at + columns);

@@ -18,3 +18,6 @@ bool launch_ggml_k(QType q, const Call& c, std::int32_t first, std::int32_t coun
 }
 
 } // namespace infernix::ops::lossless_linear_impl
+
+// This unit's copy of the noise twin's seed (ops/lossless/noise.cuh).
+INFERNIX_LOSSLESS_NOISE_UNIT(linear_ggml_k)

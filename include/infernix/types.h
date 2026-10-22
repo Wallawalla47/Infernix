@@ -595,6 +595,12 @@ struct EngineOptions {
     // a routed-expert bank's W4A4, FP4-Local's with expert_a4_activations), and the KV format's codec.
     // CausalScoring only; its output is a function of the request, the artifact and those steps.
     bool reference                     = false;
+    // The noise twin (IQS-1's noise floor, docs/maintainer/model-quality.md §6): nonzero makes every
+    // rounding of the lossless route (or the design reference) a stochastic rounding of the same exact value,
+    // seeded by this value: an ideal BF16 implementation off by at most one unit in the last place at each
+    // rounding. CausalScoring with `lossless` only; 0 (the default) is the lossless route itself. The rounding
+    // mode is process-wide device state, so one process runs one seed.
+    std::uint64_t lossless_noise_seed  = 0;
     // Qwen3.8-Flash-Next artifacts whose routed experts offer 4-bit activations as an option (only
     // nvidia/Qwen3.8-Flash-Next-FP4-Local, whose experts NVIDIA calibrated for them): run the routed
     // experts W4A4 with their stored activation scales (--expert-a4-activations) instead of the
@@ -737,7 +743,7 @@ inline constexpr std::uint32_t kMaximumConstraintSteps   = 64;
 inline constexpr std::uint32_t kMaximumConstraintChoices = 16;
 inline constexpr std::uint32_t kMaximumConstraintSets    = 4;
 // Most tokens one constrained step may observe.
-inline constexpr std::uint32_t kMaximumObservedTokens    = 64;
+inline constexpr std::uint32_t kMaximumObservedTokens    = 256;
 
 // Output step i may only produce a token of steps[i]; a one-token step forces it. Generation
 // stops after the last step at the latest, so requested_output_tokens must not exceed the step
@@ -1573,18 +1579,25 @@ struct VisionWorkspaceMemorySummary {
 };
 
 // Most tokens Engine::score_tokens returns per scored position for each distribution output.
-inline constexpr std::uint32_t kMaximumScoreTopTokens = 64;
+inline constexpr std::uint32_t kMaximumScoreTopTokens = 256;
 
 // Distribution outputs of Engine::score_tokens beyond every target token's log-probability. All
 // log-probabilities are over the model's public tokens.
 struct ScoreOptions {
-    // The top_k most probable tokens of every scored position, in [0,64].
+    // The top_k most probable tokens of every scored position, in [0,kMaximumScoreTopTokens].
     std::uint32_t top_k = 0;
     // The log-probabilities of candidates_per_position given tokens at every scored position, in
-    // [0,64]: candidates holds them position-major (scored positions x candidates_per_position).
+    // [0,kMaximumScoreTopTokens]: candidates holds them position-major (scored positions x
+    // candidates_per_position).
     std::uint32_t candidates_per_position = 0;
     std::vector<TokenId> candidates;
+    // Scored positions (0-based within the scored range, strictly ascending, at most
+    // kMaximumScoreLogitPositions) whose whole logits vector ScoreResult::logits returns, for exact
+    // comparisons (IQS-1 reference conformance).
+    std::vector<std::uint32_t> logits_positions;
 };
+
+inline constexpr std::uint32_t kMaximumScoreLogitPositions = 256;
 
 struct ScoreResult {
     // log p(tokens[i] | tokens[0..i)) for every scored position i.
@@ -1595,6 +1608,9 @@ struct ScoreResult {
     std::vector<float> top_logprobs;
     // Position-major (scored positions x candidates_per_position), in the candidates' order.
     std::vector<float> candidate_logprobs;
+    // One vocabulary-sized row per ScoreOptions::logits_positions entry, in that order: the logits as
+    // scoring computed them (FP32 on the lossless route; elsewhere their stored precision widened exactly).
+    std::vector<float> logits;
 };
 
 // Offloaded routed experts (Qwen3.5-122B-A10B): the VRAM expert cache's frames now and at startup,

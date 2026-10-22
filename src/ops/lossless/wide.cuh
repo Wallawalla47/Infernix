@@ -11,6 +11,8 @@
 //    magnitude (a truncated quotient).
 //  - divide_small(): the magnitude divided by a small integer, truncated, with the remainder's sticky.
 
+#include "ops/lossless/noise.cuh"
+
 #include <cstdint>
 
 namespace infernix::ops::lossless {
@@ -185,7 +187,23 @@ __device__ std::uint32_t round_magnitude(const std::uint32_t (&mag)[Words], int 
             if ((mag[i] & mk) != 0) { sticky = true; }
         }
     }
-    if (half && (sticky || (q & 1ULL) != 0)) { ++q; }
+    bool up = half && (sticky || (q & 1ULL) != 0);
+    if (shift > 0 && (half || sticky) && noise_active()) {
+        // The noise twin (noise.cuh): up with probability equal to the discarded fraction of the result's
+        // unit in the last place (its first 32 bits; a tail beyond them changes it by under 2^-32).
+        std::uint32_t frac = 0;
+        for (int k = 0; k < 32; ++k) {
+            const int b = shift - 1 - k;
+            if (b < 0) { break; }
+            if (b / 32 < Words && ((mag[b / 32] >> (b % 32)) & 1U) != 0) { frac |= 1U << (31 - k); }
+        }
+        std::uint64_t key = (static_cast<std::uint64_t>(static_cast<std::uint32_t>(unit)) << 2) |
+                            (negative ? 1ULL : 0ULL) | (bf16 ? 2ULL : 0ULL);
+#pragma unroll
+        for (int i = 0; i < Words; ++i) { key = noise_mix(key ^ mag[i]); }
+        up = noise_moves(static_cast<double>(frac) / 4294967296.0, key);
+    }
+    if (up) { ++q; }
     int e = ulp;
     if (q >= (1ULL << prec)) {
         q >>= 1;

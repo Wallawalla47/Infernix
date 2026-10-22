@@ -16,12 +16,15 @@
 // on the host by ggml::chunk: kappa (d sub code - dmin min_sub), the Q4_K/Q5_K min term a second term
 // per element), NVFP4 expert units (times an FP32 multiplier per row parity) and block FP8 records.
 // Shapes: rows that do not fill a tile, a row range into an output offset, T across the 512-column
-// chunk, K of the Qwen3.5 projections.
+// chunk, K of the Qwen3.5 projections. The noise twin (ops::lossless_set_noise_seed, IQS-1's noise floor):
+// every output one of its exact value's two neighbours, as often away from zero as the discarded fractions
+// say, the same bits for the same seed.
 
 #include "core/arena.h"
 #include "core/device.h"
 #include "infernix/ops/ggml_linear.h"
 #include "infernix/ops/lossless_linear.h"
+#include "infernix/ops/lossless_ops.h"
 #include "ops/ggml/ggml_exact.h"
 #include "quantized_weight.h"
 
@@ -683,9 +686,19 @@ HostWeight make_rg16_dense(int n, int k, std::mt19937& rng, float multiplier) {
 constexpr int kOracleWords = 26;
 constexpr int kOracleBias  = 300;
 
+// The exact value's two neighbours at the output precision (toward and away from zero; equal when the value
+// is representable) and its position between them in units of their gap: the noise twin rounds away with
+// that probability.
+struct Neighbours {
+    std::uint32_t toward = 0;
+    std::uint32_t away   = 0;
+    double fraction      = 0.0;
+};
+
 // The correctly rounded BF16 (prec 8) or FP32 (prec 24) bits of sign * (mag + tail) * 2^unit, the tail
-// a nonzero fraction of mag's last bit when sticky.
-std::uint32_t round_exact(const std::vector<std::uint32_t>& mag, int unit, bool negative, bool bf16, bool sticky_tail) {
+// a nonzero fraction of mag's last bit when sticky; with neighbours, also the value's two neighbours.
+std::uint32_t round_exact(const std::vector<std::uint32_t>& mag, int unit, bool negative, bool bf16, bool sticky_tail,
+                          Neighbours* neighbours = nullptr) {
     const int prec = bf16 ? 8 : 24;
     const std::uint32_t sign = negative ? (bf16 ? 0x8000U : 0x80000000U) : 0U;
     int top = -1;
@@ -697,7 +710,10 @@ std::uint32_t round_exact(const std::vector<std::uint32_t>& mag, int unit, bool 
             }
         }
     }
-    if (top < 0) { return sign; }
+    if (top < 0) {
+        if (neighbours != nullptr) { *neighbours = Neighbours{sign, sign, 0.0}; }
+        return sign;
+    }
     const auto bit = [&](int p) -> int {
         if (p < 0 || p >= 32 * static_cast<int>(mag.size())) { return 0; }
         return static_cast<int>((mag[static_cast<std::size_t>(p / 32)] >> (p % 32)) & 1U);
@@ -709,22 +725,37 @@ std::uint32_t round_exact(const std::vector<std::uint32_t>& mag, int unit, bool 
     std::uint64_t q = 0;
     for (int p = top; p >= std::max(low, 0); --p) { q = (q << 1) | static_cast<std::uint64_t>(bit(p)); }
     if (low < 0) { q <<= -low; }
+    const auto pack = [&](std::uint64_t value) -> std::uint32_t {
+        int e = ulp;
+        if (value >= (1ULL << prec)) {
+            value >>= 1;
+            ++e;
+        }
+        if (value < (1ULL << (prec - 1))) { return sign | static_cast<std::uint32_t>(value); }
+        const int biased = e + prec - 1 + 127;
+        if (biased >= 255) { return sign | (bf16 ? 0x7F80U : 0x7F800000U); }
+        return sign | (static_cast<std::uint32_t>(biased) << (prec - 1)) |
+               static_cast<std::uint32_t>(value - (1ULL << (prec - 1)));
+    };
+    bool up = false;
     if (low > 0) {
         const int half = bit(low - 1);
         bool sticky = sticky_tail;
         for (int p = 0; p < low - 1 && !sticky; ++p) { sticky = bit(p) != 0; }
-        if (half != 0 && (sticky || (q & 1) != 0)) { ++q; }
+        up = half != 0 && (sticky || (q & 1) != 0);
     }
-    int e = ulp;
-    if (q >= (1ULL << prec)) {
-        q >>= 1;
-        ++e;
+    if (neighbours != nullptr) {
+        double fraction = 0.0, scale = 0.5;
+        bool inexact = sticky_tail;
+        for (int p = low - 1; p >= 0; --p, scale *= 0.5) {
+            if (bit(p) != 0) {
+                inexact = true;
+                fraction += scale;
+            }
+        }
+        *neighbours = Neighbours{pack(q), inexact ? pack(q + 1) : pack(q), inexact ? std::max(fraction, 0x1p-60) : 0.0};
     }
-    if (q < (1ULL << (prec - 1))) { return sign | static_cast<std::uint32_t>(q); }
-    const int biased = e + prec - 1 + 127;
-    if (biased >= 255) { return sign | (bf16 ? 0x7F80U : 0x7F800000U); }
-    return sign | (static_cast<std::uint32_t>(biased) << (prec - 1)) |
-           static_cast<std::uint32_t>(q - (1ULL << (prec - 1)));
+    return pack(up ? q + 1 : q);
 }
 
 // The design reference's activation scales (FP32 bits, 0: none): a multiplier of the row (tiles: its
@@ -735,7 +766,8 @@ struct ActScales {
     std::uint32_t divisor = 0;
 };
 
-std::uint32_t oracle(const HostWeight& w, int row, const std::uint16_t* x, bool bf16, const ActScales& act = {}) {
+std::uint32_t oracle(const HostWeight& w, int row, const std::uint16_t* x, bool bf16, const ActScales& act = {},
+                     Neighbours* neighbours = nullptr) {
     std::vector<long long> chunks(kOracleWords + 1, 0);
     bool nan = false, pos_inf = false, neg_inf = false;
     for (int k = 0; k < w.k; ++k) {
@@ -865,7 +897,7 @@ std::uint32_t oracle(const HostWeight& w, int row, const std::uint16_t* x, bool 
     }
     bool zero = !sticky;
     for (const auto d : mag) { zero = zero && d == 0; }
-    return round_exact(mag, unit, negative && !zero, bf16, sticky);
+    return round_exact(mag, unit, negative && !zero, bf16, sticky, neighbours);
 }
 
 // ------------------------------------------------------------------------------- activations
@@ -955,6 +987,60 @@ void run(const std::string& label, const HostWeight& w, const std::vector<std::u
         want = oracle(w, row_begin + r, x.data() + static_cast<std::size_t>(t) * w.k, bf16);
         return true;
     });
+}
+
+// The noise twin (ops::lossless_set_noise_seed): every output is one of its exact value's two neighbours, one
+// seed gives the same bits every time and another seed other bits, and the inexact outputs rounded away from
+// zero number what the discarded fractions predict (within six binomial standard deviations).
+void run_noise(const std::string& label, const HostWeight& w, const std::vector<std::uint16_t>& x, int columns,
+               bool bf16) {
+    const int esize = bf16 ? 2 : 4;
+    const std::size_t outputs = static_cast<std::size_t>(w.n) * columns;
+    const auto launch = [&](std::uint64_t seed) {
+        ops::lossless_set_noise_seed(seed);
+        DeviceBuffer dx(x.size() * 2);
+        dx.copy_from_host(x.data(), x.size() * 2, 0);
+        DeviceBuffer dout(outputs * esize);
+        Tensor tx(dx.p, DType::BF16, {w.k, columns});
+        Tensor tout(dout.p, bf16 ? DType::BF16 : DType::FP32, {w.n, columns});
+        DeviceBuffer ws(ops::lossless_linear_workspace_bytes(w.weight, w.n, columns));
+        WorkspaceArena arena(DeviceSpan{ws.p, ws.bytes});
+        ops::lossless_linear(tx, w.weight, 0, w.n, tout, 0, arena, nullptr);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        std::vector<std::uint32_t> got(outputs, 0);
+        std::vector<std::uint8_t> raw(outputs * esize);
+        dout.copy_to_host(raw.data(), raw.size(), 0);
+        for (std::size_t i = 0; i < outputs; ++i) { std::memcpy(&got[i], raw.data() + i * esize, esize); }
+        return got;
+    };
+    const std::vector<std::uint32_t> first = launch(0x1234567ULL), again = launch(0x1234567ULL),
+                                     other = launch(0x89ABCDEF01ULL);
+    ops::lossless_set_noise_seed(0);
+    std::size_t outside = 0, inexact = 0, away = 0, reseeded = 0;
+    double expected = 0.0, variance = 0.0;
+    for (int t = 0; t < columns; ++t) {
+        for (int r = 0; r < w.n; ++r) {
+            const std::size_t i = static_cast<std::size_t>(t) * w.n + r;
+            Neighbours n;
+            (void)oracle(w, r, x.data() + static_cast<std::size_t>(t) * w.k, bf16, {}, &n);
+            outside += first[i] != n.toward && first[i] != n.away ? 1U : 0U;
+            reseeded += other[i] != first[i] ? 1U : 0U;
+            if (n.toward == n.away) { continue; }
+            ++inexact;
+            away += first[i] == n.away ? 1U : 0U;
+            expected += n.fraction;
+            variance += n.fraction * (1.0 - n.fraction);
+        }
+    }
+    check(outside == 0, label + ": " + std::to_string(outside) + " outputs are not a neighbour of the exact value");
+    check(first == again, label + ": one seed gave different bits");
+    check(reseeded > 0, label + ": another seed changed nothing");
+    const double deviation = std::abs(static_cast<double>(away) - expected);
+    check(inexact > 1000 && deviation <= 6.0 * std::sqrt(variance) + 1.0,
+          label + ": " + std::to_string(away) + " of " + std::to_string(inexact) + " inexact outputs rounded away, " +
+              std::to_string(expected) + " expected");
+    std::cout << label << ": " << outputs << " outputs, " << inexact << " inexact, " << away << " away (expected "
+              << expected << "), " << reseeded << " changed by another seed\n";
 }
 
 // The grouped form: tiles of 64 columns, each an expert's rows [e stride + offset, + rows) (some tiles
@@ -1276,6 +1362,18 @@ int main() {
             const auto x = make_columns(w.k, 70, rng, 1);
             run("nvfp4 rg16 dense k=3072 T=70 fp32", w, x, 70, 0, w.n, w.n, 0, false);
             run("nvfp4 rg16 dense k=3072 rows 48..208 T=70 bf16", w, x, 70, 48, 160, 170, 7, true);
+        }
+        // The noise twin: BF16 and FP32 outputs, a BF16 weight and an NVFP4 one (its divisor's sticky tails).
+        {
+            const HostWeight w = make_bf16(160, 4096, rng, false);
+            const auto x = make_columns(w.k, 530, rng, 7);
+            run_noise("noise twin bf16 k=4096 T=530 bf16", w, x, 530, true);
+            run_noise("noise twin bf16 k=4096 T=530 fp32", w, x, 530, false);
+        }
+        {
+            const HostWeight w = make_nvfp4(128, 17408, rng, 1.5e-4F);
+            const auto x = make_columns(w.k, 70, rng, 1);
+            run_noise("noise twin nvfp4 k=17408 T=70 bf16", w, x, 70, true);
         }
         // MXFP8 (FP4-Local's dense projections) and GGUF blocks (the GGUF imports' dense projections).
         suite(make_mxfp8(200, 640, rng), rng);

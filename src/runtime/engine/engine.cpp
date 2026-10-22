@@ -4,6 +4,7 @@
 #include "core/nvtx.h"
 #include "core/power_throttling.h"
 #include "core/startup.h"
+#include "infernix/ops/lossless_ops.h"
 #include "runtime/contract/sampling.h"
 #include "runtime/contract/request.h"
 #include "runtime/engine/causal_score_core.h"
@@ -150,6 +151,10 @@ const PromptPreparationStats& PreparedPrompt::preparation_stats() const noexcept
     return impl_ != nullptr ? impl_->prepare : empty;
 }
 
+std::span<const TokenId> PreparedPrompt::token_ids() const noexcept {
+    return impl_ != nullptr ? impl_->value.token_ids() : std::span<const TokenId>{};
+}
+
 PreparedPrompt::operator bool() const noexcept { return impl_ != nullptr; }
 
 class GenerationHandle::Impl {
@@ -231,6 +236,9 @@ public:
         : options(normalize(std::move(engine_options))),
           device(initialize_device(options)) {
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
+        // The lossless ops' rounding mode is process-wide device state: every lossless Engine sets it, so
+        // a noise twin never leaks into a later lossless run.
+        if (options.lossless) { ops::lossless_set_noise_seed(options.lossless_noise_seed); }
         if (architecture == models::Architecture::Qwen4Exp) {
             auto constructed  = runtime::construct_qwen4_exp(options, device);
             options           = std::move(constructed.options);
@@ -444,12 +452,19 @@ ScoreResult Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t firs
     if (options.top_k > kMaximumScoreTopTokens ||
         options.candidates_per_position > kMaximumScoreTopTokens) {
         throw std::invalid_argument("score_tokens top_k and candidates_per_position must be in "
-                                    "[0,64]");
+                                    "[0,kMaximumScoreTopTokens]");
     }
     if (options.candidates.size() != positions * options.candidates_per_position) {
         throw std::invalid_argument(
             "score_tokens needs candidates_per_position candidates for every scored position");
     }
+    if (options.logits_positions.size() > kMaximumScoreLogitPositions ||
+        !std::ranges::is_sorted(options.logits_positions, std::ranges::less_equal{}) ||
+        (!options.logits_positions.empty() && options.logits_positions.back() >= positions)) {
+        throw std::invalid_argument("score_tokens logits_positions must be strictly ascending scored positions, at "
+                                    "most kMaximumScoreLogitPositions");
+    }
+    const std::size_t logit_rows       = options.logits_positions.size();
     const std::size_t top_values       = positions * options.top_k;
     const std::size_t candidate_values = options.candidates.size();
     PreparedPrompt prompt              = prepare_tokens(std::move(tokens), false);
@@ -466,7 +481,8 @@ ScoreResult Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t firs
         impl_->core);
     if (result.logprobs.size() != positions || result.top_ids.size() != top_values ||
         result.top_logprobs.size() != top_values ||
-        result.candidate_logprobs.size() != candidate_values) {
+        result.candidate_logprobs.size() != candidate_values ||
+        (logit_rows == 0 ? !result.logits.empty() : result.logits.empty() || result.logits.size() % logit_rows != 0)) {
         throw std::logic_error("target Program returned an invalid causal score count");
     }
     return result;
