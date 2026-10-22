@@ -21,7 +21,7 @@ from typing import Sequence
 import torch
 
 from ..formats import valid_positive_fp32_word
-from ..layouts import ExpertBankGeometry, expert_bank_geometry
+from ..layouts import ExpertBankGeometry, expert_bank_geometry, rg16_matrix_geometry
 from ._tensor_bytes import Payload, _payload_length, _payload_tensor
 
 
@@ -160,6 +160,61 @@ def decode_nvfp4_expert_bank_words(
         "down_scales": down_scales.contiguous(),
         "multipliers": multipliers,
     }
+
+
+def encode_nvfp4_rg16_rows(packed_codes: torch.Tensor, scales: torch.Tensor) -> bytes:
+    """The ``nvfp4_rg16_v1`` units of whole 16-row groups of one dense matrix: ``packed_codes`` uint8
+    ``[R, K/2]`` (even element in the low nibble) and E4M3FN ``scales`` uint8 ``[R, K/16]``, R a
+    multiple of 16. Groups are row-group major, so row block [r, r + R) is the byte run starting at
+    ``r / 16 * (K / 16) * 144``."""
+
+    rows, half = packed_codes.shape
+    k = half * 2
+    if rows % 16 or k % 16:
+        raise ValueError("nvfp4_rg16_v1 units need whole 16-row groups and 16-element blocks")
+    codes = _matrix(packed_codes, (rows, half), "dense NVFP4 codes")
+    words = _matrix(scales, (rows, k // 16), "dense NVFP4 scales")
+    _check_scales(words, "dense NVFP4")
+    return _units(_unpack_nibbles(codes)[None], words[None]).reshape(-1).numpy().tobytes()
+
+
+def encode_nvfp4_rg16(
+    packed_codes: torch.Tensor, scales: torch.Tensor, multiplier: torch.Tensor, shape: Sequence[int]
+) -> bytes:
+    """A whole ``nvfp4_rg16_v1`` payload: the units, then the FP32 multiplier (stored bit-exactly)."""
+
+    geometry = rg16_matrix_geometry("nvfp4_mul", shape)
+    if tuple(packed_codes.shape) != (geometry.n, geometry.k // 2):
+        raise TypeError(f"dense NVFP4 codes must have shape ({geometry.n}, {geometry.k // 2})")
+    payload = bytearray(geometry.payload_bytes)
+    payload[: geometry.unit_plane_bytes] = encode_nvfp4_rg16_rows(packed_codes, scales)
+    payload[geometry.multiplier_offset :] = _multiplier_word(multiplier)
+    return bytes(payload)
+
+
+def _multiplier_word(multiplier: torch.Tensor) -> bytes:
+    if multiplier.dtype != torch.float32 or multiplier.numel() != 1:
+        raise TypeError("the dense NVFP4 multiplier must be one FP32 value")
+    word = multiplier.detach().reshape(()).cpu().view(torch.int32).item() & 0xFFFFFFFF
+    if not valid_positive_fp32_word(word):
+        raise ValueError("the dense NVFP4 multiplier must be finite and positive")
+    return struct.pack("<I", word)
+
+
+def decode_nvfp4_rg16_words(payload: Payload, shape: Sequence[int]) -> dict[str, torch.Tensor]:
+    """Recover the exact words of an ``nvfp4_rg16_v1`` payload: the inverse of :func:`encode_nvfp4_rg16`."""
+
+    geometry = rg16_matrix_geometry("nvfp4_mul", shape)
+    if _payload_length(payload) != geometry.payload_bytes:
+        raise ValueError(
+            f"dense NVFP4 payload has {_payload_length(payload)} bytes, expected {geometry.payload_bytes}"
+        )
+    raw = _payload_tensor(payload, torch.device("cpu"))
+    codes, scales = _from_units(raw[: geometry.unit_plane_bytes].reshape(1, -1), geometry.n, geometry.k)
+    _check_scales(scales, "dense NVFP4")
+    word = bytearray(raw[geometry.multiplier_offset :].numpy().tobytes())
+    multiplier = torch.frombuffer(word, dtype=torch.float32).reshape(()).clone()
+    return {"codes": _pack_nibbles(codes[0]).contiguous(), "scales": scales[0].contiguous(), "multiplier": multiplier}
 
 
 _E2M1 = torch.tensor(

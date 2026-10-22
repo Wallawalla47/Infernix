@@ -11,6 +11,7 @@ from pathlib import Path
 import struct
 from typing import Mapping
 
+from .expert_banks import ExpertBankSource
 from .model import Model, Parameter
 from .resources import load_resources
 from .sources.logical import LogicalSource, select_rows, transpose_source
@@ -181,6 +182,9 @@ def text_config(source: dict, *, mtp: bool) -> dict:
         result[key] = _positive(raw.get(key), "text." + key)
     if moe and result["num_experts_per_tok"] > result["num_experts"]:
         raise ValueError("selected experts exceed expert count")
+    if moe:
+        # The engine's router renormalizes the selected probabilities (HF's default).
+        _fixed(raw, "norm_topk_prob", True, "text")
     if mtp:
         _fixed(raw, "mtp_num_hidden_layers", 1, "text")
         _fixed(raw, "mtp_use_dedicated_embeddings", False, "text")
@@ -631,6 +635,68 @@ class _Builder:
         )
         self.group(prefix + "mlp/gate", prefix + "mlp/up")
 
+    def _source_name(self, store, name):
+        """The source tensor name as stored (a text-only export drops ``language_model.``)."""
+        if store.has(name):
+            return name
+        alternate = name.replace("model.language_model.", "model.", 1)
+        return alternate if store.has(alternate) else name
+
+    def _nvfp4_matrix(self, store, name) -> bool:
+        name = self._source_name(store, name)
+        return store.has(name) and store.describe(name).dtype == "U8"
+
+    def _expert_matrices(self, p, sp, store, prefix, e, h, ir):
+        """Per-expert logical gate/up/down matrices (the resident sparse-MoE banks): from a fused
+        ``experts.gate_up_proj`` [E, 2I, H] (gate rows first) and ``experts.down_proj`` [E, H, I], or
+        from per-expert tensors (``experts.N.gate_proj.weight``, as Ornith's BF16 MTP layer stores
+        them)."""
+        fused = store.has(self._source_name(store, sp + "experts.gate_up_proj"))
+        gate_up, downs = [], []
+        for expert in range(e):
+            ep = p + f"experts/{expert}/"
+            for role, half in (("gate", 0), ("up", 1)):
+                if fused:
+                    self.add(
+                        ep + role,
+                        store,
+                        sp + "experts.gate_up_proj",
+                        (ir, h),
+                        source_shape=(e, 2 * ir, h),
+                        offset=(expert * 2 + half) * ir * h,
+                        inputs=(prefix + "ffn_input",),
+                    )
+                else:
+                    self.add(
+                        ep + role,
+                        store,
+                        sp + f"experts.{expert}.{role}_proj.weight",
+                        (ir, h),
+                        inputs=(prefix + "ffn_input",),
+                    )
+                gate_up.append(ep + role)
+            if fused:
+                self.add(
+                    ep + "down",
+                    store,
+                    sp + "experts.down_proj",
+                    (h, ir),
+                    source_shape=(e, h, ir),
+                    offset=expert * h * ir,
+                    inputs=(ep + "product",),
+                )
+            else:
+                self.add(
+                    ep + "down",
+                    store,
+                    sp + f"experts.{expert}.down_proj.weight",
+                    (h, ir),
+                    inputs=(ep + "product",),
+                )
+            downs.append(ep + "down")
+        self.group(*gate_up)
+        self.group(*downs)
+
     def moe(self, prefix, source_prefix, store, config):
         h, e = config["hidden_size"], config["num_experts"]
         ir, shared = (
@@ -653,32 +719,23 @@ class _Builder:
             inputs=(prefix + "ffn_input",),
         )
         self.group(p + "router", p + "shared_score")
-        gate_up, downs = [], []
-        for expert in range(e):
-            ep = p + f"experts/{expert}/"
-            for role, half in (("gate", 0), ("up", 1)):
-                self.add(
-                    ep + role,
-                    store,
-                    sp + "experts.gate_up_proj",
-                    (ir, h),
-                    source_shape=(e, 2 * ir, h),
-                    offset=(expert * 2 + half) * ir * h,
-                    inputs=(prefix + "ffn_input",),
-                )
-                gate_up.append(ep + role)
-            self.add(
-                ep + "down",
-                store,
-                sp + "experts.down_proj",
-                (h, ir),
-                source_shape=(e, h, ir),
-                offset=expert * h * ir,
-                inputs=(ep + "product",),
-            )
-            downs.append(ep + "down")
-        self.group(*gate_up)
-        self.group(*downs)
+        # A ModelOpt NVFP4 export stores every expert's matrices separately: they become one exact
+        # bank [E, H, I] (nvfp4_expert_rg16_v1, imported verbatim; the routed experts the engine
+        # offloads to host memory), and its NVFP4 shared expert a one-record bank the routed-expert
+        # kernels run as a resident job.
+        if self._nvfp4_matrix(store, sp + "experts.0.gate_proj.weight"):
+            leaf = self._source_name(store, sp + "experts.0.gate_proj.weight").removesuffix("0.gate_proj.weight")
+            bank = ExpertBankSource((e, h, ir), f"{store.path}:{leaf}", store, leaf)
+            self.model.add(Parameter(p + "experts", (e, h, ir), bank, None, (prefix + "ffn_input",),
+                                     "nvfp4_mul", residency=prefix.split("/", 1)[0]))
+            if self._nvfp4_matrix(store, sp + "shared_expert.gate_proj.weight"):
+                base = self._source_name(store, sp + "shared_expert.gate_proj.weight").removesuffix("gate_proj.weight")
+                one = ExpertBankSource((1, h, shared), f"{store.path}:{base}", store, base, single=True)
+                self.model.add(Parameter(p + "shared_expert", (1, h, shared), one, None, (prefix + "ffn_input",),
+                                         "nvfp4_mul", residency=prefix.split("/", 1)[0]))
+                return
+        else:
+            self._expert_matrices(p, sp, store, prefix, e, h, ir)
         for role in ("gate", "up"):
             self.add(
                 p + "shared/" + role,

@@ -530,6 +530,15 @@ Text includes `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja` a
 --resource chat_template.jinja=/path/to/chat_template.jinja
 ```
 
+`--resource sampling.json=PATH` adds the optional text resource `sampling.json`: a checkpoint's
+recommended sampling presets, which the runtime uses as its defaults in place of the
+architecture's (process flags and request fields still override them). It holds a `thinking` and a
+`non_thinking` preset, each with `temperature` [0,2], `top_k` [1,20], `top_p` [0,1], `min_p` [0,1],
+`presence_penalty` and `frequency_penalty` [-2,2], and optionally `repetition_penalty` (only 1: the
+sampler has none), plus an optional `source` string. The converter and the runtime refuse a missing,
+unknown or out-of-range value. [ornith-1.5-122b.json](../tools/convert/sampling/ornith-1.5-122b.json)
+is Ornith-1.5-122B's model-card set.
+
 The official conversion examples select these maintained templates:
 
 | Model | Template | Defaults |

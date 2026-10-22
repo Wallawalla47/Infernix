@@ -1,0 +1,21 @@
+{
+  "source": "https://huggingface.co/ornith-ai/Ornith-1.5-122B-NVFP4 (revision f049036f): recommended sampling parameters for general tasks; the card gives one set for both modes (precise coding: temperature 0.6, presence_penalty 0.0)",
+  "thinking": {
+    "temperature": 1.0,
+    "top_k": 20,
+    "top_p": 0.95,
+    "min_p": 0.0,
+    "presence_penalty": 1.5,
+    "frequency_penalty": 0.0,
+    "repetition_penalty": 1.0
+  },
+  "non_thinking": {
+    "temperature": 1.0,
+    "top_k": 20,
+    "top_p": 0.95,
+    "min_p": 0.0,
+    "presence_penalty": 1.5,
+    "frequency_penalty": 0.0,
+    "repetition_penalty": 1.0
+  }
+}

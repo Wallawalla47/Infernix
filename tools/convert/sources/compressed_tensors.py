@@ -17,6 +17,11 @@ from .logical import EncodedRows, LogicalSource
 from .modelopt import MXFP8_FORMAT, is_mxfp8_matrix, mxfp8_matrix_source
 from .safetensors import SafetensorsSource, tensor_source
 
+_E2M1_F64 = torch.tensor(
+    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+    dtype=torch.float64,
+)
+
 
 def _divisor_word(store: SafetensorsSource, name: str) -> bytes:
     info = store.describe(name)
@@ -44,14 +49,22 @@ def _reciprocal_f32_word(raw: bytes) -> bytes:
     return word
 
 
+_ENCODED_FORMATS = ("nvfp4", "nvfp4_mul", "fp8_e4m3fn_row_bf16", "fp8_e4m3fn_row_f32")
+
+
 def compressed_matrix_source(
     store: SafetensorsSource, prefix: str, shape: tuple[int, int], format: str
 ) -> LogicalSource:
-    """Interpret the current compressed-tensors NVFP4 or per-row FP8 representation."""
-    if format not in ("nvfp4", "fp8_e4m3fn_row_bf16"):
+    """Interpret the current compressed-tensors or ModelOpt NVFP4 / per-row FP8 representation.
+
+    ``nvfp4`` divides by the matrix divisor (a ModelOpt multiplier becomes its rounded reciprocal);
+    ``nvfp4_mul`` keeps ModelOpt's FP32 ``weight_scale_2`` multiplier exactly. ``fp8_e4m3fn_row_bf16``
+    rounds an FP32 scale to BF16 once; ``fp8_e4m3fn_row_f32`` keeps it exactly (a per-tensor scale is
+    written into every row) and exposes a static FP32 ``input_scale`` when the matrix has one."""
+    if format not in _ENCODED_FORMATS:
         raise ValueError(f"unsupported encoded source format {format}")
     n, k = shape
-    if format == "nvfp4" and k % 16:
+    if format in ("nvfp4", "nvfp4_mul") and k % 16:
         raise ValueError(f"{prefix}: NVFP4 source K must be divisible by 16")
 
     def signature(name: str, expected: tuple[int, ...], dtype: str) -> None:
@@ -81,6 +94,20 @@ def compressed_matrix_source(
     def encoded(begin: int, end: int) -> EncodedRows:
         if not 0 <= begin < end <= n:
             raise ValueError(f"{prefix}: invalid encoded rows [{begin},{end})")
+        if format == "nvfp4_mul":
+            # ModelOpt's convention as stored: value = e2m1 * e4m3fn(scale) * weight_scale_2.
+            packed, scale = f"{prefix}.weight", f"{prefix}.weight_scale"
+            signature(packed, (n, k // 2), "U8")
+            signature(scale, (n, k // 16), "F8_E4M3")
+            codes = store.read_flat(packed, begin * (k // 2), end * (k // 2)).reshape(end - begin, k // 2)
+            scales = (
+                store.read_flat(scale, begin * (k // 16), end * (k // 16))
+                .view(torch.uint8)
+                .reshape(end - begin, k // 16)
+            )
+            if bool((scales > 0x7E).any()):
+                raise ValueError(f"{scale}: expected nonnegative finite E4M3FN scales")
+            return EncodedRows(format, codes, scales, None, divisor("weight_scale_2"))
         if format == "nvfp4":
             packed_name, weight_divisor_name, _, reciprocal = nvfp4_names()
             packed, scale = f"{prefix}.{packed_name}", f"{prefix}.weight_scale"
@@ -115,14 +142,13 @@ def compressed_matrix_source(
         if prod(info.shape) == n:
             scales = store.read_flat(scale, begin, end)
         else:
-            # Per-tensor FP8 (ModelOpt): replicate the global scale to every
-            # requested row, the only row-scaled FP8 representation in the v3
-            # container.
+            # Per-tensor FP8 (ModelOpt): the global scale written into every requested row.
             scales = store.read_flat(scale).repeat(end - begin)
-        if scales.dtype == torch.float32:
-            # The v3 row format stores BF16 scale words; ModelOpt checkpoints
-            # keep FP32 scales, so round them once at this boundary.
+        if format == "fp8_e4m3fn_row_bf16" and scales.dtype == torch.float32:
+            # The BF16 row format: an FP32 checkpoint scale is rounded once at this boundary.
             scales = scales.to(torch.bfloat16)
+        elif format == "fp8_e4m3fn_row_f32" and scales.dtype == torch.bfloat16:
+            scales = scales.to(torch.float32)  # exact widening
         validate_fp8_row_words(codes, scales)
         return EncodedRows(format, codes, scales)
 
@@ -135,6 +161,19 @@ def compressed_matrix_source(
             values = (
                 words.codes.view(torch.float8_e4m3fn).float()
                 * words.scales.float()[:, None]
+            )
+        elif format == "fp8_e4m3fn_row_f32":
+            # Binary64 holds every code x FP32 scale product exactly (4 + 24 significant bits).
+            values = (
+                words.codes.view(torch.float8_e4m3fn).double()
+                * words.scales.double()[:, None]
+            )
+        elif format == "nvfp4_mul":
+            codes = torch.stack((words.codes & 15, words.codes >> 4), dim=-1).reshape(last - first, k)
+            values = (
+                _E2M1_F64[codes.long()]
+                * words.scales.view(torch.float8_e4m3fn).double().repeat_interleave(16, dim=1)
+                * float(struct.unpack("<f", words.weight_multiplier)[0])
             )
         else:
             codes = torch.stack((words.codes & 15, words.codes >> 4), dim=-1).reshape(
@@ -169,6 +208,12 @@ def compressed_matrix_source(
             values = values * scales / struct.unpack("<f", words.weight_divisor)[0]
         return values.reshape(-1)[begin - first * k : end - first * k]
 
+    def input_scale() -> bytes:
+        name = f"{prefix}.input_scale"
+        if not store.has(name):
+            raise ValueError(f"{prefix}: no static activation scale (input_scale)")
+        return _divisor_word(store, name)
+
     return LogicalSource(
         shape,
         f"{store.path}:{prefix} ({format})",
@@ -180,6 +225,7 @@ def compressed_matrix_source(
         (lambda: divisor(nvfp4_names()[2], nvfp4_names()[3]))
         if format == "nvfp4"
         else None,
+        input_scale if format == "fp8_e4m3fn_row_f32" and store.has(f"{prefix}.input_scale") else None,
     )
 
 
@@ -232,4 +278,5 @@ def matrix_source(
         encoded,
         lambda: divisor("weight_divisor"),
         lambda: divisor("input_divisor"),
+        (lambda: divisor("input_scale")) if format == "fp8_e4m3fn_row_f32" else None,
     )

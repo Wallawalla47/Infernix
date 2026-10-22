@@ -16,7 +16,8 @@ from tools.convert.official_recipes import (
     qwen3_8_flash_next_nvfp4_dense8,
     qwen3_8_flash_next_nvfp4_orcarouter,
 )
-from tools.convert.qwen4_exp import ExpertBankSource, Fp8ExpertBankSource, import_expert_bank, import_fp8_expert_bank
+from tools.convert.expert_banks import ExpertBankSource, import_expert_bank
+from tools.convert.qwen4_exp import Fp8ExpertBankSource, import_fp8_expert_bank
 from tools.convert.recipe import Recipe
 from tools.convert.sources.logical import array_source
 

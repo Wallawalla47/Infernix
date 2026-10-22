@@ -12,18 +12,21 @@ from .codecs.direct import encode_direct
 from .codecs.fp8_g32 import rows16_scale_plane, validate_fp8_group_words
 from .codecs.fp8_row import encode_fp8_row_scaled
 from .codecs.nvfp4 import encode_nvfp4
+from .codecs.nvfp4_expert import encode_nvfp4_rg16_rows
 from .codecs.row_split import encode_row_split, split_row_planes
 from .formats import (
     DirectFormat,
     Fp8GroupFormat,
     Fp8RowFormat,
     Nvfp4Format,
+    Nvfp4MulFormat,
     QuantFormat,
     get_format,
 )
 from .layouts import (
     block_scale_geometry,
     group_scale_geometry,
+    rg16_matrix_geometry,
     row_scale_geometry,
     row_split_geometry,
 )
@@ -73,6 +76,9 @@ class TensorOutput:
         elif isinstance(self.format, Nvfp4Format):
             g = block_scale_geometry(self.format, obj.shape)
             gaps = ((g.code_plane_bytes, g.scale_plane_offset),)
+        elif isinstance(self.format, Nvfp4MulFormat) and obj.layout == "nvfp4_rg16_v1":
+            g = rg16_matrix_geometry(self.format, obj.shape)
+            gaps = ((g.unit_plane_bytes, g.multiplier_offset),)
         else:
             gaps = ()
         for begin, end in gaps:
@@ -86,6 +92,8 @@ class TensorOutput:
         codes: torch.Tensor,
         scales: torch.Tensor,
         weight_divisor: bytes | None = None,
+        *,
+        weight_multiplier: bytes | None = None,
     ) -> None:
         obj = self.object
         if len(obj.shape) != 2 or not 0 <= row_begin < obj.shape[0]:
@@ -106,11 +114,23 @@ class TensorOutput:
         elif isinstance(self.format, Fp8RowFormat):
             g = row_scale_geometry(self.format, obj.shape)
             local = row_scale_geometry(self.format, (rows, k))
-            block = memoryview(encode_fp8_row_scaled(codes, scales, (rows, k)))
+            block = memoryview(encode_fp8_row_scaled(codes, scales, (rows, k), self.format.name))
             self.write_bytes(row_begin * k, block[: local.code_plane_bytes])
             self.write_bytes(
-                g.scale_plane_offset + row_begin * 2, block[local.scale_plane_offset :]
+                g.scale_plane_offset + row_begin * self.format.scale_bytes,
+                block[local.scale_plane_offset :],
             )
+        elif isinstance(self.format, Nvfp4MulFormat) and obj.layout == "nvfp4_rg16_v1":
+            # Whole 16-row groups: a block of groups is one contiguous unit run.
+            if row_begin % 16 or rows % 16 or weight_multiplier is None:
+                raise ValueError(f"{obj.id}: dense nvfp4_mul output needs whole 16-row groups and its multiplier")
+            g = rg16_matrix_geometry(self.format, obj.shape)
+            self.write_bytes(row_begin // 16 * g.blocks * 144, encode_nvfp4_rg16_rows(codes, scales))
+            if self._divisor is None:
+                self.write_bytes(g.multiplier_offset, weight_multiplier)
+                self._divisor = bytes(weight_multiplier)
+            elif self._divisor != weight_multiplier:
+                raise ValueError(f"{obj.id}: weight multiplier changed between row blocks")
         elif isinstance(self.format, Fp8GroupFormat):
             # Whole 16-row tiles: a tile's scale run is contiguous, so a block of tiles is one run.
             if row_begin % 16 or rows % 16:

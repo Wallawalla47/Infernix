@@ -118,6 +118,21 @@ class ExpertBankGeometry:
 
 
 @dataclass(frozen=True, slots=True)
+class Rg16MatrixGeometry:
+    """``nvfp4_rg16_v1``: one dense ``nvfp4_mul`` matrix ``[n, k]`` as the expert record stores each
+    of its matrices: 16-row groups of 144-byte units (128 code bytes in quads, 16 E4M3FN scales),
+    row-group major, block ascending; then (256-byte aligned) the FP32 multiplier."""
+
+    n: int
+    k: int
+    row_groups: int
+    blocks: int
+    unit_plane_bytes: int
+    multiplier_offset: int
+    payload_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
 class GgmlRowsGeometry:
     """``ggml_rows_v1``: [n, k] as n rows of whole GGUF blocks, verbatim and contiguous."""
 
@@ -184,7 +199,7 @@ BLOCK_SCALE_K16_M128X4_V1 = Layout(
 ROW_SCALE_V1 = Layout(
     "row_scale_v1",
     256,
-    frozenset(("fp8_e4m3fn_row_bf16",)),
+    frozenset(("fp8_e4m3fn_row_bf16", "fp8_e4m3fn_row_f32")),
 )
 G32_SCALE_ROWS16_V1 = Layout(
     "g32_scale_rows16_v1",
@@ -197,6 +212,7 @@ NVFP4_EXPERT_RG16_V1 = Layout(
     EXPERT_RECORD_ALIGNMENT,
     frozenset(("nvfp4_mul",)),
 )
+NVFP4_RG16_V1 = Layout("nvfp4_rg16_v1", 256, frozenset(("nvfp4_mul",)))
 
 GGML_ROWS_V1 = Layout("ggml_rows_v1", 256, frozenset(GGML_FORMATS))
 
@@ -225,6 +241,7 @@ LAYOUTS = MappingProxyType(
             ROW_SCALE_V1,
             G32_SCALE_ROWS16_V1,
             NVFP4_EXPERT_RG16_V1,
+            NVFP4_RG16_V1,
             GGML_ROWS_V1,
             GGML_TILES16_V1,
             GGML_EXPERT_IQ4_NL_V1,
@@ -366,7 +383,7 @@ def row_scale_geometry(
     n, k = _shape(shape, rank=2)
     code_plane_bytes = n * k
     scale_plane_offset = align_up(code_plane_bytes, PLANE_ALIGNMENT)
-    scale_plane_bytes = n * 2
+    scale_plane_bytes = n * spec.scale_bytes
     return RowScaleGeometry(
         n=n,
         k=k,
@@ -439,6 +456,29 @@ def expert_bank_geometry(
         multiplier_offset=multiplier_offset,
         multiplier_bytes=multiplier_bytes,
         payload_bytes=multiplier_offset + multiplier_bytes,
+    )
+
+
+def rg16_matrix_geometry(format: str | Nvfp4MulFormat, shape: Sequence[int]) -> Rg16MatrixGeometry:
+    """Geometry of one dense ``nvfp4_mul`` matrix in ``nvfp4_rg16_v1`` (the output head)."""
+
+    spec = _format(format)
+    if not isinstance(spec, Nvfp4MulFormat):
+        raise ValueError("nvfp4_rg16_v1 requires nvfp4_mul")
+    n, k = _shape(shape, rank=2)
+    if n % 16 or k % 16:
+        raise ValueError("nvfp4_rg16_v1 requires N and K divisible by 16")
+    row_groups, blocks = n // 16, k // 16
+    unit_plane_bytes = row_groups * blocks * EXPERT_UNIT_BYTES
+    multiplier_offset = align_up(unit_plane_bytes, PLANE_ALIGNMENT)
+    return Rg16MatrixGeometry(
+        n=n,
+        k=k,
+        row_groups=row_groups,
+        blocks=blocks,
+        unit_plane_bytes=unit_plane_bytes,
+        multiplier_offset=multiplier_offset,
+        payload_bytes=multiplier_offset + 4,
     )
 
 
@@ -539,6 +579,8 @@ def encoded_size(
         return group_scale_geometry(numeric_spec, shape).payload_bytes
     if layout_spec is NVFP4_EXPERT_RG16_V1:
         return expert_bank_geometry(numeric_spec, shape).payload_bytes
+    if layout_spec is NVFP4_RG16_V1:
+        return rg16_matrix_geometry(numeric_spec, shape).payload_bytes
     if layout_spec is GGML_ROWS_V1:
         return ggml_rows_geometry(numeric_spec, shape).payload_bytes
     if layout_spec is GGML_TILES16_V1:

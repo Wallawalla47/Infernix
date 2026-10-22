@@ -13,6 +13,45 @@ TEXT_RESOURCES = (
     "generation_config.json",
 )
 VISION_RESOURCES = ("preprocessor_config.json", "video_preprocessor_config.json")
+# Optional text resources, packed only when given (--resource ROLE=PATH): sampling.json holds a
+# checkpoint's recommended sampling presets (its model card's), which the runtime frontend uses in
+# place of the architecture's defaults.
+OPTIONAL_TEXT_RESOURCES = ("sampling.json",)
+SAMPLING_FIELDS = (
+    "temperature",
+    "top_k",
+    "top_p",
+    "min_p",
+    "presence_penalty",
+    "frequency_penalty",
+)
+
+
+def validate_sampling(value: dict, path: Path) -> None:
+    """The presets src/models/qwen3_5/frontend/frontend.cpp sampling_presets accepts."""
+    unknown = set(value) - {"thinking", "non_thinking", "source"}
+    if unknown:
+        raise ValueError(f"{path}: unknown sampling members {sorted(unknown)}")
+    if "source" in value and not isinstance(value["source"], str):
+        raise ValueError(f"{path}: source must be a string")
+    domains = {"temperature": (0.0, 2.0), "top_p": (0.0, 1.0), "min_p": (0.0, 1.0),
+               "presence_penalty": (-2.0, 2.0), "frequency_penalty": (-2.0, 2.0)}
+    for mode in ("thinking", "non_thinking"):
+        preset = value.get(mode)
+        if not isinstance(preset, dict):
+            raise ValueError(f"{path}: missing preset {mode}")
+        extra = set(preset) - set(SAMPLING_FIELDS) - {"repetition_penalty"}
+        if extra:
+            raise ValueError(f"{path}: unknown fields {mode}.{sorted(extra)}")
+        for field, (low, high) in domains.items():
+            x = preset.get(field)
+            if isinstance(x, bool) or not isinstance(x, (int, float)) or not low <= x <= high:
+                raise ValueError(f"{path}: {mode}.{field} must be a number in [{low},{high}]")
+        top_k = preset.get("top_k")
+        if type(top_k) is not int or not 1 <= top_k <= 20:
+            raise ValueError(f"{path}: {mode}.top_k must be an integer in [1,20]")
+        if preset.get("repetition_penalty", 1) != 1:
+            raise ValueError(f"{path}: {mode}.repetition_penalty must be 1 (the sampler has none)")
 
 # Must stay byte-identical to kQwenSplitPattern in
 # src/models/qwen3_5/frontend/tokenizer.cpp: the runtime tokenizer validates
@@ -168,7 +207,7 @@ def load_resources(
     overrides: Mapping[str, str | Path] | None = None,
 ) -> tuple[dict[str, dict[str, str]], dict[str, bytes], int, tuple[int, ...]]:
     overrides = {} if overrides is None else dict(overrides)
-    roles = {"text": TEXT_RESOURCES}
+    roles = {"text": TEXT_RESOURCES + tuple(r for r in OPTIONAL_TEXT_RESOURCES if r in overrides)}
     if vision_config is not None:
         roles["vision"] = VISION_RESOURCES
     allowed = {role for names in roles.values() for role in names}
@@ -192,6 +231,8 @@ def load_resources(
                 if not isinstance(value, dict):
                     raise ValueError(f"{path}: resource must contain a JSON object")
                 parsed[role] = value
+                if role == "sampling.json":
+                    validate_sampling(value, path)
                 if component == "vision":
                     for field, config_field in (
                         ("patch_size", "patch_size"),

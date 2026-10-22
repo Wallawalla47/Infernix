@@ -15,11 +15,17 @@ class EncodedRows:
     codes: torch.Tensor
     scales: torch.Tensor
     weight_divisor: bytes | None = None
+    # nvfp4_mul: the matrix's FP32 multiplier word (ModelOpt ``weight_scale_2``, as stored).
+    weight_multiplier: bytes | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class LogicalSource:
-    """Values use flat C-order elements; an optional encoded reader uses full rows."""
+    """Values use flat C-order elements; an optional encoded reader uses full rows.
+
+    ``input_divisor`` is an NVFP4 A4 input's activation divisor; ``input_scale`` a static FP8 A8
+    input's FP32 activation scale (ModelOpt ``input_scale``: the activation is quantized as
+    ``e4m3(x * fl32(1 / s))``), as stored."""
 
     shape: tuple[int, ...]
     label: str
@@ -27,6 +33,7 @@ class LogicalSource:
     read_encoded: Callable[[int, int], EncodedRows] | None = None
     weight_divisor: Callable[[], bytes] | None = None
     input_divisor: Callable[[], bytes] | None = None
+    input_scale: Callable[[], bytes] | None = None
 
     def values(self, begin: int = 0, end: int | None = None) -> torch.Tensor:
         end = prod(self.shape) if end is None else end
@@ -105,7 +112,8 @@ def select_rows(
         ]
         first = pieces[0]
         if any(
-            (part.format, part.weight_divisor) != (first.format, first.weight_divisor)
+            (part.format, part.weight_divisor, part.weight_multiplier)
+            != (first.format, first.weight_divisor, first.weight_multiplier)
             for part in pieces
         ):
             raise ValueError(f"{source.label}: incompatible encoded row groups")
@@ -114,6 +122,7 @@ def select_rows(
             torch.cat([p.codes for p in pieces]),
             torch.cat([p.scales for p in pieces]),
             first.weight_divisor,
+            first.weight_multiplier,
         )
 
     return LogicalSource(
@@ -123,6 +132,7 @@ def select_rows(
         encoded if source.read_encoded is not None else None,
         source.weight_divisor,
         source.input_divisor,
+        source.input_scale,
     )
 
 
