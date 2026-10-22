@@ -129,6 +129,24 @@ int main() {
     failures += check(!q::fast_path_qualified(FastPath::BatchedDecode,
                                               {16, ActivationClass::A4, KvCacheStorage::Int8Group64}),
                       "batched-decode is not qualified for an unmeasured head count");
+    // The groupwise 27B and the 35B-A3B: the three coupling paths each timed faster passed on every format
+    // (2026-10-22); batched-decode and batch-split-attention, mixed or slower in their timing, are not listed.
+    for (const auto kv : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64,
+                          KvCacheStorage::Fp8E4M3Row256, KvCacheStorage::Nvfp4Group16,
+                          KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Q4KeyVq2Value,
+                          KvCacheStorage::Vq2}) {
+        for (const q::FastPathConfiguration config :
+             {q::FastPathConfiguration{24, ActivationClass::A16, kv, true}, q::FastPathConfiguration{16, ActivationClass::A16, kv}}) {
+            for (const FastPath path : {FastPath::AdaptiveSpeculation, FastPath::FreeCacheResume, FastPath::Preemption}) {
+                failures += check(q::fast_path_qualified(path, config),
+                                  std::string(infernix::fast_path_name(path)) + " is qualified for " + q::describe(config));
+            }
+            for (const FastPath path : {FastPath::BatchedDecode, FastPath::BatchSplitAttention}) {
+                failures += check(!q::fast_path_qualified(path, config),
+                                  std::string(infernix::fast_path_name(path)) + " is not qualified for " + q::describe(config));
+            }
+        }
+    }
 
     // Request invariance needs no coupling path.
     q::FastPathSelection selection{.configuration = int8_24, .paths = {}};

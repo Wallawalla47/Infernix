@@ -975,8 +975,8 @@ Qwen3.8-Flash-Next **Dense8** (Q8 dense, 4-bit experts: NVIDIA, uncensored and S
 Dense8), **IQ3_S** (GGUF dense, 16-bit experts: every GGUF import), **FP8** (BF16 dense, 16-bit
 experts: the official FP8 import), **recipe A** (BF16 dense, 4-bit experts) and **recipe C** (FP8
 dense, 16-bit experts). "Every format" is BF16, INT8, FP8, NVFP4, K8V4, VQ2 and K4V2 KV. The
-groupwise 27B and the 35B-A3B cannot be request-invariant, so their request-coupling behaviours
-always run and are not listed. The NVFP4 27B variants select identical paths (each startup's
+groupwise 27B and the 35B-A3B became request-invariant on the reproducible route in 2026-10 (6.1), so
+their request-coupling paths are listed like the others (since 2026-10-22). The NVFP4 27B variants select identical paths (each startup's
 `fast paths |` line, 2026-10-18).
 
 | Fast path | Kernels run with | Qualified configurations |
@@ -987,9 +987,9 @@ always run and are not listed. The NVFP4 27B variants select identical paths (ea
 | `batched-a8-decode`, `batched-a4-decode` | the same, with 8-bit (FP8) or 4-bit (NVFP4) activations | none (each fails, below) |
 | `batched-a4-residual-decode` | the same, with 4-bit (NVFP4) MLP activations | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
 | `batched-a8-residual-decode` | the same, with 8-bit (FP8) input-projection activations | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
-| `adaptive-speculation` | the same, with speculative decoding | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
-| `free-cache-resume` | the same, with the prefix cache | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
-| `preemption` | every Qwen3.5 artifact | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
+| `adaptive-speculation` | the same, with speculative decoding | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2); groupwise 27B and 35B-A3B, every format (2026-10-22, below) |
+| `free-cache-resume` | the same, with the prefix cache | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2); groupwise 27B and 35B-A3B, every format (2026-10-22, below) |
+| `preemption` | every Qwen3.5 artifact | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2); groupwise 27B and 35B-A3B, every format (2026-10-22, below) |
 | Qwen3.8-Flash-Next: `adaptive-speculation` (MTP), `free-cache-resume`, `preemption` | every Flash-Next artifact | Dense8, IQ3_S, FP8, recipe A, recipe C (since 2026-10-21) and NVIDIA FP4-Local (16- and 4-bit expert activations), every format |
 | Qwen3.8-Flash-Next: `q8-sliced-k`, `gdn-conv-fused`, `qsa-prepare-fused` | Q8 dense weights (`qsa-prepare-fused`: BF16, INT8, FP8, NVFP4 or K8V4 KV) | Q8 dense, 4-bit experts, every KV format (`qsa-prepare-fused`: the five it serves) |
 | `fp8-a8-pair` | row-FP8 dense weights (recipe C) | FP8 dense, 16-bit experts, with BF16, FP8, NVFP4, K8V4, VQ2 or K4V2 KV (INT8 fails its decode tail; below) |
@@ -1361,6 +1361,22 @@ prompt, 256 output tokens, three rounds; the qualified set against the exact rou
 (the 4- and 8-bit activations the old route used there are not qualified); DFlash2 with n-gram
 copies 853 vs 523 tok/s at two requests (+63 %) and 583 vs 329 at four (+77 %). VQ2, BF16 and
 FP8 KV were qualified later (below).
+
+**The groupwise 27B's and the 35B-A3B's request-coupling paths** (2026-10-22, RTX 5090, CUDA 13; against
+the lossless decode references, 256 segments). Once their reproducible routes became request-invariant,
+each coupling path was timed alone against the default route (ABBA, serve scenarios; a path is gated when
+faster in both pairs somewhere and slower in both nowhere): `free-cache-resume` second-turn time to first
+token -95.6 % (groupwise 27B) and -58.8 % (35B), `preemption` aggregate throughput under a short pool
++203 % and +109 %, `adaptive-speculation` +1.18 % (groupwise, MTP; DFlash2 +0.52 %, mixed) and +7.96 %
+(35B, MTP). `batched-decode` and `batch-split-attention` were mixed or behind (groupwise plain decode
++12.8 % at one request but -7.1 % prefill and -19.1 % decode at four requests), so they are not gated.
+The three paths were gated jointly (concurrency 4, prefix reuse with 3,000 warm tokens, a 16,640-token
+pool so the fast run preempts, groupwise DFlash2 with n-gram copies, 35B MTP; the reproducible route as the
+default arm): INT8 KV TV excess 1.07e-4 (groupwise, p99.9 ratio 1.15) and 8.6e-5 (35B). On the other six
+formats both pass (`.local/gpu-queue/stage2a`): the largest TV excess bound 5.7e-4 (35B NVFP4; groupwise at
+most 1.4e-4), the largest top-1 bound 0.24 points (35B BF16; groupwise 0.22, VQ2), p99.9 ratios 0.87-1.12;
+every fast run preempted (21-28 times) and resumed 192,000 prompt tokens from the prefix cache. The three
+paths are registered for both artifacts on every format.
 
 **`batched-a4-residual-decode`** (2026-10-14, the same artifact, corpus and arms): two NVFP4 terms
 per column, from 9 columns in the MLP. Its op error against the 16-bit oracle is 0.9 % relative L2

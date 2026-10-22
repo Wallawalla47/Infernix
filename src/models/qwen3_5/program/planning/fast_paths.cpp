@@ -132,8 +132,7 @@ constexpr std::array kQualified{
     Qualification{FastPath::PromptPv8, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value, true}},
     Qualification{FastPath::PromptPv8, {24, ActivationClass::A16, KvCacheStorage::Vq2, true}},
     Qualification{FastPath::PromptPv8, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value, true}},
-    // The groupwise 27B, its own evidence (2026-10-18; it cannot be request-invariant, so its
-    // request-coupling paths always act). idle-wide-prefill with prompt-pv8 and gdn-f16-accumulate:
+    // The groupwise 27B, its own evidence (2026-10-18). idle-wide-prefill with prompt-pv8 and gdn-f16-accumulate:
     // prefill gate (quick corpus, INT8, 896/1,792 against 3,584) passes; pp16384 +3.31 % and +0.12 %,
     // every run ahead; the other KV formats take the NVFP4 27B's per-format verdicts (6.1). decode-split64:
     // the NVFP4 27B's kernel and shapes, +0.25 % at 512-token prompts here, level at 4,096.
@@ -152,7 +151,7 @@ constexpr std::array kQualified{
     Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value, true}},
     Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A16, KvCacheStorage::Vq2, true}},
     Qualification{FastPath::GdnF16Accumulate, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value, true}},
-    // Qwen3.6-35B-A3B (16 heads, 16-bit activations; never request-invariant), its own evidence
+    // Qwen3.6-35B-A3B (16 heads, 16-bit activations), its own evidence
     // (2026-10-18): the same prefill gate passes; idle-wide-prefill pp16384 +16.9 % (other KV formats
     // from the NVFP4 27B's verdicts), prompt-pv8 +0.24 % on INT8 KV (its 16-head shapes are its own,
     // so each other format is timed before it is listed). gdn-f16-accumulate's +0.05 % was within
@@ -171,6 +170,53 @@ constexpr std::array kQualified{
     Qualification{FastPath::PromptPv8, {16, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value}},
     Qualification{FastPath::PromptPv8, {16, ActivationClass::A16, KvCacheStorage::Vq2}},
     Qualification{FastPath::PromptPv8, {16, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value}},
+    // The groupwise 27B's and the 35B-A3B's request-coupling paths, once their reproducible routes became
+    // request-invariant (2026-10-22): each timed faster alone (ABBA, serve: free-cache-resume second-turn
+    // TTFT -95.6 % and -58.8 %, preemption +203 % and +109 % aggregate, adaptive-speculation +1.18 % and
+    // +7.96 % with MTP), then gated jointly per KV format (concurrency 4, prefix reuse, a 16,640-token pool,
+    // DFlash2 with n-gram copies and MTP, 256 segments against the lossless decode references).
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A16, KvCacheStorage::BFloat16, true}},
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, true}},
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256, true}},
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16, true}},
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value, true}},
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A16, KvCacheStorage::Vq2, true}},
+    Qualification{FastPath::AdaptiveSpeculation, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value, true}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A16, KvCacheStorage::BFloat16, true}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, true}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256, true}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16, true}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value, true}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A16, KvCacheStorage::Vq2, true}},
+    Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value, true}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A16, KvCacheStorage::BFloat16, true}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, true}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256, true}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A16, KvCacheStorage::Nvfp4Group16, true}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value, true}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A16, KvCacheStorage::Vq2, true}},
+    Qualification{FastPath::Preemption, {24, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value, true}},
+    Qualification{FastPath::AdaptiveSpeculation, {16, ActivationClass::A16, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::AdaptiveSpeculation, {16, ActivationClass::A16, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::AdaptiveSpeculation, {16, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::AdaptiveSpeculation, {16, ActivationClass::A16, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::AdaptiveSpeculation, {16, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::AdaptiveSpeculation, {16, ActivationClass::A16, KvCacheStorage::Vq2}},
+    Qualification{FastPath::AdaptiveSpeculation, {16, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::FreeCacheResume, {16, ActivationClass::A16, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::FreeCacheResume, {16, ActivationClass::A16, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::FreeCacheResume, {16, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::FreeCacheResume, {16, ActivationClass::A16, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::FreeCacheResume, {16, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::FreeCacheResume, {16, ActivationClass::A16, KvCacheStorage::Vq2}},
+    Qualification{FastPath::FreeCacheResume, {16, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::Preemption, {16, ActivationClass::A16, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::Preemption, {16, ActivationClass::A16, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::Preemption, {16, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::Preemption, {16, ActivationClass::A16, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::Preemption, {16, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::Preemption, {16, ActivationClass::A16, KvCacheStorage::Vq2}},
+    Qualification{FastPath::Preemption, {16, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value}},
     // --draft-tokens auto's policy with the learned round cost (2026-10-18, INT8 KV). It changes no
     // kernel: each round's verify width is one a fixed --draft-tokens K already runs, through routes
     // qualified at every such width (6.1, item 3), so it is decided by speed alone. Against the best
