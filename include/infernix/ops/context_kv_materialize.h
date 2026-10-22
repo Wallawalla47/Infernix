@@ -7,13 +7,18 @@
 
 #include <cuda_runtime.h>
 
-#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 
 namespace infernix::ops {
 
-inline constexpr std::size_t kContextKVMaterializeLayers = 5;
+// The drafters' layer counts: five (Qwen3.8-27B's and Qwen3.8-Flash-Next's DFlash2) or six
+// (Qwen3.5-122B-A10B's).
+inline constexpr std::size_t kContextKVMaterializeMaxLayers = 6;
+[[nodiscard]] constexpr bool context_kv_materialize_layer_count(std::size_t layers) noexcept {
+    return layers == 5 || layers == 6;
+}
 
 /** One layer's non-owning projection, norm, and destination-state views. */
 struct ContextKVMaterializeLayerView {
@@ -33,17 +38,19 @@ struct ContextKVMaterializeExecutionEnvelope {
 };
 
 /**
- * Materialize one normalized context block into five layer-local cyclic K/V caches.
+ * Materialize one normalized context block into the drafter's five or six layer-local cyclic K/V
+ * caches (one per entry of `layers`).
  *
- * context is contiguous BF16 [H,W,B] with H=5120 (Qwen3.8-27B's DFlash2) or H=2560
- * (Qwen3.8-Flash-Next's), positions is contiguous device I32 [W,B], and counts and state_slots
+ * context is contiguous BF16 [H,W,B] with H=5120 (Qwen3.8-27B's DFlash2), H=2560
+ * (Qwen3.8-Flash-Next's) or H=3072 (Qwen3.5-122B-A10B's), positions is contiguous device I32
+ * [W,B], and counts and state_slots
  * are contiguous device I32 [B]. The registered domains are context blocks W=1..64,B=1..8 and
  * single-request prefill B=1,W=1..2048. W is the physical context width, independent of the draft
- * width and the device-selected committed prefix. Each of the five layer views contains
+ * width and the device-selected committed prefix. Each layer view contains
  * independent RowSplit Q8_G32_FP16 key/value weights [1024,H], a BF16 key norm weight [128], and
- * a capacity-2048 D128/H8 cyclic cache with BF16 K and FP16 V. All five caches share padded
- * capacity and lane capacity. rope_theta is finite and above 1 (1e7 for Qwen3.8-27B's drafter,
- * 1e4 for Qwen3.8-Flash-Next's).
+ * a capacity-2048 D128/H8 cyclic cache with BF16 K and FP16 V. All caches share padded
+ * capacity and lane capacity. rope_theta is finite and above 1 (1e7 for Qwen3.8-27B's and
+ * Qwen3.5-122B-A10B's drafters, 1e4 for Qwen3.8-Flash-Next's).
  *
  * For every layer l, row b, and i in [0,counts[b]), the complete operation is
  *
@@ -71,15 +78,15 @@ struct ContextKVMaterializeExecutionEnvelope {
  */
 void context_kv_materialize(
     const Tensor& context, const Tensor& positions, const Tensor& counts, const Tensor& state_slots,
-    const std::array<ContextKVMaterializeLayerView, kContextKVMaterializeLayers>& layers,
-    float rope_theta,
+    std::span<const ContextKVMaterializeLayerView> layers, float rope_theta,
     ContextKVMaterializeExecutionEnvelope envelope, WorkspaceArena& workspace, cudaStream_t stream);
 
 /**
  * Return transient capacity for every registered W in the inclusive interval at the exact batch
- * size, covering every valid count envelope and its selected route.
+ * size and layer count, covering every valid count envelope and its selected route.
  */
-[[nodiscard]] std::size_t context_kv_materialize_workspace_capacity_bytes(std::int32_t batch_size,
+[[nodiscard]] std::size_t context_kv_materialize_workspace_capacity_bytes(std::int32_t layers,
+                                                                          std::int32_t batch_size,
                                                                           std::int32_t min_width,
                                                                           std::int32_t max_width);
 

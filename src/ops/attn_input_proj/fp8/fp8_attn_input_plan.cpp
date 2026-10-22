@@ -90,4 +90,46 @@ void fp8_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, T
     fp8_attn_input_a8_launch(x, weight, q, gate, k, v, scratch, stream);
 }
 
+std::size_t fp8_attn_input_n17408_workspace_capacity_bytes(LinearPolicy policy,
+                                                           std::int32_t min_tokens,
+                                                           std::int32_t max_tokens) {
+    if (min_tokens <= 0 || max_tokens < min_tokens) {
+        throw std::invalid_argument("fp8 attn_input_proj workspace: invalid token interval");
+    }
+    for (const std::int32_t tokens : {min_tokens, max_tokens}) {
+        if (resolve_route(policy, tokens) == Fp8AttnInputRoute::A8Residual) {
+            throw std::invalid_argument(
+                "fp8 attn_input_proj: a static input scale has no A8 residual route");
+        }
+    }
+    if (resolve_route(policy, max_tokens) != Fp8AttnInputRoute::A8) { return 0; }
+    return fp8_a8_workspace_capacity_bytes(max_tokens, 3072,
+                                           fp8_attn_input_n17408_partial_capacity_bytes(max_tokens));
+}
+
+void fp8_attn_input_n17408_dispatch(const Tensor& x, const Weight& weight, Tensor& q,
+                                    Tensor& gate, Tensor& k, Tensor& v, LinearPolicy policy,
+                                    WorkspaceArena* workspace, cudaStream_t stream) {
+    switch (resolve_route(policy, x.ne[1])) {
+    case Fp8AttnInputRoute::ColumnInvariantA16:
+        fp8_attn_input_n17408_invariant_launch(x, weight, q, gate, k, v, stream);
+        return;
+    case Fp8AttnInputRoute::A16:
+        fp8_attn_input_n17408_a16_launch(x, weight, q, gate, k, v, stream);
+        return;
+    case Fp8AttnInputRoute::A8Residual:
+        throw std::invalid_argument(
+            "fp8 attn_input_proj: a static input scale has no A8 residual route");
+    case Fp8AttnInputRoute::A8:
+        break;
+    }
+    if (workspace == nullptr) {
+        throw std::invalid_argument("fp8 A8 attn_input_proj requires caller workspace");
+    }
+    auto scope                   = workspace->scope();
+    const Fp8A8Workspace scratch = allocate_fp8_a8_workspace(
+        *workspace, x.ne[1], weight.k, fp8_attn_input_n17408_partial_capacity_bytes(x.ne[1]));
+    fp8_attn_input_n17408_a8_launch(x, weight, q, gate, k, v, scratch, stream);
+}
+
 } // namespace infernix::ops::detail

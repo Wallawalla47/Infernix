@@ -11,7 +11,8 @@ namespace infernix::ops {
 
 inline constexpr float kRmsnormPackTailEps = 1.0e-6F;
 
-// Rows: the hidden width, 5120 (Qwen3.8-27B's DFlash2) or 2560 (Qwen3.8-Flash-Next's).
+// Rows: the hidden width, 5120 (Qwen3.8-27B's DFlash2), 2560 (Qwen3.8-Flash-Next's) or 3072
+// (Qwen3.5-122B-A10B's).
 template <int Rows, int kBlock>
 __device__ __forceinline__ float rmsnorm_pack_tail_inverse(float local_sum, float* warp_sums,
                                                            float* inverse) {

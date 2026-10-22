@@ -55,6 +55,7 @@ void launch_route(const Call& c, Route route, int first, int count, std::uint8_t
     case Route::Q8: launch_chunk_stage<RowSplitFormat<8>>(c, first, count, base, l, stream, stage); break;
     case Route::Nvfp4: launch_chunk_stage<Nvfp4Format>(c, first, count, base, l, stream, stage); break;
     case Route::Fp8Row: launch_chunk_stage<Fp8RowFormat>(c, first, count, base, l, stream, stage); break;
+    case Route::Fp8RowF32: launch_chunk_stage<Fp8RowF32Format>(c, first, count, base, l, stream, stage); break;
     case Route::Bf16: launch_chunk_stage<Bf16GridFormat>(c, first, count, base, l, stream, stage); break;
     case Route::Mxfp8: launch_chunk_stage<Mxfp8Format>(c, first, count, base, l, stream, stage); break;
     case Route::Rg16: launch_chunk_stage<Rg16Format>(c, first, count, base, l, stream, stage); break;
@@ -127,7 +128,9 @@ Call projection_call(const Tensor& x, const Weight& weight, std::int32_t row_beg
     const int columns = x.ne[1];
     require(rows > 0 && row_begin >= 0 && row_begin + rows <= weight.n, "the rows must lie within the weight");
     check_out(out, columns, out_row, rows);
-    require(weight.qdata != nullptr && (route == Route::Bf16 || route == Route::Ggml || weight.scales != nullptr) &&
+    // A dense rg16 matrix keeps its scales inside its units (and its multiplier in the weight).
+    require(weight.qdata != nullptr &&
+                (route == Route::Bf16 || route == Route::Ggml || route == Route::Rg16 || weight.scales != nullptr) &&
                 ((route != Route::Q5 && route != Route::Q6) || weight.qhigh != nullptr),
             "the weight's planes are missing");
     if (route == Route::Q2 || route == Route::Q4 || route == Route::Q5 || route == Route::Q6 || route == Route::Q8) {

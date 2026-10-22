@@ -57,6 +57,10 @@ GdnControlParentGeometry require_bf16_parent(const Weight& parent) {
         require_bf16_weight(parent, 64, 2048, "ab_weight");
         return {.input_rows = 2048, .heads = 32};
     }
+    if (parent.n == 128 && parent.k == 3072) {
+        require_bf16_weight(parent, 128, 3072, "ab_weight");
+        return {.input_rows = 3072, .heads = 64};
+    }
     throw std::invalid_argument("gdn_gating_proj: unsupported ab_weight geometry");
 }
 
@@ -101,8 +105,9 @@ std::size_t gdn_norm_gating_proj_workspace_capacity_bytes(std::int32_t heads,
         throw std::invalid_argument("gdn_norm_gating_proj workspace: invalid compute policy");
     }
     if (column_invariant(policy)) {
-        // The fused 27B and 35B-A3B schedules run at every T without workspace.
-        const bool fused = (heads == 48 && input_rows == 5120) || (heads == 32 && input_rows == 2048);
+        // The fused 27B, 35B-A3B and 122B-A10B schedules run at every T without workspace.
+        const bool fused = (heads == 48 && input_rows == 5120) || (heads == 32 && input_rows == 2048) ||
+                           (heads == 64 && input_rows == 3072);
         if (!fused || min_tokens <= 0 || max_tokens < min_tokens) {
             throw std::invalid_argument(
                 "gdn_norm_gating_proj workspace: no column-invariant schedule for this problem");

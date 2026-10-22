@@ -156,6 +156,15 @@ int q4_a16_conformance() {
     failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4_g64_fp16_weight,
                           {131072, 2048, 131U, Comparison::Sampled, false, kN131072K2048});
 
+    // Qwen3.5-122B-A10B's proposal head: every family boundary of its table.
+    constexpr std::array kN131072K3072{
+        a16(1),   a16(2),   a16(4),   a16(8),    a16(9),    a16(16),  a16(17),   a16(32),
+        a16(33),  a16(64),  a16(65),  a16(80),   a16(81),   a16(96),  a16(97),   a16(112),
+        a16(113), a16(128), a16(129), graph(1),  graph(5),  graph(16), graph(64), a16(512),
+    };
+    failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4_g64_fp16_weight,
+                          {131072, 3072, 137U, Comparison::Sampled, false, kN131072K3072});
+
     constexpr std::array kN3456K1152{
         a16(4),    a16(20),    a16(36),   a16(40),     a16(44),  a16(128), graph(16),
         graph(32), graph(64),  a16(68),   graph(96),   a16(100), a16(132), graph(192),

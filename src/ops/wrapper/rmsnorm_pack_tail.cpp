@@ -31,14 +31,15 @@ void rmsnorm_pack_tail(const Tensor& input, const Tensor& weight, Tensor& output
     require_bf16_contiguous_aligned(weight, "weight");
     require_bf16_contiguous_aligned(output, "output");
 
-    // The hidden width: 5120 (Qwen3.8-27B's DFlash2) or 2560 (Qwen3.8-Flash-Next's).
+    // The hidden width: 5120 (Qwen3.8-27B's DFlash2), 2560 (Qwen3.8-Flash-Next's) or 3072
+    // (Qwen3.5-122B-A10B's).
     const std::int32_t rows  = input.ne[0];
     const std::int32_t batch = input.ne[2];
     const std::int32_t width = input.ne[1];
-    if ((rows != 5120 && rows != 2560) || (width < 2 || width > 16) || batch < 1 || batch > 8 ||
+    if ((rows != 5120 && rows != 2560 && rows != 3072) || (width < 2 || width > 16) || batch < 1 || batch > 8 ||
         input.ne[3] != 1) {
         throw std::invalid_argument(
-            "rmsnorm_pack_tail: input must have shape [H,W,B], H=5120|2560, W=2..16, B=1..8");
+            "rmsnorm_pack_tail: input must have shape [H,W,B], H=5120|2560|3072, W=2..16, B=1..8");
     }
     if (weight.ne[0] != rows || weight.ne[1] != 1 || weight.ne[2] != 1 || weight.ne[3] != 1) {
         throw std::invalid_argument("rmsnorm_pack_tail: weight must have shape [H]");

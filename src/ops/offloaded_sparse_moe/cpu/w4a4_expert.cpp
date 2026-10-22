@@ -279,7 +279,10 @@ CpuFeatures detect_features() {
     const bool zmm = (xcr0 & 0xE6) == 0xE6;
     f.avx2    = ymm && (b & (1U << 5)) != 0;
     f.avxvnni = f.avx2 && (a & (1U << 4)) != 0;
-    f.avx512  = zmm && (b & (1U << 16)) != 0 && (b & (1U << 30)) != 0 && (c & (1U << 11)) != 0;
+    // AVX-512 F (EBX 16), BW (EBX 30), VL (EBX 31; the GGUF and FP8 routes' 256-bit EVEX forms) and
+    // VNNI (ECX 11), with the OS saving the opmask and ZMM state.
+    f.avx512 = f.avx2 && zmm && (b & (1U << 16)) != 0 && (b & (1U << 30)) != 0 && (b & (1U << 31)) != 0 &&
+               (c & (1U << 11)) != 0;
     return f;
 }
 

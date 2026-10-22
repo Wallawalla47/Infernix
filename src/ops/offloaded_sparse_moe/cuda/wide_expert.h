@@ -77,6 +77,62 @@ inline constexpr int kA16HRowElements = kA16HRowBytes / 2;
 static_assert(kHidden % kA16KTile == 0 && kIntermediate % kA16KTile == 0);
 static_assert(kA16HRowBytes >= kIntermediate * 2 && kA16HRowBytes % 16 == 0 && kA16XRowBytes % 16 == 0);
 
+// The limb planes of an expert geometry (w4a4_expert.h; the constants above are Flash-Next's).
+template <class G>
+struct A16Planes {
+    static constexpr int kXRowBytes    = G::kHidden / kA16KTile * kA16LimbTileBytes;
+    static constexpr int kHRowBytes    = G::kIntermediate / kA16KTile * kA16LimbTileBytes;
+    static constexpr int kHRowElements = kHRowBytes / 2;
+    static_assert(kHRowBytes >= G::kIntermediate * 2 && kHRowBytes % 16 == 0 && kXRowBytes % 16 == 0);
+};
+static_assert(A16Planes<FlashNextExperts>::kXRowBytes == kA16XRowBytes &&
+              A16Planes<FlashNextExperts>::kHRowBytes == kA16HRowBytes);
+
+INFERNIX_WIDE_HD constexpr int a16_x_row_bytes(const ExpertShape& shape) {
+    return shape.hidden / kA16KTile * kA16LimbTileBytes;
+}
+INFERNIX_WIDE_HD constexpr int a16_h_row_bytes(const ExpertShape& shape) {
+    return shape.intermediate / kA16KTile * kA16LimbTileBytes;
+}
+
+// Bytes of an NVFP4 record of `shape`: 3 H I / 256 units of 144 bytes (ExpertShape::record_bytes,
+// readable in device code).
+INFERNIX_WIDE_HD constexpr std::uint64_t nvfp4_record_bytes(const ExpertShape& shape) {
+    return 3ULL * static_cast<std::uint64_t>(shape.hidden) * static_cast<std::uint64_t>(shape.intermediate) / 256ULL *
+           kUnitBytes;
+}
+static_assert(nvfp4_record_bytes(kFlashNextShape) == kRecordBytes &&
+              nvfp4_record_bytes(kQwen3_5_122BShape) == Qwen3_5_122BExperts::kRecordBytes);
+
+// The narrow ring (moe_layer.cu's narrow_ring_a16.cuh; Qwen3.5-122B-A10B design §8.6): calls of at most
+// kRingColumns columns of an NVFP4 W4A16 bank at Qwen3.5-122B-A10B's geometry on the exact route run
+// their narrow experts as one persistent pass over every job's gate/up and down tasks. Its workspace:
+// every column's x and every entry's h in the dp4a layout (kA16ActBytes per 16 elements), two words
+// per job and the passes' task counters.
+inline constexpr int kRingColumns      = 64;
+inline constexpr int kA16ActBytes      = 48;
+inline constexpr int kRingCounterSlots = 3; // one per concurrent pass phase (All, Resident, Staged)
+[[nodiscard]] inline bool ring_call(const ExpertShape& shape, ExpertActivation activation, WideA16 wide_a16,
+                                    int columns) {
+    return shape == kQwen3_5_122BShape && activation == ExpertActivation::kA16 && wide_a16 == WideA16::kExact &&
+           columns <= kRingColumns;
+}
+
+// Whether a call of this bank's arithmetic exists at `shape`: every bank at Flash-Next's geometry;
+// another registered geometry for NVFP4 W4A16 banks on the exact and lossless routes.
+[[nodiscard]] inline bool shape_supported(const ExpertShape& shape, ExpertActivation activation, WideA16 wide_a16,
+                                          bool ggml) {
+    if (shape == kFlashNextShape) { return true; }
+    return registered_shape(shape) && activation == ExpertActivation::kA16 && !ggml &&
+           (wide_a16 == WideA16::kExact || wide_a16 == WideA16::kLossless);
+}
+
+// The x column of a call's dispatch entry: routed entries are t * top_k + slot, a shared job's
+// (MoeDispatch::shared_first) shared_first + t.
+INFERNIX_WIDE_HD constexpr int entry_column(int entry, int top_k, int shared_first) {
+    return entry >= shared_first ? entry - shared_first : entry / top_k;
+}
+
 // The 16-element A4 block b of a plane row is stored at block position plane_block(b): within each
 // group of four blocks (one 64-wide MMA K step) the middle two are swapped, so that the record's
 // 144-byte units read for one K step fall in distinct shared-memory banks. Its eight code bytes
@@ -127,8 +183,8 @@ struct ExpertsWorkspace {
     canon::A4Block* h_blocks;     // [entries][kHBlocks]; wide entries hold their A4(h) row here
     std::uint8_t* x_plane;        // [entries][kXRowBytes]
     // W4A16
-    std::uint8_t* x_limbs;        // [columns][kA16XRowBytes]: every token's x limbs (wide calls)
-    std::uint8_t* h_rows;         // [entries][kA16HRowBytes]: BF16 h, rewritten as limbs for wide entries
+    std::uint8_t* x_limbs;        // [columns][a16_x_row_bytes(shape)]: every token's x limbs (wide calls)
+    std::uint8_t* h_rows;         // [entries][a16_h_row_bytes(shape)]: BF16 h, rewritten as limbs for wide entries
     std::int32_t* x_emax;         // [columns]: column exponent of each token's x
     std::int32_t* h_emax;         // [entries]: column exponent of each wide entry's h
     // W4A16, A4 residual (h_rows holds the BF16 h)
@@ -138,30 +194,41 @@ struct ExpertsWorkspace {
     float* h_row_scale;           // [entries]
     // GGUF banks, kGgmlBf16 in calls of kGgmlBf16MinColumns or more (else null): kGgmlBf16PlaneBytes
     std::uint8_t* ggml_planes;
-    // kLossless: lossless_experts_bytes(max_jobs, entries) (moe_layer.cu's lossless_expert.cuh)
+    // kLossless: lossless_experts_bytes(shape, max_jobs, entries) (moe_layer.cu's lossless_expert.cuh)
     std::uint8_t* lossless;
+    // The narrow ring (ring_call; else null): x_acts [columns][shape.hidden / 16] and h_acts
+    // [entries][shape.intermediate / 16] blocks of kA16ActBytes, ring_done and ring_ready [max_jobs]
+    // (each job's gate/up tasks finished, 1 once its h is encoded; ring_ready follows ring_done) and
+    // ring_counters [kRingCounterSlots][2] (next task, CTAs finished).
+    std::uint8_t* x_acts;
+    std::uint8_t* h_acts;
+    std::uint32_t* ring_done;
+    std::uint32_t* ring_ready;
+    std::uint32_t* ring_counters;
 };
 
 // kLossless's region: per-job counts, the tile plan, records and column maps of every tile, and one
-// column chunk's gate/up and h planes with the projections' workspace.
+// column chunk's gate/up and h planes with the projections' workspace, at the bank's geometry.
 inline constexpr int kLosslessChunkColumns = 2048;
-[[nodiscard]] std::size_t lossless_experts_bytes(std::int32_t max_jobs, std::int32_t entries);
+[[nodiscard]] std::size_t lossless_experts_bytes(const ExpertShape& shape, std::int32_t max_jobs, std::int32_t entries);
 
 // Bytes of a call's CPU bookkeeping (moe_layer.cu's CpuCall: two words and kMaxCpuJobs job indices).
 inline constexpr std::size_t kCpuCallBytes = 2304; // 2 words + 512 indices, rounded to 256
 
 [[nodiscard]] std::int32_t max_tiles(std::int32_t max_jobs, std::int32_t entries);
 // `columns` is the call's T (entries = top_k * T); the activation and W4A16 wide route select the planes.
-[[nodiscard]] std::size_t experts_workspace_bytes(std::int32_t max_jobs, std::int32_t entries, std::int32_t columns,
-                                                  ExpertActivation activation, WideA16 wide_a16);
-[[nodiscard]] ExpertsWorkspace carve_experts_workspace(void* base, std::int32_t max_jobs, std::int32_t entries,
-                                                       std::int32_t columns, ExpertActivation activation,
-                                                       WideA16 wide_a16);
+// `shape` is the bank's geometry (MoeExpertSource::shape; shape_supported).
+[[nodiscard]] std::size_t experts_workspace_bytes(const ExpertShape& shape, std::int32_t max_jobs, std::int32_t entries,
+                                                  std::int32_t columns, ExpertActivation activation, WideA16 wide_a16);
+[[nodiscard]] ExpertsWorkspace carve_experts_workspace(void* base, const ExpertShape& shape, std::int32_t max_jobs,
+                                                       std::int32_t entries, std::int32_t columns,
+                                                       ExpertActivation activation, WideA16 wide_a16);
 
 // Device and host state of one moe_experts call's wide route; a plain value, valid until the call's
 // workspace is released. `descriptors` points to the call's staged TMA descriptors (W4A4 only).
 struct Call {
     MoeDispatch dispatch;
+    ExpertShape shape; // the bank's geometry (MoeExpertSource::shape)
     const ExpertScales* scales                = nullptr;
     const std::uint8_t* const* job_records    = nullptr;
     const std::int32_t* tiles                 = nullptr;
@@ -191,6 +258,12 @@ struct Call {
 [[nodiscard]] Call prepare(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource& source,
                            std::int32_t top_k, std::int32_t max_jobs, std::int32_t pass_jobs,
                            const ExpertsWorkspace& workspace, Tensor& outputs, cudaStream_t stream);
+
+// Every column's x limbs and column exponent, the exact wide route's A operand, for BF16 x
+// [shape.hidden, T]: limbs [T][a16_x_row_bytes(shape)] and emax [T] (the dense rg16 projection reuses
+// it).
+void encode_x_limbs(const ExpertShape& shape, const Tensor& x, std::uint8_t* limbs, std::int32_t* emax,
+                    cudaStream_t stream);
 
 // Computes the wide experts among the jobs of `pass`, whose records job_records holds by then:
 // the gate/up GEMM with SwiGLU and the encoding of h (A4, or the W4A16 limbs), then the down GEMM

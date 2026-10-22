@@ -44,6 +44,9 @@ public:
         std::vector<int> cpus;   // optional CPU of worker i (worker 0 is the service thread)
         // The arithmetic of every layer's experts; it must equal the calls' MoeExpertSource::activation.
         ExpertActivation activation = ExpertActivation::kA4;
+        // Every layer's expert geometry; it must equal the calls' MoeExpertSource::shape (another
+        // registered one than Flash-Next's for NVFP4 A16 banks only).
+        ExpertShape shape = kFlashNextShape;
         // Tiered requests (design §19.3.7): a job without a record pointer is read through `records`
         // (demanded before the other jobs run, computed after them); without a provider, or when a
         // read fails, the request is answered with an errno in the status word. The service keeps its
@@ -78,7 +81,7 @@ private:
     std::vector<Layer> layers_;
     Options options_;
     MissRequest* request_ = nullptr; // mapped
-    std::uint16_t* x_     = nullptr; // mapped BF16 [H, kMaxCpuXColumns]
+    std::uint16_t* x_     = nullptr; // mapped BF16 [H, kMaxCpuXColumns], H = options_.shape.hidden
     std::uint16_t* y_     = nullptr; // mapped BF16 [H, max(max_jobs, wide_jobs) * kMaxCpuColumns]
     int jobs_             = 0;       // max(max_jobs, wide_jobs)
     std::uint32_t* done_  = nullptr; // mapped

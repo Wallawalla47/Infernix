@@ -46,10 +46,10 @@ struct Fp8SimtSharedStorage {
     alignas(16) __nv_bfloat16 activation[kActivationElements];
 };
 
-template <class Schedule, class Output, class Epilogue, class RowPolicy>
+template <class Schedule, class Output, class Epilogue, class RowPolicy, class Scale = __nv_bfloat16>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_simt_kernel(
-    Fp8A16Operands operands, Output output, Epilogue epilogue, RowPolicy row_policy) {
+    Fp8A16OperandsT<Scale> operands, Output output, Epilogue epilogue, RowPolicy row_policy) {
     // Streams its weights through the main loop: wait for the producer first, and let dependents
     // launch only once that loop is done.
     pdl::enter_streaming();
@@ -184,7 +184,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_si
 #pragma unroll
         for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
             const int parent_row = row_policy.weight_row(row_begin, local_row, operands.rows);
-            const float scale    = __bfloat162float(__ldg(row_scales + parent_row));
+            const float scale    = fp8_widen(__ldg(row_scales + parent_row));
             float projected[Schedule::kBlockTokens];
 #pragma unroll
             for (int local_token = 0; local_token < live_tokens; ++local_token) {
@@ -223,9 +223,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_si
                     const int second_row = row_policy.weight_row(
                         row_begin, kStoredRowsPerWarp + local_row, operands.rows);
                     const float first =
-                        totals[local_row] * __bfloat162float(__ldg(row_scales + first_row));
+                        totals[local_row] * fp8_widen(__ldg(row_scales + first_row));
                     const float second = totals[kStoredRowsPerWarp + local_row] *
-                                         __bfloat162float(__ldg(row_scales + second_row));
+                                         fp8_widen(__ldg(row_scales + second_row));
                     epilogue.apply_pair(destination, row_begin + local_row, token, first, second);
                 }
             }
@@ -234,7 +234,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_si
 #pragma unroll
         for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
             const int parent_row = row_policy.weight_row(row_begin, local_row, operands.rows);
-            const float scale    = __bfloat162float(__ldg(row_scales + parent_row));
+            const float scale    = fp8_widen(__ldg(row_scales + parent_row));
 #pragma unroll
             for (int local_token = 0; local_token < Schedule::kBlockTokens; ++local_token) {
                 const int token = token0 + local_token;

@@ -11,19 +11,21 @@
 #include "ops/linear/fp8/fp8_a8_tma_mma.cuh"
 
 namespace infernix::ops::detail {
-template <class Schedule, class Output, class Epilogue, class Rows = Fp8IdentityRows>
-void launch_fp8_a16_gemv(const Fp8A16Operands& p, Output output, Epilogue epilogue,
+template <class Schedule, class Output, class Epilogue, class Rows = Fp8IdentityRows,
+          class Scale = __nv_bfloat16>
+void launch_fp8_a16_gemv(const Fp8A16OperandsT<Scale>& p, Output output, Epilogue epilogue,
                          cudaStream_t stream, Rows rows = {}) {
     validate_fp8_operands<Schedule>(p);
     if (p.tokens != 1 || p.rows % Schedule::kBlockRows || p.k % (32 * Schedule::kValuesPerLane))
         throw std::invalid_argument("FP8 GEMV requires T=1 and complete row/K tiles");
     CUDA_CHECK(pdl::launch_consumer({dim3(p.rows / Schedule::kBlockRows), dim3(Schedule::kThreads), 0, stream},
-                                    fp8_a16_gemv_kernel<Schedule, Output, Epilogue, Rows>, p.x, p.codes, p.scales,
+                                    fp8_a16_gemv_kernel<Schedule, Output, Epilogue, Rows, Scale>, p.x, p.codes, p.scales,
                                     output, epilogue, rows, p.rows, p.k));
 }
 
-template <class Schedule, class Output, class Epilogue, class Rows = Fp8IdentityRows>
-void launch_fp8_a16_simt(const Fp8A16Operands& p, Output output, Epilogue epilogue,
+template <class Schedule, class Output, class Epilogue, class Rows = Fp8IdentityRows,
+          class Scale = __nv_bfloat16>
+void launch_fp8_a16_simt(const Fp8A16OperandsT<Scale>& p, Output output, Epilogue epilogue,
                          cudaStream_t stream, Rows rows = {},
                          pdl::Dependency dependency = pdl::Dependency::Serialized) {
     validate_fp8_operands<Schedule>(p);
@@ -39,12 +41,13 @@ void launch_fp8_a16_simt(const Fp8A16Operands& p, Output output, Epilogue epilog
     const int capacity = Schedule::kTokenCapacity ? Schedule::kTokenCapacity : p.tokens;
     const int blocks   = p.rows / Schedule::kBlockRows * div_up(capacity, Schedule::kBlockTokens);
     CUDA_CHECK(pdl::launch_with(dependency, {dim3(blocks), dim3(Schedule::kThreads), 0, stream},
-                                fp8_a16_simt_kernel<Schedule, Output, Epilogue, Rows>, p, output,
+                                fp8_a16_simt_kernel<Schedule, Output, Epilogue, Rows, Scale>, p, output,
                                 epilogue, rows));
 }
 
-template <class Schedule, class Output, class Epilogue, class Rows = Fp8IdentityRows>
-void launch_fp8_a16_mma(const Fp8A16Operands& p, Output output, Epilogue epilogue,
+template <class Schedule, class Output, class Epilogue, class Rows = Fp8IdentityRows,
+          class Scale = __nv_bfloat16>
+void launch_fp8_a16_mma(const Fp8A16OperandsT<Scale>& p, Output output, Epilogue epilogue,
                         cudaStream_t stream, Rows rows = {}) {
     validate_fp8_operands<Schedule>(p);
     if (p.rows % Schedule::kBlockRows || p.k % Schedule::kBlockK)
@@ -52,7 +55,7 @@ void launch_fp8_a16_mma(const Fp8A16Operands& p, Output output, Epilogue epilogu
     for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
         const dim3 grid(p.rows / Schedule::kBlockRows, div_up(count, Schedule::kBlockTokens));
         const auto launch = [&]<bool Full>() {
-            constexpr auto kernel = fp8_a16_mma_kernel<Schedule, Full, Output, Epilogue, Rows>;
+            constexpr auto kernel = fp8_a16_mma_kernel<Schedule, Full, Output, Epilogue, Rows, Scale>;
             const int bytes =
                 fp8_prepare_shared<fp8_mma_shared_bytes<Schedule, Epilogue>, kernel, true>();
             kernel<<<grid, Schedule::kThreads, bytes, stream>>>(
@@ -66,8 +69,9 @@ void launch_fp8_a16_mma(const Fp8A16Operands& p, Output output, Epilogue epilogu
     });
 }
 
-template <class Schedule, class Output, class Epilogue, class Rows = Fp8IdentityRows>
-void launch_fp8_a16_sliced_k_mma(const Fp8A16Operands& p, Output output, Epilogue epilogue,
+template <class Schedule, class Output, class Epilogue, class Rows = Fp8IdentityRows,
+          class Scale = __nv_bfloat16>
+void launch_fp8_a16_sliced_k_mma(const Fp8A16OperandsT<Scale>& p, Output output, Epilogue epilogue,
                                  cudaStream_t stream, Rows rows = {},
                                  pdl::Dependency dependency = pdl::Dependency::Serialized) {
     validate_fp8_operands<Schedule>(p);
@@ -79,7 +83,8 @@ void launch_fp8_a16_sliced_k_mma(const Fp8A16Operands& p, Output output, Epilogu
         throw std::invalid_argument(
             "FP8 sliced-K requires complete row/K tiles and matching tokens");
     // Static: MSVC 2022 rejects the lambda's use of an automatic constexpr local (C2326).
-    static constexpr auto kernel = fp8_a16_sliced_k_mma_kernel<Schedule, Output, Epilogue, Rows>;
+    static constexpr auto kernel =
+        fp8_a16_sliced_k_mma_kernel<Schedule, Output, Epilogue, Rows, Scale>;
     const int bytes              = fp8_prepare_shared<Schedule::kSharedBytes, kernel>();
     for_each_token_slice(p.tokens, capacity, [&](int offset, int count) {
         const dim3 grid(p.rows / Schedule::kBlockRows, div_up(count, capacity));
@@ -90,8 +95,9 @@ void launch_fp8_a16_sliced_k_mma(const Fp8A16Operands& p, Output output, Epilogu
     });
 }
 
-template <class Schedule, class Output, class Epilogue, class Rows = Fp8IdentityRows>
-void launch_fp8_a8_mma(const Fp8A8Operands& p, Output output, Epilogue epilogue,
+template <class Schedule, class Output, class Epilogue, class Rows = Fp8IdentityRows,
+          class Scale = __nv_bfloat16>
+void launch_fp8_a8_mma(const Fp8A8OperandsT<Scale>& p, Output output, Epilogue epilogue,
                        cudaStream_t stream, Rows rows = {},
                        pdl::Dependency dependency = pdl::Dependency::Serialized) {
     validate_fp8_operands<Schedule>(p);
@@ -105,7 +111,7 @@ void launch_fp8_a8_mma(const Fp8A8Operands& p, Output output, Epilogue epilogue,
     for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
         const int blocks  = p.rows / Schedule::kBlockRows * div_up(count, Schedule::kBlockTokens);
         const auto launch = [&]<bool Full>() {
-            constexpr auto kernel = fp8_a8_mma_kernel<Schedule, Full, Epilogue, Output, Rows>;
+            constexpr auto kernel = fp8_a8_mma_kernel<Schedule, Full, Epilogue, Output, Rows, Scale>;
             const int bytes =
                 fp8_prepare_shared<fp8_mma_shared_bytes<Schedule, Epilogue>, kernel>();
             CUDA_CHECK(pdl::launch_with(

@@ -44,4 +44,23 @@ void fp8_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, T
                              Tensor& k, Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,
                              cudaStream_t stream);
 
+// Qwen3.5-122B-A10B: one fp8_e4m3fn_row_f32 parent [17408,3072] (query 8192, key 512, gate 8192,
+// value 512). AllowA8 encodes with the parent's static input scale from T = 17; a static scale has
+// no A8 residual profile.
+[[nodiscard]] std::size_t fp8_attn_input_n17408_partial_capacity_bytes(std::int32_t max_tokens);
+[[nodiscard]] std::size_t fp8_attn_input_n17408_workspace_capacity_bytes(LinearPolicy policy,
+                                                                         std::int32_t min_tokens,
+                                                                         std::int32_t max_tokens);
+void fp8_attn_input_n17408_invariant_launch(const Tensor& x, const Weight& weight, Tensor& q,
+                                            Tensor& gate, Tensor& k, Tensor& v,
+                                            cudaStream_t stream);
+void fp8_attn_input_n17408_a16_launch(const Tensor& x, const Weight& weight, Tensor& q,
+                                      Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream);
+void fp8_attn_input_n17408_a8_launch(const Tensor& x, const Weight& weight, Tensor& q,
+                                     Tensor& gate, Tensor& k, Tensor& v, Fp8A8Workspace workspace,
+                                     cudaStream_t stream);
+void fp8_attn_input_n17408_dispatch(const Tensor& x, const Weight& weight, Tensor& q,
+                                    Tensor& gate, Tensor& k, Tensor& v, LinearPolicy policy,
+                                    WorkspaceArena* workspace, cudaStream_t stream);
+
 } // namespace infernix::ops::detail

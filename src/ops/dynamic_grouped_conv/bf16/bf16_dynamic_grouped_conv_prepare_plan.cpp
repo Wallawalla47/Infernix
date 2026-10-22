@@ -36,8 +36,8 @@ std::size_t bf16_dynamic_grouped_conv_prepare_workspace_capacity_bytes(int hidde
                                                                        int max_width,
                                                                        int min_batch,
                                                                        int max_batch) {
-    if (hidden != 5120 && hidden != 2560)
-        throw std::invalid_argument("dynamic grouped conv prepare workspace: H must be 5120 or 2560");
+    if (hidden != 5120 && hidden != 2560 && hidden != 3072)
+        throw std::invalid_argument("dynamic grouped conv prepare workspace: H must be 5120, 2560 or 3072");
     if (min_width < 2 || max_width > 16 || min_width > max_width || min_batch < 1 ||
         max_batch > 8 || min_batch > max_batch)
         throw std::invalid_argument("dynamic grouped conv prepare workspace: invalid W/B interval");

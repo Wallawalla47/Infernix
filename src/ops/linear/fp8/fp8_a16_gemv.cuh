@@ -100,11 +100,11 @@ __device__ __forceinline__ void accumulate_rows(const Fp8CodePack<Values> (&code
     }
 }
 
-template <class Schedule, class Output, class Epilogue, class RowPolicy>
+template <class Schedule, class Output, class Epilogue, class RowPolicy, class Scale = __nv_bfloat16>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_gemv_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ weight_codes,
-    const __nv_bfloat16* __restrict__ row_scales, Output output, Epilogue epilogue,
+    const Scale* __restrict__ row_scales, Output output, Epilogue epilogue,
     RowPolicy row_policy, int rows, int input_rows) {
     constexpr bool PairRows       = RowPolicy::kPaired;
     const int K                   = Schedule::kStaticK ? Schedule::kStaticK : input_rows;
@@ -162,10 +162,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_ge
                 const int gate_row = row_policy.weight_row(row_begin, local_row, rows);
                 const int up_row =
                     row_policy.weight_row(row_begin, kStoredRowsPerWarp + local_row, rows);
-                const float gate =
-                    totals[local_row] * __bfloat162float(__ldg(row_scales + gate_row));
-                const float up = totals[kStoredRowsPerWarp + local_row] *
-                                 __bfloat162float(__ldg(row_scales + up_row));
+                const float gate = totals[local_row] * fp8_widen(__ldg(row_scales + gate_row));
+                const float up   = totals[kStoredRowsPerWarp + local_row] *
+                                 fp8_widen(__ldg(row_scales + up_row));
                 epilogue.apply_pair(destination, row_begin + local_row, 0, gate, up);
             }
         }
@@ -180,7 +179,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_ge
             total = warp_reduce_sum(total);
             if (lane == 0) {
                 const int parent_row = row_policy.weight_row(row_begin, local_row, rows);
-                const float values[1]{total * __bfloat162float(__ldg(row_scales + parent_row))};
+                const float values[1]{total * fp8_widen(__ldg(row_scales + parent_row))};
                 linear_finish_row(destination, epilogue, parent_row, 0, values, 1);
             }
         }

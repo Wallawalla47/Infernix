@@ -77,15 +77,17 @@ inline constexpr std::uint32_t vq_kv_grouped_smem_bytes() {
            Br * QKNt * 4;
 }
 
-// Columns of one ParallelQueries CTA, and the most window splits of a row: the sink and recent
+// Columns of one wide ParallelQueries CTA (128 query rows: sixteen columns, eight at GQA group 16;
+// a narrow one holds kCausalGroupedTokens), and the most window splits of a row: the sink and recent
 // tiles of one CTA's columns (at most 64 + 768 + 16 keys, 28 tiles of 32) spread over that many
 // CTAs.
-inline constexpr int kVqParallelTile   = 16;
+template <class G>
+inline constexpr int kVqParallelTile    = 2 * kCausalGroupedTokens<G>;
 inline constexpr int kVqMaxWindowSplits = 8;
 
-// Warps of a grouped CTA of TokenTile columns.
-template <int TokenTile>
-inline constexpr int kVqGroupedWarps = TokenTile > 8 ? 16 : 8;
+// Warps of a grouped CTA of TokenTile columns: sixteen above 64 query rows.
+template <class G, int TokenTile>
+inline constexpr int kVqGroupedWarps = TokenTile * G::GroupSize > 64 ? 16 : 8;
 
 // The partition the merge reads: every one of a row's `splits` partials.
 inline CausalKvPartition vq_merge_partition(int splits) {
@@ -98,13 +100,14 @@ inline CausalKvPartition vq_merge_partition(int splits) {
 
 template <class Geometry, int TokenTile, bool MultiBatch, bool Masked, KVCacheVqKeyCodec KeyCodec,
           int KeyRows, bool ParallelQueries, bool Tree>
-__launch_bounds__(kVqGroupedWarps<TokenTile> * 32, TokenTile > 8 ? 1 : 2) __global__
+__launch_bounds__(kVqGroupedWarps<Geometry, TokenTile> * 32, kVqGroupedWarps<Geometry, TokenTile> == 16 ? 1 : 2)
+    __global__
     void vq_kv_grouped_kernel(const __nv_bfloat16* q, const std::int32_t* pos, VqKvCacheView cache,
                               std::int32_t full_width, std::int32_t logical_capacity,
                               CausalKvPartition partition, std::int32_t window_splits, float scale,
                               float* partial_acc, float* partial_m, float* partial_l) {
     using Shape                 = VqKvGroupedShape<KeyCodec, KeyRows>;
-    constexpr int Wc            = kVqGroupedWarps<TokenTile>;
+    constexpr int Wc            = kVqGroupedWarps<Geometry, TokenTile>;
     constexpr int RowCount      = TokenTile * Geometry::GroupSize;
     constexpr int RowTiles      = (RowCount + 15) / 16;
     constexpr int Br            = RowTiles * 16;

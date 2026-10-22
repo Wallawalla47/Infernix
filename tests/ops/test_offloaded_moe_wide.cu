@@ -334,7 +334,7 @@ void test_layer(const char* name, int experts, int columns, int top_k, const std
     std::uint8_t* d_staging = nullptr;
     cuda_check(cudaMalloc(&d_staging, stride * 64), "cudaMalloc");
     void* d_workspace = nullptr;
-    cuda_check(cudaMalloc(&d_workspace, infernix::ops::moe_experts_workspace_bytes(max_jobs, entries, columns, moe::ExpertActivation::kA4)), "cudaMalloc");
+    cuda_check(cudaMalloc(&d_workspace, infernix::ops::moe_experts_workspace_bytes(infernix::ops::offloaded_moe::kFlashNextShape, max_jobs, entries, columns, moe::ExpertActivation::kA4)), "cudaMalloc");
     std::uint16_t* d_out = nullptr;
     const std::size_t out_elements = static_cast<std::size_t>(moe::kHidden) * entries;
     cuda_check(cudaMalloc(&d_out, out_elements * sizeof(std::uint16_t)), "cudaMalloc");
@@ -486,7 +486,7 @@ void test_layer(const char* name, int experts, int columns, int top_k, const std
                                             .scales        = d_scales,
                                             .staging_base  = d_staging,
                                             .staging_slots = 64};
-        const auto layout = wide::carve_experts_workspace(d_workspace, max_jobs, entries, columns, moe::ExpertActivation::kA4,
+        const auto layout = wide::carve_experts_workspace(d_workspace, moe::kFlashNextShape, max_jobs, entries, columns, moe::ExpertActivation::kA4,
                                                           moe::WideA16::kExact);
         Tensor tx(d_x, DType::BF16, {moe::kHidden, columns});
         Tensor out(d_out, DType::BF16, {moe::kHidden, entries});
@@ -706,7 +706,7 @@ void test_layer_a16(const char* name, int experts, int columns, int top_k, const
     std::uint8_t* d_staging = nullptr;
     cuda_check(cudaMalloc(&d_staging, stride * 64), "cudaMalloc");
     void* d_workspace = nullptr;
-    cuda_check(cudaMalloc(&d_workspace, infernix::ops::moe_experts_workspace_bytes(max_jobs, entries, columns,
+    cuda_check(cudaMalloc(&d_workspace, infernix::ops::moe_experts_workspace_bytes(infernix::ops::offloaded_moe::kFlashNextShape, max_jobs, entries, columns,
                                                                                  moe::ExpertActivation::kA16, route)),
                "cudaMalloc");
     std::uint16_t* d_out = nullptr;
@@ -775,7 +775,7 @@ void test_layer_a16(const char* name, int experts, int columns, int top_k, const
         {
             const std::uint16_t* xp[1] = {xc};
             std::uint16_t* yp[1]       = {cpu.data()};
-            moe::expert_forward_a16(moe::best_cpu_isa(), expert.record.data(), expert.scales, 1, xp, yp);
+            moe::expert_forward_a16(moe::best_cpu_isa(), moe::kFlashNextShape, expert.record.data(), expert.scales, 1, xp, yp);
         }
         const std::uint16_t* got = &first_outputs[static_cast<std::size_t>(entry) * moe::kHidden];
         const int wide = moe::wide_route(counts[static_cast<std::size_t>(e)], scales[static_cast<std::size_t>(e)]) ? 1 : 0;

@@ -1,5 +1,6 @@
 #include "core/weight.h"
 #include "infernix/ops/linear.h"
+#include "infernix/ops/rg16_linear.h"
 
 #include "ops/linear/bf16/bf16_dispatch.h"
 #include "ops/linear/fp8/fp8_dispatch.h"
@@ -105,6 +106,11 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
     case QType::FP8_E4M3FN_G32_E8M0:
         detail::mxfp8_dispatch(x, w, out, policy, stream);
         return;
+    case QType::NVFP4_MUL:
+        // A dense nvfp4_rg16_v1 matrix: the canonical W4A16 projection (exact sums), every policy.
+        if (w.layout != QuantLayout::Rg16 || workspace == nullptr) { break; }
+        rg16_linear(x, w, out, *workspace, stream);
+        return;
     case QType::FP32:
     case QType::INT32:
         break;
@@ -122,6 +128,8 @@ bool linear_column_invariant_route(QType qtype, std::int32_t output_rows,
     if (qtype == QType::FP8_E4M3FN_ROW_BF16) {
         return detail::fp8_linear_column_invariant_route(output_rows, input_rows);
     }
+    // nvfp4_rg16_v1 sums exactly: every route is column-invariant.
+    if (qtype == QType::NVFP4_MUL) { return true; }
     return false;
 }
 
@@ -167,6 +175,9 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
                                                            min_tokens, max_tokens);
     case QType::FP8_E4M3FN_G32_E8M0:
         return detail::mxfp8_linear_workspace_capacity_bytes(output_rows, input_rows, policy, min_tokens, max_tokens);
+    case QType::NVFP4_MUL:
+        // The encoded activations grow with the columns.
+        return rg16_linear_workspace_bytes(output_rows, input_rows, max_tokens);
     case QType::FP32:
     case QType::INT32:
         break;

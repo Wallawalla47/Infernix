@@ -19,7 +19,8 @@ namespace {
 using namespace infernix;
 using namespace infernix::test;
 
-// The head width under test (main): Qwen3.8-27B's 5120 or Qwen3.8-Flash-Next's 2560.
+// The head width under test (main): Qwen3.8-27B's 5120, Qwen3.5-122B-A10B's 3072 or
+// Qwen3.8-Flash-Next's 2560.
 std::int32_t g_hidden = 5120;
 constexpr std::int32_t kFullRows  = 248320;
 constexpr std::int32_t kValidRows = 248077;
@@ -493,6 +494,12 @@ int main() {
         failures += run_full(QType::FP8_E4M3FN_ROW_BF16, "fp8-full", hidden,
                              base_scores(QType::FP8_E4M3FN_ROW_BF16, host_hidden));
         failures += run_q4(hidden, base_scores(QType::Q4_G64_FP16, host_hidden));
+        // Qwen3.5-122B-A10B's Q4 proposal head (--lm-head-draft).
+        g_hidden = 3072;
+        const std::vector<std::uint16_t> mid_hidden = make_hidden();
+        DeviceBuffer mid(mid_hidden.size() * sizeof(std::uint16_t));
+        mid.copy_from_host(mid_hidden.data(), mid.bytes);
+        failures += run_q4(mid, base_scores(QType::Q4_G64_FP16, mid_hidden));
         // Qwen3.8-Flash-Next's heads: the Q8 full head and the Q4 proposal head (--lm-head-draft).
         g_hidden = 2560;
         const std::vector<std::uint16_t> narrow_hidden = make_hidden();

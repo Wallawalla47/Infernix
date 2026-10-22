@@ -24,7 +24,9 @@ namespace infernix::ops {
  * out_row + rows <= N_out. Weight formats (docs/maintainer/tensor-formats.md), each weight its format's
  * exact value: Q2, Q4, Q5 and Q6 row-split with FP16 scales per 64 and Q8 per 32 (code times scale);
  * nvfp4 (E2M1 code times its 16-element group's E4M3 scale, divided by the matrix's FP32 divisor: the
- * sum is divided exactly); fp8_e4m3fn_row_bf16 (E4M3 code times the row's BF16 scale);
+ * sum is divided exactly); fp8_e4m3fn_row_bf16 (E4M3 code times the row's BF16 scale) and
+ * fp8_e4m3fn_row_f32 (times the row's FP32 multiplier); nvfp4_rg16_v1 (a dense nvfp4_mul matrix in the
+ * expert record's layout: E2M1 code times its block's E4M3 scale, the sum times the FP32 multiplier);
  * fp8_e4m3fn_g32_e8m0 (E4M3 code times its 32-element group's power of two); the GGUF blocks of
  * ggml_rows_v1 and ggml_tiles16_v1 (Q2_0, Q4_K, Q5_K, Q6_K, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL:
  * kappa (d sub code - dmin min_sub)); BF16.

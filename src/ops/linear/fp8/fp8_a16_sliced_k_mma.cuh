@@ -21,10 +21,10 @@
 
 namespace infernix::ops::detail {
 
-template <class Schedule, class Output, class Epilogue, class RowPolicy>
+template <class Schedule, class Output, class Epilogue, class RowPolicy, class Scale = __nv_bfloat16>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_sliced_k_mma_kernel(
-    Fp8A16Operands operands, Output output, Epilogue epilogue, RowPolicy row_policy,
+    Fp8A16OperandsT<Scale> operands, Output output, Epilogue epilogue, RowPolicy row_policy,
     int token_offset) {
     // Streams its weights through the main loop: wait for the producer first, and let dependents
     // launch only once that loop is done.
@@ -227,19 +227,30 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_sl
             linear_output_tile<kBlockRows / (RowPolicy::kPaired ? 2 : 1)>(output, row0);
 #pragma unroll
         for (int tile = 0; tile < kRowTiles; ++tile) {
-            const int tile_row  = tile * 16;
-            unsigned lane_scale = 0;
-            if (lid < 2) {
-                lane_scale = static_cast<unsigned>(
-                    reinterpret_cast<const std::uint16_t*>(row_scales)[row_policy.weight_row(
-                        row0, tile_row + gid + lid * 8, operands.rows)]);
+            const int tile_row = tile * 16;
+            float top_scale, bottom_scale;
+            if constexpr (std::is_same_v<Scale, float>) {
+                float lane_scale = 0.0F;
+                if (lid < 2) {
+                    lane_scale = row_scales[row_policy.weight_row(row0, tile_row + gid + lid * 8,
+                                                                  operands.rows)];
+                }
+                top_scale    = __shfl_sync(kMask, lane_scale, lane & ~3);
+                bottom_scale = __shfl_sync(kMask, lane_scale, (lane & ~3) + 1);
+            } else {
+                unsigned lane_scale = 0;
+                if (lid < 2) {
+                    lane_scale = static_cast<unsigned>(
+                        reinterpret_cast<const std::uint16_t*>(row_scales)[row_policy.weight_row(
+                            row0, tile_row + gid + lid * 8, operands.rows)]);
+                }
+                const unsigned top_scale_bits    = __shfl_sync(kMask, lane_scale, lane & ~3);
+                const unsigned bottom_scale_bits = __shfl_sync(kMask, lane_scale, (lane & ~3) + 1);
+                top_scale = __bfloat162float(
+                    __ushort_as_bfloat16(static_cast<std::uint16_t>(top_scale_bits)));
+                bottom_scale = __bfloat162float(
+                    __ushort_as_bfloat16(static_cast<std::uint16_t>(bottom_scale_bits)));
             }
-            const unsigned top_scale_bits    = __shfl_sync(kMask, lane_scale, lane & ~3);
-            const unsigned bottom_scale_bits = __shfl_sync(kMask, lane_scale, (lane & ~3) + 1);
-            const float top_scale =
-                __bfloat162float(__ushort_as_bfloat16(static_cast<std::uint16_t>(top_scale_bits)));
-            const float bottom_scale = __bfloat162float(
-                __ushort_as_bfloat16(static_cast<std::uint16_t>(bottom_scale_bits)));
 
 #pragma unroll
             for (int token_mma = 0; token_mma < kTokenMmas; ++token_mma) {

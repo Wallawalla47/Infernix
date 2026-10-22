@@ -11,7 +11,9 @@ struct Int8KvGroupedInstance {
     // Rows of two or more columns of the 24/4 geometry use grouped_pipelined.cuh (in-register V
     // decode, double-buffered K/V, bitwise equal); single-column rows keep the staged kernel.
     static constexpr bool kPipelined = G::QHeads == 24 && Tokens >= 2;
-    static constexpr bool kWideKeys = G::GroupSize == 8 && kRowTiles >= 3;
+    // 48 or 64 query rows of the two-KV-head geometries (group 8 at six to eight columns, group 16 at
+    // three or four): 64-key tiles, four warps per row tile.
+    static constexpr bool kWideKeys = G::GroupSize >= 8 && kRowTiles >= 3;
     using Schedule                  = Int8KvGroupedMmaSchedule<Tokens,
                                               kWideKeys        ? 4 * kRowTiles
                                                                : kRowTiles <= 2 ? 8

@@ -22,8 +22,10 @@ using namespace infernix::test;
 
 namespace {
 
-constexpr int kLayers             = static_cast<int>(ops::kContextKVMaterializeLayers);
-// The drafter geometry under test (run_geometry): context width H and the rotation's theta.
+constexpr int kMaxLayers          = static_cast<int>(ops::kContextKVMaterializeMaxLayers);
+// The drafter geometry under test (run_geometry): its layers, context width H and the rotation's
+// theta.
+int g_layers                      = 0;
 int g_hidden                      = 0;
 constexpr int kRows               = 1024;
 constexpr int kHeadDim            = 128;
@@ -119,14 +121,14 @@ struct LayerStorage {
 };
 
 struct Fixture {
-    std::array<LayerStorage, kLayers> storage;
+    std::array<LayerStorage, kMaxLayers> storage;
     std::array<std::size_t, 9> observed_peak{};
-    std::array<ops::ContextKVMaterializeLayerView, kLayers> views;
+    std::array<ops::ContextKVMaterializeLayerView, kMaxLayers> views;
 
     Fixture() {
         const quantized_weight::PatternedWeightOptions weight_options{
             quantized_weight::RowSplitScalePattern::Tiny};
-        for (int layer = 0; layer < kLayers; ++layer) {
+        for (int layer = 0; layer < g_layers; ++layer) {
             LayerStorage& target = storage[static_cast<std::size_t>(layer)];
             target.key_host      = quantized_weight::make_patterned_weight(
                 QType::Q8_G32_FP16, kRows, g_hidden, 0x310U + 2U * layer, weight_options);
@@ -223,13 +225,13 @@ void append_key_oracle(const LayerStorage& layer, const float* input, int head, 
 
 // Every layer's K and V rings, read back once per launch for both verifiers.
 struct CacheSnapshot {
-    std::array<std::vector<std::uint16_t>, kLayers> k;
-    std::array<std::vector<std::uint16_t>, kLayers> v;
+    std::array<std::vector<std::uint16_t>, kMaxLayers> k;
+    std::array<std::vector<std::uint16_t>, kMaxLayers> v;
 };
 
 CacheSnapshot read_caches(const Fixture& fixture) {
     CacheSnapshot snapshot;
-    for (int layer = 0; layer < kLayers; ++layer) {
+    for (int layer = 0; layer < g_layers; ++layer) {
         const LayerStorage& source = fixture.storage[static_cast<std::size_t>(layer)];
         snapshot.k[static_cast<std::size_t>(layer)] =
             from_device<std::uint16_t>(source.cache_k.data(), cache_elements());
@@ -252,7 +254,7 @@ int verify_state_effect(const std::string& label, const CacheSnapshot& snapshot,
 
     // Each (layer, lane, head) ring row is scanned independently for its first bad element; the
     // first one found per layer in row order is the element one ascending scan would report.
-    constexpr int kRingRows = kLayers * kLaneCapacity * kHeads;
+    const int kRingRows = g_layers * kLaneCapacity * kHeads;
     std::vector<int> row_first_bad(kRingRows, -1);
     parallel_ranges(kRingRows, host_thread_count(), [&](std::int64_t begin, std::int64_t end) {
         for (auto ring = static_cast<int>(begin); ring < end; ++ring) {
@@ -278,7 +280,7 @@ int verify_state_effect(const std::string& label, const CacheSnapshot& snapshot,
     });
 
     int failures = 0;
-    for (int layer = 0; layer < kLayers; ++layer) {
+    for (int layer = 0; layer < g_layers; ++layer) {
         int first_bad = -1;
         for (int row = 0; row < kLaneCapacity * kHeads && first_bad < 0; ++row) {
             first_bad =
@@ -314,7 +316,7 @@ int verify_numeric_samples(const std::string& label, const Fixture& fixture,
     // Every (layer, sample, head) key oracle is independent: evaluate them all at once, then
     // compare in the original layer, sample and head order.
     const std::int64_t key_oracle_count =
-        static_cast<std::int64_t>(kLayers * samples.size() * heads.size());
+        static_cast<std::int64_t>(g_layers * samples.size() * heads.size());
     std::vector<std::vector<double>> key_oracles(static_cast<std::size_t>(key_oracle_count));
     const auto key_oracle_index = [&](int layer, std::size_t sample, std::size_t head_index) {
         return (static_cast<std::size_t>(layer) * samples.size() + sample) * heads.size() +
@@ -336,7 +338,7 @@ int verify_numeric_samples(const std::string& label, const Fixture& fixture,
         });
 
     int failures = 0;
-    for (int layer = 0; layer < kLayers; ++layer) {
+    for (int layer = 0; layer < g_layers; ++layer) {
         const LayerStorage& source = fixture.storage[static_cast<std::size_t>(layer)];
         const auto& cache_k_bits   = snapshot.k[static_cast<std::size_t>(layer)];
         const auto& cache_v_bits   = snapshot.v[static_cast<std::size_t>(layer)];
@@ -397,7 +399,7 @@ int run_case(Fixture& fixture, const std::string& label, int width, int batch,
     DeviceBuffer counts_device    = to_device_i32(counts);
     DeviceBuffer slots_device     = to_device_i32(state_slots);
     const std::size_t workspace_bytes =
-        ops::context_kv_materialize_workspace_capacity_bytes(batch, width, width);
+        ops::context_kv_materialize_workspace_capacity_bytes(g_layers, batch, width, width);
     GuardedDeviceBuffer scratch(std::max<std::size_t>(workspace_bytes, 1));
     WorkspaceArena workspace(DeviceSpan{scratch.data(), scratch.bytes()});
     Tensor context_tensor(context_device.p, DType::BF16, {g_hidden, width, batch});
@@ -410,7 +412,8 @@ int run_case(Fixture& fixture, const std::string& label, int width, int batch,
                : static_cast<std::uint32_t>(width)};
     const auto launch = [&](cudaStream_t stream) {
         ops::context_kv_materialize(context_tensor, positions_tensor, counts_tensor, slots_tensor,
-                                    fixture.views, static_cast<float>(g_theta), envelope, workspace,
+                                    std::span(fixture.views.data(), static_cast<std::size_t>(g_layers)),
+                                    static_cast<float>(g_theta), envelope, workspace,
                                     stream);
     };
     launch(nullptr);
@@ -473,7 +476,8 @@ int run_case(Fixture& fixture, const std::string& label, int width, int batch,
     }
     failures += verify_exact("context readonly", from_device_bf16(context_device, context.size()),
                              std::vector<double>(context.begin(), context.end()));
-    for (const auto& layer : fixture.storage) {
+    for (int index = 0; index < g_layers; ++index) {
+        const LayerStorage& layer = fixture.storage[static_cast<std::size_t>(index)];
         failures += layer.cache_k.verify_guards(label + " K ring");
         failures += layer.cache_v.verify_guards(label + " V ring");
     }
@@ -481,7 +485,8 @@ int run_case(Fixture& fixture, const std::string& label, int width, int batch,
     return failures;
 }
 
-int run_geometry(int hidden, double theta) {
+int run_geometry(int layers, int hidden, double theta) {
+    g_layers = layers;
     g_hidden = hidden;
     g_theta  = theta;
     Fixture fixture;
@@ -540,13 +545,14 @@ int run_geometry(int hidden, double theta) {
                          {-1, -1, -1, 2047, -1, -1, 262142, 262143, 262144}, 0, true, true);
     for (int batch = 1; batch <= 8; ++batch) {
         const auto capacity = ops::context_kv_materialize_workspace_capacity_bytes(
-            batch, 1, batch == 1 ? 2048 : 64);
+            g_layers, batch, 1, batch == 1 ? 2048 : 64);
         if (capacity != fixture.observed_peak[batch]) {
             std::cerr << "workspace interval peak mismatch B=" << batch << "\n";
             ++failures;
         }
     }
-    for (const auto& layer : fixture.storage) {
+    for (int index = 0; index < g_layers; ++index) {
+        const LayerStorage& layer = fixture.storage[static_cast<std::size_t>(index)];
         failures += verify_exact(
             "QKV parent readonly",
             from_device<std::uint8_t>(layer.parent_device, layer.parent_host.size()),
@@ -566,8 +572,10 @@ int main() {
             std::cout << "context_kv_materialize: SKIP (CUDA unavailable)\n";
             return 77;
         }
-        // Qwen3.8-27B's drafter (H 5120, theta 1e7) and Qwen3.8-Flash-Next's (H 2560, theta 1e4).
-        const int failures = run_geometry(5120, 1.0e7) + run_geometry(2560, 1.0e4);
+        // Qwen3.8-27B's drafter (5 layers, H 5120, theta 1e7), Qwen3.8-Flash-Next's (5, H 2560,
+        // theta 1e4) and Qwen3.5-122B-A10B's (6, H 3072, theta 1e7).
+        const int failures =
+            run_geometry(5, 5120, 1.0e7) + run_geometry(5, 2560, 1.0e4) + run_geometry(6, 3072, 1.0e7);
         if (failures != 0) {
             std::cerr << "context_kv_materialize failures=" << failures << '\n';
             return 1;

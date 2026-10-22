@@ -13,22 +13,23 @@ constexpr int kGroupedPrefillMaxWidth = 192;
 Nvfp4KvCausalPlan make_nvfp4_kv_causal_plan(int heads, int width, int batch,
                                             CausalAttentionExecutionEnvelope envelope,
                                             int multiprocessor_count) {
-    if (multiprocessor_count <= 0 || (heads != 24 && heads != 16) || width < 1 || batch < 1 ||
+    if (multiprocessor_count <= 0 || !causal_registered_heads(heads) || width < 1 || batch < 1 ||
         batch > 8 || envelope.min_visible_keys == 0 ||
         envelope.min_visible_keys > envelope.max_visible_keys ||
         envelope.max_visible_keys > kCausalAttentionMaximumVisibleKeys)
         throw std::invalid_argument("NVFP4 attention: invalid plan inputs");
-    constexpr int grouped_limit = Nvfp4KvCausalPlan::kTokenTile;
+    // A grouped CTA's columns: eight, four at GQA group 16 (64 query rows).
+    const int grouped_limit = causal_grouped_tokens(heads);
     const auto family           = width <= grouped_limit ? Nvfp4KvFamily::Grouped
                                   : width <= kGroupedPrefillMaxWidth ? Nvfp4KvFamily::ParallelGrouped
                                                                      : Nvfp4KvFamily::Tiled;
     const int tiles =
         family == Nvfp4KvFamily::ParallelGrouped ? (width + grouped_limit - 1) / grouped_limit : 1;
-    const int independent_tiles = (envelope.row_invariant_partition ? 1 : batch) * (heads == 24 ? 4 : 2) * tiles;
-    const int query_tile        = family == Nvfp4KvFamily::ParallelGrouped && width <= 16
+    const int independent_tiles = (envelope.row_invariant_partition ? 1 : batch) * causal_kv_heads(heads) * tiles;
+    const int query_tile        = family == Nvfp4KvFamily::ParallelGrouped && width <= 2 * grouped_limit
                                       ? (width + 1) / 2
                                       : std::min(width, grouped_limit);
-    const int row_tiles         = (query_tile * (heads == 24 ? 6 : 8) + 15) / 16;
+    const int row_tiles         = (query_tile * causal_group_size(heads) + 15) / 16;
     const std::int64_t sms      = multiprocessor_count;
     const auto budget =
         row_tiles <= 2 || causal_query_tiles_underfill_sms(independent_tiles, multiprocessor_count)
@@ -36,7 +37,7 @@ Nvfp4KvCausalPlan make_nvfp4_kv_causal_plan(int heads, int width, int batch,
             : sms;
     CausalKvPartition partition{1, causal_partition_target(budget, independent_tiles)};
     // Bound partial traffic by keeping enough KV work in each split.
-    partition.key_shift = (row_tiles <= 2 ? 7 : 8) - (heads == 16 ? 1 : 0);
+    partition.key_shift = (row_tiles <= 2 ? 7 : 8) - (causal_kv_heads(heads) == 2 ? 1 : 0);
     // Multi-column rows of the 24/4 geometry may split down to 64 keys, so short rows fill
     // the GPU; the live count is then balanced to the fewest splits that keep the largest
     // number of 64-key tiles per split. Rows long enough to saturate the target at the

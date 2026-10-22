@@ -4,7 +4,8 @@
 // staged jobs is cut into 64-column tiles of one job each, and column chunks run the gate/up projection
 // (x's columns through the tile's input map), h = bf16(bf16(silu(y_gate)) y_up) and the down projection
 // (written to each column's entry) through ops::lossless_linear_tiles. An output depends only on its
-// expert's record and its token's x.
+// expert's record and its token's x. The pass reads the bank's geometry (source.shape) at run time:
+// Flash-Next's for every bank kind, Qwen3.5-122B-A10B's for its NVFP4 records (wide::shape_supported).
 //
 // The design reference (source.lossless_design, lossless-route.md §3b): a W4A4 bank's experts quantize their
 // inputs as the bank declares, each column with its expert's input scale g (ModelOpt's rule,
@@ -39,29 +40,30 @@ struct LosslessRegion {
     std::size_t bytes; // the whole region
 };
 
-LosslessBankMatrix lossless_gate_up_matrix(QType q) {
+LosslessBankMatrix lossless_gate_up_matrix(QType q, const moe::ExpertShape& shape) {
     LosslessBankMatrix m;
     m.qtype = q;
-    m.rows  = 2 * moe::kIntermediate;
-    m.k     = moe::kHidden;
+    m.rows  = 2 * shape.intermediate;
+    m.k     = shape.hidden;
     return m;
 }
 
-std::size_t lossless_linear_bytes() {
+std::size_t lossless_linear_bytes(const moe::ExpertShape& shape) {
     LosslessBankMatrix down;
     down.qtype = QType::NVFP4_MUL;
-    down.rows  = moe::kHidden;
-    down.k     = moe::kIntermediate;
-    return std::max(lossless_linear_tiles_workspace_bytes(lossless_gate_up_matrix(QType::NVFP4_MUL),
+    down.rows  = shape.hidden;
+    down.k     = shape.intermediate;
+    return std::max(lossless_linear_tiles_workspace_bytes(lossless_gate_up_matrix(QType::NVFP4_MUL, shape),
                                                           moe::wide::kLosslessChunkColumns),
                     lossless_linear_tiles_workspace_bytes(down, moe::wide::kLosslessChunkColumns));
 }
 
 // The region's parts from base (null: only its size, LosslessRegion::bytes).
-LosslessRegion carve_lossless(std::uint8_t* base, std::int32_t max_jobs, std::int32_t entries) {
+LosslessRegion carve_lossless(std::uint8_t* base, const moe::ExpertShape& shape, std::int32_t max_jobs,
+                              std::int32_t entries) {
     const auto tiles = static_cast<std::size_t>(lossless_max_tiles(max_jobs, entries));
     const auto chunk = static_cast<std::size_t>(moe::wide::kLosslessChunkColumns);
-    const auto I = static_cast<std::size_t>(moe::kIntermediate), H = static_cast<std::size_t>(moe::kHidden);
+    const auto I = static_cast<std::size_t>(shape.intermediate), H = static_cast<std::size_t>(shape.hidden);
     std::size_t at = 0;
     const auto take = [&](std::size_t bytes) {
         std::uint8_t* p = base == nullptr ? nullptr : base + at;
@@ -81,7 +83,7 @@ LosslessRegion carve_lossless(std::uint8_t* base, std::int32_t max_jobs, std::in
     r.x_gate        = reinterpret_cast<std::uint16_t*>(take(H * chunk * 2));
     r.x_up          = reinterpret_cast<std::uint16_t*>(take(H * chunk * 2));
     r.gate_up_up    = reinterpret_cast<std::uint16_t*>(take(2 * I * chunk * 2));
-    r.linear_bytes  = lossless_linear_bytes();
+    r.linear_bytes  = lossless_linear_bytes(shape);
     r.linear        = take(r.linear_bytes);
     r.bytes         = at;
     return r;
@@ -119,7 +121,7 @@ __global__ void lossless_tiles_kernel(MoeDispatch dispatch, MoeExpertSource sour
         tiles_down[t]    = LosslessTile{record, {__float_as_uint(s.alpha_down), __float_as_uint(s.alpha_down)}, {act_down, act_down}};
     }
     const int entry = c < n ? dispatch.entries[dispatch.offsets[expert] + c0 + c] : -1;
-    in_columns[64 * t + c]  = entry < 0 ? -1 : entry / top_k;
+    in_columns[64 * t + c]  = entry < 0 ? -1 : moe::wide::entry_column(entry, top_k, dispatch.shared_first);
     out_columns[64 * t + c] = entry;
     if (design) {
         // Every column of the tile (padding too) takes its expert's scales.
@@ -130,8 +132,8 @@ __global__ void lossless_tiles_kernel(MoeDispatch dispatch, MoeExpertSource sour
 }
 
 // The up rows (odd: interleaved) of `up` into `gate_up` (BF16 [2I, columns] each).
-__global__ void lossless_up_rows_kernel(const std::uint16_t* __restrict__ up, int columns, std::uint16_t* __restrict__ gate_up) {
-    constexpr int I = moe::kIntermediate;
+__global__ void lossless_up_rows_kernel(const std::uint16_t* __restrict__ up, int I, int columns,
+                                        std::uint16_t* __restrict__ gate_up) {
     const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= static_cast<std::size_t>(I) * columns) { return; }
     const std::size_t c = index / I, i = index % I;
@@ -140,9 +142,8 @@ __global__ void lossless_up_rows_kernel(const std::uint16_t* __restrict__ up, in
 
 // h[i, c] = bf16(bf16(silu(g)) u) of the gate/up plane's column c (gate row 2 i and up row 2 i + 1 when
 // interleaved, else rows i and I + i).
-__global__ void lossless_swiglu_kernel(const std::uint16_t* __restrict__ gate_up, int columns, bool interleaved,
-                                       std::uint16_t* __restrict__ h) {
-    constexpr int I = moe::kIntermediate;
+__global__ void lossless_swiglu_kernel(const std::uint16_t* __restrict__ gate_up, int I, int columns,
+                                       bool interleaved, std::uint16_t* __restrict__ h) {
     const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= static_cast<std::size_t>(I) * columns) { return; }
     const int c = static_cast<int>(index / I), i = static_cast<int>(index % I);
@@ -156,18 +157,18 @@ __global__ void lossless_swiglu_kernel(const std::uint16_t* __restrict__ gate_up
 void lossless_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource& source, int top_k,
                       int max_jobs, const moe::wide::ExpertsWorkspace& layout, FetchCall* fetch, Tensor& outputs,
                       cudaStream_t stream) {
-    constexpr int I = moe::kIntermediate, H = moe::kHidden;
+    const int I = source.shape.intermediate, H = source.shape.hidden;
     const int entries = static_cast<int>(outputs.ne[1]);
-    const LosslessRegion r = carve_lossless(layout.lossless, max_jobs, entries);
-    // The banks' matrices within a record.
+    const LosslessRegion r = carve_lossless(layout.lossless, source.shape, max_jobs, entries);
+    // The banks' matrices within a record (block FP8 and GGUF banks at Flash-Next's geometry only).
     const QType gu = source.ggml.gate_up_format;
-    LosslessBankMatrix gate_up = lossless_gate_up_matrix(gu), down{};
+    LosslessBankMatrix gate_up = lossless_gate_up_matrix(gu, source.shape), down{};
     down.rows = H;
     down.k    = I;
     bool interleaved = false;
     if (gu == QType::NVFP4_MUL) {
         down.qtype        = QType::NVFP4_MUL;
-        down.codes_offset = moe::kGateUpBytes;
+        down.codes_offset = source.shape.gate_up_bytes();
         interleaved       = true;
     } else if (gu == QType::FP8_E4M3FN_B128) {
         const std::uint64_t scales = 3ULL * I * H;
@@ -242,11 +243,11 @@ void lossless_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExp
                                                    stream);
                     lossless_linear_tiles(x_up, nullptr, columns, gate_up, r.tiles_gate_up + t0, up_plane, nullptr,
                                           arena, stream);
-                    lossless_up_rows_kernel<<<blocks, 256, 0, stream>>>(r.gate_up_up, columns, r.gate_up);
+                    lossless_up_rows_kernel<<<blocks, 256, 0, stream>>>(r.gate_up_up, I, columns, r.gate_up);
                     check_launch("lossless up rows");
                 }
             }
-            lossless_swiglu_kernel<<<blocks, 256, 0, stream>>>(r.gate_up, columns, interleaved, r.h);
+            lossless_swiglu_kernel<<<blocks, 256, 0, stream>>>(r.gate_up, I, columns, interleaved, r.h);
             check_launch("lossless swiglu");
             if (!design) {
                 lossless_linear_tiles(h_plane, nullptr, columns, down, r.tiles_down + t0, outputs,

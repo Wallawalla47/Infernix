@@ -2,7 +2,9 @@
 //
 // Weights are built from known codes and scales in every format the op takes: row-split Q2/Q4/Q5/Q6
 // per 64 and Q8 per 32 (packed by the fixtures' packer), nvfp4 (E2M1 codes, swizzled E4M3 scales, an
-// FP32 divisor), fp8_e4m3fn_row_bf16 (E4M3 codes, BF16 row scales) and BF16. Each weight is an integer
+// FP32 divisor), fp8_e4m3fn_row_bf16 (E4M3 codes, BF16 row scales), fp8_e4m3fn_row_f32 (FP32 row
+// multipliers of every exponent range and both signs), dense nvfp4_rg16_v1 (the NVFP4 head's layout, one
+// FP32 multiplier) and BF16. Each weight is an integer
 // W times a power of two (and per row a factor: the FP8 row scale multiplies, the NVFP4 divisor
 // divides), so each output's exact sum is accumulated on the host in a wide integer, the factor applied
 // exactly (a quotient keeps a sticky bit), and rounded once to BF16 or FP32 (round to nearest, ties to
@@ -80,6 +82,7 @@ struct HostWeight {
     Factor factor = Factor::None;
     std::vector<std::uint32_t> fm;
     std::vector<int> fe;
+    std::vector<std::uint8_t> fneg; // Multiply: the row factor's sign (empty: positive)
     DeviceBuffer payload{};
     Weight weight{};
 };
@@ -285,6 +288,66 @@ HostWeight make_fp8_row(int n, int k, std::mt19937& rng) {
     w.shape[0]    = w.padded_shape[0] = n;
     w.shape[1]    = w.padded_shape[1] = k;
     w.scale_dtype = DType::BF16;
+    w.qdata       = h.payload.p;
+    w.scales      = static_cast<std::uint8_t*>(h.payload.p) + scale_off;
+    h.weight      = w;
+    return h;
+}
+
+// fp8_e4m3fn_row_f32 in row_scale_v1: codes [n][k], then the FP32 row multipliers (full 24-bit
+// significands, exponents from 2^-140 (subnormal) to 2^20, some negative, a zero row).
+HostWeight make_fp8_row_f32(int n, int k, std::mt19937& rng) {
+    HostWeight h;
+    h.name = "fp8row f32";
+    h.n    = n;
+    h.k    = k;
+    std::uniform_int_distribution<int> word(0, 255);
+    std::uniform_real_distribution<float> unit(0.5F, 1.0F);
+    std::uniform_int_distribution<int> exponent(-30, 20);
+    std::vector<std::uint8_t> codes(static_cast<std::size_t>(n) * k);
+    std::vector<float> scales(static_cast<std::size_t>(n));
+    h.W.resize(codes.size());
+    h.wexp.assign(codes.size(), -9);
+    h.factor = Factor::Multiply;
+    h.fm.resize(static_cast<std::size_t>(n));
+    h.fe.resize(static_cast<std::size_t>(n));
+    h.fneg.resize(static_cast<std::size_t>(n));
+    for (int r = 0; r < n; ++r) {
+        const bool zero_row = r % 23 == 7;
+        float s = zero_row ? 0.0F : std::ldexp(unit(rng), exponent(rng));
+        if (r % 31 == 3) { s = std::ldexp(unit(rng), -140); } // a subnormal multiplier
+        if (r % 17 == 5) { s = -s; }                            // a negative multiplier
+        scales[static_cast<std::size_t>(r)] = s;
+        const std::uint32_t bits = f32_bits(s);
+        const int field = static_cast<int>((bits >> 23) & 0xFF), mantissa = static_cast<int>(bits & 0x7FFFFF);
+        h.fm[static_cast<std::size_t>(r)]   = static_cast<std::uint32_t>(field == 0 ? mantissa : ((1 << 23) | mantissa));
+        h.fe[static_cast<std::size_t>(r)]   = (field == 0 ? 1 : field) - 150;
+        h.fneg[static_cast<std::size_t>(r)] = static_cast<std::uint8_t>(bits >> 31);
+        for (int i = 0; i < k; ++i) {
+            int c = word(rng);
+            if ((c & 0x7F) == 0x7F) { c ^= 1; } // not NaN
+            if (zero_row) { c &= 0x80; }
+            codes[static_cast<std::size_t>(r) * k + i] = static_cast<std::uint8_t>(c);
+            int m = 0, e = 1;
+            e4m3_parts(static_cast<std::uint32_t>(c), m, e);
+            h.W[static_cast<std::size_t>(r) * k + i] = m * (1 << (e - 1));
+        }
+    }
+    const std::size_t scale_off = (codes.size() + 255) / 256 * 256;
+    std::vector<std::uint8_t> bytes(scale_off + scales.size() * 4, 0);
+    std::memcpy(bytes.data(), codes.data(), codes.size());
+    std::memcpy(bytes.data() + scale_off, scales.data(), scales.size() * 4);
+    h.payload = DeviceBuffer(bytes.size());
+    h.payload.copy_from_host(bytes.data(), bytes.size(), 0);
+    Weight w{};
+    w.qtype       = QType::FP8_E4M3FN_ROW_F32;
+    w.layout      = QuantLayout::RowScale;
+    w.ndim        = 2;
+    w.n           = n;
+    w.k           = k;
+    w.shape[0]    = w.padded_shape[0] = n;
+    w.shape[1]    = w.padded_shape[1] = k;
+    w.scale_dtype = DType::FP32;
     w.qdata       = h.payload.p;
     w.scales      = static_cast<std::uint8_t*>(h.payload.p) + scale_off;
     h.weight      = w;
@@ -590,6 +653,30 @@ HostWeight make_mxfp8(int n, int k, std::mt19937& rng) {
     return h;
 }
 
+// A dense nvfp4_rg16_v1 matrix [n][k] (n a multiple of 16): gen_rg16's units, one FP32 multiplier for
+// every row (the Qwen3.5 NVFP4 head).
+HostWeight make_rg16_dense(int n, int k, std::mt19937& rng, float multiplier) {
+    const std::uint32_t alpha[2] = {f32_bits(multiplier), f32_bits(multiplier)};
+    GenMatrix g  = gen_rg16(n, k, rng, alpha);
+    HostWeight h = std::move(g.h);
+    h.name    = "nvfp4 rg16 dense";
+    h.payload = DeviceBuffer(g.codes.size());
+    h.payload.copy_from_host(g.codes.data(), g.codes.size(), 0);
+    Weight w{};
+    w.qtype             = QType::NVFP4_MUL;
+    w.layout            = QuantLayout::Rg16;
+    w.ndim              = 2;
+    w.n                 = n;
+    w.k                 = k;
+    w.shape[0]          = w.padded_shape[0] = n;
+    w.shape[1]          = w.padded_shape[1] = k;
+    w.group_size        = 16;
+    w.qdata             = h.payload.p;
+    w.weight_multiplier = multiplier;
+    h.weight            = w;
+    return h;
+}
+
 // ------------------------------------------------------------------------------- exact oracle
 
 // sum_k W M at exponent e - 134 + wexp, held in 32-bit chunks (deferred carries) from 2^-300.
@@ -755,6 +842,7 @@ std::uint32_t oracle(const HostWeight& w, int row, const std::uint16_t* x, bool 
     if (w.factor == Factor::Multiply) {
         multiply(w.fm[static_cast<std::size_t>(row)]);
         unit += w.fe[static_cast<std::size_t>(row)];
+        if (!w.fneg.empty() && w.fneg[static_cast<std::size_t>(row)] != 0) { negative = !negative; }
     }
     for (const std::uint32_t bits : {act.row_multiplier, act.column_multiplier}) {
         if (bits == 0) { continue; }
@@ -1134,6 +1222,8 @@ int main() {
         suite(make_nvfp4(256, 640, rng, 2.75e-3F), rng);
         suite(make_nvfp4(128, 640, rng, 3.0F), rng);
         suite(make_fp8_row(200, 640, rng), rng);
+        suite(make_fp8_row_f32(200, 640, rng), rng);
+        suite(make_rg16_dense(192, 640, rng, 0.0123F), rng);
         suite(make_bf16(70, 640, rng, true), rng);
         suite(make_bf16(200, 640, rng, false), rng);
         // Real projection depths, wide scale exponents (terms far below the largest), across the
@@ -1168,6 +1258,24 @@ int main() {
             const auto x = make_columns(w.k, 530, rng, 7);
             run("bf16 grid k=4096 T=530 bf16", w, x, 530, 0, w.n, w.n, 0, true);
             run("bf16 grid k=4096 rows 70..150 T=530 fp32", w, x, 530, 70, 80, 90, 5, false);
+        }
+        // Qwen3.5-122B-A10B's depths: its FP8 projections of the hidden state (K 3072) and of the attention
+        // output (K 8192), its NVFP4 head (K 3072) with a multiplier far from one.
+        {
+            const HostWeight w = make_fp8_row_f32(96, 3072, rng);
+            const auto x = make_columns(w.k, 530, rng, 4);
+            run("fp8row f32 k=3072 T=530 bf16", w, x, 530, 0, w.n, w.n, 0, true);
+        }
+        {
+            const HostWeight w = make_fp8_row_f32(64, 8192, rng);
+            const auto x = make_columns(w.k, 13, rng, 5);
+            run("fp8row f32 k=8192 T=13 fp32", w, x, 13, 0, w.n, w.n, 0, false);
+        }
+        {
+            const HostWeight w = make_rg16_dense(256, 3072, rng, std::ldexp(1.613F, -11));
+            const auto x = make_columns(w.k, 70, rng, 1);
+            run("nvfp4 rg16 dense k=3072 T=70 fp32", w, x, 70, 0, w.n, w.n, 0, false);
+            run("nvfp4 rg16 dense k=3072 rows 48..208 T=70 bf16", w, x, 70, 48, 160, 170, 7, true);
         }
         // MXFP8 (FP4-Local's dense projections) and GGUF blocks (the GGUF imports' dense projections).
         suite(make_mxfp8(200, 640, rng), rng);
@@ -1239,6 +1347,11 @@ int main() {
             run_scaled("nvfp4 activation divisor bf16", n4, x, 37, true, 26.953125F, {});
             run_scaled("nvfp4 activation divisor fp32", n4, x, 37, false, 2741.5F, {});
             run_scaled("fp8row column scales bf16", f8, x, 37, true, 0.0F, scales);
+            // Qwen3.5-122B-A10B's static A8 inputs: one static activation scale for every column.
+            const HostWeight f8f32 = make_fp8_row_f32(96, 640, rng);
+            run_scaled("fp8row f32 static column scale fp32", f8f32, x, 37, false, 0.0F,
+                       std::vector<float>(37, 0.0217285F));
+            run_scaled("fp8row f32 column scales bf16", f8f32, x, 37, true, 0.0F, scales);
             run_scaled("nvfp4 divisor and column scales fp32", n4, x, 37, false, 0.0371F, scales);
             run_scaled("q4 activation divisor fp32", q4, x, 37, false, 3.0e-3F, {});
         }
@@ -1254,6 +1367,12 @@ int main() {
             const HostWeight c = make_bf16(64, 512, rng, true);
             const HostWeight d = make_ggml(QType::GGML_Q6_K, 72, 512, rng, true, "q6_k tiles16");
             for (const int columns : {1, 600}) { run_shared("shared T=" + std::to_string(columns), {&a, &b, &c, &d}, columns, rng); }
+        }
+        // Qwen3.5-122B-A10B's GDN input: the FP8 projection and the BF16 control (a, b) of one hidden state.
+        {
+            const HostWeight f = make_fp8_row_f32(128, 3072, rng);
+            const HostWeight c = make_bf16(64, 3072, rng, false);
+            run_shared("shared fp8 f32 + bf16 k=3072 T=37", {&f, &c}, 37, rng);
         }
     } catch (const std::exception& e) {
         std::cerr << "FAIL exception: " << e.what() << "\n";

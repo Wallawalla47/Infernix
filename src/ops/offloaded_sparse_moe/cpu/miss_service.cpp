@@ -61,14 +61,19 @@ CpuMissService::CpuMissService(std::vector<Layer> layers, Options options)
         options_.wide_jobs > kMaxCpuJobs || (options_.wide_from > 0) != (options_.wide_jobs > 0)) {
         throw std::invalid_argument("CPU miss service options are out of range");
     }
+    const ExpertShape& shape = options_.shape;
+    if (!registered_shape(shape) || (shape != kFlashNextShape && options_.activation != ExpertActivation::kA16)) {
+        throw std::invalid_argument("CPU miss service: this expert geometry is registered for A16 banks only");
+    }
     for (const auto& layer : layers_) {
         // Without a bank (the SSD tier) every request is tiered: it carries its records' addresses.
         // A GGUF bank's records are its own size (ggml_expert.h) and carry no per-expert scalars.
         const std::uint64_t record = layer.ggml.valid()
                                          ? 2ULL * kIntermediate * layer.ggml.gate_row_bytes +
                                                static_cast<std::uint64_t>(kHidden) * layer.ggml.down_row_bytes
-                                         : kRecordBytes;
+                                         : shape.record_bytes();
         if ((layer.records == nullptr && options_.records == nullptr) ||
+            (layer.ggml.valid() && shape != kFlashNextShape) ||
             (layer.ggml.valid() ? !ggml_cpu_supported(layer.ggml) || options_.activation != ExpertActivation::kA16
                                 : layer.scales == nullptr) ||
             layer.record_stride < record) {
@@ -85,8 +90,8 @@ CpuMissService::CpuMissService(std::vector<Layer> layers, Options options)
     // A service that takes prefill calls sizes for every job a call may hand it: a gated call's cap
     // (MoeCpuChannel::wide_jobs, set per call) may rise to kMaxCpuJobs.
     jobs_    = options_.wide_jobs > 0 ? kMaxCpuJobs : options_.max_jobs;
-    x_       = static_cast<std::uint16_t*>(mapped(sizeof(std::uint16_t) * kHidden * kMaxCpuXColumns));
-    y_       = static_cast<std::uint16_t*>(mapped(sizeof(std::uint16_t) * kHidden * jobs_ * kMaxCpuColumns));
+    x_       = static_cast<std::uint16_t*>(mapped(sizeof(std::uint16_t) * shape.hidden * kMaxCpuXColumns));
+    y_       = static_cast<std::uint16_t*>(mapped(sizeof(std::uint16_t) * shape.hidden * jobs_ * kMaxCpuColumns));
     done_    = static_cast<std::uint32_t*>(mapped(64));
     status_  = done_ + 1;
     heartbeat_ = done_ + 2;
@@ -166,7 +171,9 @@ void CpuMissService::serve() {
                             .max_jobs   = jobs_,
                             .activation = options_.activation,
                             .ggml       = ggml,
+                            .shape      = options_.shape,
                             .cpus       = options_.cpus});
+        const std::size_t hidden = static_cast<std::size_t>(options_.shape.hidden);
         std::vector<CpuExpertJob> jobs(static_cast<std::size_t>(jobs_));
         std::vector<CpuExpertJob> ready, read;
         std::vector<std::uint32_t> tickets;
@@ -227,8 +234,8 @@ void CpuMissService::serve() {
                     continue;
                 }
                 for (int c = 0; c < job.ncols; ++c) {
-                    job.x[c] = x_ + static_cast<std::size_t>(r.column[j][c]) * kHidden;
-                    job.y[c] = y_ + (static_cast<std::size_t>(j) * kMaxCpuColumns + c) * kHidden;
+                    job.x[c] = x_ + static_cast<std::size_t>(r.column[j][c]) * hidden;
+                    job.y[c] = y_ + (static_cast<std::size_t>(j) * kMaxCpuColumns + c) * hidden;
                 }
                 if (job.record != nullptr) {
                     ready.push_back(job);

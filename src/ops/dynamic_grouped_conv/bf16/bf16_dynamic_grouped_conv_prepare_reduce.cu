@@ -79,6 +79,8 @@ void bf16_dynamic_grouped_conv_prepare_reduce_launch(DynamicConvPrepareRoute rou
         return launch_width<5120>(route, base, partial, prepared, finish, stream);
     case 2560:
         return launch_width<2560>(route, base, partial, prepared, finish, stream);
+    case 3072:
+        return launch_width<3072>(route, base, partial, prepared, finish, stream);
     }
     throw std::logic_error("dynamic grouped conv prepare: unregistered hidden width");
 }

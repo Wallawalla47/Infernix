@@ -124,10 +124,13 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
                           (x.ne[0] == 2560 && out.ne[0] == 640 && gate_up_weight.n == 1280 &&
                            gate_up_weight.k == 2560 && gate_up_weight.padded_shape[0] == 1280 &&
                            gate_up_weight.padded_shape[1] == 2560) ||
-                          // Qwen3.8-Flash-Next's DFlash2 MLP.
+                          // Qwen3.8-Flash-Next's and Qwen3.5-122B-A10B's DFlash2 MLPs.
                           (x.ne[0] == 2560 && out.ne[0] == 7680 && gate_up_weight.n == 15360 &&
                            gate_up_weight.k == 2560 && gate_up_weight.padded_shape[0] == 15360 &&
-                           gate_up_weight.padded_shape[1] == 2560);
+                           gate_up_weight.padded_shape[1] == 2560) ||
+                          (x.ne[0] == 3072 && out.ne[0] == 9216 && gate_up_weight.n == 18432 &&
+                           gate_up_weight.k == 3072 && gate_up_weight.padded_shape[0] == 18432 &&
+                           gate_up_weight.padded_shape[1] == 3072);
     if (t <= 0 || x.ne[2] != 1 || x.ne[3] != 1 || out.ne[1] != t || out.ne[2] != 1 ||
         out.ne[3] != 1 || (!large_shape && !q8_shape)) {
         throw std::invalid_argument("linear_swiglu: invalid tensor shape");

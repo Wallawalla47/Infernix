@@ -31,8 +31,8 @@ struct CpuExpertJob {
     ExpertScales scales{};
     GgmlExpertFormat ggml{};                // a GGUF bank's record (ggml_expert.h); scales unused
     int ncols = 0;                          // 1..kMaxColumns
-    const std::uint16_t* x[kMaxColumns]{};  // BF16 [kHidden] per column
-    std::uint16_t* y[kMaxColumns]{};        // BF16 [kHidden] per column
+    const std::uint16_t* x[kMaxColumns]{};  // BF16 [H] per column (H: the team's shape.hidden)
+    std::uint16_t* y[kMaxColumns]{};        // BF16 [H] per column
 };
 
 // A liveness word the device watches (CpuMissService's heartbeat) and its writer's counter. At
@@ -54,6 +54,9 @@ public:
         int prefetch_bytes  = kDefaultPrefetchBytes; // calibrated on the target (§14.2)
         ExpertActivation activation = ExpertActivation::kA4; // of every job's expert
         bool ggml = false; // jobs may be GGUF records (ggml_expert.h; activation kA16)
+        // Every job's expert geometry: Flash-Next's for every bank, or another registered one
+        // (w4a4_expert.h) for NVFP4 A16 banks.
+        ExpertShape shape = kFlashNextShape;
         std::vector<int> cpus;         // optional: CPU of worker i (worker 0 is the caller, not pinned)
     };
 
@@ -70,6 +73,7 @@ public:
     [[nodiscard]] int workers() const { return workers_; }
     [[nodiscard]] CpuIsa isa() const { return isa_; }
     [[nodiscard]] ExpertActivation activation() const { return activation_; }
+    [[nodiscard]] const ExpertShape& shape() const { return shape_; }
 
 private:
 
@@ -88,12 +92,13 @@ private:
     int max_jobs_;
     int spin_iterations_;
     int prefetch_bytes_;
+    ExpertShape shape_;
     std::vector<canon::A4Block> x_gate_; // [job][col][kGateUpBlocks]
     std::vector<canon::A4Block> x_up_;
     std::vector<canon::A4Block> h_; // [job][col][kHBlocks], shared between the phases
-    std::vector<canon::A16Block> x16_; // A16 jobs: [job][col][kGateUpBlocks]
-    std::vector<canon::A16Block> h16_; // A16 jobs: [job][col][kHBlocks]
-    std::vector<std::uint16_t> hv_;    // A16 jobs: BF16 h [job][col][kIntermediate]
+    std::vector<canon::A16Block> x16_; // A16 jobs: [job][col][shape_.gate_up_blocks()]
+    std::vector<canon::A16Block> h16_; // A16 jobs: [job][col][shape_.h_blocks()]
+    std::vector<std::uint16_t> hv_;    // A16 jobs: BF16 h [job][col][shape_.intermediate]
     std::vector<int> x_exp_, h_exp_;   // A16 jobs: column exponents [job][col]
     std::vector<CpuLimbSlice> xg_, hg_; // ggml jobs: [job][col][kGgmlXSlices], [job][col][kGgmlHSlices]
     ExpertActivation activation_;

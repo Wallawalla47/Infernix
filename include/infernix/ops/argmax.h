@@ -27,4 +27,17 @@ void argmax(const Tensor& logits, Tensor& out, std::int32_t valid_rows, cudaStre
 void argmax(const Tensor& logits, const Tensor& row_ids, Tensor& out, std::int32_t valid_rows,
             cudaStream_t stream);
 
+/**
+ * The softmax probability of each column's selected row (a speculative draft's confidence):
+ *
+ *   probability[t] = 1 / sum_{0 <= v < valid_rows} exp(float(logits[v,t]) - float(logits[rows[t],t])).
+ *
+ * `logits` as for argmax; `rows` contiguous I32 [T] with 0 <= rows[t] < valid_rows (argmax's `out`
+ * before any id mapping); `probability` contiguous FP32 [T]. Each column's sum runs in one fixed
+ * order (fast exponentials, FP32 accumulation), so the result depends only on the column's logits:
+ * an extent policy's input, not a sampling probability.
+ */
+void argmax_probability(const Tensor& logits, const Tensor& rows, Tensor& probability, std::int32_t valid_rows,
+                        cudaStream_t stream);
+
 } // namespace infernix::ops

@@ -297,9 +297,10 @@ int main() {
             std::cout << "SKIP: no usable CUDA device\n";
             return 77;
         }
-        // Qwen3.8-27B's drafter and Qwen3.8-Flash-Next's.
+        // Qwen3.8-27B's drafter, Qwen3.8-Flash-Next's and Qwen3.5-122B-A10B's.
         const int failures = run_profile(5120, 4096) + run_profile(5120, 17408) +
-                             run_profile(2560, 4096) + run_profile(2560, 7680);
+                             run_profile(2560, 4096) + run_profile(2560, 7680) +
+                             run_profile(3072, 4096) + run_profile(3072, 9216);
         std::cout << (failures == 0 ? "OK" : "FAIL") << " linear_dynamic_grouped_conv_add\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

@@ -32,6 +32,28 @@ bool aligned_to(const void* pointer, std::uintptr_t alignment) {
     return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) == 0;
 }
 
+// The row-scaled FP8 parents: fp8_e4m3fn_row_bf16 [16384,5120] and Qwen3.5-122B-A10B's static-scale
+// fp8_e4m3fn_row_f32 [20480,3072] (16 key heads and 64 value heads of 128).
+struct Fp8GdnShape {
+    std::int32_t hidden;
+    std::int32_t query;
+    std::int32_t key;
+    std::int32_t value;
+    std::int32_t z;
+};
+
+Fp8GdnShape fp8_gdn_shape(QType qtype) {
+    return qtype == QType::FP8_E4M3FN_ROW_F32 ? Fp8GdnShape{3072, 2048, 2048, 8192, 8192}
+                                              : Fp8GdnShape{5120, 2048, 2048, 6144, 6144};
+}
+
+bool fp8_gdn_profile(QType qtype, std::int32_t parent_rows, std::int32_t input_rows) {
+    if (!is_fp8_row(qtype)) { return false; }
+    const Fp8GdnShape shape = fp8_gdn_shape(qtype);
+    return parent_rows == shape.query + shape.key + shape.value + shape.z &&
+           input_rows == shape.hidden;
+}
+
 void require_matrix(const Tensor& tensor, std::int32_t rows, std::int32_t cols, const char* label) {
     if (tensor.dtype != DType::BF16 || tensor.ne[0] != rows || tensor.ne[1] != cols ||
         tensor.ne[2] != 1 || tensor.ne[3] != 1 || !tensor.is_contiguous() ||
@@ -332,17 +354,18 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
         return;
     }
 
-    if (weight.qtype == QType::FP8_E4M3FN_ROW_BF16) {
-        constexpr std::int32_t kHidden  = 5120;
-        constexpr std::int32_t kQkvRows = 10240;
-        constexpr std::int32_t kZRows   = 6144;
-        constexpr std::int32_t kRows    = kQkvRows + kZRows;
-        require_matrix(x, kHidden, cols, "x");
-        require_matrix(qkv, kQkvRows, cols, "qkv");
-        require_matrix(z, kZRows, cols, "z");
+    if (is_fp8_row(weight.qtype)) {
+        const Fp8GdnShape shape     = fp8_gdn_shape(weight.qtype);
+        const std::int32_t hidden   = shape.hidden;
+        const std::int32_t qkv_rows = shape.query + shape.key + shape.value;
+        const std::int32_t z_rows   = shape.z;
+        const std::int32_t rows     = qkv_rows + z_rows;
+        require_matrix(x, hidden, cols, "x");
+        require_matrix(qkv, qkv_rows, cols, "qkv");
+        require_matrix(z, z_rows, cols, "z");
         require_single_parent_nonoverlap(x, qkv, z);
         detail::validate_fp8_weight(weight, "fp8 gdn_input_proj");
-        if (weight.n != kRows || weight.k != kHidden) {
+        if (weight.n != rows || weight.k != hidden) {
             throw std::invalid_argument("fp8 gdn_input_proj: unsupported weight shape");
         }
         detail::fp8_gdn_input_dispatch(x, weight, qkv, z, policy, workspace, stream);
@@ -528,29 +551,30 @@ void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
         return;
     }
 
-    if (weight.qtype == QType::FP8_E4M3FN_ROW_BF16) {
-        constexpr std::int32_t kHidden     = 5120;
-        constexpr std::int32_t kQueryRows  = 2048;
-        constexpr std::int32_t kKeyRows    = 2048;
-        constexpr std::int32_t kValueRows  = 6144;
-        constexpr std::int32_t kZRows      = 6144;
-        constexpr std::int32_t kChannels   = kQueryRows + kKeyRows + kValueRows;
-        constexpr std::int32_t kParentRows = kChannels + kZRows;
-        const ConvGeometry geometry        = require_snapshot_input(x, kHidden);
+    if (is_fp8_row(weight.qtype)) {
+        const Fp8GdnShape shape        = fp8_gdn_shape(weight.qtype);
+        const std::int32_t hidden      = shape.hidden;
+        const std::int32_t query_rows  = shape.query;
+        const std::int32_t key_rows    = shape.key;
+        const std::int32_t value_rows  = shape.value;
+        const std::int32_t z_rows      = shape.z;
+        const std::int32_t channels    = query_rows + key_rows + value_rows;
+        const std::int32_t parent_rows = channels + z_rows;
+        const ConvGeometry geometry    = require_snapshot_input(x, hidden);
         detail::validate_fp8_weight(weight, "fp8 gdn_input_proj_conv_snapshot");
-        if (weight.n != kParentRows || weight.k != kHidden) {
+        if (weight.n != parent_rows || weight.k != hidden) {
             throw std::invalid_argument(
                 "fp8 gdn_input_proj_conv_snapshot: unsupported weight shape");
         }
         require_snapshot_operands(conv_weight, conv_states, valid_columns, initial_state_slots,
-                                  snapshot_base_slots, kChannels, geometry);
-        require_conv_tensor(query, kQueryRows, geometry.width, geometry.batch,
+                                  snapshot_base_slots, channels, geometry);
+        require_conv_tensor(query, query_rows, geometry.width, geometry.batch,
                             "gdn_input_proj_conv_snapshot", "query");
-        require_conv_tensor(key, kKeyRows, geometry.width, geometry.batch,
+        require_conv_tensor(key, key_rows, geometry.width, geometry.batch,
                             "gdn_input_proj_conv_snapshot", "key");
-        require_conv_tensor(value, kValueRows, geometry.width, geometry.batch,
+        require_conv_tensor(value, value_rows, geometry.width, geometry.batch,
                             "gdn_input_proj_conv_snapshot", "value");
-        require_conv_tensor(z, kZRows, geometry.width, geometry.batch,
+        require_conv_tensor(z, z_rows, geometry.width, geometry.batch,
                             "gdn_input_proj_conv_snapshot", "z");
         require_snapshot_nonoverlap(x, conv_weight, conv_states, valid_columns, initial_state_slots,
                                     snapshot_base_slots, query, key, value, z, workspace);
@@ -701,30 +725,31 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
         return;
     }
 
-    if (weight.qtype == QType::FP8_E4M3FN_ROW_BF16) {
-        constexpr std::int32_t kHidden     = 5120;
-        constexpr std::int32_t kQueryRows  = 2048;
-        constexpr std::int32_t kKeyRows    = 2048;
-        constexpr std::int32_t kValueRows  = 6144;
-        constexpr std::int32_t kZRows      = 6144;
-        constexpr std::int32_t kChannels   = kQueryRows + kKeyRows + kValueRows;
-        constexpr std::int32_t kParentRows = kChannels + kZRows;
-        const ConvGeometry geometry        = require_record_input(x, kHidden);
+    if (is_fp8_row(weight.qtype)) {
+        const Fp8GdnShape shape        = fp8_gdn_shape(weight.qtype);
+        const std::int32_t hidden      = shape.hidden;
+        const std::int32_t query_rows  = shape.query;
+        const std::int32_t key_rows    = shape.key;
+        const std::int32_t value_rows  = shape.value;
+        const std::int32_t z_rows      = shape.z;
+        const std::int32_t channels    = query_rows + key_rows + value_rows;
+        const std::int32_t parent_rows = channels + z_rows;
+        const ConvGeometry geometry    = require_record_input(x, hidden);
         detail::validate_fp8_weight(weight, "fp8 gdn_input_proj_conv_record");
-        if (weight.n != kParentRows || weight.k != kHidden) {
+        if (weight.n != parent_rows || weight.k != hidden) {
             throw std::invalid_argument("fp8 gdn_input_proj_conv_record: unsupported weight shape");
         }
         require_record_operands(conv_weight, conv_states, valid_columns, initial_state_slots,
-                                kChannels, geometry);
-        require_conv_tensor(conv_record, kChannels, geometry.width, geometry.batch,
+                                channels, geometry);
+        require_conv_tensor(conv_record, channels, geometry.width, geometry.batch,
                             "gdn_input_proj_conv_record", "conv record");
-        require_conv_tensor(query, kQueryRows, geometry.width, geometry.batch,
+        require_conv_tensor(query, query_rows, geometry.width, geometry.batch,
                             "gdn_input_proj_conv_record", "query");
-        require_conv_tensor(key, kKeyRows, geometry.width, geometry.batch,
+        require_conv_tensor(key, key_rows, geometry.width, geometry.batch,
                             "gdn_input_proj_conv_record", "key");
-        require_conv_tensor(value, kValueRows, geometry.width, geometry.batch,
+        require_conv_tensor(value, value_rows, geometry.width, geometry.batch,
                             "gdn_input_proj_conv_record", "value");
-        require_conv_tensor(z, kZRows, geometry.width, geometry.batch, "gdn_input_proj_conv_record",
+        require_conv_tensor(z, z_rows, geometry.width, geometry.batch, "gdn_input_proj_conv_record",
                             "z");
         require_record_nonoverlap(x, conv_weight, conv_states, valid_columns, initial_state_slots,
                                   conv_record, query, key, value, z, workspace);
@@ -817,7 +842,7 @@ bool gdn_input_proj_column_invariant_route(QType parent_qtype, std::int32_t pare
                                            std::int32_t input_rows) noexcept {
     if (parent_qtype == QType::Q8_G32_FP16) { return !(parent_rows == 16384 && input_rows == 2560); }
     // MXFP8's one route is column-invariant at every width.
-    return parent_qtype == QType::NVFP4 || parent_qtype == QType::FP8_E4M3FN_ROW_BF16 ||
+    return parent_qtype == QType::NVFP4 || is_fp8_row(parent_qtype) ||
            parent_qtype == QType::FP8_E4M3FN_G32_E8M0;
 }
 
@@ -836,12 +861,12 @@ std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int
         }
         return detail::nvfp4_gdn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
     }
-    if (parent_qtype == QType::FP8_E4M3FN_ROW_BF16) {
-        if (parent_rows != detail::Fp8N16384K5120::kOutputRows ||
-            input_rows != detail::Fp8N16384K5120::kInputRows) {
+    if (is_fp8_row(parent_qtype)) {
+        if (!fp8_gdn_profile(parent_qtype, parent_rows, input_rows)) {
             throw std::invalid_argument("gdn_input_proj workspace: unsupported FP8 profile");
         }
-        return detail::fp8_gdn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
+        return detail::fp8_gdn_input_workspace_capacity_bytes(policy, input_rows, min_tokens,
+                                                              max_tokens);
     }
     if ((parent_qtype == QType::Q8_G32_FP16 || parent_qtype == QType::FP8_E4M3FN_G32_E8M0) && parent_rows == 16384 &&
         input_rows == 2560) {
@@ -939,11 +964,9 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {
     validate_policy(policy, parent_qtype);
     require_snapshot_capacity_domain(batch_size, min_width, max_width);
-    if (parent_qtype == QType::FP8_E4M3FN_ROW_BF16 &&
-        parent_rows == detail::Fp8N16384K5120::kOutputRows &&
-        input_rows == detail::Fp8N16384K5120::kInputRows) {
-        return detail::fp8_gdn_snapshot_workspace_capacity_bytes(policy, batch_size, min_width,
-                                                                 max_width);
+    if (fp8_gdn_profile(parent_qtype, parent_rows, input_rows)) {
+        return detail::fp8_gdn_snapshot_workspace_capacity_bytes(policy, input_rows, batch_size,
+                                                                 min_width, max_width);
     }
     if (parent_qtype != QType::NVFP4 || parent_rows != detail::Nvfp4N16384K5120::kOutputRows ||
         input_rows != detail::Nvfp4N16384K5120::kInputRows) {
@@ -1002,11 +1025,9 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {
     validate_policy(policy, parent_qtype);
     require_record_capacity_domain(batch_size, min_width, max_width);
-    if (parent_qtype == QType::FP8_E4M3FN_ROW_BF16 &&
-        parent_rows == detail::Fp8N16384K5120::kOutputRows &&
-        input_rows == detail::Fp8N16384K5120::kInputRows) {
-        return detail::fp8_gdn_record_workspace_capacity_bytes(policy, batch_size, min_width,
-                                                               max_width);
+    if (fp8_gdn_profile(parent_qtype, parent_rows, input_rows)) {
+        return detail::fp8_gdn_record_workspace_capacity_bytes(policy, input_rows, batch_size,
+                                                               min_width, max_width);
     }
     if (parent_qtype != QType::NVFP4 || parent_rows != detail::Nvfp4N16384K5120::kOutputRows ||
         input_rows != detail::Nvfp4N16384K5120::kInputRows) {

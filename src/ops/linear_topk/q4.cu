@@ -6,6 +6,7 @@
 #include "ops/linear/q4/q4_sliced_k_launch.cuh"
 
 #include <cstdint>
+#include <stdexcept>
 #include <array>
 #include <utility>
 
@@ -47,8 +48,9 @@ constexpr auto make_launchers(std::index_sequence<I...>) {
     return std::array<Launch, sizeof...(I)>{&launch_sliced<Hidden, 8 * (1 + I)>...};
 }
 
-// Qwen3.8-27B's proposal head (5120) and Qwen3.8-Flash-Next's (2560).
+// Qwen3.8-27B's proposal head (5120), Qwen3.5-122B-A10B's (3072) and Qwen3.8-Flash-Next's (2560).
 constexpr auto k27BLaunchers       = make_launchers<5120>(std::make_index_sequence<2>{});
+constexpr auto k122BLaunchers      = make_launchers<3072>(std::make_index_sequence<2>{});
 constexpr auto kFlashNextLaunchers = make_launchers<2560>(std::make_index_sequence<2>{});
 
 } // namespace
@@ -57,8 +59,12 @@ void linear_topk_q4_launch(const Tensor& hidden, const Weight& head,
                            const Tensor& row_to_global_ids, const LinearTopKWorkspace& workspace,
                            cudaStream_t stream) {
     if (workspace.rows_per_producer == kLinearTopKDirectRows) {
-        const auto& launchers = hidden.ne[0] == 5120 ? k27BLaunchers : kFlashNextLaunchers;
-        launchers[(hidden.ne[1] - 1) / 8](hidden, head, row_to_global_ids, workspace, stream);
+        const auto* launchers = hidden.ne[0] == 5120   ? &k27BLaunchers
+                                : hidden.ne[0] == 3072 ? &k122BLaunchers
+                                : hidden.ne[0] == 2560 ? &kFlashNextLaunchers
+                                                       : nullptr;
+        if (launchers == nullptr) { throw std::invalid_argument("linear_topk: unregistered hidden width"); }
+        (*launchers)[(hidden.ne[1] - 1) / 8](hidden, head, row_to_global_ids, workspace, stream);
     } else {
         linear_topk_q4_m64_launch(hidden, head, row_to_global_ids, workspace, stream);
     }

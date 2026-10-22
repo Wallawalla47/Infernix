@@ -22,6 +22,8 @@ target_sources(infernix_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/cuda/narrow_exper
 target_sources(infernix_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/cuda/moe_layer.cu")
 # The wide route: experts with more than eight columns on block-scaled tensor cores.
 target_sources(infernix_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/cuda/wide_expert.cu")
+# The canonical W4A16 dense projection of an nvfp4_rg16_v1 matrix (Qwen3.5-122B-A10B's head).
+target_sources(infernix_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/cuda/rg16_linear.cu")
 # The host side of CPU-served misses: mapped channel buffers and the service thread.
 target_sources(infernix_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/cpu/miss_service.cpp")
 # The host side of the SSD tier's fetch channel: mapped request/response words and the responder.

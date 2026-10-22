@@ -330,8 +330,9 @@ void launch_hidden(const Tensor& hidden, const Weight& head,
 void linear_topk_q4_m64_launch(const Tensor& hidden, const Weight& head,
                                const Tensor& row_to_global_ids,
                                const LinearTopKWorkspace& workspace, cudaStream_t stream) {
-    // Qwen3.8-27B's heads (5120) and Qwen3.8-Flash-Next's (2560).
+    // Qwen3.8-27B's heads (5120), Qwen3.5-122B-A10B's (3072) and Qwen3.8-Flash-Next's (2560).
     if (hidden.ne[0] == 5120) { return launch_hidden<5120>(hidden, head, row_to_global_ids, workspace, stream); }
+    if (hidden.ne[0] == 3072) { return launch_hidden<3072>(hidden, head, row_to_global_ids, workspace, stream); }
     if (hidden.ne[0] == 2560) { return launch_hidden<2560>(hidden, head, row_to_global_ids, workspace, stream); }
     throw std::invalid_argument("linear_topk: unregistered hidden width");
 }

@@ -132,7 +132,7 @@ Routed make_routed(moe::ExpertActivation activation, std::uint32_t seed) {
     c.x = device_copy(a16 ? fixtures::wide_range_activations(rng, kRoutedT) : fixtures::random_activations(rng, kRoutedT));
     c.max_jobs = std::min(kExperts, kTopK * kRoutedT);
     cuda_check(cudaMalloc(&c.workspace,
-                          infernix::ops::moe_experts_workspace_bytes(c.max_jobs, kTopK * kRoutedT, kRoutedT, activation)),
+                          infernix::ops::moe_experts_workspace_bytes(infernix::ops::offloaded_moe::kFlashNextShape, c.max_jobs, kTopK * kRoutedT, kRoutedT, activation)),
                "cudaMalloc");
     cuda_check(cudaMalloc(&c.out, sizeof(std::uint16_t) * moe::kHidden * kTopK * kRoutedT), "cudaMalloc");
     cuda_check(cudaMalloc(&c.error, sizeof(std::uint32_t)), "cudaMalloc");

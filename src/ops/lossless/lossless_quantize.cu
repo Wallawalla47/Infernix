@@ -8,6 +8,7 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 #include <string>
@@ -121,6 +122,19 @@ __global__ void fp8_token_kernel(const __nv_bfloat16* __restrict__ x, int k, __n
     if (tid == 0) { scales[token] = scale; }
 }
 
+// One thread per element: fp8_a8_static_quantize_kernel's rule, c = e4m3_rn_satfinite(fl32(v r)) with
+// r = fl32(1 / s); the first T threads also write every column's scale s.
+__global__ void fp8_static_kernel(const __nv_bfloat16* __restrict__ x, long long n, int columns, float scale,
+                                  float inverse, __nv_bfloat16* __restrict__ out, float* __restrict__ scales) {
+    const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < columns) { scales[i] = scale; }
+    if (i >= n) { return; }
+    const float scaled            = __fmul_rn(__bfloat162float(x[i]), inverse);
+    const __nv_fp8_storage_t code = __nv_cvt_float_to_fp8(scaled, __NV_SATFINITE, __NV_E4M3);
+    const __half_raw value        = __nv_cvt_fp8_to_halfraw(code, __NV_E4M3);
+    out[i]                        = __float2bfloat16_rn(__half2float(__half(value)));
+}
+
 // BF16 -> FP16 (round to nearest even) -> BF16, exactly.
 __global__ void round_fp16_kernel(__nv_bfloat16* __restrict__ x, long long n) {
     const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -174,6 +188,22 @@ void lossless_quantize_fp8_token(const Tensor& x, Tensor& out, Tensor& scales, c
     fp8_token_kernel<<<static_cast<unsigned>(x.ne[1]), 256, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<int>(x.ne[0]), static_cast<__nv_bfloat16*>(out.data),
         static_cast<float*>(scales.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void lossless_quantize_fp8_static(const Tensor& x, float input_scale, Tensor& out, Tensor& scales, cudaStream_t stream) {
+    check_pair(x, out, 1);
+    require(out.ne[1] == x.ne[1], "out has x's columns");
+    require(scales.dtype == DType::FP32 && scales.is_contiguous() && scales.numel() == x.ne[1],
+            "scales must be FP32 [T]");
+    require(std::isfinite(input_scale) && input_scale > 0.0F, "the static input scale is positive and finite");
+    const long long n    = static_cast<long long>(x.numel());
+    const long long work = std::max<long long>(n, x.ne[1]);
+    const float inverse  = 1.0F / input_scale; // fl32(1 / s), as the reproducible route's encoder takes it
+    constexpr int kThreads = 256;
+    fp8_static_kernel<<<static_cast<unsigned>((work + kThreads - 1) / kThreads), kThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), n, static_cast<int>(x.ne[1]), input_scale, inverse,
+        static_cast<__nv_bfloat16*>(out.data), static_cast<float*>(scales.data));
     CUDA_CHECK(cudaGetLastError());
 }
 

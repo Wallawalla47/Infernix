@@ -45,6 +45,16 @@ void lossless_quantize_nvfp4_scaled(const Tensor& x, const std::int32_t* in_colu
 void lossless_quantize_fp8_token(const Tensor& x, Tensor& out, Tensor& scales, cudaStream_t stream);
 
 /**
+ * Op: lossless_quantize_fp8_static (a static A8 site: fp8_e4m3fn_row_f32's calibrated input scale,
+ * fp8_a8.cu's static rule)
+ *
+ * Every element with the input scale s (positive, finite): c = e4m3_rn_satfinite(fp32(v fp32(1 / s)));
+ * out = e4m3(c) and scales (device FP32 [T]) s for every column. The quantized activation is out s.
+ */
+void lossless_quantize_fp8_static(const Tensor& x, float input_scale, Tensor& out, Tensor& scales,
+                                  cudaStream_t stream);
+
+/**
  * Op: lossless_round_fp16 (the bf16 KV format's V: FP16 storage)
  *
  * Each element of x (BF16, any contiguous shape), in place: its FP16 rounding (round to nearest even; the

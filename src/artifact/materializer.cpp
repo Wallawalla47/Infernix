@@ -202,9 +202,11 @@ struct ReadSpan {
     std::uint64_t end   = 0;
 };
 
+// The positive FP32 matrix coefficient word at divisor_offset: an NVFP4 divisor, or an
+// nvfp4_rg16_v1 matrix's multiplier; 0 for every other object.
 float read_divisor(const Reader& reader, ObjectHandle handle, const WeightGeometry& geometry,
                    std::span<const std::byte> host, MaterializationStats& stats) {
-    if (geometry.format != QType::NVFP4) { return 0.0F; }
+    if (geometry.format != QType::NVFP4 && geometry.layout != QuantLayout::Rg16) { return 0.0F; }
     std::array<std::byte, 4> word{};
     if (!host.empty()) {
         std::copy_n(host.data() + geometry.divisor_offset, word.size(), word.data());
@@ -217,9 +219,22 @@ float read_divisor(const Reader& reader, ObjectHandle handle, const WeightGeomet
     const auto value = std::bit_cast<float>(read_u32_le(word.data()));
     if (!std::isfinite(value) || value <= 0) {
         throw ArtifactError(reader.directory().tensor(handle).id +
-                            ": invalid NVFP4 weight divisor");
+                            ": invalid NVFP4 weight divisor or multiplier");
     }
     return value;
+}
+
+// A parent of `geometry` at `data`: an NVFP4 parent keeps its divisor, an nvfp4_rg16_v1 parent its
+// multiplier (one word, read by read_divisor).
+WeightParent weight_parent(const WeightGeometry& geometry, const std::byte* data, float coefficient,
+                           const std::byte* device = nullptr) {
+    WeightParent parent{geometry, data, 0.0F, device};
+    if (geometry.layout == QuantLayout::Rg16) {
+        parent.weight_multiplier = coefficient;
+    } else {
+        parent.weight_scale_divisor = coefficient;
+    }
+    return parent;
 }
 
 } // namespace
@@ -407,7 +422,7 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
             const auto& geometry = reader.geometry(placement.object);
             const auto divisor =
                 read_divisor(reader, placement.object, geometry, storage.host_data, out.stats_);
-            storage.host = WeightParent{geometry, storage.host_data.data(), divisor};
+            storage.host = weight_parent(geometry, storage.host_data.data(), divisor);
         }
     }
     for (const auto& placement : plan.pinned_objects) {
@@ -429,7 +444,7 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
             checked_add(out.stats_.read_bytes, data.size(), "pinned read bytes");
         const auto geometry = reader.geometry(placement.object);
         const auto divisor = read_divisor(reader, placement.object, geometry, data, out.stats_);
-        storage.pinned = WeightParent{geometry, out.pinned_->data() + placement.offset, divisor};
+        storage.pinned = weight_parent(geometry, out.pinned_->data() + placement.offset, divisor);
         out.stats_.pinned_bytes = checked_add(out.stats_.pinned_bytes, placement.bytes,
                                               "pinned bytes");
         pinned_done = checked_add(pinned_done, placement.bytes, "pinned progress");
@@ -463,10 +478,11 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
             // Pool-backed: the plan packed offsets into the pool's home arena directly.
             storage_data = device_base + placement.offset;
         }
-        const auto divisor = object.host
-                                 ? object.host->weight_scale_divisor
-                                 : read_divisor(reader, placement.object, geometry, {}, out.stats_);
-        object.device = WeightParent{geometry, storage_data, divisor, storage_data};
+        const auto divisor =
+            object.host ? (geometry.layout == QuantLayout::Rg16 ? object.host->weight_multiplier
+                                                                : object.host->weight_scale_divisor)
+                        : read_divisor(reader, placement.object, geometry, {}, out.stats_);
+        object.device = weight_parent(geometry, storage_data, divisor, storage_data);
         const auto& descriptor = reader.directory().tensor(placement.object);
         for (const auto& segment : reader.segments(descriptor.offset, descriptor.bytes)) {
             ranges.push_back({segment.file_index, segment.file_offset,

@@ -83,6 +83,16 @@ void validate_policy(LinearPolicy policy) {
     throw std::invalid_argument("linear_add: invalid compute policy");
 }
 
+// Row-scaled FP8: fp8_e4m3fn_row_bf16 [5120,6144] and [5120,17408]; Qwen3.5-122B-A10B's
+// static-scale fp8_e4m3fn_row_f32 [3072,8192] (attention and GDN output projections).
+bool fp8_linear_add_shape(QType qtype, std::int32_t output_rows, std::int32_t input_rows) {
+    if (qtype == QType::FP8_E4M3FN_ROW_F32) { return output_rows == 3072 && input_rows == 8192; }
+    return (output_rows == detail::Fp8N5120K6144::kOutputRows &&
+            input_rows == detail::Fp8N5120K6144::kInputRows) ||
+           (output_rows == detail::Fp8N5120K17408::kOutputRows &&
+            input_rows == detail::Fp8N5120K17408::kInputRows);
+}
+
 } // namespace
 
 std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output_rows,
@@ -95,8 +105,8 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
 bool linear_add_column_invariant_route(QType qtype, std::int32_t output_rows,
                                        std::int32_t input_rows) noexcept {
     if (qtype == QType::Q8_G32_FP16) { return output_rows == 2048 && input_rows == 4096; }
-    return qtype == QType::NVFP4 || qtype == QType::FP8_E4M3FN_ROW_BF16 ||
-           qtype == QType::Q5_G64_FP16 || qtype == QType::BF16;
+    return qtype == QType::NVFP4 || is_fp8_row(qtype) || qtype == QType::Q5_G64_FP16 ||
+           qtype == QType::BF16;
 }
 
 std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output_rows,
@@ -144,11 +154,8 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
         return detail::nvfp4_linear_add_workspace_capacity_bytes(output_rows, input_rows, policy,
                                                                  min_tokens, max_tokens);
     }
-    if (qtype == QType::FP8_E4M3FN_ROW_BF16) {
-        const bool supported = (output_rows == detail::Fp8N5120K6144::kOutputRows &&
-                                input_rows == detail::Fp8N5120K6144::kInputRows) ||
-                               (output_rows == detail::Fp8N5120K17408::kOutputRows &&
-                                input_rows == detail::Fp8N5120K17408::kInputRows);
+    if (is_fp8_row(qtype)) {
+        const bool supported = fp8_linear_add_shape(qtype, output_rows, input_rows);
         if (!supported) {
             throw std::invalid_argument("linear_add workspace: unsupported FP8 profile");
         }
@@ -256,12 +263,9 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
         return;
     }
 
-    if (w.qtype == QType::FP8_E4M3FN_ROW_BF16) {
+    if (is_fp8_row(w.qtype)) {
         (void)detail::validate_fp8_weight(w, "fp8 linear_add");
-        const bool supported_shape = (w.n == detail::Fp8N5120K6144::kOutputRows &&
-                                      w.k == detail::Fp8N5120K6144::kInputRows) ||
-                                     (w.n == detail::Fp8N5120K17408::kOutputRows &&
-                                      w.k == detail::Fp8N5120K17408::kInputRows);
+        const bool supported_shape = fp8_linear_add_shape(w.qtype, w.n, w.k);
         if (!supported_shape) {
             throw std::invalid_argument("fp8 linear_add: unsupported weight shape");
         }

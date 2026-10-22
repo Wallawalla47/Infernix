@@ -152,6 +152,8 @@ void bf16_dynamic_grouped_conv_prepare_partial_launch(DynamicConvPrepareRoute ro
         return launch_route<5120>(route, input, weight, partial, stream);
     case 2560:
         return launch_route<2560>(route, input, weight, partial, stream);
+    case 3072:
+        return launch_route<3072>(route, input, weight, partial, stream);
     }
     throw std::logic_error("dynamic grouped conv prepare: unregistered hidden width");
 }

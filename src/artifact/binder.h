@@ -55,6 +55,8 @@ public:
     void require_streamed(ObjectHandle object);
     [[nodiscard]] std::span<const std::byte> host_object(ObjectHandle object);
     [[nodiscard]] ObjectHandle resource(std::string_view component, std::string_view role);
+    // Whether the component declares the resource (an optional role, e.g. text's sampling.json).
+    [[nodiscard]] bool has_resource(std::string_view component, std::string_view role) const;
     [[nodiscard]] HostValues values(const Binding& binding, std::optional<QType> format = {});
     // evictable_alignment (a power of two, typically EvictableWeightPool::kChunkBytes)
     // chunk-aligns the first ranked object so the evictable suffix is chunk-aligned.

@@ -168,6 +168,9 @@ detail::CausalConvSplitGeometry resolve_split_geometry(std::int32_t channels, st
     if (channels == 10240 && out0.ne[0] == 2048 && out1.ne[0] == 2048 && out2.ne[0] == 6144) {
         return detail::CausalConvSplitGeometry::Rows2048x2048x6144;
     }
+    if (channels == 12288 && out0.ne[0] == 2048 && out1.ne[0] == 2048 && out2.ne[0] == 8192) {
+        return detail::CausalConvSplitGeometry::Rows2048x2048x8192;
+    }
     throw std::invalid_argument("causal_conv1d: split received an unregistered row profile");
 }
 

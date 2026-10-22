@@ -35,6 +35,9 @@ constexpr int k35N           = 32;
 constexpr int k35K           = 2048;
 constexpr int k35LogicalRows = 2 * k35N;
 
+constexpr int k122N = 64;
+constexpr int k122K = 3072;
+
 template <int TokenTile, int KSlice, int RowsPerBlock>
 __global__ void bf16_gdn_gating_proj_small_t_partial_kernel(
     const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ a_weight,
@@ -250,6 +253,13 @@ void require_shape(const Weight& w, const char* name) {
     }
 }
 
+void require_shape122(const Weight& w, const char* name) {
+    if (w.n != k122N || w.k != k122K || w.shape[0] != k122N || w.shape[1] != k122K) {
+        throw std::invalid_argument(std::string("gdn_gating_proj: ") + name +
+                                    " requires contiguous BF16 [64,3072]");
+    }
+}
+
 void require_shape35(const Weight& w, const char* name) {
     if (w.n != k35N || w.k != k35K || w.shape[0] != k35N || w.shape[1] != k35K) {
         throw std::invalid_argument(std::string("gdn_gating_proj: ") + name +
@@ -265,6 +275,10 @@ constexpr std::int32_t cooperative_resident_ctas_per_sm() noexcept {
         // Qualified on the sm_120a build: BN128 split-8 uses 256 threads and split-4/2 use
         // 512 threads; registers and 40-KiB shared memory admit two resident CTAs per SM.
         return 2;
+    } else if constexpr (std::is_same_v<Geometry, Bf16Gdn122Geometry>) {
+        static_assert(SplitK == 16 || SplitK == 8 || SplitK == 4 || SplitK == 2);
+        // The 35B-A3B's BN64 tile: the same warps, registers and shared memory admit four.
+        return 4;
     } else {
         static_assert(std::is_same_v<Geometry, Bf16Gdn35Geometry>);
         static_assert(SplitK == 32 || SplitK == 16 || SplitK == 8 || SplitK == 4 || SplitK == 2);
@@ -612,6 +626,28 @@ bool bf16_gdn_gating_proj_35_mma_split2_launch(Bf16GdnGatingTokenVariant variant
     return launch_bf16_prefill_mma<Bf16Gdn35Geometry, 2, 8>(
         variant, x, nullptr, 0.0F, nullptr, a_weight, b_weight, A_log, dt_bias, workspace, g, beta,
         stream, multiprocessor_count);
+}
+
+bool bf16_gdn_gating_proj_122_mma_launch(std::int32_t split_k, Bf16GdnGatingTokenVariant variant,
+                                         const Tensor& x, const Weight& a_weight, const Weight& b_weight,
+                                         const Tensor& A_log, const Tensor& dt_bias, void* workspace,
+                                         Tensor& g, Tensor& beta, std::int32_t multiprocessor_count,
+                                         cudaStream_t stream) {
+    require_shape122(a_weight, "a_weight");
+    require_shape122(b_weight, "b_weight");
+    const auto launch = [&]<int SplitK>() {
+        return launch_bf16_prefill_mma<Bf16Gdn122Geometry, SplitK, 8>(
+            variant, x, nullptr, 0.0F, nullptr, a_weight, b_weight, A_log, dt_bias,
+            SplitK > 1 ? workspace : nullptr, g, beta, stream, multiprocessor_count);
+    };
+    switch (split_k) {
+    case 16: return launch.template operator()<16>();
+    case 8: return launch.template operator()<8>();
+    case 4: return launch.template operator()<4>();
+    case 2: return launch.template operator()<2>();
+    case 1: return launch.template operator()<1>();
+    default: throw std::invalid_argument("gdn_gating_proj: the 122B control has no such split");
+    }
 }
 
 void bf16_gdn_gating_proj_35_mma_unsplit_launch(Bf16GdnGatingTokenVariant variant, const Tensor& x,

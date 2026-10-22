@@ -35,6 +35,71 @@ inline constexpr int kDefaultPrefetchBytes = 2048;
 
 static_assert(kRecordBytes == 675 * 4096);
 
+// The expert geometries this Op computes in the `nvfp4_expert_rg16_v1` layout: Qwen3.8-Flash-Next's
+// H 2560 / I 640 (every bank and arithmetic; the constants above), and Qwen3.5-122B-A10B's
+// H 3072 / I 1024 (W4A16 banks only: the exact narrow, wide and CPU routes and the reference route).
+// The record is the gate/up matrix (2I rows, interleaved gate/up, of H) then the down matrix
+// (H rows of I), each as row-group-major 144-byte units.
+template <int Hidden, int Intermediate>
+struct ExpertGeometry {
+    static_assert(Hidden % 64 == 0 && Intermediate % 64 == 0);
+    static constexpr int kHidden          = Hidden;
+    static constexpr int kIntermediate    = Intermediate;
+    static constexpr int kGateUpRowGroups = 2 * Intermediate / 16;
+    static constexpr int kGateUpBlocks    = Hidden / 16;
+    static constexpr int kDownRowGroups   = Hidden / 16;
+    static constexpr int kDownBlocks      = Intermediate / 16;
+    static constexpr int kHBlocks         = Intermediate / 16;
+    static constexpr std::size_t kGateUpBytes =
+        static_cast<std::size_t>(kGateUpRowGroups) * kGateUpBlocks * kUnitBytes;
+    static constexpr std::size_t kDownBytes =
+        static_cast<std::size_t>(kDownRowGroups) * kDownBlocks * kUnitBytes;
+    static constexpr std::size_t kRecordBytes = kGateUpBytes + kDownBytes;
+};
+using FlashNextExperts   = ExpertGeometry<kHidden, kIntermediate>;
+using Qwen3_5_122BExperts = ExpertGeometry<3072, 1024>;
+static_assert(FlashNextExperts::kRecordBytes == kRecordBytes);
+static_assert(Qwen3_5_122BExperts::kRecordBytes == 5308416);
+
+// A bank's expert geometry at run time (MoeExpertSource::shape, the CPU engine's options).
+struct ExpertShape {
+    int hidden       = kHidden;
+    int intermediate = kIntermediate;
+
+    [[nodiscard]] constexpr int gate_up_row_groups() const { return 2 * intermediate / 16; }
+    [[nodiscard]] constexpr int gate_up_blocks() const { return hidden / 16; }
+    [[nodiscard]] constexpr int down_row_groups() const { return hidden / 16; }
+    [[nodiscard]] constexpr int down_blocks() const { return intermediate / 16; }
+    [[nodiscard]] constexpr int h_blocks() const { return intermediate / 16; }
+    [[nodiscard]] constexpr std::size_t gate_up_bytes() const {
+        return static_cast<std::size_t>(gate_up_row_groups()) * gate_up_blocks() * kUnitBytes;
+    }
+    [[nodiscard]] constexpr std::size_t down_bytes() const {
+        return static_cast<std::size_t>(down_row_groups()) * down_blocks() * kUnitBytes;
+    }
+    [[nodiscard]] constexpr std::size_t record_bytes() const { return gate_up_bytes() + down_bytes(); }
+    friend constexpr bool operator==(const ExpertShape&, const ExpertShape&) = default;
+};
+
+template <class Geometry>
+inline constexpr ExpertShape kShapeOf{Geometry::kHidden, Geometry::kIntermediate};
+inline constexpr ExpertShape kFlashNextShape    = kShapeOf<FlashNextExperts>;
+inline constexpr ExpertShape kQwen3_5_122BShape = kShapeOf<Qwen3_5_122BExperts>;
+// The largest registered hidden size (host buffers sized for any bank).
+inline constexpr int kMaxHidden = Qwen3_5_122BExperts::kHidden;
+
+[[nodiscard]] constexpr bool registered_shape(const ExpertShape& shape) {
+    return shape == kFlashNextShape || shape == kQwen3_5_122BShape;
+}
+
+// Calls f.template operator()<Geometry>() with the geometry of `shape`, which the caller has checked
+// is registered (registered_shape).
+template <class F>
+decltype(auto) with_expert_geometry(const ExpertShape& shape, F&& f) {
+    if (shape == kQwen3_5_122BShape) { return f.template operator()<Qwen3_5_122BExperts>(); }
+    return f.template operator()<FlashNextExperts>();
+}
+
 // Per-expert scalars from the checkpoint (design §6.1). alpha = fl32(weight_scale_2 * input_scale)
 // is derived once by the loader, so every route reads the same words.
 struct ExpertScales {

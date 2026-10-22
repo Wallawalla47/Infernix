@@ -22,7 +22,8 @@ constexpr const char* kPrepareOp   = "dynamic grouped conv prepare";
 constexpr const char* kAddOp       = "linear dynamic grouped conv add";
 
 // The registered hidden widths: Qwen3.8-27B's drafter and Qwen3.8-Flash-Next's.
-bool registered_hidden(std::int32_t hidden) { return hidden == 5120 || hidden == 2560; }
+// The DFlash2 drafters: Qwen3.8-27B's (5120), Qwen3.8-Flash-Next's (2560), Qwen3.5-122B-A10B's (3072).
+bool registered_hidden(std::int32_t hidden) { return hidden == 5120 || hidden == 2560 || hidden == 3072; }
 std::int32_t groups(std::int32_t hidden) { return hidden / kGroupWidth; }
 std::int32_t coefficient_rows(std::int32_t hidden) { return groups(hidden) * kTaps * kSides; }
 
@@ -126,7 +127,7 @@ void rmsnorm_dynamic_grouped_conv_prepare(const Tensor& residual, const Tensor& 
     const std::int32_t batch_size = residual.ne[2];
     const std::int32_t width      = residual.ne[1];
     if (!registered_hidden(hidden)) {
-        throw std::invalid_argument("dynamic grouped conv prepare: H must be 5120 or 2560");
+        throw std::invalid_argument("dynamic grouped conv prepare: H must be 5120, 2560 or 3072");
     }
     if (width < 2 || width > 16) {
         throw std::invalid_argument("dynamic grouped conv prepare: W must be in [2,16]");
@@ -181,9 +182,10 @@ void linear_dynamic_grouped_conv_add(const Tensor& x, const Weight& projection_w
     if (width < 2 || width > 16)
         throw std::invalid_argument("linear dynamic grouped conv add: W must be in [2,16]");
     if (!(hidden == 5120 && (input_rows == 4096 || input_rows == 17408)) &&
-        !(hidden == 2560 && (input_rows == 4096 || input_rows == 7680))) {
+        !(hidden == 2560 && (input_rows == 4096 || input_rows == 7680)) &&
+        !(hidden == 3072 && (input_rows == 4096 || input_rows == 9216))) {
         throw std::invalid_argument(
-            "linear dynamic grouped conv add: (H, C) must be (5120, 4096|17408) or (2560, 4096|7680)");
+            "linear dynamic grouped conv add: (H, C) must be (5120, 4096|17408), (2560, 4096|7680) or (3072, 4096|9216)");
     }
     if (batch_size < 1 || batch_size > 8) {
         throw std::invalid_argument("linear dynamic grouped conv add: B must be in [1,8]");

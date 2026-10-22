@@ -47,6 +47,22 @@ infernix_add_op_test(infernix_offloaded_moe_ggml_test
 infernix_add_op_test(infernix_offloaded_moe_fp8_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_fp8.cu"
   LIBRARIES infernix_ops)
+# Qwen3.5-122B-A10B's expert geometry (H 3072, I 1024) through the layer route (frames, zero-copy,
+# staged, forked and CPU-served misses; narrow and wide widths) against the exact host expert, bit for
+# bit, and its combine against the FP64 formula.
+infernix_add_op_test(infernix_offloaded_moe_qwen3_5_122b_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_qwen3_5_122b.cu"
+  LIBRARIES infernix_ops)
+# fp8_e4m3fn_row_f32 (Qwen3.5-122B-A10B): the static A8 encoding bit for bit, and the attention, GDN
+# and residual projections against FP64 under A16, static A8 and the column-invariant route.
+infernix_add_op_test(infernix_fp8_row_f32_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_fp8_row_f32.cpp"
+  LIBRARIES infernix_ops)
+# The canonical W4A16 projection of Qwen3.5-122B-A10B's nvfp4_rg16_v1 head (GEMV and integer
+# tensor-core routes, FP32 and BF16 outputs) against the CPU engine's exact row sums, bit for bit.
+infernix_add_op_test(infernix_rg16_linear_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_rg16_linear.cu"
+  LIBRARIES infernix_ops)
 # GGUF block projections against an independent exact oracle (every ggml format, K, width).
 infernix_add_op_test(infernix_ggml_linear_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ggml_linear.cpp"

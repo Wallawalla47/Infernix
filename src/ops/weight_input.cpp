@@ -109,7 +109,28 @@ SingleProjectionWeight single(std::span<const WeightInput> inputs) {
         // Keep that ABI detail out of the artifact's optional Use auxiliaries.
         if (divisor == 0) { divisor = 1.0F; }
     }
-    return {native_weight(view, divisor), policy};
+    auto weight = native_weight(view, divisor);
+    if (region.parent->geometry.format == QType::FP8_E4M3FN_ROW_F32) {
+        // A static A8 parent's inputs share one activation encoding, so one calibrated scale.
+        float scale = 0;
+        for (const auto& input : inputs) {
+            if (!input.activation_input_scale) {
+                require(!allows_a8(policy), "static FP8 A8 input requires an activation scale");
+                continue;
+            }
+            require(std::isfinite(*input.activation_input_scale) && *input.activation_input_scale > 0,
+                    "static FP8 input requires a positive activation scale");
+            if (scale == 0) {
+                scale = *input.activation_input_scale;
+            } else {
+                require(std::bit_cast<std::uint32_t>(scale) ==
+                            std::bit_cast<std::uint32_t>(*input.activation_input_scale),
+                        "fused static FP8 inputs require identical activation scales");
+            }
+        }
+        weight.input_scale = scale;
+    }
+    return {weight, policy};
 }
 
 ProjectionWeights input_projection(std::span<const WeightInput, 4> inputs, bool attention) {
@@ -127,13 +148,20 @@ ProjectionWeights input_projection(std::span<const WeightInput, 4> inputs, bool 
                         k == std::vector<std::uint64_t>{512, 2048} && third == q && fourth == k
                   : q == std::vector<std::uint64_t>{2048, 2048} && k == q &&
                         third == std::vector<std::uint64_t>{4096, 2048} && fourth == third;
-    require(dense || moe, "input projection: unsupported logical projection geometry");
+    // Qwen3.5-122B-A10B: 32 query / 2 key-value heads of 256, 16 key / 64 value GDN heads of 128.
+    const bool moe_122b =
+        attention ? q == std::vector<std::uint64_t>{8192, 3072} &&
+                        k == std::vector<std::uint64_t>{512, 3072} && third == q && fourth == k
+                  : q == std::vector<std::uint64_t>{2048, 3072} && k == q &&
+                        third == std::vector<std::uint64_t>{8192, 3072} && fourth == third;
+    require(dense || moe || moe_122b, "input projection: unsupported logical projection geometry");
     const auto joined = concatenate_rows(inputs);
     if (contiguous(joined)) {
         auto result       = single(inputs);
         const auto format = result.weight.qtype;
         const bool supported =
             (moe && format == QType::Q8_G32_FP16) ||
+            (moe_122b && format == QType::FP8_E4M3FN_ROW_F32) ||
             (dense && (format == QType::NVFP4 || format == QType::FP8_E4M3FN_ROW_BF16 ||
                        (attention && format == QType::BF16)));
         require(supported, "input projection: unsupported single-parent format");
@@ -161,10 +189,10 @@ SingleProjectionWeight prepare_attn_input_proj_weights(const WeightInput& query,
                                                        const WeightInput& key,
                                                        const WeightInput& value) {
     const auto& q = matrix(query);
-    // The 35B-A3B DFlash drafter (H 2048), Qwen3.8-27B's and Qwen3.8-Flash-Next's DFlash2 drafters
-    // (H 5120 and 2560).
+    // The 35B-A3B DFlash drafter (H 2048), Qwen3.8-27B's, Qwen3.8-Flash-Next's and Qwen3.5-122B-A10B's
+    // DFlash2 drafters (H 5120, 2560 and 3072).
     require((q == std::vector<std::uint64_t>{4096, 2048} || q == std::vector<std::uint64_t>{4096, 2560} ||
-             q == std::vector<std::uint64_t>{4096, 5120}) &&
+             q == std::vector<std::uint64_t>{4096, 5120} || q == std::vector<std::uint64_t>{4096, 3072}) &&
                 matrix(key) == std::vector<std::uint64_t>{1024, q[1]} &&
                 matrix(value) == matrix(key),
             "QKV input projection: unsupported logical geometry");
@@ -191,7 +219,8 @@ ProjectionWeights prepare_gdn_input_proj_weights(const WeightInput& query, const
 ProjectionWeights prepare_gdn_gating_proj_weights(const WeightInput& a, const WeightInput& b) {
     const auto& shape = matrix(a);
     require(shape == matrix(b) && (shape == std::vector<std::uint64_t>{48, 5120} ||
-                                   shape == std::vector<std::uint64_t>{32, 2048}),
+                                   shape == std::vector<std::uint64_t>{32, 2048} ||
+                                   shape == std::vector<std::uint64_t>{64, 3072}),
             "GDN control: unsupported A/B geometry");
     const std::array inputs{a, b};
     if (contiguous(concatenate_rows(inputs))) {
@@ -250,6 +279,43 @@ prepare_sparse_moe_weights(const WeightInput& router, const WeightInput& shared_
                   (down_format == QType::Q5_G64_FP16 || down_format == QType::Q6_G64_FP16)) ||
                  (gate_format == QType::Q8_G32_FP16 && down_format == QType::Q8_G32_FP16)),
             "SparseMoe native bank formats are unsupported");
+    return {router_bank.weight, gate_up_bank.weight, down_bank.weight, shared.weight, down.weight};
+}
+
+SparseMoeWeights
+prepare_resident_moe_weights(const WeightInput& router, const WeightInput& shared_score,
+                             std::span<const WeightInput> expert_gate_up,
+                             std::span<const WeightInput> expert_down, const WeightInput& shared_gate,
+                             const WeightInput& shared_up, const WeightInput& shared_down) {
+    require(!expert_down.empty() && expert_gate_up.size() == 2 * expert_down.size(),
+            "resident MoE input pairs every expert's gate and up with its down");
+    const auto& r = matrix(router);
+    require(r.size() == 2 && matrix(shared_score) == std::vector<std::uint64_t>{1, r[1]} &&
+                r[0] == expert_down.size(),
+            "resident MoE router geometry differs");
+    const std::uint64_t h = r[1];
+    const std::uint64_t i = matrix(expert_down.front())[1];
+    for (const auto& input : expert_gate_up) {
+        require(matrix(input) == std::vector<std::uint64_t>{i, h}, "resident MoE gate/up geometry differs");
+    }
+    for (const auto& input : expert_down) {
+        require(matrix(input) == std::vector<std::uint64_t>{h, i}, "resident MoE down geometry differs");
+    }
+    require(matrix(shared_up) == matrix(shared_gate) && matrix(shared_gate)[1] == h &&
+                matrix(shared_down) == std::vector<std::uint64_t>{h, matrix(shared_gate)[0]},
+            "resident MoE shared expert geometry differs");
+    const std::array router_inputs{router, shared_score};
+    const auto router_bank  = single(router_inputs);
+    const auto gate_up_bank = single(expert_gate_up);
+    const auto down_bank    = single(expert_down);
+    const auto shared       = single(std::array{shared_gate, shared_up});
+    const auto down         = prepare_linear_weight(shared_down);
+    const auto codec        = gate_up_bank.weight.qtype;
+    require(router_bank.weight.qtype == QType::BF16 && down_bank.weight.qtype == codec &&
+                gate_up_bank.weight.layout == QuantLayout::RowSplit &&
+                down_bank.weight.layout == QuantLayout::RowSplit &&
+                (codec == QType::Q2_G64_FP16 || codec == QType::Q4_G64_FP16 || codec == QType::Q8_G32_FP16),
+            "resident MoE banks must share one row-split Q2_G64_FP16, Q4_G64_FP16 or Q8_G32_FP16 codec");
     return {router_bank.weight, gate_up_bank.weight, down_bank.weight, shared.weight, down.weight};
 }
 

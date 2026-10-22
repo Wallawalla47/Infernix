@@ -72,7 +72,7 @@ std::vector<std::uint16_t> cpu_column(const fixtures::Expert& e, const std::uint
     const std::uint16_t* xp[1] = {x};
     std::uint16_t* yp[1]       = {y.data()};
     if (activation == moe::ExpertActivation::kA16) {
-        moe::expert_forward_a16(moe::best_cpu_isa(), e.record.data(), e.scales, 1, xp, yp);
+        moe::expert_forward_a16(moe::best_cpu_isa(), moe::kFlashNextShape, e.record.data(), e.scales, 1, xp, yp);
     } else {
         moe::expert_forward(moe::best_cpu_isa(), e.record.data(), e.scales, 1, xp, yp);
     }
@@ -280,7 +280,7 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
     std::uint8_t* d_staging = nullptr;
     cuda_check(cudaMalloc(&d_staging, stride * 64), "cudaMalloc");
     void* d_workspace = nullptr;
-    cuda_check(cudaMalloc(&d_workspace, infernix::ops::moe_experts_workspace_bytes(max_jobs, top_k * columns, columns, activation)),
+    cuda_check(cudaMalloc(&d_workspace, infernix::ops::moe_experts_workspace_bytes(infernix::ops::offloaded_moe::kFlashNextShape, max_jobs, top_k * columns, columns, activation)),
                "cudaMalloc");
     std::uint16_t* d_out = nullptr;
     cuda_check(cudaMalloc(&d_out, expected.size() * sizeof(std::uint16_t)), "cudaMalloc");
@@ -850,7 +850,7 @@ void test_tail_skip(int experts, int columns, int top_k, int rank, std::uint32_t
     std::uint8_t* d_staging = nullptr;
     cuda_check(cudaMalloc(&d_staging, stride * 64), "cudaMalloc");
     void* d_workspace = nullptr;
-    cuda_check(cudaMalloc(&d_workspace, infernix::ops::moe_experts_workspace_bytes(max_jobs, top_k * columns, columns,
+    cuda_check(cudaMalloc(&d_workspace, infernix::ops::moe_experts_workspace_bytes(infernix::ops::offloaded_moe::kFlashNextShape, max_jobs, top_k * columns, columns,
                                                                                    moe::ExpertActivation::kA4)),
                "cudaMalloc");
     std::uint16_t* d_out = nullptr;

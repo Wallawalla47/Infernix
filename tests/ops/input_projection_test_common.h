@@ -157,9 +157,11 @@ inline std::vector<double> gather_rows(const std::vector<double>& full, std::int
     return gathered;
 }
 
-inline std::vector<double>
+// `activation`: the BF16 values (float) or the values a quantized activation represents (double).
+template <class Activation>
+std::vector<double>
 projection_oracle(const quantized_weight::PackedWeight& weight, std::int32_t weight_row_offset,
-                  std::int32_t output_rows, const std::vector<float>& activation,
+                  std::int32_t output_rows, const std::vector<Activation>& activation,
                   std::int32_t hidden, std::int32_t tokens, std::int32_t sample_count = 7) {
     const std::vector<std::int32_t> selected = sampled_rows(output_rows, sample_count);
     const auto rows = static_cast<std::int64_t>(selected.size());
@@ -181,7 +183,7 @@ projection_oracle(const quantized_weight::PackedWeight& weight, std::int32_t wei
             const std::int64_t r     = index / tokens;
             const std::int64_t token = index % tokens;
             const double* row        = decoded.data() + static_cast<std::size_t>(r) * hidden;
-            const float* input       = activation.data() + static_cast<std::size_t>(token) * hidden;
+            const Activation* input  = activation.data() + static_cast<std::size_t>(token) * hidden;
             double sum               = 0.0;
             for (std::int32_t column = 0; column < hidden; ++column)
                 sum += row[column] * static_cast<double>(input[column]);

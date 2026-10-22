@@ -51,6 +51,11 @@ struct SparseMoeHints {
                                                               std::int32_t min_tokens,
                                                               std::int32_t max_tokens);
 
+/// Whether `weights` have the closed Op's 35B-A3B geometry (H 2048; 256 experts of I 512; shared
+/// expert 512). Other geometries (the Qwen3.5-122B-A10B drafter's) compose the model's MoE from
+/// projection_fp32, moe_route, resident_moe_experts and moe_combine.
+[[nodiscard]] bool sparse_moe_geometry(const SparseMoeWeights& weights) noexcept;
+
 /// The same query for the weights' policy (SparseMoeWeights::policy).
 [[nodiscard]] std::size_t sparse_moe_workspace_capacity_bytes(QType routed_gate_up,
                                                               QType routed_down,

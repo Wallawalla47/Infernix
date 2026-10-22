@@ -12,7 +12,6 @@
 
 namespace infernix::ops::detail {
 namespace {
-constexpr int kLayers  = static_cast<int>(kContextKVMaterializeLayers);
 constexpr int kRows    = 1024;
 constexpr int kHeadDim = 128;
 
@@ -32,7 +31,8 @@ struct DeviceLayerView {
 };
 
 struct DeviceLayers {
-    DeviceLayerView layer[kContextKVMaterializeLayers];
+    DeviceLayerView layer[kContextKVMaterializeMaxLayers];
+    int count; // the drafter's layers: the grid's layer extent (K and V per layer)
     // The rotation's inverse frequencies theta^(-2j/128), j < 64.
     double inv_frequency[64];
 };
@@ -321,7 +321,7 @@ void launch_mma(const Tensor& x, const Tensor& positions, const Tensor& counts, 
         CUDA_CHECK(cudaFuncSetAttribute(context_kv_mma_kernel<Hidden, Rows, Columns, BlockK, ColumnWarps>,
                                         cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
     context_kv_mma_kernel<Hidden, Rows, Columns, BlockK, ColumnWarps>
-        <<<dim3(1024 / Rows, (envelope.max_count * x.ne[2] + Columns - 1) / Columns, 10),
+        <<<dim3(1024 / Rows, (envelope.max_count * x.ne[2] + Columns - 1) / Columns, 2 * layers.count),
            Rows / 16 * ColumnWarps * 32, bytes, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data), static_cast<const int*>(positions.data),
             static_cast<const int*>(counts.data), static_cast<const int*>(slots.data), layers,
@@ -407,7 +407,7 @@ void launch_grouped(const Tensor& x, const Tensor& positions, const Tensor& coun
     const int shared =
         q8_prepare_shared<GroupedSchedule<Hidden, Columns, KWarps>::kSharedBytes, kernel>();
     CUDA_CHECK(pdl::launch_consumer(
-        {dim3(64, (envelope.max_count * x.ne[2] + Columns - 1) / Columns, 10), dim3(KWarps * 32),
+        {dim3(64, (envelope.max_count * x.ne[2] + Columns - 1) / Columns, 2 * layers.count), dim3(KWarps * 32),
          static_cast<std::size_t>(shared), stream},
         kernel, static_cast<const __nv_bfloat16*>(x.data), static_cast<const int*>(positions.data),
         static_cast<const int*>(counts.data), static_cast<const int*>(slots.data), layers,
@@ -436,12 +436,15 @@ __global__ __launch_bounds__(256) void context_kv_key_post_kernel(
     store_key_head(input, layers, layer, positions, state_slots, physical_column, width, head);
 }
 
-DeviceLayers make_device_layers(
-    const std::array<ContextKVMaterializeLayerView, kContextKVMaterializeLayers>& layers,
-    const std::array<double, 64>& inv_frequency) {
+DeviceLayers make_device_layers(std::span<const ContextKVMaterializeLayerView> layers,
+                                const std::array<double, 64>& inv_frequency) {
+    if (layers.size() > kContextKVMaterializeMaxLayers) {
+        throw std::invalid_argument("context_kv_materialize: too many layers");
+    }
     DeviceLayers result{};
+    result.count = static_cast<int>(layers.size());
     for (int pair = 0; pair < 64; ++pair) { result.inv_frequency[pair] = inv_frequency[pair]; }
-    for (int index = 0; index < kLayers; ++index) {
+    for (int index = 0; index < result.count; ++index) {
         const ContextKVMaterializeLayerView& source = layers[static_cast<std::size_t>(index)];
         result.layer[index]                         = {
             static_cast<const std::uint8_t*>(source.key_weight.qdata),
@@ -502,20 +505,20 @@ bool launch_projection(const Tensor& context, const Tensor& positions, const Ten
 
 void context_kv_materialize_launch(
     const Tensor& context, const Tensor& positions, const Tensor& counts, const Tensor& state_slots,
-    const std::array<ContextKVMaterializeLayerView, kContextKVMaterializeLayers>& layers,
+    std::span<const ContextKVMaterializeLayerView> layers,
     const std::array<double, 64>& inv_frequency, ContextKVMaterializeExecutionEnvelope envelope,
     ContextKVMaterializeRoute route, const Tensor& key_scratch, cudaStream_t stream) {
     const DeviceLayers device_layers = make_device_layers(layers, inv_frequency);
-    const bool post = context.ne[0] == 5120
-                          ? launch_projection<5120>(context, positions, counts, state_slots,
-                                                    device_layers, envelope, route, key_scratch,
-                                                    stream)
-                          : launch_projection<2560>(context, positions, counts, state_slots,
-                                                    device_layers, envelope, route, key_scratch,
-                                                    stream);
+    const auto project = [&]<int H>() {
+        return launch_projection<H>(context, positions, counts, state_slots, device_layers, envelope, route,
+                                    key_scratch, stream);
+    };
+    const bool post = context.ne[0] == 5120   ? project.template operator()<5120>()
+                      : context.ne[0] == 3072 ? project.template operator()<3072>()
+                                              : project.template operator()<2560>();
     if (!post) { return; }
     CUDA_CHECK(pdl::launch_consumer(
-        {dim3(envelope.max_count * context.ne[2], kLayers), dim3(256), 0, stream},
+        {dim3(envelope.max_count * context.ne[2], device_layers.count), dim3(256), 0, stream},
         context_kv_key_post_kernel, static_cast<const float*>(key_scratch.data),
         static_cast<const int*>(positions.data), static_cast<const int*>(counts.data),
         static_cast<const int*>(state_slots.data), device_layers, context.ne[2], context.ne[1],

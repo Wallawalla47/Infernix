@@ -10,6 +10,7 @@
 #include "ops/lossless/wide.cuh"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
@@ -278,7 +279,7 @@ __device__ __forceinline__ WeightView tile_view(const WeightView& w, const Lossl
     return v;
 }
 
-enum class Factor { None, RowScale, Divisor, Multiplier };
+enum class Factor { None, RowScale, RowScaleF32, Divisor, Multiplier };
 
 // An FP16 scale as m_s 2^(e_s - 25): signed integer significand and exponent field (subnormals e_s = 1).
 __device__ __forceinline__ void fp16_parts(std::uint16_t bits, int& m, int& e) {
@@ -460,7 +461,8 @@ __device__ __forceinline__ void fp8_digits16(const std::uint8_t* src, std::int8_
 }
 
 // Row-scaled FP8: the E4M3 value times 2^9 as three balanced base-128 digits, no group scale, the sum
-// multiplied by the row's BF16 scale.
+// multiplied by the row's BF16 scale (fp8_e4m3fn_row_bf16) or, in Fp8RowF32Format, its FP32 multiplier
+// (fp8_e4m3fn_row_f32: ModelOpt's per-tensor weight_scale in every row).
 struct Fp8RowFormat {
     static constexpr int kPlanes   = 3;
     static constexpr int kGroup    = 64;
@@ -487,6 +489,10 @@ struct Fp8RowFormat {
         W    = e4m3_integer(w.codes[static_cast<std::size_t>(row) * w.row_bytes + k]);
         wexp = -9;
     }
+};
+
+struct Fp8RowF32Format : Fp8RowFormat {
+    static constexpr Factor kFactor = Factor::RowScaleF32;
 };
 
 // MXFP8 (g32_scale_rows16_v1): W = E4M3 value 2^9, the 32-element group's UE8M0 scale 2^(e8 - 127), so
@@ -803,13 +809,19 @@ static __global__ void bf16_weight_scan_kernel(const std::uint16_t* w, int k, in
 }
 
 // The per-row factor as an integer and a power of two (RowScale: the BF16 scale m 2^(e - 134);
-// Divisor: the FP32 divisor m 2^(e - 150); Multiplier: the FP32 multiplier of the row's parity, its sign
-// in negative).
+// RowScaleF32: the row's FP32 multiplier m 2^(e - 150), its sign in negative; Divisor: the FP32 divisor
+// m 2^(e - 150); Multiplier: the FP32 multiplier of the row's parity, its sign in negative).
 template <class F>
 __device__ __forceinline__ void row_factor(const WeightView& w, int row, std::uint32_t& m, int& e, bool& negative) {
     negative = false;
     if constexpr (F::kFactor == Factor::Multiplier) {
         const std::uint32_t bits = w.alpha[row & 1];
+        const int field = static_cast<int>((bits >> 23) & 0xFF), mantissa = static_cast<int>(bits & 0x7FFFFF);
+        m        = static_cast<std::uint32_t>(field == 0 ? mantissa : ((1 << 23) | mantissa));
+        e        = (field == 0 ? 1 : field) - 150;
+        negative = (bits >> 31) != 0;
+    } else if constexpr (F::kFactor == Factor::RowScaleF32) {
+        const std::uint32_t bits = static_cast<const std::uint32_t*>(w.scales)[row];
         const int field = static_cast<int>((bits >> 23) & 0xFF), mantissa = static_cast<int>(bits & 0x7FFFFF);
         m        = static_cast<std::uint32_t>(field == 0 ? mantissa : ((1 << 23) | mantissa));
         e        = (field == 0 ? 1 : field) - 150;
@@ -842,7 +854,8 @@ __device__ std::uint32_t round_with_factor(const std::uint32_t (&mag)[Words], in
         int fe           = 0;
         bool fneg        = false;
         row_factor<F>(w, row, fm, fe, fneg);
-        if constexpr (F::kFactor == Factor::RowScale || F::kFactor == Factor::Multiplier) {
+        if constexpr (F::kFactor == Factor::RowScale || F::kFactor == Factor::RowScaleF32 ||
+                      F::kFactor == Factor::Multiplier) {
             std::uint32_t prod[Words + 1];
             unsigned long long carry = 0;
             bool zero                = true;
@@ -906,7 +919,8 @@ __device__ std::uint32_t round_scaled(const std::uint32_t (&mag)[Words], int uni
     int fe           = 0;
     bool fneg        = false;
     row_factor<F>(w, row, fm, fe, fneg);
-    if constexpr (F::kFactor == Factor::RowScale || F::kFactor == Factor::Multiplier) {
+    if constexpr (F::kFactor == Factor::RowScale || F::kFactor == Factor::RowScaleF32 ||
+                  F::kFactor == Factor::Multiplier) {
         multiply_small(q, fm);
         e += fe;
         neg = neg != fneg;
@@ -1557,7 +1571,7 @@ void launch_chunk(const Call& c, std::int32_t first, std::int32_t columns, std::
     }
 }
 
-enum class Route { None, Q2, Q4, Q5, Q6, Q8, Nvfp4, Fp8Row, Bf16, Mxfp8, Ggml, Rg16, Fp8B128 };
+enum class Route { None, Q2, Q4, Q5, Q6, Q8, Nvfp4, Fp8Row, Fp8RowF32, Bf16, Mxfp8, Ggml, Rg16, Fp8B128 };
 
 // The GGUF formats' launches (lossless_linear_ggml_k.cu: the K-quants and IQ4; lossless_linear_ggml_i.cu:
 // IQ2/IQ3 and Q2_0).
@@ -1595,6 +1609,13 @@ inline Route route_of(const Weight& w) noexcept {
                    ? Route::Nvfp4
                    : Route::None;
     case QType::FP8_E4M3FN_ROW_BF16: return w.layout == QuantLayout::RowScale ? Route::Fp8Row : Route::None;
+    case QType::FP8_E4M3FN_ROW_F32: return w.layout == QuantLayout::RowScale ? Route::Fp8RowF32 : Route::None;
+    // A dense nvfp4_rg16_v1 matrix (the Qwen3.5 NVFP4 head): the expert record's matrix layout, one
+    // FP32 multiplier for every row.
+    case QType::NVFP4_MUL:
+        return w.layout == QuantLayout::Rg16 && w.n % 16 == 0 && w.k % 64 == 0 && std::isfinite(w.weight_multiplier)
+                   ? Route::Rg16
+                   : Route::None;
     case QType::BF16: return w.layout == QuantLayout::Contiguous ? Route::Bf16 : Route::None;
     case QType::FP8_E4M3FN_G32_E8M0:
         return w.layout == QuantLayout::G32ScaleRows16 && w.k % 32 == 0 ? Route::Mxfp8 : Route::None;
@@ -1620,7 +1641,15 @@ inline WeightView view_of(const Weight& weight, Route route) {
         std::memcpy(&v.divisor, &weight.weight_scale_divisor, sizeof(v.divisor));
         break;
     }
-    case Route::Fp8Row: v.row_bytes = weight.k; v.groups = 1; break;
+    case Route::Fp8Row:
+    case Route::Fp8RowF32: v.row_bytes = weight.k; v.groups = 1; break;
+    case Route::Rg16: {
+        v.groups = weight.k / 16;
+        std::uint32_t bits = 0;
+        std::memcpy(&bits, &weight.weight_multiplier, sizeof(bits));
+        v.alpha[0] = v.alpha[1] = bits;
+        break;
+    }
     case Route::Mxfp8: v.row_bytes = weight.k; break;
     case Route::Ggml:
         v.row_bytes = static_cast<int>(ggml_row_bytes(weight.qtype, weight.k));

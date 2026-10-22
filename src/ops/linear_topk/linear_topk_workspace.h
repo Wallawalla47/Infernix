@@ -17,6 +17,7 @@ inline constexpr std::int32_t kLinearTopKFullValidRows   = 248077;
 inline constexpr std::int32_t kLinearTopKOptimizedRows   = 131072;
 inline constexpr std::int32_t kLinearTopKHidden          = 5120;
 inline constexpr std::int32_t kLinearTopKFlashNextHidden = 2560;
+inline constexpr std::int32_t kLinearTopK122BHidden      = 3072;
 
 struct LinearTopKWorkspace {
     std::int32_t tile_columns = 0;

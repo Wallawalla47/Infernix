@@ -1,6 +1,6 @@
 // resident_moe_experts (the MTP drafter's device-resident experts) against the FP64 formula over
 // the exactly decoded Q2_G64_FP16, Q4_G64_FP16 and Q8_G32_FP16 banks, at the Qwen4Exp drafter's shapes
-// (H = 2560, I = 640, top-10). Criterion: the BF16 output rounding plus the FP32 accumulation of
+// (H = 2560, I = 640, top-10) and the Qwen3.5-122B-A10B drafter's (H = 3072, I = 1024, top-8). Criterion: the BF16 output rounding plus the FP32 accumulation of
 // both projections (h is FP32), sum |D h| * (I + H) * 2^-23 for the accumulation part.
 #include "infernix/ops/resident_moe.h"
 #include "ops/linear/linear_test_common.h"
@@ -82,8 +82,17 @@ struct Decoder {
     }
 };
 
-void run_case(QType qtype, std::int32_t experts, std::int32_t columns, std::uint32_t seed) {
-    constexpr std::int32_t H = 2560, I = 640, K = 10;
+// A drafter's expert geometry: Qwen3.8-Flash-Next's (H 2560, I 640, top-10) or Qwen3.5-122B-A10B's
+// (H 3072, I 1024, top-8).
+struct Shape {
+    std::int32_t hidden, intermediate, top_k;
+};
+constexpr Shape kFlashNext{2560, 640, 10};
+constexpr Shape kQwen3_5_122B{3072, 1024, 8};
+
+void run_case(QType qtype, std::int32_t experts, std::int32_t columns, std::uint32_t seed,
+              Shape shape = kFlashNext) {
+    const std::int32_t H = shape.hidden, I = shape.intermediate, K = shape.top_k;
     const auto gate_up = qw::make_patterned_weight(qtype, experts * 2 * I, H, seed,
                                                    {qw::RowSplitScalePattern::Small, qw::RowSplitCodePattern::Hashed});
     const auto down    = qw::make_patterned_weight(qtype, experts * H, I, seed + 1,
@@ -155,7 +164,8 @@ void run_case(QType qtype, std::int32_t experts, std::int32_t columns, std::uint
         }
     }
     const std::string tag = std::string(qtype == QType::Q8_G32_FP16 ? "q8" : qtype == QType::Q2_G64_FP16 ? "q2" : "q4") +
-                            " E=" + std::to_string(experts) + " T=" + std::to_string(columns);
+                            " H=" + std::to_string(H) + " I=" + std::to_string(I) + " E=" + std::to_string(experts) +
+                            " T=" + std::to_string(columns);
     std::cout << tag << ": worst error " << worst << " of the bound, " << bad << " outside\n";
     check(bad == 0, tag + " within the bound");
     cudaFree(gu_payload);
@@ -179,6 +189,10 @@ int main() {
         run_case(QType::Q8_G32_FP16, 11, 2, 9);
         run_case(QType::Q2_G64_FP16, 12, 1, 11);
         run_case(QType::Q2_G64_FP16, 10, 3, 13);
+        // The Qwen3.5-122B-A10B drafter: Q4 banks (grouped_mse), decode and an MTP verify width.
+        run_case(QType::Q4_G64_FP16, 10, 1, 15, kQwen3_5_122B);
+        run_case(QType::Q4_G64_FP16, 12, 4, 17, kQwen3_5_122B);
+        run_case(QType::Q8_G32_FP16, 9, 2, 19, kQwen3_5_122B);
     } catch (const std::exception& e) {
         std::cerr << "FAIL: " << e.what() << "\n";
         return 1;

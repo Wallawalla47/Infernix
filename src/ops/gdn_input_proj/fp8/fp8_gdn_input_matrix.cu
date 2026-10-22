@@ -40,8 +40,8 @@ void launch_gemm(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
 
 } // namespace
 
-void fp8_gdn_input_invariant_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
-                                    cudaStream_t stream) {
+void fp8_gdn_input_n16384_invariant_launch(const Tensor& x, const Weight& weight, Tensor& qkv,
+                                           Tensor& z, cudaStream_t stream) {
     // The tiles run 4 K-warps over the same K slices and reduce them in the same order, and the
     // MMA's columns are independent; wider calls run as 64-column slices.
     const Fp8GdnInputOutput output{static_cast<__nv_bfloat16*>(qkv.data),

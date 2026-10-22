@@ -217,7 +217,7 @@ void run(QType gu, QType down, int columns, std::mt19937& rng, Spread spread = S
     std::uint8_t* d_staging = nullptr;
     cuda_check(cudaMalloc(&d_staging, pitch * 64), "cudaMalloc");
     void* d_workspace = nullptr;
-    cuda_check(cudaMalloc(&d_workspace, infernix::ops::moe_experts_workspace_bytes(max_jobs, top_k * columns, columns,
+    cuda_check(cudaMalloc(&d_workspace, infernix::ops::moe_experts_workspace_bytes(infernix::ops::offloaded_moe::kFlashNextShape, max_jobs, top_k * columns, columns,
                                                                                   moe::ExpertActivation::kA16)),
                "cudaMalloc");
     std::vector<moe::ExpertScales> scales(experts);
@@ -419,7 +419,7 @@ void run_bf16(QType gu, QType down, int columns, std::mt19937& rng) {
     std::uint8_t* d_staging = nullptr;
     cuda_check(cudaMalloc(&d_staging, stride * 64), "cudaMalloc");
     void* d_workspace = nullptr;
-    cuda_check(cudaMalloc(&d_workspace, infernix::ops::moe_experts_workspace_bytes(max_jobs, top_k * columns, columns,
+    cuda_check(cudaMalloc(&d_workspace, infernix::ops::moe_experts_workspace_bytes(infernix::ops::offloaded_moe::kFlashNextShape, max_jobs, top_k * columns, columns,
                                                                                   moe::ExpertActivation::kA16,
                                                                                   moe::WideA16::kGgmlBf16)),
                "cudaMalloc");
@@ -567,7 +567,7 @@ void bench(QType gu, QType down, int columns, std::mt19937& rng, moe::WideA16 ro
     }
     auto* d_x = device_copy(x);
     void* d_workspace = nullptr;
-    cuda_check(cudaMalloc(&d_workspace, infernix::ops::moe_experts_workspace_bytes(experts, top_k * columns, columns,
+    cuda_check(cudaMalloc(&d_workspace, infernix::ops::moe_experts_workspace_bytes(infernix::ops::offloaded_moe::kFlashNextShape, experts, top_k * columns, columns,
                                                                                   moe::ExpertActivation::kA16, route)),
                "cudaMalloc");
     std::vector<moe::ExpertScales> scales(experts);

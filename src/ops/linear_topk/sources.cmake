@@ -6,5 +6,6 @@ target_sources(infernix_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/fp8_m64.cu"
   "${CMAKE_CURRENT_LIST_DIR}/q4.cu"
   "${CMAKE_CURRENT_LIST_DIR}/q4_m64.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/nvfp4.cu"
   "${CMAKE_CURRENT_LIST_DIR}/merge.cu"
 )

@@ -43,11 +43,13 @@ inline constexpr std::uint32_t kVqWideTileMaxKeys = 32768;
 // which is worth 7-11 % on vq2 where a block already has the SM to itself (the sixteen-column CTA,
 // measured at 2-8K keys: W=16 takes 1.71x INT8 against 1.89x at 32 keys, B=1). It is not worth it
 // anywhere else: an eight-column block loses its second CTA per SM to the extra shared memory and
-// slows by 13-44 %, and single-token decode would lose it too. So 64 keys need Tokens > 8, and must
-// fit one block: k4v2's 130-byte K rows never do at that width, so it keeps 32 everywhere.
+// slows by 13-44 %, and single-token decode would lose it too. So 64 keys need the sixteen-warp CTA
+// (above 64 query rows), and must fit one block: k4v2's 130-byte K rows never do at that width, so
+// it keeps 32 everywhere.
 template <class Geometry, int Tokens, KVCacheVqKeyCodec Codec>
 inline constexpr int kVqGroupedKeyRows =
-    Tokens > 8 && vq_kv_grouped_smem_bytes<Codec, 64, Tokens, Geometry::GroupSize>() <=
+    kVqGroupedWarps<Geometry, Tokens> == 16 &&
+            vq_kv_grouped_smem_bytes<Codec, 64, Tokens, Geometry::GroupSize>() <=
                       kVqGroupedSmemLimit
         ? 64
         : 32;
@@ -55,7 +57,7 @@ inline constexpr int kVqGroupedKeyRows =
 struct VqKvCausalPlan {
     Int8KvCausalPlan plan;
     int window_splits = 0;
-    int parallel_tile = 8;
+    int parallel_tile = 8; // kCausalGroupedTokens or kVqParallelTile of the geometry
     // The prompt route's split plan and its FP32 partials must use the workspace bound the
     // planning call was given (CausalAttentionExecutionEnvelope::prompt_split_workspace_bytes),
     // so the plan carries it to the launch.
@@ -75,11 +77,12 @@ VqKvCausalPlan make_vq_kv_causal_plan(int heads, int width, int batch,
     out.prompt_pv8                   = envelope.fast_prompt_pv8;
     if (out.plan.family == Int8KvFamily::Tiled) return out;
     const bool parallel = out.plan.family == Int8KvFamily::ParallelGrouped;
-    out.parallel_tile   = envelope.max_visible_keys <= kVqWideTileMaxKeys ? kVqParallelTile : 8;
-    const bool wide     = parallel && out.parallel_tile == kVqParallelTile;
+    const int narrow    = causal_grouped_tokens(heads);
+    out.parallel_tile   = envelope.max_visible_keys <= kVqWideTileMaxKeys ? 2 * narrow : narrow;
+    const bool wide     = parallel && out.parallel_tile == 2 * narrow;
     const int tiles       = parallel ? div_up(width, out.parallel_tile) : 1;
     const int independent =
-        (envelope.row_invariant_partition ? 1 : batch) * (heads == 24 ? 4 : 2) * tiles;
+        (envelope.row_invariant_partition ? 1 : batch) * causal_kv_heads(heads) * tiles;
     const int ctas =
         std::max(2, (wide ? 1 : 2) * fast_prompt_multiprocessors() / independent);
     out.window_splits     = std::clamp(ctas / 8, 1, kVqMaxWindowSplits);
@@ -96,7 +99,7 @@ void grouped(const CausalAttentionOperands& p, const VqKvCacheView& cache,
              CausalKvPartition partition, int window_splits, CausalPartialView partial,
              cudaStream_t stream) {
     using Shape            = VqKvGroupedShape<Codec, kVqGroupedKeyRows<G, Tokens, Codec>>;
-    constexpr int kThreads = kVqGroupedWarps<Tokens> * 32;
+    constexpr int kThreads = kVqGroupedWarps<G, Tokens> * 32;
     validate_vq_causal_operands<G>(p, cache);
     if ((!Parallel && p.width != Tokens) || MultiBatch != (p.batch > 1) ||
         Masked != (cache.valid_columns != nullptr) || partition.capacity < 1 ||
@@ -164,16 +167,19 @@ void grouped_routes(const CausalAttentionOperands& p, const VqKvCacheView& cache
         }
     };
     if (vq.plan.family == Int8KvFamily::ParallelGrouped) {
-        if (vq.parallel_tile == kVqParallelTile)
-            batch.template operator()<kVqParallelTile, true>();
+        if (vq.parallel_tile == kVqParallelTile<G>)
+            batch.template operator()<kVqParallelTile<G>, true>();
         else
-            batch.template operator()<8, true>();
+            batch.template operator()<kCausalGroupedTokens<G>, true>();
         return;
     }
     switch (p.width) {
 #define INFERNIX_VQ_GROUPED(T)                                                                       \
     case T:                                                                                        \
-        return batch.template operator()<T, false>()
+        if constexpr (T <= kCausalGroupedTokens<G>) {                                          \
+            return batch.template operator()<T, false>();                                      \
+        }                                                                                      \
+        break
         INFERNIX_VQ_GROUPED(1);
         INFERNIX_VQ_GROUPED(2);
         INFERNIX_VQ_GROUPED(3);
@@ -273,22 +279,19 @@ void attention(const CausalAttentionOperands& p, const VqKvCacheView& cache,
                WorkspaceArena& workspace, cudaStream_t stream) {
     const Int8KvCausalPlan& plan = vq.plan;
     if (plan.family == Int8KvFamily::Tiled) {
-        if (p.query_heads == 24)
-            prompt<CausalD256H24Kv4, Codec>(p, cache, staging, vq.prompt_split_workspace_bytes,
-                                            vq.prompt_pv8, workspace, stream);
-        else
-            prompt<CausalD256H16Kv2, Codec>(p, cache, staging, vq.prompt_split_workspace_bytes,
-                                            vq.prompt_pv8, workspace, stream);
+        with_causal_geometry(p.query_heads, [&]<class G>() {
+            prompt<G, Codec>(p, cache, staging, vq.prompt_split_workspace_bytes, vq.prompt_pv8, workspace,
+                             stream);
+        });
         return;
     }
     auto scope         = workspace.scope();
     const auto partial = allocate_causal_partials(workspace, plan.query_heads, plan.width,
                                                   vq.window_splits + plan.partition.capacity,
                                                   plan.batch);
-    if (p.query_heads == 24)
-        grouped_routes<CausalD256H24Kv4, Codec>(p, cache, vq, partial.view(), stream);
-    else
-        grouped_routes<CausalD256H16Kv2, Codec>(p, cache, vq, partial.view(), stream);
+    with_causal_geometry(p.query_heads, [&]<class G>() {
+        grouped_routes<G, Codec>(p, cache, vq, partial.view(), stream);
+    });
 }
 
 void dispatch(KvCacheStorage storage, const CausalAttentionOperands& p, const VqKvCacheView& cache,

@@ -65,6 +65,9 @@ void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& valu
  * - NVFP4 BlockScaleK16M128x4 [16384,5120], with stored row counts [2048,2048,6144,6144].
  * - FP8_E4M3FN_ROW_BF16 RowScale [16384,5120], with stored row counts
  *   [2048,2048,6144,6144].
+ * - FP8_E4M3FN_ROW_F32 RowScale [20480,3072] (Qwen3.5-122B-A10B: FP32 row multipliers and one
+ *   static activation scale s), with stored row counts [2048,2048,8192,8192]. Its A8 route
+ *   encodes x as e4m3_rn_satfinite(fl32(x * fl32(1 / s))); it has no A8 residual route.
  *
  * The first three ranges are written contiguously to qkv and the final range is written to z.
  * Q8 uses A16 under every policy. Under A16ColumnInvariant a column's outputs do not depend on the
@@ -194,9 +197,9 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
 
 /**
  * Single-parent form of gdn_input_proj_conv_snapshot. Registered parents are Q8_G32_FP16 RowSplit
- * [12288,2048], NVFP4 BlockScaleK16M128x4 [16384,5120], and FP8_E4M3FN_ROW_BF16 RowScale
- * [16384,5120], all in q/k/value/z row order. All policies permit Q8 A16. NVFP4 uses A16
- * under A16Only/AllowA8; AllowA4 may use A4. FP8 may use A8 under AllowA8/AllowA4. B=1 accepts
+ * [12288,2048], NVFP4 BlockScaleK16M128x4 [16384,5120], FP8_E4M3FN_ROW_BF16 RowScale
+ * [16384,5120] and FP8_E4M3FN_ROW_F32 RowScale [20480,3072], all in q/k/value/z row order. All
+ * policies permit Q8 A16. NVFP4 uses A16 under A16Only/AllowA8; AllowA4 may use A4. FP8 may use A8 under AllowA8/AllowA4. B=1 accepts
  * every positive W for FP8; the batched domain is B=2..8 and W=1..64. Tensor operands, the complete
  * FP8 parent, and live workspace must be mutually non-overlapping, except that the read-only
  * initial_state_slots and snapshot_base_slots selectors may alias each other; same-row state-slot
@@ -310,10 +313,10 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
 
 /**
  * Single-parent record-producing form. Registered parents are Q8_G32_FP16 [12288,2048], NVFP4
- * [16384,5120], and FP8_E4M3FN_ROW_BF16 [16384,5120]. All policies permit Q8 A16; NVFP4
- * uses A16 under A16Only/AllowA8 and may use A4 under AllowA4. FP8 may use A8 under
- * AllowA8/AllowA4. Record and snapshot share arithmetic route selection. Every tensor operand, the
- * complete FP8 parent, and live workspace must be mutually non-overlapping.
+ * [16384,5120], FP8_E4M3FN_ROW_BF16 [16384,5120] and FP8_E4M3FN_ROW_F32 [20480,3072]. All
+ * policies permit Q8 A16; NVFP4 uses A16 under A16Only/AllowA8 and may use A4 under AllowA4. FP8
+ * may use A8 under AllowA8/AllowA4. Record and snapshot share arithmetic route selection. Every
+ * tensor operand, the complete FP8 parent, and live workspace must be mutually non-overlapping.
  */
 void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z_weight,
                                 const Tensor& conv_weight, const Tensor& conv_states,

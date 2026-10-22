@@ -13,6 +13,8 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <stdexcept>
 
@@ -87,6 +89,53 @@ __global__ __launch_bounds__(Threads,
     if (tid == 0) { scales[token] = scale; }
 }
 
+// A static A8 parent (fp8_e4m3fn_row_f32) encodes with its calibrated input scale s:
+// c = e4m3_rn_satfinite(fl32(x * r)), r = fl32(1 / s), and every token's scale is s. Each thread
+// encodes eight consecutive values of the [T, K] row-major input.
+__global__ __launch_bounds__(256) void fp8_a8_static_quantize_kernel(
+    const __nv_bfloat16* __restrict__ input, std::uint8_t* __restrict__ codes,
+    float* __restrict__ scales, float scale, float inverse, std::int64_t octets, int tokens) {
+    pdl::enter();
+    const std::int64_t index =
+        static_cast<std::int64_t>(blockIdx.x) * blockDim.x + static_cast<std::int64_t>(threadIdx.x);
+    if (index < tokens) { scales[index] = scale; }
+    if (index >= octets) { return; }
+    const uint4 words = __ldg(reinterpret_cast<const uint4*>(input) + index);
+    const std::uint32_t pairs[4]{words.x, words.y, words.z, words.w};
+    std::uint16_t out[4];
+#pragma unroll
+    for (int pair = 0; pair < 4; ++pair) {
+        const float2 value = bf16x2_bits_to_float2(pairs[pair]);
+        out[pair]          = __nv_cvt_float2_to_fp8x2(
+            make_float2(__fmul_rn(value.x, inverse), __fmul_rn(value.y, inverse)), __NV_SATFINITE,
+            __NV_E4M3);
+    }
+    reinterpret_cast<uint2*>(codes)[index] =
+        make_uint2(static_cast<std::uint32_t>(out[0]) | (static_cast<std::uint32_t>(out[1]) << 16),
+                   static_cast<std::uint32_t>(out[2]) | (static_cast<std::uint32_t>(out[3]) << 16));
+}
+
+void launch_quantize_static(const Tensor& x, const Weight& weight, Fp8A8Workspace workspace,
+                            cudaStream_t stream) {
+    if (workspace.residual != nullptr) {
+        throw std::invalid_argument("fp8 A8 quantize: a static input scale has no residual profile");
+    }
+    if (weight.k % 8 || reinterpret_cast<std::uintptr_t>(x.data) % 16 ||
+        reinterpret_cast<std::uintptr_t>(workspace.codes) % 8) {
+        throw std::invalid_argument("fp8 A8 static quantize requires K % 8 and aligned buffers");
+    }
+    constexpr int kThreads    = 256;
+    const int tokens          = static_cast<int>(x.ne[1]);
+    const std::int64_t octets = static_cast<std::int64_t>(tokens) * weight.k / 8;
+    const std::int64_t items  = std::max<std::int64_t>(octets, tokens);
+    const float scale         = weight.input_scale;
+    const float inverse       = 1.0F / scale;
+    CUDA_CHECK(pdl::launch_consumer(
+        {dim3(static_cast<unsigned>((items + kThreads - 1) / kThreads)), dim3(kThreads), 0, stream},
+        fp8_a8_static_quantize_kernel, static_cast<const __nv_bfloat16*>(x.data), workspace.codes,
+        workspace.scales, scale, inverse, octets, tokens));
+}
+
 template <class ActivationGeometry>
 void launch_quantize_exact(const Tensor& x, Fp8A8Workspace workspace, cudaStream_t stream) {
     constexpr int kThreads = 256;
@@ -102,6 +151,13 @@ void launch_fp8_a8_quantize(const Tensor& x, const Weight& weight, Fp8A8Workspac
                             cudaStream_t stream) {
     if (workspace.codes == nullptr || workspace.scales == nullptr) {
         throw std::invalid_argument("fp8 A8 requires caller workspace");
+    }
+    if (weight.qtype == QType::FP8_E4M3FN_ROW_F32) {
+        if (!(weight.input_scale > 0.0F) || !std::isfinite(weight.input_scale)) {
+            throw std::invalid_argument("fp8 A8 quantize: static parent requires its input scale");
+        }
+        launch_quantize_static(x, weight, workspace, stream);
+        return;
     }
     switch (weight.k) {
     case Fp8Activation5120Geometry::kInputRows:

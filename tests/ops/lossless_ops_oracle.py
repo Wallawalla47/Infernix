@@ -24,7 +24,7 @@ import lossless_cr_oracle as cr  # noqa: E402
  MOE_COMBINE, MOE_ROUTE, RMSNORM_GROUPED, RMSNORM_GATED_SIGMOID, HC_GATES, HC_MIX, HC_INJECT, PLE_GATE, PLE_CONV,
  QSA_POOL, QSA_SELECT, ATTENTION_SELECT, ROUTER_BF16, MOE_COMBINE_ENTRIES, CONV_SLOTS, DELTA_RULE_SLOTS, ATTENTION_PAGED,
  PLE_CONV_SLOTS, QSA_CACHE, QSA_SELECT_POSITIONS, ATTENTION_PAGED_SELECT, QUANTIZE_NVFP4, QUANTIZE_NVFP4_SCALED,
- QUANTIZE_FP8_TOKEN, ROUND_FP16) = range(36)
+ QUANTIZE_FP8_TOKEN, ROUND_FP16, QUANTIZE_FP8_STATIC) = range(37)
 
 
 def bf16_value(bits: int) -> Fraction:
@@ -978,6 +978,16 @@ def fp8_token_column(xs: list[int]) -> tuple[list[int], int]:
     return out, round_fraction(s, 24)
 
 
+def fp8_static_values(xs: list[int], s: Fraction) -> list[int]:
+    """fp8_a8's static rule with the input scale s: the E4M3 values (BF16 bits) of fl32(v fl32(1 / s))."""
+    inv = f32_of(1 / s)
+    out = []
+    for x in xs:
+        scaled = f32_of(bf16_value(x) * inv)
+        out.append(bf16_signed(e4m3_magnitude(abs(scaled)), (x >> 15) != 0))
+    return out
+
+
 def fp16_round_bits(x: int) -> int:
     """BF16 -> FP16 (round to nearest even, subnormals, infinity from 65520) -> BF16 bits."""
     v = bf16_value(x)
@@ -1048,6 +1058,14 @@ def quantize_cases(rng: random.Random):
     n = 20000
     xs = [random_bf16(rng, 60) for _ in range(n)]
     yield ROUND_FP16, [n], [xs], [fp16_round_bits(x) for x in xs]
+    # The static E4M3 rule (Qwen3.5-122B-A10B's FP8 sites): K 3072, magnitudes from subnormal to saturating
+    # (above 448 s), signed zeros, with a model-like scale and one whose reciprocal is inexact.
+    k, cols = 3072, 5
+    xs = [random_bf16(rng, 14) for _ in range(k * cols)]
+    xs[7] = 0x8000
+    for scale_f in (0.0217285, 3.0):
+        s = f32_value(f32_bits(scale_f))
+        yield QUANTIZE_FP8_STATIC, [k, cols, f32_bits(scale_f)], [xs], fp8_static_values(xs, s) + [f32_bits(scale_f)] * cols
 
 
 def write_cases(path: Path) -> None:

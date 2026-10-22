@@ -531,10 +531,21 @@ int run_fp8_target() {
     return failures;
 }
 
+// A Q8 four-output MTP parent: the 35B-A3B's [9216, 2048] or the 122B-A10B's [17408, 3072].
+struct Q8TargetGeometry {
+    std::int32_t hidden;
+    std::int32_t q_rows;
+    const char* label;
+    [[nodiscard]] std::int32_t rows() const { return 2 * q_rows + 2 * 512; }
+};
+constexpr Q8TargetGeometry kQ8Target35b{2048, 4096, " Q8 target"};
+constexpr Q8TargetGeometry kQ8Target122b{3072, 8192, " Q8 [17408,3072]"};
+
 int run_q8_target_case(DevicePackedWeight& parent, std::int32_t tokens,
-                       ops::LinearPolicy policy = ops::LinearPolicy::A16Only) {
-    constexpr std::int32_t kHidden      = 2048;
-    constexpr std::int32_t kQRows       = 4096;
+                       ops::LinearPolicy policy = ops::LinearPolicy::A16Only,
+                       const Q8TargetGeometry& geometry = kQ8Target35b) {
+    const std::int32_t kHidden          = geometry.hidden;
+    const std::int32_t kQRows           = geometry.q_rows;
     constexpr std::int32_t kKvRows      = 512;
     const std::vector<float> activation = make_bf16_activation(kHidden, tokens, 201U + tokens);
     const std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
@@ -550,15 +561,14 @@ int run_q8_target_case(DevicePackedWeight& parent, std::int32_t tokens,
     Tensor k = key.tensor();
     Tensor v = value.tensor();
     const std::size_t capacity = ops::attn_input_proj_workspace_capacity_bytes(
-        QType::Q8_G32_FP16, 9216, kHidden, policy, tokens, tokens);
+        QType::Q8_G32_FP16, geometry.rows(), kHidden, policy, tokens, tokens);
     GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 1));
     DeviceArena workspace(DeviceSpan{scratch.data(), std::max<std::size_t>(capacity, 1)});
     ops::attn_input_proj(x, parent.view(), q, g, k, v, policy, workspace, nullptr);
     cuda_synchronize();
 
-    const std::string suffix = std::string(ops::column_invariant(policy) ? " Q8 target invariant T="
-                                                                         : " Q8 target A16 T=") +
-                               std::to_string(tokens);
+    const std::string suffix = std::string(geometry.label) +
+                               (ops::column_invariant(policy) ? " invariant T=" : " A16 T=") + std::to_string(tokens);
     int failures             = 0;
     failures += verify_output("attn q" + suffix, query, parent.host, 0, kQRows, activation, kHidden,
                               tokens);
@@ -584,6 +594,15 @@ int run_q8_target() {
     // The column-invariant route: one column, the exact instances' range and its 48-column slices.
     for (const std::int32_t tokens : {1, 2, 48, 49, 96, 97, 129, 512}) {
         failures += run_q8_target_case(parent, tokens, ops::LinearPolicy::A16ColumnInvariant);
+    }
+    // The 122B-A10B's MTP parent: every route region and its edges, then the column-invariant widths.
+    DevicePackedWeight parent122(
+        quantized_weight::make_patterned_weight(QType::Q8_G32_FP16, kQ8Target122b.rows(), kQ8Target122b.hidden, 223U));
+    for (const std::int32_t tokens : {1, 2, 8, 17, 48, 49, 64, 65, 128, 129, 300}) {
+        failures += run_q8_target_case(parent122, tokens, ops::LinearPolicy::A16Only, kQ8Target122b);
+    }
+    for (const std::int32_t tokens : {1, 2, 48, 49, 97, 129}) {
+        failures += run_q8_target_case(parent122, tokens, ops::LinearPolicy::A16ColumnInvariant, kQ8Target122b);
     }
     return failures;
 }
@@ -661,10 +680,10 @@ int run_q8_companion() {
     return failures;
 }
 
-// Qwen3.8-27B's drafter (H 5120) and Qwen3.8-Flash-Next's (H 2560).
+// Qwen3.8-27B's drafter (H 5120), Qwen3.8-Flash-Next's (H 2560) and Qwen3.5-122B-A10B's (H 3072).
 int run_q8_dflash2() {
     int failures = 0;
-    for (const int hidden : {5120, 2560}) {
+    for (const int hidden : {5120, 2560, 3072}) {
         DevicePackedWeight parent(
             quantized_weight::make_patterned_weight(QType::Q8_G32_FP16, 6144, hidden, 313U));
         const std::string label = "DFlash2 H=" + std::to_string(hidden);

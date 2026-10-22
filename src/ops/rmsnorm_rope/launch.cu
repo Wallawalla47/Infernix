@@ -80,6 +80,9 @@ void rmsnorm_rope_text_launch(const Tensor& positions, const Tensor& q_norm_weig
     if (q_in.ne[1] == 16) {
         launch_text<16, 2>(positions, q_norm_weight, k_norm_weight, q_in, k_in, q_out, k_out,
                            tokens, stream);
+    } else if (q_in.ne[1] == 32) {
+        launch_text<32, 2>(positions, q_norm_weight, k_norm_weight, q_in, k_in, q_out, k_out,
+                           tokens, stream);
     } else {
         launch_text<24, 4>(positions, q_norm_weight, k_norm_weight, q_in, k_in, q_out, k_out,
                            tokens, stream);

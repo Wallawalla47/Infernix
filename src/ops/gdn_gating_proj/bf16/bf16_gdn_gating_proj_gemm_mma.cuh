@@ -2,8 +2,9 @@
 
 // SM120 BF16 GDN gating projection for the two exact registered geometries:
 //
-//   Qwen3.6-27B:     a/b = W[48,5120] @ x[5120,T]
-//   Qwen3.6-35B-A3B: a/b = W[32,2048] @ x[2048,T]
+//   Qwen3.6-27B:       a/b = W[48,5120] @ x[5120,T]
+//   Qwen3.6-35B-A3B:   a/b = W[32,2048] @ x[2048,T]
+//   Qwen3.5-122B-A10B: a/b = W[64,3072] @ x[3072,T]
 //
 // A CTA computes the same 16 output rows from both weights over 128 (27B) or
 // 64 (35B) tokens.
@@ -48,8 +49,15 @@ struct Bf16Gdn35Geometry {
     static constexpr int kBlockN = 64;
 };
 
+struct Bf16Gdn122Geometry {
+    static constexpr int kHeads  = 64;
+    static constexpr int kHidden = 3072;
+    static constexpr int kBlockN = 64;
+};
+
 static_assert(Bf16Gdn27Geometry::kHidden % kBf16GdnBlockK == 0);
 static_assert(Bf16Gdn35Geometry::kHidden % kBf16GdnBlockK == 0);
+static_assert(Bf16Gdn122Geometry::kHidden % kBf16GdnBlockK == 0);
 
 __device__ __forceinline__ int bf16_gdn_swizzle(int row, int col) {
     return (col & ~63) + gemm_swz64(row, col & 63);

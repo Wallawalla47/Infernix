@@ -24,10 +24,11 @@ namespace infernix::ops::detail {
 
 // Keep restricted pointers in the device ABI. Putting them in an aggregate loses
 // NVCC alias information and increases register pressure in the K128 mainloop.
-template <class Schedule, bool FullTokens, class Output, class Epilogue, class RowPolicy>
+template <class Schedule, bool FullTokens, class Output, class Epilogue, class RowPolicy,
+          class Scale = __nv_bfloat16>
 __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_mma_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ weight_codes,
-    const __nv_bfloat16* __restrict__ row_scales, Output output, Epilogue epilogue,
+    const Scale* __restrict__ row_scales, Output output, Epilogue epilogue,
     RowPolicy row_policy, int rows, int input_rows, int token_offset, int count) {
     const int M           = rows;
     const int K           = Schedule::kStaticK ? Schedule::kStaticK : input_rows;
@@ -208,9 +209,9 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
         for (int mi = 0; mi < MT; ++mi) {
             const int local_row = wm * WM + mi * 16 + gid;
             const float scale0 =
-                __bfloat162float(row_scales[row_policy.weight_row(row_begin, local_row, M)]);
+                fp8_widen(row_scales[row_policy.weight_row(row_begin, local_row, M)]);
             const float scale1 =
-                __bfloat162float(row_scales[row_policy.weight_row(row_begin, local_row + 8, M)]);
+                fp8_widen(row_scales[row_policy.weight_row(row_begin, local_row + 8, M)]);
 #pragma unroll
             for (int ni = 0; ni < NT; ++ni) {
                 accumulators[mi][ni][0] *= scale0;
@@ -227,8 +228,8 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
         for (int mi = 0; mi < MT; ++mi) {
             const int row0     = row_policy.weight_row(row_begin, wm * WM + mi * 16 + gid, M);
             const int row1     = row_policy.weight_row(row_begin, wm * WM + mi * 16 + gid + 8, M);
-            const float scale0 = __bfloat162float(__ldg(row_scales + row0));
-            const float scale1 = __bfloat162float(__ldg(row_scales + row1));
+            const float scale0 = fp8_widen(__ldg(row_scales + row0));
+            const float scale1 = fp8_widen(__ldg(row_scales + row1));
 #pragma unroll
             for (int ni = 0; ni < NT; ++ni) {
                 const int token0 = token_begin + wn * WN + ni * 8 + 2 * lid;

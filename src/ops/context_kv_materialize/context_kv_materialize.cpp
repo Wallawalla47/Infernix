@@ -17,8 +17,9 @@
 namespace infernix::ops {
 namespace {
 
-// The registered context widths: Qwen3.8-27B's DFlash2 (5120) and Qwen3.8-Flash-Next's (2560).
-bool registered_hidden(std::int32_t hidden) { return hidden == 5120 || hidden == 2560; }
+// The registered context widths: Qwen3.8-27B's DFlash2 (5120), Qwen3.8-Flash-Next's (2560) and
+// Qwen3.5-122B-A10B's (3072).
+bool registered_hidden(std::int32_t hidden) { return hidden == 5120 || hidden == 2560 || hidden == 3072; }
 constexpr std::int32_t kKVSize     = 1024;
 constexpr std::int32_t kHeadDim    = 128;
 constexpr std::int32_t kKVHeads    = 8;
@@ -81,14 +82,13 @@ void require_interval(std::int32_t batch, std::int32_t min_width, std::int32_t m
 }
 
 template <class Allocator>
-Tensor allocate_key_scratch(Allocator& allocator, std::int32_t columns) {
-    return allocator.alloc(
-        DType::FP32, {kKVSize, columns, static_cast<std::int32_t>(kContextKVMaterializeLayers)});
+Tensor allocate_key_scratch(Allocator& allocator, std::int32_t columns, std::int32_t layers) {
+    return allocator.alloc(DType::FP32, {kKVSize, columns, layers});
 }
 
-std::size_t key_scratch_capacity(std::int32_t columns) {
+std::size_t key_scratch_capacity(std::int32_t columns, std::int32_t layers) {
     WorkspaceLayoutBuilder layout;
-    (void)allocate_key_scratch(layout, columns);
+    (void)allocate_key_scratch(layout, columns, layers);
     return layout.peak_bytes(1);
 }
 
@@ -106,9 +106,12 @@ void validate_cache(const CyclicKVCacheLayerView& cache, std::int32_t padded,
 
 } // namespace
 
-std::size_t context_kv_materialize_workspace_capacity_bytes(std::int32_t batch_size,
+std::size_t context_kv_materialize_workspace_capacity_bytes(std::int32_t layers, std::int32_t batch_size,
                                                             std::int32_t min_width,
                                                             std::int32_t max_width) {
+    if (layers < 0 || !context_kv_materialize_layer_count(static_cast<std::size_t>(layers))) {
+        throw std::invalid_argument("context_kv_materialize workspace: the drafter has 5 or 6 layers");
+    }
     require_interval(batch_size, min_width, max_width);
     std::size_t capacity = 0;
     // Every W admits max_count=0..W. Thus max_width includes the envelopes of all smaller W,
@@ -117,24 +120,27 @@ std::size_t context_kv_materialize_workspace_capacity_bytes(std::int32_t batch_s
         const int columns = count * batch_size;
         if (detail::context_kv_materialize_uses_scratch(
                 detail::context_kv_materialize_route(columns)))
-            capacity = std::max(capacity, key_scratch_capacity(columns));
+            capacity = std::max(capacity, key_scratch_capacity(columns, layers));
     }
     return capacity;
 }
 
 void context_kv_materialize(
     const Tensor& context, const Tensor& positions, const Tensor& counts, const Tensor& state_slots,
-    const std::array<ContextKVMaterializeLayerView, kContextKVMaterializeLayers>& layers,
+    std::span<const ContextKVMaterializeLayerView> layers,
     float rope_theta, ContextKVMaterializeExecutionEnvelope envelope, WorkspaceArena& workspace,
     cudaStream_t stream) {
     const std::int32_t hidden = context.ne[0];
     const std::int32_t width  = context.ne[1];
     const std::int32_t batch  = context.ne[2];
     if (!registered_hidden(hidden)) {
-        throw std::invalid_argument("context_kv_materialize: H must be 5120 or 2560");
+        throw std::invalid_argument("context_kv_materialize: H must be 5120, 2560 or 3072");
     }
     if (!(rope_theta > 1.0F) || !std::isfinite(rope_theta)) {
         throw std::invalid_argument("context_kv_materialize: theta must be finite and above 1");
+    }
+    if (!context_kv_materialize_layer_count(layers.size())) {
+        throw std::invalid_argument("context_kv_materialize: the drafter has 5 or 6 layers");
     }
     require_profile(width, batch);
     require_tensor(context, DType::BF16, hidden, width, batch, 1, 16, "context");
@@ -167,7 +173,7 @@ void context_kv_materialize(
     auto scope        = workspace.scope();
     Tensor key_scratch;
     if (detail::context_kv_materialize_uses_scratch(route))
-        key_scratch = allocate_key_scratch(workspace, columns);
+        key_scratch = allocate_key_scratch(workspace, columns, static_cast<std::int32_t>(layers.size()));
     // theta^(-2j/128): the stored words of the 1e7 table, else prepare_rope's (so these keys rotate
     // exactly as a prepared rmsnorm_rope rotates the query block's).
     static constexpr std::array<double, 64> k1e7{INFERNIX_DFLASH_ROPE_1E7_INV_FREQUENCY};

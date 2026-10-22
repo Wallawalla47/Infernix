@@ -30,6 +30,15 @@ void fp8_linear_add_invariant_launch(const Tensor&, const Weight&, Tensor&, cuda
 void fp8_linear_add_a8_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                               WorkspaceArena& workspace, cudaStream_t stream);
 
+// Qwen3.5-122B-A10B's static-scale fp8_e4m3fn_row_f32 [3072,8192] (attention and GDN output).
+[[nodiscard]] std::size_t fp8_linear_add_n3072_partial_capacity_bytes(std::int32_t max_tokens);
+void fp8_linear_add_n3072_invariant_launch(const Tensor& x, const Weight& weight,
+                                           Tensor& residual, cudaStream_t stream);
+void fp8_linear_add_n3072_a16_launch(const Tensor& x, const Weight& weight, Tensor& residual,
+                                     cudaStream_t stream);
+void fp8_linear_add_n3072_a8_launch(const Tensor& x, const Weight& weight, Tensor& residual,
+                                    WorkspaceArena& workspace, cudaStream_t stream);
+
 void fp8_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,
                              LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream);
 

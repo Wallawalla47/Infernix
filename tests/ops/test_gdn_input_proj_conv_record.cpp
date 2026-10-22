@@ -461,16 +461,29 @@ int run_nvfp4() {
     return failures;
 }
 
-int run_fp8_case(DevicePackedWeight& parent, std::int32_t width, std::int32_t batch,
+// The registered row-scaled FP8 parents: fp8_e4m3fn_row_bf16 [16384,5120] and Qwen3.5-122B-A10B's
+// static-scale fp8_e4m3fn_row_f32 [20480,3072] (no A8 residual profile).
+struct Fp8Parent {
+    QType qtype;
+    std::int32_t hidden, value_rows, z_rows;
+    float input_scale; // 0: dynamic A8
+    [[nodiscard]] constexpr std::int32_t rows() const { return kQueryRows + kKeyRows + value_rows + z_rows; }
+    [[nodiscard]] const char* name() const { return input_scale != 0.0F ? "FP8 row-f32" : "FP8"; }
+};
+constexpr Fp8Parent kFp8RowBf16{QType::FP8_E4M3FN_ROW_BF16, 5120, 6144, 6144, 0.0F};
+// A static input scale of the checkpoint's kind: its reciprocal is inexact.
+constexpr Fp8Parent kFp8RowF32{QType::FP8_E4M3FN_ROW_F32, 3072, 8192, 8192, 0.0123456791F};
+
+int run_fp8_case(const Fp8Parent& shape, DevicePackedWeight& parent, std::int32_t width, std::int32_t batch,
                  std::vector<std::int32_t> valid, ops::LinearPolicy policy, std::uint32_t seed) {
     const std::size_t snapshot_bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-        QType::FP8_E4M3FN_ROW_BF16, 16384, 5120, policy, batch, width, width);
+        shape.qtype, shape.rows(), shape.hidden, policy, batch, width, width);
     const std::size_t record_bytes = ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
-        QType::FP8_E4M3FN_ROW_BF16, 16384, 5120, policy, batch, width, width);
+        shape.qtype, shape.rows(), shape.hidden, policy, batch, width, width);
     return run_case(
-        "FP8 policy=" + std::to_string(static_cast<int>(policy)) + " B=" + std::to_string(batch) +
-            " W=" + std::to_string(width),
-        5120, 6144, 6144, width, batch, std::move(valid), snapshot_bytes, record_bytes,
+        std::string(shape.name()) + " policy=" + std::to_string(static_cast<int>(policy)) +
+            " B=" + std::to_string(batch) + " W=" + std::to_string(width),
+        shape.hidden, shape.value_rows, shape.z_rows, width, batch, std::move(valid), snapshot_bytes, record_bytes,
         [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid_columns,
             const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
             Tensor& z, WorkspaceArena& workspace, cudaStream_t stream) {
@@ -486,31 +499,36 @@ int run_fp8_case(DevicePackedWeight& parent, std::int32_t width, std::int32_t ba
         seed);
 }
 
-int run_fp8() {
-    constexpr std::int32_t kHidden = 5120;
-    constexpr std::int32_t kRows   = 16384;
+int run_fp8(const Fp8Parent& shape, std::uint32_t weight_seed) {
+    const quantized_weight::PatternedWeightOptions options{.activation_scale = shape.input_scale};
     DevicePackedWeight parent(
-        quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16, kRows, kHidden, 1701U));
+        quantized_weight::make_patterned_weight(shape.qtype, shape.rows(), shape.hidden, weight_seed, options));
     int failures = 0;
-    for (auto policy : {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA8,
-                        ops::LinearPolicy::AllowA8Residual}) {
+    // The static parent's decode and verification policy is A16ColumnInvariant; the dynamic parent
+    // keeps its A8 residual profile.
+    const auto policies = shape.input_scale != 0.0F
+                              ? std::vector{ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA8,
+                                            ops::LinearPolicy::A16ColumnInvariant}
+                              : std::vector{ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA8,
+                                            ops::LinearPolicy::AllowA8Residual};
+    for (auto policy : policies) {
         for (int width = 2; width <= 16; ++width) {
-            failures += run_fp8_case(parent, width, 1, {}, policy, 1700U + width);
-            failures += run_fp8_case(parent, width, 8, ragged(width, 8), policy, 1750U + width);
+            failures += run_fp8_case(shape, parent, width, 1, {}, policy, 1700U + width);
+            failures += run_fp8_case(shape, parent, width, 8, ragged(width, 8), policy, 1750U + width);
         }
         for (int batch : {2, 3, 4}) {
-            failures += run_fp8_case(parent, 4, batch, ragged(4, batch), policy, 1810U + batch);
+            failures += run_fp8_case(shape, parent, 4, batch, ragged(4, batch), policy, 1810U + batch);
         }
         for (int width = 17; width <= 64; ++width) {
-            failures += run_fp8_case(parent, width, 1, {}, policy, 2700U + width);
-            failures += run_fp8_case(parent, width, 1, {width / 2}, policy, 2750U + width);
+            failures += run_fp8_case(shape, parent, width, 1, {}, policy, 2700U + width);
+            failures += run_fp8_case(shape, parent, width, 1, {width / 2}, policy, 2750U + width);
         }
         for (int width : {17, 32, 64}) {
-            failures += run_fp8_case(parent, width, 2, {width, width / 3}, policy, 2780U + width);
-            failures += run_fp8_case(parent, width, 8, ragged(width, 8), policy, 2790U + width);
+            failures += run_fp8_case(shape, parent, width, 2, {width, width / 3}, policy, 2780U + width);
+            failures += run_fp8_case(shape, parent, width, 8, ragged(width, 8), policy, 2790U + width);
         }
     }
-    failures += parent.verify_preserved("FP8 record parent weight");
+    failures += parent.verify_preserved(std::string(shape.name()) + " record parent weight");
     return failures;
 }
 
@@ -526,7 +544,8 @@ int main() {
     failures += run_q4_q5();
     failures += run_q8();
     failures += run_nvfp4();
-    failures += run_fp8();
+    failures += run_fp8(kFp8RowBf16, 1701U);
+    failures += run_fp8(kFp8RowF32, 1703U);
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj_conv_record\n";
     return failures == 0 ? 0 : 1;
 }

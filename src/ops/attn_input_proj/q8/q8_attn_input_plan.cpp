@@ -70,17 +70,28 @@ bool is_companion_shape(const Q8AttnInputProblem& problem) noexcept {
 }
 
 bool is_dflash2_shape(const Q8AttnInputProblem& problem) noexcept {
-    // Qwen3.8-27B's drafter (H 5120) and Qwen3.8-Flash-Next's (H 2560).
-    return (problem.input_rows == 5120 || problem.input_rows == 2560) && problem.query_rows == 4096 &&
+    // Qwen3.8-27B's drafter (H 5120), Qwen3.8-Flash-Next's (H 2560) and Qwen3.5-122B-A10B's (H 3072).
+    return (problem.input_rows == 5120 || problem.input_rows == 2560 || problem.input_rows == 3072) &&
+           problem.query_rows == 4096 &&
            problem.kv_rows == 1024 &&
            problem.parent_rows == 6144 && problem.padded_k == problem.input_rows;
 }
 
+// The four-output MTP parents: the Qwen3.6-35B-A3B's [9216, 2048] and the Qwen3.5-122B-A10B's
+// [17408, 3072] (q8_attn_input_n17408.cu).
+bool is_target_shape(const Q8AttnInputProblem& problem) noexcept {
+    return problem.input_rows == 2048 && problem.padded_k == 2048 && problem.query_rows == 4096 &&
+           problem.kv_rows == 512 && problem.parent_rows == 9216;
+}
+
+bool is_n17408_shape(const Q8AttnInputProblem& problem) noexcept {
+    return problem.input_rows == 3072 && problem.padded_k == 3072 && problem.query_rows == 8192 &&
+           problem.kv_rows == 512 && problem.parent_rows == 17408;
+}
+
 bool supported_shape(const Q8AttnInputProblem& problem) noexcept {
-    const bool target_qkgv =
-        problem.query_rows == 4096 && problem.kv_rows == 512 && problem.parent_rows == 9216;
-    const bool target_shape = problem.input_rows == 2048 && problem.padded_k == 2048 && target_qkgv;
-    return target_shape || is_companion_shape(problem) || is_dflash2_shape(problem);
+    return is_target_shape(problem) || is_n17408_shape(problem) || is_companion_shape(problem) ||
+           is_dflash2_shape(problem);
 }
 
 } // namespace
@@ -161,10 +172,31 @@ void q8_attn_input_execute_plan(const Q8AttnInputPlan& plan, const Tensor& x, co
     const Q8AttnInputProblem problem{x.ne[0], q.ne[0], k.ne[0], weight.n, weight.padded_shape[1],
                                      x.ne[1]};
     const Q8AttnInputPlan resolved = q8_attn_input_resolve_plan(problem, column_invariant);
-    if (problem.parent_rows != 9216 || problem.kv_rows != 512 ||
-        resolved.schedule != plan.schedule) {
+    const bool n17408              = is_n17408_shape(problem);
+    if ((!is_target_shape(problem) && !n17408) || resolved.schedule != plan.schedule) {
         throw std::invalid_argument(
             "Q8 attention input: plan does not match exact four-output problem");
+    }
+    if (n17408) {
+        switch (plan.schedule) {
+        case Q8AttnInputScheduleId::ColumnInvariant:
+            q8_attn_input_n17408_column_invariant_launch(x, weight, q, gate, k, v, stream);
+            return;
+        case Q8AttnInputScheduleId::DecodeR8Direct:
+            q8_attn_input_n17408_decode_launch(x, weight, q, gate, k, v, stream);
+            return;
+        case Q8AttnInputScheduleId::SplitKMmaDirect:
+            q8_attn_input_n17408_splitk_mma_launch(x, weight, q, gate, k, v, stream);
+            return;
+        case Q8AttnInputScheduleId::MmaR32C128:
+            q8_attn_input_n17408_mma_r32_c128_launch(x, weight, q, gate, k, v, stream);
+            return;
+        case Q8AttnInputScheduleId::MmaR64C128:
+            q8_attn_input_n17408_mma_r64_c128_launch(x, weight, q, gate, k, v, stream);
+            return;
+        default:
+            throw std::logic_error("Q8 attention input: unregistered [17408,3072] schedule");
+        }
     }
     switch (plan.schedule) {
     case Q8AttnInputScheduleId::ColumnInvariant:

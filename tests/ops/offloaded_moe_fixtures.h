@@ -24,10 +24,12 @@ struct Expert {
     moe::ExpertScales scales;
 };
 
-// Random codes; scale bytes in the realistic range plus extremes (zero, subnormal, 448).
-inline Expert random_expert(std::mt19937& rng, bool split_input_scales) {
+// Random codes; scale bytes in the realistic range plus extremes (zero, subnormal, 448). `shape` is
+// the record's expert geometry (Flash-Next's unless a test names another registered one).
+inline Expert random_expert(std::mt19937& rng, bool split_input_scales,
+                            const moe::ExpertShape& shape = moe::kFlashNextShape) {
     Expert e;
-    e.record.resize(moe::kRecordBytes);
+    e.record.resize(shape.record_bytes());
     std::uniform_int_distribution<int> byte(0, 255);
     for (std::size_t i = 0; i < e.record.size(); ++i) { e.record[i] = static_cast<std::uint8_t>(byte(rng)); }
     std::uniform_int_distribution<int> scale(40, 80), rare(0, 99);
@@ -40,8 +42,8 @@ inline Expert random_expert(std::mt19937& rng, bool split_input_scales) {
             }
         }
     };
-    fix_scales(0, moe::kGateUpRowGroups, moe::kGateUpBlocks);
-    fix_scales(moe::kGateUpBytes, moe::kDownRowGroups, moe::kDownBlocks);
+    fix_scales(0, shape.gate_up_row_groups(), shape.gate_up_blocks());
+    fix_scales(shape.gate_up_bytes(), shape.down_row_groups(), shape.down_blocks());
     std::uniform_real_distribution<float> lg(-11.0F, -7.0F);
     e.scales.input_gate = std::exp2(lg(rng));
     e.scales.input_up   = split_input_scales ? std::exp2(lg(rng)) : e.scales.input_gate;
@@ -53,21 +55,21 @@ inline Expert random_expert(std::mt19937& rng, bool split_input_scales) {
     return e;
 }
 
-inline std::vector<std::uint16_t> random_activations(std::mt19937& rng, int ncols) {
+inline std::vector<std::uint16_t> random_activations(std::mt19937& rng, int ncols, int hidden = moe::kHidden) {
     std::normal_distribution<float> n(0.0F, 1.0F);
-    std::vector<std::uint16_t> x(static_cast<std::size_t>(ncols) * moe::kHidden);
+    std::vector<std::uint16_t> x(static_cast<std::size_t>(ncols) * hidden);
     for (auto& v : x) { v = to_bf16(n(rng) * 0.05F); }
     // An outlier per column, as real activations have, at a position inside that column.
     for (int c = 0; c < ncols; ++c) {
-        x[static_cast<std::size_t>(c) * moe::kHidden + static_cast<std::size_t>(17 * (c + 1) % moe::kHidden)] = to_bf16(9.0F);
+        x[static_cast<std::size_t>(c) * hidden + static_cast<std::size_t>(17 * (c + 1) % hidden)] = to_bf16(9.0F);
     }
     return x;
 }
 
 // An expert stored without activation scales (design §16.2.1): random codes and block scales as
 // random_expert, no input scales, and multipliers m = fl32(1 / weight global scale).
-inline Expert random_a16_expert(std::mt19937& rng) {
-    Expert e = random_expert(rng, false);
+inline Expert random_a16_expert(std::mt19937& rng, const moe::ExpertShape& shape = moe::kFlashNextShape) {
+    Expert e = random_expert(rng, false, shape);
     std::uniform_real_distribution<float> lg(-14.0F, -6.0F);
     e.scales = {0.0F, 0.0F, 0.0F, std::exp2(lg(rng)), std::exp2(lg(rng)), std::exp2(lg(rng))};
     return e;
@@ -76,14 +78,14 @@ inline Expert random_a16_expert(std::mt19937& rng) {
 // Activations with a wide dynamic range per column: most elements near 0.05, a few outliers up to
 // 2^12 and some tiny ones, so the A16 encoding rounds elements more than 2^13 below the column's
 // largest (design §16.2.1).
-inline std::vector<std::uint16_t> wide_range_activations(std::mt19937& rng, int ncols) {
-    std::vector<std::uint16_t> x = random_activations(rng, ncols);
-    std::uniform_int_distribution<int> pos(0, moe::kHidden - 1);
+inline std::vector<std::uint16_t> wide_range_activations(std::mt19937& rng, int ncols, int hidden = moe::kHidden) {
+    std::vector<std::uint16_t> x = random_activations(rng, ncols, hidden);
+    std::uniform_int_distribution<int> pos(0, hidden - 1);
     std::uniform_real_distribution<float> lg(-30.0F, 12.0F);
     for (int c = 0; c < ncols; ++c) {
         for (int i = 0; i < 64; ++i) {
             const float v = std::exp2(lg(rng)) * (i % 2 ? -1.0F : 1.0F);
-            x[static_cast<std::size_t>(c) * moe::kHidden + static_cast<std::size_t>(pos(rng))] = to_bf16(v);
+            x[static_cast<std::size_t>(c) * hidden + static_cast<std::size_t>(pos(rng))] = to_bf16(v);
         }
     }
     return x;

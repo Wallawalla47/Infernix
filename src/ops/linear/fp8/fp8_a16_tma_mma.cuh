@@ -37,7 +37,7 @@ inline CUtensorMap fp8_a16_tma_activation_map(const __nv_bfloat16* pointer, int 
     return result;
 }
 
-template <class Schedule, bool FullTokens, class Output, class Epilogue>
+template <class Schedule, bool FullTokens, class Output, class Epilogue, class Scale = __nv_bfloat16>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_tma_mma_kernel(
 #ifdef _WIN32
@@ -45,7 +45,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_tm
 #else
     const __grid_constant__ Fp8TmaDescriptors descriptors,
 #endif
-    Fp8A16Operands operands, Output output, Epilogue epilogue, int token_offset, int count) {
+    Fp8A16OperandsT<Scale> operands, Output output, Epilogue epilogue, int token_offset, int count) {
 #ifdef _WIN32
     const Fp8TmaDescriptors& descriptors = *descriptors_pointer;
 #endif
@@ -121,8 +121,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_tm
         operands.scales, row_begin, token_begin, operands.rows, token_offset + count, warp, lane);
 }
 
-template <class Schedule, class Output, class Epilogue>
-void launch_fp8_a16_tma_mma(const Fp8A16Operands& p, Output output, Epilogue epilogue,
+template <class Schedule, class Output, class Epilogue, class Scale = __nv_bfloat16>
+void launch_fp8_a16_tma_mma(const Fp8A16OperandsT<Scale>& p, Output output, Epilogue epilogue,
                             cudaStream_t stream) {
     validate_fp8_operands<Schedule>(p);
     if (p.rows % Schedule::kBlockRows || p.k % Schedule::kBlockK)
@@ -137,7 +137,7 @@ void launch_fp8_a16_tma_mma(const Fp8A16Operands& p, Output output, Epilogue epi
     for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
         const int blocks  = p.rows / Schedule::kBlockRows * div_up(count, Schedule::kBlockTokens);
         const auto launch = [&]<bool Full>() {
-            constexpr auto kernel = fp8_a16_tma_mma_kernel<Schedule, Full, Output, Epilogue>;
+            constexpr auto kernel = fp8_a16_tma_mma_kernel<Schedule, Full, Output, Epilogue, Scale>;
             constexpr int bytes =
                 fp8_tma_scratch_bytes<Schedule, Epilogue> + Schedule::kBarrierBytes;
             const int dynamic = fp8_prepare_shared<bytes, kernel, true>();

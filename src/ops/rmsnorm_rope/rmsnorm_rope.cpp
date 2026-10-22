@@ -20,7 +20,7 @@ constexpr std::int32_t kTextHeadDim   = 256;
 // The text form has no width of its own to cap: one warp owns one head, so the only ceiling is the
 // launch grid, and even the largest supported context stays four orders of magnitude below it.
 constexpr std::int64_t kMaximumTextGrid       = 2147483647;
-constexpr std::int32_t kMaximumTextHeadGroups = 10;
+constexpr std::int32_t kMaximumTextHeadGroups = 12; // (32 + 2) heads, three per block
 
 bool aligned_to(const void* pointer, std::uintptr_t alignment) {
     return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) == 0;
@@ -163,8 +163,9 @@ void rmsnorm_rope(const Tensor& positions, const Tensor& q_norm_weight, const Te
         throw std::invalid_argument(
             "rmsnorm_rope: text T must be positive and fit the launch grid");
     }
-    if (!((query_heads == 16 && key_heads == 2) || (query_heads == 24 && key_heads == 4))) {
-        throw std::invalid_argument("rmsnorm_rope: text (Q,K) must be (16,2) or (24,4)");
+    if (!((query_heads == 16 && key_heads == 2) || (query_heads == 24 && key_heads == 4) ||
+          (query_heads == 32 && key_heads == 2))) {
+        throw std::invalid_argument("rmsnorm_rope: text (Q,K) must be (16,2), (24,4) or (32,2)");
     }
     require_tensor(q_in, DType::BF16, {kTextHeadDim, query_heads, tokens, 1}, "text q in");
     require_tensor(k_in, DType::BF16, {kTextHeadDim, key_heads, tokens, 1}, "text k in");

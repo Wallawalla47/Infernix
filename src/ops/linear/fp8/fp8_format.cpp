@@ -40,23 +40,27 @@ Fp8WeightGeometry validate_fp8_weight(const Weight& weight, const char* operatio
         throw std::invalid_argument(std::string(operation) + ": FP8 shape must be positive");
     }
 
+    // fp8_e4m3fn_row_bf16 multiplies each row by a BF16 word, fp8_e4m3fn_row_f32 by an FP32 word.
+    const bool f32          = weight.qtype == QType::FP8_E4M3FN_ROW_F32;
+    const std::int64_t word = f32 ? 4 : 2;
     Fp8WeightGeometry geometry{};
     geometry.code_plane_bytes   = checked_mul(static_cast<std::uint64_t>(weight.n),
                                               static_cast<std::uint64_t>(weight.k), operation);
     geometry.scale_plane_offset = align_up(geometry.code_plane_bytes, 256, operation);
-    geometry.scale_plane_bytes  = checked_mul(static_cast<std::uint64_t>(weight.n), 2, operation);
+    geometry.scale_plane_bytes  = checked_mul(static_cast<std::uint64_t>(weight.n),
+                                              static_cast<std::uint64_t>(word), operation);
     geometry.required_payload_bytes =
         checked_add(geometry.scale_plane_offset, geometry.scale_plane_bytes, operation);
 
-    const std::int64_t scale_stride = static_cast<std::int64_t>(weight.n) * 2;
-    if (weight.qtype != QType::FP8_E4M3FN_ROW_BF16 || weight.layout != QuantLayout::RowScale ||
-        weight.scale_dtype != DType::BF16 ||
+    const std::int64_t scale_stride = static_cast<std::int64_t>(weight.n) * word;
+    if (!is_fp8_row(weight.qtype) || weight.layout != QuantLayout::RowScale ||
+        weight.scale_dtype != (f32 ? DType::FP32 : DType::BF16) ||
         weight.group_size != static_cast<std::uint32_t>(weight.k) || weight.group != weight.k ||
         weight.ndim != 2 || weight.shape[0] != weight.n || weight.shape[1] != weight.k ||
         weight.shape[2] != 1 || weight.shape[3] != 1 || weight.padded_shape[0] != weight.n ||
         weight.padded_shape[1] != weight.k || weight.padded_shape[2] != 1 ||
         weight.padded_shape[3] != 1 || weight.scale_ne[0] != weight.n || weight.scale_ne[1] != 1 ||
-        weight.scale_ne[2] != 1 || weight.scale_ne[3] != 1 || weight.scale_nb[0] != 2 ||
+        weight.scale_ne[2] != 1 || weight.scale_ne[3] != 1 || weight.scale_nb[0] != word ||
         weight.scale_nb[1] != scale_stride || weight.scale_nb[2] != scale_stride ||
         weight.scale_nb[3] != scale_stride || weight.payload == nullptr ||
         weight.qdata == nullptr || weight.scales == nullptr || weight.qhigh != nullptr ||

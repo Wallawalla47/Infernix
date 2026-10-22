@@ -63,6 +63,8 @@ struct WeightParent {
     // Where device code reads `data`: data itself for device memory, the mapped address for pinned
     // host memory (registered host memory may map elsewhere: WDDM), null for host-only memory.
     const std::byte* device = nullptr;
+    // nvfp4_rg16_v1: the matrix's FP32 multiplier (ModelOpt weight_scale_2), read from divisor_offset.
+    float weight_multiplier = 0.0F;
 };
 
 struct WeightRegion {

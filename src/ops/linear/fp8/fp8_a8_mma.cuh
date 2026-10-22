@@ -24,9 +24,10 @@
 
 namespace infernix::ops::detail {
 
-template <class Schedule, bool FullTokens, class Epilogue, class Output, class RowPolicy>
+template <class Schedule, bool FullTokens, class Epilogue, class Output, class RowPolicy,
+          class Scale = __nv_bfloat16>
 __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a8_mma_kernel(
-    Fp8A8Operands operands, Output output, Epilogue epilogue, RowPolicy row_policy,
+    Fp8A8OperandsT<Scale> operands, Output output, Epilogue epilogue, RowPolicy row_policy,
     int token_offset, int count) {
     // Streams its weights through the main loop: wait for the producer first, and let dependents
     // launch only once that loop is done.

@@ -8,7 +8,6 @@ namespace infernix::ops::detail {
 enum class K8V4KvFamily { Grouped, ParallelGrouped, Tiled };
 
 struct K8V4KvCausalPlan {
-    static constexpr int kTokenTile = 8;
     K8V4KvFamily family;
     int query_heads, width, batch, query_tile;
     CausalAttentionExecutionEnvelope envelope;

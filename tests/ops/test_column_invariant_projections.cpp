@@ -490,6 +490,30 @@ int check_q8_35b() {
     return failures;
 }
 
+// The 122B-A10B's Q8 MTP attention input [17408,3072]: invariant at every width, and at the widths
+// the exact route serves with the invariant schedule (2..48) the exact route's own bits.
+int check_q8_122b() {
+    int failures = 0;
+    DeviceWeight w(QType::Q8_G32_FP16, 17408, 3072, 97U);
+    const auto attention = [&](ops::LinearPolicy policy) {
+        return Projection{"Q8 attn_input_proj [17408,3072]", 3072, {8192, 8192, 512, 512},
+                          [&w, policy](const Tensor& x, std::vector<Tensor>& out, WorkspaceArena& ws) {
+                              ops::attn_input_proj(x, w.weight, out[0], out[1], out[2], out[3], policy, ws,
+                                                   nullptr);
+                          }};
+    };
+    failures += check(attention(kInvariant));
+    const std::vector<std::uint16_t> x = activation(3072, 48, 0x3456U);
+    for (const std::int32_t width : {2, 9, 17, 48}) {
+        if (run(attention(kInvariant), x, width) != run(attention(ops::LinearPolicy::A16Only), x, width)) {
+            std::cerr << "Q8 attn_input_proj [17408,3072]: the invariant route differs from the exact route at width "
+                      << width << '\n';
+            ++failures;
+        }
+    }
+    return failures;
+}
+
 // A contiguous BF16 weight [n,k] of patterned values.
 struct Bf16DeviceWeight {
     DeviceBuffer device;
@@ -588,10 +612,10 @@ int check_q8_generic() {
     return failures;
 }
 
-// The official 27B's and 35B-A3B's Q4 proposal heads.
+// The official 27B's, 122B-A10B's and 35B-A3B's Q4 proposal heads.
 int check_q4_proposal() {
     int failures = 0;
-    for (const std::int32_t k : {5120, 2048}) {
+    for (const std::int32_t k : {5120, 3072, 2048}) {
         DeviceWeight w(QType::Q4_G64_FP16, 131072, k, 83U);
         failures += check({"Q4 linear [131072," + std::to_string(k) + "]", k, {131072},
                            [&](const Tensor& x, std::vector<Tensor>& out, WorkspaceArena& ws) {
@@ -661,6 +685,7 @@ int main() {
         failures += check_paired();
         failures += check_gdn_conv();
         failures += check_q8_35b();
+        failures += check_q8_122b();
         failures += check_bf16();
         failures += check_q8_generic();
         failures += check_q4_proposal();

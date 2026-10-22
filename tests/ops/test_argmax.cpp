@@ -3,6 +3,7 @@
 #include <algorithm>
 #include "ops/op_tester.h"
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
@@ -120,6 +121,28 @@ int run_case(std::int32_t physical_rows, std::int32_t valid_rows, std::int32_t t
     failures += verify_exact((label + " preserves logits").c_str(), logits_after, logits);
     failures += device_logits.verify_guards((label + " logits").c_str());
     failures += device_output.verify_guards((label + " output").c_str());
+
+    // The selected rows' softmax probability (argmax_probability) against its FP64 formula: fast
+    // exponentials and an FP32 sum of at most 248,077 terms in [0, 1] stay within 1e-4 relative.
+    GuardedDeviceBuffer device_probability(static_cast<std::size_t>(tokens) * sizeof(float));
+    Tensor probability_tensor(device_probability.data(), DType::FP32, {tokens});
+    ops::argmax_probability(logits_tensor, output_tensor, probability_tensor, valid_rows, nullptr);
+    cuda_synchronize();
+    const auto probability = from_device<float>(device_probability.data(), static_cast<std::size_t>(tokens));
+    std::size_t far = 0;
+    for (std::int32_t t = 0; t < tokens; ++t) {
+        const std::size_t base = static_cast<std::size_t>(t) * physical_rows;
+        const double reference = bf16_to_f32(logits[base + static_cast<std::size_t>(actual[static_cast<std::size_t>(t)])]);
+        double sum             = 0.0;
+        for (std::int32_t v = 0; v < valid_rows; ++v) { sum += std::exp(bf16_to_f32(logits[base + v]) - reference); }
+        const double want = 1.0 / sum;
+        far += std::fabs(probability[static_cast<std::size_t>(t)] - want) > 1e-4 * want;
+    }
+    if (far != 0) {
+        std::cerr << "FAIL: " << label << " probability: " << far << " columns outside 1e-4 of FP64\n";
+        ++failures;
+    }
+    failures += device_probability.verify_guards((label + " probability").c_str());
     return failures;
 }
 

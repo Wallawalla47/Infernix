@@ -134,6 +134,11 @@ ObjectHandle Binder::resource(std::string_view component, std::string_view role)
     return found->second;
 }
 
+bool Binder::has_resource(std::string_view component, std::string_view role) const {
+    const auto& resources = reader_.directory().component(component).resources;
+    return resources.find(role) != resources.end();
+}
+
 HostValues Binder::values(const Binding& binding, std::optional<QType> format) {
     HostValues out;
     out.elements = binding.elements;

@@ -354,7 +354,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     __syncthreads();
     // The represented weights carry their scales: the epilogue multiplies by nothing.
     fp8_finish_mma_tile<Schedule, FullTokens>(output, epilogue, Fp8UnscaledRows{}, mxfp8_tma_shared, accumulators,
-                                              nullptr, nullptr, row_begin, token_begin, operands.rows,
+                                              nullptr, static_cast<const __nv_bfloat16*>(nullptr), row_begin, token_begin, operands.rows,
                                               token_offset + count, warp, lane);
 }
 

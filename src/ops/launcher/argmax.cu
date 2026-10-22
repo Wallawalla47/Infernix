@@ -75,6 +75,24 @@ __global__ void argmax_map_kernel(const std::int32_t* row_ids, std::int32_t* out
 
 } // namespace
 
+void argmax_probability_launch(const Tensor& logits, const Tensor& rows, Tensor& probability,
+                               std::int32_t valid_rows, cudaStream_t stream) {
+    const dim3 grid(static_cast<unsigned int>(logits.ne[1]));
+    const auto* selected              = static_cast<const std::int32_t*>(rows.data);
+    auto* out                         = static_cast<float*>(probability.data);
+    const std::int32_t physical_rows  = logits.ne[0];
+    if (logits.dtype == DType::FP32) {
+        CUDA_CHECK(pdl::launch_consumer({grid, dim3(kArgmaxBlock), 0, stream}, argmax_probability_kernel<float>,
+                                        static_cast<const float*>(logits.data), selected, out, valid_rows,
+                                        physical_rows));
+    } else {
+        CUDA_CHECK(pdl::launch_consumer({grid, dim3(kArgmaxBlock), 0, stream},
+                                        argmax_probability_kernel<__nv_bfloat16>,
+                                        static_cast<const __nv_bfloat16*>(logits.data), selected, out, valid_rows,
+                                        physical_rows));
+    }
+}
+
 void argmax_map_launch(const Tensor& row_ids, Tensor& out, cudaStream_t stream) {
     const std::int32_t count = out.ne[0];
     if (count == 0) { return; }

@@ -208,14 +208,24 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         out.high_bytes          = mul(n, out.high_bytes_per_row);
         out.scale_offset        = add(out.high_offset, aligned(out.high_bytes, 256));
     } else if (layout == QuantLayout::RowScale) {
-        if (format != QType::FP8_E4M3FN_ROW_BF16) {
-            throw std::invalid_argument("RowScale requires row-scaled FP8");
-        }
+        if (!is_fp8_row(format)) { throw std::invalid_argument("RowScale requires row-scaled FP8"); }
         out.group_size          = k;
         out.code_bytes_per_row  = k;
-        out.scale_bytes_per_row = 2;
+        out.scale_bytes_per_row = format == QType::FP8_E4M3FN_ROW_F32 ? 4 : 2;
         out.code_bytes          = out.elements;
         out.scale_offset        = aligned(out.code_bytes, 256);
+    } else if (layout == QuantLayout::Rg16) {
+        if (format != QType::NVFP4_MUL || n % 16 || k % 16) {
+            throw std::invalid_argument("nvfp4_rg16_v1 requires nvfp4_mul with N%16=0 and K%16=0");
+        }
+        // 16-row groups of 144-byte units: a group's bytes are (k / 16) * 144, and a row "owns" a
+        // sixteenth of them (row planes address whole groups only).
+        out.group_size     = 16;
+        out.code_bytes     = mul(mul(n / 16, k / 16), 144);
+        out.scale_offset   = out.code_bytes; // the scales live inside the units
+        out.divisor_offset = aligned(out.code_bytes, 256);
+        out.bytes          = add(out.divisor_offset, 4);
+        return out;
     } else if (layout == QuantLayout::G32ScaleRows16) {
         if (format != QType::FP8_E4M3FN_G32_E8M0 || n % 16 || k % 32) {
             throw std::invalid_argument("g32_scale_rows16_v1 requires group-scaled FP8 with N%16=0 and K%32=0");
@@ -295,8 +305,8 @@ WeightRowPlanes weight_row_planes(const WeightRegion& region) {
     validate_region(region);
     const auto& parent = *region.parent;
     const auto& g      = parent.geometry;
-    if (is_expert_bank_layout(g.layout)) {
-        throw std::invalid_argument("expert banks have no row planes");
+    if (is_expert_bank_layout(g.layout) || g.layout == QuantLayout::Rg16) {
+        throw std::invalid_argument("expert banks and nvfp4_rg16_v1 matrices have no row planes");
     }
     if (!parent.data || g.shape.size() != 2 || region.begin % g.shape[1] ||
         region.end % g.shape[1]) {
@@ -360,6 +370,18 @@ Weight native_weight(const WeightView& view, float input_divisor) {
     if (g.shape.size() != 2 || view.shape[1] != g.shape[1]) {
         throw std::invalid_argument("quantized native Weight requires unchanged parent K");
     }
+    if (g.layout == QuantLayout::Rg16) {
+        // The unit plane addresses whole 16-row groups; its consumers take the complete matrix.
+        if (!is_complete_weight(view)) {
+            throw std::invalid_argument("an nvfp4_rg16_v1 native Weight requires its complete parent");
+        }
+        out.qdata             = region.parent->data;
+        out.group_size        = 16;
+        out.group             = 16;
+        out.padded_shape[1]   = out.k;
+        out.weight_multiplier = region.parent->weight_multiplier;
+        return out;
+    }
     const auto planes = weight_row_planes(region);
     if ((g.layout == QuantLayout::RowScale || g.layout == QuantLayout::BlockScaleK16M128x4 ||
          g.layout == QuantLayout::G32ScaleRows16) &&
@@ -383,10 +405,11 @@ Weight native_weight(const WeightView& view, float input_divisor) {
         out.scale_nb[1] = static_cast<std::int64_t>(g.scale_bytes_per_row);
         out.scale_nb[2] = out.scale_nb[3] = out.scale_nb[1] * out.n;
     } else if (g.layout == QuantLayout::RowScale) {
-        out.scale_dtype = DType::BF16;
+        const std::int64_t word = g.format == QType::FP8_E4M3FN_ROW_F32 ? 4 : 2;
+        out.scale_dtype = word == 4 ? DType::FP32 : DType::BF16;
         out.scale_ne[0] = out.n;
-        out.scale_nb[0] = 2;
-        out.scale_nb[1] = out.scale_nb[2] = out.scale_nb[3] = static_cast<std::int64_t>(out.n) * 2;
+        out.scale_nb[0] = word;
+        out.scale_nb[1] = out.scale_nb[2] = out.scale_nb[3] = static_cast<std::int64_t>(out.n) * word;
     } else if (g.layout == QuantLayout::BlockScaleK16M128x4) {
         out.scale_dtype = DType::FP8_E4M3FN;
     } else if (g.layout == QuantLayout::G32ScaleRows16) {

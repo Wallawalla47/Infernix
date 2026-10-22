@@ -25,6 +25,7 @@
 #include "core/device.h"
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace infernix;
@@ -132,6 +133,7 @@ struct Geometry {
 constexpr Geometry kGeometries[] = {
     {"d256-h24-kv4", 24, 4},
     {"d256-h16-kv2", 16, 2},
+    {"d256-h32-kv2", 32, 2}, // Qwen3.5-122B-A10B: GQA group 16
 };
 
 ops::AttentionHeadGeometry op_geometry(const Geometry& geometry) {
@@ -2600,6 +2602,10 @@ int run_tree_mask_cases(DeviceExecutionView execution, KvCacheStorage storage) {
     failures += run(kGeometries[0], 15, 32, 1, 4000, true);
     failures += run(kGeometries[1], 4, 7, 3, 70, false);
     failures += run(kGeometries[1], 7, 20, 4, 300, false);
+    // Group 16: a grouped tree (four columns), parallel query tiles (eight and sixteen columns).
+    failures += run(kGeometries[2], 3, 4, 3, 70, false);
+    failures += run(kGeometries[2], 5, 8, 4, 300, false);
+    failures += run(kGeometries[2], 7, 16, 2, 127, true);
     // A causal-triangle mask reproduces the causal Op.
     {
         BatchAttentionCase c{16, {5, 70}, {16, 9}, {1, 0}, MappingPattern::Fragmented, 4199u};
@@ -2710,7 +2716,7 @@ int run_geometry(DeviceExecutionView execution, const Geometry& geometry, KvCach
         failures += run_a3_case(execution, geometry, storage, test_case, MappingPattern::Identity);
     }
 
-    if (geometry.q_heads == 16) {
+    if (geometry.kv_heads == 2) {
         // Wider resource bounds must not change the positions-based mathematical result.
         failures +=
             run_a1_case(execution, geometry, storage, {7, 17, 513, 401u}, MappingPattern::Identity);
@@ -2756,9 +2762,12 @@ int run_quantized_causal_cases(DeviceExecutionView execution, KvCacheStorage sto
     int failures = 0;
     for (const Geometry& geometry : kGeometries) {
         // Grouped/parallel and decode/prefill width boundaries remain independent
-        // of context length, for both public entries.
-        constexpr int grouped_limit = 8;
-        for (int width : {grouped_limit - 1, grouped_limit, grouped_limit + 1, 15, 16, 17}) {
+        // of context length, for both public entries. A grouped CTA holds 64 query rows: eight
+        // columns, four at group 16 (whose parallel query tiles then hold three or four).
+        const int grouped_limit = geometry.query_group() == 16 ? 4 : 8;
+        std::vector<int> widths{grouped_limit - 1, grouped_limit, grouped_limit + 1, 15, 16, 17};
+        if (grouped_limit == 4) widths.insert(widths.end(), {7, 8, 9});
+        for (int width : widths) {
             failures += run_a1_case(execution, geometry, storage, {width, 17, 64, 600u},
                                     MappingPattern::Fragmented);
             failures += run_a3_case(execution, geometry, storage, {width, 17, 64, 600u},
@@ -2873,6 +2882,12 @@ int run_nvfp4_cases(DeviceExecutionView execution) {
                             {1, 64, 65, 712u, false, true}, MappingPattern::Fragmented);
     failures += run_a3_case(execution, kGeometries[0], KvCacheStorage::Nvfp4Group16,
                             {1, 64, 65, 713u, false, true}, MappingPattern::Fragmented);
+    // Group 16: grouped up to four columns, parallel query tiles of three or four beyond.
+    for (const auto& [width, seed] : {std::pair{4, 720u}, std::pair{5, 721u}, std::pair{8, 722u},
+                                      std::pair{9, 723u}, std::pair{17, 724u}}) {
+        failures += run_a1_case(execution, kGeometries[2], KvCacheStorage::Nvfp4Group16,
+                                {width, 511, static_cast<std::uint32_t>(511 + width), seed}, MappingPattern::Fragmented);
+    }
     failures += run_a1_case(execution, kGeometries[1], KvCacheStorage::Nvfp4Group16,
                             {5, 17, 22, 714u}, MappingPattern::Identity);
     failures += run_a1_case(execution, kGeometries[1], KvCacheStorage::Nvfp4Group16,
@@ -2890,6 +2905,12 @@ int run_nvfp4_cases(DeviceExecutionView execution) {
 
 int run_k8v4_cases(DeviceExecutionView execution) {
     int failures = 0;
+    // Group 16: grouped up to four columns, parallel query tiles of three or four beyond.
+    for (const auto& [width, seed] : {std::pair{4, 820u}, std::pair{5, 821u}, std::pair{8, 822u},
+                                      std::pair{9, 823u}, std::pair{17, 824u}}) {
+        failures += run_a1_case(execution, kGeometries[2], KvCacheStorage::Fp8KeyNvfp4Value,
+                                {width, 511, static_cast<std::uint32_t>(511 + width), seed}, MappingPattern::Fragmented);
+    }
     for (const Geometry& geometry : kGeometries) {
         failures += run_a1_case(execution, geometry, KvCacheStorage::Fp8KeyNvfp4Value,
                                 {1, 0, 1, 801u}, MappingPattern::Identity);

@@ -59,8 +59,19 @@ constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes,
     return routes.back().cols.last == last && expected == static_cast<std::int64_t>(last) + 1;
 }
 
+// Qwen3.5-122B-A10B: the 35B-A3B's BN64 progression (16 row tiles, one 48-tile K: every split divides it);
+// prefill calls only, since the fused SIMT route serves decode widths (bf16_gdn_norm_gating_resolve_plan).
+constexpr std::array<RouteSpec, 5> k122Routes{{
+    {{1, 127}, Bf16GdnGatingScheduleId::MmaCooperativeSplit16},
+    {{128, 1024}, Bf16GdnGatingScheduleId::MmaCooperativeSplit8},
+    {{1025, 2048}, Bf16GdnGatingScheduleId::MmaCooperativeSplit4},
+    {{2049, 4096}, Bf16GdnGatingScheduleId::MmaCooperativeSplit2},
+    {{4097, kAnyCols}, Bf16GdnGatingScheduleId::MmaUnsplit},
+}};
+
 static_assert(catalog_is_closed(k27Routes, kAnyCols));
 static_assert(catalog_is_closed(k35Routes, kAnyCols));
+static_assert(catalog_is_closed(k122Routes, kAnyCols));
 
 bool is_27(const Bf16GdnGatingProblem& problem) noexcept {
     return problem.heads == 48 && problem.input_rows == 5120;
@@ -68,6 +79,10 @@ bool is_27(const Bf16GdnGatingProblem& problem) noexcept {
 
 bool is_35(const Bf16GdnGatingProblem& problem) noexcept {
     return problem.heads == 32 && problem.input_rows == 2048;
+}
+
+bool is_122(const Bf16GdnGatingProblem& problem) noexcept {
+    return problem.heads == 64 && problem.input_rows == 3072;
 }
 
 bool schedule_uses_mma(Bf16GdnGatingScheduleId schedule) noexcept {
@@ -89,7 +104,7 @@ bool schedule_uses_mma(Bf16GdnGatingScheduleId schedule) noexcept {
 }
 
 std::int32_t mma_tile_cols(const Bf16GdnGatingProblem& problem) noexcept {
-    return is_35(problem) ? 64 : 128;
+    return is_35(problem) || is_122(problem) ? 64 : 128;
 }
 
 std::int32_t schedule_split_k(Bf16GdnGatingScheduleId schedule) {
@@ -138,6 +153,19 @@ bool candidate_is_legal(Bf16GdnGatingScheduleId schedule,
         }
     }
 
+    if (is_122(problem)) {
+        switch (schedule) {
+        case Bf16GdnGatingScheduleId::MmaCooperativeSplit16:
+        case Bf16GdnGatingScheduleId::MmaCooperativeSplit8:
+        case Bf16GdnGatingScheduleId::MmaCooperativeSplit4:
+        case Bf16GdnGatingScheduleId::MmaCooperativeSplit2:
+        case Bf16GdnGatingScheduleId::MmaUnsplit:
+            return true;
+        default:
+            return false;
+        }
+    }
+
     switch (schedule) {
     case Bf16GdnGatingScheduleId::SimtWarpRowC4:
         return problem.cols <= 4 * 65'535;
@@ -180,6 +208,17 @@ void execute_resolved(const Bf16GdnGatingPlan& plan, const Bf16GdnGatingProblem&
     auto scratch_scope = ws.scope();
     DeviceSpan scratch{};
     if (plan.workspace_bytes != 0) { scratch = ws.alloc_bytes(plan.workspace_bytes); }
+    if (is_122(problem)) {
+        const std::int32_t split = schedule_split_k(plan.schedule);
+        if (!bf16_gdn_gating_proj_122_mma_launch(split, plan.token_variant, x, a_weight, b_weight, A_log,
+                                                 dt_bias, scratch.data, g, beta,
+                                                 execution.multiprocessor_count, execution.stream)) {
+            (void)bf16_gdn_gating_proj_122_mma_launch(1, plan.token_variant, x, a_weight, b_weight, A_log,
+                                                      dt_bias, nullptr, g, beta, execution.multiprocessor_count,
+                                                      execution.stream);
+        }
+        return;
+    }
     const auto launch_unsplit = [&] {
         if (is_35(problem)) {
             bf16_gdn_gating_proj_35_mma_unsplit_launch(plan.token_variant, x, a_weight, b_weight,
@@ -307,6 +346,8 @@ const char* bf16_gdn_norm_gating_schedule_name(Bf16GdnNormGatingScheduleId sched
     switch (schedule) {
     case Bf16GdnNormGatingScheduleId::FusedSimt27:
         return "gdn_norm_gating_proj.bf16.fused_simt_27";
+    case Bf16GdnNormGatingScheduleId::FusedSimt122:
+        return "gdn_norm_gating_proj.bf16.fused_simt_122";
     case Bf16GdnNormGatingScheduleId::Composed:
         return "gdn_norm_gating_proj.bf16.composed";
     case Bf16GdnNormGatingScheduleId::MmaCooperativeSplit32:
@@ -317,7 +358,7 @@ const char* bf16_gdn_norm_gating_schedule_name(Bf16GdnNormGatingScheduleId sched
 
 bool bf16_gdn_gating_admits(const Bf16GdnGatingProblem& problem) noexcept {
     if (problem.cols < 1) { return false; }
-    return is_27(problem) || is_35(problem);
+    return is_27(problem) || is_35(problem) || is_122(problem);
 }
 
 Bf16GdnGatingPlan bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId schedule,
@@ -347,6 +388,12 @@ Bf16GdnGatingPlan bf16_gdn_gating_resolve_plan(const Bf16GdnGatingProblem& probl
                 return bf16_gdn_gating_resolve_candidate(route.schedule, problem);
             }
         }
+    } else if (is_122(problem)) {
+        for (const RouteSpec& route : k122Routes) {
+            if (route.cols.contains(problem.cols)) {
+                return bf16_gdn_gating_resolve_candidate(route.schedule, problem);
+            }
+        }
     } else {
         for (const RouteSpec& route : k35Routes) {
             if (route.cols.contains(problem.cols)) {
@@ -365,8 +412,9 @@ std::size_t bf16_gdn_gating_capacity_workspace_bytes(std::int32_t heads, std::in
     const Bf16GdnGatingProblem base{heads, input_rows, 1};
     (void)bf16_gdn_gating_resolve_plan({heads, input_rows, min_cols});
     (void)bf16_gdn_gating_resolve_plan({heads, input_rows, max_cols});
-    return is_27(base) ? route_capacity(k27Routes, base, min_cols, max_cols)
-                       : route_capacity(k35Routes, base, min_cols, max_cols);
+    return is_27(base)    ? route_capacity(k27Routes, base, min_cols, max_cols)
+           : is_122(base) ? route_capacity(k122Routes, base, min_cols, max_cols)
+                          : route_capacity(k35Routes, base, min_cols, max_cols);
 }
 
 Bf16GdnNormGatingPlan bf16_gdn_norm_gating_resolve_plan(const Bf16GdnGatingProblem& problem) {
@@ -375,6 +423,9 @@ Bf16GdnNormGatingPlan bf16_gdn_norm_gating_resolve_plan(const Bf16GdnGatingProbl
     std::int32_t norm_splits             = 0;
     if (is_27(problem) && problem.cols <= 42)
         return {Bf16GdnNormGatingScheduleId::FusedSimt27, control, 0};
+    // The 122B-A10B's fused SIMT route through 42 columns (decode, MTP and DFlash2 verification).
+    if (is_122(problem) && problem.cols <= 42)
+        return {Bf16GdnNormGatingScheduleId::FusedSimt122, control, 0};
     if (is_35(problem) && problem.cols <= 16) {
         control  = bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId::MmaCooperativeSplit32,
                                                      problem);
@@ -392,7 +443,7 @@ std::size_t bf16_gdn_norm_gating_capacity_workspace_bytes(std::int32_t heads,
                                                           std::int32_t max_cols) {
     std::size_t maximum =
         bf16_gdn_gating_capacity_workspace_bytes(heads, input_rows, min_cols, max_cols);
-    if (heads == 48 && input_rows == 5120) {
+    if ((heads == 48 && input_rows == 5120) || (heads == 64 && input_rows == 3072)) {
         if (max_cols <= 42) return 0;
         return bf16_gdn_gating_capacity_workspace_bytes(heads, input_rows, std::max(min_cols, 43),
                                                         max_cols);
@@ -455,10 +506,20 @@ void bf16_gdn_norm_gating_dispatch(const Tensor& x, const Tensor& norm_weight, f
                                                           execution.stream);
             return;
         }
+        if (is_122(problem)) {
+            bf16_gdn_norm_gating_proj_122_launch(x, norm_weight, eps, h, a_weight, b_weight, A_log,
+                                                 dt_bias, g, beta, execution.stream);
+            return;
+        }
         throw std::invalid_argument(
             "gdn_norm_gating_proj: no column-invariant schedule for this problem");
     }
     const Bf16GdnNormGatingPlan plan = bf16_gdn_norm_gating_resolve_plan(problem);
+    if (plan.schedule == Bf16GdnNormGatingScheduleId::FusedSimt122) {
+        bf16_gdn_norm_gating_proj_122_launch(x, norm_weight, eps, h, a_weight, b_weight, A_log, dt_bias,
+                                             g, beta, execution.stream);
+        return;
+    }
     if (plan.schedule == Bf16GdnNormGatingScheduleId::FusedSimt27) {
         bf16_gdn_norm_gating_proj_27_launch(x, norm_weight, eps, h, a_weight, b_weight, A_log,
                                             dt_bias, g, beta, false, execution.stream);

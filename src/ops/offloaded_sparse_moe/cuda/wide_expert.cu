@@ -169,14 +169,22 @@ struct Offsets {
     std::size_t ggml_planes;                            // GGUF banks' kGgmlBf16
     bool has_ggml_planes;
     std::size_t lossless;                               // kLossless
+    std::size_t x_acts, h_acts, ring_jobs, ring_counters; // the narrow ring (ring_call)
+    bool has_ring;
     std::size_t end;
 };
 
-Offsets offsets(std::int32_t max_jobs, std::int32_t entries, std::int32_t columns, ExpertActivation activation,
-                WideA16 wide_a16) {
+Offsets offsets(const ExpertShape& shape, std::int32_t max_jobs, std::int32_t entries, std::int32_t columns,
+                ExpertActivation activation, WideA16 wide_a16) {
     if (max_jobs <= 0 || entries <= 0 || columns <= 0) {
         throw std::invalid_argument("offloaded_sparse_moe experts workspace: empty call");
     }
+    // The bank kind (ggml or NVFP4) is checked by moe_experts; both size the same A16 planes.
+    if (!shape_supported(shape, activation, wide_a16, false)) {
+        throw std::invalid_argument("offloaded_sparse_moe experts workspace: unsupported expert geometry");
+    }
+    const auto x_row = static_cast<std::size_t>(a16_x_row_bytes(shape));
+    const auto h_row = static_cast<std::size_t>(a16_h_row_bytes(shape));
     const auto e = static_cast<std::size_t>(entries), j = static_cast<std::size_t>(max_jobs);
     const auto t = static_cast<std::size_t>(columns);
     Offsets o{};
@@ -193,18 +201,18 @@ Offsets offsets(std::int32_t max_jobs, std::int32_t entries, std::int32_t column
     o.pass_tiles  = take((j + 2) * sizeof(std::int32_t));
     const ResidualTerms terms = activation == ExpertActivation::kA16 ? residual_terms(wide_a16) : ResidualTerms{};
     if (wide_a16 == WideA16::kLossless) {
-        o.lossless = take(lossless_experts_bytes(max_jobs, entries));
+        o.lossless = take(lossless_experts_bytes(shape, max_jobs, entries));
     } else if (terms.x != 0) {
         // The narrow route still needs its h rows (BF16 h of every entry) and exponents.
-        o.h_rows      = take(e * kA16HRowBytes);
+        o.h_rows      = take(e * h_row);
         o.h_emax      = take(e * sizeof(std::int32_t));
         o.x_terms_plane = take(e * x_terms_row_bytes(terms.x));
         o.x_row_scale = take(t * sizeof(float));
         o.h_terms_plane = take(e * h_terms_row_bytes(terms.h));
         o.h_row_scale = take(e * sizeof(float));
     } else if (activation == ExpertActivation::kA16) {
-        o.x_limbs = take(t * kA16XRowBytes);
-        o.h_rows  = take(e * kA16HRowBytes);
+        o.x_limbs = take(t * x_row);
+        o.h_rows  = take(e * h_row);
         o.x_emax  = take(t * sizeof(std::int32_t));
         o.h_emax  = take(e * sizeof(std::int32_t));
         if (wide_a16 == WideA16::kGgmlBf16 && columns >= kGgmlBf16MinColumns) {
@@ -214,6 +222,13 @@ Offsets offsets(std::int32_t max_jobs, std::int32_t entries, std::int32_t column
     } else {
         o.h_blocks = take(e * kHBlocks * sizeof(canon::A4Block));
         o.x_plane  = take(e * kXRowBytes);
+    }
+    if (ring_call(shape, activation, wide_a16, columns)) {
+        o.x_acts        = take(t * static_cast<std::size_t>(shape.gate_up_blocks()) * kA16ActBytes);
+        o.h_acts        = take(e * static_cast<std::size_t>(shape.h_blocks()) * kA16ActBytes);
+        o.ring_jobs     = take(2 * j * sizeof(std::uint32_t));
+        o.ring_counters = take(2 * kRingCounterSlots * sizeof(std::uint32_t));
+        o.has_ring      = true;
     }
     o.end = p;
     return o;
@@ -271,15 +286,19 @@ __device__ __forceinline__ int a16_emax(unsigned key) {
     return key >= 0x7F80U ? canon::kA16NonFinite : max(static_cast<int>(key >> 7), 1);
 }
 
-constexpr int kEncodeXThreads = kHidden / 16; // one 16-element block per thread
+constexpr int kEncodeXThreads = kHidden / 16; // one 16-element block per thread (Flash-Next's A4 terms)
 constexpr int kEncodeWarps    = 8;
 
-// Every token's x limbs and column exponent (W4A16 wide calls): one CTA per token.
-__global__ void __launch_bounds__(kEncodeXThreads)
+// Every token's x limbs and column exponent (W4A16 wide calls): one CTA per token, one 16-element
+// block per thread.
+template <class G>
+__global__ void __launch_bounds__(G::kHidden / 16)
     encode_x_kernel(const std::uint16_t* __restrict__ x, std::uint8_t* __restrict__ limbs, std::int32_t* __restrict__ emax) {
-    __shared__ unsigned keys[kEncodeXThreads / 32];
+    constexpr int kThreads = G::kHidden / 16;
+    static_assert(kThreads % 32 == 0);
+    __shared__ unsigned keys[kThreads / 32];
     const int t = static_cast<int>(blockIdx.x), b = static_cast<int>(threadIdx.x);
-    const auto* source = reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(t) * kHidden + 16 * b);
+    const auto* source = reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(t) * G::kHidden + 16 * b);
     std::uint16_t v[16];
     unpack16(source[0], source[1], v);
     const unsigned key = __reduce_max_sync(0xFFFFFFFFU, a16_key(v));
@@ -287,18 +306,20 @@ __global__ void __launch_bounds__(kEncodeXThreads)
     __syncthreads();
     unsigned all = 0;
 #pragma unroll
-    for (int w = 0; w < kEncodeXThreads / 32; ++w) { all = max(all, keys[w]); }
+    for (int w = 0; w < kThreads / 32; ++w) { all = max(all, keys[w]); }
     const int e = a16_emax(all);
-    store_a16_block(limbs + static_cast<std::size_t>(t) * kA16XRowBytes, b, v, e);
+    store_a16_block(limbs + static_cast<std::size_t>(t) * A16Planes<G>::kXRowBytes, b, v, e);
     if (b == 0) { emax[t] = e; }
 }
 
 // The pass's wide entries' h rows rewritten in place from BF16 to limbs, with their exponents: one
 // warp per entry, which holds the whole BF16 row in registers before it writes.
+template <class G>
 __global__ void __launch_bounds__(kEncodeWarps * 32)
     encode_h_kernel(MoeDispatch dispatch, const std::int32_t* __restrict__ tiles, const std::int32_t* __restrict__ pass_tiles,
                     int pass, std::uint8_t* __restrict__ h_rows, std::int32_t* __restrict__ h_emax) {
-    constexpr int kBlocks = kIntermediate / 16; // 40: lane l holds blocks l and l + 32
+    constexpr int kBlocks = G::kIntermediate / 16; // 40 or 64: lane l holds blocks l and l + 32
+    static_assert(kBlocks > 32 && kBlocks <= 64);
     const int lane = static_cast<int>(threadIdx.x) % 32;
     const int warp = static_cast<int>(blockIdx.x) * kEncodeWarps + static_cast<int>(threadIdx.x) / 32;
     const int warps = static_cast<int>(gridDim.x) * kEncodeWarps;
@@ -309,7 +330,7 @@ __global__ void __launch_bounds__(kEncodeWarps * 32)
         const int expert = dispatch.jobs[job];
         const int entry  = dispatch.offsets[expert] + column + c;
         if (entry >= dispatch.offsets[expert + 1]) { continue; } // warp-uniform
-        std::uint8_t* row = h_rows + static_cast<std::size_t>(entry) * kA16HRowBytes;
+        std::uint8_t* row = h_rows + static_cast<std::size_t>(entry) * A16Planes<G>::kHRowBytes;
         const auto* source = reinterpret_cast<const uint4*>(row);
         std::uint16_t v0[16] = {}, v1[16] = {};
         unpack16(source[2 * lane], source[2 * lane + 1], v0);
@@ -517,14 +538,15 @@ Descriptors make_descriptors_terms(const std::uint8_t* x_terms_plane, const std:
 
 } // namespace
 
-std::size_t experts_workspace_bytes(std::int32_t max_jobs, std::int32_t entries, std::int32_t columns,
-                                    ExpertActivation activation, WideA16 wide_a16) {
-    return offsets(max_jobs, entries, columns, activation, wide_a16).end;
+std::size_t experts_workspace_bytes(const ExpertShape& shape, std::int32_t max_jobs, std::int32_t entries,
+                                    std::int32_t columns, ExpertActivation activation, WideA16 wide_a16) {
+    return offsets(shape, max_jobs, entries, columns, activation, wide_a16).end;
 }
 
-ExpertsWorkspace carve_experts_workspace(void* base, std::int32_t max_jobs, std::int32_t entries, std::int32_t columns,
-                                         ExpertActivation activation, WideA16 wide_a16) {
-    const Offsets o = offsets(max_jobs, entries, columns, activation, wide_a16);
+ExpertsWorkspace carve_experts_workspace(void* base, const ExpertShape& shape, std::int32_t max_jobs,
+                                         std::int32_t entries, std::int32_t columns, ExpertActivation activation,
+                                         WideA16 wide_a16) {
+    const Offsets o = offsets(shape, max_jobs, entries, columns, activation, wide_a16);
     auto* p         = static_cast<std::byte*>(base);
     ExpertsWorkspace w{};
     w.job_records = reinterpret_cast<const std::uint8_t**>(p + o.job_records);
@@ -551,6 +573,13 @@ ExpertsWorkspace carve_experts_workspace(void* base, std::int32_t max_jobs, std:
         w.h_blocks = reinterpret_cast<canon::A4Block*>(p + o.h_blocks);
         w.x_plane  = reinterpret_cast<std::uint8_t*>(p + o.x_plane);
     }
+    if (o.has_ring) {
+        w.x_acts        = reinterpret_cast<std::uint8_t*>(p + o.x_acts);
+        w.h_acts        = reinterpret_cast<std::uint8_t*>(p + o.h_acts);
+        w.ring_done     = reinterpret_cast<std::uint32_t*>(p + o.ring_jobs);
+        w.ring_ready    = w.ring_done + max_jobs;
+        w.ring_counters = reinterpret_cast<std::uint32_t*>(p + o.ring_counters);
+    }
     return w;
 }
 
@@ -571,6 +600,7 @@ Call prepare(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource
     const int entries = outputs.ne[1];
     Call call;
     call.dispatch    = dispatch;
+    call.shape       = source.shape;
     call.scales      = source.scales;
     call.job_records = workspace.job_records;
     call.tiles       = workspace.tiles;
@@ -621,8 +651,10 @@ Call prepare(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource
         call.x_emax  = workspace.x_emax;
         call.h_emax  = workspace.h_emax;
         call.top_k   = top_k;
-        encode_x_kernel<<<x.ne[1], kEncodeXThreads, 0, stream>>>(static_cast<const std::uint16_t*>(x.data),
-                                                                 workspace.x_limbs, workspace.x_emax);
+        with_expert_geometry(source.shape, [&]<class G>() {
+            encode_x_kernel<G><<<x.ne[1], G::kHidden / 16, 0, stream>>>(static_cast<const std::uint16_t*>(x.data),
+                                                                       workspace.x_limbs, workspace.x_emax);
+        });
         check_launch("encode x");
         return call;
     }
@@ -638,6 +670,19 @@ Call prepare(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource
     call.descriptors   = &host_descriptors();
 #endif
     return call;
+}
+
+void encode_x_limbs(const ExpertShape& shape, const Tensor& x, std::uint8_t* limbs, std::int32_t* emax,
+                    cudaStream_t stream) {
+    if (!registered_shape(shape) || x.dtype != DType::BF16 || x.ne[0] != shape.hidden || x.ne[1] <= 0 ||
+        !x.is_contiguous()) {
+        throw std::invalid_argument("offloaded_sparse_moe: x limbs need BF16 x [H, T] of a registered geometry");
+    }
+    with_expert_geometry(shape, [&]<class G>() {
+        encode_x_kernel<G><<<x.ne[1], G::kHidden / 16, 0, stream>>>(static_cast<const std::uint16_t*>(x.data), limbs,
+                                                                   emax);
+    });
+    check_launch("encode x limbs");
 }
 
 void run_pass(const Call& call, std::int32_t pass, cudaStream_t stream) {
@@ -662,14 +707,27 @@ void run_pass(const Call& call, std::int32_t pass, cudaStream_t stream) {
         return;
     }
     if (call.a16) {
-        launch_a16<Matrix::GateUp>(
-            call, pass, GateUpEpilogueA16{call.scales, call.dispatch.entries, call.x_emax, call.h_rows, call.top_k},
-            stream);
-        encode_h_kernel<<<persistent_ctas(), kEncodeWarps * 32, 0, stream>>>(call.dispatch, call.tiles, call.pass_tiles,
-                                                                             pass, call.h_rows, call.h_emax);
-        check_launch("encode h");
-        launch_a16<Matrix::Down>(call, pass, DownEpilogueA16{call.scales, call.dispatch.entries, call.h_emax, call.outputs},
-                                 stream);
+        with_expert_geometry(call.shape, [&]<class G>() {
+            // A call with shared-expert jobs maps entries through entry_column; a routed-only call
+            // (every Qwen3.8-Flash-Next call) keeps the plain token row.
+            if (call.dispatch.shared_first != 0x7FFFFFFF) {
+                launch_a16<A16Matrix<G, Matrix::GateUp, true>>(
+                    call, pass,
+                    SharedGateUpEpilogueA16<G>{call.scales, call.dispatch.entries, call.x_emax, call.h_rows,
+                                               call.top_k, call.dispatch.shared_first},
+                    stream);
+            } else {
+                launch_a16<A16Matrix<G, Matrix::GateUp>>(
+                    call, pass,
+                    GateUpEpilogueA16<G>{call.scales, call.dispatch.entries, call.x_emax, call.h_rows, call.top_k},
+                    stream);
+            }
+            encode_h_kernel<G><<<persistent_ctas(), kEncodeWarps * 32, 0, stream>>>(
+                call.dispatch, call.tiles, call.pass_tiles, pass, call.h_rows, call.h_emax);
+            check_launch("encode h");
+            launch_a16<A16Matrix<G, Matrix::Down>>(
+                call, pass, DownEpilogueA16<G>{call.scales, call.dispatch.entries, call.h_emax, call.outputs}, stream);
+        });
         return;
     }
     launch<Matrix::GateUp>(call, pass, GateUpEpilogue{call.scales, call.h_plane}, stream);

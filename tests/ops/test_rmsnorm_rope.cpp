@@ -604,6 +604,7 @@ int main() {
     for (const int tokens : {1, 2, 3, 4, 7, 8, 16, 17, 64, 128, 129, 1024, 4096}) {
         failures += run_text_case(16, 2, tokens, tokens == 1 ? 0 : 131'072, 0x3000U + tokens);
         failures += run_text_case(24, 4, tokens, tokens == 1 ? 0 : 262'000, 0x4000U + tokens);
+        failures += run_text_case(32, 2, tokens, tokens == 1 ? 0 : 200'000, 0x6000U + tokens);
     }
     failures += run_text_case(16, 2, 4, 0, 0x3101U, true);
     failures += run_text_case(24, 4, 16, 262'000, 0x4101U, true);
@@ -611,6 +612,7 @@ int main() {
     // chunk is only required to be a positive multiple of 128.
     failures += run_text_wide_case(16, 2, 8320, 0x5001U);
     failures += run_text_wide_case(24, 4, 16384, 0x5002U);
+    failures += run_text_wide_case(32, 2, 8320, 0x5003U);
 
     if (failures != 0) {
         std::cerr << "rmsnorm_rope failures=" << failures << '\n';

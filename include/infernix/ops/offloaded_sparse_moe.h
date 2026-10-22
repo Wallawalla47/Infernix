@@ -34,21 +34,41 @@ namespace infernix::ops {
  * tensor cores (qualified against FP64; design §8.5, §13). Both routes depend only on the column
  * count and the stored scales, never on placement. W4A16 experts (§16.2.1) are exact on every
  * route, the wide one included (integer tensor cores), so their bits depend on neither placement
- * nor column count. Router logits stay FP32, as in
- * the Qwen3.5 sparse MoE: rounding them to BF16 would turn experts within one BF16 step of the
- * top-k boundary into ties. Each logit is one FP32 dot product whose order depends only on H, so
- * a column's routing is identical in every batch shape. Routing weights, the shared gate and the
- * combine are FP32 evaluations rounded once; their oracle is the formula in FP64.
+ * nor column count. The route reads each router logit as its model's forward does
+ * (RouterLogits): FP32 for Qwen3.8-Flash-Next, or rounded once to BF16 for Qwen3.5-122B-A10B,
+ * whose router projection writes BF16 (Transformers' Qwen3_5MoeSparseMoeBlock; ties at that
+ * precision go to the lower id, as in the resident Qwen3.5 sparse MoE). Each logit is one FP32 dot
+ * product whose order depends only on H, so a column's routing is identical in every batch shape.
+ * Routing weights, the shared gate and the combine are FP32 evaluations rounded once; their oracle
+ * is the formula in FP64 over the logits as read.
  */
+
+/// An optional column mask of a call laid out as rows of `width` columns (a verification round's
+/// [width, rows] columns): column t is live when t % width < valid[t / width] (device I32 [T /
+/// width], read at execution, so a captured call follows it). A masked column (a round's padding past
+/// a row's drafts) routes nowhere: it adds no dispatch entry, routed or shared, so no job, miss or
+/// prefetch, its ids, weights, gate and route-log ids are still the router's, and the combine writes
+/// y = 0 for it. Every live column's bits are those of the unmasked call. Calls with a mask need the
+/// shared job (MoeDispatch::shared_first).
+struct MoeColumnMask {
+    const std::int32_t* valid = nullptr; // null: every column is live
+    std::int32_t width        = 0;
+};
 
 struct MoeRouting {
     Tensor ids;         // I32 [k, T]
     Tensor weights;     // FP32 [k, T]
     Tensor shared_gate; // FP32 [T]
+    MoeColumnMask mask; // read by the dispatch and the combine
 };
 
+/// How the route reads the FP32 router logits: as stored, or each rounded once to BF16 (round to
+/// nearest even) before selection, the routing weights and the shared gate.
+enum class RouterLogits : std::uint8_t { kFp32, kBf16 };
+
 /// logits: FP32 [E + 1, T], the router rows followed by the shared-expert gate row.
-void moe_route(const Tensor& logits, std::int32_t top_k, MoeRouting& routing, cudaStream_t stream);
+void moe_route(const Tensor& logits, std::int32_t top_k, MoeRouting& routing, cudaStream_t stream,
+               RouterLogits precision = RouterLogits::kFp32);
 
 /// Device-side dispatch of the routed (column, slot) entries by expert. Every array is
 /// caller-owned device memory sized for `max_entries = k * T` entries and E experts.
@@ -59,6 +79,11 @@ struct MoeDispatch {
     std::int32_t* entries = nullptr; // [k*T]: t * k + slot, grouped by expert
     std::int32_t* jobs    = nullptr; // [E]: experts with entries, ascending id
     std::int32_t* job_count = nullptr; // [1]
+    // A dispatch with a shared job (shared_job of moe_dispatch): expert E (one past the routed ones)
+    // holds entries shared_first + t for every column t, after the k*T routed entries
+    // (shared_first = k*T); the arrays are then sized for E + 1 experts and k*T + T entries.
+    // Set by the dispatch call; 0x7FFFFFFF without a shared job.
+    std::int32_t shared_first = 0x7FFFFFFF;
 };
 
 [[nodiscard]] std::size_t moe_dispatch_bytes(std::int32_t experts, std::int32_t entries);
@@ -66,13 +91,16 @@ struct MoeDispatch {
 /// Fills `dispatch` from routing.ids: counts, offsets (exclusive scan, offsets[E] = k*T), jobs in
 /// ascending expert id, job_count, and entries grouped by expert (their order within an expert is
 /// unspecified). When `route_log` is not null it also receives a copy of the k*T ids. The arrays need
-/// no clearing between calls, so a captured call replays correctly.
+/// no clearing between calls, so a captured call replays correctly. With `shared_job` the layer's
+/// shared expert is the last job: expert E with entries k*T + t (MoeDispatch::shared_first; the
+/// route log keeps the routed ids only).
 void moe_dispatch(const MoeRouting& routing, std::int32_t experts, MoeDispatch& dispatch,
-                  std::int32_t* route_log, cudaStream_t stream);
+                  std::int32_t* route_log, cudaStream_t stream, bool shared_job = false);
 /// moe_route then moe_dispatch (experts = E of the logits), in one kernel for decode and
 /// verification widths.
 void moe_route_dispatch(const Tensor& logits, std::int32_t top_k, MoeRouting& routing, MoeDispatch& dispatch,
-                        std::int32_t* route_log, cudaStream_t stream);
+                        std::int32_t* route_log, cudaStream_t stream,
+                        RouterLogits precision = RouterLogits::kFp32, bool shared_job = false);
 
 /// The layer's routed expert records: expert e's record is at frame_base + frames[e] *
 /// record_stride when frames[e] >= 0, else at host_records + e * record_stride (pinned host
@@ -236,6 +264,18 @@ struct MoeExpertSource {
     // frames of a layer's bank have that bank's record stride (a frame pool per record size).
     std::uint64_t frame_stride = 0;
     MoeGgmlBank ggml;
+    // The bank's expert geometry (offloaded_moe::ExpertShape): Qwen3.8-Flash-Next's H 2560 / I 640
+    // for every bank, or Qwen3.5-122B-A10B's H 3072 / I 1024 for NVFP4 W4A16 banks on the exact and
+    // lossless routes. x and outputs have shape.hidden rows; the CPU channel's service serves the
+    // same geometry.
+    offloaded_moe::ExpertShape shape = offloaded_moe::kFlashNextShape;
+    // The layer's shared expert as the call's last job (design §8.6; NVFP4 W4A16 banks): expert
+    // index shared_expert (= E, one past the routed experts; -1: none) of a dispatch made with
+    // shared_job, its record shared_record (device memory, the bank's record layout: always
+    // resident, never staged or CPU-served) and scales[E] its multipliers (so scales holds E + 1).
+    // Its outputs are the last T columns of outputs, which has k*T + T columns.
+    std::int32_t shared_expert         = -1;
+    const std::uint8_t* shared_record  = nullptr;
     // Approximate tail skip (0: off; 1..top_k-1): in a CPU-served call (moe_experts' CPU plan runs), an
     // expert neither resident nor prefetched, of at most kMaxColumns columns, that every column of the
     // call routes at top-k slot >= tail_skip_rank (the smallest router weights) is neither staged,
@@ -246,8 +286,9 @@ struct MoeExpertSource {
 };
 
 /// Workspace of one moe_experts call of `columns` (T) columns and `entries` (k*T) routed entries
-/// with the layer's expert arithmetic.
-[[nodiscard]] std::size_t moe_experts_workspace_bytes(std::int32_t max_jobs, std::int32_t entries, std::int32_t columns,
+/// with the layer's expert geometry (MoeExpertSource::shape) and arithmetic.
+[[nodiscard]] std::size_t moe_experts_workspace_bytes(const offloaded_moe::ExpertShape& shape, std::int32_t max_jobs,
+                                                      std::int32_t entries, std::int32_t columns,
                                                       offloaded_moe::ExpertActivation activation,
                                                       offloaded_moe::WideA16 wide_a16 = offloaded_moe::WideA16::kExact);
 
@@ -267,14 +308,17 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
 [[nodiscard]] bool moe_route_dispatch_plan(const Tensor& logits, std::int32_t top_k, MoeRouting& routing,
                                            MoeDispatch& dispatch, std::int32_t* route_log, const Tensor& x,
                                            const MoeExpertSource& source, std::int32_t max_jobs, void* workspace,
-                                           const Tensor& outputs, cudaStream_t stream);
+                                           const Tensor& outputs, cudaStream_t stream,
+                                           RouterLogits precision = RouterLogits::kFp32,
+                                           bool shared_job = false);
 
 /// Waits for the host's answer to a moe_experts call made with wait_for_cpu == false and places
 /// its outputs; a no-op when that call published no request.
 void moe_experts_cpu_wait(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource& source,
                           std::int32_t max_jobs, void* workspace, Tensor& outputs, cudaStream_t stream);
 
-/// y = bf16(sum_slot w * outputs + shared_gate * shared), BF16 [H, T].
+/// y = bf16(sum_slot w * outputs + shared_gate * shared), BF16 [H, T]; 0 in a column
+/// routing.mask masks.
 void moe_combine(const Tensor& outputs, const MoeRouting& routing, const Tensor& shared, Tensor& y,
                  cudaStream_t stream);
 /// moe_combine followed by hyper_connection_inject(y, inject, residual) without materializing y:

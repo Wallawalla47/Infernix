@@ -15,6 +15,7 @@ namespace infernix::ops::detail {
 enum class CausalConvSplitGeometry {
     Rows2048x2048x4096,
     Rows2048x2048x6144,
+    Rows2048x2048x8192, // Qwen3.5-122B-A10B
 };
 
 inline constexpr std::int32_t kCausalConvParallelMaxTokens = 32;

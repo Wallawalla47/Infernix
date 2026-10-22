@@ -40,6 +40,7 @@ struct Bf16GdnGatingPlan {
 
 enum class Bf16GdnNormGatingScheduleId {
     FusedSimt27,
+    FusedSimt122,
     Composed,
     MmaCooperativeSplit32,
 };
@@ -78,7 +79,7 @@ void bf16_gdn_gating_execute_candidate(Bf16GdnGatingScheduleId schedule, const T
 void bf16_gdn_gating_dispatch(const Tensor& x, const Weight& a_weight, const Weight& b_weight,
                               const Tensor& A_log, const Tensor& dt_bias, WorkspaceArena& ws,
                               Tensor& g, Tensor& beta, DeviceExecutionView execution);
-// column_invariant: the 27B fused schedule at one thread count for every T (the 27B problem only).
+// column_invariant: the fused schedule at one thread count for every T (27B, 35B-A3B, 122B-A10B).
 void bf16_gdn_norm_gating_dispatch(const Tensor& x, const Tensor& norm_weight, float eps, Tensor& h,
                                    const Weight& a_weight, const Weight& b_weight,
                                    const Tensor& A_log, const Tensor& dt_bias,

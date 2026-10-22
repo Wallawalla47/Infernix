@@ -80,4 +80,28 @@ void argmax(const Tensor& logits, const Tensor& row_ids, Tensor& out, std::int32
     detail::argmax_map_launch(row_ids, out, stream);
 }
 
+void argmax_probability(const Tensor& logits, const Tensor& rows, Tensor& probability, std::int32_t valid_rows,
+                        cudaStream_t stream) {
+    if (logits.dtype != DType::BF16 && logits.dtype != DType::FP32) {
+        throw std::invalid_argument("argmax_probability: logits must be BF16 or FP32");
+    }
+    if (logits.ne[2] != 1 || logits.ne[3] != 1 || logits.ne[0] <= 0 || !logits.is_contiguous() ||
+        logits.data == nullptr) {
+        throw std::invalid_argument("argmax_probability: logits must be contiguous rank-2 [vocab,T]");
+    }
+    if (valid_rows <= 0 || valid_rows > logits.ne[0]) {
+        throw std::invalid_argument("argmax_probability: valid_rows must be in [1, logits.ne[0]]");
+    }
+    const std::int32_t columns = logits.ne[1];
+    if (rows.dtype != DType::I32 || !rows.is_contiguous() || rows.numel() != columns ||
+        probability.dtype != DType::FP32 || !probability.is_contiguous() || probability.numel() != columns) {
+        throw std::invalid_argument("argmax_probability: rows must be I32 [T] and probability FP32 [T]");
+    }
+    if (columns == 0) { return; }
+    if (rows.data == nullptr || probability.data == nullptr) {
+        throw std::invalid_argument("argmax_probability: rows/probability data must be non-null");
+    }
+    detail::argmax_probability_launch(logits, rows, probability, valid_rows, stream);
+}
+
 } // namespace infernix::ops

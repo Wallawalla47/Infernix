@@ -322,7 +322,7 @@ int main() {
             return 77;
         }
         // Qwen3.8-27B's drafter and Qwen3.8-Flash-Next's.
-        const int failures = run_geometry(5120) + run_geometry(2560);
+        const int failures = run_geometry(5120) + run_geometry(2560) + run_geometry(3072);
         std::cout << (failures == 0 ? "OK" : "FAIL") << " rmsnorm_dynamic_grouped_conv_prepare\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

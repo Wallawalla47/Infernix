@@ -149,7 +149,7 @@ Case make_case(moe::ExpertActivation activation, int columns, std::uint32_t seed
     for (auto& v : h) { v = fixtures::to_bf16(n(rng)); }
     c.h        = device_copy(h);
     c.max_jobs = std::min(kExperts, kTopK * columns);
-    cuda_check(cudaMalloc(&c.workspace, infernix::ops::moe_experts_workspace_bytes(c.max_jobs, kTopK * columns, columns,
+    cuda_check(cudaMalloc(&c.workspace, infernix::ops::moe_experts_workspace_bytes(infernix::ops::offloaded_moe::kFlashNextShape, c.max_jobs, kTopK * columns, columns,
                                                                                    activation)),
                "cudaMalloc");
     cuda_check(cudaMalloc(&c.out, sizeof(std::uint16_t) * moe::kHidden * kTopK * columns), "cudaMalloc");

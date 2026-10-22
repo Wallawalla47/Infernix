@@ -30,6 +30,7 @@ constexpr std::array kFormats = {
     std::pair{QType::GGML_IQ4_NL, std::string_view{"ggml_iq4_nl"}},
     std::pair{QType::FP8_E4M3FN_B128, std::string_view{"fp8_e4m3fn_b128"}},
     std::pair{QType::FP8_E4M3FN_G32_E8M0, std::string_view{"fp8_e4m3fn_g32_e8m0"}},
+    std::pair{QType::FP8_E4M3FN_ROW_F32, std::string_view{"fp8_e4m3fn_row_f32"}},
 };
 constexpr std::array kLayouts = {
     std::pair{QuantLayout::Contiguous, std::string_view{"contiguous_le_v1"}},
@@ -43,6 +44,7 @@ constexpr std::array kLayouts = {
     std::pair{QuantLayout::Fp8ExpertB128, std::string_view{"fp8_expert_b128_v1"}},
     std::pair{QuantLayout::GgmlTiles16, std::string_view{"ggml_tiles16_v1"}},
     std::pair{QuantLayout::G32ScaleRows16, std::string_view{"g32_scale_rows16_v1"}},
+    std::pair{QuantLayout::Rg16, std::string_view{"nvfp4_rg16_v1"}},
 };
 
 } // namespace

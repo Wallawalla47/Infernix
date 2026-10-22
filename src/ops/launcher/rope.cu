@@ -130,6 +130,20 @@ bool launch_fixed_pair(const Tensor& positions, int rotary_dim, float theta, Ten
                 return true;
             }
         }
+        // Qwen3.5-122B-A10B (GQA 16): the same fixed text instances as the smaller models, so the
+        // split route and rmsnorm_rope agree bit for bit.
+        if (q.ne[1] == 32 && k.ne[1] == 2) {
+            if (axes == 1) {
+                launch_fixed<RopeKernelMode::Text1D, 32, 2>(positions, &q, &k, execution,
+                                                            coefficients);
+                return true;
+            }
+            if (axes == 3) {
+                launch_fixed<RopeKernelMode::TextMrope, 32, 2>(positions, &q, &k, execution,
+                                                               coefficients);
+                return true;
+            }
+        }
     }
     if (axes == 2 && rotary_dim == 72 && theta == 10'000.0F && q.ne[1] == 16 && k.ne[1] == 16) {
         launch_fixed<RopeKernelMode::Vision2D, 16, 16>(positions, &q, &k, execution, coefficients);
@@ -183,7 +197,8 @@ bool launch_fixed_single_dispatch(const Tensor& positions, int rotary_dim, float
         if (launch_text_single<24>(positions, axes, x, execution, coefficients) ||
             launch_text_single<4>(positions, axes, x, execution, coefficients) ||
             launch_text_single<16>(positions, axes, x, execution, coefficients) ||
-            launch_text_single<2>(positions, axes, x, execution, coefficients)) {
+            launch_text_single<2>(positions, axes, x, execution, coefficients) ||
+            launch_text_single<32>(positions, axes, x, execution, coefficients)) {
             return true;
         }
     }

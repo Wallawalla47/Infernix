@@ -19,6 +19,7 @@ constexpr std::array kShapes{
     ShapeEntry{34816, 5120, select_q4_n34816_k5120},
     ShapeEntry{131072, 5120, select_q4_n131072_k5120},
     ShapeEntry{131072, 2048, select_q4_n131072_k2048},
+    ShapeEntry{131072, 3072, select_q4_n131072_k3072},
     ShapeEntry{3456, 1152, select_q4_n3456_k1152},
     ShapeEntry{4304, 1152, select_q4_n4304_k1152},
 };
@@ -34,7 +35,7 @@ Q4Launch select_q4_invariant(std::int32_t t) {
 } // namespace
 
 bool q4_column_invariant_route(std::int32_t n, std::int32_t k) noexcept {
-    return n == 131072 && (k == 5120 || k == 2048);
+    return n == 131072 && (k == 5120 || k == 3072 || k == 2048);
 }
 
 Q4Launch select_q4_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {

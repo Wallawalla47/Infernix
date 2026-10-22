@@ -142,6 +142,24 @@ void bf16_gdn_norm_gating_proj_35_invariant_launch(const Tensor& x, const Tensor
     CUDA_CHECK(cudaGetLastError());
 }
 
+void bf16_gdn_norm_gating_proj_122_launch(const Tensor& x, const Tensor& norm_weight, float eps,
+                                          Tensor& h, const Weight& a_weight, const Weight& b_weight,
+                                          const Tensor& alog, const Tensor& bias, Tensor& g,
+                                          Tensor& beta, cudaStream_t stream) {
+    const NormGatingLauncher<3072, 64> launcher{x, norm_weight, eps, h, a_weight, b_weight,
+                                                alog, bias, g, beta, stream};
+    // A column's reduction order depends on the thread count, not the tile: 384 threads at every
+    // T, one 8-element load per thread over the 3072 inputs.
+    const int tokens = x.ne[1];
+    if (tokens <= 2)
+        launcher.launch<1, 384>();
+    else if (tokens <= 14)
+        launcher.launch<2, 384>();
+    else
+        launcher.launch<4, 384>();
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void bf16_gdn_norm_gating_proj_27_launch(const Tensor& x, const Tensor& norm_weight, float eps,
                                          Tensor& h, const Weight& a_weight, const Weight& b_weight,
                                          const Tensor& alog, const Tensor& bias, Tensor& g,

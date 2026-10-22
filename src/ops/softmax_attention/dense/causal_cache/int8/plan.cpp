@@ -12,18 +12,19 @@ constexpr int kGroupedPrefillMaxWidth = 256;
 Int8KvCausalPlan make_int8_kv_causal_plan(int heads, int width, int batch,
                                           CausalAttentionExecutionEnvelope envelope,
                                           int multiprocessor_count) {
-    if (multiprocessor_count <= 0 || (heads != 24 && heads != 16) || width < 1 || batch < 1 ||
+    if (multiprocessor_count <= 0 || !causal_registered_heads(heads) || width < 1 || batch < 1 ||
         batch > 8 || envelope.min_visible_keys == 0 ||
         envelope.min_visible_keys > envelope.max_visible_keys ||
         envelope.max_visible_keys > kCausalAttentionMaximumVisibleKeys)
         throw std::invalid_argument("INT8 attention: invalid plan inputs");
-    constexpr int grouped_limit = Int8KvCausalPlan::kTokenTile;
+    // A grouped CTA's columns: eight, four at GQA group 16 (64 query rows).
+    const int grouped_limit = causal_grouped_tokens(heads);
     const auto family           = width <= grouped_limit             ? Int8KvFamily::Grouped
                                   : width <= kGroupedPrefillMaxWidth ? Int8KvFamily::ParallelGrouped
                                                                      : Int8KvFamily::Tiled;
     const int tiles =
         family == Int8KvFamily::ParallelGrouped ? (width + grouped_limit - 1) / grouped_limit : 1;
-    const int independent_tiles = (envelope.row_invariant_partition ? 1 : batch) * (heads == 24 ? 4 : 2) * tiles;
+    const int independent_tiles = (envelope.row_invariant_partition ? 1 : batch) * causal_kv_heads(heads) * tiles;
     const std::int64_t sms      = multiprocessor_count;
     const auto budget =
         heads == 24 || width <= 4 ||
@@ -33,7 +34,7 @@ Int8KvCausalPlan make_int8_kv_causal_plan(int heads, int width, int batch,
     CausalKvPartition partition{1, causal_partition_target(budget, independent_tiles)};
     // Bound partial traffic by keeping enough KV work in each split. decode-split64 lets 24-head
     // single-column rows split from 64 keys, so short rows fill the GPU (a different merge order).
-    partition.key_shift = (width == 1 ? 7 : 8) - (heads == 16 ? 1 : 0);
+    partition.key_shift = (width == 1 ? 7 : 8) - (causal_kv_heads(heads) == 2 ? 1 : 0);
     if (envelope.decode_split64 && heads == 24 && width == 1) partition.key_shift = 6;
     // Multi-column rows of the 24/4 geometry may split down to 64 keys, so short rows fill
     // the GPU; the live count is then balanced to the fewest splits that keep the largest

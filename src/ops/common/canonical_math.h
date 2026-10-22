@@ -416,6 +416,19 @@ INFERNIX_CANON_HD std::uint16_t a16_row_output(std::int64_t s, int emax, float m
     return f32_to_bf16_rn(mul_rn(mul_rn(mul_rn(i64_to_f32_rn(s), s1), s2), multiplier));
 }
 
+// a16_row_output before its BF16 rounding: (fl32_rn(S) * 2^(emax - 157)) * m in binary32, the
+// canonical FP32 output of a dense W4A16 projection (the head's logits). A non-finite column gives
+// the canonical binary32 NaN; f32_to_bf16_rn of this value is a16_row_output's for finite columns.
+INFERNIX_CANON_HD float a16_row_output_f32(std::int64_t s, int emax, float multiplier) {
+    if (emax == kA16NonFinite) { return f32_from_bits(0x7FC00000U); }
+    const int k  = emax - 157;
+    const int k1 = k / 2;
+    const int k2 = k - k1;
+    const float s1 = f32_from_bits(static_cast<std::uint32_t>(k1 + 127) << 23);
+    const float s2 = f32_from_bits(static_cast<std::uint32_t>(k2 + 127) << 23);
+    return mul_rn(mul_rn(mul_rn(i64_to_f32_rn(s), s1), s2), multiplier);
+}
+
 } // namespace infernix::ops::canon
 
 #undef INFERNIX_CANON_HD

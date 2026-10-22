@@ -38,7 +38,15 @@ enum class QType : std::uint16_t {
     // MXFP8 weights (ModelOpt's, NVIDIA Qwen3.8-Flash-Next-FP4-Local): E4M3FN codes with one UE8M0
     // power-of-two scale per 32 K elements of a row (tensor-formats.md; tools/artifact/codecs/fp8_g32.py).
     FP8_E4M3FN_G32_E8M0 = 21,
+    // E4M3FN codes with one FP32 multiplier per row (row_scale_v1): ModelOpt's per-tensor FP32
+    // weight_scale kept exactly, written into each row of its matrix (tensor-formats.md).
+    FP8_E4M3FN_ROW_F32 = 22,
 };
+
+// Whether `format` is a row-scaled FP8 format (row_scale_v1: BF16 or FP32 row multipliers).
+[[nodiscard]] constexpr bool is_fp8_row(QType format) noexcept {
+    return format == QType::FP8_E4M3FN_ROW_BF16 || format == QType::FP8_E4M3FN_ROW_F32;
+}
 
 enum class QuantLayout : std::uint16_t {
     RowSplit            = 0,
@@ -64,6 +72,10 @@ enum class QuantLayout : std::uint16_t {
     // g32_scale_rows16_v1: [n, k] E4M3FN codes row-major, then (256-byte aligned) the UE8M0 group
     // scales in 16-row tiles: row r, group g at (r / 16) * (k / 32) * 16 + g * 16 + r % 16.
     G32ScaleRows16 = 10,
+    // nvfp4_rg16_v1: one dense nvfp4_mul [n, k] matrix in the expert record's matrix layout (16-row
+    // groups of 144-byte units, row-group major, block ascending), then (256-byte aligned) its FP32
+    // multiplier: the Qwen3.5 NVFP4 output head.
+    Rg16 = 11,
 };
 
 // Whether `layout` stores a matrix of GGUF blocks (ggml_rows_v1 or ggml_tiles16_v1).
@@ -99,6 +111,11 @@ struct Weight {
     std::int64_t scale_nb[4]   = {0, 0, 0, 0};
     float weight_scale_divisor = 0.0F;
     float input_scale_divisor  = 0.0F;
+    // nvfp4_rg16_v1: the matrix's FP32 multiplier (ModelOpt weight_scale_2), as stored.
+    float weight_multiplier = 0.0F;
+    // A static FP8 A8 input: its FP32 activation scale s (codes e4m3(x * fl32(1 / s))), as stored;
+    // 0 when the input has none.
+    float input_scale = 0.0F;
 };
 
 } // namespace infernix

@@ -54,7 +54,7 @@ void rmsnorm_rope(const Tensor& positions, const Tensor& norm_weight, const Prep
  *
  * The profile is q_in BF16 [256,Q,T], k_in BF16 [256,K,T], q_out and k_out of the same shapes as
  * their inputs, q_norm_weight and k_norm_weight BF16 [256], and positions I32 [T], with
- * (Q,K) either (16,2) or (24,4) and T any positive count the launch grid can address. For
+ * (Q,K) (16,2), (24,4) or (32,2) and T any positive count the launch grid can address. For
  * each head and token,
  *
  *   inv       = 1 / sqrt(sum_d x[d]^2 / 256 + 1e-6)

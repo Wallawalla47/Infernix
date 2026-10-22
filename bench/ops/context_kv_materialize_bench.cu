@@ -23,7 +23,7 @@ using namespace infernix;
 
 namespace {
 
-constexpr int kLayers       = static_cast<int>(ops::kContextKVMaterializeLayers);
+constexpr int kLayers       = 5; // Qwen3.8-27B's drafter
 constexpr int kParentRows   = 6144;
 constexpr int kKeyRow       = 4096;
 constexpr int kValueRow     = 5120;
@@ -138,7 +138,7 @@ struct Fixture {
     Fixture()
         : positions(sizeof(std::int32_t) * 2048), counts(sizeof(std::int32_t) * 8),
           slots(sizeof(std::int32_t) * 8),
-          direct_workspace(ops::context_kv_materialize_workspace_capacity_bytes(1, 1, 2048)),
+          direct_workspace(ops::context_kv_materialize_workspace_capacity_bytes(kLayers, 1, 1, 2048)),
           direct_arena(DeviceSpan{direct_workspace.p, direct_workspace.bytes}) {
         const std::size_t cache_bytes = static_cast<std::size_t>(kHeadDim) * kCapacity * kHeads *
                                         kLaneCapacity * sizeof(std::uint16_t);
@@ -252,7 +252,7 @@ int main(int argc, char** argv) {
                     std::printf(
                         "%d,%d,%d,%s,0,0,nan,nan,nan,0,%zu,0\n", width, batch, width * batch,
                         options.counts.c_str(),
-                        ops::context_kv_materialize_workspace_capacity_bytes(batch, width, width));
+                        ops::context_kv_materialize_workspace_capacity_bytes(kLayers, batch, width, width));
                     continue;
                 }
                 const auto timing = measure(
@@ -262,7 +262,7 @@ int main(int argc, char** argv) {
                     "%d,%d,%d,%s,%u,%u,%.3f,%.3f,%.3f,%zu,%zu,%zu\n", width, batch, width * batch,
                     options.counts.c_str(), fixture.envelope.min_count, fixture.envelope.max_count,
                     timing.median_us, timing.min_us, timing.p95_us, nodes,
-                    ops::context_kv_materialize_workspace_capacity_bytes(batch, width, width),
+                    ops::context_kv_materialize_workspace_capacity_bytes(kLayers, batch, width, width),
                     fixture.direct_arena.peak_used());
             }
         CUDA_CHECK(cudaStreamDestroy(stream));

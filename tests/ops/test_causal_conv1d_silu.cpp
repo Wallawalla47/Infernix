@@ -695,12 +695,13 @@ int batched_snapshot_case(std::int32_t C, std::int32_t width,
 
 // The split snapshot and from-states entries against their contiguous forms on identical inputs:
 // every output row and every state slot must carry the same bits (the arithmetic is shared; only
-// where an output value is stored differs). C = 10240 split (2048, 2048, 6144).
-int split_snapshot_case(std::int32_t width, const std::vector<std::int32_t>& initial_slots,
+// where an output value is stored differs). C = 4096 + rows2, split (2048, 2048, rows2).
+int split_snapshot_case(std::int32_t rows2, std::int32_t width, const std::vector<std::int32_t>& initial_slots,
                         const std::vector<std::int32_t>& snapshot_bases,
                         const std::vector<std::int32_t>& valid_columns, std::int32_t slots,
                         std::uint32_t seed) {
-    constexpr std::int32_t C = 10240, kRows0 = 2048, kRows1 = 2048, kRows2 = 6144;
+    constexpr std::int32_t kRows0 = 2048, kRows1 = 2048;
+    const std::int32_t kRows2 = rows2, C = kRows0 + kRows1 + kRows2;
     const std::int32_t batch   = static_cast<std::int32_t>(initial_slots.size());
     const std::int32_t columns = width * batch;
     const bool masked          = !valid_columns.empty();
@@ -760,7 +761,8 @@ int split_snapshot_case(std::int32_t width, const std::vector<std::int32_t>& ini
         return failures;
     };
 
-    const std::string shape = " W=" + std::to_string(width) + " B=" + std::to_string(batch) +
+    const std::string shape = " C=" + std::to_string(C) + " W=" + std::to_string(width) +
+                              " B=" + std::to_string(batch) +
                               (masked ? " masked" : " dense");
     packed.fill(kOutputPoison);
     out0.fill(kOutputPoison);
@@ -817,6 +819,10 @@ int main() {
     // The peer 35B-A3B geometry is a separate real channel extent.
     constexpr std::int32_t kQwen35Channels = 8192;
     failures += ordinary_case(kQwen35Channels, 257, StateCall::InPlaceEntry, 3257U);
+    // Qwen3.5-122B-A10B: 16 key heads and 64 value heads of 128.
+    constexpr std::int32_t kQwen122Channels = 12288;
+    failures += ordinary_case(kQwen122Channels, 257, StateCall::InPlaceEntry, 3258U);
+    failures += ordinary_case(kQwen122Channels, 17, StateCall::DistinctEntry, 3259U);
 
     // Snapshot decode, small-T boundary/interior, sequence route, slot 0 initialization, and
     // continuation from selected slots. A nonzero destination base proves that snapshots are not
@@ -838,21 +844,25 @@ int main() {
     // production same-row alias pattern; row 1 remains fully disjoint.
     failures += batched_snapshot_case(kQwen35Channels, 16, {15, 33}, {0, 16}, {16, 7}, 34, 5016U);
 
-    // The split entry: both channel geometries, across the column counts that select each of its
+    // The split entry: every channel geometry, across the column counts that select each of its
     // two routes and the boundary between them.
     for (const std::int32_t T : {1, 2, 7, 15, 16, 17, 32, 33, 63, 64, 65, 257, 1024}) {
         failures += split_case(kQwen27Channels, 2048, 2048, 6144, T, false, false,
                                6000U + static_cast<std::uint32_t>(T));
         failures += split_case(kQwen35Channels, 2048, 2048, 4096, T, false, false,
                                7000U + static_cast<std::uint32_t>(T));
+        failures += split_case(kQwen122Channels, 2048, 2048, 8192, T, false, false,
+                               9000U + static_cast<std::uint32_t>(T));
     }
 
-    // The exact-alias state form, on both geometries, across every route boundary.
+    // The exact-alias state form, on every geometry, across every route boundary.
     for (const std::int32_t T : {1, 2, 15, 16, 17, 32, 33, 64, 65, 257}) {
         failures += split_case(kQwen27Channels, 2048, 2048, 6144, T, true, false,
                                6100U + static_cast<std::uint32_t>(T));
         failures += split_case(kQwen35Channels, 2048, 2048, 4096, T, true, false,
                                7100U + static_cast<std::uint32_t>(T));
+        failures += split_case(kQwen122Channels, 2048, 2048, 8192, T, true, false,
+                               9100U + static_cast<std::uint32_t>(T));
     }
 
     // Destinations offset by a pair: four-byte aligned, which the contract admits, but not the
@@ -862,17 +872,23 @@ int main() {
                                6200U + static_cast<std::uint32_t>(T));
         failures += split_case(kQwen35Channels, 2048, 2048, 4096, T, false, true,
                                7200U + static_cast<std::uint32_t>(T));
+        failures += split_case(kQwen122Channels, 2048, 2048, 8192, T, false, true,
+                               9200U + static_cast<std::uint32_t>(T));
     }
 
     // The split snapshot and from-states entries (Qwen3.8-Flash-Next's GDN decode and verification):
     // the single-step decode kernel, the batched one-column kernel, the batched small-W kernel with
     // and without masking, and the single-sequence small-T and sequence kernels.
-    failures += split_snapshot_case(1, {3}, {0}, {}, 4, 8001U);
-    failures += split_snapshot_case(1, {8, 9, 10, 11, 12}, {0, 1, 2, 3, 4}, {}, 13, 8002U);
-    failures += split_snapshot_case(5, {10, 11}, {0, 5}, {}, 12, 8003U);
-    failures += split_snapshot_case(5, {10, 11}, {0, 5}, {5, 2}, 12, 8004U);
-    failures += split_snapshot_case(7, {9}, {1}, {}, 10, 8005U);
-    failures += split_snapshot_case(40, {41}, {0}, {}, 42, 8006U);
+    failures += split_snapshot_case(6144, 1, {3}, {0}, {}, 4, 8001U);
+    failures += split_snapshot_case(6144, 1, {8, 9, 10, 11, 12}, {0, 1, 2, 3, 4}, {}, 13, 8002U);
+    failures += split_snapshot_case(6144, 5, {10, 11}, {0, 5}, {}, 12, 8003U);
+    failures += split_snapshot_case(6144, 5, {10, 11}, {0, 5}, {5, 2}, 12, 8004U);
+    failures += split_snapshot_case(6144, 7, {9}, {1}, {}, 10, 8005U);
+    failures += split_snapshot_case(6144, 40, {41}, {0}, {}, 42, 8006U);
+    // The 122B's value rows: decode, a masked verification batch and the sequence kernel.
+    failures += split_snapshot_case(8192, 1, {8, 9, 10}, {0, 1, 2}, {}, 11, 8101U);
+    failures += split_snapshot_case(8192, 5, {10, 11}, {0, 5}, {5, 2}, 12, 8102U);
+    failures += split_snapshot_case(8192, 40, {41}, {0}, {}, 42, 8103U);
 
     // Argument rejection, on both sides of the route bound.
     failures += split_rejection_case(16);

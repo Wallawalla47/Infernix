@@ -895,6 +895,14 @@ int main(int argc, char** argv) {
     failures += run_case({48, 48, 10240}, 8, 2, {8, 3}, 1871U, false, 16);
     failures += run_case({48, 48, 10240}, 8, 8, {0, 1, 2, 3, 4, 5, 7, 8}, 1873U, true, 16);
     failures += run_case({30, 32, 8192}, 8, 2, {5, 8}, 1875U, false, 16);
+    // Qwen3.5-122B-A10B: 36 GDN layers, 64 value heads, 12,288 conv channels.
+    failures += run_case({36, 64, 12288}, 2, 1, {2}, 1881U, true);
+    failures += run_case({36, 64, 12288}, 6, 8, {0, 1, 2, 3, 6, 4, 1, 5}, 1883U);
+    failures += run_case({36, 64, 12288}, 16, 8, {0, 1, 2, 3, 16, 7, 12, 5}, 1885U, true);
+    for (const int commit : {0, 1, 16, 31, 32}) {
+        failures += run_case({36, 64, 12288}, 32, 1, {commit}, 2125U + commit, true);
+    }
+    failures += run_case({36, 64, 12288}, 8, 2, {5, 8}, 1887U, false, 16);
     failures += run_record_fold_rounds<16>();
     failures += run_record_fold_rounds<32>();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_replay_fold\n";

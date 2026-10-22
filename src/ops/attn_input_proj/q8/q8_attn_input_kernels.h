@@ -62,4 +62,16 @@ void q8_dflash2_attn_input_mma_r32_c32_k128_launch(const Tensor&, const Weight&,
 void q8_dflash2_attn_input_mma_r32_c64_k128_launch(const Tensor&, const Weight&, Tensor&, Tensor&,
                                                    Tensor&, cudaStream_t);
 
+// Qwen3.5-122B-A10B's MTP four-output parent [17408, 3072] (q8_attn_input_n17408.cu).
+void q8_attn_input_n17408_decode_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
+                                        Tensor& k, Tensor& v, cudaStream_t stream);
+void q8_attn_input_n17408_splitk_mma_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
+                                            Tensor& k, Tensor& v, cudaStream_t stream);
+void q8_attn_input_n17408_mma_r32_c128_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
+                                              Tensor& k, Tensor& v, cudaStream_t stream);
+void q8_attn_input_n17408_mma_r64_c128_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
+                                              Tensor& k, Tensor& v, cudaStream_t stream);
+void q8_attn_input_n17408_column_invariant_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
+                                                  Tensor& k, Tensor& v, cudaStream_t stream);
+
 } // namespace infernix::ops::detail

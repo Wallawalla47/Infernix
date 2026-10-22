@@ -592,6 +592,11 @@ int main() {
         execution, {"35b text native-context tail", 256, 64, 1, 7, kTextTheta}, 16, 2, 262'137);
     failures +=
         run_pair_case(execution, {"35b text mrope", 256, 64, 3, 7, kTextTheta}, 16, 2, 2048, 16, 8);
+    // Qwen3.5-122B-A10B: 32 query heads over 2 KV heads (34 head warps exceed one block).
+    failures += run_pair_case(execution, {"122b text decode", 256, 64, 1, 1, kTextTheta}, 32, 2, 200'003);
+    failures += run_pair_case(execution, {"122b text prefill", 256, 64, 1, 129, kTextTheta}, 32, 2, 4096);
+    failures +=
+        run_pair_case(execution, {"122b text mrope", 256, 64, 3, 7, kTextTheta}, 32, 2, 2048, 16, 8);
 
     // Exercise both public forms on either side of the large-block residency boundary.
     const int large_block_capacity = execution.multiprocessor_count * 6;
@@ -599,6 +604,9 @@ int main() {
         failures += run_pair_case(execution,
                                   {"27b text residency boundary", 256, 64, 1, tokens, kTextTheta},
                                   24, 4, 8192);
+        failures += run_pair_case(execution,
+                                  {"122b text residency boundary", 256, 64, 1, tokens, kTextTheta},
+                                  32, 2, 8192);
         failures += run_single_case(
             execution, {"27b text mrope residency boundary", 256, 64, 3, tokens, kTextTheta}, 24,
             8192);

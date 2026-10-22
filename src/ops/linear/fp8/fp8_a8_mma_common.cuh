@@ -4,7 +4,10 @@
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/linear/common/vector_output.cuh"
+#include "ops/linear/fp8/fp8_operands.h"
 #include "ops/linear/fp8/fp8_schedule.cuh"
+
+#include <type_traits>
 
 namespace infernix::ops::detail {
 
@@ -134,12 +137,14 @@ fp8_mma_compute_stage(const std::uint8_t* activation_stage, const std::uint8_t* 
     }
 }
 
-template <class Schedule, bool FullTokens, class Epilogue, class Output, class RowPolicy>
+// Weight rows' words are BF16 or FP32 (fp8_operands.h): Scale is the instance's word type.
+template <class Schedule, bool FullTokens, class Epilogue, class Output, class RowPolicy,
+          class Scale>
 __device__ __forceinline__ void
 fp8_finish_mma_tile(Output output, Epilogue epilogue, RowPolicy row_policy,
                     unsigned char* shared_raw,
                     float (&accumulators)[Schedule::kMmaTokens][Schedule::kMmaRows][4],
-                    const float* activation_scales, const __nv_bfloat16* weight_scales,
+                    const float* activation_scales, const Scale* weight_scales,
                     int row_begin, int token_begin, int rows, int tokens, int warp, int lane) {
     constexpr bool PairRows = RowPolicy::kPaired;
     constexpr int BM = Schedule::kBlockTokens, BN = Schedule::kBlockRows;
@@ -186,12 +191,16 @@ fp8_finish_mma_tile(Output output, Epilogue epilogue, RowPolicy row_policy,
                     return make_float2(1.0F, 1.0F);
                 } else {
                     if constexpr (requires { RowPolicy::kContiguousPairs; }) {
-                        if constexpr (RowPolicy::kContiguousPairs)
-                            return bf16x2_bits_to_float2(
-                                load_ldg<std::uint32_t>(weight_scales + parent_row0));
+                        if constexpr (RowPolicy::kContiguousPairs) {
+                            if constexpr (std::is_same_v<Scale, float>)
+                                return load_ldg<float2>(weight_scales + parent_row0);
+                            else
+                                return bf16x2_bits_to_float2(
+                                    load_ldg<std::uint32_t>(weight_scales + parent_row0));
+                        }
                     }
-                    return make_float2(__bfloat162float(weight_scales[parent_row0]),
-                                       __bfloat162float(weight_scales[parent_row1]));
+                    return make_float2(fp8_widen(weight_scales[parent_row0]),
+                                       fp8_widen(weight_scales[parent_row1]));
                 }
             }();
             float value00 =

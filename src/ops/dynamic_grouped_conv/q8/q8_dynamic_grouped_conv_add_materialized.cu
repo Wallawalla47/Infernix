@@ -58,12 +58,14 @@ constexpr auto make_launchers(std::index_sequence<I...>) {
         &tiled_projection<Rows, C, 8 * (1 + static_cast<int>(I))>...};
 }
 
-// The registered (H, C) pairs: Qwen3.8-27B's drafter (5120; 4096 and 17408) and
-// Qwen3.8-Flash-Next's (2560; 4096 and 7680).
+// The registered (H, C) pairs: Qwen3.8-27B's drafter (5120; 4096 and 17408),
+// Qwen3.8-Flash-Next's (2560; 4096 and 7680) and Qwen3.5-122B-A10B's (3072; 4096 and 9216).
 constexpr auto attention_5120 = make_launchers<5120, 4096>(std::make_index_sequence<11>{});
 constexpr auto mlp_5120       = make_launchers<5120, 17408>(std::make_index_sequence<11>{});
 constexpr auto attention_2560 = make_launchers<2560, 4096>(std::make_index_sequence<11>{});
 constexpr auto mlp_2560       = make_launchers<2560, 7680>(std::make_index_sequence<11>{});
+constexpr auto attention_3072 = make_launchers<3072, 4096>(std::make_index_sequence<11>{});
+constexpr auto mlp_3072       = make_launchers<3072, 9216>(std::make_index_sequence<11>{});
 
 template <int Rows>
 __global__ void finish_kernel(const __nv_bfloat16* projected, const __nv_bfloat16* base,
@@ -82,6 +84,8 @@ const std::array<Launch, 11>& tiled_launchers(int rows, int input_rows) {
     if (rows == 5120 && input_rows == 17408) return mlp_5120;
     if (rows == 2560 && input_rows == 4096) return attention_2560;
     if (rows == 2560 && input_rows == 7680) return mlp_2560;
+    if (rows == 3072 && input_rows == 4096) return attention_3072;
+    if (rows == 3072 && input_rows == 9216) return mlp_3072;
     throw std::logic_error("linear dynamic grouped conv add: unregistered (H, C)");
 }
 
@@ -113,6 +117,8 @@ void materialized(Q8DynamicConvAddSchedule schedule, const Tensor& x, const Weig
     }
     if (rows == 5120) {
         finish<5120>(projected, base, delta, residual, x.ne[1], tokens, stream);
+    } else if (rows == 3072) {
+        finish<3072>(projected, base, delta, residual, x.ne[1], tokens, stream);
     } else {
         finish<2560>(projected, base, delta, residual, x.ne[1], tokens, stream);
     }

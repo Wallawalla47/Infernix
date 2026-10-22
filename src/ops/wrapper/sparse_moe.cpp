@@ -213,6 +213,14 @@ std::size_t sparse_moe_workspace_capacity_bytes(QType routed_gate_up, QType rout
     return required;
 }
 
+bool sparse_moe_geometry(const SparseMoeWeights& weights) noexcept {
+    return weights.router_shared_gate.n == kRouterRows && weights.router_shared_gate.k == kHidden &&
+           weights.routed_gate_up.n == kRoutedGateRows && weights.routed_gate_up.k == kHidden &&
+           weights.routed_down.n == kRoutedDownRows && weights.routed_down.k == kIntermediate &&
+           weights.shared_gate_up.n == kSharedGateRows && weights.shared_gate_up.k == kHidden &&
+           weights.shared_down.n == kHidden && weights.shared_down.k == kIntermediate;
+}
+
 void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilogue epilogue,
                 Tensor& destination, WorkspaceArena& workspace, DeviceExecutionView execution) {
     sparse_moe(x, weights, epilogue, destination, SparseMoeHints{}, workspace, execution);

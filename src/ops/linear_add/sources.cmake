@@ -11,6 +11,7 @@ target_sources(infernix_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_linear_add_decode.cu"
   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_linear_add_a16.cu"
   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_linear_add_a8.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_linear_add_n3072_k8192.cu"
   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_linear_add_plan.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/q4/q4_linear_add.cu"
   "${CMAKE_CURRENT_LIST_DIR}/q5/q5_linear_add_gemm_mma.cu"

@@ -16,7 +16,8 @@ using namespace infernix;
 using namespace infernix::test;
 using namespace infernix::test::norm;
 
-// The hidden width under test: Qwen3.8-27B's 5120, then Qwen3.8-Flash-Next's 2560.
+// The hidden width under test: Qwen3.8-27B's 5120, then Qwen3.8-Flash-Next's 2560, then
+// Qwen3.5-122B-A10B's 3072.
 std::int32_t g_rows = 5120;
 constexpr ReductionCriterion kCriterion{/*relative_l2*/ 1.85e-3,
                                         /*gross_absolute*/ 1.0e-5,
@@ -124,6 +125,11 @@ int main() {
                 failures += run_case(width, batch, 1900U + width * 8 + batch);
         failures += run_case(8, 1, 1901U, true);
         failures += run_case(16, 8, 1908U, true);
+        g_rows = 3072;
+        for (int width = 2; width <= 16; ++width)
+            for (int batch = 1; batch <= 8; ++batch)
+                failures += run_case(width, batch, 2100U + width * 8 + batch);
+        failures += run_case(16, 8, 2108U, true);
         std::cout << (failures == 0 ? "OK" : "FAIL") << " rmsnorm_pack_tail\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

@@ -27,8 +27,8 @@ enum class Q8AttnInputScheduleId {
     DFlash2MmaR32C64K128,
     DFlash2MmaR32C64,
     DFlash2MmaR64C128,
-    // Request-invariant exact route of the 35B-A3B four-output parent: one sliced-K reduction at
-    // every width.
+    // Request-invariant exact route of the four-output parents (35B-A3B, 122B-A10B): one sliced-K
+    // reduction at every width.
     ColumnInvariant,
 };
 
@@ -47,7 +47,7 @@ struct Q8AttnInputPlan {
 
 const char* q8_attn_input_schedule_name(Q8AttnInputScheduleId schedule) noexcept;
 bool q8_attn_input_admits(const Q8AttnInputProblem& problem) noexcept;
-// column_invariant is registered for the four-output [9216,2048] parent only.
+// column_invariant is registered for the four-output parents ([9216,2048] and [17408,3072]) only.
 Q8AttnInputPlan q8_attn_input_resolve_plan(const Q8AttnInputProblem& problem,
                                            bool column_invariant = false);
 

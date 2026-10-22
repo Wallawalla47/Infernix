@@ -148,7 +148,7 @@ void launch(const Tensor& projected, const Tensor& conv_weight, const Tensor& st
     constexpr int kDefaultThreads = 256;
     const std::int32_t width      = projected.ne[1];
     const std::int32_t batch      = projected.ne[2];
-    if constexpr (Channels == 10240) {
+    if constexpr (Channels == 10240 || Channels == 12288) {
         if (width == 4 && batch == 1) {
             constexpr int kT4Threads = 64;
             gdn_projected_conv_kernel<Channels, QueryRows, KeyRows, ValueRows, 4>
@@ -195,6 +195,13 @@ void dispatch(const Tensor& projected, const Tensor& conv_weight, const Tensor& 
         value.ne[0] == 4096) {
         launch<8192, 2048, 2048, 4096>(projected, conv_weight, state_read, valid_columns,
                                        initial_state_slots, query, key, value, publish, stream);
+        return;
+    }
+    // Qwen3.5-122B-A10B: 16 key heads and 64 value heads of 128.
+    if (projected.ne[0] == 12288 && query.ne[0] == 2048 && key.ne[0] == 2048 &&
+        value.ne[0] == 8192) {
+        launch<12288, 2048, 2048, 8192>(projected, conv_weight, state_read, valid_columns,
+                                        initial_state_slots, query, key, value, publish, stream);
         return;
     }
     throw std::invalid_argument("GDN projected-conv received an unregistered geometry");
@@ -249,6 +256,11 @@ void gdn_projected_conv_record_tree_launch(const Tensor& conv_record, const Tens
     if (conv_record.ne[0] == 8192 && query.ne[0] == 2048 && key.ne[0] == 2048 &&
         value.ne[0] == 4096) {
         launch_tree.template operator()<8192, 2048, 2048, 4096>();
+        return;
+    }
+    if (conv_record.ne[0] == 12288 && query.ne[0] == 2048 && key.ne[0] == 2048 &&
+        value.ne[0] == 8192) {
+        launch_tree.template operator()<12288, 2048, 2048, 8192>();
         return;
     }
     throw std::invalid_argument("GDN projected-conv tree received an unregistered geometry");

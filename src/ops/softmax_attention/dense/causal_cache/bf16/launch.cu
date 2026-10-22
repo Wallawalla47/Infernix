@@ -47,7 +47,7 @@ void grouped_instance(const CausalAttentionOperands& p, Bf16KvCacheView<Writable
 
 void tiled(const CausalAttentionOperands& p, Bf16KvReadView cache, const Bf16KvCausalPlan& plan,
            cudaStream_t stream) {
-    const auto invoke = [&]<class G>() {
+    with_causal_geometry(p.query_heads, [&]<class G>() {
         if (plan.instance == Bf16KvInstance::Tiled128)
             launch_bf16_kv_tiled_mma<
                 G, typename Bf16KvInstanceTraits<Bf16KvInstance::Tiled128>::Schedule>(p, cache,
@@ -56,11 +56,7 @@ void tiled(const CausalAttentionOperands& p, Bf16KvReadView cache, const Bf16KvC
             launch_bf16_kv_tiled_mma<
                 G, typename Bf16KvInstanceTraits<Bf16KvInstance::Tiled64>::Schedule>(p, cache,
                                                                                      stream);
-    };
-    if (p.query_heads == 24)
-        invoke.template operator()<CausalD256H24Kv4>();
-    else
-        invoke.template operator()<CausalD256H16Kv2>();
+    });
 }
 
 template <class Input>
@@ -75,10 +71,9 @@ void execute_grouped(const Tensor& q, Input input, const Tensor& positions, floa
     auto view          = bf16_kv_cache_view<Input::writes_cache>(cache, valid, rows);
     view.tree_masks    = tree_masks;
     const auto partial = storage.view();
-    if (p.query_heads == 24)
-        grouped_instance<CausalD256H24Kv4>(p, view, input, plan, partial, stream);
-    else
-        grouped_instance<CausalD256H16Kv2>(p, view, input, plan, partial, stream);
+    with_causal_geometry(p.query_heads, [&]<class G>() {
+        grouped_instance<G>(p, view, input, plan, partial, stream);
+    });
 }
 } // namespace
 

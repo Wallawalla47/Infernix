@@ -35,15 +35,18 @@ struct Round {
 };
 
 Round make_round(std::mt19937& rng, const std::vector<fixtures::Expert>& pool, int n_jobs,
-                 moe::ExpertActivation activation = moe::ExpertActivation::kA4) {
+                 moe::ExpertActivation activation = moe::ExpertActivation::kA4,
+                 const moe::ExpertShape& shape = moe::kFlashNextShape) {
     const bool a16 = activation == moe::ExpertActivation::kA16;
+    const auto hidden = static_cast<std::size_t>(shape.hidden);
     Round r;
     for (int j = 0; j < n_jobs; ++j) {
         const int n = 1 + static_cast<int>(rng() % moe::kMaxColumns);
         r.experts.push_back(pool[rng() % pool.size()]);
-        r.x.push_back(a16 ? fixtures::wide_range_activations(rng, n) : fixtures::random_activations(rng, n));
-        r.y.emplace_back(static_cast<std::size_t>(n) * moe::kHidden, 0xFFFF);
-        r.ref.emplace_back(static_cast<std::size_t>(n) * moe::kHidden);
+        r.x.push_back(a16 ? fixtures::wide_range_activations(rng, n, shape.hidden)
+                          : fixtures::random_activations(rng, n, shape.hidden));
+        r.y.emplace_back(static_cast<std::size_t>(n) * hidden, 0xFFFF);
+        r.ref.emplace_back(static_cast<std::size_t>(n) * hidden);
         r.ncols.push_back(n);
     }
     for (int j = 0; j < n_jobs; ++j) {
@@ -54,13 +57,13 @@ Round make_round(std::mt19937& rng, const std::vector<fixtures::Expert>& pool, i
         const std::uint16_t* xr[moe::kMaxColumns];
         std::uint16_t* yr[moe::kMaxColumns];
         for (int c = 0; c < job.ncols; ++c) {
-            job.x[c] = xr[c] = &r.x[j][static_cast<std::size_t>(c) * moe::kHidden];
-            job.y[c] = &r.y[j][static_cast<std::size_t>(c) * moe::kHidden];
-            yr[c]    = &r.ref[j][static_cast<std::size_t>(c) * moe::kHidden];
+            job.x[c] = xr[c] = &r.x[j][static_cast<std::size_t>(c) * hidden];
+            job.y[c] = &r.y[j][static_cast<std::size_t>(c) * hidden];
+            yr[c]    = &r.ref[j][static_cast<std::size_t>(c) * hidden];
         }
         const moe::CpuIsa isa = g_quick ? moe::best_cpu_isa() : moe::CpuIsa::kScalar;
         if (a16) {
-            moe::expert_forward_a16(isa, job.record, job.scales, job.ncols, xr, yr);
+            moe::expert_forward_a16(isa, shape, job.record, job.scales, job.ncols, xr, yr);
         } else {
             moe::expert_forward(isa, job.record, job.scales, job.ncols, xr, yr);
         }
@@ -94,17 +97,19 @@ void test_worker_counts() {
     }
 }
 
-// A16 teams (design §16.2.1): any worker count gives expert_forward_a16's bits.
-void test_worker_counts_a16() {
+// A16 teams (design §16.2.1): any worker count gives expert_forward_a16's bits, at Flash-Next's
+// geometry and at Qwen3.5-122B-A10B's (up to I / 16 = 64 workers).
+void test_worker_counts_a16(const moe::ExpertShape& shape) {
     std::mt19937 rng(6);
     std::vector<fixtures::Expert> pool;
-    for (int i = 0; i < 4; ++i) { pool.push_back(fixtures::random_a16_expert(rng)); }
-    const std::vector<int> counts = g_quick ? std::vector<int>{1, 4} : std::vector<int>{1, 2, 3, 5, 13, 40};
+    for (int i = 0; i < 4; ++i) { pool.push_back(fixtures::random_a16_expert(rng, shape)); }
+    const int most = shape.h_blocks();
+    const std::vector<int> counts = g_quick ? std::vector<int>{1, 4} : std::vector<int>{1, 2, 3, 5, 13, most};
     for (int workers : counts) {
         moe::CpuExpertTeam team({.workers = workers, .spin_iterations = 256,
-                                 .activation = moe::ExpertActivation::kA16, .cpus = {}});
+                                 .activation = moe::ExpertActivation::kA16, .shape = shape, .cpus = {}});
         for (int n_jobs : {1, 3, 6}) {
-            Round r = make_round(rng, pool, n_jobs, moe::ExpertActivation::kA16);
+            Round r = make_round(rng, pool, n_jobs, moe::ExpertActivation::kA16, shape);
             team.run(r.jobs);
             if (!equal(r)) {
                 std::fprintf(stderr, "A16 workers %d jobs %d differ\n", workers, n_jobs);
@@ -134,7 +139,8 @@ void test_many_rounds_with_parking() {
 int main(int argc, char** argv) {
     g_quick = argc > 1 && std::string(argv[1]) == "--quick";
     test_worker_counts();
-    test_worker_counts_a16();
+    test_worker_counts_a16(moe::kFlashNextShape);
+    test_worker_counts_a16(moe::kQwen3_5_122BShape);
     test_many_rounds_with_parking();
     if (g_failures != 0) {
         std::fprintf(stderr, "%d check(s) failed\n", g_failures);

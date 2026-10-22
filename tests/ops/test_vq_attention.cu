@@ -61,7 +61,9 @@ struct Geometry {
     int kv_heads;
 };
 
-constexpr Geometry kGeometries[] = {{"h24-kv4", 24, 4}, {"h16-kv2", 16, 2}};
+// Qwen3.5-27B, 35B-A3B and 122B-A10B (group 16: grouped CTAs of four columns, parallel tiles of four
+// and eight).
+constexpr Geometry kGeometries[] = {{"h24-kv4", 24, 4}, {"h16-kv2", 16, 2}, {"h32-kv2", 32, 2}};
 
 struct Snapshot {
     std::vector<std::uint8_t> k, v;
@@ -513,7 +515,7 @@ int main(int argc, char** argv) {
     for (const auto storage : {KvCacheStorage::Vq2, KvCacheStorage::Q4KeyVq2Value}) {
         for (const auto& g : kGeometries) {
             // Grouped decode: sinks only, inside the window, beyond the window, page crossings.
-            for (const int w : {1, 2, 5, 8})
+            for (const int w : {1, 2, 4, 5, 8})
                 for (const int prefix : {0, 40, 700, 1500, 3200})
                     failures += run_call(g, storage, Call{.width = w, .prefix = {prefix}, .seed = 11u + w},
                                          "decode W=" + std::to_string(w) + " prefix=" + std::to_string(prefix));
