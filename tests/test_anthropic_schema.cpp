@@ -1186,6 +1186,74 @@ int test_hidden_reasoning_round_trip() {
     return failures;
 }
 
+// Claude Code auto mode's client-side classifier: the judged transcript ends with a System turn
+// stating the decision rules, with a small output budget and stop sequences beside it.
+int test_auto_mode_classifier_body() {
+    Json body                = base_request();
+    body["thinking"]         = Json{{"type", "disabled"}};
+    body["system"]           = "You are an action-safety evaluator.";
+    body["max_tokens"]       = 2112;
+    body["stop_sequences"]   = Json::array({"STOP"});
+    // The adapter admits an inline System only after a User turn and final or before an
+    // Assistant (anthropic_messages_request.cpp), which is exactly the transcript shape the
+    // real classifier sends.
+    body["messages"] = Json::array({Json{{"role", "user"}, {"content", "delete the build cache"}},
+                                     Json{{"role", "assistant"}, {"content", "rm -rf build"}},
+                                     Json{{"role", "user"}, {"content", "Should this action run?"}},
+                                     Json{{"role", "system"},
+                                          {"content", "Judge the last action against the rules."}}});
+
+    const AnthropicMessagesRequest parsed = parse(body);
+    const GenerationRequest& request      = parsed.generation;
+    int failures = check(parsed.model == "claude-local" && request.max_tokens == 2112 &&
+                             request.stop_strings.size() == 1 && request.stop_strings[0] == "STOP",
+                         "classifier envelope fields were not preserved");
+    failures += check(request.messages.size() == 5 &&
+                          request.messages[0].role == infernix::ChatRole::System &&
+                          request.messages[1].role == infernix::ChatRole::User &&
+                          request.messages[2].role == infernix::ChatRole::Assistant &&
+                          request.messages[4].role == infernix::ChatRole::System &&
+                          request.messages[4].content.front().text ==
+                              "Judge the last action against the rules.",
+                      "the classifier's mid-conversation System turn was not parsed role-faithfully");
+    const infernix::PromptInput translated = prompt(request);
+    failures += check(translated.messages.size() == 5 &&
+                          translated.messages[4].role == infernix::ChatRole::System,
+                      "PromptInput lowering lost or hoisted the mid-conversation System turn");
+    return failures;
+}
+
+// Claude Code auto mode's server-side review additionally carries a safeguards object; Infernix
+// ignores it like every field it does not implement, leaving the rest of the request untouched.
+int test_auto_mode_server_review_safeguards_body() {
+    Json body          = base_request();
+    body["thinking"]   = Json{{"type", "disabled"}};
+    body["system"]     = "Review this action for approval.";
+    body["messages"] = Json::array({Json{{"role", "user"}, {"content", "run the deploy script"}},
+                                    Json{{"role", "assistant"}, {"content", "deploying now"}},
+                                    Json{{"role", "user"}, {"content", "Was that within approval?"}},
+                                    Json{{"role", "system"},
+                                         {"content", "Approve or deny the last action."}}});
+    body["safeguards"] = Json{{"rules", Json::array({"no-secrets"})},
+                              {"future_check", Json{{"enabled", true}}}};
+    body["context_management"] = Json{{"edits", Json::array()}};
+
+    const AnthropicMessagesRequest reviewed = parse(body);
+    Json plain                          = body;
+    plain.erase("safeguards");
+    plain.erase("context_management");
+    const AnthropicMessagesRequest without = parse(plain);
+    int failures = check(reviewed.model == without.model &&
+                             reviewed.generation.messages.size() == without.generation.messages.size(),
+                         "safeguards review body was not parsed like the same request without them");
+    failures += check(reviewed.generation.messages.size() == 5 &&
+                          reviewed.generation.messages[4].role == infernix::ChatRole::System &&
+                          reviewed.generation.messages[4].content.front().text ==
+                              "Approve or deny the last action.",
+                      "the review's mid-conversation System turn was altered by the safeguards fields");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -1207,6 +1275,8 @@ int main() {
     failures += test_stream();
     failures += test_hidden_reasoning_signature();
     failures += test_hidden_reasoning_round_trip();
+    failures += test_auto_mode_classifier_body();
+    failures += test_auto_mode_server_review_safeguards_body();
     if (failures != 0) {
         std::cerr << failures << " Anthropic adapter checks failed\n";
         return 1;

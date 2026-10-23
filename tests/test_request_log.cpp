@@ -319,6 +319,7 @@ int main() {
     prepared.preparation.media_items                   = 1;
     prepared.preparation.media_cache_misses            = 1;
     prepared.preparation.built_patch_bytes             = 49152;
+    prepared.preparation.instruction_role_lowerings        = 2;
 
     const RequestLogMetadata metadata{
         .http_request_id                   = "req_wire_923",
@@ -370,6 +371,9 @@ int main() {
                           started.at("preparation_seconds").at("tokenize") == 0.02 &&
                           started.at("preparation_seconds").at("cache_misses") == 1,
                       "request-scoped media preparation diagnostics missing");
+    failures += check(
+        started.at("preparation_seconds").at("instruction_role_lowerings") == 2,
+        "instruction role lowering count missing from the preparation block");
 
     ApiError preparation_error;
     preparation_error.status             = 400;

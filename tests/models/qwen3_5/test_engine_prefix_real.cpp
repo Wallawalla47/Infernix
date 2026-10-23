@@ -127,32 +127,23 @@ infernix::PromptInput chinese_chat(bool enable_thinking) {
     return input;
 }
 
-// Whether the artifact's chat template accepts a `role` message after the conversation's first
-// message. Qwen's official template renders a late System or Developer instruction in place;
-// NVIDIA's raises "System message must be at the beginning." for any system message that is not
-// first, so such an input is invalid for that artifact and its scenario step is skipped.
+// Whether the artifact's chat template renders a `role` message after the conversation's first
+// message in place. Qwen's official template does; NVIDIA's raises "System message must be at the
+// beginning." for a system message that is not first and has no developer branch at all. The Engine
+// measures each instruction position while the template loads - that measurement is the artifact's
+// actual behaviour, not a guess from its wording - and preparation renders an unsupported turn
+// under a role the template does accept, which is exactly what these scenario steps are not meant
+// to validate. A position the template cannot render therefore skips its step.
 bool accepts_late_instruction(const infernix::Engine& engine, infernix::ChatRole role) {
-    const auto message = [](infernix::ChatRole message_role, std::string text) {
-        infernix::ChatMessage out;
-        out.role = message_role;
-        out.parts.push_back(infernix::MessagePart{
-            .kind = infernix::MessagePartKind::Text, .text = std::move(text), .media = {}});
-        return out;
-    };
-    infernix::PromptInput input;
-    input.messages.push_back(message(infernix::ChatRole::User, "Hello."));
-    input.messages.push_back(message(infernix::ChatRole::Assistant, "Hello."));
-    input.messages.push_back(message(role, "Answer briefly."));
-    input.messages.push_back(message(infernix::ChatRole::User, "Again."));
-    try {
-        (void)engine.count_tokens(std::move(input));
-        return true;
-    } catch (const std::exception& error) {
-        std::cout << "skip: the artifact's chat template rejects a late "
+    const auto support  = engine.chat_template_role_support();
+    const bool accepted = role == infernix::ChatRole::System ? support.late_system
+                                                             : support.late_developer;
+    if (!accepted) {
+        std::cout << "skip: the artifact's chat template cannot render a late "
                   << (role == infernix::ChatRole::System ? "system" : "developer")
-                  << " message (" << std::string_view(error.what()).substr(0, 200) << ")\n";
-        return false;
+                  << " message, and preparation renders this step under the User role\n";
     }
+    return accepted;
 }
 
 int exercise_artifact_frontend(const infernix::Engine& engine) {

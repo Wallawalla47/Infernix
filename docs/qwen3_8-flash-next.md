@@ -526,11 +526,46 @@ The quality change against the FP8 table has not been measured yet.
 The conversion above stores [qwen3_8.jinja](../tools/chat_templates/qwen3_8.jinja), the template
 Qwen3.8-27B uses; Flash-Next's own template is Qwen3.8-27B's. Among its Infernix changes, it keeps
 a System or developer message after the first turn in place, as serving documents (Claude Code's
-normal mode sends them). Artifacts converted without it, including the published
-Flash-Next artifacts, store the checkpoint's template, which rejects such a message with
-"System message must be at the beginning". Start them with
+normal mode sends them), and opens the conversation under either role. Artifacts converted without
+it, including the published Flash-Next artifacts, store the checkpoint's template, which raises
+"System message must be at the beginning" for a System message after the first turn and
+"Unexpected message role." for a developer message at any position.
+
+While it loads a template, Infernix measures what that template actually renders: small probe
+conversations decide, separately, whether it accepts a System message after the first turn, a
+developer message after the first turn, and a leading developer message. A template that renders
+all three keeps every role, and a template that cannot render its own probes is treated as keeping
+every role. Detection reads the rendered result rather than the template source, so a reworded or
+commented guard changes nothing. One rule is deliberate: `system` is the role these templates use
+for instructions themselves, so a template that refuses a system turn at every position is stating
+its own rule, and such a request fails as that template asks instead of being rewritten around it.
+
+Where a probe says the active template cannot render a role at its position, `infernix-serve` and
+`infernix` lower that turn's role instead of failing: a System or developer message after the
+first turn becomes a User message, a leading developer message becomes a System message, and a
+leading System message is never touched (so the ordinary single leading System block, the
+conversation's prefix-cache anchor, stays byte-identical). The text, the number of turns and their
+positions stay as they arrived, only the role changes, so such a request never fails on the
+template. Each generation request shows its lowered turns as `instruction_role_lowerings` in the
+preparation block of `--request-log-jsonl`, and both programs state once at startup which roles
+the loaded template lowers. One consequence to know: a lowered turn counts as a user query for a
+template that takes its thinking history from the last user turn, so `preserve_thinking: false` can
+then drop earlier `<think>` blocks that `qwen3_8.jinja` keeps. Passing
 `--chat-template tools/chat_templates/qwen3_8.jinja` (the file is also in the Windows release
-zip's `chat_templates` folder).
+zip's `chat_templates` folder) stays the quality-preferred way to run: it renders every turn under
+its real role.
+
+### Claude Code auto mode
+
+Claude Code's auto mode adds requests of its own beside the conversation. Its server-side review
+sends a `safeguards` object, which Infernix ignores like any field it does not implement; a
+reviewed response that carries no `safeguard_results`, which Infernix never sends, makes Claude
+Code classify locally for the rest of that session, so the review costs at most one request per
+session and `CLAUDE_CODE_AUTO_MODE_SERVER=0` skips it. Auto mode also puts System turns into the
+middle of the conversation, which the role lowering above accepts: Infernix answers those requests
+with the turn rendered under the User role instead of refusing them, so the client has no reason
+to stop sending them. The classifier works with `--no-thinking`; give it a model with
+`CLAUDE_CODE_AUTO_MODE_MODEL`.
 
 ## Prefix cache
 

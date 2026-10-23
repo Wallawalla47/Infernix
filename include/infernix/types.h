@@ -948,6 +948,41 @@ enum class ChatRole : std::uint8_t {
     Tool,
 };
 
+// Whether the active chat template renders an instruction role at each conversation position,
+// found by rendering each position once while the template loads. Agent clients legitimately send
+// instructions where a checkpoint template refuses them: Claude Code appends a mid-conversation
+// system entry, and OpenAI clients carry a leading `developer` turn. Preparation then renders the
+// turn's text under a role the template does render, never changing text, part count or position.
+//
+// The two instruction roles are treated differently on purpose. `system` is the role the Qwen
+// templates themselves use for instructions, so a template that refuses it at every position is
+// stating its own rule and the request fails as that template asks; only a positional rule (the
+// checkpoint guard, which allows a system turn first and nowhere else) is worked around.
+// `developer` is an instruction alias from the client protocols that many Qwen checkpoint
+// templates have no branch for at all, so it is always rendered under a role the template has.
+struct ChatTemplateRoleSupport {
+    // Renders a System turn as the first message. False together with a false late_system is a
+    // template's own rule about instructions, which preparation leaves alone.
+    bool leading_system = true;
+    // Renders a System turn after the first message. Otherwise, and only while it does render one
+    // first, preparation renders that turn as a User turn.
+    bool late_system = true;
+    // Renders a developer turn after the first message. Otherwise preparation renders it as a User
+    // turn.
+    bool late_developer = true;
+    // Renders a developer turn as the first message. Otherwise preparation renders it as a System
+    // turn when the template opens with one, and as a User turn otherwise.
+    bool leading_developer = true;
+
+    // True when preparation lowers a System turn that arrived after the first message.
+    [[nodiscard]] constexpr bool lowers_late_system() const noexcept {
+        return !late_system && leading_system;
+    }
+
+    [[nodiscard]] friend constexpr bool
+    operator==(const ChatTemplateRoleSupport&, const ChatTemplateRoleSupport&) noexcept = default;
+};
+
 enum class MessagePartKind : std::uint8_t {
     Text,
     Media,
@@ -1173,6 +1208,10 @@ struct PromptPreparationStats {
     std::size_t media_singleflight_waits = 0;
     std::size_t built_patch_bytes        = 0;
     std::size_t reused_patch_bytes       = 0;
+    // Instruction turns whose role preparation lowered because the active chat template cannot
+    // render them where they arrived (see ChatTemplateRoleSupport). 0 when the template renders
+    // every instruction position it received.
+    std::size_t instruction_role_lowerings = 0;
 };
 
 struct MediaCacheSummary {

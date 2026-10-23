@@ -108,6 +108,9 @@ public:
     [[nodiscard]] MemorySummary memory_summary() const;
     [[nodiscard]] RuntimeStats runtime_stats() const;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
+    // Which instruction positions the active chat template renders; prompt preparation lowers an
+    // instruction turn that arrived in an unsupported position to a role the template does render.
+    [[nodiscard]] ChatTemplateRoleSupport chat_template_role_support() const;
     [[nodiscard]] bool is_available() const;
 
     void reset_memory_peaks() noexcept;

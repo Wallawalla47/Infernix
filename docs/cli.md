@@ -194,7 +194,13 @@ Run message files from the repository root when they contain repository-relative
 
 Supported roles are `system`, `developer`, `user`, `assistant`, and `tool`.
 The selected template formats these roles. The maintained Qwen templates keep system/developer
-messages at their input positions.
+messages at their input positions. Where the selected template cannot render one of them at its
+position, Infernix lowers that turn's role instead of failing (a later system or developer message
+to `user`, a leading developer message to `system`, never a leading system message), keeping the
+text, the turn count and the positions, and it states the lowering once at startup. A template that
+refuses a system turn at every position states its own rule about instructions, and the request
+fails as that template asks. `--chat-template tools/chat_templates/qwen3_8.jinja` renders every turn
+under its real role.
 
 Message content may be a string or an ordered array containing:
 

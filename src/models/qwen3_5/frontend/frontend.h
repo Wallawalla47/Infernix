@@ -98,6 +98,10 @@ public:
                         const ToolChoice& tool_choice                     = {}) const;
     [[nodiscard]] const StopPolicy& default_stop_policy() const noexcept;
     [[nodiscard]] const ModelSamplingDefaults& sampling_defaults() const noexcept;
+    // Which instruction positions the active chat template renders. prepare() and count_tokens()
+    // lower an instruction turn that arrived in an unsupported position to a role the template does
+    // render, keeping text and position, instead of failing the request.
+    [[nodiscard]] ChatTemplateRoleSupport chat_template_role_support() const noexcept;
 
 private:
     class Impl;

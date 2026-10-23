@@ -411,6 +411,8 @@ int main(int argc, char** argv) {
 
         infernix::Engine engine(std::move(engine_options));
         startup_log.engine_ready(engine.load_summary());
+        startup_log.chat_template_roles(engine.chat_template_role_support(),
+                                        cli.chat_template_path.string());
         engine.reset_memory_peaks();
 
         infernix::PreparedPrompt prompt = engine.prepare(std::move(input));

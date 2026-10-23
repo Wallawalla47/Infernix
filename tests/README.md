@@ -19,8 +19,9 @@ ownership contracts are defined in [Engine architecture](../docs/maintainer/engi
 - `bench/ttft/` — HTTP measurements, campaign orchestration and workload construction;
 - root C++ tests — core storage, public API, serving protocols, logging, benchmark reports and
   causal-scoring evaluation;
-- `test_serve_corpus.py` — agreement between the serving request-log schema and its measurement
-  consumer.
+- root `test_*.py` — corpus measurement consumption, and the schema-version agreement between
+  what Serve writes and what each Python reader accepts (the per-language consumer tests build
+  their fixtures from their own constant, so only that pin can see a one-sided bump).
 
 Tests are grouped by observable risk, not by mirroring every source file or class.
 `CMakeLists.txt` includes explicit registrations from `cmake/`, `artifact/`, `models/qwen3_5/`

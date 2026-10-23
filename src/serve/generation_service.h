@@ -167,6 +167,10 @@ public:
         return engine_->sampling_defaults();
     }
 
+    [[nodiscard]] infernix::ChatTemplateRoleSupport chat_template_role_support() const {
+        return engine_->chat_template_role_support();
+    }
+
     // Artifact-tokenizer encoding of raw text, with no template or special token added.
     [[nodiscard]] std::vector<infernix::TokenId> tokenize_text(std::string_view text) const {
         return engine_->tokenize_text(text);

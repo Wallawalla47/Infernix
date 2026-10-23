@@ -1240,6 +1240,28 @@ int test_assistant_continuation_mode() {
     return failures;
 }
 
+// Agent clients such as Claude Code mix developer and system turns into the transcript's middle;
+// the parser must keep every role where it arrived and leave rendering decisions to preparation.
+int test_late_system_and_developer_roles_parse() {
+    Json body        = base_request();
+    body["messages"] = Json::array({Json{{"role", "system"}, {"content", "lead rules"}},
+                                    Json{{"role", "user"}, {"content", "run it"}},
+                                    Json{{"role", "developer"}, {"content", "mid policy"}},
+                                    Json{{"role", "user"}, {"content", "and now?"}}});
+    const GenerationRequest request = parse(body).generation;
+    int failures                    = check(request.messages.size() == 4 &&
+                             request.messages[0].role == infernix::ChatRole::System &&
+                             request.messages[1].role == infernix::ChatRole::User &&
+                             request.messages[2].role == infernix::ChatRole::Developer &&
+                             request.messages[3].role == infernix::ChatRole::User,
+                         "a mid-transcript developer or system turn lost its parse-time role");
+    const infernix::PromptInput prepared = prompt(request);
+    failures += check(prepared.messages.size() == 4 &&
+                          prepared.messages[2].role == infernix::ChatRole::Developer,
+                      "PromptInput lowering hoisted or renamed the mid-transcript developer turn");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -1258,6 +1280,7 @@ int main() {
     failures += test_stream_observations();
     failures += test_common_objects();
     failures += test_assistant_continuation_mode();
+    failures += test_late_system_and_developer_roles_parse();
     if (failures == 0) { std::cout << "OpenAI Chat protocol tests passed\n"; }
     return failures == 0 ? 0 : 1;
 }

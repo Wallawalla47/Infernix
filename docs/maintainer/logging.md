@@ -169,6 +169,10 @@ explicit emergency cases above remain direct outputs because they are different 
 Logging tests protect Infernix-owned observable semantics, not private object shape. The request-log
 test covers the consumed JSONL schema, representative request/throughput pretty records, Serve
 failure severity, and exclusion of arbitrary client error text. The pretty-logging test covers the
-observable Service and Tool prefixes. The corpus consumer test protects its exact schema-version
-agreement with Serve. Startup progress coordination is verified through terminal and redirected
-paths when that code changes; registry, mutex, getter, and constructor tests are not retained.
+observable Service and Tool prefixes. Serve stamps each record with `kRequestLogSchemaVersion` and
+every reader gates on its own copy of that number, so one schema test
+([tests/test_request_log_schema.py](../../tests/test_request_log_schema.py)) reads the constant
+out of the header and asserts it against each Python reader's copy; the per-language consumer
+tests build their fixtures from their own constant and cannot see that drift. Startup progress
+coordination is verified through terminal and redirected paths when that code changes; registry,
+mutex, getter, and constructor tests are not retained.

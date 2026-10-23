@@ -565,6 +565,12 @@ feature is enabled.
 V3 can carry a custom chat template in the corresponding resource object. The resource stores raw bytes,
 and recognition and rendering of the template are determined by the actual capabilities of the current
 [Frontend](../../src/models/qwen3_5/frontend/chat_template.cpp).
+That object is the only template the Frontend reads. Upstream checkpoints also embed a copy in
+`tokenizer_config.json`, which the converter removes while finalizing the resources
+(`tools/convert/resources.py`), because it is inert, is not updated by a recipe that overrides
+`chat_template.jinja`, and is the first copy a tool inspecting the artifact's JSON reaches. An
+artifact therefore carries exactly one template; a pre-existing artifact can still hold the stale
+field, and it stays unread.
 The complete tokenizer resources together determine the token domain, and the fixed model config keeps
 its own weight vocab_size.
 

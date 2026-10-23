@@ -762,6 +762,7 @@ PromptPreparationStats PreparedPrompt::preparation_stats() const noexcept {
         .media_singleflight_waits      = stats.media_singleflight_waits,
         .built_patch_bytes             = stats.built_patch_bytes,
         .reused_patch_bytes            = stats.reused_patch_bytes,
+        .instruction_role_lowerings    = stats.instruction_role_lowerings,
     };
 }
 
@@ -777,6 +778,10 @@ Frontend::~Frontend()                              = default;
 
 const ModelSamplingDefaults& Frontend::sampling_defaults() const noexcept {
     return impl_->sampling;
+}
+
+ChatTemplateRoleSupport Frontend::chat_template_role_support() const noexcept {
+    return impl_->chat_template.role_support();
 }
 
 Frontend make_frontend(const FrontendResources& resources, FrontendOptions options) {
@@ -834,12 +839,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     if (cache_hints.markers.size() > kMaximumExplicitPromptCacheMarkers) {
         throw std::invalid_argument("PromptInput supports at most four explicit cache markers");
     }
-    std::vector<ChatRole> message_roles;
-    message_roles.reserve(input.messages.size());
-    for (const ChatMessage& message : input.messages) { message_roles.push_back(message.role); }
     const auto tool_call_output = fi::build_tool_call_output_contract(options.tool_jsons);
-    const std::optional<std::uint32_t> leading_boundary =
-        leading_instruction_boundary(message_roles);
     std::vector<PromptCacheMarker> rendered_markers = cache_hints.markers;
     std::optional<std::size_t> engine_tool_marker_index;
     if (cache_hints.allow_engine_automatic_shared_prefixes && !options.tool_jsons.empty()) {
@@ -853,6 +853,20 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     }
     const std::size_t message_count       = input.messages.size();
     std::vector<fi::ChatMessage> messages = convert_messages(std::move(input.messages));
+    // A checkpoint template can refuse an instruction role in a position an agent client
+    // legitimately uses: the NVIDIA Qwen3.8 template raises for a System message that is not the
+    // first and has no developer branch at all. Lower only the positions the active template
+    // actually refuses, so a maintained template still renders every turn under its real role, and
+    // the leading System turn of an ordinary conversation stays byte-identical. Roles collected
+    // below reflect the lowering, keeping ngram sources, tap hints and block keys consistent with
+    // the render.
+    const std::size_t role_lowerings =
+        fi::lower_unsupported_instruction_roles(impl_->chat_template.role_support(), messages);
+    std::vector<ChatRole> message_roles;
+    message_roles.reserve(messages.size());
+    for (const fi::ChatMessage& message : messages) { message_roles.push_back(message.role); }
+    const std::optional<std::uint32_t> leading_boundary =
+        leading_instruction_boundary(message_roles);
     const bool has_media =
         std::any_of(messages.begin(), messages.end(),
                     [](const fi::ChatMessage& message) { return message.has_media(); });
@@ -863,6 +877,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     auto prepared              = std::make_unique<PreparedPromptData>();
     PreparedPromptData& result = *prepared;
     result.tool_call_output    = tool_call_output;
+    result.prepare.instruction_role_lowerings  = role_lowerings;
     if (impl_->ngram_sources_enabled) {
         result.ngram_boundaries = impl_->ngram_boundaries;
         std::size_t remaining   = impl_->max_context;
@@ -1022,6 +1037,8 @@ std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl
     fi::check_preparation_control(control);
     const PromptOptions options           = input.options;
     std::vector<fi::ChatMessage> messages = convert_messages(std::move(input.messages));
+    // Same role lowering as prepare(), so counting never fails where generation succeeds.
+    (void)fi::lower_unsupported_instruction_roles(impl_->chat_template.role_support(), messages);
     const bool has_media =
         std::any_of(messages.begin(), messages.end(),
                     [](const fi::ChatMessage& message) { return message.has_media(); });

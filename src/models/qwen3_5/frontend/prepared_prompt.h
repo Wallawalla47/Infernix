@@ -113,6 +113,9 @@ struct PrepareStats {
     std::size_t media_singleflight_waits = 0;
     std::size_t built_patch_bytes        = 0;
     std::size_t reused_patch_bytes       = 0;
+    // Instruction turns whose role preparation lowered because the active chat template cannot
+    // render them where they arrived. 0 when the template renders every position it received.
+    std::size_t instruction_role_lowerings = 0;
 };
 
 // The one-shot ngram index of a prepared prompt. Planning moves the index out before the prompt is

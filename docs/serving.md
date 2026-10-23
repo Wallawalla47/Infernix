@@ -414,7 +414,19 @@ arguments are not streamed incrementally.
 Assistant continuation may finish a partial call; a prefix containing a completed call is rejected.
 
 Messages enter the selected template in their input order. The maintained Qwen templates keep
-system/developer messages at their original positions. A final assistant message is an assistant
+system/developer messages at their original positions. Where the selected template cannot render an
+instruction role at its position, that turn is rendered under a role it does accept — a later
+system or developer turn under `user`, a leading developer turn under `system` — and only the
+role changes: the text, the number of turns and their positions stay as they arrived, and a
+leading system turn is never touched, so the conversation's prefix-cache anchor is unchanged. A
+template that refuses a system turn at every position is stating its own rule about instructions
+rather than placing one, and the request fails as that template asks. The lowered turn count is
+`instruction_role_lowerings` in the preparation block of `--request-log-jsonl`, and both
+`infernix-serve` and `infernix` state the lowering once at startup. Pass
+`--chat-template tools/chat_templates/qwen3_8.jinja` to render every turn under its real role. A
+lowered turn counts as a user query for a template that selects its thinking history from the last
+user turn, so `preserve_thinking: false` can drop earlier `<think>` blocks that the maintained
+template keeps. A final assistant message is an assistant
 prefill: generation continues that turn in place instead of opening a new assistant turn. Because
 a reasoning opener cannot be continued, a prefill that carries media or whose thinking is not
 explicitly disabled (top-level or `chat_template_kwargs` `enable_thinking`, or
@@ -755,7 +767,9 @@ fail.
 
 System and developer message Items retain their positions in the input array. Top-level
 `instructions` is represented as a leading developer turn for the current request; target-specific
-role lowering occurs only in the Qwen family frontend.
+role lowering occurs only in the Qwen family frontend, and it lowers a leading `developer` turn to
+`system` when the selected template has no `developer` role at all, so `instructions` renders under
+its own text instead of failing.
 
 An `input_text`, `input_image`, or tool-result part may carry
 `prompt_cache_breakpoint:{"mode":"explicit"}`. Write selection follows
@@ -978,7 +992,9 @@ curl http://127.0.0.1:8080/v1/messages \
 The endpoint accepts top-level System text, ordered User/Assistant/System history, text and image
 blocks, Thinking history, tool-use history, tool results, user-defined tools, aggregate responses,
 and Anthropic SSE. Consecutive User or Assistant messages are joined without adding separators.
-Mid-conversation System messages retain their input position. A final Assistant message
+Mid-conversation System messages retain their text and input position; where the active chat
+template rejects them there, Infernix instead renders them under the User role (role only, never
+text or position). A final Assistant message
 is an Assistant prefill: generation continues its existing text instead of opening another turn.
 Assistant prefill cannot contain media and cannot start with Thinking enabled; a turn cut by the
 output limit may carry reasoning content. It cannot carry `tool_use` blocks: every `tool_use`
@@ -1509,10 +1525,11 @@ because another process holds `FILE` open without delete sharing on Windows, the
 warning, keeps appending to `FILE`, and tries again after another `N` MiB. Rotated names are also
 checked against the model artifact path.
 
-Every line is one `infernix_serve_request_log` schema-v28 JSON object. All events carry
+Every line is one `infernix_serve_request_log` schema-v30 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance. Successful request-start records include request-scoped acquisition,
-media-preprocessing wall/work, tokenizer, cache hit/miss/single-flight, and payload-size fields;
+media-preprocessing wall/work, tokenizer, cache hit/miss/single-flight, payload-size fields, and
+`instruction_role_lowerings`, the turns the selected template could not render at their positions;
 they do not infer request behavior from process-global counter deltas.
 
 | Event | Contents |

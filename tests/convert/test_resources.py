@@ -44,6 +44,38 @@ def test_final_resources_override_defaults_without_hash_pinning(tmp_path):
     )
 
 
+def test_final_resources_keep_one_chat_template_authority(tmp_path):
+    """An override must not leave the superseded template readable inside the artifact.
+
+    Upstream ships the template twice and the Frontend binds only chat_template.jinja, so the
+    tokenizer_config.json field is inert and stale after any recipe that overrides the object.
+    """
+    tokenizer = {"model": {"type": "BPE", "vocab": {"a": 0, "b": 1}}}
+    (tmp_path / "tokenizer.json").write_text(json.dumps(tokenizer))
+    (tmp_path / "tokenizer_config.json").write_text(
+        json.dumps(
+            {
+                "added_tokens_decoder": {},
+                "chat_template": "upstream {{ messages }}",
+                "chat_template.jinja": "upstream {{ messages }}",
+            }
+        )
+    )
+    (tmp_path / "generation_config.json").write_text("{}")
+    template = tmp_path / "maintained.jinja"
+    template.write_text("maintained {{ messages }}")
+    (tmp_path / "chat_template.jinja").write_text("checkpoint {{ messages }}")
+
+    references, payloads, _, _ = load_resources(
+        tmp_path, vocab_size=2, overrides={"chat_template.jinja": template}
+    )
+
+    stored = json.loads(payloads[references["text"]["tokenizer_config.json"]])
+    assert "chat_template" not in stored and "chat_template.jinja" not in stored
+    assert payloads[references["text"]["chat_template.jinja"]] == template.read_bytes()
+    assert stored["added_tokens_decoder"] == {}
+
+
 def test_special_tokens_merge_both_resources_with_consistent_flags():
     tokenizer = {
         "model": {"vocab": {"a": 0}},

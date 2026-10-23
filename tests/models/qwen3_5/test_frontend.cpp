@@ -3308,6 +3308,300 @@ int test_ngram_proposal_only_sources() {
 
 } // namespace
 
+// Renders conversation roles the way the NVIDIA Qwen3.8 checkpoint template that the published
+// Flash-Next artifacts carry does: a System turn is accepted only as the first message, and there
+// is no developer branch at all, so a developer turn raises wherever it arrives.
+constexpr std::string_view kCheckpointRoleTemplate =
+    "{% for m in messages %}"
+    "{% if m.role == 'system' and not loop.first %}"
+    "{{ raise_exception('System message must be at the beginning.') }}{% endif %}"
+    "{% if m.role == 'developer' %}{{ raise_exception('Unexpected message role.') }}{% endif %}"
+    "{% endfor %}"
+    "{% for m in messages %}{{ m.role }}:{{ m.content }};{% endfor %}";
+
+// Every instruction position a template can render: lowering then changes nothing.
+constexpr infernix::ChatTemplateRoleSupport kAllRolesSupported;
+// The checkpoint template's support, spelled out for the pure-function checks below.
+constexpr infernix::ChatTemplateRoleSupport kCheckpointRoles{
+    .late_system = false, .late_developer = false, .leading_developer = false};
+
+infernix::PromptInput role_history_input(std::initializer_list<infernix::ChatRole> roles) {
+    infernix::PromptInput input;
+    for (const infernix::ChatRole role : roles) {
+        infernix::ChatMessage message;
+        message.role = role;
+        message.parts.push_back({.text = "text"});
+        input.messages.push_back(std::move(message));
+    }
+    return input;
+}
+
+fi::ChatMessage text_turn(infernix::ChatRole role) {
+    fi::ChatMessage message;
+    message.role = role;
+    message.parts.push_back(fi::ChatPart::text_part("text"));
+    return message;
+}
+
+int test_chat_template_role_support_probe() {
+    const auto checkpoint = fi::CompiledChatTemplate::resolve(kCheckpointRoleTemplate);
+    const auto thinking   = fi::CompiledChatTemplate::resolve(thinking_toggle_template_source());
+    const auto positional = fi::CompiledChatTemplate::resolve(reasoning_effort_template_source());
+    int failures          = check(checkpoint.role_support() == kCheckpointRoles,
+                      "resolve did not measure the instruction positions the template refuses");
+    failures += check(thinking.role_support() == kAllRolesSupported &&
+                          positional.role_support() == kAllRolesSupported,
+                      "a maintained template that renders instruction turns in place was measured "
+                      "as refusing them");
+    const auto checkpoint_frontend =
+        make_frontend(resources(std::string(kCheckpointRoleTemplate)), false);
+    const auto maintained_frontend = make_frontend(resources(), false);
+    failures += check(
+        checkpoint_frontend.chat_template_role_support() == kCheckpointRoles &&
+            maintained_frontend.chat_template_role_support() == kAllRolesSupported,
+        "Frontend did not expose the template's measured role support");
+    // Capability is measured by rendering each position, so the refusal's wording carries no
+    // weight: a differently worded guard is still found, and only for the position it covers.
+    const auto reworded = fi::CompiledChatTemplate::resolve(
+        "{% for m in messages %}{% if m.role == 'system' and not loop.first %}"
+        "{{ raise_exception('Late system turns are not allowed here.') }}{% endif %}{% endfor %}"
+        "{% for m in messages %}{{ m.role }}:{{ m.content }};{% endfor %}");
+    failures += check(!reworded.role_support().late_system &&
+                          reworded.role_support().late_developer &&
+                          reworded.role_support().leading_developer,
+                      "role support follows one guard phrase instead of what the template renders");
+    // Text that only mentions the guard phrase renders every position, so it lowers nothing. A
+    // template that carries the phrase inertly keeps its real roles.
+    const auto mentioned = fi::CompiledChatTemplate::resolve(
+        "{# System message must be at the beginning #}{% for m in messages %}"
+        "{{ m.role }}:{{ m.content }};{% endfor %}");
+    failures += check(mentioned.role_support() == kAllRolesSupported,
+                      "a template that only mentions the guard phrase lowered roles it could have "
+                      "rendered under their real role");
+    // A template with no System role at all is stating its own rule about instructions rather than
+    // placing one, so preparation reports it as unsupported without lowering anything.
+    const auto no_system = fi::CompiledChatTemplate::resolve(
+        "{% for m in messages %}{% if m.role == 'system' %}"
+        "{{ raise_exception('template declines system') }}{% endif %}{% endfor %}"
+        "{% for m in messages %}{{ m.role }}:{{ m.content }};{% endfor %}");
+    failures += check(!no_system.role_support().leading_system &&
+                          !no_system.role_support().late_system &&
+                          !no_system.role_support().lowers_late_system() &&
+                          no_system.role_support().late_developer,
+                      "a template's own rule about its instruction role was reported as a "
+                      "position preparation could work around");
+    return failures;
+}
+
+int test_instruction_role_lowering() {
+    std::vector<fi::ChatMessage> messages;
+    for (const auto role : {infernix::ChatRole::System, infernix::ChatRole::User,
+                            infernix::ChatRole::Assistant, infernix::ChatRole::System,
+                            infernix::ChatRole::Developer, infernix::ChatRole::User,
+                            infernix::ChatRole::Tool}) {
+        messages.push_back(text_turn(role));
+    }
+    const std::size_t lowered =
+        fi::lower_unsupported_instruction_roles(kCheckpointRoles, messages);
+    int failures = check(lowered == 2 && messages[3].role == infernix::ChatRole::User &&
+                             messages[4].role == infernix::ChatRole::User,
+                         "the late System and developer turns were not lowered to User");
+    failures += check(messages[0].role == infernix::ChatRole::System,
+                      "lowering touched the first message's System role");
+    failures += check(messages[3].parts.size() == 1 && messages[3].parts[0].text == "text",
+                      "lowering changed a lowered turn's text or part count");
+    failures += check(messages[2].role == infernix::ChatRole::Assistant &&
+                          messages[6].role == infernix::ChatRole::Tool,
+                      "lowering touched a non-instruction turn, breaking assistant continuation or "
+                      "the tool-response grouping");
+    // A checkpoint template with no developer branch also refuses the leading developer turn that
+    // the OpenAI Responses `instructions` field and the `developer` role produce; that turn takes
+    // the System role the same instructions hold on such a template.
+    std::vector<fi::ChatMessage> leading = {text_turn(infernix::ChatRole::Developer),
+                                            text_turn(infernix::ChatRole::User)};
+    failures += check(fi::lower_unsupported_instruction_roles(kCheckpointRoles, leading) == 1 &&
+                          leading[0].role == infernix::ChatRole::System,
+                      "a leading developer turn was not lowered to System");
+    // Only the very first message keeps an instruction role: the guard rejects any System after it,
+    // so a second instruction turn inside a leading block also becomes User.
+    std::vector<fi::ChatMessage> block = {text_turn(infernix::ChatRole::System),
+                                          text_turn(infernix::ChatRole::Developer),
+                                          text_turn(infernix::ChatRole::User)};
+    failures += check(fi::lower_unsupported_instruction_roles(kCheckpointRoles, block) == 1 &&
+                          block[0].role == infernix::ChatRole::System &&
+                          block[1].role == infernix::ChatRole::User,
+                      "the first message was lowered or the second instruction turn was left to "
+                      "trip the guard");
+    // A conversation with no leading instruction turn still ends in a mid-conversation System, the
+    // shape an Anthropic request without top-level system carries.
+    std::vector<fi::ChatMessage> no_anchor;
+    for (const auto role : {infernix::ChatRole::User, infernix::ChatRole::Assistant,
+                            infernix::ChatRole::User, infernix::ChatRole::System}) {
+        no_anchor.push_back(text_turn(role));
+    }
+    failures += check(fi::lower_unsupported_instruction_roles(kCheckpointRoles, no_anchor) == 1 &&
+                          no_anchor[3].role == infernix::ChatRole::User,
+                      "lowering was gated on the conversation opening with an instruction turn");
+    // Lowering is per position: a template that only refuses a late System keeps a late developer.
+    std::vector<fi::ChatMessage> mixed = {text_turn(infernix::ChatRole::System),
+                                          text_turn(infernix::ChatRole::User),
+                                          text_turn(infernix::ChatRole::System),
+                                          text_turn(infernix::ChatRole::Developer)};
+    constexpr infernix::ChatTemplateRoleSupport system_only{
+        .late_system = false, .late_developer = true, .leading_developer = true};
+    failures += check(fi::lower_unsupported_instruction_roles(system_only, mixed) == 1 &&
+                          mixed[2].role == infernix::ChatRole::User &&
+                          mixed[3].role == infernix::ChatRole::Developer,
+                      "lowering ignored which instruction positions the template actually refuses");
+    std::vector<fi::ChatMessage> supported;
+    for (const auto role : {infernix::ChatRole::System, infernix::ChatRole::Developer,
+                            infernix::ChatRole::User, infernix::ChatRole::System,
+                            infernix::ChatRole::Developer}) {
+        supported.push_back(text_turn(role));
+    }
+    failures += check(fi::lower_unsupported_instruction_roles(kAllRolesSupported, supported) == 0,
+                      "preparation lowered roles the active template can render");
+    // A template that refuses System at every position is stating its own rule about instructions,
+    // not placing them, so the turn is left for that template to refuse instead of being rewritten
+    // around it. System is the role the Qwen templates use for instructions themselves.
+    std::vector<fi::ChatMessage> declined = {text_turn(infernix::ChatRole::System),
+                                             text_turn(infernix::ChatRole::User),
+                                             text_turn(infernix::ChatRole::System)};
+    constexpr infernix::ChatTemplateRoleSupport no_system_role{
+        .leading_system = false, .late_system = false};
+    failures += check(fi::lower_unsupported_instruction_roles(no_system_role, declined) == 0 &&
+                          declined[0].role == infernix::ChatRole::System &&
+                          declined[2].role == infernix::ChatRole::System,
+                      "preparation rewrote a template's own rule about its instruction role");
+    // The instruction alias still needs a role on a template that has neither System nor developer,
+    // so it takes the one every template renders.
+    std::vector<fi::ChatMessage> alias = {text_turn(infernix::ChatRole::Developer),
+                                          text_turn(infernix::ChatRole::User)};
+    constexpr infernix::ChatTemplateRoleSupport instructionless{
+        .leading_system = false, .late_system = false, .late_developer = false,
+        .leading_developer = false};
+    failures += check(
+        fi::lower_unsupported_instruction_roles(instructionless, alias) == 1 &&
+            alias[0].role == infernix::ChatRole::User,
+        "a leading developer turn had no role to fall back to on a template without either role");
+    return failures;
+}
+
+int test_checkpoint_template_prepare_lowers_instruction_roles() {
+    const auto guarded = make_frontend(resources(std::string(kCheckpointRoleTemplate)), false);
+    std::vector<fi::ChatMessage> history;
+    for (const auto role : {infernix::ChatRole::System, infernix::ChatRole::User,
+                            infernix::ChatRole::Assistant, infernix::ChatRole::System}) {
+        history.push_back(text_turn(role));
+    }
+    int failures =
+        check(throws_invalid_argument([&] {
+                  (void)fi::CompiledChatTemplate::resolve(kCheckpointRoleTemplate).render(history);
+              }),
+              "the checkpoint template rendered a late System turn without lowering");
+    const auto prepared    = guarded.prepare(role_history_input({infernix::ChatRole::System,
+                                                                 infernix::ChatRole::User,
+                                                                 infernix::ChatRole::Assistant,
+                                                                 infernix::ChatRole::System}));
+    const auto& data       = FrontendFactory::inspect(prepared);
+    const auto lowered_ids = fixture_tokenizer().encode(
+        "system:text;user:text;assistant:text;user:text;");
+    failures += check(data.prepare.instruction_role_lowerings == 1 && data.token_ids == lowered_ids,
+                      "preparation did not lower the late System turn to User in place");
+    const auto reported = prepared.preparation_stats();
+    failures += check(reported.instruction_role_lowerings == 1 &&
+                          reported.media_items == data.prepare.media_items &&
+                          reported.tokenize_seconds == data.prepare.tokenize_seconds,
+                      "preparation_stats() dropped or mis-mapped the counter the Engine reports onward");
+    failures += check(guarded.count_tokens(role_history_input({infernix::ChatRole::System,
+                                                                infernix::ChatRole::User,
+                                                                infernix::ChatRole::Assistant,
+                                                                infernix::ChatRole::System})) ==
+                          data.token_ids.size(),
+                      "count_tokens failed where the same guarded generation request succeeded");
+    const auto developer_prepared =
+        guarded.prepare(role_history_input({infernix::ChatRole::System, infernix::ChatRole::User,
+                                            infernix::ChatRole::Assistant,
+                                            infernix::ChatRole::Developer}));
+    failures += check(FrontendFactory::inspect(developer_prepared)
+                          .prepare.instruction_role_lowerings == 1,
+                      "a late developer turn was not lowered like a late System turn");
+    // The OpenAI Responses `instructions` field arrives as a leading developer turn, which this
+    // template cannot render at any position: it renders under the System role instead.
+    const auto leading_prepared = guarded.prepare(
+        role_history_input({infernix::ChatRole::Developer, infernix::ChatRole::User}));
+    const auto& leading_data    = FrontendFactory::inspect(leading_prepared);
+    failures += check(
+        leading_data.prepare.instruction_role_lowerings == 1 &&
+            leading_data.token_ids ==
+                fixture_tokenizer().encode("system:text;user:text;"),
+        "a leading developer turn was not lowered to System, leaving the request to fail the "
+        "template it cannot render");
+    // A conversation that opens with a User turn still has its closing System lowered: the guard
+    // refuses a System anywhere but the first position.
+    const auto unanchored = guarded.prepare(role_history_input({infernix::ChatRole::User,
+                                                                infernix::ChatRole::Assistant,
+                                                                infernix::ChatRole::User,
+                                                                infernix::ChatRole::System}));
+    const auto& unanchored_data = FrontendFactory::inspect(unanchored);
+    failures += check(unanchored_data.prepare.instruction_role_lowerings == 1 &&
+                          unanchored_data.token_ids ==
+                              fixture_tokenizer().encode(
+                                  "user:text;assistant:text;user:text;user:text;"),
+                      "a mid-conversation System was left in place because no instruction turn led "
+                      "the conversation");
+    const auto tolerant   = make_frontend(resources(), false);
+    const auto kept       = tolerant.prepare(role_history_input({infernix::ChatRole::System,
+                                                                 infernix::ChatRole::User,
+                                                                 infernix::ChatRole::Assistant,
+                                                                 infernix::ChatRole::System}));
+    const auto& kept_data = FrontendFactory::inspect(kept);
+    const auto as_user    = tolerant.prepare(role_history_input({infernix::ChatRole::System,
+                                                                  infernix::ChatRole::User,
+                                                                  infernix::ChatRole::Assistant,
+                                                                  infernix::ChatRole::User}));
+    failures += check(kept_data.prepare.instruction_role_lowerings == 0 &&
+                          kept_data.token_ids != FrontendFactory::inspect(as_user).token_ids,
+                      "the maintained template lost the late System turn's role or position");
+    const auto kept_leading = tolerant.prepare(
+        role_history_input({infernix::ChatRole::Developer, infernix::ChatRole::User}));
+    failures += check(FrontendFactory::inspect(kept_leading).prepare.instruction_role_lowerings ==
+                          0,
+                      "the maintained template lost a leading developer turn's role");
+    return failures;
+}
+
+int test_checkpoint_lowering_precedes_leading_instruction_tap() {
+    // The structural tap sits at the boundary after the leading System/Developer block. If role
+    // collection ran before the lowering, the guarded [System, developer, User] history would
+    // place it after the lowered developer turn instead of after the first message; lowering must
+    // therefore precede it, making the prompt identical to the same history already typed as User.
+    const auto guarded = make_frontend(resources(std::string(kCheckpointRoleTemplate)), false);
+    const auto lowered = guarded.prepare(role_history_input({infernix::ChatRole::System,
+                                                             infernix::ChatRole::Developer,
+                                                             infernix::ChatRole::User}));
+    const auto as_user = guarded.prepare(role_history_input({infernix::ChatRole::System,
+                                                             infernix::ChatRole::User,
+                                                             infernix::ChatRole::User}));
+    const auto structural = [](const infernix::models::qwen3_5::PreparedPromptData& data) {
+        std::vector<std::uint32_t> positions;
+        for (const TapHint& hint : data.tap_hints.hints) {
+            if (hint.kind == TapHintKind::Structural) { positions.push_back(hint.position); }
+        }
+        return positions;
+    };
+    const auto& lowered_data = FrontendFactory::inspect(lowered);
+    int failures             = check(
+        lowered_data.prepare.instruction_role_lowerings == 1,
+        "preparation of a guarded leading-block history did not count the lowered developer turn");
+    const auto lowered_taps = structural(lowered_data);
+    const auto as_user_taps = structural(FrontendFactory::inspect(as_user));
+    failures += check(lowered_taps.size() == 1 && lowered_taps == as_user_taps &&
+                          lowered_data.token_ids == FrontendFactory::inspect(as_user).token_ids,
+                      "the leading instruction tap or render still saw the pre-lowering roles");
+    return failures;
+}
+
 int main() {
     const FrontendResources owned = resources();
     const Frontend frontend       = make_frontend(owned);
@@ -3372,5 +3666,9 @@ int main() {
     failures += test_media_preparation_cancellation();
     failures += test_invalid_media_classification();
     failures += test_disabled_vision();
+    failures += test_chat_template_role_support_probe();
+    failures += test_instruction_role_lowering();
+    failures += test_checkpoint_template_prepare_lowers_instruction_roles();
+    failures += test_checkpoint_lowering_precedes_leading_instruction_tap();
     return failures == 0 ? 0 : 1;
 }

@@ -199,6 +199,26 @@ def _normalize_prefix_semantics(config: dict) -> bool:
     return changed
 
 
+def _drop_embedded_chat_template(config: dict) -> bool:
+    """Remove tokenizer_config.json's copy of the chat template.
+
+    Upstream writes the template twice: as chat_template.jinja and as a
+    chat_template field inside tokenizer_config.json. The Frontend binds only the
+    separate object (src/models/qwen3_5/frontend/chat_template.h), so the embedded
+    field is inert, and a recipe that overrides chat_template.jinja leaves it
+    holding the superseded template permanently. Two published artifacts already
+    carry a template there that differs from the one they run, and any tool
+    inspecting an artifact by reading tokenizer_config.json sees that dead copy
+    first. Returns True if a field was removed.
+    """
+    changed = False
+    for field in ("chat_template", "chat_template.jinja"):
+        if field in config:
+            del config[field]
+            changed = True
+    return changed
+
+
 def load_resources(
     model_dir: Path,
     *,
@@ -269,6 +289,13 @@ def load_resources(
         print(
             "normalized tokenizer_config.json prefix semantics "
             "(add_bos_token/add_prefix_space=false, pad_token=<|endoftext|>)",
+            flush=True,
+        )
+        config_changed = True
+    if _drop_embedded_chat_template(tokenizer_config):
+        print(
+            "dropped tokenizer_config.json chat_template "
+            "(inert duplicate of the chat_template.jinja resource)",
             flush=True,
         )
         config_changed = True

@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <initializer_list>
 #include <map>
 #include <stdexcept>
 
@@ -91,6 +92,44 @@ std::uint8_t probe_accepted_efforts(const text::JinjaTemplate& compiled,
         if (renders(kThinkingEfforts[i])) accepted |= static_cast<std::uint8_t>(1U << i);
     }
     return accepted;
+}
+
+// Which instruction positions the template renders, measured the same way the thinking efforts
+// above are: render the position, and treat a raise as "this template cannot do that". A template
+// that cannot render the plain probe says nothing about its roles, so every position stays
+// supported and the request keeps failing loudly instead of being rewritten.
+ChatTemplateRoleSupport probe_role_support(const text::JinjaTemplate& compiled,
+                                           const Json& special_tokens) {
+    std::vector<std::string> control_variables;
+    for (const auto& item : special_tokens.items()) control_variables.push_back(item.key());
+    const text::TemplateRenderOptions execution{.control_variables = control_variables};
+    const auto conversation = [](std::initializer_list<std::string_view> roles) {
+        Json messages = Json::array();
+        for (const std::string_view role : roles)
+            messages.push_back(Json{{"role", std::string(role)}, {"content", "probe"}});
+        return messages;
+    };
+    const auto renders = [&](const Json& messages) {
+        Json context               = Json::object();
+        context["enable_thinking"] = true;
+        context["continue_final_message"] = false;
+        context["messages"]               = messages;
+        context["add_generation_prompt"]  = true;
+        context.update(special_tokens);
+        try {
+            (void)compiled.render(context, execution);
+            return true;
+        } catch (const std::exception&) {
+            return false;
+        }
+    };
+    ChatTemplateRoleSupport support;
+    if (!renders(conversation({"user"}))) return support;
+    support.leading_system    = renders(conversation({"system", "user"}));
+    support.late_system       = renders(conversation({"user", "assistant", "system"}));
+    support.late_developer    = renders(conversation({"user", "assistant", "developer"}));
+    support.leading_developer = renders(conversation({"developer", "user"}));
+    return support;
 }
 
 void merge_option(Json& context, std::string_view key, const Json& value) {
@@ -206,7 +245,37 @@ CompiledChatTemplate CompiledChatTemplate::resolve(std::string_view source, std:
     CompiledChatTemplate result(text::JinjaTemplate(std::string(source), std::move(source_name)),
                                 std::move(special_tokens));
     result.accepted_efforts_ = probe_accepted_efforts(result.compiled_, result.special_tokens_);
+    result.role_support_     = probe_role_support(result.compiled_, result.special_tokens_);
     return result;
+}
+
+std::size_t lower_unsupported_instruction_roles(ChatTemplateRoleSupport support,
+                                                std::vector<ChatMessage>& messages) {
+    std::size_t lowered = 0;
+    for (std::size_t i = 0; i < messages.size(); ++i) {
+        const ChatRole role = messages[i].role;
+        if (i == 0) {
+            // The first message is the conversation's prefix-cache anchor, so it is only ever
+            // rewritten when the template cannot render that role there at all. A leading
+            // developer turn takes the System role, which is where the same instructions sit on a
+            // template without a developer branch. On a template that renders no leading System
+            // turn either, the turn takes the User role every template renders.
+            if (role == ChatRole::Developer && !support.leading_developer) {
+                messages[i].role = support.leading_system ? ChatRole::System : ChatRole::User;
+                ++lowered;
+            }
+        } else if (role == ChatRole::Developer && !support.late_developer) {
+            messages[i].role = ChatRole::User;
+            ++lowered;
+        } else if (role == ChatRole::System && support.lowers_late_system()) {
+            // A template that refuses System at every position is stating its own rule about
+            // instructions, and the request fails as that template asks instead of being rewritten
+            // around it. Only the checkpoint guard's positional rule is worked around here.
+            messages[i].role = ChatRole::User;
+            ++lowered;
+        }
+    }
+    return lowered;
 }
 
 RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messages,

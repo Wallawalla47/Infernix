@@ -138,6 +138,13 @@ public:
     [[nodiscard]] RenderedChat render(const std::vector<ChatMessage>& messages,
                                       ChatRenderOptions options         = {},
                                       const PreparationControl& control = {}) const;
+    // Which conversation positions this template renders instruction roles in, measured by
+    // rendering each position once while the template loads. A front-end lowers an unsupported turn
+    // to a role the template does render instead of failing the request, so an agent client that
+    // appends a mid-conversation system entry, or carries a leading developer turn, is served
+    // rather than rejected. A template that renders no System turn anywhere keeps its own rule:
+    // see ChatTemplateRoleSupport in the public types.
+    [[nodiscard]] ChatTemplateRoleSupport role_support() const noexcept { return role_support_; }
 
 private:
     CompiledChatTemplate(text::JinjaTemplate compiled, nlohmann::ordered_json special_tokens)
@@ -149,6 +156,16 @@ private:
     // raising, found by rendering each once at resolve. A rejected effort renders as the nearest
     // accepted one. Every bit is set until probing ends and whenever the probe cannot render.
     std::uint8_t accepted_efforts_ = 0x3f;
+    // Measured by rendering each instruction position once at resolve; see role_support().
+    ChatTemplateRoleSupport role_support_;
 };
+
+// Rewrites the instruction roles the active template cannot render where they arrived: a leading
+// developer turn becomes System, the role the same instructions occupy on templates without a
+// developer branch, and a System or developer turn after the first message becomes User. Text,
+// part count and position never change. A pure function so callers apply it only for the positions
+// the active template actually rejects.
+std::size_t lower_unsupported_instruction_roles(ChatTemplateRoleSupport support,
+                                                std::vector<ChatMessage>& messages);
 
 } // namespace infernix::models::qwen3_5::frontend

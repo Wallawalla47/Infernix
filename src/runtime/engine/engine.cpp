@@ -607,6 +607,11 @@ MediaCacheSummary Engine::media_cache_summary() const {
     return impl_->frontend().media_cache_summary();
 }
 
+ChatTemplateRoleSupport Engine::chat_template_role_support() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return impl_->frontend().chat_template_role_support();
+}
+
 RuntimeStats Engine::runtime_stats() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     return std::visit(

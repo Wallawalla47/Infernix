@@ -288,7 +288,8 @@ Json preparation_json(const RequestLogContext& context) {
                 {"cache_misses", stats.media_cache_misses},
                 {"singleflight_waits", stats.media_singleflight_waits},
                 {"built_patch_bytes", stats.built_patch_bytes},
-                {"reused_patch_bytes", stats.reused_patch_bytes}};
+                {"reused_patch_bytes", stats.reused_patch_bytes},
+                {"instruction_role_lowerings", stats.instruction_role_lowerings}};
 }
 
 Json rejected_request_json(const RequestRejectionLogContext& context) {

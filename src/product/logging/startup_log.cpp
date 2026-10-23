@@ -382,4 +382,29 @@ void StartupLogRenderer::engine_ready(const LoadSummary& load) {
     }
 }
 
+void StartupLogRenderer::chat_template_roles(infernix::ChatTemplateRoleSupport roles,
+                                             std::string_view active_override_path) {
+    std::string lowered;
+    if (roles.lowers_late_system()) { lowered += "a system message after the first"; }
+    if (!roles.late_developer) {
+        if (!lowered.empty()) { lowered += ", "; }
+        lowered += "a developer message after the first";
+    }
+    if (!roles.leading_developer) {
+        if (!lowered.empty()) { lowered += ", "; }
+        lowered += "a leading developer message";
+    }
+    if (lowered.empty()) { return; }
+    std::string override_note;
+    if (!active_override_path.empty()) {
+        override_note = " | override active: " + std::string(active_override_path);
+    }
+    impl_->logger->warn(
+        "active chat template cannot render {} at its input position; preparation lowers such a "
+        "turn to a role the template renders, keeping its text, part count and position | for "
+        "positional rendering pass --chat-template tools/chat_templates/qwen3_8.jinja (also in the "
+        "release zip's chat_templates folder){}",
+        lowered, override_note);
+}
+
 } // namespace infernix::product

@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from tools.bench.ttft.cases import CaseDefinition, run_case
+from tools.bench.ttft.diagnostics import REQUEST_LOG_SCHEMA_VERSION
 from tools.bench.ttft.execution import CaseContext, RequestHandle
 from tools.bench.ttft.render import render_csv, render_markdown, render_request_analysis_csv
 from tools.bench.ttft.report import CampaignData, PlannedRun, load_campaign, summarize_campaign
@@ -223,7 +224,7 @@ def logged_campaign(tmp_path, records, events, *, required=()):
 
 def done_event(service_id, wire_id, response_id, *, preemptions=0, replay=0):
     return {
-        "artifact_type": "infernix_serve_request_log", "schema_version": 29,
+        "artifact_type": "infernix_serve_request_log", "schema_version": REQUEST_LOG_SCHEMA_VERSION,
         "event": "request_done", "server_instance_id": "serve-test",
         "request": {"request_id": service_id, "http_request_id": wire_id,
                     "response_id": response_id},
@@ -296,7 +297,7 @@ def test_mechanism_not_observed_keeps_valid_performance(tmp_path):
     assert summary["ttft_groups"][0]["median_ttft_ns"] == 4_000_000
 
 
-def runtime_interval(*, schema=29, final=None, host_seconds=0.0, main_pages=8):
+def runtime_interval(*, schema=REQUEST_LOG_SCHEMA_VERSION, final=None, host_seconds=0.0, main_pages=8):
     occupancy = {"device_state_slots": 1, "device_main_kv_pages": main_pages,
                  "device_backend_kv_pages": 0}
     event = {
@@ -434,7 +435,6 @@ def first_output_event():
 def test_first_output_partition_preserves_terminal_and_overlapping_work(tmp_path):
     measured = record([output(101_000_000), ProtocolEvent("terminal", "done", 102_000_000)])
     done = first_output_event()
-    done["schema_version"] = 29
     done["generation"]["admission"] = {
         "preferred_reused_tokens": 19057, "source_wait_seconds": 0.003,
         "fallback_reason": "source_invalid",
@@ -606,10 +606,9 @@ def test_replay_progress_uses_engine_interval_and_subtracts_self(tmp_path, other
     measured = record([output(5_000_000), ProtocolEvent("terminal", "done", 15_000_000)])
     measured["response_id"] = "response-a"
     done = done_event(1, "req_wire", "response-a", preemptions=1, replay=1)
-    done["schema_version"] = 29
     def transition(name, at, replayed, decoded):
         return {
-            "artifact_type": "infernix_serve_request_log", "schema_version": 29,
+            "artifact_type": "infernix_serve_request_log", "schema_version": REQUEST_LOG_SCHEMA_VERSION,
             "event": "request_scheduling", "server_instance_id": "serve-test",
             "request": {"request_id": 1, "http_request_id": "req_wire"},
             "engine_request_id": 11, "preemption_index": 1, "route": "replay",
@@ -653,9 +652,8 @@ def test_replay_evidence_missing_events_cannot_prove_no_other_progress(tmp_path,
     measured = record([output(5_000_000), ProtocolEvent("terminal", "done", 15_000_000)])
     measured["response_id"] = "response-a"
     done = done_event(1, "req_wire", "response-a", preemptions=1, replay=1)
-    done["schema_version"] = 29
     event = {
-        "artifact_type": "infernix_serve_request_log", "schema_version": 29,
+        "artifact_type": "infernix_serve_request_log", "schema_version": REQUEST_LOG_SCHEMA_VERSION,
         "event": "request_scheduling", "server_instance_id": "serve-test",
         "request": {"request_id": 1, "http_request_id": "req_wire"},
         "engine_request_id": 11, "preemption_index": 1, "route": "replay",
