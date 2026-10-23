@@ -495,7 +495,7 @@ int run_mask(const Options& options) {
     const certify::Corpus corpus = certify::load_corpus(options.corpus, options.set);
     Options exact                = options;
     exact.design                 = false;
-    infernix::Engine engine(reference_engine(exact, 2U));
+    infernix::Engine engine(reference_engine(exact, 128U)); // only its tokenizer is used: the smallest chunk
     const std::vector<certify::Window> windows = certify::load_windows(engine, corpus);
     json entries                               = json::array();
     for (const certify::Window& window : windows) {
