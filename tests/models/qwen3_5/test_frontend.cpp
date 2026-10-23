@@ -796,10 +796,17 @@ int test_context_capacity_guard() {
     // header, the user turns or the "<|im_start|>" markers.
     {
         infernix::PromptInput turns;
-        turns.messages.push_back(chat_message(infernix::ChatRole::User, "hi"));
-        turns.messages.push_back(chat_message(infernix::ChatRole::Assistant, "ok"));
-        turns.messages.push_back(chat_message(infernix::ChatRole::User, "again"));
-        turns.messages.push_back(chat_message(infernix::ChatRole::Assistant, "done"));
+        const auto turn = [&](infernix::ChatRole role, const char* text) {
+            infernix::ChatMessage message;
+            message.role = role;
+            message.parts.push_back(
+                infernix::MessagePart{.kind = infernix::MessagePartKind::Text, .text = text, .media = {}});
+            turns.messages.push_back(std::move(message));
+        };
+        turn(infernix::ChatRole::User, "hi");
+        turn(infernix::ChatRole::Assistant, "ok");
+        turn(infernix::ChatRole::User, "again");
+        turn(infernix::ChatRole::Assistant, "done");
         const infernix::ChatTokens chat = exact.tokenize_chat(turns);
         constexpr infernix::TokenId kImStart = 248045, kImEnd = 248046;
         int runs = 0;
