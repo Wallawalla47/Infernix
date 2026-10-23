@@ -55,8 +55,12 @@ def main(argv: list[str] | None = None) -> int:
         torch.set_num_threads(args.threads)
     meta = json.loads(Path(str(args.capture) + ".json").read_text(encoding="utf-8"))
     sequence = [s for s in meta["sequences"] if s["index"] == args.sequence][0]
-    tokens = sequence["tokens"][: args.tokens]
     weights = Weights(args.artifact)
+    hidden_size = int(weights.config["hidden_size"])
+    embed = args.dump / f"chunk{args.chunk}_embed.bin"
+    # the engine feeds all but the window's last token (that one is only a target), so it dumps one row fewer
+    rows = embed.stat().st_size // (2 * hidden_size) if embed.is_file() else args.tokens
+    tokens = sequence["tokens"][: min(args.tokens, rows)]
     model_type = weights.config.get("model_type", "")
     if model_type not in ("qwen3_5_text", "qwen3_5_moe_text"):
         raise SystemExit(f"bisect covers Qwen3.5/3.6 artifacts, not {model_type!r}")
