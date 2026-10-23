@@ -65,7 +65,8 @@ PromptInput chat_input(const std::string& text, const std::filesystem::path& pat
     if (doc.contains("tools")) {
         for (const auto& tool : doc.at("tools")) { input.options.tool_jsons.push_back(tool.dump()); }
     }
-    input.options.continuation = PromptContinuationMode::ContinueFinalAssistant;
+    // The window is a prefix of the rendering, so the final assistant message renders complete (a continuation
+    // needs thinking disabled, which a reasoning chat is not) and the new-turn prompt after it lies beyond the cut.
     if (doc.contains("enable_thinking")) { input.options.enable_thinking = doc.at("enable_thinking").get<bool>(); }
     // Reasoning kept in every assistant turn, not only the last (a reasoning chat's own text).
     if (doc.contains("preserve_thinking")) { input.options.preserve_thinking = doc.at("preserve_thinking").get<bool>(); }
