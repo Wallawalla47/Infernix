@@ -82,7 +82,10 @@ def _exact_argument(qv, keys, s_row, err_row, scaling, visible, j) -> float:
 # -------------------------------------------------------------------------------------------- convolution
 
 def exact_causal_conv(x, weight, bias=None, activation=None, seq_idx=None, **kwargs):
-    """causal_conv1d_fn: silu(sum over taps of w x) per channel and token, the sum exact, rounded once."""
+    """causal_conv1d_fn: the kernel accumulates in binary32 and applies SiLU to that: bf16(silu(fp32(sum over taps
+    of w x))) per channel and token, the sum exact before its one rounding to binary32 (the engine's causal_conv
+    kernel, ops/lossless/lossless_ops.cu: a SiLU of the exact sum rounded once to BF16 would differ where the
+    SiLU lands within a binary32 step of a BF16 midpoint)."""
     if bias is not None or activation not in ("silu", "swish"):
         raise NotImplementedError("shadow convolution: only the bias-free SiLU form")
     xv, wv = value(x), value(weight)
@@ -91,15 +94,19 @@ def exact_causal_conv(x, weight, bias=None, activation=None, seq_idx=None, **kwa
     terms = [wv[None, :, i, None] * padded[:, :, i:i + length] for i in range(taps)]
     s = sum(terms)
     err_s = sum(t.abs() for t in terms) * ((taps + 2) * exact.U)
-    y = torch.nn.functional.silu(s)
-    err_y = err_s * 1.1 + y.abs() * (32 * exact.U) + 2.0 ** -1070
+    s32 = exact.round_to(s, torch.float32)
+    sure = exact.certain(s, err_s, torch.float32)
+    for b, c, t in torch.nonzero(~sure).tolist():
+        total = sum((Fraction(float(wv[c, i])) * Fraction(float(padded[b, c, t + i])) for i in range(taps)),
+                    Fraction(0))
+        s32[b, c, t] = exact.round_fraction(total, torch.float32)
+    y = torch.nn.functional.silu(s32)  # of the binary32 value, itself exact in binary64
+    err_y = y.abs() * (32 * exact.U) + 2.0 ** -1070
     out = exact.round_to(y, x.dtype)
     ok = exact.certain(y, err_y, x.dtype)
     if not bool(ok.all()):
         for b, c, t in torch.nonzero(~ok).tolist():
-            total = sum((Fraction(float(wv[c, i])) * Fraction(float(padded[b, c, t + i])) for i in range(taps)),
-                        Fraction(0))
-            sm = mpmath.mpf(total.numerator) / total.denominator
+            sm = mpmath.mpf(float(s32[b, c, t]))
             out[b, c, t] = exact.round_mpf(sm / (1 + mpmath.exp(-sm)), x.dtype)
     return Shadow(out, x.dtype)
 

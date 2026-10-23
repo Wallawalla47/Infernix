@@ -116,3 +116,16 @@ def test_topk_breaks_ties_toward_the_lower_index():
     x = shadow(torch.tensor([[0.25, 0.5, 0.5, 0.125]]), torch.float32)
     values, indices = torch.topk(x, 2, dim=-1)
     assert indices.tolist() == [[1, 2]] and values.inner.tolist() == [[0.5, 0.5]]
+
+def test_the_causal_convolution_rounds_its_sum_to_binary32_before_silu():
+    # The 27B's layer 28, token 4, channel 5230 (first divergence of the lossless route from the shadow, found by
+    # tools.quality.shadow.bisect): the exact sum is -0.0626295320689678, silu of it -0.03033447187 lies 7.8e-10
+    # above the BF16 midpoint -0.03033447265625 (correct single rounding: -0.0302734375), but the kernel rounds the
+    # sum to binary32 first (-0.06262953579) and silu of that is below the midpoint: -0.0303955078125, which is
+    # what the engine's causal_conv kernel returns.
+    from tools.quality.shadow.overrides import exact_causal_conv
+    weights = [0.0020904541015625, -0.006317138671875, -0.07275390625, -0.007354736328125]
+    inputs = [0.016845703125, 0.515625, 0.73046875, 0.8515625]
+    out = exact_causal_conv(shadow(torch.tensor([[inputs]]), torch.bfloat16),
+                            shadow(torch.tensor([weights]), torch.bfloat16), activation="silu")
+    assert float(out.inner[0, 0, 3]) == -0.0303955078125
