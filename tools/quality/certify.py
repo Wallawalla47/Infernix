@@ -416,6 +416,8 @@ def kill_tree(proc: subprocess.Popen) -> None:
 def run_step(step: Step, run: Path) -> tuple[int, float]:
     log = run / "logs" / f"{step.name}.log"
     env = dict(os.environ, **step.env)
+    for output in step.outputs:
+        Path(output).parent.mkdir(parents=True, exist_ok=True)
     started = time.time()
     with log.open("ab") as out:
         out.write(f"\n=== {dt.datetime.now().isoformat(timespec='seconds')} {subprocess.list2cmdline(step.argv)}\n"

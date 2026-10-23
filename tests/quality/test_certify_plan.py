@@ -4,6 +4,7 @@ decision has its arm and noise twin planned, and the declared designs use their 
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 from tools.quality import certify
@@ -52,3 +53,13 @@ def test_missing_artifacts_are_left_out_and_said(tmp_path: Path) -> None:
     _, decisions = plan(tmp_path, ("q27gw",))
     assert "rc" in decisions["provenance"]["left_out"]
     assert all(d["label"].startswith("q27gw") for d in decisions["decisions"])
+
+
+def test_a_step_finds_its_output_directory_made(tmp_path: Path) -> None:
+    (tmp_path / "logs").mkdir()
+    output = tmp_path / "store" / "key" / "made.ref"
+    step = certify.Step(block="C1", name="probe", outputs=[str(output)], minutes=1,
+                        argv=[sys.executable, "-c", "import sys, pathlib; pathlib.Path(sys.argv[1]).write_text('x')",
+                              str(output)])
+    code, _ = certify.run_step(step, tmp_path)
+    assert code == 0 and output.exists()
