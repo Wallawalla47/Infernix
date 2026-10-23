@@ -118,9 +118,7 @@ std::vector<Window> load_windows(const Engine& engine, const Corpus& corpus) {
         if (document.kind == "text") {
             tokens = engine.tokenize_text(text);
         } else {
-            const PreparedPrompt prepared = engine.prepare(chat_input(text, document.path));
-            const std::span<const TokenId> ids = prepared.token_ids();
-            tokens.assign(ids.begin(), ids.end());
+            tokens = engine.tokenize_chat(chat_input(text, document.path));
         }
         if (tokens.size() < corpus.set.window_tokens) {
             throw std::runtime_error(document.id + " holds " + std::to_string(tokens.size()) + " tokens; the " +

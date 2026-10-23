@@ -786,6 +786,12 @@ int test_context_capacity_guard() {
     failures += check(throws_context_length([&] { (void)short_frontend.prepare(input); }, exact_count,
                                             exact_count - 1U, true),
                       "Frontend accepted a text prompt at max_context + 1, or lost its counts");
+    // tokenize_chat renders the same ids prepare() would, and has no length limit.
+    const auto prepared_prompt                            = exact.prepare(input);
+    const std::span<const infernix::TokenId> prepared_ids = prepared_prompt.token_ids();
+    failures += check(short_frontend.tokenize_chat(input) ==
+                          std::vector<infernix::TokenId>(prepared_ids.begin(), prepared_ids.end()),
+                      "tokenize_chat differs from prepare's ids or was bounded by max_context");
 
     std::vector<infernix::TokenId> exact_tokens(exact_count, 0);
     failures += check(exact.prepare_tokens(exact_tokens).summary().prompt_tokens == exact_count,

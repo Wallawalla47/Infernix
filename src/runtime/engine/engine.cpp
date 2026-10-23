@@ -435,6 +435,11 @@ std::vector<TokenId> Engine::tokenize_text(std::string_view text) const {
     return impl_->frontend().tokenize_text(text);
 }
 
+std::vector<TokenId> Engine::tokenize_chat(PromptInput input) const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return impl_->frontend().tokenize_chat(std::move(input));
+}
+
 ScoreResult Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t first_target,
                                  ScoreOptions options) {
     nvtx::ScopedRange score_range(nvtx::Name::Score, nvtx::Category::Scoring,

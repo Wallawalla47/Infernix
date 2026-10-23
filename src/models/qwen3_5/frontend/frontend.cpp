@@ -1106,6 +1106,18 @@ std::vector<TokenId> Frontend::tokenize_text(std::string_view text) const {
     return impl_->tokenizer->encode(text);
 }
 
+std::vector<TokenId> Frontend::tokenize_chat(PromptInput input) const {
+    if (impl_ == nullptr) { throw std::logic_error("frontend is empty"); }
+    const PromptOptions options           = input.options;
+    std::vector<fi::ChatMessage> messages = convert_messages(std::move(input.messages));
+    if (std::any_of(messages.begin(), messages.end(),
+                    [](const fi::ChatMessage& message) { return message.has_media(); })) {
+        throw std::invalid_argument("tokenize_chat renders text chats");
+    }
+    const fi::RenderedChat rendered = impl_->chat_template.render(messages, render_options(options));
+    return fi::encode_rendered_chat(*impl_->tokenizer, rendered).input_ids;
+}
+
 OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
                                             const StopPolicy& caller_stop,
                                             const OutputOptions& output,
