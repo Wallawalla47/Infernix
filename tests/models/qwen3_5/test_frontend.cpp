@@ -818,8 +818,14 @@ int test_context_capacity_guard() {
             runs += begins ? 1 : 0;
             if (ends && chat.ids[i] != kImEnd) { runs_end_on_im_end = false; }
         }
-        failures += check(markers_clean && runs == 2 && runs_end_on_im_end,
-                          "tokenize_chat did not mark exactly the two assistant turns' bodies through <|im_end|>");
+        const bool marked = markers_clean && runs == 2 && runs_end_on_im_end;
+        if (!marked) {
+            for (std::size_t i = 0; i < chat.ids.size(); ++i) {
+                std::cerr << chat.ids[i] << (i < chat.generated.size() && chat.generated[i] != 0 ? "*" : "") << ' ';
+            }
+            std::cerr << "(" << runs << " runs; * marks a generated token)\n";
+        }
+        failures += check(marked, "tokenize_chat did not mark exactly the two assistant turns' bodies through <|im_end|>");
     }
 
     std::vector<infernix::TokenId> exact_tokens(exact_count, 0);
