@@ -312,9 +312,11 @@ identity block table, so the planes hold production's bytes; the VQ formats' win
 append's own window-copy steps) and `lossless_codec_attention` reads them: a pack kernel decodes each row
 exactly (codes times scales; for a rotated plane the exact H_256 / 16 in 128-bit integers) onto
 `lossless_attention`'s grid integers (int32, one exponent per row), and the attention's scores, exponentials,
-sums and rounding are `lossless_attention`'s own; a query against a row whose exact value needs more than
-29 bits (only rows whose scales span more than about five binades), and every query the error interval leaves
-undecided, takes an exact fallback that decodes each key row once. On a 16-bit artifact with `bf16` KV the
+sums and rounding are `lossless_attention`'s own; a key row whose exact value needs more than 29 bits (a rotated FP8 row: an 18-bit
+E4M3 code times an 11-bit scale, then the exact H_256 / 16) keeps the bits the shift to the grid would drop as a
+second 29-bit limb, scored exactly beside the first, so such rows stay on the main path; a query against a row
+needing more than the two limbs, and every query the error interval leaves undecided, takes an exact fallback
+that decodes each key row once. On a 16-bit artifact with `bf16` KV the
 design reference differs from `--lossless` only by V's FP16 storage. Its bits are a function of the request,
 the artifact and the declared steps, so a reference survives rebuilds like `--lossless`'s.
 
