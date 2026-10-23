@@ -58,7 +58,10 @@ Notation: `bf16(v)` and `fp32(v)` are the correctly rounded value of the exact r
 
 **Gated DeltaNet** (`Qwen3_5GatedDeltaNet`):
 - `mixed = bf16(h W_qkv)`, `z = bf16(h W_z)`, `b = bf16(h W_b)`, `a = bf16(h W_a)`;
-- causal conv (`causal_conv1d_fn`, one operation): `c = bf16(silu(sum_tap w x))`, the sum exact;
+- causal conv (`causal_conv1d_fn`, one operation): `c = bf16(silu(fp32(sum_tap w x)))`, the sum exact before
+  its one rounding to binary32 (the kernel accumulates in binary32 and applies SiLU to that: SiLU of the exact
+  sum rounded once to BF16 differs where the SiLU lands within a binary32 step of a BF16 midpoint, which the
+  layer-by-layer comparison with the publisher's code found at one value of the 27B's layer 28);
 - `beta = bf16(sigmoid(b))`; `g = fp32(-fp32(exp(A_log)) fp32(softplus(fp32(a + dt_bias))))`;
 - the gated delta rule (FLA's kernels, whose L2 norm runs in FP32; the recurrence is
   `torch_recurrent_gated_delta_rule`'s, each operation correctly rounded, since a recurrence has no
