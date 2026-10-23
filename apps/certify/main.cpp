@@ -10,6 +10,7 @@
 //                    [--noise-seed N] [--windows i,j,...]
 //   infernix-certify verify    <artifact> --reference REF [--windows i,j,...]
 //   infernix-certify capture   <artifact> --corpus M --set S --out PREFIX --windows i,j [--tokens N] [--every K]
+//   infernix-certify mask      <artifact> --corpus M --set S --out FILE.json
 //   infernix-certify prefill   <artifact> --corpus M --set S --reference REF --out PREFIX [route options]
 //   infernix-certify decode    <artifact> --corpus M --set S --reference REF --out PREFIX [route options]
 //                    [--concurrency N] [--spec mtp|dflash|dflash2] [--draft-tokens N|auto]
@@ -485,6 +486,41 @@ int run_capture(const Options& options, std::uint32_t tokens, std::uint32_t ever
     return 0;
 }
 
+// The positions each window of the set scores, written once per artifact (its template and tokenizer decide where
+// the assistant turns lie): a position, the index of a target token in the window, is scored when the model writes
+// that token. tools/quality/iqs.py filters every arm of the artifact with it; the references and arms still
+// compute every position.
+int run_mask(const Options& options) {
+    if (options.out.empty()) { throw std::invalid_argument("mask needs --out"); }
+    const certify::Corpus corpus = certify::load_corpus(options.corpus, options.set);
+    Options exact                = options;
+    exact.design                 = false;
+    infernix::Engine engine(reference_engine(exact, 2U));
+    const std::vector<certify::Window> windows = certify::load_windows(engine, corpus);
+    json entries                               = json::array();
+    for (const certify::Window& window : windows) {
+        json runs = json::array();
+        std::uint64_t scored = 0;
+        for (std::size_t t = 1; t < window.generated.size();) {
+            if (window.generated[t] == 0) {
+                ++t;
+                continue;
+            }
+            std::size_t end = t;
+            while (end + 1 < window.generated.size() && window.generated[end + 1] != 0) { ++end; }
+            runs.push_back({t, end}); // inclusive
+            scored += end - t + 1;
+            t = end + 1;
+        }
+        entries.push_back({{"index", window.index}, {"id", window.id}, {"domain", window.domain},
+                           {"positions", window.generated.size() - 1}, {"scored", scored}, {"runs", runs}});
+    }
+    json meta         = provenance(options, &corpus);
+    meta["windows"]   = entries;
+    write_json(options.out, meta);
+    return 0;
+}
+
 int run_prefill(const Options& options) {
     if (options.out.empty() || options.reference.empty()) { throw std::invalid_argument("prefill needs --reference and --out"); }
     const certify::Corpus corpus = certify::load_corpus(options.corpus, options.set);
@@ -718,6 +754,7 @@ int main(int argc, char** argv) {
         if (options.command == "prefill") { return run_prefill(options); }
         if (options.command == "decode") { return run_decode(options); }
         if (options.command == "capture") { return run_capture(options, options.capture_tokens, options.capture_every); }
+        if (options.command == "mask") { return run_mask(options); }
         throw std::invalid_argument("unknown command " + options.command);
     } catch (const std::exception& error) {
         std::cerr << "infernix-certify: " << error.what() << '\n';

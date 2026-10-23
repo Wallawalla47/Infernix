@@ -1087,6 +1087,15 @@ struct PromptInput {
     ContextCacheHints context_cache;
 };
 
+// A chat rendered with the artifact's template and tokenized. generated[i] is 1 when token i belongs to an
+// assistant message (after its "<|im_start|>assistant" header, through its "<|im_end|>"), the tokens the model
+// itself writes, and 0 for the system prompt, tool schemas, user turns and tool responses: text the model is
+// never trained to predict and whose predictions are meaningless (and numerically fragile).
+struct ChatTokens {
+    std::vector<TokenId> ids;
+    std::vector<std::uint8_t> generated;
+};
+
 enum class RequestErrorKind : std::uint8_t {
     InvalidToolConstraint,
     InvalidGrammar,

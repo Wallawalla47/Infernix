@@ -789,9 +789,31 @@ int test_context_capacity_guard() {
     // tokenize_chat renders the same ids prepare() would, and has no length limit.
     const auto prepared_prompt                            = exact.prepare(input);
     const std::span<const infernix::TokenId> prepared_ids = prepared_prompt.token_ids();
-    failures += check(short_frontend.tokenize_chat(input) ==
+    failures += check(short_frontend.tokenize_chat(input).ids ==
                           std::vector<infernix::TokenId>(prepared_ids.begin(), prepared_ids.end()),
                       "tokenize_chat differs from prepare's ids or was bounded by max_context");
+    // It marks the tokens the model writes: the bodies of the assistant turns and their "<|im_end|>", not the
+    // header, the user turns or the "<|im_start|>" markers.
+    {
+        infernix::PromptInput turns;
+        turns.messages.push_back(chat_message(infernix::ChatRole::User, "hi"));
+        turns.messages.push_back(chat_message(infernix::ChatRole::Assistant, "ok"));
+        turns.messages.push_back(chat_message(infernix::ChatRole::User, "again"));
+        turns.messages.push_back(chat_message(infernix::ChatRole::Assistant, "done"));
+        const infernix::ChatTokens chat = exact.tokenize_chat(turns);
+        constexpr infernix::TokenId kImStart = 248045, kImEnd = 248046;
+        int runs = 0;
+        bool markers_clean = chat.generated.size() == chat.ids.size(), runs_end_on_im_end = true;
+        for (std::size_t i = 0; markers_clean && i < chat.ids.size(); ++i) {
+            if (chat.generated[i] != 0 && chat.ids[i] == kImStart) { markers_clean = false; }
+            const bool begins = chat.generated[i] != 0 && (i == 0 || chat.generated[i - 1] == 0);
+            const bool ends   = chat.generated[i] != 0 && (i + 1 == chat.ids.size() || chat.generated[i + 1] == 0);
+            runs += begins ? 1 : 0;
+            if (ends && chat.ids[i] != kImEnd) { runs_end_on_im_end = false; }
+        }
+        failures += check(markers_clean && runs == 2 && runs_end_on_im_end,
+                          "tokenize_chat did not mark exactly the two assistant turns' bodies through <|im_end|>");
+    }
 
     std::vector<infernix::TokenId> exact_tokens(exact_count, 0);
     failures += check(exact.prepare_tokens(exact_tokens).summary().prompt_tokens == exact_count,

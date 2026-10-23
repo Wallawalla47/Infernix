@@ -116,10 +116,14 @@ std::vector<Window> load_windows(const Engine& engine, const Corpus& corpus) {
         const CorpusDocument& document = corpus.set.documents[i];
         const std::string text         = read_file(document.path);
         std::vector<TokenId> tokens;
+        std::vector<std::uint8_t> generated;
         if (document.kind == "text") {
             tokens = engine.tokenize_text(text);
+            generated.assign(tokens.size(), 1);
         } else {
-            tokens = engine.tokenize_chat(chat_input(text, document.path));
+            ChatTokens chat = engine.tokenize_chat(chat_input(text, document.path));
+            tokens          = std::move(chat.ids);
+            generated       = std::move(chat.generated);
         }
         if (tokens.size() < corpus.set.window_tokens) {
             throw std::runtime_error(document.id + " holds " + std::to_string(tokens.size()) + " tokens; the " +
@@ -127,8 +131,9 @@ std::vector<Window> load_windows(const Engine& engine, const Corpus& corpus) {
                                      std::to_string(corpus.set.window_tokens));
         }
         tokens.resize(corpus.set.window_tokens);
+        generated.resize(corpus.set.window_tokens);
         Window window{.index = static_cast<std::uint32_t>(i), .id = document.id, .domain = document.domain,
-                      .tokens = std::move(tokens)};
+                      .tokens = std::move(tokens), .generated = std::move(generated)};
         window.input_hash = perplexity::token_fingerprint(window.tokens);
         windows.push_back(std::move(window));
     }

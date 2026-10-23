@@ -63,3 +63,15 @@ def test_a_step_finds_its_output_directory_made(tmp_path: Path) -> None:
                               str(output)])
     code, _ = certify.run_step(step, tmp_path)
     assert code == 0 and output.exists()
+
+
+def test_every_decision_names_its_scored_positions_and_they_are_made_first(tmp_path: Path) -> None:
+    steps, plan_json = plan(tmp_path, ("q27gw", "rc"))
+    made = {out for s in steps for out in s["outputs"]}
+    names = [s["name"] for s in steps]
+    for item in plan_json["decisions"] + plan_json["disclosures"]:
+        assert item["scored"] in made, f"{item['label']} reads {item['scored']} that no step makes"
+    assert names.index("mask-q27gw-main") < names.index("ref-q27gw-lossless")
+    assert "mask-q27gw-long" in names and "mask-rc-long" in names
+    assert any(i["scored"].endswith("long-scored.json") for i in plan_json["decisions"])
+    assert "e2e-sensitivity" in names  # the identity comparison's sensitivity is a check of its own

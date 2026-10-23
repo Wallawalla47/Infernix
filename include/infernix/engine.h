@@ -83,7 +83,8 @@ public:
 
     // The token ids of a text chat rendered with the artifact's chat template, whatever their number: unlike
     // prepare(), no max_context or capacity limit applies (a measurement tool cuts its windows from them).
-    [[nodiscard]] std::vector<TokenId> tokenize_chat(PromptInput input) const;
+    // Also marks the tokens the model writes (the assistant messages) apart from the prompt text.
+    [[nodiscard]] ChatTokens tokenize_chat(PromptInput input) const;
 
     // Returns log p(tokens[i] | tokens[0..i)) for i in [first_target,tokens.size()), and the
     // distribution outputs options requests for those positions.

@@ -1106,7 +1106,7 @@ std::vector<TokenId> Frontend::tokenize_text(std::string_view text) const {
     return impl_->tokenizer->encode(text);
 }
 
-std::vector<TokenId> Frontend::tokenize_chat(PromptInput input) const {
+ChatTokens Frontend::tokenize_chat(PromptInput input) const {
     if (impl_ == nullptr) { throw std::logic_error("frontend is empty"); }
     const PromptOptions options           = input.options;
     std::vector<fi::ChatMessage> messages = convert_messages(std::move(input.messages));
@@ -1115,7 +1115,30 @@ std::vector<TokenId> Frontend::tokenize_chat(PromptInput input) const {
         throw std::invalid_argument("tokenize_chat renders text chats");
     }
     const fi::RenderedChat rendered = impl_->chat_template.render(messages, render_options(options));
-    return fi::encode_rendered_chat(*impl_->tokenizer, rendered).input_ids;
+    ChatTokens out;
+    out.ids = fi::encode_rendered_chat(*impl_->tokenizer, rendered).input_ids;
+    out.generated.assign(out.ids.size(), 0);
+    // ChatML turns: "<|im_start|>" role "\n" body "<|im_end|>". The tokens the model writes are an assistant
+    // turn's body and its "<|im_end|>"; the header (its role word and newline) is prompt text.
+    const auto bytes = [&](std::size_t i) { return impl_->tokenizer->decode_token_bytes(out.ids[i]); };
+    const std::size_t count = out.ids.size();
+    for (std::size_t i = 0; i < count;) {
+        if (bytes(i) != "<|im_start|>") {
+            ++i;
+            continue;
+        }
+        const bool assistant = i + 1 < count && bytes(i + 1).starts_with("assistant");
+        std::size_t body     = i + 1;
+        while (body < count && bytes(body).find('\n') == std::string_view::npos) { ++body; }
+        ++body; // past the token that holds the header's newline
+        std::size_t end = body;
+        while (end < count && bytes(end) != "<|im_end|>") { ++end; }
+        if (assistant) {
+            for (std::size_t k = body; k <= end && k < count; ++k) { out.generated[k] = 1; }
+        }
+        i = end + 1;
+    }
+    return out;
 }
 
 OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,

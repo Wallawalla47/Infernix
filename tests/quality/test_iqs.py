@@ -155,3 +155,48 @@ def test_certificate_collects_decisions_disclosures_and_checks(tmp_path: Path) -
     assert certificate["decisions"][0]["passed"]
     assert [c["passed"] for c in certificate["checks"]] == [True, False]
     assert "IQS-1 certificate" in (tmp_path / "cert" / "certificate.html").read_text(encoding="utf-8")
+
+
+def write_scored(path: Path, windows: dict[int, tuple[int, list[list[int]]]]) -> Path:
+    """infernix-certify mask's output: per window its position count and the inclusive runs it scores."""
+    entries = [{"index": w, "id": f"doc{w}", "domain": "d", "positions": n, "scored": sum(b - a + 1 for a, b in runs),
+                "runs": runs} for w, (n, runs) in windows.items()]
+    path.write_text(json.dumps({"windows": entries}), encoding="utf-8")
+    return path
+
+
+def test_only_the_positions_the_model_writes_are_scored(tmp_path: Path) -> None:
+    # 16 windows of 100 positions; the first half of each is prompt text with a huge KL, the second half is
+    # assistant output with a small one
+    n, per = 16, 100
+    kl = np.where(np.tile(np.arange(per), n) < 50, 5.0, 1e-4)
+    arm = write_arm(tmp_path, "chat", kl, np.zeros(kl.size), np.zeros(kl.size), windows=n)
+    scored = write_scored(tmp_path / "scored.json", {w: (per, [[51, per]]) for w in range(n)})
+    everything = iqs.decide(iqs.load_arm(arm), FAST)
+    only = iqs.decide(iqs.load_arm(arm, scored), FAST)
+    assert not everything["passed"] and only["passed"]
+    assert only["positions"] == n * 50 and only["unscored"]["positions"] == n * 50
+    assert only["unscored"]["estimate"]["mean_kl"] > 4.0  # the prompt text's KL stays reported
+    assert only["estimate"]["mean_kl"] < 2e-4
+
+
+def test_a_scored_list_must_cover_the_arm(tmp_path: Path) -> None:
+    rng = np.random.default_rng(11)
+    arm = write_arm(tmp_path, "cover", *synthetic(rng, 8, 40, 1e-4, 0.0), windows=8)
+    with pytest.raises(iqs.Unusable):  # window 7 is missing
+        iqs.load_arm(arm, write_scored(tmp_path / "missing.json", {w: (40, [[1, 40]]) for w in range(7)}))
+    with pytest.raises(iqs.Unusable):  # nothing is scored
+        iqs.load_arm(arm, write_scored(tmp_path / "none.json", {w: (40, []) for w in range(8)}))
+
+
+def test_a_set_of_few_long_windows_resamples_blocks(tmp_path: Path) -> None:
+    # 4 windows of 16,384 positions: too few windows to bootstrap, 16 blocks of 4,096 enough
+    rng = np.random.default_rng(12)
+    arm = write_arm(tmp_path, "long", *synthetic(rng, 4, 16384, 2e-4, 0.002), windows=4)
+    loaded = iqs.load_arm(arm)
+    assert np.unique(loaded.unit).size == 16
+    assert iqs.decide(loaded, FAST)["bound"]["mean_kl"] > 0
+    # four short windows have nothing to resample
+    small = write_arm(tmp_path / "s", "small", *synthetic(rng, 4, 500, 2e-4, 0.002), windows=4)
+    with pytest.raises(iqs.Unusable):
+        iqs.decide(iqs.load_arm(small), FAST)

@@ -46,6 +46,10 @@ struct Window {
     std::string id;
     std::string domain;
     std::vector<TokenId> tokens; // exactly the set's window_tokens
+    // generated[i]: token i is one the model writes (all of a text window; a chat's assistant turns only), so the
+    // position that predicts it is scored. The rest of a chat (system prompt, tool schemas, user turns, tool
+    // responses) is text the model never trains on: its predictions are arbitrary and numerically fragile.
+    std::vector<std::uint8_t> generated;
     std::uint64_t input_hash = 0;
 };
 

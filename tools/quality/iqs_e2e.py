@@ -6,8 +6,10 @@ and writes a JSON result {"passed": bool, "detail": str, ...} that tools/quality
   identity   G4/G5: on --reproducible, every response under concurrency and a warm prefix cache equals the same
              request served alone (greedy and seeded sampling), and with --golden FILE the responses served alone
              equal the hashes FILE stores from earlier releases (recorded when FILE is absent); with
-             --negative-control the default route must show a difference under concurrency (proving the comparison
-             can see one)
+             --negative-control the default route's differences under concurrency are counted and reported (an
+             artifact whose default route happens to be request-invariant shows none: that says nothing against
+             its reproducible route)
+  sensitivity  the comparison above can see a difference: at least one artifact's negative control saw one
   longgen    G5: free-running thinking outputs on the default route against --reproducible: mean output length
              within 90-110 %, no more looping outputs, no fewer natural stops (MLPerf TEST06/TEST09 style)
   specdist   G5: with speculation the default route's sampled continuations follow the same distribution as
@@ -152,10 +154,25 @@ def check_identity(args) -> dict:
             alone = [client.chat(**r) for r in plain]
             together = client.many(plain, workers=len(plain))
             seen = sum(1 for a, b in zip(alone, together) if not same(a, b))
-        result["negative_control"] = {"route": "default", "differences": seen, "passed": seen > 0}
+        result["negative_control"] = {"route": "default", "differences": seen}
         result["detail"] += f"; negative control (default route) saw {seen} differences"
-        result["passed"] = result["passed"] and seen > 0
     return result
+
+
+def check_sensitivity(args) -> dict:
+    """The identity comparison is shown able to see a difference when some artifact's default route, compared
+    the same way, showed one: the comparison code is the same for every artifact."""
+    seen = {}
+    for path in args.results:
+        result = json.loads(Path(path).read_text(encoding="utf-8"))
+        control = result.get("negative_control")
+        if control is not None:
+            seen[Path(path).stem] = int(control.get("differences", 0))
+    passed = any(count > 0 for count in seen.values())
+    detail = ", ".join(f"{name}: {count}" for name, count in sorted(seen.items())) or "no negative control ran"
+    return {"passed": passed, "controls": seen,
+            "detail": ("the default route showed differences under concurrency (" + detail + ")") if passed
+            else "no artifact's default route showed a difference, so the comparison is unproven (" + detail + ")"}
 
 
 def golden(store: Path, artifact: str, hashes: list[str]) -> dict:
@@ -337,15 +354,17 @@ def check_tasks(args) -> dict:
     return result
 
 
-CHECKS = {"identity": check_identity, "longgen": check_longgen, "specdist": check_specdist, "tasks": check_tasks}
+CHECKS = {"identity": check_identity, "longgen": check_longgen, "specdist": check_specdist, "tasks": check_tasks,
+          "sensitivity": check_sensitivity}
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("check", choices=sorted(CHECKS))
-    parser.add_argument("--serve", required=True)
-    parser.add_argument("--artifact", required=True)
+    parser.add_argument("--serve")
+    parser.add_argument("--artifact", default="")
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--results", nargs="*", default=[], help="sensitivity: the identity results to read")
     parser.add_argument("--log", type=Path)
     parser.add_argument("--server-arg", dest="server_args", action="append", default=[],
                         help="an infernix-serve argument (repeat; e.g. --server-arg=--kv-dtype --server-arg=bf16)")
@@ -356,9 +375,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--count", type=int, default=16)
     parser.add_argument("--max-tokens", type=int, default=1024)
     parser.add_argument("--samples", type=int, default=400)
-    parser.add_argument("--gsm8k", type=int, default=100)
+    parser.add_argument("--gsm8k", type=int, default=250)
     parser.add_argument("--mmlu", type=int, default=500)
     args = parser.parse_args(argv)
+    if args.check != "sensitivity" and not (args.serve and args.artifact):
+        parser.error(f"{args.check} needs --serve and --artifact")
     args.log = args.log or args.out.with_suffix(".serve.log")
     started = time.time()
     try:

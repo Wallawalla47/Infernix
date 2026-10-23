@@ -160,6 +160,10 @@ class Planner:
     def twin(self, config: Config) -> Path:
         return self.store / config.key / "main-twin"
 
+    def scored(self, config: Config, set_name: str = "main") -> Path:
+        """The positions the artifact's windows score: the tokens the model writes (see infernix-certify mask)."""
+        return self.store / config.artifact / f"{set_name}-scored.json"
+
     def arm(self, config: Config, kv: str, name: str, set_name: str = "main") -> Path:
         return self.run / "arms" / f"{config.key}-{set_name}-{kv}-{name}"
 
@@ -186,11 +190,21 @@ class Planner:
                 "--out", str(out), *args]
         self.add(Step(block, name, argv, [str(p) for p in (outputs or [Path(str(out) + ".json")])], minutes))
 
-    def decide(self, label: str, arm: Path, config: Config) -> None:
-        self.decisions.append({"label": label, "arm": str(arm), "twin": str(self.twin(config))})
+    def decide(self, label: str, arm: Path, config: Config, set_name: str = "main") -> None:
+        self.decisions.append({"label": label, "arm": str(arm), "twin": str(self.twin(config)),
+                               "scored": str(self.scored(config, set_name))})
+
+    def mask(self, c: Config, set_name: str) -> None:
+        out = self.scored(c, set_name)
+        self.certify_step("C0", f"mask-{c.artifact}-{set_name}", "mask", c, [], out, 20, set_name=set_name,
+                          outputs=[out])
 
     # The regime --------------------------------------------------------------------------------------------
     def plan(self) -> None:
+        for c in self.configs:
+            self.mask(c, "main")
+            if c.key in LONG_REPRESENTATIVES:
+                self.mask(c, "long")
         for c in self.configs:
             self.references(c)
         for c in self.configs:
@@ -217,6 +231,7 @@ class Planner:
         self.functional()
         for c in self.configs:
             self.end_to_end(c)
+        self.sensitivity()
 
     def references(self, c: Config) -> None:
         lossless = self.lossless(c.artifact)
@@ -227,7 +242,7 @@ class Planner:
                               ["--design", "--kv-dtype", "bf16", "--reference", str(lossless)], design, 120,
                               outputs=compared(design))
             self.disclosures.append({"label": f"{c.key} declared design (activation quantization, bf16 KV)",
-                                     "arm": str(design) + ".compare"})
+                                     "arm": str(design) + ".compare", "scored": str(self.scored(c))})
 
     def twin_step(self, c: Config) -> None:
         route = ["--lossless", "--noise-seed", str(TWIN_SEED), "--windows", TWIN_WINDOWS,
@@ -243,7 +258,7 @@ class Planner:
                               ["--design", "--kv-dtype", kv, "--reference", str(self.lossless(c.artifact))],
                               design, 120, outputs=compared(design))
             self.disclosures.append({"label": f"{c.key} KV {kv} design error", "arm": str(design) + ".compare",
-                                     "kv": kv})
+                                     "kv": kv, "scored": str(self.scored(c))})
 
     def capture(self, c: Config) -> None:
         """G1: the lossless route's whole logits rows, which tools/quality/shadow compares bit for bit
@@ -277,7 +292,7 @@ class Planner:
                               ["--reference", str(reference), "--kv-dtype", kv, *args], out,
                               90 if set_name == "main" else 120, set_name=set_name)
             if decide:
-                self.decide(f"{c.key} {set_name} {kv} {name}", out, c)
+                self.decide(f"{c.key} {set_name} {kv} {name}", out, c, set_name)
             outs.append(out)
         return outs
 
@@ -307,7 +322,7 @@ class Planner:
                 out = self.arm_steps(c, kv, "E2", [("prefill-default", "prefill", [])], set_name="long",
                                      decide=False)[0]
                 self.disclosures.append({"label": f"{c.key} long KV {kv} (engine and design error)",
-                                         "arm": str(out), "kv": kv})
+                                         "arm": str(out), "kv": kv, "scored": str(self.scored(c, "long"))})
 
     def functional(self) -> None:
         ctest = [ctest_exe(), "--test-dir", str(self.build), "-C", "Release", "--output-on-failure"]
@@ -337,6 +352,17 @@ class Planner:
             result = self.run / "checks" / f"{name}.json"
             self.add(Step("F", name, argv, [str(result)], minutes, env=env, check=str(result)))
             self.checks.append({"name": f"F {name}", "result": str(result)})
+
+    def sensitivity(self) -> None:
+        """The identity comparison can see a difference: some representative's default route showed one."""
+        identities = [self.run / "checks" / f"e2e-{c.key}-identity.json" for c in self.configs if c.representative]
+        if not identities:
+            return
+        result = self.run / "checks" / "e2e-sensitivity.json"
+        argv = [sys.executable, "-m", "tools.quality.iqs_e2e", "sensitivity", "--out", str(result), "--results",
+                *[str(p) for p in identities]]
+        self.add(Step("F", "e2e-sensitivity", argv, [str(result)], 5))
+        self.checks.append({"name": "F identity comparison sensitivity (negative controls)", "result": str(result)})
 
     def end_to_end(self, c: Config) -> None:
         server = ["--kv-dtype", "bf16", "--max-context", "16384", *self.artifact_args(c)[1:]]

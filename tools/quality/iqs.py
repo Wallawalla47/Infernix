@@ -17,10 +17,18 @@ Each budget is max(fixed budget, kappa * N), N the same metric between the refer
 exact route with stochastic rounding, infernix-certify prefill --lossless --noise-seed): an ideal BF16
 implementation's own deviation, a property of the model. kappa = 2.
 
+Scored positions: a position counts when the model writes the token it predicts. A text window scores every
+position; a chat window only its assistant turns (infernix-certify mask writes the artifact's list, the
+`scored` field of a plan item). The system prompt, tool schemas, user turns and tool responses are text the
+model is never trained to predict: its predictions there are arbitrary, extremely sharp and numerically
+fragile, and (measured, first calibration run) held 99 % of every arm's KL while having no bearing on any
+token the model emits. The estimate over every position is still reported beside the scored one.
+
 Statistics: the unit is the window (a document); bounds are percentile bootstraps resampling windows
-(paired: both runs saw the same positions), one-sided at 97.5 %. A criterion passes when its bound is within
-budget. Budgets, kappa and the confidence are parameters (--set NAME=VALUE), so stored runs are decided again
-under other thresholds without measuring.
+(paired: both runs saw the same positions), one-sided at 97.5 %. A set with fewer windows than min_units (the
+32K long set: 4) resamples blocks of 4,096 positions of its windows instead. A criterion passes when its
+bound is within budget. Budgets, kappa and the confidence are parameters (--set NAME=VALUE), so stored runs
+are decided again under other thresholds without measuring.
 
 Subcommands:
   decide ARM [--twin TWIN]          one arm (infernix-certify prefill/decode output prefix)
@@ -55,7 +63,8 @@ class Policy:
     confidence: float = 0.975
     resamples: int = 10000
     seed: int = 20261022
-    min_windows: int = 8
+    min_units: int = 8
+    block: int = 4096  # positions per resampling unit when a set has fewer windows than min_units
 
 
 POLICY = Policy()
@@ -101,14 +110,39 @@ class Arm:
     top_mass: np.ndarray
     flip: np.ndarray
     dnll: np.ndarray
+    position: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int64))
+    unit: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int64))  # the bootstrap's resampling unit
     domains: dict[int, str] = field(default_factory=dict)
+    unscored: dict[str, float] | None = None  # the estimate over the positions the model does not write
+    unscored_positions: int = 0
 
     @property
     def name(self) -> str:
         return self.prefix.name
 
 
-def load_arm(prefix: Path) -> Arm:
+def load_scored(path: Path) -> dict[int, np.ndarray]:
+    """Per window index, a boolean array over positions (target token indices): true where the model writes the
+    token (infernix-certify mask)."""
+    if not path.is_file():
+        raise Unusable(f"missing scored-position list {path}")
+    out = {}
+    for entry in json.loads(path.read_text(encoding="utf-8"))["windows"]:
+        flags = np.zeros(int(entry["positions"]) + 1, dtype=bool)
+        for first, last in entry["runs"]:
+            flags[first:last + 1] = True
+        out[int(entry["index"])] = flags
+    return out
+
+
+def resampling_units(window: np.ndarray, position: np.ndarray, policy: Policy) -> np.ndarray:
+    """Windows are the resampling units; a set with too few of them resamples blocks of its windows."""
+    if np.unique(window).size >= policy.min_units:
+        return window
+    return window * ((int(position.max()) - 1) // policy.block + 2) + (position - 1) // policy.block
+
+
+def load_arm(prefix: Path, scored: Path | None = None, policy: Policy = POLICY) -> Arm:
     meta_path = Path(str(prefix) + ".json")
     rows_path = Path(str(prefix) + ".positions.csv")
     if not meta_path.is_file() or not rows_path.is_file():
@@ -122,8 +156,26 @@ def load_arm(prefix: Path) -> Arm:
     if ref_meta.is_file():
         for entry in json.loads(ref_meta.read_text(encoding="utf-8")).get("windows", []):
             domains[int(entry["index"])] = entry["domain"]
-    return Arm(prefix=prefix, meta=meta, window=data[:, 0].astype(np.int64), kl=data[:, 3], top_mass=data[:, 4],
-               flip=data[:, 5], dnll=data[:, 6], domains=domains)
+    window, position = data[:, 0].astype(np.int64), data[:, 2].astype(np.int64)
+    arm = Arm(prefix=prefix, meta=meta, window=window, kl=data[:, 3], top_mass=data[:, 4], flip=data[:, 5],
+              dnll=data[:, 6], position=position, domains=domains)
+    if scored is not None:
+        flags = load_scored(scored)
+        keep = np.zeros(len(window), dtype=bool)
+        for w in np.unique(window):
+            if int(w) not in flags:
+                raise Unusable(f"{scored} lists no window {int(w)}")
+            at = window == w
+            table = flags[int(w)]
+            inside = position[at] < len(table)
+            keep[np.nonzero(at)[0][inside]] = table[position[at][inside]]
+        if not keep.any():
+            raise Unusable(f"{prefix}: no scored position")
+        arm.unscored = point(arm.kl[~keep], arm.flip[~keep], arm.dnll[~keep]) if (~keep).any() else None
+        arm.unscored_positions = int((~keep).sum())
+        arm = replace(arm, window=window[keep], kl=arm.kl[keep], top_mass=arm.top_mass[keep], flip=arm.flip[keep],
+                      dnll=arm.dnll[keep], position=position[keep])
+    return replace(arm, unit=resampling_units(arm.window, arm.position, policy))
 
 
 def point(kl: np.ndarray, flip: np.ndarray, dnll: np.ndarray) -> dict[str, float]:
@@ -134,10 +186,10 @@ def point(kl: np.ndarray, flip: np.ndarray, dnll: np.ndarray) -> dict[str, float
 def bootstrap_bounds(arm: Arm, policy: Policy) -> dict[str, float]:
     """One-sided upper bounds: percentile bootstrap over windows (each resample draws windows with
     replacement; a window's positions keep their weight together)."""
-    windows, inverse = np.unique(arm.window, return_inverse=True)
-    n = len(windows)
-    if n < policy.min_windows:
-        raise Unusable(f"{arm.name}: {n} windows; bounds need at least {policy.min_windows}")
+    units, inverse = np.unique(arm.unit, return_inverse=True)
+    n = len(units)
+    if n < policy.min_units:
+        raise Unusable(f"{arm.name}: {n} resampling units; bounds need at least {policy.min_units}")
     counts = np.bincount(inverse, minlength=n).astype(np.float64)
     sums = {m: np.bincount(inverse, weights=v, minlength=n) for m, v in
             (("mean_kl", arm.kl), ("flip_rate", arm.flip), ("mean_dnll", arm.dnll))}
@@ -192,7 +244,8 @@ def decide(arm: Arm, policy: Policy = POLICY, floor: dict[str, float] | None = N
     criteria.append({"name": "F0 finite", "estimate": nonfinite, "bound": nonfinite, "budget": 0, "passed": nonfinite == 0})
     finite = np.isfinite(arm.kl) & np.isfinite(arm.dnll)
     arm_f = replace(arm, window=arm.window[finite], kl=arm.kl[finite], top_mass=arm.top_mass[finite],
-                    flip=arm.flip[finite], dnll=arm.dnll[finite])
+                    flip=arm.flip[finite], dnll=arm.dnll[finite], position=arm.position[finite],
+                    unit=arm.unit[finite])
     estimate = point(arm_f.kl, arm_f.flip, arm_f.dnll)
     bound = bootstrap_bounds(arm_f, policy)
     budget = budgets(policy, floor)
@@ -214,7 +267,8 @@ def decide(arm: Arm, policy: Policy = POLICY, floor: dict[str, float] | None = N
             "fast_paths": arm.meta.get("load", {}).get("fast_paths", []), "positions": int(arm_f.kl.size),
             "windows": int(np.unique(arm_f.window).size), "reference_top_mass": float(np.mean(arm_f.top_mass)),
             "noise_floor": floor, "estimate": estimate, "bound": bound, "budget": budget, "domains": by_domain,
-            "criteria": criteria, "passed": all(c["passed"] for c in criteria)}
+            "criteria": criteria, "passed": all(c["passed"] for c in criteria),
+            "unscored": {"positions": arm.unscored_positions, "estimate": arm.unscored}}
 
 
 def disclose(arm: Arm, kv: str | None, policy: Policy = POLICY) -> dict:
@@ -224,7 +278,8 @@ def disclose(arm: Arm, kv: str | None, policy: Policy = POLICY) -> dict:
     bound = bootstrap_bounds(arm, policy)
     if kv is None:
         return {"arm": str(arm.prefix), "kv_dtype": None, "class": "declared activation quantization (reported)",
-                "estimate": estimate, "bound": bound, "criteria": [], "passed": True}
+                "estimate": estimate, "bound": bound, "criteria": [], "passed": True,
+                "unscored": {"positions": arm.unscored_positions, "estimate": arm.unscored}}
     if kv not in KV_CLASSES:
         raise Unusable(f"no KV class for {kv}")
     name, kl_ceiling, flip_ceiling = KV_CLASSES[kv]
@@ -233,13 +288,14 @@ def disclose(arm: Arm, kv: str | None, policy: Policy = POLICY) -> dict:
                 {"name": "class flip rate", "estimate": estimate["flip_rate"], "bound": bound["flip_rate"],
                  "budget": flip_ceiling, "passed": bound["flip_rate"] <= flip_ceiling}]
     return {"arm": str(arm.prefix), "kv_dtype": kv, "class": name, "estimate": estimate, "bound": bound,
-            "criteria": criteria, "passed": all(c["passed"] for c in criteria)}
+            "criteria": criteria, "passed": all(c["passed"] for c in criteria),
+            "unscored": {"positions": arm.unscored_positions, "estimate": arm.unscored}}
 
 
-def floor_of(twin: Path | None) -> dict[str, float] | None:
+def floor_of(twin: Path | None, scored: Path | None = None) -> dict[str, float] | None:
     if twin is None:
         return None
-    arm = load_arm(twin)
+    arm = load_arm(twin, scored)
     if arm.meta.get("route") != "noise_twin":
         raise Unusable(f"{twin} is not a noise-twin run")
     return point(arm.kl, arm.flip, arm.dnll)
@@ -300,15 +356,17 @@ def run_certificate(plan_path: Path, out: Path, policy: Policy) -> int:
                    "disclosures": [], "checks": [], "unusable": []}
     for item in plan.get("decisions", []):
         try:
-            floor = floor_of(base / item["twin"]) if item.get("twin") else None
-            decision = decide(load_arm(base / item["arm"]), policy, floor)
+            scored = base / item["scored"] if item.get("scored") else None
+            floor = floor_of(base / item["twin"], scored) if item.get("twin") else None
+            decision = decide(load_arm(base / item["arm"], scored, policy), policy, floor)
             decision["label"] = item.get("label", item["arm"])
             certificate["decisions"].append(decision)
         except Unusable as error:
             certificate["unusable"].append({"label": item.get("label", item["arm"]), "error": str(error)})
     for item in plan.get("disclosures", []):
         try:
-            disclosure = disclose(load_arm(base / item["arm"]), item.get("kv"), policy)
+            scored = base / item["scored"] if item.get("scored") else None
+            disclosure = disclose(load_arm(base / item["arm"], scored, policy), item.get("kv"), policy)
             disclosure["label"] = item.get("label", item["arm"])
             certificate["disclosures"].append(disclosure)
         except Unusable as error:
@@ -349,6 +407,8 @@ def main(argv: list[str] | None = None) -> int:
     cert = commands.add_parser("certificate", help="every decision of a run plan")
     cert.add_argument("plan", type=Path)
     cert.add_argument("--out", type=Path, required=True)
+    for sub in (one, disc):
+        sub.add_argument("--scored", type=Path, help="the artifact's scored-position list (infernix-certify mask)")
     for sub in (one, disc, cert):
         sub.add_argument("--set", action="append", metavar="NAME=VALUE", help="a Policy value (budgets, kappa, ...)")
         sub.add_argument("--json", type=Path)
@@ -358,10 +418,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "certificate":
             return run_certificate(args.plan, args.out, policy)
         if args.command == "decide":
-            result = decide(load_arm(args.arm), policy, floor_of(args.twin))
+            result = decide(load_arm(args.arm, args.scored, policy), policy, floor_of(args.twin, args.scored))
             print_decision(result)
         else:
-            result = disclose(load_arm(args.arm), args.kv, policy)
+            result = disclose(load_arm(args.arm, args.scored, policy), args.kv, policy)
             print_decision(result)
         if args.json:
             args.json.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")

@@ -3,6 +3,7 @@ the homogeneity test speculation is judged by, loop detection and answer extract
 
 from __future__ import annotations
 
+import json
 import random
 
 import pytest
@@ -39,3 +40,19 @@ def test_looping_and_answers():
     assert not iqs_e2e.looping(" ".join(f"step {i} adds {i * 3}" for i in range(200)))
     assert iqs_e2e.gsm_answer("First 3 + 4 = 7, then $1,250.\nAnswer: 1,250.") == "1250"
     assert iqs_e2e.gsm_answer("no number here") is None
+
+
+def test_the_comparison_is_proven_by_any_artifacts_negative_control(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    def result(name: str, control: int | None) -> str:
+        path = tmp_path / f"{name}.json"
+        body = {"passed": True} if control is None else {"passed": True, "negative_control": {"differences": control}}
+        path.write_text(json.dumps(body), encoding="utf-8")
+        return str(path)
+
+    seen = iqs_e2e.check_sensitivity(SimpleNamespace(results=[result("q27", 5), result("q35", 0), result("fp8", None)]))
+    assert seen["passed"] and seen["controls"] == {"q27": 5, "q35": 0}
+    blind = iqs_e2e.check_sensitivity(SimpleNamespace(results=[result("a", 0), result("b", 0)]))
+    assert not blind["passed"]
+    assert not iqs_e2e.check_sensitivity(SimpleNamespace(results=[result("c", None)]))["passed"]
