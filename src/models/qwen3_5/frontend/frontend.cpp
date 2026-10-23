@@ -1127,14 +1127,22 @@ ChatTokens Frontend::tokenize_chat(PromptInput input) const {
             ++i;
             continue;
         }
-        const bool assistant = i + 1 < count && bytes(i + 1).starts_with("assistant");
-        std::size_t body     = i + 1;
-        while (body < count && bytes(body).find('\n') == std::string_view::npos) { ++body; }
+        // The role is the header's text up to its newline, whatever the tokenizer's pieces ("assistant" is one
+        // token in the real vocabulary, letters in a test one).
+        std::string role;
+        std::size_t body = i + 1;
+        for (; body < count; ++body) {
+            const std::string_view piece = bytes(body);
+            const std::size_t newline    = piece.find('\n');
+            role.append(piece.substr(0, newline));
+            if (newline != std::string_view::npos) { break; }
+        }
         ++body; // past the token that holds the header's newline
         std::size_t end = body;
         while (end < count && bytes(end) != "<|im_end|>") { ++end; }
-        if (assistant) {
-            for (std::size_t k = body; k <= end && k < count; ++k) { out.generated[k] = 1; }
+        // An assistant turn with no <|im_end|> is a generation prompt (nothing written yet), not output.
+        if (role == "assistant" && end < count) {
+            for (std::size_t k = body; k <= end; ++k) { out.generated[k] = 1; }
         }
         i = end + 1;
     }
