@@ -696,7 +696,7 @@
   "__nv_static__ggml_linear_cu__ZN8infernix3ops_GLOBAL__N__ggml_linear_cu22tiled_mma_mixed_kernelILNS_5QTypeE12ELS3_17ELb0EEEvNS1_9RowsGroupEiPKiS6_iiii": {"stack": 8, "local": 0},
   "__nv_static__lossless_attention_cu__ZN8infernix3ops_GLOBAL__N__lossless_attention_cu16attention_kernelILi0EEEvNS1_4ArgsE": {"stack": 120, "local": 0},
   "__nv_static__lossless_attention_cu__ZN8infernix3ops_GLOBAL__N__lossless_attention_cu16attention_kernelILi2EEEvNS1_4ArgsE": {"stack": 120, "local": 0},
-  "__nv_static__lossless_attention_cu__ZN8infernix3ops_GLOBAL__N__lossless_attention_cu17codec_pack_kernelENS1_4ArgsEiPiPsPhS3_Pj": {"stack": 128, "local": 0},
+  "__nv_static__lossless_attention_cu__ZN8infernix3ops_GLOBAL__N__lossless_attention_cu17codec_pack_kernelENS1_4ArgsEiPiS3_PsPhS3_Pj": {"stack": 128, "local": 0},
   "__nv_static__lossless_attention_cu__ZN8infernix3ops_GLOBAL__N__lossless_attention_cu21codec_fallback_kernelENS1_4ArgsEi": {"stack": 1472, "local": 0},
   "__nv_static__lossless_attention_cu__ZN8infernix3ops_GLOBAL__N__lossless_attention_cu25attention_fallback_kernelENS1_12FallbackArgsE": {"stack": 880, "local": 0},
   "__nv_static__lossless_flash_cu__ZN8infernix3ops50_GLOBAL__N__lossless_flash_cu_14cb962e13hc_mix_kernelEPKtS3_iiiPt": {"stack": 176, "local": 0},
