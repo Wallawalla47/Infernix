@@ -239,7 +239,10 @@ public:
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
         // The lossless ops' rounding mode is process-wide device state: every lossless Engine sets it, so
         // a noise twin never leaks into a later lossless run.
-        if (options.lossless) { ops::lossless_set_noise_seed(options.lossless_noise_seed); }
+        if (options.lossless) {
+            ops::lossless_set_noise(options.lossless_noise_seed, options.lossless_noise_units,
+                                    options.lossless_noise_scale);
+        }
         if (architecture == models::Architecture::Qwen4Exp) {
             auto constructed  = runtime::construct_qwen4_exp(options, device);
             options           = std::move(constructed.options);

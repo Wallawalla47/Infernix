@@ -601,6 +601,10 @@ struct EngineOptions {
     // rounding. CausalScoring with `lossless` only; 0 (the default) is the lossless route itself. The rounding
     // mode is process-wide device state, so one process runs one seed.
     std::uint64_t lossless_noise_seed  = 0;
+    // The attribution of the noise (ops::LosslessNoiseUnit): the bit mask of the operation groups the noise
+    // applies to (default all) and its strength in (0, 1] (default full), both with a nonzero seed only.
+    std::uint32_t lossless_noise_units = 0xFFU;
+    float lossless_noise_scale         = 1.0F;
     // Qwen3.8-Flash-Next artifacts whose routed experts offer 4-bit activations as an option (only
     // nvidia/Qwen3.8-Flash-Next-FP4-Local, whose experts NVIDIA calibrated for them): run the routed
     // experts W4A4 with their stored activation scales (--expert-a4-activations) instead of the

@@ -344,6 +344,13 @@ the artifact and the declared steps, so a reference survives rebuilds like `--lo
 
 ## 5. The noise twin
 
+**Attribution.** `EngineOptions::lossless_noise_units` (`ops::LosslessNoiseUnit`: elementwise, attention,
+Flash-Next's own operations, the delta rule, MoE, RoPE, linear, GGUF) confines the noise to chosen groups of
+operations, and `lossless_noise_scale` thins it: every rounding moves from its nearest neighbour to the other
+with that share of the twin's probability (`infernix-certify prefill --lossless --noise-seed N --noise-units
+LIST --noise-scale S`). With the noise in one group at a time, the twin's KL splits by group; with all groups
+at falling strength, the strength at which it equals a shipped route's KL says how noisy that route is.
+
 `EngineOptions::lossless_noise_seed` (`infernix-certify prefill --lossless --noise-seed N`, CausalScoring
 only) makes every correctly rounded result of the route a stochastic rounding of the same exact value:
 up with probability equal to the discarded fraction of the result's unit in the last place

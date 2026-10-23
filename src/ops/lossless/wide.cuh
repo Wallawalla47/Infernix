@@ -201,7 +201,12 @@ __device__ std::uint32_t round_magnitude(const std::uint32_t (&mag)[Words], int 
                             (negative ? 1ULL : 0ULL) | (bf16 ? 2ULL : 0ULL);
 #pragma unroll
         for (int i = 0; i < Words; ++i) { key = noise_mix(key ^ mag[i]); }
-        up = noise_moves(static_cast<double>(frac) / 4294967296.0, key);
+        // Moves from the nearest neighbour (the nearest-even decision `up` above) to the other one with the
+        // probability of its distance from the nearest, in units of the gap: the stochastic rounding, and one
+        // a weaker noise scale can thin without biasing the rounding.
+        const double distance = up ? (4294967296.0 - static_cast<double>(frac)) / 4294967296.0
+                                   : static_cast<double>(frac) / 4294967296.0;
+        up = up != noise_moves(distance, key);
     }
     if (up) { ++q; }
     int e = ulp;

@@ -1004,8 +1004,8 @@ void run_noise(const std::string& label, const HostWeight& w, const std::vector<
                bool bf16) {
     const int esize = bf16 ? 2 : 4;
     const std::size_t outputs = static_cast<std::size_t>(w.n) * columns;
-    const auto launch = [&](std::uint64_t seed) {
-        ops::lossless_set_noise_seed(seed);
+    const auto launch = [&](std::uint64_t seed, std::uint32_t units = ops::kAllLosslessNoiseUnits, float scale = 1.0F) {
+        ops::lossless_set_noise(seed, units, scale);
         DeviceBuffer dx(x.size() * 2);
         dx.copy_from_host(x.data(), x.size() * 2, 0);
         DeviceBuffer dout(outputs * esize);
@@ -1023,8 +1023,15 @@ void run_noise(const std::string& label, const HostWeight& w, const std::vector<
     };
     const std::vector<std::uint32_t> first = launch(0x1234567ULL), again = launch(0x1234567ULL),
                                      other = launch(0x89ABCDEF01ULL);
+    // The attribution: noise confined to other operation groups leaves this one round to nearest even, and a
+    // weaker noise moves proportionally fewer values.
+    const std::vector<std::uint32_t> nearest = launch(0);
+    const std::vector<std::uint32_t> elsewhere =
+        launch(0x1234567ULL, ops::kAllLosslessNoiseUnits & ~static_cast<std::uint32_t>(ops::LosslessNoiseUnit::Linear));
+    const std::vector<std::uint32_t> weak = launch(0x1234567ULL, ops::kAllLosslessNoiseUnits, 0.25F);
     ops::lossless_set_noise_seed(0);
-    std::size_t outside = 0, inexact = 0, away = 0, reseeded = 0;
+    check(elsewhere == nearest, label + ": noise confined to other groups changed this group's outputs");
+    std::size_t outside = 0, inexact = 0, away = 0, reseeded = 0, weak_away = 0;
     double expected = 0.0, variance = 0.0;
     for (int t = 0; t < columns; ++t) {
         for (int r = 0; r < w.n; ++r) {
@@ -1036,6 +1043,7 @@ void run_noise(const std::string& label, const HostWeight& w, const std::vector<
             if (n.toward == n.away) { continue; }
             ++inexact;
             away += first[i] == n.away ? 1U : 0U;
+            weak_away += weak[i] == n.away ? 1U : 0U;
             expected += n.fraction;
             variance += n.fraction * (1.0 - n.fraction);
         }
@@ -1047,8 +1055,28 @@ void run_noise(const std::string& label, const HostWeight& w, const std::vector<
     check(inexact > 1000 && deviation <= 6.0 * std::sqrt(variance) + 1.0,
           label + ": " + std::to_string(away) + " of " + std::to_string(inexact) + " inexact outputs rounded away, " +
               std::to_string(expected) + " expected");
+    // At a quarter of the strength a value moves from its nearest neighbour to the other with a quarter of the
+    // probability the twin gives it (its distance from the nearest, in units of the gap): a value at fraction
+    // f <= 1/2 of the way from `toward` to `away` ends away with 0.25 f, one at f > 1/2 (its nearest is `away`)
+    // with 1 - 0.25 (1 - f).
+    double weak_expected = 0.0, weak_variance = 0.0;
+    for (int t = 0; t < columns; ++t) {
+        for (int r = 0; r < w.n; ++r) {
+            const std::size_t i = static_cast<std::size_t>(t) * w.n + r;
+            Neighbours n;
+            (void)oracle(w, r, x.data() + static_cast<std::size_t>(t) * w.k, bf16, {}, &n);
+            if (n.toward == n.away) { continue; }
+            const double p = n.fraction <= 0.5 ? 0.25 * n.fraction : 1.0 - 0.25 * (1.0 - n.fraction);
+            weak_expected += p;
+            weak_variance += p * (1.0 - p);
+        }
+    }
+    check(std::abs(static_cast<double>(weak_away) - weak_expected) <= 6.0 * std::sqrt(weak_variance) + 1.0,
+          label + ": at a quarter of the strength " + std::to_string(weak_away) + " values rounded away, " +
+              std::to_string(weak_expected) + " expected");
     std::cout << label << ": " << outputs << " outputs, " << inexact << " inexact, " << away << " away (expected "
-              << expected << "), " << reseeded << " changed by another seed\n";
+              << expected << "), " << reseeded << " changed by another seed; at 1/4 strength " << weak_away
+              << " away (expected " << weak_expected << ")\n";
 }
 
 // The grouped form: tiles of 64 columns, each an expert's rows [e stride + offset, + rows) (some tiles

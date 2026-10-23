@@ -18,6 +18,9 @@
 namespace infernix::ops::lossless {
 
 static __constant__ unsigned long long noise_seed;
+// The share of the stochastic roundings that move (1: the twin's full noise; less: a weaker noise, for the
+// attribution of an engine's error to the noise level it is equivalent to).
+static __constant__ float noise_scale = 1.0F;
 
 __device__ __forceinline__ bool noise_active() { return noise_seed != 0ULL; }
 
@@ -37,14 +40,15 @@ __device__ __forceinline__ std::uint32_t noise_draw(std::uint64_t key) {
 // to the other one.
 __device__ __forceinline__ bool noise_moves(double fraction, std::uint64_t key) {
     if (!(fraction > 0.0)) { return false; }
-    return static_cast<double>(noise_draw(key)) < fraction * 4294967296.0;
+    return static_cast<double>(noise_draw(key)) < fraction * static_cast<double>(noise_scale) * 4294967296.0;
 }
 
 } // namespace infernix::ops::lossless
 
 #define INFERNIX_LOSSLESS_NOISE_UNIT(tag)                                                                   \
     namespace infernix::ops::lossless {                                                                     \
-    void set_noise_seed_##tag(unsigned long long seed) {                                                    \
+    void set_noise_seed_##tag(unsigned long long seed, float scale) {                                       \
         CUDA_CHECK(cudaMemcpyToSymbol(noise_seed, &seed, sizeof(seed)));                                    \
+        CUDA_CHECK(cudaMemcpyToSymbol(noise_scale, &scale, sizeof(scale)));                                 \
     }                                                                                                       \
     }

@@ -7,7 +7,7 @@
 // tools/quality/iqs.py turns into bounds and verdicts.
 //
 //   infernix-certify reference <artifact> --corpus M --set S --out REF [--design --kv-dtype K]
-//                    [--noise-seed N] [--windows i,j,...]
+//                    [--noise-seed N [--noise-units LIST] [--noise-scale S]] [--windows i,j,...]
 //   infernix-certify verify    <artifact> --reference REF [--windows i,j,...]
 //   infernix-certify capture   <artifact> --corpus M --set S --out PREFIX --windows i,j [--tokens N] [--every K]
 //   infernix-certify mask      <artifact> --corpus M --set S --out FILE.json
@@ -68,6 +68,8 @@ struct Options {
     bool lossless              = false; // prefill: score on the exact route (lossless, --design, --noise-seed)
     bool design                = false;
     std::uint64_t noise_seed   = 0;
+    std::uint32_t noise_units  = 0xFFU; // the operation groups the noise applies to (ops::LosslessNoiseUnit)
+    float noise_scale          = 1.0F;  // its strength
     std::string kv             = "bf16";
     bool reproducible          = false;
     std::vector<infernix::FastPath> candidates;
@@ -93,6 +95,28 @@ Integer parse_integer(std::string_view text, const char* label) {
         throw std::invalid_argument(std::string("invalid ") + label + ": " + std::string(text));
     }
     return value;
+}
+
+// A comma-separated list of the noise twin's operation groups (ops::LosslessNoiseUnit): elementwise, attention,
+// flash, deltarule, moe, rope, linear, gguf; "all".
+std::uint32_t parse_noise_units(std::string_view list) {
+    std::uint32_t mask = 0;
+    while (!list.empty()) {
+        const std::size_t comma = list.find(',');
+        const std::string_view name = list.substr(0, comma);
+        if (name == "all") { mask |= 0xFFU; }
+        else if (name == "elementwise") { mask |= 1U << 0; }
+        else if (name == "attention") { mask |= 1U << 1; }
+        else if (name == "flash") { mask |= 1U << 2; }
+        else if (name == "deltarule") { mask |= 1U << 3; }
+        else if (name == "moe") { mask |= 1U << 4; }
+        else if (name == "rope") { mask |= 1U << 5; }
+        else if (name == "linear") { mask |= 1U << 6; }
+        else if (name == "gguf") { mask |= 1U << 7; }
+        else { throw std::invalid_argument("--noise-units: unknown group " + std::string(name)); }
+        list = comma == std::string_view::npos ? std::string_view{} : list.substr(comma + 1);
+    }
+    return mask;
 }
 
 std::vector<std::uint32_t> parse_list(std::string_view list) {
@@ -128,6 +152,10 @@ Options parse(int argc, char** argv) {
             out.design = true;
         } else if (option == "--noise-seed") {
             out.noise_seed = parse_integer<std::uint64_t>(value(), "noise seed");
+        } else if (option == "--noise-units") {
+            out.noise_units = parse_noise_units(value());
+        } else if (option == "--noise-scale") {
+            out.noise_scale = std::stof(std::string(value()));
         } else if (option == "--kv-dtype") {
             out.kv = value();
         } else if (option == "--reproducible") {
@@ -300,6 +328,8 @@ infernix::EngineOptions reference_engine(const Options& options, std::uint32_t w
     engine_options.lossless              = true;
     engine_options.reference             = options.design;
     engine_options.lossless_noise_seed   = options.noise_seed;
+    engine_options.lossless_noise_units  = options.noise_units;
+    engine_options.lossless_noise_scale  = options.noise_scale;
     engine_options.expert_a4_activations = options.expert_a4_activations;
     engine_options.fast_paths            = false;
     if (!options.ngram_volume.empty()) { engine_options.ngram_volume_path = options.ngram_volume; }
@@ -563,6 +593,8 @@ int run_prefill(const Options& options) {
     meta["route"]            = options.lossless ? (options.noise_seed != 0 ? "noise_twin" : (options.design ? "design" : "lossless"))
                                                 : (options.reproducible ? "reproducible" : "default");
     meta["noise_seed"]       = options.noise_seed;
+    meta["noise_units"]      = options.noise_units;
+    meta["noise_scale"]      = options.noise_scale;
     meta["windows"]          = options.windows;
     meta["kv_dtype"]         = options.kv;
     meta["reference"]        = std::filesystem::absolute(options.reference).string();

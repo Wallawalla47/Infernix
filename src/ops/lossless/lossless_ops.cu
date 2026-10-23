@@ -387,27 +387,31 @@ INFERNIX_LOSSLESS_NOISE_UNIT(ops)
 namespace infernix::ops {
 namespace lossless {
 // Each rounding unit's setter (INFERNIX_LOSSLESS_NOISE_UNIT).
-void set_noise_seed_attention(unsigned long long seed);
-void set_noise_seed_flash(unsigned long long seed);
-void set_noise_seed_gdn(unsigned long long seed);
-void set_noise_seed_moe(unsigned long long seed);
-void set_noise_seed_rope(unsigned long long seed);
-void set_noise_seed_linear(unsigned long long seed);
-void set_noise_seed_linear_ggml_i(unsigned long long seed);
-void set_noise_seed_linear_ggml_k(unsigned long long seed);
+void set_noise_seed_attention(unsigned long long seed, float scale);
+void set_noise_seed_flash(unsigned long long seed, float scale);
+void set_noise_seed_gdn(unsigned long long seed, float scale);
+void set_noise_seed_moe(unsigned long long seed, float scale);
+void set_noise_seed_rope(unsigned long long seed, float scale);
+void set_noise_seed_linear(unsigned long long seed, float scale);
+void set_noise_seed_linear_ggml_i(unsigned long long seed, float scale);
+void set_noise_seed_linear_ggml_k(unsigned long long seed, float scale);
 } // namespace lossless
 
-void lossless_set_noise_seed(std::uint64_t seed) {
-    const unsigned long long value = seed;
-    lossless::set_noise_seed_ops(value);
-    lossless::set_noise_seed_attention(value);
-    lossless::set_noise_seed_flash(value);
-    lossless::set_noise_seed_gdn(value);
-    lossless::set_noise_seed_moe(value);
-    lossless::set_noise_seed_rope(value);
-    lossless::set_noise_seed_linear(value);
-    lossless::set_noise_seed_linear_ggml_i(value);
-    lossless::set_noise_seed_linear_ggml_k(value);
+void lossless_set_noise(std::uint64_t seed, std::uint32_t units, float scale) {
+    const auto pick = [&](LosslessNoiseUnit unit) -> unsigned long long {
+        return (units & static_cast<std::uint32_t>(unit)) != 0 ? seed : 0ULL;
+    };
+    lossless::set_noise_seed_ops(pick(LosslessNoiseUnit::Elementwise), scale);
+    lossless::set_noise_seed_attention(pick(LosslessNoiseUnit::Attention), scale);
+    lossless::set_noise_seed_flash(pick(LosslessNoiseUnit::Flash), scale);
+    lossless::set_noise_seed_gdn(pick(LosslessNoiseUnit::DeltaRule), scale);
+    lossless::set_noise_seed_moe(pick(LosslessNoiseUnit::Moe), scale);
+    lossless::set_noise_seed_rope(pick(LosslessNoiseUnit::Rope), scale);
+    lossless::set_noise_seed_linear(pick(LosslessNoiseUnit::Linear), scale);
+    lossless::set_noise_seed_linear_ggml_i(pick(LosslessNoiseUnit::Gguf), scale);
+    lossless::set_noise_seed_linear_ggml_k(pick(LosslessNoiseUnit::Gguf), scale);
 }
+
+void lossless_set_noise_seed(std::uint64_t seed) { lossless_set_noise(seed, kAllLosslessNoiseUnits, 1.0F); }
 
 } // namespace infernix::ops

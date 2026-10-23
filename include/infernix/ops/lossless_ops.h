@@ -24,6 +24,25 @@ namespace infernix::ops {
 void lossless_set_noise_seed(std::uint64_t seed);
 
 /**
+ * The noise twin's attribution: the lossless ops grouped by the unit that rounds them. The noise applies only
+ * to the chosen groups (a bit mask of LosslessNoiseUnit), and at `scale` (in (0, 1]) of its strength: every
+ * stochastic rounding moves to the other neighbour with `scale` times the probability the twin gives it.
+ * lossless_set_noise_seed is every group at full strength.
+ */
+enum class LosslessNoiseUnit : std::uint32_t {
+    Elementwise = 1U << 0, // norms, residual adds, activations, gates, the causal convolution, the gated norm
+    Attention   = 1U << 1, // full attention (and the design reference's codec attention)
+    Flash       = 1U << 2, // Flash-Next's own operations (hyper-connections, per-layer embeddings, QSA)
+    DeltaRule   = 1U << 3, // the gated delta rule's recurrence
+    Moe         = 1U << 4, // routing, the experts' combine
+    Rope        = 1U << 5,
+    Linear      = 1U << 6, // every projection and the head
+    Gguf        = 1U << 7, // the GGUF-format projections
+};
+inline constexpr std::uint32_t kAllLosslessNoiseUnits = 0xFFU;
+void lossless_set_noise(std::uint64_t seed, std::uint32_t units, float scale);
+
+/**
  * Qwen3_5RMSNorm over rows of x (BF16 [width, rows]) with weight w (BF16 or FP32 [width]):
  * out = bf16(fp32(y fp32(1 + w))), y = fp32(x r), r = fp32(rsqrt(fp32(m + eps))), m = fp32(mean(x^2))
  * (the sum of squares exact).
