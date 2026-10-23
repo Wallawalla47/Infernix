@@ -47,6 +47,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sequence", type=int, default=0, help="index of the captured sequence")
     parser.add_argument("--chunk", type=int, default=0, help="which lossless prefill call of the engine run")
     parser.add_argument("--threads", type=int)
+    parser.add_argument("--detail-layers", default="",
+                        help="comma-separated delta-net layers whose intermediates are compared too")
     parser.add_argument("--out", type=Path)
     args = parser.parse_args(argv)
     if args.threads:
@@ -62,8 +64,9 @@ def main(argv: list[str] | None = None) -> int:
     hidden = int(weights.config["hidden_size"])
     started = time.time()
     record: dict = {}
+    detail = frozenset(int(x) for x in args.detail_layers.split(",") if x)
     qwen3_5.run(weights, [tokens], [[len(tokens) - 1]], lambda m: print(f"[{time.time() - started:7.0f} s] {m}", flush=True),
-                record=record, stop_after_layers=True)
+                record=record, stop_after_layers=True, detail=detail)
     layers = int(weights.config["num_hidden_layers"])
     order = ["embed"] + [(i, tag) for i in range(layers) for tag in ("mixer", "layer")]
     report, first = [], None
@@ -87,6 +90,31 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{str(key):>18}  differ {entry['different']:>8} of {entry['values']}"
               + (f"  max |d| {entry['max_abs_difference']:.4g}  first {entry['first']}" if differ.any() else "  identical"),
               flush=True)
+    for layer in sorted(detail):
+        for name in ("mixed", "z", "a", "b", "g", "beta", "conv", "o", "on", "y"):
+            key = (layer, "gdn", name)
+            path = args.dump / f"chunk{args.chunk}_layer{layer:02d}_gdn_{name}{'_f32' if name == 'g' else ''}.bin"
+            if key not in record or not path.is_file():
+                print(f"{str(key):>24}  missing")
+                continue
+            ours = record[key][0].to(torch.float32).numpy()
+            channels = ours.shape[-1]
+            if name == "g":
+                engine = np.fromfile(path, dtype="<f4").reshape(-1, channels)[: len(tokens)]
+            else:
+                engine = bf16_values(np.fromfile(path, dtype="<u2").reshape(-1, channels)[: len(tokens)])
+            differ = engine.view(np.uint32) != ours.view(np.uint32)
+            entry = {"checkpoint": str(key), "values": int(engine.size), "different": int(differ.sum())}
+            if differ.any():
+                t, ch = np.argwhere(differ)[0]
+                entry["first"] = {"token": int(t), "channel": int(ch), "engine": float(engine[t, ch]),
+                                  "shadow": float(ours[t, ch])}
+                entry["max_abs_difference"] = float(np.abs(engine.astype(np.float64) - ours.astype(np.float64)).max())
+                entry["tokens"] = sorted({int(x) for x in np.argwhere(differ)[:, 0]})
+            report.append(entry)
+            print(f"{str(key):>24}  differ {entry['different']:>7} of {entry['values']}"
+                  + (f"  max |d| {entry['max_abs_difference']:.4g}  first {entry['first']}  tokens {entry['tokens']}"
+                     if differ.any() else "  identical"), flush=True)
     result = {"artifact": args.artifact, "tokens": len(tokens), "first_difference": first, "checkpoints": report}
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)

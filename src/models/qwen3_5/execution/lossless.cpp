@@ -199,6 +199,11 @@ void gdn_layer(A& a, const BlockParameters& block, const TextConfig& config, Ten
         throw std::invalid_argument("the lossless gated delta rule takes head dims 128");
     }
     auto scope = a.scope();
+    const auto tap = [&](const char* tag, const Tensor& t) {
+        if constexpr (kRuns<A>) {
+            if (g_residual_tap) { g_residual_tap(tag, t, s); }
+        }
+    };
     Tensor h = alloc(a, DType::BF16, {H, T});
     if constexpr (kRuns<A>) { ops::lossless_rmsnorm(x, block.input_norm, config.rms_norm_eps, h, s); }
     Tensor mixed = alloc(a, DType::BF16, {C, T}), z = alloc(a, DType::BF16, {VW, T});
@@ -236,11 +241,17 @@ void gdn_layer(A& a, const BlockParameters& block, const TextConfig& config, Ten
         const Quantized hc = quantize(a, control_step, h, *a_w, s);
         shared(a, hc.x, {{a_w, 0, Hv, &av, 0}, {b_w, b_row, Hv, &bv, 0}}, s, hc.scale);
     }
+    tap("gdn_mixed", mixed);
+    tap("gdn_z", z);
+    tap("gdn_a", av);
+    tap("gdn_b", bv);
     Tensor g = alloc(a, DType::FP32, {Hv, T}), beta = alloc(a, DType::BF16, {Hv, T});
     Tensor c = alloc(a, DType::BF16, {C, T});
     Tensor o = alloc(a, DType::BF16, {VW, T}), on = alloc(a, DType::BF16, {VW, T});
     if constexpr (kRuns<A>) {
         ops::lossless_gdn_gates(av, bv, p.a_log, p.dt_bias, g, beta, s);
+        tap("gdn_g", g);
+        tap("gdn_beta", beta);
         const Tensor qc = c.slice(0, 0, KW), kc = c.slice(0, KW, KW), vc = c.slice(0, 2 * KW, VW);
         if (cache != nullptr) {
             Tensor conv = cache->conv_states, recurrent = cache->recurrent_states;
@@ -250,14 +261,18 @@ void gdn_layer(A& a, const BlockParameters& block, const TextConfig& config, Ten
                                                  *cache->source_slots, *cache->destination_slots, o, s);
         } else {
             ops::lossless_causal_conv(mixed, p.convolution, c, s);
+            tap("gdn_conv", c);
             ops::lossless_gated_delta_rule(qc, kc, vc, g, beta, nullptr, o, s);
+            tap("gdn_o", o);
         }
         Tensor o2 = o.view({dv, Hv * T}), z2 = z.view({dv, Hv * T}), on2 = on.view({dv, Hv * T});
         ops::lossless_rmsnorm_gated(o2, z2, p.norm, config.rms_norm_eps, on2, s);
+        tap("gdn_on", on);
     }
     Tensor y = alloc(a, DType::BF16, {H, T});
     const Quantized oq = quantize(a, design_step(design, p.output), on, p.output.weight, s);
     linear(a, oq.x, p.output.weight, 0, H, y, 0, s, oq.scale);
+    tap("gdn_y", y);
     if constexpr (kRuns<A>) { ops::lossless_add(x, y, x, s); }
 }
 

@@ -44,13 +44,45 @@ def _transformers():
 
 # ------------------------------------------------------------------------------------------------- forward
 
+def _record_gdn(gdn, record: dict, index: int, batch: int, length: int) -> None:
+    """Hooks that record one delta-net layer's intermediates (see run)."""
+    for name, module in (("mixed", gdn.in_proj_qkv), ("z", gdn.in_proj_z), ("a", gdn.in_proj_a),
+                         ("b", gdn.in_proj_b), ("y", gdn.out_proj)):
+        module.register_forward_hook(
+            lambda m, args, output, name=name: record.__setitem__((index, "gdn", name), value(output)))
+    gdn.norm.register_forward_hook(
+        lambda m, args, output: record.__setitem__((index, "gdn", "on"), value(output).reshape(batch, length, -1)))
+    conv_fn = gdn.causal_conv1d_fn
+
+    def conv_wrapped(*fn_args, **fn_kwargs):
+        out = conv_fn(*fn_args, **fn_kwargs)
+        record[(index, "gdn", "conv")] = value(out).transpose(1, 2)  # [batch, channels, tokens] to [batch, tokens, channels]
+        return out
+
+    gdn.causal_conv1d_fn = conv_wrapped
+    rule_fn = gdn.chunk_gated_delta_rule
+
+    def rule_wrapped(*fn_args, **fn_kwargs):
+        out = rule_fn(*fn_args, **fn_kwargs)
+        record[(index, "gdn", "g")] = value(fn_kwargs["g"])
+        record[(index, "gdn", "beta")] = value(fn_kwargs["beta"])
+        record[(index, "gdn", "o")] = value(out[0]).reshape(batch, length, -1)
+        return out
+
+    gdn.chunk_gated_delta_rule = rule_wrapped
+
+
 def run(weights: Weights | str, sequences: list[list[int]], positions: list[list[int]], log=print,
-        record: dict | None = None, stop_after_layers: bool = False) -> list[torch.Tensor]:
+        record: dict | None = None, stop_after_layers: bool = False,
+        detail: frozenset = frozenset()) -> list[torch.Tensor]:
     """FP32 logits rows ([len(positions[i]), vocab] binary64 tensors) of each sequence at its positions.
 
     record (a dict) receives the residual stream, binary64 values of the BF16 tensors ([batch, tokens, hidden]):
     "embed", then (layer, "mixer") after each layer's attention or delta-net block and (layer, "layer") after the
-    layer, for tools.quality.shadow.bisect; stop_after_layers returns once the layers have run."""
+    layer, for tools.quality.shadow.bisect; stop_after_layers returns once the layers have run. For the
+    delta-net layers in `detail` it also records (layer, "gdn", name), name in mixed, z, a, b, g, beta, conv, o, on,
+    y: the projections, the gates, the convolution, the delta rule, the gated norm and the output projection
+    ([batch, tokens, channels])."""
     (dense_config, dense), (moe_config, moe) = _transformers()
     w = Weights(weights) if isinstance(weights, str) else weights
     c = dict(w.config)
@@ -109,6 +141,8 @@ def run(weights: Weights | str, sequences: list[list[int]], positions: list[list
                 record[(index, "mixer")] = value(seen["input"] + out)  # the decoder layer's residual add
 
             mixer.register_forward_hook(after_mixer, with_kwargs=True)
+            if i in detail and c["layer_types"][i] == "linear_attention":
+                _record_gdn(layer.linear_attn, record, i, batch, length)
         with torch.no_grad():
             hidden = layer(hidden, position_embeddings=(cos, sin), attention_mask=None, position_ids=position_ids)
         if record is not None:

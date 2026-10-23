@@ -121,6 +121,16 @@ def main() -> int:
             assert torch.equal(exact.round_to(stream, torch.bfloat16), stream), f"{key} is not BF16 values"
         assert not torch.equal(record[(0, "mixer")], record["embed"]), "a mixer changed nothing"
         assert qwen3_5.run(w, sequences, positions, log=lambda m: None, record={}, stop_after_layers=True) == []
+        linear = [i for i, kind in enumerate(c["layer_types"]) if kind == "linear_attention"]
+        detailed: dict = {}
+        qwen3_5.run(w, sequences, positions, log=lambda m: None, record=detailed, stop_after_layers=True,
+                    detail=frozenset(linear[:1]))
+        names = {"mixed", "z", "a", "b", "g", "beta", "conv", "o", "on", "y"}
+        assert {k[2] for k in detailed if isinstance(k, tuple) and len(k) == 3} == names, sorted(map(str, detailed))
+        for name in names:
+            stream = detailed[(linear[0], "gdn", name)]
+            assert stream.shape[0] == 2 and stream.shape[1] == 24, (name, stream.shape)
+        assert torch.equal(detailed[(linear[0], "layer")], record[(linear[0], "layer")]), "detail changed the stream"
         reference = plain(w, sequences, positions)
         scale = max(float(x.abs().max()) for x in reference)
         worst = max(float((x - y).abs().max()) for x, y in zip(a, reference))

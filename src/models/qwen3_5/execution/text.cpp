@@ -1306,19 +1306,23 @@ namespace {
 // `python -m tools.quality.shadow.bisect`): with INFERNIX_LOSSLESS_DUMP_DIR set, every lossless prefill call
 // writes the BF16 residual stream ([tokens][hidden], raw 16-bit values) after the embedding
 // (chunkC_embed.bin), after each layer's mixer (chunkC_layerLL_mixer.bin) and after each layer
-// (chunkC_layerLL_layer.bin), C counting the calls of the process.
+// (chunkC_layerLL_layer.bin), C counting the calls of the process, and a delta-net layer's intermediates
+// (chunkC_layerLL_gdn_mixed, _z, _a, _b, _g_f32, _beta, _conv, _o, _on, _y).
 struct ResidualDump {
     std::string directory;
     int chunk    = 0;
     int layer    = -1;
     cudaStream_t stream = nullptr;
 
+    // The tensor's bytes as they lie ([tokens][channels], channel fastest); an FP32 tensor's name ends "_f32".
     void write(const std::string& name, const Tensor& x) const {
         CUDA_CHECK(cudaStreamSynchronize(stream));
-        std::vector<std::uint16_t> host(static_cast<std::size_t>(x.ne[0]) * static_cast<std::size_t>(x.ne[1]));
-        CUDA_CHECK(cudaMemcpy(host.data(), x.data, host.size() * sizeof(std::uint16_t), cudaMemcpyDeviceToHost));
-        std::ofstream out(directory + "/chunk" + std::to_string(chunk) + "_" + name + ".bin", std::ios::binary);
-        out.write(reinterpret_cast<const char*>(host.data()), static_cast<std::streamsize>(host.size() * 2));
+        std::vector<char> host(x.bytes());
+        CUDA_CHECK(cudaMemcpy(host.data(), x.data, host.size(), cudaMemcpyDeviceToHost));
+        const std::string suffix = x.dtype == DType::FP32 ? "_f32" : "";
+        std::ofstream out(directory + "/chunk" + std::to_string(chunk) + "_" + name + suffix + ".bin",
+                          std::ios::binary);
+        out.write(host.data(), static_cast<std::streamsize>(host.size()));
     }
     void tap(const char* tag, const Tensor& x) const {
         char name[40];
