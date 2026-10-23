@@ -480,8 +480,16 @@ the test that verifies it.
 ### 6.3 Metrics and budgets
 
 Every metric is teacher-forced: the path and the reference see the same text, so every position
-pairs exactly and nothing diverges after a first difference. For position t with reference
-distribution p, path distribution q and corpus token x_t:
+pairs exactly and nothing diverges after a first difference. Only the positions that predict a token
+the model writes are scored: all of a text window; of a chat window, the assistant turns (an assistant
+turn's body and its `<|im_end|>`; `infernix-certify mask` lists them per artifact, because its template
+and tokenizer decide where they lie). The system prompt, tool schemas, user turns and tool responses are
+text the model is never trained to predict, and its predictions there are arbitrary, extremely sharp
+(confident copies of nearby words, `<|im_end|>` inside user turns) and numerically fragile: the first
+calibration run held 99 % of every arm's KL, and all of every noise floor, at a few hundred such positions
+per window (tens of nats, whatever the implementation), while the assistant-written tokens of the same windows
+measured near 1e-3. Every decision still publishes its estimate over the unscored positions. For position t
+with reference distribution p, path distribution q and corpus token x_t:
 
 ```text
 KL_t   = sum_v p(v) ln(p(v) / q(v))     nats, over the reference's 256 most probable tokens plus one
@@ -532,7 +540,8 @@ MMLU subset (default route against reproducible) fails only when the default rou
 
 - The unit of analysis is the window (a document). Positions in a window are correlated, so every
   bound is a percentile bootstrap that resamples windows (10,000 resamples, paired: path and
-  reference saw the same positions); no per-token Gaussian intervals.
+  reference saw the same positions); no per-token Gaussian intervals. A set with fewer than eight
+  windows (the 32K long set has four) resamples blocks of 4,096 positions of its windows instead.
 - A criterion passes when its one-sided 97.5 % upper confidence bound is within its budget, the
   non-inferiority convention of regulatory statistics (alpha 0.025, one-sided). Budgets are fixed
   before any run; `tools/quality/iqs.py --set NAME=VALUE` decides stored runs under other values
@@ -590,7 +599,8 @@ recorded provenance and licences, hashed into every certificate):
 - main set: 32 windows of 4,096 tokens, 4 from each of 8 domains (English reference text,
   long-form prose, Chinese, German, source code, mathematics with worked solutions, chat
   transcripts with reasoning in the model's own chat template, tool calls and JSON), every position
-  scored (131,072 positions);
+  that predicts a token the model writes scored (all 131,040 positions of the text windows, the
+  assistant turns of the chat and tool-call windows);
 - long set: 4 windows of 32,768 tokens (two books, a Chinese encyclopedia text, a code repository);
 - decode: the 64 tokens after each of 4 starts per window (256, 1,024, 2,048 and 3,840; long set
   8,192, 16,384, 24,576 and 32,640): 8,192 decode positions per arm. A segment's length is the most
@@ -600,7 +610,7 @@ recorded provenance and licences, hashed into every certificate):
 One reference pass serves prefill and decode: the reference's output depends only on the text, so
 the scoring pass over a window already holds the reference for every position a decode arm forces.
 
-**Tools.** `infernix-certify` measures (`reference`, `prefill`, `decode`, `verify`, `capture`;
+**Tools.** `infernix-certify` measures (`reference`, `prefill`, `decode`, `verify`, `capture`, `mask`;
 usage at the top of `apps/certify/main.cpp`); `tools/quality/iqs.py` decides (`decide`, `disclose`,
 `certificate`); `tools/quality/iqs_e2e.py` runs the end-to-end checks through `infernix-serve`;
 `python -m tools.quality.shadow` runs G1's CPU comparison (on each architecture's pinned transformers:
@@ -626,7 +636,7 @@ py -3.11 -m tools.quality.certify run D:\iqs\run-2026-10-23
 | D | BF16 KV, every configuration: reproducible prefill, default prefill, reproducible decode (4 requests), default one-request decode, default stress decode (and the NVFP4 27B tree arm) |
 | E1 | six KV formats on the representatives: reproducible and default prefill, reproducible decode, default stress decode |
 | E2 | long set: default prefill and one-request decode on the long representatives; every KV format's prefill at 32K on `q27gw` |
-| F | functional real tests on the artifacts they are written for; production identity with golden hashes on every configuration (negative controls on the representatives); speculative-sampling distribution tests; long-generation sanity (mean length within 90-110 % of the reproducible route, no more looping outputs, no fewer natural stops); task flip audit |
+| F | functional real tests on the artifacts they are written for; production identity with golden hashes on every configuration (negative controls on the representatives: each reports how many default-route requests differ, and the certificate asks that some artifact's control saw a difference, since an artifact whose default route happens to be request-invariant says nothing against its reproducible route); speculative-sampling distribution tests; long-generation sanity (mean length within 90-110 % of the reproducible route, no more looping outputs, no fewer natural stops); task flip audit |
 | G | the certificate (CPU) |
 
 The planned full run is about 9-10 GPU-hours on the RTX 5090 (the first run measures it; the
