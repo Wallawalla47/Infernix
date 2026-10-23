@@ -357,7 +357,9 @@ def run_certificate(plan_path: Path, out: Path, policy: Policy) -> int:
     for item in plan.get("decisions", []):
         try:
             scored = base / item["scored"] if item.get("scored") else None
-            floor = floor_of(base / item["twin"], scored) if item.get("twin") else None
+            # the noise twin always ran on the main set, whatever set the arm ran on
+            twin_scored = base / item["twin_scored"] if item.get("twin_scored") else scored
+            floor = floor_of(base / item["twin"], twin_scored) if item.get("twin") else None
             decision = decide(load_arm(base / item["arm"], scored, policy), policy, floor)
             decision["label"] = item.get("label", item["arm"])
             certificate["decisions"].append(decision)

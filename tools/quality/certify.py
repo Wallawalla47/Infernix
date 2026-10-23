@@ -192,7 +192,8 @@ class Planner:
 
     def decide(self, label: str, arm: Path, config: Config, set_name: str = "main") -> None:
         self.decisions.append({"label": label, "arm": str(arm), "twin": str(self.twin(config)),
-                               "scored": str(self.scored(config, set_name))})
+                               "scored": str(self.scored(config, set_name)),
+                               "twin_scored": str(self.scored(config, "main"))})
 
     def mask(self, c: Config, set_name: str) -> None:
         out = self.scored(c, set_name)

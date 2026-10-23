@@ -200,3 +200,18 @@ def test_a_set_of_few_long_windows_resamples_blocks(tmp_path: Path) -> None:
     small = write_arm(tmp_path / "s", "small", *synthetic(rng, 4, 500, 2e-4, 0.002), windows=4)
     with pytest.raises(iqs.Unusable):
         iqs.decide(iqs.load_arm(small), FAST)
+
+def test_a_long_set_arm_reads_its_main_set_twin_with_the_main_scored_list(tmp_path: Path) -> None:
+    rng = np.random.default_rng(13)
+    long_arm = write_arm(tmp_path / "long", "arm", *synthetic(rng, 4, 16384, 2e-4, 0.002), windows=4)
+    twin = write_arm(tmp_path / "main", "twin", *synthetic(rng, 8, 100, 2e-4, 0.002), windows=8, route="noise_twin")
+    long_scored = write_scored(tmp_path / "long-scored.json", {w: (16384, [[1, 16384]]) for w in range(4)})
+    main_scored = write_scored(tmp_path / "main-scored.json", {w: (100, [[1, 100]]) for w in range(8)})
+    # the twin's windows (0..7) are not the long set's (0..3): its own list must be the one that reads it
+    plan = {"decisions": [{"label": "long", "arm": "long/arm", "twin": "main/twin", "scored": "long-scored.json",
+                           "twin_scored": "main-scored.json"}]}
+    (tmp_path / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+    assert iqs.run_certificate(tmp_path / "plan.json", tmp_path / "cert", FAST) in (0, 1)
+    certificate = json.loads((tmp_path / "cert" / "certificate.json").read_text(encoding="utf-8"))
+    assert not certificate["unusable"] and len(certificate["decisions"]) == 1
+    assert long_scored.exists() and main_scored.exists()
