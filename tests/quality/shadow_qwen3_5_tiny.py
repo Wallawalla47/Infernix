@@ -107,6 +107,20 @@ def main() -> int:
         for rows in a:
             assert torch.equal(exact.round_to(rows, torch.float32), rows), "logits are not FP32 values"
             assert torch.isfinite(rows).all()
+        # the bisect's record: the embedding, then each layer's mixer and layer, BF16 values, and recording
+        # changes nothing
+        record: dict = {}
+        c = config(moe)
+        c_layers = c["num_hidden_layers"]
+        recorded = qwen3_5.run(w, sequences, positions, log=lambda m: None, record=record)
+        assert all(torch.equal(x, y) for x, y in zip(a, recorded)), "recording changed the logits"
+        assert set(record) == {"embed", *[(i, t) for i in range(c_layers) for t in ("mixer", "layer")]}, sorted(
+            map(str, record))
+        for key, stream in record.items():
+            assert tuple(stream.shape) == (2, 24, c["hidden_size"]), (key, stream.shape)
+            assert torch.equal(exact.round_to(stream, torch.bfloat16), stream), f"{key} is not BF16 values"
+        assert not torch.equal(record[(0, "mixer")], record["embed"]), "a mixer changed nothing"
+        assert qwen3_5.run(w, sequences, positions, log=lambda m: None, record={}, stop_after_layers=True) == []
         reference = plain(w, sequences, positions)
         scale = max(float(x.abs().max()) for x in reference)
         worst = max(float((x - y).abs().max()) for x, y in zip(a, reference))

@@ -18,6 +18,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 
 namespace infernix::models::qwen3_5::execution {
 
@@ -51,6 +52,12 @@ struct LosslessDesign {
     bool active       = false;                    // each projection input takes its Use's declared quantization
     KvCacheStorage kv = KvCacheStorage::BFloat16; // the KV format whose codec K and V cross
 };
+
+// A diagnostic tap on the residual stream: lossless_layer calls it with "mixer" after a layer's attention or
+// delta-net block (the residual then holds x + mixer(norm(x))). Empty (the default) costs nothing; the
+// Program sets one to dump the stream for a layer-by-layer comparison (INFERNIX_LOSSLESS_DUMP_DIR).
+using ResidualTap = std::function<void(const char* tag, const Tensor& x, cudaStream_t stream)>;
+void set_lossless_residual_tap(ResidualTap tap);
 
 // One decoder layer over the call's residual x (BF16 [H, T]), in place; cache null: the window form. An
 // offloaded MoE layer (OffloadedMoeParameters) reads its routed and shared experts from `experts` (the

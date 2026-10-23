@@ -43,6 +43,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
 #include <initializer_list>
 #include <limits>
 #include <stdexcept>
@@ -1297,9 +1300,55 @@ void TextContext::run_layers(Tensor& x, Phase ph) {
     run_layers(x, ph, tap);
 }
 
+namespace {
+
+// Diagnostic for the layer-by-layer comparison of the lossless route with the publisher's code (IQS-1 G1,
+// `python -m tools.quality.shadow.bisect`): with INFERNIX_LOSSLESS_DUMP_DIR set, every lossless prefill call
+// writes the BF16 residual stream ([tokens][hidden], raw 16-bit values) after the embedding
+// (chunkC_embed.bin), after each layer's mixer (chunkC_layerLL_mixer.bin) and after each layer
+// (chunkC_layerLL_layer.bin), C counting the calls of the process.
+struct ResidualDump {
+    std::string directory;
+    int chunk    = 0;
+    int layer    = -1;
+    cudaStream_t stream = nullptr;
+
+    void write(const std::string& name, const Tensor& x) const {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        std::vector<std::uint16_t> host(static_cast<std::size_t>(x.ne[0]) * static_cast<std::size_t>(x.ne[1]));
+        CUDA_CHECK(cudaMemcpy(host.data(), x.data, host.size() * sizeof(std::uint16_t), cudaMemcpyDeviceToHost));
+        std::ofstream out(directory + "/chunk" + std::to_string(chunk) + "_" + name + ".bin", std::ios::binary);
+        out.write(reinterpret_cast<const char*>(host.data()), static_cast<std::streamsize>(host.size() * 2));
+    }
+    void tap(const char* tag, const Tensor& x) const {
+        char name[40];
+        std::snprintf(name, sizeof(name), "layer%02d_%s", layer, tag);
+        write(name, x);
+    }
+};
+
+int g_dump_chunks = 0;
+
+} // namespace
+
 void TextContext::run_lossless_layers(Tensor& x, const Tensor& rope_table, LosslessCache* cache) {
     cudaStream_t s = ctx_.stream;
+    ResidualDump dump;
+    if (const char* directory = std::getenv("INFERNIX_LOSSLESS_DUMP_DIR"); directory != nullptr && *directory != '\0') {
+        dump.directory = directory;
+        dump.chunk     = g_dump_chunks++;
+        dump.stream    = s;
+        dump.write("embed", x);
+        set_lossless_residual_tap([&dump](const char* tag, const Tensor& t, cudaStream_t) { dump.tap(tag, t); });
+    }
+    struct ClearTap {
+        bool active;
+        ~ClearTap() {
+            if (active) { set_lossless_residual_tap({}); }
+        }
+    } clear{!dump.directory.empty()};
     for (std::size_t layer = 0; layer < parameters_.text.layers.size(); ++layer) {
+        dump.layer = static_cast<int>(layer);
         const bool full    = config_.layer_types[layer] == MixerKind::FullAttention;
         const auto compact = dimension(config_.compact_layer_indices[layer]);
         if (layer < layer_ready_.size()) { CUDA_CHECK(cudaStreamWaitEvent(s, layer_ready_[layer], 0)); }
@@ -1321,6 +1370,7 @@ void TextContext::run_lossless_layers(Tensor& x, const Tensor& rope_table, Lossl
             throw std::runtime_error("text/layers/" + std::to_string(layer) +
                                      " lossless columns=" + std::to_string(x.ne[1]) + ": " + error.what());
         }
+        if (!dump.directory.empty()) { dump.tap("layer", x); }
     }
     layer_ready_ = {};
 }

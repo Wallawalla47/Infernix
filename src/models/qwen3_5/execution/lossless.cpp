@@ -29,6 +29,8 @@ constexpr std::int32_t kFfnColumns = 4096;
 template <class A>
 constexpr bool kRuns = std::is_same_v<A, WorkspaceArena>;
 
+ResidualTap g_residual_tap;
+
 template <class A>
 Tensor alloc(A& a, DType dtype, std::initializer_list<std::int32_t> shape) {
     return a.alloc(dtype, shape);
@@ -425,6 +427,9 @@ void layer(A& a, const BlockParameters& block, const TextConfig& config, MixerKi
     } else {
         gdn_layer(a, block, config, x, s, cache, design);
     }
+    if constexpr (kRuns<A>) {
+        if (g_residual_tap) { g_residual_tap("mixer", x, s); }
+    }
     auto scope = a.scope();
     Tensor h = alloc(a, DType::BF16, {x.ne[0], x.ne[1]});
     if constexpr (kRuns<A>) { ops::lossless_rmsnorm(x, block.post_attention_norm, config.rms_norm_eps, h, s); }
@@ -442,6 +447,8 @@ void layer(A& a, const BlockParameters& block, const TextConfig& config, MixerKi
 std::int32_t rotary_pairs(const TextConfig& config) { return dimension(config.rope_parameters->rotary_dim) / 2; }
 
 } // namespace
+
+void set_lossless_residual_tap(ResidualTap tap) { g_residual_tap = std::move(tap); }
 
 Tensor lossless_rope_window(const TextConfig& config, const Tensor& positions, WorkspaceArena& workspace,
                             cudaStream_t stream) {

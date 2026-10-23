@@ -44,8 +44,13 @@ def _transformers():
 
 # ------------------------------------------------------------------------------------------------- forward
 
-def run(weights: Weights | str, sequences: list[list[int]], positions: list[list[int]], log=print) -> list[torch.Tensor]:
-    """FP32 logits rows ([len(positions[i]), vocab] binary64 tensors) of each sequence at its positions."""
+def run(weights: Weights | str, sequences: list[list[int]], positions: list[list[int]], log=print,
+        record: dict | None = None, stop_after_layers: bool = False) -> list[torch.Tensor]:
+    """FP32 logits rows ([len(positions[i]), vocab] binary64 tensors) of each sequence at its positions.
+
+    record (a dict) receives the residual stream, binary64 values of the BF16 tensors ([batch, tokens, hidden]):
+    "embed", then (layer, "mixer") after each layer's attention or delta-net block and (layer, "layer") after the
+    layer, for tools.quality.shadow.bisect; stop_after_layers returns once the layers have run."""
     (dense_config, dense), (moe_config, moe) = _transformers()
     w = Weights(weights) if isinstance(weights, str) else weights
     c = dict(w.config)
@@ -75,6 +80,8 @@ def run(weights: Weights | str, sequences: list[list[int]], positions: list[list
     rotary._buffers["inv_freq"] = 1.0 / (c["rope_parameters"]["rope_theta"] ** (steps / dim))
     position_ids = torch.arange(length)[None].expand(batch, length)
     cos, sin = rotary(hidden, position_ids)
+    if record is not None:
+        record["embed"] = value(hidden)
 
     layer_class = getattr(model, names["layer"])
     for i in range(c["num_hidden_layers"]):
@@ -90,10 +97,26 @@ def run(weights: Weights | str, sequences: list[list[int]], positions: list[list
         if c["layer_types"][i] == "linear_attention":
             layer.linear_attn.causal_conv1d_fn = exact_causal_conv
             layer.linear_attn.chunk_gated_delta_rule = fla_gated_delta_rule
+        if record is not None:
+            seen = {}
+            layer.register_forward_pre_hook(
+                lambda module, args, kwargs, seen=seen: seen.__setitem__("input", kwargs.get("hidden_states", args[0] if args else None)),
+                with_kwargs=True)
+            mixer = layer.linear_attn if c["layer_types"][i] == "linear_attention" else layer.self_attn
+
+            def after_mixer(module, args, kwargs, output, seen=seen, index=i):
+                out = output[0] if isinstance(output, tuple) else output
+                record[(index, "mixer")] = value(seen["input"] + out)  # the decoder layer's residual add
+
+            mixer.register_forward_hook(after_mixer, with_kwargs=True)
         with torch.no_grad():
             hidden = layer(hidden, position_embeddings=(cos, sin), attention_mask=None, position_ids=position_ids)
+        if record is not None:
+            record[(i, "layer")] = value(hidden)
         log(f"layer {i + 1}/{c['num_hidden_layers']} ({c['layer_types'][i]}) {time.time() - started:.0f} s")
         del layer
+    if stop_after_layers:
+        return []
 
     norm = getattr(model, names["norm"])(h, eps=c["rms_norm_eps"])
     norm._parameters["weight"] = Shadow(w.logical("text/final_norm", (h,)), w.nominal("text/final_norm"))
