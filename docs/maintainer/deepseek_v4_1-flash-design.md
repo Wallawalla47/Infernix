@@ -2,13 +2,21 @@
 
 **Status: design proposal, not implemented.** Nothing in this document is built. It is a temporary
 planning document for adding `DeepseekV41ForCausalLM` (DeepSeek-V4.1-Flash, model type
-`deepseek_v41`) to Infernix, with the NVFP4 build as the artifact. When the implementation lands,
-its stable content moves into the active authorities named in
+`deepseek_v41`) to Infernix. Its first artifact is a per-expert-bit EXL3 build of the 1017
+checkpoint; the lossless MXFP4 (NVFP4-valued) build is deferred to a later milestone. When the
+implementation lands, its stable content moves into the active authorities named in
 [§24](#24-documentation-and-authority-changes) and this file is removed. The design reuses the
 Qwen3.8-Flash-Next work and the GLM-5.3-Flash design wherever they transfer; they are cited as
 **FN §x** ([qwen3_8-flash-next-design.md](qwen3_8-flash-next-design.md)) and **GLM §x**
 ([glm5_3-flash-design.md](glm5_3-flash-design.md)). DwarfStar (`antirez/ds4`), the local engine
 whose V4.1 implementation this design studied most closely, is cited as **DS4** (§4.1).
+
+**Revised 2026-10-24** after Strata and Project Maya published their V4.1 engines (§4.3) and a survey
+of the published 1017 quantizations (§5.7). The 1017 release changes the Engram tables too (§2.6).
+The owner then made the exact prompt rule the default (decision g, §1.2) and chose **EXL3 experts
+with a bit width per expert, built for from the start**, as the first artifact (decision f); the
+MXFP4 artifact is deferred (milestone M11). Sections written for the MXFP4 records (§5.1-§5.6,
+§7.3's `mxfp4_expert_v1`, §9.5's FP4 rows) stay as that artifact's design.
 
 Labels used for numbers: **measured** (on this machine, with the method named), **upstream** (read
 from the reference code, config, checkpoint headers or another project's published record),
@@ -16,8 +24,20 @@ from the reference code, config, checkpoint headers or another project's publish
 (judgement; uncertain by the stated range). A milestone named in brackets replaces each model or
 estimate with a measurement.
 
-**The artifact.** "NVFP4 DeepSeek-V4.1-Flash" names one set of expert values, whichever file it
-comes from:
+**The first artifact** (decision f): `DeepSeek-V4.1-Flash-1017-EXL3-2.75-Infernix`, its routed
+experts taken as stored from HeNryous's per-expert EXL3 pack of 1017
+([`HeNryous/DeepSeek-V4.1-Flash-1017-EXL3-2.75bpw-DGX-Spark`](https://huggingface.co/HeNryous/DeepSeek-V4.1-Flash-1017-EXL3-2.75bpw-DGX-Spark):
+each expert 2, 3, 4 or 5 bits, 2.75 bits on average and 3.10 per decoded token, `mul1` codebook;
+published KL 0.0201 and top-1 95.96 % against DeepSeek's reference code). Its Engram table is the
+published 4-bit **IQ4_NL** table of 1017 (ISTA-DASLab's or Unsloth's, 110.6 GB; a 112.4 GB volume
+against 209.7 GB for the FP8 rows; §7.5). Everything else comes from the official release: the dense
+tensors bit-exactly and the DSpark dense weights; the drafter's experts are the pack's (2 bits; they
+change acceptance only). sudoingx's 2.8
+pack, made by the same pipeline, is accepted as a second source. Its expert records live in pages of
+a shared pool (§7.3), so any mix of widths, including a uniform one, uses the same machinery.
+
+**The deferred artifact.** "NVFP4 DeepSeek-V4.1-Flash" names one set of expert values, whichever
+file it comes from:
 
 - DeepSeek trained and released the routed experts as **MXFP4** (E2M1 codes, one UE8M0 scale per
   32 weights). NVIDIA's [`nvidia/DeepSeek-V4.1-Flash-NVFP4`](https://huggingface.co/nvidia/DeepSeek-V4.1-Flash-NVFP4)
@@ -31,8 +51,8 @@ comes from:
 - Per the owner's decision (c) the artifact stores those values in their original MXFP4 form, 5.6 %
   smaller than NVFP4 records, unless M3 finds the MXFP4 kernels slower (§7.3, §9.6).
 
-**Default artifact:** `DeepSeek-V4.1-Flash-1017-Infernix`, converted from the official 1017
-release: MXFP4 expert records striped over three NVMe volumes, the FP8 Engram volume, and every
+**Deferred MXFP4 artifact (M11):** `DeepSeek-V4.1-Flash-1017-Infernix`, converted from the official
+1017 release: MXFP4 expert records striped over three NVMe volumes, the FP8 Engram volume, and every
 dense tensor as stored (FP8 with 32 × 32 block scales, BF16, FP32). The September NVFP4 export is
 the second supported source and the reference for the NVFP4 path.
 
@@ -85,42 +105,55 @@ The product supports `DeepseekV41ForCausalLM` through the public Engine, `infern
 
 - the Text model: 40 layers in a 20-layer causal encoder and a 20-layer decoder, CSA2 sparse
   attention with the two-level indexer, single-pass mHC, Engram, and the 384-expert MoE;
-- DeepSeek's prompt rule (decoder SWA bounded replay) by default and the full-model rule as a
-  startup option (§16);
+- the full-model prompt rule, computed exactly by the decoder suffix, by default, and DeepSeek's
+  served rule (decoder SWA bounded replay) as a startup option (§16, decision g);
 - DSpark speculative decoding chosen per round by the cost model, and n-gram copy proposals (§17);
 - the model's own KV formats: FP8 window entries, FP4 compressed entries, MXFP4 index keys (§13.5);
 - the hybrid prefix cache in `infernix-serve` (§18);
 - the DeepSeek encoding: thinking, reasoning effort 1-100, DSML tool calls, tool results and
   reminders in the OpenAI and Anthropic protocol surfaces (§21);
+- routed experts as **EXL3 records of 2-5 bits per weight, one width per expert**, held in a **page
+  pool** shared by every tier (§7.3, §10);
 - routed experts in **three tiers**: a VRAM expert cache, pinned and unpinned host RAM, and expert
   volumes striped over **one to four NVMe drives** (§10-§11);
-- the Engram tables in their own volume, with **FP8 and MXFP4 row formats** selectable like
-  Flash-Next's n-gram tables (§14);
-- one recipe for the official DeepSeek release (September or 1017) and NVIDIA's ModelOpt NVFP4
-  export, and a **streaming conversion** that fits the disks free at conversion time (§7.6);
+- the Engram tables in their own volume: the first artifact plans the published **IQ4_NL** table,
+  and **FP8 and MXFP4 rows** stay selectable per run like Flash-Next's n-gram tables (§14);
+- the EXL3 recipe: routed and drafter experts from a per-expert EXL3 pack of 1017, everything else
+  from the official release, and a **streaming conversion** that fits the disks free at conversion
+  time (§7.1, §7.6);
 - an **opt-in approximate expert mode** (GLM §9.8's shape), off by default and labelled (§9.8).
 
+Deferred to M11: the MXFP4 artifact, its recipe for the official release (September or 1017) and
+NVIDIA's ModelOpt NVFP4 export, and the MXFP4 and NVFP4 expert routes.
+
 **Fidelity.** Every stored tensor is imported bit-exactly: dense FP8 codes and scales, BF16 and FP32
-tensors verbatim, Engram rows verbatim in the chosen format, and routed experts as a lossless
-re-encoding that the converter checks block by block. Every FP8 and FP4 linear takes DeepSeek's own
-activation quantization (MXFP8: E4M3 with one power-of-two scale per 32 activations, decision b)
-and computes it with exact integer sums (**MX8**, §9.5), so an expert's output is the same bits from
-a VRAM frame, a staging frame, the CPU or any landing order, and Infernix reproduces the reference
-forward up to the accumulation order the reference leaves to its tensor cores. The deviations from
+tensors verbatim, Engram rows verbatim in the chosen format, and the pack's EXL3 expert tensors
+verbatim (trellis codes and sign-scale vectors). Every FP8 linear and every expert input takes
+DeepSeek's own activation quantization (MXFP8: E4M3 with one power-of-two scale per 32 activations,
+decision b). FP8 linears compute it with exact integer sums (**MX8**, §9.5); EXL3 experts apply the
+GLM design's canonical E3A16 arithmetic to those MX8 values (§9.5). So an expert's output is the same
+bits from any page, a staging slot, the CPU or any landing order. The experts are the pack's
+approximation of DeepSeek's (§5.7); everything else reproduces the reference forward up to the
+accumulation order the reference leaves to its tensor cores. The deviations from
 `inference/model.py` are listed in §20.4.
 
 **Vision** (DeepSeek-ViT, 32 layers) is deferred: the artifact keeps the tower, the binder refuses
 `--vision` for this family until a later track adds it (§23).
 
-### 1.2 Owner decisions (2026-10-19)
+### 1.2 Owner decisions (2026-10-19 and 2026-10-24)
 
 | # | Question | Decision | Implemented in |
 |---|---|---|---|
-| a | Prompt rule | **DeepSeek's decoder bounded replay by default**: prompt tokens run the 20 encoder layers; only the last 128 run the decoder. **Switchable** to the full model (`--prompt-decoder full`), computed exactly by the 2,541-position decoder suffix DS4 uses, whose output equals running every prompt token through all 40 layers | §16 |
+| a | Prompt rule | ~~DeepSeek's decoder bounded replay by default~~, superseded by g: both rules exist and are switchable (`--prompt-decoder replay\|full`); `full` is computed exactly by the 2,541-position decoder suffix DS4 uses, whose output equals running every prompt token through all 40 layers | §16 |
 | b | Activation arithmetic | **DeepSeek's 8-bit activations** (MXFP8) at every FP8 and FP4 linear | §9.5 |
-| c | Expert storage | **The original MXFP4 form**, provided it is not slower than NVFP4 records; M3 decides by kernel measurement, NVFP4 records remain the fallback and serve non-MXFP4-representable builds | §7.3, §9.6 |
+| c | Expert storage (the MXFP4 artifact, deferred) | **The original MXFP4 form**, provided it is not slower than NVFP4 records; M11 decides by kernel measurement, NVFP4 records remain the fallback and serve non-MXFP4-representable builds | §7.3, §9.6 |
 | d | Engram tables | **Both FP8 (source) and MXFP4 (NVIDIA) rows**, read from the volume, chosen per run as Flash-Next's n-gram row formats are | §14 |
+| d (2026-10-24) | Engram table of the first artifact | **The published IQ4_NL table** (ISTA-DASLab's or Unsloth's 1017 table) instead of the 209.7 GB FP8 volume; FP8 and MXFP4 rows stay selectable per run, and §20.3 measures what the table costs | §7.5, §14.5 |
 | e | Disk space | **A conversion route designed for the disks free when the artifact is made**, not a fixed plan | §7.6 |
+| f (2026-10-24) | Expert format of the first artifact | **EXL3 with a bit width per expert, from the start**: HeNryous's 2.75 pack (sudoingx's 2.8 accepted), the page pool in the shared offload component from M2; the lossless MXFP4 artifact is not needed initially (M11) | §5.7, §7, §10 |
+| — (2026-10-24) | Disk space | The owner frees space when the artifact work is started; the planner (§7.6) sizes the plan then | §7.6 |
+| — (2026-10-24) | Shared pieces | **This track builds the shared EXL3 codec, offload extraction and page pool first; GLM reuses them** | §8.2, §23 |
+| g (2026-10-24) | Prompt-rule default | **`full`, the exact rule, by default**; bounded replay stays as `--prompt-decoder replay`. Maya measured replay against the exact rule at KL 1.6e-2 / 6.6e-3 / 3.2e-4 after 4K / 8K / 26K-token prompts (its engine's own summation-order noise: 6.4e-4 / 6.1e-3 / 8.8e-5), with greedy text diverging at tokens 2 and 8; here `full` costs +7-13 % prompt time (§4.3) | §16 |
 
 ### 1.3 Baselines
 
@@ -128,7 +161,8 @@ All comparisons run on this machine with the same prompts, output caps and sampl
 
 | Baseline | What it shows |
 |---|---|
-| **JigSawPT's llama.cpp fork** (`dsv41-porte`) with the same MXFP4 experts streamed from NVMe | **The main baseline**: the only published run on an RTX 5090 with the experts in the same format (§4.2: 5-10 tok/s with 125.7 GiB of RAM). Identical expert bytes, so speed is compared without a quality footnote |
+| **Strata** (`Niko1221/Strata` 0.2.4.x, Windows CUDA packages built for `sm_120`) and **Project Maya** (`maya-ds4` v1.1.26) | **The main baselines**: the local engines closest to this design in mechanism (VRAM expert cache, CPU lane, SSD reads) that run V4.1 natively on Windows (§4.3). Neither runs per-expert EXL3 packs, so each is compared with its nearest build in expert bytes per pick (Maya: uniform EXL3 2.9 and Maya-S; Strata: ISTA's 2.25 set), with quality beside speed |
+| **JigSawPT's llama.cpp fork** (`dsv41-porte`) with the MXFP4 experts streamed from NVMe | The only published run on an RTX 5090 (§4.2: 5-10 tok/s with 125.7 GiB of RAM); 1.4× this artifact's bytes per pick, the same values as the deferred MXFP4 artifact |
 | **DS4** (`antirez/ds4`, MIT) with its V4.1 Q2 (341 GiB file, 152 GiB of weights) and Q4 (483 / 294 GiB) GGUFs, CUDA, SSD streaming | The local engine studied most closely (§4.1). Its CUDA V4.1 path targets the DGX Spark's unified memory and Linux; on this machine it would run under WSL2 with the GGUF on an ext4 volume, and its discrete-GPU expert cache is an unmerged pull request (DS4 #647). Compared as each engine runs in practice: Q2 has about half the expert bytes of NVFP4 and measurably lower quality (§4.1), so the report gives quality beside speed |
 | **ik_llama.cpp** and the other engines of §4.2 that run V4.1 with expert offload | Their own numbers in §4.2; run here where they support Windows or WSL2 |
 | **Infernix Flash-Next** on this machine | Not a quality baseline (another model); the reference for what each mechanism achieved here |
@@ -136,40 +170,47 @@ All comparisons run on this machine with the same prompts, output caps and sampl
 
 ### 1.4 Targets
 
-Fixed on 2026-10-19 from §5's model; no measurement of this model exists on this machine.
-Primary configuration: the 1017 artifact (MXFP4 records, FP8 Engram volume), three expert volumes
-on `D:` + `E:` + `G:` (§11.4), bounded replay, `--max-context 131072`, C = 1, ≈ 88 GiB of RAM
-available (other programs closed), thinking at the encoding's default effort, 4K prompt, 512 output
-tokens.
+No measurement of this model exists on this machine. The MXFP4 targets were fixed on 2026-10-19
+from §5's model (and their prompt rows moved to the full rule with decision g, thresholds unchanged).
+The first artifact's targets were fixed on 2026-10-24 from §5.7's model, before any measurement, at
+the same ratios to the model as the MXFP4 targets (Must ≈ 0.7 × the central decode, Stretch ≈ 1.15 ×;
+prompts likewise).
+Primary configuration: the EXL3 per-expert artifact with the IQ4_NL Engram volume, three expert
+volumes (§11.4; drives chosen when the owner frees space), the full prompt rule,
+`--max-context 131072`, C = 1, ≈ 88 GiB of RAM available (other programs closed), thinking at the
+encoding's default effort, 4K prompt, 512 output tokens.
 
-| Metric | Must | Stretch | Model (§5), central (range) |
-|---|---:|---:|---:|
-| Plain decode, warm cache, C = 1, non-repeating session (§20.5) | ≥ 9 tok/s | ≥ 15 | 12.8 (9.7-16.9) |
-| Best speculative mode, same corpus | ≥ plain, never slower beyond noise | ≥ 17 | 13.6-16.2 with DSpark K = 1 at the measured acceptance (§5.4) |
-| Decode, three volumes relative to one | ≥ 1.8× | ≥ 2.0× | 2.0× |
-| Fresh 32K prompt | ≥ 2,000 tok/s | ≥ 3,500 | 2,800 |
-| Time to first token, fresh 4K prompt | ≤ 15 s | ≤ 9 s | 11.7 s |
-| Time to first token, 50-token append to a cached conversation | ≤ 6 s | ≤ 3.5 s | 4.7 s |
-| Decode at 128K actual context, relative to 4K | ≥ 90 % | ≥ 97 % | ≈ 98 % |
-| Execution fidelity against the reference forward (§20.3) | within the gate | — | — |
+| Metric | Must | Stretch | Model (§5.7), central (range) | Deferred MXFP4 artifact: Must / Stretch / model |
+|---|---:|---:|---:|---:|
+| Plain decode, warm cache, C = 1, non-repeating session (§20.5) | ≥ 14 tok/s | ≥ 23 | 20.0 (16.0-25.0) | 9 / 15 / 12.8 |
+| Best speculative mode, same corpus | ≥ plain, never slower beyond noise | ≥ 27 | 27-29 with DSpark at acceptance 0.7-0.8, before the drafter's pages are charged | plain / 17 / 13.6-16.2 |
+| Decode, three volumes relative to one | ≥ 1.6× | ≥ 1.75× | 1.75× | 1.8× / 2.0× / 2.0× |
+| Fresh 32K prompt | ≥ 2,200 tok/s | ≥ 3,800 | 3,040 | 2,000 / 3,500 / 2,500 |
+| Time to first token, fresh 4K prompt | ≤ 10 s | ≤ 6 s | 7.6 s | 15 / 9 / 13.0 s |
+| Time to first token, 50-token append to a cached conversation | ≤ 2.6 s | ≤ 1.5 s | 2.0 s | 6 / 3.5 / 4.7 s |
+| Decode at 128K actual context, relative to 4K | ≥ 90 % | ≥ 97 % | ≈ 98 % | the same |
+| Execution fidelity against the reference forward over the artifact's values (§20.3) | within the gate | — | — | the same |
+| Quality against the original model (§20.3) | reported, beside the pack's published KL 0.0201 / top-1 95.96 % | — | — | lossless by construction |
 
 The acceptance report gives the median and range of at least three runs, the worst case, the expert
 service composition (VRAM hits, RAM experts computed by the CPU, RAM experts staged over the link,
 SSD reads and bytes per token, Engram reads), and the device each number came from. A missed target
 is reported as missed; targets are not changed after measuring.
 
-These targets are far below the GLM design's (25 tok/s) because this model reads 4.5 GB of routed
-experts per decode token (GLM's EXL3 build: 3.2 GB) from a bank of 289 GB (GLM: 115 GB), and this
-machine holds about 37 % of it in memory (GLM: 87-96 %). That is a property of the model on this
-hardware; §5.6 lists the hardware changes that move it.
+These targets are below the GLM design's (25 tok/s) because this model reads 3.3 GB of routed
+experts per decode token even at 3.10 bits per pick (MXFP4: 4.5 GB; GLM's EXL3 build: 3.2 GB) from a
+bank of 188 GB (MXFP4: 289 GB; GLM: 115 GB), and this machine holds about half of it in memory (MXFP4:
+37 %; GLM: 87-96 %). That is a property of the model on this hardware; §5.6 lists the hardware
+changes that move it.
 
 ### 1.5 Non-goals
 
 - Multi-GPU, AMD GPUs, GPUs other than `sm_120a`.
 - Any change to the weights, dynamic top-k, expert deferral or skipping in the default
   configuration; the one exception is the opt-in, labelled approximate mode (§9.8).
-- Requantizing the experts to fewer bits in the default artifact. DS4's Q2 recipe shows what that
-  costs on this model (§4.1); smaller recipes are options with their own gates (§25.3).
+- Requantizing the experts at conversion: compact expert formats are imported from published builds
+  as stored (§5.7).
+- The MXFP4 artifact in the first track (decision f; M11).
 - DeepSeek's encoder SWA bounded replay for cache restores: Infernix restores the encoder exactly
   from bounded snapshots (§18.2).
 - Writing the expert or Engram volumes at runtime (read-only, FN §19.3.7 U3).
@@ -334,14 +375,14 @@ last 128 positions, built from its own input.
   decoder windows at the prompt's end, hence in every token decoded after a prompt of more than 128
   tokens. For a prompt of at most 128 tokens following nothing cached they coincide.
 
-Infernix runs bounded replay by default and the full model on request (decision a, §16).
+Infernix runs the full model by default and bounded replay on request (decision g, §16).
 
 ### 2.4 Parameters and bytes (upstream sizes from the safetensors headers; model elsewhere)
 
 | Item | Parameters | Stored bytes | Bytes read per decode token |
 |---|---:|---:|---:|
 | One routed expert: gate, up [5,120 → 2,304], down [2,304 → 5,120] | 35,389,440 | MXFP4 **18,800,640** (17.93 MiB); NVFP4 19,906,584 (+5.9 %) | — |
-| Routed bank, 40 × 384 | 543.6 B | MXFP4 **288.8 GB**; NVFP4 305.8 GB | 240 experts: 4.51 / 4.78 GB |
+| Routed bank, 40 × 384 | 543.6 B | MXFP4 **288.8 GB**; NVFP4 305.8 GB; HeNryous's per-expert EXL3 **187.6 GB** (2-5 bits, 2.75 mean) | 240 experts: 4.51 / 4.78 GB; EXL3 ≈ 3.29 GB (3.10 bits per pick) |
 | DSpark experts, 3 × 128 (MXFP4 in both sources) | 13.6 B | 7.22 GB | ≤ 45 per draft round |
 | Attention, 40 layers (wq_a, wq_b, wkv, wo_a, wo_b; FP8 + 32 × 32 scales) | 5.06 B | 5.07 GB | same |
 | Shared experts, 40 (FP8) | 1.42 B | 1.42 GB | same |
@@ -364,9 +405,12 @@ Engram tables of its current revision (MXFP4 since 2026-10-14; FP8 at revision `
 - **Dense weights are the larger part of a token's GPU reads**: 8.5 GB against 4.5 GB of routed
   experts. With every expert in VRAM a token would take ≈ 8.4 ms (≈ 120 tok/s); the GPU is not
   where this model is limited on this machine.
-- **About 7.5 % of the experts fit in VRAM and about 29 % in RAM** (§19), so ≈ 63 % live only on
-  the SSDs. At the central hit rate (§5.2) a token reads ≈ 43 experts, ≈ 0.8 GB, from the volumes.
-- **A miss moves 18.8 MB**: 0.68 ms over the x8 link, ≈ 1.33 ms from three striped volumes.
+- **With the per-expert EXL3 records about half the bank fits in VRAM and RAM** (8-10 % in VRAM,
+  §19), and a token reads ≈ 28 experts, ≈ 0.38 GB, from the volumes (model, §5.7). With MXFP4
+  records about 7.5 % fit in VRAM and 29 % in RAM, so ≈ 63 % live only on the SSDs, and a token
+  reads ≈ 43 experts, ≈ 0.8 GB (central hit rate, §5.2).
+- **A miss moves 8.9-22.2 MB** (13.7 MB per pick on average; MXFP4 18.8 MB): ≈ 0.5 ms over the x8
+  link and ≈ 0.97 ms from three striped volumes (MXFP4: 0.68 and 1.33 ms).
 - **The KV cache is negligible**: 890 B per token of compressed entries and index keys (the
   report's figure, which §13.5 reproduces), 117 MB at 128K and 0.89 GB at 1M, plus 2.9 MB of
   windows per sequence. Long context does not compete with the expert cache.
@@ -383,8 +427,10 @@ Engram tables of its current revision (MXFP4 since 2026-10-14; FP8 at revision `
 Compared on 2026-10-18 through the Hugging Face API: `config.json`, `tokenizer.json`,
 `tokenizer_config.json`, `encoding/`, `inference/` and the safetensors index are byte-identical to
 the September release; all 48 shards keep their sizes and change their SHA-256. It is a weights-only
-update; whether the Engram tables and DSpark weights changed is not stated, and M0 compares sampled
-tensors and Engram rows of the two releases by range reads (§7.5). The 1017 repository drops the
+update, and it changes **every** tensor sampled: range reads on 2026-10-24 compared six 64 KiB
+samples of each of both Engram tables' rows and scales, an Engram `wkv`, DSpark's `main_proj`, an
+attention projection and a routed expert, and none of the 48 samples were equal. An Engram volume
+therefore belongs to one checkpoint (§7.5), and so does a quantized build. The 1017 repository drops the
 community `chat_template.jinja` the September one gained (§21). DeepSeek reports DeepSWE v1.1 77.0
 (from 74.2), Terminal-Bench 4.0 42.3 (from 31.2, another harness) and shorter outputs.
 
@@ -404,6 +450,7 @@ pinning ceiling for Flash-Next on 2026-10-14 (FN §19.3.7); free space and RAM w
 | CPU | i9-13900K, 8 P + 16 E cores, AVX-VNNI, no AVX-512 | GLM §3.1 |
 | RAM visible / available | 95.8 GiB; 24.2 GiB free on 2026-10-18 with other sessions running, ≈ 88 GiB with them closed (the plans below assume the latter and print both) | `Win32_OperatingSystem` |
 | Pin room | 75.2-76.1 GiB: Windows page-locks at most the adapter's `SharedSystemMemory` (76.61 GiB); experts past it live as unpinned, locked records | FN §19.3.7 |
+| Free disk (2026-10-24) | `C:` 141 GB, `D:` 144, `E:` 18, `G:` 80: **383 GB in all** (`df`), against 895 GB on 2026-10-18 |
 | Free disk (2026-10-18) | `C:` 80.5 GB (system, CPU lanes), `D:` 300.4, `E:` 405.6 (repository and builds), `G:` 108.7 (Optane, holds Flash-Next's n-gram volumes) | `Get-PSDrive` |
 | One drive, large reads | 990 PRO 5.7-6.0 GB/s; Optane 7.0-7.1 GB/s; 1 MiB reads saturate at QD 4, 2 MiB at QD 2 | GLM §3.3 |
 | Drive sets | `D:` + `G:` 12.73 GB/s; `D:` + `E:` + `G:` **14.15** (the chipset's DMI link binds); `C:` + `D:` + `E:` + `G:` **19.27** | GLM §3.3 |
@@ -506,8 +553,10 @@ it would run under WSL2 with the GGUF on an ext4 volume.
 September NVFP4 export. `LibertAIDAI/DeepSeek-V4.1-Flash-1017-NVFP4` (2026-10-17) is a community
 ModelOpt-style export: lossless MXFP4 → NVFP4 experts ("0 mismatches over 135.90 × 10⁹
 elements") with `input_scale` values, MXFP4 Engram tables (cosine 0.9934 to the FP8 tables), DSpark
-experts in MXFP4, 399.51 GiB; it publishes no KL. Unsloth's 1017 GGUF is marked work in progress;
-bartowski, ubergarm and AesSedai have none.
+experts in MXFP4, 399.51 GiB; it publishes no KL. By 2026-10-24 about 470 repositories carried V4.1
+builds: Unsloth's nine UD GGUF sets, ISTA-DASLab's GSQ-RCO GGUFs, Maya's, DS4's, two dozen EXL3
+packs (diffbot's moved to 1017 on 2026-10-21) and several trellis formats. §5.7 compares the ones
+with published quality against their speed here.
 
 **DSpark acceptance** [M]: vLLM issue #56797 (2 × 8 H20, k = 5, GSM8K at temperature 0) measured a
 mean acceptance length of 2.817 with per-position survival 0.724 / 0.516 / 0.301 / 0.180 / 0.096;
@@ -531,14 +580,73 @@ What transfers:
 - **Lookahead prefetch lost** on this model family wherever measured (JigSawPT, hipfire, Maya on
   GLM): off by default (§11.3).
 - **Bounded replay costs little** on GSM8K (−0.005, within one standard error) and is what DeepSeek
-  and both datacenter engines serve: the default (decision a).
+  and both datacenter engines serve. Token-level measurements since then show a larger change (Maya,
+  §4.3), so the default is the exact rule (decision g) and replay an option.
 - **Engram is random row reads from disk everywhere** (DS4, JigSawPT, Xolotl, OpensourceWTF) or
-  pinned host memory where RAM allows (vLLM); no engine found it a bottleneck.
+  pinned host memory where RAM allows (vLLM). No engine found it a bottleneck in decode; in prompts
+  it can be one where reads are issued from too few threads (Maya, §4.3).
 - **Other engines are not reproducible across their own execution modes** (DS4 scalar vs batched,
   JigSawPT with more than one I/O thread). Infernix's placement invariance (FN §16.2) is the
   difference this design keeps.
 
-### 4.3 Lessons from Flash-Next and the GLM design
+### 4.3 Strata and Project Maya
+
+Project Maya (`maya-ds4`, MIT; read at v1.1.26, `f26d8ba`, 2026-10-23) added V4.1 on 2026-10-18.
+Strata (`Niko1221/Strata`; read at `7dd5cf18`, 2026-10-24) imported Maya's engine at v1.1.17
+(2026-10-20), released it as 0.2.4 and has since ported Maya's later Windows changes with its own
+A/Bs. Both run V4.1 on Windows and Linux, CUDA and HIP, on one or several GPUs:
+
+- the most-used experts sit in VRAM, placed by a routing profile and swapped by heat;
+- every other routed expert is computed by a CPU lane, from RAM or from the GGUF files on the SSD.
+
+Neither has a run on an RTX 5090. The full reviews are kept with this design's working notes.
+
+**Variants they run.**
+
+| Build | Routed experts | Dense; Engram | Engine | Published quality against the original |
+|---|---|---|---|---|
+| Unsloth UD-Q8_K_XL / UD-Q4_K_XL | MXFP4 (the original values), 288.8 GB | BF16 / Q8_0; MXFP8, 202.8 GB | both | the "original" both measure against |
+| ISTA-DASLab GSQ-RCO "1.75 / 2.00 / 2.25" | per-layer mixes of IQ1_S to IQ3_XXS: 1.69 / 1.94 / 2.19 bits, 114.6 / 132.1 / 149.1 GB | Q5_K and Q8_0, 6.2 GB; IQ4_NL, 110.6 GB | Strata (its shipped sets) | Strata, top-64 KL against its own UD-Q8_K_XL run: 0.217 / 0.170 / 0.107; perplexity +21 / +15.5 / +7.3 % (code +8.9 / +8.6 / +3.2 %); ISTA's task average 98.7 / 100 % / not run |
+| Maya-S, Maya-XS | IQ2_XXS / IQ3_XXS mix, 2.49 bits; IQ1_S, 1.56 bits | Q8_0; Q6_K, 161.3 GB | both | against DeepSeek's reference: top-1 92.6 / 87.5 %, NLL +3.2 / +8.7 %, KL 0.120 / 0.276; the engine on the original weights 96.4 % / 0.047 |
+| Unsloth UD IQ1_S to Q3_K_XL | 1.70-4.00 bits | mixed; IQ4_NL, Q5_K, Q6_K or MXFP8 | both | Unsloth's own (§5.7) |
+| EXL3 packs (LibertAIDAI 2.9 / 3.5 and others) | trellis, `mul1` codebook | EXL3; official FP8 | Maya; Strata reads Maya's `mul1` | none against the reference |
+| TQK trellis | K bits per value, converted layer by layer by Strata | — | Strata | none |
+
+**Measured on one GPU** (the sources' hardware; decode tok/s unless marked):
+
+| Machine | Build | Result |
+|---|---|---|
+| RTX 5070 12 GB, Ryzen 5 7600, 64 GB, one 3.6 GB/s NVMe (Strata's owner) | ISTA 2.00 | 4.3-4.9 with Strata's RAM store, 1.8-2.2 memory-mapped; prompts 121 tok/s at 4K, 231 at 8K |
+| RTX 3090 24 GB, Ryzen 7 9700X, 128 GB (96 GB of experts copied), NVMe | Maya-S | 16.9-18.1 |
+| RTX 4000 Ada 20 GB, 255 GB (every CPU-lane expert in RAM) | Maya-S; Maya-XS | 11.5-16.4; 16.2 plain, 19.4-22.9 with DSpark |
+| Radeon AI PRO R9700 32 GB, 188 GB | UD-Q4_K_XL (MXFP4) | 14.0; prompts 378 tok/s at 8K |
+| L40S 48 GB, 504 GB (every expert in RAM) | UD-Q8_K_XL (MXFP4) | 14.2-15 with 32 lane threads, 26.5 with 28; 41 with DSpark; prompts ≈ 1,000 tok/s at 20K |
+| RTX PRO 6000 96 GB, 128 GB, 54 % of the experts in VRAM | UD-IQ2_XXS | 78.6-80.7; 91-92 with DSpark; a 28K prompt at 3,930-4,050 tok/s |
+| 7900 XTX 24 GB with 64 GB; RTX 3090 with 64 GB and a 2.9 GB/s drive | Maya-S; EXL3 2.9 | 2.6-3.0; 4.9 (SSD-bound) |
+
+**Mechanisms, and what this design does with them:**
+
+| Practice | Evidence | Disposition |
+|---|---|---|
+| **Exact decoder suffix by default** (`PROMPT_SKIP=1`): from prompts of 3,692 tokens, rows before the last (40 − 20) · 127 + 128 = 2,668 run layers 0-19 and layer 20's KV work only. DeepSeek's 128-row replay is opt-in (`=2`) | Exact skip against no skip (summation order only): last-row KL 1.5e-4 (Maya's maintainer); 6.4e-4 / 6.1e-3 / 8.8e-5 at 4K / 8K / 26K (Maya #342); prompts 30-54 % faster. Replay against the exact skip (#342, 7900 XTX): KL 1.6e-2 / 6.6e-3 / 3.2e-4, greedy text diverging at tokens 2 and 8, prompt time −24 / −24 / −15 %: 25× that engine's noise at 4K, at it at 8K, 3.6× at 26K | `full` is this design's exact rule with a tighter suffix: 2,541 rows, because each decoder layer forms its own window entries (their layer 20 skips its window and pays 127 more rows). Adopted as the default (decision g, §16.1) |
+| **The CPU lane computes every non-VRAM expert in decode.** Streaming RAM experts over PCIe (Maya) or zero-copy reads (Strata) lost, and made output depend on the start or on timing | Maya: streaming 62.7 against 78.6-80.7 tok/s; its per-layer timing underestimated the CPU's cost 2-3×; KL 1.8e-2 between two starts. Strata `c8ead784`: zero-copy slower and timing-dependent | Here the split cannot change output (MX8, §9.5), and FN L2 measured a link share beside the CPU faster than the CPU alone. The split's calibration (§9.7) is checked by whole-token A/B in M5, which is how Maya v1.1.25 fixed its choice |
+| **Leave the host room** | 28 instead of 32 lane threads: 15 → 26.5 tok/s; two cores left free: 42 → 68.6; a 1 ms Windows timer: 40.6 → 68.6 (Maya; Strata's 6-core PC saw no change) | §12.3's team leaves the service, SSD, Engram and engine threads their own cores; waits spin then park and never rely on 15.6 ms sleeps; M5 sweeps the team size |
+| **The RAM tier as private copies** (Maya's `--mmap-experts off`, Strata's unbuffered RAM store) beat the page cache; Maya's swap-managed tier lost to it | 12.1 against 5.75, 55.5 against 33.5, 23.2 against 18.9 tok/s; Strata 4.3-4.9 against 1.8-2.2; Maya's tier 1.4 against 2.2-2.4 ("the tier's moves lag behind") | The pinned and locked tier (§10.4) is the copy model. Its admission must follow a conversation as quickly as a page cache would; M1's trace replay measures the lag |
+| **Placement by a shipped routing profile**, refreshed by use | A stale profile gave 42.3 % VRAM hits, a refreshed one 75.5 %, decode +59-64 % (Maya PR #399) | LFRU with the saved expert state (§10.2, §10.5) learns the profile; no shipped list |
+| **Next-layer lookahead prefetch** | Guess precision by rank 97 / 91 / 81 / 70 / 57 / 41 %; read-ahead into Strata's store lost (4.5 against 4.7 tok/s) | Off by default (§11.3), unchanged |
+| **Engram rows** requested at sampling and collected at layers 1 and 14; on Windows, synchronous `ReadFile` threads are the queue depth | A 28K prompt needs 1.36 M rows: 10 / 32 / 64 / 128 reader threads took 17.1 / 14.1 / 13.4 / 13.2 s (Maya PR #361); decode ≈ 1.4 ms per token from the page cache; unbuffered reads +2-5 % (Maya), −7.6 % (Strata's PC) | The overlapped direct-read ring (§14.4) is the deep queue; M0 measures the prompt read rate it reaches (§14.7) |
+| **IQ4_NL Engram table** (ISTA's, 110.6 GB) | +0.003 top-64 KL against MXFP8 with 2-bit experts (Strata `226d73b4`); larger near lossless (§5.7) | A third Engram row format (§7.5), lossy and labelled |
+| **DSpark** switched on or off once: by a load-time rule (Strata: trunk experts ≤ 1.5 × VRAM) or by an A/B (Maya) | −59 / −61 / −18 / −20 % on cards whose experts do not fit, +37 to +55 % where they do; the drafter's 6-10 GB of VRAM displaces experts | §17's per-round cost model, which also charges the pages the drafter holds (§19.1: ≈ 350 fewer pages; MXFP4 133 frames) |
+| **Conversation slots**: windows, partial groups and compressed KV per conversation (≈ 17 MB per 6.5K tokens), restored in 0.1-0.5 s against 75-200 s of re-reading | Maya PR #356, Strata `cdc3a265` | The prefix cache (§18) covers it; the sizes confirm §18.2's |
+| **Activations**: int8 (max/127 per 32) in decode, FP16 in prompts; one rounding shared by both lanes | The original weights through Maya's engine: KL 0.047, top-1 96.4 % against DeepSeek's reference; the shared rounding made 96 of 96 tokens placement-independent (50 of 96 before) | Supports decision b: MX8 (§9.5) uses the reference's own activation rounding on every route |
+| **Windows**: WDDM holds submitted work until the host queries it (two GPUs hung); pin caps of ≈ 84-91 GB per process on a 192 GB machine | Maya #303, #384, GLM-era #147 | One GPU here; no mailbox wait depends on unsubmitted work (an M5 test); pin room per FN §19.3.7 |
+| **A/B practice**: three alternating pairs, medians, a switch adopted only if faster in every pair; ≈ 5 % run-to-run spread | Strata `6c6267f3`, `a2aeb4ec` | Compatible with Infernix's speed rules |
+
+Neither engine gives the same bits across placement, lanes or starts (both document differences);
+neither stripes volumes or prices DSpark per round. What they offer that this design lacked is a
+set of compact expert formats with published quality; §5.7 weighs them.
+
+### 4.4 Lessons from Flash-Next and the GLM design
 
 GLM §4.2 lists the 22 Flash-Next lessons (L1-L22) measured on this machine. They hold here; these
 change weight:
@@ -546,12 +654,12 @@ change weight:
 | Lesson | Consequence here |
 |---|---|
 | L2: misses are a host-DRAM bandwidth problem | The SSD set binds first (≈ 0.8 GB of SSD reads per token at the central rate, §5.3); DRAM carries landings, CPU reads and DMA (≈ 30-40 GB/s, §5.1) |
-| L5, L6: promotions cost a miss's bytes; none after prefill | A promotion is 18.8 MB (6.8× Flash-Next's); the interval is recalibrated (§10.2) |
+| L5, L6: promotions cost a miss's bytes; none after prefill | A promotion is 8.9-22.2 MB (MXFP4 18.8 MB, 6.8× Flash-Next's); the interval is recalibrated (§10.2) |
 | L7: next-layer prediction recall is modest | Confirmed for this family by JigSawPT and hipfire; lookahead off by default (§11.3) |
 | L8: verify windows add misses only for rejected drafts | Here every verify column also adds its own experts' union (§5.4); the draft length is priced per round (§17.3) |
 | L13: placement invariance needs exact arithmetic | MX8 on every route (§9.5) |
 | L16: short prompts pay a whole expert pass | Worse: a 200-token append reads ≈ 155 GB from the volumes (§5.5); the prefix cache and append-only processing are first-class (§16, §18) |
-| L19: the divisor rule beats cost models for the CPU/link split | Kept, fed by measured costs per 18.8 MB expert (§9.7) |
+| L19: the divisor rule beats cost models for the CPU/link split | Kept, fed by measured costs per width (§9.7) |
 | Pin room (FN §19.3.7, 2026-10-14) | The RAM tier is pinned up to ≈ 72 GiB and unpinned past it (§10.4) |
 
 ---
@@ -559,7 +667,9 @@ change weight:
 ## 5. Performance model
 
 The script is kept with this design's working notes; M0 commits it as
-`tools/deepseek_v41/decode_model.py`.
+`tools/deepseek_v41/decode_model.py`. §5.1-§5.6 model the MXFP4 records (the deferred artifact) and
+carry the mechanisms every build shares; §5.7 applies the same model per expert format, and its
+per-expert EXL3 row is the first artifact's.
 
 ### 5.1 Per-token work at C = 1, plain decode
 
@@ -598,9 +708,12 @@ No routing traces of this model are recorded here; M1 records them. The evidence
 | FreeToken (§4.2), global LRU | V4-Flash | 11 % | 61 % |
 | hipfire (§4.2) | V4-Flash MQ2 | ≈ 5.6 / 11 / 22 / 45 % (4-32 GiB of ≈ 72 GiB, estimated) | 40.5 / 59.4 / 74.4 / 86.5 % |
 | DS4 PR #647, LRU | V4-Flash IQ2 | ≈ 27 % / 100 % (20 / 100 GB) | 51.5 % (220 tokens from cold) / 81 % short, 96-98 % long |
+| Maya (§4.3), L40S, profile and heat swaps, agent traffic at 112-127K context | V4.1-Flash MXFP4 | 9.2 % | ≈ 40-45 % of picks from VRAM |
+| Maya PR #399, the same profile stale and refreshed | V4.1-Flash EXL3 | not stated | 42.3 / 75.5 % |
 
 This family shows **much stronger locality than GLM-5.3-Flash** at equal capacity (GLM §5.2: ≈ 35-56 %
-at 11 %). This machine's capacities (§19): VRAM ≈ 1,160 frames (7.5 %), RAM ≈ 4,490 slots (29.2 %)
+at 11 %). Maya's agent traffic sits below hipfire's curve (≈ 40-45 % at 9.2 %, inside the pessimistic
+scenario below). This machine's capacities for MXFP4 records (§19): VRAM ≈ 1,160 frames (7.5 %), RAM ≈ 4,490 slots (29.2 %)
 with 88 GiB available, 37 % together (33.8 % with 79 GiB).
 
 | Scenario | h_v | h_r | h_s | SSD reads per token | SSD bytes per token |
@@ -671,12 +784,13 @@ the resident ones, so short prompts find more of theirs in memory.
 | 500 - 32,768 | 14,320 (93 %) | 161 GB | 11.7 s | 8.6-9.3 s | 13.0 s |
 | 131,072 | 14,320 | 161 GB | ≈ 25 s (compute) | ≈ 25 s | ≈ 25 s |
 
-- A fresh 32K prompt: ≈ 11.7 s, **≈ 2,800 tok/s** (compute ≈ 6 s, hidden under the bank pass);
+- A fresh 32K prompt: ≈ 13.0 s under the full rule (the default), **≈ 2,500 tok/s**; ≈ 11.7 s and
+  2,800 tok/s under replay (compute ≈ 6 s, hidden under the bank pass);
   128K in one walk span: ≈ 25 s, ≈ 5,200 tok/s, compute-bound by the experts' exact wide route. At
   1M, eight 128K spans and the indexer's O(T²) scoring: ≈ 3.5 minutes (estimated). The W4A4 fast
   path (§25.3 O2) would cut the expert compute about fourfold (FN §16.2.1: 1.65 against 6.24 ms per
   call) where a prompt is compute-bound.
-- **Any fresh prompt above ~200 tokens costs a bank pass, ≈ 11-12 s on three volumes**, and the
+- **Any fresh prompt above ~200 tokens costs a bank pass, ≈ 11-13 s on three volumes**, and the
   link (≈ 9 s for the non-VRAM experts) is the next floor. Short appends cost 2-9 s. DS4 measured
   2.9 / 5.4 / 8.7 s for 16 / 43 / 114-token appends with full GLM-5.3 IQ2 streamed on an M5 Max
   (`docs/SSD_STREAMING.md`), the same shape.
@@ -692,9 +806,144 @@ the resident ones, so short prompts find more of theirs in memory.
 | **`C:` as a fourth volume** (the only drive off the chipset; 80 GB free today) | Decode +21 % (15.5); TTFT −20-25 % |
 | More drives behind the chipset | Nothing beyond three: DMI binds at 14.15 GB/s (§3) |
 | A CPU with AVX-512 or more cores | +3 % (the CPU is near its DRAM floor) |
-| Smaller experts (requantized, lossy; DS4 Q2 halves the bytes) | +60-80 % decode, at DS4's measured +0.12-0.19 nats NLL; option O6 only |
+| **Smaller experts** (published compact builds, lossy) | 3 bits: +60 % decode, TTFT about halved; 2.2 bits: +150 %; quality and the choice in §5.7 |
 
 The link width is fixed; nothing here is tuned to a different link.
+
+### 5.7 Expert formats: speed against quality
+
+On this machine the bytes per routed pick decide decode (§5.3): a smaller record puts more of the bank
+in memory and makes each miss cheaper. This section weighs the published 1017 builds (surveyed on
+2026-10-24 through the Hugging Face API, GGUF headers read by range and EXL3 bit maps) with §5's
+model. Every row keeps the official dense weights and the FP8 Engram volume, so only the routed
+experts change. A build is imported as stored; nothing is requantized at conversion.
+
+**Quality.** No panel measures all the builds against one reference, so each figure is its source's
+own, against the original model; compare within a panel only.
+
+| Panel | Method | Builds (expert bits per pick: KL / top-1) |
+|---|---|---|
+| U: Unsloth | wiki1100 against DeepSeek's `model.py` in F32; each set's own dense and Engram formats | UD-IQ1_M 1.95: 0.314 / 87.1 %; UD-IQ2_XXS 2.31: 0.203 / 90.5 %; UD-Q2_K_XL 2.81: 0.138 / 91.5 %; UD-IQ3_XXS 3.30: 0.063 / 94.6 %; UD-IQ3_S 3.73: 0.032 / 96.0 %; UD-Q3_K_XL 4.00: 0.020 / 96.5 %; MXFP4 (UD-Q8_K_XL, the runtime's own floor) 4.25: 0.005 / 98.5 % |
+| S: sudoingX | 254,846 positions, 65 % code, against `model.py` | EXL3 with per-expert bits (sudoingx 2.8, HeNryous 2.75; 3.10 bits per pick): 0.020 / 96.0 %; uniform EXL3 2.9: 0.030 / 94.8 % |
+| K: kyuz0 short100 | full vocabulary, against `model.py` | diffbot EXL3 K3, 3.01: 0.034 / 95.4 %; DS4 Q2, 2.25: 0.130 / 90.0 % |
+| D: diffbot | its neutral / code / agentic corpora against its own run of the original (floor 0.008 / 0.005 / 0.005) | EXL3 K3: 0.052 / 0.031 / 0.011 |
+| L: Lucebox | top-256 KL, fineweb-edu | UD-Q2_K_XL: 0.114 / 85.7 %; Maya-S, 2.49: 0.195 / 82.0 %; dsx-t16 trellis, 1.92: 0.196 / 80.9 %; UD-IQ1_M: 0.275 / 78.8 % |
+| M: Maya | against DeepSeek's reference (its engine's floor 0.047 / 96.4 %) | Maya-S, 2.49: 0.120 / 92.6 %, NLL +3.2 %; Maya-XS, 1.56: 0.276 / 87.5 %, NLL +8.7 % |
+| St: Strata | top-64 renormalized KL against its own UD-Q8_K_XL run; ISTA's task average | ISTA IQ2_XS, 2.19: 0.107, perplexity +7.3 % (code +3.2 %); IQ2_XXS, 1.94: 0.170, +15.5 %, tasks 100 %; IQ1_M, 1.69: 0.217, +21 % (plain prose +53 %), tasks 98.7 % |
+
+The Engram format matters once the experts are near-lossless. With Q8 experts, Unsloth's plot puts
+an IQ4_NL table at ≈ 0.018 against 0.005 for MXFP8 (read off the chart), and TrellisMX measured a
+4-bit Engram alone at 0.045 on its panel; with 2-bit experts the difference is ≈ 0.003-0.007
+(Strata, dsx). The comparison below therefore holds the Engram rows at FP8, so that only the experts
+differ; the first artifact's own table is chosen in the decision further down (IQ4_NL), and it does
+not change the speeds.
+
+**Speed** (model; three volumes; the range is the SSD-miss rate × 1.4 to × 0.7; prompts under the
+full rule, the default; replay would take 0.3-1.3 s off a fresh 1-4K prompt):
+
+| Build (1017) | Bits per pick | MB per expert | Bank in memory | SSD reads per token | Plain decode, tok/s | Four volumes | TTFT: 50-token append / fresh 1-4K | 32K prompt, tok/s | Quality |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| MXFP4, this design | 4.25 | 18.8 | 37 % | 41 | 13.1 (10.2-16.8) | 15.7 | 4.9 / 13.1 s | 2,490 | lossless |
+| UD-IQ3_S experts | 3.73 | 16.5 | 42 % | 35 | 15.5 (12.2-19.7) | 18.2 | 3.5 / 10.6 s | 3,080 | U 0.032 |
+| UD-IQ3_XXS experts | 3.30 | 14.6 | 47 % | 30 | 18.5 (14.7-23.2) | 21.4 | 2.4 / 8.6 s | 3,810 | U 0.063 |
+| **EXL3, per-expert bits (HeNryous 2.75: the first artifact)** | 3.10 | 13.7 | 51 % | 28 | **20.0** (16.0-25.0) | 22.7 | 2.0 / 7.6 s | 3,040 | S 0.020 |
+| EXL3 K3 (diffbot) | 3.01 | 13.3 | 52 % | 27 | 20.9 (16.7-26.1) | 23.6 | 1.9 / 7.2 s | 3,040 | K 0.034; D 0.052 / 0.031 / 0.011 |
+| UD-Q2_K_XL experts | 2.81 | 12.4 | 56 % | 24 | 23.2 (18.7-28.8) | 26.3 | 1.8 / 6.4 s | 5,080 | U 0.138; L 0.114 |
+| Maya-S experts | 2.49 | 11.0 | 63 % | 20 | 27.6 (22.5-33.9) | 30.6 | 1.6 / 5.6 s | 5,080 | M 0.120; L 0.195 |
+| ISTA GSQ-RCO IQ2_XS | 2.19 | 9.7 | 71 % | 15 | 32.9 (27.0-39.9) | 35.6 | 1.4 / 4.9 s | 5,080 | St 0.107 |
+| ISTA GSQ-RCO IQ2_XXS | 1.94 | 8.6 | 81 % | 10 | 38.9 (32.2-46.7) | 41.1 | 1.3 / 4.3 s | 5,080 | St 0.170 |
+| ISTA GSQ-RCO IQ1_M | 1.69 | 7.5 | 93 % | 5 | 46.6 (38.8-55.6) | 47.9 | 1.2 / 3.7 s | 5,080 | St 0.217 |
+
+Model inputs (`quant_model.py`, kept beside §5's script):
+
+- hipfire's capacity curve (§5.2) for every build, so a format changes only its bytes and its CPU
+  cost; for MXFP4 it reproduces the central scenario (h_v 0.49, h_s 0.17);
+- the CPU's cost per expert at an estimated 25-42 GB/s of weight bytes (halving it costs ≤ 10 %);
+- prompt compute at 65 TFLOP/s for MX8 and the exact GGUF routes, and 33 for EXL3's exact E3A16
+  (four int8 products per weight against two, GLM §9.5);
+- a per-expert-bit build at its usage-weighted bytes per pick. Its hottest experts are its widest
+  (mostly K4), so VRAM holds about 8 % of the experts rather than the 10 % this assumes: slightly
+  optimistic, inside the range.
+
+Cross-check: with the capacities of Maya's RTX 3090 run (12.6 GB of experts in VRAM, 96 GB in RAM)
+and one 7 GB/s drive (the run does not state its drive), the model gives Maya-S 18.0 tok/s; the run
+measured 16.9-18.1 (§4.3). With a 5 GB/s drive the model gives 14.7.
+
+**What the tables say.**
+
+1. Decode follows the share of the bank that fits in ≈ 100 GiB of VRAM and RAM: 37 % at 4.25 bits,
+   52 % at 3, 71 % at 2.2. Three bits cut the SSD reads per token from 41 to 27 (+60 % decode); 2.2
+   bits cut them to 15 (+150 %).
+2. Quality falls slowly to about 3 bits per pick and quickly below. On Unsloth's panel KL doubles from
+   3.30 to 2.81 bits and top-1 drops 3 points. Per-expert bit plans and trellis codes move that knee
+   lower (S: 0.020 at 3.10 bits used against 0.030 for uniform EXL3 2.9).
+3. A fresh prompt stops being a bank pass: TTFT for 1-4K tokens nearly halves at 3 bits. Long prompts
+   become compute-bound, where EXL3's exact arithmetic is the slow one (3,040 against 3,800-5,080
+   tok/s at 32K, still above MXFP4's 2,490).
+4. DSpark is more likely to pay with compact experts. The model gives +37-48 % at 3 bits (+36-46 %
+   for the per-expert build) for acceptance 0.7-0.8 (MXFP4: +21-28 %), before the drafter's pages
+   are charged. That matches
+   Strata's and Maya's gains where the experts fit and losses where they do not (§4.3); §17's cost
+   model decides per round.
+
+**Decision f (2026-10-24): EXL3 with a bit width per expert, built for from the start.**
+
+- **The first artifact**: HeNryous's 1017 pack. Each expert has one width: K2 / K3 / K4 / K5 =
+  6,271 / 6,726 / 2,295 / 68 experts (2.75 bits mean, 3.10 per pick), `mul1` codebook, the plan in
+  `exl3_moe_plan.json`; the mix varies by layer (one layer holds 374 K2 experts, another 153 K4 or
+  K5). Published: KL 0.0201, top-1 95.96 % (S), against 0.030 for uniform EXL3 2.9 on the same panel
+  and 0.097 against 0.114 on instruction-following replies. sudoingx's 2.8 pack (5,709 / 7,056 /
+  2,553 / 42, KL 0.0198) is the same pipeline and an accepted second source. With the official dense
+  tensors and DSpark dense weights from DeepSeek's release, the pack's 2-bit drafter experts and the
+  IQ4_NL Engram table (below), the model gives ≈ 20 tok/s plain decode (16-25), 22.7 with four
+  volumes, 7.6 s for a fresh 1-4K prompt, 2.0 s for a short append and 3,040 tok/s at 32K. The
+  Engram format does not change these: a row is one 4 KiB read whatever its format.
+- **The analysis behind it.** The first recommendation was diffbot's uniform K3 pack (≈ 21 tok/s;
+  K 0.034, D 0.052 / 0.031 / 0.011, measured with the released FP8 dense weights), with per-expert
+  bits as a later step. Per-expert bits cost ≈ 4 % of decode in the model (the hot experts carry
+  more bits: 3.10 bits per pick against 3.01) and ≈ 5-6.5k more lines, for KL 0.020 against ≈ 0.03
+  on the packs' own panel (diffbot's K3 was not measured on it) and 17 GB less disk. Built from the
+  start, the page pool replaces the fixed frames once instead of being retrofitted, and a uniform
+  pack becomes its one-width case.
+- **Deferred**: the lossless MXFP4 artifact (≈ 13 tok/s; M11).
+- **Not chosen**: ISTA's GSQ-RCO IQ2_XS as a speed build (≈ 33 tok/s, 4.9 s for a fresh prompt;
+  perplexity +7.3 %, code +3.2 %, agent +2.2 %; it would reuse FN §16.2.2's exact GGUF arithmetic
+  with two new formats, `ggml_iq2_xxs` and `ggml_iq2_xs`) stays option O6; builds below 2 bits per
+  pick (KL ≥ 0.17; plain-prose perplexity +15-53 %); NVFP4 records (the MXFP4 values in 5.9 % more
+  bytes); Q4_K or Q4_K_M requantizations (more bytes than MXFP4, and lossy).
+
+**What the first artifact needs** (estimated):
+
+| Piece | Work | Size |
+|---|---|---:|
+| EXL3 codec and routes | The GLM design's E3A16 codec, narrow and wide routes and CPU kernel, built here for K = 2-6 (GLM reuses them), at H = 5,120 and I = 2,304 and GLM's geometry. One MoE call mixes widths, so the routes take K per job; MX8 → E3A16 chaining (§9.5); E3A16's exact oracle qualifies every K | ≈ 5-6k lines |
+| Records and volumes | `exl3_expert_v1` records in pages (§7.3); one bank per width (the volume header already holds several banks) and an expert → (bank, index) table | ≈ 0.5-1k |
+| **Page pool** (the largest new piece) | Frames, RAM slots, staging, landing and bounce slots all assume one record size in the shared offload component. Per-expert widths need **pages** of 4,456,448 B (1,088 × 4 KiB): a K2 record takes 2 pages, K3 3, K4 4 and K5 5, with < 0.6 % padding; records addressed through a per-record page list, so the pool never fragments; four 1.06 MiB stripe units per page; eviction by value per page. An artifact with one record size uses one page per record, which is today's frame pool, so Qwen4Exp's tests stay unchanged | ≈ 2.5-3.5k |
+| Policy | LFRU by value per byte, re-chosen by M1's trace replay | ≈ 0.3k and the replay |
+| Recipe and converter | Reads the plan and the pack's expert tensors (its dense weights are EXL3 K5; the official FP8 ones are used instead), range-reads the official dense tensors, copies the IQ4_NL table's rows into the Engram volume (an FP8 or MXFP4 volume from the official rows remains possible) | ≈ 1-1.5k |
+
+**The Engram table** (owner, 2026-10-24): the FP8 rows are 202.8 GB as released and a 209.7 GB
+volume, so the first artifact plans the published **IQ4_NL** table of 1017 (110.6 GB, a 112.4 GB
+volume). The other published 1017 tables are Unsloth's Q6_K (161.3 GB) and Q5_K (135.2 GB) and
+LibertAIDAI's MXFP4 (104.5 GB). What 4 bits cost depends on how good the experts are: +0.003 top-64
+KL with 2-bit experts (Strata), +0.007 on Lucebox's panel with ≈ 2-bit experts (dsx), and with
+near-lossless Q8 experts ≈ 0.018 against 0.005 for the FP8 table on Unsloth's chart, where Q5_K and
+Q6_K sit near 0.008 (read off the chart, not published numbers); TrellisMX measured its own 4-bit
+trellis table alone at 0.045 on its panel. Against this artifact's ≈ 0.020 from its experts, the
+IQ4_NL table may add a noticeable share, so §20.3 measures it separately; a Q5_K, Q6_K or FP8 volume
+replaces it per run (`--engram-volume`, §14.5) without reconverting the experts.
+
+Disk: ≈ 192 GB of expert volumes (the 188 GB main bank and a 3.4 GB drafter bank), 112.4 GB of
+IQ4_NL Engram volume and ≈ 11 GB of main artifact, **≈ 315 GB** (≈ 412 GB with FP8 rows). Download
+≈ 313 GB: the pack's expert tensors (≈ 191 GB), the IQ4_NL table (110.6 GB) and the official dense
+and DSpark dense tensors by range read (≈ 11 GB). The quality report against the original model
+needs reference logits, which §20.2 computes by streaming the official shards one at a time (510 GB
+read, FP8 Engram shards included, ≈ 15 GB on disk at once).
+
+**A hybrid (option O11).** The official MXFP4 records on a profile's hottest 10-20 % of experts and
+ISTA's IQ2_XS records on the rest model at 22-25 tok/s, with the 2-bit error on 28-43 % of picks. It
+is measured nowhere, and a profile that misses a workload moves the error onto that workload's hottest
+experts, so it stays an option.
 
 ---
 
@@ -703,19 +952,19 @@ The link width is fixed; nothing here is tuned to a different link.
 ```text
  ┌───────────────────────────────────── RTX 5090, 32 GB ─────────────────────────────────────┐
  │ dense FP8 / BF16 8.0 GiB · windows 2.9 MB/lane · compressed KV + index keys 890 B/token   │
- │ decode workspace · mailboxes · residency[43 × 384] · land_seq[frame]                      │
- │ ┌── frame pool: ~1,160 × 17.95 MiB MXFP4 records (≈ 20.3 GiB), elastic ──────────────┐   │
+ │ decode workspace · mailboxes · residency[43 × 384] · page lists · land_seq[record]        │
+ │ ┌── page pool: ≈ 4,900 pages of 4.25 MiB (≈ 20.3 GiB), 2-5 per record, elastic ──────┐   │
  │ │ cached experts │ staging │ DSpark experts (bounded) │ KV pages + loans │ walk lease  │   │
  │ └────────────────────────────────────────────────────────────────────────────────────┘   │
  └──────▲───────────────────────▲─────────────────────────▲───────────────────────────────────┘
         │ copy engine           │ mapped mailboxes        │ copy engine (landed records)
  ┌──────┴───────────────────────┴─────────────────────────┴─────────┐   ┌──────────────────────┐
- │ 96 GB host                                                        │   │ expert volume 0 (D:) │
- │  RAM tier: ~4,000 pinned slots (≈ 72 GiB) + unpinned records      │◄──┤ expert volume 1 (E:) │
- │  embedding (pinned) · Engram row cache · landing ring             │   │ expert volume 2 (G:) │
- │  transfer agent: VRAM policy, promotions, staging DMA             │   │  12 units per record │
- │  SSD agent: per-volume IOCP queues; Engram reader ring            │◄──┤ Engram volume (E:)   │
- │  CPU expert team: MX8 exact, from RAM slots or landing slots      │   │  FP8 or MXFP4 rows   │
+ │ 96 GB host                                                        │   │ expert volume 0      │
+ │  RAM tier: ≈ 17,300 pinned pages (≈ 72 GiB) + unpinned pages      │◄──┤ expert volume 1      │
+ │  embedding (pinned) · Engram row cache · landing pages            │   │ expert volume 2      │
+ │  transfer agent: VRAM policy, promotions, staging DMA             │   │  4 units per page    │
+ │  SSD agent: per-volume IOCP queues; Engram reader ring            │◄──┤ Engram volume        │
+ │  CPU expert team: MX8 + E3A16 exact, from RAM or landing pages    │   │  FP8, MXFP4 or IQ4_NL│
  │  engine worker: tokens, Engram hashes, rounds                     │   └──────────────────────┘
  └───────────────────────────────────────────────────────────────────┘
 ```
@@ -732,34 +981,52 @@ per layer l (40):
      ‖ mixes from the stream (post, comb, next pre: off the critical path)
   residual update → collapse → norm → MoE:
      router(l) → residency → GPU jobs | CPU jobs | SSD jobs
-     shared expert ‖ routed experts (MX8 narrow) ‖ CPU results ‖ landed records → combine (FP32, ascending id)
+     shared expert ‖ routed experts (MX8 → E3A16 narrow, K per job) ‖ CPU results ‖ landed records
+     → combine (FP32, ascending id)
      ‖ mixes for the next sublayer
 head: collapse with the last pre → norm → head (FP32 logits) → sample → DSpark draft (if chosen)
 ```
 
 The ideas that carry the design:
 
-- **Exact arithmetic makes placement free** (FN §5, L13): every FP4 and FP8 linear computes
-  DeepSeek's MXFP8 product exactly, so a VRAM frame, a staging frame, the CPU from a RAM slot or a
-  landing slot give the same bits, and policy may move work anywhere (§9.5).
+- **Exact arithmetic makes placement free** (FN §5, L13): every FP8 linear computes DeepSeek's
+  MXFP8 product exactly and every EXL3 expert applies E3A16 to the same MX8 inputs, so a VRAM page,
+  a staging slot, the CPU from a RAM page or a landing page give the same bits, and policy may move
+  work anywhere (§9.5).
 - **The SSDs are the bottleneck; everything is sized to read fewer, smaller, fuller records**:
-  MXFP4 records (−5.6 % bytes), three volumes striped at 1.5 MiB units (§11), units consumed as they
-  land, LFRU with a 37 % memory share, the prefix cache, short drafts only (§17).
+  per-expert EXL3 records (3.10 bits per pick against MXFP4's 4.25), three volumes striped at
+  1.06 MiB units (§11), units consumed as they land, LFRU by value per page with about half the bank
+  in memory, the prefix cache, short drafts only (§17).
+- **Pages make record size free**: one pool of 4.25 MiB pages serves every tier, so a record of any
+  width takes its pages and nothing fragments (§7.3, §10).
 - **Three tiers, exclusive, one policy owner per boundary** (GLM §6): the transfer agent owns
   VRAM↔RAM, the SSD agent RAM↔SSD; the device reads residency words.
 - **The model's own compressed KV is tiny**, so long context costs almost nothing and prefix
   snapshots are a few MB: the prefix cache can keep whole conversations (§18).
-- **Prompt rule as a declared model mode**: DeepSeek's bounded replay by default, the exact full
-  model on request; both are deterministic, request-invariant and computed with the same kernels
+- **Prompt rule as a declared model mode**: the exact full model by default, DeepSeek's bounded
+  replay on request; both are deterministic, request-invariant and computed with the same kernels
   (§16).
 
 ---
 
 ## 7. Artifacts, records, volumes and conversion
 
-### 7.1 Sources and the one recipe
+### 7.1 Sources and recipes
 
-One recipe, `deepseek_v4_1_flash`, imports any of these sources; M0 pins each revision.
+**The EXL3 recipe** (`deepseek_v4_1_flash_exl3`, the first artifact) takes three sources at pinned
+revisions:
+
+| Source | Taken from it | Checks |
+|---|---|---|
+| **`HeNryous/DeepSeek-V4.1-Flash-1017-EXL3-2.75bpw-DGX-Spark`** (default) or `sudoingx/DeepSeek-V4.1-Flash-1017-EXL3-2.8bpw` | `exl3_moe_plan.json`; every routed expert's EXL3 tensors (`layers.N.ffn.experts.E.w1/w3/w2`: trellis codes, `suh`, `svh`) and the drafter's (`mtp.0-2.ffn.experts.*`), copied verbatim | the plan's width equals each tensor's; codebook `mul1` and the producing ExLlamaV3 version are ones M0 qualified; the base revision equals the official source's |
+| **`deepseek-ai/DeepSeek-V4.1-Flash-1017`** | every dense tensor, the DSpark dense weights, the Engram hash parameters, the tokenizer and encoding; the FP8 Engram tables only if an FP8 or MXFP4 volume is made; never its routed experts | as the MXFP4 recipe below; the pack's own dense weights (EXL3) are not read |
+| **The IQ4_NL Engram table**: `ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF` (`DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf`) or `unsloth/DeepSeek-V4.1-Flash-1017-GGUF` (`engram/…-engram-IQ4_NL.gguf_file`, one tensor of 768,022,850 rows that the converter splits at layer 1's 384,006,168) | the rows, copied verbatim into the Engram volume (§7.5) | M0: the two files' row data compared (their headers differ); sampled rows decoded and compared with the official 1017 FP8 rows of the same index, which must agree far better than with September's; row counts and order against the official primes and offsets |
+
+A uniform EXL3 pack (diffbot's K3) is the same recipe with one width and no plan file. M0 pins the
+pack's tensor names, tile order and Hadamard scale against ExLlamaV3's code (GLM §9.5's list).
+
+**The MXFP4 recipe** (`deepseek_v4_1_flash`, deferred to M11) imports any of these sources; M0 pins
+each revision.
 
 | Source | Routed experts | Engram tables | Notes |
 |---|---|---|---|
@@ -788,8 +1055,8 @@ One recipe, `deepseek_v4_1_flash`, imports any of these sources; M0 pins each re
 
 | Tensor class | Stored (official) | Bytes | Infernix form |
 |---|---|---:|---|
-| Routed experts, 40 × 384 (`w1` gate, `w3` up, `w2` down) | MXFP4: packed I8 codes [2,304 × 2,560] / [5,120 × 1,152], E8M0 scales [2,304 × 160] / [5,120 × 72] | 288.8 GB | `mxfp4_expert_v1` records (§7.3) in the expert volumes (§7.4) |
-| DSpark experts, 3 × 128 | MXFP4 (in every source) | 7.22 GB | same records, DSpark bank |
+| Routed experts, 40 × 384 (`w1` gate, `w3` up, `w2` down) | EXL3 pack: trellis codes of K = 2-5 bits per weight with FP16 `suh` / `svh`, one K per expert (official: MXFP4, packed I8 codes [2,304 × 2,560] / [5,120 × 1,152], E8M0 scales [2,304 × 160] / [5,120 × 72]) | 187.6 GB (288.8 GB) | `exl3_expert_v1` records in pages (§7.3), one bank per width in the expert volumes (§7.4); MXFP4: `mxfp4_expert_v1` records (M11) |
+| DSpark experts, 3 × 128 | EXL3 pack: K = 2 (official: MXFP4) | 3.4 GB (7.22 GB) | `exl3_expert_v1` records, DSpark bank |
 | Attention `wq_a`, `wq_b`, `wkv`, `wo_a`, `wo_b`; shared experts; indexer `wq_b`; Engram `wkv`; DSpark attention, shared experts and `main_proj` | FP8 E4M3 with E8M0 per 32 × 32 | 7.5 GB | new Linear format `fp8_e4m3fn_b32_e8m0` with MX8 activations (§9.5), device-resident; `wo_a` applied per group (8 diagonal blocks of [1,024 × 4,096]) |
 | Router `gate.weight` (BF16 [384 × 5,120]); `bias`, `bias_vl` (FP32) | | 0.16 GB | direct; FP32 logits |
 | Compressor `wkv`, `wgate` (BF16), indexer `weights_proj`, `wk` (BF16), norms | | 0.08 GB | direct; FP32 (ratio 2) and BF16 (ratio 1, indexer) products |
@@ -805,9 +1072,30 @@ finite power of two, NaN codes, and a config that differs from the pinned one in
 
 ### 7.3 Expert records
 
-**`mxfp4_expert_v1`** (to be defined byte-exactly in [storage layouts](storage-layouts.md)). Both
-processors read a record in place (FN §6.2's principle): the GPU from a frame or a staging slot, the
-CPU from a RAM slot, a landing slot or an unpinned record.
+**`exl3_expert_v1`** (the first artifact; to be defined byte-exactly in
+[storage layouts](storage-layouts.md)). One expert of width K ∈ {2, 3, 4, 5}, read in place by both
+processors (FN §6.2's principle):
+
+- **Contents**: first the three matrices' FP16 sign-scale vectors (gate and up `suh` [5,120] and
+  `svh` [2,304], down `suh` [2,304] and `svh` [5,120]: 44,544 B), so a job's input rotations start
+  with the first unit; then the gate and up trellis tiles interleaved by 16-channel groups (16 × 16
+  tiles of 256 weights, 32 · K bytes each, the pack's bits verbatim), then down. M3 fixes the tile
+  order within a group for the narrow and wide routes, as GLM §7.2 does.
+- **Sizes**: 4,423,680 · K + 44,544 B: 8,891,904 (K2), 13,315,584 (K3), 17,739,264 (K4) and
+  22,162,944 B (K5).
+- **Pages**: a record of width K takes **K pages of 4,456,448 B** (1,088 × 4 KiB), with 21-119 KB of
+  padding (≤ 0.54 %). The pages need not be adjacent: every tier names a record by its page list,
+  so records of any width share one pool and it never fragments (§10.1).
+- **Stripe units**: four per page, 1,114,112 B (272 × 4 KiB) each, so a record is 8-20 units;
+  gate/up units come first, and no tile crosses a unit boundary (≤ 159 B of padding per unit), so a
+  landed unit is a whole set of work items.
+- An artifact with one record format, such as the deferred MXFP4 one or Qwen4Exp's, uses pages of
+  its record size: one page per record, which is today's frame.
+
+**`mxfp4_expert_v1`** (the deferred MXFP4 artifact, M11; to be defined byte-exactly in
+[storage layouts](storage-layouts.md)). Both processors read a record in place (FN §6.2's
+principle): the GPU from a frame or a staging slot, the CPU from a RAM slot, a landing slot or an
+unpinned record.
 
 - **Matrices**: gate/up first, rows interleaved by groups of 16 (16 gate rows, then the same 16
   channels' up rows), then down.
@@ -844,9 +1132,14 @@ defines them: a 4 KiB header (magic, artifact id, volume index and count, weight
 record bytes, unit size and record count, CRC32C), weighted placement of unit j of record r on
 volume P[(j + r) mod 12], computable offsets and no per-record table.
 
-- **Banks**: the main bank (15,360 records, numbered layer-major, expert-minor) and the DSpark bank
-  (384 records).
-- **Sizes**: MXFP4 15,744 padded records = **296.4 GB**: 98.8 GB per volume at w = (4, 4, 4). NVFP4
+- **Banks** (EXL3 artifact): one bank per width, K2 / K3 / K4 / K5 with 6,271 / 6,726 / 2,295 / 68
+  records of 2-5 pages, numbered layer-major and expert-minor within each, and a DSpark bank of 384
+  K2 records; the artifact holds the expert → (bank, index) table (15,744 entries). Unit j of a
+  record goes to volume P[(j + r) mod 12] as before, so an 8-unit record spreads over every volume.
+- **Sizes** (EXL3 artifact): 188.2 GB for the main banks and 3.4 GB for the DSpark bank, **191.7 GB**:
+  63.9 GB per volume at w = (4, 4, 4).
+- **Banks and sizes of the MXFP4 artifact (M11)**: the main bank (15,360 records) and the DSpark bank
+  (384 records); 15,744 padded records = **296.4 GB**: 98.8 GB per volume at w = (4, 4, 4). NVFP4
   fallback: 313.0 GB.
 - **Writers**: the converter (§7.6) and `python -m tools.artifact.restripe` (GLM §7.3), which
   re-stripes existing volumes for another N or weight vector without the source. Runtime never
@@ -861,6 +1154,8 @@ volume has (FN §6.3, §12.2):
 |---|---:|---:|---:|---|
 | `fp8_e4m3_e8m0_32` | 264 B (256 codes, 8 scales) | 15 | **209.7 GB** | the official release; NVIDIA at `3431dde3` |
 | `mxfp4_e8m0_32` | 136 B (128 code bytes, 8 scales) | 30 | **104.9 GB** | NVIDIA's current revision; LibertAIDAI 1017; or the converter (`--engram-format mxfp4`) |
+| `ggml_iq4_nl` | 144 B (8 IQ4_NL blocks of 18 B) | 28 | **112.4 GB** | ISTA's or Unsloth's 1017 table (110.6 GB as stored), rows copied verbatim: **the first artifact's planned table** |
+| `ggml_q5_k`, `ggml_q6_k` (option O4) | 176 B / 210 B (one 256-value block) | 23 / 19 | 136.8 / 165.6 GB | Unsloth's 1017 tables (135.2 / 161.3 GB as stored), rows copied verbatim |
 
 - Rows never straddle a block; each table's rows are contiguous in row order, so one row is one
   4 KiB direct read and prompt reads of neighbouring rows coalesce.
@@ -869,18 +1164,34 @@ volume has (FN §6.3, §12.2):
 - The converter makes an MXFP4 volume from FP8 rows with ModelOpt's MXFP4 rule (UE8M0 scale
   ⌊log₂ amax⌋ − 2 per 32, E2M1 round-to-nearest-even; M0 reads ModelOpt's code and checks it against
   NVIDIA's rows of the September table, which must match byte for byte).
-- **Sharing**: if M0 finds the 1017 Engram tables equal to September's (sampled rows by range read),
-  one FP8 volume serves every artifact of either checkpoint, bound with `--engram-reuse` as
-  Flash-Next's derivatives bind NVIDIA's n-gram volume.
+- **Sharing**: the 1017 tables differ from September's (§2.6), so a volume belongs to one checkpoint.
+  Every artifact of that checkpoint (the MXFP4 build and a compact build, §5.7) binds the same volume
+  with `--engram-reuse`, as Flash-Next's derivatives bind NVIDIA's n-gram volume.
+- The IQ4_NL format is lossy against the FP8 tables: Strata measured +0.003 top-64 KL with 2-bit
+  experts, and near-lossless experts show more (§5.7). The first artifact plans it to save 97 GB
+  (owner, 2026-10-24); §20.3 measures its share of the artifact's KL, and the Q5_K, Q6_K or FP8 rows
+  replace it per run if that share matters.
 - Runtime selection follows decision d (§14.5).
 
 ### 7.6 Conversion under the disk limits (decision e)
 
-The official source is 510.3 GB in 48 shards of at most 7.41 GB; NVIDIA's is 429.0 GB. The default
-outputs are ≈ 11 GB of main artifact (dense 8.5, embedding 1.3, DSpark dense 0.7, vision 1.0),
-296.4 GB of expert volumes and 209.7 GB of FP8 Engram volume: **≈ 517 GB**. On 2026-10-18 the four
-drives had ≈ 895 GB free in all, so the source and the outputs cannot coexist. The conversion route
-is therefore **shard by shard**, and its plan is computed from the free space at the time it runs.
+The official source is 510.3 GB in 48 shards: 46 of at most 7.41 GB and the two Engram shards
+(47 and 48) of 101.54 GB each, one table per shard (Hugging Face API, 2026-10-24; this section
+earlier said all 48 were at most 7.41 GB). NVIDIA's is 429.0 GB. The source and the outputs cannot
+coexist on these disks, so the conversion route is **shard by shard**, and its plan is computed from
+the free space at the time it runs; the owner frees the space when the artifact work starts.
+
+- **The EXL3 artifact** reads ≈ 313 GB: the pack's expert tensors (≈ 191 GB) by range read from its
+  shards, the official dense and DSpark dense tensors (≈ 11 GB) by range read, and the IQ4_NL table
+  (110.6 GB) streamed by range read straight into the Engram volume. It writes ≈ 11 GB of main
+  artifact (dense 8.5, embedding 1.3, DSpark dense 0.7, vision 1.0), 191.7 GB of expert volumes and
+  112.4 GB of IQ4_NL Engram volume: **≈ 315 GB** (with an FP8 volume instead, the two official Engram
+  shards are streamed the same way: ≈ 405 GB read, ≈ 412 GB written).
+- **The MXFP4 artifact (M11)** reads the 510 GB release and writes ≈ 11 GB of main artifact,
+  296.4 GB of expert volumes and the same Engram volume: **≈ 517 GB**. One Engram volume serves both
+  artifacts of 1017 (§7.5).
+
+Steps (both artifacts):
 
 1. **Plan.** Read the index and every shard header by HTTP range requests (≈ 15 MB of metadata);
    compute every output offset (expert units to volume offsets by §7.4, Engram rows to blocks,
@@ -892,42 +1203,60 @@ is therefore **shard by shard**, and its plan is computed from the free space at
 2. **Allocate.** Create every output at its final size; process shards in index order, which is
    layer order, so each volume is written front to back (no zero-filled gaps on NTFS).
 3. **Per shard**: download it into staging (resumable; the LFS SHA-256 is checked), convert its
-   tensors (copy or recover expert blocks into their units, pack Engram rows, write dense tensors),
-   read every written range back and compare it with the source bytes in memory, record the shard
-   and the CRC32C of each written unit in a journal, then delete the shard. One shard downloads while
-   the previous converts: peak staging ≈ 15 GB, peak RAM ≈ 4 GB (the converter runs at below-normal
-   priority and reads the machine's free RAM before starting, since other sessions may need it).
+   tensors (copy EXL3 expert tensors or copy or recover MXFP4 blocks into their units, pack Engram
+   rows, write dense tensors), read every written range back and compare it with the source bytes in
+   memory, record the shard and the CRC32C of each written unit in a journal, then delete the shard.
+   One shard downloads while the previous converts: peak staging ≈ 15 GB, peak RAM ≈ 4 GB (the
+   converter runs at below-normal priority and reads the machine's free RAM before starting, since
+   other sessions may need it). The two 101.5 GB Engram shards are never staged: their rows stream
+   by range read into the Engram volume in 1 GB pieces, the SHA-256 is computed over the stream, and
+   the journal records each piece. Tensors needed from a shard without the rest of it (the official
+   dense tensors for the EXL3 artifact) are range-read, as `tools/convert/fetch_tensors.py` does for
+   Flash-Next.
 4. **Resume**: an interrupted run restarts from the journal at the first incomplete shard.
 5. **Verify**: `tools.deepseek_v41.verify_artifact` checks headers, sizes, the journal's CRC32Cs on
    every unit and, with the source reachable again, sampled tensors by range read.
 
-**Disk plan on this machine** (2026-10-18 free space; recomputed by step 1 when the conversion
-runs):
+**Disk plan for the EXL3 artifact** (an example; step 1 recomputes it from the free space when the
+conversion runs):
 
 | Item | Size | Drive |
 |---|---:|---|
-| Expert volume 0, w = 4 | 98.8 GB | `D:` (300.4 free) |
-| Expert volume 1, w = 4 | 98.8 GB | `E:` (405.6 free) |
-| Expert volume 2, w = 4 | 98.8 GB | `G:` (108.7 free; 9.9 GB left) |
-| Engram volume, FP8 | 209.7 GB | `E:` |
-| Main artifact | ≈ 11 GB | `E:` (E: then 86 GB free) |
-| Shard staging (two shards) | ≈ 15 GB | `D:` |
+| Expert volumes 0-2, w = (4, 4, 4) | 3 × 63.9 GB | three of `D:`, `E:`, `G:` (and `C:` as a fourth, §11.4) |
+| Engram volume, IQ4_NL | 112.4 GB (FP8: 209.7 GB) | one drive, or striped (§14.7) |
+| Main artifact | ≈ 11 GB | any |
+| Shard staging (two shards) | ≈ 15 GB | any |
 
-If `G:` has less room when the conversion runs (it also holds Flash-Next's n-gram volumes), the
-planner moves units to `D:` (for example w = (5, 4, 3): 123.5 / 98.8 / 74.1 GB, ≈ 6 % slower records,
-§11.4); with less room overall it proposes the MXFP4 Engram volume (−105 GB). Downloading 510 GB
-needs the owner's go-ahead when the conversion is scheduled; it takes ≈ 70 minutes at 1 Gb/s.
+The 2026-10-18 plan for the MXFP4 artifact put 98.8 GB of expert volume on each of `D:`, `E:` and
+`G:`, the Engram volume and main artifact on `E:`, and the staging on `D:`. If a drive has less room
+when the conversion runs, the planner weights units away from it (for example w = (5, 4, 3), ≈ 6 %
+slower records, §11.4); with less room overall it proposes a 4-bit Engram volume (MXFP4 −105 GB,
+IQ4_NL −97 GB). Downloading ≈ 313 GB (EXL3 with the IQ4_NL table) or 510 GB (MXFP4) needs the
+owner's go-ahead when the conversion is scheduled; at 1 Gb/s that is ≈ 42 or 70 minutes. The
+quality report's reference logits (§20.2) stream the 510 GB release once more, without keeping it.
+
+**Space on 2026-10-24** (383 GB free, §3; staging ≈ 15 GB on top of each):
+
+| Build | FP8 Engram | 4-bit Engram (IQ4_NL / MXFP4) |
+|---|---:|---:|
+| EXL3 with per-expert bits (the first artifact) | 412 GB | 315 / 308 GB |
+| EXL3 K3 (§5.7) | 433 GB | 335 / 328 GB |
+| MXFP4 (M11) | 517 GB | 420 / 412 GB |
+| MXFP4 and an EXL3 build, one shared Engram volume | 720-740 GB | 615-643 GB |
+
+With its IQ4_NL table the first artifact (≈ 315 GB plus staging) would have fitted the 383 GB free
+on 2026-10-24 only by using `C:` and striping the Engram volume, since `E:` had 18 GB and no drive
+would keep 112 GB free beside an expert volume; with FP8 rows it needed ≈ 45 GB more. The owner
+frees space when the artifact work starts (§1.2).
 
 ### 7.7 Other artifacts
 
-- **NVIDIA's September NVFP4 export** and **LibertAIDAI's 1017 NVFP4** convert to the same expert
-  records as their official counterparts (§7.1) and bring MXFP4 Engram tables; an FP8 volume made
-  from the official release can replace those (§14.5).
-- **DS4's Q2 and Q4 GGUFs** are a different, requantized model: option O6 (§25.3) imports them with
-  Infernix's exact GGUF arithmetic (FN §16.2.2) where its block formats cover them (Q2_K, Q4_K; IQ2_XXS
-  is not built), at DS4's measured quality.
-- **EXL3 builds** (diffbot 3 bpw, KL 0.0545 neutral) would need the GLM design's EXL3 kernels; not
-  planned.
+- **NVIDIA's September NVFP4 export** and **LibertAIDAI's 1017 NVFP4** (M11) convert to the same
+  expert records as their official counterparts (§7.1) and bring MXFP4 Engram tables; an FP8 volume
+  made from the official release can replace those (§14.5).
+- **Other EXL3 packs of 1017** (diffbot's uniform K3, sudoingx's 2.8) use the EXL3 recipe unchanged.
+- **GGUF compact builds** (ISTA's GSQ-RCO, Unsloth's UD, Maya's and DS4's) would take their routed
+  experts as stored and everything else from the official release; option O6 (§5.7 compares them).
 
 ---
 
@@ -944,21 +1273,32 @@ model type `deepseek_v41`).
 | Program: lanes, windows and compressed planes, Engram rows, prefix-cache binding, DSpark drafter, graphs, expert-offload composition | Program | `src/models/deepseek_v41/program/` |
 | Engine instance | Runtime | `src/runtime/engine/deepseek_v41_instance.{h,cpp}`; a new `Architecture` value in `src/models/registry.cpp`; an `EngineCore` arm |
 | MX8 activation codec and exact block combination | Ops (common) | `src/ops/common/mx8.h`, beside `exact_combine.h`; the scalar form is the exact oracle |
+| EXL3 codec (trellis decode for K = 2-6, `mul1` codebook, 128-point Hadamard, E3A16) | Ops (common), built here and reused by GLM | `src/ops/common/exl3/` (GLM §8.3); the scalar form is the exact oracle |
 | Tokenizer pre-tokenizer, DeepSeek encoding, DSML tool-call and reasoning parsing | Frontend | §21 |
-| Recipe, streaming conversion, MX recovery, expert and Engram volume writers, verification, reference forward | Converter / tools | `tools/convert/deepseek_v41.py`, `official_recipes.py`, `tools/artifact/expert_volume.py`, `tools/artifact/restripe.py`, `tools/deepseek_v41/` |
+| Recipes (EXL3 first, MXFP4 in M11), streaming conversion, MX recovery (M11), expert and Engram volume writers, verification, reference forwards | Converter / tools | `tools/convert/deepseek_v41.py`, `official_recipes.py`, `tools/artifact/expert_volume.py`, `tools/artifact/restripe.py`, `tools/deepseek_v41/` |
 
 DeepSeek's reference code and DS4 are MIT-licensed; any code ported from them keeps its notice.
 
 ### 8.2 Shared components
 
 Three explicit families now need host-offloaded experts: Qwen4Exp (built), GLM-5.3-Flash (designed)
-and this one. The shared pieces are extracted by whichever of the two new families is implemented
-first, as GLM §8.2 describes, with no base class, virtual model interface or registry:
+and this one. **This track builds the shared pieces first and GLM reuses them** (owner, 2026-10-24):
+the offload extraction with its page pool, and the EXL3 codec with the expert routes, for K = 2-6
+so that GLM's 6-bit head and 5-bit projections are covered too. Expert volumes and the readers come
+with the extraction in this track's M2; `mhc` and the radix top-k come with its M3. As GLM §8.2
+describes, there is no base class, virtual model interface or registry:
 
 - **`src/models/offload/`**: expert cache, residency controller, RAM tier with pinned and unpinned
   records, expert store, state file, ledger terms, route trace, VRAM monitor, parameterized by an
   `ExpertBankGeometry` (banks, experts per bank, record format, record and unit bytes, H, I).
   Qwen4Exp keeps every decision bit for bit (M2's exit criterion, GLM §23).
+- **The page pool, built into that extraction from the start** (decision f): one page size per
+  artifact; a record of any format takes ⌈bytes / page⌉ pages named by a page list; VRAM, pinned and
+  unpinned RAM, staging, landing and bounce storage are all pages; eviction weighs value per page.
+  A single-format artifact (Qwen4Exp, GLM's EXL3 build, the MXFP4 artifact) chooses its record size
+  as the page size, one page per record, so its behaviour is today's frames and slots. GLM's EXL3
+  records take the `exl3_expert_v1` layout (§7.3), its 36 KiB vectors leading the record in place of
+  GLM §8.2's frame side entry, so one set of expert routes reads both models.
 - **Expert volumes and the striped reader** (GLM §7.3, §11.3), shared with GLM.
 - **The `mhc` Op** (GLM §15) with a *pre source* input: same sublayer (GLM) or the previous one
   (this model, §15).
@@ -972,7 +1312,7 @@ first, as GLM §8.2 describes, with no base class, virtual model interface or re
 | Op | Change |
 |---|---|
 | New Linear format **`fp8_e4m3fn_b32_e8m0`** | MX8 activations (§9.5); decode route (T ≤ 8, CUDA-core integer) and prompt route (int8 tensor cores), bit-identical; grouped application for `wo_a`; generalizes `fp8_block/fp8_exact.h` (128 × 128 BF16 scales) to 32 × 32 power-of-two scales |
-| `offloaded_sparse_moe` | Expert formats `mxfp4` and `nvfp4` with the **MX8 activation class** (beside today's A4 and A16); geometry from the bank; routing function `sqrtsoftplus_bias_topk_scaled` with a second bias for image tokens; the routing weight applied to h before the down projection; SwiGLU clamp 10; ungated shared expert in FP8; landing-aware jobs and partial records (GLM §11.4); a second bank for DSpark (128 experts, top-3) |
+| `offloaded_sparse_moe` | Expert format **`exl3_mul1` with a width per record** (K = 2-5, E3A16 after MX8, §9.5) on the narrow, wide and CPU routes, records read through page lists; `mxfp4` and `nvfp4` with the **MX8 activation class** (beside today's A4 and A16) in M11; geometry from the bank; routing function `sqrtsoftplus_bias_topk_scaled` with a second bias for image tokens; the routing weight applied to h before the down projection; SwiGLU clamp 10; ungated shared expert in FP8; landing-aware jobs and partial records (GLM §11.4); a second bank for DSpark (128 experts, top-3) |
 | New **`csa_attention`** | Window ring plus selected compressed entries, one shared 512-wide key/value, per-head sink, inverse RoPE on the output; decode and prompt kernels (§13.3, §13.6) |
 | New **`csa_compressor`** | Ratio-2 gated pooling and ratio-1 projection, norm, RoPE, FP4 packing, index keys (§13.2) |
 | New **`csa_indexer`** | MXFP4 query/key scores, head weights, top-512, layer 20's block candidates, Reindex masks (§13.4) |
@@ -1015,14 +1355,17 @@ Budget = bytes at 1.5 TB/s + 0.5 µs ramp under PDL, as in FN §8.3. "Pre" = bef
 | K6 | `wo_a` grouped (FP8, 8 × [1,024 × 4,096]) then `wo_b` [5,120 × 8,192]; epilogue: residual update with K1's post and comb, collapse for the FFN with the attention sublayer's pre, `ffn_norm` partial sums | 75.4 MB | 51 µs |
 | K7 | Router: FP32 logits [384 × 5,120] (BF16 weights), √softplus, top-6 with bias, weights, residency classification, jobs, mailboxes; FFN mixes run concurrently | 3.9 MB + 2.0 MB | 6 µs |
 | | **Pre** | ≈ 134 MB | **≈ 100 µs** (+ 5-17 µs on Full/Reindex layers) |
-| K8 | Shared expert (FP8 gate/up [4,608 × 5,120], down [5,120 × 2,304]) ‖ routed GPU jobs (MX8 narrow, 18.8 MB each) | 35.4 MB + 18.8 MB per hit | 24 µs + 12.6 µs per hit |
+| K8 | Shared expert (FP8 gate/up [4,608 × 5,120], down [5,120 × 2,304]) ‖ routed GPU jobs (E3A16 narrow on MX8 inputs, 8.9-22.2 MB each; MXFP4 in M11: 18.8 MB) | 35.4 MB + 13.7 MB per hit on average | 24 µs + 9.1 µs per hit (MXFP4 12.6) |
 | K9 | Combine (FP32, ascending expert id) with CPU and landed outputs; residual update; collapse for the next layer's attention; `attn_norm` partial sums | 0.1 MB | 2 µs + waits |
 
 Layers 1 and 14 add the `engram` kernel before K1: `wkv` FP8 [25,600 × 6,144] (157 MB, ≈ 105 µs),
 gates and the stream update. The head (BF16 [129,280 × 5,120], 1.32 GB) takes ≈ 0.88 ms.
 
-**Per token (GPU work only, h_v = 0.48):** 40 × (≈ 105 + 24 + 2.9 hits × 12.6 + 2) µs + Engram 0.21 ms
-+ head 0.88 ms ≈ **7.8 ms**, about 420 launches. Of it ≈ 4.2 ms precede routing (t_pre of §5.1).
+**Per token (GPU work only):** with MXFP4 records at h_v = 0.48, 40 × (≈ 105 + 24 + 2.9 hits × 12.6
++ 2) µs + Engram 0.21 ms + head 0.88 ms ≈ **7.8 ms**; with the EXL3 records at h_v ≈ 0.58,
+40 × (≈ 105 + 24 + 3.5 hits × 9.1 + 2) µs + 1.09 ms ≈ **7.6 ms** (assuming the narrow E3A16 route
+streams at memory speed, as GLM §9.3 does; M6 measures). About 420 launches; ≈ 4.2 ms precede
+routing (t_pre of §5.1).
 
 **Rules**, from FN §8.3: PDL with pre-dependency weight prefetch at ≤ 2 CTAs per SM; evict-first
 weight streams, evict-last activations, windows and next-layer routers; deterministic fixed-order
@@ -1043,8 +1386,8 @@ products, summed exactly and rounded once to FP32 (FN §16.5: FP32 logits avoid 
 2. top-6 of s_e + bias_e (bias_vl_e on image-span tokens), lower id winning exact ties;
    w_i = 1.5 · s_i / (Σ s + 1e-20) in FP32.
 3. Union over the T columns; classification from the residency word and tier tables, as GLM §9.4:
-   `READY` frame → GPU job; RAM slot → CPU or DMA job (§9.7); unpinned record → CPU job; landing
-   slot → CPU job per unit; absent everywhere → demand read, then a landing-slot job.
+   `READY` pages → GPU job; RAM pages → CPU or DMA job (§9.7); unpinned pages → CPU job; landing
+   pages → CPU job per unit; absent everywhere → demand read, then a landing-page job.
 4. Outputs: GPU job list, `miss_req[l]`, the route log with the scores of ranks 7-16 (near misses,
    §10.2).
 5. Prediction (lookahead, off by default, §11.3): layer l + 1's router applied to this layer's MoE
@@ -1054,7 +1397,7 @@ products, summed exactly and rounded once to FP32 (FN §16.5: FP32 logits avoid 
 
 **Requirement.** Every FP8 and FP4 linear computes DeepSeek's MXFP8 product (decision b), and its
 BF16 output is bit-identical on every route and processor: GPU narrow and wide routes, CPU on every
-ISA, from a frame, a staging slot, a RAM slot, an unpinned record or a landing slot in any unit
+ISA, from VRAM pages, staging, RAM pages, unpinned pages or landing pages in any unit
 order (FN §16.2's requirement, extended to dense layers as FN §16.2.2 did).
 
 **Activation encoding** of a BF16 column x of K elements, per 32-element block b (the reference's
@@ -1095,6 +1438,21 @@ x (BF16) → MX8 → gate, up (BF16 outputs) → FP32: g ← min(g, 10), u ← c
   → MX8 → down → BF16 y_i → combine: bf16( Σ_i y_i [FP32, ascending id] + y_shared )
 ```
 
+**EXL3 experts (the first artifact).** Gate, up and down are EXL3 matrices of the expert's width K,
+computed with GLM §9.5's canonical **E3A16** arithmetic on the MX8 values of their inputs. x̂ =
+MX8(x) is exact in BF16, so E3A16 takes it as its BF16 input unchanged: the rotation u =
+H(x̂ ⊙ suh) in fixed-order FP32, the 14-bit block quantization of u (F = 15 for the 5,120-wide inputs,
+16 for the 2,304-wide down input), exact integer dot products with the codebook's exact values, one
+rounding to FP32, the output rotation and `svh` in fixed-order FP32, one rounding to BF16. The
+chain above holds with "MX8 → E3A16" in place of the MXFP4 product, h rounded to BF16 and MX8 again
+before down, and the same clamps (GLM's experts clamp alike). K only changes where each weight's
+16-bit trellis state is cut from the stream (bit K · i), so one kernel serves every width with K
+per job, and the result depends only on the stored words and x: the same bits on every route and
+processor, as for MX8. Relative to the pack's own runtime (FP16 activations through ExLlamaV3 or its
+vLLM plugin), this adds DeepSeek's MXFP8 rounding of every expert input, as the reference does
+before its FP4 experts (decision b), and E3A16's own differences (the codebook's exact values,
+14-bit block activations; GLM §9.5). §20.3 measures the result against the original model.
+
 **Fidelity to the reference.** `model.py` accumulates each 32-block product on tensor cores in FP32,
 scales it and adds the blocks in FP32; its result is a rounding of the exact sum S, so the two differ
 by the reference's own accumulation error (relative ≲ 2^−24 per block added). §20.1 bounds it against
@@ -1120,17 +1478,19 @@ rounded to BF16 (`apply_rotary_emb` writes back to BF16); attention, indexer, mH
 
 | Route | When | Form |
 |---|---|---|
-| Narrow (GPU) | n ≤ 8 columns for the expert (decode, verification) | CUDA-core integer, X limbs × codes via `dp4a`; work items per gate/up unit and down unit (§7.3), so an SSD record's landed units are consumed as they arrive |
-| Wide (GPU) | n > 8 (prompts, wide verify) | int8 tensor cores, two k32 MMAs per block; codes decoded once per tile and reused over the CTA's token tile |
-| CPU | RAM, unpinned and landed records | AVX2 + AVX-VNNI (§12) and a scalar form (the oracle) |
+| Narrow (GPU) | n ≤ 8 columns for the expert (decode, verification) | EXL3: CUDA-core integer per GLM §9.5 (funnel shift to the state, `IMUL` by the codebook multiplier, `DP4A` byte sum, `IMAD` into the block sum), the state decode shared by the n columns, K per job, the record read through its page list. MXFP4 (M11): X limbs × codes via `dp4a`. Work items per gate/up unit and down unit (§7.3), so an SSD record's landed units are consumed as they arrive |
+| Wide (GPU) | n > 8 (prompts, wide verify) | EXL3: int8 tensor cores with four products per weight and activation (GLM §9.5), decoded tiles reused over the CTA's token tile; experts of one width grouped per launch. MXFP4 (M11): two k32 MMAs per block |
+| CPU | RAM, unpinned and landed records | EXL3: GLM §12.2's AVX2 + AVX-VNNI E3A16 kernel per width (MXFP4 in M11: §12.2), and a scalar form (the oracle) |
 
 All three return the same bits (§9.5); the route depends only on n, never on placement.
 
 ### 9.7 Miss arbitration
 
-- **RAM misses**: the divisor rule (L19) fed by the measured pair: the CPU team's ≈ 0.35-0.45 ms per
-  expert against the link's 0.68 ms, so the CPU takes about 60 % (d ≈ 2.5, from a per-count split
-  table calibrated at start and kept across starts, GLM §12.3).
+- **RAM misses**: the divisor rule (L19) fed by the measured pair, per width. EXL3: the CPU team's
+  ≈ 0.35 ms (K2) to ≈ 0.8 ms (K5) per expert, compute-bound (estimated at 30 GB/s of weight bytes,
+  §5.7), against the link's 0.32-0.80 ms, so about an even split; MXFP4 (M11): ≈ 0.35-0.45 ms against
+  0.68 ms, the CPU taking about 60 % (d ≈ 2.5). The split table is calibrated at start per (column
+  count, width) and kept across starts (GLM §12.3).
 - **SSD misses**: CPU jobs first, consuming units as they land; staged DMA after landing only beyond
   the CPU cap (16 jobs per call, FN §19.3.16).
 - **Unpinned records** (past the pin room): CPU jobs in place; DMA only through bounce slots
@@ -1163,11 +1523,14 @@ What differs here:
 
 ### 10.1 Tiers
 
-| Tier | Capacity on this machine | Holds | Policy owner |
+Every tier is made of **pages** (§7.3, §8.2): 4.25 MiB for the EXL3 artifact, where a record takes
+2-5 pages through its page list; one page per record (17.95 MiB) for the MXFP4 artifact.
+
+| Tier | Capacity on this machine, EXL3 artifact (MXFP4) | Holds | Policy owner |
 |---|---|---|---|
-| VRAM frames (17.95 MiB) | ≈ 1,160 (7.5 %), elastic with KV, DSpark pool and the walk lease | Hot experts; staging; loans | Transfer agent |
-| Pinned RAM slots | ≈ 4,000 (≈ 72 GiB, the pin room) | Warm experts; the landing ring; the demotion list | SSD agent (admission), transfer agent (promotion source) |
-| Unpinned records | ≈ 450 (≈ 8 GiB) at 88 GiB available | The coldest RAM experts, CPU-served in place | SSD agent |
+| VRAM pages | ≈ 4,900 (≈ 20.3 GiB): ≈ 1,250-1,600 experts, 8-10 % (1,160 frames, 7.5 %); elastic with KV, DSpark pages and the walk lease | Hot experts; staging; loans | Transfer agent |
+| Pinned RAM pages | ≈ 17,300 (≈ 72 GiB, the pin room) (≈ 4,000 slots) | Warm experts; the landing pages; the demotion list | SSD agent (admission), transfer agent (promotion source) |
+| Unpinned pages | ≈ 1,900 (≈ 8 GiB) at 88 GiB available (≈ 450 records) | The coldest RAM experts, CPU-served in place | SSD agent |
 | Expert volumes | all 15,744 records, read-only | Everything | — |
 
 Residency is **exclusive with shadows** (FN §19.3.7; GLM §10.1): a VRAM resident keeps its RAM copy
@@ -1183,15 +1546,21 @@ routing counts; a static hot set with an LRU remainder. Static profiles start be
 this family (DS4 #636, §4.1).
 
 **Promotions** come from CPU-served misses that outrank the victim and from landed records (copied
-from the landing slot). A promotion moves 18.8 MB, 6.8× Flash-Next's, so the pace is re-swept in M5
-({1, 2, 4, 8} per layer call until the frames fill, then every N tokens), with GLM §10.2's admission
-threshold (m ∈ {0, 2, 4, 6} aged routes) and free-frame refill after a prompt. No promotions after a
-walked prompt (L6).
+from the landing pages). A promotion moves 8.9-22.2 MB (MXFP4: 18.8 MB, 6.8× Flash-Next's), so the
+pace is re-swept in M5 ({1, 2, 4, 8} per layer call until the pages fill, then every N tokens), with
+GLM §10.2's admission threshold (m ∈ {0, 2, 4, 6} aged routes) and free-page refill after a prompt.
+No promotions after a walked prompt (L6).
+
+**Value per page.** With records of 2-5 pages, every policy above ranks experts by expected hits
+per page (a K5 expert must earn 2.5 × a K2 expert's hits to keep its pages), and a victim set is
+chosen until enough pages are free. M1's trace replay picks the policy with the widths in place; an
+artifact with one width ranks exactly as before.
 
 ### 10.3 Epochs, staging and loans
 
 Unchanged from FN §9.2-§9.5 (frame epochs, slack frames, KV loans, the elastic VMM pool, display
-headroom). Staging slots are frames with a staging role, at most 32 (0.56 GiB).
+headroom), with pages in place of frames. Staging uses pages with a staging role, at most 128
+(0.53 GiB: 25-64 records; MXFP4: 32 frames, 0.56 GiB).
 
 ### 10.4 RAM tier
 
@@ -1199,9 +1568,11 @@ headroom). Staging slots are frames with a staging role, at most 32 (0.56 GiB).
   embedding (1.23 GiB pinned) − Engram row cache (0.26 GiB) − prefix Host tier (§18) − Program
   buffers − 1 GiB growth − 1.5 GiB of process memory. The expert share is pinned up to the pin room
   (shared system memory − NON_LOCAL usage − 1 GiB, ≈ 72 GiB of experts) and unpinned past it; the
-  landing ring (64 slots, 1.12 GiB) and 32 bounce slots come out of the pinned part.
-- **At 88 GiB available**: ≈ 79.8 GiB of experts → ≈ 4,000 pinned slots and ≈ 450 unpinned records
-  (29.2 % of the bank with the ring excluded). **At 79 GiB**: ≈ 26 %. **With other sessions holding
+  landing pages (256, 1.06 GiB: 51-128 records; MXFP4: 64 slots, 1.12 GiB) and 128 bounce pages
+  (MXFP4: 32 slots) come out of the pinned part.
+- **At 88 GiB available**: ≈ 79.8 GiB of experts → ≈ 17,350 pinned and ≈ 1,900 unpinned pages, about
+  41 % of the EXL3 bank (with VRAM about half, §5.7); MXFP4: ≈ 4,000 pinned slots and ≈ 450 unpinned
+  records (29.2 % of the bank with the ring excluded). **At 79 GiB**: ≈ 37 % (MXFP4 26 %). **With other sessions holding
   RAM** (24 GiB free on 2026-10-18) the tier shrinks to what is left above the headroom, or startup
   refuses below FN's minimum, naming the cause.
 - **Commit charge** (GLM §10.4): the ledger plans against the commit limit as well; the 200 GB page
@@ -1221,10 +1592,12 @@ idle refill at full bandwidth.
 
 ### 10.6 DSpark experts
 
-The 384 DSpark records form their own bank. The drafter never waits for them (§17.2): a bounded VRAM
-pool (default 96 frames, 1.68 GiB, carved from the frame pool; M7 sweeps 0-192) ranked by LFRU
-weighted by acceptance, and a RAM pool (default 192 slots, 3.4 GiB, taken from the tier only while
-DSpark is on).
+The 384 DSpark records form their own bank: in the EXL3 artifact the pack's K2 drafter experts,
+2 pages each (3.4 GB in all), so the whole drafter fits in 768 pages (3.2 GiB); in the MXFP4 artifact
+the official MXFP4 ones. The drafter never waits for them (§17.2): a bounded VRAM share (default
+192 pages, 0.80 GiB, 96 experts, taken from the page pool; M7 sweeps 0-768; MXFP4: 96 frames,
+1.68 GiB) ranked by LFRU weighted by acceptance, and a RAM share (default the rest of the drafter,
+576 pages, 2.4 GiB, taken from the tier only while DSpark is on; MXFP4: 192 slots, 3.4 GiB).
 
 ---
 
@@ -1237,19 +1610,21 @@ rounds that need them, IOCP on Windows and `io_uring` or a `pread` pool on Linux
 
 ### 11.1 Reading a record
 
-A record read is 12 unit reads of 1,568,768 B issued at once, landing at their offsets in one
-contiguous 17.95 MiB landing slot. With w = (4, 4, 4) on `D:` + `E:` + `G:` each drive serves four
-units; at the DMI-bound ≈ 4.7 GB/s per drive the record completes in ≈ 1.33 ms and its first gate/up
-units in ≈ 0.35 ms (model; R0 measures). Gate/up units are issued first, so CPU and GPU consumers
-start on them while the down units are in flight (GLM §11.4).
+An EXL3 record read is 8-20 unit reads of 1,114,112 B issued at once, landing in its 2-5 landing
+pages. With w = (4, 4, 4) on three drives each serves a third of the units; at the DMI-bound
+≈ 4.7 GB/s per drive a K3 record (12 units) completes in ≈ 0.95 ms, a K5 in ≈ 1.6 ms, and the first
+gate/up units in ≈ 0.25 ms (model; R0 measures). An MXFP4 record (M11) is 12 units of 1,568,768 B in
+one 17.95 MiB slot, ≈ 1.33 ms. Gate/up units are issued first, so CPU and GPU consumers start on
+them while the down units are in flight (GLM §11.4).
 
 ### 11.2 Depth and priority
 
-- **Per-volume caps**: demand 6, prompt stream 8, background 1, total 10 (1.5 MiB units between the
-  1 MiB/QD4 and 2 MiB/QD2 knees of GLM §3.3; §11.5 calibrates).
-- **Priorities**: Engram row reads on the Engram volume's drive (`E:`) > demand (current layer) >
-  prompt stream > lookahead > background refill. A 4 KiB Engram read queued behind four 1.5 MiB units
-  would wait ≈ 1.3 ms; it is issued ahead of queued units instead (§14.7).
+- **Per-volume caps**: demand 6, prompt stream 8, background 1, total 10 (1.06 MiB EXL3 units at the
+  1 MiB/QD4 knee of GLM §3.3, MXFP4's 1.5 MiB units between it and the 2 MiB/QD2 knee; §11.5
+  calibrates).
+- **Priorities**: Engram row reads on the Engram volume's drive > demand (current layer) > prompt
+  stream > lookahead > background refill. A 4 KiB Engram read queued behind four units would wait
+  ≈ 0.9 ms (MXFP4 1.3 ms); it is issued ahead of queued units instead (§14.7).
 
 ### 11.3 Lookahead
 
@@ -1261,13 +1636,19 @@ enabled only if it gains.
 
 ### 11.4 Placement on this machine
 
+For the EXL3 artifact (record times for a K3 record of 13.4 MB; space for its 191.7 GB of volumes):
+
 | Configuration | Bandwidth (§3) | Record time | Free space needed per drive | Advice |
 |---|---:|---:|---:|---|
-| **`D:` + `E:` + `G:`, w = (4, 4, 4)** | 14.15 GB/s | 1.33 ms | 98.8 GB | **Default.** `E:` also holds the Engram volume and the repository (builds can add tail latency; §11.5 warns) |
-| `D:` + `E:` + `G:`, w = (5, 4, 3) | 14.15 | 1.41 ms (+6 %) | 123.5 / 98.8 / 74.1 GB | When `G:` is short of space |
-| `D:` + `G:`, w = (6, 6) or (7, 5) | 12.73 | 1.56-1.73 ms | 148-173 GB on `D:` | `G:` cannot hold half the bank (108.7 GB free); (7, 5) needs 123.5 GB on `G:` |
-| `C:` + `D:` + `E:` + `G:`, w = (3, 3, 3, 3) | 19.27 | 1.03 ms (−23 %) | 74.1 GB | Fastest; needs 74 GB on the system drive (80.5 GB free today): opt-in only after freeing space there |
-| One volume | 5.9-7.0 | 2.7-3.2 ms | 296.4 GB | Supported; ≈ half of three-volume decode |
+| **Three chipset drives (`D:`, `E:`, `G:`), w = (4, 4, 4)** | 14.15 GB/s | 0.95 ms | 63.9 GB | **Default.** Keep the Engram volume and the repository's builds off the busiest volume where space allows (builds add tail latency; §11.5 warns) |
+| The same, w = (5, 4, 3) | 14.15 | 1.0 ms (+6 %) | 79.9 / 63.9 / 47.9 GB | When one drive is short of space |
+| Two drives, w = (6, 6) or (7, 5) | 12.73 | 1.05-1.17 ms | 95.8-111.8 GB | Decode 18.9 tok/s (model) |
+| `C:` + three chipset drives, w = (3, 3, 3, 3) | 19.27 | 0.69 ms (−27 %) | 47.9 GB | Fastest (22.7 tok/s, model); needs room on the system drive |
+| One volume | 5.9-7.0 | 1.9-2.3 ms | 191.7 GB | Supported; 11.4 tok/s (0.57× three volumes) |
+
+The MXFP4 artifact (M11) needs 98.8 GB per drive at w = (4, 4, 4) (1.33 ms records), 74.1 GB on four
+drives and 296.4 GB on one. Which drives hold the volumes is decided when the owner frees the space
+(§7.6); free space on 2026-10-24 was 141 / 144 / 18 / 80 GB on `C:` / `D:` / `E:` / `G:`.
 
 ### 11.5 Calibration, failures and integrity
 
@@ -1282,10 +1663,21 @@ hashing.
 
 ### 12.1 Role
 
-The CPU computes about 60 % of the RAM misses, every unpinned record's expert, and every SSD miss
-within the job cap, in place, with MX8: the same bits as the GPU.
+The CPU computes about half of the RAM misses (MXFP4: about 60 %), every unpinned record's expert,
+and every SSD miss within the job cap, in place: the same bits as the GPU.
 
 ### 12.2 Kernels and cost on the i9-13900K
+
+**EXL3 (the first artifact).** GLM §12.2's E3A16 kernel (AVX2 + AVX-VNNI, a scalar form as the exact
+oracle) with K per job and the record read through its page list: per weight a 16-bit state cut
+from the stream, the `mul1` multiply and byte sum, an int16 product into the block sum; the input
+rotations and block quantization once per job. Unlike the MXFP4 kernel it is **compute-bound**:
+GLM §12.2 estimates 0.2-0.4 ms per 6.3 MB GLM expert, which scales to ≈ 0.4-0.85 ms for a DeepSeek
+K3 expert; §5.7 carries 30 GB/s of weight bytes (≈ 0.35 ms at K2, 0.49 at K3, 0.8 at K5) and shows
+that half that rate costs ≈ 10 % of decode. The 13900K has no AVX-512, which adrienbrault's EXL3 CPU
+worker used to reach DRAM speed (GLM §4.4); M0's probe measures the P- and E-core rates per width.
+
+**MXFP4 (M11).**
 
 `cpu/mx8_expert.cpp`: an AVX2 + AVX-VNNI kernel and a scalar form (the exact oracle, shared with
 `ops/common/mx8.h`). Per 32 weights of one row and one column: the 16 code bytes decoded to int16 c2
@@ -1310,7 +1702,9 @@ table calibrated at start and kept across starts.
 Prompt experts the CPU computes cheaper than the link can deliver them: the thin ones. Under bounded
 replay every decoder expert sees ≈ 2 of the 128 replayed tokens (6 · 128 / 384), so **the CPU computes
 the decoder replay's non-VRAM experts from RAM and landing slots**, layer by layer, while the GPU runs
-the replay's dense work, taking most of ≈ 6,600 expert transfers per prompt off the link (§16.4). Any
+the replay's dense work, taking most of ≈ 6,600 expert transfers per prompt off the link (§16.4).
+Under the full rule (the default) the decoder suffix gives an expert about 2 tokens at layer 39 and
+40 at layer 20, so the CPU takes the thin experts of the later decoder layers by the same cut. Any
 column count is allowed, since every MX8 route is exact (GLM §12.4's argument); the cut per layer
 comes from the calibrated cost per expert-row.
 
@@ -1456,17 +1850,20 @@ through the 64-deep polled ring with per-block deduplication, and a volume that 
 
 ### 14.5 Formats and runtime choice (decision d)
 
-- The artifact's `engram_table.format` records its own table: `fp8_e4m3_e8m0_32` (official sources)
-  or `mxfp4_e8m0_32` (NVIDIA's current revision, LibertAIDAI).
-- **`--engram-volume PATH` replaces the table at run time with a volume of either format**, as
-  `--ngram-volume` does for Flash-Next (FN §12.5): an FP8 volume in place of an MXFP4 table restores
-  DeepSeek's own table; an MXFP4 volume in place of an FP8 table halves the volume, a lossy change
-  that the startup line and the request log label.
+- The artifact's `engram_table.format` records its own table: `fp8_e4m3_e8m0_32` (official sources),
+  `mxfp4_e8m0_32` (NVIDIA's current revision, LibertAIDAI) or `ggml_iq4_nl` (ISTA's or Unsloth's
+  1017 table: **the first artifact's**, decided 2026-10-24); `ggml_q5_k` and `ggml_q6_k` with option
+  O4.
+- **`--engram-volume PATH` replaces the table at run time with a volume of any of these formats**, as
+  `--ngram-volume` does for Flash-Next (FN §12.5): an FP8 volume in place of the IQ4_NL or an MXFP4
+  table restores DeepSeek's own table; a smaller format in place of a larger one saves disk, a lossy
+  change that the startup line and the request log label.
 - `--engram-reuse PATH` binds an existing volume at conversion after checking sampled rows (equal FP8
   rows, or FP8 rows that MXFP4-quantize to the artifact's codes by ModelOpt's rule);
   `verify_artifact --engram-rows all` checks every row.
 - Row decode on the device: FP8 rows bf16(e4m3 · 2^(u−127)), MXFP4 rows bf16(e2m1 · 2^(u−127)), both
-  exact.
+  exact. IQ4_NL rows are d · `kvalues_iq4nl[code]` (binary16 × int8), exact in FP32 and rounded once
+  to BF16; this format's BF16 values are defined by that rounding.
 - `--engram-residency auto|ram|volume`: `ram` only when the whole table fits beside the planned
   expert tier, which never happens on this machine (97-195 GiB), so `auto` reads the volume.
 - The prefix cache's fingerprint names the table format, so blocks computed with one table are never
@@ -1486,6 +1883,11 @@ memory-bound on `wkv`.
   hence their priority.
 - **Prompts**: ≤ 1.57 M reads per 32K before deduplication; at an estimated 0.5-1 M random reads per
   second from one 990 PRO (R0 measures the Windows ring at QD 64), ≈ 1-3 s, overlapping the bank pass.
+  The rate is not a given: Maya's 64 synchronous reader threads reached ≈ 0.1 M rows per second
+  (1.36 M rows in 13.4 s for a 28K prompt, §4.3), which here would add ≈ 15 s to a 32K prompt. M0's
+  probe must show ≥ 0.8 M reads per second, or the Engram rows are striped over the drives as the
+  expert units are. A compact build (§5.7) makes this more pressing, because its bank pass is
+  shorter.
 
 ---
 
@@ -1523,8 +1925,8 @@ memory-bound on `wkv`.
 
 | `--prompt-decoder` | Prompt tokens through the encoder | Decoder positions evaluated | Equals |
 |---|---|---|---|
-| **`replay`** (default) | all | the last min(T, 128), window attention truncated at the replay start | DeepSeek's served model (report §3.2.2; vLLM #56752; SGLang) |
-| `full` | all | the exact suffix: layer l evaluates the last 1 + (39 − l) · 127 positions after forming the 127 window entries before them | the reference forward (every prompt token through all 40 layers), output for output (DS4's method) |
+| `replay` | all | the last min(T, 128), window attention truncated at the replay start | DeepSeek's served model (report §3.2.2; vLLM #56752; SGLang) |
+| **`full`** (default, decision g) | all | the exact suffix: layer l evaluates the last 1 + (39 − l) · 127 positions after forming the 127 window entries before them | the reference forward (every prompt token through all 40 layers), output for output (DS4's method) |
 
 - Both rules are deterministic and request-invariant (§18.3); the rule is part of the prefix cache's
   fingerprint, the startup line and the request log.
@@ -1535,6 +1937,20 @@ memory-bound on `wkv`.
   CausalScoring therefore computes every position through all 40 layers, as the reference does, and
   says so in its output.
 
+**Measured since decision a** (Maya #342, §4.3): replay against the exact rule gave KL 1.6e-2 /
+6.6e-3 / 3.2e-4 after 4K / 8K / 26K-token prompts, with greedy text diverging at tokens 2 and 8, for
+24 / 24 / 15 % less prompt time on an SSD-bound 7900 XTX. The same engine's exact rule differed from
+its own full forward by 6.4e-4 / 6.1e-3 / 8.8e-5 (summation order), so replay's effect is clear at
+4K, within that noise at 8K and 3.6 × it at 26K; Infernix's rules have no such noise (§18.3), so
+here the difference is replay's alone. On this machine §5.5's model gives the full rule +7-13 %
+prompt time: a 4K prompt 11.8 → 13.1 s with MXFP4 records and 6.4 → 7.2 s with 3-bit ones; 32K at
+2,770 → 2,490 tok/s. Replay is the model DeepSeek serves and simulated in post-training, and GSM8K
+did not separate the two (§4.2); a KL says that they differ, not which is better. But both engines
+that measured it default to the exact rule, quality is measured by teacher-forced scoring, which runs
+every position through all 40 layers (§5.7's figures, and CausalScoring here), and the cost here is
+small. The owner therefore made `full` the default on 2026-10-24 (decision g), with `replay` kept as
+an option.
+
 ### 16.2 The encoder walk
 
 - Layer-major **walk spans** (FN §19.3.8 F4) over layers 0-19, plus layer 20's prefix work for every
@@ -1542,7 +1958,7 @@ memory-bound on `wkv`.
   KV (SGLang #42901 trims the rest of layer 20 the same way).
 - **Spans up to 128K tokens** (Flash-Next's `kWalkMaxTokens` is 65,536; this family's KV is small
   enough to double it): the walk's stream state is 40 KB per token (4 × 5,120 BF16), 5.2 GB at 128K,
-  lent from frames (FN F4's lease); the decoder and the head run after the span that holds the
+  lent from pages (FN F4's lease); the decoder and the head run after the span that holds the
   prompt's end.
 - **MoE groups** of up to 16,384 columns (FN F4) and **expert groups** of G experts in ascending id
   (GLM §17.2) with an FP32 accumulator per token: bit-identical to whole-layer processing, with
@@ -1580,7 +1996,7 @@ with n ≤ 8 columns, and the CPU takes thin non-resident ones. The guide states
 ### 16.5 After prefill
 
 No promotions after a walked prompt (L6); the prompt's routes seed both policies; when the walk
-returns its lent frames, the free-frame refill (§10.2) fills them with the hottest RAM experts.
+returns its lent pages, the free-page refill (§10.2) fills them with the hottest RAM experts.
 
 ---
 
@@ -1593,6 +2009,10 @@ returns its lent frames, the free-frame refill (§10.2) fills them with the hott
   card (§4.2).
 - DSpark's confidence head predicts each draft position's acceptance, which with the measured union
   growth is what the cost model needs each round.
+- Strata and Maya measured DSpark's sign flip with VRAM pressure: −18 to −61 % where the trunk's
+  experts did not fit, +37 to +55 % where they did (§4.3). Both decide once, at load or by an A/B. The
+  cost model here decides per round and also charges the pages the drafter holds (§19.1). With
+  compact experts (§5.7) it is more likely to pay: +36-46 % for the EXL3 artifact in the model.
 
 ### 17.2 The drafter
 
@@ -1617,7 +2037,7 @@ code edits.
 
 ### 17.4 N-gram copy proposals
 
-`--ngram-draft-tokens` through the same cost model; they need no drafter or DSpark frames.
+`--ngram-draft-tokens` through the same cost model; they need no drafter or DSpark pages.
 JigSawPT measured 97 % acceptance on verbatim text.
 
 ### 17.5 Default
@@ -1684,45 +2104,48 @@ tier as the spec defines it. DeepSeek keeps persistent KV on SSD for at least 72
 | DSpark dense | — | 0.65 |
 | Compressed entries and index keys, 128K (elastic) | 0.11 | 0.11 |
 | Windows (40 layers, + 3 DSpark) | < 0.01 | < 0.01 |
-| Decode workspace, mailboxes, residency tables, io | 0.70 | 0.70 |
-| Staging (32 slots) | 0.56 | 0.56 |
+| Decode workspace, mailboxes, residency tables and page lists, io | 0.70 | 0.70 |
+| Staging (128 pages) | 0.53 | 0.53 |
 | CUDA graph reserve; headroom | 0.25; 0.25 | 0.25; 0.25 |
-| DSpark expert pool (96 frames, §10.6) | — | 1.68 |
-| **Frame pool** (of the 30.68 GiB budget) | **20.32** | 17.99 |
-| Frames of 17.95 MiB | **1,159** (7.5 % of 15,360) | 1,026 |
+| DSpark expert share (192 pages, §10.6) | — | 0.80 |
+| **Page pool** (of the 30.68 GiB budget) | **20.35** | 18.90 |
+| Pages of 4.25 MiB | **≈ 4,900** (≈ 1,250-1,600 experts, 8-10 % of 15,360) | ≈ 4,550 |
 
-At 1M actual context the KV takes 0.72 GiB more (−41 frames). A further lane costs its windows and KV
-extent only (≈ 3 MB + 890 B per token): there is no recurrent state.
+The MXFP4 artifact (M11) stages 32 frames (0.56 GiB) and holds 96 DSpark frames (1.68 GiB): a frame
+pool of 20.32 / 17.99 GiB, **1,159** / 1,026 frames of 17.95 MiB (7.5 %). At 1M actual context the
+KV takes 0.72 GiB more (−173 pages; MXFP4 −41 frames). A further lane costs its windows and KV extent
+only (≈ 3 MB + 890 B per token): there is no recurrent state.
 
 ### 19.2 Host RAM (95.8 GiB visible)
 
 | Item | GiB |
 |---|---:|
-| RAM expert tier: pinned up to the pin room, unpinned past it; includes the 64-slot landing ring (1.12) and 32 bounce slots (0.56) | the rest |
+| RAM expert tier: pinned up to the pin room, unpinned past it; includes 256 landing pages (1.06) and 128 bounce pages (0.53) (MXFP4: a 64-slot landing ring, 1.12, and 32 bounce slots, 0.56) | the rest |
 | Token embedding, pinned | 1.23 |
-| Engram row cache | 0.26 (FP8 rows) / 0.13 (MXFP4) |
+| Engram row cache | 0.26 (FP8 rows) / 0.13 (MXFP4) / 0.14 (IQ4_NL) |
 | Prefix Host tier | 2.0 (default) |
 | Program pinned buffers | 0.25 |
 | Process (tokenizer, server, frontend) | 1.5 |
 | Reserve `--ram-headroom-mib`; growth allowance | 2.0; 1.0 |
-| DSpark RAM pool (with DSpark only) | 3.37 |
+| DSpark RAM share (with DSpark only) | 2.4 (MXFP4: 3.37) |
 
-| Available at startup | Expert tier | Pinned / unpinned | Slots (ring excluded) | Share of 15,360 | With VRAM frames |
-|---:|---:|---:|---:|---:|---:|
-| 88 GiB (other programs closed) | 79.8 GiB | ≈ 72 / 7.8 GiB | 4,485 | 29.2 % | 36.7 % |
-| 79 GiB | 70.8 GiB | 70.8 / 0 | 3,972 | 25.9 % | 33.4 % |
-| 50 GiB (other sessions running) | 41.8 GiB | 41.8 / 0 | 2,318 | 15.1 % | 22.6 % |
+| Available at startup | Expert tier | Pinned / unpinned | EXL3: pages, share of experts, with VRAM | MXFP4: slots (ring excluded), share, with VRAM |
+|---:|---:|---:|---:|---:|
+| 88 GiB (other programs closed) | 79.8 GiB | ≈ 72 / 7.8 GiB | ≈ 19,200, ≈ 41 %, ≈ 51 % | 4,485, 29.2 %, 36.7 % |
+| 79 GiB | 70.8 GiB | 70.8 / 0 | ≈ 17,050, ≈ 37 %, ≈ 46 % | 3,972, 25.9 %, 33.4 % |
+| 50 GiB (other sessions running) | 41.8 GiB | 41.8 / 0 | ≈ 10,050, ≈ 21 %, ≈ 30 % | 2,318, 15.1 %, 22.6 % |
 
-Every GiB other programs release becomes ≈ 57 more slots; the startup ledger prints the split.
+Every GiB other programs release becomes ≈ 240 more pages (MXFP4: ≈ 57 slots); the startup ledger
+prints the split. The EXL3 shares are estimates: the tier holds warm experts of mixed widths.
 
 ### 19.3 Disk
 
 | Item | Size | Where (default) |
 |---|---:|---|
-| Source shards during conversion | ≤ 2 × 7.4 GB at a time | `D:` (deleted shard by shard, §7.6) |
-| Main artifact | ≈ 11 GB | `E:` |
-| Expert volumes, w = (4, 4, 4) | 3 × 98.8 GB | `D:`, `E:`, `G:` |
-| Engram volume (FP8 / MXFP4) | 209.7 / 104.9 GB | `E:` |
+| Source shards during conversion | ≤ 2 × 7.4 GB at a time; the Engram shards are streamed | any drive (deleted shard by shard, §7.6) |
+| Main artifact | ≈ 11 GB | any |
+| Expert volumes, w = (4, 4, 4) | 3 × 63.9 GB (MXFP4, M11: 3 × 98.8 GB) | three drives chosen when the owner frees space (§11.4) |
+| Engram volume (FP8 / MXFP4 / IQ4_NL) | 209.7 / 104.9 / 112.4 GB, one per checkpoint | one drive, or striped (§14.7) |
 | Expert state file | < 1 MB | beside the artifact |
 | Prefix-cache file tier | 29 MB per 32K conversation | configurable |
 
@@ -1740,22 +2163,31 @@ model shapes.
 |---|---|
 | MX8 codec (`ops/common/mx8.h`) | **Exact, exhaustive** over every BF16 input and block exponent: the CPU integer form, the GPU `cvt.rn.satfinite` form and a Python port of `act_quant` agree, including the 1e-4 floor and the ceiling rule at powers of two |
 | `fp8_e4m3fn_b32_e8m0` Linear, decode and prompt routes | **Bit-exact** between routes and against the scalar form at T = 1..8 and prompt widths, every DeepSeek shape including grouped `wo_a`; column invariance for T ≤ 8; FP64 oracle of the same quantized operands within the FP32 rounding bound |
-| `offloaded_sparse_moe`, MXFP4 and NVFP4 records, MX8 | **Bit-exact** across GPU frame, staging, CPU on every ISA, unpinned record, every unit landing order, n = 1..8 and the wide route; MXFP4 and NVFP4 records of one expert give the same bits; routing exact against an FP64 √softplus/bias/top-6 oracle on near-tie-free inputs, ties by lower id, logits beyond ±20; clamp boundaries (±10, NaN, Inf); the routing weight before the down projection |
+| EXL3 codec (shared with GLM) at K = 2-5 | **Exact**: the scalar E3A16 form against GLM §20.1's oracle (an FP64 evaluation of ExLlamaV3's decode for the codebook values, exact integer sums), every width, both input widths (5,120 and 2,304), and the pack's sampled experts decoded by ExLlamaV3 at the producing version within its FP16 rounding of the codebook |
+| `offloaded_sparse_moe`, EXL3 records in pages, MX8 → E3A16 | **Bit-exact** across GPU pages (any page order in the page list), staging, CPU on every ISA, unpinned pages, every unit landing order, n = 1..8 and the wide route; calls mixing all four widths; the routing, clamp and combine checks of the MXFP4 row below |
+| `offloaded_sparse_moe`, MXFP4 and NVFP4 records, MX8 (M11) | **Bit-exact** across GPU frame, staging, CPU on every ISA, unpinned record, every unit landing order, n = 1..8 and the wide route; MXFP4 and NVFP4 records of one expert give the same bits; routing exact against an FP64 √softplus/bias/top-6 oracle on near-tie-free inputs, ties by lower id, logits beyond ±20; clamp boundaries (±10, NaN, Inf); the routing weight before the down projection |
 | `csa_compressor`, index keys | FP64 pooling and norm; FP4 and MXFP4 packing exact against a Python port of `fp4_act_quant`, exhaustive over block exponents |
 | `csa_indexer` | exact q · k against integer arithmetic; FP64 weighted sums; exact selection on near-tie-free fixtures; selection agreement on real activations, also against the reference's BF16 scores (reported) |
 | `csa_attention` | FP64 softmax attention with the sink over the decoded entries; replay's window truncation; inverse RoPE |
 | `mhc` | FP64 including all 20 Sinkhorn rounds; one-rounding stream update |
 | `engram` | hash ids exact against `engram.py`; row decode exact for both formats; the block against FP64 |
 | DSpark attention, Markov and confidence heads | FP64 |
-| Records and volumes | MX recovery from NVIDIA's NVFP4 equals the official MXFP4 bytes on the whole September bank; every unit read through the striped reader equals the converter's bytes, in permuted completion orders and at fault seams; Engram volumes equal the source rows (FP8) or ModelOpt's MXFP4 rows |
+| Records and volumes | Every EXL3 record's tensors equal the pack's bytes and its width equals the plan's; every unit read through the striped reader equals the converter's bytes, in permuted completion orders and at fault seams; page lists address every page of every width; Engram volumes equal the source rows (FP8) or ModelOpt's MXFP4 rows; (M11) MX recovery from NVIDIA's NVFP4 equals the official MXFP4 bytes on the whole September bank |
 
 ### 20.2 Reference forwards and block checks
 
 `tools/deepseek_v41/reference_forward.py` (a qualification tool, not a product route): teacher-forced
-and layer-major, streaming each layer's weights from the converted artifact through an independent
-Python decoder and Engram rows from the volume, with FP64 accumulation over `model.py`'s quantized
-operands (MX8 activations, FP8 and FP4 KV entries, BF16 roundings where `model.py` has them). It has
-both prompt rules. `block_check.py` compares each layer type, the head and the DSpark blocks with an
+and layer-major, with FP64 accumulation over `model.py`'s quantized operands (MX8 activations, FP8 and
+FP4 KV entries, BF16 roundings where `model.py` has them). It has both prompt rules and two weight
+sources:
+
+- **the converted artifact**, streaming each layer's weights through an independent Python decoder
+  (for the EXL3 artifact, GLM §20.1's FP64 EXL3 decoder of each expert's matrix, applied after MX8)
+  and Engram rows from the volume: the reference of the execution gate;
+- **the official release**, streaming one shard at a time by download and delete (510 GB read, at
+  most ≈ 15 GB on disk; the Engram rows by range read): the original model's logits for the quality
+  report, without an MXFP4 artifact. Layer-major order lets every scored text pass a layer before
+  its shard is deleted. `block_check.py` compares each layer type, the head and the DSpark blocks with an
 FP64 evaluation on the model's own activations; M0 checks Transformers 5.6's `deepseek_v41`
 implementation against `model.py` and uses its modules for single-module agreement where they
 match.
@@ -1770,18 +2202,25 @@ check for the September checkpoint.
 
 | Gate | Against | Mean KL | p99 per-token KL | Top-1 agreement | Perplexity change |
 |---|---|---:|---:|---:|---:|
-| **Execution**, each prompt rule | the reference forward of the same rule | ≤ 0.001 nats | ≤ 0.03 | ≥ 99.5 % | ≤ 0.1 % |
-| MXFP4 records against NVFP4 records | each other | bit-identical | | | |
-| Official source against NVIDIA source (September, FP8 Engram) | each other | bit-identical | | | |
+| **Execution**, each prompt rule | the reference forward of the same rule over the artifact's own values (§20.2) | ≤ 0.001 nats | ≤ 0.03 | ≥ 99.5 % | ≤ 0.1 % |
+| (M11) MXFP4 records against NVFP4 records | each other | bit-identical | | | |
+| (M11) Official source against NVIDIA source (September, FP8 Engram) | each other | bit-identical | | | |
 
 The execution gate is tighter than GLM §20.3's because Infernix computes the reference's own
-quantized arithmetic; what remains is the accumulation order and the indexer's score precision
-(§20.4).
+quantized arithmetic; what remains is the accumulation order, the indexer's score precision
+(§20.4) and, for EXL3 experts, E3A16's 14-bit block activations against the reference's FP64
+evaluation of the same decoded matrices (GLM §9.5 bounds them far below the format's error).
 
-**Reported without a gate** (the owner's choices): replay against full (KL and top-1 on the same texts,
-and the official fixtures' NLL under each); MXFP4 Engram tables against FP8 (KL, top-1, perplexity),
-beside diffbot's 0.035 for vLLM's W4A4 + MXFP4-Engram serving; and, for the September checkpoint,
-Infernix's NLL on the official fixtures beside DS4's Q2 and Q4 references (§4.1).
+**Reported without a gate** (the owner's choices): **the EXL3 artifact against the original model**:
+its logits against the official release's (§20.2) on the same texts (KL, top-1, perplexity by
+category: code, agent, documents, chat, CJK, prose), beside the pack's published KL 0.0201 and
+top-1 95.96 % (§5.7), with **the IQ4_NL table's share** separated: the artifact-weights reference
+forward run once with the IQ4_NL rows and once with the official FP8 rows (streamed from the release),
+so the experts' and the table's contributions are reported apart; replay against full (KL and top-1
+on the same texts, and the official fixtures' NLL under each); MXFP4 Engram tables against FP8 (KL,
+top-1, perplexity), beside diffbot's 0.035 for vLLM's W4A4 + MXFP4-Engram serving; and, for the
+September checkpoint, Infernix's NLL on the official fixtures beside DS4's Q2 and Q4 references
+(§4.1).
 
 ### 20.4 Deviations from `inference/model.py`
 
@@ -1798,10 +2237,14 @@ Every BF16, FP8 and FP4 rounding point of `model.py` is kept.
 
 ### 20.5 Engine and system tests
 
-- **Placement invariance end to end**: greedy ids identical with `--expert-frames 0`, small and full
+- **Placement invariance end to end**: greedy ids identical with no VRAM experts, small and full
   VRAM caches; RAM tier caps of 16, 48 GiB and full; unpinned records forced; one, two and three
-  volumes; lookahead off and on; every CPU ISA; random unit landing order; CPU cap 0 and 16.
-- **Record formats**: an MXFP4 and an NVFP4 artifact of one checkpoint give identical ids.
+  volumes; lookahead off and on; every CPU ISA; random unit landing order; CPU cap 0 and 16;
+  shuffled and fragmented page assignments (the same expert in different pages across runs).
+- **Page pool**: under eviction pressure with all four widths no page is shared or leaked (an audit
+  after every round in the test build); a single-width artifact (Qwen4Exp) keeps every decision bit
+  for bit.
+- **Record formats (M11)**: an MXFP4 and an NVFP4 artifact of one checkpoint give identical ids.
 - **Prompt rules**: replay is identical across chunk sizes and prefix-cache states; the full rule
   matches the reference forward's full-prompt logits within the execution gate; replay matches the
   reference's replay variant.
@@ -1853,14 +2296,14 @@ Every BF16, FP8 and FP4 rounding point of `model.py` is kept.
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--prompt-decoder replay\|full` | `replay` | Decision a (§16); **changes output**; `full` equals the reference forward |
+| `--prompt-decoder full\|replay` | `full` | Decision g (§16); `full` equals the reference forward; `replay` is DeepSeek's served rule and **changes output** |
 | `--expert-volume PATH` (repeat) | required | The artifact's expert volumes, any order; startup checks ids, sizes and headers |
 | `--engram-volume PATH`, `--engram-residency auto\|ram\|volume` | the artifact's own; auto | Decision d (§14.5); a volume of the other format **changes output** and is labelled |
 | `--expert-ram-mib N\|auto`, `--expert-pin-mib N`, `--ram-headroom-mib N` | auto, auto, 2048 | RAM tier (FN §19.3.7) |
 | `--vram-headroom-mib N\|auto`, `--expert-state FILE\|off` | auto, beside the artifact | As FN |
 | `--ssd-lookahead off\|1\|2\|3` | off | §11.3 |
 | `--cpu-experts auto\|off\|N`, `--cpu-expert-cores p\|pe` | auto, auto | §12.3 |
-| `--spec off\|dspark\|auto`, `--dspark-expert-frames N\|auto`, `--draft-tokens auto\|N` | off until M7 | §17 |
+| `--spec off\|dspark\|auto`, `--dspark-expert-pages N\|auto`, `--draft-tokens auto\|N` | off until M7 | §17 |
 | `--ngram-draft-tokens N` | off | Copy proposals |
 | `--kv-dtype model` | `model` | The only accepted value (§13.5) |
 | `--max-context N` | 131072 | Up to 1,048,576 |
@@ -1869,14 +2312,18 @@ Every BF16, FP8 and FP4 rounding point of `model.py` is kept.
 | `--reasoning-effort 1..100\|low\|high\|max\|off` | high (75) | Request default; requests may override |
 | `--approx-experts off\|ssd\|vram`, `--approx-keep-map`, `--approx-min-weight θ`, `--approx-experts-rule residency\|static` | off | §9.8; **changes output** |
 
-Converter: `--recipe deepseek_v4_1_flash` (or an official entry, §7.1) with `--source REPO@REV`
-(streamed shard by shard, §7.6) or `--source DIR`; `--expert-volumes P0,P1,…` and
+Converter: `--recipe deepseek_v4_1_flash_exl3` with `--experts REPO@REV` (the EXL3 pack) and
+`--source REPO@REV` (the official release), or `--recipe deepseek_v4_1_flash` (M11, or an official
+entry, §7.1) with `--source REPO@REV`; either source streamed shard by shard (§7.6) or given as
+`DIR`; `--expert-volumes P0,P1,…` and
 `--expert-volume-weights w0,w1,…` (default chosen from free space and bandwidth); `--engram-volume PATH`,
-`--engram-format fp8|mxfp4` (default: the source's), `--engram-reuse PATH`;
-`--expert-record mxfp4|nvfp4|auto`; `--staging DIR`; `--plan` (print the disk plan and stop). Tools:
-`tools.artifact.restripe`, `tools.deepseek_v41.verify_artifact`, `tools.deepseek_v41.reference_forward`,
+`--engram-format fp8|mxfp4` (default: the source's), `--engram-gguf FILE` (a published IQ4_NL table,
+the EXL3 recipe's default, or with O4 a Q5_K or Q6_K one; rows copied verbatim), `--engram-reuse PATH`;
+`--expert-record mxfp4|nvfp4|auto` (M11); `--staging DIR`; `--plan` (print the disk plan and stop).
+Tools: `tools.artifact.restripe`, `tools.deepseek_v41.verify_artifact`,
+`tools.deepseek_v41.reference_forward` (`--weights artifact|official`),
 `tools.deepseek_v41.block_check`, `tools.deepseek_v41.decode_model`; `infernix-calibrate` gains the
-striped-read, Engram-read and CPU MX8 probes.
+striped-read, Engram-read and CPU MX8 and E3A16 probes.
 
 ---
 
@@ -1884,26 +2331,30 @@ striped-read, Engram-read and CPU MX8 probes.
 
 | # | Milestone | Deliverables | Exit criteria |
 |---|---|---|---|
-| **M0** | Facts | September-vs-1017 comparison of tensors and Engram rows (range reads); the official MXFP4 scale rule on sampled blocks; NVFP4 → MXFP4 recovery on sampled NVIDIA blocks; ModelOpt's MXFP4 Engram rule against NVIDIA's rows; Transformers 5.6 `deepseek_v41` against `model.py`; encoding fixtures and tokenizer files; DS4's suffix rule against `model.py`; C++ probes (`tools/deepseek_v41_probe/`): striped 1.5 MiB reads on `D:` + `E:` + `G:` through IOCP, Engram 4 KiB reads on `E:` under concurrent unit reads, CPU MX8 at 18.8 MB per expert on P- and E-cores, the pin room with this plan's buffers | §2, §3, §5 inputs and §7.1's rules confirmed or revised; §5 re-run |
-| **M1** | Traces and policy | Route traces from M4's engine on NRS and a broad corpus (code, chat, CJK, tool use, long context); replay of the §10.2 and §10.4 candidates; the union growth σ and lookahead recall | Policies chosen by the fixed rules; §5.2 replaced by measured hit rates |
-| **M2** | Shared components | `src/models/offload/`, expert volumes, the striped reader and the row-volume reader, unless GLM's track built them first | Qwen4Exp's tests unchanged; greedy ids identical; tg512 within noise |
-| **M3** | Ops | MX8 codec; `fp8_e4m3fn_b32_e8m0` Linear; MXFP4 and NVFP4 experts with MX8 on the GPU and the CPU; router; `csa_compressor`, `csa_indexer`, `csa_attention`; `mhc`; `engram`; DSpark Ops; the MXFP4-against-NVFP4 kernel timings (decision c) | Every §20.1 qualification passes; the timing table recorded |
-| **M4** | Artifact and functional model | Recipe and official entries, the streaming converter with its disk planner, MX recovery, volumes, restripe, `verify_artifact`; Engine, CLI, bench and CausalScoring with one volume; both prompt rules; the reference forwards | Every tensor round-trips; §20.2 checks; the execution gates for both rules; the §20.3 reports; first end-to-end numbers |
-| **M5** | Tiers at scale | Three volumes, landing ring, partial records, M1's policies, promotion sweep, CPU sweep, unpinned records, warm start, lookahead A/B, the MXFP4 and NVFP4 artifacts end to end | §20.5 invariance and fault tests; decode Must target; three volumes ≥ 1.8× one |
+| **M0** | Facts | ~~September-vs-1017 comparison of tensors and Engram rows~~ (done 2026-10-24, §2.6); the EXL3 pack: revision, base revision, tensor names, `exl3_moe_plan.json` against the tensors, tile order, bit order and Hadamard scale against ExLlamaV3 at the producing version (GLM §9.5's list), sampled experts decoded by ExLlamaV3 and by an independent FP64 decoder; the IQ4_NL Engram table (§7.1's checks: ISTA's against Unsloth's row data, sampled rows against the official 1017 FP8 rows, the split between the two tables); Transformers 5.6 `deepseek_v41` against `model.py`; encoding fixtures and tokenizer files; DS4's suffix rule against `model.py`; C++ probes (`tools/deepseek_v41_probe/`): striped 1.06 MiB reads over three drives through IOCP, Engram 4 KiB reads under concurrent unit reads (≥ 0.8 M per second, §14.7), CPU E3A16 per width on P- and E-cores, CPU MX8 for the dense rows, the pin room with this plan's buffers | §2, §3, §5.7 inputs and §7.1's rules confirmed or revised; §5.7 re-run |
+| **M1** | Traces and policy | Route traces from M4's engine on NRS and a broad corpus (code, chat, CJK, tool use, long context); replay of the §10.2 and §10.4 candidates by value per page with the pack's widths; the union growth σ and lookahead recall | Policies chosen by the fixed rules; §5.2 replaced by measured hit rates |
+| **M2** | Shared components | `src/models/offload/` **with the page pool** (§8.2): pages, page lists, value-per-page eviction, paged staging, landing and bounce storage; expert volumes with width banks, the striped reader and the row-volume reader; built here, GLM reuses them (owner, 2026-10-24) | Qwen4Exp's tests unchanged (one page per record); greedy ids identical; tg512 within noise; the page audit of §20.5 |
+| **M3** | Ops | MX8 codec; `fp8_e4m3fn_b32_e8m0` Linear; the EXL3 codec at K = 2-6 (built here, reused by GLM) and `offloaded_sparse_moe`'s `exl3_mul1` routes (narrow, wide, CPU) with mixed widths and page lists, also qualified at GLM's expert geometry; router; `csa_compressor`, `csa_indexer`, `csa_attention`; `mhc`; `engram`; DSpark Ops | Every §20.1 qualification passes; per-width kernel times recorded |
+| **M4** | Artifact and functional model | The EXL3 recipe, the streaming converter with its disk planner (run when the owner has freed the space), volumes, restripe, `verify_artifact`; Engine, CLI, bench and CausalScoring with one volume; both prompt rules; both reference forwards (artifact, official) | Every tensor round-trips; §20.2 checks; the execution gates for both rules; the §20.3 reports, the EXL3 artifact against the original model first; first end-to-end numbers |
+| **M5** | Tiers at scale | Three volumes, landing pages, partial records, M1's policies, promotion sweep, CPU sweep per width, unpinned pages, warm start, lookahead A/B | §20.5 invariance and fault tests; decode Must target; three volumes ≥ 1.6× one |
 | **M6** | Decode speed | §9.3's kernels and fusions, stall-time warming; nsys attribution of one token | Per-kernel times against the budget; anything > 30 % over gets ncu before M7 |
 | **M7** | Speculation | DSpark drafter (bounded experts, Markov and confidence heads), the cost model with σ and confidence, n-gram proposals | Default chosen by measurement; never slower than plain beyond noise |
 | **M7a** | Approximate mode | §9.8 | Mode off bit-identical to a build without it; presets meet the gates |
 | **M8** | Prompts and long context | 128K walk spans, prompt kernels, the CPU decoder replay, the full rule's suffix, indexer prompt scoring, 1M context | Prompt Must targets; decode at 128K ≥ 90 % of 4K |
 | **M9** | Frontend and serving | Tokenizer, encoding, DSML parser, protocol schema tests, prefix-cache binding for both rules | Tokenizer and encoding oracles exact; serving schema tests; prefix-cache real tests |
-| **M10** | Report | DS4 under WSL2 and the §4.2 engines that run here, head to head; the §1.4 table filled | Every result reported, favourable or not |
+| **M10** | Report | Strata, Maya, DS4 under WSL2 and the §4.2 engines that run here, head to head; the §1.4 table filled | Every result reported, favourable or not |
+| **M11** (deferred) | The MXFP4 artifact | `mxfp4_expert_v1` and `nvfp4_expert_rg16_v1` records (one page each), MX8 MXFP4 and NVFP4 routes on the GPU and the CPU, MX recovery, the official and NVIDIA recipes, the MXFP4-against-NVFP4 timings (decision c); the official scale rule, NVFP4 → MXFP4 recovery and ModelOpt's MXFP4 Engram rule on sampled blocks | The MXFP4 rows of §20.1 and §20.3; its §1.4 column |
 
 Critical path: M0 → M2 ∥ M3 → M4 → M1 → M5 → M6, then M7 and M8; M9 can start now (the tokenizer
-and encoding files are read). Rough size: ~30-34k new or moved lines (CSA2 Ops ~5k; MX8 codec, the
-FP8-b32 Linear and the expert routes with the CPU kernel ~6k; Engram ~1.5k; DSpark ~2.5k; mHC ~1k and
-volumes with the reader ~2k, shared with GLM; offload extraction ~3.5k moved; frontend ~2.5k;
-converter and tools including the streaming conversion and the reference forward ~4k; tests ~8k),
-≈ 6-7k fewer if GLM's track builds the shared pieces first, plus the 510 GB download and GPU time for
-the campaigns.
+and encoding files are read). Rough size: ~35-39k new or moved lines (CSA2 Ops ~5k; MX8 codec and the
+FP8-b32 Linear ~3k; the EXL3 codec and expert routes with the CPU kernel at K = 2-5 ~5-6k; the page
+pool ~2.5-3.5k; Engram ~1.5k; DSpark ~2.5k; mHC ~1k and volumes with the reader ~2.5k, shared with
+GLM; offload extraction ~3.5k moved; frontend ~2.5k; converter and tools including the streaming
+conversion and both reference forwards ~4.5k; tests ~9k), plus the ≈ 313 GB download and GPU time
+for the campaigns. About 9-11k of these lines (offload extraction, page pool, volumes and readers,
+mHC, the EXL3 codec and expert routes) are the shared pieces GLM's track then reuses. M11 adds ~4-5k later. At Flash-Next's pace (~34k lines in
+about six intensive days, GLM §23) the page pool and per-expert widths are about a day of the total;
+the GPU qualification and policy campaigns cost more than the code.
 
 ---
 
@@ -1913,12 +2364,13 @@ When the implementation lands: a user guide `docs/deepseek_v4_1-flash.md` (hardw
 of a fresh prompt, the prompt rules, Engram formats); README models and benchmarks; `docs/cli.md` and
 `docs/serving.md` (expert and Engram volumes, `--prompt-decoder`, DSML, reasoning effort); a
 mathematics reference `docs/maintainer/deepseek_v41-model.md` from §2.2-§2.3;
-[storage layouts](storage-layouts.md) (`mxfp4_expert_v1`, `nvfp4_expert_rg16_v1` at this geometry,
-the Engram row formats, `fp8_e4m3fn_b32_e8m0`); [tensor formats](tensor-formats.md) (MXFP4, MX8,
-FP8 with 32 × 32 power-of-two scales); [op development](op-development.md) (MX8 qualification);
-[artifact container](artifact-container.md) (expert and Engram volumes);
-[engine architecture](engine-architecture.md) (the new architecture, prompt rules as a model mode,
-shared offload components); [paged KV](paged-kv-cache.md) (compressed planes and windows);
+[storage layouts](storage-layouts.md) (`exl3_expert_v1` and its pages, width banks, the Engram row
+formats, `fp8_e4m3fn_b32_e8m0`; with M11, `mxfp4_expert_v1` and `nvfp4_expert_rg16_v1` at this
+geometry); [tensor formats](tensor-formats.md) (EXL3 with a width per record, MX8, FP8 with 32 × 32
+power-of-two scales; MXFP4 with M11); [op development](op-development.md) (MX8 and E3A16
+qualification); [artifact container](artifact-container.md) (expert and Engram volumes, the expert →
+bank table); [engine architecture](engine-architecture.md) (the new architecture, prompt rules as a
+model mode, shared offload components and the page pool); [paged KV](paged-kv-cache.md) (compressed planes and windows);
 [hybrid prefix cache](hybrid-prefix-cache-spec.md) (the binding and its snapshots);
 [model quality](model-quality.md) (§6 for this family's configurations); the conversion guide (the
 streaming conversion). This file is then removed.
@@ -1931,48 +2383,66 @@ streaming conversion). This file is then removed.
 
 | Risk | Effect | Mitigation |
 |---|---|---|
-| §5's model is optimistic, as GLM's was by 15-45 % against strata-glm | decode ≈ 9-11 tok/s central | M4's first numbers refit the overhead terms; M6 attributes one token with nsys |
-| Hit rates below central (JigSawPT's 59-66 % VRAM hits came with a 125.7 GiB host) | decode toward 10 tok/s | M1 first; the policy candidates; the RAM lever of §5.6 in the guide |
-| `G:` short of space when the conversion runs | slower weighting (+6 % record time) or a fourth volume | the planner (§7.6) |
+| §5's model is optimistic, as GLM's was by 15-45 % against strata-glm | EXL3 decode ≈ 14-17 tok/s central (MXFP4 ≈ 9-11) | M4's first numbers refit the overhead terms; M6 attributes one token with nsys |
+| Hit rates below central (JigSawPT's 59-66 % VRAM hits came with a 125.7 GiB host; Maya's agent traffic sat below hipfire's curve) | decode toward the low end of §5.7's range (EXL3 16 tok/s) | M1 first; the policy candidates; the RAM lever of §5.6 in the guide |
+| Too little disk when the conversion runs (383 GB free on 2026-10-24 against ≈ 315 GB plus staging, ≈ 412 GB with FP8 Engram rows) | slower weighting (+6 % record time), a 4-bit Engram volume, or no conversion | the owner frees space first (§1.2); the planner (§7.6) |
+| The EXL3 artifact's quality here differs from the pack's published figure (MX8 inputs and E3A16 instead of the pack's FP16 runtime; official dense weights instead of its EXL3 K5 dense; the IQ4_NL table instead of the FP8 rows it was measured with; a single-source panel) | the first artifact is worse, or better, than chosen for | §20.3's report against the original model in M4, with the table's share separated, before anything else is tuned; sudoingx's pack and diffbot's K3 use the same recipe; a Q5_K, Q6_K or FP8 table per run (O4) |
+| The pack's format details (tile order, bit order, Hadamard scale, codebook at the producing ExLlamaV3 version; a vLLM plugin's tensor naming) | wrong expert values | M0 checks them against ExLlamaV3 and an independent FP64 decoder, and the plan file against every tensor |
+| Value-per-page eviction ranks wide experts badly (thrash between widths) | more SSD reads than §5.7 assumes | M1's trace replay with the widths; a single-width artifact behaves as today |
 | Other sessions holding RAM on this machine | a smaller tier, more SSD reads | the startup ledger; the guide states it |
 | Drive thermal throttling under sustained reads; `E:` busy with builds | stalls | per-volume telemetry and warnings (§11.5) |
 | Engram reads queued behind expert units | layer-1 stalls | read priority (§11.2); measured in M0 |
-| MXFP4 kernels slower than NVFP4 | decision c falls back | M3 and M5 timings; NVFP4 records built anyway |
-| Some NVIDIA NVFP4 blocks not MX-recoverable | that source stores NVFP4 records | per-bank fallback (§7.1) |
+| (M11) MXFP4 kernels slower than NVFP4 | decision c falls back | M11 timings; NVFP4 records built anyway |
+| (M11) Some NVIDIA NVFP4 blocks not MX-recoverable | that source stores NVFP4 records | per-bank fallback (§7.1) |
 | Router near-ties (JigSawPT: the 6th-to-7th margin is about 1 %; 208 of 240 choices agreed between their runs) | differences from the reference at near-ties | exact FP32 logits, lower-id ties; agreement reported |
-| Replay costs more quality than DeepSeek's GSM8K suggests | the default questioned | the §20.3 report; `--prompt-decoder full` |
-| The 510 GB download is interrupted | time | the resumable shard journal |
+| The full rule's suffix costs more than modelled (the decoder's thick experts at layers 20-25 on the wide route) | prompt targets of §1.4 missed | M8 measures it; `--prompt-decoder replay` stays available |
+| EXL3's CPU decode on AVX2 slower than estimated (unmeasured on this CPU) | the EXL3 artifact ≈ 5-10 % slower (§5.7) | M0's CPU probe; the link takes more of the split |
+| The Engram read rate in prompts (Maya: ≈ 0.1 M rows per second) | +15 s on a 32K prompt | M0's probe (§14.7) |
+| The ≈ 313 GB download (510 GB for M11) is interrupted | time | the resumable shard journal |
 | DSpark slower than plain | no speculative gain | off by default; K = 0 in the cost model |
 | Upstream ambiguities (encoding details, Transformers against `model.py`) | wrong frontend or mathematics | M0 oracles against `encoding/tests` and `model.py` |
 
 ### 25.2 Open questions for M0
 
-1. Did the 1017 update change the Engram tables and the DSpark weights?
-2. Do DeepSeek's MXFP4 scales follow ⌊log₂ amax⌋ − 2 on every non-zero block, so that recovery is
-   byte-identical?
-3. Does every block of NVIDIA's NVFP4 export recover to MXFP4?
+1. ~~Did the 1017 update change the Engram tables and the DSpark weights?~~ Yes, every sampled tensor
+   (§2.6, 2026-10-24).
+2. (M11) Do DeepSeek's MXFP4 scales follow ⌊log₂ amax⌋ − 2 on every non-zero block, so that
+   recovery is byte-identical?
+3. (M11) Does every block of NVIDIA's NVFP4 export recover to MXFP4?
 4. Does Transformers 5.6 implement `deepseek_v41` as `model.py` does (the mHC shift, the indexer)?
-5. The Windows QD-64 4 KiB read rate on `E:` with concurrent 1.5 MiB unit reads.
-6. The CPU MX8 cost per 18.8 MB expert on P- and E-cores.
+5. The Windows QD-64 4 KiB read rate on the Engram drive with concurrent 1.06 MiB unit reads.
+6. The CPU E3A16 cost per expert of each width (and MX8 for the dense rows) on P- and E-cores.
 7. The pin room and commit limit with this plan's buffers.
+7a. The EXL3 pack's format facts (§7.1, §25.1) and its base revision of 1017.
 
 Questions for the owner:
 
 8. ~~Prompt rule, activations, records, Engram formats, the disk route~~ — decided 2026-10-19 (§1.2).
-9. Whether to free ≈ 75 GB on `C:` for a fourth expert volume (+21 % decode, model).
-10. When to schedule the 510 GB download and conversion; the converter's RAM and disk use are bounded,
-    and it checks other sessions' RAM first.
+9. ~~Disk~~ — the owner frees space when the artifact work starts (2026-10-24, §1.2); the planner
+   sizes the plan then (§7.6), including whether `C:` holds expert units (+13 % decode for the EXL3
+   artifact as a fourth volume, model).
+10. When the artifact work starts: the owner says when (the ≈ 313 GB download and the conversion
+    need that go-ahead; the converter's RAM and disk use are bounded, and it checks other sessions'
+    RAM first).
+11. ~~Decision f~~ — EXL3 with a bit width per expert from the start, decided 2026-10-24 (§1.2, §5.7).
+12. ~~Decision g: the prompt-rule default~~ — `full`, decided 2026-10-24 (§1.2).
+13. ~~The lossless MXFP4 build~~ — not needed initially (2026-10-24): M11; the quality report's
+    reference logits come from streaming the official shards (§20.2).
+14. ~~Order with the GLM track~~ — this track builds the shared EXL3 codec, offload extraction and
+    page pool first; GLM reuses them (2026-10-24, §8.2). When the work starts is question 10.
 
 ### 25.3 Options (each behind its own measured gate)
 
 | ID | Option | Gate |
 |---|---|---|
-| O1 | A fourth expert volume on `C:` | the owner frees space; M5 A/B |
+| O1 | A fourth expert volume on `C:` (+13 % decode for the EXL3 artifact, model) | the owner frees space; M5 A/B |
 | O2 | A W4A4 fast path for prompt experts (NVIDIA's activation quantization; input scales from an NVFP4 source or calibrated), ≈ 4× expert compute where a prompt is compute-bound | model-quality §6 prompt gates; never in decode |
 | O3 | Draft-informed SSD prefetch: the main routers of early layers on draft tokens start reads before verification | M1 recall ≥ 0.5 for SSD-tier experts; M7 gain |
-| O4 | The MXFP4 Engram volume as the default (−105 GB) | the owner's choice after the §20.3 report |
+| O4 | The Engram table if IQ4_NL's share (§20.3) matters: Unsloth's Q5_K (136.8 GB volume) or Q6_K (165.6 GB), or the FP8 rows (209.7 GB), swapped per run; MXFP4 (104.9 GB) if disk is shorter still | the owner's choice after the §20.3 report |
 | O5 | Mirrored expert volumes with per-unit routing (GLM O8) | M5 A/B; twice the disk |
-| O6 | Import DS4's Q2/Q4 GGUFs (requantized experts, about half or the same bytes) with exact GGUF arithmetic | an owner request; quality against the official continuations; IQ2_XXS kernels for Q2 |
+| O6 | A GGUF compact build (§5.7): ISTA's GSQ-RCO IQ2_XS as a speed build (≈ 33 tok/s, perplexity +7.3 %) or another published set; experts as stored in the page pool, everything else official; `ggml_iq2_xxs` and `ggml_iq2_xs` | an owner request; §20.3's report |
+| O10 | ~~EXL3 with per-expert bits~~ | adopted as the first artifact (decision f) |
+| O11 | Hybrid: official MXFP4 records on a profile's hottest 10-20 % of experts, a 2-bit build on the rest (§5.7); the page pool already holds mixed formats, the MXFP4 routes come with M11 | unmeasured anywhere; §20.3's report on several workloads |
 | O7 | Vision (DeepSeek-ViT, 0.97 GB) | a later track |
 | O8 | Lookahead on three volumes | M5 gain |
 | O9 | Linux `io_uring` path for the striped and row readers | Linux users; the same tests |
@@ -1984,7 +2454,7 @@ Questions for the owner:
 | FP8 or FP4 tensor cores with FP32 accumulation as the arithmetic | Not reproducible on the CPU or across routes (FN §16.2.2) |
 | BF16 activations (A16) as the exact route | Decision b: DeepSeek's trained MXFP8 forward is the model; Infernix's A16 precedent (FN §16.2.2) was for checkpoints trained in BF16 |
 | NVIDIA's W4A4 as the exact route | Served that way it measured KL 0.035 against a 0.016 floor (with MXFP4 Engram, §4.2); the 1017 release has no calibrated input scales |
-| Requantizing the experts at import (Q2, Q4, EXL3) in the default | Changes the model; DS4 measured +0.12-0.19 nats NLL for Q2 against Q4 |
+| Requantizing the experts at conversion | Published builds with measured quality exist (§5.7); Infernix imports one as stored instead of producing an unmeasured one |
 | DeepSeek's encoder SWA bounded replay for cache restores | Snapshots make restores exact for ≈ 1.4 MB of encoder windows |
 | Page-cache or memory-mapped expert tiers | Pinned and locked records measured faster (FN §19.3.7); DS4's page-cache gain (#477) is the gain over O_DIRECT re-reads, which Infernix's RAM tier already has |
 | Keeping the source shards during conversion | Does not fit the disks (§7.6) |
@@ -2033,6 +2503,29 @@ Questions for the owner:
   [OpensourceWTF's streaming repack](https://huggingface.co/OpensourceWTF/DeepSeek-V4.1-Flash-streaming-repack-exl3-3.0bpw);
   [hughmadden/ds41rt-rtx5090](https://github.com/hughmadden/ds41rt-rtx5090);
   [unsloth/DeepSeek-V4.1-Flash-1017-GGUF](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF).
+- Strata and Project Maya, read 2026-10-24: [Niko1221/Strata](https://github.com/Niko1221/Strata) at
+  `7dd5cf18` (`src/dsv41`, `tools/dsv41`, `strata_control/dsv41_fit.py`, `docs/DEEPSEEK41.md`, release
+  notes 0.2.4-0.2.4.2, the commit history since 2026-10-19);
+  [Project Maya](https://github.com/mw00/project-maya) v1.1.26 at `f26d8ba` (`README.md`, `CHANGELOG.md`,
+  `docs/SETTINGS.md`, `docs/SETUP.md`, `src/ds4`, `tools/ds4`; issues and pull requests #271-#448).
+- 1017 quantizations and their quality, read 2026-10-24:
+  [ISTA-DASLab GSQ-RCO GGUF](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF),
+  [Unsloth's GGUF](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) and its
+  [guide](https://unsloth.ai/docs/models/deepseek-v4.1-flash),
+  [Maya's GGUF](https://huggingface.co/peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF),
+  [kyuz0's GGUF](https://huggingface.co/kyuz0/deepseek-v4.1-flash-gguf) and
+  [short100 panel](https://huggingface.co/datasets/kyuz0/deepseek-v4.1-flash-1017-qa),
+  [diffbot's EXL3 pack](https://huggingface.co/diffbot/DeepSeek-V4.1-Flash-EXL3-3bpw-2x-RTX-PRO-6000)
+  (1017 since 2026-10-21),
+  [HeNryous's per-expert EXL3 2.75](https://huggingface.co/HeNryous/DeepSeek-V4.1-Flash-1017-EXL3-2.75bpw-DGX-Spark)
+  (`README.md`, `exl3_moe_plan.json`),
+  [sudoingx's EXL3 2.8](https://huggingface.co/sudoingx/DeepSeek-V4.1-Flash-1017-EXL3-2.8bpw),
+  [LibertAIDAI's EXL3 2.9](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw),
+  [lxe's dsx-t16](https://huggingface.co/lxe/DeepSeek-V4.1-Flash-1017-dsx-t16),
+  [Lucebox's ROCMFP GGUF](https://huggingface.co/Lucebox/DeepSeek-V4.1-Flash-1017-ROCMFP-GGUF),
+  [brandonmusic's TrellisMX](https://huggingface.co/brandonmusic/DeepSeek-V4.1-Flash-1017-TrellisMX-K2),
+  [prometheusAIR's GGUF](https://huggingface.co/prometheusAIR/DeepSeek-V4.1-Flash-1017-GGUF); GGUF
+  headers read by HTTP range; the survey's tables are kept with this design's working notes.
 - Infernix: the [Flash-Next design](qwen3_8-flash-next-design.md), the [GLM-5.3-Flash design](glm5_3-flash-design.md)
   (including its storage measurements of 2026-10-10), [model quality](model-quality.md) §6 and
   [engine architecture](engine-architecture.md).
