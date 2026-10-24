@@ -187,7 +187,7 @@ The endpoint supports:
 - string content and ordered text/refusal parts; adjacent parts are preserved without inserted
   separators, and empty wire content remains an empty turn;
 - User `image_url` parts, tool-result `image_url` parts used by compatible clients, and the User
-  `video_url` extension using HTTP(S) or data URIs; image detail is omitted or `auto`;
+  `video_url` extension using HTTP(S) or data URIs; image detail is omitted, `auto` or `high`;
 - nonnegative `max_completion_tokens` and the legacy `max_tokens` spelling; zero performs prompt
   processing without generation;
 - `temperature`, `top_p`, presence/frequency penalties, and signed integer `seed`;
@@ -211,9 +211,14 @@ The endpoint supports:
   `chat_template_kwargs`;
 - Assistant `reasoning_content` and `reasoning` history aliases.
 
+For both OpenAI endpoints, `high` and `auto` use the model's native full-quality image
+preprocessing, with the artifact's pixel limits and the server's vision-token budget. `high` does
+not select a separate resizing profile. `low` and `original` remain unsupported because the
+frontend does not implement their distinct preprocessing behavior.
+
 Options whose observable behavior the Engine cannot provide are rejected when they request that
 behavior. This includes nonzero `logit_bias`, requested log probabilities, audio/file input or
-audio output, explicit low/high image detail, web search, moderation, low/high verbosity, stored
+audio output, explicit low/original image detail, web search, moderation, low/high verbosity, stored
 Chat Completions, and non-empty legacy `functions`.
 Each capability rejection identifies the affected field and the guarantee Infernix cannot provide.
 
@@ -735,7 +740,7 @@ String `input` is normalized to one user `message` with an `input_text` part. Ar
 | `input_text` | message content part containing string `text` |
 | `output_text` | assistant-message replay part containing string `text` |
 | `refusal` | assistant-message replay part; its text enters assistant history |
-| `input_image` | user- or assistant-message part with HTTP(S) or data-URI `image_url`; detail omitted or `auto`; requires server `--vision` |
+| `input_image` | user- or assistant-message part with HTTP(S) or data-URI `image_url`; detail omitted, `auto` or `high`; requires server `--vision` |
 | `input_video` | Infernix extension with HTTP(S) or data-URI `video_url`; requires server `--vision` |
 | `reasoning` | raw replay Item with `reasoning_text` content; summary/encrypted metadata may accompany raw text but cannot replace it |
 | `function_call` | completed assistant call with optional `id` and namespace, plus required `call_id`, `name`, and JSON-object string `arguments` |
@@ -763,10 +768,10 @@ An `input_text`, `input_image`, or tool-result part may carry
 identity or output semantics. String message status/phase metadata is accepted but has no Qwen
 prompt representation.
 
-`input_file`, `input_audio`, image `file_id`, non-`auto` image detail, reasoning metadata without raw
-reasoning text, partial tool Items, and other Item/content types are not supported. HTTP media URLs
-stored in a response chain are fetched again when that chain is continued; use data URIs when the
-historical media bytes must be immutable.
+`input_file`, `input_audio`, image `file_id`, low/original or unknown image detail, reasoning metadata
+without raw reasoning text, partial tool Items, and other Item/content types are not supported. HTTP
+media URLs stored in a response chain are fetched again when that chain is continued; use data URIs
+when the historical media bytes must be immutable.
 
 ### Function tools
 

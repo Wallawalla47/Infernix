@@ -250,11 +250,11 @@ infernix::product::media_acquire::Source parse_media_url(const Json& part, const
                 bad_request("image_url.detail must be a string", "messages");
             }
             const std::string detail = value.at("detail").get<std::string>();
-            if (detail != "auto") {
+            if (detail != "auto" && detail != "high") {
                 bad_request(
                     "image_url.detail='" + detail +
                         "' requests an explicit preprocessing profile that Infernix's fixed Vision "
-                        "frontend cannot apply; use 'auto'",
+                        "frontend cannot apply; use 'auto' or 'high'",
                     "messages", "image_detail_not_supported");
             }
         }

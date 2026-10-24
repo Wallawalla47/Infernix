@@ -640,8 +640,15 @@ int test_messages_and_media() {
                       "image and video compatibility inputs normalize to Engine media");
 
     body["messages"][0]["content"][0]["image_url"]["detail"] = "high";
-    failures += check(api_error([&] { (void)parse(body); }).code == "image_detail_not_supported",
-                      "explicit image preprocessing detail rejected");
+    const GenerationRequest high = parse(body).generation;
+    failures += check(high.media_item_count() == media.media_item_count() &&
+                          high.messages[0].content[0].kind == ContentKind::Image,
+                      "high image detail uses the native full-quality frontend");
+    for (const char* detail : {"low", "original", "unknown"}) {
+        body["messages"][0]["content"][0]["image_url"]["detail"] = detail;
+        failures += check(api_error([&] { (void)parse(body); }).code == "image_detail_not_supported",
+                          "unsupported image preprocessing detail rejected");
+    }
 
     auto content_rejected = [&](const char* role, const char* type) {
         Json invalid                   = base_request();

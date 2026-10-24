@@ -135,8 +135,9 @@ infernix::product::media_acquire::Source parse_image_source(const Json& part) {
         if (!part.at("detail").is_string()) {
             bad_request("input_image.detail must be a string", "input");
         }
-        if (part.at("detail").get<std::string>() != "auto") {
-            bad_request("only input_image detail 'auto' is supported", "input",
+        const std::string detail = part.at("detail").get<std::string>();
+        if (detail != "auto" && detail != "high") {
+            bad_request("only input_image detail 'auto' or 'high' is supported", "input",
                         "image_detail_not_supported");
         }
     }

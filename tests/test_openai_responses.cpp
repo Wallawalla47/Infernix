@@ -280,7 +280,7 @@ int test_reasoning_encrypted_content_request() {
 }
 
 int test_typed_items_and_cache_markers() {
-    const Json body = {
+    Json body = {
         {"model", "m"},
         {"input",
          Json::array(
@@ -343,6 +343,18 @@ int test_typed_items_and_cache_markers() {
                           request.prompt.input_turns[3].content[0].cache_boundary_after->kind ==
                               infernix::PromptCacheMarkerKind::SharedStablePrefix,
                       "message cache marker preserved");
+
+    body["input"][2]["output"][1]["detail"] = "high";
+    const auto high = parse_openai_responses_create_request(body, limits());
+    failures += check(high.prompt.input_turns[1].content[1].kind == ContentKind::Image,
+                      "high image detail uses the native full-quality frontend");
+    for (const char* detail : {"low", "original", "unknown"}) {
+        body["input"][2]["output"][1]["detail"] = detail;
+        failures += check(
+            api_error([&] { (void)parse_openai_responses_create_request(body, limits()); }).code ==
+                "image_detail_not_supported",
+            "unsupported image preprocessing detail rejected");
+    }
 
     OpenAIResponsesStore store(8, 1ULL << 20);
     const OpenAIResponsesResolvedPrompt resolved =
