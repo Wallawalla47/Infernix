@@ -16,7 +16,7 @@
 // on the host by ggml::chunk: kappa (d sub code - dmin min_sub), the Q4_K/Q5_K min term a second term
 // per element), NVFP4 expert units (times an FP32 multiplier per row parity) and block FP8 records.
 // Shapes: rows that do not fill a tile, a row range into an output offset, T across the 512-column
-// chunk, K of the Qwen3.5 projections. The noise twin (ops::lossless_set_noise_seed, IQS-1's noise floor):
+// chunk, K of the Qwen3.5 projections. The noise twin (ops::lossless_set_noise_seed, IQS-2's noise floor):
 // every output one of its exact value's two neighbours, as often away from zero as the discarded fractions
 // say, the same bits for the same seed.
 

@@ -1,4 +1,4 @@
-"""The statistics and scoring behind IQS-1's end-to-end checks (tools/quality/iqs_e2e.py): the chi-square tail,
+"""The statistics and scoring behind IQS-2's end-to-end checks (tools/quality/iqs_e2e.py): the chi-square tail,
 the homogeneity test speculation is judged by, loop detection and answer extraction."""
 
 from __future__ import annotations
@@ -56,3 +56,19 @@ def test_the_comparison_is_proven_by_any_artifacts_negative_control(tmp_path: Pa
     blind = iqs_e2e.check_sensitivity(SimpleNamespace(results=[result("a", 0), result("b", 0)]))
     assert not blind["passed"]
     assert not iqs_e2e.check_sensitivity(SimpleNamespace(results=[result("c", None)]))["passed"]
+
+
+def test_task_audit_is_paired_non_inferiority_on_the_items_that_differ() -> None:
+    # 250 items, 16 answered differently, 2 more lost than gained (the 35B run of 2026-10-24): within 5 points
+    base = [True] * 200 + [False] * 50
+    fast = list(base)
+    for i in range(9):
+        fast[i] = False           # only the reproducible route answers these
+    for i in range(200, 207):
+        fast[i] = True            # only the default route answers these
+    result = iqs_e2e.paired_loss(base, fast, 0.05)
+    assert (result["only_reproducible"], result["only_default"], result["flips"]) == (9, 7, 16)
+    assert result["loss"] == pytest.approx(2 / 250) and result["passed"]
+    # a route that loses 25 items it used to answer fails, whatever it gains back by chance
+    worse = [False] * 25 + base[25:]
+    assert not iqs_e2e.paired_loss(base, worse, 0.05)["passed"]

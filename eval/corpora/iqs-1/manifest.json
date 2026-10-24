@@ -1,6 +1,6 @@
 {
  "corpus_id": "iqs-1",
- "version": 1,
+ "version": 2,
  "sets": {
   "main": {
    "window_tokens": 4096,
@@ -203,6 +203,198 @@
      "domain": "tool_calls",
      "kind": "chat",
      "path": "data/tool_calls/tools-3.json"
+    },
+    {
+     "id": "en-ref-4",
+     "domain": "english_reference",
+     "kind": "text",
+     "path": "data/english_reference/en-ref-4.txt"
+    },
+    {
+     "id": "en-ref-5",
+     "domain": "english_reference",
+     "kind": "text",
+     "path": "data/english_reference/en-ref-5.txt"
+    },
+    {
+     "id": "en-ref-6",
+     "domain": "english_reference",
+     "kind": "text",
+     "path": "data/english_reference/en-ref-6.txt"
+    },
+    {
+     "id": "en-ref-7",
+     "domain": "english_reference",
+     "kind": "text",
+     "path": "data/english_reference/en-ref-7.txt"
+    },
+    {
+     "id": "en-long-4",
+     "domain": "english_long_form",
+     "kind": "text",
+     "path": "data/english_long_form/en-long-4.txt"
+    },
+    {
+     "id": "en-long-5",
+     "domain": "english_long_form",
+     "kind": "text",
+     "path": "data/english_long_form/en-long-5.txt"
+    },
+    {
+     "id": "en-long-6",
+     "domain": "english_long_form",
+     "kind": "text",
+     "path": "data/english_long_form/en-long-6.txt"
+    },
+    {
+     "id": "en-long-7",
+     "domain": "english_long_form",
+     "kind": "text",
+     "path": "data/english_long_form/en-long-7.txt"
+    },
+    {
+     "id": "zh-4",
+     "domain": "chinese",
+     "kind": "text",
+     "path": "data/chinese/zh-4.txt"
+    },
+    {
+     "id": "zh-5",
+     "domain": "chinese",
+     "kind": "text",
+     "path": "data/chinese/zh-5.txt"
+    },
+    {
+     "id": "zh-6",
+     "domain": "chinese",
+     "kind": "text",
+     "path": "data/chinese/zh-6.txt"
+    },
+    {
+     "id": "zh-7",
+     "domain": "chinese",
+     "kind": "text",
+     "path": "data/chinese/zh-7.txt"
+    },
+    {
+     "id": "de-4",
+     "domain": "german",
+     "kind": "text",
+     "path": "data/german/de-4.txt"
+    },
+    {
+     "id": "de-5",
+     "domain": "german",
+     "kind": "text",
+     "path": "data/german/de-5.txt"
+    },
+    {
+     "id": "de-6",
+     "domain": "german",
+     "kind": "text",
+     "path": "data/german/de-6.txt"
+    },
+    {
+     "id": "de-7",
+     "domain": "german",
+     "kind": "text",
+     "path": "data/german/de-7.txt"
+    },
+    {
+     "id": "code-4",
+     "domain": "code",
+     "kind": "text",
+     "path": "data/code/code-4.txt"
+    },
+    {
+     "id": "code-5",
+     "domain": "code",
+     "kind": "text",
+     "path": "data/code/code-5.txt"
+    },
+    {
+     "id": "code-6",
+     "domain": "code",
+     "kind": "text",
+     "path": "data/code/code-6.txt"
+    },
+    {
+     "id": "code-7",
+     "domain": "code",
+     "kind": "text",
+     "path": "data/code/code-7.txt"
+    },
+    {
+     "id": "math-4",
+     "domain": "mathematics",
+     "kind": "text",
+     "path": "data/mathematics/math-4.txt"
+    },
+    {
+     "id": "math-5",
+     "domain": "mathematics",
+     "kind": "text",
+     "path": "data/mathematics/math-5.txt"
+    },
+    {
+     "id": "math-6",
+     "domain": "mathematics",
+     "kind": "text",
+     "path": "data/mathematics/math-6.txt"
+    },
+    {
+     "id": "math-7",
+     "domain": "mathematics",
+     "kind": "text",
+     "path": "data/mathematics/math-7.txt"
+    },
+    {
+     "id": "chat-4",
+     "domain": "chat",
+     "kind": "chat",
+     "path": "data/chat/chat-4.json"
+    },
+    {
+     "id": "chat-5",
+     "domain": "chat",
+     "kind": "chat",
+     "path": "data/chat/chat-5.json"
+    },
+    {
+     "id": "chat-6",
+     "domain": "chat",
+     "kind": "chat",
+     "path": "data/chat/chat-6.json"
+    },
+    {
+     "id": "chat-7",
+     "domain": "chat",
+     "kind": "chat",
+     "path": "data/chat/chat-7.json"
+    },
+    {
+     "id": "tools-4",
+     "domain": "tool_calls",
+     "kind": "chat",
+     "path": "data/tool_calls/tools-4.json"
+    },
+    {
+     "id": "tools-5",
+     "domain": "tool_calls",
+     "kind": "chat",
+     "path": "data/tool_calls/tools-5.json"
+    },
+    {
+     "id": "tools-6",
+     "domain": "tool_calls",
+     "kind": "chat",
+     "path": "data/tool_calls/tools-6.json"
+    },
+    {
+     "id": "tools-7",
+     "domain": "tool_calls",
+     "kind": "chat",
+     "path": "data/tool_calls/tools-7.json"
     }
    ]
   },

@@ -224,7 +224,7 @@ int main(int argc, char** argv) {
         }
 
         {
-            // 6. Negative control (IQS-1 G4): comparison 2 on the default route. Where it runs a
+            // 6. Negative control (IQS-2 G4): comparison 2 on the default route. Where it runs a
             //    request-coupling fast path (LoadSummary::request_invariant false), a request's tokens
             //    may depend on its round's other rows, and over four sampled 256-token outputs they often
             //    do: the count shows what the comparison can see on this artifact.
@@ -250,7 +250,7 @@ int main(int argc, char** argv) {
                     differ += handles[i].wait().generated_token_ids != alone[i].generated_token_ids ? 1U : 0U;
                 }
                 // A route that may couple requests need not do so on these four: the count is reported, and
-                // IQS-1's certificate asks that some artifact's control saw a difference (the comparison code
+                // IQS-2's certificate asks that some artifact's control saw a difference (the comparison code
                 // is the same for every artifact), not every artifact's.
                 std::cout << "negative control: " << differ << " of " << texts.size()
                           << " concurrent requests differ on the default route"

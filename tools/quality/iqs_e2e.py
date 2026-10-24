@@ -1,4 +1,4 @@
-"""IQS-1 end-to-end checks through infernix-serve (docs/maintainer/model-quality.md, section 6, block F).
+"""IQS-2 end-to-end checks through infernix-serve (docs/maintainer/model-quality.md, section 6, block F).
 
 Each check starts the server on one artifact, drives it through the OpenAI Chat Completions API like any client,
 and writes a JSON result {"passed": bool, "detail": str, ...} that tools/quality/iqs.py's certificate collects.
@@ -14,8 +14,8 @@ and writes a JSON result {"passed": bool, "detail": str, ...} that tools/quality
              within 90-110 %, no more looping outputs, no fewer natural stops (MLPerf TEST06/TEST09 style)
   specdist   G5: with speculation the default route's sampled continuations follow the same distribution as
              without it (chi-square homogeneity, Bonferroni over prompts, alpha 0.001)
-  tasks      reported, gated at 99 %: GSM8K and MMLU accuracy of the default route against --reproducible,
-             with the paired flips
+  tasks      a coarse check: GSM8K and MMLU accuracy of the default route against --reproducible; fails when
+             the one-sided 97.5 % bound on the paired accuracy loss exceeds 5 points (GSM8K) or 3 (MMLU)
 
 Usage: python -m tools.quality.iqs_e2e CHECK --serve EXE --artifact PATH --out RESULT.json [server options]
 """
@@ -344,14 +344,30 @@ def check_tasks(args) -> dict:
         fast = run_tasks(client, args.gsm8k, args.mmlu)
     result = {"passed": True, "tasks": {}}
     for name, a, b in (("gsm8k", base[0], fast[0]), ("mmlu", base[1], fast[1])):
-        acc_a, acc_b = sum(a) / len(a), sum(b) / len(b)
-        flips = sum(1 for x, y in zip(a, b) if x != y)
-        ok = acc_b >= 0.99 * acc_a
-        result["tasks"][name] = {"reproducible": acc_a, "default": acc_b, "flips": flips, "items": len(a), "passed": ok}
-        result["passed"] = result["passed"] and ok
-    result["detail"] = "; ".join(f"{k} {v['default']:.3f} vs {v['reproducible']:.3f} ({v['flips']} flips of {v['items']})"
-                                 for k, v in result["tasks"].items())
+        result["tasks"][name] = paired_loss(a, b, TASK_MARGINS[name])
+        result["passed"] = result["passed"] and result["tasks"][name]["passed"]
+    result["detail"] = "; ".join(f"{k} {v['default']:.3f} vs {v['reproducible']:.3f} ({v['flips']} flips of {v['items']}, "
+                                 f"loss bound {v['loss_bound']:+.3f} of {v['margin']:.2f})" for k, v in result["tasks"].items())
     return result
+
+
+# The accuracy a default route may lose on a task (one-sided 97.5 % bound): a coarse check for gross breakage.
+TASK_MARGINS = {"gsm8k": 0.05, "mmlu": 0.03}
+
+
+def paired_loss(base: list[bool], fast: list[bool], margin: float) -> dict:
+    """Paired non-inferiority on the items the two routes answer differently: the default route's accuracy loss
+    (b - c) / n, b the items only the reproducible route answers, c those only the default route answers, with
+    the normal bound of a paired difference of proportions."""
+    n = len(base)
+    only_base = sum(1 for x, y in zip(base, fast) if x and not y)
+    only_fast = sum(1 for x, y in zip(base, fast) if y and not x)
+    loss = (only_base - only_fast) / n
+    se = math.sqrt(max(only_base + only_fast - n * loss * loss, 0.0)) / n
+    bound = loss + 1.96 * se
+    return {"reproducible": sum(base) / n, "default": sum(fast) / n, "flips": only_base + only_fast, "items": n,
+            "only_reproducible": only_base, "only_default": only_fast, "loss": loss, "loss_bound": bound,
+            "margin": margin, "passed": bound <= margin}
 
 
 CHECKS = {"identity": check_identity, "longgen": check_longgen, "specdist": check_specdist, "tasks": check_tasks,

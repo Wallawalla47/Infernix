@@ -1,6 +1,6 @@
 #pragma once
 
-// The lossless route's noise twin (EngineOptions::lossless_noise_seed; docs/maintainer/model-quality.md, IQS-1
+// The lossless route's noise twin (EngineOptions::lossless_noise_seed; docs/maintainer/model-quality.md, IQS-2
 // noise floor): every correctly rounded result is replaced by a stochastic rounding of the same exact value,
 // rounding away from the nearest neighbour with probability equal to the exact value's distance from it in
 // units of the gap between the two neighbours. It models an ideal BF16 implementation that is off by at most

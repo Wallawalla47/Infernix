@@ -1,4 +1,4 @@
-"""Where the lossless route first leaves the publisher's code (IQS-1 G1): a layer-by-layer comparison.
+"""Where the lossless route first leaves the publisher's code (IQS-2 G1): a layer-by-layer comparison.
 
     python -m tools.quality.shadow.bisect --artifact ART --capture CAPTURE --dump DIR [--tokens N] [--sequence I]
 

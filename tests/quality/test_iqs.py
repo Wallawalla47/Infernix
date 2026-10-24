@@ -1,4 +1,4 @@
-"""IQS-1 decisions (tools/quality/iqs.py) on synthetic arms: what passes, what fails, how the noise floor
+"""IQS-2 decisions (tools/quality/iqs.py) on synthetic arms: what passes, what fails, how the noise floor
 moves a budget, and how a run plan becomes a certificate."""
 
 from __future__ import annotations
@@ -15,17 +15,19 @@ DOMAINS = ("prose", "code", "math", "chat")
 
 
 def write_arm(directory: Path, name: str, kl: np.ndarray, flip: np.ndarray, dnll: np.ndarray, windows: int,
-              route: str = "default", nonfinite: int = 0) -> Path:
-    """An infernix-certify arm (prefix.json, prefix.positions.csv) and its reference's window list."""
+              route: str = "default", nonfinite: int = 0, first: int = 0) -> Path:
+    """An infernix-certify arm (prefix.json, prefix.positions.csv) of windows first .. first+windows-1, and its
+    reference's window list."""
     directory.mkdir(parents=True, exist_ok=True)
-    reference = directory / "ref.bin"
-    meta_windows = [{"index": w, "id": f"doc{w}", "domain": DOMAINS[w % len(DOMAINS)]} for w in range(windows)]
+    reference = directory / f"ref{first}.bin"
+    meta_windows = [{"index": w, "id": f"doc{w}", "domain": DOMAINS[w % len(DOMAINS)]}
+                    for w in range(first, first + windows)]
     Path(str(reference) + ".json").write_text(json.dumps({"windows": meta_windows}), encoding="utf-8")
     prefix = directory / name
     per = kl.size // windows
     lines = ["window,segment,position,kl,top_mass,flip,dnll"]
     for i in range(kl.size):
-        lines.append(f"{i // per},-1,{i % per + 1},{float(kl[i]):.9g},0.95,{int(flip[i])},{float(dnll[i]):.9g}")
+        lines.append(f"{first + i // per},-1,{i % per + 1},{float(kl[i]):.9g},0.95,{int(flip[i])},{float(dnll[i]):.9g}")
     Path(str(prefix) + ".positions.csv").write_text("\n".join(lines) + "\n", encoding="utf-8")
     meta = {"route": route, "kv_dtype": "bf16", "reference": str(reference), "nonfinite": nonfinite,
             "load": {"fast_paths": ["prompt-pv8"]}}
@@ -59,20 +61,22 @@ def test_mean_kl_above_q8_fails(tmp_path: Path) -> None:
     arm = write_arm(tmp_path, "bad", *synthetic(rng, 32, 200, 3e-3, 0.002), windows=32)
     decision = iqs.decide(iqs.load_arm(arm), FAST)
     failing = {c["name"] for c in decision["criteria"] if not c["passed"]}
-    assert "F1 mean KL" in failing and not decision["passed"]
+    assert "C1 mean KL" in failing and not decision["passed"]
 
 
-def test_one_bad_domain_fails_on_its_own(tmp_path: Path) -> None:
+def test_per_domain_values_and_perplexity_are_disclosed_not_gated(tmp_path: Path) -> None:
     rng = np.random.default_rng(3)
-    kl, flip, dnll = synthetic(rng, 32, 200, 1e-4, 0.001)
-    # Every code window (w % 4 == 1) far worse; the overall mean stays below F1.
+    kl, flip, dnll = synthetic(rng, 32, 200, 1e-4, 0.001, dnll_mean=0.004)
+    # Every code window (w % 4 == 1) far worse; the overall mean stays below C1.
     for w in range(1, 32, 4):
-        kl[w * 200:(w + 1) * 200] *= 40
+        kl[w * 200:(w + 1) * 200] *= 10
     arm = write_arm(tmp_path, "domain", kl, flip, dnll, windows=32)
     decision = iqs.decide(iqs.load_arm(arm), FAST)
-    failing = {c["name"] for c in decision["criteria"] if not c["passed"]}
-    assert "F5 code mean_kl" in failing
-    assert "F5 prose mean_kl" not in failing
+    assert decision["passed"], decision["criteria"]
+    assert {c["name"] for c in decision["criteria"]} == {"C0 finite", "C1 mean KL", "C2 flip rate", "C3 p99.9 KL"}
+    assert decision["domains"]["code"]["mean_kl"] > 5 * decision["domains"]["prose"]["mean_kl"]
+    assert decision["perplexity"]["ratio"] == pytest.approx(np.exp(decision["estimate"]["mean_dnll"]))
+    assert decision["perplexity"]["ratio_bound"] >= decision["perplexity"]["ratio"] > 1.0
 
 
 def test_noise_floor_raises_a_budget_by_kappa(tmp_path: Path) -> None:
@@ -87,8 +91,10 @@ def test_noise_floor_raises_a_budget_by_kappa(tmp_path: Path) -> None:
 
 
 def test_a_floor_below_the_fixed_budget_changes_nothing() -> None:
-    floor = {"mean_kl": 1e-5, "flip_rate": 1e-4, "p999_kl": 1e-3, "mean_dnll": 0.0}
-    assert iqs.budgets(iqs.POLICY, floor) == iqs.budgets(iqs.POLICY, None)
+    floor = {"mean_kl": 1e-5, "flip_rate": 1e-4, "p999_kl": 1e-3, "clipped_kl": 1e-5, "mean_dnll": 0.0}
+    with_floor = iqs.budgets(iqs.POLICY, floor)
+    assert {m: with_floor[m] for m in ("mean_kl", "flip_rate", "p999_kl")} == iqs.budgets(iqs.POLICY, None)
+    assert with_floor["clipped_kl"] == pytest.approx(2e-5)  # C4 has no fixed budget
 
 
 def test_nonfinite_fails_outright(tmp_path: Path) -> None:
@@ -154,7 +160,7 @@ def test_certificate_collects_decisions_disclosures_and_checks(tmp_path: Path) -
     assert status == 1 and not certificate["passed"]
     assert certificate["decisions"][0]["passed"]
     assert [c["passed"] for c in certificate["checks"]] == [True, False]
-    assert "IQS-1 certificate" in (tmp_path / "cert" / "certificate.html").read_text(encoding="utf-8")
+    assert "IQS-2 certificate" in (tmp_path / "cert" / "certificate.html").read_text(encoding="utf-8")
 
 
 def write_scored(path: Path, windows: dict[int, tuple[int, list[list[int]]]]) -> Path:
@@ -215,3 +221,68 @@ def test_a_long_set_arm_reads_its_main_set_twin_with_the_main_scored_list(tmp_pa
     certificate = json.loads((tmp_path / "cert" / "certificate.json").read_text(encoding="utf-8"))
     assert not certificate["unusable"] and len(certificate["decisions"]) == 1
     assert long_scored.exists() and main_scored.exists()
+
+
+def test_an_arm_in_parts_is_the_arm_whole(tmp_path: Path) -> None:
+    # A corpus layer scored later: windows 0-31 in one part, 32-63 in another, decided as one arm.
+    rng = np.random.default_rng(14)
+    kl, flip, dnll = synthetic(rng, 64, 100, 2e-4, 0.002)
+    whole = write_arm(tmp_path / "whole", "arm", kl, flip, dnll, windows=64)
+    low = write_arm(tmp_path / "parts", "low", kl[:3200], flip[:3200], dnll[:3200], windows=32)
+    high = write_arm(tmp_path / "parts", "high", kl[3200:], flip[3200:], dnll[3200:], windows=32, first=32)
+    one, two = iqs.decide(iqs.load_arm(whole), FAST), iqs.decide(iqs.load_arm([low, high]), FAST)
+    assert two["windows"] == 64 and two["positions"] == one["positions"]
+    assert two["estimate"] == one["estimate"] and two["bound"] == one["bound"]
+    assert two["domains"] == one["domains"]
+
+
+def test_parts_must_hold_disjoint_windows_of_one_route(tmp_path: Path) -> None:
+    rng = np.random.default_rng(15)
+    a = write_arm(tmp_path, "a", *synthetic(rng, 32, 50, 2e-4, 0.002), windows=32)
+    b = write_arm(tmp_path, "b", *synthetic(rng, 32, 50, 2e-4, 0.002), windows=32, first=16)
+    with pytest.raises(iqs.Unusable, match="repeats window"):
+        iqs.load_arm([a, b])
+    c = write_arm(tmp_path, "c", *synthetic(rng, 32, 50, 2e-4, 0.002), windows=32, first=32, route="reproducible")
+    with pytest.raises(iqs.Unusable, match="differs"):
+        iqs.load_arm([a, c])
+
+
+def test_clipped_kl_catches_a_typical_position_error_a_heavy_tailed_floor_hides(tmp_path: Path) -> None:
+    # A floor whose mean a few near-tie positions decide: 2 x its mean is generous, 2 x its clipped mean is not.
+    rng = np.random.default_rng(16)
+    kl, flip, dnll = synthetic(rng, 32, 200, 1e-4, 0.002)
+    kl[rng.choice(kl.size, 10, replace=False)] = 5.0
+    twin = write_arm(tmp_path, "twin", kl, flip, dnll, windows=32, route="noise_twin")
+    arm = write_arm(tmp_path, "arm", *synthetic(rng, 32, 200, 1e-3, 0.002), windows=32)
+    decision = iqs.decide(iqs.load_arm(arm), FAST, iqs.floor_of(twin))
+    failing = {c["name"] for c in decision["criteria"] if not c["passed"]}
+    assert failing == {"C4 clipped KL"}, decision["criteria"]
+
+
+def test_a_fast_path_is_gated_on_its_increase_over_the_reproducible_route(tmp_path: Path) -> None:
+    rng = np.random.default_rng(17)
+    kl, flip, dnll = synthetic(rng, 32, 200, 1e-3, 0.01)
+    floor = {"mean_kl": 2e-3, "flip_rate": 0.01, "p999_kl": 0.1, "clipped_kl": 1e-3, "mean_dnll": 0.0}
+    base = iqs.load_arm(write_arm(tmp_path, "base", kl, flip, dnll, windows=32, route="reproducible"))
+    same = iqs.load_arm(write_arm(tmp_path, "same", kl, flip, dnll, windows=32))
+    result = iqs.gate(same, base, floor, FAST)
+    assert result["passed"] and all(c["bound"] == 0 for c in result["criteria"])
+    # a third of the floor more KL at every position: P1 and P3 fail, the flips and perplexity do not move
+    worse = iqs.load_arm(write_arm(tmp_path, "worse", kl + 0.6e-3, flip, dnll, windows=32))
+    failing = {c["name"] for c in iqs.gate(worse, base, floor, FAST)["criteria"] if not c["passed"]}
+    assert failing == {"P1 mean KL increase", "P3 clipped KL increase"}
+    # a perplexity shift with no KL change (a direction, e.g. a logit scale): only P4 sees it
+    biased = iqs.load_arm(write_arm(tmp_path, "biased", kl, flip, dnll + 5e-3, windows=32))
+    failing = {c["name"] for c in iqs.gate(biased, base, floor, FAST)["criteria"] if not c["passed"]}
+    assert failing == {"P4 perplexity (dNLL) increase"}
+
+
+def test_a_gate_needs_the_same_positions_and_a_floor(tmp_path: Path) -> None:
+    rng = np.random.default_rng(18)
+    base = iqs.load_arm(write_arm(tmp_path, "base", *synthetic(rng, 32, 200, 1e-3, 0.01), windows=32))
+    short = iqs.load_arm(write_arm(tmp_path, "short", *synthetic(rng, 32, 199, 1e-3, 0.01), windows=32))
+    floor = {"mean_kl": 2e-3, "flip_rate": 0.01, "p999_kl": 0.1, "clipped_kl": 1e-3, "mean_dnll": 0.0}
+    with pytest.raises(iqs.Unusable, match="same positions"):
+        iqs.gate(short, base, floor, FAST)
+    with pytest.raises(iqs.Unusable, match="noise floor"):
+        iqs.gate(base, base, None, FAST)

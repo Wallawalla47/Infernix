@@ -595,7 +595,7 @@ struct EngineOptions {
     // a routed-expert bank's W4A4, FP4-Local's with expert_a4_activations), and the KV format's codec.
     // CausalScoring only; its output is a function of the request, the artifact and those steps.
     bool reference                     = false;
-    // The noise twin (IQS-1's noise floor, docs/maintainer/model-quality.md §6): nonzero makes every
+    // The noise twin (IQS-2's noise floor, docs/maintainer/model-quality.md §6): nonzero makes every
     // rounding of the lossless route (or the design reference) a stochastic rounding of the same exact value,
     // seeded by this value: an ideal BF16 implementation off by at most one unit in the last place at each
     // rounding. CausalScoring with `lossless` only; 0 (the default) is the lossless route itself. The rounding
@@ -1606,7 +1606,7 @@ struct ScoreOptions {
     std::vector<TokenId> candidates;
     // Scored positions (0-based within the scored range, strictly ascending, at most
     // kMaximumScoreLogitPositions) whose whole logits vector ScoreResult::logits returns, for exact
-    // comparisons (IQS-1 reference conformance).
+    // comparisons (IQS-2 reference conformance).
     std::vector<std::uint32_t> logits_positions;
 };
 

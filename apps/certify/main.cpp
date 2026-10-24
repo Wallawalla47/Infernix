@@ -1,4 +1,4 @@
-// infernix-certify: the IQS-1 measurement tool (docs/maintainer/model-quality.md §6). One reference pass per
+// infernix-certify: the IQS-2 measurement tool (docs/maintainer/model-quality.md §6). One reference pass per
 // window serves every arm: the reference scores each window's positions once (the lossless route, the
 // design reference or the noise twin), a prefill arm scores the same windows on a shipped route, and a
 // decode arm forces each window's continuation through the decode path at the set's decode starts, every
@@ -13,6 +13,9 @@
 //   infernix-certify mask      <artifact> --corpus M --set S --out FILE.json
 //   infernix-certify prefill   <artifact> --corpus M --set S --reference REF --out PREFIX [route options]
 //   infernix-certify decode    <artifact> --corpus M --set S --reference REF --out PREFIX [route options]
+//                    [--windows i,j,...]
+//   --reference may repeat: a reference written in parts (reference --windows), each window in one part. Every
+//   command scores the windows --windows selects (all by default) and needs those windows in the reference.
 //                    [--concurrency N] [--spec mtp|dflash|dflash2] [--draft-tokens N|auto]
 //                    [--ngram-draft-tokens N|auto] [--draft-tree-nodes auto|LIST] [--draft-model FILE]
 //                    [--prefix-reuse [--warm-tokens N]] [--kv-tokens N]
@@ -53,7 +56,7 @@ using nlohmann::json;
 namespace perplexity = infernix::perplexity;
 namespace certify    = infernix::certify;
 
-// IQS-1 metrics: KL over the reference's 256 most probable tokens plus one bucket for the rest, in
+// IQS-2 metrics: KL over the reference's 256 most probable tokens plus one bucket for the rest, in
 // prefill (scoring candidates) and decode (observed tokens).
 constexpr std::uint32_t kTop = 256;
 static_assert(kTop <= infernix::kMaximumScoreTopTokens && kTop <= infernix::kMaximumObservedTokens);
@@ -64,7 +67,7 @@ struct Options {
     std::filesystem::path corpus;
     std::string set = "main";
     std::filesystem::path out;
-    std::filesystem::path reference;
+    std::vector<std::filesystem::path> references; // one reference, possibly in parts (windows split between files)
     bool lossless              = false; // prefill: score on the exact route (lossless, --design, --noise-seed)
     bool design                = false;
     std::uint64_t noise_seed   = 0;
@@ -145,7 +148,7 @@ Options parse(int argc, char** argv) {
         } else if (option == "--out") {
             out.out = std::string(value());
         } else if (option == "--reference") {
-            out.reference = std::string(value());
+            out.references.emplace_back(std::string(value()));
         } else if (option == "--lossless") {
             out.lossless = true;
         } else if (option == "--design") {
@@ -279,27 +282,52 @@ void apply_route(const Options& options, infernix::EngineOptions& engine_options
     if (!options.ngram_volume.empty()) { engine_options.ngram_volume_path = options.ngram_volume; }
 }
 
-std::vector<perplexity::ReferenceWindow> read_reference(const std::filesystem::path& path,
-                                                        const certify::Corpus& corpus,
+bool selected(const Options& options, std::uint32_t window);
+
+// The stored windows of a reference, which may be in parts (each file holds the windows it was written with,
+// e.g. a corpus layer added later): indexed like `windows`, filled for the windows this run selects. Every
+// stored window must carry the tokens this corpus gives it, and every selected window must be in one part.
+std::vector<perplexity::ReferenceWindow> read_reference(const Options& options, const certify::Corpus& corpus,
                                                         const std::vector<certify::Window>& windows) {
-    perplexity::ReferenceReader reader(path);
-    const perplexity::ReferenceHeader& header = reader.header();
-    if (header.corpus_id != corpus.corpus_id || header.mode != corpus.set.name ||
-        header.context != corpus.set.window_tokens || header.top_k != kTop) {
-        throw std::runtime_error(path.string() + " is a reference for corpus " + header.corpus_id + " set " +
-                                 header.mode + ", not this corpus set");
-    }
-    std::vector<perplexity::ReferenceWindow> out;
-    for (const certify::Window& window : windows) {
-        perplexity::ReferenceWindow ref = reader.next();
-        if (ref.stream_index != window.index || ref.input_hash != window.input_hash || ref.target_begin != 1 ||
-            ref.target_end != window.tokens.size()) {
-            throw std::runtime_error(path.string() + " window " + std::to_string(ref.stream_index) +
-                                     " does not match " + window.id + " (other text or tokenizer)");
+    std::vector<perplexity::ReferenceWindow> out(windows.size());
+    std::vector<bool> found(windows.size(), false);
+    for (const std::filesystem::path& path : options.references) {
+        perplexity::ReferenceReader reader(path);
+        const perplexity::ReferenceHeader& header = reader.header();
+        if (header.corpus_id != corpus.corpus_id || header.mode != corpus.set.name ||
+            header.context != corpus.set.window_tokens || header.top_k != kTop) {
+            throw std::runtime_error(path.string() + " is a reference for corpus " + header.corpus_id + " set " +
+                                     header.mode + ", not this corpus set");
         }
-        out.push_back(std::move(ref));
+        while (std::optional<perplexity::ReferenceWindow> ref = reader.try_next()) {
+            if (ref->stream_index >= windows.size()) {
+                throw std::runtime_error(path.string() + " holds window " + std::to_string(ref->stream_index) +
+                                         ", beyond this corpus set's " + std::to_string(windows.size()));
+            }
+            const certify::Window& window = windows[ref->stream_index];
+            if (ref->input_hash != window.input_hash || ref->target_begin != 1 || ref->target_end != window.tokens.size()) {
+                throw std::runtime_error(path.string() + " window " + std::to_string(ref->stream_index) +
+                                         " does not match " + window.id + " (other text or tokenizer)");
+            }
+            if (found[window.index]) {
+                throw std::runtime_error("window " + std::to_string(window.index) + " is in more than one reference part");
+            }
+            found[window.index] = true;
+            if (selected(options, window.index)) { out[window.index] = std::move(*ref); }
+        }
     }
-    reader.finish();
+    for (const certify::Window& window : windows) {
+        if (selected(options, window.index) && !found[window.index]) {
+            throw std::runtime_error("no reference part holds window " + std::to_string(window.index) + " (" +
+                                     window.id + ")");
+        }
+    }
+    return out;
+}
+
+json reference_paths(const Options& options) {
+    json out = json::array();
+    for (const std::filesystem::path& path : options.references) { out.push_back(std::filesystem::absolute(path).string()); }
     return out;
 }
 
@@ -375,9 +403,9 @@ int run_reference(const Options& options) {
     // reference), its design error, written as an arm (OUT.compare.*), so disclosure costs no second pass.
     std::vector<perplexity::ReferenceWindow> compared;
     std::optional<RowWriter> compare_rows;
-    if (!options.reference.empty()) {
+    if (!options.references.empty()) {
         if (!options.design) { throw std::invalid_argument("reference --reference compares a design reference: add --design"); }
-        compared = read_reference(options.reference, corpus, windows);
+        compared = read_reference(options, corpus, windows);
         compare_rows.emplace(std::filesystem::path(options.out.string() + ".compare.positions.csv"));
     }
     json window_list = json::array();
@@ -417,7 +445,7 @@ int run_reference(const Options& options) {
         compare["arm"]       = "design_error";
         compare["route"]     = "design";
         compare["kv_dtype"]  = options.kv;
-        compare["reference"] = std::filesystem::absolute(options.reference).string();
+        compare["reference"] = reference_paths(options);
         compare["rows"]      = compare_rows->rows;
         compare["nonfinite"] = compare_rows->nonfinite;
         write_json(std::filesystem::path(options.out.string() + ".compare.json"), compare);
@@ -437,8 +465,9 @@ int run_reference(const Options& options) {
 // The release spot check: re-score stored windows with the reference's own settings; any bit that differs
 // fails (the lossless route and the design reference never change their bits).
 int run_verify(Options options) {
-    if (options.reference.empty()) { throw std::invalid_argument("verify needs --reference"); }
-    const json meta = read_json(std::filesystem::path(options.reference.string() + ".json"));
+    if (options.references.empty()) { throw std::invalid_argument("verify needs --reference"); }
+    // Every part of a reference was written with the same settings; the first part's metadata gives them.
+    const json meta = read_json(std::filesystem::path(options.references.front().string() + ".json"));
     options.corpus     = meta.at("corpus").at("manifest").get<std::string>();
     options.set        = meta.at("corpus").at("set").get<std::string>();
     options.design     = meta.at("route") == "design";
@@ -447,27 +476,15 @@ int run_verify(Options options) {
     options.expert_a4_activations = meta.value("expert_a4_activations", false);
     if (options.windows.empty()) { options.windows = {0}; }
     const certify::Corpus corpus = certify::load_corpus(options.corpus, options.set);
-    if (hex(corpus.content_hash) != meta.at("corpus").at("content_hash").get<std::string>()) {
-        throw std::runtime_error("the corpus changed since " + options.reference.string() + " was written");
-    }
     infernix::Engine engine(reference_engine(options, corpus.set.window_tokens));
     const std::vector<certify::Window> windows = certify::load_windows(engine, corpus);
-    perplexity::ReferenceReader reader(options.reference);
+    // A stored window whose text or tokenizer changed fails here, before any scoring.
+    const std::vector<perplexity::ReferenceWindow> references = read_reference(options, corpus, windows);
     bool identical = true;
     for (const certify::Window& window : windows) {
-        perplexity::ReferenceWindow stored;
-        bool found = false;
-        try {
-            // The stored file holds the windows it was written with, in order.
-            while (true) {
-                stored = reader.next();
-                if (stored.stream_index >= window.index) { break; }
-            }
-            found = stored.stream_index == window.index;
-        } catch (const std::exception&) { found = false; }
         if (!selected(options, window.index)) { continue; }
-        if (!found) { throw std::runtime_error(options.reference.string() + " holds no window " + std::to_string(window.index)); }
-        const perplexity::ReferenceWindow fresh = score_reference_window(engine, window);
+        const perplexity::ReferenceWindow& stored = references[window.index];
+        const perplexity::ReferenceWindow fresh   = score_reference_window(engine, window);
         const auto same = [](const auto& a, const auto& b) {
             return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(a[0])) == 0;
         };
@@ -479,7 +496,7 @@ int run_verify(Options options) {
     return identical ? 0 : 1;
 }
 
-// Reference conformance (IQS-1 G1): the lossless route's whole FP32 logits at every --every'th position of the
+// Reference conformance (IQS-2 G1): the lossless route's whole FP32 logits at every --every'th position of the
 // first --tokens tokens of the chosen windows, for tools/quality/shadow to compare bit for bit with the
 // publisher's model code run in exact arithmetic. PREFIX.json holds the tokens and positions, PREFIX.f32 the
 // logits rows (little-endian binary32, one vocabulary-sized row per position, in order).
@@ -552,7 +569,7 @@ int run_mask(const Options& options) {
 }
 
 int run_prefill(const Options& options) {
-    if (options.out.empty() || options.reference.empty()) { throw std::invalid_argument("prefill needs --reference and --out"); }
+    if (options.out.empty() || options.references.empty()) { throw std::invalid_argument("prefill needs --reference and --out"); }
     const certify::Corpus corpus = certify::load_corpus(options.corpus, options.set);
     const auto started           = std::chrono::steady_clock::now();
     infernix::EngineOptions engine_options;
@@ -571,7 +588,7 @@ int run_prefill(const Options& options) {
     }
     infernix::Engine engine(engine_options);
     const std::vector<certify::Window> windows = certify::load_windows(engine, corpus);
-    const std::vector<perplexity::ReferenceWindow> references = read_reference(options.reference, corpus, windows);
+    const std::vector<perplexity::ReferenceWindow> references = read_reference(options, corpus, windows);
     RowWriter rows(std::filesystem::path(options.out.string() + ".positions.csv"));
     for (std::size_t w = 0; w < windows.size(); ++w) {
         if (!selected(options, windows[w].index)) { continue; }
@@ -597,7 +614,7 @@ int run_prefill(const Options& options) {
     meta["noise_scale"]      = options.noise_scale;
     meta["windows"]          = options.windows;
     meta["kv_dtype"]         = options.kv;
-    meta["reference"]        = std::filesystem::absolute(options.reference).string();
+    meta["reference"]        = reference_paths(options);
     meta["prefill_chunk"]    = engine.options().prefill_chunk;
     meta["load"]             = load_json(engine);
     meta["rows"]             = rows.rows;
@@ -614,7 +631,7 @@ struct Segment {
 };
 
 int run_decode(const Options& options) {
-    if (options.out.empty() || options.reference.empty()) { throw std::invalid_argument("decode needs --reference and --out"); }
+    if (options.out.empty() || options.references.empty()) { throw std::invalid_argument("decode needs --reference and --out"); }
     const certify::Corpus corpus = certify::load_corpus(options.corpus, options.set);
     const std::uint32_t forced   = corpus.set.decode_tokens;
     if (forced > infernix::kMaximumConstraintSteps) { throw std::runtime_error("decode_tokens exceeds the constraint step limit"); }
@@ -637,11 +654,12 @@ int run_decode(const Options& options) {
     }
     infernix::Engine engine(engine_options);
     const std::vector<certify::Window> windows = certify::load_windows(engine, corpus);
-    const std::vector<perplexity::ReferenceWindow> references = read_reference(options.reference, corpus, windows);
+    const std::vector<perplexity::ReferenceWindow> references = read_reference(options, corpus, windows);
 
     // Window-major: a window's segments run together, so in a prefix-reuse run they resume from its warm prefix.
     std::vector<Segment> segments;
     for (std::uint32_t w = 0; w < windows.size(); ++w) {
+        if (!selected(options, windows[w].index)) { continue; }
         for (std::size_t j = 0; j < corpus.set.decode_starts.size(); ++j) {
             segments.push_back(Segment{.window = w, .index = static_cast<int>(j), .start = corpus.set.decode_starts[j]});
         }
@@ -694,7 +712,8 @@ int run_decode(const Options& options) {
         // Per window: a warm request publishes its first warm_tokens tokens (off the prefill chunk grid), then
         // its segments run together and resume from that prefix, in groups of `concurrency`.
         const std::size_t per_window = corpus.set.decode_starts.size();
-        for (std::uint32_t w = 0; w < windows.size(); ++w) {
+        for (std::size_t base = 0; base < segments.size(); base += per_window) {
+            const std::uint32_t w = segments[base].window;
             infernix::RequestOptions warm;
             warm.execution.requested_output_tokens = 1;
             warm.execution.sampling.temperature    = 0.0F;
@@ -709,10 +728,10 @@ int run_decode(const Options& options) {
                 std::vector<infernix::GenerationHandle> handles;
                 const std::size_t end = std::min(per_window, first + options.concurrency);
                 for (std::size_t j = first; j < end; ++j) {
-                    const Segment& segment = segments[w * per_window + j];
+                    const Segment& segment = segments[base + j];
                     handles.push_back(engine.submit(prompt_of(segment), request_of(segment)));
                 }
-                for (std::size_t j = first; j < end; ++j) { results[w * per_window + j] = handles[j - first].wait(); }
+                for (std::size_t j = first; j < end; ++j) { results[base + j] = handles[j - first].wait(); }
             }
         }
     }
@@ -748,7 +767,8 @@ int run_decode(const Options& options) {
     meta["arm"]                  = "decode";
     meta["route"]                = options.reproducible ? "reproducible" : "default";
     meta["kv_dtype"]             = options.kv;
-    meta["reference"]            = std::filesystem::absolute(options.reference).string();
+    meta["reference"]            = reference_paths(options);
+    meta["windows"]              = options.windows;
     meta["concurrency"]          = options.concurrency;
     meta["spec"]                 = infernix::product::speculative_backend_name(options.speculative.backend);
     meta["draft_tokens"]         = options.speculative.draft_tokens_auto ? json("auto") : json(options.speculative.draft_tokens);

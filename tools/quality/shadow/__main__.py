@@ -1,4 +1,4 @@
-"""IQS-1 G1, reference conformance: the publisher's transformers code in exact arithmetic against --lossless.
+"""IQS-2 G1, reference conformance: the publisher's transformers code in exact arithmetic against --lossless.
 
     python -m tools.quality.shadow CAPTURE --artifact ART --out RESULT.json [--sequences N] [--ngram-volume V]
 

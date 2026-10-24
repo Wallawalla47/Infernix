@@ -16,7 +16,7 @@ namespace infernix::ops {
 // (src/ops/lossless/cr_math.cuh). Tensors are contiguous; out may alias an input of the same shape.
 
 /**
- * The noise twin (EngineOptions::lossless_noise_seed; IQS-1's noise floor): with a nonzero seed every
+ * The noise twin (EngineOptions::lossless_noise_seed; IQS-2's noise floor): with a nonzero seed every
  * correctly rounded result of the lossless ops becomes a stochastic rounding of the same exact value
  * (src/ops/lossless/noise.cuh); 0 restores round to nearest even. Process-wide device state of every
  * lossless unit, set before the ops run.

@@ -1,0 +1,986 @@
+
+        verbose_str = ""
+        if verbose:
+            if isinstance(content.content, str):
+                verbose_str = f"Text: [{content.content}]\n"
+            else:
+                verbose_str = f"Text: [{self.tokenizer.decode(content.content)}]\n"
+
+        return {"input_ids": _input_ids, "labels": _labels, "verbose": verbose_str}
+
+    def _process_image_content(self, content, verbose):
+        image_tensor = self.process_image(content.content)
+        visual_patches, thw_grid = self._flatten_visual_inputs(image_tensor, "image")
+        grid_t, grid_h, grid_w = thw_grid
+        num_media_tokens = (grid_t * grid_h * grid_w) // (self.merge_size**2)
+        _input_ids = (
+            [self.vision_start_token_id]
+            + [self.image_token_id] * num_media_tokens
+            + [self.vision_end_token_id]
+        )
+
+        verbose_str = ""
+        if verbose:
+            verbose_str = f"Image (shape={image_tensor.shape}, image_thw_grid={thw_grid}): [<vision_start> {num_media_tokens}*<vision> <vision_end>]\n"
+
+        return {
+            "input_ids": _input_ids,
+            "pixel_values": visual_patches,
+            "thw_grid": thw_grid,
+            "verbose": verbose_str,
+        }
+
+    def _process_video_content(self, content_idx, video_results, verbose):
+        visual_patches, thw_grid, timestamps, video_meta = video_results[content_idx]
+        grid_t, grid_h, grid_w = thw_grid
+        num_media_tokens = (
+            (grid_t * grid_h * grid_w)
+            // (self.merge_size**2)
+            // self.temporal_compression_ratio
+        )
+
+        assert (
+            len(timestamps) == grid_t * self.temporal_patch_size
+        ), f"Expected {grid_t} * {self.temporal_patch_size} = {grid_t * self.temporal_patch_size} timestamps, but got {len(timestamps)}"
+
+        if not self.use_video_timestamps:
+            raise NotImplementedError
+
+        num_media_tokens_per_grid = grid_h * grid_w // (self.merge_size**2)
+        text_timestamps = [
+            self.format_timestamp(ts)
+            for ts in timestamps[
+                :: self.temporal_patch_size * self.temporal_compression_ratio
+            ]
+        ]
+        text_timestamp_ids = [self.tokenizer.encode(ts) for ts in text_timestamps]
+        _input_ids = (
+            [self.video_start_token_id]
+            + sum(
+                [
+                    ts_ids
+                    + [self.vision_start_token_id]
+                    + [self.video_token_id] * num_media_tokens_per_grid
+                    + [self.vision_end_token_id]
+                    for ts_ids in text_timestamp_ids
+                ],
+                [],
+            )
+            + [self.video_end_token_id]
+        )
+
+        verbose_str = ""
+        if verbose:
+            verbose_str = f"Video (video_thw_grid={thw_grid}, video_meta={video_meta}): [<video_start> "
+            for i, ts in enumerate(text_timestamps):
+                verbose_str += f"{ts} <vision_start> {timestamps.tolist()[i*self.temporal_patch_size*self.temporal_compression_ratio : (i+1)*self.temporal_patch_size*self.temporal_compression_ratio]} {num_media_tokens_per_grid}*<vision> <vision_end> "
+            verbose_str += "<video_end>]\n"
+
+        return {
+            "input_ids": _input_ids,
+            "pixel_values": visual_patches,
+            "thw_grid": thw_grid,
+            "second_per_grid_t": self.temporal_patch_size / video_meta["fps_sampled"],
+            "verbose": verbose_str,
+        }
+
+    def _process_audio_content(self, content, verbose):
+        result = self.audio_pipeline.process_audio_input(content.content)
+        verbose_str = ""
+        if verbose:
+            verbose_str = (
+                f"Audio (is_tokenized={result['is_tokenized']}): "
+                f"[<audio_start> {result['audio_token_len']}*<audio> <audio_end>]\n"
+            )
+        return {
+            "input_ids": result["input_ids"],
+            "audio_input": result["audio_input"],
+            "is_tokenized": result["is_tokenized"],
+            "verbose": verbose_str,
+        }
+
+    def _build_video_audio_units(
+        self,
+        thw_grid,
+        timestamps,
+        video_meta,
+        processed_audio,
+        is_tokenized,
+        audio_token_len,
+    ):
+        # Compute per-grid_t audio-segment boundaries. Tokenizer-free so it
+        # runs identically on the single-node path and the EPD encoder side.
+        grid_t, grid_h, grid_w = thw_grid
+        assert (
+            len(timestamps) == grid_t * self.temporal_patch_size
+        ), f"Expected {grid_t} * {self.temporal_patch_size} timestamps, got {len(timestamps)}"
+        if not self.use_video_timestamps:
+            raise NotImplementedError
+
+        num_media_tokens_per_grid = grid_h * grid_w // (self.merge_size**2)
+        grid_t_timestamps = timestamps[
+            :: self.temporal_patch_size * self.temporal_compression_ratio
+        ]
+        audio_token_per_second = self.audio_token_per_second
+
+        units = []
+        for i in range(len(grid_t_timestamps)):
+            audio_start_token_idx = int(grid_t_timestamps[i] * audio_token_per_second)
+            audio_end_token_idx = (
+                int(grid_t_timestamps[i + 1] * audio_token_per_second)
+                if i < len(grid_t_timestamps) - 1
+                else int(video_meta["segment_end_time"] * audio_token_per_second)
+            )
+            segment_audio_token_len = (
+                min(audio_end_token_idx, audio_token_len) - audio_start_token_idx
+            )
+            assert segment_audio_token_len > 0
+            segment_audio = (
+                processed_audio[
+                    audio_start_token_idx : audio_start_token_idx
+                    + segment_audio_token_len
+                ]
+                if is_tokenized
+                else None
+            )
+            units.append(
+                {
+                    "timestamp": grid_t_timestamps[i],
+                    "num_video_tokens": num_media_tokens_per_grid,
+                    "segment_audio_token_len": segment_audio_token_len,
+                    "segment_audio": segment_audio,
+                    # Used by encoder.server to trim audio_encoder output.
+                    "audio_start_token_idx": audio_start_token_idx,
+                }
+            )
+        return units
+
+    def _build_video_audio_input_ids(
+        self,
+        units,
+        thw_grid,
+        video_meta,
+        is_tokenized,
+        audio_token_len,
+        verbose=False,
+        timestamps=None,
+    ):
+        # Assemble video+audio input_ids from the unit list produced above.
+        # Tokenizer-dependent; the language node replays this on EPD.
+        text_timestamps = [self.format_timestamp(u["timestamp"]) for u in units]
+        text_timestamp_ids = [self.tokenizer.encode(ts) for ts in text_timestamps]
+
+        if self.video_audio_interleave_length == -1:
+            groups = [list(enumerate(units))]
+        elif self.video_audio_interleave_length == 0:
+            groups = [[(i, u)] for i, u in enumerate(units)]
+        else:
+            assert self.video_audio_interleave_length > 0
+            groups = []
+            unit_idx = 0
+            current_group = []
+            time_ptr = 0
+            while unit_idx < len(units):
+                while (
+                    unit_idx < len(units)
+                    and units[unit_idx]["timestamp"] >= time_ptr
+                    and units[unit_idx]["timestamp"]
+                    < time_ptr + self.video_audio_interleave_length
+                ):
+                    current_group.append((unit_idx, units[unit_idx]))
+                    unit_idx += 1
+                if current_group:
+                    groups.append(current_group)
+                    current_group = []
+                time_ptr += self.video_audio_interleave_length
+
+        _input_ids = [self.video_start_token_id]
+        audio_segments = []
+        verbose_str = ""
+        if verbose:
+            verbose_str = (
+                f"VideoAudio (video_thw_grid={thw_grid}, video_meta={video_meta}, "
+                f"is_audio_tokenized={is_tokenized}, audio_token_len={audio_token_len}): "
+                f"[<video_start> "
+            )
+
+        for group in groups:
+            head_idx = group[0][0]
+            if not self.use_per_grid_t_timestamps:
+                _input_ids += text_timestamp_ids[head_idx]
+                if verbose:
+                    verbose_str += f"{text_timestamps[head_idx]} "
+            _video_tokens, _audio_tokens = [], []
+            video_verbose_str, audio_verbose_str = "", ""
+            for unit_idx, unit in group:
+                if self.use_per_grid_t_timestamps:
+                    _video_tokens += text_timestamp_ids[unit_idx]
+                    _audio_tokens += text_timestamp_ids[unit_idx]
+                    video_verbose_str += text_timestamps[unit_idx] + " "
+                    audio_verbose_str += text_timestamps[unit_idx] + " "
+                _video_tokens += (
+                    [self.vision_start_token_id]
+                    + [self.video_token_id] * unit["num_video_tokens"]
+                    + [self.vision_end_token_id]
+                )
+                if verbose and timestamps is not None:
+                    ts_slice = timestamps.tolist()[
+                        unit_idx
+                        * self.temporal_patch_size
+                        * self.temporal_compression_ratio : (unit_idx + 1)
+                        * self.temporal_patch_size
+                        * self.temporal_compression_ratio
+                    ]
+                    video_verbose_str += (
+                        f"[{','.join(f'{ts:.2f}' for ts in ts_slice)}] "
+                        f"<vision_start> {unit['num_video_tokens']}*<video> <vision_end> "
+                    )
+                _audio_tokens += [self.audio_token_id] * unit["segment_audio_token_len"]
+                audio_verbose_str += f"{unit['segment_audio_token_len']}*<audio> "
+                if unit["segment_audio"] is not None:
+                    audio_segments.append(unit["segment_audio"])
+
+            _input_ids += (
+                _video_tokens
+                + [self.audio_start_token_id]
+                + _audio_tokens
+                + [self.audio_end_token_id]
+            )
+            if verbose:
+                verbose_str += (
+                    f"{video_verbose_str}<audio_start> {audio_verbose_str}<audio_end> "
+                )
+
+        _input_ids += [self.video_end_token_id]
+        if verbose:
+            verbose_str += "<video_end>]\n"
+
+        return {
+            "input_ids": _input_ids,
+            "audio_segments": audio_segments,
+            "verbose": verbose_str,
+        }
+
+    def _process_video_audio_content(
+        self, content_idx, content, video_results, verbose
+    ):
+        visual_patches, thw_grid, timestamps, video_meta = video_results[content_idx]
+        processed_audio = self.audio_pipeline.process_audio(content.content)
+
+        if isinstance(processed_audio, tuple):
+            assert (
+                content.content.start_time is None and content.content.end_time is None
+            ), "Audio start_time and end_time must be None when audio is not tokenized"
+            is_tokenized = False
+            audio_spec, audio_token_len = processed_audio
+            audio_input = audio_spec
+        else:
+            is_tokenized = True
+            audio_token_len = processed_audio.shape[0]
+            audio_input = None
+
+        units = self._build_video_audio_units(
+            thw_grid,
+            timestamps,
+            video_meta,
+            processed_audio,
+            is_tokenized,
+            audio_token_len,
+        )
+        built = self._build_video_audio_input_ids(
+            units,
+            thw_grid,
+            video_meta,
+            is_tokenized,
+            audio_token_len,
+            verbose=verbose,
+            timestamps=timestamps,
+        )
+
+        return {
+            "input_ids": built["input_ids"],
+            "pixel_values": visual_patches,
+            "thw_grid": thw_grid,
+            "second_per_grid_t": self.temporal_patch_size / video_meta["fps_sampled"],
+            "audio_input": audio_input,
+            "audio_segments": built["audio_segments"],
+            "is_tokenized": is_tokenized,
+            "verbose": built["verbose"],
+        }
+
+    def process(self, contents: list[Content], verbose: bool = False):
+        input_ids, labels = [], []
+        image_pixel_values, image_thw_grids = [], []
+        video_pixel_values, video_thw_grids = [], []
+        audio_inputs = []
+        is_audio_tokenized = []
+        second_per_grid_ts = []
+        extra = {}
+        verbose_str = ""
+
+        video_results = self._process_videos_parallel(contents)
+
+        for content_idx, content in enumerate(contents):
+            _labels = None
+
+            if content.type == "text":
+                result = self._process_text_content(content, verbose)
+                _labels = result["labels"]
+
+            elif content.type == "image":
+                result = self._process_image_content(content, verbose)
+                image_pixel_values.append(result["pixel_values"])
+                image_thw_grids.append(result["thw_grid"])
+
+            elif content.type == "video":
+                result = self._process_video_content(
+                    content_idx, video_results, verbose
+                )
+                video_pixel_values.append(result["pixel_values"])
+                video_thw_grids.append(result["thw_grid"])
+                second_per_grid_ts.append(result["second_per_grid_t"])
+
+            elif content.type == "audio":
+                result = self._process_audio_content(content, verbose)
+                audio_inputs.append(result["audio_input"])
+                is_audio_tokenized.append(result["is_tokenized"])
+
+            elif content.type == "video_audio":
+                result = self._process_video_audio_content(
+                    content_idx, content, video_results, verbose
+                )
+                video_pixel_values.append(result["pixel_values"])
+                video_thw_grids.append(result["thw_grid"])
+                second_per_grid_ts.append(result["second_per_grid_t"])
+                is_audio_tokenized.append(result["is_tokenized"])
+                if result["audio_input"] is not None:
+                    audio_inputs.append(result["audio_input"])
+                audio_inputs.extend(result["audio_segments"])
+
+            input_ids.extend(result["input_ids"])
+            labels.extend(_labels or [self.pad_token_id] * len(result["input_ids"]))
+            verbose_str += result.get("verbose", "")
+
+        input_ids = torch.tensor(input_ids)
+        labels = np.roll(labels, shift=-1)
+        labels[-1] = self.pad_token_id
+        labels = torch.tensor(labels)
+
+        if len(is_audio_tokenized) > 0:
+            assert all(is_audio_tokenized) or not any(
+                is_audio_tokenized
+            ), "All audio inputs must be tokenized or not tokenized"
+            extra["is_audio_tokenized"] = is_audio_tokenized[0]
+
+        if self.rope_type == "rope":
+            position_ids = torch.arange(input_ids.shape[0]).expand(3, -1)
+            rope_deltas = torch.zeros((1, 1), dtype=torch.int32)
+        elif self.rope_type == "mrope":
+            from .rope_utils import get_rope_index
+
+            position_ids, rope_deltas = get_rope_index(
+                spatial_merge_size=self.merge_size,
+                image_token_id=self.image_token_id,
+                video_token_id=self.video_token_id,
+                vision_start_token_id=self.vision_start_token_id,
+                model_type="qwen2_5_vl",
+                tokens_per_second=self.video_tokens_per_second,
+                image_grid_thw=image_thw_grids if len(image_thw_grids) > 0 else None,
+                video_grid_thw=video_thw_grids if len(video_thw_grids) > 0 else None,
+                second_per_grid_ts=second_per_grid_ts,
+                input_ids=input_ids[None, :],
+            )
+            position_ids = position_ids.squeeze(1)
+
+        if verbose:
+            print(verbose_str.strip())
+
+        return MiMoInputSample(
+            input_ids=input_ids,
+            labels=labels,
+            pixel_values=image_pixel_values,
+            pixel_values_videos=video_pixel_values,
+            image_thw_grids=image_thw_grids,
+            video_thw_grids=video_thw_grids,
+            audio_inputs=audio_inputs,
+            position_ids=position_ids,
+            rope_deltas=rope_deltas,
+            extra=extra,
+        )
+
+    def _flatten_visual_inputs(self, visual: torch.Tensor, visual_type: str):
+        if visual_type == "image":
+            resized_height, resized_width = visual.shape[-2:]
+            patches = visual.unsqueeze(0).repeat(self.temporal_patch_size, 1, 1, 1)
+        elif visual_type == "video" or visual_type == "video_audio":
+            assert (
+                len(visual)
+                % (self.temporal_compression_ratio * self.temporal_patch_size)
+                == 0
+            )
+            patches = visual
+            resized_height, resized_width = patches.shape[-2:]
+        else:
+            raise ValueError(f"Unknown visual_type: {visual_type}")
+
+        channel = patches.shape[1]
+        grid_t = patches.shape[0] // self.temporal_patch_size
+        grid_h, grid_w = (
+            resized_height // self.patch_size,
+            resized_width // self.patch_size,
+        )
+        patches = patches.contiguous().view(
+            grid_t,
+            self.temporal_patch_size,
+            channel,
+            grid_h // self.merge_size,
+            self.merge_size,
+            self.patch_size,
+            grid_w // self.merge_size,
+            self.merge_size,
+            self.patch_size,
+        )
+        patches = patches.permute(0, 3, 6, 4, 7, 2, 1, 5, 8).contiguous()
+
+        flatten_patches = patches.view(
+            grid_t * grid_h * grid_w,
+            channel * self.temporal_patch_size * self.patch_size * self.patch_size,
+        )
+        thw_grids = torch.tensor([grid_t, grid_h, grid_w], dtype=torch.int32)
+
+        return flatten_patches, thw_grids
+
+    @staticmethod
+    def format_timestamp(timestamp: float):
+        minutes = int(timestamp // 60)
+        seconds = int(timestamp % 60)
+        return f"{minutes:02d}:{seconds:02d}"
+
+    @staticmethod
+    def smart_resize(
+        height: int, width: int, factor: int, min_pixels: int, max_pixels: int
+    ):
+        """Rescales the image so that the following conditions are met:
+
+        1. Both dimensions (height and width) are divisible by 'factor'.
+        2. The total number of pixels is within the range ['min_pixels', 'max_pixels'].
+        3. The aspect ratio of the image is maintained as closely as possible.
+        """
+        if min(height, width) < factor:
+            scale = factor / min(height, width)
+            height = int(round(height * scale))
+            width = int(round(width * scale))
+        elif max(height, width) / min(height, width) > 200:
+            raise ValueError(
+                f"absolute aspect ratio must be smaller than 200, got {max(height, width) / min(height, width)}"
+            )
+        h_bar = round(height / factor) * factor
+        w_bar = round(width / factor) * factor
+        if h_bar * w_bar > max_pixels:
+            beta = math.sqrt((height * width) / max_pixels)
+            h_bar = math.floor(height / beta / factor) * factor
+            w_bar = math.floor(width / beta / factor) * factor
+        elif h_bar * w_bar < min_pixels:
+            beta = math.sqrt(min_pixels / (height * width))
+            h_bar = math.ceil(height * beta / factor) * factor
+            w_bar = math.ceil(width * beta / factor) * factor
+        return int(h_bar), int(w_bar)
+
+    @staticmethod
+    def to_rgb(pil_image: Image.Image) -> Image.Image:
+        if pil_image.mode == "RGBA":
+            white_background = Image.new("RGB", pil_image.size, (255, 255, 255))
+            white_background.paste(pil_image, mask=pil_image.split()[3])
+            return white_background
+        else:
+            return pil_image.convert("RGB")
+
+    @staticmethod
+    def standardize_batch(images: torch.Tensor) -> torch.Tensor:
+        device_key = str(images.device)
+        if device_key not in _mean_std_cache:
+            _mean_std_cache[device_key] = (
+                _QWEN2VL_PIXEL_MEAN.detach()
+                .clone()
+                .to(images.device)
+                .view(1, -1, 1, 1),
+                _QWEN2VL_PIXEL_STD.detach().clone().to(images.device).view(1, -1, 1, 1),
+            )
+        mean, std = _mean_std_cache[device_key]
+        return (images - mean) / std
+
+    @classmethod
+    def get_visual_transform_batch(
+        cls,
+        frames: torch.Tensor,
+        factor: int,
+        min_pixels: int,
+        max_pixels: int,
+        device: Optional[torch.device] = None,
+    ):
+        if device is not None:
+            frames = frames.to(device)
+
+        _, _, h, w = frames.shape
+        h_bar, w_bar = cls.smart_resize(h, w, factor, min_pixels, max_pixels)
+
+        resized = F.interpolate(
+            frames.float(),
+            size=(h_bar, w_bar),
+            mode="bilinear",
+            align_corners=False,
+        )
+        standardized = cls.standardize_batch(resized)
+
+        return standardized, w_bar, h_bar
+
+    @classmethod
+    def get_visual_transform(
+        cls,
+        img: torch.Tensor | Image.Image,
+        factor: int,
+        min_pixels: int,
+        max_pixels: int,
+        device: Optional[torch.device] = None,
+    ):
+        if isinstance(img, torch.Tensor):
+            img_tensor = img.float()
+            _, h, w = img_tensor.shape
+        elif isinstance(img, Image.Image):
+            img = img.convert("RGB")
+            w, h = img.size
+            img_array = np.array(img)
+            img_tensor = torch.from_numpy(img_array).permute(2, 0, 1).float()
+        else:
+            raise TypeError(
+                f"Unsupported image type: {type(img)}. Expected torch.Tensor or PIL.Image.Image"
+            )
+
+        if device is not None:
+            img_tensor = img_tensor.to(device)
+
+        h_bar, w_bar = cls.smart_resize(h, w, factor, min_pixels, max_pixels)
+
+        img_resized = F.interpolate(
+            img_tensor.unsqueeze(0),
+            size=(h_bar, w_bar),
+            mode="bilinear",
+            align_corners=False,
+        )
+        img_standardized = cls.standardize_batch(img_resized).squeeze(0)
+
+        return img_standardized, w_bar, h_bar
+
+    @classmethod
+    def fetch_image(cls, image: Image.Image | str | bytes):
+        image_obj = None
+        if isinstance(image, Image.Image):
+            image_obj = image
+        elif isinstance(image, str):
+            if image.startswith("http://") or image.startswith("https://"):
+                with BytesIO(download_remote_media(image, timeout=3)) as bio:
+                    image_obj = copy.deepcopy(Image.open(bio))
+            elif image.startswith("file://"):
+                image_obj = Image.open(image[7:])
+            elif image.startswith("data:image"):
+                if "base64," in image:
+                    _, base64_data = image.split("base64,", 1)
+                    data = base64.b64decode(base64_data)
+                    with BytesIO(data) as bio:
+                        image_obj = copy.deepcopy(Image.open(bio))
+            else:
+                image_obj = Image.open(image)
+        else:
+            image_obj = Image.open(BytesIO(image))
+        if image_obj is None:
+            raise ValueError(
+                f"Unrecognized image input, support local path, http url, base64 and PIL.Image, got {image}"
+            )
+        image = cls.to_rgb(image_obj)
+        return image
+
+
+class MiMoV2Processor(BaseMultimodalProcessor):
+    models = [MiMoV2ForCausalLM]
+
+    @staticmethod
+    def _normalize_config_dict(config, name: str) -> dict:
+        if config is None:
+            return {}
+        if isinstance(config, dict):
+            return config
+        if hasattr(config, "to_dict"):
+            return config.to_dict()
+        raise ValueError(f"{name} must be a dict-like config, got {type(config)}")
+
+    @staticmethod
+    def _require_config_value(config: dict, key: str):
+        value = config.get(key)
+        if value is None:
+            raise ValueError(f"processor_config.{key} must be set for MiMo-V2")
+        return value
+
+    def _validate_placeholder_counts(
+        self,
+        text_parts,
+        multimodal_tokens_pattern,
+        image_count: int,
+        video_count: int,
+        audio_count: int,
+    ):
+        counts = {
+            Modality.IMAGE: 0,
+            Modality.VIDEO: 0,
+            Modality.AUDIO: 0,
+        }
+        for text_part in text_parts:
+            if multimodal_tokens_pattern.match(text_part):
+                modality = self.mm_tokens.get_modality_of_token(text_part)
+                if modality in counts:
+                    counts[modality] += 1
+
+        for modality, name, data_count in (
+            (Modality.IMAGE, "image", image_count),
+            (Modality.VIDEO, "video", video_count),
+            (Modality.AUDIO, "audio", audio_count),
+        ):
+            placeholder_count = counts[modality]
+            if placeholder_count != data_count:
+                raise ValueError(
+                    f"{name} placeholder/data mismatch: "
+                    f"{placeholder_count} placeholders vs {data_count} {name}s"
+                )
+
+    def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
+        super().__init__(hf_config, server_args, _processor, *args, **kwargs)
+        self.vision_config = Qwen2_5_VLVisionConfig.from_dict(hf_config.vision_config)
+
+        patch_size = self.vision_config.patch_size
+        spatial_merge_size = getattr(self.vision_config, "spatial_merge_size", 2)
+        unit_size = patch_size * spatial_merge_size
+        self.image_factor = unit_size
+
+        rope_type = "rope"
+        rope_scaling = getattr(hf_config, "rope_scaling", None)
+        if rope_scaling:
+            if (
+                rope_scaling.get("type", None) == "default"
+                and rope_scaling.get("mrope_section", None) is not None
+            ):
+                rope_type = "mrope"
+
+        processor_config = self._normalize_config_dict(
+            getattr(hf_config, "processor_config", {}), "processor_config"
+        )
+        audio_config = self._normalize_config_dict(
+            getattr(hf_config, "audio_config", None), "audio_config"
+        )
+        self.audio_sample_rate = processor_config.get("audio_sampling_rate")
+        if self.audio_sample_rate is None:
+            self.audio_sample_rate = audio_config.get(
+                "sampling_rate"
+            ) or audio_config.get("sample_rate")
+        if self.audio_sample_rate is None:
+            raise ValueError(
+                "audio_sampling_rate must be set in processor_config or audio_config"
+            )
+
+        self.IM_START_TOKEN_ID = self._require_config_value(
+            processor_config, "vision_start_token_id"
+        )
+        self.IM_END_TOKEN_ID = self._require_config_value(
+            processor_config, "vision_end_token_id"
+        )
+        self.IM_TOKEN_ID = self._require_config_value(
+            processor_config, "image_token_id"
+        )
+        self.VIDEO_TOKEN_ID = self._require_config_value(
+            processor_config, "video_token_id"
+        )
+        self.vision_start_token_id = self.IM_START_TOKEN_ID
+        self.vision_end_token_id = self.IM_END_TOKEN_ID
+
+        self.AUDIO_TOKEN_ID = self._require_config_value(
+            processor_config, "audio_token_id"
+        )
+        self.AUDIO_START_TOKEN_ID = self._require_config_value(
+            processor_config, "audio_start_token_id"
+        )
+        self.AUDIO_END_TOKEN_ID = self._require_config_value(
+            processor_config, "audio_end_token_id"
+        )
+
+        self.video_start_token_id = self._require_config_value(
+            processor_config, "video_start_token_id"
+        )
+        self.video_end_token_id = self._require_config_value(
+            processor_config, "video_end_token_id"
+        )
+        self.use_image_processor_gpu = envs.SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU.get()
+        device = get_device().device if self.use_image_processor_gpu else None
+
+        self.mimo_processor = MiMoProcessor(
+            tokenizer=self._processor.tokenizer,
+            patch_size=patch_size,
+            image_min_pixels=processor_config.get("image_min_pixels", None)
+            or 4 * unit_size * unit_size,
+            image_max_pixels=processor_config.get("image_max_pixels", None)
+            or 4096 * unit_size * unit_size,
+            video_min_pixels=processor_config.get("video_min_pixels", None)
+            or 4 * unit_size * unit_size,
+            video_max_pixels=processor_config.get("video_max_pixels", None)
+            or 4096 * unit_size * unit_size,
+            video_total_max_pixels=processor_config.get("video_total_max_pixels", None)
+            or 16384 * unit_size * unit_size,
+            fps=processor_config.get("fps", None) or 2,
+            num_frames=processor_config.get("num_frames", None),
+            max_frames=processor_config.get("max_frames", None) or 256,
+            min_frames=processor_config.get("min_frames", None) or 8,
+            video_audio_interleave_length=processor_config.get(
+                "video_audio_interleave_length", 0
+            ),
+            use_per_grid_t_timestamps=processor_config.get(
+                "use_per_grid_t_timestamps", False
+            ),
+            audio_sampling_rate=self.audio_sample_rate,
+            image_token_id=self.IM_TOKEN_ID,
+            video_token_id=self.VIDEO_TOKEN_ID,
+            audio_token_id=self.AUDIO_TOKEN_ID,
+            vision_start_token_id=self.vision_start_token_id,
+            vision_end_token_id=self.vision_end_token_id,
+            audio_start_token_id=self.AUDIO_START_TOKEN_ID,
+            audio_end_token_id=self.AUDIO_END_TOKEN_ID,
+            video_start_token_id=self.video_start_token_id,
+            video_end_token_id=self.video_end_token_id,
+            pad_token_id=self._processor.tokenizer.pad_token_id,
+            rope_type=rope_type,
+            use_video_timestamps=processor_config.get("use_video_timestamps", False),
+            device=device,
+        )
+        self._processor = self.mimo_processor
+
+        self.AUDIO_TOKEN_REGEX = re.compile(
+            r"<\|mimo_audio_start\|>(?:<\|audio_pad\|>)+<\|mimo_audio_end\|>"
+        )
+
+        self.mm_tokens = MultimodalSpecialTokens(
+            image_token="<|vision_start|><|image_pad|><|vision_end|>",
+            image_token_id=self.IM_TOKEN_ID,
+            image_token_regex=re.compile(
+                r"<\|vision_start\|>(?:<\|image_pad\|>)+<\|vision_end\|>"
+            ),
+            video_token="<|vision_start|><|video_pad|><|vision_end|>",
+            video_token_regex=re.compile(
+                r"<\|vision_start\|>(?:<\|video_pad\|>)+<\|vision_end\|>"
+            ),
+            video_token_id=self.VIDEO_TOKEN_ID,
+            audio_token="<|mimo_audio_start|><|audio_pad|><|mimo_audio_end|>",
+            audio_token_id=self.AUDIO_TOKEN_ID,
+            audio_token_regex=self.AUDIO_TOKEN_REGEX,
+        ).build(_processor)
+
+    @property
+    def spatial_merge_size(self):
+        return self.vision_config.spatial_merge_size
+
+    def _preprocess_video_sync(self, vdw, preprocess_kwargs=None):
+        # Seed with processor_config defaults so E/D agree on fps/min/max.
+        default_kwargs = {
+            k: v
+            for k, v in self.mimo_processor.default_video_processor_kwargs.items()
+            if v is not None and k in ("fps", "min_frames", "max_frames", "num_frames")
+        }
+        ele = {**default_kwargs, **(preprocess_kwargs or {})}
+        try:
+            return _decode_frames_and_timestamps(vdw, ele)
+        except Exception as e:
+            logger.error(f"Video decode failed in _preprocess_video_sync: {e}")
+            raise HTTPException(
+                status_code=432, detail="Video file is corrupted or cannot be decoded"
+            )
+
+    def process_mm_data(
+        self, input_text, images=None, videos=None, audios=None, **kwargs
+    ) -> dict:
+        if audios and not self.AUDIO_TOKEN_REGEX.search(input_text or ""):
+            input_text = f"{self.mm_tokens.audio_token}{input_text or ''}"
+
+        processed_images = []
+        processed_videos = []
+        processed_audios = []
+
+        if images:
+            processed_images = list(images)
+
+        if videos:
+            for video in videos:
+                preprocess_kwargs = {}
+                audio_source = None
+                raw_video_source = video
+                if isinstance(video, VideoData):
+                    preprocess_kwargs = getattr(video, "preprocess_kwargs", {}) or {}
+                    raw_video_source = video.url
+                    audio_source = video.url
+                    video = video.url
+                elif isinstance(video, dict):
+                    preprocess_kwargs = video.get("preprocess_kwargs", {}) or {}
+                    audio_source = video.get("audio") or video.get("url")
+                    video = video.get("url", video)
+                    raw_video_source = video
+                elif isinstance(video, str):
+                    raw_video_source = video
+                    audio_source = None
+
+                if "use_audio" in preprocess_kwargs:
+                    use_audio = preprocess_kwargs["use_audio"]
+                elif isinstance(raw_video_source, str):
+                    use_audio = self.mimo_processor.has_audio_track(raw_video_source)
+                else:
+                    use_audio = False
+
+                if (
+                    use_audio
+                    and audio_source is None
+                    and isinstance(raw_video_source, (str, bytes, torch.Tensor))
+                ):
+                    audio_source = raw_video_source
+
+                processed_videos.append(
+                    (raw_video_source, use_audio, audio_source, preprocess_kwargs)
+                )
+
+        if audios:
+            for audio in audios:
+                if isinstance(audio, np.ndarray):
+                    audio_tensor = torch.from_numpy(audio).float()
+                elif isinstance(audio, torch.Tensor):
+                    audio_tensor = audio.float()
+                else:
+                    processed_audios.append(audio)
+                    continue
+                if audio_tensor.ndim == 1:
+                    processed_audios.append(
+                        (audio_tensor.cpu().contiguous(), self.audio_sample_rate)
+                    )
+                else:
+                    processed_audios.append(audio_tensor.cpu().contiguous())
+
+        contents = []
+
+        if input_text and (processed_images or processed_videos or processed_audios):
+            multimodal_tokens_pattern = self.mm_tokens.get_combined_regex()
+            text_parts = re.split(multimodal_tokens_pattern, input_text)
+            self._validate_placeholder_counts(
+                text_parts,
+                multimodal_tokens_pattern,
+                len(processed_images),
+                len(processed_videos),
+                len(processed_audios),
+            )
+
+            image_iter = iter(processed_images)
+            video_iter = iter(processed_videos)
+            audio_iter = iter(processed_audios)
+
+            for text_part in text_parts:
+                if multimodal_tokens_pattern.match(text_part):
+                    modality = self.mm_tokens.get_modality_of_token(text_part)
+                    if modality == Modality.IMAGE:
+                        img = next(image_iter)
+                        contents.append(
+                            Content(type="image", content=ImageInput(image=img))
+                        )
+                    elif modality == Modality.VIDEO:
+                        video_data = next(video_iter)
+                        contents.append(self._make_video_content(*video_data))
+                    elif modality == Modality.AUDIO:
+                        audio = next(audio_iter)
+                        contents.append(
+                            Content(type="audio", content=AudioInput(audio=audio))
+                        )
+                else:
+                    if text_part:
+                        contents.append(Content(type="text", content=text_part))
+        else:
+            contents.extend(
+                Content(type="image", content=ImageInput(image=image))
+                for image in processed_images
+            )
+            contents.extend(
+                self._make_video_content(*video_data) for video_data in processed_videos
+            )
+            contents.extend(
+                Content(type="audio", content=AudioInput(audio=audio))
+                for audio in processed_audios
+            )
+
+        if not contents:
+            input_ids = self.mimo_processor.tokenizer(
+                input_text or "",
+                return_tensors="pt",
+                add_special_tokens=True,
+            ).input_ids
+            return {"input_ids": input_ids}
+
+        input_sample = self.mimo_processor.process(contents, verbose=False)
+
+        ret = {
+            "input_ids": input_sample.input_ids,
+            "mrope_positions": getattr(input_sample, "position_ids", None),
+            "mrope_position_delta": getattr(input_sample, "rope_deltas", None),
+        }
+        if getattr(input_sample, "pixel_values", None):
+            pixel_values = torch.cat(input_sample.pixel_values, dim=0)
+            image_grids = torch.stack(input_sample.image_thw_grids)
+            ret.update(
+                {
+                    "pixel_values": pixel_values,
+                    "image_grid_thw": image_grids,
+                }
+            )
+        if getattr(input_sample, "pixel_values_videos", None):
+            pixel_values_videos = torch.cat(input_sample.pixel_values_videos, dim=0)
+            video_grids = torch.stack(input_sample.video_thw_grids)
+            ret.update(
+                {
+                    "pixel_values_videos": pixel_values_videos,
+                    "video_grid_thw": video_grids,
+                }
+            )
+            second_per_grid_ts = getattr(input_sample, "second_per_grid_ts", None)
+            if second_per_grid_ts is None:
+                second_per_grid_ts = getattr(
+                    input_sample, "video_second_per_grid", None
+                )
+            if second_per_grid_ts is not None:
+                ret["second_per_grid_ts"] = second_per_grid_ts
+            ret["video_start_token_id"] = getattr(
+                self.mimo_processor, "video_start_token_id", None
+            )
+            ret["video_end_token_id"] = getattr(
+                self.mimo_processor, "video_end_token_id", None
+            )
+        audio_inputs = getattr(input_sample, "audio_inputs", None)
+        if audio_inputs is not None and len(audio_inputs) > 0:
+            ret["audio_features"] = audio_inputs
+            audio_attention_mask = getattr(
+                input_sample, "audio_attention_mask", None
+            ) or getattr(input_sample, "feature_attention_mask", None)
+            if audio_attention_mask is not None:
+                ret["audio_attention_mask"] = audio_attention_mask
+            audio_feature_lens = getattr(input_sample, "audio_feature_lens", None)
+            if audio_feature_lens is None:
+                audio_feature_lens = audio_attention_mask
+                if audio_feature_lens is not None:
+                    audio_feature_lens = audio_feature_lens.sum(dim=-1)
+            if audio_feature_lens is not None:
+                ret["audio_feature_lens"] = audio_feature_lens
+
+        device = kwargs.get("device")
+        if device:
+            for key in (
+                "pixel_values",
+                "image_grid_thw",
+                "pixel_values_videos",
+                "video_grid_thw",
+                "audio_features",

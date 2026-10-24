@@ -316,6 +316,338 @@
   "license": "Apache-2.0"
  },
  {
+  "id": "en-ref-4",
+  "domain": "english_reference",
+  "kind": "text",
+  "chars": 40152,
+  "source": "eval/corpora/perplexity-1m/data/wikitext/00.txt",
+  "offset": 140000,
+  "license": "CC-BY-SA-4.0 (WikiText)"
+ },
+ {
+  "id": "en-ref-5",
+  "domain": "english_reference",
+  "kind": "text",
+  "chars": 40126,
+  "source": "eval/corpora/perplexity-1m/data/wikitext/01.txt",
+  "offset": 140000,
+  "license": "CC-BY-SA-4.0 (WikiText)"
+ },
+ {
+  "id": "en-ref-6",
+  "domain": "english_reference",
+  "kind": "text",
+  "chars": 40194,
+  "source": "eval/corpora/perplexity-1m/data/wikitext/02.txt",
+  "offset": 140000,
+  "license": "CC-BY-SA-4.0 (WikiText)"
+ },
+ {
+  "id": "en-ref-7",
+  "domain": "english_reference",
+  "kind": "text",
+  "chars": 42475,
+  "source": "eval/corpora/perplexity-1m/data/wikitext/03.txt",
+  "offset": 140000,
+  "license": "CC-BY-SA-4.0 (WikiText)"
+ },
+ {
+  "id": "en-long-4",
+  "domain": "english_long_form",
+  "kind": "text",
+  "chars": 40050,
+  "source": "eval/corpora/decode-4m/data/pg19/00.txt",
+  "book": "PG-19 validation/25066",
+  "offset": 360342,
+  "license": "Apache-2.0 (PG-19)"
+ },
+ {
+  "id": "en-long-5",
+  "domain": "english_long_form",
+  "kind": "text",
+  "chars": 40009,
+  "source": "eval/corpora/decode-4m/data/pg19/00.txt",
+  "book": "PG-19 validation/5195",
+  "offset": 904989,
+  "license": "Apache-2.0 (PG-19)"
+ },
+ {
+  "id": "en-long-6",
+  "domain": "english_long_form",
+  "kind": "text",
+  "chars": 40010,
+  "source": "eval/corpora/decode-4m/data/pg19/00.txt",
+  "book": "PG-19 validation/38214",
+  "offset": 1207515,
+  "license": "Apache-2.0 (PG-19)"
+ },
+ {
+  "id": "en-long-7",
+  "domain": "english_long_form",
+  "kind": "text",
+  "chars": 40017,
+  "source": "eval/corpora/decode-4m/data/pg19/00.txt",
+  "book": "PG-19 test/44557",
+  "offset": 1761748,
+  "license": "Apache-2.0 (PG-19)"
+ },
+ {
+  "id": "zh-4",
+  "domain": "chinese",
+  "kind": "text",
+  "chars": 16168,
+  "source": "eval/corpora/perplexity-1m/data/zhwiki/00.txt",
+  "offset": 40000,
+  "license": "CC-BY-SA-3.0 (Wikipedia)"
+ },
+ {
+  "id": "zh-5",
+  "domain": "chinese",
+  "kind": "text",
+  "chars": 16051,
+  "source": "eval/corpora/perplexity-1m/data/zhwiki/01.txt",
+  "offset": 40000,
+  "license": "CC-BY-SA-3.0 (Wikipedia)"
+ },
+ {
+  "id": "zh-6",
+  "domain": "chinese",
+  "kind": "text",
+  "chars": 16018,
+  "source": "eval/corpora/perplexity-1m/data/zhwiki/02.txt",
+  "offset": 40000,
+  "license": "CC-BY-SA-3.0 (Wikipedia)"
+ },
+ {
+  "id": "zh-7",
+  "domain": "chinese",
+  "kind": "text",
+  "chars": 16044,
+  "source": "eval/corpora/perplexity-1m/data/zhwiki/03.txt",
+  "offset": 40000,
+  "license": "CC-BY-SA-3.0 (Wikipedia)"
+ },
+ {
+  "id": "de-4",
+  "domain": "german",
+  "kind": "text",
+  "chars": 40054,
+  "source": "https://www.gutenberg.org/ebooks/24746",
+  "title": "Reise in die Aequinoctial-Gegenden des neuen Continents. Band 2",
+  "author": "Alexander von Humboldt",
+  "license": "Public domain in the US (Project Gutenberg)"
+ },
+ {
+  "id": "de-5",
+  "domain": "german",
+  "kind": "text",
+  "chars": 40007,
+  "source": "https://www.gutenberg.org/ebooks/35312",
+  "title": "Aus dem Leben eines Taugenichts",
+  "author": "Joseph von Eichendorff",
+  "license": "Public domain in the US (Project Gutenberg)"
+ },
+ {
+  "id": "de-6",
+  "domain": "german",
+  "kind": "text",
+  "chars": 40061,
+  "source": "https://www.gutenberg.org/ebooks/40739",
+  "title": "Die Traumdeutung",
+  "author": "Sigmund Freud",
+  "license": "Public domain in the US (Project Gutenberg)"
+ },
+ {
+  "id": "de-7",
+  "domain": "german",
+  "kind": "text",
+  "chars": 40027,
+  "source": "https://www.gutenberg.org/ebooks/7205",
+  "title": "Also sprach Zarathustra",
+  "author": "Friedrich Nietzsche",
+  "license": "Public domain in the US (Project Gutenberg)"
+ },
+ {
+  "id": "code-4",
+  "domain": "code",
+  "kind": "text",
+  "chars": 40024,
+  "source": "eval/corpora/perplexity-1m/data/ninfer/02.txt",
+  "offset": 0,
+  "license": "Apache-2.0 (NInfer)"
+ },
+ {
+  "id": "code-5",
+  "domain": "code",
+  "kind": "text",
+  "chars": 40021,
+  "source": "eval/corpora/perplexity-1m/data/ninfer/03.txt",
+  "offset": 0,
+  "license": "Apache-2.0 (NInfer)"
+ },
+ {
+  "id": "code-6",
+  "domain": "code",
+  "kind": "text",
+  "chars": 40032,
+  "source": "eval/corpora/decode-4m/data/sglang/00.txt",
+  "offset": 3000000,
+  "license": "Apache-2.0 (SGLang)"
+ },
+ {
+  "id": "code-7",
+  "domain": "code",
+  "kind": "text",
+  "chars": 40057,
+  "source": "eval/corpora/decode-4m/data/sglang/00.txt",
+  "offset": 4000000,
+  "license": "Apache-2.0 (SGLang)"
+ },
+ {
+  "id": "math-4",
+  "domain": "mathematics",
+  "kind": "text",
+  "chars": 40154,
+  "source": "openai/gsm8k test",
+  "items": [
+   240,
+   320
+  ],
+  "license": "MIT"
+ },
+ {
+  "id": "math-5",
+  "domain": "mathematics",
+  "kind": "text",
+  "chars": 40559,
+  "source": "openai/gsm8k test",
+  "items": [
+   320,
+   403
+  ],
+  "license": "MIT"
+ },
+ {
+  "id": "math-6",
+  "domain": "mathematics",
+  "kind": "text",
+  "chars": 40331,
+  "source": "HuggingFaceH4/MATH-500 (OpenAI prm800k)",
+  "items": [
+   163,
+   215
+  ],
+  "license": "MIT"
+ },
+ {
+  "id": "math-7",
+  "domain": "mathematics",
+  "kind": "text",
+  "chars": 40215,
+  "source": "HuggingFaceH4/MATH-500 (OpenAI prm800k)",
+  "items": [
+   215,
+   269
+  ],
+  "license": "MIT"
+ },
+ {
+  "id": "chat-4",
+  "domain": "chat",
+  "kind": "chat",
+  "chars": 44180,
+  "source": "OpenAssistant/oasst2 validation (English threads)",
+  "threads": [
+   36,
+   56
+  ],
+  "license": "Apache-2.0"
+ },
+ {
+  "id": "chat-5",
+  "domain": "chat",
+  "kind": "chat",
+  "chars": 44332,
+  "source": "OpenAssistant/oasst2 validation (English threads)",
+  "threads": [
+   56,
+   82
+  ],
+  "license": "Apache-2.0"
+ },
+ {
+  "id": "chat-6",
+  "domain": "chat",
+  "kind": "chat",
+  "chars": 50404,
+  "source": "openai/gsm8k test as a reasoning chat",
+  "items": [
+   403,
+   480
+  ],
+  "license": "MIT"
+ },
+ {
+  "id": "chat-7",
+  "domain": "chat",
+  "kind": "chat",
+  "chars": 48808,
+  "source": "HuggingFaceH4/MATH-500 as a reasoning chat",
+  "items": [
+   269,
+   322
+  ],
+  "license": "MIT"
+ },
+ {
+  "id": "tools-4",
+  "domain": "tool_calls",
+  "kind": "chat",
+  "chars": 45290,
+  "source": "NousResearch/hermes-function-calling-v1 func-calling.json",
+  "items": [
+   18,
+   25
+  ],
+  "license": "Apache-2.0"
+ },
+ {
+  "id": "tools-5",
+  "domain": "tool_calls",
+  "kind": "chat",
+  "chars": 47462,
+  "source": "NousResearch/hermes-function-calling-v1 func-calling.json",
+  "items": [
+   25,
+   31
+  ],
+  "license": "Apache-2.0"
+ },
+ {
+  "id": "tools-6",
+  "domain": "tool_calls",
+  "kind": "chat",
+  "chars": 45035,
+  "source": "NousResearch/hermes-function-calling-v1 json-mode-agentic.json",
+  "items": [
+   31,
+   48
+  ],
+  "license": "Apache-2.0"
+ },
+ {
+  "id": "tools-7",
+  "domain": "tool_calls",
+  "kind": "chat",
+  "chars": 46090,
+  "source": "NousResearch/hermes-function-calling-v1 json-mode-agentic.json",
+  "items": [
+   48,
+   63
+  ],
+  "license": "Apache-2.0"
+ },
+ {
   "id": "long-en-book",
   "domain": "english_long_form",
   "kind": "text",

@@ -58,7 +58,7 @@ add_dependencies(infernix-perplexity infernix_build_id_stamp)
 target_sources(infernix-perplexity PRIVATE ${INFERNIX_BUILD_ID_HEADER})
 infernix_stage_runtime_dlls(infernix-perplexity)
 
-# The IQS-1 certification measurements (docs/maintainer/model-quality.md §6): references, prefill and
+# The IQS-2 certification measurements (docs/maintainer/model-quality.md §6): references, prefill and
 # decode arms per position; tools/quality/iqs.py decides.
 add_executable(infernix-certify
   certify/main.cpp

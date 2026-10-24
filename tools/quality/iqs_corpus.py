@@ -1,14 +1,23 @@
-"""Build the IQS-1 certification corpus (eval/corpora/iqs-1; docs/maintainer/model-quality.md, section 6).
+"""Build the IQS-2 certification corpus (eval/corpora/iqs-1; docs/maintainer/model-quality.md, section 6).
 
-Deterministic: fixed sources, fixed slices, fixed item order, no randomness. The main set is 32 documents of
-8 domains (4 each), each scored as one 4,096-token window; the long set is 4 documents scored as 32,768-token
-windows. Text documents are tokenized raw by each artifact; chat documents (JSON) are rendered with each
-model's own chat template by infernix-certify, so chat, reasoning and tool-call formatting is the model's own.
+Deterministic: fixed sources, fixed slices, fixed item order, no randomness. The main set holds --per-domain
+documents (8 by default, at most 16) of each of 8 domains, each scored as one 4,096-token window; the long set
+is 4 documents scored as 32,768-token windows. Text documents are tokenized raw by each artifact; chat
+documents (JSON) are rendered with each model's own chat template by infernix-certify, so chat, reasoning and
+tool-call formatting is the model's own.
+
+The main set grows in layers of 4 documents per domain (32 windows), appended in window order: layer 0 is the
+original 32 windows, layer 1 windows 32-63, and so on. A layer never changes the documents before it, so the
+references, noise twins and reproducible arms stored for earlier windows stay valid (infernix-certify matches
+every stored window to its tokens) and growing the corpus scores only the new windows. Each layer's sources are
+listed below; layers 2 and 3 (128 windows) need 8 more German books and more competition mathematics than
+MATH-500 holds (layers 0 and 1 use 322 of its 500 problems).
 
 Sources: the repository's existing corpora (eval/corpora/perplexity-1m, decode-4m) and the downloaded public
 datasets under --sources (one folder each: gsm8k, math500, oasst2, hermes, gutenberg), read as data only.
 
 Usage: python -I tools/quality/iqs_corpus.py --sources DIR --existing eval/corpora --out eval/corpora/iqs-1
+       [--per-domain 8]
 """
 
 from __future__ import annotations
@@ -27,12 +36,40 @@ DECODE_TOKENS = 64
 MAIN_CHARS = {"default": 40000, "chinese": 16000}
 LONG_CHARS = {"default": 240000, "chinese": 110000}
 
-GUTENBERG = [  # Project Gutenberg ebook id, title, author (public domain in the US)
+LAYER = 4  # documents per domain per layer
+GUTENBERG = [  # Project Gutenberg ebook id, title, author (public domain in the US); one book per German document
     (22367, "Die Verwandlung", "Franz Kafka"),
     (12108, "Der Tod in Venedig", "Thomas Mann"),
     (2499, "Siddhartha: eine indische Dichtung", "Hermann Hesse"),
     (5323, "Effi Briest", "Theodor Fontane"),
+    (24746, "Reise in die Aequinoctial-Gegenden des neuen Continents. Band 2", "Alexander von Humboldt"),
+    (35312, "Aus dem Leben eines Taugenichts", "Joseph von Eichendorff"),
+    (40739, "Die Traumdeutung", "Sigmund Freud"),
+    (7205, "Also sprach Zarathustra", "Friedrich Nietzsche"),
 ]
+# Per layer, the character offset of each document in its stream: WikiText-2 test and Chinese Wikipedia
+# (perplexity-1m, one stream per document of a layer), far enough apart to hold different articles.
+WIKITEXT_OFFSETS = (0, 140_000, 70_000, 210_000)
+ZHWIKI_OFFSETS = (0, 40_000, 20_000, 60_000)
+# English long form beyond layer 0: PG-19 books of decode-4m's stream (test and validation books not in
+# perplexity-1m; the long set's book is the stream's first), as (book, character offset of its start); each
+# document starts 20,000 characters into its book, past the front matter. The last two are second slices.
+PG19_BOOKS = [("validation/25066", 340_342), ("validation/5195", 884_989), ("validation/38214", 1_187_515),
+              ("test/44557", 1_741_748), ("test/26239", 1_981_984), ("test/55871", 2_328_732),
+              ("test/7987", 3_745_909), ("test/4047", 4_775_608), ("test/41603", 5_386_525),
+              ("test/29594", 256_002), ("test/55871", 2_928_732), ("test/7987", 4_245_909)]
+# Code per layer: (corpus file, character offset); the long set's code is sglang at 2,000,000.
+CODE_LAYERS = [
+    [("perplexity-1m/data/ninfer/00.txt", 0), ("perplexity-1m/data/ninfer/01.txt", 0),
+     ("decode-4m/data/sglang/00.txt", 0), ("decode-4m/data/sglang/00.txt", 1_000_000)],
+    [("perplexity-1m/data/ninfer/02.txt", 0), ("perplexity-1m/data/ninfer/03.txt", 0),
+     ("decode-4m/data/sglang/00.txt", 3_000_000), ("decode-4m/data/sglang/00.txt", 4_000_000)],
+    [("perplexity-1m/data/ninfer/00.txt", 120_000), ("perplexity-1m/data/ninfer/01.txt", 120_000),
+     ("decode-4m/data/sglang/00.txt", 500_000), ("decode-4m/data/sglang/00.txt", 1_500_000)],
+    [("perplexity-1m/data/ninfer/02.txt", 120_000), ("perplexity-1m/data/ninfer/03.txt", 120_000),
+     ("decode-4m/data/sglang/00.txt", 2_500_000), ("decode-4m/data/sglang/00.txt", 3_500_000)],
+]
+LICENSES = {"ninfer": "Apache-2.0 (NInfer)", "sglang": "Apache-2.0 (SGLang)"}
 
 
 def at_line(text: str, offset: int) -> int:
@@ -194,7 +231,11 @@ def hermes_json_chat(conversations: list[dict], first: int, chars: int) -> tuple
     return {"enable_thinking": False, "messages": messages}, i
 
 
-def build(sources: Path, existing: Path, out: Path) -> dict:
+def build(sources: Path, existing: Path, out: Path, per_domain: int = 8) -> dict:
+    if per_domain % LAYER or not LAYER <= per_domain <= 4 * LAYER:
+        raise ValueError(f"--per-domain must be a multiple of {LAYER} from {LAYER} to {4 * LAYER}")
+    if per_domain > len(GUTENBERG):
+        raise ValueError(f"{per_domain} German documents need {per_domain} books; GUTENBERG lists {len(GUTENBERG)}")
     out.mkdir(parents=True, exist_ok=True)
     data = out / "data"
     provenance: list[dict] = []
@@ -213,72 +254,91 @@ def build(sources: Path, existing: Path, out: Path) -> dict:
     def existing_text(name: str) -> str:
         return (existing / name).read_text(encoding="utf-8")
 
-    for n in range(4):
-        add(main_docs, f"en-ref-{n}", "english_reference", "text",
-            slice_text(existing_text(f"perplexity-1m/data/wikitext/0{n}.txt"), 0, MAIN_CHARS["default"]),
-            {"source": f"eval/corpora/perplexity-1m/data/wikitext/0{n}.txt", "license": "CC-BY-SA-4.0 (WikiText)"})
-    for n in range(4):
-        add(main_docs, f"en-long-{n}", "english_long_form", "text",
-            slice_text(existing_text(f"perplexity-1m/data/pg19/0{n}.txt"), 0, MAIN_CHARS["default"]),
-            {"source": f"eval/corpora/perplexity-1m/data/pg19/0{n}.txt", "license": "Apache-2.0 (PG-19)"})
-    for n in range(4):
-        add(main_docs, f"zh-{n}", "chinese", "text",
-            slice_text(existing_text(f"perplexity-1m/data/zhwiki/0{n}.txt"), 0, MAIN_CHARS["chinese"]),
-            {"source": f"eval/corpora/perplexity-1m/data/zhwiki/0{n}.txt", "license": "CC-BY-SA-3.0 (Wikipedia)"})
-    for n, (book, title, author) in enumerate(GUTENBERG):
-        body = gutenberg_body((sources / "gutenberg" / f"pg{book}.txt").read_text(encoding="utf-8"))
-        add(main_docs, f"de-{n}", "german", "text", slice_text(body, 2000, MAIN_CHARS["default"]),
-            {"source": f"https://www.gutenberg.org/ebooks/{book}", "title": title, "author": author,
-             "license": "Public domain in the US (Project Gutenberg)"})
     sglang = existing_text("decode-4m/data/sglang/00.txt")
-    code_sources = [("perplexity-1m/data/ninfer/00.txt", 0, "Apache-2.0 (NInfer)"),
-                    ("perplexity-1m/data/ninfer/01.txt", 0, "Apache-2.0 (NInfer)"),
-                    ("decode-4m/data/sglang/00.txt", 0, "Apache-2.0 (SGLang)"),
-                    ("decode-4m/data/sglang/00.txt", 1_000_000, "Apache-2.0 (SGLang)")]
-    for n, (name, offset, license_) in enumerate(code_sources):
-        text = sglang if "sglang" in name else existing_text(name)
-        add(main_docs, f"code-{n}", "code", "text", slice_text(text, offset, MAIN_CHARS["default"]),
-            {"source": f"eval/corpora/{name}", "offset": offset, "license": license_})
+    pg19 = existing_text("decode-4m/data/pg19/00.txt")
     gsm, math = gsm8k_items(sources), math500_items(sources)
-    cursor_gsm = cursor_math = 0
-    for n in range(4):
-        if n < 2:
-            text, end = math_text(gsm, cursor_gsm, MAIN_CHARS["default"])
-            src = {"source": "openai/gsm8k test", "items": [cursor_gsm, end], "license": "MIT"}
-            cursor_gsm = end
-        else:
-            text, end = math_text(math, cursor_math, MAIN_CHARS["default"])
-            src = {"source": "HuggingFaceH4/MATH-500 (OpenAI prm800k)", "items": [cursor_math, end], "license": "MIT"}
-            cursor_math = end
-        add(main_docs, f"math-{n}", "mathematics", "text", text, src)
     threads = oasst_threads(sources)
-    cursor = 0
-    for n in range(2):
-        chat, end = oasst_chat(threads, cursor, MAIN_CHARS["default"])
-        add(main_docs, f"chat-{n}", "chat", "chat", chat,
-            {"source": "OpenAssistant/oasst2 validation (English threads)", "threads": [cursor, end], "license": "Apache-2.0"})
-        cursor = end
-    for n, (items, start, name) in enumerate(((gsm, cursor_gsm, "openai/gsm8k test"),
-                                               (math, cursor_math, "HuggingFaceH4/MATH-500"))):
-        chat, end = math_chat(items, start, MAIN_CHARS["default"])
-        add(main_docs, f"chat-{n + 2}", "chat", "chat", chat,
-            {"source": f"{name} as a reasoning chat", "items": [start, end], "license": "MIT"})
     calling = json.loads((sources / "hermes" / "func-calling.json").read_text(encoding="utf-8"))
     json_mode = json.loads((sources / "hermes" / "json-mode-agentic.json").read_text(encoding="utf-8"))
-    cursor = 0
-    for n in range(2):
-        chat, end = hermes_tool_chat(calling, cursor, MAIN_CHARS["default"])
-        add(main_docs, f"tools-{n}", "tool_calls", "chat", chat,
-            {"source": "NousResearch/hermes-function-calling-v1 func-calling.json", "items": [cursor, end],
-             "license": "Apache-2.0"})
-        cursor = end
-    cursor = 0
-    for n in range(2):
-        chat, end = hermes_json_chat(json_mode, cursor, MAIN_CHARS["default"])
-        add(main_docs, f"tools-{n + 2}", "tool_calls", "chat", chat,
-            {"source": "NousResearch/hermes-function-calling-v1 json-mode-agentic.json", "items": [cursor, end],
-             "license": "Apache-2.0"})
-        cursor = end
+    # Item cursors run on across layers, so a layer continues where the one before it stopped.
+    cursor_gsm = cursor_math = cursor_threads = cursor_calling = cursor_json = 0
+    for layer in range(per_domain // LAYER):
+        first = layer * LAYER
+        for n in range(LAYER):
+            stream = f"perplexity-1m/data/wikitext/0{n}.txt"
+            offset = WIKITEXT_OFFSETS[layer]
+            add(main_docs, f"en-ref-{first + n}", "english_reference", "text",
+                slice_text(existing_text(stream), offset, MAIN_CHARS["default"]),
+                {"source": f"eval/corpora/{stream}", **({"offset": offset} if offset else {}),
+                 "license": "CC-BY-SA-4.0 (WikiText)"})
+        for n in range(LAYER):
+            if layer == 0:
+                stream = f"perplexity-1m/data/pg19/0{n}.txt"
+                add(main_docs, f"en-long-{n}", "english_long_form", "text",
+                    slice_text(existing_text(stream), 0, MAIN_CHARS["default"]),
+                    {"source": f"eval/corpora/{stream}", "license": "Apache-2.0 (PG-19)"})
+            else:
+                book, start = PG19_BOOKS[first - LAYER + n]
+                add(main_docs, f"en-long-{first + n}", "english_long_form", "text",
+                    slice_text(pg19, start + 20_000, MAIN_CHARS["default"]),
+                    {"source": "eval/corpora/decode-4m/data/pg19/00.txt", "book": f"PG-19 {book}",
+                     "offset": start + 20_000, "license": "Apache-2.0 (PG-19)"})
+        for n in range(LAYER):
+            stream = f"perplexity-1m/data/zhwiki/0{n}.txt"
+            offset = ZHWIKI_OFFSETS[layer]
+            add(main_docs, f"zh-{first + n}", "chinese", "text",
+                slice_text(existing_text(stream), offset, MAIN_CHARS["chinese"]),
+                {"source": f"eval/corpora/{stream}", **({"offset": offset} if offset else {}),
+                 "license": "CC-BY-SA-3.0 (Wikipedia)"})
+        for n in range(LAYER):
+            book, title, author = GUTENBERG[first + n]
+            body = gutenberg_body((sources / "gutenberg" / f"pg{book}.txt").read_text(encoding="utf-8"))
+            add(main_docs, f"de-{first + n}", "german", "text", slice_text(body, 2000, MAIN_CHARS["default"]),
+                {"source": f"https://www.gutenberg.org/ebooks/{book}", "title": title, "author": author,
+                 "license": "Public domain in the US (Project Gutenberg)"})
+        for n, (name, offset) in enumerate(CODE_LAYERS[layer]):
+            text = sglang if "sglang" in name else existing_text(name)
+            add(main_docs, f"code-{first + n}", "code", "text", slice_text(text, offset, MAIN_CHARS["default"]),
+                {"source": f"eval/corpora/{name}", "offset": offset,
+                 "license": LICENSES["sglang" if "sglang" in name else "ninfer"]})
+        for n in range(LAYER):
+            if n < 2:
+                text, end = math_text(gsm, cursor_gsm, MAIN_CHARS["default"])
+                src = {"source": "openai/gsm8k test", "items": [cursor_gsm, end], "license": "MIT"}
+                cursor_gsm = end
+            else:
+                text, end = math_text(math, cursor_math, MAIN_CHARS["default"])
+                src = {"source": "HuggingFaceH4/MATH-500 (OpenAI prm800k)", "items": [cursor_math, end], "license": "MIT"}
+                cursor_math = end
+            add(main_docs, f"math-{first + n}", "mathematics", "text", text, src)
+        for n in range(2):
+            chat, end = oasst_chat(threads, cursor_threads, MAIN_CHARS["default"])
+            add(main_docs, f"chat-{first + n}", "chat", "chat", chat,
+                {"source": "OpenAssistant/oasst2 validation (English threads)", "threads": [cursor_threads, end],
+                 "license": "Apache-2.0"})
+            cursor_threads = end
+        chat, end = math_chat(gsm, cursor_gsm, MAIN_CHARS["default"])
+        add(main_docs, f"chat-{first + 2}", "chat", "chat", chat,
+            {"source": "openai/gsm8k test as a reasoning chat", "items": [cursor_gsm, end], "license": "MIT"})
+        cursor_gsm = end
+        chat, end = math_chat(math, cursor_math, MAIN_CHARS["default"])
+        add(main_docs, f"chat-{first + 3}", "chat", "chat", chat,
+            {"source": "HuggingFaceH4/MATH-500 as a reasoning chat", "items": [cursor_math, end], "license": "MIT"})
+        cursor_math = end
+        for n in range(2):
+            chat, end = hermes_tool_chat(calling, cursor_calling, MAIN_CHARS["default"])
+            add(main_docs, f"tools-{first + n}", "tool_calls", "chat", chat,
+                {"source": "NousResearch/hermes-function-calling-v1 func-calling.json", "items": [cursor_calling, end],
+                 "license": "Apache-2.0"})
+            cursor_calling = end
+        for n in range(2):
+            chat, end = hermes_json_chat(json_mode, cursor_json, MAIN_CHARS["default"])
+            add(main_docs, f"tools-{first + n + 2}", "tool_calls", "chat", chat,
+                {"source": "NousResearch/hermes-function-calling-v1 json-mode-agentic.json", "items": [cursor_json, end],
+                 "license": "Apache-2.0"})
+            cursor_json = end
+    if cursor_gsm > len(gsm) - 250:
+        raise ValueError(f"the corpus reaches GSM8K item {cursor_gsm}, into the task audit's last 250 items")
 
     long_sources = [("long-en-book", "english_long_form", "decode-4m/data/pg19/00.txt", 0, "default", "Apache-2.0 (PG-19)"),
                     ("long-en-ref", "english_reference", "decode-4m/data/wikitext/00.txt", 0, "default", "CC-BY-SA-4.0 (WikiText)"),
@@ -289,7 +349,7 @@ def build(sources: Path, existing: Path, out: Path) -> dict:
         add(long_docs, doc_id, domain, "text", slice_text(text, offset, LONG_CHARS[kind_chars]),
             {"source": f"eval/corpora/{name}", "offset": offset, "license": license_, "set": "long"})
 
-    # The task flip audit's fixed items (reported, gated only below 99 % of the reproducible route): GSM8K test
+    # The task flip audit's fixed items (a paired accuracy-loss check, iqs_e2e.py tasks): GSM8K test
     # items from the end of the split (the corpus uses its start), and MMLU test questions spread over subjects.
     tasks = out / "tasks"
     tasks.mkdir(exist_ok=True)
@@ -322,7 +382,7 @@ def build(sources: Path, existing: Path, out: Path) -> dict:
 
     manifest = {
         "corpus_id": "iqs-1",
-        "version": 1,
+        "version": 2,  # 2: the main set in layers of 32 windows (version 1 was layer 0 alone)
         "sets": {
             "main": {"window_tokens": MAIN_WINDOW, "decode_tokens": DECODE_TOKENS, "decode_starts": MAIN_STARTS,
                      "documents": main_docs},
@@ -341,8 +401,9 @@ def main() -> int:
     parser.add_argument("--sources", type=Path, required=True)
     parser.add_argument("--existing", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--per-domain", type=int, default=8, help="main-set documents per domain (4, 8, 12 or 16)")
     args = parser.parse_args()
-    manifest = build(args.sources, args.existing, args.out)
+    manifest = build(args.sources, args.existing, args.out, args.per_domain)
     for name, s in manifest["sets"].items():
         print(f"{name}: {len(s['documents'])} documents, {s['window_tokens']}-token windows")
     return 0

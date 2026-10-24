@@ -17,8 +17,8 @@ Python tools are independent of CMake; there is no `INFERNIX_BUILD_TOOLS` option
 | Inspect artifact metadata and objects | [`artifact/inspect.py`](artifact/inspect.py) |
 | One-time upgrade of official v2 artifacts | [`upgrade_ninfer_v2_to_v3.py`](upgrade_ninfer_v2_to_v3.py), with positional `INPUT OUTPUT` paths |
 | Run benchmark matrices | [`bench/`](bench/README.md) |
-| Certify the engine against the numerical acceptance policy (IQS-1): plan and run the regime, decide stored runs, run the end-to-end checks and the reference conformance | `python -m tools.quality.certify plan\|run\|certificate`, `tools.quality.iqs decide\|disclose\|certificate`, `tools.quality.iqs_e2e`, `tools.quality.shadow`; [policy](../docs/maintainer/model-quality.md#6-numerical-acceptance-policy-and-fast-paths) |
-| Build the IQS-1 certification corpus from its public sources | `python -I tools/quality/iqs_corpus.py --sources DIR --existing eval/corpora --out eval/corpora/iqs-1` |
+| Certify the engine against the numerical acceptance policy (IQS-2): plan and run the regime, decide stored runs, run the end-to-end checks and the reference conformance | `python -m tools.quality.certify plan\|run\|certificate`, `tools.quality.iqs decide\|disclose\|certificate`, `tools.quality.iqs_e2e`, `tools.quality.shadow`; [policy](../docs/maintainer/model-quality.md#6-numerical-acceptance-policy-and-fast-paths) |
+| Build the IQS-2 certification corpus from its public sources | `python -I tools/quality/iqs_corpus.py --sources DIR --existing eval/corpora --out eval/corpora/iqs-1` |
 | Measure external Serve TTFT | [`bench/ttft/`](bench/ttft/README.md) |
 | Exercise a resident HTTP server | [`smoke/serve_contract.py`](smoke/serve_contract.py) |
 | Exercise thinking preservation through a managed server | [`smoke/serve_thinking_preservation.py`](smoke/serve_thinking_preservation.py) |

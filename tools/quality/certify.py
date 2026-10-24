@@ -1,4 +1,4 @@
-"""IQS-1 certification run (docs/maintainer/model-quality.md, section 6): the whole regime as one ordered list of
+"""IQS-2 certification run (docs/maintainer/model-quality.md, section 6): the whole regime as one ordered list of
 steps on one machine, decided into one certificate.
 
   python -m tools.quality.certify plan --artifacts LOCAL.json --build BUILD --store STORE --out RUN [--mode M]
@@ -8,9 +8,12 @@ steps on one machine, decided into one certificate.
 `plan` writes RUN/steps.json (every command in run order, its outputs and watchdog) and RUN/plan.json (what the
 certificate decides); `run` executes the steps not yet done, in order, logging each to RUN/logs and RUN/status.jsonl,
 then writes RUN/certificate/certificate.{json,html}. A run resumes where it stopped: a step whose outputs exist is
-skipped. References and noise twins live in STORE, keyed by artifact, set, route and KV format; the lossless route
-and the design reference never change their bits, so later runs reuse them. --mode release adds the C0 spot check
-(re-score window 0 of every stored reference, bit for bit); a missing reference is made in either mode.
+skipped. References and noise twins live in STORE, keyed by artifact, set, route and KV format; the lossless route,
+the design reference, the noise twin and the reproducible route never change their bits, so later runs reuse them.
+The main set is stored in layers of 32 windows (the corpus grows a layer at a time): each layer of a reference, twin
+or reproducible arm is its own part, so a larger corpus makes only its new layers, and the default-route arms, whose
+kernels change, run on every window. --mode release adds the C0 spot check (re-score window 0 of every stored
+reference, bit for bit); a missing reference is made in either mode.
 
 LOCAL.json maps each artifact key to this machine's files:
   {"q27": {"path": "E:/.../qwen3_8_27b_nvfp4-official.ninfer"},
@@ -23,9 +26,9 @@ G1 (block B): the run captures the lossless route's logits (STORE/<artifact>/con
 runs beside or after the GPU blocks, before the certificate.
 
 Blocks (standard section 5.2): C1 references (lossless; design reference where the artifact declares activation
-quantization), C2 noise twins (one window per domain), C3 exact-codec references for the KV formats on the family
-representatives, C4 long-set references, D BF16-KV arms of every configuration, E1 KV-format arms, E2 long-set arms,
-F functional and end-to-end checks, G the certificate.
+quantization), C2 noise twins (every main-set window; for a KV format the twin of its design), C3 exact-codec
+references for the KV formats on the family representatives, C4 long-set references, D BF16-KV arms of every
+configuration, E1 KV-format arms, E2 long-set arms, F functional and end-to-end checks, G the certificate.
 """
 
 from __future__ import annotations
@@ -49,8 +52,10 @@ KV_REPRESENTATIVES = ("q27gw", "rc")          # one per attention family (Qwen3.
 LONG_REPRESENTATIVES = ("q27gw", "q35", "rc")  # dense Qwen3.5, MoE Qwen3.5, Flash-Next
 CONFORMANCE = ("q27gw", "q35", "fp8")          # G1: one artifact per architecture (Flash-Next: the official FP8)
 CAPTURE = ("--windows", "0,8,16,24", "--tokens", "512", "--every", "16")  # 4 sequences, 31 positions each
-TWIN_WINDOWS = "0,4,8,12,16,20,24,28"          # one window per domain
+LAYER = 32  # main-set windows per corpus layer (tools/quality/iqs_corpus.py)
 TWIN_SEED = 20261022
+# The arms of the reproducible route: bit-identical from release to release, so stored per layer and reused.
+STORED_ARMS = ("prefill-reproducible", "decode-reproducible")
 # The stress arm: four requests per window resuming from a 200-token warm prefix (off the prefill chunk grid) in a
 # KV pool too small for all four (7,424 tokens of segments in 6,144), so requests are preempted and replayed.
 STRESS = ("--concurrency", "4", "--prefix-reuse", "--warm-tokens", "200", "--kv-tokens", "6144")
@@ -107,6 +112,27 @@ def compared(design: Path) -> list[Path]:
     return [Path(str(design) + ".compare.json"), Path(str(design) + ".json")]
 
 
+def main_windows() -> int:
+    manifest = json.loads(CORPUS.read_text(encoding="utf-8"))
+    count = len(manifest["sets"]["main"]["documents"])
+    if count % LAYER:
+        raise SystemExit(f"{CORPUS}: {count} main-set windows is not a whole number of {LAYER}-window layers")
+    return count
+
+
+def layer_path(path: Path, layer: int, legacy: bool = True) -> Path:
+    """Layer k of a stored main-set item: windows 32k .. 32k+31. Layer 0 of a reference keeps the name it had
+    before the corpus grew (legacy); twins and arms always carry their window range."""
+    if layer == 0 and legacy:
+        return path
+    suffix = f".w{layer * LAYER}-{(layer + 1) * LAYER - 1}"
+    return path.with_name(path.stem + suffix + path.suffix) if path.suffix == ".ref" else Path(str(path) + suffix)
+
+
+def window_list(layer: int) -> str:
+    return ",".join(str(w) for w in range(layer * LAYER, (layer + 1) * LAYER))
+
+
 def exe(build: Path, name: str) -> str:
     for candidate in (build / "apps" / "Release" / f"{name}.exe", build / "apps" / name, build / "apps" / f"{name}.exe"):
         if candidate.is_file():
@@ -139,8 +165,10 @@ class Planner:
                 raise SystemExit(f"--kv-cell {cell}: expected KEY:FORMAT, FORMAT one of {', '.join(KV_FORMATS)}")
             if kv not in self.kv_cells.setdefault(key, []):
                 self.kv_cells[key].append(kv)
+        self.layers = main_windows() // LAYER
         self.steps: list[Step] = []
         self.decisions: list[dict] = []
+        self.gates: list[dict] = []
         self.disclosures: list[dict] = []
         self.checks: list[dict] = []
 
@@ -157,8 +185,19 @@ class Planner:
             return self.lossless(config.artifact)
         return self.design(config, kv)
 
-    def twin(self, config: Config) -> Path:
-        return self.store / config.key / "main-twin"
+    def twin(self, config: Config, kv: str = "bf16") -> Path:
+        """The noise twin of R(A, K): the lossless route's for a 16-bit configuration on BF16 KV, else the design's."""
+        return self.store / config.key / ("main-twin" if kv == "bf16" else f"main-twin-{kv}")
+
+    def parts(self, path: Path, legacy: bool = True) -> list[Path]:
+        """A stored main-set item's layers, in window order."""
+        return [layer_path(path, k, legacy) for k in range(self.layers)]
+
+    def reference_args(self, path: Path, set_name: str = "main") -> list[str]:
+        out = []
+        for part in (self.parts(path) if set_name == "main" else [path]):
+            out += ["--reference", str(part)]
+        return out
 
     def scored(self, config: Config, set_name: str = "main") -> Path:
         """The positions the artifact's windows score: the tokens the model writes (see infernix-certify mask)."""
@@ -166,6 +205,10 @@ class Planner:
 
     def arm(self, config: Config, kv: str, name: str, set_name: str = "main") -> Path:
         return self.run / "arms" / f"{config.key}-{set_name}-{kv}-{name}"
+
+    def stored_arm(self, config: Config, kv: str, name: str) -> Path:
+        """A reproducible-route arm: kept with the references and reused by later runs, a layer per part."""
+        return self.store / config.key / "arms" / f"main-{kv}-{name}"
 
     # Commands ----------------------------------------------------------------------------------------------
     def artifact_args(self, config: Config) -> list[str]:
@@ -190,8 +233,11 @@ class Planner:
                 "--out", str(out), *args]
         self.add(Step(block, name, argv, [str(p) for p in (outputs or [Path(str(out) + ".json")])], minutes))
 
-    def decide(self, label: str, arm: Path, config: Config, set_name: str = "main") -> None:
-        self.decisions.append({"label": label, "arm": str(arm), "twin": str(self.twin(config)),
+    def decide(self, label: str, arm: list[Path], config: Config, kv: str, set_name: str = "main") -> None:
+        # A long-set arm takes the BF16 main-set twin: no twin runs at 32K.
+        twin = self.twin(config, kv if set_name == "main" else "bf16")
+        self.decisions.append({"label": label, "arm": [str(p) for p in arm],
+                               "twin": [str(p) for p in self.parts(twin, legacy=False)],
                                "scored": str(self.scored(config, set_name)),
                                "twin_scored": str(self.scored(config, "main"))})
 
@@ -209,9 +255,12 @@ class Planner:
         for c in self.configs:
             self.references(c)
         for c in self.configs:
-            self.twin_step(c)
+            self.twin_step(c, "bf16")
         for c in self.configs:
             self.kv_references(c)
+        for c in self.configs:
+            for kv in self.kv_cells.get(c.key, ()):
+                self.twin_step(c, kv)
         for c in self.configs:
             if c.key in LONG_REPRESENTATIVES:
                 self.certify_step("C4", f"ref-{c.artifact}-long-lossless", "reference", c, [],
@@ -234,31 +283,43 @@ class Planner:
             self.end_to_end(c)
         self.sensitivity()
 
-    def references(self, c: Config) -> None:
-        lossless = self.lossless(c.artifact)
-        self.certify_step("C1", f"ref-{c.artifact}-lossless", "reference", c, [], lossless, 120)
-        if c.declared:
-            design = self.design(c, "bf16")
-            self.certify_step("C1", f"ref-{c.key}-design-bf16", "reference", c,
-                              ["--design", "--kv-dtype", "bf16", "--reference", str(lossless)], design, 120,
-                              outputs=compared(design))
-            self.disclosures.append({"label": f"{c.key} declared design (activation quantization, bf16 KV)",
-                                     "arm": str(design) + ".compare", "scored": str(self.scored(c))})
+    @staticmethod
+    def layer_name(name: str, layer: int) -> str:
+        return name if layer == 0 else f"{name}-L{layer}"
 
-    def twin_step(self, c: Config) -> None:
-        route = ["--lossless", "--noise-seed", str(TWIN_SEED), "--windows", TWIN_WINDOWS,
-                 "--reference", str(self.reference(c, "bf16"))]
+    def design_reference(self, c: Config, kv: str, block: str) -> None:
+        """A design reference, layer by layer, measured against the lossless one in the same pass."""
+        design = self.design(c, kv)
+        for k, part in enumerate(self.parts(design)):
+            self.certify_step(block, self.layer_name(f"ref-{c.key}-design-{kv}", k), "reference", c,
+                              ["--design", "--kv-dtype", kv, *self.reference_args(self.lossless(c.artifact)),
+                               "--windows", window_list(k)], part, 120, outputs=compared(part))
+
+    def references(self, c: Config) -> None:
+        for k, part in enumerate(self.parts(self.lossless(c.artifact))):
+            self.certify_step("C1", self.layer_name(f"ref-{c.artifact}-lossless", k), "reference", c,
+                              ["--windows", window_list(k)], part, 120)
         if c.declared:
-            route[1:1] = ["--design", "--kv-dtype", "bf16"]
-        self.certify_step("C2", f"twin-{c.key}", "prefill", c, route, self.twin(c), 60)
+            self.design_reference(c, "bf16", "C1")
+            self.disclosures.append({"label": f"{c.key} declared design (activation quantization, bf16 KV)",
+                                     "arm": [str(p) + ".compare" for p in self.parts(self.design(c, "bf16"))],
+                                     "scored": str(self.scored(c))})
+
+    def twin_step(self, c: Config, kv: str) -> None:
+        """The noise twin of R(A, K) on every main-set window, a layer per part."""
+        for k, part in enumerate(self.parts(self.twin(c, kv), legacy=False)):
+            route = ["--lossless", "--noise-seed", str(TWIN_SEED), "--windows", window_list(k),
+                     *self.reference_args(self.reference(c, kv))]
+            if c.declared or kv != "bf16":
+                route[1:1] = ["--design", "--kv-dtype", kv]
+            name = f"twin-{c.key}" if kv == "bf16" else f"twin-{c.key}-{kv}"
+            self.certify_step("C2", self.layer_name(name, k), "prefill", c, route, part, 60)
 
     def kv_references(self, c: Config) -> None:
         for kv in self.kv_cells.get(c.key, ()):
-            design = self.design(c, kv)
-            self.certify_step("C3", f"ref-{c.key}-design-{kv}", "reference", c,
-                              ["--design", "--kv-dtype", kv, "--reference", str(self.lossless(c.artifact))],
-                              design, 120, outputs=compared(design))
-            self.disclosures.append({"label": f"{c.key} KV {kv} design error", "arm": str(design) + ".compare",
+            self.design_reference(c, kv, "C3")
+            self.disclosures.append({"label": f"{c.key} KV {kv} design error",
+                                     "arm": [str(p) + ".compare" for p in self.parts(self.design(c, kv))],
                                      "kv": kv, "scored": str(self.scored(c))})
 
     def capture(self, c: Config) -> None:
@@ -279,22 +340,41 @@ class Planner:
         for c, ref in refs:
             name = f"verify-{ref.parent.name}-{ref.stem}"
             result = self.run / "checks" / f"{name}.json"
-            argv = [self.certify, "verify", *self.artifact_args(c), "--reference", str(ref), "--windows", "0"]
+            argv = [self.certify, "verify", *self.artifact_args(c), *self.reference_args(ref), "--windows", "0"]
             self.add(Step("C0", name, argv, [str(result)], 30, check=str(result)))
             self.checks.append({"name": f"C0 {ref.parent.name} {ref.stem} unchanged", "result": str(result)})
 
     def arm_steps(self, c: Config, kv: str, block: str, arms: list[tuple[str, str, list[str]]],
-                  set_name: str = "main", decide: bool = True) -> list[Path]:
+                  set_name: str = "main", decide: bool = True) -> list[list[Path]]:
+        """Each arm's parts: a reproducible main-set arm is stored a layer per part (reused by later runs); every
+        other arm runs on all its set's windows in this run."""
         reference = self.lossless(c.artifact, set_name) if set_name != "main" else self.reference(c, kv)
+        common = [*self.reference_args(reference, set_name), "--kv-dtype", kv]
+        minutes = 90 if set_name == "main" else 120
         outs = []
         for name, command, args in arms:
-            out = self.arm(c, kv, name, set_name)
-            self.certify_step(block, f"arm-{c.key}-{set_name}-{kv}-{name}", command, c,
-                              ["--reference", str(reference), "--kv-dtype", kv, *args], out,
-                              90 if set_name == "main" else 120, set_name=set_name)
+            step = f"arm-{c.key}-{set_name}-{kv}-{name}"
+            if set_name == "main" and name in STORED_ARMS:
+                parts = self.parts(self.stored_arm(c, kv, name), legacy=False)
+                for k, part in enumerate(parts):
+                    self.certify_step(block, self.layer_name(step, k), command, c,
+                                      [*common, *args, "--windows", window_list(k)], part, minutes)
+            else:
+                parts = [self.arm(c, kv, name, set_name)]
+                self.certify_step(block, step, command, c, [*common, *args], parts[0], minutes, set_name=set_name)
             if decide:
-                self.decide(f"{c.key} {set_name} {kv} {name}", out, c, set_name)
-            outs.append(out)
+                self.decide(f"{c.key} {set_name} {kv} {name}", parts, c, kv, set_name)
+            outs.append(parts)
+        # Every default-route arm is a fast path: gated on its increase over the reproducible arm of its kind,
+        # which forced the same positions.
+        made = {name: parts for (name, _, _), parts in zip(arms, outs)}
+        for (name, command, _), parts in zip(arms, outs):
+            baseline = made.get(f"{command}-reproducible")
+            if decide and "default" in name and baseline:
+                self.gates.append({"label": f"{c.key} {set_name} {kv} {name}", "arm": [str(p) for p in parts],
+                                   "baseline": [str(p) for p in baseline],
+                                   "twin": [str(p) for p in self.parts(self.twin(c, kv), legacy=False)],
+                                   "scored": str(self.scored(c, set_name))})
         return outs
 
     def bf16_arms(self, c: Config) -> None:
@@ -323,7 +403,7 @@ class Planner:
                 out = self.arm_steps(c, kv, "E2", [("prefill-default", "prefill", [])], set_name="long",
                                      decide=False)[0]
                 self.disclosures.append({"label": f"{c.key} long KV {kv} (engine and design error)",
-                                         "arm": str(out), "kv": kv, "scored": str(self.scored(c, "long"))})
+                                         "arm": [str(p) for p in out], "kv": kv, "scored": str(self.scored(c, "long"))})
 
     def functional(self) -> None:
         ctest = [ctest_exe(), "--test-dir", str(self.build), "-C", "Release", "--output-on-failure"]
@@ -401,7 +481,7 @@ def provenance(build: Path, mode: str) -> dict:
             return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=60).stdout.strip()
         except (OSError, subprocess.SubprocessError):
             return ""
-    return {"standard": "IQS-1", "mode": mode, "planned": dt.datetime.now().isoformat(timespec="seconds"),
+    return {"standard": "IQS-2", "mode": mode, "planned": dt.datetime.now().isoformat(timespec="seconds"),
             "commit": run(["git", "rev-parse", "HEAD"], ROOT), "build": str(build),
             "gpu": run(["nvidia-smi", "--query-gpu=name,driver_version,clocks.max.sm,power.limit",
                         "--format=csv,noheader"]),
@@ -421,14 +501,14 @@ def plan_command(args) -> int:
     (run / "steps.json").write_text(json.dumps([asdict(s) for s in planner.steps], indent=1) + "\n", encoding="utf-8")
     prov = provenance(planner.build, args.mode)
     prov["left_out"] = planner.left_out
-    plan = {"provenance": prov, "decisions": planner.decisions, "disclosures": planner.disclosures,
-            "checks": planner.checks}
+    plan = {"provenance": prov, "decisions": planner.decisions, "gates": planner.gates,
+            "disclosures": planner.disclosures, "checks": planner.checks}
     (run / "plan.json").write_text(json.dumps(plan, indent=1) + "\n", encoding="utf-8")
     blocks: dict[str, int] = {}
     for s in planner.steps:
         blocks[s.block] = blocks.get(s.block, 0) + 1
     print(f"{len(planner.steps)} steps ({', '.join(f'{b} {n}' for b, n in blocks.items())}); "
-          f"{len(planner.decisions)} decisions, {len(planner.disclosures)} disclosures, {len(planner.checks)} checks; "
+          f"{len(planner.decisions)} decisions, {len(planner.gates)} gates, {len(planner.disclosures)} disclosures, {len(planner.checks)} checks; "
           f"left out: {', '.join(planner.left_out) or 'none'}")
     return 0
 

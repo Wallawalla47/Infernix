@@ -43,8 +43,8 @@ and the chunk size only picks the scatter. So:
 | `infernix-perplexity --lossless --save-top-tokens FILE` | a reference distribution over a perplexity corpus |
 | `infernix-perplexity --kl-reference FILE` | KL divergence and top-1 agreement against a saved reference |
 | `infernix_decode_quality_gen` / `infernix_decode_quality_judge` | end-to-end greedy decode through the production speculative path, judged token by token against a reference ([benchmarks](../../bench/README.md#decode-quality)) |
-| `infernix-certify` | IQS-1's references, noise twins, teacher-forced prefill and decode arms and G1 captures (6.6) |
-| `tools/quality/iqs.py`, `certify.py`, `iqs_e2e.py`, `shadow/` | IQS-1's decisions and certificate, the certification run, its end-to-end checks and its reference conformance (6.6) |
+| `infernix-certify` | IQS-2's references, noise twins, teacher-forced prefill and decode arms and G1 captures (6.6) |
+| `tools/quality/iqs.py`, `certify.py`, `iqs_e2e.py`, `shadow/` | IQS-2's decisions and certificate, the certification run, its end-to-end checks and its reference conformance (6.6) |
 
 Perplexity scoring runs prefill only; decode kernels, speculative verification and n-gram drafting
 need the decode tools. The generator uses only Engine API that NInfer also has, so the
@@ -327,7 +327,7 @@ pass. The decode-quality commands are in [the benchmark guide](../../bench/READM
 This section is the policy for every change that alters model output: when a numerically different
 route may ship, what it is measured against, how much it may cost, and how that is tested. 6.1
 defines the routes and how a fast path qualifies; 6.2-6.6 are the standard every shipped path is
-held to (IQS-1, since 2026-10-22); 6.7 and 6.8 record the paths and the exact-route changes with
+held to (IQS-2, since 2026-10-24; IQS-1 from 2026-10-22); 6.7 and 6.8 record the paths and the exact-route changes with
 their evidence. `tools/quality/iqs.py` implements the decisions; its constants are the ones below.
 
 ### 6.1 The reproducible route and the fast paths
@@ -409,10 +409,11 @@ A fast path is qualified for a configuration only when all three hold there:
    oracle over the full conformance domain ([Op development](op-development.md#6-qualification)).
    A fast path that changes an Op's arithmetic profile gets its own named criterion with a
    numerical derivation, under the same rules as any other route.
-2. **Path fidelity (IQS-1, 6.2-6.6), jointly.** The configuration's arms on the default route, which
+2. **Path fidelity (IQS-2, 6.2-6.6), jointly.** The configuration's arms on the default route, which
    runs every path already qualified there **together with** the candidate (the measurement tools'
-   `--fast-path NAME` adds a candidate before it is listed), pass F0-F5 against the stored reference
-   R(A, K) (`tools/quality/certify.py plan --only KEY`: block D, and block E1 when the path changes
+   `--fast-path NAME` adds a candidate before it is listed), pass C0-C4 against the stored reference
+   R(A, K) and the increase gate P1-P4 against the configuration's reproducible arms on the same
+   positions (`tools/quality/certify.py plan --only KEY`: block D, and block E1 when the path changes
    attention or KV arithmetic, which decides it on every KV format of the representative's family).
    Paths that each fit the budget therefore cannot add up past it.
 3. **A resolved speedup** at the scope it claims, measured as any performance change
@@ -443,8 +444,9 @@ with the same arms and timed. A failed run is never repeated to look for a pass 
 
 ### 6.2 The standard: terms and guarantees
 
-Adopted by the owner on 2026-10-22; it replaced every earlier gate of this section (the relative
-excess over the reproducible route with `tools/quality/fast_path_gate.py`, the reduced and
+Adopted by the owner on 2026-10-22 (IQS-1) and revised on 2026-10-24 (IQS-2: the noise-floor and
+sample-size measurements of 23-24 October below); it replaced every earlier gate of this section (the
+relative excess over the reproducible route with `tools/quality/fast_path_gate.py`, the reduced and
 1,024-segment protocols, per-configuration gate campaigns). It is written to be read without
 knowledge of Infernix: every budget is anchored to a published number, and every guarantee names
 the test that verifies it.
@@ -466,7 +468,7 @@ the test that verifies it.
   (prefill, decode, verification) x decode mode (plain, MTP, DFlash, DFlash2, trees, n-gram copies)
   x serving condition (concurrency, prefix resume, preemption and Replay, chunking, context length).
 - **Engine error** of a path: its divergence from R(A, K). **Design error**: the divergence of
-  R(A, K) from the lossless route. IQS-1 gates the first and discloses the second.
+  R(A, K) from the lossless route. IQS-2 gates the first and discloses the second.
 
 | ID | Guarantee | Verified by |
 |---|---|---|
@@ -504,20 +506,45 @@ whole distributions would take tens of gigabytes per artifact; 256 is the most
 `Engine::score_tokens` returns (`kMaximumScoreTopTokens`) and the most a constrained decode step
 observes (`kMaximumObservedTokens`).
 
+**Certification** of an arm against R(A, K):
+
 | Criterion | Budget | Why this number |
 |---|---|---|
-| F1 mean KL | 1.36e-3 nats | llama.cpp's Q8_0 weight quantization of LLaMA-3-8B: mean KL 1.355e-3. The engine's own error may cost at most what going to 8-bit weights costs. |
-| F2 flip rate | 2.33 % | the same Q8_0 run: top-1 agreement 97.674 % |
-| F3 p99.9 of KL_t | 0.05 nats | catches rare large errors a mean hides; above Q8_0's tail (its 99.9th-percentile change in the correct token's probability, 6.4 %, is about 0.01-0.02 nats) |
-| F4 mean dNLL | 1.0e-3 nats | at most 0.1 % perplexity (Q8_0: 0.04 %) |
-| F5 per domain | 2 x F1-F4 | no blind spot: a path cannot pass on average and fail on code or Chinese (point estimates) |
-| F0 | none | a non-finite logit, a crash or an invariance break fails outright |
+| C1 mean KL | max(1.36e-3 nats, 2 N) | llama.cpp's Q8_0 weight quantization of LLaMA-3-8B: mean KL 1.355e-3. The engine's own error may cost at most what going to 8-bit weights costs, or twice what an ideal BF16 implementation shows on this model. The mean is the figure every published KL comparison quotes. |
+| C2 flip rate | max(2.33 %, 2 N) | the same Q8_0 run: top-1 agreement 97.674 % |
+| C3 p99.9 of KL_t | max(0.05 nats, 2 N) | catches rare large errors a mean hides; above Q8_0's tail (its 99.9th-percentile change in the correct token's probability, 6.4 %, is about 0.01-0.02 nats) |
+| C4 clipped mean KL | 2 N | the mean of min(KL_t, 0.1 nats): the typical position's error. A few near-tie positions decide the plain mean (on the dense 27B, 50 of 112,285 positions hold 64 % of the noise twin's KL), so C1 is imprecise; the clipped mean still counts every position and separates real design errors from the floor better (NVFP4 KV: 2.2 N on the mean, 3.3 N clipped) |
+| C0 | none | a non-finite logit, a crash or an invariance break fails outright |
 
-**Noise floor.** Some models amplify the smallest rounding difference: in a mixture-of-experts model
-a last-bit change flips near-tie expert choices, and the reproducible route on the 35B-A3B sits at
-mean KL 4.1e-3 from the exact result (traced to that mechanism in October 2026), so any BF16
-implementation, the publisher's included, shows about the same. IQS-1 measures this per
-configuration instead of guessing it:
+**Disclosed, not gated:** perplexity (dNLL), as the perplexity ratio exp(mean dNLL_t) with its bound
+(the figure llama.cpp prints as `ln(PPL(Q)/PPL(base))`); every value per domain. As an absolute gate
+dNLL had no power: a +-1e-3 bound needs 125-386 windows, and with 32 its verdicts followed the noise
+twin's estimate rather than the path. Per-domain values were point estimates of 4 windows.
+
+**A fast path's gate**: the default-route arm against the configuration's reproducible arm on the same
+positions and reference, each criterion bounding the increase per window (fast minus reproducible), so
+the positions' shared sensitivity cancels; the fast arm must also pass C0-C4:
+
+| Criterion | Budget on the increase | Why |
+|---|---|---|
+| P1 mean KL | 0.25 N | a fast path may add a quarter of the model's own rounding variation; four such paths together cannot use up certification's 2 N |
+| P2 flip rate | 0.25 N | as P1 |
+| P3 clipped mean KL | 0.25 N (clipped) | as P1, for the typical position |
+| P4 perplexity (dNLL) | 2.5e-3 nats (perplexity +0.25 %) | the one measure that responds to first order to an error with a direction (a logit scale, a temperature); KL responds to it only to second order |
+
+At 64 windows an unchanged path's bound sits near 6 % of N on the dense 27B and 3 % on Flash-Next
+(P1), so the test resolves 0.25 N comfortably; a budget of 0.1 N would need about 128 windows.
+
+**Noise floor.** Every model amplifies the smallest rounding difference: one BF16 rounding a unit off
+in one layer changes the values after it slightly, which flips other roundings near their boundaries,
+and within a few layers the whole model carries rounding noise at a level set by BF16 storage itself.
+Measured on 2026-10-24: the twin with 1/64 of its noise keeps 48 % (dense 27B) and 84 % (35B-A3B) of its
+mean KL, noise in any one operation group alone gives 42-99 %, about 5-10 moved roundings per window
+already give a quarter, and the twin with no moved rounding equals R bit for bit. In a
+mixture-of-experts model the noise also flips near-tie expert choices, which puts its floor near
+8 times the dense one. So any implementation that is not bit-identical to R, the publisher's
+included, shows the floor, and no arithmetic precision lowers it. IQS-2 measures it per configuration
+instead of guessing it:
 
 ```text
 N_m(A)      = metric m between R(A, bf16) and its noise twin
@@ -527,14 +554,17 @@ budget_m(A) = max(fixed budget_m, kappa N_m(A)),  kappa = 2
 ```
 
 The twin is an ideal BF16 implementation, off by at most one unit in the last place at every
-rounding and by nothing else, measured on one window per domain. For dense models the fixed
-budgets bind; for MoE models the floor may. The floor is a property of the model, not of Infernix
-code, so it cannot hide an engine bug. The decode and KV-format arms of a configuration use its BF16
-floor.
+rounding and by nothing else, measured on every main-set window (the floor of 8 windows was wrong:
+the dense 27B measured 1.2e-3 on 8 windows and 3.6e-3 on 32, two mathematics windows holding 63 %).
+Its seed does not matter (27B 3.64e-3 against 3.58e-3, 35B 8.09e-3 against 8.34e-3). The floor is a
+property of the model, not of Infernix code, so it cannot hide an engine bug. A KV format's arms use
+the twin of that format's declared design (a coarse codec turns a one-unit difference into another
+code: NVFP4 KV's twin is 2.5 times the BF16 one); the decode arms use the floor of their KV format.
 
-**Task scores are reported, not gated**, except as MLPerf does: the paired flip audit on GSM8K and an
-MMLU subset (default route against reproducible) fails only when the default route scores below
-99 % of the reproducible route.
+**Task scores are reported, not gated**, except as a coarse check: the paired audit on GSM8K and an
+MMLU subset (default route against reproducible) fails only when the one-sided 97.5 % bound on the
+accuracy loss, from the items the two routes answer differently, exceeds 5 points (GSM8K) or 3 points
+(MMLU). It catches gross breakage only; the token-level gates do the fine work.
 
 ### 6.4 Statistics and decision rule
 
@@ -546,9 +576,11 @@ MMLU subset (default route against reproducible) fails only when the default rou
   non-inferiority convention of regulatory statistics (alpha 0.025, one-sided). Budgets are fixed
   before any run; `tools/quality/iqs.py --set NAME=VALUE` decides stored runs under other values
   without measuring again.
-- Power: the corpus is sized so that a path whose true error is half its budget passes with at least
-  90 % probability; the calibration run checks this from the measured variances and adds windows if
-  not.
+- Power (measured 2026-10-24 on the stored runs): at 64 windows the 95 % half-width of an absolute
+  mean KL is about 61 % of the estimate on the dense 27B (24 % for the clipped mean, 10 % for the
+  flip rate) and 13-26 % on the MoE and Flash-Next models; a paired fast-path increase of 17 % of the
+  reproducible route's mean KL (dense 27B) or 5 % (Flash-Next) is detected with 80 % power. 128
+  windows would tighten these by a further factor of 1.4.
 - Every criterion of every path is published (estimate, bound, budget, coverage), passing or not.
   Nothing is re-run after a fail except a run shown to be broken (a crash, the wrong binary), and the
   replaced run stays in the report.
@@ -557,7 +589,7 @@ MMLU subset (default route against reproducible) fails only when the default rou
 
 A KV format is a quantization the user chooses, like a weight recipe; its error belongs to the
 design. Engine error on a format is gated with the budgets of 6.3 against the exact-codec reference
-R(A, K): a fast attention kernel on INT8 KV must be as faithful to exact INT8 attention as a BF16-KV
+R(A, K), with the noise floor of that design's own twin: a fast attention kernel on INT8 KV must be as faithful to exact INT8 attention as a BF16-KV
 path is to exact BF16 attention. The format's design error (exact codec against lossless) is
 published per attention family and must stay under its class ceiling for the format to be
 supported:
@@ -570,13 +602,13 @@ supported:
 
 The ceilings are confirmed by the calibration run (the first full certification). A declared
 activation quantization's design error is reported without a ceiling: it is the recipe's choice,
-which IQS-1 discloses and never gates as engine quality. At 32K context each format's default-route
+which IQS-2 discloses and never gates as engine quality. At 32K context each format's default-route
 error against the lossless route (engine and design error together) is held to the same class
 ceiling on the Qwen3.5 representative.
 
 ### 6.6 Coverage and the certification run
 
-The product of the path dimensions has thousands of cells. IQS-1 covers them with one measured path
+The product of the path dimensions has thousands of cells. IQS-2 covers them with one measured path
 per numerical class plus exact proofs that the rest are in the same class: numerics follow kernels
 (two paths that run the same kernels on the same configuration produce the same bits, and Infernix
 selects every numerics-changing route by configuration), and invariance is proved, not sampled (on
@@ -596,11 +628,15 @@ the lossless and reproducible routes the serving condition cannot change a bit, 
 **Corpus** (`eval/corpora/iqs-1`, built by `tools/quality/iqs_corpus.py` from public sources with
 recorded provenance and licences, hashed into every certificate):
 
-- main set: 32 windows of 4,096 tokens, 4 from each of 8 domains (English reference text,
-  long-form prose, Chinese, German, source code, mathematics with worked solutions, chat
-  transcripts with reasoning in the model's own chat template, tool calls and JSON), every position
-  that predicts a token the model writes scored (all 131,040 positions of the text windows, the
-  assistant turns of the chat and tool-call windows);
+- main set: 64 windows of 4,096 tokens, 8 from each of 8 domains (English reference text from
+  WikiText-2 test, the corpus llama.cpp's perplexity and KL tools report on; long-form prose from PG-19;
+  Chinese Wikipedia; German Project Gutenberg books; source code; mathematics with worked solutions;
+  chat transcripts with reasoning in the model's own chat template; tool calls and JSON), every
+  position that predicts a token the model writes scored (all positions of the text windows, the
+  assistant turns of the chat and tool-call windows). The set grows in layers of 32 windows appended in
+  window order (0-31 the original corpus, 32-63 the second layer); a layer never changes the documents
+  before it, so every stored window stays valid and a larger corpus scores only its new windows (the
+  builder lists the sources of layers 2 and 3);
 - long set: 4 windows of 32,768 tokens (two books, a Chinese encyclopedia text, a code repository);
 - decode: the 64 tokens after each of 4 starts per window (256, 1,024, 2,048 and 3,840; long set
   8,192, 16,384, 24,576 and 32,640): 8,192 decode positions per arm. A segment's length is the most
@@ -616,7 +652,13 @@ usage at the top of `apps/certify/main.cpp`); `tools/quality/iqs.py` decides (`d
 `python -m tools.quality.shadow` runs G1's CPU comparison (on each architecture's pinned transformers:
 Qwen3.5/3.6 on 5.5.0, which needs its own directory first on `PYTHONPATH` with tokenizers 0.22,
 huggingface-hub 1.x and httpx; Flash-Next on main 3bb8b727); `tools/quality/certify.py` plans and runs the
-whole regime with a reference store reused across runs:
+whole regime with a store reused across runs. The store keeps every main-set item that never changes
+its bits, a 32-window layer per part: the lossless and design references (layer 0 under its original
+name, `main-lossless.ref`; later layers `main-lossless.w32-63.ref`), the noise twins
+(`main-twin.w0-31`, `main-twin-<kv>.w0-31`, ...) and the reproducible arms (`arms/main-<kv>-<arm>.w0-31`).
+`infernix-certify` takes a reference in parts (`--reference` repeated) and matches every stored window to
+its tokens; `iqs.py` reads an arm or twin from its parts. The default-route arms, whose kernels change,
+run on every window in each run:
 
 ```bat
 py -3.11 -m tools.quality.certify plan --artifacts local-artifacts.json --build build ^
@@ -629,11 +671,11 @@ py -3.11 -m tools.quality.certify run D:\iqs\run-2026-10-23
 | A | build; every op test against its exact or FP64 oracle |
 | B | G1: the lossless route's whole logits at 31 positions of 4 sequences per architecture (`capture`), compared bit for bit on the CPU with the publisher's code in exact arithmetic |
 | C1 | references: lossless for every artifact; the design reference where the artifact declares activation quantization (with its design error, in the same pass) |
-| C2 | noise twins, one window per domain, per configuration |
+| C2 | noise twins on every main-set window, per configuration and per KV format measured (the twin of that format's design) |
 | C3 | exact-codec references for the six KV formats on the two family representatives (with each format's design error) |
 | C4 | long-set lossless references on the three long representatives |
 | C0 | release mode: re-score window 0 of every stored reference; any changed bit fails (the lossless route and the design reference never change their bits) |
-| D | BF16 KV, every configuration: reproducible prefill, default prefill, reproducible decode (4 requests), default one-request decode, default stress decode (and the NVFP4 27B tree arm) |
+| D | BF16 KV, every configuration: reproducible prefill, default prefill, reproducible decode (4 requests), default one-request decode, default stress decode (and the NVFP4 27B tree arm); every default arm also gated on its increase over the reproducible arm of its kind (P1-P4) |
 | E1 | six KV formats on the representatives: reproducible and default prefill, reproducible decode, default stress decode |
 | E2 | long set: default prefill and one-request decode on the long representatives; every KV format's prefill at 32K on `q27gw` |
 | F | functional real tests on the artifacts they are written for; production identity with golden hashes on every configuration (negative controls on the representatives: each reports how many default-route requests differ, and the certificate asks that some artifact's control saw a difference, since an artifact whose default route happens to be request-invariant says nothing against its reproducible route); speculative-sampling distribution tests; long-generation sanity (mean length within 90-110 % of the reproducible route, no more looping outputs, no fewer natural stops); task flip audit |
@@ -650,7 +692,8 @@ the long set across the families on alternate releases.
 
 | Change | What runs |
 |---|---|
-| A new fast path for a configuration | its op qualification and resolved speedup (6.1), then that configuration's arms (`certify.py plan --only KEY`: blocks D, and E1 when it changes attention or KV arithmetic on a representative's family) against the stored references; registered when they pass. The next release run covers it with everything else. |
+| A new fast path for a configuration | its op qualification and resolved speedup (6.1), then that configuration's default arms (`certify.py plan --only KEY`: blocks D, and E1 when it changes attention or KV arithmetic on a representative's family) against the stored references, twins and reproducible arms, which need no new run; registered when C0-C4 and P1-P4 pass. The next release run covers it with everything else. |
+| A larger corpus (a new layer) | the new layer's references, twins and reproducible arms only; the default arms on every window |
 | A kernel change on an existing route | op tests; the arms of the affected configurations; the reproducible golden hashes, which must not change unless the change is declared (6.1) |
 | A new artifact | its references (C1), noise twin (C2), D arms and functional tests |
 | A new KV format | its codec's exact oracles; C3 and E1 on both representatives; its class |
@@ -661,7 +704,7 @@ artifact identities; GPU, driver and clock limits; every path x criterion with e
 budget and verdict; the noise floors and design errors; the invariance results with their negative
 controls; the functional and task results. A release ships only with a passing certificate.
 
-**Outside IQS-1:** the vision encoder's numerics (op tests and functional tests only; the text
+**Outside IQS-2:** the vision encoder's numerics (op tests and functional tests only; the text
 metrics do not see image-conditioned outputs); contexts beyond 32,768 tokens (attention op tests to
 1,048,576 keys and functional tests); model capability and a recipe's own quantization quality
 (disclosed as design error, never gated as engine quality); speed (a fast path ships only where
@@ -674,7 +717,7 @@ qualified for, and the evidence that admitted it. The entries up to 2026-10-22 w
 the gates IQS-1 replaced: the excess of the default route over the reproducible route against the
 lossless or precise reference (`tools/quality/fast_path_gate.py`, since removed), with the budgets of
 2026-10-16 (mean KL 1.5e-3, top-1 disagreement 0.5 points, TV 4e-3). Their records stay as that
-evidence. The first IQS-1 certification decides every registered path again against R(A, K); a path
+evidence. The first IQS-2 certification decides every registered path again against R(A, K); a path
 stays registered until a certification fails it (6.1). The configurations are the ones
 `models/qwen3_5/program/planning/fast_paths.cpp` lists (`kQualified`); a configuration not listed
 runs the path's exact counterpart. Qwen3.8-Flash-Next has three of the request-coupling paths

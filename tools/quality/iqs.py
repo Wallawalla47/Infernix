@@ -1,4 +1,4 @@
-"""IQS-1 decisions: the Infernix Quality Standard (docs/maintainer/model-quality.md, section 6).
+"""IQS-2 decisions: the Infernix Quality Standard (docs/maintainer/model-quality.md, section 6).
 
 Every shipped path is compared with its reference R(A, K): the artifact's declared design computed exactly
 (the lossless route; the design reference where the artifact declares activation quantization or the KV
@@ -6,16 +6,24 @@ format is coded). infernix-certify writes one row per teacher-forced position (K
 256 tokens plus one bucket for the rest, top-1 flip, NLL change); this tool turns an arm's rows into
 estimates, one-sided upper confidence bounds and verdicts.
 
-  F1 mean KL      <= 1.36e-3 nats   llama.cpp's Q8_0 (LLaMA-3-8B: 1.355e-3)
-  F2 flip rate    <= 2.33 %          the same Q8_0 run (top-1 agreement 97.674 %)
-  F3 p99.9 KL     <= 0.05 nats
-  F4 mean dNLL    <= 1.0e-3 nats     at most 0.1 % perplexity
-  F5 per domain   point estimates within 2x F1-F4
-  F0              no non-finite value
+Certification of an arm against R(A, K):
+  C0              no non-finite value
+  C1 mean KL      <= max(1.36e-3 nats, kappa N)   llama.cpp's Q8_0 (LLaMA-3-8B: 1.355e-3)
+  C2 flip rate    <= max(2.33 %, kappa N)         the same Q8_0 run (top-1 agreement 97.674 %)
+  C3 p99.9 KL     <= max(0.05 nats, kappa N)
+  C4 clipped KL   <= kappa N                      the mean of min(KL, 0.1 nats): the typical position's error,
+                                                  which the few near-tie positions that decide the mean cannot swing
+N is the same statistic between R(A, K) and its noise twin (the exact route with stochastic rounding,
+infernix-certify prefill --lossless --noise-seed): an ideal BF16 implementation's own deviation, a property of
+the model; kappa = 2. Disclosed, not gated: perplexity (dNLL), the mean change in the written token's negative
+log-likelihood (its exponential is the perplexity ratio), and every value per domain.
 
-Each budget is max(fixed budget, kappa * N), N the same metric between the reference and its noise twin (the
-exact route with stochastic rounding, infernix-certify prefill --lossless --noise-seed): an ideal BF16
-implementation's own deviation, a property of the model. kappa = 2.
+A fast path's gate, against the configuration's reproducible route on the same positions and reference (a plan's
+"gates"): the increase of each statistic, bounded per resampling unit, so the positions' shared sensitivity
+cancels:
+  P1 mean KL, P2 flip rate, P3 clipped KL     increase <= 0.25 N
+  P4 perplexity (dNLL)                        increase <= 2.5e-3 nats (perplexity +0.25 %)
+and the fast path's own arm is certified (C0-C4) like any other.
 
 Scored positions: a position counts when the model writes the token it predicts. A text window scores every
 position; a chat window only its assistant turns (infernix-certify mask writes the artifact's list, the
@@ -48,6 +56,7 @@ import math
 import sys
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Sequence
 
 import numpy as np
 
@@ -57,9 +66,10 @@ class Policy:
     mean_kl: float = 1.36e-3
     flip_rate: float = 0.0233
     p999_kl: float = 0.05
-    mean_dnll: float = 1.0e-3
-    domain_factor: float = 2.0
+    clip_kl: float = 0.1            # the clipped KL caps each position here (nats)
     kappa: float = 2.0
+    increase: float = 0.25          # a fast path's increase, as a share of the noise floor
+    dnll_increase: float = 2.5e-3   # a fast path's perplexity (dNLL) increase (nats)
     confidence: float = 0.975
     resamples: int = 10000
     seed: int = 20261022
@@ -68,8 +78,12 @@ class Policy:
 
 
 POLICY = Policy()
-METRICS = ("mean_kl", "flip_rate", "p999_kl", "mean_dnll")
-LABELS = {"mean_kl": "F1 mean KL", "flip_rate": "F2 flip rate", "p999_kl": "F3 p99.9 KL", "mean_dnll": "F4 mean dNLL"}
+METRICS = ("mean_kl", "flip_rate", "p999_kl", "clipped_kl", "mean_dnll")  # every reported statistic
+CERTIFIED = ("mean_kl", "flip_rate", "p999_kl", "clipped_kl")              # the gated ones
+LABELS = {"mean_kl": "C1 mean KL", "flip_rate": "C2 flip rate", "p999_kl": "C3 p99.9 KL",
+          "clipped_kl": "C4 clipped KL", "mean_dnll": "perplexity (dNLL)"}
+INCREASES = {"mean_kl": "P1 mean KL increase", "flip_rate": "P2 flip rate increase",
+             "clipped_kl": "P3 clipped KL increase", "mean_dnll": "P4 perplexity (dNLL) increase"}
 
 # A KV format's design error ceiling (mean KL, flip rate): its class, from llama.cpp's LLaMA-3-8B weight
 # quantizations (8-bit: Q8_0; mixed: Q6_K; 4-bit and VQ: between Q5_K_M and Q4_K_M).
@@ -142,20 +156,43 @@ def resampling_units(window: np.ndarray, position: np.ndarray, policy: Policy) -
     return window * ((int(position.max()) - 1) // policy.block + 2) + (position - 1) // policy.block
 
 
-def load_arm(prefix: Path, scored: Path | None = None, policy: Policy = POLICY) -> Arm:
+def load_part(prefix: Path) -> tuple[dict, np.ndarray]:
     meta_path = Path(str(prefix) + ".json")
     rows_path = Path(str(prefix) + ".positions.csv")
     if not meta_path.is_file() or not rows_path.is_file():
         raise Unusable(f"missing arm {prefix} (.json and .positions.csv)")
-    meta = json.loads(meta_path.read_text(encoding="utf-8"))
     data = np.loadtxt(rows_path, delimiter=",", skiprows=1, ndmin=2)
     if data.size == 0:
         raise Unusable(f"{rows_path} holds no positions")
+    return json.loads(meta_path.read_text(encoding="utf-8")), data
+
+
+def load_arm(prefix: Path | Sequence[Path], scored: Path | None = None, policy: Policy = POLICY) -> Arm:
+    """One arm, from one prefix or from parts (prefixes holding disjoint windows of the same run: a corpus layer
+    scored later). The parts must agree on route and KV format."""
+    parts = [Path(prefix)] if isinstance(prefix, (str, Path)) else [Path(p) for p in prefix]
+    loaded = [load_part(p) for p in parts]
+    meta = dict(loaded[0][0])
+    for p, (m, _) in zip(parts[1:], loaded[1:]):
+        if (m.get("route"), m.get("kv_dtype")) != (meta.get("route"), meta.get("kv_dtype")):
+            raise Unusable(f"{p}: route {m.get('route')}/{m.get('kv_dtype')} differs from {parts[0]}")
+    meta["nonfinite"] = sum(int(m.get("nonfinite", 0)) for m, _ in loaded)
+    seen: set[int] = set()
+    for p, (_, d) in zip(parts, loaded):
+        windows = set(np.unique(d[:, 0]).astype(int).tolist())
+        if seen & windows:
+            raise Unusable(f"{p} repeats window(s) {sorted(seen & windows)} of an earlier part")
+        seen |= windows
+    data = np.concatenate([d for _, d in loaded])
     domains: dict[int, str] = {}
-    ref_meta = Path(str(meta.get("reference", "")) + ".json")
-    if ref_meta.is_file():
-        for entry in json.loads(ref_meta.read_text(encoding="utf-8")).get("windows", []):
-            domains[int(entry["index"])] = entry["domain"]
+    for m, _ in loaded:
+        references = m.get("reference", [])
+        for reference in [references] if isinstance(references, str) else references:
+            ref_meta = Path(str(reference) + ".json")
+            if ref_meta.is_file():
+                for entry in json.loads(ref_meta.read_text(encoding="utf-8")).get("windows", []):
+                    domains[int(entry["index"])] = entry["domain"]
+    prefix = parts[0]
     window, position = data[:, 0].astype(np.int64), data[:, 2].astype(np.int64)
     arm = Arm(prefix=prefix, meta=meta, window=window, kl=data[:, 3], top_mass=data[:, 4], flip=data[:, 5],
               dnll=data[:, 6], position=position, domains=domains)
@@ -178,27 +215,40 @@ def load_arm(prefix: Path, scored: Path | None = None, policy: Policy = POLICY) 
     return replace(arm, unit=resampling_units(arm.window, arm.position, policy))
 
 
-def point(kl: np.ndarray, flip: np.ndarray, dnll: np.ndarray) -> dict[str, float]:
+def point(kl: np.ndarray, flip: np.ndarray, dnll: np.ndarray, clip: float = POLICY.clip_kl) -> dict[str, float]:
     return {"mean_kl": float(np.mean(kl)), "flip_rate": float(np.mean(flip)),
-            "p999_kl": float(np.quantile(kl, 0.999, method="higher")), "mean_dnll": float(np.mean(dnll))}
+            "p999_kl": float(np.quantile(kl, 0.999, method="higher")),
+            "clipped_kl": float(np.mean(np.minimum(kl, clip))), "mean_dnll": float(np.mean(dnll))}
+
+
+def resample(unit: np.ndarray, name: str, policy: Policy) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """The bootstrap's draws: per resample, how often each unit (window) is drawn; and per position its unit."""
+    units, inverse = np.unique(unit, return_inverse=True)
+    n = len(units)
+    if n < policy.min_units:
+        raise Unusable(f"{name}: {n} resampling units; bounds need at least {policy.min_units}")
+    rng = np.random.default_rng(policy.seed)
+    weights = rng.multinomial(n, np.full(n, 1.0 / n), size=policy.resamples).astype(np.float64)
+    return inverse, weights, weights @ np.bincount(inverse, minlength=n).astype(np.float64)
+
+
+def mean_bounds(values: dict[str, np.ndarray], inverse: np.ndarray, weights: np.ndarray, total: np.ndarray,
+                policy: Policy) -> dict[str, float]:
+    """One-sided upper bounds of position means: each resample weighs a unit's positions together."""
+    n = weights.shape[1]
+    return {m: float(np.quantile((weights @ np.bincount(inverse, weights=v, minlength=n)) / total, policy.confidence))
+            for m, v in values.items()}
 
 
 def bootstrap_bounds(arm: Arm, policy: Policy) -> dict[str, float]:
     """One-sided upper bounds: percentile bootstrap over windows (each resample draws windows with
     replacement; a window's positions keep their weight together)."""
-    units, inverse = np.unique(arm.unit, return_inverse=True)
-    n = len(units)
-    if n < policy.min_units:
-        raise Unusable(f"{arm.name}: {n} resampling units; bounds need at least {policy.min_units}")
-    counts = np.bincount(inverse, minlength=n).astype(np.float64)
-    sums = {m: np.bincount(inverse, weights=v, minlength=n) for m, v in
-            (("mean_kl", arm.kl), ("flip_rate", arm.flip), ("mean_dnll", arm.dnll))}
-    rng = np.random.default_rng(policy.seed)
-    weights = rng.multinomial(n, np.full(n, 1.0 / n), size=policy.resamples).astype(np.float64)
-    total = weights @ counts
-    draws = {m: (weights @ sums[m]) / total for m in ("mean_kl", "flip_rate", "mean_dnll")}
-    draws["p999_kl"] = weighted_upper_quantile(arm.kl, inverse, weights, total, 0.999)
-    return {m: float(np.quantile(draws[m], policy.confidence)) for m in METRICS}
+    inverse, weights, total = resample(arm.unit, arm.name, policy)
+    bounds = mean_bounds({"mean_kl": arm.kl, "flip_rate": arm.flip, "clipped_kl": np.minimum(arm.kl, policy.clip_kl),
+                          "mean_dnll": arm.dnll}, inverse, weights, total, policy)
+    bounds["p999_kl"] = float(np.quantile(weighted_upper_quantile(arm.kl, inverse, weights, total, 0.999),
+                                          policy.confidence))
+    return {m: bounds[m] for m in METRICS}
 
 
 def weighted_upper_quantile(values: np.ndarray, window: np.ndarray, weights: np.ndarray, total: np.ndarray,
@@ -230,10 +280,13 @@ def weighted_upper_quantile(values: np.ndarray, window: np.ndarray, weights: np.
 
 
 def budgets(policy: Policy, floor: dict[str, float] | None) -> dict[str, float]:
-    fixed = {m: getattr(policy, m) for m in METRICS}
+    """C1-C3: max(fixed, kappa N); C4 has no fixed budget, so without a floor it is not decided."""
+    fixed = {m: getattr(policy, m) for m in ("mean_kl", "flip_rate", "p999_kl")}
     if floor is None:
         return fixed
-    return {m: max(fixed[m], policy.kappa * max(floor[m], 0.0)) for m in METRICS}
+    out = {m: max(fixed[m], policy.kappa * max(floor[m], 0.0)) for m in fixed}
+    out["clipped_kl"] = policy.kappa * max(floor["clipped_kl"], 0.0)
+    return out
 
 
 def decide(arm: Arm, policy: Policy = POLICY, floor: dict[str, float] | None = None) -> dict:
@@ -241,34 +294,57 @@ def decide(arm: Arm, policy: Policy = POLICY, floor: dict[str, float] | None = N
     criteria = []
     counted   = int(np.sum(~(np.isfinite(arm.kl) & np.isfinite(arm.dnll))))
     nonfinite = max(int(arm.meta.get("nonfinite", 0)), counted)
-    criteria.append({"name": "F0 finite", "estimate": nonfinite, "bound": nonfinite, "budget": 0, "passed": nonfinite == 0})
+    criteria.append({"name": "C0 finite", "estimate": nonfinite, "bound": nonfinite, "budget": 0, "passed": nonfinite == 0})
     finite = np.isfinite(arm.kl) & np.isfinite(arm.dnll)
     arm_f = replace(arm, window=arm.window[finite], kl=arm.kl[finite], top_mass=arm.top_mass[finite],
                     flip=arm.flip[finite], dnll=arm.dnll[finite], position=arm.position[finite],
                     unit=arm.unit[finite])
-    estimate = point(arm_f.kl, arm_f.flip, arm_f.dnll)
+    estimate = point(arm_f.kl, arm_f.flip, arm_f.dnll, policy.clip_kl)
     bound = bootstrap_bounds(arm_f, policy)
     budget = budgets(policy, floor)
-    for m in METRICS:
-        criteria.append({"name": LABELS[m], "estimate": estimate[m], "bound": bound[m], "budget": budget[m],
-                         "passed": bound[m] <= budget[m]})
+    for m in CERTIFIED:
+        if m in budget:
+            criteria.append({"name": LABELS[m], "estimate": estimate[m], "bound": bound[m], "budget": budget[m],
+                             "passed": bound[m] <= budget[m]})
+    # Disclosed: perplexity and the per-domain values.
+    perplexity = {"mean_dnll": estimate["mean_dnll"], "bound": bound["mean_dnll"],
+                  "ratio": math.exp(estimate["mean_dnll"]), "ratio_bound": math.exp(bound["mean_dnll"])}
     by_domain = {}
     if arm_f.domains:
         domain_of = np.array([arm_f.domains.get(int(w), "?") for w in arm_f.window])
         for domain in sorted(set(domain_of)):
             mask = domain_of == domain
-            values = point(arm_f.kl[mask], arm_f.flip[mask], arm_f.dnll[mask])
-            by_domain[domain] = values
-            for m in METRICS:
-                limit = policy.domain_factor * budget[m]
-                criteria.append({"name": f"F5 {domain} {m}", "estimate": values[m], "bound": values[m],
-                                 "budget": limit, "passed": values[m] <= limit})
+            by_domain[domain] = point(arm_f.kl[mask], arm_f.flip[mask], arm_f.dnll[mask], policy.clip_kl)
     return {"arm": str(arm.prefix), "route": arm.meta.get("route"), "kv_dtype": arm.meta.get("kv_dtype"),
             "fast_paths": arm.meta.get("load", {}).get("fast_paths", []), "positions": int(arm_f.kl.size),
             "windows": int(np.unique(arm_f.window).size), "reference_top_mass": float(np.mean(arm_f.top_mass)),
-            "noise_floor": floor, "estimate": estimate, "bound": bound, "budget": budget, "domains": by_domain,
-            "criteria": criteria, "passed": all(c["passed"] for c in criteria),
+            "noise_floor": floor, "estimate": estimate, "bound": bound, "budget": budget, "perplexity": perplexity,
+            "domains": by_domain, "criteria": criteria, "passed": all(c["passed"] for c in criteria),
             "unscored": {"positions": arm.unscored_positions, "estimate": arm.unscored}}
+
+
+def gate(fast: Arm, baseline: Arm, floor: dict[str, float] | None, policy: Policy = POLICY) -> dict:
+    """A fast path against the configuration's reproducible route: P1-P4 bound the increase of each statistic
+    over the same positions, resampling the baseline's units."""
+    if floor is None:
+        raise Unusable(f"{fast.name}: a fast-path gate needs the noise floor")
+    if not (np.array_equal(fast.window, baseline.window) and np.array_equal(fast.position, baseline.position)):
+        raise Unusable(f"{fast.name} and {baseline.name} did not score the same positions")
+    finite = np.isfinite(fast.kl) & np.isfinite(fast.dnll) & np.isfinite(baseline.kl) & np.isfinite(baseline.dnll)
+    c = policy.clip_kl
+    increase = {"mean_kl": fast.kl - baseline.kl, "flip_rate": fast.flip - baseline.flip,
+                "clipped_kl": np.minimum(fast.kl, c) - np.minimum(baseline.kl, c), "mean_dnll": fast.dnll - baseline.dnll}
+    increase = {m: v[finite] for m, v in increase.items()}
+    inverse, weights, total = resample(baseline.unit[finite], fast.name, policy)
+    bound = mean_bounds(increase, inverse, weights, total, policy)
+    budget = {m: policy.increase * max(floor[m], 0.0) for m in ("mean_kl", "flip_rate", "clipped_kl")}
+    budget["mean_dnll"] = policy.dnll_increase
+    criteria = [{"name": INCREASES[m], "estimate": float(np.mean(increase[m])), "bound": bound[m], "budget": budget[m],
+                 "passed": bound[m] <= budget[m]} for m in INCREASES]
+    return {"arm": str(fast.prefix), "baseline": str(baseline.prefix), "route": fast.meta.get("route"),
+            "kv_dtype": fast.meta.get("kv_dtype"), "fast_paths": fast.meta.get("load", {}).get("fast_paths", []),
+            "positions": int(finite.sum()), "windows": int(np.unique(fast.window[finite]).size), "noise_floor": floor,
+            "criteria": criteria, "passed": all(x["passed"] for x in criteria)}
 
 
 def disclose(arm: Arm, kv: str | None, policy: Policy = POLICY) -> dict:
@@ -292,13 +368,14 @@ def disclose(arm: Arm, kv: str | None, policy: Policy = POLICY) -> dict:
             "unscored": {"positions": arm.unscored_positions, "estimate": arm.unscored}}
 
 
-def floor_of(twin: Path | None, scored: Path | None = None) -> dict[str, float] | None:
+def floor_of(twin: Path | Sequence[Path] | None, scored: Path | None = None,
+             policy: Policy = POLICY) -> dict[str, float] | None:
     if twin is None:
         return None
     arm = load_arm(twin, scored)
     if arm.meta.get("route") != "noise_twin":
         raise Unusable(f"{twin} is not a noise-twin run")
-    return point(arm.kl, arm.flip, arm.dnll)
+    return point(arm.kl, arm.flip, arm.dnll, policy.clip_kl)
 
 
 def print_decision(decision: dict) -> None:
@@ -318,7 +395,9 @@ def render_html(certificate: dict) -> str:
         rows.append(
             f"<tr><td>{html.escape(d.get('label', d['arm']))}</td><td>{html.escape(str(d.get('route')))}</td>"
             f"<td>{html.escape(str(d.get('kv_dtype')))}</td>"
-            + "".join(f"<td class=n>{d['bound'][m]:.3g} / {d['budget'][m]:.3g}</td>" for m in METRICS)
+            + "".join(f"<td class=n>{d['bound'][m]:.3g} / {d['budget'][m]:.3g}</td>" if m in d["budget"]
+                      else "<td class=n>-</td>" for m in CERTIFIED)
+            + f"<td class=n>{d['perplexity']['ratio']:.5f} (&le; {d['perplexity']['ratio_bound']:.5f})</td>"
             + f"<td>{html.escape(worst['name']) if worst else ''}</td>"
             f"<td class={'p' if d['passed'] else 'f'}>{'PASS' if d['passed'] else 'FAIL'}</td></tr>")
     disclosures = "".join(
@@ -326,49 +405,72 @@ def render_html(certificate: dict) -> str:
         f"<td class=n>{d['bound']['mean_kl']:.3g}</td><td class=n>{d['bound']['flip_rate']:.3%}</td>"
         f"<td class={'p' if d['passed'] else 'f'}>{'PASS' if d['passed'] else 'FAIL'}</td></tr>"
         for d in certificate.get("disclosures", []))
+    gates = "".join(
+        f"<tr><td>{html.escape(g.get('label', g['arm']))}</td>"
+        + "".join(f"<td class=n>{c['bound']:.3g} / {c['budget']:.3g}</td>" for c in g["criteria"])
+        + f"<td class={'p' if g['passed'] else 'f'}>{'PASS' if g['passed'] else 'FAIL'}</td></tr>"
+        for g in certificate.get("gates", []))
+    gate_head = "".join(f"<th>{INCREASES[m]} bound / budget</th>" for m in INCREASES)
     checks = "".join(
         f"<tr><td>{html.escape(c['name'])}</td><td>{html.escape(c.get('detail', ''))}</td>"
         f"<td class={'p' if c['passed'] else 'f'}>{'PASS' if c['passed'] else 'FAIL'}</td></tr>"
         for c in certificate.get("checks", []))
-    head = "".join(f"<th>{LABELS[m]} bound / budget</th>" for m in METRICS)
+    head = "".join(f"<th>{LABELS[m]} bound / budget</th>" for m in CERTIFIED) + "<th>Perplexity ratio</th>"
     verdict = "PASS" if certificate["passed"] else "FAIL"
-    return f"""<!doctype html><meta charset=utf-8><title>IQS-1 certificate</title>
+    return f"""<!doctype html><meta charset=utf-8><title>IQS-2 certificate</title>
 <style>body{{font:14px system-ui;margin:24px;max-width:1200px}}table{{border-collapse:collapse;margin:12px 0}}
 td,th{{border:1px solid #ccc;padding:4px 8px;text-align:left}}.n{{text-align:right;font-family:monospace}}
 .p{{color:#1e6b3a;font-weight:600}}.f{{color:#a3271f;font-weight:600}}</style>
-<h1>IQS-1 certificate: {verdict}</h1>
+<h1>IQS-2 certificate: {verdict}</h1>
 <pre>{html.escape(json.dumps(certificate.get('provenance', {}), indent=2))}</pre>
 <h2>Path fidelity</h2><table><tr><th>Path</th><th>Route</th><th>KV</th>{head}<th>Nearest budget</th><th>Verdict</th></tr>
 {''.join(rows)}</table>
+<h2>Fast-path gates (increase over the reproducible route)</h2><table><tr><th>Path</th>{gate_head}<th>Verdict</th></tr>{gates}</table>
 <h2>Design error disclosures</h2><table><tr><th>Format or design</th><th>Class</th><th>Mean KL bound</th><th>Flip bound</th><th>Verdict</th></tr>{disclosures}</table>
 <h2>Exactness, invariance and end-to-end checks</h2><table><tr><th>Check</th><th>Detail</th><th>Verdict</th></tr>{checks}</table>
 """
 
 
+def parts(base: Path, value: str | list[str]) -> list[Path]:
+    """A plan entry's arm or twin: one prefix, or a list of parts (relative to the plan)."""
+    return [base / v for v in ([value] if isinstance(value, str) else value)]
+
+
 def run_certificate(plan_path: Path, out: Path, policy: Policy) -> int:
     """A run plan: {"provenance": {...}, "decisions": [{"label", "arm", "twin" (optional)}],
+    "gates": [{"label", "arm", "baseline", "twin"}],
     "disclosures": [{"label", "arm", "kv" (absent: a declared activation quantization)}],
     "checks": [{"name", "result": path to a JSON with "passed" and optionally "detail"}]}; paths relative to
-    the plan."""
+    the plan. An arm or twin is one prefix or a list of parts holding disjoint windows."""
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
     base = plan_path.parent
     certificate = {"provenance": plan.get("provenance", {}), "policy": policy.__dict__, "decisions": [],
-                   "disclosures": [], "checks": [], "unusable": []}
+                   "gates": [], "disclosures": [], "checks": [], "unusable": []}
     for item in plan.get("decisions", []):
         try:
             scored = base / item["scored"] if item.get("scored") else None
             # the noise twin always ran on the main set, whatever set the arm ran on
             twin_scored = base / item["twin_scored"] if item.get("twin_scored") else scored
-            floor = floor_of(base / item["twin"], twin_scored) if item.get("twin") else None
-            decision = decide(load_arm(base / item["arm"], scored, policy), policy, floor)
+            floor = floor_of(parts(base, item["twin"]), twin_scored, policy) if item.get("twin") else None
+            decision = decide(load_arm(parts(base, item["arm"]), scored, policy), policy, floor)
             decision["label"] = item.get("label", item["arm"])
             certificate["decisions"].append(decision)
+        except Unusable as error:
+            certificate["unusable"].append({"label": item.get("label", item["arm"]), "error": str(error)})
+    for item in plan.get("gates", []):
+        try:
+            scored = base / item["scored"] if item.get("scored") else None
+            floor = floor_of(parts(base, item["twin"]), scored, policy)
+            result = gate(load_arm(parts(base, item["arm"]), scored, policy),
+                          load_arm(parts(base, item["baseline"]), scored, policy), floor, policy)
+            result["label"] = item.get("label", item["arm"])
+            certificate["gates"].append(result)
         except Unusable as error:
             certificate["unusable"].append({"label": item.get("label", item["arm"]), "error": str(error)})
     for item in plan.get("disclosures", []):
         try:
             scored = base / item["scored"] if item.get("scored") else None
-            disclosure = disclose(load_arm(base / item["arm"], scored, policy), item.get("kv"), policy)
+            disclosure = disclose(load_arm(parts(base, item["arm"]), scored, policy), item.get("kv"), policy)
             disclosure["label"] = item.get("label", item["arm"])
             certificate["disclosures"].append(disclosure)
         except Unusable as error:
@@ -382,12 +484,13 @@ def run_certificate(plan_path: Path, out: Path, policy: Policy) -> int:
         certificate["checks"].append({"name": item["name"], "detail": str(result.get("detail", "")),
                                       "passed": bool(result.get("passed"))})
     certificate["passed"] = (not certificate["unusable"] and all(d["passed"] for d in certificate["decisions"])
+                             and all(g["passed"] for g in certificate["gates"])
                              and all(d["passed"] for d in certificate["disclosures"])
                              and all(c["passed"] for c in certificate["checks"]))
     out.mkdir(parents=True, exist_ok=True)
     (out / "certificate.json").write_text(json.dumps(certificate, indent=2) + "\n", encoding="utf-8")
     (out / "certificate.html").write_text(render_html(certificate), encoding="utf-8")
-    for decision in certificate["decisions"]:
+    for decision in certificate["decisions"] + certificate["gates"]:
         print_decision(decision)
     for item in certificate["unusable"]:
         print(f"UNUSABLE {item['label']}: {item['error']}")
@@ -420,7 +523,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "certificate":
             return run_certificate(args.plan, args.out, policy)
         if args.command == "decide":
-            result = decide(load_arm(args.arm, args.scored, policy), policy, floor_of(args.twin, args.scored))
+            result = decide(load_arm(args.arm, args.scored, policy), policy, floor_of(args.twin, args.scored, policy))
             print_decision(result)
         else:
             result = disclose(load_arm(args.arm, args.scored, policy), args.kv, policy)

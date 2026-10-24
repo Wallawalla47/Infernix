@@ -146,12 +146,18 @@ ReferenceReader::ReferenceReader(const std::filesystem::path& path)
 }
 
 ReferenceWindow ReferenceReader::next() {
-    ReferenceWindow window;
-    window.stream_index = read_pod<std::uint32_t>(in_, path_);
-    if (window.stream_index == kEndMarker) {
+    std::optional<ReferenceWindow> window = try_next();
+    if (!window) {
         throw std::runtime_error("top-token reference has fewer windows than this run: " +
                                  path_.string());
     }
+    return std::move(*window);
+}
+
+std::optional<ReferenceWindow> ReferenceReader::try_next() {
+    ReferenceWindow window;
+    window.stream_index = read_pod<std::uint32_t>(in_, path_);
+    if (window.stream_index == kEndMarker) { return std::nullopt; }
     window.target_begin = read_pod<std::uint64_t>(in_, path_);
     window.target_end   = read_pod<std::uint64_t>(in_, path_);
     window.input_hash   = read_pod<std::uint64_t>(in_, path_);

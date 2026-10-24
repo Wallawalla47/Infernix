@@ -1302,7 +1302,7 @@ void TextContext::run_layers(Tensor& x, Phase ph) {
 
 namespace {
 
-// Diagnostic for the layer-by-layer comparison of the lossless route with the publisher's code (IQS-1 G1,
+// Diagnostic for the layer-by-layer comparison of the lossless route with the publisher's code (IQS-2 G1,
 // `python -m tools.quality.shadow.bisect`): with INFERNIX_LOSSLESS_DUMP_DIR set, every lossless prefill call
 // writes the BF16 residual stream ([tokens][hidden], raw 16-bit values) after the embedding
 // (chunkC_embed.bin), after each layer's mixer (chunkC_layerLL_mixer.bin) and after each layer

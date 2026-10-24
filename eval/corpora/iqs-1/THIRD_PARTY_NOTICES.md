@@ -15,8 +15,8 @@ Creative Commons Attribution-ShareAlike 4.0 International, as carried by `eval/c
 
 ## PG-19 (English long form, long set)
 
-Excerpts of books in DeepMind's PG-19 test split (Apache License 2.0; Project Gutenberg books published
-before 1919), as carried by the existing corpora. Project Gutenberg's trademark terms remain applicable.
+Excerpts of books in DeepMind's PG-19 test and validation splits (Apache License 2.0; Project Gutenberg books
+published before 1919), as carried by the existing corpora. Project Gutenberg's trademark terms remain applicable.
 
 - <https://huggingface.co/datasets/deepmind/pg19>
 - <https://www.gutenberg.org/policy/terms_of_use.html>
@@ -32,8 +32,11 @@ Creative Commons Attribution-ShareAlike 3.0 Unported and, where applicable, the 
 ## Project Gutenberg German books (German)
 
 Franz Kafka, *Die Verwandlung* (ebook 22367); Thomas Mann, *Der Tod in Venedig* (12108); Hermann Hesse,
-*Siddhartha* (2499); Theodor Fontane, *Effi Briest* (5323). Public domain in the United States; the Project
-Gutenberg licence header and footer are removed and the trademark terms remain applicable.
+*Siddhartha* (2499); Theodor Fontane, *Effi Briest* (5323); Alexander von Humboldt, *Reise in die
+Aequinoctial-Gegenden des neuen Continents*, Band 2 (24746); Joseph von Eichendorff, *Aus dem Leben eines
+Taugenichts* (35312); Sigmund Freud, *Die Traumdeutung* (40739); Friedrich Nietzsche, *Also sprach
+Zarathustra* (7205). Public domain in the United States; the Project Gutenberg licence header and footer are
+removed and the trademark terms remain applicable.
 
 - <https://www.gutenberg.org/policy/terms_of_use.html>
 

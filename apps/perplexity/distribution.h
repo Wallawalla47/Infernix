@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -64,6 +65,8 @@ public:
     [[nodiscard]] const ReferenceHeader& header() const noexcept { return header_; }
     // The next window; throws when the reference has no more windows.
     [[nodiscard]] ReferenceWindow next();
+    // The next window, or nothing at the end of the reference (which then needs no finish()).
+    [[nodiscard]] std::optional<ReferenceWindow> try_next();
     // Throws unless every window has been read.
     void finish();
 
