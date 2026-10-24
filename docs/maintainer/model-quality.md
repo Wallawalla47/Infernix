@@ -602,7 +602,12 @@ supported:
 
 The ceilings are confirmed by the calibration run (the first full certification). A declared
 activation quantization's design error is reported without a ceiling: it is the recipe's choice,
-which IQS-2 discloses and never gates as engine quality. At 32K context each format's default-route
+which IQS-2 discloses and never gates as engine quality. Beside it, the artifact's reproducible and
+default prefill routes are disclosed against the lossless route: engine and design error together,
+what a user of the artifact gets against the model itself. (Its engine error against the exact design
+compares two independent 4-bit quantizations, each choosing its own codes near the quantizer's
+boundaries, and measured 1.3-1.6 times the design error in October 2026; the total against lossless
+is the figure comparable with the design error.) At 32K context each format's default-route
 error against the lossless route (engine and design error together) is held to the same class
 ceiling on the Qwen3.5 representative.
 

@@ -150,3 +150,16 @@ def test_reuse_takes_the_unchanged_checks_and_the_single_request_arms_earlier_wi
     assert names["F q27gw identity (from earlier)"] == str(earlier / "checks" / "e2e-q27gw-identity.json")
     # release spot checks: one lossless reference per attention family
     assert [n for n in by_name if n.startswith("verify-")] == ["verify-q27gw-main-lossless"]
+
+
+def test_a_declared_design_discloses_its_shipped_routes_against_lossless(tmp_path: Path) -> None:
+    steps, plan_json = plan(tmp_path, ("q27", "q27gw"))
+    by_name = {s["name"]: s["argv"] for s in steps}
+    disclosures = {d["label"]: d for d in plan_json["disclosures"]}
+    for route in ("reproducible", "default"):
+        item = disclosures[f"q27 {route} route against lossless (engine and design error)"]
+        assert "kv" not in item  # reported, no ceiling
+        argv = by_name[f"arm-q27-main-bf16-prefill-{route}-vs-lossless"]
+        assert argv[argv.index("--reference") + 1].endswith("main-lossless.ref")
+        assert ("--reproducible" in argv) == (route == "reproducible")
+    assert not any(label.startswith("q27gw") and "against lossless" in label for label in disclosures)

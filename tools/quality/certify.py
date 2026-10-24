@@ -402,6 +402,26 @@ class Planner:
         if c.tree:
             arms.append(("decode-default-tree", "decode", ["--concurrency", "1", *self.speculation(c, c.tree)]))
         self.arm_steps(c, "bf16", "D", arms)
+        if c.declared:
+            self.total_error(c)
+
+    def total_error(self, c: Config) -> None:
+        """A declared design's shipped routes against the lossless route: engine and design error together, what a
+        user of the artifact gets against the model itself (disclosed beside the design error, never gated)."""
+        common = [*self.reference_args(self.lossless(c.artifact)), "--kv-dtype", "bf16"]
+        for route, args in (("reproducible", ["--reproducible"]), ("default", [])):
+            name = f"prefill-{route}-vs-lossless"
+            step = f"arm-{c.key}-main-bf16-{name}"
+            if route == "reproducible":
+                parts = self.parts(self.stored_arm(c, "bf16", name), legacy=False)
+                for k, part in enumerate(parts):
+                    self.certify_step("D", self.layer_name(step, k), "prefill", c,
+                                      [*common, *args, "--windows", window_list(k)], part, 90)
+            else:
+                parts = [self.arm(c, "bf16", name)]
+                self.certify_step("D", step, "prefill", c, [*common, *args], parts[0], 90)
+            self.disclosures.append({"label": f"{c.key} {route} route against lossless (engine and design error)",
+                                     "arm": [str(p) for p in parts], "scored": str(self.scored(c))})
 
     def kv_arms(self, c: Config, kv: str) -> None:
         self.arm_steps(c, kv, "E1", [("prefill-reproducible", "prefill", ["--reproducible"]),
