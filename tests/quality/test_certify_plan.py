@@ -150,4 +150,3 @@ def test_reuse_takes_the_unchanged_checks_and_the_single_request_arms_earlier_wi
     assert names["F q27gw identity (from earlier)"] == str(earlier / "checks" / "e2e-q27gw-identity.json")
     # release spot checks: one lossless reference per attention family
     assert [n for n in by_name if n.startswith("verify-")] == ["verify-q27gw-main-lossless"]
-
