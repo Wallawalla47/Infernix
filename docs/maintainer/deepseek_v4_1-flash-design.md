@@ -16,7 +16,10 @@ of the published 1017 quantizations (§5.7). The 1017 release changes the Engram
 The owner then made the exact prompt rule the default (decision g, §1.2) and chose **EXL3 experts
 with a bit width per expert, built for from the start**, as the first artifact (decision f); the
 MXFP4 artifact is deferred (milestone M11). Sections written for the MXFP4 records (§5.1-§5.6,
-§7.3's `mxfp4_expert_v1`, §9.5's FP4 rows) stay as that artifact's design.
+§7.3's `mxfp4_expert_v1`, §9.5's FP4 rows) stay as that artifact's design. A review of DeepSeek's own
+serving code (DeepInfer, the kernel libraries it pins, deepseek-recipe; §4.4) then corrected and
+extended the model facts, the state rings, the attention and top-k arithmetic, the cache rules and
+the frontend.
 
 Labels used for numbers: **measured** (on this machine, with the method named), **upstream** (read
 from the reference code, config, checkpoint headers or another project's published record),
@@ -178,16 +181,17 @@ prompts likewise).
 Primary configuration: the EXL3 per-expert artifact with the IQ4_NL Engram volume, three expert
 volumes (§11.4; drives chosen when the owner frees space), the full prompt rule,
 `--max-context 131072`, C = 1, ≈ 88 GiB of RAM available (other programs closed), thinking at the
-encoding's default effort, 4K prompt, 512 output tokens.
+encoding's default effort (75), DeepSeek's sampling (temperature 1.0, top_p 1.0; §22), 4K prompt,
+512 output tokens; greedy results are reported beside.
 
 | Metric | Must | Stretch | Model (§5.7), central (range) | Deferred MXFP4 artifact: Must / Stretch / model |
 |---|---:|---:|---:|---:|
 | Plain decode, warm cache, C = 1, non-repeating session (§20.5) | ≥ 14 tok/s | ≥ 23 | 20.0 (16.0-25.0) | 9 / 15 / 12.8 |
-| Best speculative mode, same corpus | ≥ plain, never slower beyond noise | ≥ 27 | 27-29 with DSpark at acceptance 0.7-0.8, before the drafter's pages are charged | plain / 17 / 13.6-16.2 |
+| Best speculative mode, same corpus | ≥ plain, never slower beyond noise | ≥ 27 | 27-29 with DSpark at acceptance 0.7-0.8, before the drafter's pages are charged; a greedy upper bound (§5.4) | plain / 17 / 13.6-16.2 |
 | Decode, three volumes relative to one | ≥ 1.6× | ≥ 1.75× | 1.75× | 1.8× / 2.0× / 2.0× |
 | Fresh 32K prompt | ≥ 2,200 tok/s | ≥ 3,800 | 3,040 | 2,000 / 3,500 / 2,500 |
 | Time to first token, fresh 4K prompt | ≤ 10 s | ≤ 6 s | 7.6 s | 15 / 9 / 13.0 s |
-| Time to first token, 50-token append to a cached conversation | ≤ 2.6 s | ≤ 1.5 s | 2.0 s | 6 / 3.5 / 4.7 s |
+| Time to first token, 50-token append to a cached conversation (an agent turn: tools declared, the previous reply re-rendered unchanged) | ≤ 2.6 s | ≤ 1.5 s | 2.0 s | 6 / 3.5 / 4.7 s |
 | Decode at 128K actual context, relative to 4K | ≥ 90 % | ≥ 97 % | ≈ 98 % | the same |
 | Execution fidelity against the reference forward over the artifact's values (§20.3) | within the gate | — | — | the same |
 | Quality against the original model (§20.3) | reported, beside the pack's published KL 0.0201 / top-1 95.96 % | — | — | lossless by construction |
@@ -326,10 +330,12 @@ entry  = FP4(RoPE_l(c)) at the group's first position: E2M1 with one E4M3 scale 
 q_h     = MXFP4(RoPE_l(W_qb_idx c_q))   32 × 128;   w_h = (W_w x)_h · 128^−½ · 32^−½
 score_p = Σ_h w_h · relu(q_h · k_idx,p)       over compressed positions visible to t
 Full, r = 2 (2, 8, 14):    Sel = top-512 of all visible positions
-Full, r = 1 (20):          blocks of 8 positions scored by their maximum; the block holding the newest
-                           position is always kept; top-2,048 blocks form the candidates C(t);
-                           Sel = top-512 within C(t)
+Full, r = 1 (20):          Sel = top-512 of all visible positions; separately, blocks of 8 positions
+                           scored by their maximum, the block holding the newest position always
+                           kept, and the top-2,048 blocks form the candidates C(t) for later layers
 Reindex (24, 28, 32, 36):  Sel = top-512 of its own scores within C(t)
+                           (128^−½ · 32^−½ = 2^−6 exactly: a power of two that changes no selection;
+                           DeepInfer never applies it)
 Reuse:                     Sel = the latest Full or Reindex layer's Sel
 ```
 
@@ -367,13 +373,21 @@ last 128 positions, built from its own input.
   position depends on layer l − 1's output 127 positions earlier. Layer 20 touches 2,541 positions,
   layer 39 128. DS4 computes exactly this suffix (`ds41_decoder_prepare`, read 2026-10-19), with the
   same output as the full forward.
-- **Bounded replay** (DeepSeek's serving rule, report §3.2.2): only the last n_win = 128 prompt
-  positions run the decoder, with window attention truncated at the replay start s (query i sees
-  window entries max(s, i − 127) … i). DeepSeek states it "is not mathematically equivalent" to the
-  full forward, simulates it during post-training, and serves it; decoder windows are never cached.
+- **Bounded replay** (DeepSeek's serving rule, report §3.2.2): only the last **140** prompt positions
+  run the decoder, with window attention truncated at the replay start s (query i sees window entries
+  max(s, i − 127) … i). DeepSeek states it "is not mathematically equivalent" to the full forward,
+  simulates it during post-training, and serves it; decoder windows are never cached. The report and
+  vLLM #56752 speak of 128 positions, but DeepSeek's own engine keeps 140
+  (`DEEPINFER_YOCO_PREFILL_KEEP_TOKENS=140` in DeepInfer's README; its code requires at least window
+  + drafts + 1 = 134, so a sequence that backtracks after verification still has a full window).
+  Infernix records the length as a model parameter, default 140.
 - The two rules give the same encoder state and decoder compressed entries; they differ in the
-  decoder windows at the prompt's end, hence in every token decoded after a prompt of more than 128
-  tokens. For a prompt of at most 128 tokens following nothing cached they coincide.
+  decoder windows at the prompt's end, hence in every token decoded after a prompt longer than the
+  replay length. For a prompt of at most 140 tokens following nothing cached they coincide.
+- DeepSeek's replay start is the current sequence length minus 140; after a recompute that length
+  includes generated tokens, so DeepSeek's own replay is not preemption-invariant. Infernix's replay
+  is defined on the prompt (§18.3). 140 is the default of DeepInfer's README and benchmark; its code
+  enforces only ≥ 134 and nothing derives 140.
 
 Infernix runs the full model by default and bounded replay on request (decision g, §16).
 
@@ -544,6 +558,7 @@ it would run under WSL2 with the GGUF on an ext4 volume.
 | FreeToken (arXiv 2608.16157), DeepSeek-**V4**-Flash (284B, 256 experts, MXFP4) | one global LRU; RTX 5090 at x16 (52.7 GB/s), 180 GiB RAM | [M] decode miss rate at 11 % cache: **39 %** (KTransformers 59 %, llama.cpp 89 %); 22-25 tok/s |
 | hipfire, V4-Flash-0731 (MQ2) on Strix Halo | expert cache by budget | [M] hit rate 40.5 / 59.4 / 74.4 / 86.5 / 91.0 % at 4 / 8 / 16 / 32 / 64 GiB; a learned next-layer predictor (recall@6 75.9 %) ran 0.86-0.93× and is off |
 | KTransformers | V4-Flash only (RTX 5090 and ≥ 200 GB RAM) | [C] "20+ tok/s"; no V4.1 |
+| cachedMoE (`acupof-ai/cachedMoE`, MIT), Strix Halo 128 GB | the native FP4/FP8 checkpoint with its experts streamed from NVMe | [M] exact routing 9.20 tok/s over an eight-turn conversation with two drives, 7.61 with one; a 4K prompt ≈ 29 s, 17K ≈ 45 s; its approximate modes (miss masking, top-K acceptance for DSpark) failed its own quality gates |
 | vLLM / SGLang | datacenter; **bounded replay implemented** (vLLM #56752: layers 21-39 run on the last 128 prompt tokens; GSM8K 0.9249 on vs 0.9295 off, SE 0.0075; SGLang #42901 also trims layer 20's non-KV work, TTFT −5 / −8 / −10 % at 16K / 64K / 200K); Engram in pinned host memory (vLLM #61530: MXFP4 tables 12.2 instead of 23.6 GiB per rank, GSM8K 0.967 vs 0.966); FlashMLA's sparse kernels are SM90/SM100 only, sm_120 has open blockers (#56837, #56461) | reference only |
 | **diffbot EXL3 3 bpw** (two RTX PRO 6000) | Engram int4 in pinned host RAM, read over UVA | [M] 74.4 tok/s at 2K, prefill ≈ 10K tok/s. **KL against the original** (neutral / code / agentic): EXL3 3 bpw 0.0545 / 0.0321 / 0.0101; **NVIDIA NVFP4 as served by vLLM (W4A4 + MXFP4 Engram) 0.0352 / 0.0197 / 0.0089**; the original's second run (noise floor) 0.0158 / 0.0100 / 0.0055 |
 | OpensourceWTF EXL3 streaming repack (M5 Max, 128 GiB) | 13.3 MB expert records streamed from SSD into a slot cache; Engram FP8 rows from SSD | [M] 661.5 tok/s prefill and 36.8 tok/s decode at 16K |
@@ -646,7 +661,35 @@ Neither engine gives the same bits across placement, lanes or starts (both docum
 neither stripes volumes or prices DSpark per round. What they offer that this design lacked is a
 set of compact expert formats with published quality; §5.7 weighs them.
 
-### 4.4 Lessons from Flash-Next and the GLM design
+### 4.4 DeepSeek's own serving code
+
+DeepSeek published its serving engine and API front end in October 2026, after this design's first
+draft. They are the best evidence of how DeepSeek runs V4.1, read twice (2026-10-21 and 2026-10-24):
+
+- **DeepInfer** (`deepseek-ai/DeepInfer`, Apache-2.0, at `9bd9cf24`): the offline inference engine of
+  DeepSeek's production stack for V4.1 only, on SM100 and Ascend, many GPUs (expert, data and context
+  parallelism). It has no `sm_120` path; it pins DeepGEMM `1fc9c669`, FlashMLA `2e5429fc` and
+  DeepSelect `bfa4507d` (SM100-only) and TileKernels 2.1.0, all MIT.
+- **deepseek-recipe** (`deepseek-ai/deepseek-recipe`, MIT, at `935817c6`): the API front end, which
+  converts Chat Completions, Responses and Messages requests, renders V4.1 prompts and parses the
+  output stream.
+
+Nothing in them runs on this machine, and their throughput machinery (expert parallelism, EPLB, Mega
+MoE, disaggregation, the KV store) has no single-GPU counterpart. What they settle:
+
+| Topic | Finding | Where it lands |
+|---|---|---|
+| Prompt rule | DeepSeek replays 140 positions, not 128; the replay start is the sequence length − 140 | §2.3, §16 |
+| Prompt/decode equivalence | asserted bitwise for the full rule (`test_kl.py`), with fixed splits and one attention order | §18.3, a requirement here |
+| Verification room | the window ring is 134 slots and the compressor keeps 7 tokens of state | §13.1 |
+| Model facts | layer 20 selects from all positions; the 2^−6 indexer factor; the RoPE table; the Engram compressed-vocabulary rules; the DSpark confidence head and its fixed 5-entry block | §2.2, §13.4, §13.7, §14.2, §17 |
+| Served arithmetic | eleven places where DeepSeek's server and `model.py` part, and the ones where they agree | §20.4 |
+| Kernel structure | one query per CTA with the heads as MMA rows, a canonical slot order, threshold-filter top-k, fused epilogues, Engram rows fed to the GEMM undecoded | §13, §14.6, §15 |
+| Speculation | confidence-chosen verify lengths, expected-acceptance calibration, the drafter window written inside verification | §17 |
+| Frontend | effort and thinking mapping, sampling (which Infernix's top-20 domain cannot reproduce), control tokens by id, DSML rules, join rules, response-format rendering, prefix identity | §21, §22 |
+| Not found | expert routing statistics, Engram read rates, any rationale for 140, data beyond 128K | — |
+
+### 4.5 Lessons from Flash-Next and the GLM design
 
 GLM §4.2 lists the 22 Flash-Next lessons (L1-L22) measured on this machine. They hold here; these
 change weight:
@@ -763,6 +806,12 @@ With an agentic acceptance profile (survival 0.9, 0.8, 0.7, 0.6, 0.5) and σ = 0
 16.1-19.3. **Short drafts pay; DeepSeek's five-token blocks lose here.** JigSawPT's −4 % at K = 2
 fits σ near 1 in this model, with one drive and an idle queue (an inference, not a measurement of σ).
 §17 picks K per round, including 0.
+
+**These projections are a greedy upper bound.** vLLM #56797's survival rates come from GSM8K at
+temperature 0, but thinking-mode traffic samples at temperature 1.0 (DeepSeek's API forces it,
+deepseek-recipe `options.rs`), where acceptance is lower by an amount nobody has published. §1.4's
+speculative row and §5.7's DSpark figures inherit the same optimism; M7 decides the default at
+temperature 1.0, top_p 1.0 with thinking on, and reports greedy beside it.
 
 ### 5.5 Prefill and time to first token
 
@@ -1383,8 +1432,9 @@ products, summed exactly and rounded once to FP32 (FN §16.5: FP32 logits avoid 
 1. s_e = √softplus(z_e) with the canonical `exp`/`log1p` of `ops/common/canonical_math.h` and
    torch's threshold (softplus(z) = z for z > 20); DS4 had to fix its Metal router for small logits
    (commit `0719a0ba`), so M3's oracle covers z ≤ −20 exhaustively over BF16-representable sums.
-2. top-6 of s_e + bias_e (bias_vl_e on image-span tokens), lower id winning exact ties;
-   w_i = 1.5 · s_i / (Σ s + 1e-20) in FP32.
+2. top-6 of s_e + bias_e (bias_vl_e on the whole image span), lower id winning exact ties (as
+   `model.py` and DeepSeek's fused router both do); w_i = fl32(fl32(s_i / (Σ s + 1e-20)) · 1.5), the
+   division first, as both do.
 3. Union over the T columns; classification from the residency word and tier tables, as GLM §9.4:
    `READY` pages → GPU job; RAM pages → CPU or DMA job (§9.7); unpinned pages → CPU job; landing
    pages → CPU job per unit; absent everywhere → demand read, then a landing-page job.
@@ -1406,9 +1456,15 @@ order (FN §16.2's requirement, extended to dense layers as FN §16.2.2 did).
 ```text
 a_b  = max(max_k |x_k|, fl32(1e-4))                                   exact
 e_b  = exponent(fl32(a_b · fl32(1/448))) + (mantissa ≠ 0)              integer
+     = max(⌈log₂(max_k |x_k| / 448)⌉, −22)                             the same, for every input
 q_k  = e4m3_rn(clamp(x_k · 2^−e_b, −448, 448))                          exact scaling, one rounding
 X_k  = q_k · 2^9 ∈ ℤ, |X_k| ≤ 229,376 < 2^18;  x̂_k = X_k · 2^(e_b − 9)
 ```
+
+fl32(1/448) = (1/448)(1 + 3 · 2^−26) never moves a power-of-two bin for a normal FP32 amax (the same
+holds for fl32(1/6) in E2M1 packing), and the 1e-4 floor is an exponent of at least −22. `model.py`,
+TileKernels and DeepGEMM (by an integer rule on the bits, without a float multiply) all compute this;
+§20.1's MX8 oracle checks the three forms.
 
 **Weights.** MXFP4: c2 = 2 · e2m1(code) ∈ {0, ±1, ±2, ±3, ±4, ±6, ±8, ±12} with a UE8M0 exponent u per
 32 weights along K. NVFP4: c2 with Ŝ (E4M3 · 2^9) per 16 and the matrix multiplier (FN §16.2.1).
@@ -1463,7 +1519,9 @@ uses `dp4a` with X as three byte limbs (FN §16.2.1's narrow form); the wide rou
 `mma.m16n8k32` per 32-block with FN §16.2.1's limb split (X has 18 bits instead of 21); the CPU uses
 two int16 limbs with `vpdpwssd` (FN §16.2.2's CPU GGUF form). Dense FP8 rows take FN §16.2.2's
 base-64 digit planes on the tensor cores. Rejected, as FN §16.2.2 rejected them: FP8 or FP4 tensor
-cores with FP32 accumulation (undocumented order on `sm_120`, not reproducible on the CPU).
+cores with FP32 accumulation (undocumented order on `sm_120`, not reproducible on the CPU). DeepSeek's
+server uses exactly that, the SM100 block-scaled MMA with UE8M0 scales on both operands and no
+software promotion; `sm_120`'s warp-level block-scaled MMA has the same undocumented accumulation.
 
 **Compiler and instruction rules** are FN §16.2's: `-ffp-contract=off -fno-fast-math`, explicit
 `__fmaf_rn` / `__fmul_rn` / `__fadd_rn`, and `cvt.rn.satfinite.e4m3x2.f32` checked exhaustively
@@ -1712,63 +1770,107 @@ comes from the calibrated cost per expert-row.
 
 ## 13. CSA2 attention and the hierarchical indexer
 
-No `sm_120` kernels exist for either: FlashMLA's sparse kernels are SM90/SM100 only and vLLM's
-`sm_120` route has open blockers for V4.1's shapes (§4.2). Both are new Infernix Ops.
+No `sm_120` kernels exist for either: at the commits DeepInfer pins, FlashMLA's sparse kernels and
+DeepSelect are built for SM100 only (tcgen05, tensor memory, 2-CTA clusters and up to 227 KB of shared
+memory per block), and vLLM's `sm_120` route has open blockers for V4.1's shapes (§4.2). Both are new
+Infernix Ops. What transfers from DeepSeek's kernels is their structure, not their code: the 64
+heads as the MMA's M dimension with each KV block dequantized once for all heads; the 512-wide dot
+product in two fixed-order halves; RoPE and MX8 fused into the loads and epilogues; the indexer's
+epilogue with the head weights in registers (relu, weight and head sum fused); DeepSelect's
+threshold-filter streaming top-k (§13.4); the fused router. On `sm_120` a 64-head query's 64 KB of Q
+and 128 KB of FP32 O do not fit one block's shared memory, so heads or columns are split, with the
+canonical merge of §13.3. One converter-side layout choice also transfers: FlashMLA permutes the rows
+of the q projection and the columns of `wo_a` in whole 32-groups so the kernel's loads and FP8 stores
+coalesce; the permutation is exact and is decided in M3.
 
 ### 13.1 Per-sequence state
 
 | State | Layers | Per token | At 128K | Stored form |
 |---|---|---:|---:|---|
-| Window ring | every layer (and DSpark's over main features) | bounded: 128 × 528 B per layer | 2.7 MB (+0.2 MB) | E4M3 codes + UE8M0 per 32 |
+| Window ring | every layer (and DSpark's over main features) | bounded: (128 + K_max + 1) × 528 B per layer, 134 slots at K_max = 5 | 2.8 MB (+0.2 MB) | E4M3 codes + UE8M0 per 32 |
 | Compressed entries | Full layers 2, 8, 14 (ratio 2) and 20 (ratio 1) | 3 × 144 + 288 = 720 B | 94 MB | E2M1 + E4M3 per 16, 288 B per entry, paged |
 | Index keys | the same four layers | 3 × 34 + 68 = 170 B | 22 MB | E2M1 + UE8M0 per 32, 68 B per key, paged |
-| Open compressor groups | 2, 8, 14 | — | 24 KB | FP32 kv and gate score of the incomplete pair |
+| Compressor state | 2, 8, 14 | — | ≈ 86 KB | a ring of ratio + K_max = 7 tokens per layer (28 KB), FP32 (kv, gate score) per token, indexed by absolute position |
 
 The persistent part is **890 B per token**, the report's figure.
+
+**Room for verification** (DeepInfer `worker/cache_engine.py`, the SWA block size and compress
+state size): a verify round of K drafts writes K + 1 window entries. With exactly 128 slots, column
+P + j would overwrite the entry of P + j − 128 that an earlier column still reads, and a rejected
+column would clobber a committed entry the next query needs. Verification writes every column before
+any reads, so a window ring needs at least 128 + K_max slots; Infernix uses 128 + K_max + 1 = 134,
+DeepSeek's size (its extra slot absorbs the overshoot of copies at 128-token boundaries). The
+compressor keeps per-token state for ratio + K_max = 7 positions (DeepSeek's kernel asserts
+ratio + verify width − 1 with a width of 6), so a rejection is only a frontier move, and the DSpark
+window has the same room. A unit test runs K + 1 = 6 verify columns in one slot with every rejection
+count against sequential decode, bitwise (as DeepInfer's `compress.py` tests do).
 
 ### 13.2 Compressor and index keys (`csa_compressor`)
 
 - **Ratio 2** (layers 2, 8, 14): per token, k_i = W_ck x_i and z_i = W_cg x_i as FP32 (exact BF16
   products, one rounding), held in the open group; when a token closes a pair,
-  c = Σ_i softmax_i(z_i) ⊙ k_i in FP32 (canonical exp, fixed order), rounded to BF16, RMSNorm; the
+  c = Σ_i softmax_i(z_i) ⊙ k_i in FP32 (the max subtracted, canonical exp, the two terms summed in
+  order 0, 1, one division), rounded to BF16, RMSNorm over the BF16 values; the
   index key comes from this pre-RoPE c; RoPE at the pair's first position; FP4 packing (amax per 16
   with the floor 6 · 2^−9, s = e4m3_rn(amax / 6), codes E2M1 round-to-nearest-even of value / s).
 - **Ratio 1** (layer 20): c = W_ck x as a BF16 linear, then the same norm, key, RoPE and packing.
 - Layer 20's work runs for **every prompt token** (§16.2): it is the decoder's KV.
 - The packing rules are deterministic functions of c, exhaustively checked between the CPU form and
-  the GPU form.
+  the GPU form. DeepSeek's server packs with a reciprocal multiply (§20.4); M0 counts where the two
+  forms' codes differ on real latents.
 
 ### 13.3 Decode attention (`csa_attention`)
 
 Per layer and token: Q is 64 × 512 BF16; the entries are the window ring (≤ 128) and the selected
 compressed entries (≤ 512), each one 512-vector used as key and value.
 
-- Entries decoded to BF16 in the tile loader (E4M3 · 2^k and E2M1 · E4M3 values are exact in BF16).
-- Scores q · e in FP32 with a fixed reduction order, × 512^−½; an online softmax in FP32 with the
-  canonical exp and the sink's exp(sink_h − m) in the denominator; P × V with P in FP16 and FP32
-  accumulation, Infernix's exact attention convention (model-quality §6.1; the reference casts P to
-  BF16, §20.4).
-- ≤ 640 entries per query: one CTA per group of heads with a fixed merge order; ≈ 84 MFLOP and
-  0.2 MB per layer and token.
+- **Canonical slot order** (FlashMLA's, which decode and prefill share): the window entries in
+  ascending position at the front of 128 slots, the compressed selections in ascending position in
+  512 slots, invalid slots at the tail of each list with P = 0: ten blocks of 64 entries. The place of
+  an entry in the P × V reduction changes its rounding, so prompt/decode equality (§18.3) needs one
+  order; `model.py` itself orders the decode ring with invalid slots first and the prompt window with
+  them last.
+- Entries decoded to BF16 in the tile loader (E4M3 · 2^k and E2M1 · E4M3 values are exact in BF16),
+  through the exact conversion instructions; rows padded to an odd number of 16-byte chunks (576 B
+  for the 528-byte entries) against bank conflicts; index −1 maps to a zero-filled load, so an empty
+  slot can never produce a NaN.
+- **Canonical arithmetic**: per 64-entry block, scores q · e in FP32 with a fixed reduction order,
+  × 512^−½, and a partial (m_b, l_b, o_b) in FP32, where l_b sums the unrounded exponentials and P is
+  rounded to FP16 for P × V with FP32 accumulation (Infernix's exact attention convention,
+  model-quality §6.1; the reference rounds P to BF16, and both keep the denominator unrounded, §20.4).
+  The ten partials merge unnormalized in ascending block order, then the sink's exp(sink_h − m) joins
+  the denominator. Rescale decisions are per head, never shared across a warp's heads as FlashMLA's
+  lazy rescale does.
+- **Decode at C = 1** spreads (block, head group) work items over ≈ 40 CTAs and merges in block
+  order; DeepSeek runs one CTA per query (its batches fill the GPU), which at C = 1 would occupy one
+  SM (≈ 10-20 µs per layer, estimated, against the 3-4 µs budget of §9.3). The prompt kernel (§13.6)
+  computes the same partials inside one CTA per query. ≈ 84 MFLOP and 0.2 MB per layer and token.
 - Output: inverse RoPE on o's last 64 dimensions at the query position (FP32, rounded to BF16), then
-  MX8 per group into `wo_a` (K6).
+  MX8 per group into `wo_a` (K6), fused into the attention epilogue with `model.py`'s two BF16
+  roundings kept in registers (DeepSeek's server skips them, §20.4); q's RoPE is fused into the Q
+  load, as FlashMLA does.
 - Reuse layers take the latest Full or Reindex layer's selection.
 
 ### 13.4 The indexer (`csa_indexer`)
 
 | Step | Precision |
 |---|---|
-| q_h = MXFP4(RoPE(W_qb_idx c_q)), w_h = (W_w x)_h · 128^−½ · 32^−½ | FP8 linear with MX8 input; BF16 `weights_proj` as the reference |
+| q_h = MXFP4(RoPE(W_qb_idx c_q)), w_h = bf16(W_w x)_h · 2^−6 (128^−½ · 32^−½, exact) | FP8 linear with MX8 input; BF16 `weights_proj` as the reference |
 | q_h · k_p per head and position | **exact**: E2M1 × E2M1 products, integer sums per 32-block, power-of-two scales |
 | score_p = Σ_h w_h · relu(q_h · k_p) | FP32, heads in ascending order |
-| Ratio-2 Full layers: top-512 of the visible positions | exact radix select, lower position on ties, re-sorted by position |
-| Layer 20: block maximum over 8 positions, the newest block pinned, top-2,048 blocks, then top-512 inside | same |
+| Ratio-2 Full layers: top-512 of the visible positions | DeepSelect's threshold-filter streaming top-k (stream the scores in blocks, keep what beats a running threshold, compact the candidates with a radix select) on a 64-bit total-order key, (orderable FP32 score ≪ 32) \| ~position, so ties go to the lower position whatever the visit order or launch shape; sized for `sm_120`'s shared memory, no clusters; re-sorted by position |
+| Layer 20: top-512 of all visible positions; block maximum over 8 positions, the newest block pinned, top-2,048 blocks as the candidates for later layers | same |
 | Reindex: its own scores inside the candidates, top-512 | same |
 
+- **Layer 20 selects from all positions**, not from inside its own candidates: `model.py` masks
+  scores to C(t) only in the later layers, and DeepInfer does the same (`index_attn.py`). An earlier
+  version of this design said "top-512 within C(t)" for layer 20; the two differ only when ties at
+  the 512th score spread over more than ≈ 2,047 blocks. Scanning only C(t) at layer 20 is allowed as a
+  shortcut when the tie rule keeps it exact.
 - **Deviation.** `model.py` computes q · k with a BF16 einsum, the weighted product and the head sum
-  in BF16, which rounds scores into ties that `torch.topk` breaks arbitrarily. Infernix keeps FP32
-  logits, as the training-time indexer kernels do (DeepGEMM's indexer returns FP32 logits), and
-  reports selection agreement against the reference's BF16 scores (§20.1).
+  in BF16, which rounds scores into ties that `torch.topk` breaks arbitrarily; DeepSeek's server also
+  ranks BF16 scores (§20.4). Infernix keeps FP32 logits, which make fewer ties, and reports selection
+  agreement against the reference's BF16 scores (§20.1).
 - **Decode cost**: layer 20 scans every position (68 B each: 8.9 MB at 128K, 68 MB at 1M), the
   ratio-2 Full layers half of them, the Reindex layers 16,384 candidates (1.1 MB).
 - Selections depend only on the stored keys and the query (FN §8.10's rule).
@@ -1778,18 +1880,26 @@ compressed entries (≤ 512), each one 512-vector used as key and value.
 The model defines and was trained with its KV formats (report §2.4.4): FP8 window entries (528 B),
 FP4 compressed entries (288 B, an E4M3 scale per 16, no global scale), MXFP4 index keys (68 B).
 Infernix stores exactly these codes. `--kv-dtype` accepts only `model` for this family; any other
-value is refused at startup. KV at 128K: 117 MB; at 1M: 0.89 GB; windows: 2.9 MB per sequence.
+value is refused at startup. KV at 128K: 117 MB; at 1M: 0.89 GB; windows: 3.0 MB per sequence with
+the verification room. DeepInfer stores the same three formats (528 / 288 / 68 B).
 
 ### 13.6 Prompt kernels
 
 - **Window attention**: per query the last 128 positions (causal in the chunk plus the ring), query
   tiles of 64 sharing their windows.
-- **Compressed attention**: each query's own 512 selections; a tile of 64 queries processes the union
-  of its selections with a per-query mask (FN §19.3.8 F5's QSA prompt kernel).
+- **Compressed attention**: **one query per CTA, the 64 MQA heads as the MMA rows** (an m64 tile
+  exactly), over that query's own 512 selections and its window, in the same per-query order as the
+  decode kernel; FlashMLA's sparse prefill has this structure (per-query index lists over a gathered
+  buffer of window and compressed entries). An earlier draft cited a union tile of 64 queries with a
+  per-query mask as FN §19.3.8 F5's kernel; Flash-Next rejected the union (FN §8.10) and built one CTA
+  per (column, KV head). The per-query order is also what makes prompt and decode state equal (§18.3).
 - **Indexer scoring**: a register-tiled exact int8 MMA over queries × positions per head, query
   sub-chunks of 2,048 (GLM §13.3) and a streaming top-k, never materializing the score matrix. At
   128K the three ratio-2 layers score ≈ 17 T multiply-adds each (≈ 0.1 s on int8 tensor cores,
-  estimated); layer 20 scores only the decoder's positions.
+  estimated); layer 20 scores only the decoder's positions. DeepInfer instead materializes BF16
+  scores per chunk of at most 8,192 queries (under a 10 GiB cap; its kernel down-clocks on larger
+  chunks). An option for M8: FP32 scores per sub-chunk (≈ 128 MB for 512 queries at 128K), which
+  makes the exact tie rule a plain sort; chosen by measurement.
 - **Attention arithmetic**: ≈ 84 MFLOP per query and layer, ≈ 1.1 s for a 128K prompt over the
   encoder (estimated).
 
@@ -1798,6 +1908,17 @@ value is refused at startup. KV at 128K: 117 MB; at 1M: 0.89 GB; windows: 2.9 MB
 Default `--max-context 131072`, up to 1,048,576. At 1M the compressed planes take 0.89 GB of VRAM
 and the windows are unchanged: no host KV tier is needed (unlike GLM §13.6). The decode indexer scan
 grows to ≈ 170 MB per token at 1M (≈ 0.11 ms); prompts grow quadratically in the indexer (§5.5).
+
+- **Position bound.** A verify round reaches K_max + 1 positions past the committed length and the
+  drafter's block 5 more, so the RoPE tables, rings and DSpark block cover `--max-context` + K_max + 5
+  positions; near the end K is clamped instead (DeepInfer allows max length + verify width + draft
+  block).
+- **RoPE table** (M0 check). `model.py` and DeepInfer build inv_freq in FP32 on the device with
+  `pow`, apply YaRN in FP32 (no mscale), form each angle as the FP32 product position × inv_freq and
+  take cos and sin of that FP32 angle. At 128K one ulp of an inv_freq word moves an angle by ≈ 0.01 rad
+  (≈ 0.08 rad at 1M; model), so the table is defined bit for bit as torch builds it: M0 dumps
+  `model.py`'s `freqs_cis` for both θ values at positions up to 1M and checks Infernix's table against
+  it, and if CPU and CUDA `pow` disagree the artifact stores the 2 × 32 inv_freq words.
 
 ---
 
@@ -1817,9 +1938,16 @@ grows to ≈ 170 MB per token at 1M (≈ 0.11 ms); prompts grow quadratically in
 - The **compressed token map** (129,280 → 99,092 ids) is built by the converter from `tokenizer.json`
   with the reference normalizer (NFKC, NFD, accents stripped, lowercase, whitespace collapsed, the
   single-space sentinel) and stored in the artifact, checked against `engram_compressed_vocab_size`.
-- The **multipliers** are `numpy.random.default_rng(10007 · layer_id)` draws; the converter stores
-  them, so Infernix never reimplements NumPy's generator. Primes and offsets are stored and checked
-  against `engram_num_embeddings` (each table's 24 primes sum to its row count).
+  The rules that decide it (DeepInfer `engram_metadata.py`, `engram.py`): each id is decoded alone with
+  special tokens kept; text containing U+FFFD keys on the raw token string; a normalization that
+  yields the empty string keys on the decoded text; new compressed ids are assigned in order of first
+  appearance; the pad is token 2's compressed id. M0 compares the converter's map with `engram.py`'s
+  and DeepInfer's on all 129,280 ids.
+- The **multipliers** are `numpy.random.default_rng(10007 · layer_id)` draws (odd, bounded by
+  (int64 max // 99,092) // 2); the converter stores them, so Infernix never reimplements NumPy's
+  generator. The primes are the 48 consecutive distinct primes above 15,999,999 in (layer, order,
+  head) order; primes and offsets are stored and checked against `engram_num_embeddings` (each
+  table's 24 primes sum to its row count).
 - Per position: the compressed ids of the token and its 3 predecessors (the pad id where the history
   is shorter or crosses a dead token); a rolling XOR of id × multiplier in int64 (overflow-free by the
   multipliers' bound); for order n and head h, row = (hash mod prime_{n,h}) + offset_{n,h}.
@@ -1871,10 +1999,24 @@ through the 64-deep polled ring with per-block deduplication, and a volume that 
 
 ### 14.6 The `engram` kernel
 
-Per Engram layer and token: the 24 rows decoded to BF16, MX8 per 32 over the 6,144 values, `wkv` FP8
+Per Engram layer and token: the 24 rows into MX8 per 32 over the 6,144 values, `wkv` FP8
 [25,600 × 6,144] (157 MB), FP32 keys and value, per-stream rstd and gate (signed square root with the
 1e-6 clamp, sigmoid), and the stream update with one rounding to BF16: ≈ 0.11 ms per layer per token,
 memory-bound on `wkv`.
+
+- **FP8 and MXFP4 rows need no decode.** `model.py` decodes a row to BF16 and re-quantizes it with MX8;
+  for a row stored as E4M3 (or E2M1) codes with a UE8M0 scale per 32, that returns the same codes and
+  exponent unless MX8's floor binds (u + ⌈log₂(c_max/448)⌉ < −22). The kernel therefore forms the MX8
+  operand from the stored codes and exponents by integer shifts and takes the decode path only for
+  floor-binding blocks, which M0 counts in the table; DeepSeek's server feeds the stored codes
+  straight to its GEMM (§20.4). IQ4_NL rows decode to BF16 (§14.5) and then take MX8.
+- **In production** the tables sit in host RAM sharded over the ranks, the GPU reads rows directly
+  over RDMA, the hashes are computed on the GPU, and both layers' rows are requested at the start of
+  each forward and consumed at layers 1 and 14, as §14.4 does. DeepInfer has no row cache or
+  deduplication and publishes no read rates.
+- Engram sits between the previous sublayer's residual update and the next mixing step, so layers
+  1 and 14 cannot use the producer-epilogue collapse of §15.1; their collapse is a separate step.
+  Image-span tokens add nothing and need no row reads.
 
 ### 14.7 Cost and exposure
 
@@ -1903,7 +2045,9 @@ memory-bound on `wkv`.
   (K6's `wo_b`, K9's combine) writes S'_k = post_k · y + Σ_j comb[j][k] · S_j for its rows in FP32 with
   one rounding to BF16, then the next sublayer's input x = Σ_s pre_s · S'_s (with the pre that
   sublayer will use, already computed), and the partial sums of squares for its RMSNorm and for the
-  next mixes.
+  next mixes, taken over the BF16-rounded x and S' (as `model.py` and DeepGEMM's fused mHC both do).
+  DeepGEMM's `mega_mhc` fuses the same epilogue (post, collapse, norm, cast, statistics) in one pass.
+  The Engram layers 1 and 14 are the exception (§14.6).
 - **Sinkhorn**: one warp in FP32, one column normalization then 19 row/column rounds with eps 1e-6,
   reproduced iteration for iteration.
 - **Cost**: ≈ 2 µs per sublayer, ≈ 0.16 ms per token, none of it on the critical path except the
@@ -1914,7 +2058,11 @@ memory-bound on `wkv`.
 - Mixing weights, Sinkhorn, pre, post and comb in FP32; streams in BF16; the update in FP32 with one
   rounding, exactly as the reference (GLM's reference rounded twice; this one does not).
 - Fixed orders: s = 0..3 for the collapse, j = 0..3 for the comb sum, then + post · y; qualified
-  against FP64 with the reference's single rounding.
+  against FP64 with the reference's single rounding. DeepSeek's server forms fl32(post · y) first and
+  adds comb[j] · S_j for j = 0..3 by fused multiply-adds, and computes the mixes on TF32 tensor cores
+  with approximate exp and reciprocal (§20.4); Infernix keeps `model.py`'s FP32.
+- Confirmed constants (DeepInfer): post scale 2.0, 20 Sinkhorn iterations, eps 1e-6 for pre and
+  Sinkhorn, norm eps 1e-20 with the norm weight folded into fn.
 - The first sublayer's pre is one-hot on stream 0; the head collapses with the last FFN's pre.
 
 ---
@@ -1925,7 +2073,7 @@ memory-bound on `wkv`.
 
 | `--prompt-decoder` | Prompt tokens through the encoder | Decoder positions evaluated | Equals |
 |---|---|---|---|
-| `replay` | all | the last min(T, 128), window attention truncated at the replay start | DeepSeek's served model (report §3.2.2; vLLM #56752; SGLang) |
+| `replay` | all | the last min(T, 140) (`--replay-keep N`, default 140, at least 134), window attention truncated at the replay start | DeepSeek's served model (report §3.2.2; DeepInfer; vLLM #56752 and SGLang with 128) |
 | **`full`** (default, decision g) | all | the exact suffix: layer l evaluates the last 1 + (39 − l) · 127 positions after forming the 127 window entries before them | the reference forward (every prompt token through all 40 layers), output for output (DS4's method) |
 
 - Both rules are deterministic and request-invariant (§18.3); the rule is part of the prefix cache's
@@ -1974,13 +2122,18 @@ an option.
 ### 16.3 The decoder under each rule
 
 - **replay**: after the span holding the prompt's end, decoder layers 20-39 run on the last
-  min(T, 128) positions as narrow work (≤ 128 columns), window attention truncated at the replay
+  min(T, 140) positions as narrow work (≤ 140 columns), window attention truncated at the replay
   start s (entries max(s, i − 127) … i), compressed entries from layer 20 for every position. When a
-  prompt continues a cached prefix with T < 128, the replay reaches into cached positions; their
+  prompt continues a cached prefix with T < 140, the replay reaches into cached positions; their
   layer-20 inputs come from the snapshot (§18.2).
-- **full**: layer l evaluates its suffix; layer 20 needs layer-20 inputs for the last 2,541 positions,
-  from the walk or, for cached positions, from the snapshot. A prompt shorter than a layer's suffix
-  runs that layer on all of its tokens.
+- **full**, a fresh prompt or one resumed from a tap inside an earlier prompt: layer l evaluates its
+  suffix; layer 20 needs layer-20 inputs for the last 2,541 positions, from the walk or, for cached
+  positions, from the snapshot. A prompt shorter than a layer's suffix runs that layer on all of its
+  tokens.
+- **full**, a prompt that continues an endpoint (the end of an earlier prompt or of a reply): the
+  endpoint's snapshot holds the exact decoder windows (§18.2), so the new tokens run all 40 layers
+  as decode does and no suffix is recomputed. Under the full rule these windows are the reference
+  computation; under replay they are redefined at every prompt end, so replay cannot do this.
 - Replay's decoder experts are thin (≈ 2 tokens each): the CPU computes the non-VRAM ones (§12.4).
   The full rule's are 2-40 tokens each from layer 39 to layer 20.
 - DSpark's window seeds (main-feature entries of the last 128 positions) come from the decoder
@@ -1990,8 +2143,22 @@ an option.
 
 An append of T tokens to a cached conversation runs the same walk over T tokens; only the experts
 those tokens touch are read (54 % of the bank at 50 tokens, §5.5), the narrow routes serve experts
-with n ≤ 8 columns, and the CPU takes thin non-resident ones. The guide states the cost plainly:
-2-9 s for 16-100 tokens on three volumes (model).
+with n ≤ 8 columns, and the CPU takes thin non-resident ones. Under `full` that is all (§16.3);
+under `replay` the decoder also replays 140 positions, touching ≈ 89 % of each decoder layer's
+experts whatever T is (this was missing from earlier versions of §5.5, which counted only the new
+tokens for both rules). Model, three volumes (`append_model.py` in the working notes):
+
+| Append of T tokens | EXL3 artifact, `full` | EXL3, `replay` | MXFP4, `full` | MXFP4, `replay` |
+|---:|---:|---:|---:|---:|
+| 16 | 1.0 s | 2.3 s | 2.2 s | 5.0 s |
+| 50 | 2.0 s | 3.4 s | 4.9 s | 7.4 s |
+| 100 | 4.5 s | 5.3 s | 8.9 s | 9.9 s |
+| 200 | 7.0 s | 6.5 s | 12.3 s | 11.6 s |
+
+So for chat and agent turns, mostly short appends, the exact rule is the faster one; from about
+200 new tokens replay saves ≈ 0.5-1 s, as it does on fresh prompts (§16.1). A continuing turn also
+skips re-reading the model's previous reply only if that decode-computed state is published and the
+next prompt re-renders the reply unchanged (§18.3; true for agent turns with tools).
 
 ### 16.5 After prefill
 
@@ -2016,8 +2183,16 @@ returns its lent pages, the free-page refill (§10.2) fills them with the hottes
 
 ### 17.2 The drafter
 
-- Structure §2.2. Its window of main-feature entries (3 layers × 128 × 528 B) is appended once per
-  committed token and seeded by the prompt's decoder positions.
+- Structure §2.2. Its window of main-feature entries (3 layers × 134 × 528 B, the verification room
+  of §13.1) is seeded by the prompt's decoder positions. As in DeepInfer (`models/mtp/dflash.py`),
+  every verify column's main-feature key is written into this window inside the verify forward; the
+  next draft pass's block keys overwrite the rejected columns' slots before anything reads them, so
+  there is no separate append step.
+- **Confidence head** (DeepInfer, matching §2.2): sigmoid(clamp(([h ; e_m] · w) / T_step, ±60)) with h
+  the collapsed hidden state **before** the final norm, e_m the Markov embedding of the previous
+  draft, w cast to BF16, an FP32 result and a per-step temperature (default 1.0); a draft's survival
+  is the running product. DeepSeek samples drafts with the request's sampler, one random stream per
+  draft position.
 - **Draft experts**: residency-bounded routing (FN §11.2, GLM §10.6): top-3 among the DSpark experts
   in the VRAM pool, plus the best-scored missing one computed by the CPU from the RAM pool (Maya's
   `MTP_KEEP`, GLM §4.3). This changes acceptance only, never verified output.
@@ -2034,6 +2209,19 @@ position's acceptance from the confidence head, calibrated online against observ
 sequential temperature scaling); K ∈ {0, …, 5} with K = 0 always a candidate; experts used only by
 rejected columns are not credited to the caches. Expected: K ∈ {0, 1, 2}, more on verbatim text and
 code edits.
+
+- **The drafter always computes its trained 5-entry block.** Block attention inside the drafter is
+  non-causal, so a shorter block changes every draft, the first included. K only truncates what is
+  verified (and the Markov and head steps past K). DeepInfer ties the block length to its draft-count
+  setting, so its published nextn = 3 chart ran an untrained 3-entry block.
+- **Calibration signal** (DeepInfer `fused_sample.py`): on sampled rounds the verifier knows each
+  draft's acceptance probability, Σ min(p, q) (for a point-mass draft, p of the draft token), and
+  calibrates the confidence head against that instead of the 0/1 outcome: the same mean, lower
+  variance, so K settles faster. Greedy rounds observe 0/1 as before.
+- **DeepSeek's production figures**: drafting 5 and verifying a confidence-chosen prefix cut the
+  verified drafts per step from 5 to 3.2-4.4 while the accepted length fell only from 3.29 to 3.20
+  (EP64 serving; its throughput gain ranged from −1.5 % at 16 sequences per rank to +11 % at 96).
+  Here the union cost makes every verified column far dearer, which is why K is chosen per round.
 
 ### 17.4 N-gram copy proposals
 
@@ -2061,23 +2249,65 @@ At the hybrid prefix cache's tap points (spec §17's binding, as for Qwen4Exp):
 
 | Part | Size | Why |
 |---|---:|---|
-| Encoder windows (layers 0-19) and open compressor groups | 1.35 MB + 24 KB | resume the encoder exactly; DeepSeek's lossy encoder replay is not needed |
+| Encoder windows (layers 0-19) and compressor state | 1.41 MB + ≤ 12 KB (at most one open group per layer; none at even positions) | resume the encoder exactly; DeepSeek's lossy encoder replay is not needed |
+| Endpoints: the last position's head input (the collapsed hidden state, 10 KB) | 10 KB | an exact repeat of a whole prompt (or "regenerate") samples its first token without recomputing; otherwise the resume backs off one position, which the verification room of §13.1 allows |
 | Engram history | 12 B | the n-gram state |
 | DSpark window (main-feature entries) | 0.2 MB | when DSpark is on |
-| `replay`: layer-20 inputs of the last 127 positions | 5.1 MB | a short append's replay reaches into cached positions |
-| `full`: layer-20 inputs of the last 2,540 positions | 104 MB | the exact suffix of a short append |
+| `full`, at endpoints (the end of a prompt or a reply): decoder windows (layers 20-39) | 1.41 MB | an append continues as decode does (§16.3) |
+| `full`, at taps inside a prompt: layer-20 inputs of the last 2,540 positions | 104 MB | a resume there recomputes the exact suffix |
+| `replay`: layer-20 inputs of the last 139 positions | 5.7 MB | a short append's replay reaches into cached positions |
 
-A snapshot is ≈ 6.7 MB under the default rule and ≈ 106 MB under the full rule. Decoder windows are
-never in a snapshot: replay recomputes them by definition, and the full rule recomputes them through
-its suffix.
+A snapshot is ≈ 3 MB at an endpoint under the default `full` rule (≈ 106 MB at a tap inside a
+prompt) and ≈ 7.3 MB under `replay`, where decoder windows are never stored because replay
+recomputes them by definition. DeepSeek instead caps a prefix hit at L − 134 positions so the tail
+re-runs the whole model; here a 134-token re-run would touch ≈ 88 % of each layer's experts, so the
+snapshots are kept. DeepSeek's cap also sits uneasily with its own 140-position replay (its hit logic
+is not in the released code), so its served output after a cache hit is not pinned down; Infernix
+claims request invariance for its own rules (§18.3), not bit-parity with DeepSeek after hits.
 
 ### 18.3 Request invariance
 
 Both rules make a request's output a function of the request, the artifact and the options only
-(model-quality §6.1): the encoder runs on the fixed chunk grid with exact arithmetic; the replay's
-decoder state depends only on the prompt's last 128 tokens and the encoder state, the suffix's on the
-last 2,541; a snapshot restores exactly what a cold run computes at the same grid point. As the engine
-requires (engine architecture §3.1), only prefill-computed state is published, on the chunk grid.
+(model-quality §6.1): the encoder's arithmetic is exact; the replay's decoder state depends only on
+the prompt's last 140 tokens and the encoder state, the suffix's on the last 2,541; a snapshot
+restores exactly what a cold run computes at the same point.
+
+**Prompt/decode equivalence is a requirement of this family.** Every piece of published state
+(encoder windows, compressor state, compressed entries, index keys, Engram history, layer-20
+inputs, and under `full` the decoder windows) must be the same bits whether a prompt walk (any
+chunking), a decode step or a verify column computed it. The pieces already hold: the linears and
+experts are width-invariant (MX8 and E3A16, §9.5), mHC and norms work per token, and attention runs
+one query at a time in one canonical slot order and block merge in prompts and decode (§13.3,
+§13.6). What this adds: the compressor pools and the indexer sums its heads in a fixed per-query
+order on every route, and top-k ties resolve by a total-order key (§13.4). DeepSeek's engine asserts
+the same property: DeepInfer's `tests/models/test_kl.py` (one case: 3 image-and-text prompts of
+16,384 tokens per rank, 1,024 teacher-forced tokens, 5-token DSpark drafts, two-way context
+parallelism, bounded replay off, so the full rule) requires bitwise-equal FP32 token
+log-probabilities between decoding and one full prefill, in its batch-invariant mode. That mode fixes
+every split and disables split-KV attention but leaves DeepSelect's tie order alone, so DeepSeek's
+equality relies on no ties at a selection cutoff; Infernix's total-order key removes that caveat.
+DeepSeek does not run the mode in production (it is slower).
+
+Consequences:
+
+- The fixed chunk grid is unnecessary for this family: any chunking gives the same state.
+- **Decode-computed endpoints are published.** A continuing turn walks only the new message, not the
+  model's previous reply; without this, a reply of 200 tokens or more costs a bank pass on the next
+  turn (§5.5: ≈ 7-13 s). This applies where the next prompt re-renders the reply as the ids the model
+  generated: agent turns with tools declared (earlier reasoning stays in the prompt) and chat-mode
+  turns. A thinking chat without tools drops the reply's reasoning, so its next prompt departs right
+  after the previous `<｜Assistant｜>` and the reply's answer is walked again whatever is published;
+  newline stripping and re-serialized DSML values can also cut reuse inside a reply (§21, M9
+  measures how often on real agent transcripts).
+- Engine architecture §3.1 publishes only prefill-computed state on the chunk grid, a rule made for
+  the GDN families, whose decode and chunked prefill cannot match. This family is an exception with
+  this reason (§24).
+- Under `replay` the decoder windows are redefined at every prompt end, so only the encoder-side
+  state is published, and the DSpark window is reseeded from the replay at a resume, as a cold run
+  does.
+- M0 and M2 test it: one sequence computed as T = 1 decode steps, as verify widths 2-6 and as prompt
+  walks of several chunkings, its published state compared bitwise (the Python reference first, then
+  the kernels).
 
 ### 18.4 Preemption
 
@@ -2087,9 +2317,10 @@ fast path (Replay recovery) is not registered for this family.
 
 ### 18.5 Tiers
 
-Host tier default 2 GiB (`--host-context-mib`; ≈ 160 default-rule snapshots per GiB), and the file
-tier as the spec defines it. DeepSeek keeps persistent KV on SSD for at least 72 hours (report
-§3.2.1); at 29 MB per 32K conversation the file tier can keep many agent sessions for days.
+Host tier default 2 GiB (`--host-context-mib`; ≈ 350 endpoint snapshots per GiB under the default
+rule), and the file tier as the spec defines it. DeepSeek keeps persistent KV on SSD for at least
+72 hours (report §3.2.1; DeepInfer's deployment notes give 3 days for agent traffic and 7 for chat);
+at 29 MB per 32K conversation the file tier can keep many agent sessions for days.
 
 ---
 
@@ -2161,7 +2392,7 @@ model shapes.
 
 | Op | Oracle and criteria |
 |---|---|
-| MX8 codec (`ops/common/mx8.h`) | **Exact, exhaustive** over every BF16 input and block exponent: the CPU integer form, the GPU `cvt.rn.satfinite` form and a Python port of `act_quant` agree, including the 1e-4 floor and the ceiling rule at powers of two |
+| MX8 codec (`ops/common/mx8.h`) | **Exact, exhaustive** over every BF16 input and block exponent: the CPU integer form, the GPU `cvt.rn.satfinite` form, a Python port of `act_quant` and DeepGEMM's integer exponent rule agree, including the 1e-4 floor (exponent −22) and the ceiling rule at powers of two |
 | `fp8_e4m3fn_b32_e8m0` Linear, decode and prompt routes | **Bit-exact** between routes and against the scalar form at T = 1..8 and prompt widths, every DeepSeek shape including grouped `wo_a`; column invariance for T ≤ 8; FP64 oracle of the same quantized operands within the FP32 rounding bound |
 | EXL3 codec (shared with GLM) at K = 2-5 | **Exact**: the scalar E3A16 form against GLM §20.1's oracle (an FP64 evaluation of ExLlamaV3's decode for the codebook values, exact integer sums), every width, both input widths (5,120 and 2,304), and the pack's sampled experts decoded by ExLlamaV3 at the producing version within its FP16 rounding of the codebook |
 | `offloaded_sparse_moe`, EXL3 records in pages, MX8 → E3A16 | **Bit-exact** across GPU pages (any page order in the page list), staging, CPU on every ISA, unpinned pages, every unit landing order, n = 1..8 and the wide route; calls mixing all four widths; the routing, clamp and combine checks of the MXFP4 row below |
@@ -2227,13 +2458,40 @@ September checkpoint, Infernix's NLL on the official fixtures beside DS4's Q2 an
 | Point | `model.py` | Infernix | Why |
 |---|---|---|---|
 | FP8/FP4 linear accumulation | FP32 tensor-core products per 32-block, FP32 block adds | exact sums, one rounding | placement invariance; more precise |
-| Indexer scores | BF16 einsum, BF16 product and head sum | exact q · k, FP32 weighted sum | the training kernels' FP32 logits; fewer ties; agreement reported |
+| Indexer scores | BF16 einsum, BF16 product and head sum | exact q · k, FP32 weighted sum | fewer ties; selection agreement against BF16-rounded scores is reported (§20.1). DeepSeek's server also ranks BF16 scores (DeepGEMM's MQA logits are BF16 on SM100); an earlier version of this row claimed FP32 training kernels |
 | Top-k ties | `torch.topk` (unspecified) | lower position or lower expert id | determinism |
 | Attention P × V | BF16 P | FP16 P, FP32 accumulation | Infernix's exact attention convention; FP64-qualified |
 | softplus, exp, SiLU, sigmoid | torch CUDA | canonical implementations | CPU/GPU identity |
 | mHC sums, norms | torch's order | fixed orders | determinism |
 
 Every BF16, FP8 and FP4 rounding point of `model.py` is kept.
+
+**DeepSeek's server differs from `model.py` too** (DeepInfer at `9bd9cf24` with the libraries it pins:
+DeepGEMM `1fc9c669`, FlashMLA `2e5429fc`, DeepSelect `bfa4507d`, TileKernels 2.1.0; read 2026-10-24).
+Infernix follows `model.py`, the published reference; these are the places where "the served model"
+and the reference part, so the §20.3 reports can explain small differences from API log-probabilities:
+
+| Point | `model.py` | DeepSeek's server |
+|---|---|---|
+| FP8 and FP8 × FP4 GEMMs | FP32 products per 32-block, FP32 block adds | the hardware block-scaled MMA (UE8M0 per 32 on both operands), FP32 accumulation in an undocumented order, no split-K |
+| mHC mixing coefficients | FP32 | a TF32 tensor-core GEMM (`fn` read at a 10-bit mantissa), 16 fixed split-K partials in batch-invariant mode and a token-count-dependent split otherwise; approximate exp and reciprocal in sigmoid and Sinkhorn, except on layers 0, 1 and 14, whose Sinkhorn (TileKernels) divides: two Sinkhorn arithmetics in one forward |
+| Routed experts after gate and up | BF16 outputs clamped, SwiGLU, h rounded to BF16, MX8 for down; combine in ascending id, shared expert last | the same clamp; approximate exp and reciprocal in SiLU; (silu · up) · w in FP32 quantized to FP8 **without** the BF16 rounding of h; combine with the shared expert first, then routed experts in score order |
+| Attention output | FP32 → BF16, inverse RoPE → BF16, MX8 | inverse RoPE in FP32 and MX8 straight from FP32, skipping both BF16 roundings |
+| Compressor pooling | exact functions | fast exp and division (the same max-subtracted two-term form) |
+| FP4 packing of compressed entries | s = e4m3(amax / 6), codes e2m1(x / s) | s = e4m3(min(max(amax, 6 · 2^−9) · fl32(1/6), 448)), codes e2m1(x · fl32(1/s)): the scales are always equal for BF16 inputs; codes differ only where x / s lands exactly on an E2M1 midpoint and s is not a power of two |
+| Indexer scores | q · k rounded to BF16, times the BF16 weight, heads summed in FP32, one rounding | relu and a BF16 rounding of each q · k, then a BF16 multiply-add chain over heads in four interleaved partial sums; the factor 2^−6 omitted (it changes no ranking) |
+| Top-k ties (indexer, candidate blocks) | `torch.topk` | DeepSelect: deterministic, but ties at the cutoff fill in the kernel's visit order and depend on the launch shape |
+| Engram rows into `wkv` | FP8 rows decoded to BF16, MX8 | the stored FP8 codes and scales fed straight to the FP8 GEMM: the same values except in 32-blocks where MX8's 2^−22 floor binds |
+| Speculative sampling | — | residual max(q − e^(log p − 5·10^−5), 0), which keeps outputs within ≈ 5·10^−5 relative of exact; Infernix's sampled verification stays exact |
+
+Confirmed equal to `model.py`: MX8 (all three implementations compute e_b = max(⌈log₂(a_b/448)⌉, −22),
+DeepGEMM by an integer rule on the bits), the `wo_a` → `wo_b` chain (DeepGEMM rounds to BF16 before
+the cast, "bitwise" as a BF16 output followed by the standalone cast), the MXFP4 index-key floor
+(6 · 2^−126 in all three), the router (√softplus with the z > 20 threshold, lower id on ties,
+w = (s / (Σ + 1e-20)) · 1.5), attention's BF16 P with an FP32 denominator over the unrounded
+exponentials, and the KV formats. M0 counts the FP4 packing differences on real latents and the
+floor-binding Engram blocks in the FP8 table; whether DeepSeek trained with the reciprocal FP4 form
+or the TF32 mixes is not known (TileKernels ships backward kernels too).
 
 ### 20.5 Engine and system tests
 
@@ -2247,10 +2505,23 @@ Every BF16, FP8 and FP4 rounding point of `model.py` is kept.
 - **Record formats (M11)**: an MXFP4 and an NVFP4 artifact of one checkpoint give identical ids.
 - **Prompt rules**: replay is identical across chunk sizes and prefix-cache states; the full rule
   matches the reference forward's full-prompt logits within the execution gate; replay matches the
-  reference's replay variant.
-- **Prefix cache**: cold against warm resume at every tap point under both rules.
+  reference's replay variant. Before any kernel, a CPU test checks the replay's visible-window sets
+  against a naive mask oracle for every replay start and chunk split, as DeepInfer's
+  `examples/yoco/yoco_equiv.py` does in seconds (it catches off-by-one rectangles that model gates see
+  only as small KL).
+- **Prompt/decode equivalence** (§18.3): one sequence as T = 1 decode steps, as verify widths 2-6
+  with every rejection count, and as prompt walks of several chunkings gives bitwise-identical
+  published state and logits.
+- **Prefix cache**: cold against warm resume at every tap point and at prompt and reply endpoints
+  under both rules.
 - **Speculation**: greedy speculative output equals plain greedy output (verify widths ≤ 8 columns are
-  column-invariant, FN §11.3).
+  column-invariant, FN §11.3). Sampled speculation is checked statistically with DeepInfer's
+  probability-integral-transform test (`tests/models/test_sampler.py`: 128 trajectories × 2,048
+  tokens per setting at greedy, T 1.0 / top_p 0.95, T 8.0 / top_p 0.95 and T 1.0 / top_p 1.0, with 5
+  drafts, Kolmogorov-Smirnov on the PIT values).
+- **The full rule's suffix**: a bitwise self-check that the suffix walk (§2.3) equals running every
+  prompt position through all 40 layers, as DeepSeek's mask-against-compact replay test does
+  (`examples/yoco/run_yoco_equiv_l2.sh`, which also compares the drafter's confidences).
 - **Engram**: a run-time volume swap gives the labelled output; Engram read faults reach the
   recoverable path.
 - **Faults, tier audit and policy conformance** as GLM §20.4 (unit read errors, a stalled or missing
@@ -2274,21 +2545,142 @@ Every BF16, FP8 and FP4 rounding point of `model.py` is kept.
   against `encoding/tests` and generated cases:
   - BOS, `<｜System｜>`, `<｜User｜>`, `<｜Assistant｜>`, and the `latest_reminder` role;
   - thinking mode ends the generation prompt with `<｜Assistant｜><think>`, chat mode with
-    `<｜Assistant｜></think>`; earlier turns drop their thinking unless tools are declared;
+    `<｜Assistant｜></think>`; earlier turns drop their thinking unless tools are declared, except
+    the assistant turns after the last user turn, which keep it (`encoding.py`; the recipe drops
+    those too); Infernix's `preserve_thinking` maps to `drop_thinking = False`;
   - the reasoning effort (1-100; low / high / max = 50 / 75 / 100; default high) as the encoding's
     line at index 0 in thinking mode;
   - tools under `## Tools` in the system prompt, `response_format` under `## Response Format`;
   - tool calls in DSML (`<｜DSML｜ calls>`, `invoke name=`, `parameter name= string=`), results as
-    `<tool_result>` blocks inside user turns in call order.
-- **Protocol mapping.** OpenAI `reasoning_effort` low / medium / high → 50 / 62 / 75 (62 is the
-  September template's alias), a numeric 1-100 extension, `none` → chat mode; the Anthropic thinking
-  budget → effort by a documented table. Thinking off is native here (unlike GLM).
+    `<tool_result>` blocks inside user turns in call order;
+  - JSON written as Python's `json.dumps(ensure_ascii=False)` writes it: `, ` and `: ` separators,
+    non-ASCII unescaped, member order kept, Python's float repr (`1e-05`, `1e+16`), integers beyond
+    64 bits exact; deepseek-recipe's `json.rs` agrees except on positive exponents and big integers,
+    where `encoding.py` decides.
+- **Lowering rules for this family** (the recipe decides lowering; Infernix's generic rules differ):
+  - content parts, merged consecutive user or tool-result turns, Anthropic system arrays, assistant
+    text blocks and thinking blocks are joined with a blank line (`\n\n`; Responses reasoning entries
+    with `\n`), where Infernix's generic rule joins without a separator; consecutive assistant
+    messages merge into one turn with `\n\n`;
+  - Chat Completions accepts the `developer` role (rendered `<｜System｜>`, mid-conversation if not
+    first, as Responses `instructions` are) and DeepSeek's `latest_reminder` role; an empty system
+    message is dropped;
+  - `response_format` (Chat `json_schema` / `json_object`, Responses `text.format`, Anthropic
+    `output_config.format`) is **rendered** as `## Response Format` after the tool prompt in the first
+    system turn, as the model was trained, beside the grammar constraint; this family is an
+    exception to serving.md's "the schema is not inserted";
+  - a tool definition renders as `{"name", "description", "parameters"}` in that order (empty
+    description and `{}` parameters when absent), the recipe's form; namespace tools render as
+    `{namespace}::{name}` with the namespace description prepended, and `::` inside a name is refused;
+    the Responses `apply_patch` custom tool renders with DeepSeek's fixed description and an
+    `{input: string}` schema;
+  - mid-conversation tool additions: `encoding.py` renders the full `## Tools` template on any system
+    message that carries tools, the recipe an `### Updated Tool Schemas` block; M9 compares both before
+    deferred tools are offered.
+- **Second oracle: deepseek-recipe** (DeepSeek's API front end, MIT, Rust; reviewed 2026-10-21 and
+  2026-10-24). It converts Chat Completions, Responses and Messages requests into one conversation,
+  renders V4.1 prompts with explicit control-token ranges and parses the output stream. Its
+  exact-string unit tests are ported (with the notice) as fixtures beside the five official cases.
+  Where it and `encoding.py` disagree, `encoding.py` decides rendering and the recipe decides API
+  behaviour: a `latest_reminder` after the last user message (`encoding.py` emits the assistant
+  opener first), consecutive reminders (the recipe keeps the first), numeric effort and task tokens
+  (`<｜action｜>` …, only in `encoding.py`).
+- **Control tokens are recognized by token id, never by spelling.** The template's own control
+  tokens are encoded as tokens; user text, tool results and tool arguments are encoded as ordinary
+  text, so a control spelling inside them stays text (as DeepSeek's API does). `</think>` and
+  `｜DSML｜` are added tokens with special = false, so the output parser tests added-vocabulary
+  membership, not the special flag. One exception: the grounding tokens 129271-129278 (`<｜ref｜>`,
+  `<｜box｜>`, `<｜point｜>`, `<｜polygon｜>` and their closers) found in assistant history are model
+  output and are encoded as tokens.
+- **Protocol mapping** (DeepSeek's API, deepseek-recipe `protocol/reasoning.rs`):
+  - OpenAI `reasoning_effort` minimal / low → 50, medium / high / xhigh → 75, ultra / max → 100,
+    `none` → chat mode; thinking is on by default at 75; Infernix keeps a numeric 1-100 extension
+    (`encoding.py` accepts integers). An earlier version of this section mapped medium to 62, the
+    September community template's alias.
+  - Anthropic: effort from `output_config.effort`; `thinking.type: adaptive` means enabled;
+    `thinking.budget_tokens` is Infernix's own thinking budget (the early close), not an effort table.
+  - Chat Completions also takes DeepSeek's top-level `thinking` object (`enabled` / `adaptive` /
+    `disabled`, with `budget_tokens`), which DeepSeek's clients send; today Infernix ignores unknown
+    fields, so `disabled` would leave thinking on. As in the API, an explicit `thinking` overrides the
+    effort (enabled with effort `none` thinks at 75); a conflict with `enable_thinking` or template
+    kwargs is still refused.
+  - Thinking budget: the early close is the single `</think>` token (id 128822), after the
+    `--thinking-budget-message` text when one is set; the recipe has no budget mechanism of its own.
+  - Reasoning pass-back: with tools declared, V4.1 keeps all earlier reasoning in the prompt. A client
+    that omits `reasoning_content` changes the rendered prompt at that turn: reuse stops there and the
+    model leaves its trained format. DeepSeek's API rejects the omission; tool-call ids carry an `ET_`
+    marker when a turn produced no reasoning, so an honest empty reasoning is not mistaken for an
+    omitted one. Infernix restores reasoning it generated itself from the ids it issued (as it already
+    does from Anthropic signatures), and otherwise renders what the client sent.
+  - `max_tokens` defaults: 8,192 without thinking, 65,536 with thinking, all remaining context at
+    max effort (the API's 131,072, capped by the context), with Infernix's answer-room rule.
+  - Thinking is native and can be switched off (unlike GLM).
 - **Tool calls.** A `dsml` parser with tolerant recovery and a constrained-decoding grammar (M9 checks
-  whether xgrammar's `converter_ext/deepseek.cc` covers V4.1's leading-space tags). This is advertised
-  OpenAI and Anthropic behaviour, so the schema tests and the serving documentation change together
-  (AGENTS.md).
+  whether xgrammar's `converter_ext/deepseek.cc` covers V4.1's leading-space tags), with DeepSeek's
+  API's recognition rules (deepseek-recipe `stream/output_parser.rs`): markers by token identity; a
+  call block that opens inside unclosed reasoning is parsed as calls; both closers
+  `</｜DSML｜tool_calls>` (V4) and `</｜DSML｜ calls>` (V4.1) are accepted; output after the block and
+  a stray `</think>` in content are dropped; newlines are stripped at the start of a new turn's
+  reasoning and of content (not of a prefix continuation) and consumed directly before `</think>` and
+  before the call opener, and a run of newlines inside text is held until a non-newline byte arrives;
+  `string="true"` values are JSON-escaped and `string="false"` values pass through raw. The recipe's
+  laxness is not copied: Infernix keeps its validation (an undeclared tool name, a malformed attribute
+  or an invalid raw value makes the region ordinary content unless tolerant mode recovers it; a
+  repeated parameter keeps the last value at the first position), and the Qwen heuristics (the
+  Markdown-fence rule, "`</think>` closes only before a line break") are dropped for this family.
+  Arguments are **streamed as they are generated** (the tool name as soon as it is parsed, then
+  argument fragments) only on the constrained route, where truncation by the output limit is the
+  only possible failure and is reported as such; the unconstrained route keeps publishing completed
+  calls, as serving.md's contract says. Forced tool choice (`required` or
+  a named tool) is DeepSeek's prefill of `\n\n<｜DSML｜ calls>\n` after the assistant header in chat
+  mode; the API rejects it in thinking mode, while Infernix's grammar can force calls after
+  `</think>`, and M9 decides between the two with a check of call quality. DeepInfer's structured
+  output shows the thinking-mode form: the grammar starts after a trigger token sequence, and an
+  optional bound token forces the trigger token by token once reached; drafts are not constrained,
+  masks apply per verify step with rollback. Here: bound `</think>`, trigger the DSML call opener (or
+  the start of the JSON). This is advertised OpenAI and Anthropic behaviour, so the schema tests and
+  the serving documentation change together (AGENTS.md).
+- **Tokens never generated**: DeepSeek's evaluation masks BOS 0, PAD 2 and ids 129262-129264 (129264
+  is the image placeholder) and can suppress EOS as the first token; the family masks the same ids
+  (a product choice recorded in M9).
+- **Output stream.**
+  - Detokenization flushes pending bytes before every added token and never skips added tokens,
+    including the special = true grounding tokens, so a reply re-encodes to the same ids; only EOS
+    ends the turn and is withheld.
+  - Log probabilities, if offered: each token once, in the channel its bytes land in (Chat's
+    `reasoning_content` field for reasoning, DeepSeek's extension), marker tokens nowhere, values from
+    the target distribution (the verify column under speculation); token text as UTF-8 or `\xNN` per
+    byte, with `bytes`.
+  - Usage: Infernix's exact counts, with the API's two differences documented (the API counts
+    `reasoning_tokens` by re-encoding the emitted reasoning, without `</think>`); Chat usage adds
+    `prompt_cache_hit_tokens` and `prompt_cache_miss_tokens`, which DeepSeek clients read.
+  - Tool-call ids follow the API's `call_NN_` form; the `ET_` empty-reasoning check also accepts the
+    underscore-stripped form some clients send back.
+- **Prefix identity.** The effort line sits near the start in thinking mode and the tool prompt and
+  response format in the first system turn, so switching thinking or effort misses the whole cached
+  prompt; Infernix keeps the declarations in the prompt under `tool_choice: none` and named choices
+  (as `encoding.py` renders them), which keeps the prefix stable. Mode and effort are logged per
+  request so misses can be attributed. A model reply is reused next turn only where its re-render
+  equals the generated ids: thinking chats without tools drop the reply's reasoning, so the next prompt
+  departs right after the previous `<｜Assistant｜>` (§18.3); M9 measures how often re-renders match on
+  real agent transcripts.
+- **Deferred tools and prefix continuation** (M9 or later, product choices): the API appends
+  discovered tool schemas as a mid-conversation `<｜System｜>` block ("### Updated Tool Schemas"), so
+  the prefix never changes as the tool set grows, which suits this family's cheap prefix cache;
+  whether V4.1 was trained on that block is unknown, so M9 checks it before it is offered.
+  `prefix: true` on a final assistant message continues it without a closing token or EOS; the API
+  refuses it with tool-call history, `json_object` or tools.
+- **Owner decisions for M9** (DeepSeek's API differs from Infernix's generic serving contract):
+  stop strings only in answer content (the API never matches them in reasoning or tool markup, and
+  thinking is long and on by default); the `[tool_error]` prefix on failed tool results (both
+  DeepSeek references render none); a final assistant message without `prefix` on Chat (the API opens
+  a new turn, Infernix's contract prefills); tool-result images before the vision track (a 400 ends
+  an agent session, placeholder text keeps it going).
 - **Images.** Refused for this family until the vision track: the encoding's image tokens are
-  recognized and rejected with a clear error.
+  recognized and rejected with a clear error. For that track (O7): 14-pixel patches, downsample 3, at
+  most 1,024 tokens per image, h · (w + 1) + 2 tokens, images below 544² upscaled; DeepSeek's API
+  re-encodes images as WebP at quality 90; id 129264 is `<｜deepseek_image｜>` in the 1017 tokenizer
+  (`<｜image｜>` in the recipe's copy), so prompts are compared by token id.
 
 ---
 
@@ -2297,6 +2689,7 @@ Every BF16, FP8 and FP4 rounding point of `model.py` is kept.
 | Option | Default | Meaning |
 |---|---|---|
 | `--prompt-decoder full\|replay` | `full` | Decision g (§16); `full` equals the reference forward; `replay` is DeepSeek's served rule and **changes output** |
+| `--replay-keep N` | 140 | Positions the `replay` rule runs through the decoder (DeepSeek's served value; at least 134); part of the prefix-cache fingerprint |
 | `--expert-volume PATH` (repeat) | required | The artifact's expert volumes, any order; startup checks ids, sizes and headers |
 | `--engram-volume PATH`, `--engram-residency auto\|ram\|volume` | the artifact's own; auto | Decision d (§14.5); a volume of the other format **changes output** and is labelled |
 | `--expert-ram-mib N\|auto`, `--expert-pin-mib N`, `--ram-headroom-mib N` | auto, auto, 2048 | RAM tier (FN §19.3.7) |
@@ -2309,7 +2702,8 @@ Every BF16, FP8 and FP4 rounding point of `model.py` is kept.
 | `--max-context N` | 131072 | Up to 1,048,576 |
 | `--prefill-chunk N`, `--prefill-group N` | auto, 48 | Chunking; experts per prompt group |
 | `--host-context-mib N` | 2048 | Prefix Host tier |
-| `--reasoning-effort 1..100\|low\|high\|max\|off` | high (75) | Request default; requests may override |
+| `--reasoning-effort 1..100\|minimal\|low\|medium\|high\|xhigh\|ultra\|max\|off` | high (75) | Request default; requests may override; names map as DeepSeek's API does (§21) |
+| Sampling preset for the family | temperature 1.0, top_p 1.0, min_p 0, no penalties; top_k 20 (see the note) | DeepSeek's API settings (deepseek-recipe `request/options.rs`). The API also forces temperature 1.0 and top_p ≥ 0.95 in thinking mode, replaces top_p with 1.0 outside it, and drops penalties; Infernix honours request values and documents the difference. **Note**: the API samples the full vocabulary, but Infernix's sampling pipeline has an exact top-20 candidate domain (`src/runtime/contract/sampling.cpp`), so "no top_k" cannot be represented. M4 measures the probability mass outside the top 20 at temperature 1.0 on the NRS corpus (mean, p99, share of positions above 1 %) with the reference forward; if it matters, this family gets a full-vocabulary route (129,280 candidates) for the sampler and DSpark's sampled verification (§25.2 question 15). A top-20 cut raises DSpark acceptance, so M7's figures say which domain they used |
 | `--approx-experts off\|ssd\|vram`, `--approx-keep-map`, `--approx-min-weight θ`, `--approx-experts-rule residency\|static` | off | §9.8; **changes output** |
 
 Converter: `--recipe deepseek_v4_1_flash_exl3` with `--experts REPO@REV` (the EXL3 pack) and
@@ -2338,23 +2732,24 @@ striped-read, Engram-read and CPU MX8 and E3A16 probes.
 | **M4** | Artifact and functional model | The EXL3 recipe, the streaming converter with its disk planner (run when the owner has freed the space), volumes, restripe, `verify_artifact`; Engine, CLI, bench and CausalScoring with one volume; both prompt rules; both reference forwards (artifact, official) | Every tensor round-trips; §20.2 checks; the execution gates for both rules; the §20.3 reports, the EXL3 artifact against the original model first; first end-to-end numbers |
 | **M5** | Tiers at scale | Three volumes, landing pages, partial records, M1's policies, promotion sweep, CPU sweep per width, unpinned pages, warm start, lookahead A/B | §20.5 invariance and fault tests; decode Must target; three volumes ≥ 1.6× one |
 | **M6** | Decode speed | §9.3's kernels and fusions, stall-time warming; nsys attribution of one token | Per-kernel times against the budget; anything > 30 % over gets ncu before M7 |
-| **M7** | Speculation | DSpark drafter (bounded experts, Markov and confidence heads), the cost model with σ and confidence, n-gram proposals | Default chosen by measurement; never slower than plain beyond noise |
+| **M7** | Speculation | DSpark drafter (bounded experts, Markov and confidence heads, the main-feature window written inside the verify forward), the cost model with σ and confidence calibrated on expected acceptance, n-gram proposals | Default chosen by measurement at DeepSeek's sampling (temperature 1.0, thinking on), greedy reported beside; never slower than plain beyond noise |
 | **M7a** | Approximate mode | §9.8 | Mode off bit-identical to a build without it; presets meet the gates |
 | **M8** | Prompts and long context | 128K walk spans, prompt kernels, the CPU decoder replay, the full rule's suffix, indexer prompt scoring, 1M context | Prompt Must targets; decode at 128K ≥ 90 % of 4K |
-| **M9** | Frontend and serving | Tokenizer, encoding, DSML parser, protocol schema tests, prefix-cache binding for both rules | Tokenizer and encoding oracles exact; serving schema tests; prefix-cache real tests |
+| **M9** | Frontend and serving | Tokenizer, encoding with control tokens by id, DSML parser with DeepSeek's API rules and streamed arguments, protocol mappings (§21), the family's sampling preset, protocol schema tests, prefix-cache binding for both rules with decode-computed endpoints | Tokenizer and encoding oracles exact against `encoding/tests` and deepseek-recipe's fixtures; serving schema tests; prefix-cache real tests |
 | **M10** | Report | Strata, Maya, DS4 under WSL2 and the §4.2 engines that run here, head to head; the §1.4 table filled | Every result reported, favourable or not |
 | **M11** (deferred) | The MXFP4 artifact | `mxfp4_expert_v1` and `nvfp4_expert_rg16_v1` records (one page each), MX8 MXFP4 and NVFP4 routes on the GPU and the CPU, MX recovery, the official and NVIDIA recipes, the MXFP4-against-NVFP4 timings (decision c); the official scale rule, NVFP4 → MXFP4 recovery and ModelOpt's MXFP4 Engram rule on sampled blocks | The MXFP4 rows of §20.1 and §20.3; its §1.4 column |
 
 Critical path: M0 → M2 ∥ M3 → M4 → M1 → M5 → M6, then M7 and M8; M9 can start now (the tokenizer
 and encoding files are read). Rough size: ~35-39k new or moved lines (CSA2 Ops ~5k; MX8 codec and the
-FP8-b32 Linear ~3k; the EXL3 codec and expert routes with the CPU kernel at K = 2-5 ~5-6k; the page
+FP8-b32 Linear ~3k; the EXL3 codec and expert routes with the CPU kernel at K = 2-6 ~5-6k; the page
 pool ~2.5-3.5k; Engram ~1.5k; DSpark ~2.5k; mHC ~1k and volumes with the reader ~2.5k, shared with
-GLM; offload extraction ~3.5k moved; frontend ~2.5k; converter and tools including the streaming
-conversion and both reference forwards ~4.5k; tests ~9k), plus the ≈ 313 GB download and GPU time
-for the campaigns. About 9-11k of these lines (offload extraction, page pool, volumes and readers,
-mHC, the EXL3 codec and expert routes) are the shared pieces GLM's track then reuses. M11 adds ~4-5k later. At Flash-Next's pace (~34k lines in
-about six intensive days, GLM §23) the page pool and per-expert widths are about a day of the total;
-the GPU qualification and policy campaigns cost more than the code.
+GLM; offload extraction ~3.5k moved; frontend ~3k with deepseek-recipe's rules; converter and tools
+including the streaming conversion and both reference forwards ~4.5k; tests ~9k), plus the
+≈ 313 GB download and GPU time for the campaigns. About 9-11k of these lines (offload extraction,
+page pool, volumes and readers, mHC, the EXL3 codec and expert routes) are the shared pieces GLM's
+track then reuses. M11 adds ~4-5k later. At Flash-Next's pace (~34k lines in about six intensive
+days, GLM §23) the page pool and per-expert widths are about a day of the total; the GPU
+qualification and policy campaigns cost more than the code.
 
 ---
 
@@ -2370,7 +2765,9 @@ geometry); [tensor formats](tensor-formats.md) (EXL3 with a width per record, MX
 power-of-two scales; MXFP4 with M11); [op development](op-development.md) (MX8 and E3A16
 qualification); [artifact container](artifact-container.md) (expert and Engram volumes, the expert →
 bank table); [engine architecture](engine-architecture.md) (the new architecture, prompt rules as a
-model mode, shared offload components and the page pool); [paged KV](paged-kv-cache.md) (compressed planes and windows);
+model mode, shared offload components and the page pool, and this family's exception to §3.1's
+prefill-only publication: prompt/decode equivalence lets it publish decode-computed endpoints,
+§18.3); [paged KV](paged-kv-cache.md) (compressed planes and windows with verification room);
 [hybrid prefix cache](hybrid-prefix-cache-spec.md) (the binding and its snapshots);
 [model quality](model-quality.md) (§6 for this family's configurations); the conversion guide (the
 streaming conversion). This file is then removed.
@@ -2430,6 +2827,10 @@ Questions for the owner:
     reference logits come from streaming the official shards (§20.2).
 14. ~~Order with the GLM track~~ — this track builds the shared EXL3 codec, offload extraction and
     page pool first; GLM reuses them (2026-10-24, §8.2). When the work starts is question 10.
+15. The sampling domain (§22): keep Infernix's top-20 candidate domain for this family, or build a
+    full-vocabulary route as DeepSeek's API samples; M4 measures the mass outside the top 20 first.
+16. The serving differences from DeepSeek's API listed in §21's last bullet (stop-string scope, the
+    `[tool_error]` prefix, a final assistant message on Chat, tool-result images); decided at M9.
 
 ### 25.3 Options (each behind its own measured gate)
 
@@ -2483,6 +2884,19 @@ Questions for the owner:
   `CUDA_MULTI_GPU.md`, `DGX_SPARK.md`, `QA_BEFORE_RELEASES.md` §7, §8, §17, `ds4.c`, `ds4_engram.c`,
   `ds4_cuda.cu`, `gguf-tools/README.md`, `gguf-tools/deepseek41_quantize.py`; issues #477, #636,
   #639; PR #647), read 2026-10-19.
+- DeepSeek's serving code: [deepseek-ai/DeepInfer](https://github.com/deepseek-ai/DeepInfer) (Apache-2.0;
+  read at `774ce244` on 2026-10-21 and `9bd9cf24` on 2026-10-24: the V4.1 model, cache engine, YOCO
+  replay, DSpark, sampling, structured output, `tests/`, `examples/yoco/`,
+  `doc/inference_deployment_qa.md`); the libraries it pins,
+  [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) `1fc9c669`,
+  [FlashMLA](https://github.com/deepseek-ai/FlashMLA) `2e5429fc`,
+  [DeepSelect](https://github.com/deepseek-ai/DeepSelect) `bfa4507d` and
+  [TileKernels](https://github.com/deepseek-ai/TileKernels) 2.1.0 (`4d5ad0f`), and the 1017
+  repository's `inference/kernel.py` and `engram.py`, read 2026-10-24; and
+  [deepseek-ai/deepseek-recipe](https://github.com/deepseek-ai/deepseek-recipe) (MIT, at `935817c6`:
+  protocol mapping, V4.1 rendering, the streaming parser); cachedMoE (`acupof-ai/cachedMoE`, MIT:
+  Strix Halo, NVMe expert streaming, exact routing 9.20 tok/s with two drives and 7.61 with one,
+  ≈ 29 s for a 4K prompt).
 - Other engines and artifacts, read 2026-10-19:
   [JigSawPT/deepseek-v41-flash-on-5090](https://github.com/JigSawPT/deepseek-v41-flash-on-5090) and
   [llama.cpp discussion #28766](https://github.com/ggml-org/llama.cpp/discussions/28766);
