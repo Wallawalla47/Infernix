@@ -10,13 +10,13 @@ from pathlib import Path
 from tools.quality import certify
 
 
-def plan(tmp_path: Path, keys: tuple[str, ...], mode: str = "full") -> tuple[list[dict], dict]:
+def plan(tmp_path: Path, keys: tuple[str, ...], mode: str = "full", extra: tuple[str, ...] = ()) -> tuple[list[dict], dict]:
     local = {k: {"path": f"/models/{k}.infernix", "ngram_volume": f"/models/{k}.ngram",
                  "draft_model": "/models/dflash2.infernix"} for k in keys}
     (tmp_path / "local.json").write_text(json.dumps(local), encoding="utf-8")
     run = tmp_path / "run"
     assert certify.main(["plan", "--artifacts", str(tmp_path / "local.json"), "--build", str(tmp_path / "build"),
-                         "--store", str(tmp_path / "store"), "--out", str(run), "--mode", mode]) == 0
+                         "--store", str(tmp_path / "store"), "--out", str(run), "--mode", mode, *extra]) == 0
     return (json.loads((run / "steps.json").read_text(encoding="utf-8")),
             json.loads((run / "plan.json").read_text(encoding="utf-8")))
 
@@ -122,3 +122,32 @@ def test_every_default_route_arm_is_gated_against_its_reproducible_arm(tmp_path:
     assert gates["q27gw main nvfp4 prefill-default"]["baseline"][0].endswith("main-nvfp4-prefill-reproducible.w0-31")
     for g in gates.values():
         assert all(p + ".json" in made for p in g["arm"] + g["baseline"] + g["twin"]), g["label"]
+
+
+def test_reuse_takes_the_unchanged_checks_and_the_single_request_arms_earlier_windows(tmp_path: Path) -> None:
+    earlier = tmp_path / "earlier"
+    (earlier / "arms").mkdir(parents=True)
+    (earlier / "checks").mkdir()
+    for name in ("q27gw-main-bf16-prefill-default", "q27gw-main-bf16-decode-default-one",
+                 "q27gw-main-bf16-decode-default-stress"):
+        (earlier / "arms" / f"{name}.json").write_text("{}", encoding="utf-8")
+    (earlier / "checks" / "e2e-q27gw-identity.json").write_text('{"passed": true}', encoding="utf-8")
+    steps, plan_json = plan(tmp_path, ("q27gw",), mode="release", extra=("--reuse", str(earlier)))
+    by_name = {s["name"]: s for s in steps}
+    decisions = {d["label"]: d for d in plan_json["decisions"]}
+    # a single-request default arm: windows 0-31 from the earlier run, 32 onwards made here
+    arm = decisions["q27gw main bf16 prefill-default"]["arm"]
+    assert arm[0] == str(earlier / "arms" / "q27gw-main-bf16-prefill-default") and len(arm) == certify.main_windows() // 32
+    assert "arm-q27gw-main-bf16-prefill-default" not in by_name
+    assert min(windows_of(by_name["arm-q27gw-main-bf16-prefill-default-L1"]["argv"])) == 32
+    # the stress arm always runs on every window
+    assert decisions["q27gw main bf16 decode-default-stress"]["arm"] == [
+        str(tmp_path / "run" / "arms" / "q27gw-main-bf16-decode-default-stress")]
+    assert "--windows" not in by_name["arm-q27gw-main-bf16-decode-default-stress"]["argv"]
+    # a check whose result the earlier run holds is read from there, and says so
+    assert "e2e-q27gw-identity" not in by_name
+    names = {c["name"]: c["result"] for c in plan_json["checks"]}
+    assert names["F q27gw identity (from earlier)"] == str(earlier / "checks" / "e2e-q27gw-identity.json")
+    # release spot checks: one lossless reference per attention family
+    assert [n for n in by_name if n.startswith("verify-")] == ["verify-q27gw-main-lossless"]
+

@@ -658,7 +658,11 @@ name, `main-lossless.ref`; later layers `main-lossless.w32-63.ref`), the noise t
 (`main-twin.w0-31`, `main-twin-<kv>.w0-31`, ...) and the reproducible arms (`arms/main-<kv>-<arm>.w0-31`).
 `infernix-certify` takes a reference in parts (`--reference` repeated) and matches every stored window to
 its tokens; `iqs.py` reads an arm or twin from its parts. The default-route arms, whose kernels change,
-run on every window in each run:
+run on every window in each run. `certify.py plan --reuse RUN` names an earlier run on a build whose serving,
+default and reproducible routes this one leaves unchanged (the block's reuse check re-runs windows of stored
+arms and requires identical rows): its end-to-end, functional and conformance results are read from there, and
+its single-request default arms (prefill, one-request decode, tree) supply their earlier windows; the stress
+arms, whose preemptions depend on timing, still run on every window:
 
 ```bat
 py -3.11 -m tools.quality.certify plan --artifacts local-artifacts.json --build build ^
@@ -674,7 +678,7 @@ py -3.11 -m tools.quality.certify run D:\iqs\run-2026-10-23
 | C2 | noise twins on every main-set window, per configuration and per KV format measured (the twin of that format's design) |
 | C3 | exact-codec references for the six KV formats on the two family representatives (with each format's design error) |
 | C4 | long-set lossless references on the three long representatives |
-| C0 | release mode: re-score window 0 of every stored reference; any changed bit fails (the lossless route and the design reference never change their bits) |
+| C0 | release mode: re-score window 0 of the lossless reference of each attention family's representative; any changed bit fails (the lossless route and the design reference never change their bits, and every lossless kernel serves every artifact of its family) |
 | D | BF16 KV, every configuration: reproducible prefill, default prefill, reproducible decode (4 requests), default one-request decode, default stress decode (and the NVFP4 27B tree arm); every default arm also gated on its increase over the reproducible arm of its kind (P1-P4) |
 | E1 | six KV formats on the representatives: reproducible and default prefill, reproducible decode, default stress decode |
 | E2 | long set: default prefill and one-request decode on the long representatives; every KV format's prefill at 32K on `q27gw` |

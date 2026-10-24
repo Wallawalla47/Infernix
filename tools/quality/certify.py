@@ -56,6 +56,10 @@ LAYER = 32  # main-set windows per corpus layer (tools/quality/iqs_corpus.py)
 TWIN_SEED = 20261022
 # The arms of the reproducible route: bit-identical from release to release, so stored per layer and reused.
 STORED_ARMS = ("prefill-reproducible", "decode-reproducible")
+# The default-route arms that run one request at a time: deterministic for a fixed build, so with --reuse (an
+# earlier run whose engine routes are unchanged) their earlier windows are reused and only the new layers run.
+# The stress arm's preemptions depend on timing, so it always runs on every window.
+SINGLE_REQUEST_ARMS = ("prefill-default", "decode-default-one", "decode-default-tree")
 # The stress arm: four requests per window resuming from a 200-token warm prefix (off the prefill chunk grid) in a
 # KV pool too small for all four (7,424 tokens of segments in 6,144), so requests are preempted and replayed.
 STRESS = ("--concurrency", "4", "--prefix-reuse", "--warm-tokens", "200", "--kv-tokens", "6144")
@@ -150,8 +154,11 @@ def ctest_exe() -> str:
 
 class Planner:
     def __init__(self, local: dict, build: Path, store: Path, run: Path, mode: str, only: set[str] | None,
-                 kv_cells: list[str] = ()):
+                 kv_cells: list[str] = (), reuse: Path | None = None):
         self.local, self.build, self.store, self.run, self.mode = local, build, store, run, mode
+        # An earlier run on a build whose serving, default and reproducible routes this build leaves unchanged:
+        # its end-to-end, functional and conformance results and its single-request default arms are reused.
+        self.reuse = reuse
         self.certify = exe(build, "infernix-certify")
         self.serve = exe(build, "infernix-serve")
         self.configs = [c for c in CONFIGS if c.artifact in local and (only is None or c.key in only)]
@@ -327,16 +334,17 @@ class Planner:
         with the publisher's model code in exact arithmetic (on the CPU, after the GPU blocks)."""
         out = self.store / c.artifact / "conformance"
         self.certify_step("B", f"capture-{c.artifact}", "capture", c, list(CAPTURE), out, 30)
+        if earlier := self.reused(f"shadow-{c.artifact}"):
+            self.checks.append({"name": f"B {c.artifact} reference conformance (G1, from {self.reuse.name})",
+                                "result": str(earlier)})
+            return
         self.checks.append({"name": f"B {c.artifact} reference conformance (G1)",
                             "result": str(self.run / "checks" / f"shadow-{c.artifact}.json")})
 
     def spot_checks(self) -> None:
-        refs = []
-        for c in self.configs:
-            refs.append((c, self.lossless(c.artifact)))
-            if c.declared:
-                refs.append((c, self.design(c, "bf16")))
-            refs += [(c, self.design(c, kv)) for kv in self.kv_cells.get(c.key, ())]
+        """C0: window 0 of the lossless reference of each attention family's representative, re-scored bit for bit
+        (every lossless kernel serves every artifact of its family)."""
+        refs = [(c, self.lossless(c.artifact)) for c in self.configs if c.key in KV_REPRESENTATIVES]
         for c, ref in refs:
             name = f"verify-{ref.parent.name}-{ref.stem}"
             result = self.run / "checks" / f"{name}.json"
@@ -354,9 +362,17 @@ class Planner:
         outs = []
         for name, command, args in arms:
             step = f"arm-{c.key}-{set_name}-{kv}-{name}"
+            earlier = self.reuse / "arms" / self.arm(c, kv, name, set_name).name if self.reuse else None
             if set_name == "main" and name in STORED_ARMS:
                 parts = self.parts(self.stored_arm(c, kv, name), legacy=False)
                 for k, part in enumerate(parts):
+                    self.certify_step(block, self.layer_name(step, k), command, c,
+                                      [*common, *args, "--windows", window_list(k)], part, minutes)
+            elif set_name == "main" and name in SINGLE_REQUEST_ARMS and earlier and Path(str(earlier) + ".json").is_file():
+                # windows 0-31 from the earlier run, the later layers in this one
+                parts = [earlier] + [layer_path(self.arm(c, kv, name, set_name), k, legacy=False)
+                                     for k in range(1, self.layers)]
+                for k, part in enumerate(parts[1:], start=1):
                     self.certify_step(block, self.layer_name(step, k), command, c,
                                       [*common, *args, "--windows", window_list(k)], part, minutes)
             else:
@@ -430,14 +446,26 @@ class Planner:
             suites.append(("functional-qwen4_exp-rc", ctest + ["-L", "real", "-R", "^infernix_qwen4_exp_",
                                                                 "-E", "lossless"], env, 240))
         for name, argv, env, minutes in suites:
+            if earlier := self.reused(name):
+                self.checks.append({"name": f"F {name} (from {self.reuse.name})", "result": str(earlier)})
+                continue
             result = self.run / "checks" / f"{name}.json"
             self.add(Step("F", name, argv, [str(result)], minutes, env=env, check=str(result)))
             self.checks.append({"name": f"F {name}", "result": str(result)})
+
+    def reused(self, name: str) -> Path | None:
+        """The earlier run's result of a check this build leaves unchanged."""
+        found = self.reuse / "checks" / f"{name}.json" if self.reuse else None
+        return found if found and found.is_file() else None
 
     def sensitivity(self) -> None:
         """The identity comparison can see a difference: some representative's default route showed one."""
         identities = [self.run / "checks" / f"e2e-{c.key}-identity.json" for c in self.configs if c.representative]
         if not identities:
+            return
+        if earlier := self.reused("e2e-sensitivity"):
+            self.checks.append({"name": f"F identity comparison sensitivity (negative controls, from {self.reuse.name})",
+                                "result": str(earlier)})
             return
         result = self.run / "checks" / "e2e-sensitivity.json"
         argv = [sys.executable, "-m", "tools.quality.iqs_e2e", "sensitivity", "--out", str(result), "--results",
@@ -458,6 +486,9 @@ class Planner:
         if c.representative:
             jobs += [("longgen", [], 60), ("tasks", [], 90)]
         for check, args, minutes in jobs:
+            if earlier := self.reused(f"e2e-{c.key}-{check}"):
+                self.checks.append({"name": f"F {c.key} {check} (from {self.reuse.name})", "result": str(earlier)})
+                continue
             result = self.run / "checks" / f"e2e-{c.key}-{check}.json"
             self.add(Step("F", f"e2e-{c.key}-{check}", [*base, check, *common, "--out", str(result), *args],
                           [str(result)], minutes))
@@ -492,7 +523,7 @@ def plan_command(args) -> int:
     local = json.loads(Path(args.artifacts).read_text(encoding="utf-8"))
     only = set(args.only.split(",")) if args.only else None
     planner = Planner(local, Path(args.build).resolve(), Path(args.store).resolve(), Path(args.out).resolve(),
-                      args.mode, only, args.kv_cell)
+                      args.mode, only, args.kv_cell, Path(args.reuse).resolve() if args.reuse else None)
     planner.plan()
     run = planner.run
     (run / "logs").mkdir(parents=True, exist_ok=True)
@@ -587,6 +618,9 @@ def main(argv: list[str] | None = None) -> int:
     plan.add_argument("--out", required=True)
     plan.add_argument("--mode", choices=("full", "release"), default="full")
     plan.add_argument("--only", help="comma-separated configuration keys")
+    plan.add_argument("--reuse", metavar="RUN", help="an earlier run on a build with the same serving, default and "
+                      "reproducible routes: reuse its end-to-end, functional and conformance results and the earlier "
+                      "windows of its single-request default arms")
     plan.add_argument("--kv-cell", action="append", default=[], metavar="KEY:FORMAT",
                       help="a KV format measured on a non-representative configuration (the release's rotation cell)")
     run = commands.add_parser("run")
