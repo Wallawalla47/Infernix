@@ -2,7 +2,7 @@
 steps on one machine, decided into one certificate.
 
   python -m tools.quality.certify plan --artifacts LOCAL.json --build BUILD --store STORE --out RUN [--mode M]
-  python -m tools.quality.certify run RUN [--dry-run]
+  python -m tools.quality.certify run RUN [--dry-run] [--blocks C0,C1,...]
   python -m tools.quality.certify certificate RUN
 
 `plan` writes RUN/steps.json (every command in run order, its outputs and watchdog) and RUN/plan.json (what the
@@ -545,8 +545,11 @@ def run_command(args) -> int:
     run = Path(args.run).resolve()
     steps = [Step(**s) for s in json.loads((run / "steps.json").read_text(encoding="utf-8"))]
     status = run / "status.jsonl"
+    blocks = set(args.blocks.split(",")) if args.blocks else None
     for step in steps:
         if all(complete(Path(o)) for o in step.outputs):
+            continue
+        if blocks is not None and step.block not in blocks:
             continue
         if args.dry_run:
             print(f"[{step.block}] {step.name}: {subprocess.list2cmdline(step.argv)}")
@@ -589,6 +592,7 @@ def main(argv: list[str] | None = None) -> int:
     run = commands.add_parser("run")
     run.add_argument("run")
     run.add_argument("--dry-run", action="store_true")
+    run.add_argument("--blocks", help="comma-separated blocks to run now (the rest wait for a later run)")
     cert = commands.add_parser("certificate")
     cert.add_argument("run")
     args = parser.parse_args(argv)
