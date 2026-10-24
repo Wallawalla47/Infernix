@@ -258,9 +258,11 @@ def main() -> int:
         text = artifact.directory.components["text"]["config"]
         components = tuple(artifact.directory.components)
         model = qwen4_exp.build_model(store, components=components, ngram_format=text["ngram_table"]["format"])
-        # The proposal head (--lm-head-draft) is built from a frequency ranking, outside the logical model.
-        bindings = {k: v for k, v in artifact.directory.bindings.items() if not k.startswith("proposal/")}
-        report["proposal_bindings"] = len(artifact.directory.bindings) - len(bindings)
+        # The proposal head (--lm-head-draft) is built from a frequency ranking, and the heads' 2-bit screens
+        # (--screen-heads) from the LM head, outside the logical model.
+        bindings = {k: v for k, v in artifact.directory.bindings.items() if not k.startswith(("proposal/", "screen/"))}
+        report["proposal_bindings"] = sum(1 for k in artifact.directory.bindings if k.startswith("proposal/"))
+        report["screen_bindings"] = sum(1 for k in artifact.directory.bindings if k.startswith("screen/"))
         if set(model.parameters) != set(bindings):
             missing = sorted(set(model.parameters) - set(bindings))[:5]
             extra = sorted(set(bindings) - set(model.parameters))[:5]

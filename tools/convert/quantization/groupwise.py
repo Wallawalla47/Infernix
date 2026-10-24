@@ -243,6 +243,47 @@ def quantize_matrix_mse(
     )
 
 
+def quantize_matrix_mse_norm(
+    weight: torch.Tensor,
+    format: str | QuantFormat,
+    *,
+    device: str | torch.device | None = None,
+) -> QuantizedMatrix:
+    """``quantize_matrix_mse``'s codes with each group's scale stretched:
+    ``scale * sqrt(|w|^2 / <w, w_hat>)`` with ``w_hat = codes * scale``, rounded once to binary16 (a
+    group without a positive overlap keeps its scale).
+
+    A least-squares copy is shrunk toward zero (``<w, w_hat> = |w_hat|^2 <= |w|^2``) by a factor of its
+    own in every group, so a screen built from it would score rows by their shrinkage as well as their
+    logits; at the least-squares scale this factor restores the group's norm exactly, and near it
+    (the MSE search's scale) approximately (Basalt's screened head). This is for 2-bit screens of a
+    vocabulary head (include/infernix/ops/screened_head.h), never for weights a model computes with.
+    """
+    spec = get_format(format) if isinstance(format, str) else format
+    encoded = quantize_matrix_mse(weight, spec, device=device)
+    geometry = row_split_geometry(spec, weight.shape)
+    values = weight.detach().to(device="cpu", dtype=torch.float64).numpy()
+    if geometry.k_pad != geometry.k:
+        padded = np.zeros((geometry.n, geometry.k_pad), dtype=np.float64)
+        padded[:, : geometry.k] = values
+        values = padded
+    grouped = values.reshape(geometry.n, geometry.groups_per_row, spec.group_size)
+    codes = encoded.codes.detach().cpu().numpy().astype(np.float64)
+    scales = encoded.scales.detach().cpu().numpy().astype(np.float64)
+    overlap = (grouped * codes).sum(axis=2) * scales  # <w, w_hat>
+    energy = (grouped * grouped).sum(axis=2)  # |w|^2
+    positive = overlap > 0
+    factor = np.ones_like(scales)
+    factor[positive] = np.sqrt(energy[positive] / overlap[positive])
+    stretched = (scales * factor).astype(np.float16)
+    if not np.isfinite(stretched).all():
+        raise ValueError("a stretched screen scale is not a finite binary16 value")
+    return QuantizedMatrix(
+        codes=encoded.codes,
+        scales=torch.from_numpy(stretched).to(encoded.scales.device),
+    )
+
+
 def quantize_matrix(
     weight: torch.Tensor,
     format: str | QuantFormat,

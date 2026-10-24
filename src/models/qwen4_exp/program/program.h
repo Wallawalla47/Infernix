@@ -414,6 +414,11 @@ struct ProgramOptions {
     // The reproducible route (EngineOptions::fast_paths off): sampled requests draw by Gumbel-max
     // (ops::SamplingConfig::gumbel_max), so speculation returns plain sampling's text.
     bool gumbel_sampling = false;
+    // screened-lm-head (FastPath::ScreenedLmHead): decode and verification rounds of at most 16 columns
+    // whose every row is greedy, without penalties, grammar or token constraint take the head's logits
+    // from its 2-bit screen (Parameters::output_head_screen); other rounds run the exact head. Each
+    // round kind keeps its own CUDA graphs.
+    bool screened_lm_head = false;
     // CPU-served misses (design section 10): host expert-engine workers (0 disables), the most
     // experts one layer call hands to them, and the share kept on the PCIe stage (misses / divisor;
     // 0 derives it from the measured link and CPU rates, design §19.3.12).

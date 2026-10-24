@@ -484,6 +484,12 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
                (configuration.dense == DenseKernels::Fp8Row || configuration.dense == DenseKernels::Mxfp8);
     // The GGUF imports' dense projections (ops::ggml_linear's BF16 prefill tiles).
     case FastPath::GgmlBf16Prefill: return configuration.dense == DenseKernels::Ggml;
+    // Generation's head through its 2-bit screen (a GGUF import's head has no exact rescore). The head
+    // is not part of the configuration: the loader refuses an artifact without the screen
+    // (--screen-heads) or with a head other than BF16 or row-split q8_g32_fp16 (every non-GGUF recipe
+    // stores one of those).
+    case FastPath::ScreenedLmHead:
+        return options.purpose == EnginePurpose::Generation && configuration.dense != DenseKernels::Ggml;
     case FastPath::QsaPrepareFused:
         // ops::qsa_prepare_supports's KV formats (bf16, int8, fp8, nvfp4, k8v4); VQ2 and K4V2 append
         // inside qsa_attention and keep the composed prepare.
@@ -511,10 +517,11 @@ bool FastPathSelection::request_invariant() const noexcept {
         // expert-a4-residual (either term count) routes an expert, and fp8-a8-pair a dense problem, by its
         // column count in the call, which batched rounds share between requests. ggml-bf16-prefill routes
         // a prompt's GGUF projections by its calls' widths, whose boundaries prefix-cache resumes move.
+        // screened-lm-head screens a round only when every row of it may be screened.
         return path == FastPath::AdaptiveSpeculation || path == FastPath::FreeCacheResume ||
                path == FastPath::Preemption || path == FastPath::Q8SlicedK ||
                path == FastPath::ExpertA4Residual || path == FastPath::ExpertA4Residual3 ||
-               path == FastPath::Fp8A8Pair || path == FastPath::GgmlBf16Prefill;
+               path == FastPath::Fp8A8Pair || path == FastPath::GgmlBf16Prefill || path == FastPath::ScreenedLmHead;
     });
 }
 

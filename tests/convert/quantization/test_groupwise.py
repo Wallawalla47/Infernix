@@ -8,7 +8,11 @@ from tools.artifact.codecs.row_split import (
     dequantize_row_split,
     encode_row_split,
 )
-from tools.convert.quantization.groupwise import quantize_matrix, quantize_matrix_mse
+from tools.convert.quantization.groupwise import (
+    quantize_matrix,
+    quantize_matrix_mse,
+    quantize_matrix_mse_norm,
+)
 
 
 def test_quantization_uses_stored_fp16_scale_and_zero_padding() -> None:
@@ -102,6 +106,39 @@ def test_q2_mse_puts_the_larger_side_on_the_wider_code_half() -> None:
     payload = encode_row_split(quantized.codes, quantized.scales, "q2_g64_fp16", weight.shape)
     decoded = dequantize_row_split(payload, "q2_g64_fp16", tuple(weight.shape), dtype=torch.float32)
     assert torch.equal(decoded, values(quantized))
+
+
+def test_q2_screen_keeps_the_mse_codes_and_stretches_each_scale() -> None:
+    # The screen copy (grouped_mse_norm): grouped_mse's codes, each group's scale times
+    # sqrt(|w|^2 / <w, w_hat>) rounded once to binary16 (an independent FP64 evaluation here), its sign
+    # kept; a zero group keeps its zero scale; near the least-squares scale the copy keeps the group's
+    # norm; the codec round-trips it.
+    rng = np.random.default_rng(11)
+    rows = (rng.standard_normal((6, 2560)) * 0.02).astype(np.float32)
+    rows[2, 64:128] = 0.0
+    weight = torch.from_numpy(rows)
+    mse = quantize_matrix_mse(weight, "q2_g64_fp16", device="cpu")
+    screen = quantize_matrix_mse_norm(weight, "q2_g64_fp16", device="cpu")
+    assert torch.equal(screen.codes, mse.codes)
+    assert screen.scales.dtype == torch.float16
+    codes = screen.codes.double().numpy()
+    grouped = rows.astype(np.float64).reshape(6, 40, 64)
+    least_squares = mse.scales.double().numpy()
+    overlap = (grouped * codes).sum(axis=2) * least_squares
+    energy = (grouped**2).sum(axis=2)
+    expected = np.where(overlap > 0, least_squares * np.sqrt(energy / np.where(overlap > 0, overlap, 1.0)), least_squares)
+    assert np.array_equal(screen.scales.numpy(), expected.astype(np.float16))
+    stretched = screen.scales.double().numpy()
+    assert stretched[2, 1] == 0.0 and least_squares[2, 1] == 0.0
+    live = energy > 0
+    assert np.all(np.sign(stretched[live]) == np.sign(least_squares[live]))
+    # Gaussian groups at the MSE scale: the copy's norm near the group's.
+    copy_norm = np.sqrt(((codes * stretched[..., None]) ** 2).sum(axis=2))
+    assert np.all(np.abs(copy_norm[live] / np.sqrt(energy[live]) - 1.0) <= 0.15)
+    payload = encode_row_split(screen.codes, screen.scales, "q2_g64_fp16", weight.shape)
+    decoded = dequantize_row_split(payload, "q2_g64_fp16", tuple(weight.shape), dtype=torch.float32)
+    expected_values = torch.from_numpy((codes * stretched[..., None]).reshape(6, 2560)).float()
+    assert torch.equal(decoded, expected_values)
 
 
 def test_nonzero_scale_underflow_uses_smallest_fp16_subnormal() -> None:

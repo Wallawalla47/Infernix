@@ -20,6 +20,7 @@
 #include <array>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -48,6 +49,26 @@ std::string device_contributors(std::uint64_t dense, const models::qwen4_exp::Pr
 
 void report(const EngineOptions& options, DiagnosticLevel level, const std::string& text) {
     report_engine(options, level, text);
+}
+
+// The temporary A/B switch INFERNIX_TMP_SCREENED_DRAFT_HEAD (B-03 part a, draft-only): 1 makes the MTP
+// drafter's proposal head (--lm-head-draft) score its rows from the artifact's 2-bit screen and rescore
+// the near-best ones exactly; unset or 0 keeps the exact proposal head. `shown` receives the raw value
+// for the startup log. A value other than 0 or 1 fails startup.
+bool screened_draft_head_switch(std::string& shown) {
+#ifdef _MSC_VER
+#    pragma warning(push)
+#    pragma warning(disable : 4996) // std::getenv: read once at startup
+#endif
+    const char* raw = std::getenv("INFERNIX_TMP_SCREENED_DRAFT_HEAD");
+#ifdef _MSC_VER
+#    pragma warning(pop)
+#endif
+    const std::string value = raw != nullptr ? raw : "";
+    shown                   = value.empty() ? "unset" : value;
+    if (value.empty() || value == "0") { return false; }
+    if (value == "1") { return true; }
+    throw std::invalid_argument("INFERNIX_TMP_SCREENED_DRAFT_HEAD must be 0 or 1, not " + value);
 }
 
 void validate(const EngineOptions& options) {
@@ -137,7 +158,26 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         throw std::invalid_argument("artifact is not Qwen4ExpForCausalLM");
     }
     inspect.complete();
-    auto plan = models::qwen4_exp::plan_load(reader, models::load_options(options, models::Architecture::Qwen4Exp));
+    // INFERNIX_TMP_SCREENED_DRAFT_HEAD acts on the MTP drafter's proposal head only; its value is in the
+    // startup log so an A/B arm can be checked.
+    std::string switch_value;
+    const bool screened_switch = screened_draft_head_switch(switch_value);
+    report(options, DiagnosticLevel::Info, "temporary switch: INFERNIX_TMP_SCREENED_DRAFT_HEAD=" + switch_value);
+    const bool screened_draft_head = screened_switch && options.purpose == EnginePurpose::Generation &&
+                                     options.speculative.backend == SpeculativeBackend::Mtp &&
+                                     options.speculative.proposal_head == ProposalHead::Optimized;
+    if (screened_switch && !screened_draft_head) {
+        report(options, DiagnosticLevel::Warning,
+               "INFERNIX_TMP_SCREENED_DRAFT_HEAD=1 has no effect: it screens the MTP drafter's proposal head "
+               "(--spec mtp --lm-head-draft)");
+    }
+    const auto qwen4_load = [&](bool stream_experts) {
+        auto load                = models::load_options(options, models::Architecture::Qwen4Exp);
+        load.stream_experts      = stream_experts;
+        load.screened_draft_head = screened_draft_head;
+        return load;
+    };
+    auto plan = models::qwen4_exp::plan_load(reader, qwen4_load(false));
     // The RAM ledger (design §19.3.7): the experts take what the reserve and every other planned
     // allocation leave, before anything is pinned or read.
     auto vram   = open_vram_budget_source(device.device, options.vram_past_budget);
@@ -189,11 +229,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     // the experts the ledger leaves room for (less their lock overhead) and reads the rest on use.
     const ExpertRamPlan ram = plan_expert_ram(options, demand, snapshot);
     const bool tier         = ram.tier;
-    if (tier) {
-        auto streamed           = models::load_options(options, models::Architecture::Qwen4Exp);
-        streamed.stream_experts = true;
-        plan                    = models::qwen4_exp::plan_load(reader, streamed);
-    }
+    if (tier) { plan = models::qwen4_exp::plan_load(reader, qwen4_load(true)); }
     plan.set_host_reserve(options.ram_headroom_bytes, demand.later_pinned);
 
     models::qwen4_exp::ProgramOptions program_options;
@@ -301,6 +337,9 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         options.speculative.backend == SpeculativeBackend::Mtp &&
         (options.fast_paths || std::find(options.fast_path_candidates.begin(), options.fast_path_candidates.end(),
                                          FastPath::SampledMtpDrafts) != options.fast_path_candidates.end());
+    // screened-lm-head's graphs likewise, whenever the candidate is asked for (it is qualified nowhere).
+    program_options.screened_lm_head = std::find(options.fast_path_candidates.begin(), options.fast_path_candidates.end(),
+                                                 FastPath::ScreenedLmHead) != options.fast_path_candidates.end();
     const auto device_plan =
         models::qwen4_exp::Program::plan_device(program_options, plan.config(), plan.public_token_count());
     const std::uint64_t dense = plan.device_bytes();
@@ -332,6 +371,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.free_cache_resume = fast.selected(FastPath::FreeCacheResume);
     program_options.preemption        = fast.selected(FastPath::Preemption);
     program_options.sampled_mtp_drafts = fast.selected(FastPath::SampledMtpDrafts);
+    program_options.screened_lm_head   = fast.selected(FastPath::ScreenedLmHead);
     program_options.gumbel_sampling    = !options.fast_paths;
 
     StartupPhaseScope program(options.startup_observer, StartupPhase::ProgramInitialize);

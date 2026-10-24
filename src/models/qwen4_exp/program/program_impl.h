@@ -44,6 +44,7 @@
 #include "infernix/ops/ple.h"
 #include "infernix/ops/qsa.h"
 #include "infernix/ops/sampling.h"
+#include "infernix/ops/screened_head.h"
 #include "infernix/ops/speculative_round.h"
 #include "infernix/ops/token_constraint.h"
 
@@ -722,6 +723,8 @@ public:
         b.graph_bound          = graph_bound(o.max_concurrency, static_cast<std::uint32_t>(W),
                                              static_cast<std::uint32_t>(d.mtp_k), o.sampled_mtp_drafts && d.mtp,
                                              static_cast<std::uint32_t>(d.dflash_k));
+        // screened-lm-head's rounds keep their own decode and verification graphs.
+        if (o.screened_lm_head) { b.graph_bound += o.max_concurrency * static_cast<std::uint32_t>(W + 1); }
         return d;
     }
 
@@ -851,6 +854,10 @@ public:
         if (options_.sampled_mtp_drafts && plan_.mtp && !sampled_drafts_) {
             diagnostic("sampled MTP drafts need the sparse acceptance's token domain; drafts stay one-hot",
                        DiagnosticLevel::Warning);
+        }
+        screened_head_ = options_.screened_lm_head;
+        if (screened_head_ && !parameters_.output_head_screen) {
+            throw std::logic_error("Qwen4Exp: screened-lm-head needs the LM head's bound screen");
         }
 
         // Every fixed allocation below is checked against the plan and against device free memory
@@ -2269,15 +2276,16 @@ public:
         // and releases them to the gate before ple_embed (design §12.3, n-gram S4b); a round that
         // warms or captures its graph reads them first.
         // A round whose rows are all in the host cache reads nothing, so it stages them first.
-        const bool gated = graphs_[static_cast<std::size_t>(batch - 1)].executable.ready() &&
-                           !decode_rows_cached(round_lanes, round_positions);
+        const bool screened = screened_round(round_lanes, batch);
+        DecodeGraph& graph  = (screened ? screened_graphs_ : graphs_)[static_cast<std::size_t>(batch - 1)];
+        const bool gated    = graph.executable.ready() && !decode_rows_cached(round_lanes, round_positions);
         stage_decode(round_lanes, round_positions);
         const std::uint32_t word = next_gate_word();
         if (!gated) {
             stage_decode_rows(round_lanes, round_positions);
             publish_pinned_word(gate_ready(), word);
         }
-        run_decode(batch, round_positions[0]);
+        run_decode(batch, round_positions[0], graph, screened);
         GateRelease release_gate{gated ? this : nullptr, word, io_prefix(batch) - io_layout_.ngram};
         for (std::int32_t b = 0; b < batch; ++b) { ++lanes_[lanes[b]].state_tokens; }
         sample(round_lanes, round_positions, [&] {
@@ -3740,22 +3748,43 @@ private:
     // every row is chosen on the device, so one CUDA graph per batch size serves every round. The
     // first round of a size runs eagerly (it also performs the Ops' one-time setup); the next is
     // captured and later rounds replay it.
-    // `position`: the first sequence's (a one-column round's context, for the plain divisor).
-    void run_decode(std::int32_t batch, std::int32_t position) {
+    // `position`: the first sequence's (a one-column round's context, for the plain divisor). `graph`: the
+    // round kind's graph for this batch (graphs_, or screened_graphs_ for a screened round).
+    struct DecodeGraph; // below, with the graphs
+    void run_decode(std::int32_t batch, std::int32_t position, DecodeGraph& graph, bool screened) {
         const cudaStream_t s = device_.stream;
         if (one_column_divisor() != 0) { *reinterpret_cast<std::int32_t*>(host_io() + io_layout_.divisor) = plain_divisor(position); }
         upload_pinned(io_device_.p, io_host_.data(), io_layout_.ngram, s);
         if (cpu_service_) { cpu_service_->wake(); } // its first request comes within this round
         residency_->before_round(s, /*landing=*/true, /*walking=*/walk_.active);
         const execution::NgramRowGate gate = row_gate();
-        const auto body = [&] { forward_call(batch, 1, batch, nullptr, nullptr, nullptr, &gate, false, /*decode_round=*/true); };
+        const auto body = [&] {
+            forward_call(batch, 1, batch, nullptr, nullptr, nullptr, &gate, false, /*decode_round=*/true, screened);
+        };
         // The lossless route runs eagerly (its experts' pass reads job counts on the host).
         if (c_.lossless) {
             body();
         } else {
-            replay(graphs_[static_cast<std::size_t>(batch - 1)], body);
+            replay(graph, body);
         }
         residency_->enqueue_route_download(s, batch);
+    }
+
+    // screened-lm-head: whether a round of these rows and `columns` logit columns takes the screened head.
+    // Every row must be greedy (only the argmax of its logits is read), without presence or frequency
+    // penalties (they move rows that the screen ranked below its margin), a grammar or a token
+    // constraint (masked or observed logits); and the round at most ops::kScreenedHeadMaxColumns wide.
+    [[nodiscard]] bool screened_round(std::span<const std::uint32_t> lanes, std::int32_t columns) const {
+        if (!screened_head_ || c_.lossless || columns > ops::kScreenedHeadMaxColumns) { return false; }
+        for (std::size_t b = 0; b < lanes.size(); ++b) {
+            const Lane& lane              = lanes_[lanes[b]];
+            const ops::SamplingConfig& sc = lane.sampling;
+            if (sc.temperature > 0.0F || sc.presence_penalty != 0.0F || sc.frequency_penalty != 0.0F ||
+                lane.constraint != nullptr || (grammar_ != nullptr && grammar_->constrained(b))) {
+                return false;
+            }
+        }
+        return true;
     }
 
     struct DecodeGraph {
@@ -3820,7 +3849,9 @@ private:
         RouteTraceGraph family = RouteTraceGraph::Decode;
         std::ptrdiff_t at      = route_trace_index(graphs_, &graph);
         std::ptrdiff_t stride  = 1;
-        if (at < 0 && (at = route_trace_index(verify_graphs_, &graph)) >= 0) {
+        if (at < 0) { at = route_trace_index(screened_graphs_, &graph); }
+        if (at < 0 && ((at = route_trace_index(verify_graphs_, &graph)) >= 0 ||
+                       (at = route_trace_index(screened_verify_graphs_, &graph)) >= 0)) {
             family = RouteTraceGraph::Verify;
             stride = max_width_;
         } else if (at < 0 && ((at = route_trace_index(mtp_draft_graphs_, &graph)) >= 0 ||
@@ -3854,10 +3885,11 @@ private:
     void forward_call(std::int32_t batch, std::int32_t width, std::int32_t logit_columns,
                       const execution::ForwardVerify* verify = nullptr, const execution::MtpChunk* chunk = nullptr,
                       const execution::VisionInput* vision = nullptr, const execution::NgramRowGate* gate = nullptr,
-                      bool streamed = false, bool decode_round = false) {
+                      bool streamed = false, bool decode_round = false, bool screened_head = false) {
         require_tier_round();
         execution::ForwardBatch fb = io_batch(static_cast<std::byte*>(io_device_.p), batch, width, logit_columns);
         fb.decode_round  = decode_round;
+        fb.screened_head = screened_head;
         fb.ngram_gate    = gate;
         fb.verify        = verify;
         fb.mtp_chunk     = chunk;
@@ -3920,6 +3952,7 @@ private:
         allocate(qsa_records_, plan_.qsa_records, allocated);
         folds_.resize(static_cast<std::size_t>(max_width_) + 1);
         verify_graphs_.resize(static_cast<std::size_t>(lanes) * max_width_);
+        if (screened_head_) { screened_verify_graphs_.resize(static_cast<std::size_t>(lanes) * max_width_); }
         const std::size_t cells = static_cast<std::size_t>(lanes) * max_width_;
         spec_layout_ = plan_.spec;
         allocate(spec_device_, 4ULL * spec_layout_.words, allocated);
@@ -3991,8 +4024,10 @@ private:
             }
         };
         const std::uint32_t word = next_gate_word();
-        DecodeGraph& graph = verify_graphs_[static_cast<std::size_t>(batch - 1) * max_width_ + (W - 1)];
-        const bool gated   = graph.executable.ready();
+        const bool screened = screened_round(lanes, batch * W);
+        DecodeGraph& graph  = (screened ? screened_verify_graphs_ : verify_graphs_)[static_cast<std::size_t>(batch - 1) * max_width_ +
+                                                                                 (W - 1)];
+        const bool gated    = graph.executable.ready();
         if (!gated) {
             read_rows();
             publish_pinned_word(gate_ready(), word);
@@ -4004,7 +4039,7 @@ private:
         const execution::NgramRowGate gate = row_gate();
         replay(graph, [&] {
             const execution::ForwardVerify view = verify_view(batch, W);
-            forward_call(batch, W, batch * W, &view, nullptr, nullptr, &gate, false, /*decode_round=*/true);
+            forward_call(batch, W, batch * W, &view, nullptr, nullptr, &gate, false, /*decode_round=*/true, screened);
         });
         // From here an enqueued gate waits for `word`: an error before it is published still
         // publishes it (over zeroed rows), so the stream drains and the error keeps its class.
@@ -5349,6 +5384,11 @@ private:
     bool mtp_sampled_round_ = false;
     std::vector<DecodeGraph> mtp_catch_graphs_; // (batch - 1) * max_width_ + width - 1
     std::vector<DecodeGraph> verify_graphs_; // (batch - 1) * max_width_ + width - 1
+    // screened-lm-head (screened_round): the screened rounds' decode and verification graphs, indexed as
+    // graphs_ and verify_graphs_.
+    bool screened_head_ = false;
+    std::array<DecodeGraph, kMaximumConcurrency> screened_graphs_;
+    std::vector<DecodeGraph> screened_verify_graphs_;
 
     std::array<Lane, kMaximumConcurrency> lanes_{};
     std::array<std::int32_t, kMaximumConcurrency> host_lanes_{};

@@ -286,10 +286,15 @@ NVIDIA's quantization-aware distillation of the model, bit-exactly
   [other tables](#n-gram-table-formats) also runs the model).
 - The MTP drafter is re-quantized as for the other imports (`q8_g32_fp16` projections, `q4_g64_fp16`
   experts from the experts' exact values), the only weights not held exactly.
+- `--screen-heads` adds 2-bit copies of `lm_head` (178.8 MB) and of the proposal head (94.4 MB),
+  after every other object; every other tensor is unchanged. Only the screened heads read them
+  (experimental, not yet measured): `INFERNIX_TMP_SCREENED_DRAFT_HEAD=1`, a temporary switch for the
+  MTP drafter's draft head with `--lm-head-draft`, and the unqualified `--fast-path screened-lm-head`
+  for greedy rounds ([design §19.3.30](maintainer/qwen3_8-flash-next-design.md#19330-screened-heads-a-2-bit-screen-of-the-draft-and-lm-heads-2026-10-23-built-not-measured)).
 
 ```text
 python -m tools.convert --model <dir>/Qwen3.8-Flash-Next-FP4-Local --recipe qwen3_8_flash_next_fp4_local \
-  --components text,vision,mtp --proposal --device cpu --name Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix \
+  --components text,vision,mtp --proposal --screen-heads --device cpu --name Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix \
   --resource chat_template.jinja=tools/chat_templates/qwen3_8.jinja \
   --out <dir>/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix.infernix \
   --ngram-out <fast drive>/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix.ngram

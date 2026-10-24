@@ -3,7 +3,22 @@
 #include "core/pdl.cuh"
 #include "ops/linear/bf16/bf16_mma_common.cuh"
 
+#include <cstdint>
+
 namespace infernix::ops::detail {
+// An Output may gather its tile rows (screened_head's exact rescore of listed rows): with
+// `weight_row(row)` the kernel reads weight row weight_row(row) for output row `row`, and with
+// `skip_tile(row0)` a tile it reports empty exits after the dependency wait. Every row's arithmetic
+// is the dense call's, so a gathered row carries the same bits.
+template <class Output>
+__device__ __forceinline__ std::int64_t bf16_sliced_k_weight_row(const Output& output, int row) {
+    if constexpr (requires { output.weight_row(row); }) {
+        return output.weight_row(row);
+    } else {
+        return static_cast<std::int64_t>(row);
+    }
+}
+
 template <class Schedule, class Output, class Epilogue>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_sliced_k_mma_kernel(
@@ -12,6 +27,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_s
     // Streams its weights through the K loop: wait for the producer first, and let dependents
     // launch only once that loop is done.
     pdl::enter_streaming();
+    if constexpr (requires { output.skip_tile(0); }) {
+        if (output.skip_tile(static_cast<int>(blockIdx.x) * Schedule::kBlockRows)) { return; }
+    }
     const int kHidden          = Schedule::kStaticK ? Schedule::kStaticK : input_rows;
     constexpr int kMmaRows     = Schedule::kBlockRows;
     constexpr int kMmaK        = Schedule::kWarpK;
@@ -60,12 +78,12 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_s
                 const bool valid = (!bf16_predicated_rows<Schedule> || row0 + row < rows) &&
                                    (!bf16_predicated_k<Schedule> || group_k0 + k8 * 8 < kHidden);
                 const auto source =
-                    valid ? static_cast<std::int64_t>(row0 + row) * kHidden + group_k0 + k8 * 8 : 0;
+                    valid ? bf16_sliced_k_weight_row(output, row0 + row) * kHidden + group_k0 + k8 * 8 : 0;
                 cp_async_zfill<16, Schedule::kWeightCache>(dst, weight + source, valid ? 16 : 0);
             } else {
                 cp_async<16, Schedule::kWeightCache>(
                     dst,
-                    &weight[static_cast<std::int64_t>(row0 + row) * kHidden + group_k0 + k8 * 8]);
+                    &weight[bf16_sliced_k_weight_row(output, row0 + row) * kHidden + group_k0 + k8 * 8]);
             }
         }
 

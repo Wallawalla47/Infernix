@@ -14,6 +14,7 @@ from .official_recipes import RECIPES
 from .pipeline import convert
 from .proposal import DEFAULT_RANKING, add_official_proposal
 from . import qwen4_exp
+from .screen import add_screen_heads
 from .qwen3_5 import build_model
 from .recipe import Recipe
 from .sources.safetensors import SafetensorsSource
@@ -145,6 +146,12 @@ def main(argv=None):
     )
     parser.add_argument("--proposal-rows", type=int, default=131072)
     parser.add_argument("--ranking", type=Path, default=DEFAULT_RANKING)
+    parser.add_argument(
+        "--screen-heads",
+        action="store_true",
+        help="Qwen4Exp: add 2-bit screens (q2_g64_fp16) of the LM head and, with --proposal, of the "
+        "proposal head, for the screened heads (tools/convert/screen.py); the artifact's last objects",
+    )
     parser.add_argument("--name", help="public instance name saved in metadata")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--device", default="cuda")
@@ -201,6 +208,7 @@ def main(argv=None):
             or args.gguf
             or args.mmproj
             or args.proposal
+            or args.screen_heads
             or args.ngram_out
             or args.ngram_reuse
             or overrides
@@ -275,6 +283,11 @@ def main(argv=None):
         _function(args.recipe)(model, recipe, sources)
         if args.proposal:
             add_official_proposal(recipe, ranking=args.ranking, rows=args.proposal_rows)
+        if args.screen_heads:
+            # After every other parameter: the copies are the artifact's last objects.
+            if not qwen4 or gguf_store is not None:
+                raise ValueError("--screen-heads screens a Qwen4Exp artifact converted from its checkpoint (not --gguf)")
+            add_screen_heads(recipe)
         if args.override:
             _function(args.override)(model, recipe, sources)
 
@@ -300,6 +313,8 @@ def main(argv=None):
             provenance["override"] = args.override
         if args.proposal:
             provenance["ranking"] = str(args.ranking)
+        if args.screen_heads:
+            provenance["screen_heads"] = {"format": "q2_g64_fp16", "method": "grouped_mse_norm"}
         report = convert(
             model,
             recipe,

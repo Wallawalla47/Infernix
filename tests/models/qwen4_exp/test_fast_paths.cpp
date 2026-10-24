@@ -242,6 +242,38 @@ int main() {
                           "ggml-bf16-prefill is qualified on GGUF imports with every KV format");
     }
 
+    // screened-lm-head screens generation's BF16 and 8-bit heads (a GGUF head has no exact rescore), is a
+    // candidate qualified nowhere, couples a request to the rows of its rounds, and changes no Forward
+    // flag (the Program decides it per round).
+    for (const DenseKernels dense : {DenseKernels::Q8, DenseKernels::Bf16, DenseKernels::Fp8Row, DenseKernels::Mxfp8}) {
+        failures += check(q::fast_path_applies(FastPath::ScreenedLmHead, {dense, false, KvCacheStorage::Int8Group64}, options),
+                          "screened-lm-head applies to generation with a non-GGUF head");
+    }
+    failures += check(!q::fast_path_applies(FastPath::ScreenedLmHead, {kGgml, false, KvCacheStorage::Int8Group64}, options),
+                      "screened-lm-head has no exact rescore for a GGUF head");
+    {
+        infernix::EngineOptions scoring;
+        scoring.purpose = infernix::EnginePurpose::CausalScoring;
+        failures += check(!q::fast_path_applies(FastPath::ScreenedLmHead, dense8, scoring),
+                          "screened-lm-head does not apply to causal scoring");
+    }
+    for (const DenseKernels dense : {DenseKernels::Q8, DenseKernels::Bf16, DenseKernels::Fp8Row, DenseKernels::Mxfp8}) {
+        for (const bool a4 : {false, true}) {
+            for (const auto kv : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
+                                  KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2,
+                                  KvCacheStorage::Q4KeyVq2Value}) {
+                failures += check(!q::fast_path_qualified(FastPath::ScreenedLmHead, {dense, a4, kv}),
+                                  "screened-lm-head is an unqualified candidate");
+            }
+        }
+    }
+    selection.paths = {FastPath::ScreenedLmHead};
+    failures += check(!selection.request_invariant(), "screened-lm-head couples a request to its rounds' rows");
+    failures += check(selection.forward().dense_routes == infernix::ops::LinearRoutes::Exact,
+                      "screened-lm-head sets no dense route");
+    failures += check(infernix::parse_fast_path("screened-lm-head") == FastPath::ScreenedLmHead,
+                      "screened-lm-head parses");
+
     std::cout << (failures == 0 ? "PASS" : "FAIL") << " Qwen3.8-Flash-Next fast-path selection\n";
     return failures == 0 ? 0 : 1;
 }

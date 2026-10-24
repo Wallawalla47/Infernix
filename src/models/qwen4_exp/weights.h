@@ -105,6 +105,9 @@ struct DFlash2Weights {
 struct ProposalWeights {
     WeightId head;      // [rows, H]
     WeightId token_ids; // I32 [rows]: each row's token id
+    // The converter's 2-bit copy of its rows (screen/proposal_head, q2_g64_fp16 [rows, H]), bound with
+    // the screened draft head only (LoadOptions::screened_draft_head); invalid otherwise.
+    WeightId screen;
 };
 
 // The Vision tower (design §19.3.2): Qwen3.5's tower and parameter names, BF16, pinned host memory
@@ -130,6 +133,9 @@ struct VisionWeights {
 struct TextWeights {
     WeightId token_embedding; // BF16, pinned host memory
     WeightId output_head;
+    // The converter's 2-bit copy of output_head (screen/output_head, q2_g64_fp16 [V, H]), bound for the
+    // screened-lm-head fast path only (LoadOptions::screened_lm_head); invalid otherwise.
+    WeightId output_head_screen;
     HyperConnectionWeights final_mixer;
     std::vector<BlockWeights> layers;
     std::optional<MtpWeights> mtp;

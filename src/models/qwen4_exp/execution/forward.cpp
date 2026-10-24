@@ -23,6 +23,7 @@
 #include "infernix/ops/rope.h"
 #include "infernix/ops/rows.h"
 #include "infernix/ops/scatter.h"
+#include "infernix/ops/screened_head.h"
 #include "infernix/ops/sigmoid_mul.h"
 #include "infernix/ops/silu_mul.h"
 #include "infernix/ops/speculative_round.h"
@@ -39,6 +40,10 @@ namespace infernix::models::qwen4_exp::execution {
 namespace {
 
 std::int32_t dim(std::uint64_t v) { return static_cast<std::int32_t>(v); }
+
+// The screened heads' selection: the rows within 5 logits of a column's best screen score, at most 64,
+// rescored exactly (Basalt's screened draft head: the exact head's pick in 99.93 % of 1,500 real inputs).
+constexpr ops::ScreenedHeadPolicy kScreenedHeadPolicy{.margin = 5.0F, .rescored = 64};
 
 ops::offloaded_moe::ExpertActivation expert_activation(const TextConfig& c) {
     return c.moe.a16_experts ? ops::offloaded_moe::ExpertActivation::kA16 : ops::offloaded_moe::ExpertActivation::kA4;
@@ -81,6 +86,23 @@ void text_head_logits(const Parameters& parameters, const Tensor& x, Tensor& log
     } else {
         const Tensor* head[] = {&parameters.output_head};
         ops::projection_fp32(x, head, logits, s);
+    }
+}
+
+// The screened-lm-head fast path's logits for the columns of x (at most 16): every row from the head's
+// 2-bit screen, and each column's near-best public rows with text_head_logits' bits (a BF16 or Q8 head).
+void screened_text_head_logits(const Parameters& parameters, const Tensor& x, Tensor& logits, WorkspaceArena& work,
+                               cudaStream_t s) {
+    if (!parameters.output_head_screen || (parameters.output_head_q8 && parameters.output_head_q8->is_ggml())) {
+        throw std::logic_error("Qwen4Exp forward: a screened head round needs the head's screen and a BF16 or Q8 head");
+    }
+    const std::int32_t valid = dim(parameters.model.resources().public_token_count);
+    if (parameters.output_head_q8) {
+        ops::screened_head_logits(x, Tensor{}, parameters.output_head_q8->weight, *parameters.output_head_screen, valid,
+                                  kScreenedHeadPolicy, logits, work, s);
+    } else {
+        ops::screened_head_logits(x, parameters.output_head, Weight{}, *parameters.output_head_screen, valid,
+                                  kScreenedHeadPolicy, logits, work, s);
     }
 }
 
@@ -454,7 +476,11 @@ void Forward::finish(const ForwardBatch& batch, Tensor& residual, Tensor* logits
     Tensor final_x = mix(parameters_.final_mixer, residual, nullptr);
     Tensor last    = work_.alloc(DType::BF16, {H, batch.logit_columns.ne[0]});
     ops::gather_columns(final_x, batch.logit_columns, last, s);
-    text_head_logits(parameters_, last, *logits, work_, s);
+    if (batch.screened_head) {
+        screened_text_head_logits(parameters_, last, *logits, work_, s);
+    } else {
+        text_head_logits(parameters_, last, *logits, work_, s);
+    }
 }
 
 void Forward::head_logits(const Tensor& residuals, Tensor& logits) {
@@ -1160,22 +1186,36 @@ void Forward::mtp_block(const MtpCall& call, Tensor& rows) {
         Tensor final_x = mix(p.final_mixer, residual, nullptr);
         const auto& head            = parameters_.draft_head;
         const std::int32_t rows_out = head.rows ? head.rows->weight.n : dim(config_.vocab_size);
-        Tensor head_logits = work_.alloc(DType::FP32, {rows_out, T});
-        if (head.rows) {
-            ops::projection_fp32(final_x, head.rows->weight, head_logits, s);
-        } else {
-            text_head_logits(parameters_, final_x, head_logits, work_, s);
-        }
+        const std::int32_t valid    = head.rows ? rows_out : dim(parameters_.model.resources().public_token_count);
+        // INFERNIX_TMP_SCREENED_DRAFT_HEAD (its screen bound): the proposal head's rows scored from their 2-bit
+        // copy and the near-best ones exactly (ops::screened_head_top), so the draft is the exact head's
+        // argmax unless the screen misses it, and a sampled draft's ranks carry exact logits with an
+        // approximate normalizer. Draft-only: verification is unchanged.
+        const bool screened = head.rows && head.screen;
         Tensor drafts = call.drafts;
-        Tensor narrow = work_.alloc(DType::BF16, {rows_out, T});
-        ops::cast_fp32_to_bf16(head_logits, narrow, s);
+        Tensor narrow;
+        if (!screened) {
+            Tensor head_logits = work_.alloc(DType::FP32, {rows_out, T});
+            if (head.rows) {
+                ops::projection_fp32(final_x, head.rows->weight, head_logits, s);
+            } else {
+                text_head_logits(parameters_, final_x, head_logits, work_, s);
+            }
+            narrow = work_.alloc(DType::BF16, {rows_out, T});
+            ops::cast_fp32_to_bf16(head_logits, narrow, s);
+        }
         if (call.sample_configs != nullptr) {
             // Sampled drafts: the head's top rows, one draw each under the column's sampler; the top
             // row's log-probability is also the --spec-min-p confidence.
-            const std::int32_t valid = head.rows ? rows_out : dim(parameters_.model.resources().public_token_count);
             Tensor sample_rows     = call.sample_rows;
             Tensor sample_logprobs = call.sample_logprobs;
-            ops::top_logprobs(narrow, valid, sample_rows, sample_logprobs, s);
+            if (screened) {
+                Tensor unmapped;
+                ops::screened_head_top(final_x, head.rows->weight, *head.screen, valid, kScreenedHeadPolicy, sample_rows,
+                                       sample_logprobs, unmapped, unmapped, work_, s);
+            } else {
+                ops::top_logprobs(narrow, valid, sample_rows, sample_logprobs, s);
+            }
             Tensor candidates = call.draft_candidates;
             Tensor q          = call.draft_q;
             Tensor confidence = call.draft_logprobs.data != nullptr
@@ -1184,15 +1224,21 @@ void Forward::mtp_block(const MtpCall& call, Tensor& rows) {
             ops::speculative_sample_sparse_drafts(
                 sample_rows, sample_logprobs, head.rows ? static_cast<const std::int32_t*>(head.token_ids.data) : nullptr,
                 call.sample_configs, call.positions, call.draft_step, drafts, candidates, q, confidence, s);
+        } else if (screened) {
+            // The top row, its token (the draft) and its log-probability (the confidence) in one call.
+            Tensor top_row = work_.alloc(DType::I32, {1, T});
+            Tensor logprob = call.draft_logprobs.data != nullptr ? Tensor(call.draft_logprobs.data, DType::FP32, {1, T})
+                                                                 : work_.alloc(DType::FP32, {1, T});
+            ops::screened_head_top(final_x, head.rows->weight, *head.screen, valid, kScreenedHeadPolicy, top_row, logprob,
+                                   head.token_ids, drafts, work_, s);
         } else if (head.rows) {
             ops::argmax(narrow, head.token_ids, drafts, rows_out, s);
         } else {
             ops::argmax(narrow, drafts, dim(parameters_.model.resources().public_token_count), s);
         }
-        if (call.draft_logprobs.data != nullptr && call.sample_configs == nullptr) {
+        if (!screened && call.draft_logprobs.data != nullptr && call.sample_configs == nullptr) {
             // The top row's log-probability over the head's rows: the draft's own (same rows, same
             // tie order as the argmax above).
-            const std::int32_t valid = head.rows ? rows_out : dim(parameters_.model.resources().public_token_count);
             Tensor top_row = work_.alloc(DType::I32, {1, T});
             Tensor logprob(call.draft_logprobs.data, DType::FP32, {1, T});
             ops::top_logprobs(narrow, valid, top_row, logprob, s);

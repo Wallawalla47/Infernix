@@ -171,9 +171,19 @@ enum class FastPath : std::uint8_t {
     // (a narrower tail call stays exact), which prefix-cache resumes share between requests. Without
     // it every GGUF projection and expert is exact.
     GgmlBf16Prefill,
+    // Qwen3.8-Flash-Next artifacts with a BF16 or 8-bit LM head converted with its 2-bit screen
+    // (--screen-heads): a
+    // decode or verification round of at most 16 columns whose every row is greedy, without
+    // penalties, a grammar or a token constraint, scores the whole vocabulary from the screen and
+    // computes only the rows within 5 logits of each column's best screen score (at most 64) with the
+    // exact head's arithmetic (ops::screened_head_logits). Those rows' logits carry the exact head's
+    // bits and the others the screen's scores, so a column's token is the exact head's unless the
+    // screen misses its row. Other rounds run the exact head, so a request's tokens depend on the
+    // rows it shares its rounds with. Without it every round runs the exact head.
+    ScreenedLmHead,
 };
 
-inline constexpr std::array<FastPath, 25> kFastPaths{
+inline constexpr std::array<FastPath, 26> kFastPaths{
     FastPath::PromptPv8,           FastPath::DecodeSplit64,
     FastPath::Q8SlicedK,           FastPath::GdnConvFused,
     FastPath::QsaPrepareFused,     FastPath::Fp8A8Pair,
@@ -186,7 +196,8 @@ inline constexpr std::array<FastPath, 25> kFastPaths{
     FastPath::BatchSplitAttention, FastPath::AdaptiveSpeculation,
     FastPath::AdaptiveMtp,         FastPath::AdaptiveDFlash,
     FastPath::FreeCacheResume,     FastPath::Preemption,
-    FastPath::IdleWidePrefill,     FastPath::GgmlBf16Prefill};
+    FastPath::IdleWidePrefill,     FastPath::GgmlBf16Prefill,
+    FastPath::ScreenedLmHead};
 
 [[nodiscard]] constexpr const char* fast_path_name(FastPath path) noexcept {
     switch (path) {
@@ -215,6 +226,7 @@ inline constexpr std::array<FastPath, 25> kFastPaths{
     case FastPath::SampledMtpDrafts: return "sampled-mtp-drafts";
     case FastPath::GdnF16Accumulate: return "gdn-f16-accumulate";
     case FastPath::GgmlBf16Prefill: return "ggml-bf16-prefill";
+    case FastPath::ScreenedLmHead: return "screened-lm-head";
     }
     return "unknown";
 }

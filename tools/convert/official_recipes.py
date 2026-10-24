@@ -574,7 +574,11 @@ def qwen3_8_flash_next_fp4_local(model, recipe, sources):
       weight-only NVFP4 experts' exact values and its BF16 dense projections.
 
     The QSA query/gate/key/value and indexer projections form one MXFP8 parent [13952, 2560], which
-    the model runs as one projection (the builder's grouping, as recipe A's)."""
+    the model runs as one projection (the builder's grouping, as recipe A's).
+
+    The published conversion also passes ``--proposal --screen-heads``: the proposal head, then the
+    2-bit screens of the LM head and the proposal head (tools/convert/screen.py, 273 MB), extra objects
+    after every other, so the tensors this recipe assigns keep their bytes."""
 
     from .expert_banks import ExpertBankSource, import_expert_bank, weight_only_bank
 
