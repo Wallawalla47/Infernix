@@ -56,6 +56,15 @@ void Metrics::configure(std::string model, const EngineOptions& options,
         std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
+Metrics::RequestCounts Metrics::counts() const {
+    std::lock_guard lock(mutex_);
+    return RequestCounts{.completed         = requests_.completed,
+                         .cancelled         = requests_.cancelled,
+                         .failed            = requests_.failed,
+                         .rejected          = requests_.rejected,
+                         .response_failures = requests_.response_failures};
+}
+
 void Metrics::first_token(const GenerationFirstTokenObservation& observation) {
     std::lock_guard lock(mutex_);
     requests_.ttft.observe(observation.prepare_seconds + observation.elapsed_since_submit_seconds);
@@ -153,7 +162,8 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
           "Unix time at service attachment after warmup.");
     header("model_info", "gauge", "Resident model and speculative backend.");
     out << "infernix_model_info{model_name=\"" << escape_label(model_) << "\",speculative_backend=\""
-        << product::speculative_backend_name(options_.speculative.backend) << "\"} 1\n";
+        << product::speculative_backend_name(options_.speculative.backend) << "\",kv=\""
+        << infernix::kv_cache_name(options_.kv_cache) << "\"} 1\n";
     gauge("max_concurrency", options_.max_concurrency, "Maximum resident execution lanes.");
     gauge("max_context_tokens", options_.max_context, "Per-request logical context limit.");
     gauge("spec_decode_draft_window", options_.speculative.draft_tokens,

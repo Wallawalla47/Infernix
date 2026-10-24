@@ -84,24 +84,6 @@ std::string cuda_uuid_string(const cudaUUID_t& uuid) {
     return out.str();
 }
 
-const char* finish_reason_name(infernix::FinishReason reason) {
-    switch (reason) {
-    case infernix::FinishReason::None:
-        return "none";
-    case infernix::FinishReason::OutputLimit:
-        return "output_limit";
-    case infernix::FinishReason::ContextCapacity:
-        return "context_capacity";
-    case infernix::FinishReason::StopToken:
-        return "stop_token";
-    case infernix::FinishReason::StopString:
-        return "stop_string";
-    case infernix::FinishReason::Cancelled:
-        return "cancelled";
-    }
-    return "unknown";
-}
-
 Json tool_call_parse_json(const infernix::ToolCallParseDiagnostics& diagnostics) {
     return Json{{"marker_seen", diagnostics.marker_seen},
                 {"structured_call_count", diagnostics.structured_call_count},
@@ -129,7 +111,7 @@ Json requested_reasoning_effort_json(const std::optional<RequestedReasoningEffor
                      : Json(nullptr);
 }
 
-const char* kv_cache_name(infernix::KvCacheStorage storage) {
+const char* kv_cache_json_name(infernix::KvCacheStorage storage) {
     switch (storage) {
     case infernix::KvCacheStorage::BFloat16:
         return "bf16";
@@ -567,7 +549,7 @@ std::string format_server_start_json(
              {"fast_paths", engine_options.fast_paths},
              {"lossless", engine_options.lossless},
              {"log_stats_interval_ms", options.log_stats_interval_ms},
-             {"kv_cache", kv_cache_name(engine_options.kv_cache)},
+             {"kv_cache", kv_cache_json_name(engine_options.kv_cache)},
              {"vision", engine_options.enable_vision},
              {"cuda_graph", engine_options.use_cuda_graph},
              {"prefix_reuse", options.allow_prefix_reuse},
@@ -904,6 +886,9 @@ JsonlRequestLog::JsonlRequestLog(const std::string& path,
                                  std::shared_ptr<spdlog::logger> logger,
                                  RequestLogRotation rotation)
     : path_(path), logger_(std::move(logger)), rotation_(rotation) {
+    // The metrics JSON reports this id even when no request log is written, so assign it before
+    // the disabled-path return.
+    server_instance_id_ = new_server_instance_id();
     if (path_.empty()) { return; }
     if (rotation_.keep > kMaximumRequestLogKeep) {
         throw std::invalid_argument("request JSONL log keeps too many rotated files");
@@ -921,7 +906,6 @@ JsonlRequestLog::JsonlRequestLog(const std::string& path,
             }
         }
     }
-    server_instance_id_ = new_server_instance_id();
     output_.open(path_, std::ios::out | std::ios::app);
     if (!output_) {
         throw std::runtime_error("failed to open request JSONL log for append: " + path_);

@@ -4,6 +4,7 @@
 #include "serve/decide.h"
 #include "serve/generation_service.h"
 #include "serve/metrics.h"
+#include "serve/metrics_json.h"
 #include "serve/openai_common.h"
 #include "serve/operational_log.h"
 #include "serve/openai_responses_store.h"
@@ -115,6 +116,7 @@ private:
     void record_request_failure(const RequestLogContext& context, const RequestFailure& failure);
     void record_response_failure(std::uint64_t request_id, const RequestFailure& failure);
     void record_throughput(const ThroughputReport& report);
+    [[nodiscard]] std::string metrics_json_body() const;
     void run_stats_reporter();
     void stop_stats_reporter();
 
@@ -130,6 +132,7 @@ private:
     OperationalLog operational_log_;
     JsonlRequestLog request_jsonl_;
     Metrics metrics_;
+    RequestHistory metrics_json_history_;
     std::unique_ptr<ConsoleStatsPanel> console_stats_;
     httplib::Server server_;
     std::atomic<std::uint64_t> request_seq_{0};

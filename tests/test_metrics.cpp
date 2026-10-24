@@ -46,6 +46,8 @@ int main() {
           "TTFT must include preparation and use inclusive histogram buckets");
     check(live.find("model_name=\"custom\\\"model\\\\name\\nline\"") != std::string::npos,
           "model label must escape quotes, backslashes and newlines");
+    check(live.find("kv=\"bf16\"") != std::string::npos,
+          "model_info must identify the KV cache format");
     check(metrics.render(running, true) == live, "scrapes must not consume or reset counters");
     check(live.find("infernix_prefix_selections_total 2\n") != std::string::npos &&
               live.find("infernix_device_state_capacity_slots 3\n") != std::string::npos,
@@ -83,6 +85,10 @@ int main() {
           "durations");
     check(final.find("infernix_time_to_first_token_seconds_count 1\n") != std::string::npos,
           "request settlement must not count the first token again");
+    const Metrics::RequestCounts counts = metrics.counts();
+    check(counts.completed == 400 && counts.cancelled == 2 && counts.failed == 1 &&
+              counts.rejected == 1,
+          "terminal counts must be readable without a scrape");
     outcome.constraint = ConstraintObservation{.complete          = true,
                                                .terminated        = false,
                                                .cache             = ConstraintCacheAccess::Built,
