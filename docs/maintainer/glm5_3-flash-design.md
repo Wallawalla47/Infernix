@@ -7,6 +7,11 @@ authorities named in [§24](#24-documentation-and-authority-changes) and this fi
 design reuses the Qwen3.8-Flash-Next work wherever it transfers; that design is cited as
 **FN §x** ([qwen3_8-flash-next-design.md](qwen3_8-flash-next-design.md)).
 
+**Shared pieces come from the DeepSeek-V4.1-Flash track** (owner decision, 2026-10-24): it builds
+the offload extraction with its page pool, the EXL3 codec (K = 2-6) and the `exl3_mul1` expert
+routes first, and this design reuses them ([DeepSeek design](deepseek_v4_1-flash-design.md) §8.2);
+§8.2 and §23 say what that moves.
+
 Labels used for numbers: **measured** (on this machine, with the method named), **upstream**
 (read from the reference code, config or artifact metadata), **model** (derived from measured or
 upstream inputs by the stated arithmetic), **estimated** (judgement; uncertain by the stated
@@ -982,6 +987,15 @@ bytes, H, I) and composed by each Program.
   and Flash-Next's artifact gains volumes too (one volume reproduces today's behaviour; a second drive
   gives it the same striping). FN's planned "mirror split reads" (FN §19.3.7 R14) is superseded.
 - Frames gain an optional side entry (EXL3's 36 KiB vectors; zero bytes for Qwen4Exp).
+
+**Built by the DeepSeek-V4.1-Flash track first** (owner decision, 2026-10-24; DeepSeek design §8.2):
+this extraction, with a **page pool** in place of fixed frames and slots, and the EXL3 codec and
+expert routes. GLM reuses them as a single-width artifact: its page size is its record size, one
+page per record, which is the frame described above. Its expert records take the DeepSeek design's
+`exl3_expert_v1` layout (DeepSeek design §7.3), the 36 KiB vectors leading the record instead of a
+side entry, so one set of routes reads both models; §7.2's tile grouping and work items stay as
+designed here, and M0 checks they match. GLM's track adds only what is GLM's: the `exl3` Linear
+format for the dense classes, GLM routing and the other Ops of §8.3.
 
 ### 8.3 Op changes
 
@@ -2066,8 +2080,8 @@ a8_dense,a8_experts` (records the gated permissions in the artifact); `--proposa
 |---|---|---|---|
 | **M0** | Facts | Both artifacts' config, tokenizer, template, generation config and safetensors headers (not gated; the weights are not needed yet); ExLlamaV3 at 1.4.4 and 1.4.6: tile weight order, stream bit order, Hadamard scale, `out_scales` semantics, MTP trellis shapes; vLLM/SGLang `glm5_next` MTP mathematics; C++ probes: pinning ceiling, striped 0.75 MiB reads with IOCP (`tools/glm5_next_probe/`), **CPU E3A16 at 9 MiB on P- and E-cores**, link | §2, §3, §9.5 and §19 confirmed or revised; open questions of §25.2 closed; §5.3 re-run with the measured CPU cost |
 | **M1** | Traces and policy | Route traces recorded by M4's engine on NRS and a broad corpus (code, chat, CJK, tool use, long context); two-level replay of the §10.2 and §10.4 candidates; lookahead recall by depth and width for SSD-tier experts | Policies chosen by the fixed rules; §5.2 replaced by measured hit rates |
-| **M2** | Shared offload components | `src/models/offload/` extracted from Qwen4Exp, with frame side entries; expert volumes for Qwen4Exp too | Qwen4Exp's unit and real tests pass unchanged; greedy ids identical; tg512 within noise |
-| **M3** | Ops | EXL3 codec; `exl3` Linear (decode, prompt and transposed routes); `offloaded_sparse_moe` `exl3_mul1` on the GPU and the CPU (AVX-VNNI); GLM routing; `mhc`; `kda_input_prep` and replay; `dsa_indexer`; `mla_sparse_attention`; striped reader | Every §20.1 qualification passes |
+| **M2** | Shared offload components | Reused from the DeepSeek track's M2 (`src/models/offload/` with the page pool, expert volumes and the striped reader, built there first, 2026-10-24); GLM's bank geometry and record layout on it | GLM's records round-trip through the page pool; Qwen4Exp's and DeepSeek's tests unchanged |
+| **M3** | Ops | EXL3 codec and `offloaded_sparse_moe` `exl3_mul1` on the GPU and the CPU (AVX-VNNI), reused from the DeepSeek track's M3 and qualified at GLM's geometry; `exl3` Linear (decode, prompt and transposed routes); GLM routing; `mhc`; `kda_input_prep` and replay; `dsa_indexer`; `mla_sparse_attention`; striped reader | Every §20.1 qualification passes |
 | **M4** | Artifacts and functional model | The recipe and both official entries, the supplement fetch, volumes, restripe, `verify_artifact`; Engine, CLI, bench, CausalScoring with one volume and the existing tiers; the two reference forwards | Every tensor round-trips bit-exactly; §20.2 checks; execution gate (§20.3); the quantization-quality report for both artifacts; first end-to-end numbers |
 | **M5** | Tiers at GLM scale | Striped reading on two volumes, landing ring, partial-record consumption, lookahead, M1's policies, promotion sweep, CPU worker and core-type sweep, warm start, prompt seeding, pageable fallback if needed | §20.4 invariance and fault tests; decode with two volumes ≥ 1.15× one; Must decode target |
 | **M6** | Decode speed | §9.3 budget kernels and fusions, EXL3 decode ALU check against ExLlamaV3's GEMV, stall-time warming; nsys attribution of one token | Per-kernel times against the budget; anything > 30 % over gets ncu before M7 |
@@ -2083,7 +2097,9 @@ days: ~31-37k new or moved lines (attention family ~4k, mHC ~1k, KDA consumer ~1
 extraction ~3.5k moved, volumes and reader ~2k, **EXL3 codec, Linear and expert routes, CPU kernel
 ~7k**, frontend ~2.5k, converter and tools including the reference forwards ~3k, tests ~8k): roughly
 1.4-1.7× Flash-Next's effort, plus the 126 GB download (≈ 330 GB more for the FP8 teacher) and GPU
-time for the campaigns.
+time for the campaigns. With the DeepSeek track building the offload extraction, volumes and reader,
+mHC and the EXL3 codec and expert routes first (2026-10-24), about 9-11k of these lines arrive built;
+GLM's own EXL3 work is the `exl3` Linear format and the GLM geometry's qualification.
 
 ---
 
