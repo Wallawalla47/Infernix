@@ -248,3 +248,39 @@ def test_main_artifact_uses_name_only_its_own_parameters(tmp_path):
     directory["uses"].append({"parameter": "text/output_head", "input": "dflash2/final_hidden"})
     with pytest.raises(ArtifactError, match="missing parameter"):
         parse_directory(directory)
+
+
+def test_compare_matches_bindings_by_name_and_bytes(tmp_path):
+    # A reconversion that changes one parameter and adds another: tools.artifact.inspect --compare
+    # names exactly those, while an object that only moved (a new object precedes it) compares equal.
+    from tools.artifact.inspect import compare_artifacts
+
+    def write(path: Path, *, word: int, added: bool) -> None:
+        specs = [TensorSpec("added", (128,), "bf16", "contiguous_le_v1")] if added else []
+        specs += [
+            TensorSpec("a", (2, 2), "bf16", "contiguous_le_v1"),
+            TensorSpec("b", (4,), "bf16", "contiguous_le_v1"),
+            ResourceSpec("template", 5),
+        ]
+        components = {"text": {"config": {"hidden_size": 2}, "resources": {"chat_template.jinja": "template"}}}
+        bindings = {"text/a": {"object": "a"}, "text/b": {"object": "b"}}
+        if added:
+            bindings["text/added"] = {"object": "added"}
+        uses = [{"parameter": "text/a", "input": "text/input", "activation_policy": "A16Only"}]
+        with ArtifactWriter(path, specs, components=components, bindings=bindings, uses=uses) as writer:
+            if added:
+                writer.write_object("added", bytes(256))
+            writer.write_object("a", struct.pack("<4H", 1, 2, 3, 4))
+            writer.write_object("b", struct.pack("<4H", word, 6, 7, 8))
+            writer.write_object("template", b"hello")
+
+    write(tmp_path / "old.infernix", word=5, added=False)
+    write(tmp_path / "new.infernix", word=9, added=True)
+    with Artifact(tmp_path / "new.infernix") as new, Artifact(tmp_path / "old.infernix") as old:
+        assert new.object("a").offset != old.object("a").offset
+        report = compare_artifacts(new, old)
+    assert report["differing_bindings"] == ["text/b"] and report["identical_bindings"] == 1
+    assert report["only_in_first"] == ["text/added"] and report["only_in_second"] == []
+    assert report["components_equal"] and report["metadata_equal"]
+    assert report["differing_uses"] == [] and report["differing_resources"] == []
+    assert report["resources_only_in_one"] == []

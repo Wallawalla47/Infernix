@@ -728,7 +728,7 @@ is served with: **16-bit activations everywhere** (NVIDIA's serving sets
 | MTP routed experts (512) | Weight-only ModelOpt NVFP4 (`weight_scale` stored directly) | `q4_g64_fp16` (MSE) from their exact values (`nvfp4_values_source`, the multiplier applied, not a rounded divisor), as recipes A-C's drafter | Affects only acceptance |
 | MTP dense | BF16 | `q8_g32_fp16`; router and shared-expert gate BF16 (recipe A's drafter) | As recipes A-C |
 | Vision attention (qkv, proj) | MXFP8 | Exact BF16 values | Exact |
-| Vision MLPs and merger | Weight-only NVFP4 (`W4A16_NVFP4`) | BF16, `bf16_rn(e2m1 · e4m3 · weight_scale_2)` rounded once from binary64 (`cast_direct`'s single rounding) | The conversion's only rounding of a non-drafter weight; not on the decode path |
+| Vision MLPs and merger | Weight-only NVFP4 (`W4A16_NVFP4`) | **Exact import** as dense `nvfp4_mul` matrices in `nvfp4_rg16_v1` (codes, E4M3 scales, `weight_scale_2` as the multiplier), `A16Only`, run by the canonical W4A16 projection (`rg16_linear`: exact sums, one rounding; the 122B head's arithmetic) | No non-drafter weight is rounded; 0.17 GB instead of 0.60 GB of BF16 in RAM and per offload window. Until 2026-10-23 the recipe stored their BF16 rounding (`bf16_rn(e2m1 · e4m3 · weight_scale_2)`): about 93 % of a matrix's values were inexact (verify report of the 2026-10-20 conversion) |
 
 **NVFP4-CSF.** Per matrix, the fixed stream holds `rows / 16` slabs of `16 · (1 + columns / 2)` bytes:
 the slab's 16 row bases (at most 240), then each row's `columns / 2` bytes of 4-bit offsets (the even
@@ -739,6 +739,21 @@ the restored scales meet ModelOpt's `amax / (6 · weight_scale_2)` rule at the m
 exact by construction (every scale a stored byte, or a base plus an offset); the converter validates the
 format's invariants and the restored words as E4M3FN scales, and `verify_artifact` compares the
 stored banks with the restored words.
+
+**Vision MLPs and merger (2026-10-23).** The tower's four weight-only NVFP4 matrices per layer and
+merger, fc1 [4304, 1152], fc2 [1152, 4304], merger fc1 [4608, 4608] and fc2 [2560, 4608], are
+`nvfp4_rg16_v1` matrices (each its own parent; `verify_artifact` compares their words) and run
+through `ops::linear` on `rg16_linear`, the Qwen3.5-122B head's canonical W4A16 projection: a dp4a
+GEMV through 8 columns (4 at K 4304 and 4608) and the wide expert route's integer tensor-core kernel
+beyond, in passes of 4,096 columns whose encoded activations (3 bytes per element) bound its workspace
+at 14-57 MB per projection. fc1's rows and fc2's K are not whole 128-row blocks and 128-element
+stages; the kernel runs partial last ones (limb rows zero past K). The sums are exact, so each
+projection's output depends on neither the call's width nor the offload placement; the tower's
+output differs from the BF16-rounded weights' by design. The weights shrink from 601.5 MB to 169.2 MB (the whole tower
+from 897.9 MB to 465.5 MB pinned, and each offload window streams 15.7 ms less at 27.6 GB/s); the
+offload staging aligns every object to 16 bytes, since an `nvfp4_rg16_v1` payload ends 4 bytes past a
+256-byte boundary. Speed against the BF16 tensor-core routes is unmeasured
+(`infernix_linear_bench --suite flash_next_vision`).
 
 **Why A16 by default.** The model card describes QAD as quantizing the weights in each forward pass,
 and NVIDIA's recommended vLLM serving on both RTX PRO 6000 and DGX Spark forces BF16 activations for

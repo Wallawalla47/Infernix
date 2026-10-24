@@ -278,11 +278,14 @@ NVIDIA's quantization-aware distillation of the model, bit-exactly
   codes, one power-of-two scale per 32 weights) and run with BF16 activations (W8A16) on one
   tensor-core route at every width, so the exact route stays request-invariant; the GDN a/b
   projections and the vision attention become their exact BF16 values.
+- The vision MLPs and merger keep their NVFP4 words (codes, block scales and multiplier: 0.17 GB
+  instead of 0.6 GB of BF16) and run with BF16 activations by the exact W4A16 projection, the
+  arithmetic of the experts' default.
 - The trained FP32 norms stay FP32; every other tensor keeps its dtype.
 - The n-gram table is the checkpoint's NVFP4 table, written to its own 29.1 GB volume (any of the
   [other tables](#n-gram-table-formats) also runs the model).
 - The MTP drafter is re-quantized as for the other imports (`q8_g32_fp16` projections, `q4_g64_fp16`
-  experts from the experts' exact values); the vision MLPs are rounded once to BF16.
+  experts from the experts' exact values), the only weights not held exactly.
 
 ```text
 python -m tools.convert --model <dir>/Qwen3.8-Flash-Next-FP4-Local --recipe qwen3_8_flash_next_fp4_local \

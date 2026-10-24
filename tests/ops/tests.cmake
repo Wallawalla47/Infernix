@@ -58,8 +58,10 @@ infernix_add_op_test(infernix_offloaded_moe_qwen3_5_122b_test
 infernix_add_op_test(infernix_fp8_row_f32_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_fp8_row_f32.cpp"
   LIBRARIES infernix_ops)
-# The canonical W4A16 projection of Qwen3.5-122B-A10B's nvfp4_rg16_v1 head (GEMV and integer
-# tensor-core routes, FP32 and BF16 outputs) against the CPU engine's exact row sums, bit for bit.
+# The canonical W4A16 projection of an nvfp4_rg16_v1 matrix at every registered shape (Qwen3.5-122B-A10B's
+# head; Qwen3.8-Flash-Next FP4-Local's vision MLP and merger) on the GEMV and integer tensor-core routes,
+# FP32 and BF16 outputs, against the CPU engine's exact row sums bit for bit, and the vision shapes'
+# BF16 outputs against an FP64 oracle over independently decoded weights.
 infernix_add_op_test(infernix_rg16_linear_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_rg16_linear.cu"
   LIBRARIES infernix_ops)

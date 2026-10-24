@@ -1,12 +1,21 @@
-// The canonical W4A16 dense projection of an nvfp4_rg16_v1 matrix (include/infernix/ops/rg16_linear.h):
-// Qwen3.5-122B-A10B's output head [248320, 3072], 429 MB read once per call.
+// The canonical W4A16 dense projection of an nvfp4_rg16_v1 matrix (include/infernix/ops/rg16_linear.h)
+// at its registered shapes: Qwen3.5-122B-A10B's output head [248320, 3072] (429 MB read once per
+// call), and Qwen3.8-Flash-Next FP4-Local's vision MLP (fc1 [4304, 1152], fc2 [1152, 4304]) and
+// merger (fc1 [4608, 4608], fc2 [2560, 4608]), which encode every patch of an image: widths of
+// hundreds to tens of thousands of columns.
 //
-// Through eight columns a dp4a GEMV: x is encoded once per call (canon::a16 encoding, per column),
+// Through the narrow width a dp4a GEMV: x is encoded once per call (canon::a16 encoding, per column),
 // every CTA keeps the encoded columns in shared memory, and each warp owns one 16-row group at a
-// time, streaming its 192 units (evict-first loads) with the narrow expert route's three dp4a per
-// block and an exact int64 row sum. Beyond eight columns the exact wide expert route's grouped
-// integer tensor-core kernel (wide_expert_a16.cuh) runs on the matrix as one job, its tile columns
-// the call's columns. Both form the same exact S, so outputs depend on neither the route nor T.
+// time, streaming its units (evict-first loads) with the narrow expert route's three dp4a per block
+// and an exact int64 row sum. The narrow width is eight columns, or four where eight columns'
+// encoded blocks would not fit in shared memory (K 4304 and 4608). Wider calls run the exact wide
+// expert route's grouped integer tensor-core kernel (wide_expert_a16.cuh) on the matrix as one job,
+// its tile columns the call's columns, in passes of at most kWideColumns columns that bound the
+// encoded activations' workspace: 128-row blocks by 64-column tiles, K in 128-element stages. The vision
+// matrices' 4304 rows (fc1) and 4304-element K (fc2) are not whole blocks and stages; the kernel runs
+// partial last ones (its limb rows are zero past K, so a short stage's stale units add exact zeros,
+// and the epilogue skips absent row groups). Both routes form the same exact S, so outputs depend
+// on neither the route, nor T, nor the passes.
 
 #include "infernix/ops/rg16_linear.h"
 
@@ -19,6 +28,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <stdexcept>
 #include <string>
 
@@ -28,16 +38,14 @@ namespace {
 namespace moe  = offloaded_moe;
 namespace wide = offloaded_moe::wide;
 
-// The registered matrix: Qwen3.5-122B-A10B's head.
-using Geometry          = moe::Qwen3_5_122BExperts; // K = H = 3072
-constexpr int kRows     = 248320;
-constexpr int kK        = Geometry::kHidden;
-constexpr int kBlocks   = kK / 16; // 192 units per row group
-constexpr int kGroups   = kRows / 16;
-constexpr int kNarrow   = moe::kMaxColumns; // the GEMV's widest call
-constexpr int kWarps    = 16;
-constexpr int kThreads  = kWarps * 32;
-static_assert(kRows % 128 == 0, "the wide route's row blocks are 128 rows");
+constexpr int kWarps       = 16;
+constexpr int kThreads     = kWarps * 32;
+constexpr int kNarrowBytes = 99 * 1024; // the GEMV's encoded columns, in shared memory
+// Columns per wide-route pass: the encoded activations (3 bytes per element) of at most this many
+// columns live in the workspace at once. Wider calls (a large image's patches) take several passes;
+// the vision matrices stay in L2 across them, and every pass fills the GPU (fc2 [1152, 4304]: 576
+// tiles of 128 rows by 64 columns, 3.4 waves on 170 SMs).
+constexpr int kWideColumns = 4096;
 
 void require(bool condition, const char* message) {
     if (!condition) { throw std::invalid_argument(std::string("rg16_linear: ") + message); }
@@ -58,6 +66,47 @@ struct Act {
     std::int32_t hi[4];
 };
 
+__host__ __device__ constexpr int round_up32(int n) { return (n + 31) / 32 * 32; }
+
+// A registered matrix [Rows, K]: its 16-row groups and 16-element blocks (one 144-byte unit each per
+// row group), the wide route's 128-element stages (the last one partial when K is not a multiple of
+// 128) and the bytes of an encoded limb row (whole stages, zero past K), and the GEMV's widest call.
+template <int Rows, int K>
+struct Dense {
+    using S = wide::ScheduleA16;
+    static_assert(Rows % 16 == 0 && K % 16 == 0, "nvfp4_rg16_v1 holds whole row groups and blocks");
+    static constexpr int kRows     = Rows;
+    static constexpr int kK        = K;
+    static constexpr int kGroups   = Rows / 16;
+    static constexpr int kBlocks   = K / 16;
+    static constexpr int kStages   = (kBlocks + S::kUnitsPerKTile - 1) / S::kUnitsPerKTile;
+    static constexpr int kPadBlocks = kStages * S::kUnitsPerKTile;
+    static constexpr int kRowBytes = kStages * S::kStageRowBytes;
+    static constexpr int kNarrow =
+        static_cast<int>(sizeof(Act)) * kBlocks * moe::kMaxColumns <= kNarrowBytes ? moe::kMaxColumns : 4;
+    static_assert(static_cast<int>(sizeof(Act)) * kBlocks * kNarrow <= kNarrowBytes);
+};
+
+using Head      = Dense<248320, 3072>; // Qwen3.5-122B-A10B's lm_head
+using VisionFc1 = Dense<4304, 1152>;   // Qwen3.8-Flash-Next FP4-Local's vision MLP
+using VisionFc2 = Dense<1152, 4304>;
+using MergerFc1 = Dense<4608, 4608>;   // and its merger
+using MergerFc2 = Dense<2560, 4608>;
+static_assert(Head::kNarrow == 8 && VisionFc1::kNarrow == 8 && VisionFc2::kNarrow == 4 && MergerFc1::kNarrow == 4);
+static_assert(Head::kRowBytes == wide::A16Planes<moe::Qwen3_5_122BExperts>::kXRowBytes);
+
+// Calls f.template operator()<D>() with the registered matrix of [rows, k].
+template <class F>
+decltype(auto) with_dense(std::int32_t rows, std::int32_t k, F&& f) {
+    if (rows == Head::kRows && k == Head::kK) { return f.template operator()<Head>(); }
+    if (rows == VisionFc1::kRows && k == VisionFc1::kK) { return f.template operator()<VisionFc1>(); }
+    if (rows == VisionFc2::kRows && k == VisionFc2::kK) { return f.template operator()<VisionFc2>(); }
+    if (rows == MergerFc1::kRows && k == MergerFc1::kK) { return f.template operator()<MergerFc1>(); }
+    if (rows == MergerFc2::kRows && k == MergerFc2::kK) { return f.template operator()<MergerFc2>(); }
+    throw std::invalid_argument("rg16_linear: unregistered [N, K] (the 122B head [248320, 3072], the FP4-Local vision "
+                                "MLP [4304, 1152], [1152, 4304] and merger [4608, 4608], [2560, 4608])");
+}
+
 // Signed bytes of a times unsigned bytes of b, plus c (PTX dp4a.s32.u32).
 __device__ __forceinline__ int dp4a_su(int a, std::uint32_t b, int c) {
     int d;
@@ -65,14 +114,21 @@ __device__ __forceinline__ int dp4a_su(int a, std::uint32_t b, int c) {
     return d;
 }
 
-// One CTA per column, one 16-element block per thread: the column exponent, then every block's
-// encoding into acts[column][block].
-__global__ void __launch_bounds__(kBlocks) encode_kernel(const std::uint16_t* __restrict__ x, Act* __restrict__ acts,
-                                                          std::int32_t* __restrict__ emax) {
-    __shared__ unsigned keys[kBlocks / 32];
+// One CTA per column, one 16-element block per thread (the last warp's spare threads only join the
+// exponent): the column exponent, then every block's encoding into acts[column][block].
+template <class D>
+__global__ void __launch_bounds__(round_up32(D::kBlocks))
+    encode_kernel(const std::uint16_t* __restrict__ x, Act* __restrict__ acts, std::int32_t* __restrict__ emax) {
+    constexpr int kEncodeThreads = round_up32(D::kBlocks);
+    __shared__ unsigned keys[kEncodeThreads / 32];
     const int t = static_cast<int>(blockIdx.x), b = static_cast<int>(threadIdx.x);
-    const auto* source = reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(t) * kK + 16 * b);
-    const uint4 v0 = source[0], v1 = source[1];
+    const bool block = b < D::kBlocks;
+    uint4 v0 = make_uint4(0U, 0U, 0U, 0U), v1 = v0;
+    if (block) {
+        const auto* source = reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(t) * D::kK + 16 * b);
+        v0 = source[0];
+        v1 = source[1];
+    }
     const unsigned words[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
     unsigned key = 0;
 #pragma unroll
@@ -80,9 +136,10 @@ __global__ void __launch_bounds__(kBlocks) encode_kernel(const std::uint16_t* __
     key = __reduce_max_sync(0xFFFFFFFFU, key);
     if (b % 32 == 0) { keys[b / 32] = key; }
     __syncthreads();
+    if (!block) { return; }
     unsigned all = 0;
 #pragma unroll
-    for (int w = 0; w < kBlocks / 32; ++w) { all = max(all, keys[w]); }
+    for (int w = 0; w < kEncodeThreads / 32; ++w) { all = max(all, keys[w]); }
     const int e = all >= 0x7F80U ? canon::kA16NonFinite : max(static_cast<int>(all >> 7), 1);
     Act out{};
 #pragma unroll
@@ -94,21 +151,45 @@ __global__ void __launch_bounds__(kBlocks) encode_kernel(const std::uint16_t* __
         out.mid[q] |= ((xv >> 8) & 0xFFU) << s;
         out.hi[q] = static_cast<std::int32_t>(static_cast<std::uint32_t>(out.hi[q]) | (((xv >> 16) & 0xFFU) << s));
     }
-    acts[static_cast<std::size_t>(t) * kBlocks + b] = out;
+    acts[static_cast<std::size_t>(t) * D::kBlocks + b] = out;
+    if (b == 0) { emax[t] = e; }
+}
+
+// The wide route's A operand: each column's limb row (wide_expert_a16.cuh) and exponent, one CTA per
+// column and one 16-element block per thread. The blocks of the last stage past K are zero.
+template <class D>
+__global__ void __launch_bounds__(round_up32(D::kPadBlocks))
+    limbs_kernel(const std::uint16_t* __restrict__ x, std::uint8_t* __restrict__ limbs, std::int32_t* __restrict__ emax) {
+    constexpr int kEncodeThreads = round_up32(D::kPadBlocks);
+    __shared__ unsigned keys[kEncodeThreads / 32];
+    const int t = static_cast<int>(blockIdx.x), b = static_cast<int>(threadIdx.x);
+    std::uint16_t v[16] = {};
+    if (b < D::kBlocks) {
+        const auto* source = reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(t) * D::kK + 16 * b);
+        wide::unpack16(source[0], source[1], v);
+    }
+    const unsigned key = __reduce_max_sync(0xFFFFFFFFU, wide::a16_key(v));
+    if (b % 32 == 0) { keys[b / 32] = key; }
+    __syncthreads();
+    unsigned all = 0;
+#pragma unroll
+    for (int w = 0; w < kEncodeThreads / 32; ++w) { all = max(all, keys[w]); }
+    const int e = wide::a16_emax(all);
+    if (b < D::kPadBlocks) { wide::store_a16_block(limbs + static_cast<std::size_t>(t) * D::kRowBytes, b, v, e); }
     if (b == 0) { emax[t] = e; }
 }
 
 // The GEMV of Columns-wide calls (n <= Columns columns). Lane l = 16 half + r holds row r of the
 // warp's row group at k = 8 half .. 8 half + 7 of each block; the halves' products are joined
 // before the scale, as the narrow expert route does.
-template <int Columns, bool F32>
+template <class D, int Columns, bool F32>
 __global__ void __launch_bounds__(kThreads) narrow_kernel(const Act* __restrict__ acts,
                                                           const std::int32_t* __restrict__ emax,
                                                           const std::uint8_t* __restrict__ matrix, float multiplier,
                                                           int n, void* __restrict__ out) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     auto* shared = reinterpret_cast<Act*>(smem_raw);
-    for (int i = static_cast<int>(threadIdx.x); i < n * kBlocks; i += kThreads) { shared[i] = acts[i]; }
+    for (int i = static_cast<int>(threadIdx.x); i < n * D::kBlocks; i += kThreads) { shared[i] = acts[i]; }
     __syncthreads();
     const int warp = static_cast<int>(threadIdx.x) / 32, lane = static_cast<int>(threadIdx.x) % 32;
     const int r = lane & 15, half = lane >> 4;
@@ -118,13 +199,13 @@ __global__ void __launch_bounds__(kThreads) narrow_kernel(const Act* __restrict_
     int e[Columns];
 #pragma unroll
     for (int c = 0; c < Columns; ++c) { e[c] = c < n ? emax[c] : 0; }
-    for (int g = static_cast<int>(blockIdx.x) * kWarps + warp; g < kGroups; g += static_cast<int>(gridDim.x) * kWarps) {
-        const std::uint8_t* units = matrix + static_cast<std::size_t>(g) * kBlocks * moe::kUnitBytes;
+    for (int g = static_cast<int>(blockIdx.x) * kWarps + warp; g < D::kGroups; g += static_cast<int>(gridDim.x) * kWarps) {
+        const std::uint8_t* units = matrix + static_cast<std::size_t>(g) * D::kBlocks * moe::kUnitBytes;
         long long s[Columns];
 #pragma unroll
         for (int c = 0; c < Columns; ++c) { s[c] = 0; }
 #pragma unroll 4
-        for (int b = 0; b < kBlocks; ++b) {
+        for (int b = 0; b < D::kBlocks; ++b) {
             const std::uint8_t* unit = units + b * static_cast<int>(moe::kUnitBytes);
             const unsigned c0 = __ldcs(reinterpret_cast<const unsigned*>(unit + code_offset));
             const unsigned c1 = __ldcs(reinterpret_cast<const unsigned*>(unit + code_offset + 32));
@@ -135,7 +216,7 @@ __global__ void __launch_bounds__(kThreads) narrow_kernel(const Act* __restrict_
 #pragma unroll
             for (int c = 0; c < Columns; ++c) {
                 if (c < n) { // uniform across the warp
-                    const Act& a  = shared[c * kBlocks + b];
+                    const Act& a  = shared[c * D::kBlocks + b];
                     const int lo  = dp4a_su(w1, a.lo[2 * half + 1], dp4a_su(w0, a.lo[2 * half], 0));
                     const int mid = dp4a_su(w1, a.mid[2 * half + 1], dp4a_su(w0, a.mid[2 * half], 0));
                     const int hi  = __dp4a(w1, a.hi[2 * half + 1], __dp4a(w0, a.hi[2 * half], 0));
@@ -150,7 +231,7 @@ __global__ void __launch_bounds__(kThreads) narrow_kernel(const Act* __restrict_
 #pragma unroll
             for (int c = 0; c < Columns; ++c) {
                 if (c >= n) { continue; }
-                const std::size_t at = static_cast<std::size_t>(c) * kRows + row;
+                const std::size_t at = static_cast<std::size_t>(c) * D::kRows + row;
                 if constexpr (F32) {
                     static_cast<float*>(out)[at] = canon::a16_row_output_f32(s[c], e[c], multiplier);
                 } else {
@@ -161,18 +242,20 @@ __global__ void __launch_bounds__(kThreads) narrow_kernel(const Act* __restrict_
     }
 }
 
-// The wide route's matrix: the head as one job's gate/up-like matrix, its rows by token.
-struct HeadMatrix {
-    static constexpr int kRowGroups      = kGroups;
-    static constexpr int kBlocks         = kK / 16;
+// The wide route's matrix: the projection as one job's gate/up-like matrix, its rows by token.
+template <class D>
+struct DenseMatrix {
+    static constexpr int kRowGroups      = D::kGroups;
+    static constexpr int kBlocks         = D::kBlocks;
     static constexpr std::size_t kOffset = 0;
-    static constexpr int kRowBytes       = wide::A16Planes<Geometry>::kXRowBytes;
+    static constexpr int kRowBytes       = D::kRowBytes;
     static constexpr bool kTokenRows     = true;
 };
 
-// The canonical output of each tile column into its logits column (rows 2i, 2i + 1 in one thread).
-template <bool F32>
-struct HeadEpilogue {
+// The canonical output of each tile column into its output column (rows 2i, 2i + 1 in one thread);
+// the row groups past the matrix in a partial last row block are skipped.
+template <class D, bool F32>
+struct DenseEpilogue {
     const std::int32_t* x_emax;
     void* out;
     float multiplier;
@@ -187,9 +270,12 @@ struct HeadEpilogue {
                 if (column >= ctx.columns) { continue; }
                 const int t    = ctx.first + column; // entries are the identity
                 const int emax = x_emax[t];
-                const std::size_t base = static_cast<std::size_t>(t) * kRows + static_cast<std::size_t>(ctx.row_block) * S::kBlockRows;
+                const std::size_t base = static_cast<std::size_t>(t) * D::kRows + static_cast<std::size_t>(ctx.row_block) * S::kBlockRows;
 #pragma unroll
                 for (int r = 0; r < S::kMmaRows; ++r) {
+                    if constexpr (D::kGroups % S::kRowGroups != 0) {
+                        if (ctx.row_block * S::kRowGroups + S::kGroupsPerWarp * ctx.warp_n + (r >> 1) >= D::kGroups) { continue; }
+                    }
                     const std::size_t row = base + wide::a16_tile_row(ctx.warp_n, r, ctx.tig);
                     if constexpr (F32) {
                         *reinterpret_cast<float2*>(static_cast<float*>(out) + row) =
@@ -207,17 +293,17 @@ struct HeadEpilogue {
 };
 
 // The wide route's bookkeeping in the workspace: the matrix as the one job of a dispatch whose
-// entries are the call's columns, and its 64-column tiles in one pass.
+// entries are a pass's columns, and its 64-column tiles in one pass.
 struct WidePlan {
     std::int32_t* jobs;      // [1]
     std::int32_t* job_count; // [1]
     std::int32_t* offsets;   // [2]
-    std::int32_t* entries;   // [T]
+    std::int32_t* entries;   // [columns]
     std::int32_t* tiles;     // [2 tiles]
     std::int32_t* pass_tiles; // [2]
     const std::uint8_t** job_records; // [1]
-    std::uint8_t* x_limbs;   // [T][kRowBytes]
-    std::int32_t* x_emax;    // [T]
+    std::uint8_t* x_limbs;   // [columns][D::kRowBytes]
+    std::int32_t* x_emax;    // [columns]
 };
 
 __global__ void plan_kernel(WidePlan plan, const std::uint8_t* matrix, int columns, int tiles) {
@@ -247,13 +333,14 @@ struct NarrowPlan {
     std::int32_t* emax;
 };
 
-template <class Arena>
+template <class D, class Arena>
 NarrowPlan carve_narrow(Arena& arena, std::int32_t columns) {
-    return {static_cast<Act*>(arena.alloc_bytes(round256(sizeof(Act) * kBlocks * columns), 256).data),
+    return {static_cast<Act*>(arena.alloc_bytes(round256(sizeof(Act) * D::kBlocks * columns), 256).data),
             static_cast<std::int32_t*>(arena.alloc_bytes(round256(sizeof(std::int32_t) * columns), 256).data)};
 }
 
-template <class Arena>
+// `columns`: the widest pass (at most kWideColumns).
+template <class D, class Arena>
 WidePlan carve_wide(Arena& arena, std::int32_t columns) {
     const auto t     = static_cast<std::size_t>(columns);
     const auto tiles = static_cast<std::size_t>((columns + wide::kTileColumns - 1) / wide::kTileColumns);
@@ -268,93 +355,69 @@ WidePlan carve_wide(Arena& arena, std::int32_t columns) {
     plan.tiles       = i32(2 * tiles);
     plan.pass_tiles  = i32(2);
     plan.job_records = static_cast<const std::uint8_t**>(arena.alloc_bytes(256, 256).data);
-    plan.x_limbs     = static_cast<std::uint8_t*>(arena.alloc_bytes(round256(t * HeadMatrix::kRowBytes), 256).data);
+    plan.x_limbs     = static_cast<std::uint8_t*>(arena.alloc_bytes(round256(t * D::kRowBytes), 256).data);
     plan.x_emax      = i32(t);
     return plan;
 }
 
+template <class D>
 void require_operands(const Tensor& x, const Weight& weight, const Tensor& out) {
-    require(weight.qtype == QType::NVFP4_MUL && weight.layout == QuantLayout::Rg16 && weight.n == kRows &&
-                weight.k == kK && weight.qdata != nullptr && reinterpret_cast<std::uintptr_t>(weight.qdata) % 16 == 0 &&
-                std::isfinite(weight.weight_multiplier),
-            "weight must be an nvfp4_rg16_v1 [248320, 3072] matrix with a finite multiplier");
-    require(x.dtype == DType::BF16 && x.is_contiguous() && x.ne[0] == kK && x.ne[1] > 0 && x.ne[2] == 1 &&
+    require(weight.qtype == QType::NVFP4_MUL && weight.layout == QuantLayout::Rg16 && weight.qdata != nullptr &&
+                reinterpret_cast<std::uintptr_t>(weight.qdata) % 16 == 0 && std::isfinite(weight.weight_multiplier),
+            "weight must be an nvfp4_rg16_v1 matrix with 16-byte aligned units and a finite multiplier");
+    require(x.dtype == DType::BF16 && x.is_contiguous() && x.ne[0] == D::kK && x.ne[1] > 0 && x.ne[2] == 1 &&
                 x.ne[3] == 1 && reinterpret_cast<std::uintptr_t>(x.data) % 16 == 0,
-            "x must be contiguous, 16-byte aligned BF16 [3072, T]");
-    require((out.dtype == DType::FP32 || out.dtype == DType::BF16) && out.is_contiguous() && out.ne[0] == kRows &&
+            "x must be contiguous, 16-byte aligned BF16 [K, T]");
+    require((out.dtype == DType::FP32 || out.dtype == DType::BF16) && out.is_contiguous() && out.ne[0] == D::kRows &&
                 out.ne[1] == x.ne[1] && out.ne[2] == 1 && out.ne[3] == 1 &&
                 reinterpret_cast<std::uintptr_t>(out.data) % 16 == 0,
-            "out must be contiguous FP32 or BF16 [248320, T]");
+            "out must be contiguous FP32 or BF16 [N, T]");
 }
 
-template <int Columns, bool F32>
+template <class D, int Columns, bool F32>
 void launch_narrow(const NarrowPlan& plan, const Weight& weight, int n, void* out, cudaStream_t stream) {
-    constexpr int bytes = static_cast<int>(sizeof(Act)) * kBlocks * Columns;
-    static_assert(bytes <= 99 * 1024);
+    constexpr int bytes = static_cast<int>(sizeof(Act)) * D::kBlocks * Columns;
+    static_assert(bytes <= kNarrowBytes);
     static const int ctas = [] {
-        CUDA_CHECK(cudaFuncSetAttribute(narrow_kernel<Columns, F32>, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
+        CUDA_CHECK(cudaFuncSetAttribute(narrow_kernel<D, Columns, F32>, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
         int device = 0, sms = 0, per_sm = 0;
         CUDA_CHECK(cudaGetDevice(&device));
         CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
-        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, narrow_kernel<Columns, F32>, kThreads, bytes));
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, narrow_kernel<D, Columns, F32>, kThreads, bytes));
         // A persistent grid: every resident CTA copies the encoded columns once.
-        return std::min((kGroups + kWarps - 1) / kWarps, sms * std::max(per_sm, 1));
+        return std::min((D::kGroups + kWarps - 1) / kWarps, sms * std::max(per_sm, 1));
     }();
-    narrow_kernel<Columns, F32><<<ctas, kThreads, bytes, stream>>>(plan.acts, plan.emax,
-                                                                  static_cast<const std::uint8_t*>(weight.qdata),
-                                                                  weight.weight_multiplier, n, out);
+    narrow_kernel<D, Columns, F32><<<ctas, kThreads, bytes, stream>>>(plan.acts, plan.emax,
+                                                                     static_cast<const std::uint8_t*>(weight.qdata),
+                                                                     weight.weight_multiplier, n, out);
     check_launch("narrow");
 }
 
-template <bool F32>
+template <class D, bool F32>
 void dispatch_narrow(const NarrowPlan& plan, const Weight& weight, int n, void* out, cudaStream_t stream) {
-    if (n == 1) return launch_narrow<1, F32>(plan, weight, n, out, stream);
-    if (n == 2) return launch_narrow<2, F32>(plan, weight, n, out, stream);
-    if (n <= 4) return launch_narrow<4, F32>(plan, weight, n, out, stream);
-    launch_narrow<kNarrow, F32>(plan, weight, n, out, stream);
+    if (n == 1) { return launch_narrow<D, 1, F32>(plan, weight, n, out, stream); }
+    if (n == 2) { return launch_narrow<D, 2, F32>(plan, weight, n, out, stream); }
+    if constexpr (D::kNarrow > 4) {
+        if (n > 4) { return launch_narrow<D, D::kNarrow, F32>(plan, weight, n, out, stream); }
+    }
+    launch_narrow<D, 4, F32>(plan, weight, n, out, stream);
 }
 
-} // namespace
-
-std::size_t rg16_linear_workspace_bytes(std::int32_t rows, std::int32_t input_rows, std::int32_t columns) {
-    require(rows == kRows && input_rows == kK && columns > 0, "unregistered shape or empty call");
-    WorkspaceLayoutBuilder layout;
-    if (columns <= kNarrow) {
-        (void)carve_narrow(layout, columns);
-    } else {
-        (void)carve_wide(layout, columns);
-    }
-    return layout.peak_bytes(1);
-}
-
-void rg16_linear(const Tensor& x, const Weight& weight, Tensor& out, WorkspaceArena& workspace, cudaStream_t stream) {
-    require_operands(x, weight, out);
-    const int columns = x.ne[1];
-    const bool f32    = out.dtype == DType::FP32;
-    auto scope        = workspace.scope();
-    if (columns <= kNarrow) {
-        const NarrowPlan plan = carve_narrow(workspace, columns);
-        encode_kernel<<<columns, kBlocks, 0, stream>>>(static_cast<const std::uint16_t*>(x.data), plan.acts, plan.emax);
-        check_launch("encode");
-        if (f32) {
-            dispatch_narrow<true>(plan, weight, columns, out.data, stream);
-        } else {
-            dispatch_narrow<false>(plan, weight, columns, out.data, stream);
-        }
-        return;
-    }
-    const WidePlan plan = carve_wide(workspace, columns);
-    const int tiles     = (columns + wide::kTileColumns - 1) / wide::kTileColumns;
+// One wide pass over `columns` columns of x into the same columns of out.
+template <class D, bool F32>
+void wide_pass(const WidePlan& plan, const Weight& weight, const std::uint16_t* x, int columns, void* out,
+               cudaStream_t stream) {
+    const int tiles = (columns + wide::kTileColumns - 1) / wide::kTileColumns;
     plan_kernel<<<(columns + 255) / 256, 256, 0, stream>>>(plan, static_cast<const std::uint8_t*>(weight.qdata), columns,
                                                          tiles);
     check_launch("plan");
-    wide::encode_x_limbs(moe::kShapeOf<Geometry>, x, plan.x_limbs, plan.x_emax, stream);
+    limbs_kernel<D><<<columns, round_up32(D::kPadBlocks), 0, stream>>>(x, plan.x_limbs, plan.x_emax);
+    check_launch("limbs");
     wide::Call call;
     call.dispatch.jobs      = plan.jobs;
     call.dispatch.job_count = plan.job_count;
     call.dispatch.offsets   = plan.offsets;
     call.dispatch.entries   = plan.entries;
-    call.shape              = moe::kShapeOf<Geometry>;
     call.job_records        = plan.job_records;
     call.tiles              = plan.tiles;
     call.pass_tiles         = plan.pass_tiles;
@@ -363,11 +426,65 @@ void rg16_linear(const Tensor& x, const Weight& weight, Tensor& out, WorkspaceAr
     call.x_limbs            = plan.x_limbs;
     call.x_emax             = plan.x_emax;
     call.top_k              = 1;
-    if (f32) {
-        wide::launch_a16<HeadMatrix>(call, 0, HeadEpilogue<true>{plan.x_emax, out.data, weight.weight_multiplier}, stream);
-    } else {
-        wide::launch_a16<HeadMatrix>(call, 0, HeadEpilogue<false>{plan.x_emax, out.data, weight.weight_multiplier}, stream);
+    wide::launch_a16<DenseMatrix<D>>(call, 0, DenseEpilogue<D, F32>{plan.x_emax, out, weight.weight_multiplier}, stream);
+}
+
+template <class D>
+void run(const Tensor& x, const Weight& weight, Tensor& out, WorkspaceArena& workspace, cudaStream_t stream) {
+    require_operands<D>(x, weight, out);
+    const int columns = x.ne[1];
+    const bool f32    = out.dtype == DType::FP32;
+    auto scope        = workspace.scope();
+    if (columns <= D::kNarrow) {
+        const NarrowPlan plan = carve_narrow<D>(workspace, columns);
+        encode_kernel<D><<<columns, round_up32(D::kBlocks), 0, stream>>>(static_cast<const std::uint16_t*>(x.data),
+                                                                          plan.acts, plan.emax);
+        check_launch("encode");
+        if (f32) {
+            dispatch_narrow<D, true>(plan, weight, columns, out.data, stream);
+        } else {
+            dispatch_narrow<D, false>(plan, weight, columns, out.data, stream);
+        }
+        return;
     }
+    // Passes of at most kWideColumns columns, equal in whole tiles (4,097 columns: 2,112 and 1,985,
+    // not 4,096 and a one-column pass), share one plan and limb buffer, reused in stream order.
+    const int passes    = (columns + kWideColumns - 1) / kWideColumns;
+    const int per_pass  = (columns + passes - 1) / passes;
+    const int width     = std::min(columns, (per_pass + wide::kTileColumns - 1) / wide::kTileColumns * wide::kTileColumns);
+    const WidePlan plan = carve_wide<D>(workspace, std::min(columns, kWideColumns));
+    const auto* source  = static_cast<const std::uint16_t*>(x.data);
+    auto* target        = static_cast<std::byte*>(out.data);
+    const std::size_t element_bytes = f32 ? sizeof(float) : sizeof(std::uint16_t);
+    for (int first = 0; first < columns; first += width) {
+        const int n          = std::min(width, columns - first);
+        const auto* x_pass   = source + static_cast<std::size_t>(first) * D::kK;
+        void* out_pass       = target + static_cast<std::size_t>(first) * D::kRows * element_bytes;
+        if (f32) {
+            wide_pass<D, true>(plan, weight, x_pass, n, out_pass, stream);
+        } else {
+            wide_pass<D, false>(plan, weight, x_pass, n, out_pass, stream);
+        }
+    }
+}
+
+} // namespace
+
+std::size_t rg16_linear_workspace_bytes(std::int32_t rows, std::int32_t input_rows, std::int32_t columns) {
+    require(columns > 0, "empty call");
+    return with_dense(rows, input_rows, [&]<class D>() {
+        WorkspaceLayoutBuilder layout;
+        if (columns <= D::kNarrow) {
+            (void)carve_narrow<D>(layout, columns);
+        } else {
+            (void)carve_wide<D>(layout, std::min(columns, kWideColumns));
+        }
+        return layout.peak_bytes(1);
+    });
+}
+
+void rg16_linear(const Tensor& x, const Weight& weight, Tensor& out, WorkspaceArena& workspace, cudaStream_t stream) {
+    with_dense(weight.n, weight.k, [&]<class D>() { run<D>(x, weight, out, workspace, stream); });
 }
 
 } // namespace infernix::ops

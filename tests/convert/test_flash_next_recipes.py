@@ -164,8 +164,10 @@ def test_fp4_local_recipe_keeps_the_mxfp8_words_and_defaults_the_experts_to_a16(
     activations, with its FP32 activation scales, and the text config makes 16-bit expert
     activations the default; the MXFP8 GDN, QSA (the indexer included) and shared-expert projections
     keep their words, every other main tensor its stored dtype (GDN a/b their exact BF16 values), the
-    QSA projections and indexer form one parent, and the drafter is recipe A's. Other banks and other
-    n-gram tables are refused."""
+    QSA projections and indexer form one parent, and the drafter is recipe A's. The weight-only NVFP4
+    vision MLPs and merger keep their words as dense nvfp4_mul matrices in nvfp4_rg16_v1 (16-bit
+    activations, each its own parent); the rest of the vision tower keeps its BF16 values. Other banks
+    and other n-gram tables are refused."""
 
     from tools.convert.official_recipes import qwen3_8_flash_next_fp4_local
 
@@ -176,13 +178,29 @@ def test_fp4_local_recipe_keeps_the_mxfp8_words_and_defaults_the_experts_to_a16(
     mxfp8 += (f"{LAYER}/attention/query", f"{LAYER}/attention/key", f"{LAYER}/attention/value",
               f"{LAYER}/attention/index_query")
 
+    vision_nvfp4 = ("vision/layers/0/mlp/fc1", "vision/layers/0/mlp/fc2", "vision/merger/fc1", "vision/merger/fc2")
+    vision_bf16 = ("vision/layers/0/attention/query", "vision/layers/0/attention/output", "vision/patch_embedding")
+    vision_direct = ("vision/layers/0/mlp/fc1_bias", "vision/merger/norm_weight")
+    encoded = {}  # each vision NVFP4 parameter's nvfp4_mul source, as the builder's factory returns it
+
     def model(bank_source, table="nvfp4") -> Model:
         m = Model({"text": {"config": {"architectures": ["Qwen4ExpForCausalLM"], "ngram_table": {"format": table},
                                        "layer_types": ["linear_attention"]}}})
-        for name in (*DENSE8, *KEPT, *DRAFTER_Q8, *DRAFTER_KEPT, *DRAFTER_EXPERTS):
+        for name in (*DENSE8, *KEPT, *DRAFTER_Q8, *DRAFTER_KEPT, *DRAFTER_EXPERTS, *vision_bf16):
             inputs = () if name == "text/token_embedding" else ("input",)
             source = array_source(torch.ones((4, 64), dtype=torch.bfloat16), name)
             m.add(Parameter(name, (4, 64), source, lambda store, format=None, s=source: s, inputs))
+        for name in vision_nvfp4:
+            values = array_source(torch.ones((16, 64), dtype=torch.float64), name)
+            encoded[name] = array_source(torch.ones((16, 64), dtype=torch.float64), name + " (nvfp4_mul)")
+
+            def factory(store, format=None, values=values, words=encoded[name]):
+                assert format in (None, "nvfp4_mul")
+                return words if format == "nvfp4_mul" else values
+
+            m.add(Parameter(name, (16, 64), values, factory, (name + "_input",)))
+        for name in vision_direct:
+            m.add(Parameter(name, (64,), array_source(torch.ones(64, dtype=torch.bfloat16), name)))
         m.add(Parameter(BANK, (2, 4, 64), bank_source, inputs=("input",)))
         scales = f"{LAYER}/moe/expert_input_scales"
         m.add(Parameter(scales, (2, 3), array_source(torch.ones((2, 3)), scales), direct_format="fp32"))
@@ -192,6 +210,15 @@ def test_fp4_local_recipe_keeps_the_mxfp8_words_and_defaults_the_experts_to_a16(
     recipe = Recipe(m)
     qwen3_8_flash_next_fp4_local(m, recipe, {"base": None})
     selections = recipe.selections
+    for name in vision_nvfp4:
+        chosen = _only(selections, name)
+        assert (chosen.format, chosen.layout, chosen.method) == ("nvfp4_mul", "nvfp4_rg16_v1", import_encoded), name
+        assert chosen.source is encoded[name], name
+        assert recipe.policies[(name, name + "_input")] == "A16Only"
+    for name in (*vision_bf16, *vision_direct):
+        chosen = _only(selections, name)
+        assert (chosen.format, chosen.method) == ("bf16", cast_direct), name
+    assert not any(any(n.startswith("vision/") for n in names) for names, _ in recipe.explicit_groups)
     bank = _only(selections, BANK)
     assert (bank.format, bank.layout, bank.method) == ("nvfp4_mul", "nvfp4_expert_rg16_v1", import_expert_bank)
     for name in DRAFTER_EXPERTS:

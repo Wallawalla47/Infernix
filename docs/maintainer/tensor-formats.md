@@ -334,8 +334,10 @@ W[n,k] = decode_e2m1(c[n,k]) * decode_e4m3fn(s[n,g]) * m_w
 `m_w` is a finite, strictly positive binary32 word. The product is exact in binary64. Storing
 `1/m_w` as an `nvfp4` divisor changes the represented weight unless `m_w` is a power of two, so the
 two formats are distinct. The only producer is `import_encoded`. ModelOpt's activation
-`input_scale` is a separate model-role tensor. The format's only layout is `nvfp4_expert_rg16_v1`
-([storage layouts §6](storage-layouts.md#6-nvfp4_expert_rg16_v1)).
+`input_scale` is a separate model-role tensor. The format's layouts are `nvfp4_expert_rg16_v1` for
+routed-expert banks ([storage layouts §6](storage-layouts.md#6-nvfp4_expert_rg16_v1)) and
+`nvfp4_rg16_v1` for one dense matrix ([§6.1](storage-layouts.md#61-nvfp4_rg16_v1): Qwen3.5-122B's
+output head, NVIDIA FP4-Local's vision MLPs and merger).
 
 ### 3.6 GGUF (ggml) block formats
 

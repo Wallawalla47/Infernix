@@ -87,9 +87,10 @@ checkpoint: 24,576 experts, 1,616 tensors and 320,001,536 n-gram rows with no mi
 - **GDN, attention (indexer included) and shared-expert projections:** NVIDIA's MXFP8 words, run
   with BF16 activations; the GDN a/b projections and the vision attention are their exact BF16
   values; the trained FP32 norms stay FP32.
+- **Vision MLPs and merger:** NVIDIA's NVFP4 codes, block scales and FP32 multipliers, run with BF16
+  activations and exact sums (the experts' default arithmetic).
 - **N-gram table:** every NVFP4 row, byte for byte.
-- **Converted:** the MTP drafter (1,556 tensors, re-quantized as for the other imports) and the
-  vision merger (two matrices rounded once to BF16).
+- **Converted:** only the MTP drafter (1,556 tensors, re-quantized as for the other imports).
 
 ## Run
 

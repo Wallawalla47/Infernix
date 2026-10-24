@@ -38,6 +38,10 @@ struct PinnedRangeIndex {
 };
 
 constexpr std::size_t kStagingAlignment = 256;
+// Every staged object starts 16-byte aligned, as its kernels' vector loads and bulk copies require.
+// Most objects are whole multiples of 16 bytes, so they pack unpadded; an nvfp4_rg16_v1 matrix (the
+// FP4-Local vision MLP and merger) ends 4 bytes past its unit plane's 256-byte boundary.
+constexpr std::size_t kObjectAlignment = 16;
 
 std::size_t staging_align(std::size_t bytes) {
     return (bytes + kStagingAlignment - 1) / kStagingAlignment * kStagingAlignment;
@@ -62,6 +66,7 @@ VisionOverlayGroup build_group(const PinnedRangeIndex& index,
         if (std::find(seen.begin(), seen.end(), handle.index) != seen.end()) { continue; }
         seen.push_back(handle.index);
         const auto [pinned, bytes] = index.lookup(handle);
+        staging = (staging + kObjectAlignment - 1) / kObjectAlignment * kObjectAlignment;
         group.segments.push_back(VisionOverlaySegment{pinned, staging, bytes});
         staging += bytes;
     }

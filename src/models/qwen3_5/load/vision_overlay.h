@@ -16,9 +16,10 @@ struct PendingWeight;
 
 // One contiguous run of pinned bytes staged into a group's device slot. The pinned offset is
 // the object's position in the pinned block; the staging offset is its position in the group's
-// device slot. A group's objects are not necessarily adjacent in the pinned block (the binder
-// packs pinned objects in registration order, and the converter stores the fused qkv separately
-// from each layer's other weights), so a group is a list of segments rather than one range.
+// device slot, 16-byte aligned. A group's objects are not necessarily adjacent in the pinned block
+// (the binder packs pinned objects in registration order, and the converter stores the fused qkv
+// separately from each layer's other weights), so a group is a list of segments rather than one
+// range.
 struct VisionOverlaySegment {
     std::size_t pinned_offset  = 0;
     std::size_t staging_offset = 0;
@@ -27,7 +28,7 @@ struct VisionOverlaySegment {
 
 struct VisionOverlayGroup {
     std::vector<VisionOverlaySegment> segments;
-    std::size_t bytes = 0;  // total staged bytes (sum of segment bytes)
+    std::size_t bytes = 0;  // total staged bytes (the segments and their alignment padding)
 };
 
 // Byte layout of the vision groups inside the pinned weight block, used by the overlay window

@@ -136,12 +136,67 @@ static __global__ void fill_nvfp4_weight_kernel(std::uint8_t* codes, std::uint8_
     }
 }
 
+// nvfp4_rg16_v1 units (128 code bytes, then 16 E4M3FN block scales): uniform codes, scales near 1.
+static __global__ void fill_rg16_kernel(std::uint8_t* units, std::uint64_t bytes, std::uint64_t seed) {
+    for (auto i = std::uint64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < bytes;
+         i += std::uint64_t(gridDim.x) * blockDim.x) {
+        const std::uint32_t random = fixture::bits(i, seed);
+        units[i] = static_cast<std::uint8_t>(i % 144 < 128 ? random : 0x30U + (random & 15U));
+    }
+}
+
 inline int launch_grid(std::uint64_t elements) {
     return static_cast<int>(
         std::min<std::uint64_t>(65535, std::max<std::uint64_t>(1, (elements + 255) / 256)));
 }
 
 } // namespace detail
+
+// A dense nvfp4_mul matrix in nvfp4_rg16_v1 (the 122B head; FP4-Local's vision MLP and merger):
+// 16-row groups of 144-byte units, then (256-byte aligned) its FP32 multiplier.
+inline PackedQuantizedWeight make_nvfp4_rg16_weight(std::int32_t n, std::int32_t k, std::uint64_t seed = 0x51U) {
+    if (n <= 0 || k <= 0 || n % 16 != 0 || k % 16 != 0) {
+        throw std::invalid_argument("invalid benchmark nvfp4_rg16_v1 weight shape");
+    }
+    const std::uint64_t unit_bytes = detail::checked_mul(
+        detail::checked_mul(static_cast<std::uint64_t>(n / 16), static_cast<std::uint64_t>(k / 16),
+                            "benchmark nvfp4_rg16_v1 unit count overflow"),
+        144, "benchmark nvfp4_rg16_v1 unit plane overflow");
+    const std::uint64_t multiplier_offset = detail::align_up(unit_bytes, 256);
+    const std::uint64_t payload_bytes =
+        detail::checked_add(multiplier_offset, sizeof(float), "benchmark nvfp4_rg16_v1 payload size overflow");
+    if (payload_bytes > std::numeric_limits<std::size_t>::max()) {
+        throw std::overflow_error("benchmark nvfp4_rg16_v1 payload does not fit size_t");
+    }
+    // The codes and scales are the unit plane (low_bytes); the multiplier word is not counted.
+    PackedQuantizedWeight result{DeviceBuffer(static_cast<std::size_t>(payload_bytes)), {}, unit_bytes, 0, 0, 0, 0};
+    CUDA_CHECK(cudaMemset(result.storage.p, 0, result.storage.bytes));
+    detail::fill_rg16_kernel<<<detail::launch_grid(unit_bytes), 256>>>(static_cast<std::uint8_t*>(result.storage.p),
+                                                                       unit_bytes, seed);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    constexpr float kMultiplier = 3.0517578e-05F;
+    CUDA_CHECK(cudaMemcpy(static_cast<std::uint8_t*>(result.storage.p) + multiplier_offset, &kMultiplier,
+                          sizeof(kMultiplier), cudaMemcpyHostToDevice));
+
+    Weight& weight            = result.weight;
+    weight.payload            = result.storage.p;
+    weight.payload_bytes      = payload_bytes;
+    weight.qtype              = QType::NVFP4_MUL;
+    weight.layout             = QuantLayout::Rg16;
+    weight.group_size         = 16;
+    weight.group              = 16;
+    weight.ndim               = 2;
+    weight.shape[0]           = n;
+    weight.shape[1]           = k;
+    weight.padded_shape[0]    = n;
+    weight.padded_shape[1]    = k;
+    weight.qdata              = result.storage.p;
+    weight.n                  = n;
+    weight.k                  = k;
+    weight.weight_multiplier  = kMultiplier;
+    return result;
+}
 
 inline PackedQuantizedWeight make_row_split_weight(QType qtype, std::int32_t n, std::int32_t k,
                                                    std::int32_t padded_k,
