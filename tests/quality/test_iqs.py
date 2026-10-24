@@ -257,32 +257,3 @@ def test_clipped_kl_catches_a_typical_position_error_a_heavy_tailed_floor_hides(
     decision = iqs.decide(iqs.load_arm(arm), FAST, iqs.floor_of(twin))
     failing = {c["name"] for c in decision["criteria"] if not c["passed"]}
     assert failing == {"C4 clipped KL"}, decision["criteria"]
-
-
-def test_a_fast_path_is_gated_on_its_increase_over_the_reproducible_route(tmp_path: Path) -> None:
-    rng = np.random.default_rng(17)
-    kl, flip, dnll = synthetic(rng, 32, 200, 1e-3, 0.01)
-    floor = {"mean_kl": 2e-3, "flip_rate": 0.01, "p999_kl": 0.1, "clipped_kl": 1e-3, "mean_dnll": 0.0}
-    base = iqs.load_arm(write_arm(tmp_path, "base", kl, flip, dnll, windows=32, route="reproducible"))
-    same = iqs.load_arm(write_arm(tmp_path, "same", kl, flip, dnll, windows=32))
-    result = iqs.gate(same, base, floor, FAST)
-    assert result["passed"] and all(c["bound"] == 0 for c in result["criteria"])
-    # a third of the floor more KL at every position: P1 and P3 fail, the flips and perplexity do not move
-    worse = iqs.load_arm(write_arm(tmp_path, "worse", kl + 0.6e-3, flip, dnll, windows=32))
-    failing = {c["name"] for c in iqs.gate(worse, base, floor, FAST)["criteria"] if not c["passed"]}
-    assert failing == {"P1 mean KL increase", "P3 clipped KL increase"}
-    # a perplexity shift with no KL change (a direction, e.g. a logit scale): only P4 sees it
-    biased = iqs.load_arm(write_arm(tmp_path, "biased", kl, flip, dnll + 5e-3, windows=32))
-    failing = {c["name"] for c in iqs.gate(biased, base, floor, FAST)["criteria"] if not c["passed"]}
-    assert failing == {"P4 perplexity (dNLL) increase"}
-
-
-def test_a_gate_needs_the_same_positions_and_a_floor(tmp_path: Path) -> None:
-    rng = np.random.default_rng(18)
-    base = iqs.load_arm(write_arm(tmp_path, "base", *synthetic(rng, 32, 200, 1e-3, 0.01), windows=32))
-    short = iqs.load_arm(write_arm(tmp_path, "short", *synthetic(rng, 32, 199, 1e-3, 0.01), windows=32))
-    floor = {"mean_kl": 2e-3, "flip_rate": 0.01, "p999_kl": 0.1, "clipped_kl": 1e-3, "mean_dnll": 0.0}
-    with pytest.raises(iqs.Unusable, match="same positions"):
-        iqs.gate(short, base, floor, FAST)
-    with pytest.raises(iqs.Unusable, match="noise floor"):
-        iqs.gate(base, base, None, FAST)

@@ -16,14 +16,8 @@ Certification of an arm against R(A, K):
 N is the same statistic between R(A, K) and its noise twin (the exact route with stochastic rounding,
 infernix-certify prefill --lossless --noise-seed): an ideal BF16 implementation's own deviation, a property of
 the model; kappa = 2. Disclosed, not gated: perplexity (dNLL), the mean change in the written token's negative
-log-likelihood (its exponential is the perplexity ratio), and every value per domain.
-
-A fast path's gate, against the configuration's reproducible route on the same positions and reference (a plan's
-"gates"): the increase of each statistic, bounded per resampling unit, so the positions' shared sensitivity
-cancels:
-  P1 mean KL, P2 flip rate, P3 clipped KL     increase <= 0.25 N
-  P4 perplexity (dNLL)                        increase <= 2.5e-3 nats (perplexity +0.25 %)
-and the fast path's own arm is certified (C0-C4) like any other.
+log-likelihood (its exponential is the perplexity ratio), and every value per domain. Every arm is the shipped
+default route; the reproducible route is no baseline (its bit-exactness and request invariance are tested bitwise).
 
 Scored positions: a position counts when the model writes the token it predicts. A text window scores every
 position; a chat window only its assistant turns (infernix-certify mask writes the artifact's list, the
@@ -68,8 +62,6 @@ class Policy:
     p999_kl: float = 0.05
     clip_kl: float = 0.1            # the clipped KL caps each position here (nats)
     kappa: float = 2.0
-    increase: float = 0.25          # a fast path's increase, as a share of the noise floor
-    dnll_increase: float = 2.5e-3   # a fast path's perplexity (dNLL) increase (nats)
     confidence: float = 0.975
     resamples: int = 10000
     seed: int = 20261022
@@ -82,8 +74,6 @@ METRICS = ("mean_kl", "flip_rate", "p999_kl", "clipped_kl", "mean_dnll")  # ever
 CERTIFIED = ("mean_kl", "flip_rate", "p999_kl", "clipped_kl")              # the gated ones
 LABELS = {"mean_kl": "C1 mean KL", "flip_rate": "C2 flip rate", "p999_kl": "C3 p99.9 KL",
           "clipped_kl": "C4 clipped KL", "mean_dnll": "perplexity (dNLL)"}
-INCREASES = {"mean_kl": "P1 mean KL increase", "flip_rate": "P2 flip rate increase",
-             "clipped_kl": "P3 clipped KL increase", "mean_dnll": "P4 perplexity (dNLL) increase"}
 
 # A KV format's design error ceiling (mean KL, flip rate): its class, from llama.cpp's LLaMA-3-8B weight
 # quantizations (8-bit: Q8_0; mixed: Q6_K; 4-bit and VQ: between Q5_K_M and Q4_K_M).
@@ -323,30 +313,6 @@ def decide(arm: Arm, policy: Policy = POLICY, floor: dict[str, float] | None = N
             "unscored": {"positions": arm.unscored_positions, "estimate": arm.unscored}}
 
 
-def gate(fast: Arm, baseline: Arm, floor: dict[str, float] | None, policy: Policy = POLICY) -> dict:
-    """A fast path against the configuration's reproducible route: P1-P4 bound the increase of each statistic
-    over the same positions, resampling the baseline's units."""
-    if floor is None:
-        raise Unusable(f"{fast.name}: a fast-path gate needs the noise floor")
-    if not (np.array_equal(fast.window, baseline.window) and np.array_equal(fast.position, baseline.position)):
-        raise Unusable(f"{fast.name} and {baseline.name} did not score the same positions")
-    finite = np.isfinite(fast.kl) & np.isfinite(fast.dnll) & np.isfinite(baseline.kl) & np.isfinite(baseline.dnll)
-    c = policy.clip_kl
-    increase = {"mean_kl": fast.kl - baseline.kl, "flip_rate": fast.flip - baseline.flip,
-                "clipped_kl": np.minimum(fast.kl, c) - np.minimum(baseline.kl, c), "mean_dnll": fast.dnll - baseline.dnll}
-    increase = {m: v[finite] for m, v in increase.items()}
-    inverse, weights, total = resample(baseline.unit[finite], fast.name, policy)
-    bound = mean_bounds(increase, inverse, weights, total, policy)
-    budget = {m: policy.increase * max(floor[m], 0.0) for m in ("mean_kl", "flip_rate", "clipped_kl")}
-    budget["mean_dnll"] = policy.dnll_increase
-    criteria = [{"name": INCREASES[m], "estimate": float(np.mean(increase[m])), "bound": bound[m], "budget": budget[m],
-                 "passed": bound[m] <= budget[m]} for m in INCREASES]
-    return {"arm": str(fast.prefix), "baseline": str(baseline.prefix), "route": fast.meta.get("route"),
-            "kv_dtype": fast.meta.get("kv_dtype"), "fast_paths": fast.meta.get("load", {}).get("fast_paths", []),
-            "positions": int(finite.sum()), "windows": int(np.unique(fast.window[finite]).size), "noise_floor": floor,
-            "criteria": criteria, "passed": all(x["passed"] for x in criteria)}
-
-
 def disclose(arm: Arm, kv: str | None, policy: Policy = POLICY) -> dict:
     """A design error against the lossless route: a KV format's exact codec against its class ceiling, or (kv None)
     an artifact's declared activation quantization, which has no ceiling and is reported only."""
@@ -405,12 +371,6 @@ def render_html(certificate: dict) -> str:
         f"<td class=n>{d['bound']['mean_kl']:.3g}</td><td class=n>{d['bound']['flip_rate']:.3%}</td>"
         f"<td class={'p' if d['passed'] else 'f'}>{'PASS' if d['passed'] else 'FAIL'}</td></tr>"
         for d in certificate.get("disclosures", []))
-    gates = "".join(
-        f"<tr><td>{html.escape(g.get('label', g['arm']))}</td>"
-        + "".join(f"<td class=n>{c['bound']:.3g} / {c['budget']:.3g}</td>" for c in g["criteria"])
-        + f"<td class={'p' if g['passed'] else 'f'}>{'PASS' if g['passed'] else 'FAIL'}</td></tr>"
-        for g in certificate.get("gates", []))
-    gate_head = "".join(f"<th>{INCREASES[m]} bound / budget</th>" for m in INCREASES)
     checks = "".join(
         f"<tr><td>{html.escape(c['name'])}</td><td>{html.escape(c.get('detail', ''))}</td>"
         f"<td class={'p' if c['passed'] else 'f'}>{'PASS' if c['passed'] else 'FAIL'}</td></tr>"
@@ -425,7 +385,6 @@ td,th{{border:1px solid #ccc;padding:4px 8px;text-align:left}}.n{{text-align:rig
 <pre>{html.escape(json.dumps(certificate.get('provenance', {}), indent=2))}</pre>
 <h2>Path fidelity</h2><table><tr><th>Path</th><th>Route</th><th>KV</th>{head}<th>Nearest budget</th><th>Verdict</th></tr>
 {''.join(rows)}</table>
-<h2>Fast-path gates (increase over the reproducible route)</h2><table><tr><th>Path</th>{gate_head}<th>Verdict</th></tr>{gates}</table>
 <h2>Design error disclosures</h2><table><tr><th>Format or design</th><th>Class</th><th>Mean KL bound</th><th>Flip bound</th><th>Verdict</th></tr>{disclosures}</table>
 <h2>Exactness, invariance and end-to-end checks</h2><table><tr><th>Check</th><th>Detail</th><th>Verdict</th></tr>{checks}</table>
 """
@@ -438,14 +397,13 @@ def parts(base: Path, value: str | list[str]) -> list[Path]:
 
 def run_certificate(plan_path: Path, out: Path, policy: Policy) -> int:
     """A run plan: {"provenance": {...}, "decisions": [{"label", "arm", "twin" (optional)}],
-    "gates": [{"label", "arm", "baseline", "twin"}],
     "disclosures": [{"label", "arm", "kv" (absent: a declared activation quantization)}],
     "checks": [{"name", "result": path to a JSON with "passed" and optionally "detail"}]}; paths relative to
     the plan. An arm or twin is one prefix or a list of parts holding disjoint windows."""
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
     base = plan_path.parent
     certificate = {"provenance": plan.get("provenance", {}), "policy": policy.__dict__, "decisions": [],
-                   "gates": [], "disclosures": [], "checks": [], "unusable": []}
+                   "disclosures": [], "checks": [], "unusable": []}
     for item in plan.get("decisions", []):
         try:
             scored = base / item["scored"] if item.get("scored") else None
@@ -455,16 +413,6 @@ def run_certificate(plan_path: Path, out: Path, policy: Policy) -> int:
             decision = decide(load_arm(parts(base, item["arm"]), scored, policy), policy, floor)
             decision["label"] = item.get("label", item["arm"])
             certificate["decisions"].append(decision)
-        except Unusable as error:
-            certificate["unusable"].append({"label": item.get("label", item["arm"]), "error": str(error)})
-    for item in plan.get("gates", []):
-        try:
-            scored = base / item["scored"] if item.get("scored") else None
-            floor = floor_of(parts(base, item["twin"]), scored, policy)
-            result = gate(load_arm(parts(base, item["arm"]), scored, policy),
-                          load_arm(parts(base, item["baseline"]), scored, policy), floor, policy)
-            result["label"] = item.get("label", item["arm"])
-            certificate["gates"].append(result)
         except Unusable as error:
             certificate["unusable"].append({"label": item.get("label", item["arm"]), "error": str(error)})
     for item in plan.get("disclosures", []):
@@ -484,13 +432,12 @@ def run_certificate(plan_path: Path, out: Path, policy: Policy) -> int:
         certificate["checks"].append({"name": item["name"], "detail": str(result.get("detail", "")),
                                       "passed": bool(result.get("passed"))})
     certificate["passed"] = (not certificate["unusable"] and all(d["passed"] for d in certificate["decisions"])
-                             and all(g["passed"] for g in certificate["gates"])
                              and all(d["passed"] for d in certificate["disclosures"])
                              and all(c["passed"] for c in certificate["checks"]))
     out.mkdir(parents=True, exist_ok=True)
     (out / "certificate.json").write_text(json.dumps(certificate, indent=2) + "\n", encoding="utf-8")
     (out / "certificate.html").write_text(render_html(certificate), encoding="utf-8")
-    for decision in certificate["decisions"] + certificate["gates"]:
+    for decision in certificate["decisions"]:
         print_decision(decision)
     for item in certificate["unusable"]:
         print(f"UNUSABLE {item['label']}: {item['error']}")

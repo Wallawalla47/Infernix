@@ -9,10 +9,11 @@ steps on one machine, decided into one certificate.
 certificate decides); `run` executes the steps not yet done, in order, logging each to RUN/logs and RUN/status.jsonl,
 then writes RUN/certificate/certificate.{json,html}. A run resumes where it stopped: a step whose outputs exist is
 skipped. References and noise twins live in STORE, keyed by artifact, set, route and KV format; the lossless route,
-the design reference, the noise twin and the reproducible route never change their bits, so later runs reuse them.
-The main set is stored in layers of 32 windows (the corpus grows a layer at a time): each layer of a reference, twin
-or reproducible arm is its own part, so a larger corpus makes only its new layers, and the default-route arms, whose
-kernels change, run on every window. --mode release adds the C0 spot check (re-score window 0 of every stored
+the design reference and the noise twin never change their bits, so later runs reuse them. The main set is stored in
+layers of 32 windows (the corpus grows a layer at a time): each layer of a reference or twin is its own part, so a
+larger corpus makes only its new layers, and the arms, which measure the shipped default route, run on every window.
+The reproducible route has no quality arms: its promise (bit-exact, request-invariant) is tested bitwise (block F).
+--mode release adds the C0 spot check (re-score window 0 of every stored
 reference, bit for bit); a missing reference is made in either mode.
 
 LOCAL.json maps each artifact key to this machine's files:
@@ -54,12 +55,12 @@ CONFORMANCE = ("q27gw", "q35", "fp8")          # G1: one artifact per architectu
 CAPTURE = ("--windows", "0,8,16,24", "--tokens", "512", "--every", "16")  # 4 sequences, 31 positions each
 LAYER = 32  # main-set windows per corpus layer (tools/quality/iqs_corpus.py)
 TWIN_SEED = 20261022
-# The arms of the reproducible route: bit-identical from release to release, so stored per layer and reused.
-STORED_ARMS = ("prefill-reproducible", "decode-reproducible")
-# The default-route arms that run one request at a time: deterministic for a fixed build, so with --reuse (an
-# earlier run whose engine routes are unchanged) their earlier windows are reused and only the new layers run.
-# The stress arm's preemptions depend on timing, so it always runs on every window.
-SINGLE_REQUEST_ARMS = ("prefill-default", "decode-default-one", "decode-default-tree")
+# The one-request decode arms: a window's segments run in order, each resuming from the previous segment's
+# cached prompt (the prefix cache), so a window prefills about 3,840 tokens instead of 7,168.
+CHAINED = ("--concurrency", "1", "--prefix-reuse", "--warm-tokens", "200")
+# The prefill arm: deterministic for a fixed build, so with --reuse (an earlier run whose engine routes are
+# unchanged) its earlier windows are reused and only the new layers run.
+SINGLE_REQUEST_ARMS = ("prefill-default",)
 # The stress arm: four requests per window resuming from a 200-token warm prefix (off the prefill chunk grid) in a
 # KV pool too small for all four (7,424 tokens of segments in 6,144), so requests are preempted and replayed.
 STRESS = ("--concurrency", "4", "--prefix-reuse", "--warm-tokens", "200", "--kv-tokens", "6144")
@@ -175,7 +176,6 @@ class Planner:
         self.layers = main_windows() // LAYER
         self.steps: list[Step] = []
         self.decisions: list[dict] = []
-        self.gates: list[dict] = []
         self.disclosures: list[dict] = []
         self.checks: list[dict] = []
 
@@ -212,10 +212,6 @@ class Planner:
 
     def arm(self, config: Config, kv: str, name: str, set_name: str = "main") -> Path:
         return self.run / "arms" / f"{config.key}-{set_name}-{kv}-{name}"
-
-    def stored_arm(self, config: Config, kv: str, name: str) -> Path:
-        """A reproducible-route arm: kept with the references and reused by later runs, a layer per part."""
-        return self.store / config.key / "arms" / f"main-{kv}-{name}"
 
     # Commands ----------------------------------------------------------------------------------------------
     def artifact_args(self, config: Config) -> list[str]:
@@ -354,8 +350,8 @@ class Planner:
 
     def arm_steps(self, c: Config, kv: str, block: str, arms: list[tuple[str, str, list[str]]],
                   set_name: str = "main", decide: bool = True) -> list[list[Path]]:
-        """Each arm's parts: a reproducible main-set arm is stored a layer per part (reused by later runs); every
-        other arm runs on all its set's windows in this run."""
+        """Each arm's parts: with --reuse, a single-request main-set arm takes its earlier windows from the earlier run
+        and runs its later layers here; every other arm runs on all its set's windows in this run."""
         reference = self.lossless(c.artifact, set_name) if set_name != "main" else self.reference(c, kv)
         common = [*self.reference_args(reference, set_name), "--kv-dtype", kv]
         minutes = 90 if set_name == "main" else 120
@@ -363,12 +359,7 @@ class Planner:
         for name, command, args in arms:
             step = f"arm-{c.key}-{set_name}-{kv}-{name}"
             earlier = self.reuse / "arms" / self.arm(c, kv, name, set_name).name if self.reuse else None
-            if set_name == "main" and name in STORED_ARMS:
-                parts = self.parts(self.stored_arm(c, kv, name), legacy=False)
-                for k, part in enumerate(parts):
-                    self.certify_step(block, self.layer_name(step, k), command, c,
-                                      [*common, *args, "--windows", window_list(k)], part, minutes)
-            elif set_name == "main" and name in SINGLE_REQUEST_ARMS and earlier and Path(str(earlier) + ".json").is_file():
+            if set_name == "main" and name in SINGLE_REQUEST_ARMS and earlier and Path(str(earlier) + ".json").is_file():
                 # windows 0-31 from the earlier run, the later layers in this one
                 parts = [earlier] + [layer_path(self.arm(c, kv, name, set_name), k, legacy=False)
                                      for k in range(1, self.layers)]
@@ -381,57 +372,35 @@ class Planner:
             if decide:
                 self.decide(f"{c.key} {set_name} {kv} {name}", parts, c, kv, set_name)
             outs.append(parts)
-        # Every default-route arm is a fast path: gated on its increase over the reproducible arm of its kind,
-        # which forced the same positions.
-        made = {name: parts for (name, _, _), parts in zip(arms, outs)}
-        for (name, command, _), parts in zip(arms, outs):
-            baseline = made.get(f"{command}-reproducible")
-            if decide and "default" in name and baseline:
-                self.gates.append({"label": f"{c.key} {set_name} {kv} {name}", "arm": [str(p) for p in parts],
-                                   "baseline": [str(p) for p in baseline],
-                                   "twin": [str(p) for p in self.parts(self.twin(c, kv), legacy=False)],
-                                   "scored": str(self.scored(c, set_name))})
         return outs
 
     def bf16_arms(self, c: Config) -> None:
-        arms = [("prefill-reproducible", "prefill", ["--reproducible"]),
-                ("prefill-default", "prefill", []),
-                ("decode-reproducible", "decode", ["--reproducible", "--concurrency", "4"]),
-                ("decode-default-one", "decode", ["--concurrency", "1"]),
+        arms = [("prefill-default", "prefill", []),
+                ("decode-default-one", "decode", list(CHAINED)),
                 ("decode-default-stress", "decode", [*STRESS, *self.speculation(c, c.stress)])]
         if c.tree:
-            arms.append(("decode-default-tree", "decode", ["--concurrency", "1", *self.speculation(c, c.tree)]))
+            arms.append(("decode-default-tree", "decode", [*CHAINED, *self.speculation(c, c.tree)]))
         self.arm_steps(c, "bf16", "D", arms)
         if c.declared:
             self.total_error(c)
 
     def total_error(self, c: Config) -> None:
-        """A declared design's shipped routes against the lossless route: engine and design error together, what a
+        """A declared design's shipped route against the lossless route: engine and design error together, what a
         user of the artifact gets against the model itself (disclosed beside the design error, never gated)."""
-        common = [*self.reference_args(self.lossless(c.artifact)), "--kv-dtype", "bf16"]
-        for route, args in (("reproducible", ["--reproducible"]), ("default", [])):
-            name = f"prefill-{route}-vs-lossless"
-            step = f"arm-{c.key}-main-bf16-{name}"
-            if route == "reproducible":
-                parts = self.parts(self.stored_arm(c, "bf16", name), legacy=False)
-                for k, part in enumerate(parts):
-                    self.certify_step("D", self.layer_name(step, k), "prefill", c,
-                                      [*common, *args, "--windows", window_list(k)], part, 90)
-            else:
-                parts = [self.arm(c, "bf16", name)]
-                self.certify_step("D", step, "prefill", c, [*common, *args], parts[0], 90)
-            self.disclosures.append({"label": f"{c.key} {route} route against lossless (engine and design error)",
-                                     "arm": [str(p) for p in parts], "scored": str(self.scored(c))})
+        name = "prefill-default-vs-lossless"
+        part = self.arm(c, "bf16", name)
+        self.certify_step("D", f"arm-{c.key}-main-bf16-{name}", "prefill", c,
+                          [*self.reference_args(self.lossless(c.artifact)), "--kv-dtype", "bf16"], part, 90)
+        self.disclosures.append({"label": f"{c.key} default route against lossless (engine and design error)",
+                                 "arm": [str(part)], "scored": str(self.scored(c))})
 
     def kv_arms(self, c: Config, kv: str) -> None:
-        self.arm_steps(c, kv, "E1", [("prefill-reproducible", "prefill", ["--reproducible"]),
-                                     ("prefill-default", "prefill", []),
-                                     ("decode-reproducible", "decode", ["--reproducible", "--concurrency", "4"]),
+        self.arm_steps(c, kv, "E1", [("prefill-default", "prefill", []),
                                      ("decode-default-stress", "decode", [*STRESS, *self.speculation(c, c.stress)])])
 
     def long_arms(self, c: Config) -> None:
         self.arm_steps(c, "bf16", "E2", [("prefill-default", "prefill", []),
-                                         ("decode-default-one", "decode", ["--concurrency", "1"])], set_name="long")
+                                         ("decode-default-one", "decode", list(CHAINED))], set_name="long")
         if c.key == "q27gw":
             # Every KV format at 32K against the lossless route: engine and design error together, held to the
             # format's class ceiling.
@@ -552,14 +521,14 @@ def plan_command(args) -> int:
     (run / "steps.json").write_text(json.dumps([asdict(s) for s in planner.steps], indent=1) + "\n", encoding="utf-8")
     prov = provenance(planner.build, args.mode)
     prov["left_out"] = planner.left_out
-    plan = {"provenance": prov, "decisions": planner.decisions, "gates": planner.gates,
-            "disclosures": planner.disclosures, "checks": planner.checks}
+    plan = {"provenance": prov, "decisions": planner.decisions, "disclosures": planner.disclosures,
+            "checks": planner.checks}
     (run / "plan.json").write_text(json.dumps(plan, indent=1) + "\n", encoding="utf-8")
     blocks: dict[str, int] = {}
     for s in planner.steps:
         blocks[s.block] = blocks.get(s.block, 0) + 1
     print(f"{len(planner.steps)} steps ({', '.join(f'{b} {n}' for b, n in blocks.items())}); "
-          f"{len(planner.decisions)} decisions, {len(planner.gates)} gates, {len(planner.disclosures)} disclosures, {len(planner.checks)} checks; "
+          f"{len(planner.decisions)} decisions, {len(planner.disclosures)} disclosures, {len(planner.checks)} checks; "
           f"left out: {', '.join(planner.left_out) or 'none'}")
     return 0
 

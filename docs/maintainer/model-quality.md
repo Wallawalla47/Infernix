@@ -374,9 +374,9 @@ their evidence. `tools/quality/iqs.py` implements the decisions; its constants a
   whose effect depends on load (lossy Host-tier prefix state, whose use depends on eviction) is
   refused with `--reproducible` at startup, never silently overridden. A
   change that alters any exact-route output bit is a *numerics change*. It is allowed only to fix
-  a defect or to improve precision, and only when the configuration's reproducible arms (6.6) pass
-  against the stored reference R(A, K) with point estimates of mean KL and flip rate no higher than
-  the previous build's, and the corpus NLL does not rise; the release note declares it and the
+  a defect or to improve precision, and only when the configuration's prefill and decode arms (6.6),
+  run once on the reproducible route for that change, pass against the stored reference R(A, K) with
+  point estimates of mean KL and flip rate no higher than the previous build's, and the corpus NLL does not rise; the release note declares it and the
   golden reproducible hashes are recorded again (6.8 records each one). The reference runs its own
   kernels on every model, so an exact-route change leaves it unchanged. Speed alone never justifies
   an exact-route numerics change: a faster route whose arithmetic differs is a fast path. Prompt
@@ -412,10 +412,11 @@ A fast path is qualified for a configuration only when all three hold there:
 2. **Path fidelity (IQS-2, 6.2-6.6), jointly.** The configuration's arms on the default route, which
    runs every path already qualified there **together with** the candidate (the measurement tools'
    `--fast-path NAME` adds a candidate before it is listed), pass C0-C4 against the stored reference
-   R(A, K) and the increase gate P1-P4 against the configuration's reproducible arms on the same
-   positions (`tools/quality/certify.py plan --only KEY`: block D, and block E1 when the path changes
+   R(A, K) (`tools/quality/certify.py plan --only KEY`: block D, and block E1 when the path changes
    attention or KV arithmetic, which decides it on every KV format of the representative's family).
-   Paths that each fit the budget therefore cannot add up past it.
+   Paths that each fit the budget therefore cannot add up past it. Every route is judged against the
+   reference alone: the reproducible route is an implementation like any other, never a baseline
+   (owner, 2026-10-24; the budgets relative to the noise twin are under revision).
 3. **A resolved speedup** at the scope it claims, measured as any performance change
    ([Op development](op-development.md#7-performance-evidence), `bench/README.md`): alternating
    rounds, the gain ahead in every round. A fast path with no measured gain is removed.
@@ -521,19 +522,9 @@ observes (`kMaximumObservedTokens`).
 dNLL had no power: a +-1e-3 bound needs 125-386 windows, and with 32 its verdicts followed the noise
 twin's estimate rather than the path. Per-domain values were point estimates of 4 windows.
 
-**A fast path's gate**: the default-route arm against the configuration's reproducible arm on the same
-positions and reference, each criterion bounding the increase per window (fast minus reproducible), so
-the positions' shared sensitivity cancels; the fast arm must also pass C0-C4:
-
-| Criterion | Budget on the increase | Why |
-|---|---|---|
-| P1 mean KL | 0.25 N | a fast path may add a quarter of the model's own rounding variation; four such paths together cannot use up certification's 2 N |
-| P2 flip rate | 0.25 N | as P1 |
-| P3 clipped mean KL | 0.25 N (clipped) | as P1, for the typical position |
-| P4 perplexity (dNLL) | 2.5e-3 nats (perplexity +0.25 %) | the one measure that responds to first order to an error with a direction (a logit scale, a temperature); KL responds to it only to second order |
-
-At 64 windows an unchanged path's bound sits near 6 % of N on the dense 27B and 3 % on Flash-Next
-(P1), so the test resolves 0.25 N comfortably; a budget of 0.1 N would need about 128 windows.
+A gate on a fast path's increase over the reproducible route (IQS-2 as proposed on 2026-10-24) was
+withdrawn the same day: the reproducible route is an arbitrary implementation, not an objective
+baseline. Every arm measures the shipped default route against R(A, K).
 
 **Noise floor.** Every model amplifies the smallest rounding difference: one BF16 rounding a unit off
 in one layer changes the values after it slightly, which flips other roundings near their boundaries,
@@ -578,9 +569,8 @@ accuracy loss, from the items the two routes answer differently, exceeds 5 point
   without measuring again.
 - Power (measured 2026-10-24 on the stored runs): at 64 windows the 95 % half-width of an absolute
   mean KL is about 61 % of the estimate on the dense 27B (24 % for the clipped mean, 10 % for the
-  flip rate) and 13-26 % on the MoE and Flash-Next models; a paired fast-path increase of 17 % of the
-  reproducible route's mean KL (dense 27B) or 5 % (Flash-Next) is detected with 80 % power. 128
-  windows would tighten these by a further factor of 1.4.
+  flip rate) and 13-26 % on the MoE and Flash-Next models. 128 windows would tighten these by a further
+  factor of 1.4.
 - Every criterion of every path is published (estimate, bound, budget, coverage), passing or not.
   Nothing is re-run after a fail except a run shown to be broken (a crash, the wrong binary), and the
   replaced run stays in the report.
@@ -660,14 +650,15 @@ huggingface-hub 1.x and httpx; Flash-Next on main 3bb8b727); `tools/quality/cert
 whole regime with a store reused across runs. The store keeps every main-set item that never changes
 its bits, a 32-window layer per part: the lossless and design references (layer 0 under its original
 name, `main-lossless.ref`; later layers `main-lossless.w32-63.ref`), the noise twins
-(`main-twin.w0-31`, `main-twin-<kv>.w0-31`, ...) and the reproducible arms (`arms/main-<kv>-<arm>.w0-31`).
+(`main-twin.w0-31`, `main-twin-<kv>.w0-31`, ...).
 `infernix-certify` takes a reference in parts (`--reference` repeated) and matches every stored window to
-its tokens; `iqs.py` reads an arm or twin from its parts. The default-route arms, whose kernels change,
-run on every window in each run. `certify.py plan --reuse RUN` names an earlier run on a build whose serving,
+its tokens; `iqs.py` reads an arm or twin from its parts. The arms, whose kernels change, run on every window
+in each run. A one-request decode arm runs a window's segments in order, each resuming from the previous
+segment's cached prompt (`--prefix-reuse`), so a window prefills about 3,840 tokens instead of 7,168: about
+30 % of a decode arm's time. `certify.py plan --reuse RUN` names an earlier run on a build whose serving,
 default and reproducible routes this one leaves unchanged (the block's reuse check re-runs windows of stored
-arms and requires identical rows): its end-to-end, functional and conformance results are read from there, and
-its single-request default arms (prefill, one-request decode, tree) supply their earlier windows; the stress
-arms, whose preemptions depend on timing, still run on every window:
+arms and requires identical rows): its end-to-end, functional and conformance results are read from there,
+and its default prefill arms supply their earlier windows; every decode arm runs on every window:
 
 ```bat
 py -3.11 -m tools.quality.certify plan --artifacts local-artifacts.json --build build ^
@@ -684,8 +675,8 @@ py -3.11 -m tools.quality.certify run D:\iqs\run-2026-10-23
 | C3 | exact-codec references for the six KV formats on the two family representatives (with each format's design error) |
 | C4 | long-set lossless references on the three long representatives |
 | C0 | release mode: re-score window 0 of the lossless reference of each attention family's representative; any changed bit fails (the lossless route and the design reference never change their bits, and every lossless kernel serves every artifact of its family) |
-| D | BF16 KV, every configuration: reproducible prefill, default prefill, reproducible decode (4 requests), default one-request decode, default stress decode (and the NVFP4 27B tree arm); every default arm also gated on its increase over the reproducible arm of its kind (P1-P4) |
-| E1 | six KV formats on the representatives: reproducible and default prefill, reproducible decode, default stress decode |
+| D | BF16 KV, every configuration: default prefill, default one-request decode (segments chained through the prefix cache), default stress decode (and the NVFP4 27B tree arm); a declared design's default prefill also against lossless (disclosed) |
+| E1 | six KV formats on the representatives: default prefill and default stress decode |
 | E2 | long set: default prefill and one-request decode on the long representatives; every KV format's prefill at 32K on `q27gw` |
 | F | functional real tests on the artifacts they are written for; production identity with golden hashes on every configuration (negative controls on the representatives: each reports how many default-route requests differ, and the certificate asks that some artifact's control saw a difference, since an artifact whose default route happens to be request-invariant says nothing against its reproducible route); speculative-sampling distribution tests; long-generation sanity (mean length within 90-110 % of the reproducible route, no more looping outputs, no fewer natural stops); task flip audit |
 | G | the certificate (CPU) |
@@ -701,8 +692,8 @@ the long set across the families on alternate releases.
 
 | Change | What runs |
 |---|---|
-| A new fast path for a configuration | its op qualification and resolved speedup (6.1), then that configuration's default arms (`certify.py plan --only KEY`: blocks D, and E1 when it changes attention or KV arithmetic on a representative's family) against the stored references, twins and reproducible arms, which need no new run; registered when C0-C4 and P1-P4 pass. The next release run covers it with everything else. |
-| A larger corpus (a new layer) | the new layer's references, twins and reproducible arms only; the default arms on every window |
+| A new fast path for a configuration | its op qualification and resolved speedup (6.1), then that configuration's default arms (`certify.py plan --only KEY`: blocks D, and E1 when it changes attention or KV arithmetic on a representative's family) against the stored references and twins, which need no new run; registered when C0-C4 pass. The next release run covers it with everything else. |
+| A larger corpus (a new layer) | the new layer's references and twins only; the arms on every window |
 | A kernel change on an existing route | op tests; the arms of the affected configurations; the reproducible golden hashes, which must not change unless the change is declared (6.1) |
 | A new artifact | its references (C1), noise twin (C2), D arms and functional tests |
 | A new KV format | its codec's exact oracles; C3 and E1 on both representatives; its class |
