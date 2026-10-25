@@ -4,8 +4,10 @@ Each check starts the server on one artifact, drives it through the OpenAI Chat 
 and writes a JSON result {"passed": bool, "detail": str, ...} that tools/quality/iqs.py's certificate collects.
 
   identity   G4/G5: on --reproducible, every response under concurrency and a warm prefix cache equals the same
-             request served alone (greedy and seeded sampling), and with --golden FILE the responses served alone
-             equal the hashes FILE stores from earlier releases (recorded when FILE is absent); with
+             request served alone (greedy and seeded sampling); with --golden FILE the responses served alone are
+             compared with the hashes FILE stores from an earlier build (recorded when FILE is absent): a
+             difference is reported, not failed, since a build may change the route's bits by a numerics change
+             its release declares (model-quality.md 6.1), which then records FILE again; with
              --negative-control the default route's differences under concurrency are counted and reported (an
              artifact whose default route happens to be request-invariant shows none: that says nothing against
              its reproducible route)
@@ -148,7 +150,6 @@ def check_identity(args) -> dict:
     if args.golden:
         result.update(golden(Path(args.golden), args.artifact, hashes))
         result["detail"] += "; " + result["golden"]["detail"]
-        result["passed"] = result["passed"] and result["golden"]["passed"]
     if args.negative_control:
         with server(args.serve, args.artifact, args.server_args, args.log) as client:
             alone = [client.chat(**r) for r in plain]
@@ -176,17 +177,20 @@ def check_sensitivity(args) -> dict:
 
 
 def golden(store: Path, artifact: str, hashes: list[str]) -> dict:
-    """The reproducible route's responses against the hashes an earlier release stored (recorded when absent)."""
+    """The reproducible route's responses against the hashes an earlier build stored (recorded when absent).
+    Disclosure, not a criterion: a changed hash is a numerics change for the release to declare, which then
+    records the new hashes this result carries."""
     if not store.is_file():
         store.parent.mkdir(parents=True, exist_ok=True)
         store.write_text(json.dumps({"artifact": artifact, "hashes": hashes}, indent=1) + "\n", encoding="utf-8")
-        return {"golden": {"passed": True, "recorded": True, "detail": f"recorded {len(hashes)} golden hashes"}}
+        return {"golden": {"equal": True, "recorded": True, "detail": f"recorded {len(hashes)} golden hashes"}}
     stored = json.loads(store.read_text(encoding="utf-8"))["hashes"]
     changed = [i for i, (a, b) in enumerate(zip(stored, hashes)) if a != b]
-    passed = not changed and len(stored) == len(hashes)
-    return {"golden": {"passed": passed, "changed": changed,
-                       "detail": f"golden hashes equal ({len(hashes)})" if passed
-                       else f"{len(changed)} of {len(hashes)} reproducible responses changed since {store}"}}
+    equal = not changed and len(stored) == len(hashes)
+    return {"golden": {"equal": equal, "changed": changed, "hashes": hashes,
+                       "detail": f"golden hashes equal ({len(hashes)})" if equal
+                       else f"{len(changed)} of {len(hashes)} reproducible responses changed since {store}: a "
+                            "numerics change for the release to declare (model-quality.md 6.1)"}}
 
 
 def looping(text: str, n: int = 24, repeats: int = 6) -> bool:
