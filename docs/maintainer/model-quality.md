@@ -778,6 +778,8 @@ their request-coupling paths are listed like the others (since 2026-10-22). The 
 | `idle-wide-prefill` | Qwen3.8-27B / Qwen3.6-35B-A3B generation engines | NVFP4 27B, groupwise 27B and 35B-A3B, every format |
 | `adaptive-mtp` | Qwen3.8-27B / Qwen3.6-35B-A3B with MTP and `--draft-tokens auto` | NVFP4 27B and 35B-A3B, every format |
 | `adaptive-dflash` | Qwen3.8-27B / Qwen3.6-35B-A3B with DFlash or DFlash2 and `--draft-tokens auto` | NVFP4 27B and 35B-A3B, every format (2026-10-22, below); not the groupwise 27B |
+| `gdn-tree-closed-form` | tree rounds' GDN records of at most 16 columns (wider rows walk) | NVFP4 27B and 35B-A3B, every format, by the owner's decision (2026-10-25) ahead of its gate, where measured faster (ABBA, INT8 KV, greedy pp1280+tg256, fixed trees of 16, 6 blocks): NVFP4 27B DFlash2 decode +1.19 % (6 of 6, at least +1.01 %), 35B-A3B DFlash rounds 1.0-1.7 % shorter in 6 of 6 (decode +1.6 % where the greedy text matched); its kernel 0.65-0.93 of the walk's time at 1-4 rows (`gdn_replay_bench --component tree`) |
+| `block-verification` | sampled chain rounds (DFlash2, sampled MTP) | none: re-timed after its keys were made round-unique (2026-10-25, ABBA, sampled, 6 blocks): Dense8 MTP no resolved difference (median +1.9 %, worst -14.9 %), Dense8 DFlash2 `auto` -14.2 % (6 of 6 worse), NVFP4 27B DFlash2 7 no resolved difference (median -0.1 %, worst -4.8 %) |
 | Qwen3.8-Flash-Next: `expert-a4-residual` | artifacts with NVFP4 W4A16 experts (recipe C; NVIDIA FP4-Local at its default 16-bit expert activations), expert calls of more than eight columns | FP8 dense (recipe C) and MXFP8 dense (FP4-Local, by recipe C's kernel verdicts and its own timing), 16-bit expert activations, every KV format (BF16 by FP4-Local's gates against the precise reference, below) |
 | Qwen3.8-Flash-Next: `expert-a4-residual-3` | the same calls as `expert-a4-residual`, three NVFP4 terms per x and h row (its more precise form, design §19.3.23; it takes precedence where both are selected) | none: two terms pass on every configuration and format they run in (2026-10-21), so it stays an unregistered candidate (`--fast-path expert-a4-residual-3`) for a cell where two terms fail; three terms cost 7-8 points of prefill speed (below) |
 | Qwen3.8-Flash-Next: `sampled-mtp-drafts` | MTP rounds with a sampled request | every Flash-Next configuration, every format (distribution and greedy identity, below; no logit changes) |
@@ -1467,7 +1469,14 @@ and recomputes the previous output) or admission (whole extents held without `pr
   +2.7 % at one request (146.9 against 143.0, from runs of 163.8 and 130.0), -4.7 % at two, -2.0 %
   at four and +3.6 % on sampled text (762 against 736 summed), a geometric mean of -0.15 %. The two
   one-request runs show the learned cost can settle on a worse length in one run than another (also
-  the 27B's 152.0 and 139.4 above). Earlier (2026-10-15, the fixed cost model, bench corpus at 5.9 of
+  the 27B's 152.0 and 139.4 above). Re-timed 2026-10-25 (`infernix_decode_quality_gen`, 24 slices of
+  1,280 tokens of Infernix's code continued greedily and of its docs sampled, 384 tokens each, one,
+  two and four requests, A B B A, decode tok/s): against fixed 3 `auto` is +10.3 / +4.4 / -4.8 % on
+  code and -1.5 / +0.2 / +0.6 % on docs (geometric mean +1.4 %); with its batched rounds at a fixed 3
+  they equal fixed 3 (within 0.2 % at two and four requests on the bench corpus), leaving code's
+  +10.3 % against docs' -1.5 % at one request. Not
+  a consistent gain, so the groupwise 27B keeps fixed 3. (Three bench-corpus prompts had shown
+  +4 to +25 %: two of them continue near-deterministically, where longer drafts always pay.) Earlier (2026-10-15, the fixed cost model, bench corpus at 5.9 of
   6 accepted): 1.0-4.1 % slower than five fixed drafts, from its probe rounds.
 
 **`adaptive-dflash`: the block drafters' verify width chosen per round from the proposal (qualified
@@ -1544,7 +1553,10 @@ and recomputes the previous output) or admission (whole extents held without `pr
   35B-A3B's 15-draft block (756.4 / 448.7 at one request: its 16-column proposal costs more than its
   drafts add); costs 0.01 and 0.005 per draft on the 27B (334.0 and 344.3 on code against 361.4 at
   0.02, decode tok/s); registering the groupwise 27B (one request: `auto` 300.0 / 171.3 against
-  fixed 7's 300.8 / 184.6); a lower copy floor (one-row copies of 8-15 drafts replacing the block:
+  fixed 7's 300.8 / 184.6; re-timed 2026-10-25 on code and docs at one, two and four requests,
+  decode tok/s: the 15-draft block +8.1 % on code and -4.8 % on docs at one request, its batched
+  widths -4.6 to -14.5 %; batched rounds plain at 7 equal fixed 7 (-0.2 to +1.4 %); a 7-draft block
+  equals fixed 7 at one request (-0.2 / +0.1 %): no variant is a consistent gain); a lower copy floor (one-row copies of 8-15 drafts replacing the block:
   no round changed on the copy workload); DFlash2 trees on the block: 15 drafts with 20- and
   24-column trees ran 1.3 / 2.5 % and 1.3 % behind the chain (same-text estimate -1.3 / -1.9 % and
   -1.0 %), and `auto` with automatic trees chose trees in 704 of 1,547 code rounds and 122 of 3,119

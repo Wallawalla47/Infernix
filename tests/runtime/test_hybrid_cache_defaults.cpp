@@ -321,16 +321,22 @@ int main() {
         } catch (const std::invalid_argument&) { rejected = true; }
         failures += check(!rejected, "--vram-headroom-mib was refused with offloaded experts");
     }
-    // --draft-tokens auto on a Qwen3.5 artifact with offloaded experts decodes without a drafter (no
-    // length was faster than plain decode there); a fixed length keeps its drafter.
+    // --draft-tokens auto on a Qwen3.5 artifact with offloaded experts: MTP keeps its drafter (its gated
+    // drafts beat plain decode there), DFlash2 decodes without one (no policy beat plain decode); a fixed
+    // length keeps its drafter.
     {
         EngineOptions options;
         options.speculative.backend           = infernix::SpeculativeBackend::Mtp;
         options.speculative.draft_tokens_auto = true;
-        const EngineOptions out = normalize_engine_options(options, infernix::models::Architecture::Qwen3_5, true);
-        failures += check(out.speculative.backend == infernix::SpeculativeBackend::None &&
-                              !out.speculative.draft_tokens_auto && out.speculative.draft_tokens == 0,
-                          "--draft-tokens auto kept a drafter with offloaded experts");
+        const EngineOptions mtp = normalize_engine_options(options, infernix::models::Architecture::Qwen3_5, true);
+        failures += check(mtp.speculative.backend == infernix::SpeculativeBackend::Mtp && mtp.speculative.draft_tokens_auto,
+                          "--draft-tokens auto lost the MTP drafter with offloaded experts");
+        options.speculative.backend = infernix::SpeculativeBackend::DFlash2;
+        const EngineOptions block = normalize_engine_options(options, infernix::models::Architecture::Qwen3_5, true);
+        failures += check(block.speculative.backend == infernix::SpeculativeBackend::None &&
+                              !block.speculative.draft_tokens_auto && block.speculative.draft_tokens == 0,
+                          "--draft-tokens auto kept the DFlash2 drafter with offloaded experts");
+        options.speculative.backend           = infernix::SpeculativeBackend::Mtp;
         options.speculative.draft_tokens_auto = false;
         options.speculative.draft_tokens      = 1;
         failures += check(normalize_engine_options(options, infernix::models::Architecture::Qwen3_5, true)

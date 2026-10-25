@@ -90,10 +90,10 @@ struct FastPathConfiguration {
 // Whether the path passed the acceptance gate in this configuration (the registry, section 6.7).
 [[nodiscard]] bool fast_path_qualified(FastPath path, const FastPathConfiguration& configuration);
 
-// Whether --draft-tokens auto decodes without a drafter: where no draft length was measured faster
-// than plain decode for either drafter. The engine then turns speculation off before it binds the
-// drafter (normalize_engine_options), so the drafter's VRAM stays with the expert cache.
-[[nodiscard]] bool auto_drafts_nothing(bool offloaded_experts) noexcept;
+// Whether --draft-tokens auto decodes without the drafter: where none of its draft lengths was measured
+// faster than plain decode. The engine then turns speculation off before it binds the drafter
+// (normalize_engine_options), so the drafter's VRAM stays with the expert cache.
+[[nodiscard]] bool auto_drafts_nothing(bool offloaded_experts, SpeculativeBackend backend) noexcept;
 
 // The fixed draft length --draft-tokens auto runs where its policy (adaptive-mtp, adaptive-dflash)
 // does not (not qualified for the configuration, or fast paths disabled): the single length

@@ -286,6 +286,11 @@ int main() {
         failures += check(q::auto_fixed_draft_tokens(offloaded, SpeculativeBackend::DFlash2) == 1 &&
                               q::auto_fixed_draft_tokens(resident32, SpeculativeBackend::DFlash2) == 3,
                           "offloaded experts draft one under a forced fixed length");
+        failures += check(q::auto_fixed_draft_tokens(offloaded, SpeculativeBackend::Mtp) == 2 &&
+                              !q::auto_drafts_nothing(true, SpeculativeBackend::Mtp) &&
+                              q::auto_drafts_nothing(true, SpeculativeBackend::DFlash2) &&
+                              !q::auto_drafts_nothing(false, SpeculativeBackend::DFlash2),
+                          "offloaded experts' auto drafts two gated MTP drafts and no DFlash2 draft");
         failures += check(q::dflash_width_costs(offloaded, SpeculativeBackend::DFlash2).per_draft == 0.72 &&
                               q::dflash_width_costs(resident32, SpeculativeBackend::DFlash2).per_draft == 0.15,
                           "offloaded experts price a draft column at 0.72 of a plain round");
@@ -426,9 +431,12 @@ int main() {
                           q::fast_path_applies(FastPath::GdnTreeClosedForm, int8_24, auto_trees) &&
                           !q::fast_path_applies(FastPath::GdnTreeClosedForm, int8_24, dflash2) &&
                           !q::couples_requests(FastPath::GdnTreeClosedForm) &&
-                          !q::fast_path_qualified(FastPath::GdnTreeClosedForm, int8_24),
+                          q::fast_path_qualified(FastPath::GdnTreeClosedForm, int8_24) &&
+                          q::fast_path_qualified(FastPath::GdnTreeClosedForm,
+                                                 {16, ActivationClass::A16, KvCacheStorage::Nvfp4Group16}) &&
+                          !q::fast_path_qualified(FastPath::GdnTreeClosedForm, groupwise),
                       "gdn-tree-closed-form applies to every tree configuration, keeps a request invariant "
-                      "and is qualified nowhere");
+                      "and is qualified on the NVFP4 27B and the 35B-A3B");
     failures += check(infernix::parse_fast_path("gdn-tree-closed-form") == FastPath::GdnTreeClosedForm,
                       "gdn-tree-closed-form parses");
     // q5-ksplit-mma: the 16-bit-activation (groupwise) artifacts' Q5 residual projections, on by the owner's

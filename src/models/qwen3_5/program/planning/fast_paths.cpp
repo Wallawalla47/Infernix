@@ -288,6 +288,25 @@ constexpr std::array kQualified{
     Qualification{FastPath::Q5KSplitMma, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, true}},
     Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, true}},
     Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A4, KvCacheStorage::Int8Group64}},
+    // gdn-tree-closed-form by the owner's rule of 2026-10-25 (a path measured faster goes on before its gate), where
+    // measured (ABBA, RTX 5090, INT8 KV, greedy pp1280+tg256, fixed trees of 16, 6 blocks): NVFP4 27B DFlash2
+    // decode +1.19 % (6 of 6, at least +1.01 %; rounds 1.0-1.3 % shorter), 35B-A3B DFlash rounds 1.0-1.7 % shorter in
+    // 6 of 6 (decode +1.6 % where the greedy text matched; elsewhere the changed text moved the round count). Only
+    // the GDN record changes, so every KV format.
+    Qualification{FastPath::GdnTreeClosedForm, {24, ActivationClass::A4, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::GdnTreeClosedForm, {24, ActivationClass::A4, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::GdnTreeClosedForm, {24, ActivationClass::A4, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::GdnTreeClosedForm, {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::GdnTreeClosedForm, {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::GdnTreeClosedForm, {24, ActivationClass::A4, KvCacheStorage::Vq2}},
+    Qualification{FastPath::GdnTreeClosedForm, {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::GdnTreeClosedForm, {16, ActivationClass::A16, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::GdnTreeClosedForm, {16, ActivationClass::A16, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::GdnTreeClosedForm, {16, ActivationClass::A16, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::GdnTreeClosedForm, {16, ActivationClass::A16, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::GdnTreeClosedForm, {16, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::GdnTreeClosedForm, {16, ActivationClass::A16, KvCacheStorage::Vq2}},
+    Qualification{FastPath::GdnTreeClosedForm, {16, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value}},
 };
 
 const char* kv_name(KvCacheStorage kv) {
@@ -456,8 +475,8 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
                !options.speculative.draft_tree_auto &&
                std::any_of(options.speculative.draft_tree_nodes.begin(),
                            options.speculative.draft_tree_nodes.end(), [](std::uint32_t n) { return n != 0; });
-    // Every engine with tree rounds, fixed or automatic: only their GDN records change. Qualified
-    // nowhere yet: a candidate only (op bench against the walk first).
+    // Every engine with tree rounds, fixed or automatic: only their GDN records change. Qualified on the
+    // NVFP4 27B and the 35B-A3B (kQualified).
     case FastPath::GdnTreeClosedForm:
         return options.speculative.draft_tree_auto ||
                std::any_of(options.speculative.draft_tree_nodes.begin(),
@@ -472,21 +491,31 @@ bool fast_path_qualified(FastPath path, const FastPathConfiguration& configurati
     });
 }
 
-bool auto_drafts_nothing(bool offloaded_experts) noexcept {
+bool auto_drafts_nothing(bool offloaded_experts, SpeculativeBackend backend) noexcept {
     // Qwen3.5-122B-A10B (the Qwen3.5 artifact with offloaded experts): each verify column brings its
     // own expert misses, about 10 ms a column against 13.8 ms a plain token (2026-10-22, one request,
-    // bf16 KV, warm cache, 256 tokens of one prompt): MTP 1/2/3 drafts 71.6/66.8/52.9 tok/s and DFlash2
-    // 1/2/4/7/15 65.8/61.3/57.1/35.2/19.2 tok/s against plain 72.5 with the drafter loaded; without one
-    // the expert cache also keeps the drafter's VRAM.
-    return offloaded_experts;
+    // bf16 KV, warm cache, 256 tokens of one prompt): DFlash2 1/2/4/7/15 65.8/61.3/57.1/35.2/19.2 tok/s
+    // against plain 72.5 with the drafter loaded; without one the expert cache also keeps the drafter's
+    // VRAM. MTP's confidence gate verifies only the drafts worth their misses, and its drafts beat plain
+    // decode (auto_fixed_draft_tokens). DFlash2's adaptive-dflash (forced; 2026-10-25, Ornith-1.5-122B, INT8
+    // KV) was 13.5 % faster than plain decode at one request (geometric mean of eight bench-corpus pairs)
+    // but 15.6 % slower at two (sampled docs, decode tok/s; batched rounds plain at one draft 18.3 %), so it
+    // decodes without its drafter.
+    return offloaded_experts && backend != SpeculativeBackend::Mtp;
 }
 
 std::uint32_t auto_fixed_draft_tokens(const FastPathConfiguration& configuration,
                                       SpeculativeBackend backend) noexcept {
-    // Offloaded experts (Qwen3.5-122B-A10B) decode without a drafter under --draft-tokens auto
-    // (auto_drafts_nothing); a fixed length is reached only with a forced policy: one draft, the
-    // fastest of either drafter's fixed lengths there.
-    if (configuration.offloaded_experts) { return 1; }
+    // Offloaded experts (Qwen3.5-122B-A10B, Ornith-1.5-122B): MTP drafts two behind its confidence gate,
+    // 2026-10-25 (RTX 5090, INT8 KV, one request, 256 tokens of three bench-corpus prompts, ABBA, greedy
+    // and temperature 1.0): against plain decode two gated drafts were a geometric mean 14.0 % faster over
+    // eight pairs (greedy +11 % to +26 %, sampled -1.1 % to +25 %), one draft 8.7 %, adaptive-mtp at a
+    // ceiling of 2 tied (13.9 %; greedy worst +1.2 %) and of 3 13.3 %; with two requests on sampled docs two
+    // gated drafts were about 6 % slower than plain decode (each row's verify columns bring their own
+    // misses; skipping the drafter in batched rounds would need a round kind of its own). DFlash2 decodes
+    // without its drafter
+    // (auto_drafts_nothing); a fixed length is reached only with a forced policy: one draft, its fastest.
+    if (configuration.offloaded_experts) { return backend == SpeculativeBackend::Mtp ? 2 : 1; }
     // The block drafters' fastest single fixed lengths overall (code and sampled docs; 2026-10-20 at
     // one request, the NVFP4 27B 2026-10-21/22 also at two and four): the 27B's DFlash2 7 (15 is
     // 12.4 % faster than 7 on code at one request but 1-19 % slower batched, a geometric mean 6.1 %
@@ -496,7 +525,9 @@ std::uint32_t auto_fixed_draft_tokens(const FastPathConfiguration& configuration
     }
     // 2026-10-18 sweeps (INT8 KV; tg512 at concurrency 1, 2 and 4 and sampled text, model-quality.md
     // 6.7): the NVFP4 27B is fastest overall at 5, the groupwise 27B and the 35B-A3B at 3. The KV
-    // format changes the round cost only slightly, so every format takes these.
+    // format changes the round cost only slightly, so every format takes these. The groupwise 27B's
+    // adaptive-mtp, re-timed 2026-10-25 on code and docs at one, two and four requests, won on code
+    // (+10 % at one request) and lost on docs and at four requests (-1.5 %, -4.8 %): it keeps 3.
     if (configuration.query_heads == 24 && configuration.activations == ActivationClass::A4) { return 5; }
     return 3;
 }

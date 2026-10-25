@@ -247,11 +247,11 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
     const bool forced_adaptive = forced(FastPath::AdaptiveSpeculation) &&
                                  (forced(FastPath::AdaptiveDFlash) || forced(FastPath::AdaptiveMtp));
     if (!qwen4_exp && options.speculative.draft_tokens_auto && options.speculative.backend != SpeculativeBackend::None &&
-        models::qwen3_5::auto_drafts_nothing(offloaded_experts) && !forced_adaptive) {
+        models::qwen3_5::auto_drafts_nothing(offloaded_experts, options.speculative.backend) && !forced_adaptive) {
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
-                           "--draft-tokens auto: plain decode is faster than any draft length here (each verified "
-                           "draft brings its own offloaded-expert misses), so the engine decodes without a "
-                           "drafter");
+                           "--draft-tokens auto: plain decode is faster than any of this drafter's lengths here "
+                           "(each verified draft brings its own offloaded-expert misses), so the engine decodes "
+                           "without a drafter");
         options.speculative.backend           = SpeculativeBackend::None;
         options.speculative.draft_tokens      = 0;
         options.speculative.draft_tokens_auto = false;
