@@ -299,6 +299,18 @@ Ornith-1.5-122B (experts in about 70 GiB of RAM; [guide](docs/qwen3_5-122b.md)):
 infernix-serve.exe Ornith-1.5-122B-NVFP4-Infernix-00001-of-00003.infernix --max-context 262144 --max-concurrency 2 --kv-dtype int8 --spec mtp --draft-tokens auto --host-context-mib 4096
 ```
 
+**Recommended settings per model** (each with `--kv-dtype int8`; the drafter flags are the fastest
+measured overall, and `auto` picks the draft length):
+
+| Model | Drafting | What `--draft-tokens auto` does there |
+|---|---|---|
+| Qwen3.8-Flash-Next, every conversion | `--spec dflash2 --draft-model Qwen3.8-Flash-Next-DFlash2-Infernix.infernix --draft-tokens auto --lm-head-draft`, plus `--ngram-volume` (the conversion's own or the FP8 volume, [models](#qwen38-flash-next)) | verifies the drafts of a 7-token block that their calibrated probabilities make worthwhile; without the drafter, `--spec mtp --draft-tokens auto --lm-head-draft` (0-7 drafts a round, about 10 % slower) |
+| Qwen3.8-27B NVFP4 (NVIDIA, Quasar, Uncensored, Swift, NInfer's nvfp4) | `--spec dflash2 --draft-tokens auto --lm-head-draft --ngram-draft-tokens auto` | a 15-draft block verified at the width its probabilities favour (batched rounds: 7), n-gram copies of up to 63 tokens |
+| Qwen3.8-27B groupwise (NInfer's `Qwen3.8-27B-NInfer`) | `--spec dflash2 --draft-tokens auto --lm-head-draft` | 7 drafts every round (its per-round policies were no faster); at one request 54 % faster than MTP's 3 on code, 40 % on docs |
+| Qwen3.6-35B-A3B | `--spec mtp --draft-tokens auto --lm-head-draft` | the per-round MTP length, 1-5 (DFlash `auto` is faster only on code at one request) |
+| Qwen3.6-27B (NVFP4, groupwise) | `--spec mtp --draft-tokens auto --lm-head-draft` | the per-round MTP length where its configuration registers `adaptive-mtp` (startup reports it), else 3 every round |
+| Ornith-1.5-122B | `--spec mtp --draft-tokens auto` | 2 confidence-gated drafts: 14 % faster than plain decode at one request, about 6 % slower while two decode together; DFlash2's `auto` decodes plain |
+
 `--prefix-cache-file PATH` keeps the prefix cache across restarts (Ctrl+C twice saves it and exits).
 `infernix-serve.exe --help` lists every option; `--config FILE` reads them from a TOML file
 ([configuration file](docs/serving.md#configuration-file), example
