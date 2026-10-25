@@ -45,6 +45,8 @@ inline constexpr std::int8_t kKVCacheVq2Codebook[kKVCacheVq2Patterns * 8] = {
 // shared memory. Only relocatable device code (the Op library) can reference it.
 #ifdef __CUDACC_RDC__
 extern __device__ std::int8_t g_kv_cache_vq2_codebook[kKVCacheVq2Patterns * 8];
+// The same table as FP32 values, the encoder's operands (staged without conversions).
+extern __device__ __align__(16) float g_kv_cache_vq2_codebook_f32[kKVCacheVq2Patterns * 8];
 #endif
 
 // Spreads four mask bits to four bytes of 0x00/0xff.

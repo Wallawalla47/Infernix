@@ -3,6 +3,7 @@
 #include "infernix/types.h"
 
 #include <memory>
+#include <string_view>
 
 namespace infernix::product {
 
@@ -22,6 +23,11 @@ public:
 
     [[nodiscard]] StartupObserver observer();
     void engine_ready(const LoadSummary& load);
+    // Warns once when preparation lowers instruction turns that the active chat template cannot
+    // render where they arrived. An explicit --chat-template override is named, because the
+    // measured support comes from whichever template is actually active.
+    void chat_template_roles(infernix::ChatTemplateRoleSupport roles,
+                             std::string_view active_override_path = {});
 
 private:
     struct Impl;

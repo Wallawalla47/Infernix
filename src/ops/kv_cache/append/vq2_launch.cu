@@ -1,6 +1,7 @@
 #include "ops/kv_cache/append/launch.h"
 
 #include "core/device.h"
+#include "core/temporary_switches.h"
 #include "ops/kv_cache/append/vq2_kernel.cuh"
 
 #include <algorithm>
@@ -37,6 +38,51 @@ int vq_append_multiprocessors() {
     return count;
 }
 
+// TEMPORARY (INFERNIX_TMP_VQ_APPEND_V2, candidates §2.3 VQ append), until its A/B: calls of at least
+// one row per SM take the parity-sorted split encoder (kv_cache_append_vq_split_kernel), fewer rows
+// the block kernel staging the FP32 table. With it, INFERNIX_TMP_VQ_APPEND_SPLIT=1|2|4|8 sends every
+// call to the split encoder at that many pattern ranges (Q4KeyVq2Value at least 2), so the tests
+// cover each. Same codes, scales, window slots and tags on every route.
+struct VqAppendSwitches {
+    bool v2   = false;
+    int split = 0; // 0: by rows
+};
+
+const VqAppendSwitches& vq_append_switches() {
+    static const VqAppendSwitches value = [] {
+        VqAppendSwitches switches;
+        switches.v2    = temporary_switches::flag("INFERNIX_TMP_VQ_APPEND_V2");
+        switches.split = static_cast<int>(
+            temporary_switches::integer("INFERNIX_TMP_VQ_APPEND_SPLIT", 0, 0, 8));
+        if (switches.split != 0 && (switches.split & (switches.split - 1)) != 0)
+            throw std::invalid_argument("INFERNIX_TMP_VQ_APPEND_SPLIT must be 1, 2, 4 or 8");
+        return switches;
+    }();
+    return value;
+}
+
+// The split encoder's pattern ranges. From 512 to 8,192 rows the fastest measured (append bench, both
+// geometries, 2026-10-24, RTX 5090; time against the v1 kernels): Q4 keys 8 to 1,024 rows (0.51-0.61x), 4 to 2,048
+// (0.92-0.93x; the rule below took 8 there, 1.08x), then 2 (0.85-0.89x); VQ2 keys 4 to 512 rows (0.61x), then 2
+// (0.58-0.90x; the rule took 0.69-0.95x). Outside that range: the fewest whose passes give every SM two CTAs, else 8.
+template <KVCacheVqKeyCodec Codec>
+int vq_append_split(int rows, int forced, int multiprocessors) {
+    constexpr int least = Codec == KVCacheVqKeyCodec::Q4 ? 2 : 1;
+    if (forced != 0) return std::max(forced, least);
+    if (rows >= 512 && rows <= 8192) {
+        if constexpr (Codec == KVCacheVqKeyCodec::Q4) {
+            return rows <= 1024 ? 8 : rows <= 2048 ? 4 : 2;
+        } else {
+            return rows <= 512 ? 4 : 2;
+        }
+    }
+    for (int split = least; split < 8; split *= 2) {
+        const int pass_rows = kv_cache_vq_split_pass_rows<Codec>(split);
+        if ((rows + pass_rows - 1) / pass_rows >= 2 * multiprocessors) return split;
+    }
+    return 8;
+}
+
 template <typename Geometry, KVCacheVqKeyCodec Codec, KVCacheVqWindowMode Mode, bool MultiBatch,
           typename CacheView, typename Metadata>
 void launch_for(const Tensor& k, const Tensor& v, const Tensor& positions, const CacheView& cache,
@@ -44,15 +90,31 @@ void launch_for(const Tensor& k, const Tensor& v, const Tensor& positions, const
     const auto width = static_cast<std::int32_t>(k.ne[2]);
     const int rows   = 2 * width * Geometry::KVHeads;
     const auto batch = static_cast<unsigned>(MultiBatch ? k.ne[3] : 1);
-    const auto args  = [&](auto kernel, dim3 grid, int threads) {
+    const auto args  = [&](auto kernel, dim3 grid, int threads, auto... extra) {
         kernel<<<grid, threads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(k.data), static_cast<const __nv_bfloat16*>(v.data),
             static_cast<const std::int32_t*>(positions.data), metadata,
             static_cast<std::uint8_t*>(cache.k_pages.data),
             static_cast<std::uint8_t*>(cache.v_pages.data),
             static_cast<__half*>(cache.k_scale_pages.data),
-            static_cast<__half*>(cache.v_scale_pages.data), window, width);
+            static_cast<__half*>(cache.v_scale_pages.data), window, width, extra...);
     };
+    if (const VqAppendSwitches& switches = vq_append_switches(); switches.v2) {
+        const int sms = vq_append_multiprocessors();
+        if (switches.split == 0 && rows < sms) {
+            args(kv_cache_append_vq_kernel<Geometry, Metadata, Codec, Mode, MultiBatch, true>,
+                 dim3(static_cast<unsigned>(rows), 1, batch), kKVCacheVqAppendThreads);
+        } else {
+            const int split     = vq_append_split<Codec>(rows, switches.split, sms);
+            const int pass_rows = kv_cache_vq_split_pass_rows<Codec>(split);
+            const int passes    = (rows + pass_rows - 1) / pass_rows;
+            args(kv_cache_append_vq_split_kernel<Geometry, Metadata, Codec, Mode, MultiBatch>,
+                 dim3(static_cast<unsigned>(std::min(passes, 2 * sms)), 1, batch),
+                 kKVCacheVqSplitThreads, static_cast<std::int32_t>(split));
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     // Each block stages the codebook once and loops over rows. A few rows (a decode or
     // verification step) take a whole block each for the lowest latency; a wide call's rows take a
     // warp each, three blocks per SM, for the highest throughput.

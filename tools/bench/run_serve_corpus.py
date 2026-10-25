@@ -84,9 +84,10 @@ SCENARIO_FIXTURES = {
 
 WARMUP_FIXTURE = "text_smoke_zh"
 RUN_ARTIFACT_TYPE = "infernix_serve_corpus_result"
-RUN_SCHEMA_VERSION = 8
+RUN_SCHEMA_VERSION = 9
 SERVER_LOG_ARTIFACT_TYPE = "infernix_serve_request_log"
-SERVER_LOG_SCHEMA_VERSION = 29
+SERVER_LOG_SCHEMA_VERSION = 31
+REQUEST_LABEL = "run_serve_corpus"
 STARTUP_TIMEOUT_SECONDS = 1800.0
 REQUEST_TIMEOUT_SECONDS = 24.0 * 60.0 * 60.0
 LOG_EVENT_TIMEOUT_SECONDS = 10.0
@@ -433,6 +434,8 @@ def send_json(connection: http.client.HTTPConnection, payload: dict[str, Any]) -
                 "Content-Type": "application/json",
                 "Content-Length": str(len(body)),
                 "Connection": "keep-alive",
+                # The server's request log marks this traffic as a benchmark's.
+                "X-Infernix-Request-Label": REQUEST_LABEL,
             },
         )
     except (OSError, http.client.HTTPException) as exc:
@@ -570,6 +573,7 @@ def build_result_record(
         prepare_seconds = float(timings["prepare"])
         vision_seconds = float(timings["vision"])
         prefill_seconds = float(timings["prefill"])
+        ttft_seconds = float(timings["ttft"])
         decode_seconds = float(timings["decode"])
         total_seconds = float(timings["total"])
         backend = str(speculative["backend"])
@@ -630,7 +634,10 @@ def build_result_record(
         "decode_seconds": decode_seconds,
         "total_seconds": total_seconds,
         "prefill_tok_s": safe_ratio(float(prompt_tokens), prefill_seconds),
-        "server_ttft_ms": 1000.0 * (prepare_seconds + vision_seconds + prefill_seconds),
+        # The server's own first-token time (request_done.timings_seconds.ttft: preparation, queue
+        # wait and every prompt phase to the first committed token). The sum of the prepare, vision
+        # and prefill phases omitted the queue wait and could count only a last chunk's submit.
+        "server_ttft_ms": 1000.0 * ttft_seconds,
         "decode_tok_s": safe_ratio(float(decode_tokens), decode_seconds),
         "speculative_rounds": speculative_rounds,
         "drafted_tokens": drafted_tokens,

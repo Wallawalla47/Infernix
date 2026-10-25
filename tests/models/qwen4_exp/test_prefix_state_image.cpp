@@ -388,8 +388,8 @@ void test_page_records(const TextConfig& c, KvCacheStorage storage, std::size_t 
                                static_cast<std::byte*>(records.data()) + host.page_stride,
                                static_cast<std::byte*>(records.data()) + 2 * host.page_stride};
     const DeviceKVPageHandle source = leases[2].handle(), target = leases[5].handle(), other = leases[6].handle();
-    pool.copy_to_host_records(std::span(&source, 1), std::span(&rec[0], 1), {}, host);
-    pool.copy_to_host_records(std::span(&other, 1), std::span(&rec[2], 1), {}, host);
+    pool.copy_to_host_records(std::span(&source, 1), std::span(&rec[0], 1), {}, host, nullptr);
+    pool.copy_to_host_records(std::span(&other, 1), std::span(&rec[2], 1), {}, host, nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
     std::vector<std::byte> other_before(rec[2], rec[2] + host.page_stride);
     // Into a different page one KV layer at a time, MTP first.
@@ -398,8 +398,8 @@ void test_page_records(const TextConfig& c, KvCacheStorage storage, std::size_t 
         const PlaneRange planes = kv_layer_planes(geometry, k);
         pool.copy_from_host_records(std::span(from, 1), {}, std::span(&target, 1), host, planes.begin, planes.end, nullptr);
     }
-    pool.copy_to_host_records(std::span(&target, 1), std::span(&rec[1], 1), {}, host);
-    pool.copy_to_host_records(std::span(&other, 1), std::span(&rec[2], 1), {}, host);
+    pool.copy_to_host_records(std::span(&target, 1), std::span(&rec[1], 1), {}, host, nullptr);
+    pool.copy_to_host_records(std::span(&other, 1), std::span(&rec[2], 1), {}, host, nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
     require(std::memcmp(rec[0], rec[1], host.page_stride) == 0, "a page moved by KV layers is byte-exact");
     require(std::memcmp(rec[2], other_before.data(), host.page_stride) == 0, "other pages are untouched");

@@ -6,6 +6,7 @@
 //     and no state changes; ple_conv_commit of n columns equals ple_conv_inject over those n;
 //   - qsa_pool_keys without tail updates: pooled keys equal the committing call's, and the tails
 //     do not change; qsa_commit_tails of n columns equals qsa_pool_keys over those n.
+#include "ops/op_family.h"
 #include "infernix/ops/causal_conv1d_silu.h"
 #include "infernix/ops/ple.h"
 #include "infernix/ops/qsa.h"
@@ -240,7 +241,7 @@ void test_qsa(std::int32_t W, std::int32_t B, std::int32_t first_position) {
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(speculative_state_ops) {
     if (infernix::test::cuda_unavailable()) {
         std::printf("SKIP: no usable CUDA device\n");
         return 77;

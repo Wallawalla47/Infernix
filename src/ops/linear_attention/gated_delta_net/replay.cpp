@@ -118,7 +118,11 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
     require_tensor(v, DType::BF16, {kStateDim, value_heads, width, rows}, 2, kOp, "v");
     require_tensor(g, DType::FP32, {value_heads, width, rows}, 4, kOp, "g");
     require_tensor(beta, DType::FP32, {value_heads, width, rows}, 4, kOp, "beta");
-    require_tensor(states, DType::FP32, {kStateDim, kStateDim, value_heads, states.ne[3]}, 16, kOp,
+    // The pooled state: FP32, or FP16 under fp16-gdn-state.
+    if (states.dtype != DType::FP32 && states.dtype != DType::FP16) {
+        throw std::invalid_argument(std::string(kOp) + ": states must be FP32 or FP16");
+    }
+    require_tensor(states, states.dtype, {kStateDim, kStateDim, value_heads, states.ne[3]}, 16, kOp,
                    "states");
     require_tensor(initial_slots, DType::I32, {rows}, 4, kOp, "initial state slots");
     if (valid_columns.data != nullptr) {
@@ -200,17 +204,20 @@ void validate_fold_states(const GdnReplayRecords& records,
         state.conv_channels != record.conv_channels || state.conv_width != 3 ||
         state.value_heads != record.value_heads || state.value_head_dim != kStateDim ||
         state.key_head_dim != kStateDim || state.slot_count <= 0 ||
-        state.conv_dtype != DType::BF16) {
+        state.conv_dtype != DType::BF16 ||
+        (state.recurrent_dtype != DType::FP32 && state.recurrent_dtype != DType::FP16)) {
         throw std::invalid_argument(std::string(kOp) + ": state geometry does not match records");
     }
     require_tensor(states.conv_layer0, DType::BF16, {record.conv_channels, 3, state.slot_count},
                    256, kOp, "conv state layer 0");
-    require_tensor(states.recurrent_layer0, DType::FP32,
+    require_tensor(states.recurrent_layer0, state.recurrent_dtype,
                    {kStateDim, kStateDim, record.value_heads, state.slot_count}, 256, kOp,
                    "recurrent state layer 0");
+    const auto recurrent_element =
+        static_cast<std::int64_t>(state.recurrent_dtype == DType::FP16 ? sizeof(std::uint16_t) : sizeof(float));
     if (states.conv_layer_stride_bytes <= 0 || states.recurrent_layer_stride_bytes <= 0 ||
         states.conv_layer_stride_bytes % static_cast<std::int64_t>(sizeof(std::uint16_t)) != 0 ||
-        states.recurrent_layer_stride_bytes % static_cast<std::int64_t>(sizeof(float)) != 0 ||
+        states.recurrent_layer_stride_bytes % recurrent_element != 0 ||
         static_cast<std::uint64_t>(states.conv_layer_stride_bytes) < states.conv_layer0.bytes() ||
         static_cast<std::uint64_t>(states.recurrent_layer_stride_bytes) <
             states.recurrent_layer0.bytes()) {
@@ -314,7 +321,7 @@ void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tenso
                                    const Tensor& ssm_states, const Tensor& valid_columns,
                                    const Tensor& initial_state_slots, const Tensor& tree_rows,
                                    Tensor& key_record, Tensor& value_record, Tensor& gate_record,
-                                   Tensor& out, cudaStream_t stream) {
+                                   Tensor& out, cudaStream_t stream, GdnTreeRecordRoute route) {
     if (valid_columns.data == nullptr || q.ne[2] < 2 || q.ne[2] > kSpeculativeTreeMaxNodes) {
         throw std::invalid_argument("gated_delta_net_replay_record: a tree needs valid columns "
                                     "and a width of at most 32");
@@ -324,7 +331,7 @@ void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tenso
                            key_record, value_record, gate_record, out);
     detail::gated_delta_net::launch_recurrent_tree_record(
         q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots, tree_rows,
-        key_record, value_record, gate_record, out, stream);
+        key_record, value_record, gate_record, out, stream, route == GdnTreeRecordRoute::ClosedForm);
 }
 
 GdnReplayFoldPlan::GdnReplayFoldPlan(const GdnReplayRecords& records,

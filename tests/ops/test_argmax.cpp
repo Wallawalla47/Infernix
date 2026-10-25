@@ -1,4 +1,5 @@
 #include "infernix/ops/argmax.h"
+#include "ops/op_family.h"
 #include "core/device.h"
 #include <algorithm>
 #include "ops/op_tester.h"
@@ -9,6 +10,7 @@
 #include <cstring>
 #include <iostream>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace infernix;
@@ -93,6 +95,81 @@ std::vector<float> make_logits(std::int32_t physical_rows, std::int32_t tokens, 
     return logits;
 }
 
+// argmax_with_probability on `dtype` logits (values it represents) against independent FP64 oracles: the
+// rows exactly (argmax_oracle) and each column's softmax probability of its argmax,
+// 1 / sum_v exp(l_v - l_max) in FP64 over the represented logits. Fast exponentials, the running rescale
+// and FP32 sums of at most 248,077 terms in [0, 1] stay within 1e-4 relative. Two launches give the same
+// bits (one fixed order per column).
+int probability_case(const std::vector<float>& logits, std::int32_t physical_rows, std::int32_t valid_rows,
+                     std::int32_t tokens, const std::string& label, DType dtype) {
+    const auto rows = argmax_oracle(logits, physical_rows, tokens, valid_rows);
+    std::vector<double> want(static_cast<std::size_t>(tokens));
+    for (std::int32_t t = 0; t < tokens; ++t) {
+        const std::size_t base = static_cast<std::size_t>(t) * physical_rows;
+        const double top       = logits[base + static_cast<std::size_t>(rows[static_cast<std::size_t>(t)])];
+        double sum             = 0.0;
+        for (std::int32_t v = 0; v < valid_rows; ++v) { sum += std::exp(static_cast<double>(logits[base + v]) - top); }
+        want[static_cast<std::size_t>(t)] = 1.0 / sum;
+    }
+    int failures           = 0;
+    const auto bytes       = logit_bytes(logits, dtype);
+    const std::string name = label + " with probability";
+    GuardedDeviceBuffer device_logits(bytes.size());
+    device_logits.copy_from_host(bytes.data(), bytes.size());
+    Tensor logits_tensor(device_logits.data(), dtype, {physical_rows, tokens});
+    const std::size_t workspace_bytes =
+        ops::argmax_with_probability_workspace_bytes(dtype, physical_rows, valid_rows, tokens);
+    WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes + 256));
+    std::vector<std::vector<float>> launches;
+    for (int launch = 0; launch < 2; ++launch) {
+        GuardedDeviceBuffer device_rows(static_cast<std::size_t>(tokens) * sizeof(std::int32_t));
+        GuardedDeviceBuffer device_probability(static_cast<std::size_t>(tokens) * sizeof(float));
+        device_rows.fill(0xcd);
+        device_probability.fill(0xcd);
+        Tensor rows_tensor(device_rows.data(), DType::I32, {tokens});
+        Tensor probability_tensor(device_probability.data(), DType::FP32, {tokens});
+        ops::argmax_with_probability(logits_tensor, rows_tensor, probability_tensor, valid_rows, workspace, nullptr);
+        cuda_synchronize();
+        failures += verify_exact((name + " rows").c_str(),
+                                 from_device<std::int32_t>(device_rows.data(), static_cast<std::size_t>(tokens)),
+                                 rows);
+        launches.push_back(from_device<float>(device_probability.data(), static_cast<std::size_t>(tokens)));
+        failures += device_rows.verify_guards((name + " rows").c_str());
+        failures += device_probability.verify_guards((name + " probability").c_str());
+    }
+    failures += workspace.used() == 0 ? 0 : 1; // the call releases its workspace
+    std::size_t far = 0, unequal = 0;
+    for (std::int32_t t = 0; t < tokens; ++t) {
+        const auto i = static_cast<std::size_t>(t);
+        far += std::fabs(launches[0][i] - want[i]) > 1e-4 * want[i];
+        unequal += std::memcmp(&launches[0][i], &launches[1][i], sizeof(float)) != 0;
+    }
+    if (far != 0 || unequal != 0) {
+        std::cerr << "FAIL: " << name << ": " << far << " columns outside 1e-4 of FP64, " << unequal
+                  << " columns differ between launches\n";
+        ++failures;
+    }
+    failures += device_logits.verify_guards((name + " logits").c_str());
+    return failures;
+}
+
+// Draft-head-like logits on the BF16 grid: one column per draft confidence, a leading row of logit `lead`
+// over unit-spread noise, so the probabilities span the extent policy's buckets.
+std::vector<float> make_draft_logits(std::int32_t physical_rows, std::int32_t valid_rows, std::int32_t tokens) {
+    const auto grid = [](float value) { return bf16_to_f32(f32_to_bf16(value)); };
+    std::vector<float> logits(static_cast<std::size_t>(physical_rows) * tokens);
+    for (std::int32_t t = 0; t < tokens; ++t) {
+        const std::size_t base = static_cast<std::size_t>(t) * physical_rows;
+        for (std::int32_t row = 0; row < physical_rows; ++row) {
+            const std::uint32_t mixed = static_cast<std::uint32_t>(row) * 2654435761u + static_cast<std::uint32_t>(t) * 40503u;
+            logits[base + row]        = grid(-2.0f + static_cast<float>(mixed % 1024u) * (1.0f / 512.0f));
+        }
+        const float lead = 8.0f + 2.0f * static_cast<float>(t);
+        logits[base + static_cast<std::size_t>((t * 104729 + 31) % valid_rows)] = grid(lead);
+    }
+    return logits;
+}
+
 int run_case(std::int32_t physical_rows, std::int32_t valid_rows, std::int32_t tokens,
              DType dtype = DType::BF16) {
     auto logits   = make_logits(physical_rows, tokens, valid_rows, dtype);
@@ -147,33 +224,13 @@ int run_case(std::int32_t physical_rows, std::int32_t valid_rows, std::int32_t t
     failures += device_logits.verify_guards((label + " logits").c_str());
     failures += device_output.verify_guards((label + " output").c_str());
 
-    // The selected rows' softmax probability (argmax_probability) against its FP64 formula: fast
-    // exponentials and an FP32 sum of at most 248,077 terms in [0, 1] stay within 1e-4 relative.
-    GuardedDeviceBuffer device_probability(static_cast<std::size_t>(tokens) * sizeof(float));
-    Tensor probability_tensor(device_probability.data(), DType::FP32, {tokens});
-    ops::argmax_probability(logits_tensor, output_tensor, probability_tensor, valid_rows, nullptr);
-    cuda_synchronize();
-    const auto probability = from_device<float>(device_probability.data(), static_cast<std::size_t>(tokens));
-    std::size_t far = 0;
-    for (std::int32_t t = 0; t < tokens; ++t) {
-        const std::size_t base = static_cast<std::size_t>(t) * physical_rows;
-        const double reference = logits[base + static_cast<std::size_t>(actual[static_cast<std::size_t>(t)])];
-        double sum             = 0.0;
-        for (std::int32_t v = 0; v < valid_rows; ++v) { sum += std::exp(logits[base + v] - reference); }
-        const double want = 1.0 / sum;
-        far += std::fabs(probability[static_cast<std::size_t>(t)] - want) > 1e-4 * want;
-    }
-    if (far != 0) {
-        std::cerr << "FAIL: " << label << " probability: " << far << " columns outside 1e-4 of FP64\n";
-        ++failures;
-    }
-    failures += device_probability.verify_guards((label + " probability").c_str());
+    failures += probability_case(logits, physical_rows, valid_rows, tokens, label, dtype);
     return failures;
 }
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(argmax) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
@@ -203,6 +260,18 @@ int main() {
     failures += run_case(131072, 131072, 120, DType::FP32);
     failures += run_case(248318, 248077, 8, DType::FP32);
     failures += run_case(4096, 4093, 3, DType::FP32);
+    // The MTP draft head's shapes (full vocabulary, the 131,072-row proposal head) at its batch sizes,
+    // with confidences across the extent policy's buckets; and a domain of one block (column route).
+    for (const auto& [physical, valid] : {std::pair{248320, 248077}, std::pair{131072, 131072}, std::pair{512, 509}}) {
+        for (const std::int32_t tokens : {1, 2, 5, 8}) {
+            for (const DType dtype : {DType::BF16, DType::FP32}) {
+                failures += probability_case(make_draft_logits(physical, valid, tokens), physical, valid, tokens,
+                                             std::string("draft head ") + (dtype == DType::FP32 ? "FP32" : "BF16") +
+                                                 " rows=" + std::to_string(physical) + " T=" + std::to_string(tokens),
+                                             dtype);
+            }
+        }
+    }
     std::cout << (failures ? "FAIL" : "OK") << " argmax\n";
     return failures ? 1 : 0;
 }

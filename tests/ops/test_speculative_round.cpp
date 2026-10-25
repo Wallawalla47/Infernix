@@ -1,4 +1,6 @@
 #include "infernix/ops/speculative_round.h"
+#include "ops/op_family.h"
+#include "infernix/ops/argmax.h"
 #include "ops/host_parallel.h"
 #include "ops/op_tester.h"
 #include "core/decode_graph.h"
@@ -14,8 +16,10 @@
 #include <iostream>
 #include <limits>
 #include <optional>
+#include <random>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -429,11 +433,15 @@ struct SparseAcceptSuite {
     int sample_sparse_residual(const TargetDistribution& target,
                                const std::vector<std::int32_t>& candidate_ids,
                                const std::vector<float>& proposal_q, int row, int draft,
-                               double uniform) {
+                               double uniform, bool subtract_q) {
+        const auto proposal = [&](int token) {
+            return subtract_q
+                       ? sparse_proposal_probability(candidate_ids, proposal_q, row, draft, token)
+                       : 0.0;
+        };
         double mass = 0.0;
         for (std::size_t item = 0; item < target.ids.size(); ++item) {
-            const double q = sparse_proposal_probability(candidate_ids, proposal_q, row, draft,
-                                                         target.ids[item]);
+            const double q = proposal(target.ids[item]);
             mass += std::max(target.probabilities[item] - q, 0.0);
         }
         if (!(mass > 0.0)) return target.ids.front();
@@ -441,8 +449,7 @@ struct SparseAcceptSuite {
         double cumulative = 0.0;
         int selected      = target.ids.back();
         for (std::size_t item = 0; item < target.ids.size(); ++item) {
-            const double q = sparse_proposal_probability(candidate_ids, proposal_q, row, draft,
-                                                         target.ids[item]);
+            const double q = proposal(target.ids[item]);
             const double residual = std::max(target.probabilities[item] - q, 0.0);
             if (!(residual > 0.0)) continue;
             cumulative += residual;
@@ -460,6 +467,71 @@ struct SparseAcceptSuite {
         std::vector<std::int32_t> anchors;
     };
 
+    // Block verification's host form (speculative_round.h) for one sampled row of `extent` drafts:
+    // its accepted count and terminal token, from FP64 laws of the same processed targets.
+    std::pair<int, int> sparse_block_row(const std::vector<std::uint16_t>& logits, int row, int extent,
+                                         const std::vector<std::int32_t>& drafts,
+                                         const std::vector<std::int32_t>& candidate_ids,
+                                         const std::vector<float>& proposal_q,
+                                         const ops::SamplingConfig& config,
+                                         const std::vector<std::int32_t>& token_counts, int length,
+                                         std::vector<std::int32_t>& draft_counts) {
+        std::vector<TargetDistribution> targets;
+        for (int column = 0; column <= extent; ++column) {
+            targets.push_back(sparse_target_distribution(logits, row, column, config, token_counts, drafts,
+                                                         draft_counts));
+        }
+        double weight = 1.0, accepted_weight = 1.0;
+        int tau       = 0;
+        for (int i = 1; i <= extent; ++i) {
+            const int column = i - 1;
+            const int draft  = drafts[static_cast<std::size_t>(row) * kSparseDrafts + column];
+            const double p   = distribution_probability(targets[static_cast<std::size_t>(column)], draft);
+            const double q   = sparse_proposal_probability(candidate_ids, proposal_q, row, column, draft);
+            weight           = q > 0.0 ? std::min(weight * p / q, 1.0) : 0.0;
+            double threshold = weight;
+            if (i < extent) {
+                const TargetDistribution& next = targets[static_cast<std::size_t>(i)];
+                double s                       = 0.0;
+                for (std::size_t item = 0; item < next.ids.size(); ++item) {
+                    s += std::max(weight * next.probabilities[item] -
+                                      sparse_proposal_probability(candidate_ids, proposal_q, row, i, next.ids[item]),
+                                  0.0);
+                }
+                const double denominator = s + 1.0 - weight;
+                threshold                = denominator > 0.0 ? s / denominator : 1.0;
+            }
+            if (oracle_uniform(config.seed, length + i, ops::kSamplePurposeSpeculativeAccept) <= threshold) {
+                tau             = i;
+                accepted_weight = weight;
+            }
+        }
+        const TargetDistribution& at = targets[static_cast<std::size_t>(tau)];
+        if (tau == extent) {
+            return {tau, sample_target_distribution(
+                             at, oracle_uniform(config.seed, length + extent + 1, ops::kSamplePurposeSpeculativeBonus))};
+        }
+        const auto residual = [&](std::size_t item) {
+            return std::max(accepted_weight * at.probabilities[item] -
+                                sparse_proposal_probability(candidate_ids, proposal_q, row, tau, at.ids[item]),
+                            0.0);
+        };
+        double mass = 0.0;
+        for (std::size_t item = 0; item < at.ids.size(); ++item) mass += residual(item);
+        if (!(mass > 0.0)) return {tau, at.ids.front()};
+        const double goal = oracle_uniform(config.seed, length + tau + 1, ops::kSamplePurposeSpeculativeCorrection) * mass;
+        double cumulative = 0.0;
+        int selected      = at.ids.back();
+        for (std::size_t item = 0; item < at.ids.size(); ++item) {
+            const double value = residual(item);
+            if (!(value > 0.0)) continue;
+            cumulative += value;
+            selected = at.ids[item];
+            if (goal < cumulative) return {tau, selected};
+        }
+        return {tau, selected};
+    }
+
     SparseExpected sparse_accept_oracle(const std::vector<std::uint16_t>& logits,
                                         const std::vector<std::int32_t>& drafts,
                                         const std::vector<std::int32_t>& candidate_ids,
@@ -467,7 +539,8 @@ struct SparseAcceptSuite {
                                         const std::vector<std::int32_t>& extents,
                                         const std::vector<std::int32_t>& initial_lengths,
                                         const std::vector<ops::SamplingConfig>& configs,
-                                        const std::vector<std::int32_t>& token_counts) {
+                                        const std::vector<std::int32_t>& token_counts,
+                                        bool block = false) {
         SparseExpected expected{
             .licensed_tokens = std::vector<std::int32_t>(kSparseColumns * kSparseBatch, 0),
             .licensed_counts = std::vector<std::int32_t>(kSparseBatch),
@@ -483,7 +556,16 @@ struct SparseAcceptSuite {
                     std::clamp(extents[static_cast<std::size_t>(row)], 0, kSparseDrafts);
                 int accepted_count = 0;
                 int terminal_token = 0;
-                for (int column = 0; column <= extent; ++column) {
+                const bool block_row =
+                    block && configs[static_cast<std::size_t>(row)].temperature > 0.0f &&
+                    !configs[static_cast<std::size_t>(row)].gumbel_max;
+                if (block_row) {
+                    std::tie(accepted_count, terminal_token) = sparse_block_row(
+                        logits, row, extent, drafts, candidate_ids, proposal_q,
+                        configs[static_cast<std::size_t>(row)], token_counts,
+                        initial_lengths[static_cast<std::size_t>(row)], draft_counts);
+                }
+                for (int column = 0; !block_row && column <= extent; ++column) {
                     const TargetDistribution target = sparse_target_distribution(
                         logits, row, column, configs[static_cast<std::size_t>(row)], token_counts,
                         drafts, draft_counts);
@@ -514,7 +596,9 @@ struct SparseAcceptSuite {
                         oracle_uniform(configs[static_cast<std::size_t>(row)].seed,
                                        initial_lengths[static_cast<std::size_t>(row)] + column + 1,
                                        ops::kSamplePurposeSpeculativeAccept);
-                    if (p >= q || uniform * q < p) {
+                    // A draft missing from its candidates (q = 0) is rejected and corrected
+                    // from p itself.
+                    if (q > 0.0 && (p >= q || uniform * q < p)) {
                         ++accepted_count;
                         continue;
                     }
@@ -523,7 +607,7 @@ struct SparseAcceptSuite {
                                        initial_lengths[static_cast<std::size_t>(row)] + column + 1,
                                        ops::kSamplePurposeSpeculativeCorrection);
                     terminal_token = sample_sparse_residual(target, candidate_ids, proposal_q, row,
-                                                            column, correction_uniform);
+                                                            column, correction_uniform, q > 0.0);
                     break;
                 }
 
@@ -553,7 +637,7 @@ struct SparseAcceptSuite {
         ops::SpeculativeAcceptExecutionEnvelope envelope, bool mtp_onehot = false) {
         const SparseExpected expected =
             sparse_accept_oracle(logits, drafts, candidate_ids, proposal_q, extents,
-                                 initial_lengths, host_configs, token_counts);
+                                 initial_lengths, host_configs, token_counts, envelope.block_verification);
 
         DeviceBuffer d_target_tokens                    = to_device(target_tokens);
         DeviceBuffer d_logits                           = upload_logits(logits);
@@ -700,8 +784,8 @@ struct SparseAcceptSuite {
                                                candidate_ids[base + rank] !=
                                                    drafts[row * kSparseDrafts + column])
                                             ++rank;
-                                        if (rank == 16)
-                                            throw std::runtime_error("invalid proposal fixture");
+                                        // A proposal-miss fixture keeps its q.
+                                        if (rank == 16) continue;
                                         std::fill_n(replay_q.begin() + base, 16, 0.0f);
                                         replay_q[base + rank]            = 0.75f;
                                         replay_q[base + (rank + 1) % 16] = 0.25f;
@@ -726,7 +810,8 @@ struct SparseAcceptSuite {
                     cuda_synchronize(stream);
                     const auto wanted = sparse_accept_oracle(current_logits, drafts, candidate_ids,
                                                              current_q, next_extents, next_lengths,
-                                                             host_configs, token_counts);
+                                                             host_configs, token_counts,
+                                                             envelope.block_verification);
                     failures += check_result(wanted, " replay " + std::to_string(pass));
                     if (change_inputs) {
                         failures += verify_logits_unchanged("replay logits readonly", d_logits, current_logits);
@@ -822,7 +907,9 @@ struct SparseAcceptSuite {
                                           anchors, configs, history, {!general});
     }
 
-    int generated_general_case(bool one_hot = false, bool mtp_onehot = false, int variant = 0) {
+    // block: the sampled rows accept by block verification (the greedy rows are unchanged).
+    int generated_general_case(bool one_hot = false, bool mtp_onehot = false, int variant = 0,
+                               bool block = false) {
         std::vector<int> targets(kSparseColumns * kSparseBatch),
             drafts(kSparseDrafts * kSparseBatch);
         std::vector<std::uint16_t> logits(static_cast<std::size_t>(kSparsePhysicalRows) *
@@ -887,11 +974,14 @@ struct SparseAcceptSuite {
             }
         }
         return execute_sparse_accept_case(std::string(mtp_onehot ? "MTP onehot" : "sparse") +
+                                              (block ? " block" : "") +
                                               " general K=" + std::to_string(kSparseDrafts) +
                                               " B=" + std::to_string(kSparseBatch) +
                                               " variant=" + std::to_string(variant),
                                           targets, logits, drafts, ids, q, extents, lengths,
-                                          anchors, configs, history, {false}, mtp_onehot);
+                                          anchors, configs, history,
+                                          {.all_rows_greedy_without_penalties = false, .block_verification = block},
+                                          mtp_onehot);
     }
 
     int grammar_mask_case() {
@@ -1061,6 +1151,30 @@ struct SparseAcceptSuite {
 
         // Row 5 is raw greedy inside the general mixed-batch route.
         configs[5].temperature = 0.0f;
+
+        // Proposal misses: a first draft outside its 16 candidates has q = 0 and must be rejected
+        // even when p >= q. Row 6's miss has p = 0 (once accepted unconditionally) over the target
+        // p(a) = p(b) = 1/2 with q(a) = 0.9, q(b) = 0.1: the residual max(p - q, 0) would always
+        // give b, but the correction is drawn from p, and u < 1/2 gives a. Row 7's miss is the
+        // target's only token (p = 1): it is rejected and redrawn from p, which emits the same
+        // token with no draft accepted.
+        const int row6_miss = 230000 + 6;
+        const int row6_a    = candidate_ids[sparse_candidate_index(6, 0, 0)];
+        const int row6_b    = candidate_ids[sparse_candidate_index(6, 0, 1)];
+        drafts[6 * kSparseDrafts]                 = row6_miss;
+        configs[6].top_k                          = 2;
+        logits[sparse_logit_index(6, 0, row6_a)]  = f32_to_bf16(1.0f);
+        logits[sparse_logit_index(6, 0, row6_b)]  = f32_to_bf16(1.0f);
+        targets[6 * kSparseColumns]               = row6_a;
+        proposal_q[sparse_candidate_index(6, 0, 0)] = 0.9f;
+        proposal_q[sparse_candidate_index(6, 0, 1)] = 0.1f;
+        configs[6].seed = find_seed_for_uniform(
+            lengths[6] + 1, ops::kSamplePurposeSpeculativeCorrection, 0.10f, 0.40f);
+        const int row7_miss = 230000 + 7;
+        logits[sparse_logit_index(7, 0, drafts[7 * kSparseDrafts])] = f32_to_bf16(-20.0f);
+        drafts[7 * kSparseDrafts]                                   = row7_miss;
+        logits[sparse_logit_index(7, 0, row7_miss)]                 = f32_to_bf16(12.0f);
+        targets[7 * kSparseColumns]                                 = row7_miss;
 
         return execute_sparse_accept_case(
             "sparse speculative general mixed B=8", targets, logits, drafts, candidate_ids,
@@ -1283,6 +1397,186 @@ int greedy_penalty_case(int token_domain) {
         bits, token_domain, drafts, 100, token_domain, config, counts, expected);
 }
 
+// A verification column without a finite logit (every value NaN) sets the row's
+// SamplingConfig::nonfinite flag and selects token 0 in its place, on the single-block (64) and
+// multi-block (257) routes; the finite column before it is still verified and accepted.
+int nonfinite_column_case(int token_domain) {
+    constexpr int k = 2;
+    const std::vector<std::int32_t> drafts{1, 1};
+    const std::vector<std::int32_t> raw_targets{1, 1, 1};
+    std::vector<float> logits(static_cast<std::size_t>(token_domain) * (k + 1), -20.0F);
+    logits[1] = 5.0F;
+    for (int token = 0; token < token_domain; ++token) {
+        logits[static_cast<std::size_t>(token_domain + token)] = std::numeric_limits<float>::quiet_NaN();
+    }
+    std::vector<std::uint16_t> bits(logits.size());
+    for (std::size_t index = 0; index < logits.size(); ++index) {
+        bits[index] = f32_to_bf16(logits[index]);
+    }
+
+    GuardedDeviceBuffer flag(sizeof(std::int32_t));
+    initialize(flag, std::vector<std::int32_t>{0});
+    ops::SamplingConfig config{};
+    config.temperature      = 0.0F;
+    config.presence_penalty = 1.0F; // the general route, which selects from the logits
+    config.nonfinite        = static_cast<std::int32_t*>(flag.data());
+    const std::vector<std::int32_t> counts(static_cast<std::size_t>(token_domain), 0);
+    const auto expected     = accept_state_oracle(drafts, 1, 0, 100);
+    const std::string label = "speculative non-finite column token-domain=" + std::to_string(token_domain);
+    int failures = execute_accept_case(label, raw_targets, bits, token_domain, drafts, 100, token_domain,
+                                       config, counts, expected);
+    failures += verify_exact((label + " flag").c_str(), read<std::int32_t>(flag, 1), {1});
+    failures += flag.verify_guards((label + " flag guards").c_str());
+    return failures;
+}
+
+// The raw greedy route takes its targets as given (ops::argmax publishes row 0 for an all-NaN
+// column). A reached column whose target's logit is NaN sets the row's flag with the tokens
+// unchanged; the same NaN column left unreached by an earlier rejection, and a finite round, do
+// not. Single-block (64) and multi-block (257) routes.
+int raw_greedy_nonfinite_case(int token_domain) {
+    constexpr int k = 2;
+    const std::vector<std::int32_t> drafts{1, 1};
+    std::vector<float> logits(static_cast<std::size_t>(token_domain) * (k + 1), -20.0F);
+    logits[1] = 5.0F;
+    for (int token = 0; token < token_domain; ++token) {
+        logits[static_cast<std::size_t>(token_domain + token)] = std::numeric_limits<float>::quiet_NaN();
+    }
+    std::vector<std::uint16_t> nan_bits(logits.size());
+    for (std::size_t index = 0; index < logits.size(); ++index) {
+        nan_bits[index] = f32_to_bf16(logits[index]);
+    }
+    std::vector<std::uint16_t> finite_bits = nan_bits;
+    for (int token = 0; token < token_domain; ++token) {
+        finite_bits[static_cast<std::size_t>(token_domain + token)] = f32_to_bf16(-20.0F);
+    }
+    finite_bits[static_cast<std::size_t>(token_domain)] = f32_to_bf16(5.0F); // column 1 argmax: 0
+
+    struct Case {
+        const char* name;
+        std::vector<std::int32_t> targets;
+        const std::vector<std::uint16_t>* bits;
+        int accepted;
+        std::int32_t terminal;
+        int flag;
+    };
+    const Case cases[] = {
+        {"reached NaN column", {1, 0, 0}, &nan_bits, 1, 0, 1},
+        {"unreached NaN column", {2, 0, 0}, &nan_bits, 0, 2, 0},
+        {"finite round", {1, 0, 0}, &finite_bits, 1, 0, 0},
+    };
+    int failures = 0;
+    for (const Case& c : cases) {
+        GuardedDeviceBuffer flag(sizeof(std::int32_t));
+        initialize(flag, std::vector<std::int32_t>{0});
+        ops::SamplingConfig config{};
+        config.nonfinite = static_cast<std::int32_t*>(flag.data());
+        const std::vector<std::int32_t> counts(static_cast<std::size_t>(token_domain), 0);
+        const auto expected = accept_state_oracle(drafts, c.accepted, c.terminal, 100);
+        const std::string label =
+            std::string("speculative raw greedy ") + c.name + " token-domain=" + std::to_string(token_domain);
+        failures += execute_accept_case(label, c.targets, *c.bits, token_domain, drafts, 100, token_domain, config,
+                                        counts, expected);
+        failures += verify_exact((label + " flag").c_str(), read<std::int32_t>(flag, 1), {c.flag});
+        failures += flag.verify_guards((label + " flag guards").c_str());
+    }
+    return failures;
+}
+
+// The sparse Op's raw greedy route (one warp per row) at the registered profile: row 0 reaches its
+// all-NaN column 1 (flag set), row 1 rejects at column 0 before the same column (flag clear). The
+// licensed tokens are the targets' either way.
+int sparse_raw_greedy_nonfinite_case() {
+    constexpr int k = 2, columns = k + 1, batch = 2;
+    const std::vector<std::int32_t> drafts{11, 12, 11, 12};             // [K,B]
+    const std::vector<std::int32_t> targets{11, 0, 7, 13, 0, 7};        // [K+1,B]
+    std::vector<std::uint16_t> logits(static_cast<std::size_t>(kSparsePhysicalRows) * columns * batch,
+                                      f32_to_bf16(-20.0F));
+    const auto at = [&](int row, int column, int token) {
+        return (static_cast<std::size_t>(row) * columns + column) * kSparsePhysicalRows + token;
+    };
+    for (int row = 0; row < batch; ++row) {
+        for (int column = 0; column < columns; ++column) {
+            logits[at(row, column, targets[static_cast<std::size_t>(row * columns + column)])] = f32_to_bf16(9.0F);
+        }
+        for (int token = 0; token < kSparsePhysicalRows; ++token) {
+            logits[at(row, 1, token)] = f32_to_bf16(std::numeric_limits<float>::quiet_NaN());
+        }
+    }
+    std::vector<std::int32_t> ids(static_cast<std::size_t>(kSparseCandidates) * k * batch);
+    for (std::size_t i = 0; i < ids.size(); ++i) { ids[i] = static_cast<std::int32_t>(1000 + i); }
+    std::vector<float> q(ids.size(), 0.0F);
+    for (std::size_t i = 0; i < q.size(); i += kSparseCandidates) { q[i] = 1.0F; }
+
+    GuardedDeviceBuffer flags(batch * sizeof(std::int32_t));
+    initialize(flags, std::vector<std::int32_t>{0, 0});
+    std::vector<ops::SamplingConfig> configs(batch);
+    for (int row = 0; row < batch; ++row) {
+        configs[static_cast<std::size_t>(row)].nonfinite = static_cast<std::int32_t*>(flags.data()) + row;
+    }
+    DeviceBuffer d_targets = to_device(targets), d_logits = to_device(logits), d_drafts = to_device(drafts);
+    DeviceBuffer d_ids = to_device(ids), d_q = to_device(q), d_configs = to_device(configs);
+    DeviceBuffer d_extents = to_device(std::vector<std::int32_t>{k, k});
+    GuardedDeviceBuffer d_lengths(batch * sizeof(std::int32_t)), d_anchors(batch * sizeof(std::int32_t));
+    GuardedDeviceBuffer d_licensed(columns * batch * sizeof(std::int32_t));
+    GuardedDeviceBuffer d_counts(batch * sizeof(std::int32_t)), d_accepted(batch * sizeof(std::int32_t));
+    initialize(d_lengths, std::vector<std::int32_t>{50, 60});
+    initialize(d_anchors, std::vector<std::int32_t>{-1, -1});
+
+    Tensor target_tensor(d_targets.p, DType::I32, {columns, batch});
+    Tensor logits_tensor(d_logits.p, DType::BF16, {kSparsePhysicalRows, columns, batch});
+    Tensor draft_tensor(d_drafts.p, DType::I32, {k, batch});
+    Tensor id_tensor(d_ids.p, DType::I32, {kSparseCandidates, k, batch});
+    Tensor q_tensor(d_q.p, DType::FP32, {kSparseCandidates, k, batch});
+    Tensor extent_tensor(d_extents.p, DType::I32, {batch});
+    Tensor lengths(d_lengths.data(), DType::I32, {batch});
+    Tensor anchors(d_anchors.data(), DType::I32, {batch});
+    Tensor licensed(d_licensed.data(), DType::I32, {columns, batch});
+    Tensor counts(d_counts.data(), DType::I32, {batch});
+    Tensor accepted(d_accepted.data(), DType::I32, {batch});
+    const ops::SpeculativeAcceptExecutionEnvelope raw{true};
+    WorkspaceArena workspace(std::max<std::size_t>(
+        256, ops::speculative_accept_sparse_drafts_workspace_capacity_bytes(kSparseTokenDomain, raw, k, k, batch,
+                                                                             batch)));
+    ops::speculative_accept_sparse_drafts(target_tensor, logits_tensor, draft_tensor, id_tensor, q_tensor,
+                                          extent_tensor, lengths, anchors, licensed, counts, accepted,
+                                          kSparseTokenDomain, static_cast<const ops::SamplingConfig*>(d_configs.p),
+                                          raw, workspace, nullptr);
+    cuda_synchronize();
+
+    int failures = verify_exact("sparse raw greedy non-finite licensed tokens", read<std::int32_t>(d_licensed, 6),
+                                {11, 0, 0, 13, 0, 0});
+    failures += verify_exact("sparse raw greedy non-finite accepted", read<std::int32_t>(d_accepted, 2), {1, 0});
+    failures += verify_exact("sparse raw greedy non-finite flags", read<std::int32_t>(flags, 2), {1, 0});
+    failures += flags.verify_guards("sparse raw greedy non-finite flag guards");
+    failures += d_licensed.verify_guards("sparse raw greedy non-finite licensed guards");
+    return failures;
+}
+
+// ops::argmax publishes row 0 for an all-NaN column on both of its routes (the raw greedy check
+// above relies on an in-range target): one CTA per column (64 rows) and the tiled atomic route
+// (the real vocabulary).
+int argmax_nan_column_case() {
+    int failures = 0;
+    for (const auto [physical_rows, valid_rows] : {std::pair{64, 64}, std::pair{248320, 248077}}) {
+        std::vector<std::uint16_t> bits(static_cast<std::size_t>(physical_rows) * 2,
+                                        f32_to_bf16(std::numeric_limits<float>::quiet_NaN()));
+        for (int row = 0; row < physical_rows; ++row) { bits[static_cast<std::size_t>(physical_rows + row)] = f32_to_bf16(-1.0F); }
+        bits[static_cast<std::size_t>(physical_rows + valid_rows / 2)] = f32_to_bf16(3.0F);
+        DeviceBuffer d_logits = to_device(bits);
+        GuardedDeviceBuffer d_out(2 * sizeof(std::int32_t));
+        initialize(d_out, std::vector<std::int32_t>{-5, -5});
+        Tensor logits(d_logits.p, DType::BF16, {physical_rows, 2});
+        Tensor out(d_out.data(), DType::I32, {2});
+        ops::argmax(logits, out, valid_rows, nullptr);
+        cuda_synchronize();
+        failures += verify_exact(("argmax all-NaN column rows=" + std::to_string(valid_rows)).c_str(),
+                                 read<std::int32_t>(d_out, 2), {0, valid_rows / 2});
+        failures += d_out.verify_guards("argmax all-NaN column guards");
+    }
+    return failures;
+}
+
 int batched_sampling_workspace_stride_case() {
     constexpr int physical_rows = 257;
     constexpr int token_domain  = 257;
@@ -1481,6 +1775,146 @@ int transforms_conformance() {
     failures += remap_case(1);
     failures += remap_case(15);
     failures += remap_case(120);
+    return failures;
+}
+
+// block-verification's output distribution. Every column's target is the same four-token law and
+// every draft is drawn on the host from a different proposal law over those tokens, so the block
+// rule's acceptance and residual both matter. The emitted text must follow the target: the first
+// token, and the second (the round's own, or for a round that emitted one token the next round's
+// first, a fresh target draw since the columns repeat) with the first, by token and pair.
+int block_distribution_case(int k) {
+    constexpr int batch = 8, trials = 8192 / batch;
+    const int width     = k + 1;
+    const std::array<float, 4> requested{0.6F, 0.25F, 0.1F, 0.05F};
+    const std::array<double, 4> proposal{0.3, 0.4, 0.2, 0.1};
+    std::array<double, 4> probabilities{};
+    double total = 0;
+    for (int id = 0; id < 4; ++id) {
+        probabilities[id] = std::exp(bf16_to_f32(f32_to_bf16(std::log(requested[id]))));
+        total += probabilities[id];
+    }
+    for (auto& probability : probabilities) { probability /= total; }
+    std::vector<std::uint16_t> logits(static_cast<std::size_t>(kSparsePhysicalRows) * width * batch,
+                                      f32_to_bf16(-std::numeric_limits<float>::infinity()));
+    for (int row = 0; row < width * batch; ++row) {
+        for (int id = 0; id < 4; ++id) {
+            logits[static_cast<std::size_t>(row) * kSparsePhysicalRows + id] = f32_to_bf16(std::log(requested[id]));
+        }
+    }
+    std::vector<int> ids(16 * k * batch), zero(width * batch, 0);
+    std::vector<float> q(ids.size(), 0);
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        ids[i] = static_cast<int>(i % 16);
+        q[i]   = i % 16 < 4 ? static_cast<float>(proposal[i % 16]) : 0.0F;
+    }
+    auto d_logits = to_device(logits);
+    auto d_ids    = to_device(ids);
+    auto d_q      = to_device(q);
+    auto d_zero   = to_device(zero);
+    auto d_drafts = to_device(std::vector<int>(k * batch, 0));
+    const std::vector<int> initial_anchors(batch, 0), initial_lengths(batch, 100);
+    auto d_anchors = to_device(initial_anchors);
+    auto d_extents = to_device(std::vector<int>(batch, k));
+    auto d_lengths = to_device(initial_lengths);
+    auto d_history = to_device(std::vector<int>(static_cast<std::size_t>(batch) * kSparseTokenDomain, 0));
+    std::vector<ops::SamplingConfig> configs(batch);
+    for (int row = 0; row < batch; ++row) {
+        configs[row].temperature  = 1;
+        configs[row].top_k        = 4;
+        configs[row].top_p        = 1;
+        configs[row].token_counts = static_cast<int*>(d_history.p) + row * kSparseTokenDomain;
+    }
+    auto d_configs = to_device(configs);
+    GuardedDeviceBuffer licensed(width * batch * sizeof(int)), counts(batch * sizeof(int)),
+        accepted(batch * sizeof(int));
+    Tensor target(d_zero.p, DType::I32, {width, batch});
+    Tensor target_logits(d_logits.p, DType::BF16, {kSparsePhysicalRows, width, batch});
+    Tensor drafts(d_drafts.p, DType::I32, {k, batch});
+    Tensor candidates(d_ids.p, DType::I32, {16, k, batch});
+    Tensor proposal_q(d_q.p, DType::FP32, {16, k, batch});
+    Tensor extents(d_extents.p, DType::I32, {batch});
+    Tensor lengths(d_lengths.p, DType::I32, {batch});
+    Tensor anchors(d_anchors.p, DType::I32, {batch});
+    Tensor output(licensed.data(), DType::I32, {width, batch});
+    Tensor output_counts(counts.data(), DType::I32, {batch});
+    Tensor output_accepted(accepted.data(), DType::I32, {batch});
+    const ops::SpeculativeAcceptExecutionEnvelope envelope{.all_rows_greedy_without_penalties = false,
+                                                           .block_verification                = true};
+    GuardedDeviceBuffer scratch(ops::speculative_accept_sparse_drafts_workspace_capacity_bytes(
+        kSparseTokenDomain, envelope, k, k, batch, batch));
+    WorkspaceArena workspace(DeviceSpan{scratch.data(), scratch.bytes()});
+    std::mt19937_64 generator(20261023ULL + static_cast<std::uint64_t>(k));
+    std::uniform_real_distribution<double> uniform(0.0, 1.0);
+    const auto draw = [&](const std::array<double, 4>& law) {
+        double goal = uniform(generator), cumulative = 0;
+        for (int id = 0; id < 4; ++id) {
+            cumulative += law[id];
+            if (goal < cumulative) return id;
+        }
+        return 3;
+    };
+    std::array<std::uint64_t, 4> first{}, second{};
+    std::array<std::uint64_t, 16> pairs{};
+    std::uint64_t accepted_total = 0;
+    int failures                 = 0;
+    for (int trial = 0; trial < trials; ++trial) {
+        std::vector<int> host_drafts(static_cast<std::size_t>(k) * batch);
+        for (auto& token : host_drafts) token = draw(proposal);
+        d_drafts.copy_from_host(host_drafts.data(), host_drafts.size() * sizeof(int));
+        for (int row = 0; row < batch; ++row) configs[row].seed = 777001ULL + trial * batch + row;
+        d_configs.copy_from_host(configs.data(), configs.size() * sizeof(configs[0]));
+        d_lengths.copy_from_host(initial_lengths.data(), initial_lengths.size() * sizeof(int));
+        d_anchors.copy_from_host(initial_anchors.data(), initial_anchors.size() * sizeof(int));
+        ops::speculative_accept_sparse_drafts(target, target_logits, drafts, candidates, proposal_q, extents,
+                                              lengths, anchors, output, output_counts, output_accepted,
+                                              kSparseTokenDomain, static_cast<const ops::SamplingConfig*>(d_configs.p),
+                                              envelope, workspace, nullptr);
+        cuda_synchronize();
+        const auto tokens = read<int>(licensed, width * batch);
+        const auto sizes  = read<int>(counts, batch);
+        for (int row = 0; row < batch; ++row) {
+            const int size = sizes[row];
+            if (size < 1 || size > width) {
+                ++failures;
+                continue;
+            }
+            for (int i = 0; i + 1 < size; ++i) {
+                if (tokens[row * width + i] != host_drafts[static_cast<std::size_t>(row) * k + i]) ++failures;
+            }
+            accepted_total += static_cast<std::uint64_t>(size - 1);
+            const int a = tokens[row * width];
+            const int b = size >= 2 ? tokens[row * width + 1] : draw(probabilities);
+            if (a < 0 || a >= 4 || b < 0 || b >= 4) {
+                ++failures;
+                continue;
+            }
+            ++first[a];
+            ++second[b];
+            ++pairs[a * 4 + b];
+        }
+    }
+    const std::uint64_t n = static_cast<std::uint64_t>(trials) * batch;
+    const auto within     = [&](std::uint64_t observed, double probability) {
+        const double expected = static_cast<double>(n) * probability;
+        return std::abs(static_cast<double>(observed) - expected) <=
+               6 * std::sqrt(static_cast<double>(n) * probability * (1 - probability)) + 2;
+    };
+    for (int id = 0; id < 4; ++id) {
+        failures += within(first[id], probabilities[id]) ? 0 : 1;
+        failures += within(second[id], probabilities[id]) ? 0 : 1;
+        for (int other = 0; other < 4; ++other) {
+            failures += within(pairs[id * 4 + other], probabilities[id] * probabilities[other]) ? 0 : 1;
+        }
+    }
+    failures += scratch.verify_guards("block distribution workspace");
+    failures += licensed.verify_guards("block distribution output");
+    std::cout << "block distribution K=" << k << " trials=" << n << " accepted/round="
+              << static_cast<double>(accepted_total) / static_cast<double>(n) << " first=";
+    for (const auto count : first) { std::cout << count << ','; }
+    std::cout << " second=";
+    for (const auto count : second) { std::cout << count << ','; }
+    std::cout << " failures=" << failures << '\n';
     return failures;
 }
 
@@ -1842,6 +2276,51 @@ int sample_sparse_drafts_case() {
         failures += d_q.verify_guards("sample_sparse_drafts q");
         failures += d_confidence.verify_guards("sample_sparse_drafts confidence");
     }
+    // Underflowed tail (NInfer #349): twelve equal leaders and four weights that underflow to zero,
+    // with top-p and min-p off, so all sixteen are support. q = fl(1/12) sums in FP32 to 1 - 2^-23,
+    // and a uniform of 1 - 2^-24 lies past it: the fallback must be the last positive candidate
+    // (rank 11), never a q = 0 rank.
+    {
+        constexpr int n = S, leaders = 12;
+        float cumulative = 0.0F;
+        for (int j = 0; j < leaders; ++j) cumulative += 1.0F / static_cast<float>(leaders);
+        int position = 0;
+        while (draft_uniform(1, position, ops::kSamplePurposeDFlash2Proposal, kDraw) < cumulative) {
+            if (++position == (1 << 30)) { throw std::runtime_error("no tail uniform found"); }
+        }
+        std::vector<std::int32_t> rows(n), positions{position};
+        std::vector<float> lp(n);
+        for (int j = 0; j < n; ++j) {
+            rows[j] = j;
+            lp[j]   = j < leaders ? 0.0F : -200.0F;
+        }
+        std::vector<ops::SamplingConfig> configs(1);
+        configs[0].temperature = 1.0F;
+        configs[0].top_k       = 0;
+        configs[0].top_p       = 1.0F;
+        configs[0].min_p       = 0.0F;
+        configs[0].seed        = 1;
+        DeviceBuffer d_rows = to_device(rows), d_lp = to_device(lp), d_positions = to_device(positions),
+                     d_configs = to_device(configs);
+        GuardedDeviceBuffer d_drafts(4ULL), d_candidates(4ULL * S), d_q(4ULL * S);
+        Tensor r(d_rows.p, DType::I32, {n, 1}), l(d_lp.p, DType::FP32, {n, 1}), p(d_positions.p, DType::I32, {1});
+        Tensor drafts(d_drafts.data(), DType::I32, {1}), candidates(d_candidates.data(), DType::I32, {S, 1});
+        Tensor q(d_q.data(), DType::FP32, {S, 1}), none;
+        ops::speculative_sample_sparse_drafts(r, l, nullptr, static_cast<const ops::SamplingConfig*>(d_configs.p), p,
+                                              kDraw, drafts, candidates, q, none, context.stream);
+        context.synchronize();
+        const auto got_draft = read<std::int32_t>(d_drafts, 1)[0];
+        const auto got_q     = read<float>(d_q, S);
+        bool ok              = got_draft == leaders - 1;
+        for (int j = 0; j < S; ++j) { ok = ok && (got_q[j] > 0.0F) == (j < leaders); }
+        if (!ok) {
+            ++failures;
+            std::cerr << "sample_sparse_drafts underflowed tail drew rank " << got_draft << " (want "
+                      << leaders - 1 << ")\n";
+        }
+        failures += d_drafts.verify_guards("sample_sparse_drafts tail drafts");
+        failures += d_q.verify_guards("sample_sparse_drafts tail q");
+    }
     // Frequencies: 8 identical columns at consecutive positions, 2,500 launches.
     {
         constexpr int T = 8, n = 6, launches = 2500;
@@ -1895,7 +2374,7 @@ int sample_sparse_drafts_case() {
 
 } // namespace
 
-int main(int argc, char** argv) {
+INFERNIX_OP_TEST(speculative_round) {
     if (cuda_unavailable()) {
         std::cout << "speculative_round: SKIP (CUDA unavailable)\n";
         return 77;
@@ -2068,6 +2547,12 @@ int main(int argc, char** argv) {
     failures += greedy_accept_case(31, 30, 257);
     failures += greedy_penalty_case(64);
     failures += greedy_penalty_case(257);
+    failures += nonfinite_column_case(64);
+    failures += nonfinite_column_case(257);
+    failures += raw_greedy_nonfinite_case(64);
+    failures += raw_greedy_nonfinite_case(257);
+    failures += sparse_raw_greedy_nonfinite_case();
+    failures += argmax_nan_column_case();
     failures += deterministic_sampling_case();
     failures += batched_sampling_workspace_stride_case();
     failures += sample_sparse_drafts_case();
@@ -2098,6 +2583,17 @@ int main(int argc, char** argv) {
             std::cerr << "sparse query admitted K=64 at B=8\n";
             ++failures;
         } catch (const std::invalid_argument&) {}
+    }
+    // block-verification: its output distribution, then its sampled rows against the block rule's
+    // host oracle, greedy rows unchanged.
+    for (const int k : {1, 3, 7}) failures += block_distribution_case(k);
+    for (const int k : {1, 3, 7, 15, 31}) {
+        for (const int batch : {1, 8}) {
+            SparseAcceptSuite suite(k, batch);
+            for (int variant = 0; variant < 4; ++variant) {
+                failures += suite.generated_general_case(false, false, variant, true);
+            }
+        }
     }
     for (int k : {1, 7, 15, 16, 31}) {
         SparseAcceptSuite suite(k, 8);

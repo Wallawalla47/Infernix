@@ -1,4 +1,5 @@
 #include "infernix/ops/mtp_pack.h"
+#include "ops/op_family.h"
 #include "ops/op_tester.h"
 
 #include <cstddef>
@@ -139,7 +140,7 @@ int split_case(std::int32_t tokens) {
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(mtp_pack) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;

@@ -121,6 +121,27 @@ void contracts(infernix::text::GrammarCompiler& compiler) {
           "annotation-named properties were lost");
     check(!accepts(compiler, schema, R"({"description":"first","second":{"description":"first"}})"),
           "literal data was aliased in schema cache");
+    // An object or array const/enum admits the same bounded formatting whitespace as the rest of
+    // the document; its scalars, keys and member order stay verbatim.
+    check(accepts(compiler, schema,
+                  "{\n  \"description\": \"first\",\n  \"second\": {\n    \"description\": \"second\"\n  }\n}"),
+          "an object const forced compact JSON inside a pretty-printed document");
+    check(!accepts(compiler, schema,
+                   "{\"description\":\"first\",\"second\":{\"description\" : \"sec ond\"}}"),
+          "an object const admitted whitespace inside a string literal");
+    check(!accepts(compiler, schema,
+                   "{\"description\":\"first\",\"second\":{" + std::string(33, ' ') +
+                       "\"description\":\"second\"}}"),
+          "an object const admitted an unbounded whitespace run");
+    const auto literals = Constraint::json_schema(
+        R"({"type":"object","properties":{"point":{"enum":[[1,2],{"x":[]},"[1,2]"]}},"required":["point"],"additionalProperties":false})");
+    for (const std::string text :
+         {R"({"point":[1,2]})", "{\"point\": [\n    1,\n    2\n  ]}", "{\"point\": { \"x\": [ ] }}",
+          R"({"point":"[1,2]"})"})
+        check(accepts(compiler, literals, text), "a formatted enum container was rejected");
+    for (const std::string text : {"{\"point\":[1 ,2 ,]}", "{\"point\":[12]}", "{\"point\":\"[1, 2]\"}",
+                                   "{\"point\":[ 1.0 ,2]}"})
+        check(!accepts(compiler, literals, text), "an enum container admitted a different value");
     auto length = Constraint::json_schema(R"({"type":"string","minLength":1,"maxLength":1})");
     for (const std::string value :
          std::vector<std::string>{"你", "😀", "\n", "\t", std::string(1, '\0'), "\"", "\\"})

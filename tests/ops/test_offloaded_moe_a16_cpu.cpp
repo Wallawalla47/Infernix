@@ -8,6 +8,7 @@
 //   - every CPU ISA against the scalar reference, bit for bit;
 //   - the BF16 outputs against an FP64 expert oracle on the unencoded BF16 activations.
 
+#include "ops/op_family.h"
 #include "ops/common/canonical_math.h"
 #include "ops/offloaded_sparse_moe/cpu/w4a16_expert.h"
 #include "ops/offloaded_moe_fixtures.h"
@@ -332,7 +333,7 @@ void test_golden() {
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(offloaded_moe_a16_cpu) {
     test_encoding();
     test_row_output();
     for (const moe::ExpertShape& shape : kShapes) {

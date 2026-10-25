@@ -50,21 +50,14 @@ struct alignas(128) Descriptors {
 
 enum class Matrix { GateUp, Down };
 
-template <Matrix M>
-struct MatrixShape;
-
-template <>
-struct MatrixShape<Matrix::GateUp> {
-    static constexpr int kRowGroups = kGateUpRowGroups; // 80
-    static constexpr int kBlocks    = kGateUpBlocks;    // 160 K blocks
-    static constexpr std::size_t kOffset = 0;
-};
-
-template <>
-struct MatrixShape<Matrix::Down> {
-    static constexpr int kRowGroups = kDownRowGroups; // 160
-    static constexpr int kBlocks    = kDownBlocks;    // 40 K blocks
-    static constexpr std::size_t kOffset = kGateUpBytes;
+// A matrix of an expert record of geometry G (w4a4_expert.h): its 16-row groups, its K blocks and its
+// offset in the record. Flash-Next: gate/up 80 x 160, down 160 x 40; Qwen3.5-122B-A10B (the A4 residual
+// routes only): gate/up 128 x 192, down 192 x 64.
+template <Matrix M, class G = FlashNextExperts>
+struct MatrixShape {
+    static constexpr int kRowGroups      = M == Matrix::GateUp ? G::kGateUpRowGroups : G::kDownRowGroups;
+    static constexpr int kBlocks         = M == Matrix::GateUp ? G::kGateUpBlocks : G::kDownBlocks;
+    static constexpr std::size_t kOffset = M == Matrix::GateUp ? 0 : G::kGateUpBytes;
 };
 
 // The tile shape follows Nvfp4A4TmaMmaSchedule (128 rows, 128-wide K tiles of two 64-wide MMA
@@ -97,20 +90,57 @@ struct Schedule {
     static constexpr int kUnitRunBytes     = kUnitsPerKTile * static_cast<int>(kUnitBytes); // 1,152
     static constexpr std::uint32_t kStageBytes =
         kBlockTokens * kCodeRowBytes + kBlockTokens * kScaleWordsPerRow * 4 + kRowGroups * kUnitRunBytes;
+    // Consumer warps compute every 16-column MMA tile of the 64-column token tile, valid or not.
+    static constexpr bool kSkipIdleColumns = false;
     static_assert(kWarpRows == 32, "a warp's rows are one A4 block of h");
     static_assert(kUnitRunBytes % 16 == 0, "bulk copies move multiples of 16 bytes");
 };
 
-// A4 residual (W4A16 fast paths): each stage holds every term's activation tile beside one weight
-// tile, and two stages (39 KB at two terms, 48 KB at three) keep two CTAs per SM.
-template <int Terms>
+// A4 residual (W4A16 fast paths) at expert geometry G: each stage holds every term's activation tile
+// beside one weight tile, and two stages (39 KB at two terms, 48 KB at three) keep two CTAs per SM.
+// The tile is Flash-Next's measured one (recipe C and FP4-Local: +33-35 % at 32K-64K prefill). At
+// Qwen3.5-122B-A10B's geometry it is also the right one:
+//   - its K loops are longer (gate/up 24 K tiles, down 8, against 20 and 5), so each work tile's
+//     pipeline fill and epilogue are a smaller share; its 16 and 24 row blocks of 128 keep a call's
+//     work items in several persistent waves even at 1K-token chunks;
+//   - its experts see about 32 columns per 1K chunk and 128 per 4K (256 experts, top 8), so wider
+//     token tiles would compute mostly padding, and a 64-column warp tile (twice the weight fragment
+//     reuse) needs about 140 registers a thread, past the 112 that two CTAs of 288 threads allow;
+//   - a third stage would cost the second CTA (58 KB a CTA at two terms).
+// Its consumer warps skip the 16-column MMA tiles past the tile's valid columns (kSkipIdleColumns): at
+// 1K-token chunks about half of the tiles' columns are padding, which the outputs never read, so the
+// skip removes that tensor work and its fragment loads without changing any output bit. Flash-Next's
+// instances keep their qualified and timed code.
+template <int Terms, class G = FlashNextExperts>
 struct ScheduleResidual : Schedule {
     static_assert(Terms >= 2 && Terms <= kMaxResidualTerms);
     static constexpr int kTerms  = Terms;
     static constexpr int kStages = 2;
     static constexpr std::uint32_t kStageBytes =
         kTerms * (kBlockTokens * kCodeRowBytes + kBlockTokens * kScaleWordsPerRow * 4) + kRowGroups * kUnitRunBytes;
+    static constexpr bool kSkipIdleColumns = !(G::kHidden == kHidden && G::kIntermediate == kIntermediate);
 };
+
+// TEMPORARY (INFERNIX_TMP_WIDE_EXPERT_T64, candidates P5; Basalt ebf6928), until its A/B: schedule Base with
+// a 64-token warp tile. Four consumer warps each take every column of the 64-column token tile against
+// their 32 rows, so each B fragment (rg16_fragments' decode of a row group's staged units) feeds four
+// 16-column MMA tiles instead of two: half the B decodes and shared loads per MMA. The stages, the K
+// order of every output's MMA chain and so every output bit are Base's; the 160-thread CTA keeps two
+// per SM within its shared memory, with registers to spare for the doubled accumulators.
+template <class Base>
+struct WarpTile64 : Base {
+    static constexpr int kWarpsTokens     = 1;
+    static constexpr int kWarpsRows       = 4;
+    static constexpr int kConsumerWarps   = kWarpsTokens * kWarpsRows;
+    static constexpr int kConsumerThreads = kConsumerWarps * 32;
+    static constexpr int kThreads         = kConsumerThreads + Base::kProducerThreads;
+    static constexpr int kWarpTokens      = Base::kBlockTokens / kWarpsTokens; // 64
+    static constexpr int kMmaTokens       = kWarpTokens / 16;                  // 4
+    static_assert(Base::kBlockRows / kWarpsRows == Base::kWarpRows, "the warp's rows stay one A4 block of h");
+};
+
+template <class S>
+using AccumulatorsOf = float[S::kMmaTokens][S::kMmaRows][4];
 
 template <class S>
 struct Storage {
@@ -187,7 +217,7 @@ __device__ __forceinline__ void rg16_fragments(const std::uint8_t* units, int gr
     scale_hi = __byte_perm(__byte_perm(t0, t2, select), __byte_perm(t1, t3, select), 0x5410);
 }
 
-template <Matrix M, class Epilogue, class S = Schedule>
+template <Matrix M, class Epilogue, class S = Schedule, class G = FlashNextExperts>
 __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void grouped_kernel(
 #ifdef _WIN32
     // As in nvfp4_a4_tma_kernel: MSVC cannot pass the over-aligned descriptors by value.
@@ -199,7 +229,7 @@ __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void grouped_kerne
 #ifdef _WIN32
     const Descriptors& descriptors = *descriptors_pointer;
 #endif
-    using Shape                = MatrixShape<M>;
+    using Shape                = MatrixShape<M, G>;
     constexpr int kRowBlocks   = Shape::kRowGroups / S::kRowGroups;
     constexpr int kKTiles      = Shape::kBlocks / S::kUnitsPerKTile;
     static_assert(Shape::kRowGroups % S::kRowGroups == 0 && Shape::kBlocks % S::kUnitsPerKTile == 0);
@@ -294,20 +324,28 @@ __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void grouped_kerne
         const int begin = call.dispatch.offsets[ctx.expert];
         ctx.first       = begin + column;
         ctx.columns     = min(S::kBlockTokens, call.dispatch.offsets[ctx.expert + 1] - ctx.first);
+        // The warp's 16-column MMA tiles that hold a valid column (warp-uniform): all of them, or with
+        // kSkipIdleColumns those before the tile's last valid column. A skipped tile's accumulators stay
+        // zero and its columns are never written (the epilogues stop at ctx.columns).
+        const int live_mma = S::kSkipIdleColumns
+                                 ? min(max(ctx.columns - ctx.warp_m * S::kWarpTokens + 15, 0) / 16, S::kMmaTokens)
+                                 : S::kMmaTokens;
 
-        Accumulators acc = {};
+        AccumulatorsOf<S> acc = {};
 #pragma unroll 1
         for (int k_tile = 0; k_tile < kKTiles; ++k_tile, ++it) {
             const int stage = it % S::kStages;
             cta_mbarrier_wait(&shared.full[stage], (static_cast<unsigned>(it) / S::kStages) & 1U);
 #pragma unroll
             for (int local_k64 = 0; local_k64 < S::kK64PerStage; ++local_k64) {
+                if (live_mma == 0) { break; } // an idle warp only releases the stage
                 unsigned a_fragments[S::kTerms][S::kMmaTokens][4];
                 unsigned a_scales[S::kTerms][S::kMmaTokens];
 #pragma unroll
                 for (int term = 0; term < S::kTerms; ++term) {
 #pragma unroll
                     for (int mma_m = 0; mma_m < S::kMmaTokens; ++mma_m) {
+                        if (mma_m >= live_mma) { continue; }
                         const int row          = ctx.warp_m * S::kWarpTokens + mma_m * 16 + a_row_offset;
                         const int logical_byte = local_k64 * 32 + a_column_byte;
                         const int physical_byte = ((logical_byte >> 4) ^ ((row >> 1) & 3)) * 16 + (logical_byte & 15);
@@ -332,6 +370,7 @@ __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void grouped_kerne
                 for (int term = 0; term < S::kTerms; ++term) {
 #pragma unroll
                     for (int mma_m = 0; mma_m < S::kMmaTokens; ++mma_m) {
+                        if (mma_m >= live_mma) { continue; }
 #pragma unroll
                         for (int r = 0; r < S::kMmaRows; ++r) {
                             mma_nvfp4_e4m3(acc[mma_m][r][0], acc[mma_m][r][1], acc[mma_m][r][2], acc[mma_m][r][3],
@@ -357,20 +396,22 @@ __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void grouped_kerne
 // four lanes of a group hold the 16 intermediates of one h block for a column (lane tig: block
 // elements tig, 4 + tig, 8 + tig, 12 + tig), so the block maximum and the code bytes are formed
 // with two shuffles each, and lane tig owns code bytes tig and 4 + tig of the plane layout.
+// Every epilogue takes a warp's T 16-column MMA tiles (T = 2: Schedule's; 4: WarpTile64's).
 struct GateUpEpilogue {
     const ExpertScales* scales;
     std::uint8_t* h_plane;
 
-    __device__ __forceinline__ void operator()(Accumulators& acc, const TileContext& ctx) const {
+    template <int T>
+    __device__ __forceinline__ void operator()(float (&acc)[T][Schedule::kMmaRows][4], const TileContext& ctx) const {
         using S               = Schedule;
         const ExpertScales sc = scales[ctx.expert];
         const int block       = ctx.row_block * 4 + ctx.warp_n;
         const int position    = plane_block(block);
 #pragma unroll
-        for (int m = 0; m < S::kMmaTokens; ++m) {
+        for (int m = 0; m < T; ++m) {
 #pragma unroll
             for (int half = 0; half < 2; ++half) {
-                const int column = ctx.warp_m * S::kWarpTokens + m * 16 + ctx.group + 8 * half;
+                const int column = ctx.warp_m * 16 * T + m * 16 + ctx.group + 8 * half;
                 std::uint16_t h[S::kMmaRows];
                 float amax = 0.0F;
 #pragma unroll
@@ -417,14 +458,15 @@ struct DownEpilogue {
     const std::int32_t* entries;
     std::uint16_t* outputs;
 
-    __device__ __forceinline__ void operator()(Accumulators& acc, const TileContext& ctx) const {
+    template <int T>
+    __device__ __forceinline__ void operator()(float (&acc)[T][Schedule::kMmaRows][4], const TileContext& ctx) const {
         using S           = Schedule;
         const float alpha = scales[ctx.expert].alpha_down;
 #pragma unroll
-        for (int m = 0; m < S::kMmaTokens; ++m) {
+        for (int m = 0; m < T; ++m) {
 #pragma unroll
             for (int half = 0; half < 2; ++half) {
-                const int column = ctx.warp_m * S::kWarpTokens + m * 16 + ctx.group + 8 * half;
+                const int column = ctx.warp_m * 16 * T + m * 16 + ctx.group + 8 * half;
                 if (column >= ctx.columns) { continue; }
                 std::uint16_t* out = outputs + static_cast<std::size_t>(entries[ctx.first + column]) * kHidden +
                                      ctx.row_block * S::kBlockRows;
@@ -439,28 +481,33 @@ struct DownEpilogue {
     }
 };
 
-// Two-term A4 (W4A16 fast path): the accumulators are in units of the row scale, so the gate/up
-// outputs are bf16_rn(acc * row_scale(token) * alpha), h = swiglu_bf16(gate, up) is written as the
-// entry's BF16 h row (the A16 h_rows layout), and its terms are formed by a separate pass.
+// Two-term A4 (W4A16 fast path) at expert geometry G: the accumulators are in units of the row scale,
+// so the gate/up outputs are bf16_rn(acc * row_scale(token) * alpha), h = swiglu_bf16(gate, up) is
+// written as the entry's BF16 h row (the A16 h_rows layout), and its terms are formed by a separate
+// pass. An entry's token is entry_column (a shared-expert job's entries follow the routed ones).
+template <class G = FlashNextExperts>
 struct GateUpEpilogueResidual {
     const ExpertScales* scales;
     const std::int32_t* entries;
     const float* x_row_scale; // per token
     std::uint8_t* h_rows;
     int top_k;
+    int shared_first; // MoeDispatch::shared_first (0x7FFFFFFF: routed entries only)
 
-    __device__ __forceinline__ void operator()(Accumulators& acc, const TileContext& ctx) const {
+    template <int T>
+    __device__ __forceinline__ void operator()(float (&acc)[T][Schedule::kMmaRows][4], const TileContext& ctx) const {
         using S               = Schedule;
         const ExpertScales sc = scales[ctx.expert];
 #pragma unroll
-        for (int m = 0; m < S::kMmaTokens; ++m) {
+        for (int m = 0; m < T; ++m) {
 #pragma unroll
             for (int half = 0; half < 2; ++half) {
-                const int column = ctx.warp_m * S::kWarpTokens + m * 16 + ctx.group + 8 * half;
+                const int column = ctx.warp_m * 16 * T + m * 16 + ctx.group + 8 * half;
                 if (column >= ctx.columns) { continue; }
                 const int entry = ctx.first + column;
-                const float rs  = x_row_scale[entries[entry] / top_k];
-                auto* h = reinterpret_cast<std::uint16_t*>(h_rows + static_cast<std::size_t>(entry) * kA16HRowBytes);
+                const float rs  = x_row_scale[entry_column(entries[entry], top_k, shared_first)];
+                auto* h = reinterpret_cast<std::uint16_t*>(h_rows + static_cast<std::size_t>(entry) *
+                                                                        A16Planes<G>::kHRowBytes);
 #pragma unroll
                 for (int r = 0; r < S::kMmaRows; ++r) {
                     const std::uint16_t gate =
@@ -474,24 +521,26 @@ struct GateUpEpilogueResidual {
     }
 };
 
-// y = bf16_rn(acc * row_scale(entry's h) * alpha_down) into the entry's output column.
+// y = bf16_rn(acc * row_scale(entry's h) * alpha_down) into the entry's output column (G::kHidden rows).
+template <class G = FlashNextExperts>
 struct DownEpilogueResidual {
     const ExpertScales* scales;
     const std::int32_t* entries;
     const float* h_row_scale; // per entry
     std::uint16_t* outputs;
 
-    __device__ __forceinline__ void operator()(Accumulators& acc, const TileContext& ctx) const {
+    template <int T>
+    __device__ __forceinline__ void operator()(float (&acc)[T][Schedule::kMmaRows][4], const TileContext& ctx) const {
         using S           = Schedule;
         const float alpha = scales[ctx.expert].alpha_down;
 #pragma unroll
-        for (int m = 0; m < S::kMmaTokens; ++m) {
+        for (int m = 0; m < T; ++m) {
 #pragma unroll
             for (int half = 0; half < 2; ++half) {
-                const int column = ctx.warp_m * S::kWarpTokens + m * 16 + ctx.group + 8 * half;
+                const int column = ctx.warp_m * 16 * T + m * 16 + ctx.group + 8 * half;
                 if (column >= ctx.columns) { continue; }
                 const float rs     = h_row_scale[ctx.first + column];
-                std::uint16_t* out = outputs + static_cast<std::size_t>(entries[ctx.first + column]) * kHidden +
+                std::uint16_t* out = outputs + static_cast<std::size_t>(entries[ctx.first + column]) * G::kHidden +
                                      ctx.row_block * S::kBlockRows;
 #pragma unroll
                 for (int r = 0; r < S::kMmaRows; ++r) {
@@ -509,11 +558,11 @@ struct DownEpilogueResidual {
 
 [[nodiscard]] int persistent_ctas();
 
-template <Matrix M, class S = Schedule, class Epilogue>
+template <Matrix M, class S = Schedule, class G = FlashNextExperts, class Epilogue>
 void launch(const Call& call, std::int32_t pass, const Epilogue& epilogue, cudaStream_t stream) {
     constexpr int bytes = static_cast<int>(sizeof(Storage<S>));
     // Static: MSVC 2022 rejects the lambda's use of an automatic constexpr local (C2326).
-    static constexpr auto kernel = grouped_kernel<M, Epilogue, S>;
+    static constexpr auto kernel = grouped_kernel<M, Epilogue, S, G>;
     static const bool configured = [] {
         CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
                                         cudaSharedmemCarveoutMaxShared));

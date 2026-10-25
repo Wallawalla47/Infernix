@@ -3,10 +3,13 @@
 
 #include "core/weight.h"
 #include "infernix/ops/gdn_input_proj.h"
+#include "infernix/ops/linear.h"
 
 #include "core/device.h"
+#include "core/temporary_switches.h"
 #include "infernix_bench_common.h"
 #include "quantized_weight.cuh"
+#include "roofline.h"
 
 #include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
@@ -26,11 +29,11 @@
 #include <vector>
 
 using namespace infernix;
+namespace roofline = infernix::bench::roofline;
 
 namespace {
 
 constexpr std::size_t kFlushBytes = std::size_t{256} << 20;
-constexpr double kRtx5090DramGBs  = 1792.0;
 
 enum class Format : std::uint8_t { Q4Q5, Q8, Nvfp4, Fp8, All };
 enum class CacheMode : std::uint8_t { Cold, Warm, Both };
@@ -40,6 +43,7 @@ struct Options {
     Format format                  = Format::All;
     ops::LinearPolicy nvfp4_policy = ops::LinearPolicy::AllowA4;
     ops::LinearPolicy fp8_policy   = ops::LinearPolicy::AllowA8;
+    ops::LinearPolicy q4q5_policy  = ops::LinearPolicy::A16Only;
     CacheMode cache                = CacheMode::Cold;
     std::vector<std::int32_t> tokens{1, 2, 4, 8, 12, 16, 32, 64, 128, 256, 512, 1024};
     int warmup   = 5;
@@ -71,7 +75,7 @@ struct Measurement {
                  "error: %s\n"
                  "usage: infernix_gdn_input_proj_bench "
                  "[--format q4q5|q8|nvfp4|fp8|all] [--nvfp4-policy a16|a4|invariant] "
-                 "[--fp8-policy a16|a8|a8r|invariant] "
+                 "[--fp8-policy a16|a8|a8r|invariant] [--q4q5-policy a16|invariant] "
                  "[--tokens T,...] [--cache cold|warm|both] [--execution eager|graph] "
                  "[--warmup N] [--repeat N] "
                  "[--profile] [--csv-out PATH]\n",
@@ -139,6 +143,14 @@ Options parse_options(int argc, char** argv) {
                 options.nvfp4_policy = ops::LinearPolicy::A16ColumnInvariant;
             else
                 usage("--nvfp4-policy expects a16, a4 or invariant");
+        } else if (argument == "--q4q5-policy") {
+            const std::string_view value(next("--q4q5-policy requires a value"));
+            if (value == "a16")
+                options.q4q5_policy = ops::LinearPolicy::A16Only;
+            else if (value == "invariant")
+                options.q4q5_policy = ops::LinearPolicy::A16ColumnInvariant;
+            else
+                usage("--q4q5-policy expects a16 or invariant");
         } else if (argument == "--fp8-policy") {
             const std::string_view value(next("--fp8-policy requires a value"));
             if (value == "a16")
@@ -270,8 +282,8 @@ void report(const Result& result) {
                 result.format, result.policy, cache_name(result.cache),
                 result.graph_nodes ? "graph" : "eager", result.graph_nodes, result.tokens,
                 result.workspace_bytes, result.timing.median_us, result.timing.min_us,
-                result.timing.p95_us, gbps, gbps / kRtx5090DramGBs * 100.0, kRtx5090DramGBs,
-                tflops);
+                result.timing.p95_us, gbps, gbps / roofline::kDramSpecGBs * 100.0,
+                roofline::kDramSpecGBs, tflops);
 }
 
 void append_result(std::vector<Result>& results, const char* format, const char* policy,
@@ -336,11 +348,12 @@ void run_q4q5(const Options& options, bench::L2FlushBuffer& flush, cudaStream_t 
             Tensor x(input.p, DType::BF16, {kHidden, tokens});
             Tensor tqkv(qkv.p, DType::BF16, {kQkRows + kValueRows, tokens});
             Tensor tz(z.p, DType::BF16, {kZRows, tokens});
-            ops::gdn_input_proj(x, qk.weight, value_z.weight, tqkv, tz, launch_stream);
+            ops::gdn_input_proj(x, qk.weight, value_z.weight, tqkv, tz, options.q4q5_policy,
+                                launch_stream);
         };
     };
     measure_points(
-        options, "q4q5", "a16", kHidden, kOutputRows,
+        options, "q4q5", policy_name(options.q4q5_policy), kHidden, kOutputRows,
         qk.model_weight_bytes() + value_z.model_weight_bytes(),
         [](std::int32_t) { return std::size_t{0}; }, make_launch, flush, stream, results);
 }
@@ -469,6 +482,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         const Options options = parse_options(argc, argv);
+        std::printf("# %s\n", temporary_switches::describe(temporary_switches::Scope::Qwen3_5).c_str());
         cudaStream_t stream   = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         bench::L2FlushBuffer flush(kFlushBytes);

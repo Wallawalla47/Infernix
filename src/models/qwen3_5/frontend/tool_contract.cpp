@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string_view>
@@ -152,6 +153,80 @@ std::uint8_t domain(const Json& source, const Json& document, std::set<std::stri
     return types;
 }
 
+// A plain text schema: type "string", or "string" with "null" in a type list, without enum, const or
+// structure; `nullable` is set when null is one of its types.
+bool plain_text_schema(const Json& node, bool& nullable) {
+    if (!node.is_object()) return false;
+    for (const char* key : {"enum", "const", "anyOf", "oneOf", "allOf", "properties", "items", "$ref"})
+        if (node.contains(key)) return false;
+    const auto type = node.find("type");
+    if (type == node.end()) return false;
+    if (type->is_string()) return type->get_ref<const std::string&>() == "string";
+    if (!type->is_array()) return false;
+    bool text = false;
+    for (const Json& member : *type) {
+        if (!member.is_string()) return false;
+        const auto& name = member.get_ref<const std::string&>();
+        if (name == "string") {
+            text = true;
+        } else if (name == "null") {
+            nullable = true;
+        } else {
+            return false;
+        }
+    }
+    return text;
+}
+
+// A schema of type "null" alone, without enum, const or structure.
+bool null_schema(const Json& node) {
+    if (!node.is_object()) return false;
+    for (const char* key : {"enum", "const", "anyOf", "oneOf", "allOf", "properties", "items", "$ref"})
+        if (node.contains(key)) return false;
+    const auto type = node.find("type");
+    return type != node.end() && type->is_string() && type->get_ref<const std::string&>() == "null";
+}
+
+// A nullable string parameter (BX-06: OpenAI strict mode writes every optional field as one): a type list of
+// "string" and "null", or an anyOf / oneOf whose branches are plain strings or null (at least one string).
+// Its model text is raw, as a string's, and the grammar takes it as its string branches (`null` is text it may
+// write, read back as JSON null). Empty when the schema is not one.
+std::optional<Json> nullable_text_branches(const Json& source, const Json& document) {
+    std::set<std::string> seen;
+    const Json& node = resolve(source, document, seen);
+    bool nullable    = false;
+    if (plain_text_schema(node, nullable)) {
+        if (!nullable) return std::nullopt;
+        Json text    = node;
+        text["type"] = "string";
+        return text;
+    }
+    if (!node.is_object()) return std::nullopt;
+    for (const char* key : {"type", "enum", "const", "properties", "items", "allOf"})
+        if (node.contains(key)) return std::nullopt;
+    const bool any_of = node.contains("anyOf");
+    if (any_of == node.contains("oneOf")) return std::nullopt;
+    const Json& alternatives = node[any_of ? "anyOf" : "oneOf"];
+    if (!alternatives.is_array() || alternatives.empty()) return std::nullopt;
+    Json strings = Json::array();
+    for (const Json& alternative : alternatives) {
+        std::set<std::string> branch_seen;
+        const Json& branch = resolve(alternative, document, branch_seen);
+        bool null_branch   = false;
+        if (null_schema(branch)) {
+            nullable = true;
+            continue;
+        }
+        if (!plain_text_schema(branch, null_branch)) return std::nullopt;
+        nullable = nullable || null_branch;
+        Json text    = branch;
+        text["type"] = "string";
+        strings.push_back(std::move(text));
+    }
+    if (!nullable || strings.empty()) return std::nullopt;
+    return strings.size() == 1 ? strings[0] : Json{{"anyOf", std::move(strings)}};
+}
+
 void prepare_strict_parameters(Contract::Tool& tool) {
     const Json document = Json::parse(text::prepare_json_schema(tool.schema_json));
     std::set<std::string> seen;
@@ -167,9 +242,12 @@ void prepare_strict_parameters(Contract::Tool& tool) {
             fail("tool '" + tool.name + "' requires a single declared object parameter list",
                  parameter_path(tool) + "/" + assertion);
     tool.parameters.clear();
+    tool.grammar_schema_json.clear();
     if (!root.contains("properties")) return;
     if (!root["properties"].is_object())
         fail("tool properties must be an object", parameter_path(tool));
+    Json grammar_document = document;
+    bool rewritten        = false;
     for (const auto& [name, schema] : root["properties"].items()) {
         if (!valid_parameter_name(name))
             fail("parameter name cannot be represented in Qwen tool format: " + name,
@@ -180,24 +258,40 @@ void prepare_strict_parameters(Contract::Tool& tool) {
             parameter.policy = NormalizationPolicy::DeclaredTypes;
         const auto types  = domain(schema, document);
         const bool string = (types & type_bit(SchemaType::String)) != 0;
-        if (string && types != type_bit(SchemaType::String))
+        if (string && types == (type_bit(SchemaType::String) | type_bit(SchemaType::Null))) {
+            // Raw text with null as one of its values: the grammar takes the string branches.
+            const std::optional<Json> text = nullable_text_branches(schema, document);
+            if (!text || &root != &document)
+                fail("strict tool '" + tool.name + "' parameter '" + name +
+                         "' mixes raw string and JSON value types beyond a nullable string",
+                     parameter_path(tool));
+            grammar_document["properties"][name] = *text;
+            rewritten                            = true;
+            parameter.nullable                   = true;
+        } else if (string && types != type_bit(SchemaType::String)) {
             fail("strict tool '" + tool.name + "' parameter '" + name +
                      "' mixes raw string and JSON value types",
                  parameter_path(tool));
+        }
         parameter.encoding = string ? Contract::Encoding::RawString : Contract::Encoding::Json;
         tool.parameters.push_back(std::move(parameter));
     }
+    if (rewritten) { tool.grammar_schema_json = grammar_document.dump(); }
 }
 } // namespace
 
 std::shared_ptr<const ToolCallOutputContract>
-build_tool_call_output_contract(std::span<const std::string> tool_jsons) {
-    if (tool_jsons.empty()) return {};
+build_tool_call_output_contract(std::span<const std::string> tool_jsons,
+                                std::span<const std::string> deferred_tool_jsons) {
+    const std::size_t count = tool_jsons.size() + deferred_tool_jsons.size();
+    if (count == 0) return {};
     auto result = std::make_shared<Contract>();
     std::set<std::string> names;
-    for (std::size_t i = 0; i < tool_jsons.size(); ++i) {
+    for (std::size_t i = 0; i < count; ++i) {
+        const std::string& source = i < tool_jsons.size() ? tool_jsons[i]
+                                                          : deferred_tool_jsons[i - tool_jsons.size()];
         try {
-            const auto parsed       = text::parse_json_numbers(tool_jsons[i]);
+            const auto parsed       = text::parse_json_numbers(source);
             const auto& declaration = parsed.value;
             const auto& function    = declaration.at("function");
             Contract::Tool tool;

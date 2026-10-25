@@ -29,10 +29,11 @@ constexpr bool kRuns = std::is_same_v<A, WorkspaceArena>;
 // moe_route with RouterLogits::kBf16), the routed experts resident (resident_moe_experts), the
 // shared expert, and y = bf16(sum w y_i + s y_shared) added to the residual. Every step depends
 // only on its own column, so the route is column-invariant whenever the shared expert's
-// projections run their column-invariant policy.
+// projections run their column-invariant policy. With a mask the routed experts skip the padding
+// columns (resident_moe_experts' valid_columns); the live columns' bits are unchanged.
 template <class A>
 void resident_moe(A& a, const Tensor& hidden, const ops::SparseMoeWeights& p, Tensor* residual,
-                  DeviceExecutionView execution) {
+                  DeviceExecutionView execution, ops::MoeColumnMask mask = {}) {
     const cudaStream_t s  = execution.stream;
     const std::int32_t T  = hidden.ne[1];
     const std::int32_t H  = p.router_shared_gate.k, E = p.router_shared_gate.n - 1;
@@ -55,7 +56,7 @@ void resident_moe(A& a, const Tensor& hidden, const ops::SparseMoeWeights& p, Te
         ops::projection_fp32(hidden, rows, logits, s);
         ops::moe_route(logits, kMoeTopK, routing, s, ops::RouterLogits::kBf16);
         ops::resident_moe_experts(hidden, routing.ids, p.routed_gate_up, p.routed_down, E, I, experts.data,
-                                  expert_ws, outputs, s);
+                                  expert_ws, outputs, s, mask.valid, mask.width);
         {
             auto call = a.scope();
             ops::linear(hidden, p.shared_gate_up, gate_up, p.policy, a, s);
@@ -87,10 +88,10 @@ void resident_moe(A& a, const Tensor& hidden, const ops::SparseMoeWeights& p, Te
 
 std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t first,
                                 std::int32_t last, bool mtp, bool wide_verification,
-                                ops::LinearRoutes gate_up_routes) {
+                                ops::LinearRoutes gate_up_routes, ops::offloaded_moe::WideA16 expert_wide) {
     if (first <= 0 || last < first) { throw std::invalid_argument("FFN: invalid column interval"); }
     if (const auto* offloaded = std::get_if<OffloadedMoeParameters>(&parameters)) {
-        return offloaded_moe_workspace_bytes(*offloaded, first, last);
+        return offloaded_moe_workspace_bytes(*offloaded, first, last, expert_wide);
     }
     if (const auto* moe = std::get_if<ops::SparseMoeWeights>(&parameters)) {
         if (!ops::sparse_moe_geometry(*moe)) {
@@ -144,7 +145,7 @@ std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t fi
 void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual,
          const ops::SparseMoeHints& hints, WorkspaceArena& workspace, DeviceExecutionView execution,
          bool mtp, bool wide_verification, ops::LinearRoutes gate_up_routes,
-         ops::LinearRoutes down_routes, const OffloadedMoeContext* offloaded) {
+         ops::LinearRoutes down_routes, const OffloadedMoeContext* offloaded, ops::MoeColumnMask padding) {
     const auto stream  = execution.stream;
     auto scope         = workspace.scope();
     const auto columns = hidden.ne[1];
@@ -155,7 +156,7 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
     }
     if (const auto* moe = std::get_if<ops::SparseMoeWeights>(&parameters)) {
         if (!ops::sparse_moe_geometry(*moe)) {
-            resident_moe(workspace, hidden, *moe, &residual, execution);
+            resident_moe(workspace, hidden, *moe, &residual, execution, padding);
             return;
         }
         const auto storage =

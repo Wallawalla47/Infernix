@@ -44,7 +44,11 @@ enum class GdnChunkArithmetic : std::uint8_t { Exact, Fp16Accumulate };
  *   ideal[:,h,t] = scale * S_h * q[:,qh,t].
  *
  * Shapes/dtypes are contiguous q/k BF16 [128,Hqk,T], v/out BF16 [128,Hv,T], g/beta FP32 [Hv,T],
- * and state FP32 [128,128,Hv], where Hqk>=1, Hv>=Hqk, and Hv%Hqk==0. `scale` is 1/sqrt(128). When
+ * and state FP32 [128,128,Hv], where Hqk>=1, Hv>=Hqk, and Hv%Hqk==0. `scale` is 1/sqrt(128). The state
+ * may instead be stored as FP16 (fp16-gdn-state): every form widens it exactly to its FP32 master
+ * state, runs the same arithmetic, and rounds the published state to nearest FP16 once per call,
+ * saturating at +-65504 (the oracle then starts from the represented FP16 state, and the published
+ * state compares to the FP64 result within that rounding). In and out states share their dtype. When
  * `normalize_qk` is true, the recurrent implementation consumes raw q/k and applies
  * x / sqrt(sum(x^2) + 1e-6) independently to every 128-element row before using it. When false,
  * q/k are consumed as supplied. The oracle evaluates the complete recurrence and `ideal` naively
@@ -79,7 +83,7 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
 
 /**
  * One-token update for B independent state-pool slots. q/k are contiguous BF16 [128,Hqk,1,B],
- * v/out are BF16 [128,Hv,1,B], g/beta are FP32 [Hv,1,B], `ssm_states` is contiguous FP32
+ * v/out are BF16 [128,Hv,1,B], g/beta are FP32 [Hv,1,B], `ssm_states` is contiguous FP32 (or FP16)
  * [128,128,Hv,Slots], and both selector tensors are contiguous device I32 [B]. B is in [1,8].
  * Row b reads source_state_slots[b] and publishes the transition to
  * destination_state_slots[b]; selectors may be equal for an in-place row. Destination slots are
@@ -108,7 +112,7 @@ void gated_delta_net_batch_update_gating(const Tensor& q, const Tensor& k, const
  *
  * Evaluates B independent normalized Gated DeltaNet recurrences from absolute state-pool slots
  * without modifying any state. q/k are BF16 [128,Hq,T,B], v/out are BF16 [128,Hv,T,B], g/beta
- * are FP32 [Hv,T,B], and ssm_states is FP32 [128,128,Hv,S]. The ReplaySSM execution domain is
+ * are FP32 [Hv,T,B], and ssm_states is FP32 (or FP16) [128,128,Hv,S]. The ReplaySSM execution domain is
  * B=1..8 and T=2..16, plus B=1 and T=17..64, with Hq=16 and Hv in {32,48}.
  * scale is 1/sqrt(128).
  *
@@ -128,21 +132,32 @@ void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tenso
                                    Tensor& value_record, Tensor& gate_record, Tensor& out,
                                    cudaStream_t stream);
 
+// How the tree form of gated_delta_net_replay_record computes its outputs.
+enum class GdnTreeRecordRoute : std::uint8_t {
+    // Each column's root path replayed as a chain: bit-identical to the chain Op.
+    Walk,
+    // FastPath::GdnTreeClosedForm: every column from the row's initial state and its ancestors'
+    // deltas in closed form (one solve level per depth), FP32 in another order: within rounding of
+    // the walk and the FP64 recurrence, not bit-identical.
+    ClosedForm,
+};
+
 /**
  * Verification-tree form of gated_delta_net_replay_record. tree_rows is I32
  * [kSpeculativeTreeRowWords,B] (one SpeculativeTreeRow per row), the physical width T is at most
  * kSpeculativeTreeMaxNodes and valid_columns is required. In a tree row (tree != 0) the output of
- * column c is the chain replay of the root path to c, from the row's initial state, bit-identical
- * to the chain Op evaluated on that path's columns alone, and each column's records are the raw
- * copies of its own inputs. A chain row is the chain Op over its valid prefix. Outputs past a
- * row's live columns are zero. The execution domain is the chain Op's; every live column is
- * computed once.
+ * column c is the chain replay of the root path to c, from the row's initial state (with the Walk
+ * route bit-identical to the chain Op evaluated on that path's columns alone), and each column's
+ * records are the raw copies of its own inputs. A chain row is the chain Op over its valid prefix.
+ * Outputs past a row's live columns are zero. The execution domain is the chain Op's; every live
+ * column is computed once.
  */
 void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tensor& v,
                                    const Tensor& g, const Tensor& beta, float scale,
                                    const Tensor& ssm_states, const Tensor& valid_columns,
                                    const Tensor& initial_state_slots, const Tensor& tree_rows,
                                    Tensor& key_record, Tensor& value_record, Tensor& gate_record,
-                                   Tensor& out, cudaStream_t stream);
+                                   Tensor& out, cudaStream_t stream,
+                                   GdnTreeRecordRoute route = GdnTreeRecordRoute::Walk);
 
 } // namespace infernix::ops

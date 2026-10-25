@@ -2,8 +2,10 @@
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
 
 #include "core/device.h"
+#include "core/temporary_switches.h"
 #include "ops/common/math.cuh"
 #include "ops/common/warp.cuh"
+#include "ops/linear/nvfp4/nvfp4_a16_slice_ring_mma.cuh"
 #include "ops/linear/nvfp4/nvfp4_schedule.cuh"
 #include "ops/linear/nvfp4/nvfp4_template_launch.cuh"
 #include "ops/linear/nvfp4/nvfp4_instances.cuh"
@@ -13,6 +15,7 @@
 
 #include <array>
 #include <cstddef>
+#include <stdexcept>
 #include <utility>
 
 namespace infernix::ops::detail {
@@ -50,6 +53,32 @@ constexpr auto kLaunchers = make_launchers(std::make_index_sequence<1>{});
 
 void nvfp4_linear_swiglu_invariant_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                           cudaStream_t stream) {
+    if (x.ne[1] >= 17 && temporary_switches::nvfp4_a16_tile()) {
+        nvfp4_linear_swiglu_invariant_ring_launch(x, weight, out, stream);
+        return;
+    }
+    nvfp4_linear_swiglu_invariant_sliced_launch(x, weight, out, stream);
+}
+
+void nvfp4_linear_swiglu_invariant_ring_launch(const Tensor& x, const Weight& weight, Tensor& out,
+                                               cudaStream_t stream) {
+    // The sliced-K tiles' 8 K slices on 128 weight rows (64 outputs) a CTA, 272 CTAs per token tile;
+    // 32-token tiles two CTAs an SM up to 32 columns, 64-token tiles one above.
+    if (x.ne[1] < 17) throw std::invalid_argument("nvfp4 linear_swiglu ring tile: T must be 17 or more");
+    const auto p = nvfp4_a16_operands(x, weight);
+    const LinearBf16Output output{static_cast<__nv_bfloat16*>(out.data), kIntermediate};
+    if (x.ne[1] <= 32)
+        launch_nvfp4_a16_slice_ring_mma<
+            Nvfp4ScheduleInstance<Nvfp4A16SliceRingSchedule<8, 128, 32, 8, 1, 4, 2>, 5120>>(
+            p, output, Nvfp4SwiGluEpilogue{}, stream, Nvfp4SwiGluMmaRows{});
+    else
+        launch_nvfp4_a16_slice_ring_mma<
+            Nvfp4ScheduleInstance<Nvfp4A16SliceRingSchedule<8, 128, 64, 4, 2, 4, 1>, 5120>>(
+            p, output, Nvfp4SwiGluEpilogue{}, stream, Nvfp4SwiGluMmaRows{});
+}
+
+void nvfp4_linear_swiglu_invariant_sliced_launch(const Tensor& x, const Weight& weight, Tensor& out,
+                                                 cudaStream_t stream) {
     // The tiles run 8 K-warps over the same K slices and reduce them in the same order, and the
     // MMA's columns are independent, so the tile width changes only how many columns share a
     // launch; wider calls run as 64-column slices.

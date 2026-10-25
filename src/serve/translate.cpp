@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -99,7 +100,36 @@ std::string render_tool_definition(const ToolDefinition& tool) {
     return Json{{"type", "function"}, {"function", std::move(function)}}.dump();
 }
 
+bool has_rendered_content(const infernix::ChatMessage& message) {
+    return std::any_of(message.parts.begin(), message.parts.end(), [](const auto& part) {
+        return part.kind != infernix::MessagePartKind::Text || !part.text.empty();
+    });
+}
+
 } // namespace
+
+std::string render_loaded_tools(std::span<const ToolDefinition> tools) {
+    // The Qwen tool section's own wording and framing, so a loaded definition reads like a listed
+    // one; the definitions use the same function form the listed tools are rendered from.
+    std::string text = "You now also have access to the following functions:\n\n<tools>";
+    for (const ToolDefinition& tool : tools) {
+        text += '\n';
+        text += render_tool_definition(tool);
+    }
+    text += "\n</tools>";
+    return text;
+}
+
+std::vector<std::string> tool_declaration_params(const GenerationRequest& request) {
+    std::vector<std::string> params;
+    params.reserve(request.tools.size());
+    for (const bool deferred : {false, true}) {
+        for (const ToolDefinition& tool : request.tools) {
+            if (tool.deferred == deferred) { params.push_back(tool.schema_param); }
+        }
+    }
+    return params;
+}
 
 ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& request,
                                                  const ServeOptions& server) {
@@ -264,6 +294,12 @@ infernix::PromptInput to_prompt_input(const GenerationRequest& request,
                 }
             }
         }
+        if (!turn.loaded_tools.empty()) {
+            infernix::MessagePart loaded;
+            loaded.text = (has_rendered_content(message) ? "\n\n" : "") +
+                          render_loaded_tools(turn.loaded_tools);
+            message.parts.push_back(std::move(loaded));
+        }
         input.messages.push_back(std::move(message));
         if (turn.cache_boundary_after) {
             if (input.messages.size() > std::numeric_limits<std::uint32_t>::max()) {
@@ -284,16 +320,20 @@ infernix::PromptInput to_prompt_input(const GenerationRequest& request,
     input.options.preserve_thinking         = semantics.preserve_thinking;
     input.options.chat_template_kwargs_json = semantics.chat_template_kwargs_json;
     input.options.add_vision_id             = false;
-    const auto& tools                       = request.tools;
-    input.options.tool_jsons.reserve(tools.size());
-    for (std::size_t index = 0; index < tools.size(); ++index) {
-        input.options.tool_jsons.push_back(render_tool_definition(tools[index]));
-        if (tools[index].cache_boundary_after) {
+    // Listed tools render in the prompt's tool section in request order; deferred ones only join
+    // the output contract, so declaring one never changes the prompt.
+    for (const ToolDefinition& tool : request.tools) {
+        if (tool.deferred) {
+            input.options.deferred_tool_jsons.push_back(render_tool_definition(tool));
+            continue;
+        }
+        input.options.tool_jsons.push_back(render_tool_definition(tool));
+        if (tool.cache_boundary_after) {
             input.context_cache.markers.push_back(infernix::PromptCacheMarker{
-                .kind             = tools[index].cache_boundary_after->kind,
-                .evidence         = tools[index].cache_boundary_after->evidence,
+                .kind             = tool.cache_boundary_after->kind,
+                .evidence         = tool.cache_boundary_after->evidence,
                 .location         = infernix::PromptCacheMarkerLocation::ToolBoundary,
-                .after_tool_count = static_cast<std::uint32_t>(index + 1U),
+                .after_tool_count = static_cast<std::uint32_t>(input.options.tool_jsons.size()),
             });
         }
     }
@@ -316,13 +356,8 @@ infernix::RequestOptions to_request_options(const GenerationRequest& request,
     if (semantics.enable_thinking != false) {
         options.execution.thinking.budget =
             request.thinking_budget ? request.thinking_budget : server.default_thinking_budget;
-        // max_tokens counts the thinking: without a budget, leave the answer its room.
-        if (!options.execution.thinking.budget && server.thinking_answer_room &&
-            request.max_tokens >= kThinkingAnswerRoomMinTokens) {
-            const int reserve =
-                std::min(std::max(kThinkingAnswerRoomMinReserve, request.max_tokens / 4), request.max_tokens / 2);
-            options.execution.thinking.budget = static_cast<std::uint32_t>(request.max_tokens - reserve);
-        }
+        // Without a budget, the answer room (thinking_answer_room_budget) is set once the prompt
+        // length, and so the room the context leaves, is known.
         // A token constraint owns every output step, so the guard's injected close has no room.
         if (request.token_constraint.empty()) { options.execution.thinking.loop = server.reasoning_loop; }
     }
@@ -351,6 +386,29 @@ infernix::RequestOptions to_request_options(const GenerationRequest& request,
         }
     }
     return options;
+}
+
+std::uint32_t effective_output_limit(std::uint32_t requested_output_tokens,
+                                     std::uint32_t max_context, std::uint32_t prompt_tokens) {
+    // The last output token needs no context position.
+    if (prompt_tokens > max_context) { return 0; }
+    const std::uint64_t room = static_cast<std::uint64_t>(max_context) - prompt_tokens + 1U;
+    return static_cast<std::uint32_t>(
+        std::min<std::uint64_t>(requested_output_tokens, room));
+}
+
+std::optional<std::uint32_t> thinking_answer_room_budget(const ServeOptions& server,
+                                                         std::uint32_t output_limit) {
+    // The limit counts the thinking: leave the answer a quarter (at least the minimum reserve, at
+    // most half) of what the request can actually emit.
+    if (!server.thinking_answer_room ||
+        output_limit < static_cast<std::uint32_t>(kThinkingAnswerRoomMinTokens)) {
+        return std::nullopt;
+    }
+    const std::uint32_t reserve =
+        std::min(std::max(static_cast<std::uint32_t>(kThinkingAnswerRoomMinReserve), output_limit / 4U),
+                 output_limit / 2U);
+    return output_limit - reserve;
 }
 
 } // namespace infernix::serve

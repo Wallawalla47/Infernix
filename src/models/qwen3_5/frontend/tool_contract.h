@@ -39,12 +39,17 @@ struct ToolCallOutputContract {
         NormalizationPolicy policy = NormalizationPolicy::InferredTypes;
         TypeSet types;
         Encoding encoding = Encoding::NonStrict;
+        // A strict nullable string (RawString with null as a value): the raw text `null` reads as JSON null.
+        bool nullable = false;
     };
 
     struct Tool {
         std::string name;
         std::vector<Parameter> parameters;
         std::string schema_json;
+        // A strict tool's grammar schema when it differs from schema_json: each nullable string parameter
+        // as its string branches (its value is raw text; `null` reads back as JSON null). Empty otherwise.
+        std::string grammar_schema_json;
         std::size_t declaration_index = 0;
         bool strict                   = false;
     };
@@ -55,8 +60,11 @@ struct ToolCallOutputContract {
     bool parallel    = true;
 };
 
+// Listed declarations come first, then deferred ones (declared but absent from the prompt's tool
+// section); declaration_index counts across both.
 [[nodiscard]] std::shared_ptr<const ToolCallOutputContract>
-build_tool_call_output_contract(std::span<const std::string> tool_jsons);
+build_tool_call_output_contract(std::span<const std::string> tool_jsons,
+                                std::span<const std::string> deferred_tool_jsons = {});
 
 [[nodiscard]] std::shared_ptr<const ToolCallOutputContract>
 select_tool_call_contract(const std::shared_ptr<const ToolCallOutputContract>& declarations,

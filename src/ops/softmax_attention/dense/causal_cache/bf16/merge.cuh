@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/pdl.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/tile_io.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/split_policy.h"
 #include "ops/softmax_attention/dense/causal_cache/bf16/softmax.cuh"
@@ -43,6 +44,8 @@ __launch_bounds__(Schedule::kThreads) __global__
                               const std::int32_t* valid_columns, std::int32_t tokens,
                               std::int32_t batch_size, std::int32_t visible_capacity,
                               Bf16KvPartition partition, __nv_bfloat16* out) {
+    // Every path, including the masked-column early exit, follows the producer's completion.
+    pdl::wait_for_dependencies();
     const int split_count = partition.capacity;
     constexpr int DChunk  = Schedule::kDChunk;
     static_assert(DChunk <= Geometry::kHeadDim);
@@ -108,5 +111,39 @@ __launch_bounds__(Schedule::kThreads) __global__
     out[causal_q_index<Geometry>(q_head, d, output_column)] = __float2bfloat16(value);
 }
 
+
+// The bf16-prompt-split merge: one CTA of kHeadDim threads per (query head, column) combines the
+// tiled kernel's `splits` partials of that row in split order (an empty split has sum 0 and no
+// weight); columns past the valid tokens are BF16 zero, as the unsplit kernel writes them.
+template <class Geometry, typename Metadata>
+__launch_bounds__(Geometry::kHeadDim) __global__
+    void bf16_kv_prompt_merge_kernel(CausalPartialView partial, Metadata metadata, std::int32_t splits,
+                                     std::int32_t width, __nv_bfloat16* __restrict__ out) {
+    const int q_head = static_cast<int>(blockIdx.x);
+    const int token  = static_cast<int>(blockIdx.y);
+    const int d      = static_cast<int>(threadIdx.x);
+    if (q_head >= Geometry::QHeads || token >= width) { return; }
+    if (token >= metadata.valid_tokens(width)) {
+        out[causal_q_index<Geometry>(q_head, d, token)] = __float2bfloat16(0.0f);
+        return;
+    }
+    float maximum = -CUDART_INF_F;
+    for (int split = 0; split < splits; ++split) {
+        const auto stat = causal_stat_index<Geometry>(q_head, token, split, width);
+        if (partial.sum[stat] > 0.0f) { maximum = fmaxf(maximum, partial.maximum[stat]); }
+    }
+    float numerator = 0.0f, denominator = 0.0f;
+    for (int split = 0; split < splits; ++split) {
+        const auto stat = causal_stat_index<Geometry>(q_head, token, split, width);
+        const float sum = partial.sum[stat];
+        if (sum <= 0.0f) { continue; }
+        const float weight = exp2_approx(partial.maximum[stat] - maximum);
+        denominator        = __fmaf_rn(sum, weight, denominator);
+        numerator = __fmaf_rn(partial.acc[causal_partial_index<Geometry>(q_head, d, token, split, width)], weight,
+                              numerator);
+    }
+    out[causal_q_index<Geometry>(q_head, d, token)] =
+        __float2bfloat16(denominator > 0.0f ? numerator / denominator : 0.0f);
+}
 
 } // namespace infernix::ops::detail

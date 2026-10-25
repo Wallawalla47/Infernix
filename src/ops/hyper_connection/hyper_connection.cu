@@ -1,5 +1,6 @@
 #include "infernix/ops/hyper_connection.h"
 
+#include "ops/hyper_connection/hyper_connection_inject.cuh"
 #include "ops/hyper_connection/hyper_connection_mix_fused.h"
 #include "ops/hyper_connection/hyper_connection_up_collapse.h"
 
@@ -130,7 +131,7 @@ __global__ void inject_kernel(const bf16* __restrict__ y, const float* __restric
     const std::size_t width = static_cast<std::size_t>(streams) * hidden;
     for (int s = 0; s < streams; ++s) {
         bf16& r = residual[static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden + d];
-        r       = __float2bfloat16_rn(__bfloat162float(r) + inject[static_cast<std::size_t>(t) * streams + s] * v);
+        r       = detail::hc_injected(__bfloat162float(r), inject[static_cast<std::size_t>(t) * streams + s], v);
     }
 }
 
@@ -202,21 +203,6 @@ void hyper_connection_gates(const Tensor& z, std::int32_t rank, std::int32_t str
     check_launch("gates");
 }
 
-void hyper_connection_collapse(const Tensor& mix_logits, const Tensor& normalized,
-                               std::int32_t streams, Tensor& out, cudaStream_t stream) {
-    require(contiguous_2d(mix_logits, DType::BF16) && contiguous_2d(normalized, DType::BF16) &&
-                contiguous_2d(out, DType::BF16) && streams > 0,
-            "collapse requires contiguous BF16 tensors");
-    const int width = mix_logits.ne[0], columns = mix_logits.ne[1], hidden = out.ne[0];
-    require(width == streams * hidden && normalized.ne[0] == width && normalized.ne[1] == columns &&
-                out.ne[1] == columns && columns > 0,
-            "collapse shapes disagree");
-    collapse_kernel<<<dim3((hidden + kThreads - 1) / kThreads, columns), kThreads, 0, stream>>>(
-        static_cast<const bf16*>(mix_logits.data), static_cast<const bf16*>(normalized.data), hidden,
-        streams, columns, static_cast<bf16*>(out.data));
-    check_launch("collapse");
-}
-
 std::size_t align256(std::size_t bytes) { return (bytes + 255) / 256 * 256; }
 
 // The composed route's intermediates: Rn, z, m and u in BF16, then the projections' own workspace.
@@ -232,6 +218,24 @@ std::size_t composed_bytes(const Weight& down, const Weight& up, LinearPolicy po
 }
 
 } // namespace
+
+namespace detail {
+
+void hc_collapse(const Tensor& u, const Tensor& normalized, std::int32_t streams, Tensor& x, cudaStream_t stream) {
+    require(contiguous_2d(u, DType::BF16) && contiguous_2d(normalized, DType::BF16) &&
+                contiguous_2d(x, DType::BF16) && streams > 0,
+            "collapse requires contiguous BF16 tensors");
+    const int width = u.ne[0], columns = u.ne[1], hidden = x.ne[0];
+    require(width == streams * hidden && normalized.ne[0] == width && normalized.ne[1] == columns &&
+                x.ne[1] == columns && columns > 0,
+            "collapse shapes disagree");
+    collapse_kernel<<<dim3((hidden + kThreads - 1) / kThreads, columns), kThreads, 0, stream>>>(
+        static_cast<const bf16*>(u.data), static_cast<const bf16*>(normalized.data), hidden, streams, columns,
+        static_cast<bf16*>(x.data));
+    check_launch("collapse");
+}
+
+} // namespace detail
 
 void hyper_connection_mix(const Tensor& residual, const Tensor& norm_weight, const Weight& down,
                           const Weight& up, LinearPolicy policy, std::int32_t streams,
@@ -263,14 +267,42 @@ void hyper_connection_mix(const Tensor& residual, const Tensor& norm_weight, con
     linear(normalized, down, z, policy, workspace, stream);
     Tensor m = workspace.alloc(DType::BF16, {rank, T});
     hyper_connection_gates(z, rank, streams, m, inject, stream);
-    if (detail::hc_up_collapse_supported(up, hidden, streams, T)) {
-        // Q8 W_up beyond the fused decode route: u stays in the MMA tile (bit-identical, §19.3.23).
+    if (detail::hc_up_collapse_supported(up, hidden, streams, T) &&
+        (up.qtype != QType::BF16 || detail::hc_bf16_up_collapse_enabled())) {
+        // Q8 or BF16 W_up beyond the fused decode route: u stays in the MMA tile (bit-identical, §19.3.23).
         detail::hc_up_collapse(m, up, normalized, streams, x, stream);
         return;
     }
     Tensor u = workspace.alloc(DType::BF16, {up.n, T});
     linear(m, up, u, policy, workspace, stream);
-    hyper_connection_collapse(u, normalized, streams, x, stream);
+    detail::hc_collapse(u, normalized, streams, x, stream);
+}
+
+void hyper_connection_inject_mix(const Tensor& y, const Tensor& pending_inject, Tensor& residual,
+                                 const Tensor& norm_weight, const Weight& down, const Weight& up,
+                                 LinearPolicy policy, std::int32_t streams, std::int32_t rank, float eps,
+                                 Tensor& x, Tensor* inject, WorkspaceArena& workspace, cudaStream_t stream) {
+    const std::int32_t T = residual.ne[1], hidden = x.ne[0];
+    require(inject == nullptr || inject->data != pending_inject.data,
+            "inject mix: the mix's injects would overwrite the pending ones");
+    if (contiguous_2d(residual, DType::BF16) && detail::hc_mix_fused_supported(down, up, hidden, streams, rank, T)) {
+        require(contiguous_2d(x, DType::BF16) &&
+                    (contiguous_2d(norm_weight, DType::BF16) || contiguous_2d(norm_weight, DType::FP32)) &&
+                    x.ne[1] == T && residual.ne[0] == streams * hidden && norm_weight.ne[0] == residual.ne[0] &&
+                    down.n == rank + (inject != nullptr ? streams : 0) && eps > 0,
+                "inject mix shapes disagree");
+        if (inject != nullptr) {
+            require(contiguous_2d(*inject, DType::FP32) && inject->ne[0] == streams && inject->ne[1] == T,
+                    "inject mix output must be FP32 [S, T]");
+        }
+        auto scope                = workspace.scope();
+        const DeviceSpan partials = workspace.alloc_bytes(detail::hc_mix_fused_workspace_bytes(down.n, streams, T));
+        detail::hc_inject_mix_fused(y, pending_inject, residual, norm_weight, down, up, streams, rank, eps, x, inject,
+                                    partials.data, stream);
+        return;
+    }
+    hyper_connection_inject(y, pending_inject, residual, stream);
+    hyper_connection_mix(residual, norm_weight, down, up, policy, streams, rank, eps, x, inject, workspace, stream);
 }
 
 std::size_t hyper_connection_mix_workspace_capacity_bytes(const Weight& down, const Weight& up, LinearPolicy policy,

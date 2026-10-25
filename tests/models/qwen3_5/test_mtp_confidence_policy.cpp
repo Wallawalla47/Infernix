@@ -13,7 +13,8 @@
 // Confidence-gated MTP extents (MtpConfidencePolicy): the rate-maximizing prefix against an
 // exhaustive evaluation, cheap columns verifying every draft and costly ones only the confident
 // prefix, acceptance learned per probability bucket, the round-cost fit (and its gap filter), the
-// fixed-threshold mode and invalid inputs.
+// fixed-threshold mode and invalid inputs; the step chain's threshold (no draft below it lets a later
+// one into an extent) and the draft-free round regime (MtpDraftRegime).
 namespace {
 
 using infernix::models::qwen3_5::detail::MtpConfidencePolicy;
@@ -115,6 +116,63 @@ void learned_cost() {
     check(std::abs(policy.column_cost(1) - 0.1) < 1e-6, "batch sizes fit apart");
 }
 
+// The step chain's threshold (OR-09): a draft below it never lets a later draft into the extent,
+// whatever the later drafts' probabilities, at cheap, costly and learned costs; its values.
+void step_threshold_is_sound() {
+    const std::array<float, 8> grid{0.2F, 0.6F, 0.85F, 0.93F, 0.97F, 0.99F, 0.995F, 0.999F};
+    // A learned, non-monotone acceptance (the 0.99 bucket always rejected) among the priors.
+    MtpConfidencePolicy learned(0.7);
+    const std::array<float, 1> rejected{0.995F};
+    for (int i = 0; i < 64; ++i) { learned.observe(rejected, 1, 0); }
+    const std::vector<MtpConfidencePolicy> policies{learned, MtpConfidencePolicy(0.05), MtpConfidencePolicy(0.4),
+                                                    MtpConfidencePolicy(0.7)};
+    for (const MtpConfidencePolicy& policy : policies) {
+        const double theta = policy.step_threshold(1);
+        for (const float a : grid) {
+            for (const float b : grid) {
+                for (const float c : grid) {
+                    const std::array<float, 3> q{a, b, c};
+                    for (std::uint32_t j = 0; j < 2; ++j) {
+                        if (!(static_cast<double>(q[j]) < theta)) { continue; }
+                        check(policy.extent(q, 3, 1) <= j + 1,
+                              "a draft below the step threshold ends the extent (threshold " + std::to_string(theta) + ")");
+                    }
+                }
+            }
+        }
+    }
+    check(MtpConfidencePolicy(0.05).step_threshold(1) == 0.0, "cheap columns gate no step");
+    check(MtpConfidencePolicy(0.7).step_threshold(1) == 0.7, "a 0.7 column cost gates below the 0.7 bucket");
+    check(MtpConfidencePolicy(4.0).step_threshold(1) == 2.0, "a cost no bucket pays gates every step");
+}
+
+// Draft-free rounds (OR-09): alternate runs while learning, then the faster regime with periodic
+// probes of the other; transitions and gaps are not counted.
+void draft_regime() {
+    using infernix::models::qwen3_5::detail::MtpDraftRegime;
+    MtpDraftRegime regime;
+    bool previous = true;
+    std::vector<bool> choices;
+    // Drafting rounds commit 1.05 tokens a cycle in 10.4 ms, draft-free ones 1 token in 9.6 ms.
+    for (int round = 0; round < 400; ++round) {
+        const bool drafting = regime.draft(1);
+        choices.push_back(drafting);
+        regime.observe(1, previous, drafting, drafting ? 105 : 100, drafting ? 1.04 : 0.96);
+        previous = drafting;
+    }
+    check(choices[0] && choices[3] && !choices[4] && !choices[7] && choices[8], "learning alternates runs, drafting first");
+    std::size_t free_late = 0;
+    for (std::size_t i = 320; i < 384; ++i) { free_late += choices[i] ? 0U : 1U; }
+    check(free_late == 64 - 2 * MtpDraftRegime::kProbeRounds, "the faster draft-free regime runs, probing drafting");
+    check(regime.rounds() == 400, "every round is counted");
+    // A gap cycle is not counted.
+    MtpDraftRegime gaps;
+    for (int i = 0; i < 64; ++i) { gaps.observe(1, true, true, 10, 1.0); }
+    gaps.observe(1, true, true, 10, 100.0);
+    gaps.observe(1, false, true, 10, 0.5); // a transition
+    check(gaps.draft_free_rounds() == 0, "observations choose nothing");
+}
+
 void invalid_inputs() {
     bool threw = false;
     try {
@@ -131,6 +189,8 @@ int main() {
         cheap_and_costly_columns();
         learns_acceptance();
         learned_cost();
+        step_threshold_is_sound();
+        draft_regime();
         invalid_inputs();
     } catch (const std::exception& error) {
         std::cerr << "MTP confidence policy test threw: " << error.what() << '\n';

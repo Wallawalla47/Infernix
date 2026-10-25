@@ -58,6 +58,25 @@ enum class LogitsDtype : std::uint8_t {
     // logits become exact ties, which selection breaks by token id. For comparisons.
     BF16,
 };
+[[nodiscard]] inline const char* kv_cache_cli_name(KvCacheStorage storage) noexcept {
+    switch (storage) {
+    case KvCacheStorage::BFloat16:
+        return "bf16";
+    case KvCacheStorage::Int8Group64:
+        return "int8";
+    case KvCacheStorage::Fp8E4M3Row256:
+        return "fp8";
+    case KvCacheStorage::Nvfp4Group16:
+        return "nvfp4";
+    case KvCacheStorage::Fp8KeyNvfp4Value:
+        return "k8v4";
+    case KvCacheStorage::Vq2:
+        return "vq2";
+    case KvCacheStorage::Q4KeyVq2Value:
+        return "k4v2";
+    }
+    return "unknown";
+}
 
 // A fast path: a route whose arithmetic differs from the default route's, run only under
 // EngineOptions::fast_paths and only for the configurations it is qualified for
@@ -88,21 +107,34 @@ enum class FastPath : std::uint8_t {
     // FP8 weights whose permission is 16-bit activations: prefill-width projections carry the
     // activation as two E4M3 terms on the 8-bit Tensor Core path (ops::LinearRoutes::Fp8A8Pair).
     Fp8A8Pair,
+    // The same projections and widths as fp8-a8-pair, with each term's power-of-two scale per 32
+    // values of K instead of per column, applied by the block-scaled MMA
+    // (ops::LinearRoutes::Fp8A8PairBlock32): every value within 2^14 of its block's maximum is carried
+    // exactly. It takes precedence where both are selected. It also serves MXFP8 dense weights (NVIDIA
+    // FP4-Local), whose group scales are the MMA's weight scales.
+    Fp8A8PairBlock32,
     // Groupwise Q4 gate/up weights: prefill-width projections quantize activations to int8 per token
     // and fold each group's weight scale into its accumulator (ops::LinearRoutes::Q4W4A8).
     Q4W4A8,
-    // Qwen3.8-Flash-Next MTP: a sampled request's drafts are drawn from the draft head's four most
-    // probable tokens under the request's sampler and verified by speculative rejection sampling
-    // against that proposal (ops::speculative_sample_sparse_drafts), and its rounds verify every
-    // draft (no --spec-min-p cut). The output distribution stays the sampler's; a seeded sampled
-    // request's text changes, greedy requests are unchanged. Without it the drafts are the head's
-    // argmax (one-hot proposals).
+    // Qwen3.8-Flash-Next MTP, and Qwen3.5 MTP with resident experts and no n-gram copies: a sampled
+    // request's drafts are drawn from the draft head's four most probable tokens under the request's
+    // sampler and verified by speculative rejection sampling against that proposal
+    // (ops::speculative_sample_sparse_drafts), and its rounds verify every draft (no --spec-min-p
+    // cut). The output distribution stays the sampler's; a seeded sampled request's text changes,
+    // greedy requests are unchanged. Without it the drafts are the head's argmax (one-hot proposals).
+    // Qualified on Flash-Next only; on Qwen3.5 it runs as a --fast-path candidate.
     SampledMtpDrafts,
     // Chunked Gated DeltaNet calls (prefill and other calls of 16 or more tokens) store the
     // normalized Q/K in FP16 and run the state products with FP16 operands, accumulating each pair
     // of k16 products in FP16 before the FP32 carry (ops::GdnChunkArithmetic::Fp16Accumulate).
     // Without it they keep BF16/TF32 operands with FP32 accumulators.
     GdnF16Accumulate,
+    // Groupwise Q5 output and MLP down projections (linear_add [5120,6144] and [5120,17408]):
+    // decode and verification calls run eight K warps with the pairwise reduction (NInfer's K-split
+    // residual kernel, ops::LinearRoutes::Q5KSplit) instead of the exact route's four, a different
+    // FP32 summation order. The column-invariant route stays column-invariant (one reduction at every
+    // width). Without it they keep the exact route's tiles.
+    Q5KSplitMma,
     // The paths below couple a request's arithmetic to the other requests of the Engine. Without
     // them a request's outputs depend only on the request, the artifact, the options and the build
     // (LoadSummary::request_invariant); they apply where the exact route is request-invariant.
@@ -131,13 +163,22 @@ enum class FastPath : std::uint8_t {
     // (ops::LinearPolicy::AllowA8Residual); output and down projections stay at 16 bits.
     // batched-a8-decode takes precedence. Without either they stay at 16 bits.
     BatchedA8ResidualDecode,
+    // With batched-decode, wide decode and verify rounds take the artifact's one-term 8-bit
+    // activations in a subset of the FP8 projections only: rounds of at least a minimum width, the
+    // chosen projection classes, the chosen layers (temporary_switches::A8Subset, default rounds of
+    // 65+ columns, the input projections and gate/up of every layer). The others keep their route
+    // (the A8 residual profile where batched-a8-residual-decode is selected, else 16 bits).
+    // batched-a8-decode takes precedence. The narrower rung of batched-a8-decode, which failed its
+    // decode gate (docs/maintainer/model-quality.md, 6.7).
+    BatchedA8SubsetDecode,
     // Without batched-decode: decode and verify calls of a single column (one request's plain
     // decode step alone in its round) run batched-decode's single-column routes, while every wider
     // round keeps the column-invariant route. A request's step then depends on whether another
     // request shares its round. The drafters keep their column-invariant copies. Where
     // batched-decode is selected it changes nothing.
     SingleColumnDecode,
-    // Qwen3.8-Flash-Next W4A16 experts (weight-only exports): calls of more than eight columns per
+    // W4A16 experts (weight-only exports: Qwen3.8-Flash-Next's, and Qwen3.5-122B-A10B's offloaded routed and
+    // shared experts): calls of more than eight columns per
     // expert (prefill, wide verification) take each x and h row as the A4 residual profile of two
     // NVFP4 terms with an FP32 row scale, on the FP4 Tensor Cores, instead of the exact integer limb
     // route. A column's result then depends on its expert's column count in the call, which other
@@ -147,6 +188,12 @@ enum class FastPath : std::uint8_t {
     // about a quarter of the two-term activation error for roughly a quarter of its prefill gain. It
     // takes precedence where both are selected.
     ExpertA4Residual3,
+    // Qwen3.8-Flash-Next W4A16 experts: experts of at most eight columns in a call (decode and
+    // verification, short prompts) take each x and h row as expert-a4-residual's two NVFP4 terms with
+    // an FP32 row scale, their products summed exactly (int64) on the GPU narrow kernels and in the CPU
+    // expert engine alike, instead of the exact integer limb route. A column's result then depends on
+    // its expert's column count in the call (wider experts follow expert-a4-residual or stay exact).
+    ExpertA4ResidualDecode,
     // Decode attention sizes each row's key partition from the round's batch. Without it a row's
     // partition depends only on its own keys.
     BatchSplitAttention,
@@ -163,6 +210,13 @@ enum class FastPath : std::uint8_t {
     // probabilities make fastest (one width for several rows, each row its own extent). Without it
     // they verify the configured length.
     AdaptiveDFlash,
+    // Qwen3.8-Flash-Next with a DFlash2 drafter (--spec dflash2): rounds of two decoding rows
+    // speculate. One proposal serves both rows and the round verifies one width for both (at most
+    // two drafts per row), with --draft-tokens auto the width that maximizes both rows' expected
+    // tokens from their drafts' calibrated probabilities per round time. The shared width couples
+    // the rows (adaptive-speculation's mechanism for the MTP drafter). Without it two rows decode
+    // plain, as three or more do.
+    DFlash2Pairs,
     // The prefix cache resumes from any tap or endpoint and splits prefill at taps and sibling
     // boundaries. Without it prefill splits and the cache publishes and resumes only on the
     // prefill chunk grid, and decode-computed endpoints are not published.
@@ -181,33 +235,85 @@ enum class FastPath : std::uint8_t {
     // (a narrower tail call stays exact), which prefix-cache resumes share between requests. Without
     // it every GGUF projection and expert is exact.
     GgmlBf16Prefill,
+    // Qwen3.8-Flash-Next with row-FP8 (recipe C) or MXFP8 (NVIDIA FP4-Local) dense weights: dense
+    // projections of prefill calls of 256 or more columns run on FP16 Tensor Cores at twice the
+    // FP32-accumulation rate (ops::LinearRoutes::F16Accumulate): each E4M3 code exact in FP16, each
+    // activation column exact in FP16 under a power-of-two scale (apart from values more than 2^17 below
+    // its maximum), FP16 sums over 32-value K chunks carried in FP32. Like ggml-bf16-prefill, a prompt's
+    // arithmetic then depends on where its calls start (a narrower tail call stays exact). Without it
+    // every FP8 and MXFP8 projection is exact.
+    F16AccumulatePrefill,
+    // Qwen3.5 BF16 KV: prompt-route attention (calls of more than 256 columns) splits every query
+    // tile's keys into the equal shares that fill whole waves of the SMs and merges their FP32
+    // partials (a different softmax merge order). Without it each query tile runs all its keys in one
+    // CTA.
+    Bf16PromptSplit,
+    // Qwen3.8-Flash-Next: the MoE router logits of prefill calls of 256 or more columns (the routed
+    // experts' rows) on BF16 Tensor Cores with FP32 accumulation (ops::projection_fp32_router_mma; capy-flash
+    // e0c0a5b5), exact products summed in the tile's order. Like ggml-bf16-prefill, a prompt's routing then
+    // depends on where its calls start. Without it the router runs the FP32 SIMT dot products.
+    RouterMma,
     // Qwen3.8-Flash-Next artifacts with a BF16 or 8-bit LM head converted with its 2-bit screen
-    // (--screen-heads): a
-    // decode or verification round of at most 16 columns whose every row is greedy, without
-    // penalties, a grammar or a token constraint, scores the whole vocabulary from the screen and
+    // (--screen-heads): a decode or verification round of at most 16 columns whose every row is
+    // greedy, without penalties, a grammar or a token constraint, scores the whole vocabulary from the screen and
     // computes only the rows within 5 logits of each column's best screen score (at most 64) with the
     // exact head's arithmetic (ops::screened_head_logits). Those rows' logits carry the exact head's
     // bits and the others the screen's scores, so a column's token is the exact head's unless the
     // screen misses its row. Other rounds run the exact head, so a request's tokens depend on the
     // rows it shares its rounds with. Without it every round runs the exact head.
     ScreenedLmHead,
+    // Every GDN model: the state pool stores each request's GDN recurrent state as FP16 instead of FP32,
+    // halving the state's DRAM traffic in every decode, verification and prefill call (and its pool and
+    // prefix-cache images). Each call widens the stored state exactly, runs its FP32 arithmetic and
+    // rounds the state it publishes once to nearest FP16 (saturating at its largest finite value), so a
+    // request's state carries one rounding per call. FP16 keeps 10 mantissa bits where BF16 keeps 7
+    // (DAMP, arXiv 2608.27513: Qwen3.6-35B-A3B AIME 84.58 with an FP16 state, 79.71 with BF16, 85.46
+    // FP32). Calls follow the request alone on the reproducible route, so its output stays
+    // request-invariant. Without it the state is FP32.
+    Fp16GdnState,
+    // Speculative rounds whose drafts carry their proposal laws (DFlash2, sampled-mtp-drafts): a
+    // sampled row's chain is accepted by block verification (Sun et al., arXiv 2403.10444;
+    // ops::speculative_accept_sparse_drafts) instead of token by token. Its output distribution is the
+    // target's either way and its expected accepted length is at least the token rule's, but a
+    // seeded request draws other text. Greedy rows, tree rows and the reproducible route's Gumbel
+    // rows are unchanged; a row's acceptance reads only that row.
+    BlockVerification,
+    // Tree rounds of a fixed --draft-tree-nodes table whose drafter builds its own trees (DFlash2,
+    // DFlash): sampled rows' trees take each node's top ranks and at most one draw from the rest of
+    // its law, and are verified by UniVer (Weng, Hu, Yairi, arXiv 2605.04543) instead of recursive
+    // rejection without replacement. The output distribution is the target's either way; the drawn
+    // text differs. Greedy rows, chain rows and automatic widths are unchanged.
+    UniverTrees,
+    // Tree rounds (any drafter, fixed or automatic widths): each GDN layer's verification record
+    // computes every tree column in closed form from the row's initial state and its ancestors'
+    // deltas, one solve level per depth (ops::GdnTreeRecordRoute::ClosedForm; TreeWY, arXiv
+    // 2608.20961), instead of walking the tree column by column. FP32 in another order: outputs
+    // within rounding of the walk, not bit-identical; records unchanged.
+    GdnTreeClosedForm,
 };
 
-inline constexpr std::array<FastPath, 26> kFastPaths{
+inline constexpr std::array<FastPath, 38> kFastPaths{
     FastPath::PromptPv8,           FastPath::DecodeSplit64,
     FastPath::Q8SlicedK,           FastPath::GdnConvFused,
     FastPath::QsaPrepareFused,     FastPath::Fp8A8Pair,
+    FastPath::Fp8A8PairBlock32,
     FastPath::Q4W4A8,              FastPath::SampledMtpDrafts,
-    FastPath::GdnF16Accumulate,
+    FastPath::GdnF16Accumulate,    FastPath::Q5KSplitMma,
     FastPath::BatchedDecode,       FastPath::BatchedA8Decode,
     FastPath::BatchedA4Decode,     FastPath::BatchedA4ResidualDecode,
-    FastPath::BatchedA8ResidualDecode, FastPath::SingleColumnDecode,
+    FastPath::BatchedA8ResidualDecode, FastPath::BatchedA8SubsetDecode,
+    FastPath::SingleColumnDecode,
     FastPath::ExpertA4Residual,    FastPath::ExpertA4Residual3,
+    FastPath::ExpertA4ResidualDecode,
     FastPath::BatchSplitAttention, FastPath::AdaptiveSpeculation,
     FastPath::AdaptiveMtp,         FastPath::AdaptiveDFlash,
-    FastPath::FreeCacheResume,     FastPath::Preemption,
-    FastPath::IdleWidePrefill,     FastPath::GgmlBf16Prefill,
-    FastPath::ScreenedLmHead};
+    FastPath::DFlash2Pairs,        FastPath::FreeCacheResume,
+    FastPath::Preemption,          FastPath::IdleWidePrefill,
+    FastPath::GgmlBf16Prefill,     FastPath::F16AccumulatePrefill,
+    FastPath::Bf16PromptSplit,     FastPath::RouterMma,
+    FastPath::ScreenedLmHead,      FastPath::Fp16GdnState,
+    FastPath::BlockVerification,   FastPath::UniverTrees,
+    FastPath::GdnTreeClosedForm};
 
 [[nodiscard]] constexpr const char* fast_path_name(FastPath path) noexcept {
     switch (path) {
@@ -218,13 +324,16 @@ inline constexpr std::array<FastPath, 26> kFastPaths{
     case FastPath::BatchedA4Decode: return "batched-a4-decode";
     case FastPath::BatchedA4ResidualDecode: return "batched-a4-residual-decode";
     case FastPath::BatchedA8ResidualDecode: return "batched-a8-residual-decode";
+    case FastPath::BatchedA8SubsetDecode: return "batched-a8-subset-decode";
     case FastPath::SingleColumnDecode: return "single-column-decode";
     case FastPath::ExpertA4Residual: return "expert-a4-residual";
     case FastPath::ExpertA4Residual3: return "expert-a4-residual-3";
+    case FastPath::ExpertA4ResidualDecode: return "expert-a4-residual-decode";
     case FastPath::BatchSplitAttention: return "batch-split-attention";
     case FastPath::AdaptiveSpeculation: return "adaptive-speculation";
     case FastPath::AdaptiveMtp: return "adaptive-mtp";
     case FastPath::AdaptiveDFlash: return "adaptive-dflash";
+    case FastPath::DFlash2Pairs: return "dflash2-pairs";
     case FastPath::FreeCacheResume: return "free-cache-resume";
     case FastPath::Preemption: return "preemption";
     case FastPath::Q8SlicedK: return "q8-sliced-k";
@@ -232,11 +341,20 @@ inline constexpr std::array<FastPath, 26> kFastPaths{
     case FastPath::QsaPrepareFused: return "qsa-prepare-fused";
     case FastPath::IdleWidePrefill: return "idle-wide-prefill";
     case FastPath::Fp8A8Pair: return "fp8-a8-pair";
+    case FastPath::Fp8A8PairBlock32: return "fp8-a8-pair-block32";
     case FastPath::Q4W4A8: return "q4-w4a8";
     case FastPath::SampledMtpDrafts: return "sampled-mtp-drafts";
     case FastPath::GdnF16Accumulate: return "gdn-f16-accumulate";
+    case FastPath::Q5KSplitMma: return "q5-ksplit-mma";
     case FastPath::GgmlBf16Prefill: return "ggml-bf16-prefill";
+    case FastPath::F16AccumulatePrefill: return "f16-accumulate-prefill";
+    case FastPath::Bf16PromptSplit: return "bf16-prompt-split";
+    case FastPath::RouterMma: return "router-mma";
     case FastPath::ScreenedLmHead: return "screened-lm-head";
+    case FastPath::Fp16GdnState: return "fp16-gdn-state";
+    case FastPath::BlockVerification: return "block-verification";
+    case FastPath::UniverTrees: return "univer-trees";
+    case FastPath::GdnTreeClosedForm: return "gdn-tree-closed-form";
     }
     return "unknown";
 }
@@ -292,7 +410,7 @@ enum class SpeculativeBackend : std::uint8_t {
     DFlash2,
 };
 
-// Automatic DFlash2 tree verification considers, besides the chain, trees of these many columns
+// Automatic tree verification considers, besides the chain, trees of these many columns
 // (anchor included) for all-neural rounds of at most kDraftTreeAutoMaxBatch rows.
 inline constexpr std::uint32_t kDraftTreeAutoMaxBatch = 4;
 
@@ -340,11 +458,13 @@ struct SpeculativeOptions {
     // is the measured 0.5 with draft_tokens_auto and 0 with a fixed draft length. Other models
     // refuse it.
     std::optional<float> draft_min_p;
-    // DFlash2 tree verification by batch size: entry c-1 is the column count (anchor included,
-    // draft_tokens+2..32) a neural round of c rows verifies per row as a draft tree built from the
-    // drafter's lattice; zero keeps that batch size on chain verification. All zero disables trees.
+    // DFlash2, DFlash or MTP tree verification by batch size: entry c-1 is the column count (anchor
+    // included, draft_tokens+2..32) a neural round of c rows verifies per row as a draft tree built
+    // from the drafter's candidates (DFlash2's lattice, DFlash's most probable tokens per
+    // position, leaves beside MTP's sampled drafts); zero keeps that batch size on chain
+    // verification. All zero disables trees.
     std::array<std::uint32_t, kMaximumConcurrency> draft_tree_nodes{};
-    // Automatic DFlash2 tree verification (draft_tree_nodes all zero): each all-neural round
+    // Automatic tree verification (draft_tree_nodes all zero): each all-neural round
     // verifies a chain or one of draft_tree_auto_widths, whichever measured round time and
     // same-text acceptance favour at its batch size and context length. A target whose GDN input
     // projections cannot verify trees resolves this to false (chain verification).
@@ -550,9 +670,10 @@ struct EngineOptions {
     // expert record on a second drive, read beside each record's head in the artifact when the SSD
     // expert tier serves the experts. Empty: whole records from the artifact.
     std::filesystem::path expert_stripe_path;
-    // Qwen3.8-Flash-Next: writes the internal per-round route trace (route_trace.h) to this file,
-    // truncating it at startup. Empty (default): no trace is written and the run is numerically
-    // unchanged. Other architectures ignore it.
+    // Offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B): writes the internal per-round route
+    // trace (runtime/expert_offload/route_trace.h) to this file, truncating it at startup. Empty
+    // (default): no trace is written and the run is numerically unchanged. Programs without
+    // offloaded experts ignore it.
     std::filesystem::path route_trace_path;
     std::size_t grammar_cache_bytes    = 256ULL * 1024 * 1024;
     // Message the model receives when it hits its thinking budget, before the canonical
@@ -634,6 +755,10 @@ struct EngineOptions {
     // default 16-bit activations. Other artifacts refuse it, as does the lossless route without the
     // design reference.
     bool expert_a4_activations         = false;
+    // Qwen3.5-family artifacts (--embedding-host): keep the token embedding in pinned host memory and
+    // gather its rows zero-copy, as artifacts with offloaded experts already do, so its VRAM (1.18 GiB on
+    // the 27B) goes to the KV and prefix caches. Same bits; a prefill chunk reads its rows over the link.
+    bool embedding_host                = false;
     // Run every fast path qualified for this configuration (model geometry, activation precision
     // and KV format): routes whose arithmetic differs from the reproducible route but whose measured cost
     // stays within Infernix's numerical acceptance policy (docs/maintainer/model-quality.md
@@ -984,6 +1109,41 @@ enum class ChatRole : std::uint8_t {
     Tool,
 };
 
+// Whether the active chat template renders an instruction role at each conversation position,
+// found by rendering each position once while the template loads. Agent clients legitimately send
+// instructions where a checkpoint template refuses them: Claude Code appends a mid-conversation
+// system entry, and OpenAI clients carry a leading `developer` turn. Preparation then renders the
+// turn's text under a role the template does render, never changing text, part count or position.
+//
+// The two instruction roles are treated differently on purpose. `system` is the role the Qwen
+// templates themselves use for instructions, so a template that refuses it at every position is
+// stating its own rule and the request fails as that template asks; only a positional rule (the
+// checkpoint guard, which allows a system turn first and nowhere else) is worked around.
+// `developer` is an instruction alias from the client protocols that many Qwen checkpoint
+// templates have no branch for at all, so it is always rendered under a role the template has.
+struct ChatTemplateRoleSupport {
+    // Renders a System turn as the first message. False together with a false late_system is a
+    // template's own rule about instructions, which preparation leaves alone.
+    bool leading_system = true;
+    // Renders a System turn after the first message. Otherwise, and only while it does render one
+    // first, preparation renders that turn as a User turn.
+    bool late_system = true;
+    // Renders a developer turn after the first message. Otherwise preparation renders it as a User
+    // turn.
+    bool late_developer = true;
+    // Renders a developer turn as the first message. Otherwise preparation renders it as a System
+    // turn when the template opens with one, and as a User turn otherwise.
+    bool leading_developer = true;
+
+    // True when preparation lowers a System turn that arrived after the first message.
+    [[nodiscard]] constexpr bool lowers_late_system() const noexcept {
+        return !late_system && leading_system;
+    }
+
+    [[nodiscard]] friend constexpr bool
+    operator==(const ChatTemplateRoleSupport&, const ChatTemplateRoleSupport&) noexcept = default;
+};
+
 enum class MessagePartKind : std::uint8_t {
     Text,
     Media,
@@ -1047,6 +1207,10 @@ struct PromptOptions {
     std::string chat_template_kwargs_json;
     bool add_vision_id = false;
     std::vector<std::string> tool_jsons;
+    // Declarations the prompt does not list (deferred tools). Tool-call parsing, selection and
+    // constraints cover them after tool_jsons, in this order, while the template's tool section
+    // omits them; a message that loads one carries its definition in its own content.
+    std::vector<std::string> deferred_tool_jsons;
 };
 
 enum class PromptCacheMarkerKind : std::uint8_t {
@@ -1149,10 +1313,14 @@ enum class RequestErrorSource : std::uint8_t { OutputConstraint, Tools };
 
 // A prompt longer than the Engine's max_context. Counting stops at a bound past the limit, so
 // prompt_tokens is exact only when `exact`; otherwise the prompt has more than prompt_tokens.
+// With `vision`, the counts are the prompt's images and videos together (their vision tokens)
+// against the processor's per-prompt vision budget: an aggregate overflow a client recovers from by
+// compacting, as from a long prompt (a single item over Vision capacity stays MediaBudgetExceeded).
 struct ContextLengthDetails {
     std::uint64_t prompt_tokens = 0;
     std::uint32_t max_context   = 0;
     bool exact                  = true;
+    bool vision                 = false;
 };
 
 class RequestError final : public std::invalid_argument {
@@ -1165,7 +1333,9 @@ public:
     // RequestErrorKind::ContextLengthExceeded with its counts.
     explicit RequestError(ContextLengthDetails details)
         : std::invalid_argument("prepared prompt has " + std::string(details.exact ? "" : "more than ") +
-                                std::to_string(details.prompt_tokens) + " tokens, exceeding Engine max_context " +
+                                std::to_string(details.prompt_tokens) +
+                                (details.vision ? " vision tokens, exceeding the prompt vision budget "
+                                                : " tokens, exceeding Engine max_context ") +
                                 std::to_string(details.max_context)),
           kind_(RequestErrorKind::ContextLengthExceeded), source_(RequestErrorSource::OutputConstraint),
           context_length_(details) {}
@@ -1218,6 +1388,10 @@ struct PromptPreparationStats {
     std::size_t media_singleflight_waits = 0;
     std::size_t built_patch_bytes        = 0;
     std::size_t reused_patch_bytes       = 0;
+    // Instruction turns whose role preparation lowered because the active chat template cannot
+    // render them where they arrived (see ChatTemplateRoleSupport). 0 when the template renders
+    // every instruction position it received.
+    std::size_t instruction_role_lowerings = 0;
 };
 
 struct MediaCacheSummary {
@@ -1249,6 +1423,18 @@ enum class FinishReason : std::uint8_t {
 struct OutputDelta {
     OutputChannel channel = OutputChannel::Content;
     std::string text;
+};
+
+// One step of a tool call as the constrained tool route generates it (calls of free tool output
+// arrive whole, in GenerationResult::tool_calls). A call's first delta names its tool; every delta
+// carries the next bytes of its arguments JSON, and the call's last one is marked complete. A
+// call's deltas concatenate to the arguments_json the result holds for it; a call cut by the output
+// limit, the context or a cancellation never completes and stays out of the result.
+struct ToolCallDelta {
+    std::uint32_t index = 0; // the call's position among the turn's calls
+    std::string name;        // the tool's name, on the call's first delta only
+    std::string arguments;
+    bool complete = false;
 };
 
 // Exact prompt accounting selected at admission. Streaming consumers receive this once before any
@@ -1285,6 +1471,8 @@ public:
     virtual void progress(PromptProgress progress)          = 0;
     virtual void timing(GenerationTimingObservation timing) = 0;
     virtual void publish(OutputDelta delta)                 = 0;
+    // Published after the content that precedes the call, in generation order.
+    virtual void tool_call(ToolCallDelta delta)             = 0;
 };
 
 enum class OutputConsumerMode : std::uint8_t {
@@ -1471,11 +1659,22 @@ struct SpeculativeStats {
     std::uint64_t ngram_archive_rounds          = 0;
     std::uint64_t ngram_archive_drafted_tokens  = 0;
     std::uint64_t ngram_archive_accepted_tokens = 0;
+    // Qwen3.8-Flash-Next with INFERNIX_TMP_NGRAM_AGREE: copy proposals the agreement gate refused.
+    std::uint64_t ngram_gate_rejections = 0;
     // Tree-verified rounds, those whose accepted path left the main chain, and the drafts those
     // paths accepted after leaving it (what the main chain alone would not have accepted).
     std::uint64_t tree_rounds               = 0;
     std::uint64_t tree_side_rounds          = 0;
     std::uint64_t tree_side_accepted_tokens = 0;
+    // Every verified round in order (fallback steps excluded): the drafts it verified, how many it
+    // accepted and whether they were n-gram (copy) drafts. Qwen3.5-family MTP and DFlash rounds and
+    // Qwen3.8-Flash-Next rounds; empty for other models.
+    struct RoundStep {
+        std::uint16_t drafted  = 0;
+        std::uint16_t accepted = 0;
+        bool ngram             = false;
+    };
+    std::vector<RoundStep> round_steps;
 };
 
 struct ThinkingBudgetStats {
@@ -1564,6 +1763,17 @@ struct ExpertCacheStats {
     std::uint64_t decode_hits   = 0;
 };
 
+// Qwen3.8-Flash-Next: the VRAM expert cache's cumulative counters since startup and its current
+// size (RuntimeStats::expert_cache, exported by /metrics). Absent for models without one.
+struct ExpertCacheTotals {
+    std::uint32_t frames     = 0; // frames backed now, one routed expert each
+    std::uint64_t routed     = 0; // routed (layer, expert) uses
+    std::uint64_t hits       = 0; // of those, served from a frame
+    std::uint64_t promotions = 0; // experts copied into frames by the cache policy
+    std::uint64_t landed     = 0; // staged misses adopted into frames
+    std::uint64_t cpu_served = 0; // misses computed by the CPU expert team
+};
+
 struct GenerationResult {
     // Unique within this Engine instance; diagnostic correlation only.
     std::uint64_t engine_request_id = 0;
@@ -1591,6 +1801,10 @@ struct GenerationResult {
     // Present for models that cache routed experts in VRAM (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B)
     // and requests that finished normally.
     std::optional<ExpertCacheStats> expert_cache;
+    // With the prefix cache, for a request that finished normally: the prompt tokens past its reused
+    // prefix whose state its snapshots made reusable for a later request (Anthropic's
+    // cache_creation_input_tokens). Absent without the cache or for a prompt that does not publish.
+    std::optional<std::uint32_t> cache_created_prompt_tokens;
     // Present exactly when the request named readout tokens and its prompt completed.
     std::optional<PromptReadout> readout;
     // One entry per generated token of a constrained request, in output order.
@@ -1701,6 +1915,30 @@ struct MemorySummary {
     std::optional<ExpertCacheMemorySummary> expert_cache;
 };
 
+// A count and total of durations, and the longest since Engine::reset_execution_maxima().
+struct DurationCounter {
+    std::uint64_t count    = 0;
+    std::uint64_t total_ns = 0;
+    std::uint64_t max_ns   = 0;
+
+    void add(std::uint64_t ns) noexcept {
+        ++count;
+        total_ns += ns;
+        if (ns > max_ns) { max_ns = ns; }
+    }
+};
+
+// The Engine worker's execution units by kind, each from its call to its return (Host work and
+// Device waits together): the maximum shows stalls the totals hide, and decode_by_batch[b - 1]
+// (decode rounds of b rows) the cost of the batch size.
+struct RuntimeExecutionLatency {
+    DurationCounter prefill; // one prefill step of a request
+    DurationCounter replay;  // one Replay step
+    DurationCounter control; // one control batch
+    DurationCounter decode;  // one decode round
+    std::array<DurationCounter, kMaximumConcurrency> decode_by_batch;
+};
+
 // Worker-owned monotonic nanosecond counters. Top-level Host phases are mutually exclusive;
 // device_wait_ns is blocked wall time and is intentionally excluded from their sum. Detail values
 // are subsets of a top-level phase and must not be added to Host-active time again.
@@ -1730,6 +1968,7 @@ struct RuntimeHostWorkStats {
 // decision observations. Consumers derive interval counters by subtracting two snapshots.
 struct RuntimeStats {
     RuntimeHostWorkStats host_work;
+    RuntimeExecutionLatency execution;
     // Full prompt counted once when initial binding succeeds; includes reused tokens.
     std::uint64_t prompt_tokens = 0;
     // All committed output tokens, including the first token and Engine-injected control tokens.
@@ -1776,6 +2015,9 @@ struct RuntimeStats {
     std::uint32_t device_state_occupied_slots      = 0;
     std::uint32_t device_main_kv_occupied_pages    = 0;
     std::uint32_t device_backend_kv_occupied_pages = 0;
+
+    // The VRAM expert cache of an offloaded-expert model (Qwen3.8-Flash-Next); absent otherwise.
+    std::optional<ExpertCacheTotals> expert_cache;
 
     // The prefix cache; zero when it is disabled. Block and snapshot gauges are absolute; the
     // rest are cumulative event counters.
@@ -1893,6 +2135,8 @@ struct LoadSummary {
     std::string fast_path_configuration;
     std::vector<std::string> fast_paths;
     bool fast_paths_disabled = false;
+    // The temporary A/B switches (INFERNIX_TMP_*) this process read, as "NAME=value | ...".
+    std::string temporary_switches;
     // Whether a request's output depends only on the request, the artifact, the options and the
     // build: no request-coupling fast path (FastPath::BatchedDecode and after) runs, and no
     // Qwen3.5 DFlash or DFlash2 drafter (whose batched draft calls are not yet column-invariant).

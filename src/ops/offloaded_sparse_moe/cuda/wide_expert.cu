@@ -5,6 +5,7 @@
 #include "ops/offloaded_sparse_moe/cuda/wide_expert_a16.cuh"
 
 #include "core/device.h"
+#include "core/temporary_switches.h"
 #include "ops/linear/nvfp4/nvfp4_codec.cuh"
 
 #include <cuda_bf16.h>
@@ -203,19 +204,23 @@ Offsets offsets(const ExpertShape& shape, std::int32_t max_jobs, std::int32_t en
     if (wide_a16 == WideA16::kLossless) {
         o.lossless = take(lossless_experts_bytes(shape, max_jobs, entries));
     } else if (terms.x != 0) {
-        // The narrow route still needs its h rows (BF16 h of every entry) and exponents.
-        o.h_rows      = take(e * h_row);
-        o.h_emax      = take(e * sizeof(std::int32_t));
-        o.x_terms_plane = take(e * x_terms_row_bytes(terms.x));
-        o.x_row_scale = take(t * sizeof(float));
-        o.h_terms_plane = take(e * h_terms_row_bytes(terms.h));
-        o.h_row_scale = take(e * sizeof(float));
+        // The narrow route still needs its h rows (BF16 h of every entry) and exponents, and a ring
+        // call (ring_call) its x exponents.
+        o.h_rows = take(e * h_row);
+        if (ring_call(shape, activation, wide_a16, columns)) { o.x_emax = take(t * sizeof(std::int32_t)); }
+        o.h_emax        = take(e * sizeof(std::int32_t));
+        o.x_terms_plane = take(e * static_cast<std::size_t>(x_terms_row_bytes(shape, terms.x)));
+        o.x_row_scale   = take(t * sizeof(float));
+        o.h_terms_plane = take(e * static_cast<std::size_t>(h_terms_row_bytes(shape, terms.h)));
+        o.h_row_scale   = take(e * sizeof(float));
     } else if (activation == ExpertActivation::kA16) {
         o.x_limbs = take(t * x_row);
         o.h_rows  = take(e * h_row);
         o.x_emax  = take(t * sizeof(std::int32_t));
         o.h_emax  = take(e * sizeof(std::int32_t));
-        if (wide_a16 == WideA16::kGgmlBf16 && columns >= kGgmlBf16MinColumns) {
+        // TEMPORARY: the threshold from the environment (MoeGgmlTiles, default kGgmlBf16MinColumns),
+        // the same for every call of the process, so that a call's layout matches its sizing.
+        if (wide_a16 == WideA16::kGgmlBf16 && columns >= MoeGgmlTiles::from_environment().plane_min_columns) {
             o.ggml_planes     = take(kGgmlBf16PlaneBytes);
             o.has_ggml_planes = true;
         }
@@ -234,8 +239,7 @@ Offsets offsets(const ExpertShape& shape, std::int32_t max_jobs, std::int32_t en
     return o;
 }
 
-constexpr int kEncodeXThreads = kHidden / 16; // one 16-element block per thread (Flash-Next's A4 terms)
-constexpr int kEncodeWarps    = 8;
+constexpr int kEncodeWarps = 8;
 
 // Every token's x limbs and column exponent (W4A16 wide calls): one CTA per token, one 16-element
 // block per thread.
@@ -350,12 +354,15 @@ __device__ __forceinline__ void store_terms(std::uint8_t* row, int b, int code_b
     }
 }
 
-// Every token's x row scale: one CTA per token.
-__global__ void __launch_bounds__(kEncodeXThreads)
+// Every token's x row scale: one CTA per token, one 16-element block per thread (160 or 192).
+template <class G>
+__global__ void __launch_bounds__(G::kHidden / 16)
     x_row_scale_kernel(const std::uint16_t* __restrict__ x, float* __restrict__ row_scale) {
-    __shared__ float maxima[kEncodeXThreads / 32];
+    constexpr int kThreads = G::kHidden / 16;
+    static_assert(kThreads % 32 == 0);
+    __shared__ float maxima[kThreads / 32];
     const int t = static_cast<int>(blockIdx.x), b = static_cast<int>(threadIdx.x);
-    const auto* source = reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(t) * kHidden + 16 * b);
+    const auto* source = reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(t) * G::kHidden + 16 * b);
     std::uint16_t v[16];
     unpack16(source[0], source[1], v);
     float amax = 0.0F;
@@ -374,41 +381,47 @@ __global__ void __launch_bounds__(kEncodeXThreads)
     if (b == 0) {
         float all = 0.0F;
 #pragma unroll
-        for (int w = 0; w < kEncodeXThreads / 32; ++w) { all = maxima[w] > all || maxima[w] != maxima[w] ? maxima[w] : all; }
+        for (int w = 0; w < kThreads / 32; ++w) { all = maxima[w] > all || maxima[w] != maxima[w] ? maxima[w] : all; }
         row_scale[t] = residual_row_scale(all);
     }
 }
 
-// The terms of every wide entry's x (its token's row), as quantize_kernel does for A4.
-template <int Terms>
+// The terms of every wide entry's x (its token's row, entry_column: a shared-expert job's entries
+// follow the routed ones), as quantize_kernel does for A4.
+template <class G, int Terms>
 __global__ void __launch_bounds__(kQuantizeThreads)
     quantize_x_terms_kernel(const std::uint16_t* __restrict__ x, int top_k, MoeDispatch dispatch,
                        const std::int32_t* __restrict__ tiles, const std::int32_t* __restrict__ pass_tiles, int passes,
                        const float* __restrict__ row_scale, std::uint8_t* __restrict__ plane) {
+    using P            = A4Planes<G>;
+    constexpr int kBlocks = G::kGateUpBlocks; // 160 or 192
     const int total = pass_tiles[passes];
     for (int tile = static_cast<int>(blockIdx.x); tile < total; tile += static_cast<int>(gridDim.x)) {
         const int job = tiles[2 * tile], column = tiles[2 * tile + 1];
         const int expert = dispatch.jobs[job];
         const int first  = dispatch.offsets[expert] + column;
         const int count  = min(kTileColumns, dispatch.offsets[expert + 1] - first);
-        for (int task = static_cast<int>(threadIdx.x); task < count * kGateUpBlocks; task += kQuantizeThreads) {
-            const int i = task / kGateUpBlocks, b = task % kGateUpBlocks;
+        for (int task = static_cast<int>(threadIdx.x); task < count * kBlocks; task += kQuantizeThreads) {
+            const int i = task / kBlocks, b = task % kBlocks;
             const int p = first + i;
-            const int t = dispatch.entries[p] / top_k;
+            const int t = entry_column(dispatch.entries[p], top_k, dispatch.shared_first);
             TermBlock<Terms> q;
-            term_block(x + static_cast<std::size_t>(t) * kHidden + 16 * b, row_scale[t], q);
-            store_terms(plane + static_cast<std::size_t>(p) * x_terms_row_bytes(Terms), b, kXCodeBytes, kXRowBytes, q);
+            term_block(x + static_cast<std::size_t>(t) * G::kHidden + 16 * b, row_scale[t], q);
+            store_terms(plane + static_cast<std::size_t>(p) * P::x_terms_row_bytes(Terms), b, P::kXCodeBytes,
+                        P::kXRowBytes, q);
         }
     }
 }
 
 // The pass's wide entries' h (BF16 rows) as terms with their row scales: one warp per entry.
-template <int Terms>
+template <class G, int Terms>
 __global__ void __launch_bounds__(kEncodeWarps * 32)
     quantize_h_terms_kernel(MoeDispatch dispatch, const std::int32_t* __restrict__ tiles,
                        const std::int32_t* __restrict__ pass_tiles, int pass, const std::uint8_t* __restrict__ h_rows,
                        std::uint8_t* __restrict__ plane, float* __restrict__ row_scale) {
-    constexpr int kBlocks = kIntermediate / 16; // 40: lane l holds blocks l and l + 32
+    using P               = A4Planes<G>;
+    constexpr int kBlocks = G::kIntermediate / 16; // 40 or 64: lane l holds blocks l and l + 32
+    static_assert(kBlocks > 32 && kBlocks <= 64);
     const int lane  = static_cast<int>(threadIdx.x) % 32;
     const int warp  = static_cast<int>(blockIdx.x) * kEncodeWarps + static_cast<int>(threadIdx.x) / 32;
     const int warps = static_cast<int>(gridDim.x) * kEncodeWarps;
@@ -419,7 +432,8 @@ __global__ void __launch_bounds__(kEncodeWarps * 32)
         const int expert = dispatch.jobs[job];
         const int entry  = dispatch.offsets[expert] + column + c;
         if (entry >= dispatch.offsets[expert + 1]) { continue; } // warp-uniform
-        const auto* source = reinterpret_cast<const uint4*>(h_rows + static_cast<std::size_t>(entry) * kA16HRowBytes);
+        const auto* source =
+            reinterpret_cast<const uint4*>(h_rows + static_cast<std::size_t>(entry) * A16Planes<G>::kHRowBytes);
         const bool second  = lane + 32 < kBlocks;
         std::uint16_t v0[16] = {}, v1[16] = {};
         unpack16(source[2 * lane], source[2 * lane + 1], v0);
@@ -437,50 +451,53 @@ __global__ void __launch_bounds__(kEncodeWarps * 32)
             amax              = other > amax || other != other ? other : amax;
         }
         const float rs    = residual_row_scale(amax);
-        const auto* h     = reinterpret_cast<const std::uint16_t*>(h_rows + static_cast<std::size_t>(entry) * kA16HRowBytes);
-        std::uint8_t* row = plane + static_cast<std::size_t>(entry) * h_terms_row_bytes(Terms);
+        const auto* h = reinterpret_cast<const std::uint16_t*>(h_rows + static_cast<std::size_t>(entry) *
+                                                                            A16Planes<G>::kHRowBytes);
+        std::uint8_t* row = plane + static_cast<std::size_t>(entry) * P::h_terms_row_bytes(Terms);
         TermBlock<Terms> q;
         term_block(h + 16 * lane, rs, q);
-        store_terms(row, lane, kHCodeBytes, kHRowStride, q);
+        store_terms(row, lane, P::kHCodeBytes, P::kHTermStride, q);
         if (second) {
             term_block(h + 16 * (lane + 32), rs, q);
-            store_terms(row, lane + 32, kHCodeBytes, kHRowStride, q);
+            store_terms(row, lane + 32, P::kHCodeBytes, P::kHTermStride, q);
         }
         if (lane == 0) { row_scale[entry] = rs; }
     }
 }
 
-// Every term's TMA maps (unused third-term maps, at two terms, are encoded but never read).
+// Every term's TMA maps at geometry G (unused third-term maps, at two terms, are encoded but never read).
+template <class G>
 Descriptors make_descriptors_terms(const std::uint8_t* x_terms_plane, const std::uint8_t* h_terms_plane, int entries,
                                    ResidualTerms terms) {
+    using P         = A4Planes<G>;
     const auto rows = static_cast<std::uint64_t>(entries);
     auto* x = const_cast<std::uint8_t*>(x_terms_plane);
     auto* h = const_cast<std::uint8_t*>(h_terms_plane);
-    const auto x_stride = static_cast<std::uint64_t>(x_terms_row_bytes(terms.x));
-    const auto h_stride = static_cast<std::uint64_t>(h_terms_row_bytes(terms.h));
+    const auto x_stride = static_cast<std::uint64_t>(P::x_terms_row_bytes(terms.x));
+    const auto h_stride = static_cast<std::uint64_t>(P::h_terms_row_bytes(terms.h));
     Descriptors d{};
     const auto x_maps = [&](std::uint8_t* base, CUtensorMap& codes, CUtensorMap& scales) {
-        codes  = detail::nvfp4_make_tma_2d(base, CU_TENSOR_MAP_DATA_TYPE_UINT8, kXCodeBytes, rows, x_stride,
+        codes  = detail::nvfp4_make_tma_2d(base, CU_TENSOR_MAP_DATA_TYPE_UINT8, P::kXCodeBytes, rows, x_stride,
                                            Schedule::kCodeRowBytes, Schedule::kBlockTokens, CU_TENSOR_MAP_SWIZZLE_64B,
                                            "encode wide A4 residual x codes TMA");
-        scales = detail::nvfp4_make_tma_2d(base + kXCodeBytes, CU_TENSOR_MAP_DATA_TYPE_UINT8, kXScaleBytes, rows,
+        scales = detail::nvfp4_make_tma_2d(base + P::kXCodeBytes, CU_TENSOR_MAP_DATA_TYPE_UINT8, P::kXScaleBytes, rows,
                                            x_stride, 16, Schedule::kBlockTokens, CU_TENSOR_MAP_SWIZZLE_NONE,
                                            "encode wide A4 residual x scales TMA");
     };
     const auto h_maps = [&](std::uint8_t* base, CUtensorMap& codes, CUtensorMap& scales) {
-        codes  = detail::nvfp4_make_tma_2d(base, CU_TENSOR_MAP_DATA_TYPE_UINT8, kHCodeBytes, rows, h_stride,
+        codes  = detail::nvfp4_make_tma_2d(base, CU_TENSOR_MAP_DATA_TYPE_UINT8, P::kHCodeBytes, rows, h_stride,
                                            Schedule::kCodeRowBytes, Schedule::kBlockTokens, CU_TENSOR_MAP_SWIZZLE_64B,
                                            "encode wide A4 residual h codes TMA");
-        scales = detail::nvfp4_make_tma_2d(base + kHCodeBytes, CU_TENSOR_MAP_DATA_TYPE_UINT8, kHScaleMapBytes, rows,
-                                           h_stride, 16, Schedule::kBlockTokens, CU_TENSOR_MAP_SWIZZLE_NONE,
+        scales = detail::nvfp4_make_tma_2d(base + P::kHCodeBytes, CU_TENSOR_MAP_DATA_TYPE_UINT8, P::kHScaleMapBytes,
+                                           rows, h_stride, 16, Schedule::kBlockTokens, CU_TENSOR_MAP_SWIZZLE_NONE,
                                            "encode wide A4 residual h scales TMA");
     };
     x_maps(x, d.x_codes, d.x_scales);
-    x_maps(x + kXRowBytes, d.x2_codes, d.x2_scales);
-    x_maps(x + 2 * kXRowBytes, d.x3_codes, d.x3_scales);
+    x_maps(x + P::kXRowBytes, d.x2_codes, d.x2_scales);
+    x_maps(x + 2 * P::kXRowBytes, d.x3_codes, d.x3_scales);
     h_maps(h, d.h_codes, d.h_scales);
-    h_maps(h + kHRowStride, d.h2_codes, d.h2_scales);
-    h_maps(h + 2 * kHRowStride, d.h3_codes, d.h3_scales);
+    h_maps(h + P::kHTermStride, d.h2_codes, d.h2_scales);
+    h_maps(h + 2 * P::kHTermStride, d.h3_codes, d.h3_scales);
     return d;
 }
 
@@ -506,6 +523,7 @@ ExpertsWorkspace carve_experts_workspace(void* base, const ExpertShape& shape, s
         w.lossless = reinterpret_cast<std::uint8_t*>(p + o.lossless);
     } else if (activation == ExpertActivation::kA16 && residual_terms(wide_a16).x != 0) {
         w.h_rows      = reinterpret_cast<std::uint8_t*>(p + o.h_rows);
+        w.x_emax      = o.has_ring ? reinterpret_cast<std::int32_t*>(p + o.x_emax) : nullptr;
         w.h_emax      = reinterpret_cast<std::int32_t*>(p + o.h_emax);
         w.x_terms_plane = reinterpret_cast<std::uint8_t*>(p + o.x_terms_plane);
         w.x_row_scale = reinterpret_cast<float*>(p + o.x_row_scale);
@@ -556,6 +574,7 @@ Call prepare(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource
     call.h_plane     = reinterpret_cast<std::uint8_t*>(workspace.h_blocks);
     call.outputs     = static_cast<std::uint16_t*>(outputs.data);
     call.passes      = (max_jobs + pass_jobs - 1) / pass_jobs;
+    call.mean_job_columns = entries / max_jobs;
     plan_kernel<<<1, kPlanThreads, 0, stream>>>(dispatch, source.scales, max_jobs, pass_jobs, call.passes,
                                                 workspace.tiles, workspace.pass_tiles);
     check_launch("plan");
@@ -571,18 +590,20 @@ Call prepare(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource
         call.x_row_scale   = workspace.x_row_scale;
         call.h_terms_plane = workspace.h_terms_plane;
         call.h_row_scale   = workspace.h_row_scale;
-        x_row_scale_kernel<<<x.ne[1], kEncodeXThreads, 0, stream>>>(static_cast<const std::uint16_t*>(x.data),
-                                                                    workspace.x_row_scale);
-        check_launch("x row scale");
-        const auto quantize_x = [&]<int Terms>() {
-            quantize_x_terms_kernel<Terms><<<persistent_ctas() * 2, kQuantizeThreads, 0, stream>>>(
-                static_cast<const std::uint16_t*>(x.data), top_k, dispatch, workspace.tiles, workspace.pass_tiles,
-                call.passes, workspace.x_row_scale, workspace.x_terms_plane);
-        };
-        terms.x == 3 ? quantize_x.template operator()<3>() : quantize_x.template operator()<2>();
-        check_launch("quantize A4 residual x");
-        const Descriptors descriptors =
-            make_descriptors_terms(workspace.x_terms_plane, workspace.h_terms_plane, entries, terms);
+        Descriptors descriptors{};
+        with_expert_geometry(source.shape, [&]<class G>() {
+            x_row_scale_kernel<G><<<x.ne[1], G::kHidden / 16, 0, stream>>>(static_cast<const std::uint16_t*>(x.data),
+                                                                          workspace.x_row_scale);
+            check_launch("x row scale");
+            const auto quantize_x = [&]<int Terms>() {
+                quantize_x_terms_kernel<G, Terms><<<persistent_ctas() * 2, kQuantizeThreads, 0, stream>>>(
+                    static_cast<const std::uint16_t*>(x.data), top_k, dispatch, workspace.tiles, workspace.pass_tiles,
+                    call.passes, workspace.x_row_scale, workspace.x_terms_plane);
+            };
+            terms.x == 3 ? quantize_x.template operator()<3>() : quantize_x.template operator()<2>();
+            check_launch("quantize A4 residual x");
+            descriptors = make_descriptors_terms<G>(workspace.x_terms_plane, workspace.h_terms_plane, entries, terms);
+        });
 #ifdef _WIN32
         call.descriptors = descriptor_staging().stage(descriptors, stream);
 #else
@@ -620,25 +641,43 @@ Call prepare(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource
     return call;
 }
 
+// TEMPORARY (INFERNIX_TMP_WIDE_EXPERT_T64=<n>, candidates P5), until its A/B: the W4A4 and A4-residual
+// grouped GEMMs on WarpTile64 schedules (the same bits) in calls of at least n columns per expert on
+// average (unset: never; 1: every call). Op bench 2026-10-24: 1.05-1.11x the time at 80 columns per
+// expert (Flash-Next 4K tokens), 0.94-0.97x from about 128 (the 122B at 4K, either model at 16K+).
+bool wide_t64(const Call& call) {
+    static const std::int64_t threshold =
+        temporary_switches::integer("INFERNIX_TMP_WIDE_EXPERT_T64", 0, 0, 1 << 30);
+    return threshold > 0 && call.mean_job_columns >= threshold;
+}
+
 void run_pass(const Call& call, std::int32_t pass, cudaStream_t stream) {
     if (pass < 0 || pass >= call.passes) { throw std::out_of_range("offloaded_sparse_moe wide: pass out of range"); }
     if (call.a4_residual) {
-        const auto gate_up = [&]<int Terms>() {
-            launch<Matrix::GateUp, ScheduleResidual<Terms>>(
-                call, pass,
-                GateUpEpilogueResidual{call.scales, call.dispatch.entries, call.x_row_scale, call.h_rows, call.top_k},
-                stream);
-        };
-        const auto down = [&]<int Terms>() {
-            quantize_h_terms_kernel<Terms><<<persistent_ctas(), kEncodeWarps * 32, 0, stream>>>(
-                call.dispatch, call.tiles, call.pass_tiles, pass, call.h_rows, call.h_terms_plane, call.h_row_scale);
-            check_launch("quantize A4 residual h");
-            launch<Matrix::Down, ScheduleResidual<Terms>>(
-                call, pass, DownEpilogueResidual{call.scales, call.dispatch.entries, call.h_row_scale, call.outputs},
-                stream);
-        };
-        call.terms.x == 3 ? gate_up.template operator()<3>() : gate_up.template operator()<2>();
-        call.terms.h == 3 ? down.template operator()<3>() : down.template operator()<2>();
+        with_expert_geometry(call.shape, [&]<class G>() {
+            const auto gate_up = [&]<int Terms>() {
+                const GateUpEpilogueResidual<G> epilogue{call.scales, call.dispatch.entries, call.x_row_scale, call.h_rows,
+                                                         call.top_k, call.dispatch.shared_first};
+                if (wide_t64(call)) {
+                    launch<Matrix::GateUp, WarpTile64<ScheduleResidual<Terms, G>>, G>(call, pass, epilogue, stream);
+                } else {
+                    launch<Matrix::GateUp, ScheduleResidual<Terms, G>, G>(call, pass, epilogue, stream);
+                }
+            };
+            const auto down = [&]<int Terms>() {
+                quantize_h_terms_kernel<G, Terms><<<persistent_ctas(), kEncodeWarps * 32, 0, stream>>>(
+                    call.dispatch, call.tiles, call.pass_tiles, pass, call.h_rows, call.h_terms_plane, call.h_row_scale);
+                check_launch("quantize A4 residual h");
+                const DownEpilogueResidual<G> epilogue{call.scales, call.dispatch.entries, call.h_row_scale, call.outputs};
+                if (wide_t64(call)) {
+                    launch<Matrix::Down, WarpTile64<ScheduleResidual<Terms, G>>, G>(call, pass, epilogue, stream);
+                } else {
+                    launch<Matrix::Down, ScheduleResidual<Terms, G>, G>(call, pass, epilogue, stream);
+                }
+            };
+            call.terms.x == 3 ? gate_up.template operator()<3>() : gate_up.template operator()<2>();
+            call.terms.h == 3 ? down.template operator()<3>() : down.template operator()<2>();
+        });
         return;
     }
     if (call.a16) {
@@ -663,6 +702,12 @@ void run_pass(const Call& call, std::int32_t pass, cudaStream_t stream) {
             launch_a16<A16Matrix<G, Matrix::Down>>(
                 call, pass, DownEpilogueA16<G>{call.scales, call.dispatch.entries, call.h_emax, call.outputs}, stream);
         });
+        return;
+    }
+    if (wide_t64(call)) {
+        launch<Matrix::GateUp, WarpTile64<Schedule>>(call, pass, GateUpEpilogue{call.scales, call.h_plane}, stream);
+        launch<Matrix::Down, WarpTile64<Schedule>>(call, pass, DownEpilogue{call.scales, call.dispatch.entries, call.outputs},
+                                                   stream);
         return;
     }
     launch<Matrix::GateUp>(call, pass, GateUpEpilogue{call.scales, call.h_plane}, stream);

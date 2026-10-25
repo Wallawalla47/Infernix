@@ -3,6 +3,7 @@
 // production kv_cache_append writes for that position (the sinks and the call's last 1,024 keys), and every code
 // plane the production pages of the same keys (an identity block table).
 
+#include "ops/op_family.h"
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/paged_kv_storage.h"
@@ -129,7 +130,7 @@ int check(KvCacheStorage storage, const char* name, int kv_heads, int columns) {
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(lossless_kv_encode) {
     int failures = 0;
     // The 27B's 4 KV heads; 1,200 keys so the window wraps its ring once (positions 176-1,199 and the sinks).
     failures += check(KvCacheStorage::Int8Group64, "int8", 4, 1200);

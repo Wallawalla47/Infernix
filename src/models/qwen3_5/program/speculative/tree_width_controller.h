@@ -10,7 +10,7 @@
 
 namespace infernix::models::qwen3_5::detail {
 
-// Automatic DFlash2 tree verification: chooses each all-neural round's width among the chain and
+// Automatic tree verification: chooses each all-neural round's width among the chain and
 // the tree widths captured for its batch size.
 //
 // The gain of a width is measured on the generated text itself. The tree builder adds columns
@@ -42,6 +42,35 @@ public:
     // Columns per row for the next all-neural round of batch_size rows whose largest execution
     // frontier is context; chain_columns selects chain verification.
     [[nodiscard]] std::uint32_t choose(std::uint32_t batch_size, std::uint32_t context);
+
+    // TEMPORARY (INFERNIX_TMP_TREE_ROUND_WIDTH, candidates §13 PUB-03): a row of a round whose width
+    // is chosen after its proposal (a tree block round): the drafter's probability of each chain
+    // draft (DFlash2's selector probability), and whether a tree may extend the row (its chain is
+    // the whole window).
+    struct RoundRow {
+        std::span<const float> probabilities;
+        bool tree = false;
+    };
+    // The row's own estimates: expected chain tokens 1 + sum_j prod_{i<=j} p_i, and miss mass, the
+    // chance the chain stops before its end, 1 - prod_j p_j, which a tree's side columns may recover.
+    struct RoundEstimate {
+        double chain = 1.0;
+        double miss  = 0.0;
+    };
+    [[nodiscard]] static RoundEstimate estimate(const RoundRow& row) noexcept;
+    // Whether rounds of batch_size rows choose among tree widths at all.
+    [[nodiscard]] bool automatic(std::uint32_t batch_size) const noexcept;
+    // choose() for a tree block round. Exploration is choose()'s; otherwise, once calibrated, a width
+    // w's tokens are each row's beta x chain + (tree rows) alpha_w x miss, beta the measured chain
+    // tokens over the estimated ones and alpha_w the measured tokens w adds over the chain per unit of
+    // miss (each a running sum decaying by kGainDecay per row, counted after kMinimumGainRows rows),
+    // and the round takes the width with the most tokens per second; uncalibrated, choose()'s rule.
+    [[nodiscard]] std::uint32_t choose(std::uint32_t batch_size, std::uint32_t context,
+                                       std::span<const RoundRow> rows);
+    // One row of a tree block round verified at `columns`: its accepted columns c_0 = 0 .. c_A (a
+    // chain row's are 0 .. A) calibrate beta and, for a tree row, alpha of every tree width up to
+    // `columns`.
+    void observe_round_row(const RoundRow& row, std::span<const std::int32_t> path, std::uint32_t columns);
 
     // One verified tree row of a round of `columns` columns: path holds its accepted columns
     // c_0 = 0, c_1 .. c_A.
@@ -76,12 +105,31 @@ private:
         std::vector<Timing> timings; // per candidate of the batch size
     };
 
+    // A running ratio of decayed sums (TEMPORARY, INFERNIX_TMP_TREE_ROUND_WIDTH).
+    struct Calibration {
+        double measured    = 0;
+        double estimated   = 0;
+        std::uint64_t rows = 0;
+        [[nodiscard]] bool ready() const noexcept { return rows >= kMinimumGainRows && estimated > 0; }
+        [[nodiscard]] double ratio() const noexcept { return measured / estimated; }
+        void add(double m, double e) noexcept {
+            measured  = measured * kGainDecay + m;
+            estimated = estimated * kGainDecay + e;
+            rows += 1;
+        }
+    };
+
+    // The exploration choose() makes before its rate rule, or 0 when it makes none.
+    [[nodiscard]] std::uint32_t explore(std::uint32_t batch_size, std::uint32_t context);
+
     // Candidate columns of rounds of b + 1 rows: the chain, then the tree widths ascending.
     std::array<std::vector<std::uint32_t>, kMaximumConcurrency> candidates_;
     std::array<std::array<Cell, kContextBuckets>, kMaximumConcurrency> cells_;
     std::vector<std::uint32_t> tree_widths_; // every tree width, ascending
     std::vector<Gain> gains_;                // per tree_widths_ entry
     std::uint32_t chain_columns_ = 0;
+    Calibration chain_tokens_;                   // beta
+    std::vector<Calibration> miss_recovery_;     // alpha, per tree_widths_ entry
 };
 
 } // namespace infernix::models::qwen3_5::detail

@@ -146,7 +146,9 @@ void ExpertStream::begin(DeviceSpan ring, const std::int32_t* residency, cudaStr
         complete_[l] = complete ? 1 : 0;
     }
     const std::size_t table_bytes = static_cast<std::size_t>(layers_) * experts_ * sizeof(std::int32_t);
-    CUDA_CHECK(cudaMemcpyAsync(tables_, tables_host_.data(), table_bytes, cudaMemcpyHostToDevice, compute));
+    // Read by the SMs (upload_pinned): the compute stream's table never waits behind the ring's own
+    // copies on the copy engine (W7).
+    upload_pinned(tables_, tables_host_.data(), table_bytes, compute);
     CUDA_CHECK(cudaEventRecord(uploaded_, compute));
     uploading_ = true;
     // The ring's previous readers (the last chunk's experts, the lender's last use) come first.

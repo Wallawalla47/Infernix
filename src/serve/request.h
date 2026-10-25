@@ -32,6 +32,8 @@ struct ApiError {
     std::string code;  // optional
     // A context overflow's counts, so each protocol can word it as its clients detect it.
     std::optional<ContextLengthDetails> context_length;
+    // A queue-pressure answer's Retry-After (seconds; 0 sends none): the server's admission window.
+    std::uint32_t retry_after_seconds = 0;
 };
 
 class ApiException : public std::runtime_error {
@@ -92,6 +94,9 @@ struct ToolDefinition {
     std::string input_schema_json;
     std::string schema_param; // Original protocol path; never included in the model prompt.
     bool strict = false;
+    // A deferred tool is declared for parsing and constraints but left out of the prompt's tool
+    // list; the model sees its definition only where a later turn loads it (ChatTurn::loaded_tools).
+    bool deferred = false;
     std::optional<std::string> input_examples_json;
     std::optional<CacheBoundary> cache_boundary_after;
 };
@@ -116,6 +121,9 @@ struct ChatTurn {
     bool tool_result_is_error = false;
     std::string reasoning_content; // assistant thinking carried across turns (round-tripped to the
                                    // template)
+    // Tool definitions this turn loads (a tool-search result, or a block of additional tools).
+    // They are rendered after the turn's content, so everything before the turn keeps its tokens.
+    std::vector<ToolDefinition> loaded_tools;
     std::optional<CacheBoundary> cache_boundary_after;
 };
 
@@ -245,6 +253,14 @@ struct GenerationRequest {
             if (!message.tool_calls.empty() || message.role == ChatRole::Tool) { return true; }
         }
         return false;
+    }
+
+    // The last tool the prompt lists, or nullptr: a deferred declaration has no prompt position.
+    [[nodiscard]] ToolDefinition* last_listed_tool() noexcept {
+        for (auto tool = tools.rbegin(); tool != tools.rend(); ++tool) {
+            if (!tool->deferred) { return &*tool; }
+        }
+        return nullptr;
     }
 };
 

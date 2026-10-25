@@ -5,7 +5,9 @@
 
 #include <nlohmann/json.hpp>
 #include <iostream>
+#include <span>
 #include <stdexcept>
+#include <vector>
 
 namespace {
 namespace frontend = infernix::models::qwen3_5::frontend;
@@ -15,11 +17,50 @@ void require(bool value, const char* message) {
     if (!value) throw std::runtime_error(message);
 }
 
+// Byte tokens 0-255, EOS 256 and the model's `<tool_call>` token.
+constexpr std::int32_t kEos      = 256;
+constexpr std::int32_t kToolCall = 257;
+
 infernix::text::GrammarCompiler compiler() {
     std::vector<std::string> tokens;
     for (int i = 0; i < 256; ++i) tokens.emplace_back(1, static_cast<char>(i));
     tokens.emplace_back();
-    return {std::move(tokens), {256}, 32 * 1024 * 1024};
+    tokens.emplace_back(frontend::kToolCallOpen);
+    return {std::move(tokens), {kEos}, 32 * 1024 * 1024};
+}
+
+// The offsets of the `<tool_call>` spellings in generated text: the model writes each as its token.
+std::vector<std::size_t> openers(std::string_view text) {
+    std::vector<std::size_t> found;
+    for (auto at = text.find(frontend::kToolCallOpen); at != std::string_view::npos;
+         at = text.find(frontend::kToolCallOpen, at + 1))
+        found.push_back(at);
+    return found;
+}
+
+// The tokens of generated text: each `<tool_call>` spelling as the model's token unless `spelled`,
+// every other byte as its byte token.
+std::vector<std::int32_t> tokens(std::string_view text, bool spelled = false) {
+    std::vector<std::int32_t> result;
+    for (std::size_t at = 0; at < text.size();) {
+        if (!spelled && text.substr(at).starts_with(frontend::kToolCallOpen)) {
+            result.push_back(kToolCall);
+            at += frontend::kToolCallOpen.size();
+        } else {
+            result.push_back(static_cast<unsigned char>(text[at++]));
+        }
+    }
+    return result;
+}
+
+// Feeds bytes [begin, begin + size) of generated text, with the `<tool_call>` tokens starting there.
+std::string feed(frontend::ToolCallOutputDecoder& decoder, std::string_view text,
+                 std::size_t begin = 0, std::size_t size = std::string_view::npos) {
+    const auto piece = text.substr(begin, size);
+    std::vector<std::size_t> starts;
+    for (const auto at : openers(text))
+        if (at >= begin && at - begin < piece.size()) starts.push_back(at - begin);
+    return decoder.feed({piece, starts});
 }
 
 auto contract(const Json& schema, bool strict, infernix::ToolChoice choice = {}) {
@@ -31,16 +72,22 @@ auto contract(const Json& schema, bool strict, infernix::ToolChoice choice = {})
         frontend::build_tool_call_output_contract(definitions), choice);
 }
 
-bool accepts(infernix::text::GrammarCompiler& compiler,
-             const frontend::ToolCallOutputContract& contract, std::string_view value) {
-    auto matcher = frontend::compile_tool_grammar(compiler, contract, {}, {});
+bool accepts_tokens(infernix::text::GrammarCompiler& compiler,
+                    const frontend::ToolCallOutputContract& contract,
+                    const std::vector<std::int32_t>& value) {
+    auto matcher = frontend::compile_tool_grammar(compiler, contract, kToolCall, {}, {});
     std::vector<std::uint32_t> words(matcher->mask_words());
-    for (unsigned char c : value) {
-        if (matcher->masks({}, words) || !(words[c / 32] & (1u << (c % 32)))) return false;
-        matcher->accept(c);
+    for (const std::int32_t token : value) {
+        if (matcher->masks({}, words) || !(words[token / 32] & (1u << (token % 32)))) return false;
+        matcher->accept(token);
         matcher->confirm();
     }
-    return matcher->masks({}, words) == 0 && (words[256 / 32] & 1u);
+    return matcher->masks({}, words) == 0 && (words[kEos / 32] & (1u << (kEos % 32)));
+}
+
+bool accepts(infernix::text::GrammarCompiler& compiler,
+             const frontend::ToolCallOutputContract& contract, std::string_view value) {
+    return accepts_tokens(compiler, contract, tokens(value));
 }
 
 std::string call(std::string_view value, std::string_view name = "call") {
@@ -70,7 +117,7 @@ void basic_contracts(infernix::text::GrammarCompiler& compiled) {
     require(accepts(compiled, *basic, reordered),
             "basic closed or reordered an open parameter list");
     frontend::ToolCallOutputDecoder decoded(basic, 64);
-    (void)decoded.feed(reordered);
+    (void)feed(decoded, reordered);
     const auto arguments = Json::parse(decoded.finish().tool_calls.at(0).arguments_json);
     require(arguments == Json{{"b", 1}, {"a", "007"}, {"extra-key.键", true}},
             "non-strict value normalization changed");
@@ -89,15 +136,40 @@ void basic_contracts(infernix::text::GrammarCompiler& compiled) {
                 "non-strict schema reached strict validation or closed the parameter list");
     }
 
-    const auto integer         = contract(schema({{"type", "integer"}}), false);
-    const std::string repeated = "<tool_call>\n<function=call>\n<parameter=x>\n1\n</parameter>\n"
-                                 "<parameter=x>\n2\n</parameter>\n</function>\n</tool_call>";
-    require(accepts(compiled, *integer, repeated),
-            "generic argument syntax rejected repeated keys");
-    frontend::ToolCallOutputDecoder duplicate(integer, 64);
-    (void)duplicate.feed(repeated);
-    require(duplicate.finish().tool_calls.at(0).arguments_json == R"({"x":2})",
-            "non-strict duplicate was not resolved to one final value");
+    // A call names each parameter once (the grammar's companion), so a streamed call never repeats a
+    // key; a name extending a used one, and the same name in the next call, stay open.
+    const auto integer      = contract(schema({{"type", "integer"}}), false);
+    const std::string first = "<tool_call>\n<function=call>\n<parameter=x>\n1\n</parameter>\n";
+    require(!accepts(compiled, *integer, first + "<parameter=x>\n2\n</parameter>\n</function>\n</tool_call>"),
+            "basic arguments admitted a repeated parameter name");
+    require(accepts(compiled, *integer,
+                    first + "<parameter=xy>\n2\n</parameter>\n</function>\n</tool_call>\n" + call("3")),
+            "the parameter-name rule refused a new name or the next call's");
+    {
+        // Lookahead through a draft that repeats the name masks the `>` that would complete it and
+        // leaves the session where it was; accepting that `>` is refused.
+        auto matcher = frontend::compile_tool_grammar(compiled, *integer, kToolCall, {}, {});
+        for (const std::int32_t token : tokens(first + "<parameter=")) {
+            matcher->accept(token);
+            matcher->confirm();
+        }
+        const std::vector<std::int32_t> drafts{'x', '>'};
+        std::vector<std::uint32_t> words(3 * matcher->mask_words());
+        (void)matcher->masks(drafts, words);
+        const auto after_x = std::span(words).subspan(matcher->mask_words(), matcher->mask_words());
+        require((after_x['>' / 32] & (1u << ('>' % 32))) == 0 && (after_x['y' / 32] & (1u << ('y' % 32))) != 0,
+                "lookahead did not mask the repeated name's end");
+        std::vector<std::uint32_t> now(matcher->mask_words());
+        (void)matcher->masks({}, now);
+        require((now['x' / 32] & (1u << ('x' % 32))) != 0, "lookahead moved the companion's state");
+        matcher->accept('x');
+        bool refused = false;
+        try {
+            matcher->accept('>');
+        } catch (const std::logic_error&) { refused = true; }
+        require(refused, "a repeated parameter name was accepted");
+        matcher->discard();
+    }
 
     // These requests share the same compiled envelope but have different value normalization.
     const auto string = contract(schema({{"type", "string"}}), false);
@@ -105,7 +177,7 @@ void basic_contracts(infernix::text::GrammarCompiler& compiled) {
         require(accepts(compiled, *bound, call("7")),
                 "shared basic grammar changed with value types");
         frontend::ToolCallOutputDecoder decoder(bound, 64);
-        (void)decoder.feed(call("7"));
+        (void)feed(decoder, call("7"));
         const auto args = Json::parse(decoder.finish().tool_calls.at(0).arguments_json);
         require(args["x"] == (bound == string ? Json("7") : Json(7)),
                 "compiled grammar leaked another request's argument types");
@@ -114,7 +186,7 @@ void basic_contracts(infernix::text::GrammarCompiler& compiled) {
     const auto two = reordered + "\n" + call("later");
     for (std::size_t cut = 0; cut < two.size(); ++cut) {
         frontend::ToolCallOutputDecoder decoder(basic, 64);
-        (void)decoder.feed(std::string_view(two).substr(0, cut));
+        (void)feed(decoder, std::string_view(two).substr(0, cut));
         const auto result = decoder.finish(infernix::FinishReason::OutputLimit);
         require(result.tool_calls.size() == (cut >= reordered.size() ? 1 : 0),
                 "non-strict truncation lost a completed call");
@@ -155,7 +227,7 @@ void selected_contracts(infernix::text::GrammarCompiler& compiled) {
     const auto mixed = call("2", "strict") + "\n" + call("wrong", "loose");
     require(accepts(compiled, *selected, mixed), "mixed strict/non-strict calls rejected");
     frontend::ToolCallOutputDecoder decoder(selected, 64);
-    (void)decoder.feed(mixed);
+    (void)feed(decoder, mixed);
     const auto calls = decoder.finish().tool_calls;
     require(calls.size() == 2 && Json::parse(calls[0].arguments_json)["x"] == 2 &&
                 Json::parse(calls[1].arguments_json)["x"] == "wrong",
@@ -203,12 +275,30 @@ void run() {
     require(!accepts(compiled, *automatic,
                      "<tool_call>\n<function=unknown>\n</function>\n</tool_call>"),
             "auto escaped through free text");
+    // Only the `<tool_call>` token opens a call; its spelling in ordinary tokens is free text that
+    // the grammar admits and the decoder publishes as content.
+    require(accepts_tokens(compiled, *automatic,
+                           tokens("<tool_call>\n<function=unknown>\n</function>\n</tool_call>", true)),
+            "auto read a spelled marker as a call opener");
+    require(!accepts_tokens(compiled, *fixed, tokens(call("2"), true)),
+            "a required call accepted a spelled opener");
+    {
+        const std::string text = "Calling.\n" + call("2");
+        frontend::ToolCallOutputDecoder spelled(automatic, 64);
+        std::string visible = spelled.feed({text, {}});
+        const auto terminal = spelled.finish();
+        require(visible + terminal.content == text && terminal.tool_calls.empty() &&
+                    !terminal.diagnostics.marker_seen,
+                "a spelled marker opened a constrained call");
+    }
     auto disabled = required;
     disabled.mode = infernix::ToolChoiceMode::None;
     auto no_tools = contract(schema({{"type", "string"}}), true, disabled);
     require(accepts(compiled, *no_tools, "ordinary answer") &&
                 !accepts(compiled, *no_tools, call("a")),
             "none allowed a tool marker");
+    require(accepts_tokens(compiled, *no_tools, tokens(call("a"), true)),
+            "none refused the marker spelled as text");
     infernix::ToolChoice basic;
     basic.constraints = infernix::ToolConstraintMode::Basic;
     auto structure    = contract(schema({{"type", "integer"}, {"minimum", 2}}), false, basic);
@@ -240,7 +330,8 @@ void run() {
     const auto value = std::string("  你好\n");
     frontend::ToolCallOutputDecoder decoder(automatic, 64);
     const auto text = call(value);
-    for (char c : text) require(decoder.feed(std::string_view(&c, 1)).empty(), "tool bytes leaked");
+    for (std::size_t at = 0; at < text.size(); ++at)
+        require(feed(decoder, text, at, 1).empty(), "tool bytes leaked");
     auto result = decoder.finish();
     require(result.tool_calls.size() == 1 &&
                 Json::parse(result.tool_calls[0].arguments_json)["x"] == value,
@@ -253,7 +344,7 @@ void run() {
     const auto json_value = std::string(R"({"s": "</parameter>"})");
     require(accepts(compiled, *nested, call(json_value)), "nested marker rejected");
     frontend::ToolCallOutputDecoder json_decoder(nested, 64);
-    (void)json_decoder.feed(call(json_value));
+    (void)feed(json_decoder, call(json_value));
     require(Json::parse(json_decoder.finish().tool_calls[0].arguments_json)["x"]["s"] ==
                 "</parameter>",
             "nested marker broke parser");
@@ -261,7 +352,7 @@ void run() {
     for (auto reason : {infernix::FinishReason::OutputLimit, infernix::FinishReason::Cancelled})
         for (std::size_t cut = 0; cut < two.size(); ++cut) {
             frontend::ToolCallOutputDecoder truncated(fixed, 64);
-            (void)truncated.feed(std::string_view(two).substr(0, cut));
+            (void)feed(truncated, std::string_view(two).substr(0, cut));
             const auto output = truncated.finish(reason);
             require(output.tool_calls.size() == (cut >= call("2").size() ? 1 : 0),
                     "interruption lost a complete call");
@@ -269,14 +360,33 @@ void run() {
     const auto seed = call("你好").substr(0, call("你好").size() - 20);
     frontend::ToolCallOutputDecoder continuation(automatic, 64);
     continuation.initialize_continuation(seed);
-    auto match = frontend::compile_tool_grammar(compiled, *automatic, {}, seed);
-    (void)continuation.feed(std::string_view(call("你好")).substr(seed.size()));
+    auto match = frontend::compile_tool_grammar(compiled, *automatic, kToolCall, {}, tokens(seed));
+    (void)feed(continuation, call("你好"), seed.size());
     require(continuation.finish().tool_calls.size() == 1, "continuation did not complete the call");
+    // A nullable string (OpenAI strict mode's optional field: a type list of string and null, or an anyOf /
+    // oneOf of strings and null) is raw text, as a string is; the text `null` reads as JSON null (BX-06).
+    for (const Json& nullable :
+         {Json{{"type", {"string", "null"}}},
+          Json{{"anyOf", {{{"type", "string"}, {"maxLength", 100}}, {{"type", "null"}}}}},
+          Json{{"oneOf", {{{"type", "null"}}, {{"type", "string"}}}}}}) {
+        const auto bound = contract(schema(nullable), true, required);
+        require(accepts(compiled, *bound, call("src/main.cpp")) && accepts(compiled, *bound, call("null")),
+                ("a nullable string refused raw text or null: " + nullable.dump()).c_str());
+        frontend::ToolCallOutputDecoder text_decoder(bound, 64);
+        (void)feed(text_decoder, call("src/main.cpp"));
+        require(Json::parse(text_decoder.finish().tool_calls.at(0).arguments_json)["x"] == "src/main.cpp",
+                ("a nullable string's text changed: " + nullable.dump()).c_str());
+        frontend::ToolCallOutputDecoder null_decoder(bound, 64);
+        (void)feed(null_decoder, call("null"));
+        require(Json::parse(null_decoder.finish().tool_calls.at(0).arguments_json)["x"].is_null(),
+                ("a nullable string's null was not null: " + nullable.dump()).c_str());
+    }
+    // A string mixed with another JSON value type stays ambiguous.
     bool rejected = false;
     try {
-        (void)contract(schema({{"type", {"string", "null"}}}), true, required);
+        (void)contract(schema({{"anyOf", {{{"type", "string"}}, {{"type", "integer"}}}}}), true, required);
     } catch (const infernix::RequestError&) { rejected = true; }
-    require(rejected, "ambiguous top-level representation accepted");
+    require(rejected, "ambiguous string and integer representation accepted");
 }
 } // namespace
 
@@ -299,7 +409,7 @@ int main(int argc, char** argv) {
                         response["accepted"].push_back(allowed);
                         if (allowed) {
                             frontend::ToolCallOutputDecoder decode(bound, 64);
-                            (void)decode.feed(text.get<std::string>());
+                            (void)feed(decode, text.get<std::string>());
                             response["arguments"].push_back(
                                 Json::parse(decode.finish().tool_calls[0].arguments_json));
                         } else

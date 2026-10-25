@@ -54,13 +54,14 @@ void launch_recurrent_record(const Tensor& q, const Tensor& k, const Tensor& v, 
                              Tensor& key_record, Tensor& value_record, Tensor& gate_record,
                              Tensor& out, cudaStream_t stream);
 
-// Verification-tree replay (see recurrent_tree_walk_kernel); valid_columns is required.
+// Verification-tree replay (see recurrent_tree_walk_kernel; with closed_form,
+// recurrent_tree_closed_form_kernel); valid_columns is required.
 void launch_recurrent_tree_record(const Tensor& q, const Tensor& k, const Tensor& v,
                                   const Tensor& g, const Tensor& beta, float scale,
                                   const Tensor& ssm_states, const Tensor& valid_columns,
                                   const Tensor& initial_state_slots, const Tensor& tree_rows,
                                   Tensor& key_record, Tensor& value_record, Tensor& gate_record,
-                                  Tensor& out, cudaStream_t stream);
+                                  Tensor& out, cudaStream_t stream, bool closed_form);
 
 void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
                         const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,

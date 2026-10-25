@@ -2,6 +2,7 @@
 // lossless_cr_oracle.py's exact results: run as python lossless_cr_oracle.py <this executable>, which
 // passes the vector file (records of function, input bits, expected bits). Every result must match.
 
+#include "ops/op_family.h"
 #include "core/arena.h"
 #include "core/device.h"
 #include "ops/lossless/cr_math.cuh"
@@ -44,7 +45,7 @@ const char* kNames[] = {"exp", "sigmoid", "sigmoid_bf16", "silu", "silu_bf16", "
 
 } // namespace
 
-int main(int argc, char** argv) {
+INFERNIX_OP_TEST(lossless_cr_math) {
     if (argc != 2) {
         std::cerr << "usage: test_lossless_cr_math <vectors.bin> (run through lossless_cr_oracle.py)\n";
         return 2;

@@ -75,6 +75,10 @@ bool ProgramImpl::stage_constraints(std::span<const std::uint32_t> lanes, std::i
     if (columns > constraint_host_.size()) { throw std::logic_error("Qwen4Exp: a constrained round is wider than its table"); }
     const std::size_t sets_total = static_cast<std::size_t>(options_.max_concurrency) * kSets;
     auto* const words            = static_cast<std::int32_t*>(constraint_.p);
+    // Every upload stages its words at their offsets in constraint_pinned_ and is read by the SMs
+    // (upload_pinned), so a constrained round never waits on the copy engine or on a pageable
+    // staging copy (W7). Both callers synchronize the device before they stage again.
+    auto* const pinned = static_cast<std::int32_t*>(constraint_pinned_.data());
     std::fill(constraint_host_.begin(), constraint_host_.begin() + static_cast<std::ptrdiff_t>(columns), -1);
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         const std::uint32_t index = lanes[row];
@@ -83,15 +87,16 @@ bool ProgramImpl::stage_constraints(std::span<const std::uint32_t> lanes, std::i
         const ConstraintPlan& plan = *lane.constraint;
         if (constraint_serials_[index] != plan.serial) {
             // The lane's set columns: written once per request.
-            std::vector<std::int32_t> choices(kSets * kChoices, 0), counts(kSets, 0);
+            std::int32_t* choices = pinned + index * kSets * kChoices;
+            std::int32_t* counts  = pinned + sets_total * kChoices + index * kSets;
+            std::fill(choices, choices + kSets * kChoices, 0);
+            std::fill(counts, counts + kSets, 0);
             for (std::size_t set = 0; set < plan.sets.size(); ++set) {
-                std::copy(plan.sets[set].begin(), plan.sets[set].end(), choices.begin() + static_cast<std::ptrdiff_t>(set * kChoices));
+                std::copy(plan.sets[set].begin(), plan.sets[set].end(), choices + set * kChoices);
                 counts[set] = static_cast<std::int32_t>(plan.sets[set].size());
             }
-            CUDA_CHECK(cudaMemcpyAsync(words + index * kSets * kChoices, choices.data(), 4ULL * choices.size(),
-                                       cudaMemcpyHostToDevice, s));
-            CUDA_CHECK(cudaMemcpyAsync(words + sets_total * kChoices + index * kSets, counts.data(), 4ULL * counts.size(),
-                                       cudaMemcpyHostToDevice, s));
+            upload_pinned(words + index * kSets * kChoices, choices, 4ULL * kSets * kChoices, s);
+            upload_pinned(words + sets_total * kChoices + index * kSets, counts, 4ULL * kSets, s);
             constraint_serials_[index] = plan.serial;
         }
         // Column j of the row samples output step (generated tokens) + j.
@@ -102,10 +107,12 @@ bool ProgramImpl::stage_constraints(std::span<const std::uint32_t> lanes, std::i
                 d >= 0 ? static_cast<std::int32_t>(index * kSets) + d : d;
         }
     }
-    CUDA_CHECK(cudaMemcpyAsync(words + sets_total * (kChoices + 1), constraint_host_.data(), 4ULL * columns,
-                               cudaMemcpyHostToDevice, s));
+    std::int32_t* descriptors = pinned + sets_total * (kChoices + 1);
+    std::copy_n(constraint_host_.begin(), columns, descriptors);
+    upload_pinned(words + sets_total * (kChoices + 1), descriptors, 4ULL * columns, s);
     // Every constrained round stages its observe lists: -1 where the step observes nothing.
-    std::vector<std::int32_t> observe(columns * kObserve, -1);
+    std::int32_t* observe = pinned + observe_offset();
+    std::fill(observe, observe + columns * kObserve, -1);
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         const Lane& lane = lanes_[lanes[row]];
         if (!lane.constraint || lane.constraint->observe.empty()) { continue; }
@@ -113,12 +120,10 @@ bool ProgramImpl::stage_constraints(std::span<const std::uint32_t> lanes, std::i
         for (std::size_t j = 0; j < static_cast<std::size_t>(width) && first + j < lane.constraint->observe.size();
              ++j) {
             const std::vector<TokenId>& tokens = lane.constraint->observe[first + j];
-            std::copy(tokens.begin(), tokens.end(),
-                      observe.begin() + static_cast<std::ptrdiff_t>((row * static_cast<std::size_t>(width) + j) * kObserve));
+            std::copy(tokens.begin(), tokens.end(), observe + (row * static_cast<std::size_t>(width) + j) * kObserve);
         }
     }
-    CUDA_CHECK(cudaMemcpyAsync(words + observe_offset(), observe.data(), 4ULL * observe.size(), cudaMemcpyHostToDevice,
-                               s));
+    upload_pinned(words + observe_offset(), observe, 4ULL * columns * kObserve, s);
     constraint_columns_ = static_cast<std::int32_t>(columns);
     return true;
 }

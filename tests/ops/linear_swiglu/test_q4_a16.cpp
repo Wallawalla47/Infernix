@@ -1,3 +1,4 @@
+#include "ops/op_family.h"
 #include "core/weight.h"
 #include "ops/linear_swiglu/linear_swiglu_test_common.h"
 
@@ -5,7 +6,7 @@
 #include <exception>
 #include <iostream>
 
-int main() {
+INFERNIX_OP_TEST(linear_swiglu_q4_a16) {
     using namespace infernix;
     using namespace infernix::test::linear_swiglu;
 

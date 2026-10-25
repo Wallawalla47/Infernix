@@ -8,6 +8,7 @@
 #include "models/qwen4_exp/program/calibrated_order.h"
 #include "runtime/expert_offload/expert_cache.h"
 #include "runtime/expert_offload/expert_state.h"
+#include "runtime/expert_offload/route_predictor.h"
 
 #include <algorithm>
 #include <chrono>
@@ -583,6 +584,59 @@ void test_prompt_credit() {
           "the controller credits without loading");
 }
 
+// Prompt seeding's promotions (INFERNIX_TMP_PROMPT_SEED's budget, design §19.3.27): admit makes the
+// best credited misses resident, each only if it outranks the lowest resident outside the credited
+// keys, up to the budget, counting no use and ticking no clock; the controller loads them.
+void test_prompt_promotions() {
+    LfruPolicy policy(64, 3);
+    LfruPolicy::Step step;
+    const std::vector<std::uint32_t> fill{0, 1, 2};
+    policy.step(fill, step); // now 1: keys 0, 1, 2 count 1, score 1
+    const std::vector<std::uint32_t> keys{10, 11, 1};
+    const std::vector<double> amounts{5.0, 0.5, 2.0};
+    policy.credit(keys, amounts); // 10 scores 5, 11 0.5, resident 1 3
+    const std::uint64_t now = policy.now();
+    policy.admit(keys, 0, step);
+    check(step.admitted.empty() && !policy.resident(10), "a zero budget admits nothing");
+    // Admission is filtered: with key 10 inadmissible, 11 (0.5) does not outrank the victim (1).
+    const LfruPolicy::Admissible not_ten = [](std::uint32_t k) { return k != 10; };
+    policy.admit(keys, 8, step, &not_ten);
+    check(step.admitted.empty() && step.victims.empty(), "an inadmissible key is passed over, and a weak one stops");
+    // Key 10 (5) replaces key 0 (the lowest-key resident of score 1 outside the credited keys); key 11
+    // (0.5) does not outrank key 2 (1), so admission stops there although the budget allows more.
+    policy.admit(keys, 8, step);
+    check(step.admitted == std::vector<std::uint32_t>{10} && step.victims == std::vector<std::uint32_t>{0},
+          "the best credited miss replaces the lowest resident outside the prompt's keys");
+    check(policy.resident(1) && policy.resident(2) && !policy.resident(11), "the credited resident is protected");
+    check(policy.now() == now && policy.count(10) == 5.0 && policy.count(11) == 0.5,
+          "promotions count no use and tick no clock");
+
+    // The controller: the victim's frame retires, so the load waits for the quiescent boundary.
+    CacheController cache(64, 4, 0, 1);
+    std::vector<CacheController::Command> cmds;
+    const std::vector<std::uint32_t> warm{0, 1, 2, 3};
+    cache.on_route(warm, 1, cmds);
+    cmds.clear();
+    const std::vector<std::uint32_t> prompt{20, 21};
+    const std::vector<double> credit{9.0, 6.0};
+    cache.credit(prompt, credit);
+    check(cache.admit_credited(prompt, 1, 1, cmds) == 1, "the budget caps the promotions");
+    check(cache.policy().resident(20) && !cache.policy().resident(21) && !cache.policy().resident(0),
+          "the best credited miss is admitted in place of the lowest resident");
+    bool copied = false;
+    for (const auto& c : cmds) { copied |= c.kind == CacheController::Command::Kind::kCopy; }
+    check(!copied && cache.queued_loads() == 1, "with every frame held the promotion queues");
+    cache.on_quiescent(cmds);
+    std::uint32_t copies = 0;
+    for (const auto& c : cmds) {
+        if (c.kind == CacheController::Command::Kind::kCopy) {
+            ++copies;
+            check(c.key == 20, "the queued promotion loads into the victim's retired frame");
+        }
+    }
+    check(copies == 1 && cache.queued_loads() == 0, "the quiescent boundary loads the promotion");
+}
+
 // The saved state file: a round trip keeps counts and ranking; another identity, key count, version
 // or a truncated file loads nothing (with a reason).
 void test_state_file() {
@@ -717,7 +771,70 @@ void test_tier_gates() {
     }
 }
 
+// INFERNIX_TMP_ROUTE_PROTECT (candidates §13 PUB-22): guarded residents are evicted last, as
+// tools/expert_cache_replay's TierSim.guard (test_guarded_residents_are_evicted_last) decides.
+void test_route_guard() {
+    struct Case {
+        std::vector<std::uint32_t> guarded;
+        std::uint32_t evicted;
+    };
+    for (const Case& c : {Case{{}, 0}, Case{{0}, 1}, Case{{0, 1}, 0}}) {
+        LfruPolicy policy(8, 2);
+        LfruPolicy::Step step;
+        int calls = 0;
+        const LfruPolicy::Guard guard = [&] {
+            ++calls;
+            return std::span<const std::uint32_t>(c.guarded);
+        };
+        for (const std::uint32_t k : {0U, 1U, 1U}) { policy.step(std::span<const std::uint32_t>(&k, 1), step); }
+        const std::uint32_t miss = 2;
+        policy.step(std::span<const std::uint32_t>(&miss, 1), step, static_cast<std::size_t>(-1), nullptr, nullptr,
+                    &guard);
+        check(step.victims == std::vector<std::uint32_t>{c.evicted}, "a guarded resident is evicted last");
+        check(calls == 1, "the guard is evaluated once, when a victim is needed");
+        // Without a guard the next step forgets it: the LFRU order alone decides.
+        const std::uint32_t again = 3;
+        policy.step(std::span<const std::uint32_t>(&again, 1), step);
+        check(calls == 1 && step.victims.size() == 1, "a guard holds for its own step only");
+    }
+}
+
+// The engine's route predictor learns a lane's expert sequence (route_predictor.py's
+// test_transition_predictor_learns_a_lane_sequence).
+void test_route_predictor() {
+    RoutePredictor predictor(1, 8, 1, 1);
+    const std::int32_t cycle[] = {0, 3, 5};
+    const std::int32_t lane0[] = {0}, lane1[] = {1};
+    bool learned = true;
+    for (int t = 0; t < 12; ++t) {
+        predictor.observe(&cycle[t % 3], 1, 1, lane0, {});
+        const auto keys = predictor.predict(0);
+        if (t >= 3) {
+            learned = learned && keys.size() == 1 && keys[0] == static_cast<std::uint32_t>(cycle[(t + 1) % 3]);
+        }
+    }
+    check(learned, "each token predicts its successor once the cycle repeats");
+    const std::int32_t other = 7;
+    predictor.observe(&other, 1, 1, lane1, {});
+    check(predictor.predict(0).empty(), "a lane's first token follows nothing and predicts nothing yet");
+    // A two-row round: each row continues its own lane (lane 0 after 5 sees 0; lane 1 after 7 sees 3),
+    // and each lane predicts from its own last token over the layer's shared counts: 0 -> 3, 3 -> 5.
+    const std::int32_t routes[] = {0, 3};
+    const std::int32_t lanes[]  = {0, 1};
+    predictor.observe(routes, 2, 2, lanes, {});
+    const auto keys = predictor.predict(0);
+    check(std::vector<std::uint32_t>(keys.begin(), keys.end()) == std::vector<std::uint32_t>{3, 5},
+          "rows learn and predict per lane");
+    bool threw = false;
+    try {
+        RoutePredictor empty(1, 8, 1, 0);
+    } catch (const std::invalid_argument&) { threw = true; }
+    check(threw, "a predictor protects at least one expert");
+}
+
 int main() {
+    test_route_guard();
+    test_route_predictor();
     test_residency_entries();
     test_tier_gates();
     test_lfru_conformance();
@@ -730,6 +847,7 @@ int main() {
     test_lending();
     test_seed();
     test_prompt_credit();
+    test_prompt_promotions();
     test_landing();
     test_state_file();
     test_calibrated_order();

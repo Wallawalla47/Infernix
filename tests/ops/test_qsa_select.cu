@@ -10,7 +10,11 @@
 // columns write count -1), also inside one row; widths 1-1024 and 1-9 rows, groups beyond 128
 // columns; index heads 1-4; ratios 4, 8, 64 and 128 (a pooled key across two pages); exact ties
 // across the threshold, zero-score ties, bins larger than the candidate buffer, near ties; and CUDA
-// Graph capture replayed with new positions over garbage scratch.
+// Graph capture replayed with new positions over garbage scratch. Every case runs both routes
+// (histogram and sampled), each bitwise against the reference; two strided key families put the
+// sampled route's sample on the only high-scoring blocks (too few candidates) or on the only
+// zero-scoring ones (too many), so its fallback runs.
+#include "ops/op_family.h"
 #include "infernix/ops/qsa.h"
 #include "core/paged_kv_cache.h"
 #include "ops/host_parallel.h"
@@ -226,6 +230,9 @@ enum class Keys {
     ZeroHeavy,    // `extra` blocks score > 0, every other block exactly 0 (all heads' dots < 0)
     Concentrated, // one key plus 2 % noise: the threshold bin holds (nearly) every block
     NearTies,     // block 2i+1 repeats block 2i with one element one BF16 ulp up
+    // Blocks b % 64 < 4 (the sampled route's sample at n a multiple of 64 up to 32K blocks) score > 0
+    // and every other block exactly 0 (`extra` 1), or the reverse (`extra` 0).
+    Strided,
 };
 
 struct Case {
@@ -298,12 +305,12 @@ Fixture build(const Case& c, const std::vector<int>& key_first) {
     f.max_context = c.max_context;
     f.top         = c.budget / c.ratio;
     std::mt19937 rng(c.seed);
-    // Queries; ZeroHeavy aligns every head with one direction u.
+    // Queries; ZeroHeavy and Strided align every head with one direction u.
     const std::vector<float> u = random_vector(rng, kDi, 0, nullptr, 0);
+    const bool aligned         = c.keys == Keys::ZeroHeavy || c.keys == Keys::Strided;
     f.q.reserve(static_cast<std::size_t>(f.columns) * c.index_heads * kDi);
     for (int t = 0; t < f.columns * c.index_heads; ++t) {
-        const auto v = c.keys == Keys::ZeroHeavy ? random_vector(rng, kDi, 1.0F, &u, 0.1F)
-                                                 : random_vector(rng, kDi, 0, nullptr, 0);
+        const auto v = aligned ? random_vector(rng, kDi, 1.0F, &u, 0.1F) : random_vector(rng, kDi, 0, nullptr, 0);
         f.q.insert(f.q.end(), v.begin(), v.end());
     }
     // Keys per row.
@@ -334,6 +341,9 @@ Fixture build(const Case& c, const std::vector<int>& key_first) {
             case Keys::Random: v = random_vector(rng, kDi, 0, nullptr, 0); break;
             case Keys::Ties: v = period_keys[blk % c.extra]; break;
             case Keys::ZeroHeavy: v = random_vector(rng, kDi, positive[blk] ? 1.0F : -1.0F, &u, 0.3F); break;
+            case Keys::Strided:
+                v = random_vector(rng, kDi, ((blk % 64 < 4) == (c.extra != 0)) ? 1.0F : -1.0F, &u, 0.3F);
+                break;
             case Keys::Concentrated: v = random_vector(rng, kDi, 1.0F, &base, 0.02F); break;
             case Keys::NearTies:
                 if (blk % 2 == 0) {
@@ -472,12 +482,18 @@ struct ProductionBuffers {
           counts(sizeof(std::int32_t) * static_cast<std::size_t>(f.columns)) {}
 };
 
-void launch_production(const Fixture& f, ProductionBuffers& buffers, cudaStream_t stream) {
+using infernix::ops::detail::QsaSelectRoute;
+
+constexpr QsaSelectRoute kRoutes[] = {QsaSelectRoute::Histogram, QsaSelectRoute::Sampled};
+
+std::string route_name(QsaSelectRoute route) { return route == QsaSelectRoute::Sampled ? "sampled" : "histogram"; }
+
+void launch_production(const Fixture& f, ProductionBuffers& buffers, cudaStream_t stream, QsaSelectRoute route) {
     infernix::ops::detail::qsa_select(f.index_q(), f.pooled(), f.batch_view(), f.g, f.max_context,
                                     buffers.scratch.data(), buffers.scratch.bytes(),
                                     {static_cast<std::int32_t*>(buffers.selected.data()),
                                      static_cast<std::int32_t*>(buffers.counts.data())},
-                                    stream);
+                                    stream, {}, route);
 }
 
 Selection read_production(const Fixture& f, ProductionBuffers& buffers, const std::string& tag) {
@@ -619,16 +635,18 @@ void run_case(const Case& c) {
     const Selection ref = run_reference(f, nullptr);
     std::vector<std::pair<int, Fp64Scores>> oracle;
     for (const int t : fp64_columns(f)) { oracle.emplace_back(t, fp64_scores(f, t)); }
-    const std::string& tag = c.name;
-    ProductionBuffers buffers(f);
-    buffers.scratch.fill(0xA5);
-    buffers.selected.fill(0x7F);
-    buffers.counts.fill(0x7F);
-    launch_production(f, buffers, nullptr);
-    cuda_check(cudaStreamSynchronize(nullptr), "production select");
-    const Selection got = read_production(f, buffers, tag);
-    compare(f, ref, got, tag);
-    for (const auto& [t, o] : oracle) { check_fp64(f, got, t, o, tag); }
+    for (const QsaSelectRoute route : kRoutes) {
+        const std::string tag = c.name + " (" + route_name(route) + ")";
+        ProductionBuffers buffers(f);
+        buffers.scratch.fill(0xA5);
+        buffers.selected.fill(0x7F);
+        buffers.counts.fill(0x7F);
+        launch_production(f, buffers, nullptr, route);
+        cuda_check(cudaStreamSynchronize(nullptr), "production select");
+        const Selection got = read_production(f, buffers, tag);
+        compare(f, ref, got, tag);
+        for (const auto& [t, o] : oracle) { check_fp64(f, got, t, o, tag); }
+    }
     std::printf("  %-44s %5d columns, %6d..%6d blocks\n", c.name.c_str(), f.columns, blocks_of(f, 0),
                 blocks_of(f, f.columns - 1));
 }
@@ -646,34 +664,40 @@ void run_graph_case() {
     Fixture f = build(c, {130000, 130000});
     cudaStream_t stream = nullptr;
     cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "graph stream");
-    ProductionBuffers buffers(f);
-    cudaGraph_t graph     = nullptr;
-    cudaGraphExec_t exec = nullptr;
-    cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "begin capture");
-    launch_production(f, buffers, stream);
-    cuda_check(cudaStreamEndCapture(stream, &graph), "end capture");
-    cuda_check(cudaGraphInstantiate(&exec, graph, 0), "instantiate");
-    for (std::size_t r = 0; r < replays.size(); ++r) {
-        const std::string tag = c.name + " replay " + std::to_string(r);
-        f.set_positions(replays[r]);
-        cuda_check(cudaMemcpyAsync(f.d_positions.p, f.positions.data(), f.positions.size() * 4,
-                                   cudaMemcpyHostToDevice, stream),
-                   "upload positions");
-        cuda_check(cudaMemsetAsync(buffers.scratch.data(), 0x5A + static_cast<int>(r), buffers.scratch.bytes(), stream),
-                   "garbage scratch");
-        cuda_check(cudaMemsetAsync(buffers.selected.data(), 0x7F, buffers.selected.bytes(), stream),
-                   "garbage selected");
-        cuda_check(cudaMemsetAsync(buffers.counts.data(), 0x7F, buffers.counts.bytes(), stream), "garbage counts");
-        cuda_check(cudaGraphLaunch(exec, stream), "graph launch");
-        cuda_check(cudaStreamSynchronize(stream), "graph replay");
-        const Selection got = read_production(f, buffers, tag);
-        const Selection ref = run_reference(f, stream);
-        compare(f, ref, got, tag);
+    for (const QsaSelectRoute route : kRoutes) {
+        ProductionBuffers buffers(f);
+        cudaGraph_t graph    = nullptr;
+        cudaGraphExec_t exec = nullptr;
+        f.set_positions(c.first);
+        cuda_check(cudaMemcpy(f.d_positions.p, f.positions.data(), f.positions.size() * 4, cudaMemcpyHostToDevice),
+                   "reset positions");
+        cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "begin capture");
+        launch_production(f, buffers, stream, route);
+        cuda_check(cudaStreamEndCapture(stream, &graph), "end capture");
+        cuda_check(cudaGraphInstantiate(&exec, graph, 0), "instantiate");
+        for (std::size_t r = 0; r < replays.size(); ++r) {
+            const std::string tag = c.name + " (" + route_name(route) + ") replay " + std::to_string(r);
+            f.set_positions(replays[r]);
+            cuda_check(cudaMemcpyAsync(f.d_positions.p, f.positions.data(), f.positions.size() * 4,
+                                       cudaMemcpyHostToDevice, stream),
+                       "upload positions");
+            cuda_check(cudaMemsetAsync(buffers.scratch.data(), 0x5A + static_cast<int>(r), buffers.scratch.bytes(),
+                                       stream),
+                       "garbage scratch");
+            cuda_check(cudaMemsetAsync(buffers.selected.data(), 0x7F, buffers.selected.bytes(), stream),
+                       "garbage selected");
+            cuda_check(cudaMemsetAsync(buffers.counts.data(), 0x7F, buffers.counts.bytes(), stream), "garbage counts");
+            cuda_check(cudaGraphLaunch(exec, stream), "graph launch");
+            cuda_check(cudaStreamSynchronize(stream), "graph replay");
+            const Selection got = read_production(f, buffers, tag);
+            const Selection ref = run_reference(f, stream);
+            compare(f, ref, got, tag);
+        }
+        cuda_check(cudaGraphExecDestroy(exec), "destroy graph exec");
+        cuda_check(cudaGraphDestroy(graph), "destroy graph");
     }
-    cuda_check(cudaGraphExecDestroy(exec), "destroy graph exec");
-    cuda_check(cudaGraphDestroy(graph), "destroy graph");
     cuda_check(cudaStreamDestroy(stream), "destroy graph stream");
-    std::printf("  %-44s %zu replays\n", c.name.c_str(), replays.size());
+    std::printf("  %-44s %zu replays per route\n", c.name.c_str(), replays.size());
 }
 
 std::vector<Case> cases() {
@@ -739,6 +763,11 @@ std::vector<Case> cases() {
     add("concentrated, bin beyond the buffer", 1, 1, {120000}, Keys::Concentrated);
     add("concentrated, 6K blocks", 2, 2, {24000, 25000}, Keys::Concentrated);
     add("near ties, 5K blocks", 1, 4, {20000}, Keys::NearTies);
+    // The sampled route's fallback (16K blocks): its sample holds only the high blocks, or none (in
+    // the W=64 row, the columns of 16,384 blocks; the wider ones sample elsewhere).
+    add("strided: sample on the high blocks", 1, 2, {65535}, Keys::Strided, 1);
+    add("strided: sample on the zero blocks", 1, 2, {65535}, Keys::Strided, 0);
+    add("prefill W=64 strided high blocks", 1, 64, {65535}, Keys::Strided, 1);
     // Beyond 262K tokens.
     auto* far = add("beyond: 131K blocks", 1, 2, {524286});
     far->max_context = 524288 + 1024;
@@ -767,7 +796,7 @@ std::vector<Case> cases() {
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(qsa_select) {
     if (infernix::test::cuda_unavailable()) {
         std::printf("SKIP: no usable CUDA device\n");
         return 77;

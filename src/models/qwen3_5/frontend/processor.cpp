@@ -627,15 +627,24 @@ void enforce_media_item_resource_limits(const PreprocessStats& stats) {
     }
 }
 
+// The prompt's images and videos together over the budget: a context overflow of the vision budget
+// (ContextLengthDetails::vision), which agent clients recover from by compacting, unlike one item
+// over Vision execution capacity (enforce_media_item_resource_limits). The check runs as items are
+// added, so the prompt has at least the counted tokens (more than one fewer); raw patches count in
+// vision tokens.
 void enforce_media_resource_limits(const PreprocessStats& stats, const ProcessorOptions& options) {
+    constexpr std::uint64_t kPatchesPerToken = kMerge * kMerge;
+    const auto overflow = [](std::uint64_t counted, std::uint64_t allowed) {
+        throw ProcessorError(ContextLengthDetails{.prompt_tokens = counted - 1,
+                                                  .max_context   = static_cast<std::uint32_t>(allowed),
+                                                  .exact         = false,
+                                                  .vision        = true});
+    };
     if (stats.raw_patches > options.max_raw_patches) {
-        throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
-                             "vision raw patches exceed processor budget");
+        overflow((stats.raw_patches + kPatchesPerToken - 1) / kPatchesPerToken,
+                 options.max_raw_patches / kPatchesPerToken);
     }
-    if (stats.vision_tokens > options.max_vision_tokens) {
-        throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
-                             "vision tokens exceed processor budget");
-    }
+    if (stats.vision_tokens > options.max_vision_tokens) { overflow(stats.vision_tokens, options.max_vision_tokens); }
 }
 
 void assign_positions(ProcessedInput& output,

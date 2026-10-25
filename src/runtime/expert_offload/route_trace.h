@@ -1,9 +1,10 @@
 #pragma once
 
-// Internal route trace of the Qwen4Exp Program (ProgramOptions::route_trace; design §19.3.7, the
-// memory track's step R0): every round's routed experts per layer, with its kind, columns, rows,
-// live mask and the promotion budget the expert cache applied, appended to a binary file for the
-// two-level replay tools/expert_cache_replay/host_tier.py; and every CUDA graph executable the
+// Internal route trace of the expert offload engine (OffloadOptions::route_trace, shared by the
+// Qwen4Exp and offloaded Qwen3.5 Programs; Flash-Next design §19.3.7, the memory track's step R0):
+// every round's routed experts per layer, with its kind, columns, rows, live mask and the promotion
+// budget the expert cache applied, appended to a binary file for the replays
+// tools/expert_cache_replay/host_tier.py and replay.py; and every CUDA graph executable the
 // Program instantiates, with device free memory around it (measurement RM0d). It only reads the
 // route log that the expert cache already downloads with each round and queries free device
 // memory outside graph capture, so it never changes execution.

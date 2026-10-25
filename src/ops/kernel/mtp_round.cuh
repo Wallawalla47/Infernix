@@ -8,7 +8,7 @@
 namespace infernix::ops {
 
 __global__ void mtp_prepare_next_round_kernel(
-    const std::int32_t* verify_ids, const std::int32_t* next_anchors, const std::int32_t* accepted,
+    const std::int32_t* licensed_tokens, const std::int32_t* next_anchors, const std::int32_t* accepted,
     const std::int32_t* updated_frontiers, const std::int32_t* remaining_budgets,
     const std::int32_t* licensed_counts, const std::int32_t* rope_deltas,
     std::int32_t* alignment_ids, std::int32_t* next_extents, std::int32_t* ar_positions,
@@ -20,7 +20,7 @@ __global__ void mtp_prepare_next_round_kernel(
     a             = a < 0 ? 0 : (a > k ? k : a);
     for (int j = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x; j < T;
          j += blockDim.x * gridDim.x) {
-        alignment_ids[row * T + j] = j < a ? verify_ids[row * T + j + 1] : next_anchors[row];
+        alignment_ids[row * T + j] = j < a ? licensed_tokens[row * T + j] : next_anchors[row];
     }
     if (blockIdx.x == 0 && threadIdx.x == 0) {
         const int licensed       = licensed_counts[row];

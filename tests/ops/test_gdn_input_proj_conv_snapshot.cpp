@@ -1,3 +1,4 @@
+#include "ops/op_family.h"
 #include "core/weight.h"
 #include "infernix/ops/gdn_input_proj.h"
 
@@ -1255,7 +1256,7 @@ int run_fp8(const Fp8Parent& shape, std::uint32_t seed) {
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(gdn_input_proj_conv_snapshot) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;

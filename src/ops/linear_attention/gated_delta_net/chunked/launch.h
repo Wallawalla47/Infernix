@@ -17,11 +17,15 @@ inline constexpr float kNormEps = 1.0e-6F;
 
 struct Arguments {
     const __nv_bfloat16 *q, *k, *v;
-    const float *g, *beta, *state_in;
-    float* state_out;
+    const float *g, *beta;
+    // The initial and final state: FP32, or FP16 under fp16-gdn-state (fp16_state; stored saturating).
+    // The master state between them is FP32 either way.
+    const void* state_in;
+    void* state_out;
     __nv_bfloat16* out;
     int qk_heads, value_heads, tokens;
     float scale;
+    bool fp16_state = false;
 };
 
 // Q/K are independent of value-head gates. One packet is shared by the entire Q/K group.

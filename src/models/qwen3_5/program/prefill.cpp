@@ -396,18 +396,19 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
             .execute(std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()),
                      device.stream);
 
-        // Sparse acceptance reads counts. Publish only the prefix licensed by the Frontend.
-        if (speculative_backend == SpeculativeBackend::DFlash2) {
+        // Sparse acceptance (DFlash2, sampled MTP drafts) reads counts but leaves them to the
+        // commit. Publish only the prefix licensed by the Frontend.
+        const bool sparse_mtp = speculative_backend == SpeculativeBackend::Mtp && execution_schedule.sampled_mtp_drafts;
+        if (speculative_backend == SpeculativeBackend::DFlash2 || sparse_mtp) {
             for (std::size_t row = 0; row < lanes.size(); ++row) {
                 if (discarded[row] || !requests[lanes[row]].sampling_host.token_counts) {
                     continue;
                 }
                 const auto count = static_cast<std::int32_t>(accepted_tokens[row]);
-                Tensor ids =
-                    io.dflash_decode->narrowed(verify_drafts)
-                        .licensed_tokens.slice(1, static_cast<std::int32_t>(row), 1)
-                        .slice(0, 0, count)
-                        .view({count});
+                const Tensor licensed =
+                    sparse_mtp ? io.mtp_decode->narrowed(verify_drafts, neural_draft_window).licensed_tokens
+                               : io.dflash_decode->narrowed(verify_drafts).licensed_tokens;
+                Tensor ids = licensed.slice(1, static_cast<std::int32_t>(row), 1).slice(0, 0, count).view({count});
                 Tensor counts =
                     token_counts.slice(1, static_cast<std::int32_t>(lanes[row]), 1)
                         .view({dimension(parameters.model.resources().public_token_count)});
@@ -523,16 +524,42 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                 if (terminal[row]) {
                     sequence.mtp_draft_count = 0;
                 } else {
-                    const std::int32_t next  = mtp_host_egress->next_extents[row];
-                    sequence.mtp_draft_count = static_cast<std::uint32_t>(next);
+                    // The round's proposal limit (a chained round's draft length; else its every
+                    // step): drafts past it were not proposed (their words are stale).
+                    const std::int32_t next  = std::min(mtp_host_egress->next_extents[row],
+                                                        mtp_host_ingress->proposal_limits[row]);
+                    sequence.mtp_draft_count = static_cast<std::uint32_t>(std::max(next, 0));
+                    if (execution_schedule.mtp_step_chain) {
+                        // The step chain: the row's drafts end at its first below the round's step
+                        // threshold (a later step ran only for another row, or not at all), the
+                        // gate's comparison of a float widened to binary64.
+                        for (std::uint32_t step = 0; step < sequence.mtp_draft_count; ++step) {
+                            const float q = mtp_host_egress->next_probabilities[step * max_concurrency + row];
+                            if (static_cast<double>(q) < mtp_host_ingress->step_threshold) {
+                                sequence.mtp_draft_count = step + 1U;
+                                break;
+                            }
+                        }
+                    }
+                    sequence.mtp_draft_proposals = execution_schedule.sampled_mtp_drafts;
                     for (std::uint32_t step = 0; step < sequence.mtp_draft_count; ++step) {
-                        sequence.mtp_drafts[step] =
-                            mtp_host_egress->next_drafts[step * max_concurrency + row];
-                        // Without the confidence policy the round writes no probabilities.
+                        const std::size_t at = step * max_concurrency + row;
+                        sequence.mtp_drafts[step] = mtp_host_egress->next_drafts[at];
+                        // Without the confidence schedule the round writes no probabilities.
                         sequence.mtp_draft_probabilities[step] =
-                            execution_schedule.mtp_draft_confidence
-                                ? mtp_host_egress->next_probabilities[step * max_concurrency + row]
-                                : 1.0F;
+                            execution_schedule.mtp_draft_confidence ? mtp_host_egress->next_probabilities[at] : 1.0F;
+                        if (sequence.mtp_draft_proposals) {
+                            std::copy_n(mtp_host_egress->next_candidates.begin() +
+                                            static_cast<std::ptrdiff_t>(at * kMtpSparseSlots),
+                                        kMtpSparseSlots, sequence.mtp_draft_candidates[step].begin());
+                            std::copy_n(mtp_host_egress->next_q.begin() + static_cast<std::ptrdiff_t>(at * kMtpSparseSlots),
+                                        kMtpSparseSlots, sequence.mtp_draft_q[step].begin());
+                            if (mtp_tree_rounds) {
+                                std::copy_n(mtp_host_egress->next_scores.begin() +
+                                                static_cast<std::ptrdiff_t>(at * kMtpSampledDraftRanks),
+                                            kMtpSampledDraftRanks, sequence.mtp_draft_scores[step].begin());
+                            }
+                        }
                     }
                 }
             } else {
@@ -794,7 +821,8 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                     // Synchronized: the expert error word, the lane's prompt routes and the cache.
                     offload->end_pass(device.stream, offload_call, ProgramOffload::PassKind::Prompt, sequence.lane,
                                       static_cast<std::int32_t>(result.processed_tokens), pass_begin,
-                                      result.finalized, parameters.model.info().name);
+                                      result.finalized, parameters.model.info().name,
+                                      ProgramOffload::continuing_prompt(staged.base, staged.prompt_tokens));
                     // The prompt's last pass returns the stream's leases unless another lane prefills.
                     if (result.finalized && !other_lane_prefilling(sequence.lane)) {
                         offload->return_stream(device.stream);
@@ -911,8 +939,10 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             sequence.mtp_draft_count = staged.initial_mtp_extent;
             std::copy_n(initial_drafts.begin(), staged.initial_mtp_extent,
                         sequence.mtp_drafts.begin());
-            // The prompt's drafts carry no probability: the confidence policy verifies them.
+            // The prompt's drafts carry no probability (the confidence policy and the cut verify
+            // them) and, being argmax drafts, no sparse proposal (they verify one-hot).
             sequence.mtp_draft_probabilities.fill(1.0F);
+            sequence.mtp_draft_proposals = false;
         } else if (is_masked_draft_backend(speculative_backend) &&
                    sequence.dflash_context_frontier != prompt_tokens) {
             throw std::logic_error("staged DFlash prefill did not reach the prompt frontier");

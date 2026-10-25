@@ -3,6 +3,7 @@
 // sum_k |w x| * K * 2^-24, plus its column invariance: a column's bits do not depend on the batch
 // width or the column's position.
 #include "infernix/ops/projection_fp32.h"
+#include "ops/op_family.h"
 #include "ops/projection_fp32/projection_fp32_route.h"
 #include "ops/linear/linear_test_common.h"
 
@@ -294,6 +295,99 @@ void bf16_wide_case(const std::vector<std::int32_t>& rows, std::int32_t k, std::
     for (auto* p : devices) { cudaFree(p); }
 }
 
+// router-mma (projection_fp32_router_mma): the first weight's rows on BF16 tensor cores meet the FP64 bound
+// and do not depend on the call's width (every 256-column slice equals the full call's columns); the other
+// weights' rows equal projection_fp32's bit for bit. Informational: both routes' time at 4096 columns.
+void router_mma_case(const std::vector<std::int32_t>& rows, std::int32_t k, std::int32_t t, std::uint32_t seed) {
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> d(0.0F, 0.05F);
+    std::vector<float> wv;
+    std::vector<std::uint16_t*> devices;
+    std::vector<Tensor> tensors;
+    std::int32_t n = 0;
+    for (const std::int32_t segment : rows) {
+        std::vector<std::uint16_t> part(static_cast<std::size_t>(segment) * k);
+        for (auto& v : part) { v = bf16_bits(d(rng)); }
+        for (auto v : part) { wv.push_back(bf16_value(v)); }
+        devices.push_back(device(part));
+        tensors.push_back(Tensor(devices.back(), DType::BF16, {k, segment}));
+        n += segment;
+    }
+    std::vector<const Tensor*> weights;
+    for (const auto& w : tensors) { weights.push_back(&w); }
+    std::vector<std::uint16_t> bits;
+    std::vector<float> values;
+    random_activations(k, t, seed + 3, bits, values);
+    auto* dx    = device(bits);
+    float* dout = nullptr;
+    cudaMalloc(&dout, sizeof(float) * n * t);
+    const auto run = [&](std::int32_t first, std::int32_t width, bool mma) {
+        Tensor x(dx + static_cast<std::size_t>(first) * k, DType::BF16, {k, width});
+        Tensor out(dout + static_cast<std::size_t>(first) * n, DType::FP32, {n, width});
+        if (mma) {
+            infernix::ops::projection_fp32_router_mma(x, weights, out, nullptr);
+        } else {
+            infernix::ops::projection_fp32(x, weights, out, nullptr);
+        }
+        if (cudaDeviceSynchronize() != cudaSuccess) { throw std::runtime_error("router-mma failed"); }
+        std::vector<float> host(static_cast<std::size_t>(n) * width);
+        cudaMemcpy(host.data(), out.data, host.size() * sizeof(float), cudaMemcpyDeviceToHost);
+        return host;
+    };
+    const std::vector<float> simt = run(0, t, false);
+    const std::vector<float> full = run(0, t, true);
+    const std::string label = "router-mma N=" + std::to_string(n) + " K=" + std::to_string(k) + " T=" + std::to_string(t);
+    const std::int32_t first_rows = rows.front();
+    long other_differ = 0;
+    for (std::int32_t c = 0; c < t; ++c) {
+        if (std::memcmp(simt.data() + static_cast<std::size_t>(c) * n + first_rows,
+                        full.data() + static_cast<std::size_t>(c) * n + first_rows,
+                        sizeof(float) * (n - first_rows)) != 0) {
+            ++other_differ;
+        }
+    }
+    check(other_differ == 0, label + " other weights' rows equal projection_fp32");
+    long slice_differ = 0;
+    for (std::int32_t first = 0; first + 256 <= t; first += 256) {
+        const std::vector<float> slice = run(first, 256, true);
+        if (std::memcmp(slice.data(), full.data() + static_cast<std::size_t>(first) * n, sizeof(float) * n * 256) != 0) {
+            ++slice_differ;
+        }
+    }
+    check(slice_differ == 0, label + " 256-column slices equal the full call");
+    const WeightAt w = [&](std::int32_t r, std::int32_t i) { return static_cast<double>(wv[static_cast<std::size_t>(r) * k + i]); };
+    verify(label + " (first columns)", full, w, values, n, k, 3, {});
+    const std::vector<float> tail(full.end() - static_cast<std::ptrdiff_t>(n) * 3, full.end());
+    const std::vector<float> tail_x(values.end() - static_cast<std::ptrdiff_t>(k) * 3, values.end());
+    verify(label + " (last columns)", tail, w, tail_x, n, k, 3, {});
+    if (t >= 4096) {
+        Tensor x(dx, DType::BF16, {k, t}), out(dout, DType::FP32, {n, t});
+        for (const bool mma : {false, true}) {
+            cudaEvent_t begin, end;
+            cudaEventCreate(&begin);
+            cudaEventCreate(&end);
+            cudaEventRecord(begin);
+            for (int i = 0; i < 20; ++i) {
+                if (mma) {
+                    infernix::ops::projection_fp32_router_mma(x, weights, out, nullptr);
+                } else {
+                    infernix::ops::projection_fp32(x, weights, out, nullptr);
+                }
+            }
+            cudaEventRecord(end);
+            cudaEventSynchronize(end);
+            float ms = 0;
+            cudaEventElapsedTime(&ms, begin, end);
+            std::cout << label << (mma ? " tensor cores: " : " SIMT: ") << ms / 20 * 1000 << " us per call\n";
+            cudaEventDestroy(begin);
+            cudaEventDestroy(end);
+        }
+    }
+    cudaFree(dx);
+    cudaFree(dout);
+    for (auto* p : devices) { cudaFree(p); }
+}
+
 } // namespace
 
 // Tall BF16 projections (vocabulary heads) at verification widths take the tall mapping: every column
@@ -351,7 +445,7 @@ void bf16_tall_case(std::int32_t n, std::int32_t k, std::uint32_t seed) {
     cudaFree(dw);
 }
 
-int main() {
+INFERNIX_OP_TEST(projection_fp32) {
     if (!cuda_available()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
@@ -365,6 +459,12 @@ int main() {
         bf16_wide_case({512, 1}, 2560, 4096, 37);  // a 4096-token prefill chunk's router
         bf16_wide_case({7, 300, 1, 64}, 3072, 301, 41); // K at its limit, partial CTA range and pass
         bf16_wide_case({129}, 1024, 135, 43);
+        router_mma_case({512, 1}, 2560, 256, 51);   // the narrowest router-mma call
+        router_mma_case({512, 1}, 2560, 4096, 53);  // a 4096-token chunk (64-token tiles)
+        router_mma_case({512, 1}, 2560, 9000, 57);  // past 8,192 (128-token tiles), a ragged last tile
+        // The Qwen3.5-122B-A10B's router (256 experts and the shared score, H 3,072: K at its limit).
+        router_mma_case({256, 1}, 3072, 256, 59);
+        router_mma_case({256, 1}, 3072, 4096, 61);
         bf16_tall_case(40000, 2560, 47);  // the tall mapping (a vocabulary head's width)
         quantized_case(infernix::QType::Q8_G32_FP16, 1000, 2560, 17, false);
         quantized_case(infernix::QType::Q8_G32_FP16, 248320, 2560, 19, true); // the 8-bit lm_head, sampled rows

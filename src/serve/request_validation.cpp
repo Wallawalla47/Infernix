@@ -205,6 +205,34 @@ std::optional<int> optional_int(const RequestJson& object, const char* key) {
     return static_cast<int>(converted);
 }
 
+void parse_openai_thinking_budget(const RequestJson& body, GenerationRequest& request) {
+    static constexpr const char* kNames[] = {"thinking_budget_tokens", "thinking_token_budget", "thinking_budget",
+                                             "reasoning_budget_tokens"};
+    std::optional<int> budget;
+    const char* name = nullptr;
+    for (const char* key : kNames) {
+        const std::optional<int> value = optional_int(body, key);
+        if (!value) { continue; }
+        if (budget && *budget != *value) {
+            bad_request(std::string("conflicting thinking budgets in ") + name + " and " + key, key,
+                        "conflicting_template_option");
+        }
+        budget = value;
+        name   = key;
+    }
+    if (!budget || *budget == -1) { return; }
+    if (*budget < -1) { bad_request(std::string(name) + " must be a positive token count, 0 or -1", name); }
+    if (*budget == 0) {
+        if (request.enable_thinking == true) {
+            bad_request(std::string(name) + " 0 disables thinking, which conflicts with enable_thinking true", name,
+                        "conflicting_template_option");
+        }
+        request.enable_thinking = false;
+        return;
+    }
+    request.thinking_budget = static_cast<std::uint32_t>(*budget);
+}
+
 std::optional<double> optional_number(const RequestJson& object, const char* key) {
     if (!object.contains(key) || object.at(key).is_null()) { return std::nullopt; }
     if (!object.at(key).is_number()) { bad_request(std::string(key) + " must be a number", key); }

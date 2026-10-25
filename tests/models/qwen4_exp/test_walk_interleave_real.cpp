@@ -83,6 +83,8 @@ public:
             times_.push_back(Clock::now());
         }
     }
+    void tool_call(infernix::ToolCallDelta) override {}
+
     void publish(infernix::OutputDelta) override {}
     [[nodiscard]] std::uint32_t generated() const {
         const std::lock_guard<std::mutex> lock(mutex_);

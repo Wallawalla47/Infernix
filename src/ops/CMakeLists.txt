@@ -6,7 +6,8 @@ target_link_libraries(infernix_ops PUBLIC infernix_core PRIVATE infernix_nvfp4_n
 
 # Warp-specialized SM120 NVFP4 kernels use setmaxnreg to transfer registers from
 # producer to consumer warpgroups. RDC makes ptxas discard that contract. These
-# self-contained kernels therefore use a non-RDC archive and host launchers.
+# self-contained kernels therefore use a non-RDC archive and host launchers (and the
+# f16-accumulate split-register launches).
 add_library(infernix_nvfp4_non_rdc STATIC)
 infernix_internal_includes(infernix_nvfp4_non_rdc)
 infernix_cuda_non_rdc_archive(infernix_nvfp4_non_rdc)

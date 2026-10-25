@@ -15,9 +15,12 @@
 
 #include <cuda_runtime.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace infernix::models::qwen3_5::detail {
 
@@ -29,12 +32,20 @@ struct OffloadGeometry {
     std::int32_t chunk     = 1024;
     std::uint32_t walk_max_tokens = 65536;
     bool speculative             = false;
+    // The route trace's header (route_trace.h): MTP drafts per round and the n-gram copy window.
+    std::uint32_t mtp_draft_tokens   = 0;
+    std::uint32_t ngram_draft_tokens = 0;
     std::uint32_t graph_bound    = 0; // graph executables the frame sizing leaves room for
     // A full-width prefill pass's workspace (WorkspacePlan::text_prefill_wide, mtp_prefill_wide): what
     // the cache lends a pass wider than kOffloadedMoeStaticColumns; 0 without lent passes.
     std::uint64_t wide_pass_bytes = 0;
-    // Plain decode's one-column divisor word (ExpertOffload::plain_divisor), when the Program keeps one.
-    const std::int32_t* one_column_divisor_device = nullptr;
+    // WorkspacePlan::prefill_wide_ladder: the pass workspace by width (INFERNIX_TMP_PROMPT_SIZED_LOAN).
+    std::vector<std::pair<std::int32_t, std::size_t>> wide_pass_ladder;
+    // The experts' wide route (ExecutionSchedule::expert_wide; OffloadedExperts::wide_a16), which the
+    // workspace plan sized.
+    ops::offloaded_moe::WideA16 expert_wide = ops::offloaded_moe::WideA16::kExact;
+    // router-mma (ExecutionSchedule::router_mma; OffloadedExperts::router_mma).
+    bool router_mma = false;
     int device = 0;
 };
 
@@ -94,9 +105,16 @@ public:
     // A prompt pass credits `lane`'s prompt routes and promotes at the decode rate only at decode
     // width (a wider one never; its routes still count, Flash-Next §19.3.17), and at the prompt's end
     // (`prompt_end`) the lane's routes seed the cache; a forced pass promotes kDecodePromotionsPerLayer.
-    // `position`: the pass's first position.
+    // `position`: the pass's first position. TEMPORARY (INFERNIX_TMP_CONTINUING_PROMPT, candidates CF-01 as on
+    // Flash-Next), until its A/B: a `continuing` prompt's pass (continuing_prompt) credits nothing, promotes
+    // nothing and passes every column as not live, so a conversation's decode experts keep their ranks
+    // against its new turn's tokens.
     void end_pass(cudaStream_t compute, const execution::OffloadedCall& call, PassKind kind, std::uint32_t lane,
-                  std::int32_t columns, std::uint32_t position, bool prompt_end, const std::string& model);
+                  std::int32_t columns, std::uint32_t position, bool prompt_end, const std::string& model,
+                  bool continuing = false);
+    // Whether a prompt whose reused prefix holds `reused` of its `prompt` tokens is a continuing turn
+    // (INFERNIX_TMP_CONTINUING_PROMPT=<fraction>: at least that share reused; unset: never).
+    [[nodiscard]] static bool continuing_prompt(std::uint32_t reused, std::uint32_t prompt);
     // A failed pass: the stream ends without the cache update.
     void abandon_pass(const execution::OffloadedCall& call) noexcept;
     // Once a prompt's passes end: the stream's leases (ExpertOffload::return_stream) and the wide
@@ -106,8 +124,10 @@ public:
 
     // ---- a decode or verification round (graphed or eager; Flash-Next design §19.3.5) ----
     // Before its forward: settles an update still pending, wakes the CPU service and opens the round
-    // with landings.
-    void begin_round(cudaStream_t compute);
+    // with landings. `position`: a plain decode round's first row's context tokens, which plain
+    // decode's one-column divisor follows where it applies (ExpertOffload::set_plain_position); -1:
+    // a verification round.
+    void begin_round(cudaStream_t compute, std::int32_t position = -1);
     // After the forward is enqueued: the round's route download (`columns` routed columns).
     void enqueue_routes(cudaStream_t compute, std::int32_t columns) { engine_.enqueue_route_download(compute, columns); }
     // After the round's synchronization: the expert error check (RecoverableExecutionError naming
@@ -145,6 +165,10 @@ private:
 
     const execution::Parameters& parameters_;
     std::uint64_t wide_pass_bytes_ = 0; // OffloadGeometry::wide_pass_bytes
+    std::vector<std::pair<std::int32_t, std::size_t>> wide_ladder_; // with INFERNIX_TMP_PROMPT_SIZED_LOAN: OffloadGeometry::wide_pass_ladder
+    ops::offloaded_moe::WideA16 expert_wide_ = ops::offloaded_moe::WideA16::kExact; // OffloadGeometry::expert_wide
+    bool router_mma_                         = false;                                // OffloadGeometry::router_mma
+    std::vector<std::uint8_t> silent_columns_; // a continuing prompt pass's not-live column flags (end_pass)
     runtime::expert_offload::ExpertOffload engine_;
     execution::OffloadedExperts experts_;
     VisionFrames vision_window_{*this};

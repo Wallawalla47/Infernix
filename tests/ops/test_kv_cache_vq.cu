@@ -3,6 +3,7 @@
 // kv_cache_vq_reference.h; untouched cache and window bytes; and, independently of the FP32
 // encoder, that every stored VQ2 word is a nearest codeword in FP64.
 
+#include "ops/op_family.h"
 #include "core/paged_kv_cache.h"
 #include "kv_cache_vq_reference.h"
 #include "infernix/ops/kv_cache_append.h"
@@ -416,7 +417,7 @@ int compaction_case(KvCacheStorage storage) {
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(kv_cache_vq) {
     if (cuda_unavailable()) {
         std::cout << "SKIP no CUDA device\n";
         return 77;
@@ -429,6 +430,12 @@ int main() {
         }
         // A wide append writes only its final ring span (and sinks) into the window.
         failures += append_case(storage, 4, 1100, 0, 0x7777u);
+        // Mid-width calls: on 170 SMs, INFERNIX_TMP_VQ_APPEND_V2's split encoder takes 8, 4 and 2
+        // pattern ranges here (Q4KeyVq2Value 8, 8 and 4); the 1,100-token call takes 1 (2). The
+        // forced-range variants also run the short calls as partial passes.
+        failures += append_case(storage, 2, 100, 37, 0x5151u);
+        failures += append_case(storage, 4, 200, 0, 0x5252u);
+        failures += append_case(storage, 4, 401, 777, 0x5353u);
         failures += compaction_case(storage);
     }
     std::cout << (failures == 0 ? "PASS" : "FAIL") << " kv_cache_vq (" << failures

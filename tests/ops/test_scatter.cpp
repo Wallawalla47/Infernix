@@ -1,4 +1,5 @@
 #include "infernix/ops/scatter.h"
+#include "ops/op_family.h"
 #include "infernix/ops/speculative_round.h"
 #include "core/device.h"
 #include "core/decode_graph.h"
@@ -158,7 +159,7 @@ int continuation_case(int width, int batch) {
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(scatter) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;

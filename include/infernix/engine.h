@@ -52,6 +52,14 @@ public:
 
     GenerationResult wait(OutputSink* sink = nullptr, const CancellationView& cancellation = {});
 
+    // Blocks until the Engine admits this handle's request (the boundary that publishes its
+    // GenerationStart) or answers it before admission, consuming nothing: wait() still delivers every
+    // event. An error answered before admission (a queue timeout, an orderly stop) is rethrown here as
+    // wait() would rethrow it, so a streaming route can answer with a plain HTTP status before it
+    // commits a response; a request settled without admission and without an error (cancelled while
+    // queued) returns, and wait() gives its answer. Valid on a stream-consumed handle only.
+    void await_admission(const CancellationView& cancellation = {});
+
 private:
     class Impl;
     explicit GenerationHandle(std::unique_ptr<Impl> impl) noexcept;
@@ -80,6 +88,10 @@ public:
 
     // Artifact-tokenizer raw-text encoding. No chat template or implicit special token is added.
     [[nodiscard]] std::vector<TokenId> tokenize_text(std::string_view text) const;
+
+    // Artifact-tokenizer decoding of token ids, special tokens included. The bytes of a character
+    // that the ids cut are returned as they are (not necessarily valid UTF-8).
+    [[nodiscard]] std::string detokenize(std::span<const TokenId> token_ids) const;
 
     // The token ids of a text chat rendered with the artifact's chat template, whatever their number: unlike
     // prepare(), no max_context or capacity limit applies (a measurement tool cuts its windows from them).
@@ -117,9 +129,18 @@ public:
     [[nodiscard]] MemorySummary memory_summary() const;
     [[nodiscard]] RuntimeStats runtime_stats() const;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
+    // Which instruction positions the active chat template renders; prompt preparation lowers an
+    // instruction turn that arrived in an unsupported position to a role the template does render.
+    [[nodiscard]] ChatTemplateRoleSupport chat_template_role_support() const;
     [[nodiscard]] bool is_available() const;
+    // True once an execution failure has ended every request: the Engine refuses new work until
+    // the process starts a new one. An orderly stop() is not a failure.
+    [[nodiscard]] bool has_failed() const;
 
     void reset_memory_peaks() noexcept;
+    // Restarts RuntimeStats::execution's maxima (counts and totals keep running), so they describe
+    // what follows: a benchmark's measured runs, or serving after the startup warm-up.
+    void reset_execution_maxima() noexcept;
 
     // Begins the orderly stop without waiting for it: new work is refused, and queued and active
     // generation requests end with an Unavailable error within one unit of work. A Generation

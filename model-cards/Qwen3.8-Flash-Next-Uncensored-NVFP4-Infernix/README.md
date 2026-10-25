@@ -205,12 +205,15 @@ It serves the OpenAI Chat Completions and Responses APIs and the Anthropic Messa
 covers the KV formats, YaRN beyond 262K, images and video, the prefix cache, the SSD expert tier
 and tuning.
 
-This artifact stores the checkpoint's own chat template. It rejects a System or developer message
-after the first turn (Claude Code's normal mode sends them) with "System message must be at the
-beginning". Start the server with `--chat-template qwen3_8.jinja`, the maintained Qwen3.8
-template (`chat_templates` in the Windows release zip, or
+This artifact stores the checkpoint's own chat template. That template has no developer role and
+accepts a System message only at the start, so it refuses the traffic Claude Code normally sends.
+Infernix detects this while it loads the template and renders such a turn under a role the
+template does accept, keeping its text, the turn count and the positions, and it says so once at
+startup, so those requests work as they are. Pass
+`--chat-template qwen3_8.jinja`, the maintained Qwen3.8 template (`chat_templates` in the Windows
+release zip, or
 [tools/chat_templates](https://github.com/Wallawalla47/Infernix/blob/main/tools/chat_templates/qwen3_8.jinja)),
-to keep such messages in place.
+to render every turn under its real role.
 
 ## Quality
 

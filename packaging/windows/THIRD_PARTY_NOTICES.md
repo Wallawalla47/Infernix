@@ -26,6 +26,7 @@ package, under the file name given here.
 | `avcodec-*.dll`, `avformat-*.dll`, `avutil-*.dll`, `swresample-*.dll`, `swscale-*.dll` | [FFmpeg](https://ffmpeg.org), built by vcpkg without GPL or non-free components | LGPL-2.1-or-later | `FFmpeg-LICENSE.txt` |
 | `libcurl.dll` | [curl](https://curl.se) (TLS through Windows Schannel) | curl licence (MIT-style) | `curl-LICENSE.txt` |
 | `z.dll` | [zlib](https://zlib.net) | zlib licence | `zlib-LICENSE.txt` |
+| `jpeg62.dll` | [libjpeg-turbo](https://libjpeg-turbo.org) (JPEG image decoding) | IJG licence, BSD-3-Clause and zlib licence | `libjpeg-turbo-LICENSE.txt` |
 
 FFmpeg is used only through its DLLs, unmodified by Infernix, so it can be replaced by another build
 of the same FFmpeg major versions. Its corresponding source is published next to the Infernix

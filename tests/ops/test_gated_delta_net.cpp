@@ -1,4 +1,5 @@
 #include "infernix/ops/gated_delta_net.h"
+#include "ops/op_family.h"
 #include "infernix/ops/gdn_gating.h"
 
 #include "ops/gdn_ref.h"
@@ -750,6 +751,115 @@ int batch_update_gating_case(int batch, std::uint32_t seed) {
     return same_out && same_states ? 0 : 1;
 }
 
+// fp16-gdn-state: the state stored as FP16. From an initial state that FP16 represents exactly, every form
+// runs the FP32-state call's arithmetic on the same FP32 master state and rounds only the state it
+// publishes, so its outputs are bit-identical to the FP32-state call's (qualified against the FP64 oracle
+// above) and its state is that call's state rounded once to nearest FP16 (saturating). In place and
+// distinct states.
+int fp16_state_case(const Case& test_case, std::uint32_t seed, InputPattern pattern = InputPattern::Ordinary,
+                    ops::GdnChunkArithmetic arithmetic = ops::GdnChunkArithmetic::Exact) {
+    gdn_ref::Inputs in = make_inputs(test_case, seed, pattern);
+    round_to_fp16(in.state);
+    const float scale = 1.0F / std::sqrt(static_cast<float>(kStateDim));
+    DeviceInputs device(in);
+    DeviceBuffer fp32_in = to_device_f32(in.state), fp16_in = to_device(fp16_saturated_bits(in.state));
+    DeviceBuffer fp16_inplace = to_device(fp16_saturated_bits(in.state));
+    DeviceBuffer fp32_out(in.state.size() * sizeof(float)), fp16_out(in.state.size() * sizeof(std::uint16_t));
+    DeviceBuffer out_fp32(in.v.size() * sizeof(std::uint16_t)), out_fp16(in.v.size() * sizeof(std::uint16_t));
+    DeviceBuffer out_inplace(in.v.size() * sizeof(std::uint16_t));
+    Tensor q(device.q.p, DType::BF16, {kStateDim, test_case.qk_heads, test_case.tokens});
+    Tensor k(device.k.p, DType::BF16, {kStateDim, test_case.qk_heads, test_case.tokens});
+    Tensor v(device.v.p, DType::BF16, {kStateDim, test_case.value_heads, test_case.tokens});
+    Tensor g(device.g.p, DType::FP32, {test_case.value_heads, test_case.tokens});
+    Tensor beta(device.beta.p, DType::FP32, {test_case.value_heads, test_case.tokens});
+    const auto state = [&](void* data, DType dtype) {
+        return Tensor(data, dtype, {kStateDim, kStateDim, test_case.value_heads});
+    };
+    const auto output = [&](DeviceBuffer& buffer) {
+        return Tensor(buffer.p, DType::BF16, {kStateDim, test_case.value_heads, test_case.tokens});
+    };
+    const auto workspace_bytes = ops::gated_delta_net_workspace_capacity_bytes(
+        test_case.qk_heads, test_case.value_heads, test_case.tokens, test_case.tokens);
+    DeviceBuffer scratch(std::max<std::size_t>(workspace_bytes, 256));
+    WorkspaceArena workspace(DeviceSpan{scratch.p, scratch.bytes});
+    const bool normalize = test_case.normalize_qk;
+    Tensor fp32_state_in = state(fp32_in.p, DType::FP32), fp32_state_out = state(fp32_out.p, DType::FP32);
+    Tensor fp16_state_in = state(fp16_in.p, DType::FP16), fp16_state_out = state(fp16_out.p, DType::FP16);
+    Tensor fp16_state_inplace = state(fp16_inplace.p, DType::FP16);
+    Tensor fp32_output = output(out_fp32), fp16_output = output(out_fp16), inplace_output = output(out_inplace);
+    ops::gated_delta_net(q, k, v, g, beta, scale, normalize, workspace, fp32_state_in, fp32_state_out, fp32_output,
+                         execution(), arithmetic);
+    ops::gated_delta_net(q, k, v, g, beta, scale, normalize, workspace, fp16_state_in, fp16_state_out, fp16_output,
+                         execution(), arithmetic);
+    ops::gated_delta_net(q, k, v, g, beta, scale, normalize, workspace, fp16_state_inplace, inplace_output, execution(),
+                         arithmetic);
+    cuda_synchronize();
+    const std::string label = std::string(test_case.name) + " fp16 state H=" + std::to_string(test_case.qk_heads) + "/" +
+                              std::to_string(test_case.value_heads) + " T=" + std::to_string(test_case.tokens) +
+                              (arithmetic == ops::GdnChunkArithmetic::Fp16Accumulate ? " fp16acc" : "");
+    std::cout << "GDN_CASE " << label << std::endl;
+    const std::vector<std::uint16_t> reference_out = from_device<std::uint16_t>(out_fp32, in.v.size());
+    const std::vector<std::uint16_t> rounded_state =
+        fp16_saturated_bits(from_device<float>(fp32_out, in.state.size()));
+    int failures = 0;
+    failures += verify_exact(label + " out", from_device<std::uint16_t>(out_fp16, in.v.size()), reference_out);
+    failures += verify_exact(label + " in-place out", from_device<std::uint16_t>(out_inplace, in.v.size()), reference_out);
+    failures += verify_exact(label + " state", from_device<std::uint16_t>(fp16_out, in.state.size()), rounded_state);
+    failures += verify_exact(label + " in-place state", from_device<std::uint16_t>(fp16_inplace, in.state.size()),
+                             rounded_state);
+    failures += verify_exact(label + " source state unchanged", from_device<std::uint16_t>(fp16_in, in.state.size()),
+                             fp16_saturated_bits(in.state));
+    return failures;
+}
+
+// The decode update with an FP16 state pool: each written slot is the FP32 pool's state rounded once, the
+// outputs and untouched slots bit-equal, for in-place and forked destinations.
+int fp16_batch_update_case(const std::vector<int>& source, const std::vector<int>& destination, int slots,
+                           std::uint32_t seed) {
+    constexpr int qk_heads = 16, value_heads = 48;
+    const int batch   = static_cast<int>(source.size());
+    const float scale = 1.0F / std::sqrt(static_cast<float>(kStateDim));
+    std::vector<float> q(static_cast<std::size_t>(kStateDim) * qk_heads * batch), k(q.size());
+    std::vector<float> v(static_cast<std::size_t>(kStateDim) * value_heads * batch);
+    std::vector<float> gate(static_cast<std::size_t>(value_heads) * batch), beta_values(gate.size());
+    std::vector<float> states(static_cast<std::size_t>(kStateDim) * kStateDim * value_heads * slots);
+    std::mt19937 generator(seed);
+    fill_uniform(q, generator, -1.0f, 1.0f);
+    fill_uniform(k, generator, -1.0f, 1.0f);
+    fill_uniform(v, generator, -0.5f, 0.5f);
+    fill_uniform(gate, generator, -0.10f, -0.005f);
+    fill_uniform(beta_values, generator, 0.05f, 0.95f);
+    fill_uniform(states, generator, -0.5f, 0.5f);
+    round_to_fp16(states);
+    DeviceBuffer dq = to_device_bf16(q), dk = to_device_bf16(k), dv = to_device_bf16(v);
+    DeviceBuffer dg = to_device_f32(gate), dbeta = to_device_f32(beta_values);
+    DeviceBuffer dsource = to_device_i32(source), ddestination = to_device_i32(destination);
+    DeviceBuffer fp32_states = to_device_f32(states), fp16_states = to_device(fp16_saturated_bits(states));
+    DeviceBuffer fp32_out(sizeof(std::uint16_t) * v.size()), fp16_out(sizeof(std::uint16_t) * v.size());
+    const Tensor tq(dq.p, DType::BF16, {kStateDim, qk_heads, 1, batch});
+    const Tensor tk(dk.p, DType::BF16, {kStateDim, qk_heads, 1, batch});
+    const Tensor tv(dv.p, DType::BF16, {kStateDim, value_heads, 1, batch});
+    const Tensor tg(dg.p, DType::FP32, {value_heads, 1, batch}), tbeta(dbeta.p, DType::FP32, {value_heads, 1, batch});
+    const Tensor tsource(dsource.p, DType::I32, {batch}), tdestination(ddestination.p, DType::I32, {batch});
+    Tensor fp32_pool(fp32_states.p, DType::FP32, {kStateDim, kStateDim, value_heads, slots});
+    Tensor fp16_pool(fp16_states.p, DType::FP16, {kStateDim, kStateDim, value_heads, slots});
+    Tensor fp32_output(fp32_out.p, DType::BF16, {kStateDim, value_heads, 1, batch});
+    Tensor fp16_output(fp16_out.p, DType::BF16, {kStateDim, value_heads, 1, batch});
+    ops::gated_delta_net_batch_update(tq, tk, tv, tg, tbeta, scale, true, fp32_pool, tsource, tdestination,
+                                      fp32_output, nullptr);
+    ops::gated_delta_net_batch_update(tq, tk, tv, tg, tbeta, scale, true, fp16_pool, tsource, tdestination,
+                                      fp16_output, nullptr);
+    cuda_synchronize();
+    const std::string label = "fp16 state batch update B=" + std::to_string(batch);
+    int failures = verify_exact(label + " out", from_device<std::uint16_t>(fp16_out, v.size()),
+                                from_device<std::uint16_t>(fp32_out, v.size()));
+    // Written slots hold the FP32 pool's state rounded once; untouched ones their FP16 initial state, which
+    // the FP32 pool holds exactly.
+    failures += verify_exact(label + " pool", from_device<std::uint16_t>(fp16_states, states.size()),
+                             fp16_saturated_bits(from_device<float>(fp32_states, states.size())));
+    return failures;
+}
+
 int contract_rejection_cases() {
     DeviceBuffer q_buffer(kStateDim * 8 * sizeof(std::uint16_t));
     DeviceBuffer k_buffer(kStateDim * 8 * sizeof(std::uint16_t));
@@ -794,7 +904,7 @@ int contract_rejection_cases() {
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(gated_delta_net) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
@@ -929,6 +1039,20 @@ int main() {
     failures += fp16_accumulate_case({"zero signal", 1, 3, 17, true}, 14417U, InputPattern::ZeroSignal);
     failures += fp16_accumulate_case({"zero beta", 1, 3, 17, true}, 14517U, InputPattern::ZeroBeta);
     failures += fp16_accumulate_case({"unit beta", 1, 3, 257, true}, 14657U, InputPattern::UnitBeta);
+
+    // fp16-gdn-state on the recurrent route (T < 16), across the chunked boundary and on the 27B, 35B and
+    // 122B geometries, with both chunk arithmetics, and through the decode update.
+    for (int tokens : {1, 7, 15, 16, 17, 1025}) {
+        failures += fp16_state_case({"fp16 state", 16, 48, tokens, true}, 92000U + tokens);
+    }
+    failures += fp16_state_case({"fp16 state 35b", 16, 32, 1025, true}, 92100U);
+    failures += fp16_state_case({"fp16 state 122b", 16, 64, 1025, true}, 92200U);
+    failures += fp16_state_case({"fp16 state raw", 5, 15, 65, false}, 92300U);
+    failures += fp16_state_case({"fp16 state fp16acc", 16, 48, 1025, true}, 92400U, InputPattern::Ordinary,
+                                ops::GdnChunkArithmetic::Fp16Accumulate);
+    failures += fp16_state_case({"fp16 state weak decay", 1, 3, 4097, true}, 92500U, InputPattern::WeakDecay);
+    failures += fp16_batch_update_case({7}, {7}, 8, 92600U);
+    failures += fp16_batch_update_case({0, 2, 4, 6}, {1, 3, 5, 7}, 9, 92700U);
 
     print_summaries();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gated_delta_net correctness\n";

@@ -138,14 +138,18 @@ fp8_mma_compute_stage(const std::uint8_t* activation_stage, const std::uint8_t* 
 }
 
 // Weight rows' words are BF16 or FP32 (fp8_operands.h): Scale is the instance's word type.
+// `activation_scales` is `nullptr` (A16 tiles: no per-token scales) or a validated non-null pointer, so
+// the choice is the instance's and the A8 epilogue carries no unscaled copy.
 template <class Schedule, bool FullTokens, class Epilogue, class Output, class RowPolicy,
-          class Scale>
+          class Scale, class ActivationScales>
 __device__ __forceinline__ void
 fp8_finish_mma_tile(Output output, Epilogue epilogue, RowPolicy row_policy,
                     unsigned char* shared_raw,
                     float (&accumulators)[Schedule::kMmaTokens][Schedule::kMmaRows][4],
-                    const float* activation_scales, const Scale* weight_scales,
+                    ActivationScales activation_scales, const Scale* weight_scales,
                     int row_begin, int token_begin, int rows, int tokens, int warp, int lane) {
+    static_assert(std::is_null_pointer_v<ActivationScales> || std::is_same_v<ActivationScales, const float*>);
+    constexpr bool kTokenScales = !std::is_null_pointer_v<ActivationScales>;
     constexpr bool PairRows = RowPolicy::kPaired;
     constexpr int BM = Schedule::kBlockTokens, BN = Schedule::kBlockRows;
     constexpr int producers = [] {
@@ -173,14 +177,15 @@ fp8_finish_mma_tile(Output output, Epilogue epilogue, RowPolicy row_policy,
             token_begin + warp_token * Schedule::kWarpTokens + mma_token * 16 + accumulator_token;
         const int token1 = token0 + 8;
         // A16 tiles carry unscaled activations and pass no per-token scales.
-        const float activation_scale0 =
-            activation_scales == nullptr
-                ? 1.0F
-                : ((FullTokens || token0 < tokens) ? __ldg(activation_scales + token0) : 0.0F);
-        const float activation_scale1 =
-            activation_scales == nullptr
-                ? 1.0F
-                : ((FullTokens || token1 < tokens) ? __ldg(activation_scales + token1) : 0.0F);
+        const auto activation_scale = [&](int token) {
+            if constexpr (kTokenScales) {
+                return (FullTokens || token < tokens) ? __ldg(activation_scales + token) : 0.0F;
+            } else {
+                return 1.0F;
+            }
+        };
+        const float activation_scale0 = activation_scale(token0);
+        const float activation_scale1 = activation_scale(token1);
 #pragma unroll
         for (int mma_row = 0; mma_row < Schedule::kMmaRows; ++mma_row) {
             const int local_row0  = warp_row * Schedule::kWarpRows + mma_row * 8 + accumulator_row;
@@ -203,14 +208,18 @@ fp8_finish_mma_tile(Output output, Epilogue epilogue, RowPolicy row_policy,
                                        fp8_widen(weight_scales[parent_row1]));
                 }
             }();
-            float value00 =
-                accumulators[mma_token][mma_row][0] * activation_scale0 * weight_scale.x;
-            float value01 =
-                accumulators[mma_token][mma_row][1] * activation_scale0 * weight_scale.y;
-            float value10 =
-                accumulators[mma_token][mma_row][2] * activation_scale1 * weight_scale.x;
-            float value11 =
-                accumulators[mma_token][mma_row][3] * activation_scale1 * weight_scale.y;
+            // Scale with explicit rounded multiplies: a residual add after them must not contract
+            // into one FMA in the FullTokens instance only, or a token's bits would depend on
+            // whether its tile is full (upstream Neroued/ninfer#374). Every route that finishes
+            // here, and the TMA split-K reduce, rounds the products, then the sum.
+            float value00 = __fmul_rn(
+                __fmul_rn(accumulators[mma_token][mma_row][0], activation_scale0), weight_scale.x);
+            float value01 = __fmul_rn(
+                __fmul_rn(accumulators[mma_token][mma_row][1], activation_scale0), weight_scale.y);
+            float value10 = __fmul_rn(
+                __fmul_rn(accumulators[mma_token][mma_row][2], activation_scale1), weight_scale.x);
+            float value11 = __fmul_rn(
+                __fmul_rn(accumulators[mma_token][mma_row][3], activation_scale1), weight_scale.y);
             if constexpr (collective) {
                 accumulators[mma_token][mma_row][0] = value00;
                 accumulators[mma_token][mma_row][1] = value01;

@@ -1,3 +1,4 @@
+#include "ops/op_family.h"
 #include "core/device.h"
 #include <algorithm>
 #include "infernix/ops/prepare_masked_block.h"
@@ -133,7 +134,7 @@ int run_batch_case(int width, int batch, bool dense) {
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(prepare_masked_block) {
     if (cuda_unavailable()) {
         std::cout << "prepare_masked_block: SKIP (CUDA unavailable)\n";
         return 77;

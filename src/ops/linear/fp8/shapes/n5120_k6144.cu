@@ -1,5 +1,6 @@
 #include "ops/linear/fp8/fp8_shapes.h"
 #include "ops/linear/fp8/fp8_launch.cuh"
+#include "ops/linear/f16acc/f16acc_mma.cuh"
 
 namespace infernix::ops::detail {
 namespace {
@@ -50,8 +51,18 @@ std::size_t partial_capacity_bytes(std::int32_t max_tokens) {
     return max_tokens > 192 ? MidBulk::kPartialBytes : 0;
 }
 
+// f16-accumulate-prefill (A16Only permissions: under AllowA8 the single-term A8 route takes these
+// widths): the ring tiles of the Flash-Next problems, whose K this shares (not yet swept for this route).
+void launch_f16(const Tensor& x, const Weight& weight, Tensor& out, F16AccumulateWorkspace scratch,
+                cudaStream_t stream) {
+    if (x.ne[1] <= 4096) return fp8_linear_f16acc<Geometry, Fp8A16RingT64R128>(x, weight, out, scratch, stream);
+    fp8_linear_f16acc<Geometry, Fp8A16RingMmaSchedule<128, 128, 4, 4, 2, 1>>(x, weight, out, scratch, stream);
+}
+
 } // namespace
 
 const Fp8LinearShape kFp8N5120K6144{5120,      6144,    launch_a16,
-                                    launch_a8, uses_a8, partial_capacity_bytes};
+                                    launch_a8, uses_a8, partial_capacity_bytes,
+                                    /*invariant*/ nullptr, /*pair*/ nullptr, 0,
+                                    /*pair_block32*/ nullptr, launch_f16, kFp8F16MinTokens};
 } // namespace infernix::ops::detail

@@ -95,6 +95,9 @@ bool supported_shape(const Q5LinearAddProblem& problem) noexcept {
 
 // Keep complete 512-token waves on the wide collective MMA route. A short
 // remainder uses the measured narrow schedules to avoid another mostly empty wave.
+constexpr std::int32_t kKSplitFirstCols = 2;
+constexpr std::int32_t kKSplitLastCols  = 16;
+
 constexpr std::int32_t kWaveCols       = 512;
 constexpr std::int32_t kNarrowTailCols = 192;
 
@@ -151,6 +154,10 @@ const char* q5_linear_add_schedule_name(Q5LinearAddScheduleId schedule) noexcept
         return "linear_add.q5.mma.r64.t128.cta_collective_residual.narrow_tail";
     case Q5LinearAddScheduleId::SlicedColumnInvariant:
         return "linear_add.q5.sliced.w4.linear.column_invariant.residual";
+    case Q5LinearAddScheduleId::KSplitW8:
+        return "linear_add.q5.ksplit.w8.pairwise.residual";
+    case Q5LinearAddScheduleId::KSplitColumnInvariant:
+        return "linear_add.q5.ksplit.w8.pairwise.column_invariant.residual";
     }
     return "linear_add.q5.unknown";
 }
@@ -160,11 +167,20 @@ bool q5_linear_add_admits(const Q5LinearAddProblem& problem) noexcept {
 }
 
 Q5LinearAddPlan q5_linear_add_resolve_plan(const Q5LinearAddProblem& problem,
-                                           bool column_invariant) {
+                                           bool column_invariant, bool ksplit) {
     if (!q5_linear_add_admits(problem)) {
         throw std::invalid_argument("q5 linear_add: exact problem or column count is not admitted");
     }
-    if (column_invariant) { return {Q5LinearAddScheduleId::SlicedColumnInvariant, 0}; }
+    if (column_invariant) {
+        return {ksplit ? Q5LinearAddScheduleId::KSplitColumnInvariant
+                       : Q5LinearAddScheduleId::SlicedColumnInvariant,
+                0};
+    }
+    // q5-ksplit-mma: NInfer's (giveen/ninfer-ext e01b11645) verification widths; one column keeps
+    // split2, 17 and more the release routes.
+    if (ksplit && problem.cols >= kKSplitFirstCols && problem.cols <= kKSplitLastCols) {
+        return {Q5LinearAddScheduleId::KSplitW8, 0};
+    }
 
     const auto resolve_from = [&](const auto& routes) -> Q5LinearAddPlan {
         for (const RouteSpec& route : routes) {
@@ -189,9 +205,9 @@ std::size_t q5_linear_add_capacity_workspace_bytes(std::int32_t rows, std::int32
 
 void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, const Weight& w,
                                 Tensor& residual_out, WorkspaceArena& ws, cudaStream_t stream,
-                                bool column_invariant) {
+                                bool column_invariant, bool ksplit) {
     const Q5LinearAddProblem problem{residual_out.ne[0], x.ne[0], w.padded_shape[1], x.ne[1]};
-    const Q5LinearAddPlan resolved = q5_linear_add_resolve_plan(problem, column_invariant);
+    const Q5LinearAddPlan resolved = q5_linear_add_resolve_plan(problem, column_invariant, ksplit);
     if (resolved.schedule != plan.schedule || resolved.workspace_bytes != plan.workspace_bytes) {
         throw std::invalid_argument("q5 linear_add: plan does not match the exact problem");
     }
@@ -240,15 +256,20 @@ void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, co
     case Q5LinearAddScheduleId::SlicedColumnInvariant:
         q5_linear_add_sliced_invariant_launch(x, w, residual_out, stream);
         return;
+    case Q5LinearAddScheduleId::KSplitW8:
+    case Q5LinearAddScheduleId::KSplitColumnInvariant:
+        q5_linear_add_ksplit_launch(x, w, residual_out, stream);
+        return;
     }
     throw std::logic_error("q5 linear_add: unknown schedule");
 }
 
 void q5_linear_add_dispatch(const Tensor& x, const Weight& w, Tensor& residual_out,
-                            WorkspaceArena& ws, cudaStream_t stream, bool column_invariant) {
+                            WorkspaceArena& ws, cudaStream_t stream, bool column_invariant,
+                            bool ksplit) {
     const Q5LinearAddProblem problem{residual_out.ne[0], x.ne[0], w.padded_shape[1], x.ne[1]};
-    const Q5LinearAddPlan plan = q5_linear_add_resolve_plan(problem, column_invariant);
-    q5_linear_add_execute_plan(plan, x, w, residual_out, ws, stream, column_invariant);
+    const Q5LinearAddPlan plan = q5_linear_add_resolve_plan(problem, column_invariant, ksplit);
+    q5_linear_add_execute_plan(plan, x, w, residual_out, ws, stream, column_invariant, ksplit);
 }
 
 } // namespace infernix::ops::detail

@@ -266,7 +266,8 @@ public:
         require(static_cast<bool>(program_.reserve_units(units)), "grammar mixed unit reservation");
         const std::array<runtime::RoundBudget, 2> budgets{{{1}, {1}}};
         auto pending = program_.decode(members, budgets, nullptr, &masks);
-        require(pending.constraint_failed(0) && !pending.constraint_failed(1),
+        require(pending.row_failure(0) == runtime::PendingRowFailure::ConstraintDeadEnd &&
+                    pending.row_failure(1) == runtime::PendingRowFailure::None,
                 "grammar failure lost its row");
         const std::array<runtime::CommitDecision, 2> decisions{
             {{.terminal = true, .failed = true}, {.accepted_tokens = 1}}};

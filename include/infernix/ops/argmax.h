@@ -1,7 +1,9 @@
 #pragma once
 
+#include "core/arena.h"
 #include "core/tensor.h"
 
+#include <cstddef>
 #include <cstdint>
 
 #include <cuda_runtime.h> // cudaStream_t
@@ -28,16 +30,23 @@ void argmax(const Tensor& logits, const Tensor& row_ids, Tensor& out, std::int32
             cudaStream_t stream);
 
 /**
- * The softmax probability of each column's selected row (a speculative draft's confidence):
+ * The argmax of each column with its softmax probability (a speculative draft's confidence), from one
+ * pass over the logits:
  *
- *   probability[t] = 1 / sum_{0 <= v < valid_rows} exp(float(logits[v,t]) - float(logits[rows[t],t])).
+ *   out[t]         = min argmax_{0 <= v < valid_rows} float(logits[v,t])   (as argmax above),
+ *   probability[t] = 1 / sum_{0 <= v < valid_rows} exp(float(logits[v,t]) - float(logits[out[t],t])).
  *
- * `logits` as for argmax; `rows` contiguous I32 [T] with 0 <= rows[t] < valid_rows (argmax's `out`
- * before any id mapping); `probability` contiguous FP32 [T]. Each column's sum runs in one fixed
- * order (fast exponentials, FP32 accumulation), so the result depends only on the column's logits:
- * an extent policy's input, not a sampling probability.
+ * `logits`, `out` and valid_rows as for argmax (out holds rows: map them to token ids afterwards);
+ * the logits are finite; `probability` is contiguous FP32 [T], T <= 65535. Each column's sum runs in
+ * one fixed order (fast exponentials and FP32 accumulation; each thread rescales its running sum at
+ * a new maximum, then a fixed tree combines the threads and, in row order, the row tiles), so the
+ * result depends only on the column's logits: an extent policy's input, not a sampling probability.
+ * `workspace` supplies argmax_with_probability_workspace_bytes() of transient storage (the row
+ * tiles' partial maxima and sums), free again when the call returns.
  */
-void argmax_probability(const Tensor& logits, const Tensor& rows, Tensor& probability, std::int32_t valid_rows,
-                        cudaStream_t stream);
+[[nodiscard]] std::size_t argmax_with_probability_workspace_bytes(DType logits, std::int32_t physical_rows,
+                                                                  std::int32_t valid_rows, std::int32_t columns);
+void argmax_with_probability(const Tensor& logits, Tensor& out, Tensor& probability, std::int32_t valid_rows,
+                             WorkspaceArena& workspace, cudaStream_t stream);
 
 } // namespace infernix::ops

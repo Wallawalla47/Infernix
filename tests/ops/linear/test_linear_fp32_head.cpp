@@ -5,6 +5,7 @@
 // criterion against the FP64 product of the stored weights (decoded with their stored scales) and the BF16
 // activations; its worst error in units of the FP32 accumulation bound sum_k |w x| * K * 2^-24 is reported.
 #include "ops/linear/linear_test_common.h"
+#include "ops/op_family.h"
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
 
@@ -149,7 +150,7 @@ int run_case(const HeadCase& head) {
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(linear_fp32_head) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;

@@ -21,6 +21,9 @@ namespace infernix::serve {
                                                       const RequestJson& body,
                                                       const ServeOptions& options);
 void set_ngram_generation_header(httplib::Response& response, const NgramArchiveStats& stats);
+// The request log's label from one X-Infernix-Request-Label header of 1-128 printable ASCII
+// characters (a benchmark marks its traffic with it); empty when absent or malformed.
+[[nodiscard]] std::string request_label(const httplib::Request& request);
 [[nodiscard]] std::string ngram_generation_comment(const NgramArchiveStats& stats);
 class ResponseRenderFailure final : public std::runtime_error {
 public:

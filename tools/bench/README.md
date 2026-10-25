@@ -20,6 +20,51 @@ client, stages the NVFP4 artifact once in `/dev/shm`, stores raw/progress/Serve 
 JSON, and CSV summaries. The case catalog, exact profiles, TTFT boundary, and fixture qualification
 are documented in the dedicated README.
 
+## Interleaved A/B of switches and fast paths
+
+`abba.py` times `infernix_bench` arms that differ by `INFERNIX_TMP_*` switches, `--fast-path`
+candidates, options or binaries, one fresh process per sample, in interleaved blocks (A B, B A, or a
+rotation for more arms). It discards a warm-up process, adds a noise arm (the control again), varies
+the prompt per block with `--corpus-offset` when the arm file lists offsets, and drops any sample
+whose startup evidence is wrong: an arm's switch missing from the `temporary switches` record, a
+requested fast path absent from the report, a PCIe link probe below `--min-link-gbs`, or a CPU expert
+team rate off the run's median. Per metric and arm it reports pairs better than the control, the
+median and worst paired ratio, the ratio of pooled means and an exact Wilcoxon signed-rank p-value
+with Holm's correction; a resolved difference in the noise arm marks the whole run noisy. The arm
+file format is in the script's docstring.
+
+For exact changes below about 1 %, which sit inside run-to-run drift, the TEMPORARY replay bench
+(`INFERNIX_TMP_REPLAY_BENCH=<warm rounds>` in the common `env`) replays one greedy request the same way
+in every process. The expert cache freezes after the warm rounds (start it from `--expert-state` and use
+0 to freeze at once), and Flash-Next's MTP width cost keeps its prior, so every arm runs the same rounds
+with the same hits and misses. The metric `replay_ms_per_round` (lower is better) is the decode rounds'
+device time less the CPU waits inside them, per round, read from each process's log; `replay_device_ms`,
+`replay_wait_ms` and `replay_less_waits_ms` are the totals. It measures GPU work only: changes to the
+CPU expert leg, acceptance or the cache policy need the ordinary metrics.
+
+```bash
+python3 tools/bench/abba.py arms.json --out profiles/bench/abba/<name> --blocks 6
+```
+
+## Basalt parity runs
+
+`basalt_parity.py` runs Basalt's own workload through `infernix_bench`, one fresh process per
+measurement with no warm-up, as `basalt-bench --community` does (one discarded process goes first).
+`--suite community` reads Basalt's `data/bench` fixtures as data: conv and prose (1,200 tokens, T 0.6,
+top-p 0.95, top-k 20), struct (8,192 tokens, greedy), each ending at EOS, and 16K / 64K prefills of
+Basalt's filler construction. It reports per-fixture decode tok/s and tokens per round, Basalt's
+token-weighted `decode_tps`, and the prefill rates, beside Basalt's published row. `--suite chart` runs
+giveen's chart protocol (16K-256K cold prompts, 256 output tokens, greedy and T 1.0, 262,144 max
+context). The arms are plain, `mtp`, `mtp-copies` (n-gram copies at min match 4 with the agreement
+gate) and `dflash2`, each sampled request over `--seeds` seeds; the `--route-trace-arm` writes a route
+trace per decode fixture for the cache-policy replays. The machines and quantizations differ, so the
+figures place Infernix beside Basalt rather than decide a winner.
+
+```bash
+python3 tools/bench/basalt_parity.py --bench build/bench/infernix_bench --model <Dense8 artifact> \
+  --ngram-volume <volume> --fixtures <basalt>/data/bench --out profiles/bench/basalt --suite both
+```
+
 ## Corpus baker
 
 `infernix_bench` benchmarks prefill at an exact length by slicing the first `P` token ids of a
@@ -159,8 +204,11 @@ The serial runner writes `run.jsonl`, `summary.csv`, `summary.md`, and per-serve
 `server/`. JSONL contains the completed requests and responses; CSV/Markdown contain fixture and
 category summaries. The output directory is supplied explicitly with `--output`.
 
-Its schema-v8 result and flattened summaries retain the KV dtype, actual `prefill_signature`, request Host
-exposure, and decode Host/Device-wait time per round received from the schema-v26 serving records.
+Its schema-v9 result and flattened summaries retain the KV dtype, actual `prefill_signature`, request Host
+exposure, and decode Host/Device-wait time per round received from the serving records. Each
+runner accepts only the schema version Serve writes, and
+[the schema test](../../tests/test_request_log_schema.py) pins that accepted version to Serve's
+own, so a campaign fails at once on a version mismatch rather than after a full engine load.
 Request exposure is a latency distribution value and is never summed across concurrent requests;
 worker aggregation uses the serving `throughput.host_work` interval deltas. The stochastic route pins its complete
 temperature/top-p/top-k/min-p/presence/frequency profile explicitly, so model-default changes do

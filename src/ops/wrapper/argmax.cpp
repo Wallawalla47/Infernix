@@ -80,28 +80,43 @@ void argmax(const Tensor& logits, const Tensor& row_ids, Tensor& out, std::int32
     detail::argmax_map_launch(row_ids, out, stream);
 }
 
-void argmax_probability(const Tensor& logits, const Tensor& rows, Tensor& probability, std::int32_t valid_rows,
-                        cudaStream_t stream) {
+std::size_t argmax_with_probability_workspace_bytes(DType logits, std::int32_t physical_rows,
+                                                   std::int32_t valid_rows, std::int32_t columns) {
+    if (physical_rows <= 0 || valid_rows <= 0 || valid_rows > physical_rows || columns < 0) {
+        throw std::invalid_argument("argmax_with_probability: invalid workspace dimensions");
+    }
+    if (columns == 0) { return 0; }
+    return detail::argmax_probability_workspace_bytes(
+        detail::argmax_probability_tiles(logits, physical_rows, valid_rows, columns), columns);
+}
+
+void argmax_with_probability(const Tensor& logits, Tensor& out, Tensor& probability, std::int32_t valid_rows,
+                             WorkspaceArena& workspace, cudaStream_t stream) {
+    constexpr const char* op = "argmax_with_probability";
     if (logits.dtype != DType::BF16 && logits.dtype != DType::FP32) {
-        throw std::invalid_argument("argmax_probability: logits must be BF16 or FP32");
+        throw std::invalid_argument(std::string(op) + ": logits must be BF16 or FP32");
     }
     if (logits.ne[2] != 1 || logits.ne[3] != 1 || logits.ne[0] <= 0 || !logits.is_contiguous() ||
         logits.data == nullptr) {
-        throw std::invalid_argument("argmax_probability: logits must be contiguous rank-2 [vocab,T]");
+        throw std::invalid_argument(std::string(op) + ": logits must be contiguous rank-2 [vocab,T]");
     }
     if (valid_rows <= 0 || valid_rows > logits.ne[0]) {
-        throw std::invalid_argument("argmax_probability: valid_rows must be in [1, logits.ne[0]]");
+        throw std::invalid_argument(std::string(op) + ": valid_rows must be in [1, logits.ne[0]]");
     }
     const std::int32_t columns = logits.ne[1];
-    if (rows.dtype != DType::I32 || !rows.is_contiguous() || rows.numel() != columns ||
+    if (columns > 65535) { throw std::invalid_argument(std::string(op) + ": at most 65535 columns"); }
+    if (out.dtype != DType::I32 || !out.is_contiguous() || out.numel() != columns ||
         probability.dtype != DType::FP32 || !probability.is_contiguous() || probability.numel() != columns) {
-        throw std::invalid_argument("argmax_probability: rows must be I32 [T] and probability FP32 [T]");
+        throw std::invalid_argument(std::string(op) + ": out must be I32 [T] and probability FP32 [T]");
     }
     if (columns == 0) { return; }
-    if (rows.data == nullptr || probability.data == nullptr) {
-        throw std::invalid_argument("argmax_probability: rows/probability data must be non-null");
+    if (out.data == nullptr || probability.data == nullptr) {
+        throw std::invalid_argument(std::string(op) + ": out/probability data must be non-null");
     }
-    detail::argmax_probability_launch(logits, rows, probability, valid_rows, stream);
+    auto scope              = workspace.scope();
+    const std::size_t bytes = argmax_with_probability_workspace_bytes(logits.dtype, logits.ne[0], valid_rows, columns);
+    const DeviceSpan region = bytes != 0 ? workspace.alloc_bytes(bytes) : DeviceSpan{};
+    detail::argmax_probability_launch(logits, out, probability, valid_rows, region, stream);
 }
 
 } // namespace infernix::ops

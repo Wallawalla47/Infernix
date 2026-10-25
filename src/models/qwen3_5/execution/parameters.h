@@ -196,19 +196,22 @@ column_by_column_projections(const TextParameters& invariant_text,
 // which sampled tokens a round accepts.
 [[nodiscard]] MtpParameters column_invariant_mtp(const MtpParameters& mtp);
 // The activation precision each projection class may take in batched decode and verification.
-// The one-term permission takes precedence over its residual profile.
+// The one-term permission takes precedence over its residual profile; `a8_subset` grants the
+// one-term 8-bit permission to temporary_switches::A8Subset's projections only.
 struct DecodePrecision {
     bool a8          = true;
     bool a4          = true;
     bool a8_residual = false;
     bool a4_residual = false;
+    bool a8_subset   = false;
 };
 
-// `text` with each FP8 projection's policy LinearPolicy::A16Only unless `a8`, and each NVFP4
-// projection's unless `a4`; with `a8_residual` (and not `a8`) an FP8 projection permitted 8-bit
-// activations takes LinearPolicy::AllowA8Residual, and with `a4_residual` (and not `a4`) an NVFP4
-// MLP projection permitted 4-bit activations takes LinearPolicy::AllowA4Residual (others and the
-// GDN control keep their own).
+// `text` with each FP8 projection's policy LinearPolicy::A16Only unless `a8` (or `a8_subset` and
+// the projection is in temporary_switches::a8_subset()), and each NVFP4 projection's unless `a4`;
+// with `a8_residual` an FP8 projection permitted 8-bit activations and not given one term takes
+// LinearPolicy::AllowA8Residual, and with `a4_residual` (and not `a4`) an NVFP4 MLP projection
+// permitted 4-bit activations takes LinearPolicy::AllowA4Residual (others and the GDN control keep
+// their own).
 [[nodiscard]] TextParameters precision_decode_text(const TextParameters& text,
                                                    DecodePrecision precision);
 
@@ -234,12 +237,16 @@ public:
     std::vector<ColumnByColumnProjection> column_by_column;
     // `text` for batched decode and verification under each DecodePrecision, indexed by
     // precision_index (precision_decode_text).
-    std::array<std::optional<TextParameters>, 9> precision_text;
+    std::array<std::optional<TextParameters>, 15> precision_text;
 
+    // The FP8 permission: none, one term, the residual profile, or the one-term subset over the
+    // residual profile or over 16 bits (5 forms), by the NVFP4 permission's 3.
     [[nodiscard]] static constexpr std::size_t precision_index(DecodePrecision precision) noexcept {
-        const std::size_t fp8   = precision.a8 ? 1U : (precision.a8_residual ? 2U : 0U);
+        const std::size_t fp8   = precision.a8          ? 1U
+                                  : precision.a8_subset ? (precision.a8_residual ? 3U : 4U)
+                                                        : (precision.a8_residual ? 2U : 0U);
         const std::size_t nvfp4 = precision.a4 ? 1U : (precision.a4_residual ? 2U : 0U);
-        return fp8 + 3U * nvfp4;
+        return fp8 + 5U * nvfp4;
     }
 
     // The parameters decode and verification run with: the column-invariant copy, else the copy

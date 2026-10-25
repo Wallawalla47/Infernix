@@ -301,6 +301,8 @@ int main(int argc, char** argv) {
             options, startup_log.observer(), infernix::product::engine_diagnostic_observer(logger));
         startup_log.engine_ready(service.load_summary());
         operational_log.engine_capacity(service);
+        startup_log.chat_template_roles(service.chat_template_role_support(),
+                                        options.chat_template_path.string());
 
         using Clock                            = std::chrono::steady_clock;
         const Clock::time_point warmup_started = Clock::now();
@@ -326,6 +328,10 @@ int main(int argc, char** argv) {
         if (!ok) {
             operational_log.listen_failure(options.host, options.port);
             return 1;
+        }
+        if (server.engine_failed()) {
+            operational_log.engine_failure_exit(infernix::serve::kEngineFailureExitStatus);
+            return infernix::serve::kEngineFailureExitStatus;
         }
         operational_log.server_stopped();
         return 0;

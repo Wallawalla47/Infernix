@@ -1,11 +1,13 @@
 #include "ops/offloaded_sparse_moe/cpu/miss_service.h"
 
 #include "core/nvtx.h"
+#include "core/temporary_switches.h"
 
 #include <cuda_runtime.h>
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -25,6 +27,10 @@
 #if defined(__x86_64__) || defined(_M_X64)
 #    include <immintrin.h>
 #endif
+#if defined(__linux__)
+#    include <pthread.h>
+#    include <sched.h>
+#endif
 
 #include <cerrno>
 
@@ -43,11 +49,18 @@ void relax() {
 #endif
 }
 
-void pin(int cpu) {
-#if defined(_WIN32)
-    if (cpu >= 0 && cpu < 64) { (void)SetThreadAffinityMask(GetCurrentThread(), DWORD_PTR{1} << cpu); }
-#else
-    (void)cpu;
+// The service thread's CPUs (CpuExpertTeam's pin_current_thread does the same for its workers).
+void pin(std::uint64_t cpus) {
+    if (cpus == 0) { return; }
+#if defined(__linux__)
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    for (int c = 0; c < 64; ++c) {
+        if (((cpus >> c) & 1U) != 0) { CPU_SET(c, &set); }
+    }
+    (void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+#elif defined(_WIN32)
+    (void)SetThreadAffinityMask(GetCurrentThread(), static_cast<DWORD_PTR>(cpus));
 #endif
 }
 
@@ -64,6 +77,11 @@ CpuMissService::CpuMissService(std::vector<Layer> layers, Options options)
     const ExpertShape& shape = options_.shape;
     if (!registered_shape(shape) || (shape != kFlashNextShape && options_.activation != ExpertActivation::kA16)) {
         throw std::invalid_argument("CPU miss service: this expert geometry is registered for A16 banks only");
+    }
+    if (options_.narrow_a16 == NarrowA16::kA4Residual &&
+        (options_.activation != ExpertActivation::kA16 || shape != kFlashNextShape ||
+         std::any_of(layers_.begin(), layers_.end(), [](const Layer& l) { return l.ggml.valid(); }))) {
+        throw std::invalid_argument("CPU miss service: two-term A4 jobs need NVFP4 W4A16 banks of Flash-Next's geometry");
     }
     for (const auto& layer : layers_) {
         // Without a bank (the SSD tier) every request is tiered: it carries its records' addresses.
@@ -157,22 +175,44 @@ MoeCpuChannel CpuMissService::channel(int layer) const {
     out.max_columns  = options_.max_columns;
     out.pcie_divisor = options_.pcie_divisor;
     out.one_column_divisor = options_.one_column_divisor;
+    out.pcie_share      = options_.pcie_share;
     out.max_job_columns = options_.max_job_columns;
     out.wide_from       = options_.wide_from;
     out.wide_jobs       = options_.wide_jobs;
+    out.narrow_a16      = options_.narrow_a16;
     return out;
 }
 
 void CpuMissService::serve() {
+    // The request being served, for the failure's context (layer -1: none).
+    int serving_layer = -1;
+    int serving_jobs  = 0;
+    const auto stopped = [&](const char* what) {
+        std::string text;
+        try {
+            text = serving_layer < 0 ? std::string("outside a request: ")
+                                     : "serving layer " + std::to_string(serving_layer) + " (" +
+                                           std::to_string(serving_jobs) + " experts): ";
+            text += what != nullptr && *what != '\0' ? what : "unknown exception";
+        } catch (...) {}
+        record_failure(text);
+        if (options_.on_failure) {
+            try {
+                options_.on_failure(failure());
+            } catch (...) {}
+        }
+    };
     try {
-        pin(options_.cpus.empty() ? -1 : options_.cpus[0]);
+        pin(options_.cpus.empty() ? 0 : options_.cpus[0]);
         const bool ggml = std::any_of(layers_.begin(), layers_.end(), [](const Layer& l) { return l.ggml.valid(); });
         CpuExpertTeam team({.workers    = options_.workers,
                             .max_jobs   = jobs_,
                             .activation = options_.activation,
+                            .narrow_a16 = options_.narrow_a16,
                             .ggml       = ggml,
                             .shape      = options_.shape,
-                            .cpus       = options_.cpus});
+                            .cpus       = options_.cpus,
+                            .shared_x   = temporary_switches::flag("INFERNIX_TMP_CPU_SHARED_X")});
         const std::size_t hidden = static_cast<std::size_t>(options_.shape.hidden);
         std::vector<CpuExpertJob> jobs(static_cast<std::size_t>(jobs_));
         std::vector<CpuExpertJob> ready, read;
@@ -208,6 +248,8 @@ void CpuMissService::serve() {
             std::atomic_thread_fence(std::memory_order_acquire);
             seen = sequence;
             const MissRequest& r = *request_;
+            serving_layer        = r.layer;
+            serving_jobs         = r.jobs;
             const Layer& layer   = layers_.at(static_cast<std::size_t>(r.layer));
             const int count      = r.jobs;
             // One request's experts (payload: layer << 32 | job count).
@@ -272,15 +314,16 @@ void CpuMissService::serve() {
             *volatile_done = sequence;
             served_.fetch_add(1, std::memory_order_relaxed);
             experts_.fetch_add(static_cast<std::uint64_t>(count), std::memory_order_relaxed);
-            last  = std::chrono::steady_clock::now();
-            polls = 0;
+            serving_layer = -1;
+            last          = std::chrono::steady_clock::now();
+            polls         = 0;
         }
     } catch (const std::exception& error) {
         // A failed service never answers: the device wait ends after its timeout instead of hanging,
-        // and failure() tells the caller why.
-        record_failure(error.what());
+        // failure() tells the caller why, and on_failure reports it now.
+        stopped(error.what());
     } catch (...) {
-        record_failure("unknown exception");
+        stopped(nullptr);
     }
 }
 

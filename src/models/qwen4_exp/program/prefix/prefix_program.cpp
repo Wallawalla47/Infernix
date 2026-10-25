@@ -52,7 +52,8 @@ void ProgramImpl::create_prefix_cache() {
             ring_v.push_back(static_cast<std::byte*>(view.v.data));
         }
     }
-    image_layout_    = prefix::plan_state_image(prefix::state_image_spec(c_, mtp_, options_.kv_cache, ring));
+    image_layout_    = prefix::plan_state_image(prefix::state_image_spec(
+        c_, mtp_, options_.kv_cache, ring, options_.fp16_gdn_state ? DType::FP16 : DType::FP32));
     lane_image_      = std::make_unique<prefix::LaneStateImage>(
         image_layout_,
         prefix::LaneStateBuffers{.gdn       = gdn_.get(),
@@ -390,8 +391,11 @@ std::uint64_t ProgramImpl::hybrid_cache_epoch() const noexcept {
 // Qwen3.5 hybrid cache, hybrid-prefix-cache-spec): a /v1/decide fan-out's questions over one state,
 // or concurrent requests over one image, prefill the shared part once.
 bool ProgramImpl::prefix_await_sibling(const qwen3_5::PreparedPromptData& prompt, std::uint32_t reuse) {
-    // Coalescing waits on another request and inserts its tap into this one's prefill.
-    if (!options_.free_cache_resume) { return false; }
+    // Coalescing waits on another request and inserts its tap into this one's prefill. Without free cache
+    // resume (the reproducible route) the tap is a block boundary, which lies on the 16-token resume grid
+    // and cuts the sibling's calls only on it, and the waiting request resumes from a prefill tap there:
+    // both prompts keep their cold bits (candidates §9.2 VR-01).
+    const bool grid = !options_.free_cache_resume;
     if (options_.prefix_coalesce_wait_seconds <= 0.0) { return false; }
     const auto n = static_cast<std::uint32_t>(prompt.token_ids.size());
     if (n < 2) { return false; }
@@ -422,8 +426,10 @@ bool ProgramImpl::prefix_await_sibling(const qwen3_5::PreparedPromptData& prompt
         if (shared <= reuse) { continue; }
         // A capture of the lane's inside the shared prefix that has not landed publishes within a
         // copy time.
+        // On the grid only a prefilling lane's capture (a tap) can serve: an endpoint's state is decode's.
         if (lane.prefix.capture != 0 && !prefix_->capture_result(lane.prefix.capture) &&
-            lane.prefix.deepest > reuse && lane.prefix.deepest <= shared) {
+            lane.prefix.deepest > reuse && lane.prefix.deepest <= shared &&
+            (!grid || (lane.phase == Phase::Prefill && lane.prefix.deepest % kResumeGrid == 0))) {
             consider(Wait{.lane = i, .target = lane.prefix.deepest, .plan_tap = false});
         }
         if (lane.phase != Phase::Prefill) { continue; }
@@ -439,7 +445,10 @@ bool ProgramImpl::prefix_await_sibling(const qwen3_5::PreparedPromptData& prompt
         // resumes past the whole image and encodes nothing for it.
         std::uint32_t aligned = shared / kBlock * kBlock;
         for (const pc::TapExclusion& span : lane.prefix.exclusions) {
-            if (span.begin < aligned && aligned < span.end && span.end <= shared) { aligned = span.end; }
+            if (span.begin < aligned && aligned < span.end && span.end <= shared &&
+                (!grid || span.end % kResumeGrid == 0)) {
+                aligned = span.end;
+            }
         }
         std::optional<Wait> wait;
         if (realizable(aligned) && aligned > reuse && aligned < lane.prompt_tokens) {
@@ -943,6 +952,7 @@ void ProgramImpl::prefix_release(Lane& lane) noexcept {
     lane.prefix.resume.reset();
     lane.prefix.page_base = 0;
     lane.prefix.deepest   = 0;
+    lane.prefix.reused    = 0;
     lane.prefix.reuse     = false;
 }
 

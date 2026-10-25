@@ -75,8 +75,21 @@ class SafetensorsSource:
                 if file.is_file():
                     self.weight_map = {name: file for name in self._header(file)}
                 elif self.path.is_dir():
-                    # A custom recipe may supply every logical value from another source.
+                    # Shards without their index: every top-level *.safetensors file, in name
+                    # order. None leaves the map empty, as a custom recipe may supply every
+                    # logical value from another source.
                     self.weight_map = {}
+                    for shard in sorted(self.root.glob("*.safetensors")):
+                        if not shard.is_file():
+                            continue
+                        for name in self._header(shard):
+                            other = self.weight_map.setdefault(name, shard)
+                            if other != shard:
+                                raise ValueError(
+                                    f"{self.root}: source tensor {name!r} is in both "
+                                    f"{other.name} and {shard.name}, and no "
+                                    "model.safetensors.index.json selects one"
+                                )
                 else:
                     raise FileNotFoundError(self.path)
 

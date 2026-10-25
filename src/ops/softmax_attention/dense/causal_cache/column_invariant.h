@@ -14,6 +14,12 @@ namespace infernix::ops::detail {
 void causal_column_valid_launch(const Tensor& counts, Tensor& flags, std::int32_t width,
                                 std::int32_t batch, cudaStream_t stream);
 
+// The rows variant of that round (INFERNIX_TMP_VERIFY_ROWS_ATTENTION) runs every column as a row of
+// one launch: rows [width][batch] receives row b's KV table row (table_rows[b], or 0 when the call
+// has no table rows) for each column, so a column-major row reads its round row's pages.
+void causal_column_table_rows_launch(const Tensor& table_rows, Tensor& rows, std::int32_t width,
+                                     std::int32_t batch, cudaStream_t stream);
+
 // One tensor of a verification round whose rows (one per token, `row_bytes` each, a multiple of
 // 4) are reordered between the round's row-major order (row b * width + column j) and column-major
 // order (column j * batch + row b), so each column's rows are contiguous.

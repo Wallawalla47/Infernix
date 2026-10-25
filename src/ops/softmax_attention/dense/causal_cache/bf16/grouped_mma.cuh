@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/pdl.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/epilogue.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/softmax.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/split_policy.h"
@@ -270,6 +271,9 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
         }
         __syncthreads();
     }
+    // The KV stream is done: a programmatic merge may begin launching as CTAs finish (it waits for
+    // this grid before reading any partial).
+    pdl::trigger_dependents();
     state[0].finish();
     state[1].finish();
     float m[2]    = {state[0].maximum * scale_log2, state[1].maximum * scale_log2};

@@ -3,6 +3,9 @@
 
 #include "core/layout.h"
 
+#include "core/temporary_switches.h"
+
+#include <algorithm>
 #include <stdexcept>
 
 namespace infernix::ops::detail {
@@ -21,7 +24,8 @@ std::size_t sparse_moe_small_t_workspace_bytes(std::int32_t tokens) {
 }
 
 SparseMoeSmallTPlan resolve_sparse_moe_small_t_plan(std::int32_t tokens, QType routed_gate_up,
-                                                    QType routed_down, bool column_invariant) {
+                                                    QType routed_down, bool column_invariant,
+                                                    const SparseMoeHints& hints) {
     if (!sparse_moe_uses_small_t(tokens)) {
         throw std::invalid_argument("sparse_moe small-T: unsupported token count");
     }
@@ -36,6 +40,12 @@ SparseMoeSmallTPlan resolve_sparse_moe_small_t_plan(std::int32_t tokens, QType r
 
     SparseMoeSmallTPlan plan{tokens, sparse_moe_small_t_workspace_bytes(tokens)};
     plan.column_invariant = column_invariant;
+    // INFERNIX_TMP_SMALL_T_L2_HINTS: the next consumer's warm at T = 1's limit (8 MiB).
+    if (hints.next_weight_prefetch != nullptr && temporary_switches::flag("INFERNIX_TMP_SMALL_T_L2_HINTS")) {
+        constexpr std::size_t kNextWeightPrefetchLimit = std::size_t{8} << 20;
+        plan.next_weight_prefetch       = hints.next_weight_prefetch;
+        plan.next_weight_prefetch_bytes = std::min(hints.next_weight_prefetch_bytes, kNextWeightPrefetchLimit);
+    }
     if (mtp_profile) {
         plan.d3_schedule =
             tokens <= 5 ? SparseMoeSmallTD3Schedule::Paths1 : SparseMoeSmallTD3Schedule::Paths9;

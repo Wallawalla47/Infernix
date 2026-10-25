@@ -1,4 +1,5 @@
 #include "infernix/ops/rmsnorm_pack_tail.h"
+#include "ops/op_family.h"
 #include "core/decode_graph.h"
 
 #include "ops/norm_test_common.h"
@@ -107,7 +108,7 @@ int run_case(std::int32_t width, std::int32_t batch, std::uint32_t seed, bool gr
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(rmsnorm_pack_tail) {
     if (infernix::test::cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;

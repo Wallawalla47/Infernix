@@ -81,6 +81,28 @@ __device__ __forceinline__ void kv_cache_vq2_stage_encoder_codebook(KVCacheVqCod
     }
 }
 
+// The same staging from the FP32 table: two 16-byte loads per pattern and its norm from them (the
+// values are integers, so every product and sum is exact and equals the integer norm).
+__device__ __forceinline__ void kv_cache_vq2_stage_encoder_codebook_f32(KVCacheVqCodebookShared& book,
+                                                                        int thread, int threads) {
+    const auto* table = reinterpret_cast<const float4*>(g_kv_cache_vq2_codebook_f32);
+    auto* staged      = reinterpret_cast<float4*>(book.codebook);
+    for (int p = thread; p < kKVCacheVq2Patterns; p += threads) {
+        const float4 lo   = table[2 * p];
+        const float4 hi   = table[2 * p + 1];
+        staged[2 * p]     = lo;
+        staged[2 * p + 1] = hi;
+        float norm        = __fmul_rn(lo.x, lo.x);
+        norm              = __fmaf_rn(lo.y, lo.y, norm);
+        norm              = __fmaf_rn(lo.z, lo.z, norm);
+        norm              = __fmaf_rn(lo.w, lo.w, norm);
+        norm              = __fmaf_rn(hi.x, hi.x, norm);
+        norm              = __fmaf_rn(hi.y, hi.y, norm);
+        norm              = __fmaf_rn(hi.z, hi.z, norm);
+        book.norm[p]      = __fmaf_rn(hi.w, hi.w, norm);
+    }
+}
+
 template <int CodeBytes>
 __device__ __forceinline__ std::int64_t kv_cache_vq_code_index(int kv_heads, int physical_page,
                                                                int kv_head, int page_offset) {
@@ -401,9 +423,11 @@ __device__ __forceinline__ void kv_cache_append_vq_select_batch(int batch, Metad
 
 // Grid (blocks, 1, batch) of 1024-thread blocks: each block stages the codebook once, then encodes
 // items blockIdx.x, blockIdx.x + gridDim.x, ... of its batch row with the whole block (the lowest
-// latency per row: a decode step's few rows).
+// latency per row: a decode step's few rows). TableF32 (TEMPORARY, INFERNIX_TMP_VQ_APPEND_V2) stages
+// the FP32 table instead, and the first row's sync after its rotation publishes it, so the staging
+// overlaps warp 0's rotation.
 template <typename Geometry, typename Metadata, KVCacheVqKeyCodec KeyCodec, KVCacheVqWindowMode Mode,
-          bool MultiBatch = false>
+          bool MultiBatch = false, bool TableF32 = false>
 __launch_bounds__(kKVCacheVqAppendThreads) __global__ void kv_cache_append_vq_kernel(
     const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
     const std::int32_t* __restrict__ positions, Metadata metadata,
@@ -422,9 +446,15 @@ __launch_bounds__(kKVCacheVqAppendThreads) __global__ void kv_cache_append_vq_ke
     const int tokens = metadata.valid_tokens(width);
     const int items  = 2 * tokens * Geometry::KVHeads;
     if (static_cast<int>(blockIdx.x) >= items) return;
-    kv_cache_vq2_stage_encoder_codebook(book, static_cast<int>(threadIdx.x),
-                                        static_cast<int>(blockDim.x));
-    __syncthreads();
+    if constexpr (TableF32) {
+        // Read only after kv_cache_vq_append_row_block's first __syncthreads.
+        kv_cache_vq2_stage_encoder_codebook_f32(book, static_cast<int>(threadIdx.x),
+                                                static_cast<int>(blockDim.x));
+    } else {
+        kv_cache_vq2_stage_encoder_codebook(book, static_cast<int>(threadIdx.x),
+                                            static_cast<int>(blockDim.x));
+        __syncthreads();
+    }
     for (int item = static_cast<int>(blockIdx.x); item < items;
          item += static_cast<int>(gridDim.x)) {
         const KVCacheVqRowTarget target =
@@ -471,6 +501,346 @@ __launch_bounds__(32 * kKVCacheVqAppendWarpRows) __global__ void kv_cache_append
                 window, width);
         kv_cache_vq_append_row_warp<KeyCodec>(target, book, rows[warp]);
         __syncwarp();
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// TEMPORARY (INFERNIX_TMP_VQ_APPEND_V2, candidates §2.3 VQ append): the parity-sorted split encoder,
+// the same codes, scales, window slots and tags as the kernels above.
+//
+// A 256-thread CTA encodes one pass of rows at a time:
+//   1. one warp per row rotates it into shared memory; a Q4 key row is finished there, and a VQ2
+//      row's 32 words join the CTA's even- or odd-parity list;
+//   2. each warp scans one 64-word slice of the lists (two words per lane) over one of `split`
+//      pattern ranges. A slice of even words skips the parity term, so all its lanes share one
+//      path, and a lane's two words share each pattern read;
+//   3. with split > 1, each word's range bests reduce to one (min distance, earlier range on ties);
+//   4. one warp per VQ2 row finishes it as kv_cache_vq_append_row_warp does.
+// A pass holds 16 / split VQ2 rows (and as many Q4 key rows on Q4KeyVq2Value), so each pass is 8
+// units of work, one per warp.
+//
+// A scan keeps each word's minimum per chunk of 4 patterns and the first chunk that lowers it
+// (strict <), then takes that chunk's first pattern at the minimum: the first nearest pattern, as
+// the per-pattern strict < scan picks. Distances use the paired FP32 instructions; each component
+// rounds as the scalar instruction does (INFERNIX_VQ2_PAIRED_FP32=0 builds them as scalar pairs).
+
+#ifndef INFERNIX_VQ2_PAIRED_FP32
+#define INFERNIX_VQ2_PAIRED_FP32 1
+#endif
+
+__device__ __forceinline__ float2 kv_cache_vq2_mul2(float2 a, float2 b) {
+#if INFERNIX_VQ2_PAIRED_FP32 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+    return __fmul2_rn(a, b);
+#else
+    return make_float2(__fmul_rn(a.x, b.x), __fmul_rn(a.y, b.y));
+#endif
+}
+
+__device__ __forceinline__ float2 kv_cache_vq2_add2(float2 a, float2 b) {
+#if INFERNIX_VQ2_PAIRED_FP32 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+    return __fadd2_rn(a, b);
+#else
+    return make_float2(__fadd_rn(a.x, b.x), __fadd_rn(a.y, b.y));
+#endif
+}
+
+__device__ __forceinline__ float2 kv_cache_vq2_fma2(float2 a, float2 b, float2 c) {
+#if INFERNIX_VQ2_PAIRED_FP32 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+    return __ffma2_rn(a, b, c);
+#else
+    return make_float2(__fmaf_rn(a.x, b.x, c.x), __fmaf_rn(a.y, b.y, c.y));
+#endif
+}
+
+inline constexpr int kKVCacheVqSplitWarps   = 8;
+inline constexpr int kKVCacheVqSplitThreads = 32 * kKVCacheVqSplitWarps;
+// Rows a pass holds, VQ2 rows of a pass at one pattern range, patterns per chunk minimum.
+inline constexpr int kKVCacheVqSplitSlots   = 16;
+inline constexpr int kKVCacheVqSplitVq2Rows = 16;
+inline constexpr int kKVCacheVqSplitChunk   = 4;
+inline constexpr int kKVCacheVqSplitWords   = kKVCacheVqSplitVq2Rows * kKVCacheVq2Words;
+inline constexpr float kKVCacheVqSplitFar   = 3.402823466e38f;
+
+// Rows of one pass at `split` pattern ranges (Q4KeyVq2Value: half of them Q4 key rows, so `split`
+// is at least 2 there).
+template <KVCacheVqKeyCodec KeyCodec>
+__host__ __device__ constexpr int kv_cache_vq_split_pass_rows(int split) {
+    return (KeyCodec == KVCacheVqKeyCodec::Q4 ? 2 : 1) * (kKVCacheVqSplitVq2Rows / split);
+}
+
+struct KVCacheVqSplitShared {
+    KVCacheVqCodebookShared book;
+    KVCacheVqRowShared row[kKVCacheVqSplitSlots];
+    float to_units[kKVCacheVqSplitSlots];
+    std::uint8_t negative[kKVCacheVqSplitSlots][kKVCacheVq2Words];
+    // Word ids (slot * 32 + word) of the even- and odd-parity lists, and their lengths.
+    std::uint16_t list[2][kKVCacheVqSplitWords];
+    int count[2];
+    // The range bests of list position k at [k * split + range].
+    float part_distance[kKVCacheVqSplitWords];
+    std::uint16_t part_pattern[kKVCacheVqSplitWords];
+    std::uint16_t word_pattern[kKVCacheVqSplitSlots][kKVCacheVq2Words];
+};
+
+enum class KVCacheVqSliceParity { Even, Odd, Mixed };
+
+// kv_cache_vq2_pattern_distance for two words at once (components x and y): the same operations
+// in the same order per component. Even skips the minimum it does not use; Mixed selects by
+// `odd_x` / `odd_y`.
+template <KVCacheVqSliceParity Parity>
+__device__ __forceinline__ float2 kv_cache_vq2_pattern_distance2(const float2 (&A)[8], bool odd_x,
+                                                                 bool odd_y, const float* pattern,
+                                                                 float norm) {
+    float2 t                    = kv_cache_vq2_mul2(A[0], make_float2(pattern[0], pattern[0]));
+    float2 dot                  = t;
+    [[maybe_unused]] float2 m   = t;
+#pragma unroll
+    for (int j = 1; j < 8; ++j) {
+        t   = kv_cache_vq2_mul2(A[j], make_float2(pattern[j], pattern[j]));
+        dot = kv_cache_vq2_add2(dot, t);
+        if constexpr (Parity != KVCacheVqSliceParity::Even) {
+            m.x = fminf(m.x, t.x);
+            m.y = fminf(m.y, t.y);
+        }
+    }
+    const float2 d = kv_cache_vq2_fma2(make_float2(-2.0f, -2.0f), dot, make_float2(norm, norm));
+    if constexpr (Parity == KVCacheVqSliceParity::Even) {
+        return d;
+    } else {
+        const float2 e = kv_cache_vq2_fma2(make_float2(4.0f, 4.0f), m, d);
+        if constexpr (Parity == KVCacheVqSliceParity::Odd) return e;
+        return make_float2(odd_x ? e.x : d.x, odd_y ? e.y : d.y);
+    }
+}
+
+__device__ __forceinline__ void kv_cache_vq2_load_pattern(const KVCacheVqCodebookShared& book,
+                                                          int p, float (&pattern)[8]) {
+    *reinterpret_cast<float4*>(&pattern[0]) = *reinterpret_cast<const float4*>(&book.codebook[8 * p]);
+    *reinterpret_cast<float4*>(&pattern[4]) =
+        *reinterpret_cast<const float4*>(&book.codebook[8 * p + 4]);
+}
+
+// List position k's word: its id, scaled magnitudes (kv_cache_vq2_word_magnitudes' values) and
+// parity. Positions past `words` give zero magnitudes and no id.
+__device__ __forceinline__ int kv_cache_vq_split_word(const KVCacheVqSplitShared& s, int n_even,
+                                                      int words, int k, float (&A)[8], bool& odd) {
+    odd = false;
+    if (k >= words) {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) A[j] = 0.0f;
+        return -1;
+    }
+    const int id         = k < n_even ? s.list[0][k] : s.list[1][k - n_even];
+    const int slot       = id >> 5;
+    const int word       = id & 31;
+    const float to_units = s.to_units[slot];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) A[j] = __fmul_rn(fabsf(s.row[slot].y[8 * word + j]), to_units);
+    odd = (__popc(static_cast<unsigned>(s.negative[slot][word])) & 1) != 0;
+    return id;
+}
+
+// One warp's unit: list positions first + lane and first + 32 + lane over patterns
+// [begin, begin + count). Writes each word's first nearest pattern of the range (with split > 1,
+// also its distance; kKVCacheVqSplitFar and `begin` when no distance is below it, as the
+// per-pattern scan's initial best).
+template <KVCacheVqSliceParity Parity>
+__device__ __forceinline__ void kv_cache_vq_split_scan(KVCacheVqSplitShared& s, int n_even, int words,
+                                                       int first, int begin, int count, int split,
+                                                       int range, int lane) {
+    const int position[2] = {first + lane, first + 32 + lane};
+    float a[8], b[8];
+    bool odd_a = false, odd_b = false;
+    const int id_a = kv_cache_vq_split_word(s, n_even, words, position[0], a, odd_a);
+    const int id_b = kv_cache_vq_split_word(s, n_even, words, position[1], b, odd_b);
+    float2 A[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) A[j] = make_float2(a[j], b[j]);
+
+    float2 best    = make_float2(kKVCacheVqSplitFar, kKVCacheVqSplitFar);
+    int chunk_a    = 0;
+    int chunk_b    = 0;
+    const int last = count / kKVCacheVqSplitChunk;
+    for (int c = 0; c < last; ++c) {
+        float2 low = make_float2(kKVCacheVqSplitFar, kKVCacheVqSplitFar);
+#pragma unroll
+        for (int i = 0; i < kKVCacheVqSplitChunk; ++i) {
+            const int p = begin + c * kKVCacheVqSplitChunk + i;
+            float pattern[8];
+            kv_cache_vq2_load_pattern(s.book, p, pattern);
+            const float2 d =
+                kv_cache_vq2_pattern_distance2<Parity>(A, odd_a, odd_b, pattern, s.book.norm[p]);
+            low.x = fminf(low.x, d.x);
+            low.y = fminf(low.y, d.y);
+        }
+        if (low.x < best.x) {
+            best.x  = low.x;
+            chunk_a = c;
+        }
+        if (low.y < best.y) {
+            best.y  = low.y;
+            chunk_b = c;
+        }
+    }
+
+    const auto settle = [&](int id, int k, const float (&A1)[8], bool odd, float distance, int chunk) {
+        if (id < 0) return;
+        int pattern_index = begin;
+        if (distance < kKVCacheVqSplitFar) {
+            const int from = begin + chunk * kKVCacheVqSplitChunk;
+#pragma unroll
+            for (int i = 0; i < kKVCacheVqSplitChunk; ++i) {
+                float pattern[8];
+                kv_cache_vq2_load_pattern(s.book, from + i, pattern);
+                if (kv_cache_vq2_pattern_distance(A1, odd, pattern, s.book.norm[from + i]) == distance) {
+                    pattern_index = from + i;
+                    break;
+                }
+            }
+        }
+        if (split == 1) {
+            s.word_pattern[id >> 5][id & 31] = static_cast<std::uint16_t>(pattern_index);
+        } else {
+            s.part_distance[k * split + range] = distance;
+            s.part_pattern[k * split + range]  = static_cast<std::uint16_t>(pattern_index);
+        }
+    };
+    settle(id_a, position[0], a, odd_a, best.x, chunk_a);
+    settle(id_b, position[1], b, odd_b, best.y, chunk_b);
+}
+
+// Grid (blocks, 1, batch) of 256-thread CTAs, two per SM: CTA x encodes passes x, x + gridDim.x, ...
+// of its batch row (the highest throughput: calls of at least one row per SM).
+template <typename Geometry, typename Metadata, KVCacheVqKeyCodec KeyCodec, KVCacheVqWindowMode Mode,
+          bool MultiBatch = false>
+__launch_bounds__(kKVCacheVqSplitThreads, 2) __global__ void kv_cache_append_vq_split_kernel(
+    const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+    const std::int32_t* __restrict__ positions, Metadata metadata,
+    std::uint8_t* __restrict__ cache_k, std::uint8_t* __restrict__ cache_v,
+    __half* __restrict__ scale_k, __half* __restrict__ scale_v, KVCacheVqWindowTarget window,
+    std::int32_t width, std::int32_t split) {
+    constexpr unsigned Full = 0xffffffffu;
+    __shared__ KVCacheVqSplitShared s;
+    // As kv_cache_append_vq_kernel: only the attention's window CTAs read what this writes, and
+    // they wait for this grid.
+    pdl::trigger_dependents();
+    const int batch = MultiBatch ? static_cast<int>(blockIdx.z) : 0;
+    kv_cache_append_vq_select_batch<Geometry, Metadata, MultiBatch>(batch, metadata, k, v,
+                                                                   positions, width);
+    const int tokens    = metadata.valid_tokens(width);
+    const int items     = 2 * tokens * Geometry::KVHeads;
+    const int pass_rows = kv_cache_vq_split_pass_rows<KeyCodec>(split);
+    const int passes    = (items + pass_rows - 1) / pass_rows;
+    if (static_cast<int>(blockIdx.x) >= passes) return;
+    const int thread = static_cast<int>(threadIdx.x);
+    const int warp   = thread >> 5;
+    const int lane   = thread & 31;
+    kv_cache_vq2_stage_encoder_codebook_f32(s.book, thread, kKVCacheVqSplitThreads);
+    if (thread < 2) s.count[thread] = 0;
+    __syncthreads();
+    const int range_patterns = kKVCacheVq2Patterns / split;
+    const auto target_of = [&](int item) {
+        return kv_cache_append_vq_target<Geometry, Metadata, KeyCodec, Mode>(
+            item, batch, tokens, k, v, positions, metadata, cache_k, cache_v, scale_k, scale_v,
+            window, width);
+    };
+
+    for (int pass = static_cast<int>(blockIdx.x); pass < passes;
+         pass += static_cast<int>(gridDim.x)) {
+        const int base = pass * pass_rows;
+        const int rows = min(pass_rows, items - base);
+
+        // 1. Rotate; finish Q4 key rows; list each VQ2 row's words by parity.
+        for (int slot = warp; slot < rows; slot += kKVCacheVqSplitWarps) {
+            const KVCacheVqRowTarget target = target_of(base + slot);
+            KVCacheVqRowShared& row         = s.row[slot];
+            kv_cache_vq_rotate_row(target.source, row, lane);
+            __syncwarp();
+            const float sigma = sqrtf(row.sum_square * (1.0f / 256.0f));
+            if (KeyCodec == KVCacheVqKeyCodec::Q4 && !target.value) {
+                const float dot = kv_cache_q4_encode_warp(row, lane, sigma);
+                __syncwarp();
+                kv_cache_vq_store_row<kKVCacheQ4CodeBytes / 4>(row, lane, dot, target);
+                continue;
+            }
+            unsigned negative = 0;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) negative |= (row.y[8 * lane + j] < 0.0f ? 1u : 0u) << j;
+            s.negative[slot][lane] = static_cast<std::uint8_t>(negative);
+            if (lane == 0) s.to_units[slot] = sigma > 0.0f ? 16.0f / sigma : 0.0f;
+            const bool odd          = (__popc(negative) & 1) != 0;
+            const unsigned odd_mask = __ballot_sync(Full, odd);
+            const int odd_words     = __popc(odd_mask);
+            int even_base = 0, odd_base = 0;
+            if (lane == 0) {
+                even_base = atomicAdd(&s.count[0], kKVCacheVq2Words - odd_words);
+                odd_base  = atomicAdd(&s.count[1], odd_words);
+            }
+            even_base             = __shfl_sync(Full, even_base, 0);
+            odd_base              = __shfl_sync(Full, odd_base, 0);
+            const unsigned below  = (1u << lane) - 1u;
+            const int rank        = __popc((odd ? odd_mask : ~odd_mask) & below);
+            s.list[odd ? 1 : 0][(odd ? odd_base : even_base) + rank] =
+                static_cast<std::uint16_t>(slot * kKVCacheVq2Words + lane);
+        }
+        __syncthreads();
+
+        // 2. Scan: unit u is slice u / split over range u % split.
+        const int n_even = s.count[0];
+        const int words  = n_even + s.count[1];
+        const int units  = (words + 63) / 64 * split;
+        for (int unit = warp; unit < units; unit += kKVCacheVqSplitWarps) {
+            const int first = unit / split * 64;
+            const int range = unit % split;
+            const int begin = range * range_patterns;
+            if (min(first + 64, words) <= n_even) {
+                kv_cache_vq_split_scan<KVCacheVqSliceParity::Even>(s, n_even, words, first, begin,
+                                                                   range_patterns, split, range, lane);
+            } else if (first >= n_even) {
+                kv_cache_vq_split_scan<KVCacheVqSliceParity::Odd>(s, n_even, words, first, begin,
+                                                                  range_patterns, split, range, lane);
+            } else {
+                kv_cache_vq_split_scan<KVCacheVqSliceParity::Mixed>(s, n_even, words, first, begin,
+                                                                    range_patterns, split, range, lane);
+            }
+        }
+        __syncthreads();
+
+        // 3. Each word's range bests: the least distance, the earlier range (smaller pattern) on ties.
+        if (split > 1) {
+            for (int position = thread; position < words; position += kKVCacheVqSplitThreads) {
+                float distance = s.part_distance[position * split];
+                int pattern    = s.part_pattern[position * split];
+                for (int range = 1; range < split; ++range) {
+                    const float other = s.part_distance[position * split + range];
+                    if (other < distance) {
+                        distance = other;
+                        pattern  = s.part_pattern[position * split + range];
+                    }
+                }
+                const int id = position < n_even ? s.list[0][position] : s.list[1][position - n_even];
+                s.word_pattern[id >> 5][id & 31] = static_cast<std::uint16_t>(pattern);
+            }
+            __syncthreads();
+        }
+
+        // 4. Finish the VQ2 rows. Every thread read the list lengths before the sync above, so the
+        // next pass's lists may start here.
+        if (thread < 2) s.count[thread] = 0;
+        for (int slot = warp; slot < rows; slot += kKVCacheVqSplitWarps) {
+            const KVCacheVqRowTarget target = target_of(base + slot);
+            if (KeyCodec == KVCacheVqKeyCodec::Q4 && !target.value) continue;
+            KVCacheVqRowShared& row = s.row[slot];
+            const float sigma       = sqrtf(row.sum_square * (1.0f / 256.0f));
+            float A[8];
+            unsigned negative = 0;
+            kv_cache_vq2_word_magnitudes(row, lane, sigma, A, negative);
+            const float dot = kv_cache_vq2_finish_word(s.book, row, lane, sigma, A, negative,
+                                                       s.word_pattern[slot][lane]);
+            __syncwarp();
+            kv_cache_vq_store_row<kKVCacheVq2CodeBytes / 4>(row, lane, dot, target);
+        }
+        __syncthreads();
     }
 }
 

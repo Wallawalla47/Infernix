@@ -1,4 +1,5 @@
 #include "media/decode/decode.h"
+#include "media/decode/jpeg_decode.h"
 #include "media/decode/png_decode.h"
 
 extern "C" {
@@ -110,6 +111,49 @@ int exif_orientation(std::span<const std::uint8_t> bytes) {
         marker += 2 + length;
     }
     return 1;
+}
+
+Image apply_orientation(Image image, int orientation) {
+    if (orientation == 1) { return image; }
+    const int width  = image.width;
+    const int height = image.height;
+    const bool swap  = orientation >= 5;
+    Image rotated;
+    rotated.width  = swap ? height : width;
+    rotated.height = swap ? width : height;
+    rotated.rgb.resize(image.rgb.size());
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            int rx = 0;
+            int ry = 0;
+            if (orientation == 2) {
+                rx = width - 1 - x;
+                ry = y;
+            } else if (orientation == 3) {
+                rx = width - 1 - x;
+                ry = height - 1 - y;
+            } else if (orientation == 4) {
+                rx = x;
+                ry = height - 1 - y;
+            } else if (orientation == 5) {
+                rx = y;
+                ry = x;
+            } else if (orientation == 6) {
+                rx = height - 1 - y;
+                ry = x;
+            } else if (orientation == 7) {
+                rx = height - 1 - y;
+                ry = width - 1 - x;
+            } else { // orientation 8
+                rx = y;
+                ry = width - 1 - x;
+            }
+            const std::size_t src = (static_cast<std::size_t>(y) * width + x) * 3;
+            const std::size_t dst = (static_cast<std::size_t>(ry) * rotated.width + rx) * 3;
+            std::copy_n(image.rgb.data() + src, 3, rotated.rgb.data() + dst);
+        }
+    }
+    return rotated;
 }
 
 struct BufferCursor {
@@ -299,9 +343,12 @@ public:
                            (descriptor->flags & AV_PIX_FMT_FLAG_ALPHA) != 0;
         const AVPixelFormat destination_format = alpha ? AV_PIX_FMT_RGBA : AV_PIX_FMT_RGB24;
         AvImageBuffer converted(width, height, destination_format);
+        // Subsampled chroma is interpolated to every pixel and rounded accurately, as libjpeg's
+        // fancy upsampling does for JPEG images, instead of repeating the nearest chroma sample.
+        constexpr int conversion_flags = SWS_BILINEAR | SWS_FULL_CHR_H_INT | SWS_ACCURATE_RND;
         sws_ = sws_getCachedContext(sws_, width, height, static_cast<AVPixelFormat>(frame->format),
-                                    width, height, destination_format, SWS_POINT, nullptr, nullptr,
-                                    nullptr);
+                                    width, height, destination_format, conversion_flags, nullptr,
+                                    nullptr, nullptr);
         if (sws_ == nullptr) { throw std::runtime_error("failed to create media color converter"); }
         const int rows = sws_scale(sws_, frame->data, frame->linesize, 0, height, converted.data(),
                                    converted.linesize());
@@ -331,48 +378,14 @@ public:
                 }
             }
         }
-        if (orientation == 1) { return out; }
-        Image rotated;
-        const bool swap = orientation >= 5;
-        rotated.width   = swap ? height : width;
-        rotated.height  = swap ? width : height;
-        rotated.rgb.resize(out.rgb.size());
-        for (int y = 0; y < height; ++y) {
-            for (int x = 0; x < width; ++x) {
-                int rx = 0;
-                int ry = 0;
-                if (orientation == 2) {
-                    rx = width - 1 - x;
-                    ry = y;
-                } else if (orientation == 3) {
-                    rx = width - 1 - x;
-                    ry = height - 1 - y;
-                } else if (orientation == 4) {
-                    rx = x;
-                    ry = height - 1 - y;
-                } else if (orientation == 5) {
-                    rx = y;
-                    ry = x;
-                } else if (orientation == 6) {
-                    rx = height - 1 - y;
-                    ry = x;
-                } else if (orientation == 7) {
-                    rx = height - 1 - y;
-                    ry = width - 1 - x;
-                } else { // orientation 8
-                    rx = y;
-                    ry = width - 1 - x;
-                }
-                const std::size_t src = (static_cast<std::size_t>(y) * width + x) * 3;
-                const std::size_t dst_index =
-                    (static_cast<std::size_t>(ry) * rotated.width + rx) * 3;
-                std::copy_n(out.rgb.data() + src, 3, rotated.rgb.data() + dst_index);
-            }
-        }
-        return rotated;
+        return apply_orientation(std::move(out), orientation);
     }
 
 private:
+    // Every constructor failure and the destructor end here. A custom AVIOContext's buffer stays
+    // the caller's: neither avformat_close_input (AVFMT_FLAG_CUSTOM_IO) nor avio_context_free
+    // frees it, and FFmpeg may have replaced the one passed in, so the context's current buffer is
+    // freed.
     void cleanup() noexcept {
         sws_freeContext(sws_);
         sws_ = nullptr;
@@ -380,7 +393,10 @@ private:
         av_packet_free(&packet_);
         avcodec_free_context(&codec_);
         if (format_ != nullptr) { avformat_close_input(&format_); }
-        if (io_ != nullptr) { avio_context_free(&io_); }
+        if (io_ != nullptr) {
+            av_freep(&io_->buffer);
+            avio_context_free(&io_);
+        }
     }
 
     AVFormatContext* format_ = nullptr;
@@ -652,11 +668,13 @@ ImageInfo inspect_image(std::span<const std::uint8_t> bytes, const Policy& polic
         return png_image_info(bytes, policy.max_decoded_pixels);
     }
 #endif
-    Decoder decoder(bytes, policy.max_decoded_pixels);
-    int orientation = exif_orientation(bytes);
-    if (orientation == 1) {
-        orientation = orientation_from_rotation(rotation_of(decoder.stream()));
+    if (is_jpeg(bytes)) {
+        ImageInfo result = inspect_jpeg(bytes, policy);
+        if (exif_orientation(bytes) >= 5) { std::swap(result.width, result.height); }
+        return result;
     }
+    Decoder decoder(bytes, policy.max_decoded_pixels);
+    const int orientation = orientation_from_rotation(rotation_of(decoder.stream()));
     ImageInfo result;
     decoder.frames([&](int index, const AVFrame* frame) {
         if (policy.checkpoint) { policy.checkpoint(); }
@@ -700,11 +718,13 @@ Image decode_image(std::span<const std::uint8_t> bytes, const Policy& policy) {
         return decode_png(bytes, policy.max_decoded_pixels);
     }
 #endif
-    Decoder decoder(bytes, policy.max_decoded_pixels);
-    int orientation = exif_orientation(bytes);
-    if (orientation == 1) {
-        orientation = orientation_from_rotation(rotation_of(decoder.stream()));
+    // JPEG through libjpeg with Pillow's settings, so the pixels equal the reference processors';
+    // other formats through FFmpeg.
+    if (is_jpeg(bytes)) {
+        return apply_orientation(decode_jpeg(bytes, policy), exif_orientation(bytes));
     }
+    Decoder decoder(bytes, policy.max_decoded_pixels);
+    const int orientation = orientation_from_rotation(rotation_of(decoder.stream()));
     Image result;
     decoder.frames([&](int index, const AVFrame* frame) {
         if (policy.checkpoint) { policy.checkpoint(); }

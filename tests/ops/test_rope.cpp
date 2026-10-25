@@ -1,3 +1,4 @@
+#include "ops/op_family.h"
 #include "core/device.h"
 #include "infernix/ops/rope.h"
 #include "ops/op_tester.h"
@@ -555,7 +556,7 @@ int run_scaling_validation(DeviceExecutionView execution) {
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(rope) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;

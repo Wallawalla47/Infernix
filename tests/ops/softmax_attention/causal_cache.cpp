@@ -25,6 +25,7 @@
 #include "core/device.h"
 #include <span>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -2160,6 +2161,7 @@ struct BatchAttentionCase {
     bool decode_split64     = false;
     bool row_invariant_partition = false;
     bool column_invariant        = false;
+    bool bf16_prompt_split       = false;
     // Speculative verification-tree ancestor masks, [B][W] row-major (one per column of every
     // row); empty is the causal Op.
     std::vector<std::uint32_t> tree_masks;
@@ -2229,6 +2231,7 @@ int run_batch_case(DeviceExecutionView execution, const Geometry& geometry, KvCa
     envelope.decode_split64     = test_case.decode_split64;
     envelope.row_invariant_partition = test_case.row_invariant_partition;
     envelope.column_invariant        = test_case.column_invariant;
+    envelope.bf16_prompt_split       = test_case.bf16_prompt_split;
     const std::size_t q_column_elements  = std::size_t(kHeadDim) * geometry.q_heads,
                       kv_column_elements = std::size_t(kHeadDim) * geometry.kv_heads;
     const std::size_t columns            = std::size_t(width) * batch;
@@ -2371,7 +2374,8 @@ int run_batch_case(DeviceExecutionView execution, const Geometry& geometry, KvCa
                                   " phase=" + std::to_string(phase) +
                                   (test_case.decode_split64 ? " decode-split64" : "") +
                                   (test_case.row_invariant_partition ? " row-invariant" : "") +
-                                  (test_case.column_invariant ? " column-invariant" : "");
+                                  (test_case.column_invariant ? " column-invariant" : "") +
+                                  (test_case.bf16_prompt_split ? " bf16-prompt-split" : "");
         const auto output = copy_from_guarded<std::uint16_t>(dout, q.size());
         failures += verify_attention(label, bf16_bits_to_double(output), reference,
                                      attention_criterion(storage, test_case.fast_prompt_pv8));
@@ -2379,6 +2383,76 @@ int run_batch_case(DeviceExecutionView execution, const Geometry& geometry, KvCa
         BatchDeviceCache::Bytes after = cache.snapshot_bytes();
         failures += cache.verify(label, expected, after);
         failures += cache.verify_untouched(label, before, after, positions, lanes, valid, width);
+        if (test_case.column_invariant && !tree && phase == 0) {
+            // The column-invariant contract, whichever variant ran (the column loop, or
+            // INFERNIX_TMP_VERIFY_ROWS_ATTENTION's rows): column j equals a one-column call made
+            // after columns 0..j-1 appended, bit for bit, and the caches end byte-identical.
+            BatchDeviceCache columns(initial, test_case.mapping, envelope.max_visible_keys);
+            ops::CausalAttentionExecutionEnvelope one = envelope;
+            one.column_invariant                      = false;
+            const auto one_capacity = ops::causal_softmax_attention_workspace_capacity_bytes(
+                op_geometry(geometry), storage, one, batch, 1, 1, execution);
+            GuardedDeviceBuffer cq(q_column_elements * batch * 2), ck(kv_column_elements * batch * 2),
+                cv(kv_column_elements * batch * 2), cp(batch * 4), cvalid(batch * 4),
+                cout(q_column_elements * batch * 2), cscratch(std::max<std::size_t>(one_capacity, 256));
+            WorkspaceArena column_workspace(DeviceSpan{cscratch.data(), cscratch.bytes()});
+            Tensor oq(cq.data(), DType::BF16, {kHeadDim, geometry.q_heads, 1, batch});
+            Tensor ok(ck.data(), DType::BF16, {kHeadDim, geometry.kv_heads, 1, batch});
+            Tensor ov(cv.data(), DType::BF16, {kHeadDim, geometry.kv_heads, 1, batch});
+            Tensor op(cp.data(), DType::I32, {1, batch}), ovalid(cvalid.data(), DType::I32, {batch});
+            Tensor oout(cout.data(), DType::BF16, {kHeadDim, geometry.q_heads, 1, batch});
+            std::vector<std::uint16_t> column_output(q.size(), 0);
+            for (int j = 0; j < width; ++j) {
+                std::vector<std::uint16_t> col_q(q_column_elements * batch), col_k(kv_column_elements * batch),
+                    col_v(kv_column_elements * batch);
+                std::vector<int> col_p(batch), col_valid(batch);
+                for (int b = 0; b < batch; ++b) {
+                    const std::size_t column = static_cast<std::size_t>(b) * width + j;
+                    std::copy_n(q_bits.begin() + column * q_column_elements, q_column_elements,
+                                col_q.begin() + static_cast<std::size_t>(b) * q_column_elements);
+                    std::copy_n(k_bits.begin() + column * kv_column_elements, kv_column_elements,
+                                col_k.begin() + static_cast<std::size_t>(b) * kv_column_elements);
+                    std::copy_n(v_bits.begin() + column * kv_column_elements, kv_column_elements,
+                                col_v.begin() + static_cast<std::size_t>(b) * kv_column_elements);
+                    col_p[b]     = positions[column];
+                    col_valid[b] = j < valid[b] ? 1 : 0;
+                }
+                cq.copy_from_host(col_q.data(), col_q.size() * 2);
+                ck.copy_from_host(col_k.data(), col_k.size() * 2);
+                cv.copy_from_host(col_v.data(), col_v.size() * 2);
+                cp.copy_from_host(col_p.data(), batch * 4);
+                cvalid.copy_from_host(col_valid.data(), batch * 4);
+                cout.fill(0xff);
+                cuda_synchronize();
+                ops::causal_softmax_attention(oq, ok, ov, op, masked ? ovalid : Tensor{}, tlanes, Tensor{},
+                                              op_geometry(geometry), kAttentionScale, columns.view(), one,
+                                              column_workspace, oout, execution);
+                cuda_synchronize(execution.stream);
+                const auto one_output = copy_from_guarded<std::uint16_t>(cout, col_q.size());
+                for (int b = 0; b < batch; ++b) {
+                    std::copy_n(one_output.begin() + static_cast<std::size_t>(b) * q_column_elements,
+                                q_column_elements,
+                                column_output.begin() +
+                                    (static_cast<std::size_t>(b) * width + j) * q_column_elements);
+                }
+            }
+            for (int b = 0; b < batch; ++b) {
+                for (int j = 0; j < valid[b]; ++j) {
+                    const std::size_t begin = (static_cast<std::size_t>(b) * width + j) * q_column_elements;
+                    if (!std::equal(output.begin() + begin, output.begin() + begin + q_column_elements,
+                                    column_output.begin() + begin)) {
+                        std::cerr << label << ": row " << b << " column " << j
+                                  << " differs from its one-column call\n";
+                        ++failures;
+                    }
+                }
+            }
+            const auto column_bytes = columns.snapshot_bytes();
+            for (int plane = 0; plane < 4; ++plane)
+                failures += verify_exact(
+                    (label + " one-column cache plane=" + std::to_string(plane)).c_str(),
+                    after[plane], column_bytes[plane]);
+        }
         if (control) {
             for (int b = 0; b < batch; ++b)
                 if (valid[b]) {
@@ -2617,6 +2691,34 @@ int run_tree_mask_cases(DeviceExecutionView execution, KvCacheStorage storage) {
 }
 
 // The exact route's row-invariant partition: every row splits its keys as if alone, so batched
+// Column-invariant rounds: each column equals a one-column call made in column order (run_batch_case
+// checks it bit for bit), every row full or ending early (its later columns masked), with and
+// without the row-invariant partition. CTest also runs these with INFERNIX_TMP_VERIFY_ROWS_ATTENTION=1
+// (--column-invariant-only).
+int run_column_invariant_cases(DeviceExecutionView execution, KvCacheStorage storage) {
+    int failures       = 0;
+    std::uint32_t seed = 3900u;
+    for (const Geometry& geometry : kGeometries) {
+        for (const bool row_invariant : {true, false}) {
+            for (const std::int32_t width : {2, 5, 8, 16}) {
+                const std::vector<std::int32_t> contexts{0, 700, 5400, 17000};
+                const std::vector<std::int32_t> valid{width, 1, width - 1, width / 2 + 1};
+                BatchAttentionCase test_case{width, contexts, valid, {2, 0, 3, 1},
+                                             MappingPattern::Fragmented, seed++};
+                test_case.row_invariant_partition = row_invariant;
+                test_case.column_invariant        = true;
+                failures += run_batch_case(execution, geometry, storage, test_case);
+            }
+        }
+        // One row, every column live (the C = 1 verification round).
+        BatchAttentionCase single{8, {9000}, {8}, {0}, MappingPattern::Identity, seed++};
+        single.row_invariant_partition = true;
+        single.column_invariant        = true;
+        failures += run_batch_case(execution, geometry, storage, single);
+    }
+    return failures;
+}
+
 // rows long enough to saturate the batch's split target take more splits than the default
 // schedule gives them (and a larger workspace).
 int run_row_invariant_batch_cases(DeviceExecutionView execution, KvCacheStorage storage) {
@@ -2640,19 +2742,8 @@ int run_row_invariant_batch_cases(DeviceExecutionView execution, KvCacheStorage 
                 failures += run_batch_case(execution, geometry, storage, test_case);
             }
         }
-        // Column-invariant rounds: each column a one-column call in order, every row full or
-        // ending early (its later columns masked).
-        for (const std::int32_t width : {2, 5, 16}) {
-            const std::vector<std::int32_t> contexts{0, 700, 5400, 17000};
-            const std::vector<std::int32_t> valid{width, 1, width - 1, width / 2 + 1};
-            BatchAttentionCase test_case{width, contexts, valid, {2, 0, 3, 1},
-                                         MappingPattern::Fragmented, seed++};
-            test_case.row_invariant_partition = true;
-            test_case.column_invariant        = true;
-            failures += run_batch_case(execution, geometry, storage, test_case);
-        }
     }
-    return failures;
+    return failures + run_column_invariant_cases(execution, storage);
 }
 
 int run_batch_cases(DeviceExecutionView execution, KvCacheStorage storage) {
@@ -2662,6 +2753,18 @@ int run_batch_cases(DeviceExecutionView execution, KvCacheStorage storage) {
     failures += run_batch_case(execution, kGeometries[0], storage,
                                {16, {0}, {1}, {0}, MappingPattern::Fragmented, 1502u});
     if (storage == KvCacheStorage::BFloat16) {
+        // bf16-prompt-split: prompt-route widths over short and long prefixes, a ragged last query
+        // tile and a masked tail, against the oracle on every geometry.
+        for (const Geometry& geometry : kGeometries) {
+            std::uint32_t split_seed = 4200u;
+            for (const auto& [width, context, valid] :
+                 {std::tuple{1024, 0, 1024}, std::tuple{1024, 6000, 1024}, std::tuple{777, 30000, 777},
+                  std::tuple{2048, 17000, 1500}}) {
+                BatchAttentionCase split{width, {context}, {valid}, {0}, MappingPattern::Fragmented, split_seed++};
+                split.bf16_prompt_split = true;
+                failures += run_batch_case(execution, geometry, storage, split);
+            }
+        }
         failures += run_batch_case(execution, kGeometries[0], storage,
                                    {16, {49}, {7}, {0}, MappingPattern::Identity, 500u});
         failures +=
@@ -3583,6 +3686,26 @@ int run_softmax_attention_extended_tests(std::optional<KvCacheStorage> selected)
                                         MappingPattern::Fragmented);
         std::cout << (current ? "FAIL" : "PASS") << " causal_softmax_attention "
                   << cache_name(storage) << " 300001 visible keys\n";
+        failures += current;
+    }
+    return failures ? 1 : 0;
+}
+
+int run_softmax_attention_column_invariant_tests(std::optional<KvCacheStorage> selected) {
+    if (cuda_unavailable()) {
+        std::cout << "SKIP: no usable CUDA device\n";
+        return 77;
+    }
+    DeviceContext device;
+    const auto execution = device.execution_view();
+    int failures         = 0;
+    for (const auto storage :
+         {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
+          KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
+        if (selected && storage != *selected) continue;
+        const int current = run_column_invariant_cases(execution, storage);
+        std::cout << (current ? "FAIL" : "PASS") << " column-invariant causal_softmax_attention "
+                  << cache_name(storage) << std::endl;
         failures += current;
     }
     return failures ? 1 : 0;

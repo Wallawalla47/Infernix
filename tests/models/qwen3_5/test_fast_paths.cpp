@@ -73,7 +73,7 @@ int main() {
                           std::string(infernix::fast_path_name(path)) + " must apply on every artifact");
     }
     // Low-precision batched decode needs an artifact whose activations go below 16 bits.
-    for (const FastPath path : {FastPath::BatchedA8Decode, FastPath::BatchedA4Decode,
+    for (const FastPath path : {FastPath::BatchedA8Decode, FastPath::BatchedA8SubsetDecode, FastPath::BatchedA4Decode,
                                 FastPath::BatchedA4ResidualDecode, FastPath::BatchedA8ResidualDecode}) {
         failures += check(!q::fast_path_applies(path,
                                                 {24, ActivationClass::A16, KvCacheStorage::Int8Group64},
@@ -112,9 +112,15 @@ int main() {
                       "single-column-decode couples requests");
     failures += check(infernix::parse_fast_path("single-column-decode") == FastPath::SingleColumnDecode,
                       "single-column-decode is parsed by name");
+    // batched-a8-subset-decode: a round's route depends on its width, which other requests share.
+    failures += check(q::couples_requests(FastPath::BatchedA8SubsetDecode),
+                      "batched-a8-subset-decode couples requests");
+    failures += check(infernix::parse_fast_path("batched-a8-subset-decode") == FastPath::BatchedA8SubsetDecode,
+                      "batched-a8-subset-decode is parsed by name");
 
     // The request-coupling paths and both residual routes are qualified on every KV format
-    // (4-bit activations); the one-term 4- and 8-bit paths failed the decode gate.
+    // (4-bit activations); the one-term 4- and 8-bit paths failed the decode gate (the 8-bit one is
+    // registered anyway).
     for (const auto kv : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64,
                           KvCacheStorage::Fp8E4M3Row256, KvCacheStorage::Nvfp4Group16,
                           KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Q4KeyVq2Value,
@@ -126,10 +132,13 @@ int main() {
             failures += check(q::fast_path_qualified(path, {24, ActivationClass::A4, kv}),
                               std::string(infernix::fast_path_name(path)) + " is qualified");
         }
-        for (const FastPath path : {FastPath::BatchedA4Decode, FastPath::BatchedA8Decode}) {
+        for (const FastPath path : {FastPath::BatchedA4Decode, FastPath::BatchedA8SubsetDecode}) {
             failures += check(!q::fast_path_qualified(path, {24, ActivationClass::A4, kv}),
                               std::string(infernix::fast_path_name(path)) + " is not qualified");
         }
+        // batched-a8-decode by the owner's decision (2026-10-24), although it failed its decode gate.
+        failures += check(q::fast_path_qualified(FastPath::BatchedA8Decode, {24, ActivationClass::A4, kv}),
+                          "batched-a8-decode is registered");
     }
     failures += check(!q::fast_path_qualified(FastPath::BatchedDecode,
                                               {16, ActivationClass::A4, KvCacheStorage::Int8Group64}),
@@ -200,9 +209,31 @@ int main() {
     failures += check(q::fast_path_applies(FastPath::GdnF16Accumulate, int8_24, options) &&
                           !q::couples_requests(FastPath::GdnF16Accumulate),
                       "gdn-f16-accumulate applies everywhere and keeps a request invariant");
+    failures += check(q::fast_path_applies(FastPath::Fp16GdnState, int8_24, options) &&
+                          !q::couples_requests(FastPath::Fp16GdnState) &&
+                          !q::fast_path_qualified(FastPath::Fp16GdnState, int8_24),
+                      "fp16-gdn-state applies everywhere, keeps a request invariant and is qualified nowhere");
     failures += check(!q::fast_path_qualified(FastPath::IdleWidePrefill,
                                               {24, ActivationClass::A16, KvCacheStorage::Int8Group64}),
                       "idle-wide-prefill is not qualified at 16-bit activations");
+    // expert-a4-residual (either term count) acts on offloaded W4A16 experts (Qwen3.5-122B-A10B) only, as a
+    // candidate: it is qualified for no Qwen3.5 configuration, and it couples a column to its call.
+    for (const KvCacheStorage kv : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64,
+                                    KvCacheStorage::Fp8E4M3Row256, KvCacheStorage::Nvfp4Group16,
+                                    KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2,
+                                    KvCacheStorage::Q4KeyVq2Value}) {
+        const q::FastPathConfiguration offloaded{32, ActivationClass::A16, kv, false, true};
+        for (const FastPath path : {FastPath::ExpertA4Residual, FastPath::ExpertA4Residual3}) {
+            failures += check(q::fast_path_applies(path, offloaded, options),
+                              "expert-a4-residual applies to the 122B's offloaded experts");
+            failures += check(!q::fast_path_qualified(path, offloaded), "expert-a4-residual is not qualified on the 122B");
+        }
+    }
+    failures += check(!q::fast_path_applies(FastPath::ExpertA4Residual, int8_24, options) &&
+                          !q::fast_path_applies(FastPath::ExpertA4Residual3, int8_24, options),
+                      "expert-a4-residual needs offloaded experts");
+    failures += check(q::couples_requests(FastPath::ExpertA4Residual) && q::couples_requests(FastPath::ExpertA4Residual3),
+                      "expert-a4-residual couples a column to its expert's column count in the call");
     auto mtp                 = options;
     mtp.speculative.backend  = infernix::SpeculativeBackend::Mtp;
     failures += check(!q::fast_path_applies(FastPath::AdaptiveMtp, int8_24, mtp),
@@ -322,6 +353,92 @@ int main() {
                       "q4-w4a8 failed its gate");
     failures += check(q::describe(groupwise) == "24 heads, 16-bit activations, int8 KV, Q4 gate/up",
                       "groupwise configuration description changed");
+
+    // sampled-mtp-drafts: MTP rounds of resident experts without n-gram copies; not yet qualified on
+    // any Qwen3.5 configuration (a candidate only).
+    mtp = options; // reset: the sampled-drafts cases below start from the plain options
+    mtp.speculative.backend      = infernix::SpeculativeBackend::Mtp;
+    mtp.speculative.draft_tokens = 3;
+    infernix::EngineOptions mtp_ngram = mtp;
+    mtp_ngram.speculative.ngram_draft_tokens = 16;
+    infernix::EngineOptions dflash2 = options;
+    dflash2.speculative.backend      = infernix::SpeculativeBackend::DFlash2;
+    dflash2.speculative.draft_tokens = 7;
+    FastPathConfiguration offloaded = int8_24;
+    offloaded.offloaded_experts     = true;
+    failures += check(q::fast_path_applies(FastPath::SampledMtpDrafts, int8_24, mtp) &&
+                          !q::fast_path_applies(FastPath::SampledMtpDrafts, int8_24, mtp_ngram) &&
+                          !q::fast_path_applies(FastPath::SampledMtpDrafts, int8_24, dflash2) &&
+                          !q::fast_path_applies(FastPath::SampledMtpDrafts, int8_24, options) &&
+                          !q::fast_path_applies(FastPath::SampledMtpDrafts, offloaded, mtp),
+                      "sampled-mtp-drafts applies to resident MTP rounds without copies only");
+    for (const auto kv : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Nvfp4Group16}) {
+        failures += check(!q::fast_path_qualified(FastPath::SampledMtpDrafts, {24, ActivationClass::A4, kv}) &&
+                              !q::fast_path_qualified(FastPath::SampledMtpDrafts, {16, ActivationClass::A16, kv}),
+                          "sampled-mtp-drafts is not qualified on Qwen3.5");
+    }
+    // router-mma: the offloaded MoE layers' router only (the resident MoE models' SparseMoe Op has its own
+    // MMA router), a candidate only.
+    failures += check(q::fast_path_applies(FastPath::RouterMma, offloaded, options) &&
+                          !q::fast_path_applies(FastPath::RouterMma, int8_24, options) &&
+                          !q::fast_path_qualified(FastPath::RouterMma, offloaded),
+                      "router-mma applies to offloaded experts only and is qualified nowhere on Qwen3.5");
+    // block-verification: chains with proposal laws (DFlash2, and MTP under sampled-mtp-drafts); a
+    // row's acceptance reads only that row, and it is a candidate only.
+    infernix::EngineOptions dflash = options;
+    dflash.speculative.backend      = infernix::SpeculativeBackend::DFlash;
+    dflash.speculative.draft_tokens = 7;
+    failures += check(q::fast_path_applies(FastPath::BlockVerification, int8_24, dflash2) &&
+                          q::fast_path_applies(FastPath::BlockVerification, int8_24, mtp) &&
+                          !q::fast_path_applies(FastPath::BlockVerification, int8_24, dflash) &&
+                          !q::fast_path_applies(FastPath::BlockVerification, int8_24, options) &&
+                          !q::couples_requests(FastPath::BlockVerification) &&
+                          !q::fast_path_qualified(FastPath::BlockVerification, int8_24),
+                      "block-verification applies to DFlash2 and MTP chains, keeps a request invariant "
+                      "and is qualified nowhere");
+    failures += check(infernix::parse_fast_path("block-verification") == FastPath::BlockVerification,
+                      "block-verification parses");
+    // univer-trees: fixed-table tree rounds of the drafters that build their trees (DFlash2, DFlash);
+    // not automatic widths, not MTP's leaf trees, not chains.
+    infernix::EngineOptions dflash2_trees = dflash2, dflash_trees = dflash, mtp_trees = mtp,
+                            auto_trees = dflash2;
+    dflash2_trees.speculative.draft_tree_nodes = {16};
+    dflash_trees.speculative.draft_tree_nodes  = {12};
+    mtp_trees.speculative.draft_tree_nodes     = {12};
+    auto_trees.speculative.draft_tree_auto     = true;
+    failures += check(q::fast_path_applies(FastPath::UniverTrees, int8_24, dflash2_trees) &&
+                          q::fast_path_applies(FastPath::UniverTrees, int8_24, dflash_trees) &&
+                          !q::fast_path_applies(FastPath::UniverTrees, int8_24, mtp_trees) &&
+                          !q::fast_path_applies(FastPath::UniverTrees, int8_24, auto_trees) &&
+                          !q::fast_path_applies(FastPath::UniverTrees, int8_24, dflash2) &&
+                          !q::couples_requests(FastPath::UniverTrees) &&
+                          !q::fast_path_qualified(FastPath::UniverTrees, int8_24),
+                      "univer-trees applies to fixed DFlash2/DFlash tree tables only, keeps a request "
+                      "invariant and is qualified nowhere");
+    failures += check(infernix::parse_fast_path("univer-trees") == FastPath::UniverTrees, "univer-trees parses");
+    // gdn-tree-closed-form: every engine with tree rounds (any drafter, fixed or automatic widths).
+    failures += check(q::fast_path_applies(FastPath::GdnTreeClosedForm, int8_24, dflash2_trees) &&
+                          q::fast_path_applies(FastPath::GdnTreeClosedForm, int8_24, dflash_trees) &&
+                          q::fast_path_applies(FastPath::GdnTreeClosedForm, int8_24, mtp_trees) &&
+                          q::fast_path_applies(FastPath::GdnTreeClosedForm, int8_24, auto_trees) &&
+                          !q::fast_path_applies(FastPath::GdnTreeClosedForm, int8_24, dflash2) &&
+                          !q::couples_requests(FastPath::GdnTreeClosedForm) &&
+                          !q::fast_path_qualified(FastPath::GdnTreeClosedForm, int8_24),
+                      "gdn-tree-closed-form applies to every tree configuration, keeps a request invariant "
+                      "and is qualified nowhere");
+    failures += check(infernix::parse_fast_path("gdn-tree-closed-form") == FastPath::GdnTreeClosedForm,
+                      "gdn-tree-closed-form parses");
+    // q5-ksplit-mma: the 16-bit-activation (groupwise) artifacts' Q5 residual projections; not yet
+    // gated, so nowhere qualified, and it keeps a request invariant.
+    failures += check(q::fast_path_applies(FastPath::Q5KSplitMma, groupwise, options),
+                      "q5-ksplit-mma must apply to the groupwise configuration");
+    failures += check(!q::fast_path_applies(FastPath::Q5KSplitMma,
+                                            {24, ActivationClass::A4, KvCacheStorage::Int8Group64}, options),
+                      "q5-ksplit-mma must not apply to 4-bit-activation artifacts");
+    failures += check(!q::fast_path_qualified(FastPath::Q5KSplitMma, groupwise),
+                      "q5-ksplit-mma is not qualified anywhere");
+    failures += check(!q::couples_requests(FastPath::Q5KSplitMma),
+                      "q5-ksplit-mma must not couple requests");
 
     std::cout << (failures == 0 ? "PASS" : "FAIL") << " fast-path selection\n";
     return failures == 0 ? 0 : 1;

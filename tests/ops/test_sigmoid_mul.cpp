@@ -1,3 +1,4 @@
+#include "ops/op_family.h"
 #include "core/device.h"
 #include "infernix/ops/sigmoid_mul.h"
 #include "ops/op_tester.h"
@@ -114,7 +115,7 @@ int run_edge_case() {
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(sigmoid_mul) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;

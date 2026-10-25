@@ -118,7 +118,8 @@ struct RequestRecord {
     using SequenceHandle = typename ModelContract::SequenceHandle;
     using ResumeState    = typename ModelContract::ResumeState;
     using StreamEvent = std::variant<GenerationTimingObservation, GenerationFirstTokenObservation,
-                                     OutputDelta, std::unique_ptr<GenerationSchedulingObservation>>;
+                                     OutputDelta, ToolCallDelta,
+                                     std::unique_ptr<GenerationSchedulingObservation>>;
 
     RequestRecord(std::uint64_t request_identity, std::uint64_t publication_sequence,
                   PreparedPrompt input, OutputSession output_session, PromptSummary summary,
@@ -215,6 +216,7 @@ struct RequestRecord {
     std::optional<GenerationFirstOutputTiming> first_output_timing;
     SpeculativeStats speculative_stats;
     std::optional<ExpertCacheStats> expert_cache;
+    std::optional<std::uint32_t> cache_created_prompt_tokens;
     std::optional<PromptReadout> readout;
     std::vector<ConstrainedDraw> constrained_draws;
 

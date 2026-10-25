@@ -91,6 +91,7 @@ public:
     [[nodiscard]] PreparedPrompt prepare_tokens(std::vector<TokenId> token_ids,
                                                 bool allow_prefix_identity = true) const;
     [[nodiscard]] std::vector<TokenId> tokenize_text(std::string_view text) const;
+    [[nodiscard]] std::string detokenize(std::span<const TokenId> token_ids) const;
     [[nodiscard]] ChatTokens tokenize_chat(PromptInput input) const;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
     [[nodiscard]] OutputSession
@@ -101,6 +102,10 @@ public:
                         const ToolChoice& tool_choice                     = {}) const;
     [[nodiscard]] const StopPolicy& default_stop_policy() const noexcept;
     [[nodiscard]] const ModelSamplingDefaults& sampling_defaults() const noexcept;
+    // Which instruction positions the active chat template renders. prepare() and count_tokens()
+    // lower an instruction turn that arrived in an unsupported position to a role the template does
+    // render, keeping text and position, instead of failing the request.
+    [[nodiscard]] ChatTemplateRoleSupport chat_template_role_support() const noexcept;
 
 private:
     class Impl;

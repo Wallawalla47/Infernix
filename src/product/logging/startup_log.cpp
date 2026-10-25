@@ -336,6 +336,10 @@ void StartupLogRenderer::engine_ready(const LoadSummary& load) {
         paths += load.request_invariant ? " | request-invariant" : " | request-coupled";
         impl_->logger->info("fast paths | {} | {}", paths, load.fast_path_configuration);
     }
+    // The temporary A/B switches, so an arm can be checked from its log.
+    if (!load.temporary_switches.empty()) {
+        impl_->logger->info("temporary switches | {}", load.temporary_switches);
+    }
     // Projections whose format and shape have no column-invariant route: decode and verification
     // stay request-invariant by running each once per column, which is much slower. Such an
     // artifact is unsupported, so say so plainly.
@@ -380,6 +384,31 @@ void StartupLogRenderer::engine_ready(const LoadSummary& load) {
     } else if (load.prefix_cache.attempted) {
         impl_->logger->info("prefix cache not restored | {}", load.prefix_cache.message);
     }
+}
+
+void StartupLogRenderer::chat_template_roles(infernix::ChatTemplateRoleSupport roles,
+                                             std::string_view active_override_path) {
+    std::string lowered;
+    if (roles.lowers_late_system()) { lowered += "a system message after the first"; }
+    if (!roles.late_developer) {
+        if (!lowered.empty()) { lowered += ", "; }
+        lowered += "a developer message after the first";
+    }
+    if (!roles.leading_developer) {
+        if (!lowered.empty()) { lowered += ", "; }
+        lowered += "a leading developer message";
+    }
+    if (lowered.empty()) { return; }
+    std::string override_note;
+    if (!active_override_path.empty()) {
+        override_note = " | override active: " + std::string(active_override_path);
+    }
+    impl_->logger->warn(
+        "active chat template cannot render {} at its input position; preparation lowers such a "
+        "turn to a role the template renders, keeping its text, part count and position | for "
+        "positional rendering pass --chat-template tools/chat_templates/qwen3_8.jinja (also in the "
+        "release zip's chat_templates folder){}",
+        lowered, override_note);
 }
 
 } // namespace infernix::product

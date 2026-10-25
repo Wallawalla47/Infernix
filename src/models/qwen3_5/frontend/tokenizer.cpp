@@ -991,6 +991,13 @@ bool Tokenizer::is_valid_token(int id) const noexcept {
            valid_token_ids_[static_cast<std::size_t>(id)];
 }
 
+const AddedToken* Tokenizer::find_added_token(std::string_view content) const noexcept {
+    const auto found =
+        std::find_if(added_tokens_.begin(), added_tokens_.end(),
+                     [&](const AddedToken& token) { return token.content == content; });
+    return found == added_tokens_.end() ? nullptr : &*found;
+}
+
 bool Tokenizer::has_exact_token_domain(std::size_t size) const noexcept {
     return valid_token_ids_.size() == size &&
            std::find(valid_token_ids_.begin(), valid_token_ids_.end(), false) ==

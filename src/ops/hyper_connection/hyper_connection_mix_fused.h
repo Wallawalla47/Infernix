@@ -31,4 +31,11 @@ void hc_mix_fused(const Tensor& residual, const Tensor& norm_weight, const Weigh
                   std::int32_t streams, std::int32_t rank, float eps, Tensor& x, Tensor* inject, void* partials,
                   cudaStream_t stream);
 
+// hyper_connection_inject(y, pending_inject, residual) folded into hc_mix_fused: K1a reads and K1b
+// reads and writes back each residual value with the inject applied (hc_injected), so x, inject and
+// the residual are those of the inject then the mix, bit for bit. `inject` must not be pending_inject.
+void hc_inject_mix_fused(const Tensor& y, const Tensor& pending_inject, Tensor& residual, const Tensor& norm_weight,
+                         const Weight& down, const Weight& up, std::int32_t streams, std::int32_t rank, float eps,
+                         Tensor& x, Tensor* inject, void* partials, cudaStream_t stream);
+
 } // namespace infernix::ops::detail

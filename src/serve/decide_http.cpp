@@ -108,6 +108,7 @@ void HttpServer::handle_decide(const httplib::Request& req, httplib::Response& r
             .model                  = public_model_id_,
             .stream                 = false,
             .output_tokens_explicit = true,
+            .label                  = request_label(req),
         };
         try {
             run.prepared.emplace(service_->prepare(
@@ -136,8 +137,8 @@ void HttpServer::handle_decide(const httplib::Request& req, httplib::Response& r
             run.prompt_tokens   = outcome.prompt_tokens;
             // A readout's one staged token is never returned; a generated run is the answer.
             run.output_tokens   = schedule ? outcome.completion_tokens : 0;
-            run.computed_tokens = outcome.metrics.computed_prefill_tokens;
-            run.cached_tokens   = outcome.metrics.prefix_cache_hit_tokens;
+            run.computed_tokens = outcome.computed_prefill_tokens;
+            run.cached_tokens   = outcome.reused_prompt_tokens;
             if (outcome.finish_reason == infernix::FinishReason::Cancelled) {
                 run.error = ApiError{.status  = 499,
                                      .type    = "cancelled",

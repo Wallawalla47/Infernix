@@ -1,3 +1,4 @@
+#include "ops/op_family.h"
 #include "ops/linear_pair/linear_pair_test_common.h"
 
 #include <array>
@@ -33,7 +34,7 @@ int q8_a16_conformance() {
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(linear_pair_q8_a16) {
     if (!infernix::test::linear_pair::cuda_available()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;

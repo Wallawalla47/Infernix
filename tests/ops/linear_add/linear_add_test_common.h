@@ -32,6 +32,8 @@ struct ShapeCase {
     std::int32_t composite_offset = 0;
     // The policy of every call (the graph and permissive probes too, when it is column-invariant).
     ops::LinearPolicy policy = ops::LinearPolicy::A16Only;
+    // The fast-path routes of every call (LinearRoutes::Q5KSplit for q5-ksplit-mma).
+    ops::LinearRoutes routes = ops::LinearRoutes::Exact;
 };
 
 bool cuda_available();

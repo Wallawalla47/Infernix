@@ -80,6 +80,9 @@ Setup and tuning: the [Qwen3.8-Flash-Next guide](docs/qwen3_8-flash-next.md).
 - **Tool calling that holds up**: the XML call forms agents emit, tolerant recovery of broken calls
   (`--tolerant-tool-calls`), calls stranded in unclosed thinking recovered, and calls an answer only
   quotes in Markdown code kept as text.
+- **Deferred tools**: `defer_loading` with Anthropic's regex/BM25 tool search, `tool_reference`
+  results and the Responses `tool_search` tool; found tools load later in the conversation, so
+  large MCP catalogs stay out of the prompt and its cached prefix.
 - **Constrained decoding**: JSON object and JSON Schema outputs, strict tool arguments and tool
   choice, and GBNF, regex and choice grammars, on every model and speculative mode.
 - **Thinking control**: budgets with a custom wrap-up message, reasoning effort levels and a guard
@@ -382,15 +385,16 @@ at two and 20 % at four. In the agentic replay the 27B now runs
 ## Quick start (Windows)
 
 Prerequisites: Visual Studio 2026 (MSVC; the VS 2022 compiler, MSVC 14.44, also builds it), the
-CUDA 13 toolkit, and FFmpeg + curl from vcpkg (`x64-windows`, at `C:\vcpkg`); adjust the paths at
-the top of `build_native.bat` for your machine (and, for Visual Studio 2022, its generator).
+CUDA 13 toolkit, and FFmpeg, libjpeg-turbo and curl from vcpkg (`x64-windows`, at `C:\vcpkg`;
+`vcpkg install libjpeg-turbo:x64-windows` adds libjpeg-turbo to an existing tree); adjust the paths
+at the top of `build_native.bat` for your machine (and, for Visual Studio 2022, its generator).
 
 ```bat
 build_native.bat configure
 build_native.bat build
 ```
 
-The server is `build-windows\apps\Release\infernix-serve.exe`, with the FFmpeg, curl and zlib DLLs
+The server is `build-windows\apps\Release\infernix-serve.exe`, with the FFmpeg, libjpeg, curl and zlib DLLs
 next to it. Qwen3.8-Flash-Next (see the [guide](docs/qwen3_8-flash-next.md#run)):
 
 ```bat
@@ -430,10 +434,10 @@ DLLs and every licence they need into a release zip
 
 Builds and runs on 64-bit Linux, including WSL2 (tested on Ubuntu 24.04 with CUDA 13.4 and GCC
 13.3). Prerequisites: a CUDA 13 toolkit, CMake 3.28 or newer, a C++20 compiler, Ninja, `pkg-config`,
-and the FFmpeg and curl development packages:
+and the FFmpeg, libjpeg-turbo and curl development packages:
 
 ```bash
-sudo apt-get install -y build-essential cmake ninja-build pkg-config libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libcurl4-openssl-dev
+sudo apt-get install -y build-essential cmake ninja-build pkg-config libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libjpeg-turbo8-dev libcurl4-openssl-dev
 cmake --preset release
 cmake --build build -j
 ```

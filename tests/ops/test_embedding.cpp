@@ -1,3 +1,4 @@
+#include "ops/op_family.h"
 #include "core/weight.h"
 #include "infernix/ops/embedding.h"
 #include "ops/op_tester.h"
@@ -714,7 +715,7 @@ int test_dense() {
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(embedding) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;

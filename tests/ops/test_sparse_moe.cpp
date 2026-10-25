@@ -1,3 +1,4 @@
+#include "ops/op_family.h"
 #include "core/weight.h"
 #include "infernix/ops/sparse_moe.h"
 
@@ -722,7 +723,7 @@ int run_profile(DeviceExecutionView execution, const CodecProfile& profile) {
 
 } // namespace
 
-int main(int argc, char** argv) {
+INFERNIX_OP_TEST(sparse_moe) {
     const bool wide_only = argc == 2 && std::string_view(argv[1]) == "--wide-only";
     if (argc != 1 && !wide_only) {
         std::cerr << "usage: " << argv[0] << " [--wide-only]\n";

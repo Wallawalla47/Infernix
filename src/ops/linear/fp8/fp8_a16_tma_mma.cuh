@@ -37,11 +37,12 @@ inline CUtensorMap fp8_a16_tma_activation_map(const __nv_bfloat16* pointer, int 
     return result;
 }
 
-template <class Schedule, bool FullTokens, class Output, class Epilogue, class Scale = __nv_bfloat16>
+template <class Schedule, bool FullTokens, class Output, class Epilogue, class Scale = __nv_bfloat16,
+          bool InPlace = false>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_tma_mma_kernel(
 #ifdef _WIN32
-    const Fp8TmaDescriptors* descriptors_pointer,
+    const __grid_constant__ TmaDescriptorParameter<Fp8TmaDescriptors, InPlace> descriptors_pointer,
 #else
     const __grid_constant__ Fp8TmaDescriptors descriptors,
 #endif
@@ -78,8 +79,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_tm
     if (threadIdx.x < Schedule::kProducerThreads) {
         if (threadIdx.x == 0) {
 #ifdef _WIN32
-            acquire_staged_tensor_map(&descriptors.activation);
-            acquire_staged_tensor_map(&descriptors.weight);
+            acquire_staged_tensor_map<InPlace>(&descriptors.activation);
+            acquire_staged_tensor_map<InPlace>(&descriptors.weight);
 #endif
             for (int kt = 0; kt < tiles_k; ++kt) {
                 const int stage = kt % S;
@@ -131,30 +132,30 @@ void launch_fp8_a16_tma_mma(const Fp8A16OperandsT<Scale>& p, Output output, Epil
     const Fp8TmaDescriptors descriptors{
         fp8_a16_tma_activation_map(p.x, p.tokens, p.k, Schedule::kBlockTokens, 64),
         fp8_tma_map(p.codes, p.rows, p.k, Schedule::kBlockRows, Schedule::kBlockK)};
+    const auto launch_slices = [&]<bool InPlace>(std::bool_constant<InPlace>, const auto& parameter) {
+        for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
+            const int blocks  = p.rows / Schedule::kBlockRows * div_up(count, Schedule::kBlockTokens);
+            const auto launch = [&]<bool Full>() {
+                constexpr auto kernel =
+                    fp8_a16_tma_mma_kernel<Schedule, Full, Output, Epilogue, Scale, InPlace>;
+                constexpr int bytes =
+                    fp8_tma_scratch_bytes<Schedule, Epilogue> + Schedule::kBarrierBytes;
+                const int dynamic = fp8_prepare_shared<bytes, kernel, true>();
+                kernel<<<blocks, Schedule::kThreads, dynamic, stream>>>(parameter, p, output, epilogue,
+                                                                        offset, count);
+                CUDA_CHECK(cudaGetLastError());
+            };
+            if (count % Schedule::kBlockTokens == 0)
+                launch.template operator()<true>();
+            else
+                launch.template operator()<false>();
+        });
+    };
 #ifdef _WIN32
-    const Fp8TmaDescriptors* staged = fp8_tma_descriptor_staging().stage(descriptors, stream);
-#endif
-    for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
-        const int blocks  = p.rows / Schedule::kBlockRows * div_up(count, Schedule::kBlockTokens);
-        const auto launch = [&]<bool Full>() {
-            constexpr auto kernel = fp8_a16_tma_mma_kernel<Schedule, Full, Output, Epilogue, Scale>;
-            constexpr int bytes =
-                fp8_tma_scratch_bytes<Schedule, Epilogue> + Schedule::kBarrierBytes;
-            const int dynamic = fp8_prepare_shared<bytes, kernel, true>();
-#ifdef _WIN32
-            kernel<<<blocks, Schedule::kThreads, dynamic, stream>>>(staged, p, output, epilogue,
-                                                                    offset, count);
+    with_tma_descriptor_parameter(fp8_tma_descriptor_staging(), descriptors, stream, launch_slices);
 #else
-            kernel<<<blocks, Schedule::kThreads, dynamic, stream>>>(descriptors, p, output,
-                                                                    epilogue, offset, count);
+    launch_slices(std::false_type{}, descriptors);
 #endif
-            CUDA_CHECK(cudaGetLastError());
-        };
-        if (count % Schedule::kBlockTokens == 0)
-            launch.template operator()<true>();
-        else
-            launch.template operator()<false>();
-    });
 }
 
 } // namespace infernix::ops::detail

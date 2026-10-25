@@ -226,6 +226,16 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
                                               "MTP decode autoregressive rope positions");
         decode.ar_valid_columns  = add_tensor(builder, DType::I32, {batch, ar_steps},
                                               "MTP decode autoregressive valid columns");
+        if (layout.spec.tree) {
+            decode.tree_rows = add_tensor(builder, DType::I32, {ops::kSpeculativeTreeRowWords, batch},
+                                          "MTP verification tree rows");
+            decode.tree_masks = add_tensor(builder, DType::I32, {columns, batch},
+                                           "MTP verification tree ancestor masks");
+            decode.tree_candidates = add_tensor(builder, DType::I32, {16, columns - 1, batch},
+                                                "MTP verification tree candidate ids");
+            decode.tree_q = add_tensor(builder, DType::FP32, {16, columns - 1, batch},
+                                       "MTP verification tree laws");
+        }
     }
     if (is_masked_draft_backend(layout.spec.backend)) {
         DFlashPrefillStateLayout& prefill = layout.dflash_prefill.emplace();
@@ -245,16 +255,16 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
             add_tensor(builder, DType::I32, {columns, batch}, "DFlash proposal positions");
         decode.verify_positions =
             add_tensor(builder, DType::I32, {columns, batch}, "target verify cache positions");
-        if (layout.spec.backend == SpeculativeBackend::DFlash2) {
+        if (layout.spec.backend == SpeculativeBackend::DFlash2 || layout.spec.tree) {
             decode.candidate_ids =
-                add_tensor(builder, DType::I32, {16, columns - 1, batch}, "DFlash2 candidate ids");
+                add_tensor(builder, DType::I32, {16, columns - 1, batch}, "DFlash candidate ids");
             decode.proposal_q = add_tensor(builder, DType::FP32, {16, columns - 1, batch},
-                                           "DFlash2 sampled proposal q");
+                                           "DFlash sampled proposal q");
             decode.tree_rows =
                 add_tensor(builder, DType::I32, {ops::kSpeculativeTreeRowWords, batch},
-                           "DFlash2 verification tree rows");
+                           "DFlash verification tree rows");
             decode.tree_masks = add_tensor(builder, DType::I32, {columns, batch},
-                                           "DFlash2 verification tree ancestor masks");
+                                           "DFlash verification tree ancestor masks");
         }
         decode.append_positions =
             add_tensor(builder, DType::I32, {columns, batch}, "DFlash append positions");
@@ -285,6 +295,13 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
                                                      "DFlash2 block proposal candidate ids");
                 decode.block_q = add_tensor(builder, DType::FP32, {16, block, batch},
                                             "DFlash2 block proposal q");
+                if (layout.spec.block_lattice_rank != 0) {
+                    decode.block_scores = add_tensor(builder, DType::FP32, {16, block, batch},
+                                                     "DFlash2 block lattice scores");
+                    decode.block_projected =
+                        add_tensor(builder, DType::BF16, {layout.spec.block_lattice_rank, block, batch},
+                                   "DFlash2 block lattice selector projections");
+                }
             }
         }
     }
@@ -357,6 +374,16 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
     rope_deltas = ingress_tensor(offsetof(MtpDecodeIngress, rope_deltas), DType::I32, {batch});
     sampling    = reinterpret_cast<const ops::SamplingConfig*>(
         static_cast<const unsigned char*>(ingress.data) + offsetof(MtpDecodeIngress, sampling));
+    proposal_limits = ingress_tensor(offsetof(MtpDecodeIngress, proposal_limits), DType::I32, {batch});
+    step_threshold  = reinterpret_cast<const double*>(static_cast<const unsigned char*>(ingress.data) +
+                                                     offsetof(MtpDecodeIngress, step_threshold));
+    constexpr auto slots = static_cast<std::int32_t>(kMtpSparseSlots);
+    current_candidates   = ingress_tensor(offsetof(MtpDecodeIngress, current_candidates), DType::I32,
+                                          {slots, neural_drafts, batch});
+    current_q = ingress_tensor(offsetof(MtpDecodeIngress, current_q), DType::FP32, {slots, neural_drafts, batch});
+    constexpr auto ranks = kMtpSampledDraftRanks;
+    current_scores = ingress_tensor(offsetof(MtpDecodeIngress, current_scores), DType::FP32,
+                                    {ranks, neural_drafts, batch});
 
     licensed_tokens =
         egress_tensor(offsetof(MtpDecodeEgress, licensed_tokens), DType::I32, {width, batch});
@@ -369,6 +396,18 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
     next_extents     = egress_tensor(offsetof(MtpDecodeEgress, next_extents), DType::I32, {batch});
     next_probabilities = egress_tensor(offsetof(MtpDecodeEgress, next_probabilities), DType::FP32,
                                        {batch, neural_drafts});
+    next_candidates =
+        egress_tensor(offsetof(MtpDecodeEgress, next_candidates), DType::I32, {slots, batch, neural_drafts});
+    next_q           = egress_tensor(offsetof(MtpDecodeEgress, next_q), DType::FP32, {slots, batch, neural_drafts});
+    next_scores =
+        egress_tensor(offsetof(MtpDecodeEgress, next_scores), DType::FP32, {ranks, batch, neural_drafts});
+    accepted_path = egress_tensor(offsetof(MtpDecodeEgress, accepted_path), DType::I32, {width, batch});
+    accepted_branch =
+        egress_tensor(offsetof(MtpDecodeEgress, accepted_branch), DType::I32, {batch});
+    if (layout.tree_rows) { tree_rows = layout.tree_rows->bind(backing); }
+    if (layout.tree_masks) { tree_masks = layout.tree_masks->bind(backing); }
+    if (layout.tree_candidates) { tree_candidates = layout.tree_candidates->bind(backing); }
+    if (layout.tree_q) { tree_q = layout.tree_q->bind(backing); }
     verify_ids       = layout.verify_ids.bind(backing);
     target_positions = layout.target_positions.bind(backing);
     target_argmax    = layout.target_argmax.bind(backing);
@@ -390,9 +429,11 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
     }
 }
 
-MtpDecodeState MtpDecodeState::narrowed(std::uint32_t k, std::uint32_t next_k) const {
+MtpDecodeState MtpDecodeState::narrowed(std::uint32_t k, std::uint32_t next_k,
+                                        std::uint32_t chain) const {
     if (k == 0 || k > static_cast<std::uint32_t>(current_drafts.ne[0]) || next_k == 0 ||
-        next_k > static_cast<std::uint32_t>(next_drafts.ne[1])) {
+        next_k > static_cast<std::uint32_t>(next_drafts.ne[1]) ||
+        (chain != 0 && (chain > k || chain > kMtpDecodeMaximumDrafts || !tree_rows.data))) {
         throw std::invalid_argument("MTP narrowed view requires allocated verify/proposal widths");
     }
     auto result      = *this;
@@ -403,11 +444,33 @@ MtpDecodeState MtpDecodeState::narrowed(std::uint32_t k, std::uint32_t next_k) c
     // native storage is exact for any row count.
     for (Tensor* tensor :
          {&result.target_rope_positions, &result.licensed_tokens, &result.verify_ids,
-          &result.target_positions, &result.target_argmax, &result.alignment_ids}) {
+          &result.target_positions, &result.target_argmax, &result.alignment_ids,
+          &result.accepted_path}) {
         *tensor = Tensor(tensor->data, tensor->dtype, {width, rows});
+    }
+    if (tree_masks.data) { result.tree_masks = Tensor(tree_masks.data, tree_masks.dtype, {width, rows}); }
+    for (Tensor* tensor : {&result.tree_candidates, &result.tree_q}) {
+        if (tensor->data) {
+            *tensor = Tensor(tensor->data, tensor->dtype,
+                             {static_cast<std::int32_t>(kMtpSparseSlots), static_cast<std::int32_t>(k), rows});
+        }
     }
     result.current_drafts =
         Tensor(current_drafts.data, DType::I32, {static_cast<std::int32_t>(k), rows});
+    // The sparse planes hold the MTP draft window only; wider (copy) views have none, and a tree
+    // round's are at its chain length.
+    const std::uint32_t sparse = chain != 0 ? chain : k;
+    for (Tensor* tensor : {&result.current_candidates, &result.current_q}) {
+        *tensor = sparse <= kMtpDecodeMaximumDrafts
+                      ? Tensor(tensor->data, tensor->dtype,
+                               {static_cast<std::int32_t>(kMtpSparseSlots), static_cast<std::int32_t>(sparse), rows})
+                      : Tensor{};
+    }
+    result.current_scores =
+        sparse <= kMtpDecodeMaximumDrafts
+            ? Tensor(current_scores.data, DType::FP32,
+                     {kMtpSampledDraftRanks, static_cast<std::int32_t>(sparse), rows})
+            : Tensor{};
     for (Tensor* tensor : {&result.target_hidden, &result.alignment_hidden}) {
         *tensor = Tensor(tensor->data, tensor->dtype, {tensor->ne[0], width, rows});
     }
@@ -420,6 +483,9 @@ MtpDecodeState MtpDecodeState::narrowed(std::uint32_t k, std::uint32_t next_k) c
     }
     result.next_drafts        = next_drafts.slice(1, 0, static_cast<std::int32_t>(next_k));
     result.next_probabilities = next_probabilities.slice(1, 0, static_cast<std::int32_t>(next_k));
+    result.next_candidates    = next_candidates.slice(2, 0, static_cast<std::int32_t>(next_k));
+    result.next_q             = next_q.slice(2, 0, static_cast<std::int32_t>(next_k));
+    result.next_scores        = next_scores.slice(2, 0, static_cast<std::int32_t>(next_k));
     return result;
 }
 
@@ -536,6 +602,8 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
     if (layout.block_candidates) { block_candidates = layout.block_candidates->bind(backing); }
     if (layout.block_q) { block_q = layout.block_q->bind(backing); }
     if (layout.block_confidence) { block_confidence = layout.block_confidence->bind(backing); }
+    if (layout.block_scores) { block_scores = layout.block_scores->bind(backing); }
+    if (layout.block_projected) { block_projected = layout.block_projected->bind(backing); }
 }
 
 void constrain_round_logits(const RoundState& io, const Tensor& logits, const Tensor* argmax,

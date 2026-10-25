@@ -279,7 +279,7 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
                                                  stream);
             } else {
                 const detail::SparseMoeSmallTPlan plan = detail::resolve_sparse_moe_small_t_plan(
-                    count, weights.routed_gate_up.qtype, weights.routed_down.qtype, true);
+                    count, weights.routed_gate_up.qtype, weights.routed_down.qtype, true, hints);
                 const detail::SparseMoeSmallTWorkspace views =
                     detail::allocate_sparse_moe_small_t_workspace(workspace, count);
                 detail::sparse_moe_small_t_launch(x_slice, weights, destination_slice, plan, views,
@@ -330,7 +330,7 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
     }
     if (use_small_t) {
         const detail::SparseMoeSmallTPlan plan = detail::resolve_sparse_moe_small_t_plan(
-            tokens, weights.routed_gate_up.qtype, weights.routed_down.qtype);
+            tokens, weights.routed_gate_up.qtype, weights.routed_down.qtype, false, hints);
         const detail::SparseMoeSmallTWorkspace views =
             detail::allocate_sparse_moe_small_t_workspace(workspace, tokens);
         detail::sparse_moe_small_t_launch(x, weights, destination, plan, views, stream);

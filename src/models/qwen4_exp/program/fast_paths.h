@@ -51,8 +51,9 @@ struct FastPathSelection {
     [[nodiscard]] bool selected(FastPath path) const noexcept;
     // The Forward's flags for the selected paths.
     [[nodiscard]] execution::ForwardFastPaths forward() const noexcept;
-    // No request-coupling path (adaptive-speculation, free-cache-resume, preemption, q8-sliced-k,
-    // expert-a4-residual, fp8-a8-pair, ggml-bf16-prefill, screened-lm-head) is selected:
+    // No request-coupling path (adaptive-speculation, dflash2-pairs, free-cache-resume, preemption, q8-sliced-k,
+    // expert-a4-residual and its forms, fp8-a8-pair, fp8-a8-pair-block32, ggml-bf16-prefill,
+    // f16-accumulate-prefill, router-mma, screened-lm-head) is selected:
     // a request's output depends only on the request, the artifact, the options and the build.
     [[nodiscard]] bool request_invariant() const noexcept;
 };

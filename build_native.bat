@@ -3,7 +3,7 @@ setlocal
 REM Native MSVC (VS18) + CUDA 13.4 native Windows build driver for Infernix.
 REM Based on PR #13 (docs/windows.md) with one local adaptation: dependencies come
 REM from the prebuilt global vcpkg tree at C:\vcpkg (ffmpeg 9.0.1 + curl 8.21
-REM x64-windows) instead of manifest-mode rebuilding (ffmpeg 8.1.1 source build
+REM + libjpeg-turbo, x64-windows) instead of manifest-mode rebuilding (ffmpeg 8.1.1 source build
 REM fails here). No vcpkg toolchain file: deps are found via CMAKE_PREFIX_PATH
 REM plus the local FindFFMPEG module.
 call "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat" >nul

@@ -28,6 +28,7 @@ ProgramDevicePlan Program::plan_device(const ProgramOptions& options, const Conf
 const ProgramDevicePlan& Program::device_plan() const noexcept { return impl_->device_layout().bytes; }
 
 const VramSizing& Program::vram_sizing() const noexcept { return impl_->vram_sizing(); }
+std::optional<ExpertCacheTotals> Program::expert_cache_totals() const noexcept { return impl_->expert_cache_totals(); }
 
 void Program::set_maintenance_waker(std::function<void()> waker) { impl_->set_maintenance_waker(std::move(waker)); }
 

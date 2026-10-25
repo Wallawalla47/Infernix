@@ -75,7 +75,7 @@ OperationalSeverity failure_severity(RequestFailureClass classification) noexcep
     return OperationalSeverity::Error;
 }
 
-const char* finish_reason_name(infernix::FinishReason reason) noexcept {
+const char* finish_reason_text(infernix::FinishReason reason) noexcept {
     switch (reason) {
     case infernix::FinishReason::None:
         return "none";
@@ -119,26 +119,6 @@ const char* protocol_name(std::string_view protocol) noexcept {
     if (protocol == "anthropic_count_tokens") { return "anthropic-count-tokens"; }
     if (protocol == "decide") { return "decide"; }
     return "http";
-}
-
-const char* kv_cache_name(infernix::KvCacheStorage storage) noexcept {
-    switch (storage) {
-    case infernix::KvCacheStorage::BFloat16:
-        return "bf16";
-    case infernix::KvCacheStorage::Int8Group64:
-        return "int8";
-    case infernix::KvCacheStorage::Fp8E4M3Row256:
-        return "fp8";
-    case infernix::KvCacheStorage::Nvfp4Group16:
-        return "nvfp4";
-    case infernix::KvCacheStorage::Fp8KeyNvfp4Value:
-        return "k8v4";
-    case infernix::KvCacheStorage::Vq2:
-        return "vq2";
-    case infernix::KvCacheStorage::Q4KeyVq2Value:
-        return "k4v2";
-    }
-    return "unknown";
 }
 
 const char* kv_capacity_mode_name(infernix::KvCapacityMode mode) noexcept {
@@ -240,14 +220,13 @@ OperationalRecord render_request_rejected(const RequestRejectionLogContext& cont
 
 OperationalRecord render_request_done(const RequestLogContext& context,
                                       const GenerationOutcome& outcome) {
-    const GenerationMetrics& metrics     = outcome.metrics;
-    const double computed_prefill_tokens = static_cast<double>(metrics.computed_prefill_tokens);
+    const double computed_prefill_tokens = static_cast<double>(outcome.computed_prefill_tokens);
     const double decode_tokens =
         outcome.completion_tokens > 0 ? static_cast<double>(outcome.completion_tokens - 1) : 0.0;
     std::ostringstream out;
     out << "req#" << context.id << " done | " << protocol_name(context.protocol) << " | ";
     if (outcome.tool_calls.empty()) {
-        out << finish_reason_name(outcome.finish_reason);
+        out << finish_reason_text(outcome.finish_reason);
     } else {
         out << "tool calls " << product::format_pretty_count(outcome.tool_calls.size());
     }
@@ -258,68 +237,74 @@ OperationalRecord render_request_done(const RequestLogContext& context,
         << product::format_pretty_count(
                static_cast<std::uint64_t>(std::max(outcome.completion_tokens, 0)));
     const double cache_ratio = outcome.prompt_tokens > 0
-                                   ? static_cast<double>(metrics.prefix_cache_hit_tokens) /
+                                   ? static_cast<double>(outcome.reused_prompt_tokens) /
                                          static_cast<double>(outcome.prompt_tokens)
                                    : 0.0;
-    out << " | cache " << product::format_pretty_count(metrics.prefix_cache_hit_tokens) << " ("
+    out << " | cache " << product::format_pretty_count(outcome.reused_prompt_tokens) << " ("
         << product::format_pretty_percent(cache_ratio);
-    if (metrics.prefix_reuse_path != infernix::PrefixReusePath::Root) {
-        out << ", " << prefix_reuse_path_name(metrics.prefix_reuse_path);
+    if (outcome.prefix_reuse_path != infernix::PrefixReusePath::Root) {
+        out << ", " << prefix_reuse_path_name(outcome.prefix_reuse_path);
     }
-    out << ") | TTFT " << product::format_pretty_duration(metrics.ttft_seconds) << " | total "
-        << product::format_pretty_duration(metrics.total_seconds);
-    if (metrics.engine_timing.queue_wait_seconds >= 0.01) {
+    out << ") | TTFT " << product::format_pretty_duration(outcome.timings.first_token_seconds)
+        << " | total " << product::format_pretty_duration(outcome.timings.total_seconds);
+    if (outcome.engine_timing.queue_wait_seconds >= 0.01) {
         out << " | queue "
-            << product::format_pretty_duration(metrics.engine_timing.queue_wait_seconds);
+            << product::format_pretty_duration(outcome.engine_timing.queue_wait_seconds);
     }
-    if (metrics.prefill_seconds > 0.0) {
+    if (outcome.timings.prefill_seconds > 0.0) {
         out << " | prefill "
-            << product::format_pretty_rate(computed_prefill_tokens / metrics.prefill_seconds,
-                                           "tok");
+            << product::format_pretty_rate(
+                   computed_prefill_tokens / outcome.timings.prefill_seconds, "tok");
     }
-    if (metrics.decode_seconds > 0.0) {
+    if (outcome.timings.decode_seconds > 0.0) {
         out << " | decode "
-            << product::format_pretty_rate(decode_tokens / metrics.decode_seconds, "tok");
+            << product::format_pretty_rate(decode_tokens / outcome.timings.decode_seconds, "tok");
     }
-    if (metrics.speculative_draft_tokens != 0) {
-        const double acceptance = static_cast<double>(metrics.speculative_accepted_tokens) /
-                                  static_cast<double>(metrics.speculative_draft_tokens);
+    if (outcome.speculative.drafted_tokens != 0) {
+        const double acceptance = static_cast<double>(outcome.speculative.accepted_tokens) /
+                                  static_cast<double>(outcome.speculative.drafted_tokens);
         out << " | "
-            << (metrics.ngram_rounds != 0
+            << (outcome.speculative.ngram_rounds != 0
                     ? "mixed speculation"
-                    : product::speculative_backend_name(metrics.speculative_backend))
-            << " accepted " << product::format_pretty_count(metrics.speculative_accepted_tokens)
-            << '/' << product::format_pretty_count(metrics.speculative_draft_tokens) << " ("
+                    : product::speculative_backend_name(outcome.speculative.backend))
+            << " accepted " << product::format_pretty_count(outcome.speculative.accepted_tokens)
+            << '/' << product::format_pretty_count(outcome.speculative.drafted_tokens) << " ("
             << product::format_pretty_percent(acceptance) << ')';
     }
-    if (metrics.ngram_rounds != 0) {
-        out << " | ngram " << product::format_pretty_count(metrics.ngram_accepted_tokens) << '/'
-            << product::format_pretty_count(metrics.ngram_drafted_tokens) << " accepted, "
-            << product::format_pretty_count(metrics.ngram_rounds) << " rounds";
+    if (outcome.speculative.ngram_rounds != 0) {
+        out << " | ngram "
+            << product::format_pretty_count(outcome.speculative.ngram_accepted_tokens) << '/'
+            << product::format_pretty_count(outcome.speculative.ngram_drafted_tokens)
+            << " accepted, " << product::format_pretty_count(outcome.speculative.ngram_rounds)
+            << " rounds";
     }
-    if (metrics.expert_cache && metrics.expert_cache->routed != 0) {
+    if (outcome.expert_cache && outcome.expert_cache->routed != 0) {
         out << " | expert cache "
-            << product::format_pretty_percent(static_cast<double>(metrics.expert_cache->hits) /
-                                              static_cast<double>(metrics.expert_cache->routed))
+            << product::format_pretty_percent(static_cast<double>(outcome.expert_cache->hits) /
+                                              static_cast<double>(outcome.expert_cache->routed))
             << " hit";
-        if (metrics.expert_cache->decode_routed != 0) {
+        if (outcome.expert_cache->decode_routed != 0) {
             out << ", decode "
-                << product::format_pretty_percent(static_cast<double>(metrics.expert_cache->decode_hits) /
-                                                  static_cast<double>(metrics.expert_cache->decode_routed));
+                << product::format_pretty_percent(
+                       static_cast<double>(outcome.expert_cache->decode_hits) /
+                       static_cast<double>(outcome.expert_cache->decode_routed));
         }
     }
-    if (metrics.tree_rounds != 0) {
-        out << " | trees " << product::format_pretty_count(metrics.tree_rounds) << " rounds, "
-            << product::format_pretty_count(metrics.tree_side_accepted_tokens)
+    if (outcome.speculative.tree_rounds != 0) {
+        out << " | trees " << product::format_pretty_count(outcome.speculative.tree_rounds)
+            << " rounds, "
+            << product::format_pretty_count(outcome.speculative.tree_side_accepted_tokens)
             << " side-branch drafts";
     }
-    if (metrics.ngram_archive.enabled) {
-        out << " | archive " << (metrics.ngram_archive.bound ? "bound" : "unbound");
-        if (metrics.ngram_archive.bound) {
-            out << " " << product::format_pretty_count(metrics.ngram_archive_accepted_tokens) << '/'
-                << product::format_pretty_count(metrics.ngram_archive_drafted_tokens)
-                << " accepted, gen " << metrics.ngram_archive.generation << ", "
-                << product::format_pretty_count(metrics.ngram_archive.sources) << " sources";
+    if (outcome.ngram_archive.enabled) {
+        out << " | archive " << (outcome.ngram_archive.bound ? "bound" : "unbound");
+        if (outcome.ngram_archive.bound) {
+            out << " "
+                << product::format_pretty_count(outcome.speculative.ngram_archive_accepted_tokens)
+                << '/'
+                << product::format_pretty_count(outcome.speculative.ngram_archive_drafted_tokens)
+                << " accepted, gen " << outcome.ngram_archive.generation << ", "
+                << product::format_pretty_count(outcome.ngram_archive.sources) << " sources";
         }
     }
     if (outcome.thinking.configured_budget) {
@@ -336,13 +321,15 @@ OperationalRecord render_request_done(const RequestLogContext& context,
             << static_cast<int>(outcome.thinking.loop_coverage * 100.0F + 0.5F) << "% repeated), "
             << (outcome.thinking.applied ? "concluded" : "stopped");
     }
-    if (metrics.vision_offload_window_seconds > 0.0) {
-        out << " vision_offload_ms=" << metrics.vision_offload_window_seconds * 1000.0
+    if (outcome.timings.vision_offload_window_seconds > 0.0) {
+        out << " vision_offload_ms=" << outcome.timings.vision_offload_window_seconds * 1000.0
             << " vision_offload_evicted_mib="
-            << metrics.vision_offload_evicted_bytes / (1024 * 1024)
-            << " vision_offload_evict_ms=" << metrics.vision_offload_evict_seconds * 1000.0
-            << " vision_offload_restore_ms=" << metrics.vision_offload_restore_seconds * 1000.0
-            << " vision_offload_staged_mib=" << metrics.vision_offload_staged_bytes / (1024 * 1024);
+            << outcome.timings.vision_offload_evicted_bytes / (1024 * 1024)
+            << " vision_offload_evict_ms=" << outcome.timings.vision_offload_evict_seconds * 1000.0
+            << " vision_offload_restore_ms="
+            << outcome.timings.vision_offload_restore_seconds * 1000.0
+            << " vision_offload_staged_mib="
+            << outcome.timings.vision_offload_staged_bytes / (1024 * 1024);
     }
     return {.severity = OperationalSeverity::Info, .message = out.str()};
 }
@@ -473,7 +460,40 @@ OperationalRecord render_throughput(const ThroughputReport& report) {
         report.interval_seconds > 0.0 ? host_seconds / report.interval_seconds : 0.0;
     out << " | host " << product::format_pretty_percent(host_ratio) << " ("
         << product::format_pretty_duration(host_seconds) << ')';
+    // The device at the interval's end and its energy over it; the clock reasons other than idle.
+    if (const auto& gpu = report.gpu_current; gpu.valid) {
+        const GpuInterval interval = gpu_interval(report);
+        out << " | gpu " << gpu.sm_clock_mhz << '/' << gpu.memory_clock_mhz << " MHz " << std::fixed
+            << std::setprecision(0) << gpu.power_watts << " W " << gpu.temperature_c << " C";
+        if (interval.average_power_watts) { out << " avg " << *interval.average_power_watts << " W"; }
+        if (interval.joules_per_decode_token) {
+            out << ' ' << std::setprecision(2) << *interval.joules_per_decode_token << " J/tok";
+        }
+        if (const std::uint64_t limiting = gpu.clock_event_reasons & ~std::uint64_t{1}; limiting != 0) {
+            out << " limited " << gpu_clock_event_reason_names(limiting);
+        }
+        if (interval.power_violation_fraction && *interval.power_violation_fraction > 0.0) {
+            out << " power-capped " << product::format_pretty_percent(*interval.power_violation_fraction);
+        }
+        if (interval.thermal_violation_fraction && *interval.thermal_violation_fraction > 0.0) {
+            out << " thermal " << product::format_pretty_percent(*interval.thermal_violation_fraction);
+        }
+    }
     return {.severity = OperationalSeverity::Info, .message = out.str()};
+}
+
+std::optional<OperationalRecord> render_output_limit_note(std::uint32_t max_context,
+                                                          int default_max_tokens) {
+    if (default_max_tokens <= 0 ||
+        max_context < static_cast<std::uint64_t>(default_max_tokens) * kOutputLimitNoteRatio) {
+        return std::nullopt;
+    }
+    std::ostringstream out;
+    out << "output limit | a request that sets none stops after "
+        << product::format_pretty_count(static_cast<std::uint64_t>(default_max_tokens))
+        << " tokens of its " << product::format_pretty_count(max_context)
+        << " context (--default-max-tokens)";
+    return OperationalRecord{.severity = OperationalSeverity::Info, .message = out.str()};
 }
 
 OperationalLog::OperationalLog(std::shared_ptr<spdlog::logger> logger)
@@ -546,14 +566,20 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
     const infernix::ContextCostSummary context_cost = service.load_summary().context_cost;
 
     logger_->info("capacity | {} tokens of context across all requests ({} KV)",
-                  product::format_pretty_count(memory.kv_capacity), kv_cache_name(memory.kv_cache));
+                  product::format_pretty_count(memory.kv_capacity),
+                  infernix::kv_cache_cli_name(memory.kv_cache));
     logger_->debug("capacity | KV {} tokens, {}, {} | pages {}/{} | runtime {} | free {}",
-                   product::format_pretty_count(memory.kv_capacity), kv_cache_name(memory.kv_cache),
+                   product::format_pretty_count(memory.kv_capacity),
+                   infernix::kv_cache_cli_name(memory.kv_cache),
                    kv_capacity_mode_name(memory.kv_capacity_mode),
                    product::format_pretty_count(memory.kv_capacity_page_groups),
                    product::format_pretty_count(memory.kv_capacity_max_page_groups),
                    product::format_pretty_bytes(memory.runtime_reservation_bytes),
                    product::format_pretty_bytes(memory.available_after_startup_bytes));
+    if (const auto note =
+            render_output_limit_note(engine.max_context, service.options().default_max_tokens)) {
+        logger_->info("{}", note->message);
+    }
 
     if (cache.enabled) {
         logger_->info("prefix cache | on | {} in RAM", product::format_pretty_bytes(*cache.host_capacity_bytes));
@@ -641,6 +667,11 @@ void OperationalLog::server_stopped() const { logger_->info("server stopped"); }
 void OperationalLog::server_failure(bool serving, std::string_view detail) const {
     logger_->critical("server failed during {} | {}", serving ? "serving" : "startup",
                       product::format_pretty_text(detail));
+}
+
+void OperationalLog::engine_failure_exit(int status) const {
+    logger_->critical("inference engine failed; server stopped, exit status {} (restart to serve again)",
+                      status);
 }
 
 } // namespace infernix::serve

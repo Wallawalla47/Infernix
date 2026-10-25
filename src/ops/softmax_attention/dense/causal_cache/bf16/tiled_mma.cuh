@@ -9,13 +9,17 @@ namespace infernix::ops::detail {
 
 // Online attention, one CTA per (query tile, query head), with
 // bottom-right causal alignment (query row i sees keys [0, base_pos + i]).
-template <typename Geometry, class Schedule, typename Metadata>
+// Split (the bf16-prompt-split fast path, candidates §10.3 KW-07): blockIdx.z of gridDim.z takes an
+// equal share of the CTA's own key blocks and publishes FP32 partials (unnormalized numerator, log2
+// maximum, sum) for bf16_kv_prompt_merge_kernel; rows past the valid tokens are left to the merge.
+template <typename Geometry, class Schedule, typename Metadata, bool Split = false>
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     void bf16_kv_tiled_mma_kernel(const __nv_bfloat16* __restrict__ q,
                                   const __nv_bfloat16* __restrict__ cache_k,
                                   const __half* __restrict__ cache_v, Metadata metadata,
                                   const std::int32_t* __restrict__ positions, float scale,
-                                  __nv_bfloat16* __restrict__ out, std::int32_t width) {
+                                  __nv_bfloat16* __restrict__ out, std::int32_t width,
+                                  CausalPartialView partial = {}) {
     constexpr int D             = Geometry::kHeadDim;   // 256
     constexpr int Br            = Schedule::kQueryRows; // 64 query rows
     constexpr int Bc            = Schedule::kKeyRows;   // 64 key cols
@@ -45,7 +49,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
 
     if (q_head >= Geometry::QHeads || q0 >= width) { return; }
     if (q0 >= tokens) {
-        causal_zero_rows<Geometry>(out, q_head, q0, min(q0 + Br, width), tid, Threads);
+        if constexpr (!Split) { causal_zero_rows<Geometry>(out, q_head, q0, min(q0 + Br, width), tid, Threads); }
         return;
     }
     const int base_pos              = positions[0];
@@ -122,21 +126,30 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     const int tile_rows     = min(Br, tokens - q0);
     const int max_query_abs = base_pos + q0 + tile_rows - 1;
     const int n_block_max   = (max_query_abs / Bc) + 1; // n_block_min == 0
+    // The key blocks this CTA runs: all of them, or its split's equal share.
+    int kb_lo = 0, kb_hi = n_block_max;
+    if constexpr (Split) {
+        const int splits = static_cast<int>(gridDim.z), split = static_cast<int>(blockIdx.z);
+        kb_lo            = split * n_block_max / splits;
+        kb_hi            = (split + 1) * n_block_max / splits;
+    }
 
     // Fold softmax_scale into the exp2 (FA-style): scores stay raw, so the
     // per-element "* scale" multiply drops out of the QK epilogue entirely.
     const float scale_l2 = scale * kLog2E;
-    int physical_page    = block_table[0];
+    int physical_page    = block_table[(kb_lo * Bc) >> kPagedKVPageShift];
 
-    // Prologue: commit Q, then kick off K(0). The loop's wait<0> below drains both.
+    // Prologue: commit Q, then kick off K(kb_lo). The loop's wait<0> below drains both.
     infernix::ops::cp_commit();
-    bf16_kv_stage_tile<Geometry, Schedule>(k_s, cache_k, kv_head, 0, max_query_abs, physical_page,
-                                           tid);
+    if (kb_lo < kb_hi) {
+        bf16_kv_stage_tile<Geometry, Schedule>(k_s, cache_k, kv_head, kb_lo * Bc, max_query_abs,
+                                               physical_page, tid);
+    }
     infernix::ops::cp_commit();
 
     const auto step = [&]<bool FullTile>(int kb) {
         const int k0                 = kb * Bc;
-        const int next_physical_page = (kb + 1 < n_block_max)
+        const int next_physical_page = (kb + 1 < kb_hi)
                                            ? block_table[((kb + 1) * Bc) >> kPagedKVPageShift]
                                            : physical_page;
 
@@ -198,7 +211,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
         __syncthreads();
 
         // Prefetch K(kb+1) into the (now-free) K buffer, overlapping the PV MMA.
-        if (kb + 1 < n_block_max) {
+        if (kb + 1 < kb_hi) {
             physical_page = next_physical_page;
             bf16_kv_stage_tile<Geometry, Schedule>(k_s, cache_k, kv_head, (kb + 1) * Bc,
                                                    max_query_abs, physical_page, tid);
@@ -336,8 +349,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
         }
     };
     const int full_blocks = q0 + Br <= tokens ? min(n_block_max, (base_pos + q0 + 1) / Bc) : 0;
-    for (int kb = 0; kb < full_blocks; ++kb) step.template operator()<true>(kb);
-    for (int kb = full_blocks; kb < n_block_max; ++kb) step.template operator()<false>(kb);
+    for (int kb = kb_lo; kb < min(kb_hi, full_blocks); ++kb) step.template operator()<true>(kb);
+    for (int kb = max(kb_lo, full_blocks); kb < kb_hi; ++kb) step.template operator()<false>(kb);
+    if constexpr (Split) { infernix::ops::cp_wait<0>(); } // an empty split's Q copy
 
     state0.finish();
     state1.finish();
@@ -347,16 +361,17 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
         const int d0    = n * 8 + 2 * lid;
         const int qrow0 = q0 + warp_row0 + gid;
         const int qrow1 = q0 + warp_row0 + gid + 8;
+        const int split = Split ? static_cast<int>(blockIdx.z) : 0;
         if (qrow0 < tokens) {
-            bf16_kv_store_pair<Geometry, false>({}, out, q_head, qrow0, d0, width, 0, acc[n][0],
+            bf16_kv_store_pair<Geometry, Split>(partial, out, q_head, qrow0, d0, width, split, acc[n][0],
                                                 acc[n][1], state0.scaled_maximum, state0.sum);
         }
         if (qrow1 < tokens) {
-            bf16_kv_store_pair<Geometry, false>({}, out, q_head, qrow1, d0, width, 0, acc[n][2],
+            bf16_kv_store_pair<Geometry, Split>(partial, out, q_head, qrow1, d0, width, split, acc[n][2],
                                                 acc[n][3], state1.scaled_maximum, state1.sum);
         }
     }
-    causal_zero_rows<Geometry>(out, q_head, tokens, min(q0 + Br, width), tid, Threads);
+    if constexpr (!Split) { causal_zero_rows<Geometry>(out, q_head, tokens, min(q0 + Br, width), tid, Threads); }
 }
 
 

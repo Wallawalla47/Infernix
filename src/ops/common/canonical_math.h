@@ -17,6 +17,13 @@
 #else
 #    define INFERNIX_CANON_HD inline
 #endif
+// Full unrolling of fixed-trip loops over register arrays in device code (they would otherwise live in
+// local memory); host compilers see nothing.
+#if defined(__CUDA_ARCH__)
+#    define INFERNIX_CANON_UNROLL _Pragma("unroll")
+#else
+#    define INFERNIX_CANON_UNROLL
+#endif
 
 namespace infernix::ops::canon {
 
@@ -427,6 +434,104 @@ INFERNIX_CANON_HD float a16_row_output_f32(std::int64_t s, int emax, float multi
     const float s1 = f32_from_bits(static_cast<std::uint32_t>(k1 + 127) << 23);
     const float s2 = f32_from_bits(static_cast<std::uint32_t>(k2 + 127) << 23);
     return mul_rn(mul_rn(mul_rn(i64_to_f32_rn(s), s1), s2), multiplier);
+}
+
+// ------------------------------------------------- A4 residual (W4A16 fast paths, §19.3.23)
+
+// The two-term A4 activations of experts stored without activation scales (fast paths
+// expert-a4-residual, wide calls, and expert-a4-residual-decode, narrow calls). A BF16 row v (one
+// token's x, or one entry's h) has the row scale r = fl(amax / 2688) (6 * 448: every block's first
+// term scale is then finite) and the multiplier d = fl(1 / r). Each 16-element block of fl(v_j * d)
+// is the sum of kA4ResidualTerms NVFP4 terms: term t has the scale word
+//   s_t = e4m3_rn_satfinite(fl(max_j |rem_j| / 6)),  code_j = e2m1_rn_satfinite(fl(rem_j / e4m3(s_t)))
+// and leaves rem_j - code_j * e4m3(s_t) (the product is exact, the subtraction rounds once) to the
+// next; a zero scale word encodes zero codes and passes its remainder on unchanged. This is the
+// encoding of ops::detail::quantize_nvfp4_terms_k16 (wide_expert.cu's term planes) bit for bit,
+// codes and signed zeros included, for every row whose multiplier is finite.
+//
+// The narrow route and the CPU engine sum the terms' products exactly:
+//   S = sum_t sum_b P_{t,b} * Sw_b * Sa_{t,b}  (doubled codes, scales times 2^9; |S| < 2^56)
+// and y = bf16_rn(((fl32_rn(S) * 2^-20) * r) * alpha), so both give the same bits; the wide route
+// sums the same terms in the tensor core's FP32 order instead.
+inline constexpr int kA4ResidualTerms = 2;
+
+// The row scale from the row's largest magnitude key (the maximum of v_j & 0x7FFF over its BF16
+// elements): 0 for an all-zero row, the canonical NaN for a row holding an Inf or a NaN (its outputs
+// are then NaN on every route).
+INFERNIX_CANON_HD float a4r_row_scale(unsigned key) {
+    if (key >= 0x7F80U) { return f32_from_bits(kCanonicalNan); }
+    return div_rn(bf16_to_f32(static_cast<std::uint16_t>(key)), 2688.0F);
+}
+
+// The multiplier of a row with row scale r: fl(1 / r), or 0 (zero terms) for a zero or non-finite
+// row and for a row whose fl(1 / r) overflows (r < 2^-128: amax below 2^-116, outputs of order
+// 2^-116 * |w|). The wide route's encoder saturates such rows instead; no activation reaches them.
+INFERNIX_CANON_HD float a4r_multiplier(float row_scale) {
+    if (!(row_scale > 0.0F)) { return 0.0F; }
+    const float d = div_rn(1.0F, row_scale);
+    return f32_bits(d) >= 0x7F800000U ? 0.0F : d;
+}
+
+// The signed E2M1 value of a code (the sign bit of code 8 gives -0, as the device's decode does).
+INFERNIX_CANON_HD float e2m1_value(unsigned code) {
+    const float m = mul_rn(static_cast<float>(e2m1_x2(code & 7U)), 0.5F);
+    return (code & 8U) != 0 ? -m : m;
+}
+
+// The terms of one 16-element block of a row with multiplier d (a4r_multiplier): out[t].code[j] are
+// term t's E2M1 code words (sign in bit 3), out[t].scale_word its E4M3 scale.
+template <int Terms>
+INFERNIX_CANON_HD void a4r_block_terms(const std::uint16_t* v_bf16, float multiplier, A4Codes (&out)[Terms]) {
+    INFERNIX_CANON_UNROLL
+    for (int t = 0; t < Terms; ++t) { out[t] = A4Codes{}; }
+    if (multiplier == 0.0F) { return; }
+    float rem[16];
+    INFERNIX_CANON_UNROLL
+    for (int j = 0; j < 16; ++j) { rem[j] = mul_rn(bf16_to_f32(v_bf16[j]), multiplier); }
+    INFERNIX_CANON_UNROLL
+    for (int t = 0; t < Terms; ++t) {
+        float amax = 0.0F;
+        INFERNIX_CANON_UNROLL
+        for (int j = 0; j < 16; ++j) {
+            const float a = f32_from_bits(f32_bits(rem[j]) & 0x7FFFFFFFU);
+            amax          = a > amax ? a : amax;
+        }
+        const std::uint8_t s = e4m3_rn_satfinite(div_rn(amax, 6.0F));
+        out[t].scale_word    = s;
+        // A zero scale encodes zero codes; the remainder carries on unchanged. (No early exit from the
+        // unrolled loop: the later terms' guards are compile-time.)
+        if (s != 0) {
+            const float scale = e4m3_value(s);
+            INFERNIX_CANON_UNROLL
+            for (int j = 0; j < 16; ++j) { out[t].code[j] = e2m1_rn_satfinite(div_rn(rem[j], scale)); }
+            if (t + 1 < Terms) {
+                INFERNIX_CANON_UNROLL
+                for (int j = 0; j < 16; ++j) { rem[j] = add_rn(rem[j], -mul_rn(e2m1_value(out[t].code[j]), scale)); }
+            }
+        }
+    }
+}
+
+// The A4Block of one term (doubled values, scale word, scaled scale and value sum), the form the CPU
+// row sums read.
+INFERNIX_CANON_HD A4Block a4_block_of_codes(const A4Codes& codes) {
+    A4Block out{};
+    out.scale_word   = codes.scale_word;
+    out.scale_scaled = e4m3_scaled(codes.scale_word);
+    std::int32_t sum = 0;
+    for (int j = 0; j < 16; ++j) {
+        const int c = e2m1_x2(codes.code[j]);
+        out.c2[j]   = static_cast<std::int8_t>(c);
+        sum += c;
+    }
+    out.c2_sum = sum;
+    return out;
+}
+
+// y = bf16_rn(((fl32_rn(S) * 2^-20) * r) * alpha) for the exact two-term sum S of a row with row
+// scale r; the scaling by 2^-20 is exact, and a NaN row scale gives the canonical NaN.
+INFERNIX_CANON_HD std::uint16_t a4r_row_output(std::int64_t s, float row_scale, float alpha) {
+    return f32_to_bf16_rn(mul_rn(mul_rn(mul_rn(i64_to_f32_rn(s), 1.0F / 1048576.0F), row_scale), alpha));
 }
 
 } // namespace infernix::ops::canon

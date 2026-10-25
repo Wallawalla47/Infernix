@@ -256,6 +256,51 @@ struct Nvfp4A16SlicedKMmaSchedule {
     static_assert(kSharedBytes <= 99 * 1024);
 };
 
+// The sliced-K tile's arithmetic over BlockRows weight rows (nvfp4_a16_slice_ring_mma.cuh): KSlices is
+// the sliced-K tile's K-warp count whose reduction it reproduces, each stage one 64-value K slice of
+// BlockTokens BF16 activation rows (128 bytes each, 128-byte swizzle), BlockRows rows of E2M1 codes
+// (32 bytes each) and their four E4M3 scales, in a Stages-deep ring filled by one producer warp.
+// Every consumer warp holds three accumulator sets (the chain, the even slice's kept chain, the
+// running total) of kWarpRows x kWarpTokens.
+template <int KSlices, int BlockRows, int BlockTokens, int WarpsRows, int WarpsTokens, int Stages,
+          int MinBlocksPerSm>
+struct Nvfp4A16SliceRingSchedule {
+    static_assert(KSlices == 2 || KSlices == 4 || KSlices == 8 || KSlices == 16);
+    static_assert(Stages >= 2 && Stages <= 8 && MinBlocksPerSm > 0);
+    static constexpr int kStaticK         = 0;
+    static constexpr int kTokenCapacity   = 0;
+    static constexpr bool kExactTokens    = false;
+    static constexpr int kKSlices         = KSlices;
+    static constexpr int kSliceK          = 64;
+    static constexpr int kBlockK          = KSlices * kSliceK;
+    static constexpr int kBlockRows       = BlockRows;
+    static constexpr int kBlockTokens     = BlockTokens;
+    static constexpr int kWarpsRows       = WarpsRows;
+    static constexpr int kWarpsTokens     = WarpsTokens;
+    static constexpr int kStages          = Stages;
+    static constexpr int kMinBlocksPerSm  = MinBlocksPerSm;
+    static constexpr int kConsumerWarps   = WarpsRows * WarpsTokens;
+    static constexpr int kProducerThreads = 32;
+    static constexpr int kThreads         = kProducerThreads + kConsumerWarps * 32;
+    static constexpr int kWarpRows        = BlockRows / WarpsRows;
+    static constexpr int kWarpTokens      = BlockTokens / WarpsTokens;
+    static constexpr int kMmaRows         = kWarpRows / 16;
+    static constexpr int kMmaTokens       = kWarpTokens / 8;
+
+    static constexpr int kActivationStageBytes = BlockTokens * kSliceK * 2;
+    static constexpr int kCodeStageBytes       = BlockRows * (kSliceK / 2);
+    static constexpr int kScaleStageBytes      = BlockRows * (kSliceK / 16);
+    static constexpr int kStageBytes = kActivationStageBytes + kCodeStageBytes + kScaleStageBytes;
+    static constexpr int kBarrierBytes = Stages * 2 * static_cast<int>(sizeof(std::uint64_t));
+    static constexpr int kSharedBytes  = Stages * kStageBytes + kBarrierBytes;
+
+    static_assert(BlockRows % WarpsRows == 0 && BlockTokens % WarpsTokens == 0);
+    // m16 A tiles (paired SwiGLU rows: 8 gate over 8 up) and n8 pairs per ldmatrix.x4.
+    static_assert(kWarpRows % 16 == 0 && kWarpTokens % 16 == 0);
+    static_assert(kStageBytes % 16 == 0);
+    static_assert(kThreads <= 1024 && kSharedBytes <= 99 * 1024);
+};
+
 // Shape instances retain measured compile-time K and token extents; the templates also
 // accept dynamic dimensions when no specialization is selected.
 template <class Schedule, int K, int Capacity = 0, bool ExactTokens = false>

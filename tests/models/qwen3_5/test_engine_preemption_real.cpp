@@ -190,6 +190,8 @@ public:
         timeline_.output(row_, timing.generated_tokens == kOutputTokens);
     }
 
+    void tool_call(infernix::ToolCallDelta) override {}
+
     void publish(infernix::OutputDelta delta) override {
         require(timing_seen_, "output delta preceded its committed-token observation");
         (delta.channel == infernix::OutputChannel::Reasoning ? reasoning_ : content_) += delta.text;
@@ -508,6 +510,12 @@ void exercise(const std::filesystem::path& artifact, infernix::SpeculativeBacken
     (void)engine.memory_summary(); // the worker boundary, as above
     settled(engine.runtime_stats(), prefix_cache);
     require(engine.is_available(), "Engine became unavailable after recovery");
+    // Recovered pressure is not an Engine failure (infernix-serve would exit with status 2), and
+    // neither is an orderly stop.
+    require(!engine.has_failed(), "recovered resource pressure was reported as an Engine failure");
+    engine.stop();
+    require(!engine.is_available() && !engine.has_failed(),
+            "an orderly stop was reported as an Engine failure");
 }
 
 } // namespace

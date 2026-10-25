@@ -1,6 +1,7 @@
 #include "serve/http_server.h"
 
 #include "product/logging/logging.h"
+#include "product/speculative_options.h"
 #include "serve/anthropic_messages.h"
 #include "serve/http_transport.h"
 #include "serve/openai_common.h"
@@ -117,6 +118,9 @@ std::string response_request_id(const httplib::Response& response) {
 
 void write_openai_error(httplib::Response& response, const ApiError& error) {
     response.status = error.status;
+    if (error.retry_after_seconds > 0) {
+        response.set_header("Retry-After", std::to_string(error.retry_after_seconds));
+    }
     response.set_content(make_error_body(error), "application/json");
 }
 
@@ -126,6 +130,9 @@ void write_anthropic_error(httplib::Response& response, const ApiError& api_erro
     response.status      = error.status;
     response.headers.erase("request-id");
     response.set_header("request-id", request_id);
+    if (error.retry_after_seconds > 0) {
+        response.set_header("Retry-After", std::to_string(error.retry_after_seconds));
+    }
     response.set_content(make_anthropic_error_body(error, request_id), "application/json");
 }
 
@@ -278,6 +285,7 @@ infernix::GenerationSchedulingObserver HttpServer::scheduling_observer(std::uint
 void HttpServer::record_request_done(const RequestLogContext& context,
                                      const GenerationOutcome& outcome) {
     metrics_.done(outcome);
+    metrics_json_history_.done(context, outcome);
     request_jsonl_.write_request_done(context, outcome);
     operational_log_.request_done(context, outcome);
     if (console_stats_) { console_stats_->request_done(outcome); }
@@ -285,7 +293,9 @@ void HttpServer::record_request_done(const RequestLogContext& context,
 
 void HttpServer::record_request_failure(const RequestLogContext& context,
                                         const RequestFailure& failure) {
-    metrics_.failed(failure.classification == RequestFailureClass::ClientDisconnected);
+    const bool cancelled = failure.classification == RequestFailureClass::ClientDisconnected;
+    metrics_.failed(cancelled);
+    metrics_json_history_.failure(context, cancelled);
     request_jsonl_.write_request_error(context, failure.machine_message);
     operational_log_.request_failure(context, failure);
     if (console_stats_) { console_stats_->request_failure(failure); }
@@ -296,13 +306,49 @@ void HttpServer::record_response_failure(std::uint64_t request_id, const Request
     operational_log_.response_failure(request_id, failure);
 }
 
+std::string HttpServer::metrics_json_body() const {
+    MetricsJsonSnapshot snapshot;
+    const infernix::LoadSummary load      = service_->load_summary();
+    const infernix::EngineOptions& engine = service_->engine_options();
+    const Metrics::RequestCounts counts   = metrics_.counts();
+
+    snapshot.instance_id  = request_jsonl_.server_instance_id();
+    snapshot.model        = public_model_id_;
+    snapshot.architecture = load.architecture;
+    snapshot.weights = load.weight_formats.empty() ? std::string{} : load.weight_formats.front();
+    snapshot.kv      = infernix::kv_cache_cli_name(engine.kv_cache);
+    snapshot.speculative_backend = product::speculative_backend_name(engine.speculative.backend);
+    snapshot.time_unix           = unix_time_seconds();
+    snapshot.start_time_unix     = metrics_.start_time_seconds();
+    snapshot.max_context         = engine.max_context;
+    snapshot.max_concurrency     = engine.max_concurrency;
+    snapshot.stats               = service_->runtime_stats();
+    snapshot.counts              = {.completed = counts.completed,
+                                    .cancelled = counts.cancelled,
+                                    .failed    = counts.failed,
+                                    .rejected  = counts.rejected};
+    snapshot.requests            = metrics_json_history_.rows();
+    snapshot.rates_valid         = metrics_json_history_.rates(snapshot.decode_tokens_per_second,
+                                                               snapshot.prefill_tokens_per_second);
+    return render_metrics_json(snapshot);
+}
+
 void HttpServer::record_throughput(const ThroughputReport& report) {
+    if (report.interval_seconds > 0.0) {
+        metrics_json_history_.set_rates(
+            static_cast<double>(report.committed_decode_tokens) / report.interval_seconds,
+            static_cast<double>(report.computed_prefill_tokens) / report.interval_seconds);
+    }
     request_jsonl_.write_throughput(report);
     operational_log_.throughput(report);
 }
 
 void HttpServer::run_stats_reporter() {
     using Clock                     = std::chrono::steady_clock;
+    // The device's clocks, power, energy and throttle reasons beside each interval (NVML; every
+    // sample is invalid without it).
+    const infernix::GpuTelemetry telemetry(options_.device);
+    infernix::GpuTelemetrySample gpu_previous = telemetry.sample();
     infernix::RuntimeStats previous   = service_->runtime_stats();
     Clock::time_point previous_time = Clock::now();
     const auto interval             = std::chrono::milliseconds(options_.log_stats_interval_ms);
@@ -328,8 +374,11 @@ void HttpServer::run_stats_reporter() {
         try {
             const infernix::RuntimeStats current = service_->runtime_stats();
             const Clock::time_point now        = Clock::now();
-            const ThroughputReport report      = make_throughput_report(
+            ThroughputReport report            = make_throughput_report(
                 previous, current, std::chrono::duration<double>(now - previous_time).count());
+            report.gpu_previous = gpu_previous;
+            report.gpu_current  = telemetry.sample();
+            gpu_previous        = report.gpu_current;
             previous      = current;
             previous_time = now;
             if (report_has_activity(report)) { record_throughput(report); }
@@ -349,6 +398,8 @@ void HttpServer::run_stats_reporter() {
         const Clock::time_point now        = Clock::now();
         ThroughputReport tail              = make_throughput_report(
             previous, current, std::chrono::duration<double>(now - previous_time).count());
+        tail.gpu_previous = gpu_previous;
+        tail.gpu_current  = telemetry.sample();
         // The exact partial interval remains useful to measurement consumers. Pretty throughput is
         // a fixed-cadence operational record and deliberately has no irregular shutdown tail.
         tail.final_interval = true;
@@ -473,10 +524,22 @@ void HttpServer::register_routes() {
                 [this](const httplib::Request& req, httplib::Response& res) {
                     handle_models(req, res);
                 });
-    server_.Get("/metrics", [this](const httplib::Request&, httplib::Response& res) {
-        const auto stats = service_->runtime_stats();
+    server_.Get("/metrics", [this](const httplib::Request& req, httplib::Response& res) {
+        const MetricsFormat format =
+            select_metrics_format(req.get_param_value("format"), req.get_header_value("Accept"));
         res.set_header("Cache-Control", "no-store");
-        res.set_content(metrics_.render(stats, service_->is_available()),
+        if (format == MetricsFormat::Invalid) {
+            res.status = 400;
+            res.set_content(
+                R"({"error":{"code":"invalid_format","message":"format must be json or prometheus"}})",
+                "application/json; charset=utf-8");
+            return;
+        }
+        if (format == MetricsFormat::Json) {
+            res.set_content(metrics_json_body(), "application/json; charset=utf-8");
+            return;
+        }
+        res.set_content(metrics_.render(service_->runtime_stats(), service_->is_available()),
                         "text/plain; version=0.0.4; charset=utf-8");
     });
     server_.Get(api_route_pattern(R"(/models/(.+))"),
@@ -561,8 +624,10 @@ void HttpServer::attach(GenerationService& service) {
         throw std::logic_error("HTTP generation service is already attached");
     }
     const infernix::LoadSummary load = service.load_summary();
-    // memory_summary waits for the completed worker boundary, including warmup publication.
+    // memory_summary waits for the completed worker boundary, including warmup publication. The
+    // execution maxima restart here, so /metrics reports serving's, not the warm-up's.
     const infernix::MemorySummary memory  = service.memory_summary();
+    service.reset_execution_maxima();
     const infernix::RuntimeStats baseline = service.runtime_stats();
     public_model_id_                    = resolve_public_model_id(options_, load.model_name);
     model_metadata_                     = service.model_metadata();
@@ -587,14 +652,47 @@ bool HttpServer::listen() {
         stats_stopping_ = false;
         stats_thread_   = std::thread([this] { run_stats_reporter(); });
     }
+    watch_stopping_ = false;
+    watch_thread_   = std::thread([this] { run_engine_watch(); });
     try {
         const bool result = server_.listen_after_bind();
+        stop_engine_watch();
         stop_stats_reporter();
-        return result;
+        // A stop for an Engine failure is not a listen failure.
+        return result || engine_failed_.load();
     } catch (...) {
+        stop_engine_watch();
         stop_stats_reporter();
         throw;
     }
+}
+
+void HttpServer::run_engine_watch() {
+    for (;;) {
+        {
+            std::unique_lock lock(watch_mutex_);
+            if (watch_cv_.wait_for(lock, kEngineWatchInterval, [this] { return watch_stopping_; })) {
+                return;
+            }
+        }
+        // The failed Engine has already answered every request with an error; nothing more can
+        // be served, so the accept loop ends and the process exits for a launcher to restart.
+        if (service_->has_failed()) {
+            engine_failed_.store(true);
+            server_.stop();
+            return;
+        }
+    }
+}
+
+void HttpServer::stop_engine_watch() {
+    if (!watch_thread_.joinable()) { return; }
+    {
+        std::lock_guard lock(watch_mutex_);
+        watch_stopping_ = true;
+    }
+    watch_cv_.notify_one();
+    watch_thread_.join();
 }
 
 void HttpServer::stop() {

@@ -1,4 +1,5 @@
 #include "infernix/ops/gdn_gating.h"
+#include "ops/op_family.h"
 
 #include "ops/op_tester.h"
 
@@ -137,7 +138,7 @@ int run_case(std::int32_t tokens, std::uint32_t seed, bool stress_transcendental
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(gdn_gating) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;

@@ -7,6 +7,7 @@
 // - ple_gate with FP32 norm weights (FP4-Local's trained norms) against the FP64 closed formula,
 //   under the bound it meets with BF16 norms: |out - ref| <= 2^-8 |ref| + 2^-12 rms(ref).
 
+#include "ops/op_family.h"
 #include "infernix/ops/ple.h"
 #include "ops/linear/linear_test_common.h"
 #include "ops/op_tester.h"
@@ -219,7 +220,7 @@ void gate_fp32_norms() {
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(ple_nvfp4) {
     try {
         if (!t::linear::cuda_available()) {
             std::printf("SKIP: no CUDA device\n");

@@ -21,7 +21,8 @@ struct Buffers {
 };
 
 template <class A>
-Buffers allocate(A& a, const OffloadedMoeParameters& p, const moe::ExpertShape& shape, std::int32_t T) {
+Buffers allocate(A& a, const OffloadedMoeParameters& p, const moe::ExpertShape& shape, std::int32_t T,
+                 moe::WideA16 wide_a16) {
     const auto E = static_cast<std::int32_t>(p.experts), K = static_cast<std::int32_t>(p.top_k);
     const std::int32_t entries  = (K + 1) * T; // the routed entries and the shared job's
     const std::int32_t max_jobs = std::min(E, K * T) + 1;
@@ -33,7 +34,7 @@ Buffers allocate(A& a, const OffloadedMoeParameters& p, const moe::ExpertShape& 
     b.dispatch = a.alloc_bytes(ops::moe_dispatch_bytes(E + 1, entries));
     b.outputs  = a.alloc(DType::BF16, {shape.hidden, entries});
     b.experts  = a.alloc_bytes(
-        ops::moe_experts_workspace_bytes(shape, max_jobs, entries, T, moe::ExpertActivation::kA16, moe::WideA16::kExact));
+        ops::moe_experts_workspace_bytes(shape, max_jobs, entries, T, moe::ExpertActivation::kA16, wide_a16));
     b.y        = a.alloc(DType::BF16, {shape.hidden, T});
     return b;
 }
@@ -91,11 +92,12 @@ void warm_next(const BlockParameters& next, std::int32_t columns, ops::MoeExpert
 
 } // namespace
 
-std::size_t offloaded_moe_workspace_bytes(const OffloadedMoeParameters& p, std::int32_t first, std::int32_t last) {
+std::size_t offloaded_moe_workspace_bytes(const OffloadedMoeParameters& p, std::int32_t first, std::int32_t last,
+                                          moe::WideA16 wide_a16) {
     if (first <= 0 || last < first) { throw std::invalid_argument("offloaded MoE: invalid column interval"); }
-    // Every allocation grows with T: the interval's widest call bounds it.
+    // Every allocation grows with T (the A4 residual planes too): the interval's widest call bounds it.
     WorkspaceLayoutBuilder layout;
-    (void)allocate(layout, p, p.bank->shape(), last);
+    (void)allocate(layout, p, p.bank->shape(), last, wide_a16);
     return layout.peak_bytes(1);
 }
 
@@ -110,11 +112,15 @@ void offloaded_moe(const Tensor& hidden, const OffloadedMoeParameters& p, Tensor
     ops::MoeExpertSource source = experts.sources.at(p.layer);
     // A wide pass's arena is already the span the expert cache lent the pass (prefill.cpp).
     auto scope = workspace.scope();
-    Buffers b  = allocate(workspace, p, source.shape, T);
+    Buffers b  = allocate(workspace, p, source.shape, T, experts.wide_a16);
 
     // Router and shared-gate logits: one FP32 dot product each, read at BF16 by the route.
     const Tensor* rows[] = {&p.router, &p.shared_score};
-    ops::projection_fp32(hidden, rows, b.logits, s);
+    if (experts.router_mma && T >= kRouterMmaMinColumns) {
+        ops::projection_fp32_router_mma(hidden, rows, b.logits, s);
+    } else {
+        ops::projection_fp32(hidden, rows, b.logits, s);
+    }
     ops::MoeRouting routing{b.ids, b.weights, b.gate, call.mask};
     ops::MoeDispatch dispatch = ops::carve_moe_dispatch(b.dispatch.data, E + 1, (K + 1) * T);
     std::int32_t* route_log   = nullptr;
@@ -173,6 +179,7 @@ void offloaded_moe(const Tensor& hidden, const OffloadedMoeParameters& p, Tensor
             if (cpu > 0) {
                 source.cpu.max_columns               = moe::kMaxCpuCallColumns;
                 source.cpu.pcie_divisor              = 0;
+                source.cpu.pcie_share                = 0;
                 source.cpu.one_column_divisor        = 0;
                 source.cpu.one_column_divisor_device = nullptr;
                 source.cpu.wide_from                 = 1;
@@ -194,7 +201,7 @@ void offloaded_moe(const Tensor& hidden, const OffloadedMoeParameters& p, Tensor
     }
 
     const std::int32_t max_jobs = std::min(E, K * T) + 1;
-    source.wide_a16             = moe::WideA16::kExact;
+    source.wide_a16             = experts.wide_a16;
     const bool planned =
         streaming == nullptr && ops::moe_route_dispatch_plan(b.logits, K, routing, dispatch, route_log, hidden, source,
                                                              max_jobs, b.experts.data, b.outputs, s,

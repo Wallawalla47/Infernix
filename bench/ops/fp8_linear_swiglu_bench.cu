@@ -6,6 +6,7 @@
 #include "core/device.h"
 #include "infernix_bench_common.h"
 #include "quantized_weight.cuh"
+#include "roofline.h"
 
 #include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
@@ -22,6 +23,7 @@
 #include <vector>
 
 using namespace infernix;
+namespace roofline = infernix::bench::roofline;
 
 namespace {
 
@@ -29,7 +31,6 @@ constexpr std::int32_t kGateUpRows        = 34816;
 constexpr std::int32_t kOutputRows        = 17408;
 constexpr std::int32_t kHidden            = 5120;
 constexpr std::size_t kFlushBytes         = 256ULL << 20;
-constexpr double kMxFp8Fp32AccumulatePeak = 838.0;
 
 struct Options {
     ops::LinearPolicy policy = ops::LinearPolicy::AllowA8;
@@ -158,7 +159,7 @@ int main(int argc, char** argv) {
         }
 
         std::printf("# mxfp8_fp32_accumulate_peak_tflops=%.1f cache=cold\n",
-                    kMxFp8Fp32AccumulatePeak);
+                    roofline::kMxfp8Fp32AccumulateTFLOPs);
         std::printf("%-4s %6s %11s %11s %11s %10s %10s %8s\n", "pol", "T", "median_us", "min_us",
                     "p95_us", "eff_GB/s", "TFLOP/s", "TC_%");
         for (const std::int32_t tokens : options.tokens) {
@@ -171,8 +172,9 @@ int main(int argc, char** argv) {
                                  2.0 * static_cast<double>(kHidden + kOutputRows) * tokens;
             const double tflops     = flops / seconds / 1.0e12;
             const bool tensor_route = options.policy == ops::LinearPolicy::AllowA8 && tokens >= 5;
-            const double tensor_percent = tensor_route ? 100.0 * tflops / kMxFp8Fp32AccumulatePeak
-                                                       : std::numeric_limits<double>::quiet_NaN();
+            const double tensor_percent =
+                tensor_route ? 100.0 * tflops / roofline::kMxfp8Fp32AccumulateTFLOPs
+                             : std::numeric_limits<double>::quiet_NaN();
             if (std::isfinite(tensor_percent)) {
                 std::printf("%-4s %6d %11.3f %11.3f %11.3f %10.1f %10.2f %8.2f\n",
                             policy_name(options.policy), tokens, timing.median_us, timing.min_us,

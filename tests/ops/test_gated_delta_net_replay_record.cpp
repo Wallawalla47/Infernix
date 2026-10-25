@@ -1,3 +1,4 @@
+#include "ops/op_family.h"
 #include "infernix/ops/gated_delta_net.h"
 
 #include "core/device.h"
@@ -282,7 +283,7 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(gated_delta_net_replay_record) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;

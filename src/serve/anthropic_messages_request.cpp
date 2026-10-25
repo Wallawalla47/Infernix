@@ -1,5 +1,6 @@
 #include "serve/anthropic_messages.h"
 #include "serve/request_validation.h"
+#include "serve/tool_search.h"
 
 #include <algorithm>
 #include <array>
@@ -204,17 +205,67 @@ void merge_turn(GenerationRequest& request, ChatTurn turn) {
 struct ParsedToolResult {
     std::string tool_use_id;
     std::vector<ContentPart> content;
+    // Definitions loaded by tool_reference blocks (client tool search) or a server search result.
+    std::vector<ToolDefinition> loaded_tools;
     bool is_error = false;
     std::optional<CacheBoundary::Ttl> cache_boundary_after;
 };
 
 using ParsedUserBlock = std::variant<ContentPart, ParsedToolResult>;
 
+// One generation inside an Assistant message. A message that ran server-side tool searches holds
+// several: every block after a search result belongs to the next generation, which the server ran
+// after appending that result.
+struct AssistantRound {
+    ChatTurn turn;
+    std::unordered_set<std::string> server_call_ids;
+    std::vector<ParsedToolResult> server_results; // in block order
+};
+
 struct ParsedMessage {
     ChatRole role = ChatRole::User;
-    ChatTurn turn;
+    ChatTurn turn; // System messages
     std::vector<ParsedUserBlock> user_blocks;
+    std::vector<AssistantRound> rounds; // Assistant messages: at least one
 };
+
+// The request state history lowering resolves against: declared tools and search tools.
+struct LoweringContext {
+    const GenerationRequest& request;
+    const std::vector<AnthropicToolSearch>& searches;
+
+    [[nodiscard]] bool is_search_tool(std::string_view name) const {
+        return std::any_of(searches.begin(), searches.end(),
+                           [&](const AnthropicToolSearch& search) { return search.name == name; });
+    }
+};
+
+const ToolDefinition& referenced_tool(const GenerationRequest& request, const std::string& name) {
+    for (const ToolDefinition& tool : request.tools) {
+        if (tool.name == name) { return tool; }
+    }
+    bad_request("Tool reference '" + name + "' not found in available tools", "messages",
+                "tool_reference_not_found");
+}
+
+// Each tool loads once per result; repeated references keep the first position.
+void load_tool(std::vector<ToolDefinition>& loaded, const ToolDefinition& tool) {
+    if (std::none_of(loaded.begin(), loaded.end(),
+                     [&](const ToolDefinition& item) { return item.name == tool.name; })) {
+        ToolDefinition copy           = tool;
+        copy.cache_boundary_after.reset();
+        loaded.push_back(std::move(copy));
+    }
+}
+
+std::string require_tool_reference_name(const Json& reference) {
+    if (!reference.is_object() || !reference.contains("tool_name") ||
+        !reference.at("tool_name").is_string() ||
+        reference.at("tool_name").get_ref<const std::string&>().empty()) {
+        bad_request("tool_reference blocks must contain a non-empty string tool_name", "messages");
+    }
+    return reference.at("tool_name").get<std::string>();
+}
 
 std::string require_tool_history_id(const Json& object, const char* key,
                                     std::string_view block_name) {
@@ -225,7 +276,11 @@ std::string require_tool_history_id(const Json& object, const char* key,
     return object.at(key).get<std::string>();
 }
 
-std::vector<ContentPart> parse_tool_result_content(const Json& block) {
+// tool_reference blocks (a client-side tool search) load the referenced definitions after the
+// result's text and images instead of standing at their own position.
+std::vector<ContentPart> parse_tool_result_content(const Json& block,
+                                                   const GenerationRequest& request,
+                                                   std::vector<ToolDefinition>& loaded) {
     if (!block.contains("content") || block.at("content").is_null()) { return {text_part({})}; }
     const Json& content = block.at("content");
     if (content.is_string()) { return {text_part(content.get<std::string>())}; }
@@ -240,12 +295,14 @@ std::vector<ContentPart> parse_tool_result_content(const Json& block) {
                                        cache_boundary(part, "messages")));
         } else if (type == "image") {
             result.push_back(parse_image(part));
+        } else if (type == "tool_reference") {
+            load_tool(loaded, referenced_tool(request, require_tool_reference_name(part)));
         } else {
             bad_request("unsupported tool_result content block: " + type, "messages",
                         "content_block_not_supported");
         }
     }
-    if (result.empty()) { result.push_back(text_part({})); }
+    if (result.empty() && loaded.empty()) { result.push_back(text_part({})); }
     return result;
 }
 
@@ -260,10 +317,10 @@ ToolCall parse_tool_use(const Json& block) {
     return call;
 }
 
-ParsedToolResult parse_tool_result(const Json& block) {
+ParsedToolResult parse_tool_result(const Json& block, const GenerationRequest& request) {
     ParsedToolResult result;
     result.tool_use_id = require_tool_history_id(block, "tool_use_id", "tool_result block");
-    result.content     = parse_tool_result_content(block);
+    result.content     = parse_tool_result_content(block, request, result.loaded_tools);
     if (block.contains("is_error") && !block.at("is_error").is_null()) {
         if (!block.at("is_error").is_boolean()) {
             bad_request("tool_result.is_error must be a boolean", "messages");
@@ -274,7 +331,8 @@ ParsedToolResult parse_tool_result(const Json& block) {
     return result;
 }
 
-std::vector<ParsedUserBlock> parse_user_blocks(const Json& content) {
+std::vector<ParsedUserBlock> parse_user_blocks(const Json& content,
+                                               const LoweringContext& context) {
     std::vector<ParsedUserBlock> result;
     result.reserve(content.size());
     for (const Json& block : content) {
@@ -285,7 +343,10 @@ std::vector<ParsedUserBlock> parse_user_blocks(const Json& content) {
         } else if (type == "image") {
             result.emplace_back(parse_image(block));
         } else if (type == "tool_result") {
-            result.emplace_back(parse_tool_result(block));
+            result.emplace_back(parse_tool_result(block, context.request));
+        } else if (type == "tool_reference") {
+            bad_request("tool_reference blocks are valid only inside a tool_result", "messages",
+                        "content_block_not_supported");
         } else if (type == "document") {
             bad_request("document blocks require document and citation semantics that Infernix does "
                         "not provide",
@@ -306,12 +367,46 @@ std::vector<ParsedUserBlock> parse_user_blocks(const Json& content) {
     return result;
 }
 
-ChatTurn parse_assistant_blocks(const Json& content) {
-    ChatTurn assistant;
-    assistant.role = ChatRole::Assistant;
+ParsedToolResult parse_server_tool_search_result(const Json& block, AssistantRound& round,
+                                                 const LoweringContext& context) {
+    std::string tool_use_id =
+        require_tool_history_id(block, "tool_use_id", "tool_search_tool_result block");
+    if (!round.server_call_ids.contains(tool_use_id) ||
+        std::any_of(round.server_results.begin(), round.server_results.end(),
+                    [&](const ParsedToolResult& result) {
+                        return result.tool_use_id == tool_use_id;
+                    })) {
+        invalid_tool_history("tool_search_tool_result for '" + tool_use_id +
+                             "' must follow its own server_tool_use in the same generation");
+    }
+    if (!block.contains("content") || !block.at("content").is_object()) {
+        bad_request("tool_search_tool_result blocks must contain a content object", "messages");
+    }
+    ChatTurn lowered = lower_anthropic_tool_search_result(block.at("content"), tool_use_id,
+                                                          context.request);
+    ParsedToolResult result;
+    result.tool_use_id          = std::move(tool_use_id);
+    result.content              = std::move(lowered.content);
+    result.loaded_tools         = std::move(lowered.loaded_tools);
+    result.is_error             = lowered.tool_result_is_error;
+    result.cache_boundary_after = cache_boundary(block, "messages");
+    return result;
+}
+
+std::vector<AssistantRound> parse_assistant_blocks(const Json& content,
+                                                   const LoweringContext& context) {
+    std::vector<AssistantRound> rounds(1);
+    rounds.back().turn.role = ChatRole::Assistant;
     for (std::size_t index = 0; index < content.size(); ++index) {
         const Json& block      = content[index];
         const std::string type = require_block_type(block, "messages");
+        if (type != "tool_search_tool_result" && !rounds.back().server_results.empty()) {
+            // The server ran the next generation after appending the search results.
+            rounds.emplace_back();
+            rounds.back().turn.role = ChatRole::Assistant;
+        }
+        AssistantRound& round = rounds.back();
+        ChatTurn& assistant   = round.turn;
         if (type == "text") {
             assistant.content.push_back(
                 text_part(require_string(block, "text", "messages", "text block"),
@@ -351,6 +446,17 @@ ChatTurn parse_assistant_blocks(const Json& content) {
                 // A valid non-terminal tool_use breakpoint cannot be represented by the Qwen
                 // flattened assistant turn. It is advisory, so execution continues without it.
             }
+        } else if (type == "server_tool_use" && block.contains("name") &&
+                   block.at("name").is_string() &&
+                   context.is_search_tool(block.at("name").get_ref<const std::string&>())) {
+            ToolCall call = parse_tool_use(block);
+            if (!round.server_call_ids.insert(call.id).second) {
+                invalid_tool_history("duplicate server_tool_use id '" + call.id + "'");
+            }
+            assistant.tool_calls.push_back(std::move(call));
+            // A server call is always followed by its result, so its breakpoint is never final.
+        } else if (type == "tool_search_tool_result") {
+            round.server_results.push_back(parse_server_tool_search_result(block, round, context));
         } else if (is_server_tool_block(type)) {
             bad_request("server tool content blocks require an executor that Infernix does not "
                         "provide",
@@ -360,7 +466,7 @@ ChatTurn parse_assistant_blocks(const Json& content) {
                         "content_block_not_supported");
         }
     }
-    return assistant;
+    return rounds;
 }
 
 ChatTurn parse_system_value(const Json& value, const char* param, std::size_t first_block = 0) {
@@ -646,6 +752,23 @@ void parse_system(const Json& body, GenerationRequest& request,
     if (!system.content.empty()) { request.messages.push_back(std::move(system)); }
 }
 
+// Consecutive Assistant messages form one. A generation with no search result yet continues with
+// the next message's first blocks; after a result, the next message's blocks are later generations.
+void append_rounds(std::vector<AssistantRound>& target, std::vector<AssistantRound> rounds) {
+    auto next = rounds.begin();
+    if (next != rounds.end() && !target.empty() && target.back().server_results.empty()) {
+        AssistantRound& open = target.back();
+        append_turn(open.turn, std::move(next->turn));
+        open.server_call_ids.insert(next->server_call_ids.begin(), next->server_call_ids.end());
+        open.server_results.insert(open.server_results.end(),
+                                   std::make_move_iterator(next->server_results.begin()),
+                                   std::make_move_iterator(next->server_results.end()));
+        ++next;
+    }
+    target.insert(target.end(), std::make_move_iterator(next),
+                  std::make_move_iterator(rounds.end()));
+}
+
 std::vector<ParsedMessage> normalize_same_role_messages(std::vector<ParsedMessage> messages) {
     std::vector<ParsedMessage> normalized;
     normalized.reserve(messages.size());
@@ -661,10 +784,54 @@ std::vector<ParsedMessage> normalize_same_role_messages(std::vector<ParsedMessag
                                       std::make_move_iterator(message.user_blocks.begin()),
                                       std::make_move_iterator(message.user_blocks.end()));
         } else {
-            append_turn(target.turn, std::move(message.turn));
+            append_rounds(target.rounds, std::move(message.rounds));
         }
     }
     return normalized;
+}
+
+bool is_server_call(const AssistantRound& round, const ToolCall& call) {
+    return round.server_call_ids.contains(call.id);
+}
+
+bool has_server_result(const AssistantRound& round, const std::string& id) {
+    return std::any_of(round.server_results.begin(), round.server_results.end(),
+                       [&](const ParsedToolResult& result) { return result.tool_use_id == id; });
+}
+
+// Every generation but the last ended in searches the server answered within the message; the
+// last may also call client tools, whose results come from the next User message.
+void validate_assistant_rounds(const ParsedMessage& message) {
+    for (std::size_t index = 0; index < message.rounds.size(); ++index) {
+        const AssistantRound& round = message.rounds[index];
+        const bool last             = index + 1U == message.rounds.size();
+        for (const ToolCall& call : round.turn.tool_calls) {
+            if (!is_server_call(round, call)) {
+                if (!last) {
+                    invalid_tool_history("tool_use id '" + call.id +
+                                         "' has no tool_result: its assistant message continues "
+                                         "after a tool search result");
+                }
+            } else if (!has_server_result(round, call.id)) {
+                invalid_tool_history("server_tool_use id '" + call.id +
+                                     "' has no tool_search_tool_result");
+            }
+        }
+    }
+}
+
+// The round's server results in call order.
+std::vector<ParsedToolResult> take_server_results(AssistantRound& round) {
+    std::vector<ParsedToolResult> ordered;
+    ordered.reserve(round.server_results.size());
+    for (const ToolCall& call : round.turn.tool_calls) {
+        const auto found = std::find_if(
+            round.server_results.begin(), round.server_results.end(),
+            [&](const ParsedToolResult& result) { return result.tool_use_id == call.id; });
+        if (found != round.server_results.end()) { ordered.push_back(std::move(*found)); }
+    }
+    round.server_results.clear();
+    return ordered;
 }
 
 std::size_t validate_user_result_prefix(const ParsedMessage& message) {
@@ -692,10 +859,12 @@ std::size_t validate_user_result_prefix(const ParsedMessage& message) {
 
 void validate_assistant_tool_ids(const ParsedMessage& message) {
     std::unordered_set<std::string> ids;
-    for (const ToolCall& call : message.turn.tool_calls) {
-        if (!ids.insert(call.id).second) {
-            invalid_tool_history("duplicate tool_use id '" + call.id +
-                                 "' in one assistant message");
+    for (const AssistantRound& round : message.rounds) {
+        for (const ToolCall& call : round.turn.tool_calls) {
+            if (!ids.insert(call.id).second) {
+                invalid_tool_history("duplicate tool_use id '" + call.id +
+                                     "' in one assistant message");
+            }
         }
     }
 }
@@ -708,17 +877,25 @@ void normalize_tool_history(std::vector<ParsedMessage>& messages) {
             result_counts[index] = validate_user_result_prefix(messages[index]);
         } else if (messages[index].role == ChatRole::Assistant) {
             validate_assistant_tool_ids(messages[index]);
+            validate_assistant_rounds(messages[index]);
         }
     }
 
     for (std::size_t index = 0; index < messages.size(); ++index) {
         ParsedMessage& assistant = messages[index];
-        if (assistant.role != ChatRole::Assistant || assistant.turn.tool_calls.empty()) {
-            continue;
+        if (assistant.role != ChatRole::Assistant) { continue; }
+        // Only the final generation can wait for client results; server searches carry their own.
+        AssistantRound& round = assistant.rounds.back();
+        std::unordered_set<std::string> call_ids;
+        for (const ToolCall& call : round.turn.tool_calls) {
+            if (!is_server_call(round, call)) { call_ids.insert(call.id); }
         }
+        if (call_ids.empty()) { continue; }
+        const auto first_client_call =
+            std::find_if(round.turn.tool_calls.begin(), round.turn.tool_calls.end(),
+                         [&](const ToolCall& call) { return !is_server_call(round, call); });
         if (index + 1U >= messages.size() || messages[index + 1U].role != ChatRole::User) {
-            invalid_tool_history("tool_result for visible tool_use id '" +
-                                 assistant.turn.tool_calls.front().id +
+            invalid_tool_history("tool_result for visible tool_use id '" + first_client_call->id +
                                  "' must immediately follow its assistant message");
         }
 
@@ -732,28 +909,37 @@ void normalize_tool_history(std::vector<ParsedMessage>& messages) {
             result_by_id.emplace(result.tool_use_id, result_index);
         }
 
-        std::unordered_set<std::string> call_ids;
-        call_ids.reserve(assistant.turn.tool_calls.size());
-        for (const ToolCall& call : assistant.turn.tool_calls) { call_ids.insert(call.id); }
         for (std::size_t result_index = 0; result_index < result_count; ++result_index) {
             const ParsedToolResult& result =
                 std::get<ParsedToolResult>(user.user_blocks[result_index]);
+            if (round.server_call_ids.contains(result.tool_use_id)) {
+                invalid_tool_history("tool_result id '" + result.tool_use_id +
+                                     "' answers a server_tool_use, whose result the server "
+                                     "already returned");
+            }
             if (!call_ids.contains(result.tool_use_id)) {
                 invalid_tool_history("unknown tool_result id '" + result.tool_use_id +
                                      "' after visible assistant tool_use");
             }
         }
-        for (const ToolCall& call : assistant.turn.tool_calls) {
-            if (!result_by_id.contains(call.id)) {
+        for (const ToolCall& call : round.turn.tool_calls) {
+            if (!is_server_call(round, call) && !result_by_id.contains(call.id)) {
                 invalid_tool_history("missing tool_result for visible tool_use id '" + call.id +
                                      "'");
             }
         }
 
+        // Results follow call order, the generation's search results among the client's.
+        std::vector<ParsedToolResult> server_results = take_server_results(round);
+        auto next_server                             = server_results.begin();
         std::vector<ParsedUserBlock> ordered;
-        ordered.reserve(user.user_blocks.size());
-        for (const ToolCall& call : assistant.turn.tool_calls) {
-            ordered.push_back(std::move(user.user_blocks[result_by_id.at(call.id)]));
+        ordered.reserve(user.user_blocks.size() + server_results.size());
+        for (const ToolCall& call : round.turn.tool_calls) {
+            if (is_server_call(round, call)) {
+                ordered.emplace_back(std::move(*next_server++));
+            } else {
+                ordered.push_back(std::move(user.user_blocks[result_by_id.at(call.id)]));
+            }
         }
         for (std::size_t block_index = result_count; block_index < user.user_blocks.size();
              ++block_index) {
@@ -773,10 +959,35 @@ void normalize_tool_history(std::vector<ParsedMessage>& messages) {
     }
 }
 
+void lower_tool_result(GenerationRequest& request, ParsedToolResult result) {
+    ChatTurn tool;
+    tool.role                 = ChatRole::Tool;
+    tool.tool_call_id         = std::move(result.tool_use_id);
+    tool.content              = std::move(result.content);
+    tool.loaded_tools         = std::move(result.loaded_tools);
+    tool.tool_result_is_error = result.is_error;
+    if (result.cache_boundary_after) {
+        tool.cache_boundary_after = explicit_cache_boundary(*result.cache_boundary_after);
+    }
+    request.messages.push_back(std::move(tool));
+}
+
 void lower_messages(std::vector<ParsedMessage> messages, GenerationRequest& request) {
     for (ParsedMessage& message : messages) {
-        if (message.role != ChatRole::User) {
+        if (message.role == ChatRole::System) {
             merge_turn(request, std::move(message.turn));
+            continue;
+        }
+        if (message.role == ChatRole::Assistant) {
+            // Each generation, then its search results; a final generation's results that share
+            // a turn with client calls were moved into the next User message in call order.
+            for (AssistantRound& round : message.rounds) {
+                std::vector<ParsedToolResult> results = take_server_results(round);
+                merge_turn(request, std::move(round.turn));
+                for (ParsedToolResult& result : results) {
+                    lower_tool_result(request, std::move(result));
+                }
+            }
             continue;
         }
 
@@ -787,16 +998,7 @@ void lower_messages(std::vector<ParsedMessage> messages, GenerationRequest& requ
                 user.content.push_back(std::move(std::get<ContentPart>(block)));
                 continue;
             }
-            ParsedToolResult& result = std::get<ParsedToolResult>(block);
-            ChatTurn tool;
-            tool.role                 = ChatRole::Tool;
-            tool.tool_call_id         = std::move(result.tool_use_id);
-            tool.content              = std::move(result.content);
-            tool.tool_result_is_error = result.is_error;
-            if (result.cache_boundary_after) {
-                tool.cache_boundary_after = explicit_cache_boundary(*result.cache_boundary_after);
-            }
-            request.messages.push_back(std::move(tool));
+            lower_tool_result(request, std::move(std::get<ParsedToolResult>(block)));
         }
         if (!user.content.empty() || message.user_blocks.empty()) {
             merge_turn(request, std::move(user));
@@ -804,7 +1006,7 @@ void lower_messages(std::vector<ParsedMessage> messages, GenerationRequest& requ
     }
 }
 
-void parse_messages(const Json& body, GenerationRequest& request) {
+void parse_messages(const Json& body, GenerationRequest& request, const LoweringContext& context) {
     if (!body.contains("messages")) { bad_request("missing required field: messages", "messages"); }
     const Json& messages = body.at("messages");
     if (!messages.is_array() || messages.empty()) {
@@ -864,7 +1066,10 @@ void parse_messages(const Json& body, GenerationRequest& request) {
         }
         if (content.is_string()) {
             if (role == ChatRole::Assistant) {
-                message.turn.content.push_back(text_part(content.get<std::string>()));
+                AssistantRound round;
+                round.turn.role = ChatRole::Assistant;
+                round.turn.content.push_back(text_part(content.get<std::string>()));
+                message.rounds.push_back(std::move(round));
             } else {
                 message.user_blocks.emplace_back(text_part(content.get<std::string>()));
             }
@@ -875,9 +1080,9 @@ void parse_messages(const Json& body, GenerationRequest& request) {
             bad_request("message content must be a string or an array", "messages");
         }
         if (role == ChatRole::Assistant) {
-            message.turn = parse_assistant_blocks(content);
+            message.rounds = parse_assistant_blocks(content, context);
         } else {
-            message.user_blocks = parse_user_blocks(content);
+            message.user_blocks = parse_user_blocks(content, context);
         }
         parsed.push_back(std::move(message));
     }
@@ -930,6 +1135,7 @@ ToolSelection parse_tool_choice(const Json& body) {
 
 enum class ToolSource {
     UserDefined,
+    ToolSearch,
     AnthropicProvided,
     Toolset,
 };
@@ -940,7 +1146,56 @@ struct ParsedTool {
     std::string source_type;
     bool defer_loading = false;
     std::optional<std::vector<std::string>> allowed_callers;
+    std::optional<AnthropicToolSearch> search;
 };
+
+struct ToolSearchType {
+    std::string_view type;
+    std::string_view name;
+    AnthropicToolSearchVariant variant;
+};
+
+constexpr std::array<ToolSearchType, 2> kToolSearchTypes{{
+    {"tool_search_tool_regex_20251119", "tool_search_tool_regex", AnthropicToolSearchVariant::Regex},
+    {"tool_search_tool_bm25_20251119", "tool_search_tool_bm25", AnthropicToolSearchVariant::Bm25},
+}};
+
+// How the model sees a tool search tool: an ordinary function whose fixed description and schema
+// keep the prompt's tool section identical on every request.
+constexpr std::string_view kRegexSearchDescription =
+    "Search the deferred tools: tools you can call whose definitions are not loaded yet. The "
+    "pattern is a Python regular expression, matched case-insensitively (re.search) against each "
+    "deferred tool's name, description, argument names and argument descriptions. Matching tools "
+    "are loaded and listed in the result, and you can call them as soon as it arrives. Prefer "
+    "broad patterns, such as \"weather\" or \"get_.*_data\".";
+constexpr std::string_view kRegexSearchSchema =
+    R"({"type":"object","properties":{"pattern":{"type":"string","description":"A Python regular expression of at most 200 characters, matched case-insensitively."},"limit":{"type":"integer","description":"The most tools to load, from 1 to 10000. Defaults to 5."}},"required":["pattern"]})";
+constexpr std::string_view kBm25SearchDescription =
+    "Search the deferred tools: tools you can call whose definitions are not loaded yet. The query "
+    "is natural language; deferred tools are ranked by how well their names, descriptions, "
+    "argument names and argument descriptions match its words. The best matches are loaded and "
+    "listed in the result, and you can call them as soon as it arrives.";
+constexpr std::string_view kBm25SearchSchema =
+    R"({"type":"object","properties":{"query":{"type":"string","description":"A natural-language description of the tools you need, at most 500 characters."},"limit":{"type":"integer","description":"The most tools to load, from 1 to 10000. Defaults to 5."}},"required":["query"]})";
+
+void define_tool_search(ParsedTool& parsed, const ToolSearchType& type, const Json& item) {
+    if (item.contains("name") && !item.at("name").is_null() &&
+        (!item.at("name").is_string() || item.at("name").get_ref<const std::string&>() != type.name)) {
+        bad_request("tool type '" + std::string(type.type) + "' must be named '" +
+                        std::string(type.name) + "'",
+                    "tools");
+    }
+    parsed.source            = ToolSource::ToolSearch;
+    parsed.search            = AnthropicToolSearch{.name = std::string(type.name), .variant = type.variant};
+    parsed.definition.name   = std::string(type.name);
+    const bool regex         = type.variant == AnthropicToolSearchVariant::Regex;
+    parsed.definition.description =
+        std::string(regex ? kRegexSearchDescription : kBm25SearchDescription);
+    parsed.definition.input_schema_json = std::string(regex ? kRegexSearchSchema : kBm25SearchSchema);
+    if (const auto ttl = cache_boundary(item, "tools")) {
+        parsed.definition.cache_boundary_after = explicit_cache_boundary(*ttl);
+    }
+}
 
 std::vector<ParsedTool> parse_tool_definitions(const Json& body) {
     std::vector<ParsedTool> result;
@@ -958,10 +1213,18 @@ std::vector<ParsedTool> parse_tool_definitions(const Json& body) {
                 bad_request("tool type must be a string or null", "tools");
             }
             parsed.source_type = item.at("type").get<std::string>();
+            const auto search  = std::find_if(
+                kToolSearchTypes.begin(), kToolSearchTypes.end(),
+                [&](const ToolSearchType& type) { return type.type == parsed.source_type; });
             if (parsed.source_type == "custom") {
                 parsed.source = ToolSource::UserDefined;
             } else if (parsed.source_type == "toolset") {
                 parsed.source = ToolSource::Toolset;
+            } else if (search != kToolSearchTypes.end()) {
+                define_tool_search(parsed, *search, item);
+                if (!names.insert(parsed.definition.name).second) {
+                    bad_request("duplicate tool name: " + parsed.definition.name, "tools");
+                }
             } else {
                 parsed.source = ToolSource::AnthropicProvided;
             }
@@ -991,7 +1254,8 @@ std::vector<ParsedTool> parse_tool_definitions(const Json& body) {
             if (const auto ttl = cache_boundary(item, "tools")) {
                 parsed.definition.cache_boundary_after = explicit_cache_boundary(*ttl);
             }
-        } else if (item.contains("name") && item.at("name").is_string()) {
+        } else if (parsed.source != ToolSource::ToolSearch && item.contains("name") &&
+                   item.at("name").is_string()) {
             parsed.definition.name = item.at("name").get<std::string>();
         }
 
@@ -1028,9 +1292,46 @@ std::vector<ParsedTool> parse_tool_definitions(const Json& body) {
     return result;
 }
 
-void lower_tools(const Json& body, GenerationRequest& request) {
+// defer_loading keeps a user-defined tool out of the prompt until a search result or a
+// tool_reference loads it. Anthropic's rules: the search tool itself is never deferred, a deferred
+// tool carries no cache breakpoint, and at least one tool stays listed.
+void validate_deferral(std::vector<ParsedTool>& definitions) {
+    std::size_t deferred = 0;
+    bool listed          = false;
+    for (ParsedTool& tool : definitions) {
+        if (!tool.defer_loading) {
+            listed = listed || tool.source == ToolSource::UserDefined ||
+                     tool.source == ToolSource::ToolSearch;
+            continue;
+        }
+        if (tool.source == ToolSource::ToolSearch) {
+            bad_request("the tool search tool cannot set defer_loading=true", "tools",
+                        "invalid_deferred_tool");
+        }
+        if (tool.source != ToolSource::UserDefined) { continue; }
+        if (tool.definition.cache_boundary_after) {
+            bad_request("a tool with defer_loading=true cannot carry cache_control", "tools",
+                        "invalid_cache_control");
+        }
+        tool.definition.deferred = true;
+        ++deferred;
+    }
+    if (deferred != 0 && !listed) {
+        bad_request("At least one tool must have defer_loading=false. All tools cannot be deferred.",
+                    "tools", "all_tools_deferred");
+    }
+    if (deferred > kToolSearchMaximumDeferred) {
+        bad_request("at most " + std::to_string(kToolSearchMaximumDeferred) +
+                        " tools may set defer_loading=true",
+                    "tools", "too_many_deferred_tools");
+    }
+}
+
+void lower_tools(const Json& body, GenerationRequest& request,
+                 std::vector<AnthropicToolSearch>& searches) {
     const ToolSelection selection       = parse_tool_choice(body);
     std::vector<ParsedTool> definitions = parse_tool_definitions(body);
+    validate_deferral(definitions);
     const auto named                    = [&](const ParsedTool& tool) {
         return tool.definition.name == selection.name;
     };
@@ -1051,8 +1352,10 @@ void lower_tools(const Json& body, GenerationRequest& request) {
                                        : ToolChoiceMode::Required;
     request.tool_choice.parallel = !selection.disable_parallel;
     if (selection.kind == ToolSelectionKind::None) {
+        // The declarations still render, so the prompt is the one tool_choice:auto would give.
         for (ParsedTool& tool : definitions) {
-            if (tool.source == ToolSource::UserDefined) {
+            if (tool.source == ToolSource::UserDefined || tool.source == ToolSource::ToolSearch) {
+                if (tool.search) { searches.push_back(*tool.search); }
                 request.tools.push_back(std::move(tool.definition));
             }
         }
@@ -1070,11 +1373,7 @@ void lower_tools(const Json& body, GenerationRequest& request) {
                             "Infernix does not provide",
                         "tools", "anthropic_tools_not_supported");
         }
-        if (tool.defer_loading) {
-            bad_request("defer_loading=true requires a deferred tool loader that Infernix does not "
-                        "provide",
-                        "tools", "deferred_tools_not_supported");
-        }
+        if (tool.search) { searches.push_back(*tool.search); }
         if (tool.allowed_callers &&
             std::find(tool.allowed_callers->begin(), tool.allowed_callers->end(), "direct") ==
                 tool.allowed_callers->end()) {
@@ -1219,7 +1518,8 @@ void apply_anthropic_prompt_cache_policy(const Json& body, GenerationRequest& re
 
     std::optional<CacheBoundary>* automatic_target = nullptr;
     for (auto turn = request.messages.rbegin(); turn != request.messages.rend(); ++turn) {
-        if (!turn->tool_calls.empty()) {
+        // Calls and loaded tool definitions render after the turn's content parts.
+        if (!turn->tool_calls.empty() || !turn->loaded_tools.empty()) {
             automatic_target = &turn->cache_boundary_after;
             break;
         }
@@ -1228,8 +1528,10 @@ void apply_anthropic_prompt_cache_policy(const Json& body, GenerationRequest& re
             break;
         }
     }
-    if (automatic_target == nullptr && !request.tools.empty()) {
-        automatic_target = &request.tools.back().cache_boundary_after;
+    if (automatic_target == nullptr) {
+        if (ToolDefinition* listed = request.last_listed_tool()) {
+            automatic_target = &listed->cache_boundary_after;
+        }
     }
     if (automatic_target == nullptr) { return; }
 
@@ -1253,11 +1555,13 @@ void apply_anthropic_prompt_cache_policy(const Json& body, GenerationRequest& re
                       .ttl      = *automatic_ttl};
 }
 
-void parse_common_prompt(const Json& body, GenerationRequest& request, ParsePurpose purpose,
-                         ClaudeCodePrompt claude_code_prompt) {
-    lower_tools(body, request);
+std::vector<AnthropicToolSearch> parse_common_prompt(const Json& body, GenerationRequest& request,
+                                                     ParsePurpose purpose,
+                                                     ClaudeCodePrompt claude_code_prompt) {
+    std::vector<AnthropicToolSearch> searches;
+    lower_tools(body, request, searches);
     parse_system(body, request, claude_code_prompt);
-    parse_messages(body, request);
+    parse_messages(body, request, LoweringContext{.request = request, .searches = searches});
     parse_thinking(body, request);
     parse_effort(body, request, purpose);
     apply_anthropic_prompt_cache_policy(body, request);
@@ -1277,6 +1581,7 @@ void parse_common_prompt(const Json& body, GenerationRequest& request, ParsePurp
         }
         request.preserve_thinking = body.at("preserve_thinking").get<bool>();
     }
+    return searches;
 }
 
 } // namespace
@@ -1303,7 +1608,8 @@ AnthropicMessagesRequest parse_anthropic_messages_request(const Json& body,
         result.generation.max_tokens = limits.default_max_tokens;
     }
 
-    parse_common_prompt(body, result.generation, ParsePurpose::Messages, limits.claude_code_prompt);
+    result.tool_searches = parse_common_prompt(body, result.generation, ParsePurpose::Messages,
+                                               limits.claude_code_prompt);
     result.hide_thinking = thinking_display_omitted(body);
     parse_generation_fields(body, result.generation);
     parse_structured_outputs(body, result.generation);
@@ -1316,8 +1622,8 @@ AnthropicCountTokensRequest parse_anthropic_count_tokens_request(const Json& bod
     AnthropicCountTokensRequest result;
     result.model                           = parse_model(body);
     result.generation.tool_name_max_length = kMaxToolNameLength;
-    parse_common_prompt(body, result.generation, ParsePurpose::CountTokens,
-                        limits.claude_code_prompt);
+    (void)parse_common_prompt(body, result.generation, ParsePurpose::CountTokens,
+                              limits.claude_code_prompt);
     return result;
 }
 

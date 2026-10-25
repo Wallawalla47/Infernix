@@ -28,11 +28,14 @@
 //   C6  Placement invariance: outputs bit-identical for records in frames, staged through 3 or 64
 //       slots, read zero-copy (bulk copies from mapped host memory, last, since only tests use it),
 //       in the double-buffered prefill passes, and on a rerun.
+#include "ops/op_family.h"
 #include "core/vmm_arena.h"
 #include "infernix/ops/offloaded_sparse_moe.h"
 #include "ops/common/canonical_math.h"
 #include "ops/host_parallel.h"
+#include "ops/offloaded_moe_a4r_oracle.h"
 #include "ops/offloaded_moe_fixtures.h"
+#include "ops/offloaded_sparse_moe/cpu/a4r_expert.h"
 #include "ops/offloaded_sparse_moe/cpu/w4a16_expert.h"
 #include "ops/offloaded_sparse_moe/cpu/w4a4_expert.h"
 #include "ops/offloaded_sparse_moe/cuda/wide_expert.cuh"
@@ -208,18 +211,20 @@ Error error_against(const std::uint16_t* y, const std::vector<double>& reference
 
 // ------------------------------------------------------------------------------------ probes
 
-// Writes each valid FP32 accumulator unscaled: probe[(first + column) * rows + row].
+// Writes each valid FP32 accumulator unscaled: probe[(first + column) * rows + row]. T: the warp's
+// 16-column MMA tiles (2: wide::Schedule; 4: wide::WarpTile64).
 struct ProbeEpilogue {
     float* probe;
     int rows;
 
-    __device__ __forceinline__ void operator()(wide::Accumulators& acc, const wide::TileContext& ctx) const {
+    template <int T>
+    __device__ __forceinline__ void operator()(float (&acc)[T][wide::Schedule::kMmaRows][4], const wide::TileContext& ctx) const {
         using S = wide::Schedule;
 #pragma unroll
-        for (int m = 0; m < S::kMmaTokens; ++m) {
+        for (int m = 0; m < T; ++m) {
 #pragma unroll
             for (int half = 0; half < 2; ++half) {
-                const int column = ctx.warp_m * S::kWarpTokens + m * 16 + ctx.group + 8 * half;
+                const int column = ctx.warp_m * 16 * T + m * 16 + ctx.group + 8 * half;
                 if (column >= ctx.columns) { continue; }
                 float* out = probe + static_cast<std::size_t>(ctx.first + column) * rows + ctx.row_block * S::kBlockRows;
 #pragma unroll
@@ -500,6 +505,29 @@ void test_layer(const char* name, int experts, int columns, int top_k, const std
         cuda_check(cudaDeviceSynchronize(), "probes");
         const auto probe_gu   = host_copy(d_probe_gu, static_cast<std::size_t>(entries) * 2 * moe::kIntermediate);
         const auto probe_down = host_copy(d_probe_down, static_cast<std::size_t>(entries) * moe::kHidden);
+        {
+            // TEMPORARY with INFERNIX_TMP_WIDE_EXPERT_T64 (candidates P5): the 64-token warp tile's accumulators
+            // are the default schedule's bit for bit (every output keeps its K-ordered MMA chain).
+            using T64 = wide::WarpTile64<wide::Schedule>;
+            cuda_check(cudaMemset(d_probe_gu, 0xFF, sizeof(float) * entries * 2 * moe::kIntermediate), "cudaMemset");
+            cuda_check(cudaMemset(d_probe_down, 0xFF, sizeof(float) * entries * moe::kHidden), "cudaMemset");
+            wide::launch<wide::Matrix::GateUp, T64>(call, 0, ProbeEpilogue{d_probe_gu, 2 * moe::kIntermediate}, nullptr);
+            wide::launch<wide::Matrix::Down, T64>(call, 0, ProbeEpilogue{d_probe_down, moe::kHidden}, nullptr);
+            cuda_check(cudaDeviceSynchronize(), "T64 probes");
+            const auto t64_gu   = host_copy(d_probe_gu, probe_gu.size());
+            const auto t64_down = host_copy(d_probe_down, probe_down.size());
+            long differing = 0;
+            for (int entry = 0; entry < entries; ++entry) {
+                if (!is_wide(entry)) { continue; }
+                const std::size_t p = static_cast<std::size_t>(packed[static_cast<std::size_t>(entry)]);
+                differing += std::memcmp(&t64_gu[p * 2 * moe::kIntermediate], &probe_gu[p * 2 * moe::kIntermediate],
+                                         sizeof(float) * 2 * moe::kIntermediate) != 0;
+                differing += std::memcmp(&t64_down[p * moe::kHidden], &probe_down[p * moe::kHidden],
+                                         sizeof(float) * moe::kHidden) != 0;
+            }
+            std::printf("   P5 64-token warp tile: %ld wide entries' accumulators differ\n", differing);
+            check(differing == 0, "P5: WarpTile64 accumulators equal the default schedule's bit for bit");
+        }
 
         std::vector<long> c1_bad(static_cast<std::size_t>(entries), 0), c2_bad(static_cast<std::size_t>(entries), 0),
             c3_bad(static_cast<std::size_t>(entries), 0);
@@ -639,12 +667,23 @@ void test_layer(const char* name, int experts, int columns, int top_k, const std
 //       percent and a layout or scale error by ~100 %. A non-finite column's outputs are the canonical
 //       NaN.
 //   A2  as above (the route depends on the data and the column count only).
+// With the two-term narrow route (expert-a4-residual-decode, NarrowA16::kA4Residual):
+//   N1  Narrow entries equal the CPU engine's two-term arithmetic (expert_forward_a4r) bit for bit,
+//       so a CPU-served miss changes nothing, and the GPU route's outputs of up to 48 of them lie
+//       within BF16 rounding of the FP64 expert on the decoded terms (offloaded_moe_a4r_oracle.h,
+//       the CPU test's E4), checked on the GPU's own outputs.
+//   N2  Beside two-term wide calls (the same term encoding, summed by the tensor cores in FP32 order
+//       instead of exactly): each wide entry within 2^-7 relative L2 of the CPU's exact two-term sums
+//       and their mean within 2^-10 (a few FP32 roundings and the BF16 flips they cause; an encoding
+//       difference moves an entry by ~1 %). Wide entries beside exact wide calls keep A1.
 void test_layer_a16(const char* name, int experts, int columns, int top_k, const std::vector<double>& weight,
-                    std::uint32_t seed, bool nonfinite = false, moe::WideA16 route = moe::WideA16::kExact) {
+                    std::uint32_t seed, bool nonfinite = false, moe::WideA16 route = moe::WideA16::kExact,
+                    moe::NarrowA16 narrow = moe::NarrowA16::kExact) {
     const bool a4_residual = route == moe::WideA16::kA4Residual || route == moe::WideA16::kA4Residual3;
     const bool three       = route == moe::WideA16::kA4Residual3;
-    std::printf("== W4A16%s %s: E=%d T=%d k=%d\n", a4_residual ? (three ? " three-term" : " two-term") : "", name,
-                experts, columns, top_k);
+    const bool narrow_a4r  = narrow == moe::NarrowA16::kA4Residual;
+    std::printf("== W4A16%s%s %s: E=%d T=%d k=%d\n", a4_residual ? (three ? " three-term" : " two-term") : "",
+                narrow_a4r ? " (two-term narrow)" : "", name, experts, columns, top_k);
     std::mt19937 rng(seed);
     const std::size_t stride = moe::kRecordBytes;
     std::vector<fixtures::Expert> bank;
@@ -736,6 +775,7 @@ void test_layer_a16(const char* name, int experts, int columns, int top_k, const
                                             .scales        = d_scales,
                                             .activation    = moe::ExpertActivation::kA16,
                                             .wide_a16      = route,
+                                            .narrow_a16    = narrow,
                                             .staging_base  = config.slots > 0 ? d_staging : nullptr,
                                             .staging_slots = config.slots};
         if (config.overlap) {
@@ -767,18 +807,31 @@ void test_layer_a16(const char* name, int experts, int columns, int top_k, const
     long nan_columns = 0;
     double worst = 0.0, sum = 0.0;
     long measured = 0;
+    int oracle_checked = 0, oracle_bad = 0; // N1's FP64 check of narrow entries
     for (int entry = 0; entry < entries; ++entry) {
         const int e = ids[static_cast<std::size_t>(entry)];
         const fixtures::Expert& expert = bank[static_cast<std::size_t>(e)];
         const std::uint16_t* xc = &x[static_cast<std::size_t>(entry / top_k) * moe::kHidden];
+        const int wide = moe::wide_route(counts[static_cast<std::size_t>(e)], scales[static_cast<std::size_t>(e)]) ? 1 : 0;
+        // The CPU engine's arithmetic for this entry's route: the two-term sums for narrow entries under
+        // the two-term narrow route and, beside it, for two-term wide entries (N2's reference); else exact.
+        const bool two_term_cpu = narrow_a4r && (wide == 0 || a4_residual);
         std::vector<std::uint16_t> cpu(moe::kHidden);
         {
             const std::uint16_t* xp[1] = {xc};
             std::uint16_t* yp[1]       = {cpu.data()};
-            moe::expert_forward_a16(moe::best_cpu_isa(), moe::kFlashNextShape, expert.record.data(), expert.scales, 1, xp, yp);
+            if (two_term_cpu) {
+                moe::expert_forward_a4r(moe::best_cpu_isa(), expert.record.data(), expert.scales, 1, xp, yp);
+            } else {
+                moe::expert_forward_a16(moe::best_cpu_isa(), moe::kFlashNextShape, expert.record.data(), expert.scales, 1,
+                                        xp, yp);
+            }
         }
         const std::uint16_t* got = &first_outputs[static_cast<std::size_t>(entry) * moe::kHidden];
-        const int wide = moe::wide_route(counts[static_cast<std::size_t>(e)], scales[static_cast<std::size_t>(e)]) ? 1 : 0;
+        if (narrow_a4r && wide == 0 && oracle_checked < 48 && !(nonfinite && entry / top_k == 0)) {
+            oracle_bad += fixtures::oracle_outliers(fixtures::oracle_expert(expert, xc), got);
+            ++oracle_checked;
+        }
         mismatch[static_cast<std::size_t>(wide)] += std::memcmp(got, cpu.data(), moe::kHidden * 2) != 0;
         ++checked[static_cast<std::size_t>(wide)];
         nan_columns += entry / top_k == 0 && got[0] == 0x7FC0U;
@@ -798,7 +851,21 @@ void test_layer_a16(const char* name, int experts, int columns, int top_k, const
     }
     std::printf("   A1 entries differing from the CPU engine: narrow %ld of %ld, wide %ld of %ld\n", mismatch[0],
                 checked[0], mismatch[1], checked[1]);
-    if (a4_residual) {
+    if (narrow_a4r) {
+        std::printf("   N1 narrow entries within the FP64 tolerance: %d outputs outside, of %d entries checked\n",
+                    oracle_bad, oracle_checked);
+        check(mismatch[0] == 0, "N1: every narrow entry equals the CPU engine's two-term arithmetic bit for bit");
+        check(oracle_bad == 0, "N1: the GPU narrow outputs lie within BF16 rounding of the FP64 two-term expert");
+    }
+    if (narrow_a4r && a4_residual) {
+        const double mean = measured > 0 ? sum / static_cast<double>(measured) : 0.0;
+        std::printf("   N2 wide entries' relative L2 against the exact two-term sums: mean %.6f, worst %.6f (%ld entries)\n",
+                    mean, worst, measured);
+        check(worst <= std::ldexp(1.0, -7), "N2: every wide entry within 2^-7 of the exact two-term sums");
+        check(mean <= std::ldexp(1.0, -10), "N2: the wide entries' mean within 2^-10 of the exact two-term sums");
+    } else if (narrow_a4r) {
+        check(mismatch[1] == 0, "A1: exact wide entries equal the CPU engine bit for bit");
+    } else if (a4_residual) {
         const double mean = measured > 0 ? sum / static_cast<double>(measured) : 0.0;
         std::printf("   X1 wide entries' relative L2 against the exact arithmetic: mean %.5f, worst %.5f (%ld entries)\n",
                     mean, worst, measured);
@@ -833,7 +900,7 @@ void test_layer_a16(const char* name, int experts, int columns, int top_k, const
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(offloaded_moe_wide) {
     // Unbuffered, so a failing case's last progress line survives a crash.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     test_codes_quantizer();
@@ -866,6 +933,16 @@ int main() {
             test_layer_a16("n = 9", 4, 9, 4, std::vector<double>(4, 1.0), 43, false, route);
             test_layer_a16("n = 65", 2, 65, 2, std::vector<double>(2, 1.0), 47, true, route);
             test_layer_a16("T = 10", 12, 10, 10, std::vector<double>(12, 1.0), 53, false, route);
+        }
+        // The two-term narrow route (expert-a4-residual-decode), beside exact and two-term wide calls:
+        // decode (one column, ten experts), MTP verification widths, the mix and the boundaries.
+        constexpr auto kNarrow = moe::NarrowA16::kA4Residual;
+        for (const moe::WideA16 route : {moe::WideA16::kExact, moe::WideA16::kA4Residual}) {
+            test_layer_a16("decode", 64, 1, 10, std::vector<double>(64, 1.0), 61, false, route, kNarrow);
+            test_layer_a16("T = 4", 64, 4, 10, std::vector<double>(64, 1.0), 67, false, route, kNarrow);
+            test_layer_a16("T = 10", 12, 10, 10, std::vector<double>(12, 1.0), 53, false, route, kNarrow);
+            test_layer_a16("prefill mix", 20, 300, 4, popularity, 41, false, route, kNarrow);
+            test_layer_a16("n = 9", 4, 9, 4, std::vector<double>(4, 1.0), 43, true, route, kNarrow);
         }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL: %s\n", e.what());

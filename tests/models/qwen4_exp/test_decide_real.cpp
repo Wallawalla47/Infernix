@@ -4,8 +4,9 @@
 //
 //   readout      A prompt's readout names its greedy first token and 15 others: the top token is the
 //                one generated, no named token outscores it, and a resumed prompt reads what its cold
-//                run reads (within rounding: their prefill calls differ; with expert-a4-residual, whose
-//                expert arithmetic depends on where an expert runs, its top token). With
+//                run reads (within rounding: their prefill calls differ; with expert-a4-residual or its
+//                narrow form alone, whose expert arithmetic depends on an expert's column count, its
+//                top token). With
 //                INFERNIX_DECIDE_DUMP=DIR the prompt ids and readout are written there for the FP64
 //                oracle of the gate, which log-softmaxes the forward test's FP32 logits of the same
 //                prompt rounded to BF16.
@@ -152,18 +153,23 @@ int readout(infernix::Engine& engine, bool dump) {
             worst = std::max(worst, std::fabs(static_cast<double>(a.readout->logprobs[i] - b.readout->logprobs[i])));
         }
     }
-    // expert-a4-residual computes a GPU wide call's experts from A4 activation terms and a CPU-served
-    // miss exactly, so a resumed run, whose experts are placed otherwise than its cold run's, reads
-    // within the path's own error rather than rounding (NVIDIA FP4-Local, 2026-10-21: up to 0.33 nats on
-    // this prompt's flat distribution, bit-identical without the path): there the claim is its top token.
+    // expert-a4-residual computes an expert of more than eight columns in a call from A4 activation terms
+    // and one of at most eight (GPU narrow kernels and CPU-served misses alike) exactly, so a resumed run,
+    // whose prefill calls give its experts other column counts than its cold run's, reads within the
+    // path's own error rather than rounding (NVIDIA FP4-Local, 2026-10-21: up to 0.33 nats on this
+    // prompt's flat distribution, bit-identical without the path): there the claim is its top token.
+    // expert-a4-residual-decode alone splits the arithmetic the other way. With both, every expert takes
+    // the same two terms and the widths differ only in how the products are summed (tensor-core FP32
+    // order against exact): the claim is rounding again.
     const std::vector<std::string>& paths = engine.load_summary().fast_paths;
-    const bool placed_arithmetic = std::any_of(paths.begin(), paths.end(), [](const std::string& path) {
-        return path == "expert-a4-residual" || path == "expert-a4-residual-3";
-    });
+    const auto has = [&](const char* name) { return std::find(paths.begin(), paths.end(), name) != paths.end(); };
+    const bool narrow_terms = has("expert-a4-residual-decode");
+    const bool wide_terms   = has("expert-a4-residual") || has("expert-a4-residual-3");
+    const bool width_arithmetic = narrow_terms != wide_terms || has("expert-a4-residual-3");
     const bool same_top = a.readout && b.readout && a.readout->top_token == b.readout->top_token;
-    if (placed_arithmetic) {
-        failures += check(same_top, "readout: resumed reads cold's top token (expert-a4-residual; worst " +
-                                        std::to_string(worst) + " nats)");
+    if (width_arithmetic) {
+        failures += check(same_top, "readout: resumed reads cold's top token (expert-a4-residual or its narrow form "
+                                    "alone; worst " + std::to_string(worst) + " nats)");
     } else {
         failures += check(same_top && worst <= 0.05,
                           "readout: resumed equals cold within 0.05 nats (worst " + std::to_string(worst) + ")");
@@ -284,9 +290,11 @@ int prefetch(infernix::Engine& engine) {
     return failures + check(waited.generated_token_ids == reference, "prefetch: the head equals an uncached run");
 }
 
-int run_mode(const char* artifact, const char* ngram, bool mtp) {
+int run_mode(const char* artifact, const char* ngram, bool mtp, const std::vector<infernix::FastPath>& candidates) {
     std::printf("== %s\n", mtp ? "MTP drafter (--spec mtp, 3 drafts)" : "plain decode");
-    infernix::Engine engine(base_options(artifact, ngram, mtp));
+    infernix::EngineOptions options = base_options(artifact, ngram, mtp);
+    options.fast_path_candidates.insert(options.fast_path_candidates.end(), candidates.begin(), candidates.end());
+    infernix::Engine engine(options);
     int failures = 0;
     failures += readout(engine, !mtp && std::getenv("INFERNIX_DECIDE_DUMP") != nullptr);
     failures += forced(engine);
@@ -310,15 +318,26 @@ int main(int argc, char** argv) {
     }
     const char* ngram = std::getenv("INFERNIX_QWEN4_NGRAM");
     bool plain = true, mtp = true;
+    // --fast-path NAME (repeatable): also run that fast path, qualified or not (the readout's resume
+    // claim follows the selected expert paths).
+    std::vector<infernix::FastPath> candidates;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--mtp") { plain = false; }
         if (arg == "--plain") { mtp = false; }
+        if (arg == "--fast-path" && i + 1 < argc) {
+            const auto path = infernix::parse_fast_path(argv[++i]);
+            if (!path) {
+                std::fprintf(stderr, "FAIL: unknown fast path %s\n", argv[i]);
+                return 1;
+            }
+            candidates.push_back(*path);
+        }
     }
     try {
         int failures = 0;
-        if (plain) { failures += run_mode(artifact, ngram, false); }
-        if (mtp) { failures += run_mode(artifact, ngram, true); }
+        if (plain) { failures += run_mode(artifact, ngram, false, candidates); }
+        if (mtp) { failures += run_mode(artifact, ngram, true, candidates); }
         std::printf(failures == 0 ? "qwen4_exp decide checks passed\n" : "FAIL: %d checks failed\n", failures);
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

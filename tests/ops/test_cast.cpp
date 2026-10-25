@@ -1,4 +1,5 @@
 #include "infernix/ops/cast.h"
+#include "ops/op_family.h"
 #include "ops/op_tester.h"
 
 #include <algorithm>
@@ -52,7 +53,7 @@ int run_case(const char* label, std::int32_t rows, std::int32_t columns, std::ui
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(cast) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;

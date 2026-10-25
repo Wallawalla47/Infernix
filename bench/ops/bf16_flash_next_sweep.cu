@@ -32,6 +32,7 @@
 #include "ops/linear/bf16/bf16_launch.cuh"
 #include "ops/linear/bf16/bf16_shapes.h"
 #include "ops/linear/bf16/bf16_skinny.cuh"
+#include "roofline.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -51,6 +52,7 @@
 #include <vector>
 
 using namespace infernix;
+namespace roofline = infernix::bench::roofline;
 using namespace infernix::ops::detail;
 
 namespace {
@@ -178,7 +180,7 @@ struct Options {
     int warmup          = 2;
     int repeat          = 7;
     double tolerance    = 0.02;
-    double dram_gbps    = 1792.0; // RTX 5090 GDDR7 peak
+    double dram_gbps    = roofline::kDramSpecGBs;
     bool decode_only    = false;
     std::string csv;
 };

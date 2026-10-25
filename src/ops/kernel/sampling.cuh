@@ -59,9 +59,9 @@ __launch_bounds__(kSamplerBlock) __global__
             __syncthreads();
         }
         if (tid == 0) {
-            if (cfg.mask.words && !isfinite(red_val[0])) { asm volatile("trap;"); }
-            out[row] = red_idx[0];
-            if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[red_idx[0]], 1); }
+            const int picked = isfinite(red_val[0]) ? red_idx[0] : sampling_report_nonfinite(cfg);
+            out[row]         = picked;
+            if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
         }
         return;
     }
@@ -216,8 +216,8 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sa
         }
         best = sampling_block_max_key(best, greedy_warp_keys);
         if (tid == 0) {
-            if (cfg.mask.words && !isfinite(sampling_key_float(best))) { asm volatile("trap;"); }
-            const int picked = sampling_key_index(best);
+            const int picked = isfinite(sampling_key_float(best)) ? sampling_key_index(best)
+                                                                  : sampling_report_nonfinite(cfg);
             out[col]         = picked;
             if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
             workspace.group_done[col] = 0;

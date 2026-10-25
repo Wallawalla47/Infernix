@@ -176,7 +176,7 @@ public:
           rows_(other.rows_), row_count_(std::exchange(other.row_count_, 0)),
           tokens_(std::exchange(other.tokens_, {})), row_counts_(std::exchange(other.row_counts_, {})),
           row_stride_(std::exchange(other.row_stride_, 0)),
-          timing_(std::exchange(other.timing_, {})), constraint_failed_(other.constraint_failed_) {}
+          timing_(std::exchange(other.timing_, {})), row_failures_(other.row_failures_) {}
     PendingBatch& operator=(PendingBatch&&)      = delete;
     PendingBatch(const PendingBatch&)            = delete;
     PendingBatch& operator=(const PendingBatch&) = delete;
@@ -187,8 +187,8 @@ public:
     [[nodiscard]] std::span<const std::int32_t> row_counts() const noexcept { return row_counts_; }
     [[nodiscard]] std::uint32_t row_stride() const noexcept { return row_stride_; }
     [[nodiscard]] runtime::ExecutionTiming execution_timing() const noexcept { return timing_; }
-    // The row's emitted tokens reach a position where its grammar admits no token.
-    [[nodiscard]] bool constraint_failed(std::size_t row) const { return constraint_failed_.at(row); }
+    // Why the row cannot commit (None: it can).
+    [[nodiscard]] runtime::PendingRowFailure row_failure(std::size_t row) const { return row_failures_.at(row); }
 
 private:
     const void* owner_         = nullptr;
@@ -199,7 +199,7 @@ private:
     std::span<const std::int32_t> row_counts_;
     std::uint32_t row_stride_ = 0;
     runtime::ExecutionTiming timing_;
-    std::array<bool, kMaximumConcurrency> constraint_failed_{};
+    std::array<runtime::PendingRowFailure, kMaximumConcurrency> row_failures_{};
 
     friend struct detail::ContractAccess;
 };
@@ -262,6 +262,9 @@ struct FinishResult {
     SpeculativeStats speculative;
     std::vector<ConstrainedDraw> constrained_draws;
     std::optional<ExpertCacheStats> expert_cache;
+    // With the prefix cache: the prompt tokens past the reused prefix whose state this request's
+    // snapshots made reusable (its deepest accepted capture within the prompt).
+    std::optional<std::uint32_t> cache_created_prompt_tokens;
 };
 
 struct AbortResult {
@@ -384,8 +387,10 @@ struct ProgramOptions {
     std::uint32_t dflash2_draft_tokens = 0;
     // The automatic draft length (--draft-tokens auto, design 11.3): each one-row round drafts the
     // length in 0..mtp_draft_tokens that maximizes its expected tokens per round time, and a pair
-    // round one length in 0..min(mtp_draft_tokens, 2) from both rows' acceptance. False: one-row
-    // rounds draft mtp_draft_tokens and pair rounds min(mtp_draft_tokens, 2).
+    // round one length in 0..min(mtp_draft_tokens, 2) from both rows' acceptance (DFlash2: its
+    // calibrated length, and a pair round's one width from both rows' calibrated drafts). False:
+    // one-row rounds draft mtp_draft_tokens and pair rounds min(mtp_draft_tokens, 2) (DFlash2:
+    // dflash2_draft_tokens and min(dflash2_draft_tokens, 2)).
     bool auto_draft_length = false;
     // A one-row round verifies its neural drafts up to the first whose drafter probability is below
     // this value (design §19.3.5; --spec-min-p): MTP's draft-head probability, DFlash2's
@@ -395,8 +400,10 @@ struct ProgramOptions {
     // The request-coupling fast paths (FastPath; docs/maintainer/model-quality.md section 6.7). Each
     // is off unless selected, and with all three off a request's output does not depend on the other
     // requests (concurrency, cache contents, KV pressure):
-    // - pair_speculation (adaptive-speculation): two-row rounds draft one length chosen from both
-    //   rows' acceptance; without it they decode plain, as rounds of three or more rows do;
+    // - pair_speculation (adaptive-speculation with MTP, dflash2-pairs with DFlash2): two-row rounds
+    //   draft one length chosen from both rows' acceptance (DFlash2: after the proposal, from both
+    //   rows' calibrated draft probabilities); without it they decode plain, as rounds of three or
+    //   more rows do;
     // - free_cache_resume (free-cache-resume): prefill calls, taps and resumes at any position, sibling
     //   coalescing, and endpoints and blocks holding decode-computed state; without it every call
     //   boundary, tap and resume is a multiple of 16 tokens (the GDN prefill's sub-chunk) and only
@@ -422,6 +429,12 @@ struct ProgramOptions {
     // from its 2-bit screen (Parameters::output_head_screen); other rounds run the exact head. Each
     // round kind keeps its own CUDA graphs.
     bool screened_lm_head = false;
+    // fp16-gdn-state (FastPath::Fp16GdnState): the GDN recurrent state pool (and so its prefix-cache
+    // images) stores FP16; every GDN call keeps an FP32 master state and rounds the state it publishes.
+    bool fp16_gdn_state = false;
+    // block-verification (FastPath::BlockVerification): sampled rows of DFlash2 and sampled-MTP chain
+    // rounds accept by block verification (ops::speculative_accept_sparse_drafts).
+    bool block_verification = false;
     // CPU-served misses (design section 10): host expert-engine workers (0 disables), the most
     // experts one layer call hands to them, and the share kept on the PCIe stage (misses / divisor;
     // 0 derives it from the measured link and CPU rates, design §19.3.12).
@@ -498,6 +511,9 @@ public:
     [[nodiscard]] const ProgramDevicePlan& device_plan() const noexcept;
     // How the expert frames were sized at construction.
     [[nodiscard]] const VramSizing& vram_sizing() const noexcept;
+    // The expert cache's cumulative counters and current size (RuntimeStats::expert_cache); nothing
+    // without an expert cache. Engine thread, between rounds.
+    [[nodiscard]] std::optional<ExpertCacheTotals> expert_cache_totals() const noexcept;
 
     // Expert-cache resizing outside rounds (design §19.3.7). The VRAM monitor calls the waker from
     // its own thread when the cache should resize; the engine then calls maintain() from its

@@ -2,6 +2,7 @@
 
 #include "core/device.h"
 #include "core/pdl.cuh"
+#include "core/temporary_switches.h"
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
 #include "ops/sparse_moe/decode/sparse_moe_decode.h"
@@ -21,11 +22,24 @@ constexpr int kRouterRows       = 257;
 constexpr int kTopK             = 8;
 constexpr int kRouterPartitions = 4;
 constexpr int kRouterWarps      = 4;
+// The shared expert's intermediate width (its down codes: kHidden x this, one byte per code).
+constexpr int kSharedIntermediate = 512;
+
+// INFERNIX_TMP_SMALL_T_L2_HINTS: both S1 forms warm L2 with the shared-expert down codes, as T = 1's
+// D1 does (shared_down null: no warm). Pure cache hint.
+__device__ __forceinline__ void small_t_warm_shared_down(const char* shared_down, unsigned long long bytes) {
+    if (shared_down == nullptr) { return; }
+    const unsigned long long offset =
+        (static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x) * 128ull;
+    if (offset < bytes) { asm volatile("prefetch.global.L2 [%0];" ::"l"(shared_down + offset)); }
+}
 
 template <int Tokens>
 __global__ void sparse_moe_small_t_s1_kernel(const __nv_bfloat16* __restrict__ x,
                                              const __nv_bfloat16* __restrict__ router,
-                                             float* __restrict__ partial_scores) {
+                                             float* __restrict__ partial_scores,
+                                             const char* __restrict__ shared_down,
+                                             unsigned long long shared_down_bytes) {
     static_assert(Tokens >= 1 && Tokens <= kSparseMoeSmallTMax);
     __shared__ float partial[kRouterWarps][Tokens];
     if (threadIdx.x == 0) { pdl::trigger_dependents(); }
@@ -71,6 +85,7 @@ __global__ void sparse_moe_small_t_s1_kernel(const __nv_bfloat16* __restrict__ x
                            partition] = sum;
         }
     }
+    small_t_warm_shared_down(shared_down, shared_down_bytes);
 }
 
 // The column-invariant router (request-invariant exact route): one CTA per router row reduces each
@@ -81,7 +96,9 @@ template <int Tokens>
 __global__ void __launch_bounds__(kSparseMoeRouterWarps * 32)
     sparse_moe_small_t_s1_invariant_kernel(const __nv_bfloat16* __restrict__ x,
                                            const __nv_bfloat16* __restrict__ router,
-                                           float* __restrict__ scores) {
+                                           float* __restrict__ scores,
+                                           const char* __restrict__ shared_down,
+                                           unsigned long long shared_down_bytes) {
     static_assert(Tokens >= 1 && Tokens <= kSparseMoeSmallTMax);
     static_assert(kSparseMoeRouterHidden == kHidden);
     __shared__ float partial[Tokens][kSparseMoeRouterWarps];
@@ -102,6 +119,7 @@ __global__ void __launch_bounds__(kSparseMoeRouterWarps * 32)
             if (lane == 0) { scores[static_cast<std::int64_t>(token) * kRouterRows + row] = value; }
         }
     }
+    small_t_warm_shared_down(shared_down, shared_down_bytes);
 }
 
 // S2 runs one CTA per token: the router scores of a single token take 1 060 B of shared
@@ -142,14 +160,16 @@ __global__ void sparse_moe_small_t_s2_kernel(const float* __restrict__ partial_s
 
 template <int Tokens>
 void launch_s1(const __nv_bfloat16* x, const __nv_bfloat16* router, float* partial_scores,
-               bool column_invariant, cudaStream_t stream) {
+               bool column_invariant, const char* shared_down, unsigned long long shared_down_bytes,
+               cudaStream_t stream) {
     if (column_invariant) {
         sparse_moe_small_t_s1_invariant_kernel<Tokens>
-            <<<kRouterRows, kSparseMoeRouterWarps * 32, 0, stream>>>(x, router, partial_scores);
+            <<<kRouterRows, kSparseMoeRouterWarps * 32, 0, stream>>>(x, router, partial_scores, shared_down,
+                                                                     shared_down_bytes);
     } else {
         sparse_moe_small_t_s1_kernel<Tokens>
-            <<<kRouterRows * kRouterPartitions, kRouterWarps * 32, 0, stream>>>(x, router,
-                                                                                partial_scores);
+            <<<kRouterRows * kRouterPartitions, kRouterWarps * 32, 0, stream>>>(x, router, partial_scores,
+                                                                                shared_down, shared_down_bytes);
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -179,7 +199,8 @@ void launch_s4_tiled(const SparseMoeWeights& weights, Tensor& destination,
         weights, destination, static_cast<const int*>(workspace.token_ids.data),
         static_cast<const float*>(workspace.token_alpha.data),
         static_cast<const float*>(workspace.shared_scale.data),
-        static_cast<const float*>(workspace.scratch.data), plan.tokens, plan.d4_schedule, stream);
+        static_cast<const float*>(workspace.scratch.data), plan.tokens, plan.d4_schedule, stream, nullptr,
+        plan.next_weight_prefetch, plan.next_weight_prefetch_bytes);
 }
 
 template <class Launch>
@@ -333,11 +354,15 @@ void dispatch_tokens(std::int32_t tokens, Launch&& launch) {
 void sparse_moe_small_t_launch(const Tensor& x, const SparseMoeWeights& weights,
                                Tensor& destination, const SparseMoeSmallTPlan& plan,
                                const SparseMoeSmallTWorkspace& workspace, cudaStream_t stream) {
+    // The shared expert's down codes: [hidden, intermediate] bytes, as T = 1's D1 warms them.
+    const bool hints = temporary_switches::flag("INFERNIX_TMP_SMALL_T_L2_HINTS");
+    const auto* shared_down = hints ? static_cast<const char*>(weights.shared_down.qdata) : nullptr;
+    const auto shared_down_bytes = static_cast<unsigned long long>(kHidden) * kSharedIntermediate;
     dispatch_tokens(plan.tokens, [&]<int Tokens>() {
         launch_s1<Tokens>(static_cast<const __nv_bfloat16*>(x.data),
                           static_cast<const __nv_bfloat16*>(weights.router_shared_gate.qdata),
                           static_cast<float*>(workspace.scratch.data), plan.column_invariant,
-                          stream);
+                          shared_down, shared_down_bytes, stream);
     });
     launch_s2(static_cast<const float*>(workspace.scratch.data),
               static_cast<int*>(workspace.token_ids.data),

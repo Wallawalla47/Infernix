@@ -46,16 +46,21 @@ void grouped_instance(const CausalAttentionOperands& p, Bf16KvCacheView<Writable
 }
 
 void tiled(const CausalAttentionOperands& p, Bf16KvReadView cache, const Bf16KvCausalPlan& plan,
-           cudaStream_t stream) {
+           WorkspaceArena& workspace, cudaStream_t stream) {
+    auto scope = workspace.scope();
+    CausalPartialView partial{};
+    if (plan.prompt_splits > 1) {
+        partial = allocate_causal_partials(workspace, plan.query_heads, plan.width, plan.prompt_splits, 1).view();
+    }
     with_causal_geometry(p.query_heads, [&]<class G>() {
         if (plan.instance == Bf16KvInstance::Tiled128)
             launch_bf16_kv_tiled_mma<
-                G, typename Bf16KvInstanceTraits<Bf16KvInstance::Tiled128>::Schedule>(p, cache,
-                                                                                      stream);
+                G, typename Bf16KvInstanceTraits<Bf16KvInstance::Tiled128>::Schedule>(p, cache, stream,
+                                                                                      plan.prompt_splits, partial);
         else
             launch_bf16_kv_tiled_mma<
-                G, typename Bf16KvInstanceTraits<Bf16KvInstance::Tiled64>::Schedule>(p, cache,
-                                                                                     stream);
+                G, typename Bf16KvInstanceTraits<Bf16KvInstance::Tiled64>::Schedule>(p, cache, stream,
+                                                                                     plan.prompt_splits, partial);
     });
 }
 
@@ -92,7 +97,7 @@ void bf16_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     if (!plan.grouped()) {
         kv_cache_append_batch_launch(k, v, positions, valid_columns, table_rows, cache, stream);
         tiled(make_causal_operands(q, positions, out, scale, envelope.max_visible_keys),
-              bf16_kv_cache_view<false>(cache, &valid_columns, &table_rows), plan, stream);
+              bf16_kv_cache_view<false>(cache, &valid_columns, &table_rows), plan, workspace, stream);
     } else {
         execute_grouped(q,
                         CausalAppendInput{static_cast<const __nv_bfloat16*>(k.data),
@@ -112,10 +117,32 @@ void bf16_kv_cached_attention(const Tensor& q, const Tensor& positions, float sc
     const auto view = single_row_paged_kv_batch_view(cache);
     if (!plan.grouped()) {
         tiled(make_causal_operands(q, positions, out, scale, envelope.max_visible_keys),
-              bf16_kv_cache_view<false>(view), plan, stream);
+              bf16_kv_cache_view<false>(view), plan, workspace, stream);
     } else {
         execute_grouped(q, CausalCachedInput{}, positions, scale, view, nullptr, nullptr, nullptr,
                         plan, workspace, out, stream);
     }
 }
+void bf16_kv_cached_rows_attention(const Tensor& q, const Tensor& positions, const Tensor& valid,
+                                   const Tensor& rows, float scale, PagedKVBatchLayerView cache,
+                                   CausalAttentionExecutionEnvelope envelope, std::int32_t call_batch,
+                                   WorkspaceArena& workspace, Tensor& out, DeviceExecutionView execution) {
+    auto plan = make_bf16_kv_causal_plan(q.ne[1], 1, call_batch, envelope,
+                                         execution.multiprocessor_count);
+    if (!plan.grouped() || q.ne[2] != 1)
+        throw std::logic_error("BF16 attention: one-column rows take the grouped route");
+    plan.batch = q.ne[3];
+    execute_grouped(q, CausalCachedInput{}, positions, scale, cache, &valid, &rows, nullptr, plan,
+                    workspace, out, execution.stream);
+}
+
+std::size_t bf16_kv_cached_rows_workspace_bytes(int heads, int call_batch, int rows,
+                                                CausalAttentionExecutionEnvelope envelope,
+                                                int multiprocessor_count) {
+    const auto plan = make_bf16_kv_causal_plan(heads, 1, call_batch, envelope, multiprocessor_count);
+    WorkspaceLayoutBuilder layout;
+    (void)allocate_causal_partials(layout, heads, 1, plan.partition.capacity, rows);
+    return layout.peak_bytes(1);
+}
+
 } // namespace infernix::ops::detail

@@ -26,6 +26,14 @@ void parse_json_output_format(const RequestJson& format, GenerationRequest& requ
 
 void parse_structured_outputs(const RequestJson& body, GenerationRequest& request);
 
+// Chat Completions and Responses: the per-request thinking budget under the names other servers'
+// clients send (thinking_budget_tokens, thinking_token_budget, thinking_budget,
+// reasoning_budget_tokens; at most one value). N > 0 caps model-origin thinking at N tokens as
+// Anthropic's budget_tokens does, 0 disables thinking (llama.cpp's reasoning budget 0) and -1 asks
+// for no request budget (the server default applies). Call after request.enable_thinking is
+// parsed: 0 conflicts with an explicit enable_thinking true.
+void parse_openai_thinking_budget(const RequestJson& body, GenerationRequest& request);
+
 [[nodiscard]] bool valid_tool_name(std::string_view name, std::size_t maximum_length) noexcept;
 
 // Name of a JSON value's type for error messages ("string", "array", ...).

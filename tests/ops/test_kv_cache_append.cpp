@@ -1,4 +1,5 @@
 #include "infernix/ops/kv_cache_append.h"
+#include "ops/op_family.h"
 #include "ops/op_tester.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
@@ -1391,7 +1392,7 @@ int cyclic_variable_prefix_tests() {
 
 } // namespace
 
-int main(int argc, char** argv) {
+INFERNIX_OP_TEST(kv_cache_append) {
     if (cuda_unavailable()) {
         std::cout << "kv_cache_append: SKIP (CUDA unavailable)\n";
         return 77;

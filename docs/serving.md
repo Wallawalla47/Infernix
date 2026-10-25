@@ -78,6 +78,7 @@ tier must be saved. Before the server is ready, one Ctrl+C ends startup at once.
 |---|---|
 | `GET /health` | Engine readiness |
 | `GET /metrics` | Prometheus counters, gauges and latency histograms |
+| `GET /metrics?format=json` | JSON snapshot: engine identity, live gauges, totals, and the last 128 terminal requests (`Accept: application/json` also selects it) |
 | `GET /v1/models` | configured OpenAI model alias, effective `max_model_len`, and llama.cpp-compatible `meta` and `chat_template_caps` objects |
 | `GET /v1/models/{id}` | lookup of the configured alias, `max_model_len`, `meta` and `chat_template_caps` |
 | `POST /v1/chat/completions` | OpenAI-style chat generation |
@@ -104,24 +105,39 @@ How failures end:
 - An out-of-memory condition or a failed internal check during one unit of work fails the requests
   that unit involved, logs `worker out of memory: ... - recovering` or `worker recovering from a
   failed request`, and the Engine carries on with its queue.
+- Logits with no finite value to sample from (NaN or infinity, a numerical failure of the model's
+  execution) fail only the request whose row produced them, with an HTTP 500 `internal_error`
+  (an error event once its stream has started), and log `the model produced non-finite logits:
+  failed 1 request; the Engine keeps serving`; the other requests of the round continue. A grammar
+  that refuses a committed token, or reaches a position with no legal token, likewise fails only
+  its own request.
 - A failure after eight such recoveries in a row, with no successful unit between them, fails every
-  queued and running request and stops the Engine: `/health` then answers 503 and every request
-  fails until the server is restarted. Any other exception on the worker (`worker crash: ...`)
-  ends the Engine the same way.
+  queued and running request and stops the Engine. Any other exception on the worker (`worker
+  crash: ...`) ends the Engine the same way. Nothing can be served until a restart, so within about
+  250 ms the server stops accepting connections, logs `inference engine failed; server stopped,
+  exit status 2`, and `infernix-serve` exits with status **2**. A launcher or service manager can
+  restart it on that status; until it exits, `/health` answers 503.
 - A CUDA error other than out of memory (an illegal address, a lost device) cannot be recovered
-  in-process: the server prints `CUDA_CHECK(...) failed` with the error and exits, without final
-  request-log records for the requests in flight.
+  in-process: the server prints `CUDA_CHECK(...) failed` with the error and aborts (a non-zero
+  status other than 2), without final request-log records for the requests in flight.
+
+`infernix-serve` exits with status 0 after an orderly stop (Ctrl+C or a termination signal), 130
+when a further Ctrl+C exits before that stop finished, 2 after an Engine-wide failure while
+serving, and 1 for an invalid command line, any startup, bind, warm-up or listen failure, or
+another server exception.
 
 Every OpenAI-compatible response carries a unique `x-request-id` header, including streaming and
 error responses. Anthropic endpoints use their separate `request-id` contract.
 
-All three generation SSE endpoints emit the standard `: keep-alive` comment after five seconds
-without a protocol event. The comment is transport-only: SSE clients ignore it, and it does not
-change generated text, event ordering, usage, stored Responses, or request logs. Accepted
-connections also use TCP keepalive and a 15-second retransmission limit (`TCP_USER_TIMEOUT` on
-Linux, `TCP_MAXRTMS` on Windows); together with the heartbeat,
-a dead or unacknowledging peer is normally cancelled within about 20 seconds, including while the
-request is waiting or prefilling. A peer whose TCP stack remains connected and acknowledges data
+A generation SSE endpoint commits its response only once the Engine has admitted the request: while
+the request is still queued the client receives no response bytes, and the queue's own answers (a
+queue timeout, an orderly stop) are plain HTTP statuses ([Execution behavior](#execution-behavior)).
+A started stream emits the standard `: keep-alive` comment after five seconds without a protocol
+event. The comment is transport-only: SSE clients ignore it, and it does not change generated text,
+event ordering, usage, stored Responses, or request logs. Accepted connections also use TCP
+keepalive and a 15-second retransmission limit (`TCP_USER_TIMEOUT` on Linux, `TCP_MAXRTMS` on
+Windows); together with the heartbeat, a dead or unacknowledging peer is normally cancelled within
+about 20 seconds, including while the request is waiting (TCP alone) or prefilling. A peer whose TCP stack remains connected and acknowledges data
 cannot be distinguished from a reading application; proxies must close their upstream Infernix
 connection when the downstream client disappears.
 
@@ -187,9 +203,11 @@ The endpoint supports:
 - string content and ordered text/refusal parts; adjacent parts are preserved without inserted
   separators, and empty wire content remains an empty turn;
 - User `image_url` parts, tool-result `image_url` parts used by compatible clients, and the User
-  `video_url` extension using HTTP(S) or data URIs; image detail is omitted or `auto`;
+  `video_url` extension using HTTP(S) or data URIs; image detail is omitted, `auto` or `high` (both the
+  model's native full-quality preprocessing);
 - nonnegative `max_completion_tokens` and the legacy `max_tokens` spelling; zero performs prompt
-  processing without generation;
+  processing without generation. As an extension (OpenAI rejects it), `-1` means no explicit limit:
+  the field is treated as omitted, so the other spelling or `--default-max-tokens` applies;
 - `temperature`, `top_p`, presence/frequency penalties, and signed integer `seed`;
 - the compatible `top_k` (`0..20`) and `min_p` (`0..1`) sampler extensions;
 - up to four non-empty stop strings, applied to both reasoning and answer output;
@@ -213,7 +231,7 @@ The endpoint supports:
 
 Options whose observable behavior the Engine cannot provide are rejected when they request that
 behavior. This includes nonzero `logit_bias`, requested log probabilities, audio/file input or
-audio output, explicit low/high image detail, web search, moderation, low/high verbosity, stored
+audio output, image detail other than `auto` or `high`, web search, moderation, low/high verbosity, stored
 Chat Completions, and non-empty legacy `functions`.
 Each capability rejection identifies the affected field and the guarantee Infernix cannot provide.
 
@@ -234,7 +252,9 @@ errors distinguish `invalid_json_schema`, `unsupported_json_schema` and `unsatis
 selected `text.format` in aggregate responses and SSE response objects.
 
 JSON output uses declared property order and admits JSON's insignificant whitespace, in runs of at
-most 32 characters, so a model may write the pretty-printed layout it prefers. State the desired
+most 32 characters, so a model may write the pretty-printed layout it prefers; this includes the
+inside of an object or array `const`/`enum` value (its keys, strings and numbers stay verbatim, its
+members in the schema's order). State the desired
 content in the prompt; the schema is not inserted into it. Only one output constraint may be supplied.
 
 Schemas support positional arrays (`prefixItems` plus tail `items`) and inclusive/exclusive
@@ -316,7 +336,8 @@ Reasoning is returned separately as `reasoning_content`; answer text remains in 
 For non-strict tools, a direct top-level tool-parameter
 `type`, or an `anyOf`/`oneOf` composed entirely of explicit primitive types, guides conversion of
 Qwen's untyped parameter text. It does not decide whether structurally complete markup is a tool
-call. String-admitting values remain strings, including the empty string. An empty block for a
+call. String-admitting values remain strings, including the empty string, except that the text `null`
+is the null value where `null` is a declared type too. An empty block for a
 declared non-string parameter is omitted. Admitted JSON values retain their JSON type;
 case-insensitive boolean text is normalized to `true` or `false`. A nonempty schema mismatch remains
 a structured call: valid JSON retains its represented type and other text becomes a JSON string so
@@ -335,10 +356,7 @@ the first tool-call region (any accepted marker form) that parses becomes the st
 quoted markup before it stays ordinary content. A marker inside a Markdown code fence (```` ``` ```` or
 `~~~`) or inline code of the answer is a quoted example and stays content even when it is a complete
 call; only the text before the marker decides, so streamed and complete responses agree. A marker
-after a closed fence, or after a sentence on the same line, still opens a call. Generated reasoning closes only at a `</think>`
-followed by a line break or the end of the turn, so a marker the model quotes while reasoning (followed
-by a space, punctuation or an escaped `
-`) stays in the reasoning channel.
+after a closed fence, or after a sentence on the same line, still opens a call.
 
 By default the unconstrained parser keeps that all-or-nothing behaviour. With
 `--tolerant-tool-calls` the server recovers a call instead when the model adds a suffix after a
@@ -346,6 +364,13 @@ complete call, a second call is malformed, a single final call is cut by the out
 its closing tags, or the closing bracket after the function name is missing: the recovered call is
 reported structurally with a `truncated_tail` diagnostic (logged at Info severity) rather than
 demoted to text, and an undeclared tool name stays structured for the consumer to judge.
+
+Tolerant mode also reads a drifted function opener inside `<tool_call>` as `<function=NAME>`: a
+doubled or dropped `<` or a leaked `<|im_start|>` before it, `<=NAME>`, `<function:NAME>`
+(`<invoke:NAME>`) and a bare `<NAME>` (closed by `</function>` or `</NAME>`). The forms without
+the `function`/`invoke` keyword followed by `=` or a space are calls only when `NAME` is a declared
+tool; for any other name, or with no tools declared, the region stays text. `<function =NAME>` is
+ordinary markup in both modes. A repaired opener reports `tolerant_recovered`.
 
 Tolerant mode also recovers calls the model wrote inside its thinking when it ends the turn with
 its stop token without closing the thinking, so no call reached the answer. If, from some marker to
@@ -355,6 +380,21 @@ reasoning and is never published as content. Nothing is recovered when the think
 when the turn published any content, when it ended at the output limit, context capacity or a
 cancellation, or when prose or a cut call follows the last call. Constrained tool output (below) is
 well formed by construction and does not use either recovery.
+
+Markers that are tokens of the model's vocabulary are recognized by the generated token, never by
+their spelling. Generated reasoning ends at the model's `</think>` token wherever it appears, with or
+without a following line break, and `<tool_call>` opens a call only as the model's `<tool_call>`
+token, on both the constrained and the unconstrained route and in the recovery from unclosed
+thinking. The same spellings written with ordinary text tokens (for example while the model
+discusses a chat template) stay text in their channel. The model writes the marker tokens when it
+quotes them too: a quoted `</think>` token ends the reasoning, and a quoted `<tool_call>` token stays
+text only by the Markdown code rule above or when its region does not parse. Leading whitespace of
+the answer after `</think>` is dropped; with an output constraint the grammar requires exactly `\n\n`
+after the token, and only that separator is dropped. The wrapper-less forms agent harnesses drift
+into (`<function=...>`, `<invoke ...>`, `<function_calls>`) have no token of their own and are read
+by their spelling on the unconstrained route, except directly inside a `<tool_call>` spelled with
+ordinary tokens, which stays text. An assistant prefill is the client's text, so a `<tool_call>` it
+spells is the opener of the call it continues.
 
 ### Tool constraints
 
@@ -377,9 +417,9 @@ declared function name.
 
 Non-strict parameter names and order remain open. Their schema supplies the existing value
 normalization hints; it is not compiled as a strict constraint. Open objects, root unions, and
-unsupported schema assertions therefore remain usable. Repeated parameter names use the last
-value, retaining the first key position; the published JSON object contains each key once.
-`strict:true` additionally enforces the parameter contract below.
+unsupported schema assertions therefore remain usable. A call names each parameter at most once
+(the constraint refuses a repeated name), so the published JSON object, streamed or whole, contains
+each key once. `strict:true` additionally enforces the parameter contract below.
 
 Top-level `tool_constraints:"auto"` opts into request-driven constraints: ordinary non-strict
 `tool_choice:"auto"` then uses free generation. Strict tools, selection/count restrictions, and
@@ -396,9 +436,11 @@ root must reduce to a `type:"object"` schema with `additionalProperties:false`, 
 `allOf` and local-reference combinations.
 Properties are emitted in declaration order; optional properties may be omitted. Root
 const/enum/unions are not supported. Values use the supported JSON Schema subset described above.
-Top-level pure string parameters use raw text and preserve whitespace. Other values use JSON;
-a top-level string/non-string union (such as string/null) is rejected because the Qwen parameter
-format cannot distinguish those branches. Such unions inside JSON objects or arrays are supported.
+Top-level pure string parameters use raw text and preserve whitespace. A nullable string (a type list
+of `string` and `null`, or an `anyOf`/`oneOf` of plain strings and null: OpenAI strict mode's form of an
+optional field) is raw text too, and the text `null` is the null value. Other values use JSON; any other
+top-level string/non-string union (such as string/integer) is rejected because the Qwen parameter format
+cannot distinguish those branches. Such unions inside JSON objects or arrays are supported.
 Raw values cannot contain the delimiter `\n</parameter>`; unsatisfiable required values are rejected.
 Integer arguments use signed 64-bit values; number arguments use finite binary64-compatible
 representations. Unsupported schemas fail with HTTP 400 before generation.
@@ -409,12 +451,35 @@ and model EOS. Active tool constraints require model EOS and reject custom stop 
 For ordinary non-strict auto calls that need custom stops, select `tool_constraints:"auto"`.
 Token limits and cancellation can still stop generation: only completed calls are published.
 A later call truncated by the token limit keeps `length`/`max_tokens`/Responses `incomplete` as the
-terminal status. Streaming publishes each completed call in the terminal event sequence;
-arguments are not streamed incrementally.
+terminal status.
+
+Streaming publishes a constrained call as it is generated: its name when the function opener is
+complete, then its arguments JSON in fragments, which concatenate to the arguments of the complete
+call. A string value streams as it is generated (a strict string parameter, or a non-strict one whose
+declared type admits strings); a strict JSON value streams verbatim; a value whose JSON depends on all
+of it (a nullable string, a non-strict declared non-string type, or no declared type) arrives when its
+parameter closes. A call cut by the token limit or the context keeps the fragments it streamed (its arguments
+are then incomplete JSON) and closes with the terminal status; it stays out of the aggregate response
+and of stored history. Each protocol renders the steps in its own events (below). Free tool output
+(`tool_constraints:"auto"` without a constraint that applies) still publishes its calls whole in the
+terminal event sequence, since a malformed region there reverts to text.
 Assistant continuation may finish a partial call; a prefix containing a completed call is rejected.
+The call such a prefix began streams from its start, prefix included.
 
 Messages enter the selected template in their input order. The maintained Qwen templates keep
-system/developer messages at their original positions. A final assistant message is an assistant
+system/developer messages at their original positions. Where the selected template cannot render an
+instruction role at its position, that turn is rendered under a role it does accept — a later
+system or developer turn under `user`, a leading developer turn under `system` — and only the
+role changes: the text, the number of turns and their positions stay as they arrived, and a
+leading system turn is never touched, so the conversation's prefix-cache anchor is unchanged. A
+template that refuses a system turn at every position is stating its own rule about instructions
+rather than placing one, and the request fails as that template asks. The lowered turn count is
+`instruction_role_lowerings` in the preparation block of `--request-log-jsonl`, and both
+`infernix-serve` and `infernix` state the lowering once at startup. Pass
+`--chat-template tools/chat_templates/qwen3_8.jinja` to render every turn under its real role. A
+lowered turn counts as a user query for a template that selects its thinking history from the last
+user turn, so `preserve_thinking: false` can drop earlier `<think>` blocks that the maintained
+template keeps. A final assistant message is an assistant
 prefill: generation continues that turn in place instead of opening a new assistant turn. Because
 a reasoning opener cannot be continued, a prefill that carries media or whose thinking is not
 explicitly disabled (top-level or `chat_template_kwargs` `enable_thinking`, or
@@ -431,8 +496,15 @@ Generated token segmentation can also differ from re-encoding the same text, lim
 `--chat-template FILE` selects a local Jinja template; by default, the server uses the template
 stored in the artifact. See the [CLI guide](cli.md#text-input) for an example.
 
-Control-token spellings quoted in message content, tool data or ordinary template kwargs are
-encoded as text. Media placeholders come from the template and bind to actual image/video inputs.
+Only markup the chat template writes itself becomes control tokens. Every request string the
+template receives is encoded as ordinary text: message content of every role, assistant reasoning
+history, tool-call names and arguments, tool definitions and ordinary template kwargs. A spelling
+such as `<|im_start|>`, `<|im_end|>`, `<think>` or `<|image_pad|>` there becomes ordinary text
+tokens, so it cannot open, close or imitate a turn, reasoning block or media item. This differs
+from Hugging Face `apply_chat_template` plus the tokenizer and from vLLM, which turn such spellings
+into control tokens wherever they occur, so a prompt that contains them gets different token ids
+here; a prompt without them encodes exactly as one tokenizer pass over the rendered text. Media
+placeholders come from the template and bind to actual image/video inputs.
 
 `chat_template_kwargs` passes a JSON object to the template in Chat Completions, Responses and
 Anthropic Messages. Values duplicated in typed request fields must agree. Null standard options
@@ -442,7 +514,11 @@ special tokens cannot be overridden through kwargs.
 `--default-thinking-budget N` sets a positive default thinking-token cap for requests that start
 in thinking mode. Non-thinking requests receive no cap. It may coexist with `--no-thinking`
 because requests can explicitly enable thinking. Anthropic
-`thinking:{"type":"enabled","budget_tokens":N}` overrides this default for that request.
+`thinking:{"type":"enabled","budget_tokens":N}` overrides this default for that request, and so
+does a top-level `thinking_budget_tokens`, `thinking_token_budget`, `thinking_budget` or
+`reasoning_budget_tokens` in Chat Completions and Responses (the names other servers' clients send;
+two of them must agree). There, a positive N caps that request's thinking, `0` disables thinking
+(rejected with `enable_thinking: true`), and `-1` keeps the server default.
 
 Add `--default-thinking-budget 512` to the startup command to cap model-origin thinking at 512
 tokens for every thinking-enabled request.
@@ -450,11 +526,14 @@ tokens for every thinking-enabled request.
 `max_tokens` counts the thinking, so a request that thinks for its whole output limit ends with
 no answer (a harness that sends `max_completion_tokens: 8192` on every request hits this on hard
 tasks). A thinking request with no budget of its own and no `--default-thinking-budget` therefore
-gets one when `max_tokens` is at least 1,024: thinking closes early enough to leave the answer a
-quarter of `max_tokens` (at least 256 tokens, at most half), through the same early close as any
-budget. 8,192 leaves 2,048 for the answer, 1,024 leaves 256. Below 1,024 nothing changes, and
-`--no-thinking-answer-room` lets thinking use all of `max_tokens` again. The request log's
-`thinking_budget` shows the budget a request ran with.
+gets one when its output limit is at least 1,024: thinking closes early enough to leave the
+answer a quarter of that limit (at least 256 tokens, at most half), through the same early close
+as any budget. 8,192 leaves 2,048 for the answer, 1,024 leaves 256. The output limit is
+`max_tokens`, or the room the prompt leaves in `--max-context` when that is less: a client that
+sends `max_tokens` 32,000 with a 250,000-token prompt at 262,144 context can emit 12,145 tokens,
+so thinking closes after 9,109 rather than running to the end of the context. Below 1,024
+nothing changes, and `--no-thinking-answer-room` lets thinking use all of the output limit again.
+The request log's `thinking_budget` shows the budget a request ran with.
 
 At the cap boundary, Engine first honors a natural `</think>`, stop condition, cancellation, or
 total output/context limit. If thinking remains open, it commits Qwen's canonical early-close
@@ -501,8 +580,21 @@ for.
 options override server defaults set with `--no-thinking` and `--preserve-thinking`. Unspecified
 thinking, effort and preservation options use the template's defaults.
 
+Many agent clients send an assistant tool-call message back without its `reasoning_content`. Within
+a tool loop the template renders that reasoning, so the history then differs from the tokens the
+model generated, and each later turn re-prefills from that message. With `--restore-tool-reasoning`,
+the server remembers the reasoning of its last 4,096 tool-calling Chat Completions responses (at most
+64 MiB) by tool-call id. An assistant message whose tool calls all belong to one remembered response,
+and which carries no reasoning of its own, renders with that response's reasoning. Messages that
+carry reasoning are left unchanged. `infernix_chat_reasoning_missing_total` counts the tool-call
+messages received without reasoning, with or without the option, and
+`infernix_chat_reasoning_restored_total` counts those restored.
+
 Streaming begins with an assistant-role chunk, sends separate reasoning and content deltas, then a
-finish-reason chunk and `[DONE]`. When `stream_options.include_usage` is true, a final empty
+finish-reason chunk and `[DONE]`. A constrained tool call streams as `delta.tool_calls` chunks: the
+first carries the call's `index`, `id`, `type` and `function.name` with the first argument
+fragment, later ones its `index` and the next `function.arguments` fragment. Free tool output sends
+each call whole in one chunk before the finish reason. When `stream_options.include_usage` is true, a final empty
 `choices` chunk contains completed usage. Aggregate and streamed usage include cached prompt tokens
 and reasoning-token details; choices carry `logprobs: null` when log probabilities were not
 requested, and aggregate assistant messages carry `refusal: null` because refusal output is not
@@ -510,7 +602,9 @@ supported.
 
 A failure after the stream has started is sent as OpenAI does: one unnamed `data:` event whose
 payload is the usual error body (`{"error": {...}}`, which OpenAI SDKs raise as an API error), then
-the connection closes without a finish-reason chunk, usage chunk or `[DONE]`.
+the connection closes without a finish-reason chunk, usage chunk or `[DONE]`. A stream starts at
+Engine admission, so it carries only mid-generation failures: a queue timeout or an orderly stop
+before admission answers as a plain HTTP status on every route.
 
 ### llama.cpp-compatible request observations
 
@@ -542,7 +636,10 @@ starts at that first token and ends at the last committed output token. Accordin
 speed uses `max(predicted_n - 1, 0)` token intervals; the first token belongs to prompt latency and
 is not counted again as a decode interval. Zero-token, one-token, zero-duration, and exact-cache-hit
 cases report finite zero rates rather than `NaN` or infinity. Speculative requests additionally
-include terminal `draft_n` and `draft_n_accepted` when draft work occurred.
+include terminal `draft_n` and `draft_n_accepted` when draft work occurred. Qwen3.8-Flash-Next
+responses additionally include `expert_routed_n`, the request's routed (layer, expert) uses, and
+`expert_hit_n`, how many of them its VRAM expert cache served. The cumulative per-token snapshots
+below carry neither the draft nor the expert fields.
 
 Set top-level `timings_per_token: true` on a streaming request to attach the latest cumulative
 timing snapshot to each visible reasoning or content chunk. This does not enable terminal timings,
@@ -616,8 +713,14 @@ context length is N tokens. However, your messages resulted in M tokens. Please 
 of the messages." The Anthropic route returns `invalid_request_error` with the Anthropic API's
 "prompt is too long: M tokens > N maximum", which Claude Code matches the same way. M is exact up
 to four times the limit; a longer prompt is not tokenized further and reads "more than M tokens".
-A media preprocessing resource rejection
-returns HTTP 400 `media_budget_exceeded`. HTTP 413 `request_too_large` is reserved for a raw request
+The prompt's images and videos together beyond the 32,768-token Vision envelope (every turn of an
+agent session resends its screenshots, so a long session reaches it) answer in the same
+`context_length_exceeded` form, so the client compacts instead of failing every later turn: N is
+the envelope, M the vision tokens counted up to the item that crossed it ("more than M"), and the
+message ends with a parenthesized note that the counts are image and video tokens against the
+per-prompt vision budget. A single image or video beyond the Vision execution capacity, and the
+other media preprocessing resource rejections (source bytes, decoded pixels, live memory), return
+HTTP 400 `media_budget_exceeded`. HTTP 413 `request_too_large` is reserved for a raw request
 body that exceeds `--max-request-mib` before JSON parsing; it is not used for model-context or media
 resource errors.
 
@@ -695,7 +798,7 @@ wire response contains typed `output` Items.
 | `input` | string or typed Item array; it may be omitted or empty only when `previous_response_id` already supplies a user query |
 | `instructions` | optional string, inserted before the reconstructed conversation for this request only |
 | `previous_response_id` | optional ID of a retained local Response |
-| `max_output_tokens` | non-negative integer; omission executes with `--default-max-tokens` but remains `null` in the Response object |
+| `max_output_tokens` | non-negative integer; omission executes with `--default-max-tokens` but remains `null` in the Response object. `-1` (an extension) is treated as omitted |
 | `stream` | boolean; `true` selects Responses SSE rather than a JSON body |
 | `store` | boolean, default `true`; controls local retrieval and continuation state |
 | `temperature` | finite number in `[0,2]` |
@@ -735,7 +838,7 @@ String `input` is normalized to one user `message` with an `input_text` part. Ar
 | `input_text` | message content part containing string `text` |
 | `output_text` | assistant-message replay part containing string `text` |
 | `refusal` | assistant-message replay part; its text enters assistant history |
-| `input_image` | user- or assistant-message part with HTTP(S) or data-URI `image_url`; detail omitted or `auto`; requires server `--vision` |
+| `input_image` | user- or assistant-message part with HTTP(S) or data-URI `image_url`; detail omitted, `auto` or `high`; requires server `--vision` |
 | `input_video` | Infernix extension with HTTP(S) or data-URI `video_url`; requires server `--vision` |
 | `reasoning` | raw replay Item with `reasoning_text` content; summary/encrypted metadata may accompany raw text but cannot replace it |
 | `function_call` | completed assistant call with optional `id` and namespace, plus required `call_id`, `name`, and JSON-object string `arguments` |
@@ -755,7 +858,9 @@ fail.
 
 System and developer message Items retain their positions in the input array. Top-level
 `instructions` is represented as a leading developer turn for the current request; target-specific
-role lowering occurs only in the Qwen family frontend.
+role lowering occurs only in the Qwen family frontend, and it lowers a leading `developer` turn to
+`system` when the selected template has no `developer` role at all, so `instructions` renders under
+its own text instead of failing.
 
 An `input_text`, `input_image`, or tool-result part may carry
 `prompt_cache_breakpoint:{"mode":"explicit"}`. Write selection follows
@@ -763,7 +868,7 @@ An `input_text`, `input_image`, or tool-result part may carry
 identity or output semantics. String message status/phase metadata is accepted but has no Qwen
 prompt representation.
 
-`input_file`, `input_audio`, image `file_id`, non-`auto` image detail, reasoning metadata without raw
+`input_file`, `input_audio`, image `file_id`, image detail other than `auto` or `high`, reasoning metadata without raw
 reasoning text, partial tool Items, and other Item/content types are not supported. HTTP media URLs
 stored in a response chain are fetched again when that chain is continued; use data URIs when the
 historical media bytes must be immutable.
@@ -818,8 +923,11 @@ model's text exactly; streaming emits `response.output_item.added`, then
 `response.custom_tool_call_input.delta` and `.done`, then `response.output_item.done`. The client
 sends its result back as a `custom_tool_call_output` Item.
 
-Hosted tools, remote MCP tools, deferred loading, output schemas, and caller restrictions that
-exclude direct invocation remain unsupported.
+Functions and custom tools, top-level or in a namespace, accept `defer_loading:true` together with a
+`tool_search` tool; `tool_search_call`, `tool_search_output` and `additional_tools` Items are accepted
+as input. See [Deferred tools and tool search](#deferred-tools-and-tool-search). Other hosted tools,
+remote MCP tools, output schemas, and caller restrictions that exclude direct invocation remain
+unsupported.
 
 ### Response object and usage
 
@@ -892,9 +1000,18 @@ not available yet. `response.output_item.done` and the terminal Response output 
 complete raw mirror. A response with no reasoning Item emits no encrypted placeholder.
 
 Function arguments use `response.function_call_arguments.delta` and `.done`. IDs, output indices,
-and content indices remain stable, and concatenated deltas equal the terminal Item. Responses SSE
+and content indices remain stable, and concatenated deltas equal the terminal Item. On the
+constrained route a call's `response.output_item.added` arrives when its function opener is complete
+(the reasoning and message Items are done by then); a `function_call` streams its argument deltas as
+they are generated and ends with `.done` and `response.output_item.done` when the call completes.
+`custom_tool_call` and `tool_search_call` Items complete when their generation ends: their input is
+taken from the whole call. A call the output limit cut ends with an `incomplete` Item carrying the
+arguments it streamed; the terminal Response lists it, and stored history does not. Free tool output
+publishes every call Item at the end of its generation. Responses SSE
 does not emit the Chat Completions `[DONE]` sentinel. With tools enabled, ordinary answer text still
-streams immediately; only an ambiguous `<tool_call>` suffix or the structured tool region is held.
+streams immediately; only trailing whitespace, a possible wrapper-less opener (`<function...`,
+`<invoke...`) on the unconstrained route, or the structured tool region is held. `<tool_call>` is one
+token, so it never waits for following bytes.
 On the unconstrained route, malformed tool markup is flushed back as ordinary text without losing bytes.
 
 ### Local response state and resources
@@ -978,7 +1095,9 @@ curl http://127.0.0.1:8080/v1/messages \
 The endpoint accepts top-level System text, ordered User/Assistant/System history, text and image
 blocks, Thinking history, tool-use history, tool results, user-defined tools, aggregate responses,
 and Anthropic SSE. Consecutive User or Assistant messages are joined without adding separators.
-Mid-conversation System messages retain their input position. A final Assistant message
+Mid-conversation System messages retain their text and input position; where the active chat
+template rejects them there, Infernix instead renders them under the User role (role only, never
+text or position). A final Assistant message
 is an Assistant prefill: generation continues its existing text instead of opening another turn.
 Assistant prefill cannot contain media and cannot start with Thinking enabled; a turn cut by the
 output limit may carry reasoning content. It cannot carry `tool_use` blocks: every `tool_use`
@@ -1051,8 +1170,11 @@ selected template, substituting the nearest value the template accepts as descri
 User-defined tools support `name`, `description`, object `input_schema`, `input_examples`, and
 `strict`. `tool_choice` accepts `auto`, `none`, `any`, or named `tool`; `disable_parallel_tool_use`
 enforces a single-call limit. See the common tool contract above for schema and framing details.
-Deferred tools, tools that exclude direct model calls, Anthropic-provided/server tools, toolsets,
-MCP, and containers remain unsupported. `tool_result` preserves text/image order and marks
+`defer_loading:true`, the tool search tools (`tool_search_tool_regex_20251119`,
+`tool_search_tool_bm25_20251119`) and `tool_reference` blocks inside a `tool_result` follow
+[Deferred tools and tool search](#deferred-tools-and-tool-search). Tools that exclude direct model
+calls, other Anthropic-provided/server tools, toolsets, MCP, and containers remain unsupported.
+`tool_result` preserves text/image order and marks
 `is_error:true` explicitly in the model prompt. For a visible Assistant tool-use turn, the next
 User turn must provide exactly one leading result for every declared ID; valid results are matched
 by ID and normalized to call order. A history that begins with results remains valid as a truncated
@@ -1068,10 +1190,14 @@ an available fifth slot when four different explicit targets already exist. TTL 
 Infernix maps representable boundaries to exact prompt frontiers and ignores a legal but
 unrepresentable advisory boundary without changing the prompt. Reuse still requires exact rendered
 identity and can read an existing owner without another `cache_control`. Aggregate usage reports
-verified reused tokens in `cache_read_input_tokens` and leaves cache creation unknown. Streaming
-emits `message_start` after Engine admission commits the prefix selection and before
-transfer/prefill output, so its uncached/cache-read split is already exact; terminal cumulative
-usage matches the aggregate response.
+verified reused tokens in `cache_read_input_tokens` and, with the prefix cache, in
+`cache_creation_input_tokens` the prompt tokens past them whose state this request's snapshots made
+reusable for a later request (its deepest snapshot within the prompt); as in the Anthropic API,
+`input_tokens` is then the rest, so the three sum to the prompt. Without the prefix cache, or for a
+prompt that publishes nothing, creation is `null`. Streaming emits `message_start` after Engine
+admission commits the prefix selection and before transfer/prefill output, so its cache-read split
+is already exact and creation is still `null` there; terminal cumulative usage matches the aggregate
+response.
 
 Every successful Messages response also carries the llama.cpp-compatible top-level `timings`
 object described for [Chat Completions](#llamacpp-compatible-request-observations), with the same
@@ -1079,15 +1205,21 @@ fields and semantics (`cache_n` equals `cache_read_input_tokens`). It is not an 
 stream attaches it only to the terminal `message_delta` event; `timings_per_token` and
 `return_progress` are Chat Completions options and have no Messages equivalent.
 
-Documents, Search Results, Files, Structured Outputs, server-tool results, container uploads, and
-other execution-dependent blocks are rejected with the missing capability identified. Metadata,
+Documents, Search Results, Files, Structured Outputs, server-tool blocks other than tool search,
+container uploads, and other execution-dependent blocks are rejected with the missing capability
+identified. Metadata,
 service tier, inference geography, protocol-version/beta headers, cache TTL, and unknown advisory
 fields do not block an otherwise executable request. The request `model` is any non-empty local
 proxy label and is echoed in the response; it does not select the resident artifact.
 
 Every Messages response carries a `request-id` header; error bodies also carry `request_id` and use
 Anthropic error categories. Local admission overload maps to HTTP 529 and queue/media timeouts to
-HTTP 504. Streaming owns the full Anthropic block lifecycle for Thinking, text, and tool use.
+HTTP 504. Streaming owns the full Anthropic block lifecycle for Thinking, text, and tool use. A
+constrained call opens its `tool_use` block (`server_tool_use` for a tool search tool) when its name
+is complete, streams `input_json_delta` fragments as the arguments are generated, and closes when the
+call completes; a call the output limit cut closes before `message_delta` with the fragments it
+streamed. Infernix streams every constrained call this way, so a tool's `eager_input_streaming` is
+accepted and changes nothing. Free tool output sends each call as one `input_json_delta`.
 
 `POST /v1/messages/count_tokens` uses the artifact's tokenizer, chat template, and media expansion
 without generation. It shares the same prompt normalization, tools, Thinking mode, Assistant
@@ -1102,6 +1234,139 @@ curl http://127.0.0.1:8080/v1/messages/count_tokens \
     "messages": [{"role": "user", "content": "Count this prompt."}]
   }'
 ```
+
+## Deferred tools and tool search
+
+Agent clients with large tool catalogs (many MCP servers) can mark tools `defer_loading:true` on
+Anthropic Messages and OpenAI Responses. The client still sends every definition on every request,
+but the prompt's tool list leaves deferred tools out: the model finds them with a tool search, and
+a found tool's definition appears in the conversation at the search's result. Everything before that
+result (System prompt, listed tools, earlier turns) keeps its tokens as tools load, so the prefix
+cache keeps serving the conversation, and the first prompt carries none of the deferred schemas.
+
+- **Rendering.** Listed tools render in the template's tool section exactly as before; a request
+  that defers nothing renders token-identically to one without these features. A result that loads
+  tools ends with `You now also have access to the following functions:`, a blank line, and the
+  definitions inside `<tools>`...`</tools>`, one JSON function definition per line in the form the
+  listed tools use (with `input_examples` when declared). The text depends only on the loaded
+  definitions, so a continuation Infernix runs and a later request that replays the same history
+  render the same tokens. Each tool loads once per result.
+- **Calls.** Every declared tool, deferred or not, belongs to the tool-call contract, which the
+  Engine builds from the listed tools followed by the deferred ones (`PromptOptions::deferred_tool_jsons`).
+  A call to a deferred tool parses, and is constrained under basic constraints or `strict:true`,
+  like a call to a listed one, whether or not it has been loaded; the contract does not change as
+  tools load. A named `tool_choice` may select a deferred tool.
+- **Searching.** Infernix searches the deferred tools' names, descriptions, and their input schema's
+  top-level property names and property descriptions. The regex search follows Python `re.search`
+  with `IGNORECASE`, field by field (a field is one string, so `^` and `$` anchor to a name or a
+  description), in linear time: patterns that need backtracking (backreferences, lookaround,
+  possessive quantifiers, atomic and conditional groups) are refused as invalid input, as is a
+  pattern over 200 characters or one that expands past 10,000 automaton states. Name matches come
+  first, then other matches, each in declaration order. The BM25 search (k1 1.2, b 0.75) ranks
+  tools by word tokens split at non-alphanumerics and lower-to-upper case changes, lowercased, with a
+  final plural `s` removed from words over three characters; name words count twice; queries are
+  at most 500 characters. Results are capped by `limit` (1 to 10,000, default 5).
+- **Server-side searches continue the response.** When the model calls a search tool Infernix
+  executes (Anthropic's search tools, a hosted Responses `tool_search`), the response does not end:
+  Infernix appends the call and its result to the conversation and runs another generation, as a
+  client tool loop would. A generation that also calls a client tool, or that the output limit cut,
+  ends the response after its searches run. One response runs at most 10 generations; the output
+  budget (`max_tokens`, `max_output_tokens`) covers all of them; a continuation keeps the request's
+  ingress reservation. Usage sums the generations' input, cached and output tokens; `timings`
+  sum them too, except that time to first token is the first generation's. A tool choice that
+  forced a call was satisfied by the search: continuations use `auto`, and a selection that named
+  only the search tool is lifted.
+
+### Anthropic Messages
+
+Declare a search tool beside the tools:
+
+```json
+{"type": "tool_search_tool_regex_20251119", "name": "tool_search_tool_regex"}
+{"type": "tool_search_tool_bm25_20251119", "name": "tool_search_tool_bm25"}
+```
+
+The `name` may be omitted but no other name is accepted. The model sees an ordinary function with
+`pattern` (regex) or `query` (BM25) and an optional integer `limit`. Requests follow Anthropic's
+rules: at least one tool stays listed (`all_tools_deferred`), a search tool is never deferred
+(`invalid_deferred_tool`), a deferred tool carries no `cache_control` (`invalid_cache_control`),
+and at most 10,000 tools are deferred (`too_many_deferred_tools`).
+
+A search appears in the response as Anthropic returns it: the generation's calls in call order
+(`server_tool_use` with a `srvtoolu_` id for a search, `tool_use` for a client tool), then each
+search's result, then the next generation's blocks:
+
+```json
+{"type": "server_tool_use", "id": "srvtoolu_…", "name": "tool_search_tool_regex",
+ "input": {"pattern": "weather"}}
+{"type": "tool_search_tool_result", "tool_use_id": "srvtoolu_…",
+ "content": {"type": "tool_search_tool_search_result",
+             "tool_references": [{"type": "tool_reference", "tool_name": "get_weather"}]}}
+```
+
+A failed search returns `content: {"type": "tool_search_tool_result_error", "error_code":
+"invalid_tool_input" | "execution_time_exceeded", "error_message": "…"}` with HTTP 200, and the model
+reads `Tool search failed (code): message` as an error result; a search that matches nothing returns
+an empty `tool_references` array, which the model reads as `No deferred tools matched the search.`
+Streaming emits a search call as a `server_tool_use` block (`content_block_start` with an empty
+`input`, one `input_json_delta`, `content_block_stop`) and its result as one `tool_search_tool_result`
+block carried whole by its `content_block_start`. A response that reaches the generation limit ends
+with `stop_reason:"pause_turn"`; one whose budget or context runs out after a search ends with
+`max_tokens` or `model_context_window_exceeded`.
+
+The client sends the assistant content back unchanged. Request lowering splits it at search results:
+the blocks after a result belong to the generation the server ran after it, so the history renders
+as the continuation did. Results follow call order even when a generation mixed a search with a
+client call. A `tool_result` for a `srvtoolu_` id, a `server_tool_use` without its result, a result
+before its call, a client `tool_use` answered nowhere before the next generation, and a search
+history for a search tool the request does not declare are rejected; a `tool_reference` to an
+undeclared tool fails with `tool_reference_not_found`. An Assistant message that ends with a search
+result (a paused response) resumes with a new assistant turn.
+
+A client that runs its own search (Claude Code's tool search, for example) returns `tool_reference`
+blocks inside an ordinary `tool_result`:
+
+```json
+{"type": "tool_result", "tool_use_id": "toolu_…",
+ "content": [{"type": "tool_reference", "tool_name": "get_weather"}]}
+```
+
+The referenced definitions load after the result's text and images. A `tool_reference` outside a
+`tool_result` is rejected. Count Tokens lowers the same history.
+
+### OpenAI Responses
+
+Declare one `tool_search` tool. Without `execution`, or with `"execution":"server"`, the search is
+hosted: the tool's description lists what can be loaded, each namespace that has deferred members
+(with the namespace description) and each top-level deferred function or custom tool (with its
+description), and the model passes the names in `paths`. Infernix loads the named namespaces'
+deferred members and the named functions; unknown names load nothing. The response shows
+
+```json
+{"id": "tsc_…", "type": "tool_search_call", "execution": "server", "call_id": null,
+ "status": "completed", "arguments": {"paths": ["crm"]}}
+{"id": "tso_…", "type": "tool_search_output", "execution": "server", "call_id": null,
+ "status": "completed", "tools": [{"type": "namespace", "name": "crm", "tools": […]}]}
+```
+
+after the generation's other call Items, and the next generation's Items follow. A search Item has
+no events of its own beyond `response.output_item.added` and `.done`. A Response that reaches the
+generation limit, or the request's `max_tool_calls` hosted searches, ends `completed` after its last
+searches; one whose budget or context runs out ends `incomplete`.
+
+With `"execution":"client"`, the model sees the client's `description` and `parameters` (a default
+`query` string otherwise), and its call ends the Response as a `tool_search_call` Item carrying a
+`call_id`. The client answers with a `tool_search_output` Item of that `call_id` whose `tools` are the
+definitions to load; they need not appear in `tools`, and remain callable in later turns. An
+`additional_tools` Item (`role:"developer"`, non-empty `tools`) loads its tools at its own position,
+which renders as a System message there: a template that refuses System messages after the first
+message refuses the request.
+
+`defer_loading:true` needs a `tool_search` tool (`tool_search_required`), and a request declares at
+most one. Hosted `tool_search_call`/`tool_search_output` Items without `call_id` pair in order. A
+Response stored for `previous_response_id` keeps its searches' results as history. The namespace of
+a namespaced tool that only a client `tool_search_output` declared is restored on output only while
+the request still carries that Item; afterwards its calls show the flattened `namespace__name`.
 
 ## Decisions
 
@@ -1251,6 +1516,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--lossless` | run the lossless route: every operation of the model's Hugging Face forward pass computed exactly and rounded once to the dtype it has there (weights decoded exactly, sums exact, logits correctly rounded to `--logits-dtype`, FP32 by default), so a request's output depends on the request and the artifact alone: not on the build, the prefill chunk, prefill or decode, other requests, the prefix cache or preemption. Text requests with `--kv-dtype bf16` (whose pages then hold V as BF16) and no speculation; no fast path runs, so it is slower than the reproducible route. Sampled tokens are drawn by Gumbel-max keyed by the seed, position and token ([definition](maintainer/lossless-route.md)) | off |
 | `--fast-path NAME` | also run this fast path (a name from the [registry](maintainer/model-quality.md#67-fast-path-registry)), qualified for the configuration or not; repeatable. For qualification and timing runs (with `--reproducible`, it times one path against the reproducible route): a path that cannot apply to the loaded model fails startup | none |
 | `--expert-a4-activations` | [nvidia/Qwen3.8-Flash-Next-FP4-Local](qwen3_8-flash-next.md#nvidia-fp4-local-checkpoint) only: run the routed experts with 4-bit NVFP4 activations (W4A4) at the activation scales NVIDIA calibrated for this checkpoint, instead of the 16-bit activations NVIDIA serves it with. Changes the output (a saved prefix-cache file from the other setting is not loaded). Every other artifact refuses it: their experts' arithmetic is fixed by the conversion | off: 16-bit expert activations |
+| `--embedding-host` | Qwen3.5-family artifacts: keep the token embedding in pinned host memory and read its rows zero-copy, as artifacts with offloaded experts always do, so its VRAM (1.18 GiB on the 27B) goes to the KV and prefix caches. Same output; a prompt chunk reads its rows over PCIe | off: in VRAM |
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--log-stats-panel on\|off` | pin the session statistics panel beneath the console log on an interactive terminal | `on` |
 | `--log-colours on\|off` | colour the console statistics lines; never applies to file logs | `off` |
@@ -1277,18 +1543,18 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--draft-tokens N\|auto` | MTP `1..7` (Qwen3.5/3.6 `1..5`); DFlash/DFlash2 `1..15` (Qwen3.8-Flash-Next DFlash2 `1..7`). `N` drafts and verifies N tokens every round (fewer only near the output limit). `auto` with DFlash or DFlash2: each round drafts the whole block and verifies the number its drafts' calibrated probabilities make fastest; on Qwen3.8-Flash-Next DFlash2 a block of 7 ([guide](qwen3_8-flash-next.md#run)); on Qwen3.5/3.6 the `adaptive-dflash` fast path where that is qualified (the NVFP4 Qwen3.8-27B, a block of 15 whose rounds of several requests verify 7; the Qwen3.6-35B-A3B, a block of 7; [DFlash](maintainer/dflash.md#automatic-verify-width-qwen38-27b--qwen36-35b-a3b)), elsewhere, and with `--reproducible`, the artifact's fastest fixed length every round (7 on the 27B, 3 on the 35B-A3B). On the 122B-A10B, whose verify columns each bring their own expert misses, `auto` with either drafter decodes without one (no draft length was faster than plain decode; the drafter is not loaded). `auto` (MTP): each round drafts the length the request's learned acceptance makes fastest, `0..7` on Qwen3.8-Flash-Next (whose one-request rounds also apply the `--spec-min-p` cut, [design §11.3](maintainer/qwen3_8-flash-next-design.md#113-draft-length)); on Qwen3.5/3.6 it is the `adaptive-mtp` fast path (`1..5`) where that is qualified (the NVFP4 Qwen3.8-27B and Qwen3.6-35B-A3B); elsewhere, and with `--reproducible`, every round drafts the artifact's fastest fixed length (5 on the NVFP4 27B, 3 otherwise; none on the 122B-A10B, as above), which startup reports | unset |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--draft-model FILE` | Qwen3.8-Flash-Next with `--spec dflash2`: the DFlash2 drafter's companion artifact (`tools.convert --components dflash2`); Qwen3.5/3.6 artifacts bundle their drafters and refuse it | unset |
-| `--spec-min-p P` | Qwen3.8-Flash-Next with `--spec mtp` or `--spec dflash2` only (other models refuse it at startup): a one-request round verifies its drafts up to the first whose drafter probability (MTP's draft head, DFlash2's candidate selector) is below `P`, `0..1`; `0` verifies every draft. It changes how many drafts a round verifies, not what is generated: greedy output still equals plain decoding, and sampling keeps its distribution (only the realization of a seeded run may differ). The default was measured on sampled AIME prompts at one lane on an RTX 5090: 0.5 gave 147.2 tok/s against 138.8 with every draft and 142.6 at 0.7 (with the automatic draft length); other workloads may prefer another value | `0.5` with `--draft-tokens auto`, else `0` |
-| `--draft-tree-nodes auto\|LIST` | DFlash2 tree verification, each row's tree built on the device from the drafter's candidate lattice; works with every `--kv-dtype`. `auto` (recommended) lets every all-neural round of up to four rows choose the chain or a tree of `draft tokens + 5` or `+ 9` columns from measured round time and acceptance at its batch size and context length; on an artifact whose GDN input projections cannot verify trees, and beside `--draft-tokens auto`'s `adaptive-dflash` widths (which verify chains faster), it keeps chain verification and logs a warning. A LIST fixes the column count by batch size: entry *c* (anchor included, `draft tokens + 2..32`) applies to rounds of *c* rows, the last entry repeats for larger batches and `0` keeps chain verification; see [tree verification](maintainer/tree-verification.md) | off |
+| `--spec-min-p P` | `--spec mtp`, and `--spec dflash2` on Qwen3.8-Flash-Next (other combinations refuse it at startup). On Qwen3.5/3.6 it defaults to 0 (no measured default yet); with `--draft-tokens auto` a cut round verifies at the cut's width while the drafter keeps proposing the `adaptive-mtp` length, and with `--fast-path sampled-mtp-drafts` every draft is verified. A one-request round verifies its drafts up to the first whose drafter probability (MTP's draft head, DFlash2's candidate selector) is below `P`, `0..1`; `0` verifies every draft. It changes how many drafts a round verifies, not the target's distribution: with `--reproducible` greedy output still equals plain decoding, fast paths whose arithmetic depends on the round's width (on Qwen3.8-Flash-Next the default `q8-sliced-k`, `gdn-conv-fused` and `qsa-prepare-fused`, [registry](maintainer/model-quality.md#67-fast-path-registry)) can change near-tie greedy tokens with the verify width, and sampling keeps its distribution (only the realization of a seeded run may differ). The default was measured on sampled AIME prompts at one lane on an RTX 5090: 0.5 gave 147.2 tok/s against 138.8 with every draft and 142.6 at 0.7 (with the automatic draft length); other workloads may prefer another value | `0.5` with `--draft-tokens auto`, else `0` |
+| `--draft-tree-nodes auto\|LIST` | DFlash2, DFlash or MTP tree verification, each row's tree built on the device from the drafter's candidates (DFlash2's candidate lattice, DFlash's 16 most probable tokens per position, alternatives beside each MTP draft, which need `--fast-path sampled-mtp-drafts`); works with every `--kv-dtype`. `auto` (recommended) lets every all-neural round of up to four rows choose the chain or a tree of `draft tokens + 5` or `+ 9` columns from measured round time and acceptance at its batch size and context length; on an artifact whose GDN input projections cannot verify trees, and beside `--draft-tokens auto`'s `adaptive-dflash` widths (which verify chains faster), it keeps chain verification and logs a warning. A LIST fixes the column count by batch size: entry *c* (anchor included, `draft tokens + 2..32`) applies to rounds of *c* rows, the last entry repeats for larger batches and `0` keeps chain verification; see [tree verification](maintainer/tree-verification.md) | off |
 | `--draft-tree-paths N` | most root-to-leaf paths per tree row, `2..8` | `8` |
 | `--ngram-draft-tokens N\|auto` | verified n-gram copy proposals per round beside the `--spec` drafter (Qwen3.8-Flash-Next: also alone, `1..15`), `1..63`; `0` disables. `auto` (Qwen3.8-27B / Qwen3.6-35B-A3B) takes the configuration's measured window and minimum match: beside the NVFP4 27B's `--spec dflash2 --draft-tokens auto`, copies of up to 63 drafts (31 in rounds of several requests) at a minimum match of 12; elsewhere copies stay off (none was measured faster), which startup reports; see [ngram copy proposals](ngram.md#automatic-window) | `0` |
 | `--ngram-min-match N` | minimum matched tokens for an n-gram proposal, `4..64` | `12` |
 | `--ngram-archive-mib N` | RAM archive that keeps n-gram sources across the requests of a conversation; requires `--ngram-draft-tokens`; `0` keeps drafting request-local | `0` |
 | `--ngram-session-mib N` | one conversation's share of the n-gram archive; no effect without `--ngram-archive-mib` | `128` |
 | `--ngram-native-sessions` | also recognize Kilo, Codex and Claude session metadata as conversation identities; requires `--ngram-archive-mib` | off |
-| `--default-max-tokens N` | output limit when omitted by a request | `8192` |
+| `--default-max-tokens N` | output limit when omitted by a request; startup logs an `output limit` note when `--max-context` is at least four times it | `8192` |
 | `--default-thinking-budget N` | positive thinking cap inherited by thinking-enabled requests | unset |
-| `--no-thinking-answer-room` | without a budget, thinking may use all of `max_tokens` (by default, from `max_tokens` 1,024, it closes early enough to leave a quarter for the answer) | answer room on |
-| `--thinking-budget-message S` | text committed when a thinking budget ends thinking, replacing Qwen's early-close guidance; the close marker is appended when `S` lacks it | Qwen guidance |
+| `--no-thinking-answer-room` | without a budget, thinking may use all of the output limit (by default, from an output limit of 1,024, it closes early enough to leave a quarter for the answer; the limit is `max_tokens` or the context the prompt leaves, whichever is less) | answer room on |
+| `--thinking-budget-message S` | text committed when a thinking budget ends thinking, replacing Qwen's early-close guidance; the close marker is appended when `S` lacks it, and `S` may contain `</think>` only as that final close | Qwen guidance |
 | `--reasoning-loop MODE` | `off`, `stop` or `conclude`: reasoning-loop guard for thinking requests without a token constraint (details under [OpenAI Chat Completions](#openai-chat-completions)) | `off` |
 | `--vision` | enable media input and load Vision GPU allocations | off |
 | `--vision-offload auto\|on\|off` | keep the vision tower in pinned system RAM and borrow Device memory only while encoding; `on` requires `--vision`. `auto` is on for artifacts with offloaded experts, Qwen3.8-Flash-Next and Qwen3.5-122B-A10B (the expert cache lends the encode memory), and off for the other Qwen3.5 artifacts | `auto` |
@@ -1302,12 +1568,13 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--cache-tap-min-gap N` | minimum tokens between ladder snapshots | `max(1024, prefill-chunk)`; Qwen3.8-Flash-Next counts the chunk as at most `4096` |
 | `--no-queue-holds` | turn off queue holds. With them, the snapshot each waiting request would resume from and its blocks are evicted after every other cache entry, the request furthest back in the queue first, and new snapshots or Host block writes that would need a held snapshot's slabs are skipped instead; without them eviction is plain LRU (Device) and GDSF (Host), so under a working set larger than the cache a queued request can lose its prefix while it waits ([spec §9.6](maintainer/hybrid-prefix-cache-spec.md#96-queue-holds)) | holds on |
 | `--cache-tool-hold-secs N` | Qwen3.5: after a reply that ends in a tool call, hold the snapshots its next turn resumes from (and their blocks) like a queued request's, after every queued one, for `N` seconds (`0..3600`), since an agent client usually sends the next turn once its tool has run; `0` turns the holds off. Qwen3.8-Flash-Next has none and refuses a nonzero value ([spec §9.7](maintainer/hybrid-prefix-cache-spec.md#97-tool-call-holds)) | `30` (Qwen3.5) |
-| `--cache-host-state fp32\|fp24\|bf16` | Qwen3.5: Host-tier form of snapshot recurrent (Gated DeltaNet) state; the attention KV cache keeps `--kv-dtype` and the Device copies stay exact. `fp24` and `bf16` round it to 15 or 7 mantissa bits, shrinking each 27B snapshot by 36 or 72 MiB (about 19 % and 39 % of a DFlash2 image), so the same Host tier keeps more snapshots and restores move fewer bytes; a snapshot restored from the Host then resumes from the rounded state, so output is no longer bit-identical to `fp32`. A cache file written with another form is not loaded; `fp24` and `bf16` are refused with `--reproducible` (whether a turn resumes from the Host depends on eviction) and for Qwen3.8-Flash-Next ([spec §5.6](maintainer/hybrid-prefix-cache-spec.md#56-host-state-precision)) | `fp32`: exact |
+| `--cache-host-state fp32\|fp24\|bf16` | Qwen3.5: Host-tier form of snapshot recurrent (Gated DeltaNet) state; the attention KV cache keeps `--kv-dtype` and the Device copies stay exact. `fp24` and `bf16` round it to 15 or 7 mantissa bits, shrinking each 27B snapshot by 36 or 72 MiB (about 19 % and 39 % of a DFlash2 image), so the same Host tier keeps more snapshots and restores move fewer bytes; a snapshot restored from the Host then resumes from the rounded state, so output is no longer bit-identical to `fp32`. A cache file written with another form is not loaded; `fp24` and `bf16` are refused with `--reproducible` (whether a turn resumes from the Host depends on eviction) and for Qwen3.8-Flash-Next ([spec §5.6](maintainer/hybrid-prefix-cache-spec.md#56-host-state-precision)). Under the `fp16-gdn-state` fast-path candidate the pool itself stores the state as FP16, and the Host keeps those bytes exactly whatever this option says | `fp32`: exact |
 | `--prefix-cache-file PATH` | at startup, restore the Host tier from `PATH` if the file exists; when the server stops ([Stop the server](#stop-the-server)), save it there once running and queued requests are cancelled (every Host-backed snapshot and the block path it resumes through). A save cut short is abandoned and the previous file kept: one more Ctrl+C during the stop also deletes the unfinished `PATH.tmp`, while Windows ending a closed console's process about 5 s after the close leaves it until the next save, so stop large caches with Ctrl+C. `PATH` may be relative (resolved against the launch directory) or absolute, e.g. `--prefix-cache-file "e:\NInfer-Deploy-V3\file.cache"`. Its directory must exist, and the flag needs a Host tier (not `--host-context-mib 0`). A file written for another artifact, KV format, speculative backend, RoPE scaling or `infernix-serve` binary is ignored and replaced at shutdown. The startup log shows the read's progress and reports what was restored; with a `--host-context-mib` smaller than the file needs, the most valuable snapshots and only the blocks they resume through are restored, and the log warns with the size the file needs; when no snapshot fits, it warns that nothing was restored and that the save at shutdown replaces the file. Saving writes up to `--host-context-mib` of data. | off: nothing is saved or restored |
 | `--prefix-cache-save-mins N` | with `--prefix-cache-file`: also save the Host tier there every `N` minutes while serving, counted from the end of the previous save, and only when it changed since the last save or load. The save runs at the first point between execution units once due, also while requests run: they wait while it is written (the log reports the size, the save time and how long requests waited). It writes `PATH.tmp` and replaces `PATH` only once complete, so a crash or power loss leaves the previous file; stopping the server during a periodic save abandons it before the shutdown save. Each save rewrites the whole file (up to `--host-context-mib`, several GB), so a short interval writes a lot to the drive and wears an SSD faster: at 7.5 GB every 5 minutes that is up to ~2 TB a day, every 30 minutes ~360 GB. | off: saved only when the server stops |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
 | `--tolerant-tool-calls` | recover complete tool calls cut by a malformed wrapper, a trailing suffix or the output budget instead of demoting them to text, and complete calls stranded in thinking the model never closed | off |
+| `--restore-tool-reasoning` | give a Chat Completions tool-call message sent back without reasoning the reasoning this server generated for it (see Chat Completions) | off |
 | `--cors` | permissive browser CORS headers | off |
 | `--usage-chunk-choice` | give the streamed usage chunk a zero-delta choice, for strict client parsers that reject the OpenAI-conformant empty `choices` array | off |
 | `--temperature F` | process-level temperature override | unset |
@@ -1357,7 +1624,7 @@ that cannot grow, recovery from out of memory or a failed request, and a failed 
 are warnings or errors; the prefix-cache save at shutdown is `info`. FFmpeg's media-decoding
 messages are records prefixed `media |`, so they never write inside the statistics panel: FFmpeg
 errors are warnings, and its warnings and notices, such as swscaler's `deprecated pixel format`
-notice for each JPEG, are `debug`. A terminal may use one
+notice for each full-range (JPEG-coded) video, are `debug`. A terminal may use one
 transient line during startup, but Serve throughput is always a persistent record. Redirected
 stderr contains no terminal control sequences.
 
@@ -1466,14 +1733,21 @@ curl http://127.0.0.1:8080/metrics
 | `infernix_prefill_tokens_total`, `infernix_replayed_tokens_total` | Actual initial prefill and separate recovery recomputation |
 | `infernix_generation_tokens_total`, `infernix_decode_tokens_total` | All committed outputs, or decode/control outputs excluding the first token; include thinking and injected control tokens |
 | `infernix_spec_decode_{rounds,draft_tokens,accepted_tokens,fallback_steps}_total` | Live native speculative work, including MTP and DFlash/DFlash2 |
+| `infernix_expert_cache_frames`, `infernix_expert_cache_{routed,hits,promotions,landed,cpu_served}_total` | Qwen3.8-Flash-Next's VRAM expert cache: frames backed now (one expert each), routed (layer, expert) uses, those served from a frame, experts copied into frames by the policy or adopted from staged misses, and misses computed by the CPU expert team; absent for other models |
 | `infernix_{preemptions,snapshot_restores,replay_restores}_total` | Pressure pauses and recovery routes; a snapshot restore resumed from a cache snapshot at the paused frontier |
 | `infernix_{root,prefix}_selections_total` | Initial bindings from the root and from a prefix-cache snapshot |
 | `infernix_device_kv_{used,capacity}_pages`, `infernix_device_state_{used,capacity}_slots` | Physical Main KV and StateImage occupancy; cached blocks and snapshots also occupy these pools |
+| `infernix_prefix_cache_{blocks,device_blocks,evictable_blocks,snapshots}` | Prefix-cache tree blocks (Device or Host), those resident in Device KV, the Device ones no request holds, and state snapshots; zero without the cache |
+| `infernix_host_context_{used,capacity}_bytes` | Host context-cache occupancy in occupied slabs and its capacity (`--host-context-mib`); size the tier from these |
+| `infernix_prefix_cache_{snapshot_hits,evicted_blocks}_total`, `infernix_host_context_{snapshot_evictions,write_bytes,restore_bytes}_total` | Snapshot hits, tree-block evictions, Host-tier snapshot evictions and Host-tier copy volume |
 | `infernix_host_work_seconds_total{phase}`, `infernix_device_wait_seconds_total` | Instrumented worker wall time; device wait is not CUDA kernel time |
+| `infernix_executions_total{kind}`, `infernix_execution_seconds_total{kind}`, `infernix_execution_max_seconds{kind}` | The Engine worker's execution units (`prefill` steps, `replay` steps, `control` batches, `decode` rounds), each from its call to its return: counts and wall time since startup, and the longest since the warm-up, which shows a stall the totals hide |
+| `infernix_decode_batch_rounds_total{batch}`, `infernix_decode_batch_seconds_total{batch}`, `infernix_decode_batch_max_seconds{batch}` | Decode rounds by batch size (1 to `--max-concurrency`): the cost of a batch size, and its longest round since the warm-up |
 | `infernix_constraint_requests_total{outcome}`, `infernix_constraint_cache_total{result}` | Settled constrained requests by completion state and compilation-cache access |
 | `infernix_constraint_{prepare,mask,matcher}_seconds_total`, `infernix_constraint_mask_{positions,upload_bytes}_total` | Constraint work aggregated at request settlement, including truncated/cancelled results |
 | `infernix_constraint_draft_wait_seconds_total` | Live draft-ready wait counted once per batch; a subset of device wait |
 | `infernix_requests_total{outcome}`, `infernix_response_failures_total` | Generation attempts entering preparation and subsequent response failures; protocol/model validation failures and token-count requests are excluded |
+| `infernix_chat_reasoning_missing_total`, `infernix_chat_reasoning_restored_total` | Chat Completions assistant tool-call messages received without reasoning, and those `--restore-tool-reasoning` restored |
 | `infernix_time_to_first_token_seconds` | Histogram updated once at the first committed token, including preparation, queueing and binding |
 | `infernix_request_duration_seconds`, `infernix_request_queue_seconds` | Histograms for settled generation outcomes, including cancellation; exceptional failures have separate counts |
 
@@ -1490,6 +1764,38 @@ rate(infernix_spec_decode_accepted_tokens_total[1m])
 The handler copies published snapshots and formats them outside the Engine worker. Scraping does
 not reset counters or initiate device work. Detailed per-request records remain available through
 the JSONL log. Monitoring tools with engine-specific metric names need an Infernix adapter.
+
+### JSON representation
+
+`GET /metrics?format=json` (or `Accept: application/json`) returns one JSON document instead of the
+text exposition. Prometheus text remains the default; `?format=prometheus` selects it explicitly.
+An unknown `format` is a `400`, never a silent fallback.
+
+```bash
+curl 'http://127.0.0.1:8080/metrics?format=json'
+```
+
+The document carries `schema`, `time`, `engine`, `live`, `totals`, and `requests`. It exists because
+the text exposition cannot carry per-request records: a request id or a per-row timing in a label
+would make the series cardinality unbounded.
+
+| Field | Meaning |
+|---|---|
+| `schema` | `infernix.telemetry/1`; additive-only within v1 |
+| `engine` | model id, architecture, weight and KV formats, speculative backend, context and concurrency limits |
+| `live` | engine phase (`idle`, `reading`, `generating`), request counts by phase, and the interval prefill/decode rates. A rate is `null` until the throughput reporter has produced one |
+| `totals` | monotonic counters since startup, plus terminal request counts |
+| `requests` | the last 128 settled generation requests (completed, cancelled, failed), oldest first; requests rejected before generation appear only in `totals.rejected` |
+
+Each request row carries its id, completion time in Unix seconds, protocol, finish reason, token
+counts, cache reuse, TTFT/prompt/decode milliseconds, total seconds, speculative draft and accept
+counts, and the Qwen3.8-Flash-Next expert-cache lookups. Time sums the engine does not accumulate
+(`prompt_ms` and `decode_ms` at the totals level) are `null`. There is no `hardware` object: the
+engine measures no GPU telemetry, and an absent block is honest where a zero would not be.
+
+The route follows the server's API-key authentication. The document contains no prompt, completion,
+tool argument, header value, key, or client address. `requests` is a bounded window, not a durable
+log; use `--request-log-jsonl` when every request must be retained.
 
 ## Structured request log
 
@@ -1510,30 +1816,52 @@ because another process holds `FILE` open without delete sharing on Windows, the
 warning, keeps appending to `FILE`, and tries again after another `N` MiB. Rotated names are also
 checked against the model artifact path.
 
-Every line is one `infernix_serve_request_log` schema-v28 JSON object. All events carry
+Every line is one `infernix_serve_request_log` schema-v31 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance. Successful request-start records include request-scoped acquisition,
-media-preprocessing wall/work, tokenizer, cache hit/miss/single-flight, and payload-size fields;
+media-preprocessing wall/work, tokenizer, cache hit/miss/single-flight, payload-size fields, and
+`instruction_role_lowerings`, the turns the selected template could not render at their positions;
 they do not infer request behavior from process-global counter deltas.
 
 | Event | Contents |
 |---|---|
 | `server_start` | artifact path, architecture, public name, actual formats and prefill signature; resolved Engine and context-cache capacities, prompt-attention kernel and n-gram drafting options, thinking/non-thinking sampler defaults plus process overrides, thinking-history and thinking-budget defaults, Device arenas, the optional non-additive Vision layout inside the unified workspace, unified Host context capacity and occupancy, KV sizing ledger, CUDA Graph allowance, CUDA/GPU environment, redacted argv, and the `--config` file's path and redacted options (`null` without one) |
-| `request_start` | protocol, resolved sampler and seed, requested reasoning effort, actual initial thinking mode and optional budget, Responses semantic-change flag, output budget, stream/message/tool shape |
-| `request_rejected` | parsed request shape, requested reasoning effort, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
-| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, tool-call parse diagnostics, preemption/recovery counters, thinking-budget application counters, unrounded request-stage seconds, per-request Engine Host exposure, and complete speculative-decoding counters including n-gram and draft-archive counters |
+| `request_start` | protocol, `label`, resolved sampler and seed, requested reasoning effort, actual initial thinking mode and optional budget, Responses semantic-change flag, output budget, stream/message/tool shape |
+| `request_rejected` | parsed request shape, `label`, requested reasoning effort, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
+| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, `prefix_miss`, tool-call parse diagnostics, preemption/recovery counters, thinking-budget application counters, unrounded request-stage seconds, per-request Engine Host exposure, and complete speculative-decoding counters including n-gram and draft-archive counters |
 | `request_scheduling` | request identity, pause/restore/recovery transitions, Engine observation time and cumulative global/request work counters |
 | `request_error` | the resolved request configuration and the generation, cancellation, or pre-outcome transport terminal message |
-| `throughput` | interval token/decode/context-cache pressure counter deltas, authoritative worker Host-work deltas, current scheduler/resource gauges including Device KV growth leases, decode-round batch statistics, and hybrid prefix-cache gauges and counters when that cache is in use |
+| `throughput` | interval token/decode/context-cache pressure counter deltas, authoritative worker Host-work deltas, current scheduler/resource gauges including Device KV growth leases, decode-round batch statistics, hybrid prefix-cache gauges and counters when that cache is in use, and `gpu` (NVML, `null` without it): the device's SM and memory clocks, temperature, power and clock-event reasons at the interval's end, its energy, average power, joules per decode token (intervals without prefill) and the fractions of it the power and thermal policies held the clocks down; a figure the driver does not report is `null` |
 
 `requested_reasoning_effort` and `preserve_thinking` record the explicit options, or `null` when
 unspecified. `enable_thinking` records whether the response starts in thinking mode.
 
+`request_done.prefix_miss` explains a large re-prefill, or is `null`. The server keeps the token
+contexts (prompt and output) of its last 16 requests while the request log is on. A request that
+computes at least 4,096 prompt tokens is compared with them, and the context sharing the longest
+prefix with its prompt (`common_prefix_tokens`) decides:
+
+- `kind: "diverged"`: the prompt departs from that context inside it, and they share at least half
+  the prompt. The client changed history there (it dropped earlier reasoning, say). `earlier` and
+  `current` hold the token ids and text 64 tokens either side of the divergence (`first` is the
+  window's first index; characters a cut splits become U+FFFD).
+- `kind: "evicted"`: that context is a prefix of the prompt (or the prompt of it), yet at least
+  4,096 of its tokens were recomputed (`lost_reuse_tokens`): the cache had lost them.
+
+Both also give the earlier request's `earlier_engine_request_id` and `earlier_context_tokens`, and
+this request's `reused_tokens` and `computed_prefill_tokens`.
+
+`label` is the request's `X-Infernix-Request-Label` header, or `null` without one: a client
+(`tools/bench/run_serve_corpus.py` sends `run_serve_corpus`) marks its traffic so that benchmark
+requests can be told from real use. Only a single header of 1-128 printable ASCII characters
+counts; anything else is ignored, and the request itself is unaffected.
+
 `request_done.result.tool_call_parse` records whether a complete marker was seen, the structured
 call count, empty non-string arguments omitted during normalization, schema-mismatched arguments
 preserved for consumer validation, `duplicate_parameters_repaired`, and a stable fallback reason.
-A parameter named more than once in one call keeps its last value, as in JSON object syntax, and
-counts once in `duplicate_parameters_repaired` for each repeat instead of demoting the call to text.
+On the unconstrained route a parameter named more than once in one call keeps its last value, as in
+JSON object syntax, and counts once in `duplicate_parameters_repaired` for each repeat instead of
+demoting the call to text (a constrained call cannot repeat a name).
 Fallback reasons are `none`, `malformed_structure`, `invalid_tool_name`, `undeclared_tool`,
 `trailing_content`, and `truncated_tail`. `truncated_tail` occurs only with `--tolerant-tool-calls`:
 with a nonzero `structured_call_count` the recovered calls were returned structurally (a discarded
@@ -1553,8 +1881,13 @@ as full-precision JSON numbers. Its `speculative` object contains `backend`, `dr
 `drafted_tokens`, `accepted_tokens`, `fallback_steps`, `accepted_per_position`, and
 `rounds_by_draft_length`: with MTP on Qwen3.5-family models, entry k-1 counts the all-neural rounds
 that ran draft length k (all at `--draft-tokens` unless the `adaptive-mtp` fast path chooses the
-length per round); empty for other backends. Rates can be
-derived downstream from raw token counts and seconds instead of rounded stderr strings.
+length per round); empty for other backends. `round_steps` lists every verified round in order as
+`[drafted, accepted, ngram]` (`ngram` 1 for n-gram copy drafts) and `accepted_length_histogram`
+counts those rounds by accepted drafts (Qwen3.5-family MTP and DFlash, Qwen3.8-Flash-Next; empty
+for other models). With the request log, `output_4grams` counts the output's token 4-grams and
+`output_4grams_in_prompt` those that also occur in the prompt (`null` for an output or prompt
+shorter than four tokens). Rates can be derived downstream from raw token counts and seconds
+instead of rounded stderr strings.
 `generation.scheduling` records preemptions, snapshot/replay restores, replayed tokens and paused
 time. Replay rebuilds committed state without adding new output usage.
 
@@ -1581,7 +1914,9 @@ only with request logging and add no per-token records.
 `drafted_tokens`, and `accepted_tokens` whose proposal came from n-gram copy drafting, and the
 `ngram_archive_rounds`, `ngram_archive_drafted_tokens`, and `ngram_archive_accepted_tokens` counters
 are the part of those whose copy source was the retained draft archive (see [n-gram
-drafting](ngram.md)). With DFlash2 tree verification (`--draft-tree-nodes`), `tree_rounds` counts
+drafting](ngram.md)). `ngram_gate_rejections` counts Qwen3.8-Flash-Next copy proposals that the
+temporary agreement gate (`INFERNIX_TMP_NGRAM_AGREE=1`) refused because their first token was not the
+neural drafter's first draft (0 without it). With tree verification (`--draft-tree-nodes`), `tree_rounds` counts
 rounds that verified a tree, `tree_side_rounds` those whose accepted path left the main chain, and
 `tree_side_accepted_tokens` the drafts those paths accepted after leaving it, which a chain round
 would not have accepted; `drafted_tokens` counts every verified tree column. The `speculative.ngram_archive` object reports that archive at the end of the
@@ -1713,8 +2048,10 @@ are already contained in a top-level Host phase and must not be added to `total`
 Per-round, per-row-round, and per-invocation normalized values are
 `null` when their denominator is zero. Pretty throughput contains nonzero token rates and counts,
 the current running/prefill/decode-ready composition, nonzero waiting/materialization/terminal
-states, average decode batch, and Host-active time plus its fraction of the interval. Use JSONL for
-complete measurement analysis.
+states, average decode batch, Host-active time plus its fraction of the interval, and with NVML the
+device (`gpu SM/memory MHz, power, temperature`, the interval's average power, joules per decode
+token, any clock-event reason other than idle, and the power-capped and thermal fractions when
+nonzero). Use JSONL for complete measurement analysis.
 Intervals with context materialization or retention activity are retained even when they contain no
 token execution; only fully idle intervals are omitted. Downstream measurement should prefer the
 raw counters and seconds over rounded stderr rates.
@@ -1730,12 +2067,14 @@ cancelled, the next boundary rebuilds the batch without an empty row.
 `--max-pending-requests` bounds the requests waiting behind the active set. The total generation
 request lifetime capacity is `max_concurrency + max_pending_requests`, including requests still in
 CPU/media preparation and completed model results whose response has not yet been released. A full
-capacity returns HTTP 429 with code `server_overloaded`. Token-count requests (Anthropic
+capacity returns HTTP 429 with code `server_overloaded` and a `Retry-After` header (seconds: the
+`--pending-timeout-ms` window, at least 1). Token-count requests (Anthropic
 `count_tokens`, Responses `input_tokens`) run the same preparation without generating; a separate
 capacity of the same size bounds how many run at once, and beyond it they are rejected as
 overloaded, as generation requests are. The absolute
 `--pending-timeout-ms` deadline starts before preparation, covers media acquisition and Engine FIFO
-waiting, and returns HTTP 503 with code `request_queue_timeout` if admission does not occur in time.
+waiting, and returns HTTP 503 with code `request_queue_timeout` and the same `Retry-After` if admission
+does not occur in time, on streaming routes too (their response starts at admission).
 Once admitted, a request may pause for resource pressure without restarting this initial-admission
 deadline. Fresh requests enter in FIFO order with a bounded bypass allowance when an earlier request
 cannot fit. There is no admission ETA or unbounded overflow queue.
@@ -1808,7 +2147,9 @@ a following compatible turn can reuse it. Output-limit and context-capacity fini
 `length`/ `max_tokens`; ordinary model or string stops map to `stop`/ `end_turn`.
 
 Function tools are rendered into the model prompt and generated calls are parsed into protocol
-responses. Infernix does not execute tools or enforce tool-argument schemas through constrained decoding.
+responses. Infernix executes no client tools: the only tool it runs is the search of
+[deferred tools](#deferred-tools-and-tool-search). It does not enforce tool-argument schemas through
+constrained decoding.
 
 Prompt-token usage includes chat-template and expanded media tokens. Generated-token usage comes
 from accepted output token IDs, including a stop token whose decoded text may be withheld.

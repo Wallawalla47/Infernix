@@ -81,8 +81,9 @@ struct StateImageSpec {
     std::array<std::size_t, KvWindowGeometry::kPlanes> window_bytes{};
 };
 
+// `gdn_state` is the GDN state pool's recurrent dtype (FP32, or FP16 under fp16-gdn-state).
 [[nodiscard]] StateImageSpec state_image_spec(const TextConfig& config, bool mtp, KvCacheStorage storage,
-                                              DraftRingGeometry draft_ring = {});
+                                              DraftRingGeometry draft_ring = {}, DType gdn_state = DType::FP32);
 
 struct StateImagePart {
     enum class Kind : std::uint8_t {

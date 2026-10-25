@@ -8,6 +8,7 @@
 #include "infernix/ops/speculative_tree.h"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 #include <cstdint>
 
@@ -22,14 +23,40 @@ static_assert(kStateDim % kWarpSize == 0);
 static_assert(kQkPerLane == 4);
 static_assert(kStateDim % kBlockDv == 0);
 
+// A lane's four state values. The pool stores FP32, or FP16 under fp16-gdn-state: then the values widen
+// exactly on load and round to nearest even on store, saturating at FP16's largest finite value
+// (saturate_fp16_state), and every transition between runs in FP32.
 __device__ __forceinline__ void load_qk_lane(float (&reg)[kQkPerLane], const float* base,
                                              std::uint32_t dqk_base) {
     store_vec(reg, load_vec<float4>(base + dqk_base));
 }
 
+struct Fp16x4Pack {
+    __half2 pair[2];
+};
+
+__device__ __forceinline__ void load_qk_lane(float (&reg)[kQkPerLane], const __half* base,
+                                             std::uint32_t dqk_base) {
+    const Fp16x4Pack packed = load_vec<Fp16x4Pack>(base + dqk_base);
+    const float2 lo         = __half22float2(packed.pair[0]);
+    const float2 hi         = __half22float2(packed.pair[1]);
+    reg[0]                  = lo.x;
+    reg[1]                  = lo.y;
+    reg[2]                  = hi.x;
+    reg[3]                  = hi.y;
+}
+
 __device__ __forceinline__ void store_qk_lane(const float (&reg)[kQkPerLane], float* base,
                                               std::uint32_t dqk_base) {
     store_vec(base + dqk_base, load_vec<float4>(reg));
+}
+
+__device__ __forceinline__ void store_qk_lane(const float (&reg)[kQkPerLane], __half* base,
+                                              std::uint32_t dqk_base) {
+    Fp16x4Pack packed;
+    packed.pair[0] = __floats2half2_rn(saturate_fp16_state(reg[0]), saturate_fp16_state(reg[1]));
+    packed.pair[1] = __floats2half2_rn(saturate_fp16_state(reg[2]), saturate_fp16_state(reg[3]));
+    store_vec(base + dqk_base, packed);
 }
 
 inline constexpr float kQkL2NormEps = 1.0e-6f;
@@ -227,14 +254,15 @@ struct FoldEffects {
                    std::int32_t) {}
 };
 
+template <class State>
 struct DirectAccess {
     const __nv_bfloat16* q;
     const __nv_bfloat16* k;
     const __nv_bfloat16* v;
     const float* g;
     const float* beta;
-    const float* state_read;
-    float* state_write;
+    const State* state_read;
+    State* state_write;
     __nv_bfloat16* out;
     head_map heads;
     std::int32_t width;
@@ -250,12 +278,12 @@ struct DirectAccess {
         return token;
     }
 
-    __device__ __forceinline__ const float*
+    __device__ __forceinline__ const State*
     state_read_base(const RecurrentCoordinates& coord) const {
         return state_read + static_cast<std::int64_t>(coord.value_head) * kStateDim * kStateDim;
     }
 
-    __device__ __forceinline__ float* state_write_base(const RecurrentCoordinates& coord) const {
+    __device__ __forceinline__ State* state_write_base(const RecurrentCoordinates& coord) const {
         return state_write + static_cast<std::int64_t>(coord.value_head) * kStateDim * kStateDim;
     }
 
@@ -285,14 +313,15 @@ struct DirectAccess {
     }
 };
 
+template <class State>
 struct BatchUpdateAccess {
     const __nv_bfloat16* q;
     const __nv_bfloat16* k;
     const __nv_bfloat16* v;
     const float* g;
     const float* beta;
-    const float* states_read;
-    float* states_write;
+    const State* states_read;
+    State* states_write;
     const std::int32_t* source_state_slots;
     const std::int32_t* destination_state_slots;
     __nv_bfloat16* out;
@@ -318,14 +347,14 @@ struct BatchUpdateAccess {
         return coord.batch;
     }
 
-    __device__ __forceinline__ const float*
+    __device__ __forceinline__ const State*
     state_read_base(const RecurrentCoordinates& coord) const {
         return states_read +
                static_cast<std::int64_t>(source_state_slots[coord.batch]) * state_slot_stride +
                static_cast<std::int64_t>(coord.value_head) * kStateDim * kStateDim;
     }
 
-    __device__ __forceinline__ float* state_write_base(const RecurrentCoordinates& coord) const {
+    __device__ __forceinline__ State* state_write_base(const RecurrentCoordinates& coord) const {
         return states_write +
                static_cast<std::int64_t>(destination_state_slots[coord.batch]) * state_slot_stride +
                static_cast<std::int64_t>(coord.value_head) * kStateDim * kStateDim;
@@ -365,14 +394,14 @@ struct BatchUpdateAccess {
     }
 };
 
-template <bool Masked>
+template <bool Masked, class State>
 struct RecordAccess {
     const __nv_bfloat16* q;
     const __nv_bfloat16* k;
     const __nv_bfloat16* v;
     const float* g;
     const float* beta;
-    const float* states;
+    const State* states;
     const std::int32_t* valid_columns;
     const std::int32_t* initial_slots;
     __nv_bfloat16* key_record;
@@ -400,7 +429,7 @@ struct RecordAccess {
         return static_cast<std::int64_t>(coord.batch) * width + token;
     }
 
-    __device__ __forceinline__ const float*
+    __device__ __forceinline__ const State*
     state_read_base(const RecurrentCoordinates& coord) const {
         return states + static_cast<std::int64_t>(initial_slots[coord.batch]) * state_slot_stride +
                static_cast<std::int64_t>(coord.value_head) * kStateDim * kStateDim;
@@ -475,13 +504,13 @@ using FoldGeometry36x48 = FoldGeometry<36, 16, 48, 10240>;
 // Qwen3.5-122B-A10B: 36 GDN layers, 64 value heads (group 4), 12,288 conv channels.
 using FoldGeometry36x64 = FoldGeometry<36, 16, 64, 12288>;
 
-template <class Geometry>
+template <class Geometry, class State>
 struct FoldAccess {
     const __nv_bfloat16* key_record;
     const __nv_bfloat16* value_record;
     const uint2* gate_record;
     const __nv_bfloat16* conv_record;
-    float* recurrent_layer0;
+    State* recurrent_layer0;
     __nv_bfloat16* conv_layer0;
     std::int64_t recurrent_layer_stride;
     std::int64_t conv_layer_stride;
@@ -520,7 +549,7 @@ struct FoldAccess {
         return static_cast<std::int64_t>(coord.layer) * record_capacity + coord.batch;
     }
 
-    __device__ __forceinline__ const float*
+    __device__ __forceinline__ const State*
     state_read_base(const RecurrentCoordinates& coord) const {
         const std::int64_t slot_stride =
             static_cast<std::int64_t>(Geometry::kValueHeads) * kStateDim * kStateDim;
@@ -529,7 +558,7 @@ struct FoldAccess {
                static_cast<std::int64_t>(coord.value_head) * kStateDim * kStateDim;
     }
 
-    __device__ __forceinline__ float* state_write_base(const RecurrentCoordinates& coord) const {
+    __device__ __forceinline__ State* state_write_base(const RecurrentCoordinates& coord) const {
         const std::int64_t slot_stride =
             static_cast<std::int64_t>(Geometry::kValueHeads) * kStateDim * kStateDim;
         return recurrent_layer0 + static_cast<std::int64_t>(coord.layer) * recurrent_layer_stride +
@@ -559,7 +588,7 @@ struct FoldAccess {
     __device__ __forceinline__ void
     store_final_state(const RecurrentCoordinates& coord,
                       const float (&state)[kDvPerWarp][kQkPerLane]) const {
-        float* destination = state_write_base(coord);
+        State* destination = state_write_base(coord);
 #pragma unroll
         for (int r = 0; r < kDvPerWarp; ++r) {
             store_qk_lane(state[r],
@@ -611,8 +640,9 @@ struct FoldAccess {
     }
 };
 
+template <class State>
 __device__ __forceinline__ void load_state_tile(float (&state)[kDvPerWarp][kQkPerLane],
-                                                const float* base,
+                                                const State* base,
                                                 const RecurrentCoordinates& coord) {
 #pragma unroll
     for (int r = 0; r < kDvPerWarp; ++r) {
@@ -621,8 +651,9 @@ __device__ __forceinline__ void load_state_tile(float (&state)[kDvPerWarp][kQkPe
     }
 }
 
+template <class State>
 __device__ __forceinline__ void store_state_tile(const float (&state)[kDvPerWarp][kQkPerLane],
-                                                 float* base, const RecurrentCoordinates& coord) {
+                                                 State* base, const RecurrentCoordinates& coord) {
 #pragma unroll
     for (int r = 0; r < kDvPerWarp; ++r) {
         store_qk_lane(state[r], base + static_cast<std::int64_t>(coord.dv_base + r) * kStateDim,
@@ -667,16 +698,16 @@ __device__ __forceinline__ void zero_output_suffix(const Access& access,
     }
 }
 
-template <bool NormalizeInputs>
+template <bool NormalizeInputs, class State>
 __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     recurrent_bf16_direct_kernel(const __nv_bfloat16* __restrict__ q,
                                  const __nv_bfloat16* __restrict__ k,
                                  const __nv_bfloat16* __restrict__ v, const float* __restrict__ g,
                                  const float* __restrict__ beta,
-                                 const float* __restrict__ state_read,
-                                 float* __restrict__ state_write, __nv_bfloat16* __restrict__ out,
+                                 const State* __restrict__ state_read,
+                                 State* __restrict__ state_write, __nv_bfloat16* __restrict__ out,
                                  std::int32_t width, head_map heads, float scale) {
-    const DirectAccess access{q, k, v, g, beta, state_read, state_write, out, heads, width, scale};
+    const DirectAccess<State> access{q, k, v, g, beta, state_read, state_write, out, heads, width, scale};
     const RecurrentCoordinates coord = access.coordinates();
     __align__(16) float state[kDvPerWarp][kQkPerLane];
     load_state_tile(state, access.state_read_base(coord), coord);
@@ -684,9 +715,9 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     store_state_tile(state, access.state_write_base(coord), coord);
 }
 
-template <bool NormalizeInputs>
+template <bool NormalizeInputs, class State>
 __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
-    recurrent_batch_update_kernel(BatchUpdateAccess access) {
+    recurrent_batch_update_kernel(BatchUpdateAccess<State> access) {
     const RecurrentCoordinates coord = access.coordinates();
     __align__(16) float state[kDvPerWarp][kQkPerLane];
     // As in the record kernel: the state tile was last written by an earlier round and its slot comes
@@ -697,9 +728,9 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     store_state_tile(state, access.state_write_base(coord), coord);
 }
 
-template <bool Masked>
+template <bool Masked, class State>
 __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
-    recurrent_record_kernel(RecordAccess<Masked> access) {
+    recurrent_record_kernel(RecordAccess<Masked, State> access) {
     const RecurrentCoordinates coord = access.coordinates();
     __align__(16) float state[kDvPerWarp][kQkPerLane];
     // Verification leaves the persistent state unchanged: it was last written by the preceding
@@ -817,8 +848,9 @@ restore_state_tile(float (&state)[kDvPerWarp][kQkPerLane],
 
 // Rebuilds the state after `node` from the initial state along its root path: the same
 // transitions the walk applied there, without effects.
+template <class State>
 __device__ void replay_root_path(float (&state)[kDvPerWarp][kQkPerLane],
-                                 const RecordAccess<true>& access,
+                                 const RecordAccess<true, State>& access,
                                  const RecurrentCoordinates& coord, const SpeculativeTreeRow& row,
                                  int node) {
     int path[kSpeculativeTreeMaxPathLength];
@@ -839,9 +871,9 @@ __device__ void replay_root_path(float (&state)[kDvPerWarp][kQkPerLane],
 // once (build_tree_walk), so every live column is computed exactly once, by the chain recurrence
 // of its root path from the row's initial state, and publishes its output and records. A chain
 // row of a tree round walks its valid prefix.
-template <int Slots>
+template <int Slots, class State>
 __global__ void __launch_bounds__(kWarpSize* kNumWarps, 4)
-    recurrent_tree_walk_kernel(const __grid_constant__ RecordAccess<true> access,
+    recurrent_tree_walk_kernel(const __grid_constant__ RecordAccess<true, State> access,
                                const SpeculativeTreeRow* __restrict__ trees) {
     __shared__ TreeWalkShared<Slots> shared;
     const RecurrentCoordinates coord = access.coordinates();
@@ -897,9 +929,9 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 4)
     zero_output_suffix(access, coord, live, access.width);
 }
 
-template <class Geometry>
+template <class Geometry, class State>
 __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
-    recurrent_fold_kernel(const __grid_constant__ FoldAccess<Geometry> access) {
+    recurrent_fold_kernel(const __grid_constant__ FoldAccess<Geometry, State> access) {
     const RecurrentCoordinates coord = access.coordinates();
     const std::int32_t valid         = access.active_columns(coord);
     if (valid == 0) { return; }

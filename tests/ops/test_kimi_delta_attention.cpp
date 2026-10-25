@@ -1,4 +1,5 @@
 #include "infernix/ops/kimi_delta_attention.h"
+#include "ops/op_family.h"
 
 #include "ops/kda_ref.h"
 #include "ops/op_tester.h"
@@ -657,7 +658,7 @@ int contract_rejection_cases() {
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(kimi_delta_attention) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;

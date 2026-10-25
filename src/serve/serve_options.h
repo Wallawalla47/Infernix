@@ -56,6 +56,7 @@ struct ServeOptions {
     bool vram_past_budget = false;
     std::uint32_t expert_tail_skip = 0; // EngineOptions::expert_tail_skip
     bool expert_a4_activations     = false; // EngineOptions::expert_a4_activations
+    bool embedding_host            = false; // EngineOptions::embedding_host
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
@@ -94,15 +95,21 @@ struct ServeOptions {
     std::optional<bool> preserve_thinking;
     // Recover complete Qwen calls with malformed wrapper/suffix output (opt-in; strict by default).
     bool tolerant_tool_calls = false;
+    // --restore-tool-reasoning: a Chat Completions assistant turn whose client dropped the reasoning of a
+    // tool-calling response this server produced gets it back (serve/reasoning_store.h), so a tool loop's
+    // history renders as generated and keeps its prefix-cache match. Off by default: it changes the
+    // history the client sent.
+    bool restore_tool_reasoning = false;
     // --claude-code-prompt as-sent|local: Anthropic Messages from Claude Code keep its System prompt,
     // or have its Claude-specific parts replaced by a short local-agent preamble.
     ClaudeCodePrompt claude_code_prompt = ClaudeCodePrompt::AsSent;
     std::optional<std::uint32_t> default_thinking_budget;
     // A thinking request without a budget (its own or --default-thinking-budget) and at least
-    // kThinkingAnswerRoomMinTokens of max_tokens gets a budget that leaves a quarter of max_tokens
-    // (at least kThinkingAnswerRoomMinReserve, at most half) for the answer: max_tokens counts the
-    // thinking, so a long thought would otherwise end the request with no answer.
-    // --no-thinking-answer-room turns it off.
+    // kThinkingAnswerRoomMinTokens of output limit (max_tokens, or the context the prompt leaves
+    // when that is less) gets a budget that leaves a quarter of that limit (at least
+    // kThinkingAnswerRoomMinReserve, at most half) for the answer: the limit counts the thinking,
+    // so a long thought would otherwise end the request with no answer. See
+    // thinking_answer_room_budget. --no-thinking-answer-room turns it off.
     bool thinking_answer_room = true;
     // End-of-thinking message fed to the model when it hits the thinking budget; empty
     // preserves the model's built-in control suffix.

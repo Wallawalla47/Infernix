@@ -1,4 +1,5 @@
 #include "media/decode/decode.h"
+#include "fixtures/media/jpeg.h"
 
 #ifdef INFERNIX_MEDIA_NATIVE_PNG
 #include "media/decode/png_decode.h"
@@ -146,9 +147,122 @@ void test_issue_20_unaligned_jpeg() {
     }
 }
 
-// FFmpeg's swscaler reports the yuvj420p input of every such JPEG. With a handler installed the
-// line reaches it whole, without FFmpeg's "[name @ address]" prefix or line break, instead of
-// stderr; clearing the handler hands back the one installed.
+// Pillow's pixels (libjpeg islow IDCT, fancy upsampling): every fixture byte-exact, through both
+// the probe and the decoder.
+void expect_image(std::span<const std::uint8_t> encoded, int width, int height,
+                  std::span<const std::uint8_t> expected, std::string_view name) {
+    const auto info  = infernix::media::decode::inspect_image(encoded, {});
+    const auto image = infernix::media::decode::decode_image(encoded, {});
+    if (info.width != width || info.height != height || image.width != width ||
+        image.height != height || image.rgb.size() != expected.size()) {
+        throw std::runtime_error(std::string(name) + ": JPEG geometry mismatch");
+    }
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        if (image.rgb[i] != expected[i]) {
+            throw std::runtime_error(std::string(name) + ": JPEG RGB mismatch at byte " +
+                                     std::to_string(i));
+        }
+    }
+}
+
+void test_jpeg_references() {
+    for (const auto& fixture : jpeg_fixtures::cases) {
+        const auto encoded  = decode_base64(fixture.encoded);
+        const auto expected = decode_base64(fixture.rgb);
+        expect_image(encoded, fixture.width, fixture.height, expected, fixture.name);
+    }
+}
+
+// EXIF orientations 1..8 against ImageOps.exif_transpose().
+void test_jpeg_orientation() {
+    const auto& fixture = jpeg_fixtures::cases[2];
+    const auto encoded  = decode_base64(fixture.encoded);
+    for (int orientation = 1; orientation <= 8; ++orientation) {
+        // EXIF IFD0 with one SHORT Orientation entry, little endian.
+        std::array<std::uint8_t, 36> exif = {
+            0xff, 0xe1, 0x00, 0x22, 'E', 'x', 'i', 'f', 0, 0, 'I', 'I', 42, 0, 8, 0, 0, 0,
+            1,    0,    0x12, 0x01, 3,   0,   1,   0,   0, 0, 1,   0,   0,  0, 0, 0, 0, 0};
+        exif[28]      = static_cast<std::uint8_t>(orientation);
+        auto oriented = encoded;
+        oriented.insert(oriented.begin() + 2, exif.begin(), exif.end());
+        const auto expected = decode_base64(jpeg_fixtures::orientation_rgb[orientation - 1]);
+        const bool swap     = orientation >= 5;
+        expect_image(oriented, swap ? fixture.height : fixture.width,
+                     swap ? fixture.width : fixture.height, expected,
+                     "EXIF orientation " + std::to_string(orientation));
+    }
+}
+
+// FFmpeg (the video path) interpolates chroma to every column, so the last column of an odd-width
+// 4:2:0 frame keeps its colour.
+void test_ffmpeg_odd_width() {
+    const auto& fixture = jpeg_fixtures::cases[0];
+    const auto encoded  = decode_base64(fixture.encoded);
+    const auto video    = infernix::media::decode::decode_video(encoded, {}, 2.0, 1, 1);
+    if (video.frames.size() != 1 || video.width != fixture.width ||
+        video.height != fixture.height) {
+        throw std::runtime_error("odd-width JPEG video geometry mismatch");
+    }
+    for (int y = 0; y < fixture.height; ++y) {
+        expect_pixel(video.frames[0], fixture.width - 1, y, {29, 120, 199}, 3);
+    }
+}
+
+void expect_error(std::span<const std::uint8_t> encoded,
+                  const infernix::media::decode::Policy& policy,
+                  infernix::media::decode::ErrorKind kind) {
+    for (const bool inspect : {false, true}) {
+        try {
+            if (inspect) {
+                (void)infernix::media::decode::inspect_image(encoded, policy);
+            } else {
+                (void)infernix::media::decode::decode_image(encoded, policy);
+            }
+        } catch (const infernix::media::decode::Error& error) {
+            if (error.kind() == kind) { continue; }
+            throw std::runtime_error("incorrect media error category");
+        }
+        throw std::runtime_error("invalid or over-budget JPEG was accepted");
+    }
+}
+
+// Truncation (Pillow rejects it; libjpeg alone would pad the image), budgets, and cancellation
+// through the checkpoint, after which the decoder is still usable.
+void test_jpeg_errors() {
+    using namespace infernix::media::decode;
+    const auto& fixture = jpeg_fixtures::cases[0];
+    const auto encoded  = decode_base64(fixture.encoded);
+    expect_error(std::span(encoded).first(encoded.size() - 2), {}, ErrorKind::InvalidInput);
+    expect_error(std::span(encoded).first(encoded.size() - 16), {}, ErrorKind::InvalidInput);
+    expect_error(std::span(encoded).first(8), {}, ErrorKind::InvalidInput);
+    expect_error(encoded, {.max_bytes = encoded.size() - 1}, ErrorKind::BudgetExceeded);
+    expect_error(
+        encoded,
+        {.max_decoded_pixels = static_cast<std::uint64_t>(fixture.width) * fixture.height - 1},
+        ErrorKind::BudgetExceeded);
+
+    struct Cancelled {};
+
+    for (const bool inspect : {false, true}) {
+        int checkpoints = 0;
+        Policy policy{.checkpoint = [&] {
+            if (++checkpoints == 3) { throw Cancelled{}; }
+        }};
+        try {
+            if (inspect) {
+                (void)inspect_image(encoded, policy);
+            } else {
+                (void)decode_image(encoded, policy);
+            }
+            throw std::runtime_error("JPEG cancellation was ignored");
+        } catch (const Cancelled&) {}
+    }
+    expect_image(encoded, fixture.width, fixture.height, decode_base64(fixture.rgb), fixture.name);
+}
+
+// FFmpeg's swscaler reports the yuvj420p input of every JPEG-coded video frame. With a handler
+// installed the line reaches it whole, without FFmpeg's "[name @ address]" prefix or line break,
+// instead of stderr; clearing the handler hands back the one installed.
 void test_library_log_routing() {
     namespace decode = infernix::media::decode;
 
@@ -167,7 +281,8 @@ void test_library_log_routing() {
         throw std::runtime_error("an FFmpeg log handler was installed before the test");
     }
     try {
-        (void)decode::decode_image(decode_base64(issue_20_jpeg_base64), {});
+        // JPEG images decode through libjpeg; the same bytes as a video go through FFmpeg.
+        (void)decode::decode_video(decode_base64(issue_20_jpeg_base64), {}, 2.0, 1, 1);
     } catch (...) {
         (void)decode::set_library_log_handler({});
         throw;
@@ -400,6 +515,10 @@ void test_png_row_width_guard() {
 int main() {
     try {
         test_issue_20_unaligned_jpeg();
+        test_jpeg_references();
+        test_jpeg_orientation();
+        test_ffmpeg_odd_width();
+        test_jpeg_errors();
         test_library_log_routing();
 #ifdef INFERNIX_MEDIA_NATIVE_PNG
         test_png_decoders();

@@ -1,3 +1,4 @@
+#include "ops/op_family.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
 #include "infernix/ops/attn_input_proj.h"
@@ -223,7 +224,7 @@ int run_case(const Weight& weight, const quantized_weight::PackedWeight& host, i
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(attn_input_proj_fused_rmsnorm) {
     try {
         if (cuda_unavailable()) { return 77; }
         quantized_weight::PatternedWeightOptions options;

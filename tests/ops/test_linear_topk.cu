@@ -1,3 +1,4 @@
+#include "ops/op_family.h"
 #include "core/weight.h"
 #include "infernix/ops/linear_topk.h"
 
@@ -478,7 +479,7 @@ int run_q4(const DeviceBuffer& hidden, const std::vector<double>& base_score) {
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(linear_topk) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;

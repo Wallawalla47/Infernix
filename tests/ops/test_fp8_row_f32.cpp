@@ -11,6 +11,7 @@
 //     the output's BF16 rounding. Widths cover every schedule band and the split-K tails.
 //   - Column invariance: under A16ColumnInvariant a column's outputs are the same bits at every width.
 
+#include "ops/op_family.h"
 #include "core/weight.h"
 #include "infernix/ops/attn_input_proj.h"
 #include "infernix/ops/gdn_input_proj.h"
@@ -250,7 +251,7 @@ int run_linear_add(DevicePackedWeight& parent, int tokens, ops::LinearPolicy pol
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(fp8_row_f32) {
     int failures = 0;
     for (const int k : {3072, 8192}) {
         for (const int tokens : {1, 17, 300}) { failures += run_quantizer(k, tokens); }

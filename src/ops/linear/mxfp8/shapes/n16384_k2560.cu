@@ -7,6 +7,11 @@
 #include "ops/linear/common/output.cuh"
 #include "ops/linear/mxfp8/mxfp8_launch.cuh"
 #include "ops/linear/mxfp8/mxfp8_shapes.h"
+#include "ops/linear/f16acc/f16acc_mma.cuh"
+#include "ops/linear/fp8/fp8_a8_pair_tma_mma.cuh"
+#include "ops/linear/mxfp8/mxfp8_dispatch.h"
+
+#include <stdexcept>
 
 namespace infernix::ops::detail {
 namespace {
@@ -29,14 +34,51 @@ void select(const Mxfp8Operands& p, Output output, cudaStream_t stream) {
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     select(mxfp8_operands(x, weight), LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), weight.n}, stream);
 }
+
+// f16-accumulate-prefill: the exact route's TMA tiles at the same widths (not yet swept for this route).
+template <class Output>
+void select_f16(const Tensor& x, const Weight& weight, Output output, F16AccumulateWorkspace scratch,
+                cudaStream_t stream) {
+    if (x.ne[1] <= 3072) return mxfp8_f16acc<Geometry, Mxfp8Tma<Fp8A16RingT64R128>>(x, weight, output, scratch, stream);
+    mxfp8_f16acc<Geometry, Mxfp8Tma<Mxfp8TmaT128R128>>(x, weight, output, scratch, stream);
+}
+
+void launch_f16(const Tensor& x, const Weight& weight, Tensor& out, F16AccumulateWorkspace scratch,
+                cudaStream_t stream) {
+    select_f16(x, weight, LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), weight.n}, scratch, stream);
+}
+
+// fp8-a8-pair-block32: the activation as two E4M3 terms with per-32 UE8M0 scales, the weight's own group
+// scales in the same block-scaled MMA (fp8_a8_pair_tma_mma.cuh); recipe C's pair tiles, not yet swept here.
+void launch_pair_block32(const Tensor& x, const Weight& weight, Tensor& out, Fp8A8PairBlock32Workspace scratch,
+                         cudaStream_t stream) {
+    fp8_a8_pair_block32_gemm<Geometry, true>(x, weight, LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), weight.n},
+                                             scratch, stream);
+}
 } // namespace
 
-const Mxfp8LinearShape kMxfp8N16384K2560{16384, 2560, launch_a16};
+const Mxfp8LinearShape kMxfp8N16384K2560{16384, 2560, launch_a16, launch_f16, kMxfp8F16MinTokens, launch_pair_block32, kMxfp8PairMinTokensN16384};
 
-void mxfp8_gdn_input_n16384_k2560(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z, cudaStream_t stream) {
-    select(mxfp8_operands(x, weight),
-           LinearBf16SegmentedOutput<10240, 6144>{
-               {static_cast<__nv_bfloat16*>(qkv.data), static_cast<__nv_bfloat16*>(z.data)}},
-           stream);
+void mxfp8_gdn_input_n16384_k2560(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z, LinearRoutes routes,
+                                  WorkspaceArena* workspace, cudaStream_t stream) {
+    const LinearBf16SegmentedOutput<10240, 6144> output{
+        {static_cast<__nv_bfloat16*>(qkv.data), static_cast<__nv_bfloat16*>(z.data)}};
+    if (has_route(routes, LinearRoutes::F16Accumulate) && x.ne[1] >= kMxfp8F16MinTokens) {
+        if (workspace == nullptr) {
+            throw std::invalid_argument("mxfp8 gdn_input_proj: the f16-accumulate route requires caller workspace");
+        }
+        auto scope = workspace->scope();
+        return select_f16(x, weight, output, allocate_f16_accumulate_workspace(*workspace, x.ne[1], weight.k),
+                          stream);
+    }
+    if (has_route(routes, LinearRoutes::Fp8A8PairBlock32) && x.ne[1] >= kMxfp8PairMinTokensN16384) {
+        if (workspace == nullptr) {
+            throw std::invalid_argument("mxfp8 gdn_input_proj: the block32 pair route requires caller workspace");
+        }
+        auto scope = workspace->scope();
+        return fp8_a8_pair_block32_gemm<Geometry, true>(
+            x, weight, output, allocate_fp8_a8_pair_block32_workspace(*workspace, x.ne[1], weight.k), stream);
+    }
+    select(mxfp8_operands(x, weight), output, stream);
 }
 } // namespace infernix::ops::detail

@@ -1,4 +1,5 @@
 #include "infernix/ops/add_bias.h"
+#include "ops/op_family.h"
 #include "ops/op_tester.h"
 
 #include <cstdint>
@@ -65,7 +66,7 @@ int run_case(const char* label, std::int32_t rows, std::int32_t columns, std::ui
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(add_bias) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;

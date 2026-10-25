@@ -1,13 +1,14 @@
-# DFlash2 tree verification
+# Tree verification
 
-DFlash2 proposes one conditional path per round and the target verifies it as a causal chain. A
+DFlash2, DFlash and MTP propose one path per round and the target verifies it as a causal chain. A
 round ends at the first rejected proposal, so a wrong guess at an early position discards the whole
 rest of the path. Tree verification lets the target check a small tree of proposals in the same
 forward pass: alternatives share the prefix they extend, and the round continues along whichever
 alternative the target accepts. Each round builds a new tree for every row from the drafter's
-candidate lattice, spending its columns where the drafter is least sure. The output distribution
-is unchanged: greedy rounds emit the target's argmax continuation and sampled rounds emit exactly
-the processed target distribution (see [Exactness](#exactness)).
+candidates (DFlash2's candidate lattice, DFlash's independent positions, the alternatives beside
+each MTP draft), spending its columns where the drafter is least sure. The output distribution is unchanged: greedy rounds emit the
+target's argmax continuation and sampled rounds emit exactly the processed target distribution
+(see [Exactness](#exactness)).
 
 This document owns the tree mathematics, the per-round tree builder, acceptance, compaction and
 configuration. [DFlash](dflash.md) owns the drafter and the chain round it extends;
@@ -15,13 +16,14 @@ configuration. [DFlash](dflash.md) owns the drafter and the chain round it exten
 
 ## Scope
 
-- DFlash2 neural rounds only. Ngram copy rounds, MTP and DFlash (v1) keep chain verification.
+- DFlash2, DFlash and MTP neural rounds only; n-gram copy rounds keep chain verification. MTP
+  trees need `--fast-path sampled-mtp-drafts` with resident experts (see [MTP](#mtp)).
 - Every KV storage (`bf16`, `int8`, `fp8`, `nvfp4`, `k8v4`, `vq2`, `k4v2`): each format's grouped
   and parallel verification attention applies per-row ancestor masks, and compaction moves every
   stored plane. For `vq2` and `k4v2` it also moves each accepted column's exact-window slot in the
   row's StateImage slot, re-tagged for the destination position (cleared when the source slot no
   longer matches its codes).
-- Single FP8 or NVFP4 GDN input projections (the tree convolution reads ancestors from the
+- Single FP8, NVFP4 or Q8 GDN input projections (the tree convolution reads ancestors from the
   materialized projection); startup rejects other parents.
 - A tree row holds at most 32 columns (one 32-bit ancestor mask per column) and 8 root-to-leaf
   paths.
@@ -33,7 +35,7 @@ token at position F); every other column c has `parent[c] < c` and
 `depth[c] = depth[parent[c]] + 1`. Two layout rules are relied on throughout:
 
 1. **The main chain occupies columns 0..K** (`parent[c] = c-1`, K = `--draft-tokens`): it is the
-   chain round's proposal, bit for bit.
+   chain round's proposal, bit for bit (for DFlash, on greedy rows; see [Tree builder](#tree-builder)).
 2. **Every other column lies after the main chain, at depth at most K.** Any accepted path's
    columns c_i satisfy either `c_i = i` (main) or `c_i > K >= i`, so copying accepted side columns
    onto positions `i` never reads a slot the same copy writes ([Compaction](#compaction)).
@@ -94,7 +96,10 @@ and +6.1 % on sampled docs against the 7-draft chain that day):
   keeps every estimate current at a cost of about one wide round in 32.
 
 The choice depends only on earlier rounds, never on the draws of the round it sizes, so sampling
-stays exact. It does depend on measured time: two runs of a seeded request may verify different
+stays exact. (The temporary A/B switch `INFERNIX_TMP_TREE_ROUND_WIDTH`, DFlash2 only, instead
+proposes first and sizes each round from its own draft probabilities, calibrated by the same measured
+gains: the width then depends on the main chain's draws, which precede every side column's, as the
+builder's priorities already do.) It does depend on measured time: two runs of a seeded request may verify different
 trees and so sample different, equally distributed text. A fixed table keeps seeded runs at one
 request reproducible. On a target whose GDN input projections cannot verify trees (see
 [Scope](#scope)) automatic mode resolves to chain verification: the Engine's resolved options
@@ -130,6 +135,37 @@ A child's priority is fixed before it is drawn, from the earlier draws only. The
 therefore depend on any draw except a column's own token and the draws that depend on it, which
 is what keeps recursive rejection sampling exact. The counter index is unique per (parent,
 sibling), so no two columns at one position share a uniform.
+
+**DFlash.** The DFlash drafter predicts each position of its block on its own, so a tree round
+takes, at each position i, the head's 16 most probable tokens and their log-probabilities
+(`ops::top_logprobs` over the head's logits; a shortlist head's rows are mapped to vocabulary ids)
+as the position's candidates and an edge row that does not depend on the predecessor, and
+`ops::candidate_tree` runs the same builder over these independent positions: every node at
+depth i-1 has the law `softmax_c(logprob_i(c) / temperature)`. A greedy row's main chain is each
+position's most probable token, the chain round's argmax proposal. A sampled row's drafts are
+drawn from that 16-candidate law with the counter keys above, where a chain round proposes the
+argmax; both are exact under the target's acceptance, which reads each column's candidates and
+law in the same frame as DFlash2's. DFlash's chain rounds keep their deterministic-draft
+verifier.
+
+### MTP
+
+MTP drafts its chain in the previous round's Finish, one autoregressive step per draft, so a
+round's tree cannot draft past a branch: an MTP tree is the chain with **leaves**. Every round of
+an engine with MTP tree families drafts through the sparse proposal of `sampled-mtp-drafts`
+(each draft drawn from its law over the head's top four ranks, rank 0 with a one-hot law at
+temperature 0) and also keeps those ranks' log-probabilities. In a tree round
+`ops::candidate_chain_tree` takes each full-window row's chain as proposed and adds side columns
+best first with the builder's priority, draws and counter keys, but only as children of chain
+columns, which take no children themselves: a sampled row's law at step i is the law its chain draft
+was drawn from, and a greedy row ranks its alternatives by the temperature-1 softmax of the
+log-probabilities. The verification, acceptance and compaction are the DFlash rounds' (MTP has no
+pending features); the alignment of the next proposal then reads the accepted path's tokens from the
+licensed tokens (`ops::mtp_prepare_next_round`) and its compacted target hidden states, so the next
+chain is drafted after the accepted path. Rows whose chain is shorter than the window (a budget or
+context tail, or the prompt's argmax drafts, which carry no proposals) are chain rows of the round,
+and a round of a fixed table's tree batch size runs instead of adaptive-mtp's draft-length policy;
+automatic widths resolve to chains beside that policy.
 
 ## Verification forward
 
@@ -169,6 +205,15 @@ slots cover every tree of up to four side columns (K+5 columns); a deeper nestin
 branch state from the initial state along its root path. Replay is exact: every column's state is
 the chain recurrence of its root path, bit for bit. The persistent recurrent and convolution state
 is not modified by verification (ReplaySSM record mode), so rejected branches need no rollback.
+
+The `gdn-tree-closed-form` fast-path candidate (`ops::GdnTreeRecordRoute::ClosedForm`; TreeWY,
+arXiv 2608.20961) replaces the walk's W dependent steps: along a column's root path the transition
+unrolls to `s_c = exp(G_c) s_0 + sum_a exp(G_c - G_a) u_a k_a^T` (G the summed gates), so each
+column's delta `u_c` needs only its ancestors' deltas and `s_0 k_c` (one solve level per depth), and
+its output `scale (exp(G_c) s_0 q_c + sum_a exp(G_c - G_a) (k_a . q_c) u_a)`. A CTA computes its 16
+state rows against every column at once and follows the tree's ancestor pairs for the rest. FP32 in
+another order than the walk, its outputs are within BF16 rounding of the FP64 recurrence but not
+bit-identical; the records are the same copies.
 
 A tree widens the verification block, which selects other GEMM tiles and attention routes, so the
 main-chain columns of a tree round are not bit-identical to those of a chain round, as ngram
@@ -221,6 +266,42 @@ conditions on the emitted token, as in chain speculative sampling, so the whole 
 has the target's joint distribution. Greedy rows are exact because they emit the argmax at every
 step.
 
+### UniVer trees (`univer-trees`)
+
+The `univer-trees` fast-path candidate verifies sampled tree rows by UniVer (Weng, Hu, Yairi, arXiv
+2605.04543), which composes local optimal-transport plans and reports +4.2..+8.5 % accepted length
+over recursive rejection without replacement. It needs its own tree shape, so it applies to the
+drafters that build their trees (DFlash2, DFlash) under a fixed `--draft-tree-nodes` table: an MTP
+chain is drawn before any sibling exists, and automatic widths read narrower widths' tokens off the
+wider tree's walk, which UniVer's decision does not share. Greedy rows, chain rows and Gumbel rows
+are unchanged.
+
+- **Builder** (`SpeculativeTreeShape::transport`). The row's shape is built first as a greedy row's
+  is, under its sampled law: each node takes its best untaken rank, best first. No draw enters the
+  shape. The tokens are then filled parents first: a node's children but the last take its law's
+  top ranks in rank order, and its last child is drawn from its law restricted to the other ranks
+  (counter key: the chain's for a main column's only child, `((v+1) << 5) | j` otherwise). A node
+  with one child therefore proposes as the chain round does, and the main chain is the top rank
+  wherever a main column has siblings. The row is marked `transport`, and `sampled` holds each
+  residual draw's column.
+- **Acceptance.** Allocation runs parents before children from `pt(anchor) = 1` with UniVer's
+  local plan (`speculative_accept_sparse_tree`): the residual draw passes with
+  `min(1, pt·p(u)/q'(u))`, every deterministic child takes `pt·p(d)` scaled by `(1 - a_u)/Z`, and
+  each child's `pt` is its share given the earlier siblings' rejection. Then every column draws one
+  uniform `(seed, L+depth+1, Accept, column)`, and the first passing column in post-order (subtrees
+  in sibling order, then the node; the anchor always passes) ends the path. A leaf emits the bonus
+  from its target; any other node emits a correction from `max(pt·p - q', 0)` over the tokens that
+  are not its children.
+- **Exactness.** The tree is locally lossless: at every node the expected emitted mass of each
+  token over the residual draw is `pt·p`, because the deterministic children and the draw's law
+  are fixed before the draw. The paper's two-stage theorem then gives the processed target
+  distribution of every emitted token. Shapes may depend on draws elsewhere in the tree, because
+  each subtree's expected return given its shape is its `pt`. The builder's shape depends on no
+  draw at all.
+- **Checks.** `tests/ops/test_speculative_tree.cpp` replays both builders' transport shapes and
+  token fills, and tests the first emitted token and every reached column's next token against
+  their targets (chi-square) on a two-level tree with deterministic children and residual draws.
+
 ## Compaction
 
 After acceptance and before the continuation hidden is selected, one in-graph step makes the
@@ -270,7 +351,11 @@ Op tests (`tests/ops/test_speculative_tree.cpp`, `tests/ops/softmax_attention/ca
    the host derivation of its parent array; masks and live counts; and a host replay with FP64
    lattice laws: every side column's parent had the highest priority (within FP32 rounding) when the
    column was added, its rank is the untaken-restricted inverse CDF of the parent's law with the
-   column's counter key, and a short row has no extendable node left.
+   column's counter key, and a short row has no extendable node left. `candidate_tree` (DFlash)
+   against the same host replay over FP64 independent-position laws, with its main chain checked
+   against the host argmax and inverse CDF directly. `candidate_chain_tree` (MTP): the chain columns
+   as given, bit for bit, and the replay with leaf-only side columns, including a row whose chain
+   draft is missing from its candidates (no side column).
 2. Acceptance: greedy walks over per-row trees (main, side, below-main branches, short rows, chain
    rows); chain-shaped tree rows bit-identical to the chain Op; the emitted-token distribution at a
    root fan-out of 1..4 children against `p_v` (chi-square).

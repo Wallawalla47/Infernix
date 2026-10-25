@@ -284,6 +284,10 @@ std::uint32_t resolve_auto_ngram(const Model& model, EngineOptions& options) {
     return detail::resolve_auto_ngram_impl(model, options);
 }
 
+std::string mtp_draft_switch_report(const execution::Parameters& parameters, const EngineOptions& options) {
+    return detail::mtp_draft_switch_report_impl(parameters, options);
+}
+
 std::unique_ptr<Program> create_program(const execution::Parameters& parameters,
                                         SequencePlan&& plan, DeviceContext& device,
                                         const StartupObserver& startup_observer,

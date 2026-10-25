@@ -51,8 +51,12 @@ std::string codepoint_to_utf8(std::int32_t codepoint);
 bool is_letter(std::int32_t codepoint) noexcept;
 bool is_mark(std::int32_t codepoint) noexcept;
 bool is_number(std::int32_t codepoint) noexcept;
+// General category Nd only (the decimal digits of every script).
+bool is_decimal_digit(std::int32_t codepoint) noexcept;
 bool is_whitespace(std::int32_t codepoint) noexcept;
 // The Unicode simple lowercase mapping (UnicodeData.txt); the codepoint itself where none exists.
 std::int32_t simple_lowercase(std::int32_t codepoint) noexcept;
+// The Unicode simple uppercase mapping; the codepoint itself where none exists.
+std::int32_t simple_uppercase(std::int32_t codepoint) noexcept;
 
 } // namespace infernix::text::unicode_internal

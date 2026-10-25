@@ -39,4 +39,14 @@ void projection_fp32(const Tensor& x, std::span<const Tensor* const> weights, Te
  */
 void projection_fp32(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream);
 
+/**
+ * The router-mma fast path's form of the BF16 projection (candidates §8.3 CF-02): the first weight's rows
+ * (a multiple of 64; K a multiple of 64) on the BF16 tensor-core tile with FP32 accumulation, the other
+ * weights' rows exactly as projection_fp32 computes them. Products are exact in FP32; the first weight's
+ * sums take the tile's order, which depends on K alone, so a column's bits still do not depend on the
+ * call's width, but they differ in rounding from projection_fp32's. Calls of at least 64 columns.
+ */
+void projection_fp32_router_mma(const Tensor& x, std::span<const Tensor* const> weights, Tensor& out,
+                                cudaStream_t stream);
+
 } // namespace infernix::ops

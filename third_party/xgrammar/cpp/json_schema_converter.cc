@@ -3178,11 +3178,65 @@ int32_t JSONSchemaConverter::GenerateAny(const AnySpec& spec, const std::string&
   );
 }
 
+int32_t JSONSchemaConverter::LiteralExpression(const std::string& json_value) {
+  // Scalars keep their serialized bytes; only a container is re-read.
+  if (!any_whitespace_ || json_value.empty() ||
+      (json_value.front() != '{' && json_value.front() != '[')) {
+    return ByteString(json_value);
+  }
+  picojson::value value;
+  XGRAMMAR_CHECK(picojson::parse(value, json_value).empty());
+  return LiteralExpression(value);
+}
+
+int32_t JSONSchemaConverter::LiteralExpression(const picojson::value& value) {
+  // A compact-only container literal inside a pretty-printed document forces the model off its
+  // layout, the failure any_whitespace exists for (NInfer #392).
+  const bool is_array = value.is<picojson::array>();
+  if (!any_whitespace_ || (!is_array && !value.is<picojson::object>())) {
+    return ByteString(value.serialize());
+  }
+  std::vector<int32_t> items;
+  items.push_back(ByteString(is_array ? "[" : "{"));
+  items.push_back(WhitespaceExpression());
+  bool first = true;
+  const auto separate = [&]() {
+    if (!first) {
+      items.push_back(WhitespaceExpression());
+      items.push_back(ByteString(","));
+      items.push_back(WhitespaceExpression());
+    }
+    first = false;
+  };
+  if (is_array) {
+    for (const auto& element : value.get<picojson::array>()) {
+      separate();
+      items.push_back(LiteralExpression(element));
+    }
+  } else {
+    // Members in the schema's order, as serialize() writes them.
+    const auto& object = value.get<picojson::object>();
+    for (const auto& key : object.ordered_keys()) {
+      separate();
+      items.push_back(ByteString(picojson::value(key).serialize()));
+      items.push_back(WhitespaceExpression());
+      items.push_back(ByteString(":"));
+      items.push_back(WhitespaceExpression());
+      items.push_back(LiteralExpression(object.at(key)));
+    }
+  }
+  if (!first) {
+    items.push_back(WhitespaceExpression());
+  }
+  items.push_back(ByteString(is_array ? "]" : "}"));
+  return Sequence(items);
+}
+
 int32_t JSONSchemaConverter::GenerateConst(const ConstSpec& spec, const std::string& rule_name) {
   if (!IsAllowedJSONLiteral(spec.json_value)) {
     return Unsatisfiable();
   }
-  return ByteString(spec.json_value);
+  return LiteralExpression(spec.json_value);
 }
 
 int32_t JSONSchemaConverter::GenerateEnum(const EnumSpec& spec, const std::string& rule_name) {
@@ -3190,9 +3244,9 @@ int32_t JSONSchemaConverter::GenerateEnum(const EnumSpec& spec, const std::strin
       << "GenerateEnum called with empty enum spec for rule: " << rule_name;
   std::vector<int32_t> values;
   values.reserve(spec.json_values.size());
-  for (const auto& value : spec.json_values) {
-    if (IsAllowedJSONLiteral(value)) {
-      values.push_back(ByteString(value));
+  for (const auto& json_value : spec.json_values) {
+    if (IsAllowedJSONLiteral(json_value)) {
+      values.push_back(LiteralExpression(json_value));
     }
   }
   if (values.empty()) {

@@ -24,6 +24,13 @@ void require_dtype(const Tensor& t, DType dtype, const char* name) {
     if (t.dtype != dtype) { throw std::invalid_argument(std::string("gated_delta_net: ") + name); }
 }
 
+// The stored recurrent state: FP32, or FP16 (fp16-gdn-state).
+void require_state_dtype(const Tensor& t, const char* name) {
+    if (t.dtype != DType::FP32 && t.dtype != DType::FP16) {
+        throw std::invalid_argument(std::string("gated_delta_net: ") + name + " must be FP32 or FP16");
+    }
+}
+
 void require_shape(const Tensor& t, std::int32_t n0, std::int32_t n1, std::int32_t n2,
                    std::int32_t n3, const char* name) {
     if (t.ne[0] != n0 || t.ne[1] != n1 || t.ne[2] != n2 || t.ne[3] != n3) {
@@ -74,7 +81,7 @@ Geometry validate_recurrent(const Tensor& q, const Tensor& k, const Tensor& v, c
     require_dtype(out, DType::BF16, "out must be BF16");
     require_dtype(g, DType::FP32, "g must be FP32");
     require_dtype(beta, DType::FP32, "beta must be FP32");
-    require_dtype(ssm_state, DType::FP32, "ssm_state must be FP32");
+    require_state_dtype(ssm_state, "ssm_state");
 
     const Geometry geometry = require_geometry(q, v);
     require_shape(q, detail::gated_delta_net::kStateDim, geometry.qk_heads, geometry.tokens, 1,
@@ -111,7 +118,7 @@ Geometry validate_batch_update_core(const Tensor& q, const Tensor& k, const Tens
     require_dtype(k, DType::BF16, "k must be BF16");
     require_dtype(v, DType::BF16, "v must be BF16");
     require_dtype(out, DType::BF16, "out must be BF16");
-    require_dtype(ssm_states, DType::FP32, "ssm_states must be FP32");
+    require_state_dtype(ssm_states, "ssm_states");
     require_dtype(source_state_slots, DType::I32, "source_state_slots must be I32");
     require_dtype(destination_state_slots, DType::I32, "destination_state_slots must be I32");
 
@@ -190,7 +197,7 @@ void validate_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const T
     // ssm_state_out carries the running-state contract validated by validate_recurrent;
     // ssm_state_in is an equally-shaped read view (may alias ssm_state_out for in-place).
     const Geometry geometry = validate_recurrent(q, k, v, g, beta, scale, ssm_state_out, out);
-    require_dtype(ssm_state_in, DType::FP32, "ssm_state_in must be FP32");
+    require_dtype(ssm_state_in, ssm_state_out.dtype, "ssm_state_in must have ssm_state_out's dtype");
     require_shape(ssm_state_in, detail::gated_delta_net::kStateDim,
                   detail::gated_delta_net::kStateDim, geometry.value_heads, 1, "ssm_state_in");
     require_contiguous_nonnull(ssm_state_in, "ssm_state_in");
@@ -276,13 +283,14 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
                                   static_cast<const __nv_bfloat16*>(v.data),
                                   static_cast<const float*>(g.data),
                                   static_cast<const float*>(beta.data),
-                                  static_cast<const float*>(ssm_state_in.data),
-                                  static_cast<float*>(ssm_state_out.data),
+                                  ssm_state_in.data,
+                                  ssm_state_out.data,
                                   static_cast<__nv_bfloat16*>(out.data),
                                   q.ne[1],
                                   v.ne[1],
                                   q.ne[2],
-                                  scale};
+                                  scale,
+                                  ssm_state_out.dtype == DType::FP16};
     chunked::launch_prepare(args, qk, control, normalize_qk, execution.stream, fp16);
     chunked::launch_recurrence(args, qk, control, execution, fp16);
 }

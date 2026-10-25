@@ -20,6 +20,7 @@
 // every output one of its exact value's two neighbours, as often away from zero as the discarded fractions
 // say, the same bits for the same seed.
 
+#include "ops/op_family.h"
 #include "core/arena.h"
 #include "core/device.h"
 #include "infernix/ops/ggml_linear.h"
@@ -1335,7 +1336,7 @@ void suite(const HostWeight& w, std::mt19937& rng) {
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(lossless_linear) {
     try {
         std::mt19937 rng(20261021);
         const QType formats[] = {QType::Q4_G64_FP16, QType::Q5_G64_FP16, QType::Q6_G64_FP16, QType::Q8_G32_FP16,

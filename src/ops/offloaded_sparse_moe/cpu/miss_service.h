@@ -4,8 +4,8 @@
 // service thread watches the mapped request that moe_experts publishes for a layer call, computes
 // the requested experts with the worker team (the service thread is worker 0) from the pinned
 // expert banks, writes the BF16 outputs to mapped memory and answers with the request's sequence.
-// The arithmetic is expert_forward's (A16: expert_forward_a16's), so a CPU-served output equals the
-// GPU's bit for bit.
+// The arithmetic is expert_forward's (A16: expert_forward_a16's, or expert_forward_a4r's under
+// NarrowA16::kA4Residual), so a CPU-served output equals the GPU's bit for bit.
 //
 // The service owns the mapped channel buffers and the device sequence counter. It must outlive
 // every call that uses its channels, and its destructor must run only when no call is pending.
@@ -17,6 +17,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -38,12 +39,18 @@ public:
         int max_columns = 64;    // calls with more columns stay on the GPU, at most kMaxCpuCallColumns
         int pcie_divisor = 3;    // misses / pcie_divisor stay on the GPU stage (0: none)
         int one_column_divisor = 0; // one-column calls' divisor instead (0: pcie_divisor)
+        int pcie_share = 0;      // > 0: (misses * pcie_share) >> 8 stay on the GPU stage instead (MoeCpuChannel)
         int max_job_columns = kMaxCpuColumns; // misses with more columns stay on the GPU
         int wide_from   = 0;     // calls of at least this many columns (0: none) take wide_jobs as their cap
         int wide_jobs   = 0;     // prefill assist cap, at most kMaxCpuJobs
-        std::vector<int> cpus;   // optional CPU of worker i (worker 0 is the service thread)
+        // Optional: the logical CPUs (a mask, bit i: CPU i) worker i may run on; 0 or a missing entry
+        // leaves it unpinned (worker 0 is the service thread).
+        std::vector<std::uint64_t> cpus;
         // The arithmetic of every layer's experts; it must equal the calls' MoeExpertSource::activation.
         ExpertActivation activation = ExpertActivation::kA4;
+        // The arithmetic of A16 jobs (exact, or expert-a4-residual-decode's two terms); it must equal
+        // the calls' MoeExpertSource::narrow_a16, which moe_experts checks through the channel.
+        NarrowA16 narrow_a16 = NarrowA16::kExact;
         // Every layer's expert geometry; it must equal the calls' MoeExpertSource::shape (another
         // registered one than Flash-Next's for NVFP4 A16 banks only).
         ExpertShape shape = kFlashNextShape;
@@ -53,6 +60,10 @@ public:
         // heartbeat word changing while it waits for a record and as its team completes work items,
         // so the device waits as long as the request makes progress.
         RecordProvider* records = nullptr;
+        // Called once, on the service thread, when the thread stops serving, with failure()'s text
+        // (the request it was serving and the exception). It must be safe to call from that
+        // thread; its own exceptions are ignored.
+        std::function<void(const std::string&)> on_failure;
     };
 
     CpuMissService(std::vector<Layer> layers, Options options);

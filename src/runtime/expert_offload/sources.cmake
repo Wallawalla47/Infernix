@@ -13,6 +13,7 @@ target_sources(infernix_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/expert_residency.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/expert_stream.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/host_expert_tier.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/placement.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/route_trace.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/vram_monitor.cpp"
 )
@@ -22,6 +23,7 @@ target_sources(infernix_model_runtime PRIVATE
 add_library(infernix_expert_offload_cache STATIC
   "${CMAKE_CURRENT_LIST_DIR}/expert_cache.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/expert_state.cpp"
-  "${CMAKE_CURRENT_LIST_DIR}/host_tier.cpp")
+  "${CMAKE_CURRENT_LIST_DIR}/host_tier.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/route_predictor.cpp")
 infernix_internal_includes(infernix_expert_offload_cache)
 target_link_libraries(infernix_model_runtime PUBLIC infernix_expert_offload_cache)

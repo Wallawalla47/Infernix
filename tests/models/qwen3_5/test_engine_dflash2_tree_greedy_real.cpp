@@ -12,8 +12,8 @@
 #include <string>
 #include <vector>
 
-// Greedy DFlash2 tree rounds, and adaptive-dflash block rounds of DFlash2 or DFlash, against the
-// target's own greedy choice on the real model.
+// Greedy tree rounds of DFlash2, DFlash or MTP, and adaptive-dflash block rounds of either masked
+// drafter, against the target's own greedy choice on the real model.
 //
 // A greedy tree round commits the target's argmax at every position, including positions verified
 // on a side branch whose columns compaction then moved onto the main chain. For every position of
@@ -36,7 +36,8 @@
 // Arguments: KV codec (default int8), tree table (default "16"; "auto" for automatic widths, "0"
 // runs chain rounds as the baseline, "block" block rounds), output tokens per prompt (default
 // 160), draft tokens K (default 7; with "block" the ceiling, 0 the Engine's), drafter (default
-// dflash2; dflash for an artifact with a DFlash drafter, chain or block rounds only), n-gram copy
+// dflash2; dflash for an artifact with a DFlash drafter, whose trees take each position's 16 most
+// probable tokens; mtp, whose trees add leaves to its chain, with K at most 5), n-gram copy
 // drafts beside the drafter (default 0: none; minimum match 12; "auto" the Engine's resolved
 // window), streams decoded at once (default 1), a prompt file in place of the built-in prompts
 // (4,096-token context).
@@ -115,7 +116,13 @@ int main(int argc, char** argv) {
         options.max_concurrency             = streams;
         options.kv_cache                    = kv;
         options.speculative.backend         = drafter == "dflash" ? infernix::SpeculativeBackend::DFlash
-                                                                      : infernix::SpeculativeBackend::DFlash2;
+                                              : drafter == "mtp"  ? infernix::SpeculativeBackend::Mtp
+                                                                  : infernix::SpeculativeBackend::DFlash2;
+        // MTP trees extend chains over the drafts' sparse proposals (sampled-mtp-drafts).
+        if (drafter == "mtp") {
+            options.fast_path_candidates = {infernix::FastPath::AdaptiveSpeculation,
+                                            infernix::FastPath::SampledMtpDrafts};
+        }
         options.speculative.draft_tokens    = drafts;
         options.speculative.proposal_head   = infernix::ProposalHead::Optimized;
         options.speculative.draft_tree_auto = table == "auto";

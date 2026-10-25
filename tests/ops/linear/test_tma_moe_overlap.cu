@@ -8,7 +8,8 @@
 // outputs in 20 and 7 of 200 calls beside W4A16 banks (eager, graph) and 147 and 133 beside W4A4.
 // BF16 A16 ([2560,640] at T = 40, [1280,2560] at T = 192), the FP8 A8 pair ([1280,2560] at T = 1536)
 // and NVFP4 A4 ([5120,6144] at T = 1024) never failed here unfenced (0 of 200 each), so they are not
-// victims; they fence for the same proxy rule.
+// victims; they fence for the same proxy rule. fp8-a8-pair-block32 ([2560,6144] at T = 1024,
+// [16384,2560] at T = 200), whose first, unfenced form was nondeterministic even in isolation, is one.
 //
 // Every victim and routed output must equal a serialized run's bits, over many repeats, eager and
 // graph-replayed, beside W4A16 and W4A4 banks. The serialized outputs' hashes are printed so that
@@ -16,6 +17,7 @@
 //
 //   infernix_tma_moe_overlap_test [repeats (200)] [victim name filter]
 
+#include "ops/op_family.h"
 #include "core/arena.h"
 #include "infernix/ops/linear.h"
 #include "infernix/ops/offloaded_sparse_moe.h"
@@ -311,7 +313,7 @@ int run(const Routed& c, const Victim& victim, int repeats) {
 
 } // namespace
 
-int main(int argc, char** argv) {
+INFERNIX_OP_TEST(tma_moe_overlap) {
     const int repeats       = argc > 1 ? std::max(1, std::atoi(argv[1])) : 200;
     const std::string only  = argc > 2 ? argv[2] : "";
     namespace linear_test   = infernix::test::linear;
@@ -320,6 +322,14 @@ int main(int argc, char** argv) {
         std::vector<Victim> victims;
         victims.push_back(make_victim(keep, "FP8 A8 [14336,5120] T=128", linear_test::make_fp8_weight(14336, 5120, 9103U),
                                       128, true, LinearPolicy::AllowA8, LinearRoutes::Exact));
+        // fp8-a8-pair-block32 (fenced from the start): its 2026-10-17 unfenced form changed bits between
+        // identical isolated calls on [2560,6144] in the 128-column tiles; also the 64-column tiles.
+        victims.push_back(make_victim(keep, "FP8 pair-block32 [2560,6144] T=1024",
+                                      linear_test::make_fp8_weight(2560, 6144, 9107U), 1024, true,
+                                      LinearPolicy::A16Only, LinearRoutes::Fp8A8PairBlock32));
+        victims.push_back(make_victim(keep, "FP8 pair-block32 [16384,2560] T=200",
+                                      linear_test::make_fp8_weight(16384, 2560, 9109U), 200, true,
+                                      LinearPolicy::A16Only, LinearRoutes::Fp8A8PairBlock32));
         int failures       = 0;
         std::uint32_t seed = 911U;
         for (const auto activation : {moe::ExpertActivation::kA16, moe::ExpertActivation::kA4}) {

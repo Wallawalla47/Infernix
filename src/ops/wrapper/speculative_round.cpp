@@ -298,7 +298,8 @@ void speculative_accept_sparse_drafts(
     detail::speculative_accept_sparse_drafts_launch(
         target_tokens, logits, drafts, candidate_ids, proposal_q, current_extents, round_lengths,
         round_anchors, licensed_tokens, licensed_counts, accepted_drafts, token_domain, configs,
-        envelope.all_rows_greedy_without_penalties, scratch, stream);
+        envelope.all_rows_greedy_without_penalties,
+        envelope.block_verification && !envelope.all_rows_greedy_without_penalties, scratch, stream);
 }
 
 std::size_t speculative_accept_sparse_tree_workspace_capacity_bytes(std::int32_t token_domain,

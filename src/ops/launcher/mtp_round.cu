@@ -9,7 +9,7 @@
 
 namespace infernix::ops::detail {
 
-void mtp_prepare_next_round_launch(const Tensor& verify_ids, const Tensor& next_anchors,
+void mtp_prepare_next_round_launch(const Tensor& licensed_tokens, const Tensor& next_anchors,
                                    const Tensor& accepted, const Tensor& updated_frontiers,
                                    const Tensor& remaining_budgets, const Tensor& licensed_counts,
                                    const Tensor& rope_deltas, Tensor& alignment_ids,
@@ -18,14 +18,14 @@ void mtp_prepare_next_round_launch(const Tensor& verify_ids, const Tensor& next_
                                    std::int32_t max_context, std::int32_t next_k,
                                    cudaStream_t stream) {
     constexpr int kBlock = 32;
-    const int k          = verify_ids.ne[0] - 1;
-    const int batch      = verify_ids.ne[1];
+    const int k          = licensed_tokens.ne[0] - 1;
+    const int batch      = licensed_tokens.ne[1];
     const int ar_step_stride =
         static_cast<int>(ar_positions.nb[1] / static_cast<std::int64_t>(sizeof(std::int32_t)));
     const dim3 grid(static_cast<unsigned int>((k + kBlock) / kBlock),
                     static_cast<unsigned int>(batch));
     mtp_prepare_next_round_kernel<<<grid, kBlock, 0, stream>>>(
-        static_cast<const std::int32_t*>(verify_ids.data),
+        static_cast<const std::int32_t*>(licensed_tokens.data),
         static_cast<const std::int32_t*>(next_anchors.data),
         static_cast<const std::int32_t*>(accepted.data),
         static_cast<const std::int32_t*>(updated_frontiers.data),

@@ -1,4 +1,6 @@
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_plan.h"
+#include "core/temporary_switches.h"
+#include "ops/linear/nvfp4/nvfp4_a16_slice_ring_mma.cuh"
 #include "ops/linear/nvfp4/nvfp4_template_launch.cuh"
 #include "ops/linear/nvfp4/nvfp4_instances.cuh"
 
@@ -132,6 +134,50 @@ void launch_matrix(const Tensor& x, const Weight& weight, Tensor& residual, bool
 
 void nvfp4_linear_add_invariant_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                        cudaStream_t stream) {
+    if (x.ne[1] >= 17 && temporary_switches::nvfp4_a16_tile()) {
+        nvfp4_linear_add_invariant_ring_launch(x, weight, residual, stream);
+        return;
+    }
+    nvfp4_linear_add_invariant_sliced_launch(x, weight, residual, stream);
+}
+
+namespace {
+template <int KSlices, int K>
+void launch_invariant_ring(const Tensor& x, const Weight& weight, Tensor& residual,
+                           cudaStream_t stream) {
+    const auto p      = nvfp4_a16_operands(x, weight);
+    const auto output = LinearBf16Output{static_cast<__nv_bfloat16*>(residual.data), weight.n};
+    const auto epilogue =
+        LinearResidualAddEpilogue{{static_cast<__nv_bfloat16*>(residual.data), weight.n}};
+    // N=5120: 32-row tiles give 160 CTAs a token tile, two an SM; above 64 columns 64-row tiles
+    // keep 160 CTAs over two token tiles with half the activation reads.
+    if (x.ne[1] <= 32) {
+        launch_nvfp4_a16_slice_ring_mma<
+            Nvfp4ScheduleInstance<Nvfp4A16SliceRingSchedule<KSlices, 32, 32, 2, 2, 4, 2>, K>>(
+            p, output, epilogue, stream);
+    } else if (x.ne[1] <= 64) {
+        launch_nvfp4_a16_slice_ring_mma<
+            Nvfp4ScheduleInstance<Nvfp4A16SliceRingSchedule<KSlices, 32, 64, 2, 4, 4, 2>, K>>(
+            p, output, epilogue, stream);
+    } else {
+        launch_nvfp4_a16_slice_ring_mma<
+            Nvfp4ScheduleInstance<Nvfp4A16SliceRingSchedule<KSlices, 64, 64, 4, 2, 4, 2>, K>>(
+            p, output, epilogue, stream);
+    }
+}
+} // namespace
+
+void nvfp4_linear_add_invariant_ring_launch(const Tensor& x, const Weight& weight, Tensor& residual,
+                                            cudaStream_t stream) {
+    // The K-warp counts of the sliced-K tiles below: 8 at K=6144, 4 at K=17408.
+    if (x.ne[1] < 17) throw std::invalid_argument("nvfp4 linear_add ring tile: T must be 17 or more");
+    if (weight.k == 6144) return launch_invariant_ring<8, 6144>(x, weight, residual, stream);
+    if (weight.k == 17408) return launch_invariant_ring<4, 17408>(x, weight, residual, stream);
+    throw std::invalid_argument("nvfp4 linear_add: unsupported column-invariant problem");
+}
+
+void nvfp4_linear_add_invariant_sliced_launch(const Tensor& x, const Weight& weight,
+                                              Tensor& residual, cudaStream_t stream) {
     // Tiles of one K-warp count walk the same K slices and reduce them in the same order, and the
     // MMA's columns are independent: the tile width only sets how many columns share a launch,
     // and wider calls run as 64-column slices.

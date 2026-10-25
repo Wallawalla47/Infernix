@@ -36,6 +36,10 @@ else()
   set(INFERNIX_FFMPEG_TARGET PkgConfig::FFMPEG)
 endif()
 
+# libjpeg(-turbo) decodes JPEG images as Pillow does (media decoding). Windows finds it in the
+# same vcpkg tree (`vcpkg install libjpeg-turbo:x64-windows`), elsewhere the system package.
+find_package(JPEG REQUIRED)
+
 # Repository-pinned header dependencies. No configure-time downloads.
 add_library(infernix::json INTERFACE IMPORTED GLOBAL)
 target_include_directories(infernix::json INTERFACE

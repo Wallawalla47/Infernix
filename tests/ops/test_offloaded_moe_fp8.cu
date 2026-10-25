@@ -14,6 +14,7 @@
 // `--bench [tokens]` times one layer's expert call of a prefill chunk (512 experts, top-10, every
 // record resident) instead.
 
+#include "ops/op_family.h"
 #include "infernix/ops/offloaded_sparse_moe.h"
 #include "ops/fp8_block/fp8_exact.h"
 #include "ops/offloaded_sparse_moe/cpu/miss_service.h"
@@ -444,7 +445,7 @@ void bench(int columns, std::mt19937& rng) {
 
 } // namespace
 
-int main(int argc, char** argv) {
+INFERNIX_OP_TEST(offloaded_moe_fp8) {
     std::mt19937 rng(20261011);
     if (argc > 1 && std::strcmp(argv[1], "--bench") == 0) {
         try {

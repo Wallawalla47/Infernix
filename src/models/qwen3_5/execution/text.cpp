@@ -12,6 +12,7 @@
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/program/vision_control.h"
 #include "infernix/ops/argmax.h"
+#include "infernix/ops/top_logprobs.h"
 #include "infernix/ops/attn_input_proj.h"
 #include "infernix/ops/causal_conv1d_silu.h"
 #include "infernix/ops/embedding.h"
@@ -478,7 +479,15 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
 
     {
         auto post_mixer_scope = work_.scope();
-        ffn(mh, mtp_->ffn, x, {}, work_, ctx_.execution_view(), true);
+        // TEMPORARY (INFERNIX_TMP_QWEN35_MTP_PAD_MASK): a batched call's columns past each row's
+        // valid count (an alignment's past the licensed tokens) route no resident expert.
+        ops::MoeColumnMask padding;
+        if (execution_schedule_.mtp_drafter_mask && active_sequence_batch_ != 0 && active_valid_columns_ != nullptr &&
+            active_sequence_width_ > 1) {
+            padding = {static_cast<const std::int32_t*>(active_valid_columns_->data), active_sequence_width_};
+        }
+        ffn(mh, mtp_->ffn, x, {}, work_, ctx_.execution_view(), true, false, ops::LinearRoutes::Exact,
+            ops::LinearRoutes::Exact, nullptr, padding);
     }
 
     Tensor flat_mtp_hidden = mtp_hidden.view({dimension(config_.hidden_size), T});
@@ -636,7 +645,7 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
 }
 
 void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& proposal_tokens,
-                                  Tensor* probabilities) {
+                                  Tensor* probabilities, const SampledDraftStep* sampled) {
     auto proposal_scope = work_.scope();
     const int T         = hidden.ne[1];
     require_tensor_shape(hidden, DType::BF16, {dimension(config_.hidden_size), T},
@@ -644,31 +653,51 @@ void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& 
     require_tensor_shape(proposal_tokens, DType::I32, {T}, "proposal tokens");
     require_tensor_window(logits, DType::BF16, dimension(config_.vocab_size), T, "proposal logits");
     if (probabilities != nullptr) { require_tensor_shape(*probabilities, DType::FP32, {T}, "proposal probabilities"); }
+    if (sampled != nullptr && probabilities != nullptr) {
+        throw std::logic_error("sampled MTP drafts carry their sparse proposal, not a probability");
+    }
+    if (sampled != nullptr && sampled->scores.data != nullptr) {
+        require_tensor_shape(sampled->scores, DType::FP32, {kMtpSampledDraftRanks, T},
+                             "sampled MTP draft scores");
+    }
     nvtx::ScopedRange proposal_range(nvtx::Name::MtpProposal, nvtx::Category::Mtp,
                                      static_cast<std::uint64_t>(T));
-    // The drafter's probability of each selected row, over the head's rows (a shortlist head: its
-    // own rows), before the row ids map to token ids.
+    // The head's logits over its rows (a shortlist head: its own rows, mapped to token ids last).
+    Tensor head_logits;
+    std::int32_t valid_rows = dimension(parameters_.model.resources().public_token_count);
     if (proposal_head_ != nullptr) {
-        Tensor proposal_logits = work_.alloc(DType::BF16, {proposal_head_n_, T});
-        project(hidden, *proposal_head_, proposal_logits, work_, ctx_.stream);
-        const std::int32_t valid_rows =
-            proposal_head_ids_ ? proposal_head_n_ : dimension(parameters_.model.resources().public_token_count);
-        ops::argmax(proposal_logits, proposal_tokens, valid_rows, ctx_.stream);
-        if (probabilities != nullptr) {
-            ops::argmax_probability(proposal_logits, proposal_tokens, *probabilities, valid_rows, ctx_.stream);
-        }
-        if (proposal_head_ids_ != nullptr) {
-            ops::proposal_remap_token_ids(proposal_tokens, proposal_head_ids_, proposal_head_n_,
-                                          ctx_.stream);
-        }
+        head_logits = work_.alloc(DType::BF16, {proposal_head_n_, T});
+        project(hidden, *proposal_head_, head_logits, work_, ctx_.stream);
+        if (proposal_head_ids_ != nullptr) { valid_rows = proposal_head_n_; }
     } else {
-        Tensor output_logits = matrix_window(logits, T);
-        project(hidden, mtp_->output_head, output_logits, work_, ctx_.stream);
-        const std::int32_t valid_rows = dimension(parameters_.model.resources().public_token_count);
-        ops::argmax(output_logits, proposal_tokens, valid_rows, ctx_.stream);
-        if (probabilities != nullptr) {
-            ops::argmax_probability(output_logits, proposal_tokens, *probabilities, valid_rows, ctx_.stream);
-        }
+        head_logits = matrix_window(logits, T);
+        project(hidden, mtp_->output_head, head_logits, work_, ctx_.stream);
+    }
+    if (sampled != nullptr) {
+        // sampled-mtp-drafts: each row draws from the head's top ranks under its sampler (rank 0,
+        // the argmax, with a one-hot proposal at temperature 0); the Op maps rows to token ids.
+        Tensor ranks     = work_.alloc(DType::I32, {kMtpSampledDraftRanks, T});
+        Tensor logprobs  = sampled->scores.data != nullptr
+                               ? sampled->scores
+                               : work_.alloc(DType::FP32, {kMtpSampledDraftRanks, T});
+        Tensor candidates = sampled->candidates;
+        Tensor q          = sampled->q;
+        Tensor no_confidence;
+        ops::top_logprobs(head_logits, valid_rows, ranks, logprobs, ctx_.stream);
+        ops::speculative_sample_sparse_drafts(ranks, logprobs, proposal_head_ids_, sampled->configs,
+                                              sampled->positions, sampled->draw, proposal_tokens, candidates, q,
+                                              no_confidence, ctx_.stream);
+        return;
+    }
+    // The drafter's probability of each selected row comes from the argmax's own pass, over the
+    // head's rows, before the row ids map to token ids.
+    if (probabilities != nullptr) {
+        ops::argmax_with_probability(head_logits, proposal_tokens, *probabilities, valid_rows, work_, ctx_.stream);
+    } else {
+        ops::argmax(head_logits, proposal_tokens, valid_rows, ctx_.stream);
+    }
+    if (proposal_head_ != nullptr && proposal_head_ids_ != nullptr) {
+        ops::proposal_remap_token_ids(proposal_tokens, proposal_head_ids_, proposal_head_n_, ctx_.stream);
     }
 }
 
@@ -941,7 +970,7 @@ void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidd
 }
 
 void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens,
-                                    Tensor* probabilities) {
+                                    Tensor* probabilities, const SampledDraftStep* sampled) {
     const std::int32_t batch = hidden.ne[1];
     require_tensor_shape(hidden, DType::BF16, {dimension(config_.hidden_size), batch},
                          "MTP proposal batch hidden");
@@ -950,7 +979,7 @@ void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor
     require_tensor_shape(draft_tokens, DType::I32, {batch}, "MTP proposal batch tokens");
     ScopedValue<const MtpParameters*> drafter_binding(mtp_, batch_mtp());
     ScopedValue<const LinearParameters*> head_binding(proposal_head_, batch_proposal_head());
-    proposal_argmax(hidden, logits, draft_tokens, probabilities);
+    proposal_argmax(hidden, logits, draft_tokens, probabilities, sampled);
 }
 
 const MtpParameters* TextContext::batch_mtp() const noexcept {
@@ -1066,7 +1095,9 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     ops::linear_add(a.view({dimension(config_.attention->query_width()), T}), p.output.weight, x,
                     residual_projection_policy(
                         p.output, wide_residual_verification(ph, row_width(T), row_width(T))),
-                    work_, s);
+                    work_, s,
+                    ph == Phase::Verify ? execution_schedule_.residual_decode_routes(T, false)
+                                        : ops::LinearRoutes::Exact);
 }
 
 void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase ph) {
@@ -1178,7 +1209,9 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
                 ops::gated_delta_net_replay_record(
                     q_batch, k_batch, v_batch, g_batch, beta_batch, scale, recurrent_states, valid,
                     *active_linear_state_source_slots_, *verification_tree_, records.key,
-                    records.value, records.gate, out_batch, s);
+                    records.value, records.gate, out_batch, s,
+                    execution_schedule_.gdn_tree_closed_form ? ops::GdnTreeRecordRoute::ClosedForm
+                                                             : ops::GdnTreeRecordRoute::Walk);
             } else {
                 ops::gated_delta_net_replay_record(q_batch, k_batch, v_batch, g_batch, beta_batch,
                                                    scale, recurrent_states, valid,
@@ -1213,7 +1246,9 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
     ops::linear_add(on.view({dimension(config_.gdn->value_width()), T}), p.output.weight, x,
                     residual_projection_policy(
                         p.output, wide_residual_verification(ph, row_width(T), row_width(T))),
-                    work_, s);
+                    work_, s,
+                    ph == Phase::Verify ? execution_schedule_.residual_decode_routes(T, false)
+                                        : ops::LinearRoutes::Exact);
 }
 
 ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {
@@ -1242,8 +1277,7 @@ void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase ph,
     }
     ffn(h, weights.ffn, x, hints, work_, ctx_.execution_view(), false,
         wide_residual_verification(ph, width, width), execution_schedule_.linear_routes,
-        ph == Phase::Verify && execution_schedule_.batched_columns(x.ne[1]) ? ops::LinearRoutes::WideDownTile
-                                                                             : ops::LinearRoutes::Exact,
+        ph == Phase::Verify ? execution_schedule_.residual_decode_routes(x.ne[1], true) : ops::LinearRoutes::Exact,
         offloaded.experts != nullptr ? &offloaded : nullptr);
 }
 

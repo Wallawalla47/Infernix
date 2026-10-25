@@ -58,6 +58,19 @@ enum class LinearRoutes : std::uint8_t {
     /// ggml-bf16-prefill: GGUF projections of 32 or more columns on BF16 tensor cores with FP32 sums
     /// (ops::ggml_linear) instead of the exact A16 integer tiles.
     GgmlBf16Wide = 16,
+    /// fp8-a8-pair-block32: fp8-a8-pair's two E4M3 activation terms with a power-of-two scale per
+    /// 32 values of K and term, applied by the block-scaled MMA; it takes precedence over Fp8A8Pair. On
+    /// MXFP8 weights (the registered FP4-Local problems) the weight's group scales are the MMA's weight
+    /// scales; F16Accumulate takes precedence there.
+    Fp8A8PairBlock32 = 32,
+    /// f16-accumulate-prefill: E4M3-weight projections (row-scaled FP8, MXFP8) of prefill widths on FP16
+    /// Tensor Cores, the activation as FP16 under a power-of-two column scale and FP16 sums over 32-value
+    /// K chunks with an FP32 carry (twice the FP32-accumulation rate).
+    F16Accumulate = 64,
+    /// q5-ksplit-mma: Q5 linear_add [5120,6144] and [5120,17408] with eight K warps and the pairwise
+    /// reduction (NInfer's K-split residual kernel) at 2-16 columns, and at every width of the
+    /// column-invariant policy; the exact route keeps four K warps (a different summation order).
+    Q5KSplit = 128,
 };
 
 [[nodiscard]] constexpr LinearRoutes operator|(LinearRoutes a, LinearRoutes b) noexcept {
@@ -69,7 +82,7 @@ enum class LinearRoutes : std::uint8_t {
 }
 
 [[nodiscard]] constexpr bool valid_linear_routes(LinearRoutes routes) noexcept {
-    return (static_cast<std::uint8_t>(routes) & ~std::uint8_t{31}) == 0;
+    return (static_cast<std::uint8_t>(routes) & ~std::uint8_t{255}) == 0;
 }
 
 [[nodiscard]] constexpr bool valid_linear_policy(LinearPolicy policy) noexcept {
@@ -126,6 +139,15 @@ enum class LinearRoutes : std::uint8_t {
  * FP8_E4M3FN_ROW_BF16 and nvfp4_rg16_v1. The other formats refuse one.
  */
 [[nodiscard]] bool linear_fp32_output(QType qtype) noexcept;
+
+/**
+ * The transient bytes LinearRoutes::F16Accumulate needs for a call of `tokens` columns of K =
+ * `input_rows` (the FP16-encoded activation and its column scales). linear_workspace_capacity_bytes()
+ * and gdn_input_proj_workspace_capacity_bytes() include it wherever an interval reaches the route; a
+ * caller that sizes one arena for many projections adds it for the largest K.
+ */
+[[nodiscard]] std::size_t linear_f16_accumulate_workspace_bytes(std::int32_t input_rows,
+                                                                std::int32_t tokens);
 
 /**
  * @brief Applies a bias-free matrix projection independently to every input column.
@@ -206,10 +228,20 @@ enum class LinearRoutes : std::uint8_t {
  * which accumulate in a different order from the exact routes; a column's bits then depend on the
  * call's T. Under LinearRoutes::Fp8A8Pair, FP8 [16384,2560], [13312,2560], [2560,6144], [1280,2560]
  * and [2560,640] at T >= 17, unless a single-term A8 route is selected, carry each activation column
- * as two E4M3 terms with their own scales on the 8-bit Tensor Core path. Every other problem runs its
- * exact route under a flag it does not register. Under A16ColumnInvariant every flag is ignored:
- * the column-invariant route is the exact route's. Every route meets the A16 criterion; the
- * workspace query covers the two-term route's scratch.
+ * as two E4M3 terms with their own scales on the 8-bit Tensor Core path. Under
+ * LinearRoutes::Fp8A8PairBlock32 the same problems at the same widths carry the two terms with a
+ * power-of-two scale per 32 values of K and term instead of per column (taking precedence where both
+ * flags are set). Under LinearRoutes::F16Accumulate, the FP8 problems [16384,2560], [13312,2560],
+ * [2560,6144], [1280,2560], [2560,640] and [5120,6144] and every MXFP8 problem, at T >= 256 and where
+ * no single-term A8 route is selected, encode each activation column exactly as FP16 under a
+ * power-of-two scale that puts its maximum in [1,2) (values more than 2^17 below the column maximum
+ * keep fewer bits, those about 2^25 below flush to zero), sum each 32-value K chunk on FP16 Tensor
+ * Cores with FP16 accumulation (at most 32 * 448 * 2 in magnitude, so it cannot overflow) and carry
+ * the chunks in FP32; it takes precedence over both pair routes where several are set. A column's bits
+ * then depend only on the column, but differ from the exact route's. Every other problem runs its
+ * exact route under a flag it does not register. Under A16ColumnInvariant every flag is ignored: the
+ * column-invariant route is the exact route's. Every route meets the A16 criterion; the workspace
+ * query covers the two-term and FP16 routes' scratch.
  *
  * @par Workspace
  * `workspace` is caller-owned call-scoped transient storage sized by
@@ -241,5 +273,19 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
  * @param[in] stream CUDA stream on which execution is enqueued.
  */
 void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
+
+/**
+ * The QSA group projection of Qwen3.8-Flash-Next, `[13952,2560]` (query 6,144, gate 6,144, key 512,
+ * value 512, index query 512 and index key 128 rows), with each row segment written to its own
+ * contiguous BF16 `[rows, T]` tensor: the bits linear() writes to those rows under the same policy and
+ * routes. Registered for Q8_G32_FP16 (Dense8) and FP8_E4M3FN_G32_E8M0 (FP4-Local) weights;
+ * linear_qsa_group_supported() says whether a weight and segment layout has it (else a caller splits
+ * linear()'s output). Its workspace is linear_workspace_capacity_bytes() of `[13952,2560]`.
+ */
+inline constexpr std::int32_t kQsaGroupSegments = 6;
+[[nodiscard]] bool linear_qsa_group_supported(const Weight& w, const Tensor* const* parts,
+                                              LinearPolicy policy) noexcept;
+void linear_qsa_group(const Tensor& x, const Weight& w, Tensor* const* parts, LinearPolicy policy,
+                      WorkspaceArena& workspace, cudaStream_t stream, LinearRoutes routes = LinearRoutes::Exact);
 
 } // namespace infernix::ops

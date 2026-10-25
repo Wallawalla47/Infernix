@@ -16,10 +16,14 @@
 //            (the cold-layer case, bound by the staging copy).
 // The FLOP figure counts the wide entries' gate/up and down products only. --activation a16 gives
 // the experts W4A16 arithmetic (no input scales, design §16.2.1); a16x2 and a16x3 run their wide calls
-// on the two- and three-term A4 fast paths (design §19.3.23).
+// on the two- and three-term A4 fast paths (design §19.3.23), at either geometry; --narrow a4r (with a
+// W4A16 activation, Flash-Next geometry only) runs the experts of at most eight columns on
+// expert-a4-residual-decode's two-term narrow kernels.
+// Decode shapes: --tokens 1,2,4,8 --cold (one call is a layer's routed experts of one decode or MTP round).
 //
 //   infernix_offloaded_moe_wide_bench [--tokens 64,256,1024,4096] [--placement frames|staged|both]
-//                                   [--activation a4|a16|a16x2|a16x3] [--cold] [--warmup 3] [--repeat 10] [--seed N]
+//                                   [--activation a4|a16|a16x2|a16x3] [--narrow exact|a4r] [--cold] [--warmup 3]
+//                                   [--repeat 10] [--seed N]
 //                                   [--columns-per-expert C] [--split-scales] [--geometry flash-next|122b]
 //
 // --columns-per-expert C routes uniformly instead (every used expert gets exactly C columns while
@@ -76,6 +80,7 @@ struct Options {
     std::uint32_t seed    = 20261004U;
     bool a16              = false;
     moe::WideA16 wide_a16 = moe::WideA16::kExact; // a16x2 / a16x3: W4A16 experts on an A4 residual route
+    moe::NarrowA16 narrow_a16 = moe::NarrowA16::kExact; // --narrow a4r: W4A16 narrow jobs on two-term A4
     bool cold             = false;
     int columns_per_expert = 0;     // > 0: uniform routing, every used expert has exactly this many columns
     bool split_scales      = false; // distinct gate and up input scales: no expert takes the wide route
@@ -119,6 +124,10 @@ Options parse_options(int argc, char** argv) {
             options.wide_a16 = v == "a16x2"   ? moe::WideA16::kA4Residual
                                : v == "a16x3" ? moe::WideA16::kA4Residual3
                                               : moe::WideA16::kExact;
+        } else if (arg == "--narrow") {
+            const std::string v = value();
+            if (v != "exact" && v != "a4r") { throw std::invalid_argument("--narrow takes exact or a4r"); }
+            options.narrow_a16 = v == "a4r" ? moe::NarrowA16::kA4Residual : moe::NarrowA16::kExact;
         } else if (arg == "--cold") {
             options.cold = true;
         } else if (arg == "--seed") {
@@ -139,8 +148,11 @@ Options parse_options(int argc, char** argv) {
     if (options.placement != "frames" && options.placement != "staged" && options.placement != "both") {
         throw std::invalid_argument("--placement takes frames, staged or both");
     }
-    if (options.geometry_122b && (!options.a16 || options.wide_a16 != moe::WideA16::kExact)) {
-        throw std::invalid_argument("--geometry 122b registers W4A16 experts only: add --activation a16");
+    if (options.geometry_122b && !options.a16) {
+        throw std::invalid_argument("--geometry 122b registers W4A16 experts only: add --activation a16, a16x2 or a16x3");
+    }
+    if (options.narrow_a16 == moe::NarrowA16::kA4Residual && (!options.a16 || options.geometry_122b)) {
+        throw std::invalid_argument("--narrow a4r takes Flash-Next's W4A16 experts: add --activation a16");
     }
     return options;
 }
@@ -310,6 +322,7 @@ void run_point(Fixture& fixture, int tokens, const Options& options, bench::L2Fl
         if ((staged && options.placement == "frames") || (!staged && options.placement == "staged")) { continue; }
         ops::MoeExpertSource source = fixture.source(staged);
         source.wide_a16             = options.wide_a16;
+        source.narrow_a16           = options.narrow_a16;
         Tensor tx(x.p, DType::BF16, {g_geometry.shape.hidden, tokens});
         Tensor out(outputs.p, DType::BF16, {g_geometry.shape.hidden, entries});
         const auto launch = [&](cudaStream_t s) {
@@ -339,9 +352,11 @@ int main(int argc, char** argv) {
         const Options options = parse_options(argc, argv);
         if (options.geometry_122b) { g_geometry = {256, 8, moe::kQwen3_5_122BShape}; }
         DeviceContext context;
-        std::printf("# gpu=%s geometry=%s timed=moe_experts (routing and dispatch untimed%s) activation=%s staging_slots=%d\n",
+        std::printf("# gpu=%s geometry=%s timed=moe_experts (routing and dispatch untimed%s) activation=%s narrow=%s "
+                    "staging_slots=%d\n",
                     context.props.name, options.geometry_122b ? "122b" : "flash-next",
-                    options.cold ? ", L2 flushed before each call" : "", options.a16 ? "a16" : "a4", kStagingSlots);
+                    options.cold ? ", L2 flushed before each call" : "", options.a16 ? "a16" : "a4",
+                    options.narrow_a16 == moe::NarrowA16::kA4Residual ? "a4r" : "exact", kStagingSlots);
         Fixture fixture(options.seed, options.a16, options.split_scales);
         std::unique_ptr<bench::L2FlushBuffer> flush;
         if (options.cold) { flush = std::make_unique<bench::L2FlushBuffer>(256ULL << 20); }

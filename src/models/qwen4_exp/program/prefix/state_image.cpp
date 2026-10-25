@@ -101,12 +101,16 @@ PagedKVWindowView kv_window_view(const KvWindowGeometry& g, void* base, std::uin
                              .slots    = {}};
 }
 
-StateImageSpec state_image_spec(const TextConfig& c, bool mtp, KvCacheStorage storage, DraftRingGeometry draft_ring) {
+StateImageSpec state_image_spec(const TextConfig& c, bool mtp, KvCacheStorage storage, DraftRingGeometry draft_ring,
+                                DType gdn_state) {
+    if (gdn_state != DType::FP32 && gdn_state != DType::BF16) {
+        throw std::invalid_argument("Qwen4Exp state image: the GDN state is FP32 or BF16");
+    }
     StateImageSpec spec;
     spec.layer_types         = c.layer_types;
     spec.ple_layer           = c.ple.layer;
     spec.gdn_recurrent_bytes = static_cast<std::size_t>(c.gdn.key_head_dim) * c.gdn.value_head_dim * c.gdn.value_heads *
-                               sizeof(float);
+                               (gdn_state == DType::BF16 ? 2U : sizeof(float));
     spec.gdn_conv_bytes = static_cast<std::size_t>(c.gdn.conv_channels()) * (c.gdn.conv_kernel - 1U) * 2U;
     spec.ple_bytes      = static_cast<std::size_t>(c.residual_width()) * c.ple.conv_span() * 2U;
     spec.qsa_tail_bytes = static_cast<std::size_t>(c.qsa.index_head_dim) * (c.qsa.compress_ratio - 1U) * 2U;

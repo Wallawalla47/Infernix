@@ -1,3 +1,4 @@
+#include "ops/op_family.h"
 #include "core/weight.h"
 #include "infernix/ops/gdn_gating_proj.h"
 #include "infernix/ops/weight_input.h"
@@ -488,7 +489,7 @@ int verify_workspace_capacity_contract(const Geometry& geometry,
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(gdn_gating_proj) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;

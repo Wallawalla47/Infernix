@@ -35,6 +35,7 @@
 #include "runtime/expert_offload/expert_stream.h"
 #include "runtime/expert_offload/host_expert_tier.h"
 #include "runtime/expert_offload/memory_plan.h"
+#include "runtime/expert_offload/placement.h"
 #include "runtime/expert_offload/route_trace.h"
 #include "runtime/expert_offload/vram_monitor.h"
 
@@ -78,7 +79,8 @@ struct OffloadOptions {
     std::uint32_t cpu_expert_jobs    = 16;  // CPU-served misses per decode or verification call
     std::uint32_t cpu_assist_jobs    = 256; // CPU-served misses per assisted prefill call (0: none)
     int cpu_pcie_divisor             = 0;  // > 0 fixes the decode miss divisor
-    // A GGUF import's one-column calls take the context's divisor (plain_divisor) without speculation.
+    // A GGUF import's one-column calls take the context's divisor (plain_divisor) without speculation
+    // (INFERNIX_TMP_PLAIN_DIVISOR_ALL: every bank's).
     bool plain_divisor_by_context    = false;
     double link_bytes_per_second     = 0.0; // > 0 fixes the link rate (else measured)
     // The CPU team's reference rates (i9-13900K, 6 workers, NVFP4 records) until measured, and the
@@ -125,8 +127,6 @@ struct OffloadSetup {
     // Program captures them all right after the frames are sized (VramDemand::eager_graphs).
     std::uint32_t graph_bound = 0;
     bool eager_graphs         = false;
-    // The decode io word the one-column divisor is read from (plain_divisor), when the Program has one.
-    const std::int32_t* one_column_divisor_device = nullptr;
     // A model's calibrated expert order (Qwen3.8-Flash-Next's): the warm start's seed when the saved
     // state cannot be used; null: none.
     const expert_cache::SavedState* calibrated_state = nullptr;
@@ -251,9 +251,9 @@ public:
     void settle(cudaStream_t compute);
     void drop_deferred() noexcept { deferred_.pending = false; }
     // A prefill or forced call's update (after its synchronization): `promotions` per layer, the call
-    // advancing `tokens` positions.
+    // advancing `tokens` positions; `live` (one flag per column, empty: every column) as defer's.
     void after_call(cudaStream_t compute, std::int32_t columns, std::uint32_t tokens, std::size_t promotions,
-                    const TracedRound& round);
+                    const TracedRound& round, std::span<const std::uint8_t> live = {});
     // Promotions per layer for a round advancing `tokens` tokens: one per token while the frames fill,
     // then every promotion_interval()-th token.
     [[nodiscard]] std::size_t decode_budget(std::uint32_t tokens);
@@ -263,9 +263,10 @@ public:
     // routes (read from the route log its after_call is about to apply; a layer walk's span counts
     // its last chunk) add to its lane's uses, and at the prompt's end, after its last after_call, an
     // expert every counted token routed to gains kPromptSeedCredit of count, the others in
-    // proportion. A lane's uses clear when it binds a new request.
+    // proportion (INFERNIX_TMP_PROMPT_SEED: another credit, and promotions on `compute`). A lane's
+    // uses clear when it binds a new request.
     void note_prompt_routes(std::uint32_t lane, std::int32_t columns);
-    void seed_prompt(std::uint32_t lane);
+    void seed_prompt(std::uint32_t lane, cudaStream_t compute);
     void clear_prompt_uses(std::uint32_t lane);
 
     // ---- frames and memory ----
@@ -318,9 +319,14 @@ public:
     [[nodiscard]] double cpu_expert_rate() const noexcept;
     [[nodiscard]] double cpu_column_rate() const noexcept;
     [[nodiscard]] int pcie_divisor() const noexcept;
-    // Plain decode's one-column divisor by context (Flash-Next: d = 1 below 1,536 tokens, 2 from there).
-    [[nodiscard]] static std::int32_t plain_divisor(std::int32_t position) noexcept { return position >= 1536 ? 2 : 1; }
+    // INFERNIX_TMP_LINK_SHARE: the link's share of a call's misses in 256ths (0: pcie_divisor).
+    [[nodiscard]] int pcie_share() const noexcept;
+    // Plain decode's one-column divisor by context (placement.h plain_divisor; Flash-Next: d = 1
+    // below 1,536 tokens, 2 from there): its startup value, 0 when the rule does not apply.
     [[nodiscard]] int one_column_divisor() const noexcept;
+    // Before a one-column decode round at `position` context tokens: the divisor word the calls read
+    // follows the context (uploaded on `compute` when it changes). A no-op without the rule.
+    void set_plain_position(std::int32_t position, cudaStream_t compute);
     // The widest call the prefill CPU split takes at the measured link.
     [[nodiscard]] std::int32_t split_columns() const noexcept;
 
@@ -335,6 +341,10 @@ public:
 private:
     void measure_link();
     void measure_cpu_rate();
+    // INFERNIX_TMP_CPU_PROBE_DETAIL=1 (candidates §11.2 OR-08): the team's rates on the same 32 records
+    // where they live (the tier's slots or the registered banks), in registered VirtualAlloc copies and
+    // in cudaHostAlloc copies, logged once at startup.
+    void cpu_probe_detail();
     void create_tier();
     void create_stream();
     void create_cpu_service();
@@ -355,6 +365,13 @@ private:
     std::vector<std::uint64_t> host_strides_;
     std::int32_t staging_slots_  = 0;
     DeviceBuffer staging_;
+    // Plain decode's divisor word (one_column_divisor() != 0): the device I32 the one-column calls read,
+    // its pinned source and the value last uploaded.
+    DeviceBuffer divisor_word_;
+    PinnedHostBuffer divisor_host_{16};
+    std::int32_t divisor_now_ = 0;
+    // The CPU expert team's worker count and CPUs (INFERNIX_TMP_CPU_PLACEMENT / _ENGINE_ISOLATE).
+    CpuPlacement placement_;
     std::unique_ptr<ExpertResidency> residency_;
     std::optional<ExpertStore> striped_store_;
     std::unique_ptr<ops::offloaded_moe::FetchChannel> fetch_channel_;
@@ -365,6 +382,7 @@ private:
     std::unique_ptr<CpuSplitPolicy> split_;
     double link_bytes_per_second_ = kReferenceLinkBytesPerSecond;
     double cpu_expert_rate_ = 0.0, cpu_column_rate_ = 0.0; // 0 until measured
+    std::string calibration_note_; // INFERNIX_TMP_MACHINE_CALIBRATION's note on the CPU rates (the startup line)
     bool failed_round_ = false;
 
     // The fork / overlap stream and its events (start, staged[2], consumed[2]; the fork uses the first two).

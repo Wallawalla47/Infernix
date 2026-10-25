@@ -19,6 +19,11 @@ from .model import Model
 from .recipe import Recipe, WeightJob
 
 
+# Parallel CPU conversion buffers every object in flight whole (about 0.9 GB for a Flash-Next
+# expert parent); their total stays within this many bytes.
+DEFAULT_MAX_BUFFERED_BYTES = 8 << 30
+
+
 def _json_default(value):
     if isinstance(value, Path):
         return str(value)
@@ -95,6 +100,7 @@ def convert(
     rows_per_chunk: int = 512,
     max_file_bytes: int = DEFAULT_MAX_FILE_BYTES,
     workers: int = 1,
+    max_buffered_bytes: int = DEFAULT_MAX_BUFFERED_BYTES,
     progress: Callable[[int, int, WeightJob], None] | None = None,
 ) -> dict:
     path = Path(output)
@@ -110,6 +116,8 @@ def convert(
         raise ValueError("--workers must be a positive integer")
     if chosen_device.type != "cpu" and workers != 1:
         raise ValueError("--workers > 1 is currently supported only with --device cpu")
+    if type(max_buffered_bytes) is not int or max_buffered_bytes <= 0:
+        raise ValueError("--max-buffered-bytes must be a positive integer")
     start = time.perf_counter()
     prepared = recipe.prepare(device=str(chosen_device), rows_per_chunk=rows_per_chunk)
     preparation_seconds = time.perf_counter() - start
@@ -132,6 +140,7 @@ def convert(
         "cuda_version": torch.version.cuda,
         "rows_per_chunk": rows_per_chunk,
         "workers": workers,
+        "max_buffered_bytes": max_buffered_bytes,
         "provenance": provenance,
         "preparation_seconds": preparation_seconds,
         "parameters": len(model.parameters),
@@ -178,29 +187,32 @@ def convert(
                     ) from error
         else:
             total = len(prepared.weights)
-            window = min(total, workers * 2)
 
             with ThreadPoolExecutor(
                 max_workers=workers,
                 thread_name_prefix="infernix-convert",
             ) as executor:
                 futures = {}
+                # Objects submitted and not yet written are each buffered whole, so the window is
+                # bounded by their bytes as well as their count. The next object to write is
+                # always admitted, so one object larger than the budget still converts (alone).
+                buffered = 0
+                next_submit = 0
 
-                def submit(index):
-                    job = prepared.weights[index]
-                    if progress is not None:
-                        progress(index, total, job)
-                    obj = writer.by_id[job.spec.id]
-                    futures[index] = executor.submit(
-                        _produce_buffered,
-                        job,
-                        obj,
-                    )
+                def fill():
+                    nonlocal buffered, next_submit
+                    while next_submit < total and len(futures) < workers * 2:
+                        job = prepared.weights[next_submit]
+                        obj = writer.by_id[job.spec.id]
+                        if futures and buffered + obj.bytes > max_buffered_bytes:
+                            return
+                        if progress is not None:
+                            progress(next_submit, total, job)
+                        futures[next_submit] = executor.submit(_produce_buffered, job, obj)
+                        buffered += obj.bytes
+                        next_submit += 1
 
-                for index in range(window):
-                    submit(index)
-
-                next_submit = window
+                fill()
 
                 for index, job in enumerate(prepared.weights):
                     future = futures.pop(index)
@@ -215,10 +227,10 @@ def convert(
 
                     # Publication remains strictly ordered and single-threaded.
                     writer.write_object(job.spec.id, data)
-
-                    if next_submit < total:
-                        submit(next_submit)
-                        next_submit += 1
+                    # The future holds the buffer too: release both before admitting more.
+                    del data, future
+                    buffered -= writer.by_id[job.spec.id].bytes
+                    fill()
         for spec, data in prepared.auxiliaries:
             writer.write_object(spec.id, data)
         report["artifact_id"] = writer.artifact_id.hex()

@@ -54,6 +54,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--lossless", false},
     ServeOptionArity{"--fast-path", true, true},
     ServeOptionArity{"--expert-a4-activations", false},
+    ServeOptionArity{"--embedding-host", false},
     ServeOptionArity{"--context-cost-presets"},
     ServeOptionArity{"--log-stats-interval-ms"},
     ServeOptionArity{"--log-colours"},
@@ -109,6 +110,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--no-thinking", false},
     ServeOptionArity{"--preserve-thinking", false},
     ServeOptionArity{"--tolerant-tool-calls", false},
+    ServeOptionArity{"--restore-tool-reasoning", false},
     ServeOptionArity{"--cors", false},
     ServeOptionArity{"--usage-chunk-choice", false},
     ServeOptionArity{"--temperature"},
@@ -304,6 +306,10 @@ std::string serve_usage_text(const char* argv0) {
            "                             the activation scales NVIDIA calibrated for them.\n"
            "                             Changes the output. No other artifact supports it\n"
            "                             (default: 16-bit activations, as NVIDIA serves it)\n"
+           "  --embedding-host           Qwen3.5-family artifacts: keep the token embedding in\n"
+           "                             pinned host memory, read zero-copy, so its VRAM\n"
+           "                             (1.18 GiB on the 27B) goes to the KV and prefix caches.\n"
+           "                             Same output; prompts read their rows over PCIe\n"
            "  --no-cuda-graph            disable CUDA-graph decode rounds (on by default)\n"
            "  --default-max-tokens N     default max_tokens when a request omits it\n"
            "                             (default " +
@@ -312,9 +318,11 @@ std::string serve_usage_text(const char* argv0) {
            "  --default-thinking-budget N  cap model-origin thinking for enabled\n"
            "                             requests; control tokens count toward the\n"
            "                             request output limit\n"
-           "  --no-thinking-answer-room  without a budget, thinking may use all of\n"
-           "                             max_tokens (default: from max_tokens 1024, thinking\n"
-           "                             closes early enough to leave a quarter for the answer)\n"
+           "  --no-thinking-answer-room  without a budget, thinking may use all of the\n"
+           "                             output limit (default: from a limit of 1024, thinking\n"
+           "                             closes early enough to leave a quarter for the answer;\n"
+           "                             the limit is max_tokens or the context the prompt\n"
+           "                             leaves, whichever is less)\n"
            "  --thinking-budget-message S  message fed to the model when it hits its thinking\n"
            "                             budget, replacing the built-in end-of-thinking notice\n"
            "                             (wrap the message in double quotes, e.g.\n"
@@ -466,9 +474,11 @@ std::string serve_usage_text(const char* argv0) {
            "                             companion artifact (Qwen3.5/3.6 artifacts bundle\n"
            "                             theirs)\n"
            "  --lm-head-draft            use the optimized proposal head\n"
-           "  --spec-min-p P             Qwen3.8-Flash-Next mtp: verify drafts only up to\n"
-           "                             the first below probability P, 0-1 (default 0.5\n"
-           "                             with --draft-tokens auto, else 0 = all)\n"
+           "  --spec-min-p P             mtp (and Qwen3.8-Flash-Next dflash2): one-request\n"
+           "                             rounds verify drafts only up to the first below\n"
+           "                             probability P, 0-1 (Flash-Next default 0.5 with\n"
+           "                             --draft-tokens auto, else 0 = all; Qwen3.5/3.6\n"
+           "                             default 0)\n"
            "  --draft-tree-nodes auto|LIST\n"
            "                             dflash2: verify a small tree of alternative drafts\n"
            "                             each round instead of a single draft, so more drafted\n"
@@ -527,6 +537,10 @@ std::string serve_usage_text(const char* argv0) {
            "                             budget and an undeclared name, and return complete\n"
            "                             calls stranded in unclosed thinking (strict\n"
            "                             all-or-nothing by default)\n"
+           "  --restore-tool-reasoning   give a Chat Completions tool-call turn sent back\n"
+           "                             without its reasoning the reasoning this server\n"
+           "                             generated for it, so a tool loop keeps its\n"
+           "                             prefix-cache match (off by default)\n"
            "\n"
            "NETWORKING & RESOURCES\n"
            "  --host H                   listen address (default 127.0.0.1)\n"
@@ -714,6 +728,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.fast_path_candidates.push_back(*path);
         } else if (arg == "--expert-a4-activations") {
             options.expert_a4_activations = true;
+        } else if (arg == "--embedding-host") {
+            options.embedding_host = true;
         } else if (arg == "--context-cost-presets") {
             options.context_cost_presets = require_value("--context-cost-presets");
             if (options.context_cost_presets.empty()) {
@@ -989,6 +1005,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.preserve_thinking = true;
         } else if (arg == "--tolerant-tool-calls") {
             options.tolerant_tool_calls = true;
+        } else if (arg == "--restore-tool-reasoning") {
+            options.restore_tool_reasoning = true;
         } else if (arg == "--cors") {
             options.enable_cors = true;
         } else if (arg == "--usage-chunk-choice") {

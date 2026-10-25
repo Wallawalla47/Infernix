@@ -5,7 +5,10 @@
 #include "serve/openai_common.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <iterator>
+#include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -34,12 +37,30 @@ std::string response_status(infernix::FinishReason reason) {
     return "failed";
 }
 
+// The Item identities of one generation's output. Streaming assigns them as it emits each Item and
+// hands them to the terminal response, so both carry the same ids.
 struct ItemIds {
     std::string reasoning;
     std::string message;
-    std::vector<std::string> function_calls;
-    std::vector<std::string> call_ids;
+    std::vector<std::string> function_calls; // per call: its call Item id
+    std::vector<std::string> call_ids;       // per call: its call_id (a hosted search's Item id)
+    std::vector<std::string> search_outputs; // per call: a hosted search's tool_search_output id
+    // A streamed call the turn's end cut: its incomplete Item, in the output but not the history.
+    std::optional<Json> cut_call;
 };
+
+enum class CallKind : std::uint8_t {
+    Function,
+    Custom,
+    ClientSearch,
+    HostedSearch,
+};
+
+const OpenAIToolSearchExecution* hosted_search(const OpenAIResponsesRound& round,
+                                               std::size_t index) {
+    return index < round.searches.size() && round.searches[index] ? &*round.searches[index]
+                                                                  : nullptr;
+}
 
 void add_wire_function_identity(Json& object, const OpenAIResponsesCreateRequest& request,
                                 std::string_view engine_name) {
@@ -90,6 +111,101 @@ Json tool_call_item(const OpenAIResponsesCreateRequest& request, const infernix:
                            {"arguments", empty ? std::string() : call.arguments_json}};
     add_wire_function_identity(item, request, call.name);
     return item;
+}
+
+CallKind call_kind(const OpenAIResponsesCreateRequest& request, const OpenAIResponsesRound& round,
+                   std::size_t index) {
+    if (hosted_search(round, index) != nullptr) { return CallKind::HostedSearch; }
+    const std::string& name = round.outcome->tool_calls[index].name;
+    const auto position     = request.tool_identities.find(name);
+    if (position != request.tool_identities.end() && position->second.tool_search) {
+        return CallKind::ClientSearch;
+    }
+    return is_custom_tool(request, name) ? CallKind::Custom : CallKind::Function;
+}
+
+const char* call_item_prefix(CallKind kind) {
+    switch (kind) {
+    case CallKind::Function:
+        return "fc";
+    case CallKind::Custom:
+        return "ctc";
+    case CallKind::ClientSearch:
+    case CallKind::HostedSearch:
+        return "tsc";
+    }
+    return "fc";
+}
+
+// Fills the round's missing Item ids. A hosted search's call identifier is its Item id, the one
+// the server used for its result turn.
+void complete_call_ids(ItemIds& ids, const OpenAIResponsesCreateRequest& request,
+                       const OpenAIResponsesRound& round) {
+    const std::size_t count = round.outcome->tool_calls.size();
+    ids.function_calls.resize(count);
+    ids.call_ids.resize(count);
+    ids.search_outputs.resize(count);
+    for (std::size_t index = 0; index < count; ++index) {
+        const CallKind kind = call_kind(request, round, index);
+        const std::string given =
+            index < round.call_ids.size() ? round.call_ids[index] : std::string();
+        if (kind == CallKind::HostedSearch) {
+            if (given.empty()) { throw std::logic_error("hosted search call has no identifier"); }
+            ids.function_calls[index] = given;
+            ids.call_ids[index]       = given;
+            if (ids.search_outputs[index].empty()) {
+                ids.search_outputs[index] = new_openai_response_item_id("tso");
+            }
+            continue;
+        }
+        if (ids.function_calls[index].empty()) {
+            ids.function_calls[index] = new_openai_response_item_id(call_item_prefix(kind));
+        }
+        if (ids.call_ids[index].empty()) {
+            ids.call_ids[index] = given.empty() ? new_openai_response_item_id("call") : given;
+        }
+    }
+}
+
+Json search_arguments(const std::string& arguments_json) {
+    Json arguments = Json::parse(arguments_json, nullptr, false);
+    return arguments.is_object() ? arguments : Json::object();
+}
+
+// The output Item of one call. `empty` gives the in-progress form streamed before its arguments.
+Json call_item(const OpenAIResponsesCreateRequest& request, const OpenAIResponsesRound& round,
+               std::size_t index, const ItemIds& ids, const char* status, bool empty) {
+    const infernix::GeneratedToolCall& call = round.outcome->tool_calls[index];
+    switch (call_kind(request, round, index)) {
+    case CallKind::HostedSearch:
+        return Json{{"id", ids.function_calls[index]},
+                    {"type", "tool_search_call"},
+                    {"execution", "server"},
+                    {"call_id", nullptr},
+                    {"status", status},
+                    {"arguments", empty ? Json::object() : hosted_search(round, index)->arguments}};
+    case CallKind::ClientSearch:
+        return Json{{"id", ids.function_calls[index]},
+                    {"type", "tool_search_call"},
+                    {"execution", "client"},
+                    {"call_id", ids.call_ids[index]},
+                    {"status", status},
+                    {"arguments", empty ? Json::object() : search_arguments(call.arguments_json)}};
+    case CallKind::Function:
+    case CallKind::Custom:
+        break;
+    }
+    return tool_call_item(request, call, ids.function_calls[index], ids.call_ids[index], status,
+                          empty);
+}
+
+Json search_output_item(const OpenAIResponsesRound& round, std::size_t index, const ItemIds& ids) {
+    return Json{{"id", ids.search_outputs[index]},
+                {"type", "tool_search_output"},
+                {"execution", "server"},
+                {"call_id", nullptr},
+                {"status", "completed"},
+                {"tools", hosted_search(round, index)->tools}};
 }
 
 // Build the display-only reasoning summary requested by the client.
@@ -152,19 +268,20 @@ bool needs_message_item(const GenerationOutcome& outcome, const std::string& sta
     return status == "completed";
 }
 
-BuiltOpenAIResponse build_response(const std::string& id, std::int64_t created_at,
-                                   const OpenAIResponsesCreateRequest& request,
-                                   const OpenAIResponsesRuntimeValues& runtime,
-                                   const GenerationOutcome& outcome, ItemIds ids) {
-    BuiltOpenAIResponse built;
-    const std::string status      = response_status(outcome.finish_reason);
-    const std::string item_status = status == "completed" ? "completed" : "incomplete";
+// Appends one generation's output Items and history. A generation the server continued ended in
+// hosted searches: its Items are complete, and the searches' tool_search_output Items and result
+// turns follow its calls.
+void append_round(BuiltOpenAIResponse& built, const OpenAIResponsesCreateRequest& request,
+                  const OpenAIResponsesRound& round, ItemIds& ids, const std::string& status,
+                  bool final_round) {
+    const GenerationOutcome& outcome = *round.outcome;
+    const std::string item_status = !final_round || status == "completed" ? "completed" : "incomplete";
 
     if (!outcome.reasoning.empty()) {
         if (ids.reasoning.empty()) { ids.reasoning = new_openai_response_item_id("rs"); }
-        const char* reasoning_status = (!outcome.text.empty() || !outcome.tool_calls.empty())
-                                           ? "completed"
-                                           : item_status.c_str();
+        const char* reasoning_status =
+            (!outcome.text.empty() || !outcome.tool_calls.empty() || ids.cut_call) ? "completed"
+                                                                                    : item_status.c_str();
         Json reasoning_item = {
             {"id", ids.reasoning},
             {"type", "reasoning"},
@@ -176,7 +293,7 @@ BuiltOpenAIResponse build_response(const std::string& id, std::int64_t created_a
         built.output_items.push_back(std::move(reasoning_item));
     }
 
-    if (needs_message_item(outcome, status)) {
+    if (final_round ? needs_message_item(outcome, status) : !outcome.text.empty()) {
         if (ids.message.empty()) { ids.message = new_openai_response_item_id("msg"); }
         built.output_items.push_back(
             Json{{"id", ids.message},
@@ -188,22 +305,19 @@ BuiltOpenAIResponse build_response(const std::string& id, std::int64_t created_a
                                                {"text", outcome.text}}})}});
     }
 
-    ids.function_calls.resize(outcome.tool_calls.size());
-    ids.call_ids.resize(outcome.tool_calls.size());
+    complete_call_ids(ids, request, round);
     for (std::size_t index = 0; index < outcome.tool_calls.size(); ++index) {
-        const infernix::GeneratedToolCall& call = outcome.tool_calls[index];
-        if (ids.function_calls[index].empty()) {
-            ids.function_calls[index] = new_openai_response_item_id(is_custom_tool(request, call.name) ? "ctc" : "fc");
+        built.output_items.push_back(call_item(request, round, index, ids, "completed", false));
+    }
+    if (ids.cut_call) { built.output_items.push_back(*ids.cut_call); }
+    for (std::size_t index = 0; index < outcome.tool_calls.size(); ++index) {
+        if (hosted_search(round, index) != nullptr) {
+            built.output_items.push_back(search_output_item(round, index, ids));
         }
-        if (ids.call_ids[index].empty()) {
-            ids.call_ids[index] = new_openai_response_item_id("call");
-        }
-        built.output_items.push_back(
-            tool_call_item(request, call, ids.function_calls[index], ids.call_ids[index], "completed", false));
     }
 
-    if (!outcome.reasoning.empty() || !outcome.text.empty() || !outcome.tool_calls.empty() ||
-        status == "completed") {
+    if (!final_round || !outcome.reasoning.empty() || !outcome.text.empty() ||
+        !outcome.tool_calls.empty() || status == "completed") {
         ChatTurn history;
         history.role              = ChatRole::Assistant;
         history.reasoning_content = outcome.reasoning;
@@ -222,6 +336,29 @@ BuiltOpenAIResponse build_response(const std::string& id, std::int64_t created_a
             history.content.push_back(std::move(part));
         }
         built.output_history.push_back(std::move(history));
+        for (std::size_t index = 0; index < outcome.tool_calls.size(); ++index) {
+            if (const OpenAIToolSearchExecution* search = hosted_search(round, index)) {
+                built.output_history.push_back(search->turn);
+            }
+        }
+    }
+}
+
+BuiltOpenAIResponse build_response(const std::string& id, std::int64_t created_at,
+                                   const OpenAIResponsesCreateRequest& request,
+                                   const OpenAIResponsesRuntimeValues& runtime,
+                                   std::span<const OpenAIResponsesRound> rounds,
+                                   const GenerationOutcome& totals,
+                                   std::optional<infernix::FinishReason> finish,
+                                   std::vector<ItemIds> ids) {
+    if (rounds.empty()) { throw std::logic_error("Responses response has no generation"); }
+    BuiltOpenAIResponse built;
+    const GenerationOutcome& final_outcome = *rounds.back().outcome;
+    const std::string status = response_status(finish.value_or(final_outcome.finish_reason));
+    ids.resize(rounds.size());
+    for (std::size_t index = 0; index < rounds.size(); ++index) {
+        append_round(built, request, rounds[index], ids[index], status,
+                     index + 1U == rounds.size());
     }
 
     Json response            = response_common(id, created_at, request, runtime);
@@ -231,19 +368,23 @@ BuiltOpenAIResponse build_response(const std::string& id, std::int64_t created_a
     response["output"]       = built.output_items;
     response["incomplete_details"] =
         status == "incomplete" ? Json{{"reason", "max_output_tokens"}} : Json(nullptr);
-    const int observed_cached = std::max(runtime.cached_input_tokens,
-                                         static_cast<int>(outcome.metrics.prefix_cache_hit_tokens));
-    const int cached_tokens   = std::clamp(observed_cached, 0, outcome.prompt_tokens);
+    const int observed_cached =
+        std::max(runtime.cached_input_tokens, static_cast<int>(totals.reused_prompt_tokens));
+    const int cached_tokens   = std::clamp(observed_cached, 0, totals.prompt_tokens);
     response["usage"] =
-        Json{{"input_tokens", outcome.prompt_tokens},
+        Json{{"input_tokens", totals.prompt_tokens},
              {"input_tokens_details", Json{{"cached_tokens", cached_tokens}}},
-             {"output_tokens", outcome.completion_tokens},
-             {"output_tokens_details", Json{{"reasoning_tokens", outcome.reasoning_tokens}}},
-             {"total_tokens", outcome.prompt_tokens + outcome.completion_tokens}};
+             {"output_tokens", totals.completion_tokens},
+             {"output_tokens_details", Json{{"reasoning_tokens", totals.reasoning_tokens}}},
+             {"total_tokens", totals.prompt_tokens + totals.completion_tokens}};
     built.body = std::move(response);
-    if (outcome.constraint)
-        built.body["constraint"] = product::constraint_observation_json(outcome.constraint);
+    if (final_outcome.constraint)
+        built.body["constraint"] = product::constraint_observation_json(final_outcome.constraint);
     return built;
+}
+
+OpenAIResponsesRound single_round(const GenerationOutcome& outcome) {
+    return OpenAIResponsesRound{.outcome = &outcome, .call_ids = {}, .searches = {}};
 }
 
 std::string sse(const Json& event) {
@@ -270,7 +411,18 @@ BuiltOpenAIResponse make_openai_response_object(const std::string& id, std::int6
                                                 const OpenAIResponsesCreateRequest& request,
                                                 const OpenAIResponsesRuntimeValues& runtime,
                                                 const GenerationOutcome& outcome) {
-    return build_response(id, created_at, request, runtime, outcome, {});
+    const OpenAIResponsesRound round = single_round(outcome);
+    return build_response(id, created_at, request, runtime, std::span(&round, 1), outcome,
+                          std::nullopt, {});
+}
+
+BuiltOpenAIResponse make_openai_response_object(const std::string& id, std::int64_t created_at,
+                                                const OpenAIResponsesCreateRequest& request,
+                                                const OpenAIResponsesRuntimeValues& runtime,
+                                                std::span<const OpenAIResponsesRound> rounds,
+                                                const GenerationOutcome& totals,
+                                                std::optional<infernix::FinishReason> finish) {
+    return build_response(id, created_at, request, runtime, rounds, totals, finish, {});
 }
 
 std::string make_openai_response_input_tokens_body(int input_tokens) {
@@ -405,6 +557,226 @@ public:
                           Json{{"output_index", message_index}, {"item", item}}))};
     }
 
+    // Streams what the deltas have not shown of a generation's reasoning and answer, and closes
+    // its Items. A generation the server continues closes them complete, with no empty message.
+    std::vector<std::string> close_generation(const GenerationOutcome& outcome,
+                                              const std::string& status, bool final_round) {
+        std::vector<std::string> events;
+        const auto append = [&](std::vector<std::string> more) {
+            events.insert(events.end(), std::make_move_iterator(more.begin()),
+                          std::make_move_iterator(more.end()));
+        };
+        const char* item_status =
+            !final_round || status == "completed" ? "completed" : "incomplete";
+        if (!outcome.reasoning.empty() && !reasoning_started) {
+            append(ensure_reasoning());
+            reasoning_text = outcome.reasoning;
+            events.push_back(sse(event("response.reasoning_text.delta",
+                                       Json{{"item_id", ids.reasoning},
+                                            {"output_index", reasoning_index},
+                                            {"content_index", 0},
+                                            {"delta", outcome.reasoning}})));
+        }
+        const char* reasoning_status =
+            (!outcome.text.empty() || !outcome.tool_calls.empty()) ? "completed" : item_status;
+        append(close_reasoning(outcome.reasoning, reasoning_status));
+
+        if (final_round ? needs_message_item(outcome, status) : !outcome.text.empty()) {
+            append(ensure_message());
+            if (outcome.text != content_text) {
+                if (!outcome.text.starts_with(content_text)) {
+                    throw std::logic_error("streamed content does not match terminal content");
+                }
+                const std::string suffix = outcome.text.substr(content_text.size());
+                if (!suffix.empty()) {
+                    content_text += suffix;
+                    events.push_back(sse(event("response.output_text.delta",
+                                               Json{{"item_id", ids.message},
+                                                    {"output_index", message_index},
+                                                    {"content_index", 0},
+                                                    {"delta", suffix},
+                                                    {"logprobs", Json::array()}})));
+                }
+            }
+            append(close_message(outcome.text, item_status));
+        }
+        return events;
+    }
+
+    // A streamed call's kind, decided by its name as the round will decide it.
+    [[nodiscard]] CallKind streamed_kind(const std::string& name) const {
+        if (request.prompt.tool_search && request.prompt.tool_search->server && name == kToolSearchFunctionName) {
+            return CallKind::HostedSearch;
+        }
+        const auto position = request.tool_identities.find(name);
+        if (position != request.tool_identities.end() && position->second.tool_search) {
+            return CallKind::ClientSearch;
+        }
+        return is_custom_tool(request, name) ? CallKind::Custom : CallKind::Function;
+    }
+
+    // The Item of streamed call `index` from what it streamed; `empty` gives the in-progress form.
+    [[nodiscard]] Json streamed_item(std::size_t index, const char* status, bool empty) const {
+        const StreamedCall& call = calls[index];
+        switch (call.kind) {
+        case CallKind::HostedSearch:
+            return Json{{"id", ids.function_calls[index]}, {"type", "tool_search_call"}, {"execution", "server"},
+                        {"call_id", nullptr},           {"status", status},          {"arguments", Json::object()}};
+        case CallKind::ClientSearch:
+            return Json{{"id", ids.function_calls[index]},
+                        {"type", "tool_search_call"},
+                        {"execution", "client"},
+                        {"call_id", ids.call_ids[index]},
+                        {"status", status},
+                        {"arguments", empty ? Json::object() : search_arguments(call.arguments)}};
+        case CallKind::Function:
+        case CallKind::Custom:
+            break;
+        }
+        return tool_call_item(request, infernix::GeneratedToolCall{.name = call.name, .arguments_json = call.arguments},
+                              ids.function_calls[index], ids.call_ids[index], status, empty);
+    }
+
+    std::vector<std::string> open_call(const infernix::ToolCallDelta& delta) {
+        // Content never follows a constrained call: the reasoning and answer Items are complete.
+        std::vector<std::string> events = close_reasoning(reasoning_text);
+        std::vector<std::string> message = close_message(content_text);
+        events.insert(events.end(), std::make_move_iterator(message.begin()),
+                      std::make_move_iterator(message.end()));
+        const CallKind kind     = streamed_kind(delta.name);
+        const std::size_t index = delta.index;
+        ids.function_calls.resize(index + 1U);
+        ids.call_ids.resize(index + 1U);
+        ids.search_outputs.resize(index + 1U);
+        ids.function_calls[index] = new_openai_response_item_id(call_item_prefix(kind));
+        ids.call_ids[index] =
+            kind == CallKind::HostedSearch ? ids.function_calls[index] : new_openai_response_item_id("call");
+        calls.push_back(StreamedCall{.name = delta.name, .kind = kind, .output_index = next_output_index++});
+        events.push_back(sse(event("response.output_item.added",
+                                   Json{{"output_index", calls.back().output_index},
+                                        {"item", streamed_item(index, "in_progress", true)}})));
+        return events;
+    }
+
+    // A function call's arguments are whole: its done events.
+    std::vector<std::string> complete_function(std::size_t index, const char* status) {
+        const StreamedCall& call = calls[index];
+        Json arguments_done      = {{"item_id", ids.function_calls[index]},
+                                    {"output_index", call.output_index},
+                                    {"arguments", call.arguments}};
+        add_wire_function_identity(arguments_done, request, call.name);
+        return {sse(event("response.function_call_arguments.done", std::move(arguments_done))),
+                sse(event("response.output_item.done",
+                          Json{{"output_index", call.output_index}, {"item", streamed_item(index, status, false)}}))};
+    }
+
+    // Streams a generation's calls, then the tool_search_output of each hosted search among them.
+    // Streamed calls are the generation's, and at most one more that the turn's end cut: a function
+    // call completed with its last step, the others complete here; the cut one closes incomplete.
+    std::vector<std::string> emit_calls(const OpenAIResponsesRound& round) {
+        std::vector<std::string> events;
+        const GenerationOutcome& outcome = *round.outcome;
+        const std::size_t count          = outcome.tool_calls.size();
+        if (!calls.empty()) {
+            bool matches = calls.size() == count || (calls.size() == count + 1U && !calls.back().complete);
+            for (std::size_t position = 0; matches && position < count; ++position) {
+                matches = calls[position].complete && calls[position].name == outcome.tool_calls[position].name &&
+                          calls[position].arguments == outcome.tool_calls[position].arguments_json &&
+                          calls[position].kind == call_kind(request, round, position);
+            }
+            if (!matches) { throw std::logic_error("streamed tool calls do not match terminal output"); }
+            if (calls.size() > count) {
+                const std::size_t cut = count;
+                if (calls[cut].kind == CallKind::Function) {
+                    std::vector<std::string> done = complete_function(cut, "incomplete");
+                    events.insert(events.end(), std::make_move_iterator(done.begin()),
+                                  std::make_move_iterator(done.end()));
+                } else {
+                    events.push_back(sse(event("response.output_item.done",
+                                               Json{{"output_index", calls[cut].output_index},
+                                                    {"item", streamed_item(cut, "incomplete", true)}})));
+                }
+                ids.cut_call = calls[cut].kind == CallKind::Function ? streamed_item(cut, "incomplete", false)
+                                                                     : streamed_item(cut, "incomplete", true);
+            }
+        }
+        complete_call_ids(ids, request, round);
+        for (std::size_t position = 0; position < count; ++position) {
+            const infernix::GeneratedToolCall& call = outcome.tool_calls[position];
+            const CallKind kind                     = call_kind(request, round, position);
+            const std::string& item_id              = ids.function_calls[position];
+            const bool streamed                     = position < calls.size();
+            if (streamed && kind == CallKind::Function) { continue; }
+            const int output_index = streamed ? calls[position].output_index : next_output_index++;
+            if (!streamed) {
+                events.push_back(sse(event(
+                    "response.output_item.added",
+                    Json{{"output_index", output_index},
+                         {"item", call_item(request, round, position, ids, "in_progress", true)}})));
+            }
+            if (kind == CallKind::Custom) {
+                // The custom tool's input, as OpenAI streams it (Codex reads the delta by item_id).
+                const std::string input = custom_tool_input(call.arguments_json);
+                if (!input.empty()) {
+                    events.push_back(sse(event(
+                        "response.custom_tool_call_input.delta",
+                        Json{{"item_id", item_id}, {"output_index", output_index}, {"delta", input}})));
+                }
+                events.push_back(sse(event(
+                    "response.custom_tool_call_input.done",
+                    Json{{"item_id", item_id}, {"output_index", output_index}, {"input", input}})));
+            } else if (kind == CallKind::Function) {
+                if (!call.arguments_json.empty()) {
+                    events.push_back(sse(event("response.function_call_arguments.delta",
+                                               Json{{"item_id", item_id},
+                                                    {"output_index", output_index},
+                                                    {"delta", call.arguments_json}})));
+                }
+                Json arguments_done = {{"item_id", item_id},
+                                       {"output_index", output_index},
+                                       {"arguments", call.arguments_json}};
+                add_wire_function_identity(arguments_done, request, call.name);
+                events.push_back(
+                    sse(event("response.function_call_arguments.done", std::move(arguments_done))));
+            }
+            events.push_back(sse(event(
+                "response.output_item.done",
+                Json{{"output_index", output_index},
+                     {"item", call_item(request, round, position, ids, "completed", false)}})));
+        }
+        for (std::size_t position = 0; position < outcome.tool_calls.size(); ++position) {
+            if (hosted_search(round, position) == nullptr) { continue; }
+            const int output_index = next_output_index++;
+            const Json item        = search_output_item(round, position, ids);
+            events.push_back(sse(event("response.output_item.added",
+                                       Json{{"output_index", output_index}, {"item", item}})));
+            events.push_back(sse(event("response.output_item.done",
+                                       Json{{"output_index", output_index}, {"item", item}})));
+        }
+        return events;
+    }
+
+    // The next generation's deltas open new Items.
+    void next_round() {
+        round_ids.push_back(std::move(ids));
+        ids               = ItemIds{};
+        reasoning_started = false;
+        reasoning_done    = false;
+        message_started   = false;
+        message_done      = false;
+        reasoning_text.clear();
+        content_text.clear();
+        calls.clear();
+    }
+
+    struct StreamedCall {
+        std::string name;
+        std::string arguments;
+        CallKind kind    = CallKind::Function;
+        int output_index = 0;
+        bool complete    = false;
+    };
+
     std::string id;
     std::int64_t created_at = 0;
     OpenAIResponsesCreateRequest request;
@@ -422,7 +794,9 @@ public:
     bool terminal_emitted  = false;
     std::string reasoning_text;
     std::string content_text;
-    ItemIds ids;
+    ItemIds ids;                     // the current generation's
+    std::vector<ItemIds> round_ids; // generations the server continued
+    std::vector<StreamedCall> calls; // the current generation's streamed calls
 };
 
 OpenAIResponsesEventStream::OpenAIResponsesEventStream(std::string response_id,
@@ -481,108 +855,76 @@ std::vector<std::string> OpenAIResponsesEventStream::content_delta(const std::st
     return events;
 }
 
-OpenAIResponsesStreamFinish OpenAIResponsesEventStream::finish(const GenerationOutcome& outcome) {
+std::vector<std::string> OpenAIResponsesEventStream::tool_call_delta(const infernix::ToolCallDelta& delta) {
+    Impl& s          = *impl_;
+    const bool opens = delta.index == s.calls.size();
+    if (!s.started || s.finish_built || (opens && delta.name.empty()) ||
+        (!opens && (delta.index + 1U != s.calls.size() || s.calls.back().complete || !delta.name.empty()))) {
+        throw std::logic_error("invalid Responses tool-call delta state");
+    }
+    std::vector<std::string> events;
+    if (opens) { events = s.open_call(delta); }
+    auto& call = s.calls.back();
+    call.arguments += delta.arguments;
+    if (call.kind == CallKind::Function && !delta.arguments.empty()) {
+        events.push_back(sse(s.event("response.function_call_arguments.delta",
+                                     Json{{"item_id", s.ids.function_calls[delta.index]},
+                                          {"output_index", call.output_index},
+                                          {"delta", delta.arguments}})));
+    }
+    if (delta.complete) {
+        call.complete = true;
+        if (call.kind == CallKind::Function) {
+            std::vector<std::string> done = s.complete_function(delta.index, "completed");
+            events.insert(events.end(), std::make_move_iterator(done.begin()),
+                          std::make_move_iterator(done.end()));
+        }
+    }
+    return events;
+}
+
+std::string OpenAIResponsesEventStream::hosted_search_id(std::size_t index) const {
+    return index < impl_->calls.size() ? impl_->ids.function_calls[index] : new_openai_response_item_id("tsc");
+}
+
+std::vector<std::string> OpenAIResponsesEventStream::round(const OpenAIResponsesRound& round) {
     if (!impl_->started || impl_->finish_built) {
+        throw std::logic_error("invalid Responses stream round state");
+    }
+    std::vector<std::string> events = impl_->close_generation(*round.outcome, "completed", false);
+    std::vector<std::string> calls  = impl_->emit_calls(round);
+    events.insert(events.end(), std::make_move_iterator(calls.begin()),
+                  std::make_move_iterator(calls.end()));
+    impl_->next_round();
+    return events;
+}
+
+OpenAIResponsesStreamFinish OpenAIResponsesEventStream::finish(const GenerationOutcome& outcome) {
+    const OpenAIResponsesRound round = single_round(outcome);
+    return finish(std::span(&round, 1), outcome, std::nullopt);
+}
+
+OpenAIResponsesStreamFinish
+OpenAIResponsesEventStream::finish(std::span<const OpenAIResponsesRound> rounds,
+                                   const GenerationOutcome& totals,
+                                   std::optional<infernix::FinishReason> finish_reason) {
+    if (!impl_->started || impl_->finish_built || rounds.empty() ||
+        rounds.size() != impl_->round_ids.size() + 1U) {
         throw std::logic_error("invalid Responses stream finish state");
     }
     impl_->finish_built = true;
     OpenAIResponsesStreamFinish finished;
-    const std::string status = response_status(outcome.finish_reason);
-    const char* item_status  = status == "completed" ? "completed" : "incomplete";
-
-    auto append = [&](std::vector<std::string> events) {
-        finished.events_before_terminal.insert(finished.events_before_terminal.end(),
-                                               std::make_move_iterator(events.begin()),
-                                               std::make_move_iterator(events.end()));
-    };
-    if (!outcome.reasoning.empty() && !impl_->reasoning_started) {
-        append(impl_->ensure_reasoning());
-        impl_->reasoning_text = outcome.reasoning;
-        finished.events_before_terminal.push_back(sse(impl_->event(
-            "response.reasoning_text.delta", Json{{"item_id", impl_->ids.reasoning},
-                                                  {"output_index", impl_->reasoning_index},
-                                                  {"content_index", 0},
-                                                  {"delta", outcome.reasoning}})));
-    }
-    const char* reasoning_status =
-        (!outcome.text.empty() || !outcome.tool_calls.empty()) ? "completed" : item_status;
-    append(impl_->close_reasoning(outcome.reasoning, reasoning_status));
-
-    if (needs_message_item(outcome, status)) {
-        append(impl_->ensure_message());
-        if (outcome.text != impl_->content_text) {
-            if (!outcome.text.starts_with(impl_->content_text)) {
-                throw std::logic_error("streamed content does not match terminal content");
-            }
-            const std::string suffix = outcome.text.substr(impl_->content_text.size());
-            if (!suffix.empty()) {
-                impl_->content_text += suffix;
-                finished.events_before_terminal.push_back(sse(impl_->event(
-                    "response.output_text.delta", Json{{"item_id", impl_->ids.message},
-                                                       {"output_index", impl_->message_index},
-                                                       {"content_index", 0},
-                                                       {"delta", suffix},
-                                                       {"logprobs", Json::array()}})));
-            }
-        }
-        append(impl_->close_message(outcome.text, item_status));
-    }
-
-    impl_->ids.function_calls.reserve(outcome.tool_calls.size());
-    impl_->ids.call_ids.reserve(outcome.tool_calls.size());
-    for (const infernix::GeneratedToolCall& call : outcome.tool_calls) {
-        const bool custom         = is_custom_tool(impl_->request, call.name);
-        const std::string item_id = new_openai_response_item_id(custom ? "ctc" : "fc");
-        const std::string call_id = new_openai_response_item_id("call");
-        impl_->ids.function_calls.push_back(item_id);
-        impl_->ids.call_ids.push_back(call_id);
-        const int output_index = impl_->next_output_index++;
-        finished.events_before_terminal.push_back(sse(impl_->event(
-            "response.output_item.added",
-            Json{{"output_index", output_index},
-                 {"item", tool_call_item(impl_->request, call, item_id, call_id, "in_progress", true)}})));
-        if (custom) {
-            // The custom tool's input, as OpenAI streams it (Codex reads the delta by item_id).
-            const std::string input = custom_tool_input(call.arguments_json);
-            if (!input.empty()) {
-                finished.events_before_terminal.push_back(sse(impl_->event(
-                    "response.custom_tool_call_input.delta",
-                    Json{{"item_id", item_id}, {"output_index", output_index}, {"delta", input}})));
-            }
-            finished.events_before_terminal.push_back(sse(impl_->event(
-                "response.custom_tool_call_input.done",
-                Json{{"item_id", item_id}, {"output_index", output_index}, {"input", input}})));
-            finished.events_before_terminal.push_back(sse(impl_->event(
-                "response.output_item.done",
-                Json{{"output_index", output_index},
-                     {"item", tool_call_item(impl_->request, call, item_id, call_id, "completed", false)}})));
-            continue;
-        }
-        if (!call.arguments_json.empty()) {
-            finished.events_before_terminal.push_back(sse(impl_->event(
-                "response.function_call_arguments.delta", Json{{"item_id", item_id},
-                                                               {"output_index", output_index},
-                                                               {"delta", call.arguments_json}})));
-        }
-        Json arguments_done = {{"item_id", item_id},
-                               {"output_index", output_index},
-                               {"arguments", call.arguments_json}};
-        add_wire_function_identity(arguments_done, impl_->request, call.name);
-        finished.events_before_terminal.push_back(
-            sse(impl_->event("response.function_call_arguments.done", std::move(arguments_done))));
-        Json done_item = {{"id", item_id},
-                          {"type", "function_call"},
-                          {"status", "completed"},
-                          {"call_id", call_id},
-                          {"arguments", call.arguments_json}};
-        add_wire_function_identity(done_item, impl_->request, call.name);
-        finished.events_before_terminal.push_back(
-            sse(impl_->event("response.output_item.done",
-                             Json{{"output_index", output_index}, {"item", done_item}})));
-    }
-
+    const OpenAIResponsesRound& final_round = rounds.back();
+    const std::string status =
+        response_status(finish_reason.value_or(final_round.outcome->finish_reason));
+    finished.events_before_terminal = impl_->close_generation(*final_round.outcome, status, true);
+    std::vector<std::string> calls  = impl_->emit_calls(final_round);
+    finished.events_before_terminal.insert(finished.events_before_terminal.end(),
+                                           std::make_move_iterator(calls.begin()),
+                                           std::make_move_iterator(calls.end()));
+    impl_->next_round();
     finished.response = build_response(impl_->id, impl_->created_at, impl_->request, impl_->runtime,
-                                       outcome, impl_->ids);
+                                       rounds, totals, finish_reason, impl_->round_ids);
     return finished;
 }
 

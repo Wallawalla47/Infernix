@@ -20,6 +20,9 @@ struct LinearAttentionStatePoolSpec {
     std::int32_t key_head_dim   = 0;
     std::int32_t slot_count     = 1;
     DType conv_dtype            = DType::BF16;
+    // FP32, or FP16 under fp16-gdn-state (the recurrent kernels keep an FP32 master state between
+    // loading and storing it).
+    DType recurrent_dtype = DType::FP32;
 };
 
 struct LinearAttentionStatePoolLayout {
@@ -80,9 +83,9 @@ public:
     [[nodiscard]] Tensor conv_slot(std::uint32_t layer, std::int32_t slot) const;
     [[nodiscard]] Tensor recurrent_slot(std::uint32_t layer, std::int32_t slot) const;
 
-    void copy_slot(std::int32_t src, std::int32_t dst, cudaStream_t stream = nullptr);
-    void zero_slot(std::int32_t slot, cudaStream_t stream = nullptr);
-    void zero_all(cudaStream_t stream = nullptr);
+    void copy_slot(std::int32_t src, std::int32_t dst, cudaStream_t stream);
+    void zero_slot(std::int32_t slot, cudaStream_t stream);
+    void zero_all(cudaStream_t stream);
 
 private:
     std::vector<Tensor> conv_;

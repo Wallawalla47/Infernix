@@ -56,7 +56,9 @@ void sparse_moe_decode_launch_d4_small_t(const SparseMoeWeights& weights, Tensor
                                          const float* shared_scale, const float* token_activations,
                                          std::int32_t tokens, SparseMoeSmallTD4Schedule schedule,
                                          cudaStream_t stream,
-                                         const int* adaptive_route_jobs = nullptr);
+                                         const int* adaptive_route_jobs = nullptr,
+                                         const void* prefetch_data = nullptr,
+                                         std::size_t prefetch_bytes = 0);
 void sparse_moe_decode_launch(const Tensor& x, const SparseMoeWeights& weights, Tensor& destination,
                               const SparseMoeDecodePlan& plan,
                               const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream);

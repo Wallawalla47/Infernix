@@ -6,7 +6,10 @@
 // call's last job, the routed and shared experts in one ops::moe_experts call over the Program's
 // expert sources (runtime::expert_offload::ExpertOffload), and the combine into the residual. Every
 // expert route is exact W4A16, so the layer's bits depend on neither the call's width nor where a
-// record was read.
+// record was read; with an expert-a4-residual fast path (OffloadedExperts::wide_a16) an expert of more
+// than eight columns in a call, routed or shared, computes from A4 terms, so its bits then depend on
+// its column count in the call (not on where its record was read: CPU-served misses have at most
+// eight columns and are exact, as the GPU's narrow experts are).
 
 #include "core/arena.h"
 #include "core/device.h"
@@ -40,6 +43,14 @@ struct OffloadedExperts {
     std::int32_t landing_slots  = 0;
     // --expert-tail-skip's rank for graphed rounds (0: off; MoeExpertSource::tail_skip_rank).
     std::int32_t tail_skip_rank = 0;
+    // The wide route of every call (MoeExpertSource::wide_a16): exact, or the expert-a4-residual fast
+    // paths' two or three A4 terms (ExecutionSchedule::expert_wide, which sized the workspace).
+    ops::offloaded_moe::WideA16 wide_a16 = ops::offloaded_moe::WideA16::kExact;
+    // router-mma: calls of at least kRouterMmaMinColumns columns (prefill chunks and walk calls, never a
+    // decode or verification round) compute the router and shared-gate logits on tensor cores
+    // (ops::projection_fp32_router_mma: BF16 operands, FP32 accumulation, a column's bits the same at
+    // every such width).
+    bool router_mma = false;
     // The side stream: a graphed round's fork (its first two events) or an eager call's staging
     // overlap (all five).
     cudaStream_t side_stream = nullptr;
@@ -84,9 +95,12 @@ struct OffloadedMoeContext {
 // rounds are planned at their own widths.
 inline constexpr std::int32_t kOffloadedMoeStaticColumns = 256;
 
-// The layer's workspace for every call of `first`..`last` columns.
+// router-mma's narrowest call (OffloadedExperts::router_mma), as Flash-Next's.
+inline constexpr std::int32_t kRouterMmaMinColumns = 256;
+
+// The layer's workspace for every call of `first`..`last` columns on the experts' wide route `wide_a16`.
 [[nodiscard]] std::size_t offloaded_moe_workspace_bytes(const OffloadedMoeParameters& p, std::int32_t first,
-                                                        std::int32_t last);
+                                                        std::int32_t last, ops::offloaded_moe::WideA16 wide_a16);
 // residual += moe(hidden) for BF16 hidden and residual [H, T].
 void offloaded_moe(const Tensor& hidden, const OffloadedMoeParameters& p, Tensor& residual,
                    const OffloadedMoeContext& context, WorkspaceArena& workspace, DeviceExecutionView execution);

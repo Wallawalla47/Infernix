@@ -17,6 +17,7 @@
 #include "direct_bf16_weight.cuh"
 #include "infernix_bench_common.h"
 #include "quantized_weight.cuh"
+#include "roofline.h"
 
 #include <cuda_bf16.h>
 #include <cuda_profiler_api.h>
@@ -38,19 +39,10 @@
 #include <vector>
 
 using namespace infernix;
+namespace roofline = infernix::bench::roofline;
 using infernix::ops::LinearPolicy;
 
 namespace {
-
-constexpr double kRtx5090DramGBs          = 1792.0;
-constexpr double kRtx5090SustainedReadGBs = 1674.5;
-// NVIDIA's GB202 table reports dense/sparse pairs at boost clock. Keep input and accumulator
-// precision explicit for the qualified Tensor Core routes below.
-constexpr double kRtx5090Fp8Fp16AccumulateTFLOPs = 838.0;
-constexpr double kRtx5090Fp8Fp32AccumulateTFLOPs = 419.0;
-// Unit-scale block-scaled FP8 uses the full-rate FP32 accumulation path on RTX 5090.
-constexpr double kRtx5090MxFp8Fp32AccumulateTFLOPs = 838.0;
-constexpr double kRtx5090Bf16Fp32AccumulateTFLOPs  = 209.5;
 constexpr std::uint64_t kDefaultFlushBytes         = 256ULL << 20;
 constexpr int kDefaultWarmup                       = 3;
 constexpr int kDefaultRepeat                       = 20;
@@ -251,6 +243,8 @@ const char* qtype_name(QType qtype) {
         return "NVFP4";
     case QType::FP8_E4M3FN_ROW_BF16:
         return "FP8";
+    case QType::FP8_E4M3FN_G32_E8M0:
+        return "MXFP8";
     case QType::NVFP4_MUL:
         return "RG16";
     default:
@@ -276,6 +270,7 @@ QType parse_qtype(std::string_view text) {
     if (value == "bf16") { return QType::BF16; }
     if (value == "nvfp4") { return QType::NVFP4; }
     if (value == "fp8" || value == "fp8_e4m3fn_row_bf16") { return QType::FP8_E4M3FN_ROW_BF16; }
+    if (value == "mxfp8" || value == "fp8_e4m3fn_g32_e8m0") { return QType::FP8_E4M3FN_G32_E8M0; }
     if (value == "rg16" || value == "nvfp4_mul") { return QType::NVFP4_MUL; }
     throw std::invalid_argument("unknown qtype: " + std::string(text));
 }
@@ -344,14 +339,16 @@ Sweep parse_sweep(std::string_view text) {
 void usage(const char* argv0) {
     std::fprintf(stderr,
                  "Usage:\n"
-                 "  %s --qtype Q4|Q5|Q6|Q8|BF16|NVFP4|FP8|RG16 --n N --k K --t T [options]\n"
-                 "  %s --qtype Q4|Q5|Q6|Q8|BF16|NVFP4|FP8|RG16 --n N --k K --sweep START:END[:STEP] "
+                 "  %s --qtype Q4|Q5|Q6|Q8|BF16|NVFP4|FP8|MXFP8|RG16 --n N --k K --t T [options]\n"
+                 "  %s --qtype Q4|Q5|Q6|Q8|BF16|NVFP4|FP8|MXFP8|RG16 --n N --k K --sweep START:END[:STEP] "
                  "[options]\n"
                  "  %s --suite qwen3_6_27b|qwen3_6_35b_a3b|flash_next_vision|all [options]\n\n"
                  "RG16 is a dense nvfp4_mul matrix in nvfp4_rg16_v1 (registered [N,K] only).\n"
                  "Options:\n"
                  "  --policy a16|a8|a4|invariant  Activation-compute policy (default a16).\n"
-                 "  --routes exact|fast Route set (default exact; fast admits fast-path routes).\n"
+                 "  --routes exact|fast|block32|f16 Route set (default exact; fast admits fast-path\n"
+                 "                     routes; block32 the same with fp8-a8-pair-block32; f16 only\n"
+                 "                     f16-accumulate-prefill's FP8/MXFP8 route).\n"
                  "  --execution MODE   eager (default) or graph; time the complete Op.\n"
                  "  --graph-calls N    Calls per timed graph (1..64, default 1); report per call.\n"
                  "  --profile          Capture exactly one post-warmup public Linear call.\n"
@@ -378,12 +375,17 @@ Options parse_args(int argc, char** argv) {
             opt.policy = parse_policy(next("policy"));
         } else if (arg == "--routes") {
             const std::string_view routes = next("routes");
-            if (routes != "exact" && routes != "fast") {
-                throw std::invalid_argument("Linear benchmark routes must be exact or fast");
+            if (routes != "exact" && routes != "fast" && routes != "block32" && routes != "f16") {
+                throw std::invalid_argument("Linear benchmark routes must be exact, fast, block32 or f16");
             }
-            opt.routes = routes == "fast" ? infernix::ops::LinearRoutes::Q8SlicedK | infernix::ops::LinearRoutes::Fp8A8Pair |
-                                                infernix::ops::LinearRoutes::Q4W4A8
-                                          : infernix::ops::LinearRoutes::Exact;
+            // block32: the fast set with fp8-a8-pair-block32 in place of the column-scaled pair. f16 admits
+            // only f16-accumulate-prefill's route, so an A/B against exact isolates it.
+            using infernix::ops::LinearRoutes;
+            opt.routes = routes == "fast"      ? LinearRoutes::Q8SlicedK | LinearRoutes::Fp8A8Pair | LinearRoutes::Q4W4A8
+                         : routes == "block32" ? LinearRoutes::Q8SlicedK | LinearRoutes::Fp8A8PairBlock32 |
+                                                     LinearRoutes::Q4W4A8
+                         : routes == "f16"     ? LinearRoutes::F16Accumulate
+                                               : LinearRoutes::Exact;
         } else if (arg == "--n") {
             opt.n      = parse_i32(next("N"), "N");
             opt.have_n = true;
@@ -562,6 +564,11 @@ LinearBenchWeight make_weight(QType qtype, std::int32_t n, std::int32_t k) {
         const std::uint64_t model_bytes     = packed.model_weight_bytes();
         return {std::move(packed.storage), packed.weight, model_bytes};
     }
+    if (qtype == QType::FP8_E4M3FN_G32_E8M0) {
+        bench::PackedQuantizedWeight packed = bench::make_mxfp8_weight(n, k);
+        const std::uint64_t model_bytes     = packed.model_weight_bytes();
+        return {std::move(packed.storage), packed.weight, model_bytes};
+    }
     if (qtype == QType::NVFP4_MUL) {
         bench::PackedQuantizedWeight packed = bench::make_nvfp4_rg16_weight(n, k);
         const std::uint64_t model_bytes     = packed.model_weight_bytes();
@@ -594,20 +601,40 @@ std::string join_labels(const std::vector<std::string>& labels) {
 double registered_tensor_peak_tflops(const BenchPoint& point, const char*& profile) {
     // Report Tensor Core utilization only when the exact registered problem and extent determine
     // that the public route executes the named MMA profile.
+    // f16-accumulate-prefill (fp8_shapes.h / mxfp8_shapes.h: every registered problem from 256 columns,
+    // A16 permission; an unregistered problem fails in Linear itself).
+    if (infernix::ops::has_route(point.routes, infernix::ops::LinearRoutes::F16Accumulate) &&
+        (point.qtype == QType::FP8_E4M3FN_ROW_BF16 || point.qtype == QType::FP8_E4M3FN_G32_E8M0) &&
+        point.policy == LinearPolicy::A16Only && point.t >= 256) {
+        profile = "F16_F16ACC";
+        return roofline::kFp16Fp16AccumulateTFLOPs;
+    }
+    // fp8-a8-pair-block32 on MXFP8 (mxfp8_shapes.h kMxfp8PairMinTokens*: from 33 columns on [16384,2560], 97 on
+    // [13952,2560], 513 on the N = 2560 problems, 1025 on [1280,2560]): two block-scaled E4M3 MMAs per product.
+    if (infernix::ops::has_route(point.routes, infernix::ops::LinearRoutes::Fp8A8PairBlock32) &&
+        point.qtype == QType::FP8_E4M3FN_G32_E8M0 && point.policy == LinearPolicy::A16Only &&
+        point.t >= (point.n == 16384 ? 33 : point.n == 13952 ? 97 : point.n == 1280 ? 1025 : 513)) {
+        profile = "MXFP8_F32ACC_X2";
+        return roofline::kMxfp8Fp32AccumulateTFLOPs / 2.0;
+    }
+    if (point.qtype == QType::FP8_E4M3FN_G32_E8M0 && point.t > 16) {
+        profile = "BF16_F32ACC"; // the exact MXFP8 route's Tensor Core tiles
+        return roofline::kBf16Fp32AccumulateTFLOPs;
+    }
     if (point.qtype == QType::Q8_G32_FP16 &&
         ((point.n == 2560 && point.k == 6144) || (point.n == 6144 && point.k == 2560) ||
          (point.n == 10240 && point.k == 2560) || (point.n == 12288 && point.k == 2560) ||
          (point.n == 16384 && point.k == 2560)) &&
         point.t > 1) {
         profile = "BF16_F32ACC";
-        return kRtx5090Bf16Fp32AccumulateTFLOPs;
+        return roofline::kBf16Fp32AccumulateTFLOPs;
     }
     if (point.qtype == QType::FP8_E4M3FN_ROW_BF16 &&
         (((point.n == 14336 || point.n == 16384) && point.k == 5120) ||
          (point.n == 5120 && (point.k == 6144 || point.k == 17408))) &&
         point.t > 1 && (point.policy == LinearPolicy::A16Only || point.t <= 16)) {
         profile = "BF16_F32ACC";
-        return kRtx5090Bf16Fp32AccumulateTFLOPs;
+        return roofline::kBf16Fp32AccumulateTFLOPs;
     }
     const bool fp8_problem =
         (point.n == 14336 && point.k == 5120) || (point.n == 16384 && point.k == 5120) ||
@@ -621,7 +648,7 @@ double registered_tensor_peak_tflops(const BenchPoint& point, const char*& profi
     if (point.qtype == QType::FP8_E4M3FN_ROW_BF16 && point.policy == LinearPolicy::AllowA8 &&
         fp8_problem && fp8_tensor_route) {
         profile = "MXFP8_F32ACC";
-        return kRtx5090MxFp8Fp32AccumulateTFLOPs;
+        return roofline::kMxfp8Fp32AccumulateTFLOPs;
     }
     if (point.qtype == QType::BF16 &&
         ((point.n == 256 && point.k == 5120) ||
@@ -643,7 +670,7 @@ double registered_tensor_peak_tflops(const BenchPoint& point, const char*& profi
          (point.n == 320 && point.k == 10240 && point.t >= 9) ||
          (point.n == 324 && point.k == 10240 && point.t >= 9))) {
         profile = "BF16_F32ACC";
-        return kRtx5090Bf16Fp32AccumulateTFLOPs;
+        return roofline::kBf16Fp32AccumulateTFLOPs;
     }
     // The BF16 Vision tower problems run MMA routes above T = 8 and the skinny GEMV at or below.
     const bool bf16_vision_problem =
@@ -653,14 +680,21 @@ double registered_tensor_peak_tflops(const BenchPoint& point, const char*& profi
     if (point.qtype == QType::BF16 && point.policy == LinearPolicy::A16Only &&
         bf16_vision_problem && point.t > 8) {
         profile = "BF16_F32ACC";
-        return kRtx5090Bf16Fp32AccumulateTFLOPs;
+        return roofline::kBf16Fp32AccumulateTFLOPs;
     }
     // The canonical W4A16 wide route (beyond the GEMV's 8 columns, 4 at K 4304 and 4608): two
     // m16n8k32 integer MMAs per 16-element block issue in a BF16 m16n8k16's time, so its MMA peak is
     // the BF16 one's.
     if (point.qtype == QType::NVFP4_MUL && point.t > (point.k >= 4304 ? 4 : 8)) {
         profile = "INT8_LIMB_A16";
-        return kRtx5090Bf16Fp32AccumulateTFLOPs;
+        return roofline::kBf16Fp32AccumulateTFLOPs;
+    }
+    // The canonical W4A16 wide route (beyond the GEMV's 8 columns, 4 at K 4304 and 4608): two
+    // m16n8k32 integer MMAs per 16-element block issue in a BF16 m16n8k16's time, so its MMA peak is
+    // the BF16 one's.
+    if (point.qtype == QType::NVFP4_MUL && point.t > (point.k >= 4304 ? 4 : 8)) {
+        profile = "INT8_LIMB_A16";
+        return roofline::kBf16Fp32AccumulateTFLOPs;
     }
     profile = "";
     return std::numeric_limits<double>::quiet_NaN();
@@ -680,7 +714,7 @@ Result make_result(const BenchPoint& point, const LinearBenchWeight& weight,
                                 static_cast<double>(point.t);
     const double seconds = timing.median_us * 1.0e-6;
     const double memory_floor_us =
-        static_cast<double>(model_bytes) / (kRtx5090DramGBs * 1.0e9) * 1.0e6;
+        static_cast<double>(model_bytes) / (roofline::kDramSpecGBs * 1.0e9) * 1.0e6;
 
     Result result;
     result.labels             = join_labels(point.labels);
@@ -698,8 +732,8 @@ Result make_result(const BenchPoint& point, const LinearBenchWeight& weight,
     result.min_us             = timing.min_us;
     result.p95_us             = timing.p95_us;
     result.effective_gbs      = static_cast<double>(model_bytes) / seconds / 1.0e9;
-    result.dram_spec_pct      = result.effective_gbs / kRtx5090DramGBs * 100.0;
-    result.sustained_read_pct = result.effective_gbs / kRtx5090SustainedReadGBs * 100.0;
+    result.dram_spec_pct      = result.effective_gbs / roofline::kDramSpecGBs * 100.0;
+    result.sustained_read_pct = result.effective_gbs / roofline::kDramReadGBs * 100.0;
     result.useful_tflops      = useful_flops / seconds / 1.0e12;
     result.tensor_peak_tflops = registered_tensor_peak_tflops(point, result.tensor_profile);
     if (std::isfinite(result.tensor_peak_tflops)) {
@@ -849,13 +883,13 @@ void print_header(const Options& opt) {
     CUDA_CHECK(cudaGetDeviceProperties(&properties, device));
     std::printf("# actual_gpu=%s sm=%d%d reference_gpu=RTX_5090\n", properties.name,
                 properties.major, properties.minor);
-    std::printf("# dram_spec_gbs=%.1f sustained_read_gbs=%.1f cache=%s\n", kRtx5090DramGBs,
-                kRtx5090SustainedReadGBs,
+    std::printf("# dram_spec_gbs=%.1f sustained_read_gbs=%.1f cache=%s\n", roofline::kDramSpecGBs,
+                roofline::kDramReadGBs,
                 opt.graph_calls == 1 ? "cold" : "cold-before-graph-bundle");
     std::printf("# dense_fp8_tensor_tflops fp16_acc=%.1f fp32_acc=%.1f mxfp8_fp32_acc=%.1f\n",
-                kRtx5090Fp8Fp16AccumulateTFLOPs, kRtx5090Fp8Fp32AccumulateTFLOPs,
-                kRtx5090MxFp8Fp32AccumulateTFLOPs);
-    std::printf("# dense_bf16_tensor_tflops fp32_acc=%.1f\n", kRtx5090Bf16Fp32AccumulateTFLOPs);
+                roofline::kFp8Fp16AccumulateTFLOPs, roofline::kFp8Fp32AccumulateTFLOPs,
+                roofline::kMxfp8Fp32AccumulateTFLOPs);
+    std::printf("# dense_bf16_tensor_tflops fp32_acc=%.1f\n", roofline::kBf16Fp32AccumulateTFLOPs);
 }
 
 void print_results(const std::vector<Result>& results) {
@@ -920,8 +954,8 @@ void write_csv(const std::filesystem::path& path, const std::vector<Result>& res
             << ',' << result.n << ',' << result.k << ',' << result.t << ',' << result.weight_bytes
             << ',' << result.x_bytes << ',' << result.out_bytes << ',' << result.model_bytes << ','
             << result.useful_flops << ',' << result.median_us << ',' << result.min_us << ','
-            << result.p95_us << ',' << result.effective_gbs << ',' << kRtx5090DramGBs << ','
-            << result.dram_spec_pct << ',' << kRtx5090SustainedReadGBs << ','
+            << result.p95_us << ',' << result.effective_gbs << ',' << roofline::kDramSpecGBs << ','
+            << result.dram_spec_pct << ',' << roofline::kDramReadGBs << ','
             << result.sustained_read_pct << ',' << result.useful_tflops << ','
             << result.tensor_profile << ',';
         if (std::isfinite(result.tensor_peak_tflops)) { out << result.tensor_peak_tflops; }

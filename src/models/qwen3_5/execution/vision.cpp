@@ -467,8 +467,9 @@ VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32
             }
             handoff_.owner_ = nullptr;
             ++handoff_.generation_;
-            CUDA_CHECK(cudaMemcpyAsync(output.data, ready.buffer->data(), ready.bytes,
-                                       cudaMemcpyHostToDevice, device_.stream));
+            // Pinned and read by the SMs, so another request's image never waits on the copy engine
+            // behind expert transfers (W7).
+            upload_pinned(output.data, ready.buffer->data(), ready.bytes, device_.stream);
         } else {
             const auto& payload = prompt_.media_payloads[active->prepared_item_index];
             if (!payload) {

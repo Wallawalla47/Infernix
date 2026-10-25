@@ -369,7 +369,8 @@ their evidence. `tools/quality/iqs.py` implements the decisions; its constants a
   there and a draft is accepted exactly when it equals it. The default route keeps speculative
   rejection sampling (same distribution, other text for a seed). The real test
   `infernix_qwen3_5_speculation_invariance_real_test` checks MTP, DFlash2 and DFlash2 with n-gram
-  proposals (or the drafters it is given) against one plain run, greedy and sampled.
+  proposals (or the drafters it is given) against one plain run, greedy and sampled, and that a
+  raw one-token prompt verifies drafts too.
   Prompt and decode need not agree with each other. An option
   whose effect depends on load (lossy Host-tier prefix state, whose use depends on eviction) is
   refused with `--reproducible` at startup, never silently overridden. A
@@ -434,8 +435,10 @@ short pool). Each 6.7 entry names the configuration whose timing it takes. A ker
 shapes does not carry: `gdn-f16-accumulate` gained 0.24 % on the 27B and nothing on Flash-Next.
 
 A path that changes no logit (`sampled-mtp-drafts`: drafts from the head's top tokens, verified by
-rejection sampling) is decided by its distribution test (`iqs_e2e.py specdist`); it is registered
-on every configuration whose drafter it runs on.
+rejection sampling; `block-verification`: sampled chains with proposal laws accepted by block
+verification, Sun et al., arXiv 2403.10444; `univer-trees`: sampled fixed-table trees of top ranks
+and residual draws verified by UniVer, arXiv 2605.04543) is decided by its distribution test
+(`iqs_e2e.py specdist`); it is registered on every configuration whose drafter it runs on.
 
 **A failing path** (owner, 2026-10-20): a certification that fails a registered path removes it from
 that configuration; a candidate that fails is not registered there. Either way the next more precise
@@ -755,7 +758,7 @@ their request-coupling paths are listed like the others (since 2026-10-22). The 
 | `prompt-pv8` | INT8 KV (fast prompt kernel), NVFP4 KV (fast kernel), K8V4, VQ2, K4V2 KV | NVFP4 27B, groupwise 27B and 35B-A3B, with INT8, NVFP4, K8V4, VQ2 or K4V2 KV |
 | `batched-decode`, `batch-split-attention` | every Qwen3.5 artifact | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
 | `single-column-decode` | Qwen3.5 artifacts without `batched-decode`: decode and verify calls of one column | groupwise 27B, every format (2026-10-22, below); not the 35B-A3B (1 % slower at four requests) |
-| `batched-a8-decode`, `batched-a4-decode` | the same, with 8-bit (FP8) or 4-bit (NVFP4) activations | none (each fails, below) |
+| `batched-a8-decode`, `batched-a4-decode` | the same, with 8-bit (FP8) or 4-bit (NVFP4) activations | `batched-a8-decode`: 24 heads, 4-bit activations, every KV format, by the owner's decision (2026-10-24) although it fails (below); `batched-a4-decode`: none (fails, below) |
 | `batched-a4-residual-decode` | the same, with 4-bit (NVFP4) MLP activations | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
 | `batched-a8-residual-decode` | the same, with 8-bit (FP8) input-projection activations | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2) |
 | `adaptive-speculation` | the same, with speculative decoding | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2); groupwise 27B and 35B-A3B, every format (2026-10-22, below) |
@@ -763,7 +766,7 @@ their request-coupling paths are listed like the others (since 2026-10-22). The 
 | `preemption` | every Qwen3.5 artifact | 24 heads, 4-bit activations, with every KV format (BF16, INT8, FP8, NVFP4, K8V4, VQ2, K4V2); groupwise 27B and 35B-A3B, every format (2026-10-22, below) |
 | Qwen3.8-Flash-Next: `adaptive-speculation` (MTP), `free-cache-resume`, `preemption` | every Flash-Next artifact | Dense8, IQ3_S, FP8, recipe A, recipe C (since 2026-10-21) and NVIDIA FP4-Local (16- and 4-bit expert activations), every format |
 | Qwen3.8-Flash-Next: `q8-sliced-k`, `gdn-conv-fused`, `qsa-prepare-fused` | Q8 dense weights (`qsa-prepare-fused`: BF16, INT8, FP8, NVFP4 or K8V4 KV) | Q8 dense, 4-bit experts, every KV format (`qsa-prepare-fused`: the five it serves) |
-| `fp8-a8-pair` | row-FP8 dense weights (recipe C) | FP8 dense, 16-bit experts, with BF16, FP8, NVFP4, K8V4, VQ2 or K4V2 KV (INT8 fails its decode tail; below) |
+| `fp8-a8-pair` | row-FP8 dense weights (recipe C) | FP8 dense, 16-bit experts, every KV format (INT8 fails its decode tail, below; registered by the owner's decision, 2026-10-24) |
 | `q4-w4a8` | groupwise Q4 MLP gate/up | none (fails, below) |
 | `idle-wide-prefill` | Qwen3.8-27B / Qwen3.6-35B-A3B generation engines | NVFP4 27B, groupwise 27B and 35B-A3B, every format |
 | `adaptive-mtp` | Qwen3.8-27B / Qwen3.6-35B-A3B with MTP and `--draft-tokens auto` | NVFP4 27B and 35B-A3B, every format |
@@ -771,6 +774,7 @@ their request-coupling paths are listed like the others (since 2026-10-22). The 
 | Qwen3.8-Flash-Next: `expert-a4-residual` | artifacts with NVFP4 W4A16 experts (recipe C; NVIDIA FP4-Local at its default 16-bit expert activations), expert calls of more than eight columns | FP8 dense (recipe C) and MXFP8 dense (FP4-Local, by recipe C's kernel verdicts and its own timing), 16-bit expert activations, every KV format (BF16 by FP4-Local's gates against the precise reference, below) |
 | Qwen3.8-Flash-Next: `expert-a4-residual-3` | the same calls as `expert-a4-residual`, three NVFP4 terms per x and h row (its more precise form, design §19.3.23; it takes precedence where both are selected) | none: two terms pass on every configuration and format they run in (2026-10-21), so it stays an unregistered candidate (`--fast-path expert-a4-residual-3`) for a cell where two terms fail; three terms cost 7-8 points of prefill speed (below) |
 | Qwen3.8-Flash-Next: `sampled-mtp-drafts` | MTP rounds with a sampled request | every Flash-Next configuration, every format (distribution and greedy identity, below; no logit changes) |
+| Qwen3.8-Flash-Next: `dflash2-pairs` | two-row rounds with the DFlash2 drafter (`--spec dflash2 --draft-model`) | every Flash-Next configuration, every format, by the owner's decision (2026-10-24) ahead of its gate (not run); timed on Dense8, two requests, INT8 KV: decode +28 % median, 4 of 4 blocks |
 | Qwen3.8-Flash-Next: `ggml-bf16-prefill` | GGUF dense projections in prefill calls of 32+ columns, GGUF expert calls of 14,336+ columns | IQ3_S, every format (BF16 KV since 2026-10-20, against the precise reference; below) |
 | `gdn-f16-accumulate` | chunked GDN calls (16+ tokens) of every Qwen3.5-family and Flash-Next artifact | NVFP4 27B, groupwise 27B, FP8 and IQ3_S, every format (FP8 with BF16 KV by its prefill gate against the precise reference, 2026-10-21; IQ3_S with BF16 since 2026-10-20, below); not the 35B-A3B, Dense8 or FP4-Local (no gain beyond spread, below; recipe C and recipe A are timed in the 2026-10-20 queue) |
 

@@ -9,12 +9,15 @@
 #include "infernix/ops/prepare_ragged_prefix.h"
 #include "infernix/ops/sampling.h"
 #include "infernix/ops/scatter.h"
+#include "infernix/ops/speculative_tree.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <fstream>
+#include <limits>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -90,7 +93,25 @@ void ordinary_decode_batch(OrdinaryBatchContext& state, std::int32_t batch_size,
 
 namespace infernix::models::qwen3_5::detail {
 
-namespace {} // namespace
+namespace {
+
+// The sparse acceptance's proposal of a deterministic draft (sampled-mtp-drafts verifying an
+// argmax draft or a padding column): the draft with q 1, then the smallest other ids with q 0, as
+// ops::speculative_sample_sparse_drafts fills a one-hot column.
+void one_hot_proposal(TokenId draft, std::span<TokenId> candidates, std::span<float> q) {
+    TokenId filler = 0;
+    for (std::size_t slot = 0; slot < candidates.size(); ++slot) {
+        if (slot == 0) {
+            candidates[slot] = draft;
+        } else {
+            if (filler == draft) { ++filler; }
+            candidates[slot] = filler++;
+        }
+        q[slot] = slot == 0 ? 1.0F : 0.0F;
+    }
+}
+
+} // namespace
 
 void ProgramImpl::install_sampling(SequenceState& sequence, RequestControl& request,
                                    const ops::SamplingConfig& config) {
@@ -118,6 +139,9 @@ void ProgramImpl::install_sampling(SequenceState& sequence, RequestControl& requ
     if (penalties) { CUDA_CHECK(cudaMemsetAsync(counts.data, 0, counts.bytes(), device.stream)); }
     request.sampling_host.token_counts =
         penalties ? static_cast<std::int32_t*>(counts.data) : nullptr;
+    // The lane's earlier rounds have completed: a flag they left belongs to no request now.
+    *nonfinite_flag(sequence.lane)  = 0;
+    request.sampling_host.nonfinite = nonfinite_flag(sequence.lane);
     Tensor config_lane = sampling_config.slice(1, static_cast<std::int32_t>(sequence.lane), 1);
     CUDA_CHECK(cudaMemcpyAsync(config_lane.data, &request.sampling_host,
                                sizeof(request.sampling_host), cudaMemcpyHostToDevice,
@@ -359,7 +383,8 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
             std::span<const ConstraintRow>(constraint_rows.data(), lanes.size()), 1);
 
         mark_workspace_usage(workspace_plan.ordinary_round);
-        if (offload) { offload->begin_round(device.stream); }
+        // A one-row round's context sets plain decode's one-column divisor where it applies.
+        if (offload) { offload->begin_round(device.stream, checked_i32(maximum_frontier, "ordinary batch position")); }
         execution::ordinary_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                          envelope, executable);
         if (offload) { offload->enqueue_routes(device.stream, static_cast<std::int32_t>(lanes.size())); }
@@ -565,7 +590,19 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
     // configured MTP depth.
     const bool fixed_width        = execution_schedule.fixed_speculation;
     std::uint32_t neural_drafts   = neural_draft_window;
-    const bool policy_round = !fixed_width && execution_schedule.adaptive_mtp && mtp_draft_policy && !any_ngram;
+    // A tree round: an all-neural round without a constrained row (grammar masks follow one chain)
+    // whose batch size the tree table gives a tree, or the controller's choice in automatic mode
+    // (which planning leaves only beside a fixed draft length). It verifies each full-window row's
+    // chain with side leaves (candidate_chain_tree) and runs instead of the draft-length policy.
+    bool constrained = false;
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        constrained |= masks && masks->constrained(row);
+    }
+    const bool tree_eligible = mtp_tree_rounds && !fixed_width && !any_ngram && !constrained;
+    std::uint32_t tree_nodes =
+        tree_eligible && !tree_controller ? tree_widths.fixed[lanes.size() - 1U] : 0U;
+    const bool policy_round = !fixed_width && execution_schedule.adaptive_mtp && mtp_draft_policy && !any_ngram &&
+                              tree_nodes == 0U;
     if (mtp_draft_policy) {
         // The previous policy round's start-to-start cycle at its length teaches the round cost.
         const auto batch = static_cast<std::uint32_t>(lanes.size());
@@ -575,14 +612,35 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
         }
         mtp_cost_round = {.start = started, .drafts = 0, .batch = batch};
     }
-    if (mtp_confidence) {
-        // The previous round's start-to-start cycle at its verified draft columns teaches the cost.
+    if (mtp_draft_log) {
+        mtp_draft_log_cycle = mtp_draft_log_start == Clock::time_point{}
+                                  ? 0.0
+                                  : std::chrono::duration<double>(started - mtp_draft_log_start).count();
+        mtp_draft_log_start = started;
+    }
+    // TEMPORARY (INFERNIX_TMP_QWEN35_MTP_SKIP_ROUNDS): the previous round's cycle teaches its regime,
+    // and this round drafts or runs its alignment alone (proposal limit 0).
+    bool drafting = true;
+    if (mtp_regime) {
         const auto batch = static_cast<std::uint32_t>(lanes.size());
-        if (mtp_confidence_round.batch == batch) {
+        const bool same  = mtp_regime_round.batch == batch;
+        if (same) {
+            mtp_regime->observe(batch, mtp_regime_round.previous, mtp_regime_round.drafted, mtp_regime_round.tokens,
+                                std::chrono::duration<double>(started - mtp_regime_round.start).count());
+        }
+        drafting                 = mtp_regime->draft(batch);
+        const bool previous      = same ? mtp_regime_round.drafted : !drafting; // another batch size: a transition
+        mtp_regime_round = {.start = started, .batch = batch, .previous = previous, .drafted = drafting, .tokens = 0};
+    }
+    if (mtp_confidence) {
+        // The previous round's start-to-start cycle at its verified draft columns teaches the cost
+        // (a draft-free round's cycle lacks the drafter's steps, so it teaches nothing).
+        const auto batch = static_cast<std::uint32_t>(lanes.size());
+        if (mtp_confidence_round.batch == batch && mtp_confidence_round.drafted) {
             mtp_confidence->observe_round(batch, mtp_confidence_round.columns,
                                           std::chrono::duration<double>(started - mtp_confidence_round.start).count());
         }
-        mtp_confidence_round = {.start = started, .batch = batch, .columns = 0};
+        mtp_confidence_round = {.start = started, .batch = batch, .columns = 0, .drafted = drafting};
     }
     if (policy_round) {
         if (lanes.size() == 1) {
@@ -597,15 +655,6 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
         }
         mtp_cost_round.drafts = neural_drafts;
     }
-    SpeculativeRoundFamily& family =
-        fixed_width ? (ngram_draft_window != 0
-                           ? round_family(SpeculativeRoundKind::Ngram, ngram_draft_window)
-                           : round_family(SpeculativeRoundKind::Neural, neural_draft_window))
-        : any_ngram ? round_family(SpeculativeRoundKind::Ngram, longest_copy)
-                    : round_family(SpeculativeRoundKind::Neural, neural_drafts);
-    const std::uint32_t verify_drafts = family.shape.verify_drafts;
-    const std::uint32_t mtp_ar_depth  = mtp_proposal_drafts(family.shape, neural_draft_window);
-    const std::uint32_t width         = verify_drafts + 1;
     std::uint32_t maximum_frontier    = 0;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         const std::uint32_t lane = lanes[row];
@@ -630,6 +679,70 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
         }
         maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
     }
+    if (tree_eligible && tree_controller) {
+        const std::uint32_t columns =
+            tree_controller->choose(static_cast<std::uint32_t>(lanes.size()), maximum_frontier);
+        tree_nodes = columns == neural_draft_window + 1U ? 0U : columns;
+    }
+    const bool tree_round = tree_nodes != 0U;
+
+    // Each row's verified extent: its drafts (MTP's own or a copy) that the round, its output
+    // budget and its context admit. A one-row round of the drafting package then keeps the prefix
+    // before its first draft below --spec-min-p (mtp_min_p) and, with the calibrated extents, the
+    // prefix of that its drafts' learned acceptance makes fastest. With the proposal chain
+    // (adaptive-mtp) such a round runs the family of that width: its verify width follows its drafts,
+    // and its proposal depth (the limit the chain's gates read) the draft-length policy's choice.
+    // With offloaded experts every row's extent is the confidence policy's (columns past it are
+    // masked padding).
+    const bool one_row = lanes.size() == 1;
+    const auto row_extent = [&](std::size_t row, std::uint32_t window) {
+        const SequenceState& sequence     = active_sequence(lanes[row]);
+        const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
+                                                ? budgets[row].generated_tokens_remaining - 1
+                                                : 0;
+        const bool row_ngram = !matches[row].tokens.empty();
+        std::uint32_t extent = std::min({row_ngram ? static_cast<std::uint32_t>(matches[row].tokens.size())
+                                                   : sequence.mtp_draft_count,
+                                         window, max_by_budget, capacity - sequence.execution_frontier - 1});
+        if (row_ngram || extent == 0) { return extent; }
+        const std::span<const float> q(sequence.mtp_draft_probabilities.data(), extent);
+        if (one_row && execution_schedule.mtp_min_p > 0.0) {
+            for (std::uint32_t j = 0; j < extent; ++j) {
+                // The device gate's comparison (launch_graph_gate): a float widened to binary64.
+                if (static_cast<double>(q[j]) < execution_schedule.mtp_min_p) {
+                    extent = j;
+                    break;
+                }
+            }
+        }
+        if (mtp_confidence && extent > 0 && (offload || (one_row && execution_schedule.mtp_calibrated_extent))) {
+            extent = mtp_confidence->extent(q.first(extent), extent, static_cast<std::uint32_t>(lanes.size()));
+        }
+        return extent;
+    };
+    const bool chained =
+        one_row && !any_ngram && !fixed_width && !tree_round && execution_schedule.mtp_proposal_chain;
+    const std::uint32_t chained_extent = chained ? row_extent(0, neural_draft_window) : 0U;
+    SpeculativeRoundFamily& family =
+        fixed_width ? (ngram_draft_window != 0
+                           ? round_family(SpeculativeRoundKind::Ngram, ngram_draft_window)
+                           : round_family(SpeculativeRoundKind::Neural, neural_draft_window))
+        : any_ngram  ? round_family(SpeculativeRoundKind::Ngram, longest_copy)
+        : tree_round ? round_family(SpeculativeRoundKind::Tree, tree_nodes - 1U)
+        : chained    ? round_family(SpeculativeRoundKind::Neural, std::max(chained_extent, 1U))
+                     : round_family(SpeculativeRoundKind::Neural, neural_drafts);
+    if (chained != mtp_chained_round(family.shape, static_cast<std::uint32_t>(lanes.size()),
+                                     execution_schedule.mtp_proposal_chain)) {
+        throw std::logic_error("an MTP round's proposal chain does not match its captured family");
+    }
+    const std::uint32_t verify_drafts = family.shape.verify_drafts;
+    const std::uint32_t mtp_ar_depth =
+        mtp_proposal_drafts(family.shape, neural_draft_window, static_cast<std::uint32_t>(lanes.size()),
+                            execution_schedule.mtp_proposal_chain);
+    // The most drafts the round proposes: a chained round's draft-length choice, else every step (none
+    // in a draft-free round).
+    const std::uint32_t proposal_limit = !drafting ? 0U : chained ? std::min(neural_drafts, mtp_ar_depth) : mtp_ar_depth;
+    const std::uint32_t width          = verify_drafts + 1;
 
     try {
         std::optional<nvtx::ScopedRange> submit_range;
@@ -647,26 +760,26 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
             envelopes = mtp_causal_attention_envelopes(profile.max_execution_frontier, verify_drafts,
                                                        capacity, mtp_ar_depth);
         }
+        // The step chain's gates: the confidence policy's threshold for this batch size.
+        mtp_host_ingress->step_threshold =
+            execution_schedule.mtp_step_chain && mtp_confidence
+                ? mtp_confidence->step_threshold(static_cast<std::uint32_t>(lanes.size()))
+                : 0.0;
 
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence           = active_sequence(lanes[row]);
             const RequestControl& request     = requests[lanes[row]];
             const std::uint32_t frontier      = sequence.execution_frontier;
-            const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
-                                                    ? budgets[row].generated_tokens_remaining - 1
-                                                    : 0;
             const bool row_ngram              = !matches[row].tokens.empty();
-            std::uint32_t extent              = std::min(
-                {row_ngram ? static_cast<std::uint32_t>(matches[row].tokens.size())
-                           : sequence.mtp_draft_count,
-                 verify_drafts, max_by_budget, capacity - sequence.execution_frontier - 1});
-            // Confidence-gated MTP: the prefix of the row's own drafts worth verifying; the columns past
-            // it are padding, which the offloaded experts' route masks.
-            if (mtp_confidence && !row_ngram && extent > 0) {
-                extent = mtp_confidence->extent(
-                    std::span<const float>(sequence.mtp_draft_probabilities.data(), extent), extent,
-                    static_cast<std::uint32_t>(lanes.size()));
-            }
+            // A chained round verifies its family's width, which its extent chose. In a tree round
+            // a row whose chain is the whole window (MTP drafts with their sparse proposals) and
+            // whose context holds the tree verifies the tree (extent W-1, the device adds each
+            // column's depth to the anchor's RoPE position); any other row its chain.
+            const std::uint32_t chain_extent =
+                chained ? chained_extent : row_extent(row, tree_round ? neural_draft_window : verify_drafts);
+            const bool tree_row = tree_round && chain_extent == neural_draft_window &&
+                                  sequence.mtp_draft_proposals && capacity - frontier - 1U >= verify_drafts;
+            const std::uint32_t extent = tree_row ? verify_drafts : chain_extent;
             if (mtp_confidence) { mtp_confidence_round.columns += extent; }
             mtp_host_ingress->anchors[row]        = sequence.ledger.back();
             mtp_host_ingress->base_frontiers[row] = checked_i32(frontier, "MTP batch frontier");
@@ -676,11 +789,11 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
             mtp_host_ingress->target_valid_columns[row] = static_cast<std::int32_t>(extent + 1);
             for (std::uint32_t j = 0; j < verify_drafts; ++j) {
                 mtp_host_ingress->current_drafts[row * verify_drafts + j] =
-                    j < extent ? (row_ngram ? matches[row].tokens[j] : sequence.mtp_drafts[j])
-                               : sequence.ledger.back();
+                    j < chain_extent ? (row_ngram ? matches[row].tokens[j] : sequence.mtp_drafts[j])
+                                     : sequence.ledger.back();
             }
             for (std::uint32_t j = 0; j < width; ++j) {
-                const std::uint32_t position = frontier + std::min(j, extent);
+                const std::uint32_t position = frontier + (tree_row ? 0U : std::min(j, extent));
                 mtp_host_ingress->target_rope_positions[row * width + j] =
                     checked_i32(position, "MTP batch RoPE position") + sequence.rope_delta;
             }
@@ -694,6 +807,35 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
             mtp_host_ingress->rope_deltas[row]             = sequence.rope_delta;
             mtp_host_ingress->sampling[row]                = request.sampling_host;
             mtp_host_ingress->sampling[row].mask           = bind_grammar_mask(masks, row);
+            mtp_host_ingress->proposal_limits[row]         = static_cast<std::int32_t>(proposal_limit);
+            if (execution_schedule.sampled_mtp_drafts) {
+                // Each verified draft's sparse proposal: a sampled draft's own, one-hot at an argmax
+                // draft (the prompt's) or a padding column. A tree round's planes hold its chain
+                // (the window) with each draft's ranking scores; the tree builder writes its columns'.
+                const std::uint32_t sparse = tree_round ? neural_draft_window : verify_drafts;
+                for (std::uint32_t j = 0; j < sparse; ++j) {
+                    const std::size_t base = (row * sparse + j) * kMtpSparseSlots;
+                    const bool proposed    = j < chain_extent && sequence.mtp_draft_proposals;
+                    if (proposed) {
+                        std::copy_n(sequence.mtp_draft_candidates[j].begin(), kMtpSparseSlots,
+                                    mtp_host_ingress->current_candidates.begin() + static_cast<std::ptrdiff_t>(base));
+                        std::copy_n(sequence.mtp_draft_q[j].begin(), kMtpSparseSlots,
+                                    mtp_host_ingress->current_q.begin() + static_cast<std::ptrdiff_t>(base));
+                    } else {
+                        one_hot_proposal(mtp_host_ingress->current_drafts[row * verify_drafts + j],
+                                         std::span<TokenId>(mtp_host_ingress->current_candidates).subspan(base, kMtpSparseSlots),
+                                         std::span<float>(mtp_host_ingress->current_q).subspan(base, kMtpSparseSlots));
+                    }
+                    if (tree_round) {
+                        const std::size_t at = (row * sparse + j) * kMtpSampledDraftRanks;
+                        for (std::int32_t rank = 0; rank < kMtpSampledDraftRanks; ++rank) {
+                            mtp_host_ingress->current_scores[at + static_cast<std::size_t>(rank)] =
+                                proposed ? sequence.mtp_draft_scores[j][static_cast<std::size_t>(rank)]
+                                         : (rank == 0 ? 0.0F : -std::numeric_limits<float>::infinity());
+                        }
+                    }
+                }
+            }
             ensure_sequence_kv_mapped(sequence, frontier + extent + 1,
                                       std::min(capacity, frontier + extent + mtp_ar_depth));
         }
@@ -715,6 +857,12 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
             *mtp_host_egress,
             state_images->continuation_hidden_store()};
         schedule_state.neural_proposal_drafts = mtp_ar_depth;
+        schedule_state.proposal_chain         = chained;
+        schedule_state.step_chain             = execution_schedule.mtp_step_chain && !tree_round;
+        schedule_state.tree                   = tree_round;
+        schedule_state.chain_drafts           = neural_draft_window;
+        schedule_state.tree_paths             = draft_tree_paths;
+        schedule_state.tree_proposals         = mtp_tree_rounds;
         mark_workspace_usage(workspace_plan.mtp_round);
         const auto batch = static_cast<std::int32_t>(lanes.size());
         if (offload) { offload->begin_round(device.stream); }
@@ -761,6 +909,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
                     capacity) {
                 throw std::runtime_error("MTP batch returned invalid row metadata");
             }
+            if (mtp_regime) { mtp_regime_round.tokens += static_cast<std::uint32_t>(count_i); }
             const std::span<const TokenId> row_tokens(mtp_host_egress->licensed_tokens.data() +
                                                           row * width,
                                                       static_cast<std::size_t>(count_i));
@@ -782,16 +931,39 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
                     request.speculative_stats.accepted_per_position[static_cast<std::size_t>(i)] +=
                         1;
                 }
+                request.speculative_stats.round_steps.push_back(
+                    {.drafted  = static_cast<std::uint16_t>(pcur),
+                     .accepted = static_cast<std::uint16_t>(accepted_i),
+                     .ngram    = !matches[row].tokens.empty()});
                 std::vector<std::uint64_t>& by_length =
                     request.speculative_stats.rounds_by_draft_length;
                 if (family.shape.kind == SpeculativeRoundKind::Neural &&
                     verify_drafts <= by_length.size()) {
                     by_length[verify_drafts - 1U] += 1;
                 }
-                // The row verified MTP drafts (its own, also in a copy round): learn from them.
+                // The row verified MTP drafts (its own, also in a copy round): learn from them (a
+                // tree row's chain is the window).
                 if (mtp_draft_policy && matches[row].tokens.empty()) {
-                    sequence.mtp_draft.acceptance.observe(pcur,
+                    sequence.mtp_draft.acceptance.observe(std::min(pcur, neural_draft_window),
                                                           static_cast<std::uint32_t>(accepted_i));
+                }
+                if (tree_round && pcur == verify_drafts) {
+                    if (tree_controller) {
+                        tree_controller->observe_tree_row(
+                            std::span<const std::int32_t>(mtp_host_egress->accepted_path.data() + row * width,
+                                                          static_cast<std::size_t>(accepted_i) + 1U),
+                            width);
+                    }
+                    request.speculative_stats.tree_rounds += 1;
+                    const std::int32_t branch = mtp_host_egress->accepted_branch[row];
+                    if (branch > 0) {
+                        if (branch > accepted_i) {
+                            throw std::runtime_error("MTP batch returned invalid row metadata");
+                        }
+                        request.speculative_stats.tree_side_rounds += 1;
+                        request.speculative_stats.tree_side_accepted_tokens +=
+                            static_cast<std::uint32_t>(accepted_i - branch + 1);
+                    }
                 }
                 // The verified drafts' probabilities (still this round's: the commit follows).
                 if (mtp_confidence && matches[row].tokens.empty()) {
@@ -799,6 +971,18 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
                         std::span<const float>(sequence.mtp_draft_probabilities.data(), pcur), pcur,
                         static_cast<std::uint32_t>(accepted_i));
                 }
+            }
+            // TEMPORARY (INFERNIX_TMP_QWEN35_MTP_DRAFT_LOG): the row's MTP drafts as the round
+            // found them, for the offline replay of the cut: each held draft's probability, how many
+            // the round verified and accepted, its family, proposal limit and start-to-start cycle.
+            if (mtp_draft_log && matches[row].tokens.empty() && sequence.mtp_draft_count != 0) {
+                *mtp_draft_log << "mtp," << lanes.size() << ',' << lanes[row] << ',' << verify_drafts << ','
+                               << proposal_limit << ',' << mtp_draft_log_cycle << ',' << sequence.mtp_draft_count
+                               << ',' << pcur << ',' << accepted_i;
+                for (std::uint32_t j = 0; j < sequence.mtp_draft_count; ++j) {
+                    *mtp_draft_log << ',' << sequence.mtp_draft_probabilities[j];
+                }
+                *mtp_draft_log << '\n';
             }
             if (!matches[row].tokens.empty()) {
                 request.speculative_stats.ngram_rounds += 1;
@@ -821,6 +1005,11 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
             request.lifecycle = Lifecycle::Pending;
             request.timings.decode_seconds += seconds;
             request.timings.decode_share_seconds += share;
+        }
+        // Automatic trees time every all-neural round at its width: a tree, or the window's chain.
+        if (tree_controller && !any_ngram && (tree_round || width == neural_draft_window + 1U)) {
+            tree_controller->observe_round(static_cast<std::uint32_t>(lanes.size()), maximum_frontier, width,
+                                           seconds);
         }
         return runtime::BatchedGeneratedRound{
             .tokens     = std::span<const TokenId>(mtp_host_egress->licensed_tokens.data(),
@@ -911,8 +1100,15 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
     // (the n-gram window when n-gram drafting is configured, else the drafter's), and the drafter
     // runs for every row: no tree tables or controller, and nothing taken from the other rows.
     const bool fixed_width   = execution_schedule.fixed_speculation;
+    // TEMPORARY (INFERNIX_TMP_TREE_ROUND_WIDTH, candidates §13 PUB-03): an automatic round proposes
+    // first, as a block round does, and the controller chooses its width from the round's own draft
+    // probabilities (a tree block round); its family is then a split chain or tree family. The width
+    // depends on the main chain's draws only, which every side column follows (Tree builder), so
+    // sampling stays exact.
+    const bool tree_block_round = execution_schedule.tree_round_width && !fixed_width && !any_ngram &&
+                                  !constrained && tree_controller && tree_controller->automatic(batch_rows);
     std::uint32_t tree_nodes = 0;
-    if (fixed_width) {
+    if (fixed_width || tree_block_round) {
         tree_nodes = 0;
     } else if (!any_ngram && !constrained && tree_controller) {
         const std::uint32_t columns = tree_controller->choose(batch_rows, maximum_frontier);
@@ -920,7 +1116,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
     } else if (!any_ngram && !constrained) {
         tree_nodes = tree_widths.fixed[batch_rows - 1U];
     }
-    const bool tree_round = tree_nodes != 0U;
+    bool tree_round = tree_nodes != 0U; // a tree block round's is set once its width is chosen
     // adaptive-dflash: an all-neural chain round proposes the whole block, then verifies the width
     // the policy picks from its drafts' probabilities; its family is chosen after the proposal.
     // With a batch length, a chain round of several rows (neural or copy) instead drafts that
@@ -928,6 +1124,8 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
     const bool plain_batch = dflash_batch_drafts != 0 && !fixed_width && batch_rows > 1U && !tree_round;
     const bool block_round =
         dflash_width_policy.has_value() && !fixed_width && !any_ngram && !tree_round && !plain_batch;
+    // Both draft the whole block on the proposal graph before their width is chosen.
+    const bool proposes_first = block_round || tree_block_round;
     // The drafts the drafter proposes for a row that runs it this round.
     const std::uint32_t proposal_drafts = plain_batch ? dflash_batch_drafts : neural_draft_window;
     SpeculativeRoundFamily* family = nullptr;
@@ -941,7 +1139,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
                                batch_rows > 1U ? std::max(longest_copy, proposal_drafts) : longest_copy);
     } else if (tree_round) {
         family = &round_family(SpeculativeRoundKind::Tree, tree_nodes - 1U);
-    } else if (!block_round) {
+    } else if (!proposes_first) {
         family = &round_family(SpeculativeRoundKind::Neural, proposal_drafts);
         if (plain_batch && (family->shape.verify_drafts != proposal_drafts || !family->shape.batch_only)) {
             throw std::logic_error("adaptive DFlash batch length has no plain family");
@@ -1014,13 +1212,13 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
             auto& profile = family->forward.select(batch_rows_u, maximum_frontier);
             forward       = &family->forward.install(profile);
             finish = &family->finish.install(family->finish.select(batch_rows_u, maximum_frontier));
-            if (!block_round) {
+            if (!proposes_first) {
                 envelopes = dflash_envelopes(profile.min_execution_frontier,
                                              profile.max_execution_frontier, invariant_drafts, capacity);
             }
             target_envelope = target_envelope_for(profile.max_execution_frontier);
         };
-        if (!block_round) {
+        if (!proposes_first) {
             install_family();
         } else if (use_cuda_graph) {
             auto& profile = dflash_propose_graphs.select(batch_rows_u, maximum_frontier);
@@ -1144,6 +1342,53 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
                                       std::min(verified, limits[row]), false, sequence.rope_delta);
             }
         }
+        // A tree block round's rows as the controller saw them, kept for its calibration.
+        std::array<TreeWidthController::RoundRow, kMaximumConcurrency> round_rows{};
+        if (tree_block_round) {
+            auto proposal = round_state(neural_draft_window);
+            execution::dflash_decode_batch(proposal, batch, neural_draft_window, envelopes,
+                                           target_envelope, propose,
+                                           execution::SpeculativePhase::Propose);
+            timing.begin_wait();
+            {
+                nvtx::ScopedRange wait_range(nvtx::Name::DecodeDFlashWait, nvtx::Category::Control,
+                                             static_cast<std::uint64_t>(lanes.size()));
+                dflash_draft_handoff->ready.synchronize();
+            }
+            timing.end_wait();
+            timing.resume_submit();
+            // DFlash2 publishes each draft's selector probability.
+            const std::span<const float> published = dflash_draft_handoff->confidence();
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                std::copy_n(published.begin() + static_cast<std::ptrdiff_t>(row * neural_draft_window),
+                            neural_draft_window, probabilities[row].begin());
+                round_rows[row] = TreeWidthController::RoundRow{
+                    .probabilities = std::span<const float>(probabilities[row].data(), neural_draft_window),
+                    .tree          = limits[row] == neural_draft_window};
+            }
+            const std::uint32_t columns = tree_controller->choose(
+                batch_rows, maximum_frontier,
+                std::span<const TreeWidthController::RoundRow>(round_rows.data(), lanes.size()));
+            tree_nodes    = columns == neural_draft_window + 1U ? 0U : columns;
+            tree_round    = tree_nodes != 0U;
+            verify_drafts = tree_round ? tree_nodes - 1U : neural_draft_window;
+            width         = verify_drafts + 1U;
+            family = &round_family(tree_round ? SpeculativeRoundKind::Tree : SpeculativeRoundKind::Neural,
+                                   verify_drafts, true);
+            if (family->shape.verify_drafts != verify_drafts || !family->shape.split) {
+                throw std::logic_error("a tree block round's width has no split family");
+            }
+            install_family();
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                SequenceState& sequence      = active_sequence(lanes[row]);
+                const std::uint32_t frontier = sequence.execution_frontier;
+                const std::uint32_t extent   = row_extent(row, frontier);
+                write_verify_controls(row, frontier, extent, tree_round && extent == verify_drafts,
+                                      sequence.rope_delta);
+                ensure_sequence_kv_mapped(sequence, frontier + extent + 1U,
+                                          backend_kv_cache() ? frontier : 0U);
+            }
+        }
 
         std::array<ConstraintRow, kMaximumConcurrency> constraint_rows{};
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -1155,8 +1400,8 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
         auto schedule_state = round_state(verify_drafts);
         execution::dflash_decode_batch(schedule_state, batch, verify_drafts, envelopes,
                                        target_envelope, forward,
-                                       block_round ? execution::SpeculativePhase::Verify
-                                                   : execution::SpeculativePhase::Forward);
+                                       proposes_first ? execution::SpeculativePhase::Verify
+                                                      : execution::SpeculativePhase::Forward);
         if (constrained) {
             // The forward graph signals draft readiness before running the target model; a block
             // round's proposal already did. The handoff carries the verified drafts of every row,
@@ -1238,13 +1483,17 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
                 }
                 // A neural chain row's verified length.
                 const bool copy_row = any_ngram && !matches[row].tokens.empty();
+                request.speculative_stats.round_steps.push_back(
+                    {.drafted  = static_cast<std::uint16_t>(extent),
+                     .accepted = static_cast<std::uint16_t>(accepted_i),
+                     .ngram    = copy_row});
                 if (!copy_row && !(tree_round && extent == verify_drafts) &&
                     extent <= request.speculative_stats.rounds_by_draft_length.size()) {
                     request.speculative_stats.rounds_by_draft_length[extent - 1U] += 1;
                 }
             }
             if (block_round) {
-                DFlashWidthPolicy::observe(
+                dflash_width_policy->learn(
                     sequence.dflash_draft,
                     std::span<const float>(probabilities[row].data(), neural_draft_window), extent,
                     static_cast<std::uint32_t>(accepted_i));
@@ -1258,6 +1507,18 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
                     request.speculative_stats.ngram_archive_drafted_tokens += extent;
                     request.speculative_stats.ngram_archive_accepted_tokens += accepted_i;
                 }
+            }
+            if (tree_block_round) {
+                // The row's accepted columns: a tree row's path, or a chain row's leading columns.
+                std::array<std::int32_t, ops::kSpeculativeTreeMaxNodes> chain_path{};
+                for (std::int32_t i = 0; i <= accepted_i; ++i) { chain_path[static_cast<std::size_t>(i)] = i; }
+                const bool path_row = tree_round && extent == verify_drafts;
+                tree_controller->observe_round_row(
+                    round_rows[row],
+                    std::span<const std::int32_t>(path_row ? dflash_host_egress->accepted_path.data() + row * width
+                                                           : chain_path.data(),
+                                                  static_cast<std::size_t>(accepted_i) + 1U),
+                    width);
             }
             if (tree_round && extent == verify_drafts) {
                 if (tree_controller) {

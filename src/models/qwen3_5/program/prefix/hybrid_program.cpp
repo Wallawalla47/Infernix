@@ -514,9 +514,13 @@ std::uint64_t ProgramImpl::hybrid_cache_epoch() const noexcept {
 }
 
 bool ProgramImpl::hybrid_await_sibling(const PreparedPromptData& prompt, std::uint32_t reuse) {
-    if (hybrid_coalesce_wait_seconds_ <= 0.0 || execution_schedule.grid_cache) {
+    if (hybrid_coalesce_wait_seconds_ <= 0.0) {
         return false;
     }
+    // Without free cache resume (the reproducible route) a request resumes only on the prefill chunk
+    // grid, where the sibling's prefill splits anyway: it waits for the sibling's grid boundary below the
+    // divergence (candidates §9.2 VR-01), and both prompts keep their cold bits.
+    const bool grid = execution_schedule.grid_cache;
     const auto n = static_cast<std::uint32_t>(prompt.token_ids.size());
 
     struct Wait {
@@ -548,12 +552,14 @@ bool ProgramImpl::hybrid_await_sibling(const PreparedPromptData& prompt, std::ui
             if (!best || wait.target > best->target) { best = wait; }
         };
         // A new tap goes on the block boundary below the divergence: a frontier inside a block
-        // publishes only once the sibling completes that block.
-        std::uint32_t aligned = shared / kBlock * kBlock;
+        // publishes only once the sibling completes that block. On the grid it goes on the chunk
+        // boundary below the divergence (prefill_chunk is a whole number of blocks).
+        std::uint32_t aligned = grid ? shared / prefill_chunk * prefill_chunk : shared / kBlock * kBlock;
         // A block boundary inside an image both prompts carry moves to the image's end: the
-        // whole image is shared, and resuming past it saves its encode as well as its prefill.
+        // whole image is shared, and resuming past it saves its encode as well as its prefill. A grid
+        // boundary inside an image stays put (the image's end is off the grid): no wait below.
         for (const pc::TapExclusion& span : state.exclusions) {
-            if (span.begin < aligned && aligned < span.end && span.end <= shared) {
+            if (!grid && span.begin < aligned && aligned < span.end && span.end <= shared) {
                 aligned = span.end;
             }
         }
@@ -562,8 +568,9 @@ bool ProgramImpl::hybrid_await_sibling(const PreparedPromptData& prompt, std::ui
             wait = Wait{.lane = lane, .target = aligned, .plan_tap = true};
         }
         // An exact tap the sibling already plans near the divergence serves instead, unless
-        // prefilling the tokens between it and the new tap costs more than the split.
-        for (std::size_t tap = state.next_tap; tap < state.taps.size(); ++tap) {
+        // prefilling the tokens between it and the new tap costs more than the split. (On the grid
+        // every tap is realized at a chunk boundary, so the grid boundary is the only one.)
+        for (std::size_t tap = grid ? state.taps.size() : state.next_tap; tap < state.taps.size(); ++tap) {
             const pc::PlannedTap& planned = state.taps[tap];
             if (planned.position > shared) { break; }
             if (planned.placement != pc::TapPlacement::Exact ||
@@ -581,10 +588,11 @@ bool ProgramImpl::hybrid_await_sibling(const PreparedPromptData& prompt, std::ui
             // Waiting saves this request's prefill of the shared tokens; a new tap costs the
             // sibling one split. The sibling's remaining prefill to the snapshot is the wait,
             // doubled because decode rounds of other lanes interleave with it.
+            // On the grid the tap splits nothing: the sibling's prefill ends a chunk there anyway.
             const double saved = hybrid_cost_.prefill_seconds(reuse, wait->target - reuse);
             const double predicted =
                 2.0 * hybrid_cost_.prefill_seconds(prefill.cursor, wait->target - prefill.cursor);
-            if (saved > (wait->plan_tap ? hybrid_cost_.chunk_seconds : 0.0) &&
+            if (saved > (wait->plan_tap && !grid ? hybrid_cost_.chunk_seconds : 0.0) &&
                 predicted <= hybrid_coalesce_wait_seconds_) {
                 consider(*wait);
                 continue;
@@ -991,6 +999,7 @@ void ProgramImpl::complete_hybrid_binding(ContextTransaction& tx, ContextProgres
     lane_state.path_hash        = full == 0 ? pc::kRootLookupHash : prompt.block_hashes[full - 1U];
     lane_state.trailing_extra   = all_vision_key(ranges);
     lane_state.deepest_snapshot = reuse;
+    lane_state.prompt_tokens    = n;
     lane_state.resume_snapshot  = reuse != 0 ? quote.snapshot : pc::SnapshotRef{};
     lane_state.resume_frontier  = reuse;
     lane_state.latest_snapshot  = lane_state.resume_snapshot;
@@ -1247,6 +1256,9 @@ void ProgramImpl::hybrid_after_prefill_chunk(SequenceState& sequence, std::uint3
             break;
         } else {
             flexible = true;
+            // On the grid a coalescing tap (VR-01) lands at its grid boundary and stays a boundary, so
+            // the sibling's deeper taps do not supersede the snapshot the waiting request resumes from.
+            boundary = boundary || (invariant && tap.boundary && tap.position == cursor);
         }
         ++lane.next_tap;
     }
@@ -1363,12 +1375,19 @@ void ProgramImpl::hybrid_release_lane(std::uint32_t lane) noexcept {
     state = HybridLaneState{};
 }
 
-void ProgramImpl::hybrid_finish_lane(SequenceState& sequence, bool endpoint) noexcept {
+void ProgramImpl::hybrid_finish_lane(SequenceState& sequence, bool endpoint,
+                                     std::optional<std::uint32_t>* created) noexcept {
     if (!hybrid_ || sequence.lane >= max_concurrency) { return; }
     const pc::SnapshotRef published = hybrid_publish_endpoint(sequence, endpoint);
     const HybridLaneState& lane     = hybrid_lanes_[sequence.lane];
     hybrid_finished_sources_[0]     = published.valid() ? published : lane.latest_snapshot;
     hybrid_finished_sources_[1]     = lane.tap_snapshot;
+    if (created != nullptr && lane.publish) {
+        // The prompt tokens past the resume frontier whose state this sequence's snapshots made
+        // reusable (Anthropic's cache_creation_input_tokens).
+        const std::uint32_t deepest = std::min(lane.deepest_snapshot, lane.prompt_tokens);
+        *created                    = deepest > lane.resume_frontier ? deepest - lane.resume_frontier : 0U;
+    }
     hybrid_release_lane(sequence.lane);
 }
 

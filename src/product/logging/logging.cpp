@@ -157,8 +157,8 @@ spdlog::color_mode to_spdlog_color_mode(LogColorMode mode) {
 
 // FFmpeg's lines concern client-supplied media and name no request, and a decode that fails also
 // fails its request, which reports that in its own record. FFmpeg's errors are therefore warnings,
-// and its warnings and notices, such as swscaler's "deprecated pixel format" notice on every JPEG,
-// are debug detail.
+// and its warnings and notices, such as swscaler's "deprecated pixel format" notice on every
+// full-range (JPEG-coded) video, are debug detail.
 media::decode::LibraryLogHandler media_log_handler(std::shared_ptr<spdlog::logger> logger) {
     return [logger = std::move(logger)](const media::decode::LibraryLogLine& line) {
         const spdlog::level::level_enum level =

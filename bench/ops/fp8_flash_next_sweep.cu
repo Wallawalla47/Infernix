@@ -23,6 +23,7 @@
 #include "ops/linear/fp8/fp8_a16_ring_mma.cuh"
 #include "ops/linear/fp8/fp8_launch.cuh"
 #include "quantized_weight.cuh"
+#include "roofline.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -44,6 +45,7 @@
 #include <vector>
 
 using namespace infernix;
+namespace roofline = infernix::bench::roofline;
 using namespace infernix::ops::detail;
 
 namespace {
@@ -227,7 +229,7 @@ struct Options {
     int warmup          = 2;
     int repeat          = 7;
     double tolerance    = 0.02;
-    double dram_gbps    = 1792.0; // RTX 5090 GDDR7 peak
+    double dram_gbps    = roofline::kDramSpecGBs;
     bool decode_only    = false;
     std::string csv;
 };

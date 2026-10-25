@@ -8,6 +8,7 @@
 #include "core/device.h"
 #include "core/paged_kv_cache.h"
 #include "core/pdl.cuh"
+#include "core/temporary_switches.h"
 #include "ops/common/score_id_order.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
 
@@ -680,43 +681,12 @@ __device__ void compact_words(const unsigned* words, int nwords, int id_base, st
     }
 }
 
-// Grid (slices, columns of the group). Each CTA adds the histogram of its slice
-// of the column into the column's global histogram (zeroed by qsa_score_kernel); the last CTA to
-// arrive finds the bin, filters the column (bitmap above the bin, candidates in it), selects the
-// candidates by radix and writes the ids in ascending order.
-__global__ void __launch_bounds__(kSelectThreads)
-    qsa_select_global_kernel(const std::int32_t* __restrict__ positions, int ratio, int top_blocks,
-                             int group_begin, const float* __restrict__ scores, int score_stride,
-                             unsigned* __restrict__ histograms, unsigned* __restrict__ arrivals,
-                             std::int32_t* __restrict__ selected, std::int32_t* __restrict__ counts) {
-    pdl::enter();
-    extern __shared__ __align__(16) unsigned char dynamic_smem[];
-    __shared__ SelectShared sh;
-    const int c = static_cast<int>(blockIdx.y), t = group_begin + c;
-    const int slice = static_cast<int>(blockIdx.x), slices = static_cast<int>(gridDim.x);
-    const int n = (positions[t] + 1) / ratio;
-    if (n <= top_blocks) {
-        if (slice == 0 && threadIdx.x == 0) { counts[t] = -1; }
-        return;
-    }
-    const float* column = scores + static_cast<std::size_t>(c) * score_stride;
-    auto* hist          = reinterpret_cast<unsigned*>(dynamic_smem); // [kScoreBins], then candidates
-    for (int i = static_cast<int>(threadIdx.x); i < kScoreBins; i += kSelectThreads) { hist[i] = 0; }
-    __syncthreads();
-    score_histogram(column, slice_begin(n, slice, slices), slice_begin(n, slice + 1, slices), hist);
-    __syncthreads();
-    unsigned* column_hist = histograms + static_cast<std::size_t>(c) * kScoreBins;
-    for (int i = static_cast<int>(threadIdx.x); i < kScoreBins; i += kSelectThreads) {
-        if (hist[i] != 0) { atomicAdd(column_hist + i, hist[i]); }
-    }
-    __threadfence();
-    __syncthreads();
-    if (threadIdx.x == 0) { sh.last = atomicAdd(arrivals + c, 1U) + 1 == static_cast<unsigned>(slices); }
-    __syncthreads();
-    if (sh.last == 0) { return; }
-    __threadfence();
-
-    for (int i = static_cast<int>(threadIdx.x); i < kScoreBins; i += kSelectThreads) { hist[i] = __ldcg(column_hist + i); }
+// The column's selection from its complete histogram (dynamic_smem[0, kScoreBins words), every
+// thread past the barrier that completed it): finds the bin, filters the column (bitmap above the
+// bin, candidates in it), selects the candidates by radix and writes the ids in ascending order.
+__device__ void select_from_histogram(const float* column, int n, int top_blocks, unsigned char* dynamic_smem,
+                                      std::int32_t* out, SelectShared& sh) {
+    const auto* hist = reinterpret_cast<const unsigned*>(dynamic_smem);
     if (threadIdx.x == 0) {
         sh.candidates = 0;
         sh.and_key    = ~0ULL;
@@ -757,7 +727,226 @@ __global__ void __launch_bounds__(kSelectThreads)
         });
     }
     __syncthreads();
-    compact_words(bitmap, (n + 31) / 32, 0, selected + static_cast<std::size_t>(t) * top_blocks, sh);
+    compact_words(bitmap, (n + 31) / 32, 0, out, sh);
+}
+
+// Grid (slices, columns of the group). Each CTA adds the histogram of its slice of the column into
+// the column's global histogram (zeroed by the score kernel); the last CTA to arrive selects the
+// column from it.
+__global__ void __launch_bounds__(kSelectThreads)
+    qsa_select_global_kernel(const std::int32_t* __restrict__ positions, int ratio, int top_blocks,
+                             int group_begin, const float* __restrict__ scores, int score_stride,
+                             unsigned* __restrict__ histograms, unsigned* __restrict__ arrivals,
+                             std::int32_t* __restrict__ selected, std::int32_t* __restrict__ counts) {
+    pdl::enter();
+    extern __shared__ __align__(16) unsigned char dynamic_smem[];
+    __shared__ SelectShared sh;
+    const int c = static_cast<int>(blockIdx.y), t = group_begin + c;
+    const int slice = static_cast<int>(blockIdx.x), slices = static_cast<int>(gridDim.x);
+    const int n = (positions[t] + 1) / ratio;
+    if (n <= top_blocks) {
+        if (slice == 0 && threadIdx.x == 0) { counts[t] = -1; }
+        return;
+    }
+    const float* column = scores + static_cast<std::size_t>(c) * score_stride;
+    auto* hist          = reinterpret_cast<unsigned*>(dynamic_smem); // [kScoreBins], then candidates
+    for (int i = static_cast<int>(threadIdx.x); i < kScoreBins; i += kSelectThreads) { hist[i] = 0; }
+    __syncthreads();
+    score_histogram(column, slice_begin(n, slice, slices), slice_begin(n, slice + 1, slices), hist);
+    __syncthreads();
+    unsigned* column_hist = histograms + static_cast<std::size_t>(c) * kScoreBins;
+    for (int i = static_cast<int>(threadIdx.x); i < kScoreBins; i += kSelectThreads) {
+        if (hist[i] != 0) { atomicAdd(column_hist + i, hist[i]); }
+    }
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) { sh.last = atomicAdd(arrivals + c, 1U) + 1 == static_cast<unsigned>(slices); }
+    __syncthreads();
+    if (sh.last == 0) { return; }
+    __threadfence();
+
+    for (int i = static_cast<int>(threadIdx.x); i < kScoreBins; i += kSelectThreads) { hist[i] = __ldcg(column_hist + i); }
+    select_from_histogram(column, n, top_blocks, dynamic_smem, selected + static_cast<std::size_t>(t) * top_blocks, sh);
+    if (threadIdx.x == 0) { counts[t] = top_blocks; }
+}
+
+// ----------------------------------------------------------------------------- sampled selection
+//
+// The sampled route (arXiv 2609.08450): no histogram pass. Every CTA of a column reads the same
+// strided sample of the column's scores and takes the key floor F that exactly r sample keys reach,
+// r sized so about sqrt(top x kCandidateCapacity) keys of the column reach F; each CTA then appends
+// the keys >= F of its own slice to the column's global candidate buffer, and the last CTA to arrive
+// selects the top keys among them by radix. Whenever at least `top` keys reach F, F is at or below
+// the top-th key of the column, so the candidates hold every selected key and the ids are the
+// histogram route's. A buffer that holds fewer than `top` keys or overflows (a sample unlike its
+// column) sends the last CTA through the histogram route alone.
+
+// Sample spacing (blocks between sampled float4 groups) until the sample reaches one group per
+// thread (columns beyond kSelectThreads * kSampleSpacing blocks space it wider).
+constexpr int kSampleSpacing = 64;
+
+// Folds per-thread AND / OR of keys into sh.and_key / sh.or_key (initialised before a barrier).
+__device__ __forceinline__ void fold_keys(unsigned long long and_key, unsigned long long or_key, SelectShared& sh) {
+    const unsigned and_hi = __reduce_and_sync(kFullMask, static_cast<unsigned>(and_key >> 32));
+    const unsigned and_lo = __reduce_and_sync(kFullMask, static_cast<unsigned>(and_key));
+    const unsigned or_hi  = __reduce_or_sync(kFullMask, static_cast<unsigned>(or_key >> 32));
+    const unsigned or_lo  = __reduce_or_sync(kFullMask, static_cast<unsigned>(or_key));
+    if (threadIdx.x % 32 == 0) {
+        atomicAnd(&sh.and_key, (static_cast<unsigned long long>(and_hi) << 32) | and_lo);
+        atomicOr(&sh.or_key, (static_cast<unsigned long long>(or_hi) << 32) | or_lo);
+    }
+}
+
+// The floor F of a column of n > kCandidateCapacity blocks. The sample is G = min(kSelectThreads,
+// ceil(n / kSampleSpacing)) float4 groups, group j at block 4 floor(j (n / 4) / G); r = ceil(target
+// m / n) of its m = 4 G keys reach F, so about target = sqrt(top x kCandidateCapacity) keys of the
+// column do. `keys`: shared memory for m keys. Block-wide; every CTA of the column gets the same F.
+__device__ std::uint64_t sample_floor(const float* column, int n, int top_blocks, std::uint64_t* keys,
+                                      SelectShared& sh) {
+    const int tid    = static_cast<int>(threadIdx.x);
+    const int quads  = n / 4;
+    const int groups = min(kSelectThreads, (n + kSampleSpacing - 1) / kSampleSpacing);
+    if (tid == 0) {
+        sh.and_key = ~0ULL;
+        sh.or_key  = 0;
+    }
+    __syncthreads();
+    unsigned long long and_key = ~0ULL, or_key = 0;
+    if (tid < groups) {
+        const int first  = 4 * static_cast<int>(static_cast<std::int64_t>(tid) * quads / groups);
+        const float4 v   = *reinterpret_cast<const float4*>(column + first);
+        const float s[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const std::uint64_t key = score_id_order_key(s[k], first + k);
+            keys[4 * tid + k]       = key;
+            and_key &= key;
+            or_key |= key;
+        }
+    }
+    fold_keys(and_key, or_key, sh);
+    __syncthreads();
+    const int m        = 4 * groups;
+    const float target = sqrtf(static_cast<float>(top_blocks) * static_cast<float>(kCandidateCapacity));
+    const int r        = min(m, max(1, static_cast<int>(ceilf(target * static_cast<float>(m) / static_cast<float>(n)))));
+    return radix_threshold(CandidateKeys{keys, m}, r, sh.and_key, sh.or_key, sh);
+}
+
+// Appends the keys >= key_floor of scores [lo, hi) to `buffer` (up to kCandidateCapacity; `count`
+// counts them all).
+__device__ void append_candidates(const float* column, int lo, int hi, std::uint64_t key_floor,
+                                  std::uint64_t* buffer, unsigned* count) {
+    const int lane = static_cast<int>(threadIdx.x) % 32;
+    walk_scores(column, lo, hi, [&](int, int base, float4 v, unsigned ok) {
+        const float s[4] = {v.x, v.y, v.z, v.w};
+        std::uint64_t key[4];
+        unsigned take = 0;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            key[k] = score_id_order_key(s[k], base + k);
+            take |= static_cast<unsigned>(((ok >> k) & 1U) != 0 && key[k] >= key_floor) << k;
+        }
+        const int mine = __popc(take);
+        if (__any_sync(kFullMask, mine != 0)) {
+            int inclusive = mine;
+#pragma unroll
+            for (int o = 1; o < 32; o <<= 1) {
+                const int other = __shfl_up_sync(kFullMask, inclusive, o);
+                if (lane >= o) { inclusive += other; }
+            }
+            unsigned start = 0;
+            if (lane == 31 && inclusive != 0) { start = atomicAdd(count, static_cast<unsigned>(inclusive)); }
+            start    = __shfl_sync(kFullMask, start, 31);
+            int slot = static_cast<int>(start) + inclusive - mine;
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                if ((take >> k) & 1U) {
+                    if (slot < kCandidateCapacity) { buffer[slot] = key[k]; }
+                    ++slot;
+                }
+            }
+        }
+    });
+}
+
+// Grid (slices, columns of the group). Columns of more than kCandidateCapacity blocks: each CTA takes
+// the sample's floor and appends its slice's keys >= floor to the column's candidates
+// (candidate_keys [group][kCandidateCapacity], counted in candidate_counts); the last CTA selects
+// the top among them, or the whole column through the histogram route when they number fewer than
+// `top` or overflowed. Columns of at most kCandidateCapacity blocks: the last CTA takes every block
+// as a candidate. arrivals and candidate_counts are zeroed by the score kernel.
+__global__ void __launch_bounds__(kSelectThreads)
+    qsa_select_sampled_kernel(const std::int32_t* __restrict__ positions, int ratio, int top_blocks,
+                              int group_begin, const float* __restrict__ scores, int score_stride,
+                              unsigned* __restrict__ arrivals, unsigned* __restrict__ candidate_counts,
+                              std::uint64_t* __restrict__ candidate_keys, std::int32_t* __restrict__ selected,
+                              std::int32_t* __restrict__ counts) {
+    pdl::enter();
+    extern __shared__ __align__(16) unsigned char dynamic_smem[];
+    __shared__ SelectShared sh;
+    const int c = static_cast<int>(blockIdx.y), t = group_begin + c;
+    const int slice = static_cast<int>(blockIdx.x), slices = static_cast<int>(gridDim.x);
+    const int n = (positions[t] + 1) / ratio;
+    if (n <= top_blocks) {
+        if (slice == 0 && threadIdx.x == 0) { counts[t] = -1; }
+        return;
+    }
+    const float* column  = scores + static_cast<std::size_t>(c) * score_stride;
+    auto* keys           = reinterpret_cast<std::uint64_t*>(dynamic_smem); // the sample, then the candidates
+    std::uint64_t* found = candidate_keys + static_cast<std::size_t>(c) * kCandidateCapacity;
+    const bool sampled   = n > kCandidateCapacity;
+    if (sampled) {
+        const std::uint64_t key_floor = sample_floor(column, n, top_blocks, keys, sh);
+        append_candidates(column, slice_begin(n, slice, slices), slice_begin(n, slice + 1, slices), key_floor,
+                          found, candidate_counts + c);
+    }
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) { sh.last = atomicAdd(arrivals + c, 1U) + 1 == static_cast<unsigned>(slices); }
+    __syncthreads();
+    if (sh.last == 0) { return; }
+    __threadfence();
+
+    std::int32_t* out = selected + static_cast<std::size_t>(t) * top_blocks;
+    const int count   = sampled ? static_cast<int>(__ldcg(candidate_counts + c)) : n;
+    if (count < top_blocks || count > kCandidateCapacity) {
+        auto* hist = reinterpret_cast<unsigned*>(dynamic_smem);
+        for (int i = static_cast<int>(threadIdx.x); i < kScoreBins; i += kSelectThreads) { hist[i] = 0; }
+        __syncthreads();
+        score_histogram(column, 0, n, hist);
+        __syncthreads();
+        select_from_histogram(column, n, top_blocks, dynamic_smem, out, sh);
+    } else {
+        if (threadIdx.x == 0) {
+            sh.and_key = ~0ULL;
+            sh.or_key  = 0;
+        }
+        __syncthreads();
+        unsigned long long and_key = ~0ULL, or_key = 0;
+        for (int i = static_cast<int>(threadIdx.x); i < count; i += kSelectThreads) {
+            const std::uint64_t key = sampled ? __ldcg(found + i) : score_id_order_key(column[i], i);
+            keys[i]                 = key;
+            and_key &= key;
+            or_key |= key;
+        }
+        fold_keys(and_key, or_key, sh);
+        __syncthreads();
+        const std::uint64_t threshold =
+            radix_threshold(CandidateKeys{keys, count}, top_blocks, sh.and_key, sh.or_key, sh);
+        auto* bitmap      = reinterpret_cast<unsigned*>(dynamic_smem + kCandidateBytes);
+        const int words   = (n + 31) / 32;
+        for (int i = static_cast<int>(threadIdx.x); i < words; i += kSelectThreads) { bitmap[i] = 0; }
+        __syncthreads();
+        for (int i = static_cast<int>(threadIdx.x); i < count; i += kSelectThreads) {
+            const std::uint64_t key = keys[i];
+            if (key >= threshold) {
+                const int id = id_from_order_key(key);
+                atomicOr(bitmap + id / 32, 1U << (id % 32));
+            }
+        }
+        __syncthreads();
+        compact_words(bitmap, words, 0, out, sh);
+    }
     if (threadIdx.x == 0) { counts[t] = top_blocks; }
 }
 
@@ -784,7 +973,7 @@ int multiprocessors() {
 struct Layout {
     std::int32_t group  = 0; // columns per score pass
     std::int32_t stride = 0; // floats per column score row
-    std::size_t scores = 0, state = 0, total = 0;
+    std::size_t scores = 0, state = 0, candidates = 0, total = 0;
 };
 
 Layout layout(const QsaGeometry& g, std::int32_t columns, std::int32_t max_context) {
@@ -792,9 +981,12 @@ Layout layout(const QsaGeometry& g, std::int32_t columns, std::int32_t max_conte
     l.group  = std::min(columns, kQsaSelectGroupColumns);
     l.stride = (max_context / g.ratio + 1 + 31) / 32 * 32;
     l.scores = align256(sizeof(float) * static_cast<std::size_t>(l.group) * l.stride);
-    // kScoreBins histogram words, then one arrival counter, per column.
-    l.state = align256(sizeof(std::uint32_t) * static_cast<std::size_t>(l.group) * (kScoreBins + 1));
-    l.total = l.scores + l.state;
+    // Per column: an arrival counter and a candidate count, then the histogram route's kScoreBins
+    // histogram words per column.
+    l.state = align256(sizeof(std::uint32_t) * static_cast<std::size_t>(l.group) * (2 + kScoreBins));
+    // The sampled route's candidate keys per column.
+    l.candidates = align256(kCandidateBytes * static_cast<std::size_t>(l.group));
+    l.total      = l.scores + l.state + l.candidates;
     return l;
 }
 
@@ -826,9 +1018,16 @@ void reserve_shared(Kernel kernel, std::size_t bytes, std::atomic<std::size_t>& 
 }
 
 std::atomic<std::size_t> g_global_reserved{0};
+std::atomic<std::size_t> g_sampled_reserved{0};
 std::atomic<std::size_t> g_wide_reserved{0};
 
 } // namespace
+
+QsaSelectRoute qsa_select_default_route() noexcept {
+    // TEMPORARY (INFERNIX_TMP_QSA_SAMPLED_SELECT) until the select op bench and the long-prompt A/B.
+    static const bool sampled = temporary_switches::flag("INFERNIX_TMP_QSA_SAMPLED_SELECT");
+    return sampled ? QsaSelectRoute::Sampled : QsaSelectRoute::Histogram;
+}
 
 std::size_t qsa_select_scratch_bytes(const QsaGeometry& geometry, std::int32_t columns, std::int32_t max_context) {
     require(columns > 0 && max_context > 0 && geometry.ratio > 0, "columns and max_context must be positive");
@@ -842,7 +1041,7 @@ QsaSelectScores qsa_select_scores(const void* scratch, const QsaGeometry& geomet
 void qsa_select(const Tensor& index_q, const Tensor& pooled_pages, const QsaBatch& batch,
                 const QsaGeometry& geometry, std::int32_t max_context, void* scratch,
                 std::size_t scratch_bytes, const QsaSelectOutput& output, cudaStream_t stream,
-                const QsaPageSpaces& spaces) {
+                const QsaPageSpaces& spaces, QsaSelectRoute route) {
     const std::int32_t columns = batch.batch * batch.width;
     require(geometry.index_head_dim == kIndexDim && geometry.index_heads >= 1 &&
                 geometry.index_heads <= kScoreHeadSlots && geometry.ratio > 1 && kIndexDim % geometry.ratio == 0 &&
@@ -863,12 +1062,22 @@ void qsa_select(const Tensor& index_q, const Tensor& pooled_pages, const QsaBatc
     auto* base                    = static_cast<unsigned char*>(scratch);
     auto* scores                  = reinterpret_cast<float*>(base);
     auto* state                   = reinterpret_cast<std::uint32_t*>(base + l.scores);
-    auto* histograms              = state;
-    auto* arrivals                = state + static_cast<std::size_t>(l.group) * kScoreBins;
+    auto* arrivals                = state;
+    auto* candidate_counts        = state + l.group;
+    auto* histograms              = state + static_cast<std::size_t>(2) * l.group;
+    auto* candidate_keys          = reinterpret_cast<std::uint64_t*>(base + l.scores + l.state);
+    // The sampled route's floor aims at sqrt(top x kCandidateCapacity) candidates, at least twice top.
+    const bool sampled = route == QsaSelectRoute::Sampled && 4 * top_blocks <= kCandidateCapacity;
+    // The score kernel zeroes the counters (and the histograms the histogram route adds into).
+    const int clear_words = l.group * (sampled ? 2 : 2 + kScoreBins);
 
-    // Dynamic shared memory: candidates (aliasing the histogram) and the column bitmap.
+    // Dynamic shared memory: candidates (aliasing the histogram or the sample) and the column bitmap.
     const std::size_t smem = kCandidateBytes + sizeof(unsigned) * 4 * static_cast<std::size_t>(ceil_div(max_blocks + 1, 128));
-    reserve_shared(qsa_select_global_kernel, smem, g_global_reserved);
+    if (sampled) {
+        reserve_shared(qsa_select_sampled_kernel, smem, g_sampled_reserved);
+    } else {
+        reserve_shared(qsa_select_global_kernel, smem, g_global_reserved);
+    }
 
     const auto* index      = static_cast<const bf16*>(index_q.data);
     const auto* pooled     = static_cast<const bf16*>(pooled_pages.data);
@@ -892,8 +1101,7 @@ void qsa_select(const Tensor& index_q, const Tensor& pooled_pages, const QsaBatc
                 {dim3(static_cast<unsigned>(ctas), static_cast<unsigned>(tiles.count)), dim3(kWideThreads),
                  kWideSharedBytes, stream},
                 qsa_score_wide_kernel, index, geometry.index_heads, pooled, tables, table_stride, rows, positions,
-                batch.width, geometry.ratio, top_blocks, begin, tiles, scores, l.stride, state,
-                l.group * (kScoreBins + 1), spaces));
+                batch.width, geometry.ratio, top_blocks, begin, tiles, scores, l.stride, state, clear_words, spaces));
         } else {
             const int ctas = std::clamp(ceil_div(std::int64_t{kScoreCtasPerSm} * sms, tiles.count), 1,
                                         std::max(1, ceil_div(max_steps, kScoreWarps)));
@@ -901,16 +1109,21 @@ void qsa_select(const Tensor& index_q, const Tensor& pooled_pages, const QsaBatc
                                              dim3(kScoreThreads), 0, stream},
                                             qsa_score_kernel, index, geometry.index_heads, pooled, tables,
                                             table_stride, rows, positions, batch.width, geometry.ratio, top_blocks,
-                                            begin, tiles, scores, l.stride, state, l.group * (kScoreBins + 1),
-                                            spaces));
+                                            begin, tiles, scores, l.stride, state, clear_words, spaces));
         }
         const int slices = std::clamp(std::min(ceil_div(max_blocks, kSliceBlocks), ceil_div(std::int64_t{4} * sms, n)),
                                       1, kMaxSlices);
-        CUDA_CHECK(pdl::launch_consumer({dim3(static_cast<unsigned>(slices), static_cast<unsigned>(n)),
-                                         dim3(kSelectThreads), smem, stream},
-                                        qsa_select_global_kernel, positions, geometry.ratio, top_blocks, begin,
-                                        static_cast<const float*>(scores), l.stride, histograms, arrivals,
-                                        output.selected, output.counts));
+        const pdl::LaunchConfig select_launch{dim3(static_cast<unsigned>(slices), static_cast<unsigned>(n)),
+                                            dim3(kSelectThreads), smem, stream};
+        if (sampled) {
+            CUDA_CHECK(pdl::launch_consumer(select_launch, qsa_select_sampled_kernel, positions, geometry.ratio,
+                                            top_blocks, begin, static_cast<const float*>(scores), l.stride, arrivals,
+                                            candidate_counts, candidate_keys, output.selected, output.counts));
+        } else {
+            CUDA_CHECK(pdl::launch_consumer(select_launch, qsa_select_global_kernel, positions, geometry.ratio,
+                                            top_blocks, begin, static_cast<const float*>(scores), l.stride,
+                                            histograms, arrivals, output.selected, output.counts));
+        }
     }
 }
 

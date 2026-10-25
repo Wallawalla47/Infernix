@@ -1,3 +1,4 @@
+#include "ops/op_family.h"
 #include "infernix/ops/scatter.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
@@ -119,7 +120,7 @@ int run_case(int d, int width, int batch, bool padded, int mode, bool replay, in
 }
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(scatter_bf16_batch) {
     if (cuda_unavailable()) return 77;
     int failures = 0;
     for (int w = 1; w <= 16; ++w)

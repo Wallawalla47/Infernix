@@ -70,6 +70,19 @@ struct DFlashFeatureSink {
 
 class VisionPrefillSession;
 
+// sampled-mtp-drafts: one MTP proposal step's draw (ops::speculative_sample_sparse_drafts) from the
+// draft head's kMtpSampledDraftRanks most probable rows.
+struct SampledDraftStep {
+    const ops::SamplingConfig* configs = nullptr; // device SamplingConfig[T]: the rows' samplers
+    Tensor positions;                             // I32 [T]: each row's RNG position
+    std::uint32_t draw = 0;                       // the step (distinct draws at one position)
+    Tensor candidates;                            // I32 [16,T]: the proposal's candidate ids
+    Tensor q;                                     // FP32 [16,T]: its law
+    // FP32 [kMtpSampledDraftRanks,T] or empty: the head's log-probabilities of the ranks the draw
+    // chose among, which rank a greedy row's alternatives in a tree round.
+    Tensor scores;
+};
+
 class TextContext {
 public:
     TextContext(DeviceContext& ctx, const execution::Parameters& weights, WorkspaceArena& work,
@@ -184,9 +197,11 @@ public:
                                   const Tensor& state_destination_slots,
                                   ops::CausalAttentionExecutionEnvelope envelope,
                                   Tensor& mtp_hidden);
-    // `probabilities` (FP32 [batch], optional): each draft's drafter probability (ops::argmax_probability).
+    // `probabilities` (FP32 [batch], optional): each draft's drafter probability, from the argmax's
+    // own pass (ops::argmax_with_probability). `sampled` (sampled-mtp-drafts): the drafts are drawn
+    // under each row's sampler instead, with their sparse proposals (no probabilities).
     void mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens,
-                           Tensor* probabilities = nullptr);
+                           Tensor* probabilities = nullptr, const SampledDraftStep* sampled = nullptr);
     void mtp_forward_batch(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
                            ops::CausalAttentionExecutionEnvelope envelope, Tensor& mtp_hidden,
                            int logits_column, Tensor* logits, Tensor* draft_token,
@@ -232,10 +247,7 @@ private:
     [[nodiscard]] const TextParameters& phase_text(Phase phase, std::int64_t columns) const noexcept {
         return phase == Phase::Verify
                    ? parameters_.decode_text(!execution_schedule_.batched_columns(columns),
-                                             {execution_schedule_.a8_decode,
-                                              execution_schedule_.a4_decode,
-                                              execution_schedule_.a8_residual_decode,
-                                              execution_schedule_.a4_residual_decode})
+                                             execution_schedule_.decode_precision(columns))
                    : parameters_.text;
     }
     template <class Tap>
@@ -263,7 +275,7 @@ private:
                            ops::CausalAttentionExecutionEnvelope envelope, bool final_chunk,
                            Tensor* final_hidden, Tensor* logits, Tensor* draft_token);
     void proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& proposal_tokens,
-                         Tensor* probabilities = nullptr);
+                         Tensor* probabilities = nullptr, const SampledDraftStep* sampled = nullptr);
 
     struct MultimodalPrefill {
         std::span<const int> token_ids;

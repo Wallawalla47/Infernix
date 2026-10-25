@@ -18,7 +18,9 @@ enum class DisplayState : std::uint8_t {
 };
 
 struct VramSnapshot {
-    std::size_t device_free  = 0; // cudaMemGetInfo (device-wide under WDDM)
+    // cudaMemGetInfo (device-wide under WDDM); under WDDM with a DXGI budget, past the budget or with
+    // several CUDA devices visible, the budget less this process's usage instead.
+    std::size_t device_free  = 0;
     std::size_t device_total = 0;
     // Windows WDDM: this process's local-memory budget and usage (DXGI QueryVideoMemoryInfo).
     bool has_budget            = false;
@@ -30,7 +32,8 @@ struct VramSnapshot {
     // local_budget and device_free); 0 otherwise.
     std::uint64_t budget_allowance = 0;
     // Windows WDDM: the adapter's shared system memory (DXGI_ADAPTER_DESC SharedSystemMemory) and
-    // this process's use of it (NON_LOCAL CurrentUsage), 0 unknown. Every byte page-locked for the
+    // this process's use of it (NON_LOCAL CurrentUsage), 0 unknown; under WSL2 the same two facts
+    // through DXCore (core/dxcore_adapter.h), native Linux 0. Every byte page-locked for the
     // device (cudaHostAlloc, cudaHostRegister) counts in the usage, and page-locking fails just
     // below the shared size (RTX 5090, 95.8 GiB of RAM: shared 76.61 GiB, locking failed at 76.07
     // GiB in 64 MiB steps, the same for mapped, unmapped and registered memory). Windows sets the

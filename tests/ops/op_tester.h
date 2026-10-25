@@ -27,6 +27,8 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <functional>
+#include <initializer_list>
 #include <iostream>
 #include <limits>
 #include <random>
@@ -84,6 +86,68 @@ inline std::uint16_t f32_to_bf16(float f) {
 // from EXACTLY the values the kernel will read.
 inline void round_to_bf16(std::vector<float>& v) {
     for (auto& x : v) x = bf16_to_f32(f32_to_bf16(x));
+}
+
+// --- fp16 <-> f32 (round-to-nearest-even, saturating) -------------------------
+inline float fp16_to_f32(std::uint16_t bits) {
+    const bool negative = (bits & 0x8000u) != 0;
+    const int exponent  = (bits >> 10) & 0x1f;
+    const int mantissa  = bits & 0x03ff;
+    float magnitude     = 0.0f;
+    if (exponent == 0) {
+        magnitude = std::ldexp(static_cast<float>(mantissa), -24);
+    } else if (exponent == 31) {
+        magnitude = mantissa == 0 ? std::numeric_limits<float>::infinity()
+                                  : std::numeric_limits<float>::quiet_NaN();
+    } else {
+        magnitude = std::ldexp(1.0f + static_cast<float>(mantissa) / 1024.0f, exponent - 15);
+    }
+    return negative ? -magnitude : magnitude;
+}
+
+// Round to nearest even FP16 after clamping a finite value to +-65504 (the device's
+// __floats2half2_rn of a clamped value, as the fp16-gdn-state store does); NaN stays NaN.
+inline std::uint16_t f32_to_fp16_saturated(float value) {
+    if (value == value) { value = std::min(std::max(value, -65504.0f), 65504.0f); }
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    const std::uint32_t sign = (bits >> 16) & 0x8000u;
+    const std::uint32_t exp  = (bits >> 23) & 0xffu;
+    std::uint32_t mantissa   = bits & 0x007fffffu;
+    if (exp == 0xffu) { return static_cast<std::uint16_t>(sign | 0x7e00u); }
+    const int half_exp = static_cast<int>(exp) - 127 + 15;
+    if (half_exp <= 0) {
+        if (half_exp < -10) { return static_cast<std::uint16_t>(sign); }
+        mantissa |= 0x00800000u;
+        const int shift             = 14 - half_exp;
+        std::uint32_t half_mantissa = mantissa >> shift;
+        const std::uint32_t halfway = 1u << (shift - 1);
+        const std::uint32_t tail    = mantissa & ((1u << shift) - 1u);
+        if (tail > halfway || (tail == halfway && (half_mantissa & 1u) != 0u)) { ++half_mantissa; }
+        return static_cast<std::uint16_t>(sign | half_mantissa);
+    }
+    std::uint32_t half_mantissa = mantissa >> 13;
+    const std::uint32_t tail    = mantissa & 0x1fffu;
+    std::uint32_t rounded_exp   = static_cast<std::uint32_t>(half_exp);
+    if (tail > 0x1000u || (tail == 0x1000u && (half_mantissa & 1u) != 0u)) {
+        ++half_mantissa;
+        if (half_mantissa == 0x400u) {
+            half_mantissa = 0;
+            ++rounded_exp;
+        }
+    }
+    return static_cast<std::uint16_t>(sign | (rounded_exp << 10) | half_mantissa);
+}
+
+// Round an fp32 buffer to the fp16 grid in place.
+inline void round_to_fp16(std::vector<float>& v) {
+    for (auto& x : v) x = fp16_to_f32(f32_to_fp16_saturated(x));
+}
+
+inline std::vector<std::uint16_t> fp16_saturated_bits(const std::vector<float>& values) {
+    std::vector<std::uint16_t> bits(values.size());
+    for (std::size_t i = 0; i < values.size(); ++i) bits[i] = f32_to_fp16_saturated(values[i]);
+    return bits;
 }
 
 // --- seeded honest inputs ---------------------------------------------------
@@ -322,6 +386,86 @@ private:
     std::size_t guard_bytes_;
     std::uint8_t guard_byte_;
 };
+
+// --- repeatability (op-development.md, "Repeat and compare") ----------------
+// A device byte range an Op writes.
+struct OutputRegion {
+    const void* data   = nullptr;
+    std::size_t bytes  = 0;
+};
+
+// Runs `launch` (which enqueues the Op with its fixed inputs on `stream` and returns) 1 + repeats
+// times and compares every output region's bytes after each run with the first run's: an Op whose
+// bits vary between identical calls (a race between a producer and its consumers, an unordered
+// atomic sum, a stale pipeline stage) fails. Before each run the regions are filled with a byte
+// pattern that changes from run to run, so an output the Op leaves unwritten fails too; an Op that
+// reads an output as an input (an in-place residual) must restore it inside `launch`. With `contend`
+// every run after the first has a device-to-device copy of `contention_bytes` streaming on a second
+// stream beside it, so the Op's CTAs start and finish in other orders (the TMA proxy race reproduced
+// only under such a side stream).
+inline int verify_repeatable(std::string_view label, int repeats, cudaStream_t stream,
+                             const std::function<void()>& launch, std::initializer_list<OutputRegion> outputs,
+                             bool contend = true, std::size_t contention_bytes = std::size_t{256} << 20) {
+    std::vector<OutputRegion> regions(outputs);
+    const auto poison = [&](int run) {
+        for (const auto& region : regions) {
+            cuda_check(cudaMemsetAsync(const_cast<void*>(region.data), 0x5A ^ (run * 0x33 & 0xFF), region.bytes,
+                                       stream),
+                       "poison repeat output");
+        }
+    };
+    const auto read = [&]() {
+        cuda_synchronize(stream);
+        std::vector<std::vector<std::uint8_t>> bytes;
+        for (const auto& region : regions) { bytes.push_back(from_device<std::uint8_t>(region.data, region.bytes)); }
+        return bytes;
+    };
+    poison(0);
+    launch();
+    const auto first = read();
+    DeviceBuffer from, to;
+    cudaStream_t side = nullptr;
+    if (contend) {
+        from = DeviceBuffer(contention_bytes);
+        to   = DeviceBuffer(contention_bytes);
+        cuda_check(cudaStreamCreateWithFlags(&side, cudaStreamNonBlocking), "contention stream");
+    }
+    int failures = 0;
+    for (int run = 1; run <= repeats && failures == 0; ++run) {
+        poison(run);
+        if (side != nullptr) {
+            cuda_check(cudaMemcpyAsync(to.p, from.p, contention_bytes, cudaMemcpyDeviceToDevice, side),
+                       "contention copy");
+        }
+        launch();
+        const auto again = read();
+        if (side != nullptr) { cuda_synchronize(side); }
+        for (std::size_t r = 0; r < regions.size(); ++r) {
+            if (again[r] != first[r]) {
+                const auto at = std::mismatch(again[r].begin(), again[r].end(), first[r].begin()).first - again[r].begin();
+                std::cerr << label << ": run " << run << " differs from run 0 in output " << r << " at byte " << at
+                          << '\n';
+                ++failures;
+                break;
+            }
+        }
+    }
+    if (side != nullptr) { (void)cudaStreamDestroy(side); }
+    return failures;
+}
+
+// Whether a fixture can tell two summation orders apart: some row's FP32 sum of its terms in order
+// differs from the same terms summed in reverse. Two routes claimed bit-identical on a fixture where
+// none does have only shown that their orders agree on easy data (op-development.md).
+inline bool summation_order_visible(std::span<const float> terms, std::size_t rows, std::size_t length) {
+    for (std::size_t row = 0; row < rows; ++row) {
+        float forward = 0.0F, backward = 0.0F;
+        for (std::size_t k = 0; k < length; ++k) { forward += terms[row * length + k]; }
+        for (std::size_t k = length; k-- > 0;) { backward += terms[row * length + k]; }
+        if (forward != backward) { return true; }
+    }
+    return false;
+}
 
 // Returns 0 (pass) / 1 (fail). Concrete criteria are supplied by the semantic Op suite.
 inline int verify_pointwise(std::string_view label, std::span<const double> got,

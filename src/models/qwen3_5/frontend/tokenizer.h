@@ -151,6 +151,13 @@ public:
     [[nodiscard]] bool is_special_token(int id) const noexcept;
     [[nodiscard]] bool is_valid_token(int id) const noexcept;
     [[nodiscard]] bool has_exact_token_domain(std::size_t size) const noexcept;
+    // The added token whose content is exactly `content`, or null.
+    [[nodiscard]] const AddedToken* find_added_token(std::string_view content) const noexcept;
+
+    // The byte-level token of one raw byte, or -1 when the vocabulary has none.
+    [[nodiscard]] int byte_token_id(std::uint8_t byte) const noexcept {
+        return byte_token_ids_[byte];
+    }
 
 private:
     std::vector<std::string> decoded_token_bytes_;

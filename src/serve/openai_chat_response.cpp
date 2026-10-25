@@ -104,7 +104,7 @@ CompletionUsage usage_from(const GenerationOutcome& outcome) {
     return CompletionUsage{
         .prompt_tokens     = outcome.prompt_tokens,
         .completion_tokens = outcome.completion_tokens,
-        .cached_tokens     = static_cast<int>(outcome.metrics.prefix_cache_hit_tokens),
+        .cached_tokens     = static_cast<int>(outcome.reused_prompt_tokens),
         .reasoning_tokens  = outcome.reasoning_tokens,
     };
 }
@@ -163,7 +163,7 @@ OpenAIChatResponseIdentity make_openai_chat_response_identity(std::string model)
 }
 
 std::string make_chat_completion_response(const OpenAIChatResponseIdentity& identity,
-                                          const GenerationOutcome& outcome) {
+                                          const GenerationOutcome& outcome, std::vector<std::string>* call_ids) {
     Json message = {{"role", "assistant"}, {"content", outcome.text}, {"refusal", nullptr}};
     const bool has_tool_calls = !outcome.tool_calls.empty();
     // vLLM/SGLang-compatible reasoning_content preserves the Engine's Reasoning/Content split.
@@ -172,6 +172,9 @@ std::string make_chat_completion_response(const OpenAIChatResponseIdentity& iden
         const std::vector<ToolCall> calls = materialize_tool_calls(outcome.tool_calls);
         message["content"]    = outcome.text.empty() ? Json(nullptr) : Json(outcome.text);
         message["tool_calls"] = tool_calls_json(calls, false);
+        if (call_ids != nullptr) {
+            for (const ToolCall& call : calls) { call_ids->push_back(call.id); }
+        }
     }
 
     Json payload       = base_payload(identity, "chat.completion");
@@ -283,6 +286,27 @@ std::string OpenAIChatStream::content_delta(const std::string& text) {
     return chunk(identity_, Json{{"content", text}}, nullptr, include_usage_, live_timings_json());
 }
 
+std::string OpenAIChatStream::tool_call_delta(const infernix::ToolCallDelta& delta) {
+    const bool opens = delta.index == calls_.size();
+    if (!started_ || finished_ || (opens && delta.name.empty()) ||
+        (!opens && (delta.index + 1U != calls_.size() || calls_.back().complete || !delta.name.empty()))) {
+        throw std::logic_error("invalid OpenAI Chat tool-call delta state");
+    }
+    Json call{{"index", delta.index}};
+    if (opens) {
+        calls_.push_back(StreamedCall{.id = new_openai_chat_tool_call_id(), .name = delta.name});
+        call["id"]       = calls_.back().id;
+        call["type"]     = "function";
+        call["function"] = Json{{"name", delta.name}, {"arguments", delta.arguments}};
+    } else {
+        call["function"] = Json{{"arguments", delta.arguments}};
+    }
+    calls_.back().arguments += delta.arguments;
+    calls_.back().complete = delta.complete;
+    return chunk(identity_, Json{{"tool_calls", Json::array({std::move(call)})}}, nullptr,
+                 include_usage_, live_timings_json());
+}
+
 std::vector<std::string> OpenAIChatStream::finish(const GenerationOutcome& outcome) {
     if (!started_ || finished_) {
         throw std::logic_error("invalid OpenAI Chat stream finish state");
@@ -290,6 +314,16 @@ std::vector<std::string> OpenAIChatStream::finish(const GenerationOutcome& outco
     finished_ = true;
     require_prefix(outcome.reasoning, reasoning_, "reasoning");
     require_prefix(outcome.text, content_, "content");
+    // Streamed calls are the result's, and at most one more that the turn's end cut.
+    if (!calls_.empty()) {
+        bool matches = calls_.size() == outcome.tool_calls.size() ||
+                       (calls_.size() == outcome.tool_calls.size() + 1U && !calls_.back().complete);
+        for (std::size_t index = 0; matches && index < outcome.tool_calls.size(); ++index) {
+            matches = calls_[index].complete && calls_[index].name == outcome.tool_calls[index].name &&
+                      calls_[index].arguments == outcome.tool_calls[index].arguments_json;
+        }
+        if (!matches) { throw std::logic_error("streamed tool calls do not match terminal output"); }
+    }
 
     const Json constraint     = product::constraint_observation_json(outcome.constraint);
     const Json final_timings  = timings_json(outcome_timings(outcome));
@@ -310,9 +344,15 @@ std::vector<std::string> OpenAIChatStream::finish(const GenerationOutcome& outco
     }
 
     if (!outcome.tool_calls.empty()) {
-        const std::vector<ToolCall> calls = materialize_tool_calls(outcome.tool_calls);
-        events.push_back(chunk(identity_, Json{{"tool_calls", tool_calls_json(calls, true)}},
-                               nullptr, include_usage_, output_timings));
+        // Free tool output publishes its calls here; constrained calls have streamed.
+        if (calls_.empty()) {
+            const std::vector<ToolCall> calls = materialize_tool_calls(outcome.tool_calls);
+            for (const ToolCall& call : calls) { call_ids_.push_back(call.id); }
+            events.push_back(chunk(identity_, Json{{"tool_calls", tool_calls_json(calls, true)}},
+                                   nullptr, include_usage_, output_timings));
+        } else {
+            for (std::size_t index = 0; index < outcome.tool_calls.size(); ++index) { call_ids_.push_back(calls_[index].id); }
+        }
         events.push_back(chunk(identity_, Json::object(), finish_reason(outcome), include_usage_,
                                include_usage_ ? Json(nullptr) : final_timings,
                                include_usage_ ? Json(nullptr) : constraint));

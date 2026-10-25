@@ -10,7 +10,9 @@
 namespace infernix::artifact {
 
 // Direct reads require aligned offsets and buffers. A short final direct block is allowed;
-// read_exact always requires the complete requested byte range.
+// read_exact always requires the complete requested byte range. On a POSIX filesystem that refuses
+// O_DIRECT (tmpfs, 9p, some FUSE mounts), direct reads go through the page cache, with the same
+// alignment rules.
 class InputFile {
 public:
     explicit InputFile(std::filesystem::path path);

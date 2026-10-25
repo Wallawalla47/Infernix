@@ -11,8 +11,8 @@ namespace infernix::ops {
  *
  * Math / indexing:
  *   For T=K+1 and each row b with A=accepted[b], L=licensed_counts[b]:
- *     alignment_ids[j,b] = verify_ids[j+1,b]  for 0<=j<A
- *                          next_anchors[b]     otherwise;
+ *     alignment_ids[j,b] = licensed_tokens[j,b]  for 0<=j<A
+ *                          next_anchors[b]       otherwise;
  *     remaining_after = max(remaining_budgets[b]-L,0);
  *     context_after   = max(max_context-updated_frontiers[b]-1,0);
  *     next_extents[b] = min(N,max(remaining_after-1,0),context_after);
@@ -22,7 +22,9 @@ namespace infernix::ops {
  *       ar_valid_columns[b,s]  = (s+1 < next_extents[b]).
  *
  * Logical shapes / effects:
- *   verify_ids/alignment_ids are distinct contiguous I32 [K+1,B]. ar_positions,
+ *   licensed_tokens (the round's accepted drafts, then its correction or bonus token: a
+ *   chain's drafts or a tree's accepted path) and alignment_ids are distinct contiguous I32
+ *   [K+1,B]; K+1 is the round's verification width. ar_positions,
  *   ar_rope_positions, and ar_valid_columns are I32 [B,max(N-1,1)] with contiguous rows and one
  *   shared step stride at least B; this permits an exact-B prefix of a fixed-capacity frame. All
  *   other tensors are contiguous I32 [B]. B>=1, 1<=K<=63,
@@ -32,7 +34,7 @@ namespace infernix::ops {
  *   and max_context is positive. The Op writes every output slot, including safe invalid-tail
  *   values. Inputs remain unchanged. No workspace or other state is used.
  */
-void mtp_prepare_next_round(const Tensor& verify_ids, const Tensor& next_anchors,
+void mtp_prepare_next_round(const Tensor& licensed_tokens, const Tensor& next_anchors,
                             const Tensor& accepted, const Tensor& updated_frontiers,
                             const Tensor& remaining_budgets, const Tensor& licensed_counts,
                             const Tensor& rope_deltas, Tensor& alignment_ids, Tensor& next_extents,

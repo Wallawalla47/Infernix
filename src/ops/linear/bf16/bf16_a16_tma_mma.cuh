@@ -97,13 +97,14 @@ inline constexpr int bf16_tma_scratch_bytes =
           : bf16_epilogue_bytes<Schedule, Epilogue>)+127) /
     128 * 128;
 
-template <class Schedule, bool FullTokens, class Output, class Epilogue>
+template <class Schedule, bool FullTokens, class Output, class Epilogue, bool InPlace = false>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_tma_mma_kernel(
 #ifdef _WIN32
     // MSVC cannot pass the over-aligned (alignas(128)) CUtensorMap struct by value as a
-    // __grid_constant__ parameter (C2719); on Windows the descriptors come from the staging buffer.
-    const Bf16TmaDescriptors* descriptors_pointer,
+    // __grid_constant__ parameter (C2719); on Windows the descriptors come from the staging buffer
+    // (or, InPlace, the parameter words).
+    const __grid_constant__ TmaDescriptorParameter<Bf16TmaDescriptors, InPlace> descriptors_pointer,
 #else
     const __grid_constant__ Bf16TmaDescriptors descriptors,
 #endif
@@ -139,8 +140,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_t
         if (threadIdx.x == 0) {
 #ifdef _WIN32
             // Each staged 128-byte map needs its own acquire for the TMA (tensormap) proxy.
-            acquire_staged_tensor_map(&descriptors.weight);
-            acquire_staged_tensor_map(&descriptors.activation);
+            acquire_staged_tensor_map<InPlace>(&descriptors.weight);
+            acquire_staged_tensor_map<InPlace>(&descriptors.activation);
 #endif
             for (int kt = 0; kt < tiles_k; ++kt) {
                 const int stage = kt % S;
@@ -178,36 +179,35 @@ void launch_bf16_a16_tma_mma(const Bf16A16Operands& p, Output output, Epilogue e
                              cudaStream_t stream) {
     // Descriptors are launch-owned values, copied into kernel parameters during Graph capture.
     const auto descriptors = make_bf16_tma_descriptors<Schedule>(p);
+    const auto launch_slices = [&]<bool InPlace>(std::bool_constant<InPlace>, const auto& parameter) {
+        for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
+            const auto blocks = static_cast<std::int64_t>(bf16_predicated_rows<Schedule>
+                                                              ? div_up(p.rows, Schedule::kBlockRows)
+                                                              : p.rows / Schedule::kBlockRows) *
+                                div_up(count, Schedule::kBlockTokens);
+            if (blocks > 2147483647LL)
+                throw std::invalid_argument("BF16 TMA grid exceeds CUDA grid.x capacity");
+            const auto launch = [&]<bool Full>() {
+                constexpr auto kernel = bf16_a16_tma_mma_kernel<Schedule, Full, Output, Epilogue, InPlace>;
+                constexpr int bytes =
+                    bf16_tma_scratch_bytes<Schedule, Epilogue> + Schedule::kBarrierBytes;
+                bf16_prepare_shared<bytes, kernel>();
+                kernel<<<static_cast<unsigned>(blocks), Schedule::kThreads, bytes, stream>>>(
+                    parameter, output, epilogue, p.rows, p.k, offset, count);
+                CUDA_CHECK(cudaGetLastError());
+            };
+            if (count % Schedule::kBlockTokens == 0)
+                launch.template operator()<true>();
+            else
+                launch.template operator()<false>();
+        });
+    };
 #ifdef _WIN32
-    // Staged once: every token-slice launch below reads the same copy, in stream order.
-    const Bf16TmaDescriptors* staged = bf16_tma_descriptor_staging().stage(descriptors, stream);
-#endif
-    for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
-        const auto blocks = static_cast<std::int64_t>(bf16_predicated_rows<Schedule>
-                                                          ? div_up(p.rows, Schedule::kBlockRows)
-                                                          : p.rows / Schedule::kBlockRows) *
-                            div_up(count, Schedule::kBlockTokens);
-        if (blocks > 2147483647LL)
-            throw std::invalid_argument("BF16 TMA grid exceeds CUDA grid.x capacity");
-        const auto launch = [&]<bool Full>() {
-            constexpr auto kernel = bf16_a16_tma_mma_kernel<Schedule, Full, Output, Epilogue>;
-            constexpr int bytes =
-                bf16_tma_scratch_bytes<Schedule, Epilogue> + Schedule::kBarrierBytes;
-            bf16_prepare_shared<bytes, kernel>();
-#ifdef _WIN32
-            kernel<<<static_cast<unsigned>(blocks), Schedule::kThreads, bytes, stream>>>(
-                staged, output, epilogue, p.rows, p.k, offset, count);
+    // Staged once: every token-slice launch reads the same copy, in stream order.
+    with_tma_descriptor_parameter(bf16_tma_descriptor_staging(), descriptors, stream, launch_slices);
 #else
-            kernel<<<static_cast<unsigned>(blocks), Schedule::kThreads, bytes, stream>>>(
-                descriptors, output, epilogue, p.rows, p.k, offset, count);
+    launch_slices(std::false_type{}, descriptors);
 #endif
-            CUDA_CHECK(cudaGetLastError());
-        };
-        if (count % Schedule::kBlockTokens == 0)
-            launch.template operator()<true>();
-        else
-            launch.template operator()<false>();
-    });
 }
 
 } // namespace infernix::ops::detail

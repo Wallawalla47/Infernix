@@ -141,11 +141,50 @@ __device__ __forceinline__ void speculative_sparse_warp_store(const int* drafts,
     }
 }
 
-__device__ __forceinline__ void speculative_sparse_warp_greedy(const int* target_tokens,
-                                                               const int* drafts, int* lengths,
-                                                               int* anchors, int* licensed_tokens,
-                                                               int* licensed_counts, int* accepted,
-                                                               int row, int extent, int k) {
+// The raw greedy route takes its targets from ops::argmax, which publishes an in-range row even for
+// a column with no finite value. A column the verification reached whose target's logit is not
+// finite (sampling.h's rule) sets the row's SamplingConfig::nonfinite. `row_logits` is the row's
+// column 0 (columns physical_rows apart; FP32 or BF16); a null pointer or flag skips the check.
+template <class Logit>
+__device__ __forceinline__ bool speculative_target_finite(const Logit* row_logits, int physical_rows,
+                                                          int column, int target) {
+    return isfinite(sampling_logit(row_logits[static_cast<std::int64_t>(column) * physical_rows + target]));
+}
+
+// thread-local form: the reached columns are 0..a.
+template <class Logit>
+__device__ __forceinline__ void speculative_check_targets(const int* row_targets, const Logit* row_logits,
+                                                          int physical_rows, int a,
+                                                          std::int32_t* nonfinite) {
+    if (row_logits == nullptr || nonfinite == nullptr) { return; }
+    bool finite = true;
+    for (int column = 0; column <= a; ++column) {
+        finite = finite && speculative_target_finite(row_logits, physical_rows, column,
+                                                     row_targets[column]);
+    }
+    if (!finite) { *nonfinite = 1; }
+}
+
+// warp-wide form of speculative_check_targets (every lane of the warp calls).
+template <class Logit>
+__device__ __forceinline__ void speculative_check_targets_warp(const int* row_targets, const Logit* row_logits,
+                                                               int physical_rows, int a,
+                                                               std::int32_t* nonfinite) {
+    if (row_logits == nullptr || nonfinite == nullptr) { return; } // uniform across the warp
+    const int lane = threadIdx.x & 31;
+    bool finite    = true;
+    for (int column = lane; column <= a; column += 32) {
+        finite = finite && speculative_target_finite(row_logits, physical_rows, column,
+                                                     row_targets[column]);
+    }
+    if (__ballot_sync(0xffffffffU, !finite) != 0U && lane == 0) { *nonfinite = 1; }
+}
+
+template <class Logit = __nv_bfloat16>
+__device__ __forceinline__ void speculative_sparse_warp_greedy(
+    const int* target_tokens, const int* drafts, int* lengths, int* anchors, int* licensed_tokens,
+    int* licensed_counts, int* accepted, int row, int extent, int k, const Logit* row_logits = nullptr,
+    int physical_rows = 0, std::int32_t* nonfinite = nullptr) {
     const int lane = threadIdx.x & 31;
     int a          = extent;
     for (int base = 0; base < k; base += 32) {
@@ -158,15 +197,21 @@ __device__ __forceinline__ void speculative_sparse_warp_greedy(const int* target
     const int terminal = target_tokens[row * (k + 1) + a];
     speculative_sparse_warp_store(drafts, k, row, a, terminal, lengths, anchors, licensed_tokens,
                                   licensed_counts, accepted);
+    speculative_check_targets_warp(target_tokens + row * (k + 1), row_logits, physical_rows, a,
+                                   nonfinite);
 }
 
+template <class Logit>
 __global__ __launch_bounds__(256) void speculative_accept_sparse_warp_greedy_kernel(
-    const int* target_tokens, const int* drafts, const int* current_extents, int* lengths,
-    int* anchors, int* licensed_tokens, int* licensed_counts, int* accepted, int k) {
+    const int* target_tokens, const Logit* logits, const int* drafts,
+    const int* current_extents, int* lengths, int* anchors, int* licensed_tokens,
+    int* licensed_counts, int* accepted, const SamplingConfig* configs, int physical_rows, int k) {
     const int row    = threadIdx.x / 32;
     const int extent = min(k, max(0, current_extents[row]));
-    speculative_sparse_warp_greedy(target_tokens, drafts, lengths, anchors, licensed_tokens,
-                                   licensed_counts, accepted, row, extent, k);
+    speculative_sparse_warp_greedy(
+        target_tokens, drafts, lengths, anchors, licensed_tokens, licensed_counts, accepted, row,
+        extent, k, logits + static_cast<std::int64_t>(row) * (k + 1) * physical_rows,
+        physical_rows, configs[row].nonfinite);
 }
 
 // SamplingConfig::gumbel_max: the Gumbel-max token of column `column`'s stored support, the token
@@ -210,7 +255,8 @@ __device__ __forceinline__ void speculative_sparse_warp_accept(
                     speculative_sparse_probability(candidate_ids + at, proposal_q + at, d);
                 const float u = sampling_uniform(cfg.seed, old_length + column + 1,
                                                  kSamplePurposeSpeculativeAccept, 0);
-                reject        = !(pd >= qd || u * qd < pd);
+                // A draft outside its proposal's candidates (q = 0) was not drawn from q: reject it.
+                reject = !(qd > 0.0f) || !(pd >= qd || u * qd < pd);
             }
         }
         const unsigned failures = __ballot_sync(0xffffffffU, reject);
@@ -223,18 +269,23 @@ __device__ __forceinline__ void speculative_sparse_warp_accept(
         terminal = speculative_gumbel_target(workspace, cfg, a, old_length + a + 1);
     else {
         const int n  = workspace.dist_support[a];
+        // The residual max(p - q, 0) assumes the rejected draft was drawn from q. A missed draft
+        // (q = 0) carries no proposal information, so its correction is drawn from p itself, as
+        // the tree walk does for a missed sibling.
+        const int q_row = (row * k + a) * kSparseSpeculativeCandidates;
+        const bool residual =
+            a < extent && speculative_sparse_probability(candidate_ids + q_row, proposal_q + q_row,
+                                                         drafts[row * k + a]) > 0.0f;
         int token    = 0;
         float weight = 0.0f;
         if (lane < n) {
             const int at = sampling_dist_offset(a, lane);
             token        = workspace.dist_idx[at];
             weight       = workspace.dist_prob[at];
-            if (a < extent) {
-                const int q_at = (row * k + a) * kSparseSpeculativeCandidates;
-                weight         = fmaxf(weight - speculative_sparse_probability(candidate_ids + q_at,
-                                                                               proposal_q + q_at, token),
-                                       0.0f);
-            }
+            if (residual)
+                weight = fmaxf(weight - speculative_sparse_probability(candidate_ids + q_row,
+                                                                       proposal_q + q_row, token),
+                               0.0f);
         }
         float cdf = weight;
 #pragma unroll
@@ -257,6 +308,94 @@ __device__ __forceinline__ void speculative_sparse_warp_accept(
         terminal           = __shfl_sync(0xffffffffU, token, selected);
     }
     speculative_sparse_warp_store(drafts, k, row, a, terminal, lengths, anchors, licensed_tokens,
+                                  licensed_counts, accepted);
+}
+
+// Block verification (Sun et al., arXiv 2403.10444, Algorithm 2) of a sampled row's chain, for
+// block-verification rounds: the same output distribution as the token rule above with at least
+// its expected accepted length. With P_c the processed target and Q_c the proposal law of
+// column c, p_0 = 1 and p_i = min(p_{i-1} P_{i-1}(d_{i-1}) / Q_{i-1}(d_{i-1}), 1) (0 for a draft
+// outside its candidates, which was not drawn from Q). Each prefix i < extent passes when
+// eta_i <= S_i / (S_i + 1 - p_i), S_i = sum_x max(p_i P_i(x) - Q_i(x), 0) over column i's support,
+// and the full chain when eta_extent <= p_extent; eta_i is the token rule's uniform (seed, L+i,
+// SpeculativeAccept, 0). The longest passing prefix tau is accepted: a bonus from P_extent when it
+// is the chain, else a correction from max(p_tau P_tau - Q_tau, 0) with the token rule's keys.
+__device__ __forceinline__ void speculative_sparse_warp_block_accept(
+    SamplingWorkspace workspace, const int* drafts, const int* candidate_ids,
+    const float* proposal_q, const SamplingConfig& cfg, int k, int row, int extent, int* lengths,
+    int* anchors, int* licensed_tokens, int* licensed_counts, int* accepted) {
+    const int lane       = threadIdx.x & 31;
+    const int old_length = lengths[row];
+    // Column c's support entry at `lane` (zero weight past the support).
+    const auto support_entry = [&](int column, int& token, float& weight) {
+        const int n = workspace.dist_support[column];
+        token       = 0;
+        weight      = 0.0f;
+        if (lane < n) {
+            const int at = sampling_dist_offset(column, lane);
+            token        = workspace.dist_idx[at];
+            weight       = workspace.dist_prob[at];
+        }
+        return n;
+    };
+    const auto q_of = [&](int column, int token) {
+        const int at = (row * k + column) * kSparseSpeculativeCandidates;
+        return speculative_sparse_probability(candidate_ids + at, proposal_q + at, token);
+    };
+    float p     = 1.0f; // p_{i-1}, then p_i
+    float p_tau = 1.0f;
+    int tau     = 0;
+    for (int i = 1; i <= extent; ++i) {
+        const int column = i - 1;
+        const int d      = drafts[row * k + column];
+        int token;
+        float weight;
+        const int n         = support_entry(column, token, weight);
+        const unsigned hit  = __ballot_sync(0xffffffffU, lane < n && token == d);
+        const float pd      = hit ? __shfl_sync(0xffffffffU, weight, __ffs(hit) - 1) : 0.0f;
+        const float qd      = q_of(column, d);
+        p                   = qd > 0.0f ? fminf(p * pd / qd, 1.0f) : 0.0f;
+        float threshold     = p;
+        if (i < extent) {
+            int next_token;
+            float next_weight;
+            (void)support_entry(i, next_token, next_weight);
+            const float excess =
+                next_weight > 0.0f ? fmaxf(p * next_weight - q_of(i, next_token), 0.0f) : 0.0f;
+            const float s     = warp_sum(excess);
+            const float denom = s + 1.0f - p;
+            threshold         = denom > 0.0f ? s / denom : 1.0f;
+        }
+        const float eta =
+            sampling_uniform(cfg.seed, old_length + i, kSamplePurposeSpeculativeAccept, 0);
+        if (eta <= threshold) {
+            tau   = i;
+            p_tau = p;
+        }
+    }
+    int token;
+    float weight;
+    const int n = support_entry(tau, token, weight);
+    if (tau < extent && weight > 0.0f) weight = fmaxf(p_tau * weight - q_of(tau, token), 0.0f);
+    float cdf = weight;
+#pragma unroll
+    for (int offset = 1; offset < 32; offset *= 2) {
+        const float earlier = __shfl_up_sync(0xffffffffU, cdf, offset);
+        if (lane >= offset) cdf += earlier;
+    }
+    const float mass = __shfl_sync(0xffffffffU, cdf, 31);
+    const int purpose =
+        tau < extent ? kSamplePurposeSpeculativeCorrection : kSamplePurposeSpeculativeBonus;
+    const float u           = sampling_uniform(cfg.seed, old_length + tau + 1, purpose, 0);
+    const float goal        = u * mass;
+    const unsigned positive = __ballot_sync(0xffffffffU, lane < n && weight > 0.0f);
+    const unsigned below    = __ballot_sync(0xffffffffU, lane < n && weight > 0.0f && goal < cdf);
+    const int selected      = !(mass > 0.0f) ? 0
+                              : below        ? __ffs(below) - 1
+                              : positive     ? 31 - __clz(positive)
+                                             : 0;
+    const int terminal      = __shfl_sync(0xffffffffU, token, selected);
+    speculative_sparse_warp_store(drafts, k, row, tau, terminal, lengths, anchors, licensed_tokens,
                                   licensed_counts, accepted);
 }
 
@@ -299,6 +438,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
             const int t_star = row_targets[a];
             speculative_store_accept_result<true>(row_drafts, k, row, a, t_star, lengths, anchors,
                                                   row_tokens, licensed_counts, accepted, &cfg);
+            speculative_check_targets(row_targets, row_logits, physical_rows, a, cfg.nonfinite);
         }
         return;
     }
@@ -357,9 +497,9 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
                 __syncthreads();
             }
             if (tid == 0) {
-                if (cfg.mask.words && !isfinite(red_val[0])) { asm volatile("trap;"); }
-                const int selected = red_idx[0];
-                if (i < extent && selected == row_drafts[i]) {
+                const bool finite  = isfinite(red_val[0]);
+                const int selected = finite ? red_idx[0] : sampling_report_nonfinite(cfg);
+                if (finite && i < extent && selected == row_drafts[i]) {
                     a_sh = i + 1;
                 } else {
                     tstar_sh = selected;
@@ -524,14 +664,17 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_to
     sampling_store_tile_topk(keys, cap, workspace, col, partial, topk_storage.fp32);
 }
 
-template <bool SparseProposal>
+// BlockVerification (sparse proposals only): sampled rows other than Gumbel ones accept by block
+// verification (speculative_sparse_warp_block_accept) instead of token by token.
+template <class Logit, bool SparseProposal, bool BlockVerification = false>
 __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group_finalize_kernel(
     const std::int32_t* target_tokens, const std::int32_t* drafts,
     const std::int32_t* candidate_ids, const float* proposal_q, const std::int32_t* current_extents,
     std::int32_t* lengths, std::int32_t* anchors, std::int32_t* licensed_tokens,
     std::int32_t* licensed_counts, std::int32_t* accepted, const SamplingConfig* configs,
     std::int32_t token_domain, std::int32_t cols, std::int32_t partial_blocks,
-    std::int32_t group_count, SamplingWorkspace workspace, std::size_t workspace_row_stride) {
+    std::int32_t group_count, SamplingWorkspace workspace, std::size_t workspace_row_stride,
+    const Logit* logits, std::int32_t physical_rows) {
     pdl::enter();
     const int row   = static_cast<int>(blockIdx.z);
     const int group = static_cast<int>(blockIdx.x);
@@ -550,11 +693,13 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
     const bool penalties = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
 
     if (greedy && !penalties && cfg.mask.words == nullptr) {
+        const Logit* row_logits = logits + static_cast<std::int64_t>(row) * cols * physical_rows;
         if constexpr (SparseProposal) {
             if (tid < 32 && col == 0 && group == 0)
                 speculative_sparse_warp_greedy(target_tokens, drafts, lengths, anchors,
                                                licensed_tokens, licensed_counts, accepted, row,
-                                               extent, k);
+                                               extent, k, row_logits, physical_rows,
+                                               cfg.nonfinite);
         } else {
 
             if (tid == 0 && col == 0 && group == 0) {
@@ -564,6 +709,8 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
                 speculative_store_accept_result<!SparseProposal>(row_drafts, k, row, a, t_star,
                                                                  lengths, anchors, row_tokens,
                                                                  licensed_counts, accepted, &cfg);
+                speculative_check_targets(row_targets, row_logits, physical_rows, a,
+                                          cfg.nonfinite);
             }
         }
         return;
@@ -636,7 +783,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
     }
     __syncthreads();
 
-    if (tid == 0 && greedy && cfg.mask.words && !isfinite(cand_val[0])) { asm volatile("trap;"); }
+    if (tid == 0 && greedy && !isfinite(cand_val[0])) { cand_idx[0] = sampling_report_nonfinite(cfg); }
 
     if constexpr (SparseProposal) {
         __shared__ int last_column;
@@ -668,10 +815,17 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
             last_column = atomicAdd(workspace.speculative_finalize_count, 1) + 1 == extent + 1;
         }
         __syncthreads();
-        if (last_column && tid < 32)
-            speculative_sparse_warp_accept(workspace, drafts, candidate_ids, proposal_q, cfg, k,
-                                           row, extent, false, lengths, anchors, licensed_tokens,
-                                           licensed_counts, accepted);
+        if (last_column && tid < 32) {
+            if (BlockVerification && !cfg.gumbel_max) {
+                speculative_sparse_warp_block_accept(workspace, drafts, candidate_ids, proposal_q,
+                                                     cfg, k, row, extent, lengths, anchors,
+                                                     licensed_tokens, licensed_counts, accepted);
+            } else {
+                speculative_sparse_warp_accept(workspace, drafts, candidate_ids, proposal_q, cfg, k,
+                                               row, extent, false, lengths, anchors,
+                                               licensed_tokens, licensed_counts, accepted);
+            }
+        }
         if (last_column && tid == 0) *workspace.speculative_finalize_count = 0;
         return;
     } else {
@@ -846,13 +1000,16 @@ speculative_tree_warp_store(const int* drafts, int row, int columns, int accepte
     }
 }
 
-// Greedy tree walk: accept the child equal to the column's target token, else emit it.
-template <class TargetAt>
+// Greedy tree walk: accept the child equal to the column's target token, else emit it. With
+// `row_logits` (raw argmax targets) the walked columns are checked as speculative_check_targets
+// does: lane i <= a holds the i-th column of the path, the last one the terminal's.
+template <class TargetAt, class Logit = __nv_bfloat16>
 __device__ __forceinline__ void
 speculative_tree_warp_greedy(const SpeculativeTreeRow& tree, TargetAt target_at, const int* drafts,
                              int row, int columns, int* lengths, int* anchors, int* licensed_tokens,
                              int* licensed_counts, int* accepted, int* accepted_path,
-                             int* accepted_branch) {
+                             int* accepted_branch, const Logit* row_logits = nullptr,
+                             int physical_rows = 0, std::int32_t* nonfinite = nullptr) {
     const int lane = threadIdx.x & 31;
     const int k    = columns - 1;
     int v = 0, a = 0, path_reg = lane == 0 ? 0 : -1, terminal = 0;
@@ -876,6 +1033,11 @@ speculative_tree_warp_greedy(const SpeculativeTreeRow& tree, TargetAt target_at,
     speculative_tree_warp_store(drafts, row, columns, a, path_reg, terminal, lengths, anchors,
                                 licensed_tokens, licensed_counts, accepted, accepted_path,
                                 accepted_branch);
+    if (row_logits != nullptr && nonfinite != nullptr) { // uniform across the warp
+        const bool finite = lane > a || speculative_target_finite(row_logits, physical_rows,
+                                                                  path_reg, target_at(path_reg));
+        if (__ballot_sync(0xffffffffU, !finite) != 0U && lane == 0) { *nonfinite = 1; }
+    }
 }
 
 // Recursive rejection over the tree (see speculative_accept_sparse_tree). Weights stay one warp
@@ -949,8 +1111,9 @@ speculative_tree_warp_accept(SamplingWorkspace workspace, const SpeculativeTreeR
             const float u =
                 sampling_uniform(cfg.seed, old_length + tree.depth[s],
                                  kSamplePurposeSpeculativeAccept, static_cast<std::uint32_t>(j));
-            // The chain test: a zero-probability proposal is always accepted.
-            const bool accept_child = rx >= Qx || u * Qx < rx;
+            // The chain test. A sibling outside the candidates (Q = 0) was not drawn from q: it is
+            // rejected and leaves the residual unchanged.
+            const bool accept_child = Qx > 0.0f && (rx >= Qx || u * Qx < rx);
             if (accept_child) {
                 v = s;
                 ++a;
@@ -979,6 +1142,196 @@ speculative_tree_warp_accept(SamplingWorkspace workspace, const SpeculativeTreeR
                                 accepted_branch);
 }
 
+// One node of a transport row as UniVer's allocation sees it (warp-wide; per-lane fields hold this
+// lane's entry of the node's processed target support, lane < n). The node's children are its
+// deterministic ranks and at most one residual draw (the row's sampled bit); a draw whose rank has
+// no q_v mass, or with no mass left outside the deterministic ranks, could not come from q' and
+// counts as deterministic.
+struct SpeculativeTransportNode {
+    int n;            // the target support size
+    int token;        // this lane's support token
+    float w;          // its target probability
+    float excess;     // max(pt p(token) - q'(token), 0)
+    float scale;      // (1 - a_u) / Z_v, 0 when it vanishes
+    float a_residual; // a_u, 0 without a residual draw
+    int residual;     // the residual draw's column, -1 without one
+};
+
+__device__ __forceinline__ SpeculativeTransportNode
+speculative_transport_node(const SamplingWorkspace& workspace, const SpeculativeTreeRow& tree, const int* drafts,
+                           const int* candidate_ids, const float* proposal_q, int row, int k, int v, float pt) {
+    const int lane = threadIdx.x & 31;
+    SpeculativeTransportNode node{};
+    node.n     = workspace.dist_support[v];
+    node.token = 0;
+    node.w     = 0.0f;
+    if (lane < node.n) {
+        const int at = sampling_dist_offset(v, lane);
+        node.token   = workspace.dist_idx[at];
+        node.w       = workspace.dist_prob[at];
+    }
+    // Every child of v stores v's full law and candidates.
+    const int first = tree.first_child[v];
+    const int q_at  = (row * k + first - 1) * kSparseSpeculativeCandidates;
+    const int cand  = lane < kSparseSpeculativeCandidates ? candidate_ids[q_at + lane] : -1;
+    const float qv  = lane < kSparseSpeculativeCandidates ? proposal_q[q_at + lane] : 0.0f;
+    unsigned deterministic = 0U;
+    int residual_rank = -1, residual = -1;
+    for (int s = first; s >= 0; s = tree.next_sibling[s]) {
+        const int x            = drafts[row * k + s - 1];
+        const unsigned x_lane  = __ballot_sync(0xffffffffU, lane < kSparseSpeculativeCandidates && cand == x);
+        const int rank         = x_lane ? __ffs(x_lane) - 1 : -1;
+        const bool residual_bit = ((tree.sampled >> s) & 1U) != 0U;
+        if (residual_bit && rank >= 0) {
+            residual_rank = rank;
+            residual      = s;
+        } else if (rank >= 0) {
+            deterministic |= 1U << rank;
+        }
+    }
+    const float mass =
+        warp_sum(lane < kSparseSpeculativeCandidates && ((deterministic >> lane) & 1U) == 0U ? qv : 0.0f);
+    const float q_residual = residual_rank >= 0 ? __shfl_sync(0xffffffffU, qv, residual_rank) : 0.0f;
+    if (residual_rank >= 0 && !(mass > 0.0f && q_residual > 0.0f)) {
+        deterministic |= 1U << residual_rank;
+        residual_rank = -1;
+        residual      = -1;
+    }
+    // q' of this lane's support token: q_v / R_v outside the deterministic ranks.
+    float q_token  = 0.0f;
+    int token_rank = -1;
+#pragma unroll
+    for (int c = 0; c < kSparseSpeculativeCandidates; ++c) {
+        const int id  = __shfl_sync(0xffffffffU, cand, c);
+        const float q = __shfl_sync(0xffffffffU, qv, c);
+        if (lane < node.n && id == node.token && token_rank < 0) {
+            q_token    = q;
+            token_rank = c;
+        }
+    }
+    const float q_prime = residual_rank >= 0 && token_rank >= 0 && ((deterministic >> token_rank) & 1U) == 0U
+                              ? q_token / mass
+                              : 0.0f;
+    node.excess   = lane < node.n ? fmaxf(pt * node.w - q_prime, 0.0f) : 0.0f;
+    const float z = 1.0f - pt + warp_sum(node.excess);
+    if (residual_rank >= 0) {
+        const int u           = __shfl_sync(0xffffffffU, cand, residual_rank);
+        const unsigned u_lane = __ballot_sync(0xffffffffU, lane < node.n && node.token == u);
+        const float pu        = u_lane ? __shfl_sync(0xffffffffU, node.w, __ffs(u_lane) - 1) : 0.0f;
+        node.a_residual       = fminf(1.0f, pt * pu / (q_residual / mass));
+    }
+    const float keep = 1.0f - node.a_residual;
+    node.scale       = keep > 0.0f && z > 0.0f ? keep / z : 0.0f;
+    node.residual    = residual;
+    return node;
+}
+
+// UniVer verification of a transport row (Weng, Hu, Yairi, arXiv 2605.04543, Algorithm 1; see
+// speculative_accept_sparse_tree). Allocation runs parents before children: lane c ends with
+// column c's prefix probability pt and its decision threshold. Then every column draws its uniform,
+// and the first passing column in post-order (children's subtrees in sibling order, then the node;
+// the anchor, last, always passes) ends the path: a leaf emits the bonus from its target, any other
+// node the correction from its excess over the tokens that are not its children.
+__device__ __forceinline__ void
+speculative_tree_warp_transport(SamplingWorkspace workspace, const SpeculativeTreeRow& tree,
+                                const int* drafts, const int* candidate_ids, const float* proposal_q,
+                                const SamplingConfig& cfg, int row, int columns, int* lengths,
+                                int* anchors, int* licensed_tokens, int* licensed_counts,
+                                int* accepted, int* accepted_path, int* accepted_branch) {
+    const int lane       = threadIdx.x & 31;
+    const int k          = columns - 1;
+    const int old_length = lengths[row];
+    const int nodes      = tree.nodes;
+    float pt = lane == 0 ? 1.0f : 0.0f, threshold = 0.0f;
+    for (int v = 0; v < nodes; ++v) {
+        const float pt_v = __shfl_sync(0xffffffffU, pt, v);
+        const int first  = tree.first_child[v];
+        if (first < 0) {
+            if (lane == v) threshold = pt_v;
+            continue;
+        }
+        const SpeculativeTransportNode node =
+            speculative_transport_node(workspace, tree, drafts, candidate_ids, proposal_q, row, k, v, pt_v);
+        float before = 0.0f; // the a of v's earlier children
+        for (int s = first; s >= 0; s = tree.next_sibling[s]) {
+            float a = node.a_residual;
+            if (s != node.residual) {
+                const int x           = drafts[row * k + s - 1];
+                const unsigned x_lane = __ballot_sync(0xffffffffU, lane < node.n && node.token == x);
+                const float px        = x_lane ? __shfl_sync(0xffffffffU, node.w, __ffs(x_lane) - 1) : 0.0f;
+                a                     = pt_v * px * node.scale;
+            }
+            const float rest = 1.0f - before;
+            if (lane == s) pt = rest > 0.0f ? fminf(1.0f, a / rest) : 0.0f;
+            before += a;
+        }
+        const float rest   = 1.0f - before;
+        const float reject = node.scale * (1.0f - pt_v);
+        const float pass   = rest > 0.0f ? fminf(1.0f, fmaxf(0.0f, 1.0f - reject / rest)) : 0.0f;
+        if (lane == v) threshold = v == 0 ? 1.0f : pass; // the anchor's reject is 0: it always passes
+    }
+    // Post-order index of each column (every lane walks the tree and keeps its own).
+    int post = 64;
+    {
+        const auto descend = [&](int x) {
+            while (tree.first_child[x] >= 0) x = tree.first_child[x];
+            return x;
+        };
+        int c = descend(0), index = 0;
+        for (;;) {
+            if (c == lane) post = index;
+            ++index;
+            if (c == 0) break;
+            const int s = tree.next_sibling[c];
+            c           = s >= 0 ? descend(s) : tree.parent[c];
+        }
+    }
+    bool passes = false;
+    if (lane < nodes) {
+        const float eta = sampling_uniform(cfg.seed, old_length + tree.depth[lane] + 1,
+                                           kSamplePurposeSpeculativeAccept, static_cast<std::uint32_t>(lane));
+        passes          = lane == 0 || eta < threshold;
+    }
+    int first_pass = passes ? post : 64;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        first_pass = min(first_pass, __shfl_xor_sync(0xffffffffU, first_pass, offset));
+    }
+    const unsigned chosen = __ballot_sync(0xffffffffU, passes && post == first_pass);
+    const int v           = chosen ? __ffs(chosen) - 1 : 0;
+    const int a_count     = tree.depth[v];
+    int path_reg          = -1;
+    for (int c = v, i = a_count; c >= 0; c = tree.parent[c], --i) {
+        if (lane == i) path_reg = c;
+    }
+    int terminal = 0;
+    if (tree.first_child[v] < 0) {
+        const int n = workspace.dist_support[v];
+        int token   = 0;
+        float w     = 0.0f;
+        if (lane < n) {
+            const int at = sampling_dist_offset(v, lane);
+            token        = workspace.dist_idx[at];
+            w            = workspace.dist_prob[at];
+        }
+        const float u = sampling_uniform(cfg.seed, old_length + a_count + 1, kSamplePurposeSpeculativeBonus, 0);
+        terminal      = speculative_tree_pick(token, w, n, u);
+    } else {
+        const float pt_v = __shfl_sync(0xffffffffU, pt, v);
+        const SpeculativeTransportNode node =
+            speculative_transport_node(workspace, tree, drafts, candidate_ids, proposal_q, row, k, v, pt_v);
+        bool child = false;
+        for (int s = tree.first_child[v]; s >= 0; s = tree.next_sibling[s]) {
+            child = child || (lane < node.n && node.token == drafts[row * k + s - 1]);
+        }
+        const float weight = lane < node.n && !child ? node.excess : 0.0f;
+        const float u      = sampling_uniform(cfg.seed, old_length + a_count + 1, kSamplePurposeSpeculativeCorrection, 0);
+        terminal           = speculative_tree_pick(node.token, weight, node.n, u);
+    }
+    speculative_tree_warp_store(drafts, row, columns, a_count, path_reg, terminal, lengths, anchors,
+                                licensed_tokens, licensed_counts, accepted, accepted_path, accepted_branch);
+}
+
 // A chain row of a tree round: the chain acceptance above, then its main-chain path.
 __device__ __forceinline__ void speculative_tree_chain_path(int row, int columns,
                                                             const int* accepted, int* accepted_path,
@@ -990,22 +1343,28 @@ __device__ __forceinline__ void speculative_tree_chain_path(int row, int columns
     if (lane == 0) accepted_branch[row] = -1;
 }
 
+template <class Logit>
 __global__ __launch_bounds__(256) void speculative_accept_tree_warp_greedy_kernel(
-    const int* target_tokens, const int* drafts, const int* current_extents, int* lengths,
-    int* anchors, int* licensed_tokens, int* licensed_counts, int* accepted, int* accepted_path,
-    int* accepted_branch, const SpeculativeTreeRow* trees, int columns) {
+    const int* target_tokens, const Logit* logits, const int* drafts,
+    const int* current_extents, int* lengths, int* anchors, int* licensed_tokens,
+    int* licensed_counts, int* accepted, int* accepted_path, int* accepted_branch,
+    const SpeculativeTreeRow* trees, const SamplingConfig* configs, int physical_rows,
+    int columns) {
     const int row                  = threadIdx.x / 32;
     const SpeculativeTreeRow& tree = trees[row];
+    const Logit* row_logits        = logits + static_cast<std::int64_t>(row) * columns * physical_rows;
+    std::int32_t* const nonfinite   = configs[row].nonfinite;
     if (tree.tree != 0) {
         speculative_tree_warp_greedy(
             tree, [&](int column) { return target_tokens[row * columns + column]; }, drafts, row,
             columns, lengths, anchors, licensed_tokens, licensed_counts, accepted, accepted_path,
-            accepted_branch);
+            accepted_branch, row_logits, physical_rows, nonfinite);
         return;
     }
     const int chain = min(columns - 1, max(0, current_extents[row]));
     speculative_sparse_warp_greedy(target_tokens, drafts, lengths, anchors, licensed_tokens,
-                                   licensed_counts, accepted, row, chain, columns - 1);
+                                   licensed_counts, accepted, row, chain, columns - 1, row_logits,
+                                   physical_rows, nonfinite);
     speculative_tree_chain_path(row, columns, accepted, accepted_path, accepted_branch);
 }
 
@@ -1090,6 +1449,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_tree_sampling_parti
     sampling_store_tile_topk(keys, cap, workspace, col, partial, topk_storage.fp32);
 }
 
+template <class Logit>
 __launch_bounds__(kSamplerGroupBlock) __global__
     void speculative_tree_sampling_group_finalize_kernel(
         const std::int32_t* target_tokens, const std::int32_t* drafts,
@@ -1099,7 +1459,8 @@ __launch_bounds__(kSamplerGroupBlock) __global__
         std::int32_t* accepted_path, std::int32_t* accepted_branch, const SamplingConfig* configs,
         std::int32_t token_domain, std::int32_t partial_blocks, std::int32_t group_count,
         SamplingWorkspace workspace, std::size_t workspace_row_stride,
-        const SpeculativeTreeRow* trees, int cols) {
+        const SpeculativeTreeRow* trees, int cols, const Logit* logits,
+        std::int32_t physical_rows) {
     pdl::enter();
     const int row                  = static_cast<int>(blockIdx.z);
     const int group                = static_cast<int>(blockIdx.x);
@@ -1119,15 +1480,17 @@ __launch_bounds__(kSamplerGroupBlock) __global__
 
     if (greedy && !penalties) {
         if (tid < 32 && col == 0 && group == 0) {
+            const Logit* row_logits = logits + static_cast<std::int64_t>(row) * cols * physical_rows;
             if (tree_row) {
                 speculative_tree_warp_greedy(
                     tree, [&](int column) { return target_tokens[row * cols + column]; }, drafts,
                     row, cols, lengths, anchors, licensed_tokens, licensed_counts, accepted,
-                    accepted_path, accepted_branch);
+                    accepted_path, accepted_branch, row_logits, physical_rows, cfg.nonfinite);
             } else {
                 speculative_sparse_warp_greedy(target_tokens, drafts, lengths, anchors,
                                                licensed_tokens, licensed_counts, accepted, row,
-                                               chain, k);
+                                               chain, k, row_logits, physical_rows,
+                                               cfg.nonfinite);
                 speculative_tree_chain_path(row, cols, accepted, accepted_path, accepted_branch);
             }
         }
@@ -1200,7 +1563,10 @@ __launch_bounds__(kSamplerGroupBlock) __global__
     __syncthreads();
 
     if (greedy) {
-        if (tid == 0) workspace.dist_idx[sampling_dist_offset(col, 0)] = cand_idx[0];
+        if (tid == 0) {
+            workspace.dist_idx[sampling_dist_offset(col, 0)] =
+                isfinite(cand_val[0]) ? cand_idx[0] : sampling_report_nonfinite(cfg);
+        }
     } else {
         sampling_normalize_support(cfg, cand_val, cand_idx, prob, &n_support, cap);
         if (tid == 0) {
@@ -1225,6 +1591,10 @@ __launch_bounds__(kSamplerGroupBlock) __global__
                 [&](int column) { return workspace.dist_idx[sampling_dist_offset(column, 0)]; },
                 drafts, row, cols, lengths, anchors, licensed_tokens, licensed_counts, accepted,
                 accepted_path, accepted_branch);
+        } else if (tree_row && tree.transport != 0 && !cfg.gumbel_max) {
+            speculative_tree_warp_transport(workspace, tree, drafts, candidate_ids, proposal_q, cfg,
+                                            row, cols, lengths, anchors, licensed_tokens,
+                                            licensed_counts, accepted, accepted_path, accepted_branch);
         } else if (tree_row) {
             speculative_tree_warp_accept(workspace, tree, drafts, candidate_ids, proposal_q, cfg,
                                          row, cols, lengths, anchors, licensed_tokens,

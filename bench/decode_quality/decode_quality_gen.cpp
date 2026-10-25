@@ -31,7 +31,7 @@
 //                                  [draft-model=FILE [drafts=N] [auto] [full-head]] (Qwen3.8-Flash-Next DFlash2)
 //                                  [temperature=T] [logits=fp32|bf16] (the head's logits; bf16 for comparisons)
 //                                  [ngram-volume=FILE] (Qwen3.8-Flash-Next; default <artifact>.ngram)
-//                                  [route-trace=FILE] (Qwen3.8-Flash-Next's route trace, route_trace.h)
+//                                  [route-trace=FILE] (offloaded experts' route trace, route_trace.h)
 // Output, one line per segment: <corpus token offset> <prompt_tokens> <generated ids...>
 
 #include "infernix/engine.h"
@@ -244,7 +244,8 @@ int main(int argc, char** argv) {
             return 2;
         }
 #else
-        // Qwen3.8-Flash-Next: the per-round expert routes for tools/expert_cache_replay/host_tier.py.
+        // Offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B): the per-round expert routes for
+        // tools/expert_cache_replay (host_tier.py, replay.py).
         options.route_trace_path = route_trace;
         options.fast_paths = !reproducible;
         for (const std::string& name : paths) {

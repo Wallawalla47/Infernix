@@ -45,6 +45,13 @@ inline uint3 init_fastdiv_values(std::uint64_t d64) {
 
 #ifdef __CUDACC__
 
+// fp16-gdn-state: a state value before its round to FP16, clamped to FP16's largest finite magnitude
+// so the stored state saturates rather than overflowing to infinity (a NaN stays NaN).
+static __device__ __forceinline__ float saturate_fp16_state(float value) {
+    constexpr float kMaximum = 65504.0f;
+    return value == value ? fminf(fmaxf(value, -kMaximum), kMaximum) : value;
+}
+
 static __device__ __forceinline__ std::uint32_t fastdiv(std::uint32_t n, uint3 fastdiv_values) {
     const std::uint32_t hi = __umulhi(n, fastdiv_values.x);
     return (hi + n) >> fastdiv_values.y;

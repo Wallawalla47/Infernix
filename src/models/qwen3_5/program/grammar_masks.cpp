@@ -23,8 +23,8 @@ ops::SamplingMask ProgramImpl::fill_grammar_mask(runtime::TokenMaskProvider* pro
                                   (drafts.size() + 1) * words);
     grammar_dead_positions[row] = provider->fill(row, drafts, host);
     auto* device_words          = static_cast<std::uint32_t*>(grammar_masks_device.data) + offset;
-    CUDA_CHECK(cudaMemcpyAsync(device_words, host.data(), host.size_bytes(), cudaMemcpyHostToDevice,
-                               device.stream));
+    // Pinned and read by the SMs, so it never waits on the copy engine (W7).
+    upload_pinned(device_words, host.data(), host.size_bytes(), device.stream);
     provider->uploaded(row, host.size_bytes());
     return {device_words, static_cast<std::int32_t>(words)};
 }

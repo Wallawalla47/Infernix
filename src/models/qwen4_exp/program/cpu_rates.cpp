@@ -17,7 +17,9 @@
 
 #include "models/qwen4_exp/program/program_impl.h"
 
+#include "core/cpu_topology.h"
 #include "core/host_load.h"
+#include "core/temporary_switches.h"
 
 #include <algorithm>
 #include <chrono>
@@ -72,10 +74,15 @@ void ProgramImpl::measure_cpu_rate(std::uint64_t record_stride) {
         measured = !held[l].empty();
     }
     if (measured) {
+        // The service's team and placement (its worker 0, the service thread, is this thread here).
         moe::CpuExpertTeam team({.workers    = static_cast<int>(cpu_workers()),
                                  .max_jobs   = kRateJobs,
                                  .activation = layers.front().moe.bank->activation,
-                                 .ggml       = ggml_format(*layers.front().moe.bank).valid()});
+                                 .narrow_a16 = cpu_narrow_a16(), // the service's arithmetic sets its rates
+                                 .ggml       = ggml_format(*layers.front().moe.bank).valid(),
+                                 .cpus       = placement_.cpus,
+                                 .shared_x   = temporary_switches::flag("INFERNIX_TMP_CPU_SHARED_X")});
+        const std::uint64_t caller_cpus = set_current_thread_cpus(placement_.cpus.empty() ? 0 : placement_.cpus.front());
         std::vector<std::uint16_t> x(static_cast<std::size_t>(moe::kHidden) * kNarrowColumns);
         std::vector<std::uint16_t> y(static_cast<std::size_t>(moe::kHidden) * kRateJobs * kNarrowColumns);
         for (std::size_t i = 0; i < x.size(); ++i) { x[i] = static_cast<std::uint16_t>(0x3C00U + (i * 7919U) % 640U); }
@@ -111,7 +118,7 @@ void ProgramImpl::measure_cpu_rate(std::uint64_t record_stride) {
             for (int repeat = 0; repeat < kRepeats; ++repeat) {
                 for (int i = 0; i < kLoadCopies; ++i) {
                     const auto& first = held.front();
-                    CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(staging_.p) + (i % kStagingSlots) * record_stride,
+                    CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(staging_.p) + (i % plan_.staging_slots) * record_stride,
                                                record_of(0, first[static_cast<std::size_t>(i) % first.size()]),
                                                source_stride, cudaMemcpyHostToDevice, stream));
                 }
@@ -143,12 +150,31 @@ void ProgramImpl::measure_cpu_rate(std::uint64_t record_stride) {
             if (quiet || std::chrono::steady_clock::now() - began >= kRetryBudget) { break; }
             std::this_thread::sleep_for(kRetryPause);
         }
+        // TEMPORARY (INFERNIX_TMP_MACHINE_CALIBRATION, candidates §7.3 D11): a rate far below this
+        // configuration's saved one is measured once more (one quiet attempt), and the saved rate kept
+        // when that is low too.
+        if (const auto calibration = MachineCalibration::from_switch()) {
+            const std::string key = "cpu|" + std::to_string(cpu_workers()) + "|" + placement_.text + "|" +
+                                    std::to_string(static_cast<int>(cpu_narrow_a16())) + "|" +
+                                    std::to_string(ggml_format(*layers.front().moe.bank).valid() ? 1 : 0) + "|" +
+                                    std::to_string(record_stride) + (tier_ ? "|tier" : "");
+            std::string note;
+            expert_rate = calibration->resolve(key + "|experts", expert_rate, [&] { return rate(1, 0); }, note);
+            if (!note.empty()) { calibration_note_ = "experts/s " + note; }
+            note.clear();
+            column_rate = calibration->resolve(key + "|columns", column_rate,
+                                               [&] { return rate(kNarrowColumns, (kRepeats + 1) * kRounds) * kNarrowColumns; },
+                                               note);
+            if (!note.empty()) { calibration_note_ += (calibration_note_.empty() ? "" : "; ") + ("columns/s " + note); }
+        }
         cpu_expert_rate_ = expert_rate;
         cpu_column_rate_ = column_rate;
+        (void)set_current_thread_cpus(caller_cpus);
         CUDA_CHECK(cudaStreamDestroy(stream));
     }
     std::string how = measured ? (tier_ ? "measured on the SSD tier's RAM copies" : "measured")
                                : "reference: no expert records in RAM yet";
+    if (!calibration_note_.empty()) { how += "; calibration: " + calibration_note_; }
     char share[160];
     if (measured && attempts > 1) {
         std::snprintf(share, sizeof(share), " after %d attempts: other processes used %.0f %% of the CPU at first, %.0f %% last",
@@ -158,12 +184,21 @@ void ProgramImpl::measure_cpu_rate(std::uint64_t record_stride) {
         std::snprintf(share, sizeof(share), "; other processes used %.0f %% of the CPU", 100.0 * last_share);
         how += share;
     }
-    char text[512];
+    char kept[160];
+    if (const int share = pcie_share(); share > 0) {
+        std::snprintf(kept, sizeof(kept), "%d/256 (INFERNIX_TMP_LINK_SHARE; the divisor rule's 1/%d)", share, pcie_divisor());
+    } else {
+        std::snprintf(kept, sizeof(kept), "1/%d", pcie_divisor());
+    }
+    char text[640];
     std::snprintf(text, sizeof(text),
-                  "CPU expert team: %u workers, %.0f experts/s and %.0f expert columns/s (%s); decode misses kept on "
-                  "the link: 1/%d",
-                  cpu_workers(), cpu_expert_rate_, cpu_column_rate_, how.c_str(), pcie_divisor());
-    diagnostic(text, DiagnosticLevel::Debug);
+                  "CPU expert team: %u workers%s, %.0f experts/s and %.0f expert columns/s (%s); decode misses kept on "
+                  "the link: %s",
+                  cpu_workers(),
+                  cpu_narrow_a16() == moe::NarrowA16::kA4Residual ? " (two-term A4 activations)" : "",
+                  cpu_expert_rate_, cpu_column_rate_, how.c_str(), kept);
+    // An A/B arm of the link share shows its choice without debug logging.
+    diagnostic(text, pcie_share() > 0 ? DiagnosticLevel::Info : DiagnosticLevel::Debug);
     if (measured && !quiet) {
         diagnostic("the CPU expert team's rates were measured while other processes kept the CPU busy (" +
                        std::to_string(static_cast<int>(100.0 * last_share + 0.5)) +

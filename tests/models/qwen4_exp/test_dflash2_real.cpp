@@ -9,6 +9,11 @@
 //                 drafts are accepted (a drafter reading wrong features accepts next to nothing).
 //   concurrency   Four greedy requests in flight on a four-lane engine (plain rounds of several rows,
 //                 whose catch-up writes several rings at once) give the one-lane tokens.
+//   pairs         With dflash2-pairs (two-row rounds share one proposal and one verify width), at
+//                 DFlash2 7 (pair rounds verify two drafts per row) and with --draft-tokens auto (the
+//                 width from both rows' calibrated drafts): two greedy requests in flight on a two-lane
+//                 engine give the one-lane tokens, and their rounds draft; N seeded requests sampled two
+//                 at a time match plain sampling's distribution as above.
 //   tap resume    With the prefix cache (512-token calls), a request resuming from another's tap at
 //                 1024 restores the drafter's context ring with the rest of the state: its tokens and
 //                 its drafted and accepted counts equal a cold run's (same call boundaries).
@@ -346,6 +351,44 @@ int main(int argc, char** argv) {
                 failures += check(got == plain_greedy.tokens[i % 2],
                                   "concurrent request " + std::to_string(i) + " equals one-lane decoding (" +
                                       first_difference(got, plain_greedy.tokens[i % 2]) + ")");
+            }
+        }
+        // dflash2-pairs: both greedy prompts in flight together decode in two-row rounds, which stay
+        // on the column-invariant routes (at most 2 x 3 columns), so each equals its one-lane run.
+        for (const bool automatic : {false, true}) {
+            std::printf("== DFlash2 %s, dflash2-pairs, two lanes, two greedy requests in flight\n",
+                        automatic ? "auto" : "7 (pair rounds verify 2)");
+            infernix::EngineOptions options       = engine_options(setup, Drafter::TextHead, 2);
+            options.fast_path_candidates          = {infernix::FastPath::DFlash2Pairs};
+            options.speculative.draft_tokens_auto = automatic;
+            infernix::Engine engine(std::move(options));
+            const auto& paths = engine.load_summary().fast_paths;
+            failures += check(std::find(paths.begin(), paths.end(), "dflash2-pairs") != paths.end() &&
+                                  !engine.load_summary().request_invariant,
+                              "the engine runs dflash2-pairs and reports its requests coupled");
+            std::vector<infernix::GenerationHandle> handles;
+            for (const char* text : kGreedyPrompts) {
+                handles.push_back(engine.submit(engine.prepare_tokens(engine.tokenize_text(text)), request(0.0F, 0, 256)));
+            }
+            infernix::SpeculativeStats paired;
+            for (std::size_t i = 0; i < handles.size(); ++i) {
+                const infernix::GenerationResult result = handles[i].wait();
+                add(paired, result.speculative);
+                failures += check(result.generated_token_ids == plain_greedy.tokens[i],
+                                  "paired request " + std::to_string(i) + " equals one-lane decoding (" +
+                                      first_difference(result.generated_token_ids, plain_greedy.tokens[i]) + ")");
+            }
+            print_acceptance(paired);
+            // One-row rounds alone (one request finishing first) would draft too; the pair rounds' share
+            // of drafts is not observable from the public stats, so this checks only that drafting runs.
+            failures += check(paired.drafted_tokens > 0 && paired.accepted_tokens > 0,
+                              "the paired requests draft and accept");
+            if (!greedy_only) {
+                const Outputs sampled = sample(engine, prompt, 1.0F, 5ULL * trials + 1, trials, tokens, 2);
+                print_acceptance(sampled.speculative);
+                const double alpha = 1e-3 / static_cast<double>(tokens + 1);
+                failures += report(automatic ? "DFlash2 auto pairs sampling" : "DFlash2 pairs sampling",
+                                   compare(plain.tokens, sampled.tokens, tokens), alpha, true);
             }
         }
         std::optional<infernix::Engine> proposal;

@@ -160,8 +160,8 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
         throw std::invalid_argument("--ngram-draft-tokens auto requires --spec mtp, dflash or dflash2");
     }
     if (draft_tree_enabled(options)) {
-        if (options.backend != SpeculativeBackend::DFlash2) {
-            throw std::invalid_argument("--draft-tree-nodes requires --spec dflash2");
+        if (options.backend == SpeculativeBackend::None) {
+            throw std::invalid_argument("--draft-tree-nodes requires --spec mtp, dflash or dflash2");
         }
         if (options.draft_tree_auto &&
             std::any_of(options.draft_tree_nodes.begin(), options.draft_tree_nodes.end(),

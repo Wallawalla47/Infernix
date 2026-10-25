@@ -1,3 +1,4 @@
+#include "ops/op_family.h"
 #include "ops/linear_add/linear_add_test_common.h"
 
 #include <array>
@@ -24,6 +25,12 @@ int q5_a16_conformance() {
     constexpr std::array<std::int32_t, 20> invariant{2,  4,  5,  8,  9,  16, 17, 24,  25,  32,
                                                      33, 40, 48, 49, 64, 65, 96, 97, 129, 512};
     constexpr std::array<std::int32_t, 2> invariant_graphs{9, 40};
+    const auto ksplit_widths = [] {
+        std::array<std::int32_t, 48> out{};
+        for (std::int32_t index = 0; index < 48; ++index) { out[index] = index + 1; }
+        return out;
+    }();
+    constexpr std::array<std::int32_t, 3> ksplit_graphs{4, 8, 16};
     int failures = 0;
     for (const auto k : {6144, 17408}) {
         failures += infernix::test::linear_add::run_shape(
@@ -36,13 +43,22 @@ int q5_a16_conformance() {
             "Q5_A16 LinearAdd column-invariant", WeightFormat::Q5G64F16S,
             ShapeCase{5120, k, 407U, no_starts, invariant, invariant_graphs, false, 0,
                       infernix::ops::LinearPolicy::A16ColumnInvariant});
+        // q5-ksplit-mma against the FP64 oracle at every verification width 1..48 (its own 2..16
+        // route and the release routes around it; at every width under the invariant policy).
+        for (const auto policy : {infernix::ops::LinearPolicy::A16Only,
+                                  infernix::ops::LinearPolicy::A16ColumnInvariant}) {
+            failures += infernix::test::linear_add::run_shape(
+                "Q5_A16 LinearAdd q5-ksplit-mma", WeightFormat::Q5G64F16S,
+                ShapeCase{5120, k, 409U, no_starts, ksplit_widths, ksplit_graphs, false, 0, policy,
+                          infernix::ops::LinearRoutes::Q5KSplit});
+        }
     }
     return failures;
 }
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(linear_add_q5_a16) {
     if (!infernix::test::linear_add::cuda_available()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;

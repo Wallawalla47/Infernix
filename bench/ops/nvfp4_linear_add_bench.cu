@@ -2,6 +2,7 @@
 #include "infernix/ops/linear_add.h"
 
 #include "core/device.h"
+#include "core/temporary_switches.h"
 #include "infernix_bench_common.h"
 #include "quantized_weight.cuh"
 
@@ -123,6 +124,7 @@ Options parse_options(int argc, char** argv) {
 
 const char* policy_name(ops::LinearPolicy policy) {
     if (policy == ops::LinearPolicy::AllowA4Residual) { return "A4R"; }
+    if (policy == ops::LinearPolicy::A16ColumnInvariant) { return "INV"; }
     return policy == ops::LinearPolicy::AllowA4 ? "A4" : "A16";
 }
 
@@ -198,6 +200,7 @@ int main(int argc, char** argv) {
 
         std::vector<Result> results;
         results.reserve(options.t_sweep.size());
+        std::printf("# %s\n", temporary_switches::describe(temporary_switches::Scope::Qwen3_5).c_str());
         std::printf("%-11s %3s %8s %8s %6s %11s %11s %11s %10s %10s\n", "op", "pol", "N", "K", "T",
                     "median_us", "min_us", "p95_us", "eff_GB/s", "TFLOP/s");
         for (const std::int32_t tokens : options.t_sweep) {

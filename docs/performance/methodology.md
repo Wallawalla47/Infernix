@@ -88,7 +88,7 @@ not a repeated-sample mean.
 | Published metric | Definition |
 |---|---|
 | Prefill phase (tok/s) | `prompt_tokens / prefill_seconds` for each serial request |
-| Server TTFT (ms) | `1000 * (prepare_seconds + vision_seconds + prefill_seconds)` |
+| Server TTFT (ms) | `1000 * ttft_seconds`, the request log's `timings_seconds.ttft` (corpus result schema 9) |
 | Decode phase (tok/s) | `(completion_tokens - 1) / decode_seconds` for each serial request |
 | Corpus prefill (tok/s) | Total computed prefill tokens / full corpus makespan |
 | Corpus decode (tok/s) | Total decode tokens / full corpus makespan |
@@ -97,8 +97,11 @@ not a repeated-sample mean.
 | Spec acceptance | Accepted draft tokens / drafted tokens |
 | Spec tokens/round | `1 + accepted_tokens / speculative_rounds` |
 
-Server TTFT is an internal phase sum. It does not include ingress queueing or HTTP transport and
-is not the external streaming TTFT measured by the [Serve TTFT client](../../tools/bench/ttft/README.md).
+Server TTFT is the server's own first-token time: preparation, Engine queue wait and every prompt
+phase up to the first committed token. Schema 8 and earlier results summed the prepare, vision and
+prefill phases instead, which omitted the queue wait (and on Flash-Next could count only a last
+chunk's submit time); the two do not mix. It does not include HTTP transport and is not the external
+streaming TTFT measured by the [Serve TTFT client](../../tools/bench/ttft/README.md).
 The three decode rates have different time denominators and must not share an unlabeled column.
 Committed decode tokens exclude the first completion token produced by prefill.
 

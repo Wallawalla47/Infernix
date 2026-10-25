@@ -1,4 +1,5 @@
 #include "infernix/ops/l2norm.h"
+#include "ops/op_family.h"
 #include "ops/norm_test_common.h"
 
 #include <algorithm>
@@ -79,7 +80,7 @@ int run_case(const char* label, const Shape& shape, std::uint32_t seed, float sc
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(l2norm) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;

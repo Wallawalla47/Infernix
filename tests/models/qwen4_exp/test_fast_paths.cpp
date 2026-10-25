@@ -81,14 +81,12 @@ int main() {
                           "a kernel path stays unqualified with 16-bit expert activations");
     }
     // fp8-a8-pair runs on recipe C (FP8 dense, 16-bit expert activations) where its own decode gate
-    // passed; INT8 fails its tail.
-    for (const KvCacheStorage kv : {KvCacheStorage::BFloat16, KvCacheStorage::Fp8E4M3Row256, KvCacheStorage::Nvfp4Group16,
-                                    KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2,
+    // passed; INT8, which fails its tail, by the owner's decision (2026-10-24).
+    for (const KvCacheStorage kv : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
+                                    KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2,
                                     KvCacheStorage::Q4KeyVq2Value})
         failures += check(q::fast_path_qualified(FastPath::Fp8A8Pair, {DenseKernels::Fp8Row, false, kv}),
-                          "fp8-a8-pair is qualified on recipe C with every KV format but INT8");
-    failures += check(!q::fast_path_qualified(FastPath::Fp8A8Pair, {DenseKernels::Fp8Row, false, KvCacheStorage::Int8Group64}),
-                      "fp8-a8-pair stays unqualified on recipe C with INT8 KV");
+                          "fp8-a8-pair is registered on recipe C with every KV format");
     failures += check(!q::fast_path_qualified(FastPath::Fp8A8Pair, {DenseKernels::Fp8Row, true, KvCacheStorage::Int8Group64}),
                       "fp8-a8-pair is not qualified with 4-bit expert activations");
 
@@ -147,6 +145,35 @@ int main() {
     // fp8-a8-pair admits a dense call by its width, which batched rounds share.
     selection.paths = {FastPath::Fp8A8Pair};
     failures += check(!selection.request_invariant(), "fp8-a8-pair couples a request to its round");
+    // fp8-a8-pair-block32 runs where fp8-a8-pair does and also on FP4-Local's MXFP8 dense (whose group
+    // scales feed the same block-scaled MMA), is an unqualified candidate on every configuration, couples
+    // requests the same way, and sets its own route flag (the linear dispatch gives it precedence when
+    // both are selected).
+    const FastPathConfiguration mxfp8{DenseKernels::Mxfp8, false, KvCacheStorage::Int8Group64};
+    for (const auto& configuration : {recipe_c, dense8, FastPathConfiguration{DenseKernels::Ggml, false, KvCacheStorage::Int8Group64}}) {
+        failures += check(q::fast_path_applies(FastPath::Fp8A8PairBlock32, configuration, options) ==
+                              q::fast_path_applies(FastPath::Fp8A8Pair, configuration, options),
+                          "fp8-a8-pair-block32 applies exactly where fp8-a8-pair does");
+    }
+    failures += check(q::fast_path_applies(FastPath::Fp8A8PairBlock32, mxfp8, options) &&
+                          !q::fast_path_applies(FastPath::Fp8A8Pair, mxfp8, options),
+                      "fp8-a8-pair-block32 does not serve MXFP8 dense weights");
+    for (const KvCacheStorage kv : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
+                                    KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2,
+                                    KvCacheStorage::Q4KeyVq2Value}) {
+        for (const DenseKernels dense : {DenseKernels::Fp8Row, DenseKernels::Mxfp8}) {
+            failures += check(!q::fast_path_qualified(FastPath::Fp8A8PairBlock32, {dense, false, kv}),
+                              "fp8-a8-pair-block32 is not qualified anywhere yet");
+        }
+    }
+    selection.paths = {FastPath::Fp8A8PairBlock32};
+    failures += check(!selection.request_invariant(), "fp8-a8-pair-block32 couples a request to its round");
+    failures += check(selection.forward().dense_routes == infernix::ops::LinearRoutes::Fp8A8PairBlock32,
+                      "fp8-a8-pair-block32 sets its own dense route flag");
+    selection.paths = {FastPath::Fp8A8Pair, FastPath::Fp8A8PairBlock32};
+    failures += check(selection.forward().dense_routes ==
+                          (infernix::ops::LinearRoutes::Fp8A8Pair | infernix::ops::LinearRoutes::Fp8A8PairBlock32),
+                      "both pair paths set both flags");
     selection.paths = {FastPath::ExpertA4Residual};
     // Every KV format, BF16 by its precise-reference gates on FP4-Local (the same expert kernels as recipe C).
     for (const auto kv : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
@@ -163,6 +190,32 @@ int main() {
     failures += check(!q::fast_path_qualified(FastPath::ExpertA4Residual,
                                               {DenseKernels::Q8, false, KvCacheStorage::Int8Group64}),
                       "expert-a4-residual is qualified only where its kernels were gated and timed");
+    // expert-a4-residual-decode, the narrow form (GPU narrow kernels and the CPU engine), serves the same
+    // banks, sets its own flag, couples a request to its round (an expert's route follows its column
+    // count) and is a candidate only: no configuration registers it.
+    for (const auto& configuration : {recipe_c, dense8, FastPathConfiguration{DenseKernels::Mxfp8, false, KvCacheStorage::Int8Group64},
+                                      FastPathConfiguration{DenseKernels::Mxfp8, true, KvCacheStorage::Int8Group64},
+                                      FastPathConfiguration{DenseKernels::Ggml, false, KvCacheStorage::Int8Group64}}) {
+        failures += check(q::fast_path_applies(FastPath::ExpertA4ResidualDecode, configuration, options) ==
+                              q::fast_path_applies(FastPath::ExpertA4Residual, configuration, options),
+                          "expert-a4-residual-decode applies exactly where expert-a4-residual does");
+    }
+    failures += check(!exact.expert_a4_narrow, "the exact route keeps W4A16 experts' narrow calls exact");
+    selection.paths = {FastPath::ExpertA4ResidualDecode};
+    failures += check(selection.forward().expert_a4_narrow && selection.forward().expert_a4_terms == 0,
+                      "expert-a4-residual-decode sets the narrow flag alone");
+    failures += check(!selection.request_invariant(), "expert-a4-residual-decode couples a request to its round");
+    selection.paths = {FastPath::ExpertA4Residual, FastPath::ExpertA4ResidualDecode};
+    failures += check(selection.forward().expert_a4_narrow && selection.forward().expert_a4_terms == 2,
+                      "expert-a4-residual-decode combines with expert-a4-residual");
+    for (const auto kv : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
+                          KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2,
+                          KvCacheStorage::Q4KeyVq2Value}) {
+        for (const DenseKernels dense : {DenseKernels::Fp8Row, DenseKernels::Mxfp8}) {
+            failures += check(!q::fast_path_qualified(FastPath::ExpertA4ResidualDecode, {dense, false, kv}),
+                              "expert-a4-residual-decode is an unqualified candidate (--fast-path only)");
+        }
+    }
 
     // sampled-mtp-drafts acts on the MTP drafter only; gdn-f16-accumulate on every artifact's GDN
     // prefill, per call, so it keeps a request invariant.
@@ -242,6 +295,66 @@ int main() {
                           "ggml-bf16-prefill is qualified on GGUF imports with every KV format");
     }
 
+    // Two-row rounds are adaptive-speculation's with the MTP drafter and dflash2-pairs' with DFlash2,
+    // each only with its drafter, so MTP's qualifications never select DFlash2 pairs. dflash2-pairs is
+    // registered on every configuration, and it couples the rows of its rounds.
+    infernix::EngineOptions dflash2 = options;
+    dflash2.speculative.backend     = infernix::SpeculativeBackend::DFlash2;
+    failures += check(q::fast_path_applies(FastPath::DFlash2Pairs, dense8, dflash2) &&
+                          !q::fast_path_applies(FastPath::DFlash2Pairs, dense8, mtp) &&
+                          !q::fast_path_applies(FastPath::DFlash2Pairs, dense8, options),
+                      "dflash2-pairs applies with the DFlash2 drafter only");
+    failures += check(!q::fast_path_applies(FastPath::AdaptiveSpeculation, dense8, dflash2),
+                      "adaptive-speculation (MTP pairs) does not apply with the DFlash2 drafter");
+    for (const auto kv : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
+                          KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2,
+                          KvCacheStorage::Q4KeyVq2Value}) {
+        for (const DenseKernels dense : {DenseKernels::Q8, DenseKernels::Bf16, DenseKernels::Fp8Row, DenseKernels::Ggml,
+                                         DenseKernels::Mxfp8}) {
+            // Every Flash-Next artifact's configuration (the owner's decision, 2026-10-24): Q8 with 4-bit
+            // experts (Dense8), GGUF and FP8 with 16-bit (IQ3_S, recipe C), BF16 and MXFP8 with both.
+            for (const bool a4 : {false, true}) {
+                if (dense == DenseKernels::Fp8Row && a4) { continue; }
+                if (dense == DenseKernels::Q8 && !a4) { continue; }
+                if (dense == DenseKernels::Ggml && a4) { continue; }
+                failures += check(q::fast_path_qualified(FastPath::DFlash2Pairs, {dense, a4, kv}),
+                                  "dflash2-pairs is registered on " + q::describe({dense, a4, kv}));
+            }
+        }
+    }
+    selection.paths = {FastPath::DFlash2Pairs};
+    failures += check(!selection.request_invariant(), "dflash2-pairs couples the rows of a two-row round");
+    failures += check(infernix::parse_fast_path("dflash2-pairs") == FastPath::DFlash2Pairs, "dflash2-pairs parses");
+    // f16-accumulate-prefill acts on the 8-bit-code dense projections (recipe C's row FP8, FP4-Local's
+    // MXFP8, Dense8's Q8) only, sets its route flag, couples a prompt to its call boundaries, and is
+    // qualified nowhere.
+    for (const DenseKernels dense : {DenseKernels::Fp8Row, DenseKernels::Mxfp8, DenseKernels::Q8}) {
+        failures += check(q::fast_path_applies(FastPath::F16AccumulatePrefill, {dense, false, KvCacheStorage::Int8Group64},
+                                               options),
+                          "f16-accumulate-prefill runs on FP8, MXFP8 and Q8 dense weights");
+    }
+    for (const DenseKernels dense : {DenseKernels::Bf16, DenseKernels::Ggml, DenseKernels::Nvfp4}) {
+        failures += check(!q::fast_path_applies(FastPath::F16AccumulatePrefill, {dense, false, KvCacheStorage::Int8Group64},
+                                                options),
+                          "f16-accumulate-prefill has no route for 16-bit or GGUF dense weights");
+    }
+    failures += check(!infernix::ops::has_route(exact.dense_routes, infernix::ops::LinearRoutes::F16Accumulate),
+                      "the exact route keeps FP8 and MXFP8 projections exact");
+    selection.paths = {FastPath::F16AccumulatePrefill};
+    failures += check(infernix::ops::has_route(selection.forward().dense_routes, infernix::ops::LinearRoutes::F16Accumulate),
+                      "f16-accumulate-prefill sets its route flag");
+    failures += check(!selection.request_invariant(), "f16-accumulate-prefill couples a prompt to its call boundaries");
+    for (const DenseKernels dense : {DenseKernels::Fp8Row, DenseKernels::Mxfp8}) {
+        for (const bool a4 : {false, true}) {
+            for (const auto kv : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
+                                  KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2,
+                                  KvCacheStorage::Q4KeyVq2Value}) {
+                failures += check(!q::fast_path_qualified(FastPath::F16AccumulatePrefill, {dense, a4, kv}),
+                                  "f16-accumulate-prefill is not qualified anywhere yet");
+            }
+        }
+    }
+
     // screened-lm-head screens generation's BF16 and 8-bit heads (a GGUF head has no exact rescore), is a
     // candidate qualified nowhere, couples a request to the rows of its rounds, and changes no Forward
     // flag (the Program decides it per round).
@@ -273,6 +386,40 @@ int main() {
                       "screened-lm-head sets no dense route");
     failures += check(infernix::parse_fast_path("screened-lm-head") == FastPath::ScreenedLmHead,
                       "screened-lm-head parses");
+
+    // fp16-gdn-state applies to every artifact (36 GDN layers each), is qualified nowhere, keeps a request
+    // invariant (its roundings follow the request's own calls) and sets no Forward flag (the Program's
+    // state pool carries it).
+    for (const DenseKernels dense : {DenseKernels::Q8, DenseKernels::Bf16, DenseKernels::Fp8Row, DenseKernels::Mxfp8,
+                                     DenseKernels::Ggml, DenseKernels::Nvfp4}) {
+        failures += check(q::fast_path_applies(FastPath::Fp16GdnState, {dense, false, KvCacheStorage::Int8Group64}, options) &&
+                              !q::fast_path_qualified(FastPath::Fp16GdnState, {dense, false, KvCacheStorage::Int8Group64}),
+                          "fp16-gdn-state is an unqualified candidate on every artifact");
+    }
+    selection.paths = {FastPath::Fp16GdnState};
+    failures += check(selection.request_invariant(), "fp16-gdn-state coupled requests");
+    failures += check(selection.forward().dense_routes == infernix::ops::LinearRoutes::Exact,
+                      "fp16-gdn-state sets a dense route");
+    failures += check(infernix::parse_fast_path("fp16-gdn-state") == FastPath::Fp16GdnState, "fp16-gdn-state parses");
+
+    // block-verification: DFlash2 and MTP chains (the program accepts them through the sparse rule),
+    // unqualified, and a row's acceptance reads only that row.
+    {
+        infernix::EngineOptions dflash2 = options;
+        dflash2.speculative.backend     = infernix::SpeculativeBackend::DFlash2;
+        infernix::EngineOptions mtp     = options;
+        mtp.speculative.backend         = infernix::SpeculativeBackend::Mtp;
+        infernix::EngineOptions none    = options;
+        none.speculative.backend        = infernix::SpeculativeBackend::None;
+        const FastPathConfiguration dense{DenseKernels::Q8, false, KvCacheStorage::Int8Group64};
+        failures += check(q::fast_path_applies(FastPath::BlockVerification, dense, dflash2) &&
+                              q::fast_path_applies(FastPath::BlockVerification, dense, mtp) &&
+                              !q::fast_path_applies(FastPath::BlockVerification, dense, none) &&
+                              !q::fast_path_qualified(FastPath::BlockVerification, dense),
+                          "block-verification is an unqualified candidate on drafted chains");
+        selection.paths = {FastPath::BlockVerification};
+        failures += check(selection.request_invariant(), "block-verification coupled requests");
+    }
 
     std::cout << (failures == 0 ? "PASS" : "FAIL") << " Qwen3.8-Flash-Next fast-path selection\n";
     return failures == 0 ? 0 : 1;

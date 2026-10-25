@@ -18,6 +18,13 @@ namespace infernix::models::qwen3_5 {
 namespace frontend {
 class Tokenizer;
 struct ToolCallOutputContract;
+
+// The added tokens whose identity marks a turn's phases: `</think>` ends the reasoning and
+// `<tool_call>` opens a call. The same spellings from ordinary text tokens are text.
+struct OutputMarkerTokens {
+    TokenId reasoning_close = -1;
+    TokenId tool_call       = -1;
+};
 } // namespace frontend
 class Frontend;
 
@@ -48,12 +55,18 @@ public:
 
     [[nodiscard]] const OutputDelta& back() const noexcept { return values_[size_ - 1]; }
 
+    // The constrained calls' steps, published after the text deltas (empty() counts text only).
+    [[nodiscard]] std::vector<ToolCallDelta>& tool_calls() noexcept { return tool_calls_; }
+
+    [[nodiscard]] const std::vector<ToolCallDelta>& tool_calls() const noexcept { return tool_calls_; }
+
     void clear() noexcept;
     void push_back(OutputDelta value);
 
 private:
     std::array<OutputDelta, 2> values_{};
     std::size_t size_ = 0;
+    std::vector<ToolCallDelta> tool_calls_;
 };
 
 class OutputSession {
@@ -93,8 +106,9 @@ public:
 
 private:
     class Impl;
-    OutputSession(std::shared_ptr<const frontend::Tokenizer> tokenizer, StopPolicy policy,
-                  OutputOptions output, bool starts_in_reasoning, ThinkingControlOptions thinking,
+    OutputSession(std::shared_ptr<const frontend::Tokenizer> tokenizer,
+                  frontend::OutputMarkerTokens markers, StopPolicy policy, OutputOptions output,
+                  bool starts_in_reasoning, ThinkingControlOptions thinking,
                   std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens,
                   std::shared_ptr<const frontend::ToolCallOutputContract> tool_call_output,
                   std::unique_ptr<text::GrammarSession> grammar = {},

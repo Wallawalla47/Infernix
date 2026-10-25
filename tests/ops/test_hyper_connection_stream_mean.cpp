@@ -9,6 +9,7 @@
 // wider feature matrix (pitch 5 H, the DFlash2 feature layout: the other rows stay untouched), a
 // graph-captured replay bit-identical to the eager call, and input preservation.
 
+#include "ops/op_family.h"
 #include "infernix/ops/hyper_connection.h"
 #include "core/decode_graph.h"
 #include "ops/op_tester.h"
@@ -122,7 +123,7 @@ void run_case(int columns, int pitch, std::uint32_t seed, bool graph) {
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(hyper_connection_stream_mean) {
     if (t::cuda_unavailable()) {
         std::printf("SKIP: no usable CUDA device\n");
         return 77;

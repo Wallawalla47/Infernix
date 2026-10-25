@@ -147,6 +147,17 @@ runs. A binding's first step takes it only when the free pages alone hold it (an
 block, counted as restored); Replay and recovering requests keep one chunk
 ([model quality §6.7](model-quality.md#67-fast-path-registry)).
 
+A decode share (under A/B, the temporary switches `INFERNIX_TMP_DECODE_SHARE` = s in [0, 1],
+default 0, and `INFERNIX_TMP_DECODE_SHARE_MIN_TOKENS`, default 0, logged at startup) lets other
+lanes' Control/Decode batches run for s times the wall time of each non-last ordinary prefill unit
+that leaves at least the threshold of its prompt while another lane waits to decode: the prefill
+turns of the following cycles yield until that time is spent (decode then gets s / (1 + s) of the
+wall time beside a long prompt). Replay and recovering requests never yield. Units stay whole, so
+the chunk grid and every output bit are unchanged. With Qwen3.8-Flash-Next,
+`INFERNIX_TMP_DECODE_SHARE_WALK_TOKENS` = N (default 0: off) also cuts each layer-walk step to
+about N tokens of one-call work while another lane decodes; a step boundary only changes when work
+is enqueued, not its bits.
+
 The fresh queue keeps FIFO tickets, and each blocked request can be successfully bypassed by at most C
 younger requests. Each scan checks the queue head and at most C following candidates; failed checks do
 not consume the allowance, and an incomplete scan continues in ticket order. Queue changes, actual

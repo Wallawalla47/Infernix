@@ -3,12 +3,14 @@
 #include "product/speculative_options.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <iomanip>
 #include <locale>
 #include <sstream>
 #include <string_view>
+#include <tuple>
 #include <utility>
 
 namespace infernix::serve {
@@ -56,6 +58,15 @@ void Metrics::configure(std::string model, const EngineOptions& options,
         std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
+Metrics::RequestCounts Metrics::counts() const {
+    std::lock_guard lock(mutex_);
+    return RequestCounts{.completed         = requests_.completed,
+                         .cancelled         = requests_.cancelled,
+                         .failed            = requests_.failed,
+                         .rejected          = requests_.rejected,
+                         .response_failures = requests_.response_failures};
+}
+
 void Metrics::first_token(const GenerationFirstTokenObservation& observation) {
     std::lock_guard lock(mutex_);
     requests_.ttft.observe(observation.prepare_seconds + observation.elapsed_since_submit_seconds);
@@ -78,8 +89,8 @@ void Metrics::done(const GenerationOutcome& outcome) {
         requests_.constraint_positions += c.mask_positions;
         requests_.constraint_upload_bytes += c.mask_upload_bytes;
     }
-    requests_.duration.observe(outcome.metrics.total_seconds);
-    requests_.queue.observe(outcome.metrics.engine_timing.queue_wait_seconds);
+    requests_.duration.observe(outcome.timings.total_seconds);
+    requests_.queue.observe(outcome.engine_timing.queue_wait_seconds);
 }
 
 void Metrics::rejected() {
@@ -99,6 +110,12 @@ void Metrics::failed(bool cancelled) {
 void Metrics::response_failed() {
     std::lock_guard lock(mutex_);
     ++requests_.response_failures;
+}
+
+void Metrics::reasoning(std::size_t missing, std::size_t restored) {
+    std::lock_guard lock(mutex_);
+    requests_.reasoning_missing += missing;
+    requests_.reasoning_restored += restored;
 }
 
 std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
@@ -152,8 +169,10 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
     gauge("server_start_time_seconds", start_seconds_,
           "Unix time at service attachment after warmup.");
     header("model_info", "gauge", "Resident model and speculative backend.");
-    out << "infernix_model_info{model_name=\"" << escape_label(model_) << "\",speculative_backend=\""
-        << product::speculative_backend_name(options_.speculative.backend) << "\"} 1\n";
+    out << "infernix_model_info{model_name=\"" << escape_label(model_)
+        << "\",speculative_backend=\""
+        << product::speculative_backend_name(options_.speculative.backend) << "\",kv=\""
+        << infernix::kv_cache_cli_name(options_.kv_cache) << "\"} 1\n";
     gauge("max_concurrency", options_.max_concurrency, "Maximum resident execution lanes.");
     gauge("max_context_tokens", options_.max_context, "Per-request logical context limit.");
     gauge("spec_decode_draft_window", options_.speculative.draft_tokens,
@@ -209,6 +228,41 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
           "Main KV pool capacity in pages.");
     GAUGE(device_backend_kv_occupied_pages, "device_backend_kv_used_pages",
           "Occupied speculative backend KV pages.");
+    // The prefix cache's tree and Host tier (zero without the cache or without --host-context-mib).
+    GAUGE(hybrid_tree_blocks, "prefix_cache_blocks", "Prefix-cache tree blocks, Device or Host.");
+    GAUGE(hybrid_cached_blocks, "prefix_cache_device_blocks",
+          "Prefix-cache tree blocks resident in Device KV.");
+    GAUGE(hybrid_evictable_blocks, "prefix_cache_evictable_blocks",
+          "Device-resident tree blocks no request holds.");
+    GAUGE(hybrid_snapshots, "prefix_cache_snapshots", "Prefix-cache state snapshots, Device or Host.");
+    GAUGE(hybrid_host_used_bytes, "host_context_used_bytes",
+          "Host context-cache bytes in occupied slabs.");
+    GAUGE(hybrid_host_capacity_bytes, "host_context_capacity_bytes", "Host context-cache capacity.");
+    COUNTER(hybrid_snapshot_hits, "prefix_cache_snapshot_hits_total",
+            "Admissions that resumed from a prefix-cache snapshot.");
+    COUNTER(hybrid_evicted_blocks, "prefix_cache_evicted_blocks_total",
+            "Tree blocks evicted from the prefix cache.");
+    COUNTER(hybrid_host_snapshot_evictions, "host_context_snapshot_evictions_total",
+            "Snapshots evicted from the Host tier.");
+    COUNTER(hybrid_host_write_bytes, "host_context_write_bytes_total",
+            "Bytes copied into the Host tier.");
+    COUNTER(hybrid_host_restore_bytes, "host_context_restore_bytes_total",
+            "Bytes restored from the Host tier.");
+    // The VRAM expert cache (Qwen3.8-Flash-Next): a gauge for its size, counters for its traffic.
+    if (stats.expert_cache) {
+        const ExpertCacheTotals& e = *stats.expert_cache;
+        const ExpertCacheTotals b  = baseline_.expert_cache.value_or(ExpertCacheTotals{});
+        gauge("expert_cache_frames", e.frames,
+              "VRAM expert-cache frames backed now, one routed expert each.");
+        counter("expert_cache_routed_total", e.routed, b.routed, "Routed (layer, expert) uses.");
+        counter("expert_cache_hits_total", e.hits, b.hits, "Routed uses served from a VRAM frame.");
+        counter("expert_cache_promotions_total", e.promotions, b.promotions,
+                "Experts copied into frames by the cache policy.");
+        counter("expert_cache_landed_total", e.landed, b.landed,
+                "Staged misses adopted into frames.");
+        counter("expert_cache_cpu_served_total", e.cpu_served, b.cpu_served,
+                "Misses computed by the CPU expert team.");
+    }
 #undef GAUGE
 #undef COUNTER
 
@@ -228,6 +282,49 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
     counter("device_wait_seconds_total", stats.host_work.device_wait_ns * 1e-9,
             baseline_.host_work.device_wait_ns * 1e-9,
             "Engine wall time waiting for device work, not kernel time.");
+    // The Engine's execution units (RuntimeStats::execution): counts and wall time since startup,
+    // the longest since the warm-up (the serve restarts the maxima after it). Seconds are ns / 1e9,
+    // correctly rounded.
+    const RuntimeExecutionLatency& run  = stats.execution;
+    const RuntimeExecutionLatency& base = baseline_.execution;
+    const std::array kinds{std::tuple{"prefill", &run.prefill, &base.prefill},
+                           std::tuple{"replay", &run.replay, &base.replay},
+                           std::tuple{"control", &run.control, &base.control},
+                           std::tuple{"decode", &run.decode, &base.decode}};
+    header("executions_total", "counter", "Engine execution units by kind.");
+    for (const auto& [kind, now, then] : kinds) {
+        out << "infernix_executions_total{kind=\"" << kind << "\"} " << now->count - then->count
+            << '\n';
+    }
+    header("execution_seconds_total", "counter", "Engine execution units' wall time by kind.");
+    for (const auto& [kind, now, then] : kinds) {
+        out << "infernix_execution_seconds_total{kind=\"" << kind << "\"} "
+            << static_cast<double>(now->total_ns - then->total_ns) / 1e9 << '\n';
+    }
+    header("execution_max_seconds", "gauge",
+           "The longest execution unit since the warm-up, by kind.");
+    for (const auto& [kind, now, then] : kinds) {
+        out << "infernix_execution_max_seconds{kind=\"" << kind << "\"} "
+            << static_cast<double>(now->max_ns) / 1e9 << '\n';
+    }
+    // Decode rounds by batch size, the sizes the lanes allow.
+    header("decode_batch_rounds_total", "counter", "Decode rounds by batch size.");
+    for (std::uint32_t b = 1; b <= options_.max_concurrency; ++b) {
+        out << "infernix_decode_batch_rounds_total{batch=\"" << b << "\"} "
+            << run.decode_by_batch[b - 1].count - base.decode_by_batch[b - 1].count << '\n';
+    }
+    header("decode_batch_seconds_total", "counter", "Decode rounds' wall time by batch size.");
+    for (std::uint32_t b = 1; b <= options_.max_concurrency; ++b) {
+        out << "infernix_decode_batch_seconds_total{batch=\"" << b << "\"} "
+            << static_cast<double>(run.decode_by_batch[b - 1].total_ns - base.decode_by_batch[b - 1].total_ns) / 1e9
+            << '\n';
+    }
+    header("decode_batch_max_seconds", "gauge",
+           "The longest decode round since the warm-up by batch size.");
+    for (std::uint32_t b = 1; b <= options_.max_concurrency; ++b) {
+        out << "infernix_decode_batch_max_seconds{batch=\"" << b << "\"} "
+            << static_cast<double>(run.decode_by_batch[b - 1].max_ns) / 1e9 << '\n';
+    }
     header("requests_total", "counter",
            "Generation attempts entering preparation, by terminal outcome.");
     for (const auto& [outcome, count] : std::array{
@@ -237,6 +334,10 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
     }
     counter("response_failures_total", requests.response_failures, 0U,
             "Response rendering, storage or transport failures after generation settlement.");
+    counter("chat_reasoning_missing_total", requests.reasoning_missing, 0U,
+            "Chat Completions assistant tool-call turns received without their reasoning.");
+    counter("chat_reasoning_restored_total", requests.reasoning_restored, 0U,
+            "Of those, turns given back the reasoning this server generated (--restore-tool-reasoning).");
     const auto histogram = [&](std::string_view name, const Histogram& value,
                                std::string_view help) {
         header(name, "histogram", help);

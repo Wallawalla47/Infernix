@@ -1,4 +1,5 @@
 #include "infernix/ops/residual_add.h"
+#include "ops/op_family.h"
 #include "ops/op_tester.h"
 
 #include <cstdint>
@@ -89,7 +90,7 @@ int run_cancellation_case() {
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(residual_add) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;

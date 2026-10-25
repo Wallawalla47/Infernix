@@ -34,7 +34,13 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       idle_prefill_width(plan.idle_prefill_width),
       execution_schedule(plan.execution_schedule), draft_window(plan.draft_window),
       neural_draft_window(plan.neural_draft_window), tree_widths(plan.tree_widths),
-      draft_tree_paths(plan.draft_tree_paths), ngram_draft_window(plan.ngram_draft_window),
+      draft_tree_paths(plan.draft_tree_paths),
+      mtp_tree_rounds(plan.speculative_backend == SpeculativeBackend::Mtp &&
+                      std::any_of(plan.round_shapes.begin(), plan.round_shapes.end(),
+                                  [](const SpeculativeRoundShape& shape) {
+                                      return shape.kind == SpeculativeRoundKind::Tree;
+                                  })),
+      ngram_draft_window(plan.ngram_draft_window),
       ngram_batch_window(plan.ngram_batch_window != 0 ? plan.ngram_batch_window : plan.ngram_draft_window),
       ngram_min_match(plan.ngram_min_match), speculative_backend(plan.speculative_backend),
       kv_storage(plan.kv_storage), proposal_head(plan.proposal_head),
@@ -79,12 +85,23 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
          workspace_plan.vision->general_capacity_bytes != workspace_plan.general_capacity)) {
         throw std::invalid_argument("Qwen3.5 workspace plan does not match startup features");
     }
-    if (execution_schedule.mtp_draft_confidence) {
+    if (execution_schedule.mtp_draft_confidence && parameters.model.offloaded_experts()) {
         // A verified draft column's prior cost against a round without drafts: with experts held
-        // outside device memory (the only configuration the schedule enables this for) its misses,
-        // Qwen3.5-122B design §0: ~10 ms a column against 13.8 ms a plain token on the 5090. The fit
-        // replaces it.
+        // outside device memory its misses, Qwen3.5-122B design §0: ~10 ms a column against 13.8 ms
+        // a plain token on the 5090. The fit replaces it.
         mtp_confidence.emplace(0.7);
+    } else if (execution_schedule.mtp_calibrated_extent) {
+        // Resident targets (one-row calibrated extents): the configuration's measured cost of a
+        // verified draft column, as adaptive-dflash's (NVFP4 27B 0.02, 35B-A3B 0.15 of a plain
+        // round); the fit replaces it.
+        mtp_confidence.emplace(plan.dflash_width_costs.per_draft);
+    }
+    if (execution_schedule.mtp_draft_regime) { mtp_regime.emplace(); }
+    if (const std::string& path = mtp_draft_switches().draft_log;
+        !path.empty() && speculative_backend == SpeculativeBackend::Mtp) {
+        mtp_draft_log = std::make_unique<std::ofstream>(path, std::ios::app);
+        if (!*mtp_draft_log) { throw std::runtime_error("INFERNIX_TMP_QWEN35_MTP_DRAFT_LOG: cannot open " + path); }
+        *mtp_draft_log << "# mtp,batch,lane,family,limit,cycle_s,held,verified,accepted,q...\n";
     }
     if (tree_widths.automatic_mode()) {
         std::array<std::vector<std::uint32_t>, kMaximumConcurrency> trees;
@@ -253,8 +270,9 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         dflash_draft_handoff.emplace(device, draft_window * max_concurrency);
     }
     for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
-        lane_epochs[lane]    = 1;
-        sequences[lane].lane = lane;
+        lane_epochs[lane]     = 1;
+        *nonfinite_flag(lane) = 0;
+        sequences[lane].lane  = lane;
     }
     host_tokens = round_host
                       ? &static_cast<qwen3_5::PrefillRoundHost*>(round_host->data())->sampled_token
@@ -308,10 +326,15 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
                 std::max(idle_prefill_width, prefill_chunk), max_concurrency * (draft_window + 1U))),
             .chunk       = static_cast<std::int32_t>(prefill_chunk),
             .speculative = speculative_backend != SpeculativeBackend::None || ngram_draft_window != 0,
+            .mtp_draft_tokens   = speculative_backend == SpeculativeBackend::Mtp ? neural_draft_window : 0U,
+            .ngram_draft_tokens = ngram_draft_window,
             .graph_bound = static_cast<std::uint32_t>(
                 (graph_allowance_bytes + runtime::expert_offload::kGraphExecutableBytes - 1) /
                 runtime::expert_offload::kGraphExecutableBytes),
             .wide_pass_bytes = std::max(workspace_plan.text_prefill_wide, workspace_plan.mtp_prefill_wide),
+            .wide_pass_ladder = workspace_plan.prefill_wide_ladder,
+            .expert_wide     = execution_schedule.expert_wide,
+            .router_mma      = execution_schedule.router_mma,
             .device      = device.device};
         offload = std::make_unique<ProgramOffload>(parameters, geometry, offload_options->engine,
                                                    offload_options->diagnostic);
@@ -351,6 +374,13 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
 ProgramImpl::~ProgramImpl() noexcept {
     if (device.transfer_stream != nullptr) { (void)cudaStreamSynchronize(device.transfer_stream); }
     if (device.stream != nullptr) { (void)cudaStreamSynchronize(device.stream); }
+    // TEMPORARY (INFERNIX_TMP_QWEN35_MTP_SKIP_ROUNDS): how often the regime chose draft-free rounds.
+    if (mtp_regime && offload) {
+        try {
+            offload->engine().report("MTP draft-free rounds: " + std::to_string(mtp_regime->draft_free_rounds()) +
+                                     " of " + std::to_string(mtp_regime->rounds()));
+        } catch (...) {}
+    }
 }
 
 ScoreResult ProgramImpl::causal_score(PreparedPromptData&& prompt, std::uint32_t first_target,

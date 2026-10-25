@@ -85,24 +85,6 @@ std::string cuda_uuid_string(const cudaUUID_t& uuid) {
     return out.str();
 }
 
-const char* finish_reason_name(infernix::FinishReason reason) {
-    switch (reason) {
-    case infernix::FinishReason::None:
-        return "none";
-    case infernix::FinishReason::OutputLimit:
-        return "output_limit";
-    case infernix::FinishReason::ContextCapacity:
-        return "context_capacity";
-    case infernix::FinishReason::StopToken:
-        return "stop_token";
-    case infernix::FinishReason::StopString:
-        return "stop_string";
-    case infernix::FinishReason::Cancelled:
-        return "cancelled";
-    }
-    return "unknown";
-}
-
 Json tool_call_parse_json(const infernix::ToolCallParseDiagnostics& diagnostics) {
     return Json{{"marker_seen", diagnostics.marker_seen},
                 {"structured_call_count", diagnostics.structured_call_count},
@@ -130,7 +112,7 @@ Json requested_reasoning_effort_json(const std::optional<RequestedReasoningEffor
                      : Json(nullptr);
 }
 
-const char* kv_cache_name(infernix::KvCacheStorage storage) {
+const char* kv_cache_json_name(infernix::KvCacheStorage storage) {
     switch (storage) {
     case infernix::KvCacheStorage::BFloat16:
         return "bf16";
@@ -251,6 +233,7 @@ Json request_json(const RequestLogContext& context) {
     if (context.thinking_budget) { thinking_budget = *context.thinking_budget; }
     return Json{{"request_id", context.id},
                 {"http_request_id", context.http_request_id},
+                {"label", context.label.empty() ? Json(nullptr) : Json(context.label)},
                 {"response_id", context.response_id},
                 {"protocol", context.protocol},
                 {"model", context.model},
@@ -289,12 +272,14 @@ Json preparation_json(const RequestLogContext& context) {
                 {"cache_misses", stats.media_cache_misses},
                 {"singleflight_waits", stats.media_singleflight_waits},
                 {"built_patch_bytes", stats.built_patch_bytes},
-                {"reused_patch_bytes", stats.reused_patch_bytes}};
+                {"reused_patch_bytes", stats.reused_patch_bytes},
+                {"instruction_role_lowerings", stats.instruction_role_lowerings}};
 }
 
 Json rejected_request_json(const RequestRejectionLogContext& context) {
     return Json{{"request_id", context.id},
                 {"http_request_id", context.http_request_id},
+                {"label", context.label.empty() ? Json(nullptr) : Json(context.label)},
                 {"response_id", context.response_id},
                 {"protocol", context.protocol},
                 {"model", context.model},
@@ -339,35 +324,52 @@ Json vision_workspace_json(const std::optional<infernix::VisionWorkspaceMemorySu
                 {"handoff_peak_bytes", vision->handoff_peak_bytes}};
 }
 
-Json speculative_json(const GenerationMetrics& metrics) {
-    return Json{{"backend", product::speculative_backend_name(metrics.speculative_backend)},
-                {"draft_window", metrics.speculative_draft_window},
-                {"rounds", metrics.speculative_rounds},
-                {"drafted_tokens", metrics.speculative_draft_tokens},
-                {"accepted_tokens", metrics.speculative_accepted_tokens},
-                {"fallback_steps", metrics.speculative_fallback_steps},
-                {"accepted_per_position", metrics.speculative_accepted_per_position},
-                {"rounds_by_draft_length", metrics.speculative_rounds_by_draft_length},
-                {"ngram_rounds", metrics.ngram_rounds},
-                {"ngram_drafted_tokens", metrics.ngram_drafted_tokens},
-                {"ngram_accepted_tokens", metrics.ngram_accepted_tokens},
-                {"ngram_archive_rounds", metrics.ngram_archive_rounds},
-                {"ngram_archive_drafted_tokens", metrics.ngram_archive_drafted_tokens},
-                {"ngram_archive_accepted_tokens", metrics.ngram_archive_accepted_tokens},
-                {"tree_rounds", metrics.tree_rounds},
-                {"tree_side_rounds", metrics.tree_side_rounds},
-                {"tree_side_accepted_tokens", metrics.tree_side_accepted_tokens},
-                {"ngram_archive",
-                 {{"enabled", metrics.ngram_archive.enabled},
-                  {"bound", metrics.ngram_archive.bound},
-                  {"published", metrics.ngram_archive.published},
-                  {"generation", metrics.ngram_archive.generation},
-                  {"sources", metrics.ngram_archive.sources},
-                  {"session_bytes", metrics.ngram_archive.session_bytes},
-                  {"total_bytes", metrics.ngram_archive.total_bytes},
-                  {"sampling_seed", metrics.ngram_archive.sampling_seed
-                                        ? Json(*metrics.ngram_archive.sampling_seed)
-                                        : Json(nullptr)}}}};
+Json speculative_json(const GenerationOutcome& outcome) {
+    // The verified rounds by accepted drafts, and each round in order as [drafted, accepted, n-gram].
+    Json histogram = Json::array();
+    Json steps     = Json::array();
+    for (const auto& step : outcome.speculative.round_steps) {
+        while (histogram.size() <= step.accepted) { histogram.push_back(0); }
+        histogram[step.accepted] = histogram[step.accepted].get<std::uint64_t>() + 1;
+        steps.push_back(Json::array({step.drafted, step.accepted, step.ngram ? 1 : 0}));
+    }
+    const auto optional = [](const std::optional<std::uint64_t>& value) {
+        return value ? Json(*value) : Json(nullptr);
+    };
+    return Json{
+        {"backend", product::speculative_backend_name(outcome.speculative.backend)},
+        {"accepted_length_histogram", std::move(histogram)},
+        {"round_steps", std::move(steps)},
+        {"output_4grams", optional(outcome.output_4grams)},
+        {"output_4grams_in_prompt", optional(outcome.output_4grams_in_prompt)},
+        {"draft_window", outcome.speculative.draft_window},
+        {"rounds", outcome.speculative.rounds},
+        {"drafted_tokens", outcome.speculative.drafted_tokens},
+        {"accepted_tokens", outcome.speculative.accepted_tokens},
+        {"fallback_steps", outcome.speculative.fallback_steps},
+        {"accepted_per_position", outcome.speculative.accepted_per_position},
+        {"rounds_by_draft_length", outcome.speculative.rounds_by_draft_length},
+        {"ngram_rounds", outcome.speculative.ngram_rounds},
+        {"ngram_drafted_tokens", outcome.speculative.ngram_drafted_tokens},
+        {"ngram_accepted_tokens", outcome.speculative.ngram_accepted_tokens},
+        {"ngram_archive_rounds", outcome.speculative.ngram_archive_rounds},
+        {"ngram_archive_drafted_tokens", outcome.speculative.ngram_archive_drafted_tokens},
+        {"ngram_archive_accepted_tokens", outcome.speculative.ngram_archive_accepted_tokens},
+        {"ngram_gate_rejections", outcome.speculative.ngram_gate_rejections},
+        {"tree_rounds", outcome.speculative.tree_rounds},
+        {"tree_side_rounds", outcome.speculative.tree_side_rounds},
+        {"tree_side_accepted_tokens", outcome.speculative.tree_side_accepted_tokens},
+        {"ngram_archive",
+         {{"enabled", outcome.ngram_archive.enabled},
+          {"bound", outcome.ngram_archive.bound},
+          {"published", outcome.ngram_archive.published},
+          {"generation", outcome.ngram_archive.generation},
+          {"sources", outcome.ngram_archive.sources},
+          {"session_bytes", outcome.ngram_archive.session_bytes},
+          {"total_bytes", outcome.ngram_archive.total_bytes},
+          {"sampling_seed", outcome.ngram_archive.sampling_seed
+                                ? Json(*outcome.ngram_archive.sampling_seed)
+                                : Json(nullptr)}}}};
 }
 
 Json scheduling_json(const infernix::GenerationSchedulingStats& stats) {
@@ -568,7 +570,7 @@ std::string format_server_start_json(
              {"fast_paths", engine_options.fast_paths},
              {"lossless", engine_options.lossless},
              {"log_stats_interval_ms", options.log_stats_interval_ms},
-             {"kv_cache", kv_cache_name(engine_options.kv_cache)},
+             {"kv_cache", kv_cache_json_name(engine_options.kv_cache)},
              {"logits_dtype", product::logits_dtype_name(engine_options.logits_dtype)},
              {"vision", engine_options.enable_vision},
              {"cuda_graph", engine_options.use_cuda_graph},
@@ -598,11 +600,11 @@ std::string format_server_start_json(
                                    {"hardware_class", context_cost.hardware_class},
                                    {"prefill_signature", context_cost.prefill_signature},
                                    {"preset_path", context_cost.preset_path.string()}}},
-             {"context_cache", Json{{"enabled", cache.enabled},
-                                    {"device_snapshot_slots",
-                                     cache.hybrid.device_snapshot_slots.value()},
-                                    {"total_device_state_slots", total_device_state_slots},
-                                    {"host_capacity_bytes", cache.host_capacity_bytes.value()}}}};
+             {"context_cache",
+              Json{{"enabled", cache.enabled},
+                   {"device_snapshot_slots", cache.hybrid.device_snapshot_slots.value()},
+                   {"total_device_state_slots", total_device_state_slots},
+                   {"host_capacity_bytes", cache.host_capacity_bytes.value()}}}};
     record["sampling_defaults"] =
         Json{{"thinking", preset_json(sampling_defaults.thinking)},
              {"non_thinking", preset_json(sampling_defaults.non_thinking)},
@@ -683,6 +685,27 @@ std::string format_request_rejected_json(const std::string& server_instance_id,
     return record.dump();
 }
 
+namespace {
+
+Json prefix_miss_json(const std::optional<PrefixMiss>& miss) {
+    if (!miss) { return nullptr; }
+    const auto window = [](const std::optional<PrefixMissWindow>& part) -> Json {
+        if (!part) { return nullptr; }
+        return Json{{"first", part->first}, {"token_ids", part->token_ids}, {"text", part->text}};
+    };
+    return Json{{"kind", prefix_miss_kind_name(miss->kind)},
+                {"earlier_engine_request_id", miss->earlier_engine_request_id},
+                {"earlier_context_tokens", miss->earlier_context_tokens},
+                {"common_prefix_tokens", miss->common_prefix_tokens},
+                {"reused_tokens", miss->reused_tokens},
+                {"computed_prefill_tokens", miss->computed_prefill_tokens},
+                {"lost_reuse_tokens", miss->lost_reuse_tokens},
+                {"earlier", window(miss->earlier)},
+                {"current", window(miss->current)}};
+}
+
+} // namespace
+
 std::string format_request_done_json(const std::string& server_instance_id, std::uint64_t timestamp,
                                      const RequestLogContext& context,
                                      const GenerationOutcome& outcome) {
@@ -693,9 +716,9 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
              {"prompt_tokens", outcome.prompt_tokens},
              {"completion_tokens", outcome.completion_tokens},
              {"generated_token_ids", outcome.generated_token_ids},
-             {"computed_prefill_tokens", outcome.metrics.computed_prefill_tokens},
-             {"prefix_cache_hit_tokens", outcome.metrics.prefix_cache_hit_tokens},
-             {"prefix_reuse_path", prefix_reuse_path_name(outcome.metrics.prefix_reuse_path)},
+             {"computed_prefill_tokens", outcome.computed_prefill_tokens},
+             {"prefix_cache_hit_tokens", outcome.reused_prompt_tokens},
+             {"prefix_reuse_path", prefix_reuse_path_name(outcome.prefix_reuse_path)},
              {"thinking_budget", outcome.thinking.configured_budget
                                      ? Json(*outcome.thinking.configured_budget)
                                      : Json(nullptr)},
@@ -708,19 +731,19 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
              {"tool_call_count", outcome.tool_calls.size()},
              {"tool_call_parse", tool_call_parse_json(outcome.tool_call_parse)}};
     record["timings_seconds"] = Json{
-        {"prepare", outcome.metrics.prepare_seconds}, {"ttft", outcome.metrics.ttft_seconds},
-        {"vision", outcome.metrics.vision_seconds},   {"prefill", outcome.metrics.prefill_seconds},
-        {"decode", outcome.metrics.decode_seconds},   {"total", outcome.metrics.total_seconds}};
-    record["engine_timing"] = request_engine_timing_json(outcome.metrics.engine_timing);
+        {"prepare", outcome.timings.prepare_seconds}, {"ttft", outcome.timings.first_token_seconds},
+        {"vision", outcome.timings.vision_seconds},   {"prefill", outcome.timings.prefill_seconds},
+        {"decode", outcome.timings.decode_seconds},   {"total", outcome.timings.total_seconds}};
+    record["engine_timing"]       = request_engine_timing_json(outcome.engine_timing);
     record["constraint"]    = product::constraint_observation_json(outcome.constraint);
-    record["first_output_timing"] =
-        outcome.metrics.first_output_timing
-            ? first_output_timing_json(*outcome.metrics.first_output_timing)
-            : Json(nullptr);
-    record["speculative"] = speculative_json(outcome.metrics);
-    record["generation"]  = Json{{"engine_request_id", outcome.metrics.engine_request_id},
-                                 {"scheduling", scheduling_json(outcome.metrics.scheduling)},
-                                 {"admission", admission_json(outcome.metrics.admission)}};
+    record["first_output_timing"] = outcome.first_output_timing
+                                        ? first_output_timing_json(*outcome.first_output_timing)
+                                        : Json(nullptr);
+    record["speculative"]         = speculative_json(outcome);
+    record["generation"]          = Json{{"engine_request_id", outcome.engine_request_id},
+                                         {"scheduling", scheduling_json(outcome.scheduling)},
+                                         {"admission", admission_json(outcome.admission)}};
+    record["prefix_miss"] = prefix_miss_json(outcome.prefix_miss);
     return record.dump();
 }
 
@@ -874,6 +897,32 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                  {"held_host_refusals", delta(&RuntimeStats::hybrid_held_host_refusals)},
                  {"tool_call_holds", delta(&RuntimeStats::hybrid_tool_call_holds)}};
     }
+    // The device (NVML): readings at the interval's end, energy and policy-limited time over it;
+    // null without NVML, and each figure null where the driver does not report it.
+    if (const auto& gpu = report.gpu_current; gpu.valid) {
+        const GpuInterval interval = gpu_interval(report);
+        const auto optional        = [](const std::optional<double>& value) {
+            return value ? Json(*value) : Json(nullptr);
+        };
+        Json reasons = Json::array();
+        for (std::uint64_t bit = 0; bit < 64; ++bit) {
+            if ((gpu.clock_event_reasons & (1ULL << bit)) != 0) {
+                reasons.push_back(gpu_clock_event_reason_names(1ULL << bit));
+            }
+        }
+        record["gpu"] = Json{{"sm_clock_mhz", gpu.sm_clock_mhz},
+                             {"memory_clock_mhz", gpu.memory_clock_mhz},
+                             {"temperature_c", gpu.temperature_c},
+                             {"power_watts", gpu.power_watts},
+                             {"clock_event_reasons", std::move(reasons)},
+                             {"energy_joules", optional(interval.energy_joules)},
+                             {"average_power_watts", optional(interval.average_power_watts)},
+                             {"joules_per_decode_token", optional(interval.joules_per_decode_token)},
+                             {"power_violation_fraction", optional(interval.power_violation_fraction)},
+                             {"thermal_violation_fraction", optional(interval.thermal_violation_fraction)}};
+    } else {
+        record["gpu"] = nullptr;
+    }
     return record.dump();
 }
 
@@ -906,6 +955,9 @@ JsonlRequestLog::JsonlRequestLog(const std::string& path,
                                  std::shared_ptr<spdlog::logger> logger,
                                  RequestLogRotation rotation)
     : path_(path), logger_(std::move(logger)), rotation_(rotation) {
+    // The metrics JSON reports this id even when no request log is written, so assign it before
+    // the disabled-path return.
+    server_instance_id_ = new_server_instance_id();
     if (path_.empty()) { return; }
     if (rotation_.keep > kMaximumRequestLogKeep) {
         throw std::invalid_argument("request JSONL log keeps too many rotated files");
@@ -923,7 +975,6 @@ JsonlRequestLog::JsonlRequestLog(const std::string& path,
             }
         }
     }
-    server_instance_id_ = new_server_instance_id();
     output_.open(path_, std::ios::out | std::ios::app);
     if (!output_) {
         throw std::runtime_error("failed to open request JSONL log for append: " + path_);

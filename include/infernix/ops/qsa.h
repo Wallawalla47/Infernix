@@ -243,9 +243,13 @@ struct QsaAppend {
 ///     a window slot for keys before the call, the call's own row for its columns (staged in the
 ///     workspace for calls wider than kKVWindowInlineWidth, which take one sequence, and committed
 ///     to the window afterwards); from its codes otherwise.
+/// With `output_gate` (BF16 [head_dim * heads, T]), out is then gated as ops::sigmoid_mul(gate, out)
+/// would gate it, bit for bit: in the split merge of decode and verification calls, after the attention
+/// otherwise (TEMPORARY, INFERNIX_TMP_QSA_GATE_MERGE, candidates §7.3 D7).
 void qsa_attention(const Tensor& q, const Tensor& index_q, const QsaKVLayer& layer,
                    const QsaBatch& batch, const QsaGeometry& geometry, float scale,
                    std::int32_t max_context, void* workspace, std::size_t workspace_bytes,
-                   Tensor& out, cudaStream_t stream, const QsaAppend* append = nullptr);
+                   Tensor& out, cudaStream_t stream, const QsaAppend* append = nullptr,
+                   const Tensor* output_gate = nullptr);
 
 } // namespace infernix::ops

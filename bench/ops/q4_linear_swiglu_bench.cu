@@ -1,11 +1,14 @@
 // Cold-cache public Op benchmark for the registered Q4 LinearSwiGLU profile.
 
 #include "core/weight.h"
+#include "infernix/ops/linear.h"
 #include "infernix/ops/linear_swiglu.h"
 
 #include "core/device.h"
+#include "core/temporary_switches.h"
 #include "infernix_bench_common.h"
 #include "quantized_weight.cuh"
+#include "roofline.h"
 
 #include <cuda_runtime.h>
 
@@ -20,6 +23,7 @@
 #include <vector>
 
 using namespace infernix;
+namespace roofline = infernix::bench::roofline;
 
 namespace {
 
@@ -36,6 +40,8 @@ struct Options {
     bool graph   = false;
     std::string csv_out;
     ops::LinearRoutes routes = ops::LinearRoutes::Exact;
+    // a16 (A16Only) or invariant (A16ColumnInvariant, the default route's decode and verification).
+    ops::LinearPolicy policy = ops::LinearPolicy::A16Only;
 };
 
 struct Result {
@@ -101,13 +107,21 @@ Options parse_options(int argc, char** argv) {
                 throw std::invalid_argument("--routes must be exact or fast");
             }
             options.routes = routes == "fast" ? ops::LinearRoutes::Q4W4A8 : ops::LinearRoutes::Exact;
+        } else if (argument == "--policy") {
+            const std::string_view policy = next("--policy value");
+            if (policy != "a16" && policy != "invariant") {
+                throw std::invalid_argument("--policy must be a16 or invariant");
+            }
+            options.policy = policy == "invariant" ? ops::LinearPolicy::A16ColumnInvariant
+                                                   : ops::LinearPolicy::A16Only;
         } else if (argument == "--profile") {
             options.profile = true;
         } else if (argument == "--help" || argument == "-h") {
             std::printf(
                 "Usage: %s [--t-sweep 1,2,...] [--warmup N] [--repeat N] [--execution "
                 "eager|graph]\n"
-                "          [--routes exact|fast] [--csv-out PATH] [--profile]\n"
+                "          [--routes exact|fast] [--policy a16|invariant] [--csv-out PATH] "
+                "[--profile]\n"
                 "  --execution graph captures ONE complete public ops::linear_swiglu call per\n"
                 "  graph; the reported graph_nodes is the captured count, not an assumption.\n"
                 "  --routes fast passes LinearRoutes::Q4W4A8 (the q4-w4a8 fast path, which serves\n"
@@ -143,7 +157,7 @@ void write_csv(const std::string& path, const std::vector<Result>& results) {
                      result.tokens, result.execution, result.graph_nodes, result.median_us,
                      result.min_us, result.p95_us, result.weight_bytes, result.logical_bytes,
                      result.projection_flops, result.logical_bytes / seconds / 1.0e9,
-                     result.logical_bytes / seconds / 1.0e9 / 1792.0 * 100.0,
+                     result.logical_bytes / seconds / 1.0e9 / roofline::kDramSpecGBs * 100.0,
                      result.projection_flops / seconds / 1.0e12, result.workspace_sweep_bytes,
                      result.workspace_exact_bytes);
     }
@@ -168,14 +182,14 @@ int main(int argc, char** argv) {
         bench::PackedQuantizedWeight packed =
             bench::make_row_split_weight(QType::Q4_G64_FP16, kGateUpRows, kHidden, kHidden, 501U);
         const std::size_t workspace_capacity = ops::linear_swiglu_workspace_capacity_bytes(
-            QType::Q4_G64_FP16, kGateUpRows, kHidden, ops::LinearPolicy::A16Only, min_t, max_t,
+            QType::Q4_G64_FP16, kGateUpRows, kHidden, options.policy, min_t, max_t,
             options.routes);
         WorkspaceArena workspace(std::max<std::size_t>(workspace_capacity, 256));
 
         const auto launch = [&](std::int32_t tokens, cudaStream_t launch_stream) {
             Tensor x(input.p, DType::BF16, {kHidden, tokens});
             Tensor out(output.p, DType::BF16, {kOutputRows, tokens});
-            ops::linear_swiglu(x, packed.weight, out, ops::LinearPolicy::A16Only, workspace,
+            ops::linear_swiglu(x, packed.weight, out, options.policy, workspace,
                                launch_stream, options.routes);
         };
         const char* routes_name = options.routes == ops::LinearRoutes::Exact ? "exact" : "fast";
@@ -199,10 +213,12 @@ int main(int argc, char** argv) {
             return 0;
         }
 
-        std::printf("# execution=%s routes=%s warmup=%d repeat=%d flush_bytes=%zu "
-                    "workspace_sweep_bytes=%zu\n",
-                    options.graph ? "graph" : "eager", routes_name, options.warmup, options.repeat,
-                    kFlushBytes, workspace_capacity);
+        std::printf("# execution=%s routes=%s policy=%s warmup=%d repeat=%d flush_bytes=%zu "
+                    "workspace_sweep_bytes=%zu %s\n",
+                    options.graph ? "graph" : "eager", routes_name,
+                    options.policy == ops::LinearPolicy::A16Only ? "a16" : "invariant",
+                    options.warmup, options.repeat, kFlushBytes, workspace_capacity,
+                    temporary_switches::describe(temporary_switches::Scope::Qwen3_5).c_str());
         std::vector<Result> results;
         results.reserve(options.tokens.size());
         for (const std::int32_t tokens : options.tokens) {
@@ -223,7 +239,7 @@ int main(int argc, char** argv) {
             const double bytes   = static_cast<double>(packed.model_weight_bytes()) +
                                  2.0 * static_cast<double>(kHidden + kOutputRows) * tokens;
             const std::size_t workspace_exact = ops::linear_swiglu_workspace_capacity_bytes(
-                QType::Q4_G64_FP16, kGateUpRows, kHidden, ops::LinearPolicy::A16Only, tokens,
+                QType::Q4_G64_FP16, kGateUpRows, kHidden, options.policy, tokens,
                 tokens, options.routes);
             std::printf("T=%-4d median=%9.3f us min=%9.3f p95=%9.3f %7.1f GB/s %7.2f TFLOP/s "
                         "workspace_sweep=%zu workspace_exact=%zu nodes=%zu\n",

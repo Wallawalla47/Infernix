@@ -7,6 +7,7 @@ import math
 import struct
 
 import numpy as np
+import pytest
 
 from tools.expert_cache_replay import host_tier as ht
 
@@ -99,6 +100,57 @@ def test_full_mode_never_reads_the_ssd():
     sim.run(trace.rounds)
     total = sim.summary()['total']
     assert total['ssd_reads'] == 0 and total['promotions'] > 0 and total['vram_hit_live'] > 0.2
+
+
+def test_link_charged_speed_pays_for_promotions_and_misses():
+    # Review 2026-10-24 §7.2: a policy's promotion copies are charged to the x8 link and its decode misses
+    # to their service, so more hits bought with more copies are not free.
+    trace = ht.synthetic_trace(seed=3)
+    sim = ht.TierSim(trace.header, vram=100, ram_slots=None, prior='none')
+    sim.run(trace.rounds)
+    s = sim.summary()['total']
+    assert s['promotions_per_token'] == pytest.approx(s['promotions'] / s['generated_tokens'])
+    assert 0.0 <= s['decode_vram_misses_per_token']
+    base = ht.link_charged_speed(s, t0_ms=10.0, cost_ms=0.65, miss_ms=0.0, link_gbs=1e12)
+    assert base == pytest.approx(1000.0 / (10.0 + s['reads_per_token'] * 0.65))
+    copies = dict(s, promotions_per_token=s['promotions_per_token'] + 10.0)
+    slower = ht.link_charged_speed(copies, t0_ms=10.0, cost_ms=0.65, miss_ms=0.0, link_gbs=27.5)
+    expected_ms = 1000.0 / base + 10.0 * ht.RECORD_BYTES / 27.5e9 * 1e3 + s['promotions_per_token'] * ht.RECORD_BYTES / 27.5e9 * 1e3
+    assert slower == pytest.approx(1000.0 / expected_ms)
+
+
+def test_adaptive_vram_policy_parses_basalts_rules():
+    assert ht.parse_vram_policy('lfru') is None
+    assert ht.parse_vram_policy('adaptive') == (0.85, 2.0, 1.5, 96)
+    assert ht.parse_vram_policy('adaptive:0.9,3') == (0.9, 3.0, 1.5, 96)
+    for bad in ('adaptive:1.5', 'adaptive:0.8,1,1,0', 'adaptive:1,2,3,4,5', 'belady'):
+        with pytest.raises(ValueError):
+            ht.parse_vram_policy(bad)
+
+
+def test_adaptive_vram_policy_stays_within_its_frames_and_swap_cap():
+    # Basalt's adaptive tier (candidates D12) on a topic-switching trace: the frames hold at most V
+    # experts, a round admits at most its cap (4 x SWAPS after a backlog), full mode reads no SSD, and
+    # the decayed counts still find the live experts.
+    trace = ht.synthetic_trace(layers=4, experts=64, top_k=4, requests=6, prompt=96, decode=128, chunk=32,
+                               topics=3, seed=7)
+    swaps = 3
+    sim = ht.TierSim(trace.header, vram=48, ram_slots=None, prior='none', vram_policy=f'adaptive:0.85,2,1.5,{swaps}')
+
+    def event(name):
+        return sum(m.events[name] for m in sim.metrics)
+
+    starts = sum(1 for r in trace.rounds if r.kind == ht.PREFILL and r.position == 0)
+    sim.half_of_request = lambda q: 0 if q < (starts + 1) // 2 else 1
+    for r in trace.rounds:
+        before = event('promotions')
+        sim.step(r)
+        assert sim.v_n <= 48
+        assert event('promotions') - before <= 4 * swaps
+    total = sim.summary()['total']
+    assert total['ssd_reads'] == 0 and total['promotions'] > 0 and total['vram_hit_live'] > 0.2
+    assert event('adaptive_swaps') > 0
+    assert event('adaptive_swaps') + event('adaptive_admissions') == event('promotions')
 
 
 def test_prompt_seeding_credits_the_prompt_and_promotes_within_its_budget():

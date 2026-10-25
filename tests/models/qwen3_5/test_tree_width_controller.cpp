@@ -183,6 +183,41 @@ void timing_spike_is_bounded() {
     check(sim.round(1, 4000) == 16, "one timing spike does not change the choice");
 }
 
+// INFERNIX_TMP_TREE_ROUND_WIDTH (candidates §13 PUB-03): a tree block round's own draft probabilities
+// choose its width. Confident rounds (every draft at 0.98) stay on the main chain, so a tree buys
+// them nothing; unsure rounds (0.5) leave it at depth 1 for column 13 (chain 1 token, 16 columns 3).
+// Averaged over both, 16 columns pay (11/9 the tokens for 10 % more time); per round, the chain wins
+// the confident rounds and 16 columns the unsure ones.
+void per_round_width() {
+    const std::array<float, 7> confident{0.98F, 0.98F, 0.98F, 0.98F, 0.98F, 0.98F, 0.98F};
+    const std::array<float, 7> unsure{0.5F, 0.5F, 0.5F, 0.5F, 0.5F, 0.5F, 0.5F};
+    const std::vector<std::int32_t> stays{0, 1, 2, 3, 4, 5, 6, 7};
+    const std::vector<std::int32_t> leaves{0, 13, 14};
+    const auto seconds = [](std::uint32_t columns) { return columns == 16 ? 0.0110 : columns == 12 ? 0.0104 : 0.0100; };
+    TreeWidthController controller(kChain, trees_upto(1, {12, 16}));
+    std::map<std::uint32_t, int> confident_choices, unsure_choices;
+    for (int round = 0; round < 1200; ++round) {
+        const bool sure = round % 2 == 0;
+        const TreeWidthController::RoundRow row{.probabilities = sure ? std::span<const float>(confident)
+                                                                       : std::span<const float>(unsure),
+                                                .tree          = true};
+        const std::uint32_t columns = controller.choose(1, 4000, std::span<const TreeWidthController::RoundRow>(&row, 1));
+        const auto path             = narrowed(sure ? stays : leaves, columns);
+        controller.observe_round_row(row, path, columns);
+        if (columns != kChain) { controller.observe_tree_row(path, columns); }
+        controller.observe_round(1, 4000, columns, seconds(columns));
+        if (round >= 400) { (sure ? confident_choices : unsure_choices)[columns] += 1; }
+    }
+    // Besides the widest width every 32 rounds and stale refreshes.
+    check(confident_choices[kChain] >= 400 - 400 / 16 - 4, "confident rounds verify the chain");
+    check(unsure_choices[16] >= 400 - 4, "unsure rounds verify 16 columns");
+    const auto estimate = TreeWidthController::estimate(
+        TreeWidthController::RoundRow{.probabilities = std::span<const float>(unsure), .tree = true});
+    check(near(estimate.chain, 2.0 - std::pow(0.5, 7), 1e-12) && near(estimate.miss, 1.0 - std::pow(0.5, 7), 1e-12),
+          "a row's own estimate: expected chain tokens and miss mass");
+    check(controller.automatic(1) && !controller.automatic(2), "rounds of two rows have no tree widths here");
+}
+
 void invalid_inputs() {
     bool threw = false;
     try {
@@ -212,6 +247,7 @@ int main() {
         choice_per_context();
         middle_width_wins();
         timing_spike_is_bounded();
+        per_round_width();
         invalid_inputs();
     } catch (const std::exception& error) {
         std::cerr << "tree width controller test threw: " << error.what() << '\n';

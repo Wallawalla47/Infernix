@@ -1,3 +1,4 @@
+#include "ops/op_family.h"
 #include "ops/linear_add/linear_add_test_common.h"
 
 #include "infernix/ops/linear_add.h"
@@ -113,7 +114,7 @@ int q8_a16_conformance() {
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(linear_add_q8_a16) {
     if (!infernix::test::linear_add::cuda_available()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;

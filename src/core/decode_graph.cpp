@@ -2,6 +2,7 @@
 
 #include "core/device.h"
 #include "core/nvtx.h"
+#include "core/temporary_switches.h"
 
 #include <cstddef>
 #include <cstdio>
@@ -87,7 +88,7 @@ void DecodeGraphDefinition::capture(cudaStream_t stream, const std::function<voi
 
 void DecodeGraphDefinition::capture_gated_chain(
     cudaStream_t stream, std::int32_t steps, const std::function<void(std::int32_t)>& body,
-    const std::function<void(std::int32_t, cudaGraphConditionalHandle)>& gate) {
+    const std::function<void(std::int32_t, cudaGraphConditionalHandle)>& gate, const std::function<void()>& tail) {
     nvtx::ScopedRange capture_range(nvtx::Name::CudaGraphCapture, nvtx::Category::Graph);
     if (steps < 1) { throw std::invalid_argument("a gated graph chain needs at least one step"); }
     reset();
@@ -97,6 +98,8 @@ void DecodeGraphDefinition::capture_gated_chain(
     // Body j is captured into `target`: the chain itself for j = 0, else the IF body that the gate
     // after body j - 1 controls (owned by its conditional node, so by the chain).
     cudaGraph_t target = chain;
+    // The chain graph's first IF node (steps > 1): the tail follows it.
+    cudaGraphNode_t first_conditional = nullptr;
     try {
         for (std::int32_t j = 0; j < steps; ++j) {
             CUDA_CHECK(cudaStreamBeginCaptureToGraph(stream, target, nullptr, nullptr, 0,
@@ -104,6 +107,8 @@ void DecodeGraphDefinition::capture_gated_chain(
             cudaGraph_t next = nullptr;
             try {
                 body(j);
+                // One step: the tail continues the same capture.
+                if (steps == 1 && tail) { tail(); }
                 if (j + 1 < steps) {
                     cudaGraphConditionalHandle handle{};
                     CUDA_CHECK(cudaGraphConditionalHandleCreate(&handle, target, 0, cudaGraphCondAssignDefault));
@@ -124,6 +129,7 @@ void DecodeGraphDefinition::capture_gated_chain(
                     CUDA_CHECK(cudaStreamUpdateCaptureDependencies(stream, &node, nullptr, 1,
                                                                    cudaStreamSetCaptureDependencies));
                     next = params.conditional.phGraph_out[0];
+                    if (j == 0) { first_conditional = node; }
                 }
             } catch (...) {
                 // The capture's graph is `target`, which the chain owns: end it without destroying it.
@@ -134,6 +140,21 @@ void DecodeGraphDefinition::capture_gated_chain(
             cudaGraph_t captured = nullptr;
             CUDA_CHECK(cudaStreamEndCapture(stream, &captured));
             target = next;
+        }
+        if (steps > 1 && tail) {
+            // Back into the chain's graph behind its first IF node, which completes with every
+            // nested body.
+            CUDA_CHECK(cudaStreamBeginCaptureToGraph(stream, chain, &first_conditional, nullptr, 1,
+                                                     cudaStreamCaptureModeThreadLocal));
+            try {
+                tail();
+            } catch (...) {
+                cudaGraph_t ended = nullptr;
+                log_cuda_error("cudaStreamEndCapture(discard)", cudaStreamEndCapture(stream, &ended));
+                throw;
+            }
+            cudaGraph_t captured = nullptr;
+            CUDA_CHECK(cudaStreamEndCapture(stream, &captured));
         }
     } catch (...) {
         destroy_graph(chain);
@@ -169,8 +190,12 @@ void DecodeGraphExecutable::instantiate(const DecodeGraphDefinition& definition)
     }
     reset();
 
-    cudaGraphExec_t exec  = nullptr;
-    const cudaError_t err = cudaGraphInstantiate(&exec, definition.graph_, 0);
+    cudaGraphExec_t exec = nullptr;
+    // TEMPORARY (INFERNIX_TMP_STREAM_PRIORITY, candidates §11 D5): kernels captured from a stream of
+    // greater priority (Flash-Next's staging and shared-expert streams) keep it inside the graph.
+    static const bool node_priority = temporary_switches::flag("INFERNIX_TMP_STREAM_PRIORITY");
+    const cudaError_t err =
+        cudaGraphInstantiate(&exec, definition.graph_, node_priority ? cudaGraphInstantiateFlagUseNodePriority : 0);
     if (err != cudaSuccess) {
         destroy_graph_exec(exec);
         if (err == cudaErrorMemoryAllocation) {

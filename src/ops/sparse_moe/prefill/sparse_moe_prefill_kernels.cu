@@ -6,6 +6,7 @@
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/common/rowsplit_mma.cuh"
+#include "core/temporary_switches.h"
 #include "ops/linear/q4/q4_rowsplit_storage.cuh"
 #include "ops/linear/q5/q5_rowsplit_storage.cuh"
 #include "ops/linear/q6/q6_rowsplit_storage.cuh"
@@ -794,7 +795,10 @@ struct Q6DownMma {
     }
 };
 
-template <class Codec, int ExpertWarps, int ExpertBN>
+// Fp32Scale (temporary switch INFERNIX_TMP_Q56_FP32_SCALE): the tile's codes enter the MMA as BF16
+// integers and each 64-group scale multiplies that group's FP32 partial sum, as in the Q4 gate/up
+// kernel; otherwise q x scale is rounded to BF16 before the MMA.
+template <class Codec, int ExpertWarps, int ExpertBN, bool Fp32Scale>
 __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_qx_down_kernel(
     const __nv_bfloat16* __restrict__ activation, const int* __restrict__ expert_offsets,
     const int* __restrict__ route_job_experts, const int* __restrict__ route_job_columns,
@@ -885,8 +889,10 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_qx_dow
             for (int item = tid; item < kExpertBM * CodeChunksPerRow; item += ExpertThreads) {
                 const int row     = item / CodeChunksPerRow;
                 const int chunk   = item - row * CodeChunksPerRow;
-                const float scale = __half2float(__ushort_as_half(
-                    *reinterpret_cast<const std::uint16_t*>(&Sr[(row * GroupsPerRow + kt) * 2])));
+                const float scale =
+                    Fp32Scale ? 1.0f
+                              : __half2float(__ushort_as_half(*reinterpret_cast<const std::uint16_t*>(
+                                    &Sr[(row * GroupsPerRow + kt) * 2])));
                 unsigned decoded[4];
                 Codec::decode_eight(
                     *reinterpret_cast<const unsigned*>(&Cr[stage][row * 32 + chunk * 4]),
@@ -914,6 +920,8 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_qx_dow
             __syncthreads();
 
             if (warp * 8 < cols) {
+                float partial[4][4] = {}; // Fp32Scale only: the group's unscaled sums
+                float(&sums)[4][4]  = *(Fp32Scale ? &partial : &acc);
 #pragma unroll
                 for (int ki = 0; ki < kExpertBK / 16; ++ki) {
                     unsigned af[4][4];
@@ -931,8 +939,23 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_qx_dow
                                 smem_addr(&Bs[stage][brow * kExpertBK + gemm_swz64(brow, bcol)]));
 #pragma unroll
                     for (int mi = 0; mi < 4; ++mi) {
-                        mma_bf16(acc[mi][0], acc[mi][1], acc[mi][2], acc[mi][3], af[mi][0],
+                        mma_bf16(sums[mi][0], sums[mi][1], sums[mi][2], sums[mi][3], af[mi][0],
                                  af[mi][1], af[mi][2], af[mi][3], bf[0], bf[1]);
+                    }
+                }
+                if constexpr (Fp32Scale) {
+                    // The tile is one 64-group: acc += partial * scale of rows gid and gid + 8.
+#pragma unroll
+                    for (int mi = 0; mi < 4; ++mi) {
+                        const int local_row0 = mi * 16 + gid;
+                        const float scale0   = __half2float(__ushort_as_half(*reinterpret_cast<const std::uint16_t*>(
+                            &Sr[(local_row0 * GroupsPerRow + kt) * 2])));
+                        const float scale1   = __half2float(__ushort_as_half(*reinterpret_cast<const std::uint16_t*>(
+                            &Sr[((local_row0 + 8) * GroupsPerRow + kt) * 2])));
+                        acc[mi][0] = fmaf(partial[mi][0], scale0, acc[mi][0]);
+                        acc[mi][1] = fmaf(partial[mi][1], scale0, acc[mi][1]);
+                        acc[mi][2] = fmaf(partial[mi][2], scale1, acc[mi][2]);
+                        acc[mi][3] = fmaf(partial[mi][3], scale1, acc[mi][3]);
                     }
                 }
             }
@@ -1320,36 +1343,29 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         CUDA_CHECK(cudaGetLastError());
 
         const dim3 routed_down_grid(kHidden / kExpertBM, kExperts);
+        const auto qx_down = [&]<class Codec, int Warps, int BN, bool Fp32Scale>() {
+            sparse_moe_prefill_qx_down_kernel<Codec, Warps, BN, Fp32Scale>
+                <<<routed_down_blocks, Warps * 32, 0, stream>>>(
+                    routed_activation, offsets, route_job_experts, route_job_columns,
+                    route_job_count, routed_down_codes, routed_down_high, routed_down_scales,
+                    grouped_io);
+        };
+        const auto qx_down_codec = [&]<class Codec>() {
+            const bool fp32_scale = temporary_switches::q56_fp32_scale();
+            if (wide_plan) {
+                fp32_scale ? qx_down.template operator()<Codec, 8, 64, true>()
+                           : qx_down.template operator()<Codec, 8, 64, false>();
+            } else {
+                fp32_scale ? qx_down.template operator()<Codec, 4, 32, true>()
+                           : qx_down.template operator()<Codec, 4, 32, false>();
+            }
+        };
         switch (weights.routed_down.qtype) {
         case QType::Q5_G64_FP16:
-            if (wide_plan) {
-                sparse_moe_prefill_qx_down_kernel<Q5DownMma, 8, 64>
-                    <<<routed_down_blocks, 8 * 32, 0, stream>>>(
-                        routed_activation, offsets, route_job_experts, route_job_columns,
-                        route_job_count, routed_down_codes, routed_down_high, routed_down_scales,
-                        grouped_io);
-            } else {
-                sparse_moe_prefill_qx_down_kernel<Q5DownMma, 4, 32>
-                    <<<routed_down_blocks, 4 * 32, 0, stream>>>(
-                        routed_activation, offsets, route_job_experts, route_job_columns,
-                        route_job_count, routed_down_codes, routed_down_high, routed_down_scales,
-                        grouped_io);
-            }
+            qx_down_codec.template operator()<Q5DownMma>();
             break;
         case QType::Q6_G64_FP16:
-            if (wide_plan) {
-                sparse_moe_prefill_qx_down_kernel<Q6DownMma, 8, 64>
-                    <<<routed_down_blocks, 8 * 32, 0, stream>>>(
-                        routed_activation, offsets, route_job_experts, route_job_columns,
-                        route_job_count, routed_down_codes, routed_down_high, routed_down_scales,
-                        grouped_io);
-            } else {
-                sparse_moe_prefill_qx_down_kernel<Q6DownMma, 4, 32>
-                    <<<routed_down_blocks, 4 * 32, 0, stream>>>(
-                        routed_activation, offsets, route_job_experts, route_job_columns,
-                        route_job_count, routed_down_codes, routed_down_high, routed_down_scales,
-                        grouped_io);
-            }
+            qx_down_codec.template operator()<Q6DownMma>();
             break;
         case QType::Q8_G32_FP16:
             sparse_moe_prefill_q8_down_kernel<true>

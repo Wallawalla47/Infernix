@@ -4,6 +4,7 @@ target_sources(infernix_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/q8_simt.cu"
   "${CMAKE_CURRENT_LIST_DIR}/q8_gemv.cu"
   "${CMAKE_CURRENT_LIST_DIR}/q8_dispatch.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/q8_f16acc.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n1024_k2048.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n1024_k5120.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n10240_k2560.cu"

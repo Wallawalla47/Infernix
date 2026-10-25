@@ -482,6 +482,17 @@ Different production routes use different criteria only when their arithmetic or
 profiles differ materially. Widening a criterion requires a numerical reason and requalification
 of its complete affected domain; one failing implementation is not sufficient justification.
 
+**Repeat and compare.** A route with a pipeline (cp.async or TMA stages), atomics, a persistent work
+counter or a second stream also checks that repeated identical calls give the same bits:
+`verify_repeatable` (`tests/ops/op_tester.h`) reruns the call with its outputs poisoned between runs
+and a copy streaming on a second stream beside it, and compares every output byte with the first
+run. A race between a stage's producer and its consumers corrupts one call in many and only under
+other traffic (the TMA proxy fence race showed in 19 of 20 cases under a side stream, never alone),
+which a single call against the oracle does not see. **A bit-identity claim needs a fixture that can
+fail it:** before two routes are declared identical, the test confirms that its inputs make
+summation order visible (`summation_order_visible`: some row's FP32 sum differs between two orders),
+or the comparison only shows that both orders agree on easy data.
+
 Op qualification does not show what a change does to a whole model's output. On artifacts with
 4-bit activations even reordered arithmetic moves the output distribution measurably, so a
 model-level claim follows [Model-level numerical quality](model-quality.md): several prefill chunk

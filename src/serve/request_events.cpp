@@ -11,6 +11,7 @@ RequestLogContext make_request_log_context(std::uint64_t id, std::string protoco
     RequestLogContext context;
     context.id                                 = id;
     context.http_request_id                    = metadata.http_request_id;
+    context.label                              = metadata.label;
     context.response_id                        = metadata.response_id;
     context.protocol                           = std::move(protocol);
     context.model                              = metadata.model;
@@ -44,6 +45,7 @@ RequestRejectionLogContext make_request_rejection_log_context(std::uint64_t id,
     RequestRejectionLogContext context;
     context.id                                 = id;
     context.http_request_id                    = metadata.http_request_id;
+    context.label                              = metadata.label;
     context.response_id                        = metadata.response_id;
     context.protocol                           = std::move(protocol);
     context.model                              = metadata.model;
@@ -115,6 +117,29 @@ RequestFailure make_client_disconnected_failure(RequestFailurePhase phase) {
         .error_code      = "client_disconnected",
         .machine_message = "client disconnected",
     };
+}
+
+GpuInterval gpu_interval(const ThroughputReport& report) {
+    GpuInterval out;
+    const auto& a = report.gpu_previous;
+    const auto& b = report.gpu_current;
+    if (!a.valid || !b.valid || report.interval_seconds <= 0.0) { return out; }
+    // The counters are cumulative; one that went backwards (a driver reload) gives no delta.
+    if (a.has_energy && b.has_energy && b.energy_millijoules >= a.energy_millijoules) {
+        const double joules     = static_cast<double>(b.energy_millijoules - a.energy_millijoules) * 1e-3;
+        out.energy_joules       = joules;
+        out.average_power_watts = joules / report.interval_seconds;
+        if (report.computed_prefill_tokens == 0 && report.committed_decode_tokens != 0) {
+            out.joules_per_decode_token = joules / static_cast<double>(report.committed_decode_tokens);
+        }
+    }
+    if (a.has_violations && b.has_violations && b.power_violation_ns >= a.power_violation_ns &&
+        b.thermal_violation_ns >= a.thermal_violation_ns) {
+        const double interval_ns       = report.interval_seconds * 1e9;
+        out.power_violation_fraction   = static_cast<double>(b.power_violation_ns - a.power_violation_ns) / interval_ns;
+        out.thermal_violation_fraction = static_cast<double>(b.thermal_violation_ns - a.thermal_violation_ns) / interval_ns;
+    }
+    return out;
 }
 
 } // namespace infernix::serve

@@ -1,5 +1,7 @@
 #include "models/qwen3_5/program/speculative/dflash_width_policy.h"
 
+#include "core/temporary_switches.h"
+
 #include <algorithm>
 #include <stdexcept>
 
@@ -32,6 +34,8 @@ DFlashWidthPolicy::DFlashWidthPolicy(std::uint32_t ceiling, std::uint32_t max_ba
     }
     row_widths_   = dflash_policy_widths(ceiling, false, zero_drafts);
     if (batches) { batch_widths_ = dflash_policy_widths(ceiling, true, zero_drafts); }
+    pool_ = temporary_switches::flag("INFERNIX_TMP_DRAFT_PROCESS_STATS");
+    pooled_.reset();
 }
 
 const std::vector<std::uint32_t>& DFlashWidthPolicy::widths(std::uint32_t batch_size) const {
@@ -58,6 +62,11 @@ std::uint32_t DFlashWidthPolicy::choose(std::span<const DFlashPolicyRow> rows) {
     for (const DFlashPolicyRow& row : rows) {
         if (row.state == nullptr) { throw std::invalid_argument("DFlash width policy row has no state"); }
         most = std::max(most, row.limit);
+        // A request's first choice starts from what the process has learned (INFERNIX_TMP_DRAFT_PROCESS_STATS).
+        if (pool_ && !row.state->pooled) {
+            row.state->calibration = pooled_;
+            row.state->pooled      = true;
+        }
     }
     // Widths past every row's limit verify nothing more: the narrowest width holding the longest
     // row's drafts bounds the choice.
@@ -81,6 +90,12 @@ std::uint32_t DFlashWidthPolicy::choose(std::span<const DFlashPolicyRow> rows) {
 void DFlashWidthPolicy::observe(DFlashLaneDraftState& state, std::span<const float> probabilities,
                                 std::uint32_t verified, std::uint32_t accepted) noexcept {
     state.calibration.observe(probabilities, verified, accepted, kCalibrationWeight);
+}
+
+void DFlashWidthPolicy::learn(DFlashLaneDraftState& state, std::span<const float> probabilities,
+                              std::uint32_t verified, std::uint32_t accepted) noexcept {
+    observe(state, probabilities, verified, accepted);
+    if (pool_) { pooled_.observe(probabilities, verified, accepted, kCalibrationWeight); }
 }
 
 } // namespace infernix::models::qwen3_5::detail

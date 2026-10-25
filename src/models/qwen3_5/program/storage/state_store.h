@@ -76,7 +76,7 @@ public:
         return allocate(StateImageRole::ReservedDestination);
     }
 
-    [[nodiscard]] std::optional<StateImageHandle> reserve_reset(cudaStream_t stream = nullptr) {
+    [[nodiscard]] std::optional<StateImageHandle> reserve_reset(cudaStream_t stream) {
         std::optional<StateImageHandle> handle = allocate(StateImageRole::ActiveMutable);
         if (!handle) { return std::nullopt; }
         try {
@@ -88,7 +88,7 @@ public:
         return handle;
     }
 
-    void activate_reset(StateImageHandle handle, cudaStream_t stream = nullptr) {
+    void activate_reset(StateImageHandle handle, cudaStream_t stream) {
         Object& object = require_role(handle, StateImageRole::ReservedDestination,
                                       "StateImage reset reservation is not activatable");
         device_->zero_slot(static_cast<std::int32_t>(handle.index_), stream);

@@ -95,4 +95,56 @@ void candidate_selector_tree(const Tensor& candidate_ids, const Tensor& unary_sc
                                                                            std::int32_t min_batch,
                                                                            std::int32_t max_batch);
 
+/**
+ * Op: candidate_tree
+ *
+ * candidate_selector_tree over K independent positions, for a drafter that proposes each position
+ * of its block on its own (DFlash): the edge of candidate c at position i is unary_scores[c,i,b]
+ * whatever the predecessor, so the law of every child at position i is
+ * softmax(unary_scores[.,i,b]/temperature). candidate_ids I32 [16,K,B] (distinct ids per position)
+ * and unary_scores FP32 [16,K,B] are the position's top candidates and their scores (linear_topk);
+ * base_positions, current_extents, configs, shape, the draws, their counter keys and every output
+ * are as candidate_selector_tree's. The main chain is the path walk over these edges: a greedy row
+ * takes each position's lowest rank attaining its maximum score, a sampled row draws from the
+ * position's law with (seed, base+i, kSamplePurposeDFlash2Proposal, 0). No workspace.
+ */
+void candidate_tree(const Tensor& candidate_ids, const Tensor& unary_scores,
+                    const Tensor& base_positions, const Tensor& current_extents,
+                    const SamplingConfig* configs, SpeculativeTreeShape shape, Tensor& drafts,
+                    Tensor& column_candidates, Tensor& proposal_q, Tensor& tree_rows,
+                    Tensor& tree_masks, Tensor& valid_columns, cudaStream_t stream);
+
+/**
+ * Op: candidate_chain_tree
+ *
+ * Extends a chain proposed before the round (MTP's) to a tree of leaves. For K in [1,15] and B in
+ * [1,8], candidate_ids I32 [16,K,B] holds each chain position's 16 distinct candidates, laws FP32
+ * [16,K,B] the normalized law each chain draft was drawn from (one-hot for greedy rows), and
+ * scores FP32 [n,K,B] (n in [1,16]) the log-probabilities of candidate ranks 0..n-1, which rank a
+ * greedy row's alternatives. drafts I32 [W-1,B] (W = shape.nodes, shape.main_depth == K) holds the
+ * chain in its leading K columns on entry.
+ *
+ * A row with current_extents[b] == W-1 is a tree row. Its columns 1..K are the chain as proposed
+ * (each draft at its rank among its position's candidates), and side columns K+1.. are added best
+ * first until the row holds W columns or shape.paths leaves: every side column is a child of a
+ * chain column v (depth v < K) and takes no children. Node v's law over position v+1's candidates
+ * is the given law for sampled rows and the temperature-1 softmax of the scores (ranks >= n
+ * excluded) for greedy rows; v's next child has priority score(v) * E[law value of that child]
+ * with candidate_selector_tree's score, expectation, without-replacement draw and counter key
+ * (seed, base_positions[b]+v, kSamplePurposeDFlash2Proposal, ((v+1) << 5) | j) for sibling j
+ * (j >= 1); greedy rows take the best untaken rank. A tree row whose chain draft is absent from its
+ * candidates takes no side column. Other rows are chain rows of their current_extents[b]+1 columns.
+ *
+ * Outputs: the side columns' drafts; column_candidates I32 [16,W-1,B] (the candidates of the
+ * column's position); proposal_q FP32 [16,W-1,B] (a chain column's given law; a side column's
+ * parent law for sampled rows, a one-hot of its rank for greedy rows); tree_rows, tree_masks and
+ * valid_columns as candidate_selector_tree. The tree's shape never depends on a column's own
+ * token, which keeps recursive rejection sampling exact over the given laws. No workspace.
+ */
+void candidate_chain_tree(const Tensor& candidate_ids, const Tensor& laws, const Tensor& scores,
+                          const Tensor& base_positions, const Tensor& current_extents,
+                          const SamplingConfig* configs, SpeculativeTreeShape shape, Tensor& drafts,
+                          Tensor& column_candidates, Tensor& proposal_q, Tensor& tree_rows,
+                          Tensor& tree_masks, Tensor& valid_columns, cudaStream_t stream);
+
 } // namespace infernix::ops

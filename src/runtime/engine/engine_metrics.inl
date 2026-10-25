@@ -172,6 +172,9 @@ void EngineCore<Instance>::publish_runtime_stats() {
     if constexpr (requires { resources_.populate_runtime_stats(*instance_.program, snapshot); }) {
         resources_.populate_runtime_stats(*instance_.program, snapshot);
     }
+    if constexpr (requires { instance_.program->expert_cache_totals(); }) {
+        snapshot.expert_cache = instance_.program->expert_cache_totals();
+    }
 
     {
         std::lock_guard lock(queue_mutex_);

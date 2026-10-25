@@ -43,8 +43,10 @@ struct OpenAIChatResponseIdentity {
 };
 
 OpenAIChatResponseIdentity make_openai_chat_response_identity(std::string model);
+// `call_ids`, when given, receives the ids of the response's tool calls in order.
 std::string make_chat_completion_response(const OpenAIChatResponseIdentity& identity,
-                                          const GenerationOutcome& outcome);
+                                          const GenerationOutcome& outcome,
+                                          std::vector<std::string>* call_ids = nullptr);
 
 class OpenAIChatStream {
 public:
@@ -59,14 +61,28 @@ public:
     void note_timing(const infernix::GenerationTimingObservation& timing);
     std::string reasoning_delta(const std::string& text);
     std::string content_delta(const std::string& text);
+    // A constrained call's step: its first opens the call (id, type, name), every one extends its
+    // arguments.
+    std::string tool_call_delta(const infernix::ToolCallDelta& delta);
     std::vector<std::string> finish(const GenerationOutcome& outcome);
+    // After finish: the ids of the result's tool calls, in order.
+    [[nodiscard]] const std::vector<std::string>& tool_call_ids() const noexcept { return call_ids_; }
 
 private:
     nlohmann::json live_timings_json() const;
 
+    struct StreamedCall {
+        std::string id;
+        std::string name;
+        std::string arguments;
+        bool complete = false;
+    };
+
     OpenAIChatResponseIdentity identity_;
     std::string reasoning_;
     std::string content_;
+    std::vector<StreamedCall> calls_;
+    std::vector<std::string> call_ids_;
     std::optional<infernix::GenerationTimingObservation> live_timing_;
     std::uint32_t prompt_tokens_            = 0;
     std::uint32_t cached_tokens_            = 0;

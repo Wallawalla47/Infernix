@@ -129,6 +129,12 @@ class ToolSchema(unittest.TestCase):
                 schema({"type": ["integer", "null"]}),
                 [{"x": x} for x in [None, True, 0, 7]],
             ),
+            # A nullable string parameter: the text null is JSON null, other text the string itself
+            # (so the string "null" and digits are not distinct values here, and are left out).
+            (
+                schema({"type": ["string", "null"]}),
+                [{"x": x} for x in [None, "a", "two words"]],
+            ),
             (
                 schema(
                     {
@@ -220,7 +226,6 @@ class ToolSchema(unittest.TestCase):
 
     def test_prepare_rejections(self):
         specs = [
-            schema({"type": ["string", "null"]}),
             schema({"type": ["string", "integer"], "enum": ["1.0", 1.0]}),
             schema(
                 {

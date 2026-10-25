@@ -218,15 +218,17 @@ __device__ __forceinline__ void nvfp4_tma_load_activation(void* destination,
     }
 }
 
-template <class Schedule, class Epilogue, class OutputPolicy, class Rows>
+template <class Schedule, class Epilogue, class OutputPolicy, class Rows, bool InPlace = false>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_tma_kernel(
 #ifdef _WIN32
     // MSVC cannot pass the over-aligned (alignas(128)) CUtensorMap struct by value as a
     // __grid_constant__ parameter (C2719), so on Windows the descriptors are pointer-passed from
-    // the staging buffer. The epilogue and output stay ordinary by-value parameters: a
-    // grid-constant struct holding a sub-8-byte member mis-packs under MSVC.
-    const Nvfp4A4TmaDescriptors* descriptors_pointer, float alpha, const Epilogue epilogue,
+    // the staging buffer (or, InPlace, read from the parameter words). The epilogue and output stay
+    // ordinary by-value parameters: a grid-constant struct holding a sub-8-byte member mis-packs
+    // under MSVC.
+    const __grid_constant__ TmaDescriptorParameter<Nvfp4A4TmaDescriptors, InPlace> descriptors_pointer, float alpha,
+    const Epilogue epilogue,
     const OutputPolicy output,
 #else
     const __grid_constant__ Nvfp4A4TmaDescriptors descriptors, float alpha,
@@ -270,10 +272,10 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_t
 #ifdef _WIN32
             // A staged tensor map was written through the generic proxy; each 128-byte map needs
             // its own acquire for the TMA (tensormap) proxy before its first use.
-            acquire_staged_tensor_map(&descriptors.a_codes);
-            acquire_staged_tensor_map(&descriptors.b_codes);
-            acquire_staged_tensor_map(&descriptors.a_scales);
-            acquire_staged_tensor_map(&descriptors.b_scales);
+            acquire_staged_tensor_map<InPlace>(&descriptors.a_codes);
+            acquire_staged_tensor_map<InPlace>(&descriptors.b_codes);
+            acquire_staged_tensor_map<InPlace>(&descriptors.a_scales);
+            acquire_staged_tensor_map<InPlace>(&descriptors.b_scales);
 #endif
 #pragma unroll 1
             for (int k_tile = 0; k_tile < kKTiles; ++k_tile) {
@@ -515,25 +517,23 @@ void launch_nvfp4_a4_tma_mma(const Nvfp4A4Operands& p, Output output, Epilogue e
     if (!aligned(p.x) || !aligned(p.codes) || !aligned(p.scales) || !aligned(p.x_scales))
         throw std::invalid_argument("NVFP4 TMA operands require 16-byte alignment");
     const auto descriptors = make_nvfp4_a4_tma_descriptors<Schedule, Rows>(p);
+    const auto launch_slices = [&]<bool InPlace>(std::bool_constant<InPlace>, const auto& parameter) {
+        // Static: MSVC 2022 rejects the lambda's use of an automatic constexpr local (C2326).
+        static constexpr int bytes   = sizeof(Nvfp4A4TmaSharedStorage<Schedule, Rows, Epilogue>);
+        static constexpr auto kernel = nvfp4_a4_tma_kernel<Schedule, Epilogue, Output, Rows, InPlace>;
+        (void)nvfp4_prepare_shared<bytes, kernel, true>();
+        for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
+            const dim3 grid(p.rows / Schedule::kBlockRows, div_up(count, Schedule::kBlockTokens));
+            kernel<<<grid, Schedule::kThreads, bytes, stream>>>(parameter, p.alpha, epilogue, output,
+                                                                offset + count, p.rows, p.k, offset);
+            CUDA_CHECK(cudaGetLastError());
+        });
+    };
 #ifdef _WIN32
-    // Staged once: every token-slice launch below reads the same copy, in stream order.
-    const Nvfp4A4TmaDescriptors* staged =
-        nvfp4_a4_tma_descriptor_staging().stage(descriptors, stream);
-#endif
-    constexpr int bytes = sizeof(Nvfp4A4TmaSharedStorage<Schedule, Rows, Epilogue>);
-    // Static: MSVC 2022 rejects the lambda's use of an automatic constexpr local (C2326).
-    static constexpr auto kernel = nvfp4_a4_tma_kernel<Schedule, Epilogue, Output, Rows>;
-    (void)nvfp4_prepare_shared<bytes, kernel, true>();
-    for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
-        const dim3 grid(p.rows / Schedule::kBlockRows, div_up(count, Schedule::kBlockTokens));
-#ifdef _WIN32
-        kernel<<<grid, Schedule::kThreads, bytes, stream>>>(staged, p.alpha, epilogue, output,
-                                                            offset + count, p.rows, p.k, offset);
+    // Staged once: every token-slice launch reads the same copy, in stream order.
+    with_tma_descriptor_parameter(nvfp4_a4_tma_descriptor_staging(), descriptors, stream, launch_slices);
 #else
-        kernel<<<grid, Schedule::kThreads, bytes, stream>>>(descriptors, p.alpha, epilogue, output,
-                                                            offset + count, p.rows, p.k, offset);
+    launch_slices(std::false_type{}, descriptors);
 #endif
-        CUDA_CHECK(cudaGetLastError());
-    });
 }
 } // namespace infernix::ops::detail

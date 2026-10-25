@@ -30,8 +30,11 @@ downloaded files.
 
 Source-weight conversion requires a Python 3.11 environment with PyTorch and NumPy. It uses CUDA
 by default; `--device cpu` selects CPU conversion, and `--workers N` converts up to N weight objects
-at once on the CPU (written in order; each in-flight object, at most 2N, is held whole in RAM). The
-input paths below are placeholders for your local checkpoint directories.
+at once on the CPU (written in order; each in-flight object, at most 2N, is held whole in RAM, and
+`--max-buffered-bytes`, default 8 GiB, bounds their total; a larger object converts alone). The
+input paths below are placeholders for your local checkpoint directories. A Safetensors checkpoint
+is read through its `model.safetensors.index.json`; without one, `model.safetensors`, or else every
+`*.safetensors` file in the directory (a tensor stored in two of them is rejected).
 
 For Qwen3.6-27B floating-point source weights:
 

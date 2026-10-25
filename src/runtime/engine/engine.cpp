@@ -4,6 +4,7 @@
 #include "core/nvtx.h"
 #include "core/power_throttling.h"
 #include "core/startup.h"
+#include "core/temporary_switches.h"
 #include "infernix/ops/lossless_ops.h"
 #include "runtime/contract/sampling.h"
 #include "runtime/contract/request.h"
@@ -164,6 +165,7 @@ public:
     public:
         virtual ~Concept() = default;
         virtual GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) = 0;
+        virtual void await_admission(const CancellationView& cancellation) = 0;
     };
 
     template <class Submission>
@@ -174,6 +176,10 @@ public:
 
         GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) override {
             return submission_.wait(sink, cancellation);
+        }
+
+        void await_admission(const CancellationView& cancellation) override {
+            submission_.await_admission(cancellation);
         }
 
     private:
@@ -190,6 +196,8 @@ public:
     GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) {
         return state_->wait(sink, cancellation);
     }
+
+    void await_admission(const CancellationView& cancellation) { state_->await_admission(cancellation); }
 
     [[nodiscard]] const ResolvedSamplingParameters& resolved_sampling() const noexcept {
         return sampling_;
@@ -218,6 +226,11 @@ GenerationResult GenerationHandle::wait(OutputSink* sink, const CancellationView
     if (impl_ == nullptr) { throw std::logic_error("GenerationHandle is empty"); }
     std::unique_ptr<Impl> impl = std::move(impl_);
     return impl->wait(sink, cancellation);
+}
+
+void GenerationHandle::await_admission(const CancellationView& cancellation) {
+    if (impl_ == nullptr) { throw std::logic_error("GenerationHandle is empty"); }
+    impl_->await_admission(cancellation);
 }
 
 class Engine::Impl {
@@ -250,6 +263,7 @@ public:
             load              = std::move(constructed.load);
             model_metadata    = std::move(constructed.model_metadata);
             load.cuda_sync_mode = device.sync_mode();
+            load.temporary_switches = temporary_switches::describe(temporary_switches::Scope::Qwen4Exp);
             sampling_defaults = qwen4->frontend.sampling_defaults();
             StartupPhaseScope finalize_phase(options.startup_observer, StartupPhase::EngineFinalize);
             if (options.purpose == EnginePurpose::CausalScoring) {
@@ -266,11 +280,13 @@ public:
         load                           = std::move(constructed.load);
         model_metadata                 = std::move(constructed.model_metadata);
         load.cuda_sync_mode            = device.sync_mode();
+        load.temporary_switches        = temporary_switches::describe(temporary_switches::Scope::Qwen3_5);
         if (tree_auto_requested && !options.speculative.draft_tree_auto) {
             runtime::publish_diagnostic(
                 options.diagnostic_observer, DiagnosticLevel::Warning,
-                "automatic DFlash2 tree verification does not run here (an artifact whose GDN input "
-                "projections are not single FP8 or NVFP4 parents, fixed speculation, or --draft-tokens "
+                "automatic tree verification does not run here (an artifact whose GDN input "
+                "projections are not single FP8, NVFP4 or Q8 parents, fixed speculation, MTP without "
+                "sampled-mtp-drafts or beside adaptive-mtp's draft lengths, or --draft-tokens "
                 "auto's adaptive-dflash widths, which verify chains faster); rounds verify chains");
         }
         sampling_defaults = active->frontend.sampling_defaults();
@@ -438,6 +454,11 @@ std::vector<TokenId> Engine::tokenize_text(std::string_view text) const {
     return impl_->frontend().tokenize_text(text);
 }
 
+std::string Engine::detokenize(std::span<const TokenId> token_ids) const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return impl_->frontend().detokenize(token_ids);
+}
+
 ChatTokens Engine::tokenize_chat(PromptInput input) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     return impl_->frontend().tokenize_chat(std::move(input));
@@ -559,6 +580,9 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
                 if (cancellation.requested()) { result.finish_reason = FinishReason::Cancelled; }
                 return std::move(result);
             }
+
+            // Answered on submit: no queue, so no admission to wait for.
+            void await_admission(const CancellationView&) const noexcept {}
         } immediate{.consumer_mode = consumer_mode};
 
         immediate.result.prompt                     = prompt_summary;
@@ -632,6 +656,11 @@ MediaCacheSummary Engine::media_cache_summary() const {
     return impl_->frontend().media_cache_summary();
 }
 
+ChatTemplateRoleSupport Engine::chat_template_role_support() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return impl_->frontend().chat_template_role_support();
+}
+
 RuntimeStats Engine::runtime_stats() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     return std::visit(
@@ -660,6 +689,22 @@ bool Engine::is_available() const {
         impl_->core);
 }
 
+bool Engine::has_failed() const {
+    if (impl_ == nullptr) { return false; }
+    return std::visit(
+        [](const auto& core) {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::monostate>) {
+                return false;
+            } else if constexpr (requires { core->has_failed(); }) {
+                return core != nullptr && core->has_failed();
+            } else {
+                return false; // a causal scoring core fails its call instead
+            }
+        },
+        impl_->core);
+}
+
 void Engine::reset_memory_peaks() noexcept {
     if (impl_ == nullptr) { return; }
     std::visit(
@@ -667,6 +712,17 @@ void Engine::reset_memory_peaks() noexcept {
             using CoreState = std::remove_cvref_t<decltype(core)>;
             if constexpr (!std::is_same_v<CoreState, std::monostate>) {
                 core->reset_memory_peaks();
+            }
+        },
+        impl_->core);
+}
+
+void Engine::reset_execution_maxima() noexcept {
+    if (impl_ == nullptr) { return; }
+    std::visit(
+        [](auto& core) {
+            if constexpr (requires { core->reset_execution_maxima(); }) {
+                core->reset_execution_maxima();
             }
         },
         impl_->core);

@@ -124,41 +124,41 @@ std::string render_row(std::string_view label, const ConsoleStatsTotals& totals,
 } // namespace
 
 ConsoleRequestSample make_console_request_sample(const GenerationOutcome& outcome) {
-    const GenerationMetrics& metrics = outcome.metrics;
     const auto prompt_tokens = static_cast<std::uint64_t>(std::max(outcome.prompt_tokens, 0));
-    const std::uint64_t cache_hit_tokens = metrics.prefix_cache_hit_tokens;
-    const std::optional<infernix::ExpertCacheStats>& experts = metrics.expert_cache;
+    const std::uint64_t cache_hit_tokens                     = outcome.reused_prompt_tokens;
+    const std::optional<infernix::ExpertCacheStats>& experts = outcome.expert_cache;
     const SpeculativeBackend backend =
-        metrics.speculative_draft_tokens > metrics.ngram_drafted_tokens
-            ? metrics.speculative_backend
+        outcome.speculative.drafted_tokens > outcome.speculative.ngram_drafted_tokens
+            ? outcome.speculative.backend
             : SpeculativeBackend::None;
     return ConsoleRequestSample{
         .speculative_backend     = backend,
-        .ttft_seconds            = metrics.ttft_seconds,
+        .ttft_seconds            = outcome.timings.first_token_seconds,
         .prompt_tokens           = prompt_tokens,
         .cache_hit_tokens        = cache_hit_tokens,
         .computed_prefill_tokens = saturating_sub(prompt_tokens, cache_hit_tokens),
-        .prefill_seconds         = metrics.prefill_seconds,
+        .prefill_seconds         = outcome.timings.prefill_seconds,
         // The first output token comes from prefill; the decode rate covers the rest, as the
         // request-done record does. The time is this request's share of each batched decode unit,
         // so the summed rate is aggregate throughput, not the per-stream rate the record prints.
-        .decode_tokens  = outcome.completion_tokens > 0
-                              ? static_cast<std::uint64_t>(outcome.completion_tokens - 1)
-                              : 0,
+        .decode_tokens = outcome.completion_tokens > 0
+                             ? static_cast<std::uint64_t>(outcome.completion_tokens - 1)
+                             : 0,
         // Each round's elapsed time over this request's share of it is that round's batch size, so
         // the summed ratio weighs each round's batch by its duration.
-        .decode_seconds       = metrics.decode_share_seconds,
-        .decode_round_seconds = metrics.decode_seconds,
-        .model_rounds = saturating_sub(metrics.speculative_rounds, metrics.ngram_rounds),
-        .model_drafted_tokens =
-            saturating_sub(metrics.speculative_draft_tokens, metrics.ngram_drafted_tokens),
-        .model_accepted_tokens =
-            saturating_sub(metrics.speculative_accepted_tokens, metrics.ngram_accepted_tokens),
-        .ngram_rounds            = metrics.ngram_rounds,
-        .ngram_drafted_tokens    = metrics.ngram_drafted_tokens,
-        .ngram_accepted_tokens   = metrics.ngram_accepted_tokens,
-        .archive_drafted_tokens  = metrics.ngram_archive_drafted_tokens,
-        .archive_accepted_tokens = metrics.ngram_archive_accepted_tokens,
+        .decode_seconds       = outcome.timings.decode_share_seconds,
+        .decode_round_seconds = outcome.timings.decode_seconds,
+        .model_rounds =
+            saturating_sub(outcome.speculative.rounds, outcome.speculative.ngram_rounds),
+        .model_drafted_tokens    = saturating_sub(outcome.speculative.drafted_tokens,
+                                                  outcome.speculative.ngram_drafted_tokens),
+        .model_accepted_tokens   = saturating_sub(outcome.speculative.accepted_tokens,
+                                                  outcome.speculative.ngram_accepted_tokens),
+        .ngram_rounds            = outcome.speculative.ngram_rounds,
+        .ngram_drafted_tokens    = outcome.speculative.ngram_drafted_tokens,
+        .ngram_accepted_tokens   = outcome.speculative.ngram_accepted_tokens,
+        .archive_drafted_tokens  = outcome.speculative.ngram_archive_drafted_tokens,
+        .archive_accepted_tokens = outcome.speculative.ngram_archive_accepted_tokens,
         .routed_experts          = experts ? experts->routed : 0,
         .vram_expert_hits        = experts ? experts->hits : 0,
     };

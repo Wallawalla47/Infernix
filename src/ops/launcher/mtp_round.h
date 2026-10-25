@@ -6,7 +6,7 @@
 
 namespace infernix::ops::detail {
 
-void mtp_prepare_next_round_launch(const Tensor& verify_ids, const Tensor& next_anchors,
+void mtp_prepare_next_round_launch(const Tensor& licensed_tokens, const Tensor& next_anchors,
                                    const Tensor& accepted, const Tensor& updated_frontiers,
                                    const Tensor& remaining_budgets, const Tensor& licensed_counts,
                                    const Tensor& rope_deltas, Tensor& alignment_ids,

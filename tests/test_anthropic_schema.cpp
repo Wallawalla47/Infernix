@@ -1,6 +1,7 @@
 #include "serve/anthropic_messages.h"
 
 #include "serve/generation_service.h"
+#include "serve/server_tools.h"
 #include "serve/translate.h"
 
 #include <nlohmann/json.hpp>
@@ -10,6 +11,7 @@
 #include <iostream>
 #include <iterator>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -556,11 +558,13 @@ int test_tools() {
     failures += check(!parse(body).generation.tools[0].strict, "a null strict means not strict");
     body["tools"][0]["strict"] = true;
     body["tool_choice"]               = Json{{"type", "none"}, {"disable_parallel_tool_use", true}};
-    body["tools"][0]["defer_loading"] = true;
     body["tools"][0]["allowed_callers"] = Json::array({"code_execution"});
     const GenerationRequest disabled    = parse(body).generation;
     failures += check(!disabled.uses_tools() && prompt(disabled).options.tool_jsons.size() == 1,
                       "tool_choice:none keeps prompt declarations");
+    body["tools"][0]["defer_loading"] = true;
+    failures += check(api_code([&] { (void)parse(body); }) == "all_tools_deferred",
+                      "a request whose only tool is deferred was accepted under tool_choice:none");
 
     body                = base_request();
     body["tools"]       = Json::array({ordinary_tool()});
@@ -783,7 +787,7 @@ GenerationOutcome sample_outcome() {
     outcome.reasoning_tokens                = 5;
     outcome.finish_reason                   = infernix::FinishReason::StopString;
     outcome.matched_stop_string             = "STOP";
-    outcome.metrics.prefix_cache_hit_tokens = 60;
+    outcome.reused_prompt_tokens            = 60;
     return outcome;
 }
 
@@ -803,8 +807,21 @@ int test_aggregate_and_errors() {
                           response["usage"]["output_tokens_details"]["thinking_tokens"] == 5,
                       "aggregate cache/reasoning usage was fabricated or lost");
 
+    // With the prefix cache, the tokens this request made reusable leave input_tokens for
+    // cache_creation_input_tokens, as in the Anthropic API (the three sum to the prompt).
+    outcome.cache_created_prompt_tokens = 32;
+    const Json created = Json::parse(make_anthropic_messages_response(identity, outcome));
+    failures += check(created["usage"]["input_tokens"] == 8 && created["usage"]["cache_read_input_tokens"] == 60 &&
+                          created["usage"]["cache_creation_input_tokens"] == 32,
+                      "cache creation usage was not split out of the uncached input");
+    outcome.cache_created_prompt_tokens = 500;
+    failures += check(Json::parse(make_anthropic_messages_response(identity, outcome))["usage"]
+                                                                                         ["cache_creation_input_tokens"] == 40,
+                      "cache creation usage was not clamped to the uncached input");
+    outcome.cache_created_prompt_tokens.reset();
+
     outcome.prompt_tokens                   = 10;
-    outcome.metrics.prefix_cache_hit_tokens = 1000;
+    outcome.reused_prompt_tokens            = 1000;
     const Json clamped = Json::parse(make_anthropic_messages_response(identity, outcome));
     failures += check(clamped["usage"]["input_tokens"] == 0 &&
                           clamped["usage"]["cache_read_input_tokens"] == 10,
@@ -845,6 +862,17 @@ int test_aggregate_and_errors() {
     failures += check(overflow_response["error"]["type"] == "invalid_request_error" &&
                           overflow_response["error"]["message"] == "prompt is too long: 200 tokens > 128 maximum",
                       "Anthropic context overflow lost the wording Claude Code matches to compact");
+    // The prompt's images together over the vision budget: the same matchable sentence, then what
+    // the counts are.
+    ApiError vision_overflow        = overflow;
+    vision_overflow.context_length  = infernix::ContextLengthDetails{
+         .prompt_tokens = 40'959, .max_context = 32'768, .exact = false, .vision = true};
+    const Json vision_response = Json::parse(make_anthropic_error_body(vision_overflow, "req_error"));
+    const std::string vision_message = vision_response["error"]["message"].get<std::string>();
+    failures += check(vision_response["error"]["type"] == "invalid_request_error" &&
+                          vision_message.starts_with("prompt is too long: more than 40959 tokens > 32768 maximum (") &&
+                          vision_message.find("vision budget of 32768 tokens") != std::string::npos,
+                      "Anthropic vision overflow lost the compaction wording or its images note: " + vision_message);
     return failures;
 }
 
@@ -854,10 +882,10 @@ int test_timings() {
     const AnthropicResponseIdentity identity =
         make_anthropic_response_identity("req_timings", "claude-local");
     GenerationOutcome outcome                   = sample_outcome();
-    outcome.metrics.prompt_wall_seconds         = 0.0625;
-    outcome.metrics.generation_wall_seconds     = 0.125;
-    outcome.metrics.speculative_draft_tokens    = 9;
-    outcome.metrics.speculative_accepted_tokens = 6;
+    outcome.timings.prompt_wall_seconds         = 0.0625;
+    outcome.timings.generation_wall_seconds     = 0.125;
+    outcome.speculative.drafted_tokens          = 9;
+    outcome.speculative.accepted_tokens         = 6;
     const Json timings = Json::parse(make_anthropic_messages_response(identity, outcome))["timings"];
     int failures       = check(
         timings["cache_n"] == 60 && timings["prompt_n"] == 40 && timings["prompt_ms"] == 62.5 &&
@@ -957,6 +985,74 @@ int test_tool_call_presentation() {
                           partial["constraint"]["complete"] == true &&
                           partial["constraint"]["terminated"] == false,
                       "completed tool before truncation lost its call or stop reason");
+    return failures;
+}
+
+// A constrained call streams its block as it is generated: the text block closes, the call opens
+// (`server_tool_use` for a search tool) when named, its input arrives in `input_json_delta`
+// fragments and the block stops when the call completes. finish repeats nothing, and the call's
+// wire id is the one it streamed with.
+int test_streamed_tool_calls() {
+    const AnthropicResponseIdentity identity = make_anthropic_response_identity("req_streamed", "claude-local");
+    const std::vector<AnthropicToolSearch> searches{{.name = "tool_search_tool_regex"}};
+    AnthropicMessagesStream stream(identity, 10, false, searches);
+    std::vector<std::string> events{stream.start()};
+    const auto append = [&](std::vector<std::string> values) {
+        events.insert(events.end(), std::make_move_iterator(values.begin()), std::make_move_iterator(values.end()));
+    };
+    append(stream.content_delta("Checking."));
+    append(stream.tool_call_delta({.index = 0, .name = "Edit", .arguments = R"({"zeta":)"}));
+    append(stream.tool_call_delta({.index = 0, .arguments = R"("last"})", .complete = true}));
+    append(stream.tool_call_delta({.index = 1, .name = "tool_search_tool_regex", .arguments = R"({"pattern":"x"})",
+                                   .complete = true}));
+    GenerationOutcome outcome;
+    outcome.text          = "Checking.";
+    outcome.finish_reason = infernix::FinishReason::StopToken;
+    outcome.tool_calls    = {{.name = "Edit", .arguments_json = R"({"zeta":"last"})"},
+                             {.name = "tool_search_tool_regex", .arguments_json = R"({"pattern":"x"})"}};
+    const std::vector<ToolCall> calls = stream.identify_calls(outcome);
+    AnthropicResponseSegment segment{.outcome = &outcome, .calls = calls, .search_results = {}};
+    segment.search_results.resize(calls.size());
+    append(stream.finish(segment, outcome, std::nullopt));
+
+    std::vector<std::string> sequence;
+    std::string edit_input;
+    std::string edit_id;
+    std::string search_type;
+    for (const std::string& wire : events) {
+        const Json event = parse_event(wire);
+        const std::string type = event.at("type");
+        if (type == "content_block_start") {
+            const Json& block = event.at("content_block");
+            sequence.push_back("start:" + block.at("type").get<std::string>());
+            if (block.at("type") == "tool_use") { edit_id = block.at("id"); }
+            if (block.contains("name") && block.at("name") == "tool_search_tool_regex") { search_type = block.at("type"); }
+        } else if (type == "content_block_delta" && event.at("delta").at("type") == "input_json_delta") {
+            if (event.at("index") == 1) { edit_input += event.at("delta").at("partial_json").get<std::string>(); }
+            sequence.push_back("input");
+        } else if (type == "content_block_stop") {
+            sequence.push_back("stop");
+        } else if (type == "message_delta") {
+            sequence.push_back(event.at("delta").at("stop_reason").get<std::string>());
+        }
+    }
+    const std::vector<std::string> expected{"start:text", "stop",  "start:tool_use", "input", "input", "stop",
+                                            "start:server_tool_use", "input", "stop", "tool_use"};
+    int failures = check(sequence == expected && edit_input == R"({"zeta":"last"})" && search_type == "server_tool_use",
+                         "a streamed Anthropic call lost its block lifecycle or was repeated at finish");
+    failures += check(edit_id.starts_with("toolu_") && calls[0].id == edit_id && calls[1].id.starts_with("srvtoolu_"),
+                      "a streamed call's wire id differs from its segment's");
+
+    // A call the output limit cut closes its block before message_delta with what it streamed.
+    AnthropicMessagesStream cut(identity, 10);
+    (void)cut.start();
+    (void)cut.tool_call_delta({.index = 0, .name = "Edit", .arguments = R"({"ze)"});
+    GenerationOutcome cut_outcome;
+    cut_outcome.finish_reason = infernix::FinishReason::OutputLimit;
+    const std::vector<std::string> cut_events = cut.finish(cut_outcome);
+    failures += check(cut_events.size() == 3 && parse_event(cut_events[0]).at("type") == "content_block_stop" &&
+                          parse_event(cut_events[1]).at("delta").at("stop_reason") == "max_tokens",
+                      "a cut streamed call did not close before the terminal message_delta");
     return failures;
 }
 
@@ -1186,6 +1282,566 @@ int test_hidden_reasoning_round_trip() {
     return failures;
 }
 
+// Deferred tools (defer_loading) and tool search.
+
+Json deferred_tool(std::string name, std::string description) {
+    return Json{{"name", std::move(name)},
+                {"description", std::move(description)},
+                {"input_schema",
+                 Json{{"type", "object"},
+                      {"properties",
+                       Json{{"city", Json{{"type", "string"}, {"description", "City name"}}}}}}},
+                {"defer_loading", true}};
+}
+
+Json regex_search_tool() {
+    return Json{{"type", "tool_search_tool_regex_20251119"}, {"name", "tool_search_tool_regex"}};
+}
+
+std::string message_text(const infernix::ChatMessage& message) {
+    std::string text;
+    for (const infernix::MessagePart& part : message.parts) { text += part.text; }
+    return text;
+}
+
+// Whether the first `count` messages of two prompts render the same: same roles, text, reasoning
+// and calls. The Engine renders a PromptInput from these and the tool declarations alone.
+bool same_messages(const infernix::PromptInput& left, const infernix::PromptInput& right,
+                   std::size_t count) {
+    if (left.messages.size() < count || right.messages.size() < count) { return false; }
+    for (std::size_t index = 0; index < count; ++index) {
+        const infernix::ChatMessage& a = left.messages[index];
+        const infernix::ChatMessage& b = right.messages[index];
+        if (a.role != b.role || message_text(a) != message_text(b) ||
+            a.parts.size() != b.parts.size() || a.reasoning_content != b.reasoning_content ||
+            a.tool_calls.size() != b.tool_calls.size()) {
+            return false;
+        }
+        for (std::size_t call = 0; call < a.tool_calls.size(); ++call) {
+            if (a.tool_calls[call].name != b.tool_calls[call].name ||
+                a.tool_calls[call].arguments_json != b.tool_calls[call].arguments_json) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+int test_deferred_tool_declarations() {
+    Json listed     = base_request();
+    listed["tools"] = Json::array({ordinary_tool(), regex_search_tool()});
+    Json deferred   = listed;
+    deferred["tools"].push_back(deferred_tool("get_forecast", "Weather forecast for a city"));
+
+    const AnthropicMessagesRequest with    = parse(deferred);
+    const infernix::PromptInput without_prompt = prompt(parse(listed).generation);
+    const infernix::PromptInput with_prompt    = prompt(with.generation);
+    int failures = check(with_prompt.options.tool_jsons == without_prompt.options.tool_jsons &&
+                             same_messages(with_prompt, without_prompt, 1) &&
+                             without_prompt.options.deferred_tool_jsons.empty() &&
+                             with_prompt.options.deferred_tool_jsons.size() == 1 &&
+                             Json::parse(with_prompt.options.deferred_tool_jsons[0])["function"]
+                                     ["name"] == "get_forecast",
+                         "a deferred tool changed the prompt or missed the output contract");
+    const Json search = Json::parse(with_prompt.options.tool_jsons.at(1));
+    failures += check(search["function"]["name"] == "tool_search_tool_regex" &&
+                          search["function"]["parameters"]["required"] == Json::array({"pattern"}) &&
+                          with.tool_searches.size() == 1 &&
+                          with.tool_searches[0].name == "tool_search_tool_regex" &&
+                          with.tool_searches[0].variant == AnthropicToolSearchVariant::Regex,
+                      "the regex tool search tool was not declared as a listed function");
+    failures += check(tool_declaration_params(with.generation) ==
+                          std::vector<std::string>{"tools/0/input_schema", "tools/1/input_schema",
+                                                   "tools/2/input_schema"},
+                      "Engine tool-schema errors no longer map to their request tools");
+
+    Json none           = deferred;
+    none["tool_choice"] = Json{{"type", "none"}};
+    const infernix::PromptInput none_prompt = prompt(parse(none).generation);
+    failures += check(none_prompt.options.tool_jsons == without_prompt.options.tool_jsons &&
+                          none_prompt.options.deferred_tool_jsons.size() == 1,
+                      "tool_choice:none changed which tools the prompt lists");
+
+    Json bm25     = base_request();
+    bm25["tools"] = Json::array({ordinary_tool(), Json{{"type", "tool_search_tool_bm25_20251119"}},
+                                 deferred_tool("get_forecast", "Weather forecast")});
+    const AnthropicMessagesRequest bm25_request = parse(bm25);
+    failures += check(bm25_request.tool_searches.size() == 1 &&
+                          bm25_request.tool_searches[0].name == "tool_search_tool_bm25" &&
+                          bm25_request.tool_searches[0].variant == AnthropicToolSearchVariant::Bm25,
+                      "the BM25 tool search tool was not declared");
+
+    Json all     = base_request();
+    all["tools"] = Json::array({deferred_tool("a", "A"), deferred_tool("b", "B")});
+    failures += check(api_code([&] { (void)parse(all); }) == "all_tools_deferred",
+                      "a request with every tool deferred was accepted");
+    Json search_deferred                      = deferred;
+    search_deferred["tools"][1]["defer_loading"] = true;
+    failures += check(api_code([&] { (void)parse(search_deferred); }) == "invalid_deferred_tool",
+                      "a deferred tool search tool was accepted");
+    Json cached                     = deferred;
+    cached["tools"][2]["cache_control"] = Json{{"type", "ephemeral"}};
+    failures += check(api_code([&] { (void)parse(cached); }) == "invalid_cache_control",
+                      "a deferred tool with a cache breakpoint was accepted");
+    Json renamed               = listed;
+    renamed["tools"][1]["name"] = "search";
+    failures += check(api_param([&] { (void)parse(renamed); }) == "tools",
+                      "a tool search tool with another name was accepted");
+    Json duplicate = listed;
+    duplicate["tools"].push_back(Json{{"name", "tool_search_tool_regex"},
+                                      {"input_schema", Json{{"type", "object"}}}});
+    failures += check(api_param([&] { (void)parse(duplicate); }) == "tools",
+                      "a user tool shadowing the search tool name was accepted");
+    Json named           = deferred;
+    named["tool_choice"] = Json{{"type", "tool"}, {"name", "get_forecast"}};
+    failures += check(parse(named).generation.tool_choice.allowed_names ==
+                          std::vector<std::string>{"get_forecast"},
+                      "a named choice of a deferred tool was refused");
+    return failures;
+}
+
+int test_client_tool_references() {
+    Json body     = base_request();
+    body["tools"] = Json::array({Json{{"name", "find_tools"},
+                                      {"description", "Find tools by keyword"},
+                                      {"input_schema", Json{{"type", "object"}}}},
+                                 deferred_tool("get_forecast", "Weather forecast for a city")});
+    body["messages"] = Json::array(
+        {Json{{"role", "user"}, {"content", "Forecast for Paris?"}},
+         Json{{"role", "assistant"},
+              {"content", Json::array({tool_use("toolu_find", "find_tools")})}},
+         Json{{"role", "user"},
+              {"content",
+               Json::array({Json{{"type", "tool_result"},
+                                 {"tool_use_id", "toolu_find"},
+                                 {"content",
+                                  Json::array({Json{{"type", "text"}, {"text", "Found one."}},
+                                               Json{{"type", "tool_reference"},
+                                                    {"tool_name", "get_forecast"}},
+                                               Json{{"type", "tool_reference"},
+                                                    {"tool_name", "get_forecast"}}})}}})}}});
+    const GenerationRequest request = parse(body).generation;
+    int failures = check(request.messages.size() == 3 &&
+                             request.messages[2].role == infernix::ChatRole::Tool &&
+                             request.messages[2].content.size() == 1 &&
+                             request.messages[2].content[0].text == "Found one." &&
+                             request.messages[2].loaded_tools.size() == 1 &&
+                             request.messages[2].loaded_tools[0].name == "get_forecast",
+                         "tool_reference blocks did not load their tool once into the result");
+    const infernix::PromptInput translated = prompt(request);
+    const std::string loaded = render_loaded_tools(request.messages[2].loaded_tools);
+    failures += check(translated.messages[2].parts.size() == 2 &&
+                          translated.messages[2].parts[0].text == "Found one." &&
+                          translated.messages[2].parts[1].text == "\n\n" + loaded &&
+                          loaded.find("\"get_forecast\"") != std::string::npos &&
+                          loaded.find("City name") != std::string::npos &&
+                          loaded.starts_with("You now also have access to the following "
+                                             "functions:\n\n<tools>\n") &&
+                          loaded.ends_with("\n</tools>"),
+                      "a loaded definition was not rendered after the tool result");
+
+    body["messages"][2]["content"][0]["content"] = Json::array(
+        {Json{{"type", "tool_reference"}, {"tool_name", "get_forecast"}}});
+    const infernix::PromptInput only_reference = prompt(parse(body).generation);
+    failures += check(only_reference.messages[2].parts.size() == 1 &&
+                          only_reference.messages[2].parts[0].text == loaded,
+                      "a reference-only result rendered an empty part or separator");
+
+    body["messages"][2]["content"][0]["content"][0]["tool_name"] = "missing_tool";
+    failures += check(api_code([&] { (void)parse(body); }) == "tool_reference_not_found",
+                      "a reference to an undeclared tool was accepted");
+    body["messages"][2]["content"] =
+        Json::array({tool_result("toolu_find", "none"),
+                     Json{{"type", "tool_reference"}, {"tool_name", "get_forecast"}}});
+    failures += check(api_code([&] { (void)parse(body); }) == "content_block_not_supported",
+                      "a tool_reference outside a tool_result was accepted");
+    return failures;
+}
+
+GenerationOutcome search_round_outcome() {
+    GenerationOutcome outcome;
+    outcome.reasoning         = "I need a forecast tool.";
+    outcome.prompt_tokens     = 40;
+    outcome.completion_tokens = 12;
+    outcome.reasoning_tokens  = 6;
+    outcome.finish_reason     = infernix::FinishReason::StopToken;
+    outcome.tool_calls.push_back(infernix::GeneratedToolCall{
+        .name = "tool_search_tool_regex", .arguments_json = R"({"pattern":"forecast"})"});
+    return outcome;
+}
+
+GenerationOutcome client_round_outcome() {
+    GenerationOutcome outcome;
+    outcome.text                            = "Let me check.";
+    outcome.prompt_tokens                   = 90;
+    outcome.completion_tokens               = 9;
+    outcome.finish_reason                   = infernix::FinishReason::StopToken;
+    outcome.reused_prompt_tokens            = 52;
+    outcome.tool_calls.push_back(infernix::GeneratedToolCall{
+        .name = "get_forecast", .arguments_json = R"({"city":"Paris"})"});
+    return outcome;
+}
+
+Json search_request_body() {
+    Json body        = base_request();
+    body["tools"]    = Json::array({ordinary_tool(), regex_search_tool(),
+                                    deferred_tool("get_forecast", "Weather forecast for a city"),
+                                    deferred_tool("get_tides", "Tide tables for a harbour")});
+    body["messages"] = Json::array({Json{{"role", "user"}, {"content", "Forecast for Paris?"}}});
+    return body;
+}
+
+int test_tool_search_execution() {
+    const AnthropicMessagesRequest request = parse(search_request_body());
+    AnthropicToolSearchExecutor executor(request);
+    int failures = check(executor.search_tool("tool_search_tool_regex") != nullptr &&
+                             executor.search_tool("weather") == nullptr &&
+                             executor.names() == std::vector<std::string>{"tool_search_tool_regex"},
+                         "the executor did not recognize the declared search tool");
+    const auto run = [&](std::string arguments) {
+        return executor.execute(ToolCall{.id             = "srvtoolu_test",
+                                         .name           = "tool_search_tool_regex",
+                                         .arguments_json = std::move(arguments)});
+    };
+    const AnthropicToolSearchResult found = run(R"({"pattern":"forecast|tide"})");
+    failures += check(found.content["type"] == "tool_search_tool_search_result" &&
+                          found.content["tool_references"].size() == 2 &&
+                          found.content["tool_references"][0] ==
+                              Json{{"type", "tool_reference"}, {"tool_name", "get_forecast"}} &&
+                          found.turn.role == infernix::ChatRole::Tool &&
+                          found.turn.tool_call_id == "srvtoolu_test" &&
+                          found.turn.content.empty() && found.turn.loaded_tools.size() == 2,
+                      "a search did not return and load the matching deferred tools");
+    failures += check(run(R"({"pattern":"forecast|tide","limit":1})")
+                              .content["tool_references"]
+                              .size() == 1,
+                      "the search limit was not applied");
+    // Listed tools are not in the catalog: "weather" is listed, so nothing matches.
+    const AnthropicToolSearchResult listed_only = run(R"({"pattern":"^weather$"})");
+    failures += check(listed_only.content["tool_references"].empty() &&
+                          listed_only.turn.loaded_tools.empty() &&
+                          listed_only.turn.content.at(0).text ==
+                              "No deferred tools matched the search.",
+                      "an empty search did not say so");
+    const AnthropicToolSearchResult invalid = run(R"({"pattern":"("})");
+    failures += check(invalid.content["type"] == "tool_search_tool_result_error" &&
+                          invalid.content["error_code"] == "invalid_tool_input" &&
+                          invalid.turn.tool_result_is_error &&
+                          invalid.turn.content.at(0).text.starts_with(
+                              "Tool search failed (invalid_tool_input): Invalid regular "
+                              "expression pattern: missing ),"),
+                      "an invalid pattern did not become an error result");
+    for (const char* arguments :
+         {R"({"pattern":"x","limit":0})", R"({"pattern":"x","limit":10001})", R"({"query":"x"})"}) {
+        failures += check(run(arguments).content["error_code"] == "invalid_tool_input",
+                          std::string("invalid search input was accepted: ") + arguments);
+    }
+    // History lowering of the same content gives the same turn.
+    const ChatTurn lowered =
+        lower_anthropic_tool_search_result(found.content, "srvtoolu_test", request.generation);
+    failures += check(lowered.loaded_tools.size() == found.turn.loaded_tools.size() &&
+                          lowered.loaded_tools[0].name == found.turn.loaded_tools[0].name &&
+                          lowered.loaded_tools[0].input_schema_json ==
+                              found.turn.loaded_tools[0].input_schema_json,
+                      "replayed search content lowered differently from the executed search");
+    return failures;
+}
+
+// A search round, its continuation, and the client's next request that replays the response:
+// the replay renders the continuation's messages unchanged, so the prefix cache serves it.
+int test_tool_search_round_trip() {
+    const AnthropicMessagesRequest request = parse(search_request_body());
+    AnthropicToolSearchExecutor executor(request);
+    const GenerationOutcome first = search_round_outcome();
+    ServerToolRound round;
+    round.outcome                            = first;
+    round.calls                              = identify_anthropic_tool_calls(first, request.tool_searches);
+    const AnthropicToolSearchResult executed = executor.execute(round.calls.at(0));
+    round.results.push_back(executed.turn);
+    GenerationRequest continuation = request.generation;
+    append_server_round(continuation, round, executor.names());
+    int failures = check(round.calls[0].id.starts_with("srvtoolu_") &&
+                             continuation.messages.size() == 3 &&
+                             continuation.messages[1].role == infernix::ChatRole::Assistant &&
+                             continuation.messages[1].reasoning_content == first.reasoning &&
+                             continuation.messages[2].role == infernix::ChatRole::Tool &&
+                             continuation.max_tokens == 4096 - first.completion_tokens &&
+                             continuation.continuation ==
+                                 infernix::PromptContinuationMode::NewAssistantTurn,
+                         "the continuation did not append the search round");
+    const infernix::PromptInput continued = prompt(continuation);
+
+    const GenerationOutcome second = client_round_outcome();
+    const std::vector<ToolCall> second_calls =
+        identify_anthropic_tool_calls(second, request.tool_searches);
+    const std::vector<AnthropicResponseSegment> segments{
+        AnthropicResponseSegment{.outcome        = &round.outcome,
+                                 .calls          = round.calls,
+                                 .search_results = {executed.content}},
+        AnthropicResponseSegment{
+            .outcome = &second, .calls = second_calls, .search_results = {std::nullopt}}};
+    const GenerationOutcome totals = combine_round_outcomes(std::span(&round, 1), second);
+    const AnthropicResponseIdentity identity =
+        make_anthropic_response_identity("req_search", "claude-local");
+    const Json response =
+        Json::parse(make_anthropic_messages_response(identity, segments, totals, std::nullopt));
+    const Json& content = response.at("content");
+    std::vector<std::string> types;
+    for (const Json& block : content) { types.push_back(block.at("type").get<std::string>()); }
+    failures += check(types == std::vector<std::string>{"thinking", "server_tool_use",
+                                                        "tool_search_tool_result", "text",
+                                                        "tool_use"} &&
+                          content[1].at("id") == content[2].at("tool_use_id") &&
+                          content[1].at("input") == Json{{"pattern", "forecast"}} &&
+                          content[2].at("content").at("tool_references").size() == 1 &&
+                          response.at("stop_reason") == "tool_use",
+                      "the response did not show the search between the generations");
+    failures += check(response.at("usage").at("output_tokens") == 21 &&
+                          response.at("usage").at("cache_read_input_tokens") == 52 &&
+                          response.at("usage").at("input_tokens") == 130 - 52,
+                      "response usage did not sum the generations");
+
+    Json replay = search_request_body();
+    replay["messages"].push_back(Json{{"role", "assistant"}, {"content", content}});
+    replay["messages"].push_back(Json{
+        {"role", "user"},
+        {"content", Json::array({tool_result(content[4].at("id").get<std::string>(), "Sunny")})}});
+    const GenerationRequest replayed = parse(replay).generation;
+    const infernix::PromptInput replayed_prompt = prompt(replayed);
+    failures += check(replayed.messages.size() == 5 &&
+                          replayed.messages[3].role == infernix::ChatRole::Assistant &&
+                          replayed.messages[3].tool_calls.size() == 1 &&
+                          replayed.messages[3].tool_calls[0].name == "get_forecast" &&
+                          replayed.messages[4].role == infernix::ChatRole::Tool &&
+                          replayed.messages[4].content[0].text == "Sunny",
+                      "the replayed response was not lowered as two generations");
+    failures += check(replayed_prompt.options.tool_jsons == continued.options.tool_jsons &&
+                          replayed_prompt.options.deferred_tool_jsons ==
+                              continued.options.deferred_tool_jsons &&
+                          same_messages(replayed_prompt, continued, continued.messages.size()),
+                      "the replayed history did not render the continuation's prompt prefix");
+
+    // Count Tokens shares the lowering.
+    failures += check(parse_anthropic_count_tokens_request(replay).generation.messages.size() == 5,
+                      "Count Tokens did not lower tool search history");
+    return failures;
+}
+
+int test_tool_search_history_errors() {
+    const Json body = search_request_body();
+    const Json search_use{{"type", "server_tool_use"},
+                          {"id", "srvtoolu_1"},
+                          {"name", "tool_search_tool_regex"},
+                          {"input", Json{{"pattern", "forecast"}}}};
+    const Json search_result{
+        {"type", "tool_search_tool_result"},
+        {"tool_use_id", "srvtoolu_1"},
+        {"content", Json{{"type", "tool_search_tool_search_result"},
+                         {"tool_references", Json::array({Json{{"type", "tool_reference"},
+                                                               {"tool_name", "get_forecast"}}})}}}};
+    const auto with_history = [&](Json assistant, std::optional<Json> user = std::nullopt) {
+        Json request = body;
+        request["messages"].push_back(Json{{"role", "assistant"}, {"content", std::move(assistant)}});
+        if (user) { request["messages"].push_back(Json{{"role", "user"}, {"content", *user}}); }
+        return request;
+    };
+
+    // A response paused after a search: the next generation opens a new assistant turn.
+    const GenerationRequest paused =
+        parse(with_history(Json::array({search_use, search_result}))).generation;
+    int failures = check(paused.messages.size() == 3 &&
+                             paused.messages.back().role == infernix::ChatRole::Tool &&
+                             paused.continuation ==
+                                 infernix::PromptContinuationMode::NewAssistantTurn,
+                         "a history ending in a search result was not resumed as a new turn");
+
+    failures += check(api_code([&] { (void)parse(with_history(Json::array({search_use}))); }) ==
+                          "invalid_tool_history",
+                      "a server_tool_use without its result was accepted");
+    failures += check(api_code([&] {
+                          (void)parse(with_history(Json::array({search_use, search_result}),
+                                                   Json::array({tool_result("srvtoolu_1", "x")})));
+                      }) == "invalid_tool_history",
+                      "a client tool_result for a server search was accepted");
+    failures +=
+        check(api_code([&] {
+                  (void)parse(with_history(Json::array({search_result, search_use})));
+              }) == "invalid_tool_history",
+              "a search result before its call was accepted");
+    failures += check(api_code([&] {
+                          (void)parse(with_history(Json::array(
+                              {search_use, tool_use("toolu_x", "weather"), search_result,
+                               Json{{"type", "text"}, {"text", "next"}}})));
+                      }) == "invalid_tool_history",
+                      "a client call left unanswered inside a continued message was accepted");
+    Json unknown = search_result;
+    unknown["content"]["tool_references"][0]["tool_name"] = "missing_tool";
+    failures += check(api_code([&] {
+                          (void)parse(with_history(Json::array({search_use, unknown})));
+                      }) == "tool_reference_not_found",
+                      "a search result naming an undeclared tool was accepted");
+    Json no_search     = with_history(Json::array({search_use, search_result}));
+    no_search["tools"] = Json::array({ordinary_tool()});
+    failures += check(api_code([&] { (void)parse(no_search); }) == "server_tools_not_supported",
+                      "a search history without a declared search tool was accepted");
+
+    // A search and a client call in one generation: results follow call order.
+    const GenerationRequest mixed =
+        parse(with_history(Json::array({tool_use("toolu_w", "weather"), search_use, search_result}),
+                           Json::array({tool_result("toolu_w", "Rain")})))
+            .generation;
+    failures += check(mixed.messages.size() == 4 && mixed.messages[1].tool_calls.size() == 2 &&
+                          mixed.messages[2].tool_call_id == "toolu_w" &&
+                          mixed.messages[3].tool_call_id == "srvtoolu_1" &&
+                          mixed.messages[3].loaded_tools.size() == 1,
+                      "results of a mixed generation did not follow call order");
+    return failures;
+}
+
+int test_tool_search_stream() {
+    const AnthropicMessagesRequest request = parse(search_request_body());
+    AnthropicToolSearchExecutor executor(request);
+    const GenerationOutcome first  = search_round_outcome();
+    const GenerationOutcome second = client_round_outcome();
+    AnthropicResponseSegment search_segment{
+        .outcome = &first,
+        .calls   = identify_anthropic_tool_calls(first, request.tool_searches),
+        .search_results = {}};
+    search_segment.search_results.push_back(executor.execute(search_segment.calls.at(0)).content);
+    const AnthropicResponseSegment final_segment{
+        .outcome        = &second,
+        .calls          = identify_anthropic_tool_calls(second, request.tool_searches),
+        .search_results = {std::nullopt}};
+    ServerToolRound round{.outcome = first, .calls = search_segment.calls, .results = {}};
+    const GenerationOutcome totals = combine_round_outcomes(std::span(&round, 1), second);
+
+    const AnthropicResponseIdentity identity =
+        make_anthropic_response_identity("req_search_stream", "claude-local");
+    AnthropicMessagesStream stream(identity, first.prompt_tokens);
+    std::vector<std::string> events{stream.start(infernix::GenerationStart{
+        .prompt = infernix::PromptSummary{.prompt_tokens = 40}, .reused_prompt_tokens = 0})};
+    const auto append_events = [&](std::vector<std::string> values) {
+        events.insert(events.end(), std::make_move_iterator(values.begin()),
+                      std::make_move_iterator(values.end()));
+    };
+    append_events(stream.reasoning_delta("I need a "));
+    append_events(stream.segment(search_segment));
+    append_events(stream.content_delta("Let me "));
+    append_events(stream.finish(final_segment, totals, std::nullopt));
+
+    std::vector<std::string> blocks;
+    std::vector<int> indices;
+    int starts      = 0;
+    bool reasoning  = false;
+    bool arguments  = false;
+    Json terminal;
+    for (const std::string& wire : events) {
+        const Json event = parse_event(wire);
+        if (event.at("type") == "message_start") { ++starts; }
+        if (event.at("type") == "content_block_start") {
+            blocks.push_back(event.at("content_block").at("type").get<std::string>());
+            indices.push_back(event.at("index").get<int>());
+        }
+        if (event.at("type") == "content_block_delta" &&
+            event.at("delta").at("type") == "thinking_delta") {
+            reasoning = reasoning || event.at("delta").at("thinking") == "forecast tool.";
+        }
+        if (event.at("type") == "content_block_delta" &&
+            event.at("delta").at("type") == "input_json_delta" && blocks.back() == "server_tool_use") {
+            arguments = event.at("delta").at("partial_json") == R"({"pattern":"forecast"})";
+        }
+        if (event.at("type") == "message_delta") { terminal = event; }
+    }
+    int failures = check(starts == 1 &&
+                             blocks == std::vector<std::string>{"thinking", "server_tool_use",
+                                                                "tool_search_tool_result", "text",
+                                                                "tool_use"} &&
+                             indices == std::vector<int>{0, 1, 2, 3, 4} && reasoning && arguments,
+                         "the stream did not show the search between the generations in order");
+    failures += check(terminal.at("delta").at("stop_reason") == "tool_use" &&
+                          terminal.at("usage").at("output_tokens") == 21,
+                      "the stream's terminal usage did not sum the generations");
+
+    // A response that reached the generation limit pauses instead of claiming a tool call.
+    const AnthropicResponseSegment paused{.outcome        = &first,
+                                          .calls          = search_segment.calls,
+                                          .search_results = search_segment.search_results};
+    const Json pause = Json::parse(make_anthropic_messages_response(
+        identity, std::span(&paused, 1), first, std::string_view("pause_turn")));
+    failures += check(pause.at("stop_reason") == "pause_turn" && pause.at("content").size() == 3,
+                      "a paused response did not report pause_turn with its search");
+    return failures;
+}
+
+// Claude Code auto mode's client-side classifier: the judged transcript ends with a System turn
+// stating the decision rules, with a small output budget and stop sequences beside it.
+int test_auto_mode_classifier_body() {
+    Json body              = base_request();
+    body["thinking"]       = Json{{"type", "disabled"}};
+    body["system"]         = "You are an action-safety evaluator.";
+    body["max_tokens"]     = 2112;
+    body["stop_sequences"] = Json::array({"STOP"});
+    // The adapter admits an inline System only after a User turn and final or before an
+    // Assistant (anthropic_messages_request.cpp), which is exactly the transcript shape the
+    // real classifier sends.
+    body["messages"] = Json::array(
+        {Json{{"role", "user"}, {"content", "delete the build cache"}},
+         Json{{"role", "assistant"}, {"content", "rm -rf build"}},
+         Json{{"role", "user"}, {"content", "Should this action run?"}},
+         Json{{"role", "system"}, {"content", "Judge the last action against the rules."}}});
+
+    const AnthropicMessagesRequest parsed = parse(body);
+    const GenerationRequest& request      = parsed.generation;
+    int failures = check(parsed.model == "claude-local" && request.max_tokens == 2112 &&
+                             request.stop_strings.size() == 1 && request.stop_strings[0] == "STOP",
+                         "classifier envelope fields were not preserved");
+    failures += check(
+        request.messages.size() == 5 && request.messages[0].role == infernix::ChatRole::System &&
+            request.messages[1].role == infernix::ChatRole::User &&
+            request.messages[2].role == infernix::ChatRole::Assistant &&
+            request.messages[4].role == infernix::ChatRole::System &&
+            request.messages[4].content.front().text == "Judge the last action against the rules.",
+        "the classifier's mid-conversation System turn was not parsed role-faithfully");
+    const infernix::PromptInput translated = prompt(request);
+    failures += check(translated.messages.size() == 5 &&
+                          translated.messages[4].role == infernix::ChatRole::System,
+                      "PromptInput lowering lost or hoisted the mid-conversation System turn");
+    return failures;
+}
+
+// Claude Code auto mode's server-side review additionally carries a safeguards object; Infernix
+// ignores it like every field it does not implement, leaving the rest of the request untouched.
+int test_auto_mode_server_review_safeguards_body() {
+    Json body        = base_request();
+    body["thinking"] = Json{{"type", "disabled"}};
+    body["system"]   = "Review this action for approval.";
+    body["messages"] =
+        Json::array({Json{{"role", "user"}, {"content", "run the deploy script"}},
+                     Json{{"role", "assistant"}, {"content", "deploying now"}},
+                     Json{{"role", "user"}, {"content", "Was that within approval?"}},
+                     Json{{"role", "system"}, {"content", "Approve or deny the last action."}}});
+    body["safeguards"] =
+        Json{{"rules", Json::array({"no-secrets"})}, {"future_check", Json{{"enabled", true}}}};
+    body["context_management"] = Json{{"edits", Json::array()}};
+
+    const AnthropicMessagesRequest reviewed = parse(body);
+    Json plain                              = body;
+    plain.erase("safeguards");
+    plain.erase("context_management");
+    const AnthropicMessagesRequest without = parse(plain);
+    int failures =
+        check(reviewed.model == without.model &&
+                  reviewed.generation.messages.size() == without.generation.messages.size(),
+              "safeguards review body was not parsed like the same request without them");
+    failures +=
+        check(reviewed.generation.messages.size() == 5 &&
+                  reviewed.generation.messages[4].role == infernix::ChatRole::System &&
+                  reviewed.generation.messages[4].content.front().text ==
+                      "Approve or deny the last action.",
+              "the review's mid-conversation System turn was altered by the safeguards fields");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -1204,9 +1860,18 @@ int main() {
     failures += test_aggregate_and_errors();
     failures += test_timings();
     failures += test_tool_call_presentation();
+    failures += test_streamed_tool_calls();
     failures += test_stream();
     failures += test_hidden_reasoning_signature();
     failures += test_hidden_reasoning_round_trip();
+    failures += test_auto_mode_classifier_body();
+    failures += test_auto_mode_server_review_safeguards_body();
+    failures += test_deferred_tool_declarations();
+    failures += test_client_tool_references();
+    failures += test_tool_search_execution();
+    failures += test_tool_search_round_trip();
+    failures += test_tool_search_history_errors();
+    failures += test_tool_search_stream();
     if (failures != 0) {
         std::cerr << failures << " Anthropic adapter checks failed\n";
         return 1;

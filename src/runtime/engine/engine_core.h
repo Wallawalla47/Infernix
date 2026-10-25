@@ -4,6 +4,7 @@
 
 #include "core/device.h"
 #include "core/nvtx.h"
+#include "core/temporary_switches.h"
 #include "infernix/types.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/resources.h"
@@ -12,6 +13,7 @@
 #include "runtime/engine/diagnostics.h"
 #include "runtime/engine/scheduler.h"
 #include "runtime/engine/generation_budget.h"
+#include "runtime/expert_offload/placement.h"
 
 #include <algorithm>
 #include <array>
@@ -20,6 +22,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <deque>
 #include <exception>
 #include <future>
@@ -38,6 +41,17 @@
 #include <vector>
 
 namespace infernix::runtime {
+
+// The decode share's temporary A/B switches (DecodeShare), read once at Engine construction:
+// INFERNIX_TMP_DECODE_SHARE in [0, 1] (unset: 0) and INFERNIX_TMP_DECODE_SHARE_MIN_TOKENS
+// (unset: 0).
+[[nodiscard]] inline DecodeShare decode_share_from_environment() {
+    DecodeShare policy;
+    policy.share                = temporary_switches::number("INFERNIX_TMP_DECODE_SHARE", 0.0, 0.0, 1.0);
+    policy.min_remaining_tokens = static_cast<std::uint32_t>(temporary_switches::integer(
+        "INFERNIX_TMP_DECODE_SHARE_MIN_TOKENS", 0, 0, std::numeric_limits<std::uint32_t>::max()));
+    return policy;
+}
 
 // Requests reuse context through the Program's prefix cache, driven by HybridResourceManager
 // (docs/maintainer/hybrid-prefix-cache-spec.md).
@@ -101,6 +115,7 @@ public:
                 .total_bytes   = options.speculative.ngram_archive_bytes});
         }
         diagnostics_ = options.diagnostic_observer;
+        scheduler_.set_decode_share(decode_share_from_environment());
         if (options.context_cache.enabled &&
             !options.context_cache.hybrid.persistent_file.empty()) {
             prefix_save_interval_ = options.context_cache.hybrid.persistent_save_interval;
@@ -111,6 +126,8 @@ public:
         worker_                   = std::thread([this, startup = std::move(startup)]() mutable {
             try {
                 device_.bind_to_current_thread();
+                // INFERNIX_TMP_ENGINE_ISOLATE: this round thread on a core no CPU expert worker uses.
+                expert_offload::place_engine_thread();
                 startup.set_value();
             } catch (...) {
                 startup.set_exception(std::current_exception());
@@ -198,6 +215,17 @@ public:
             }
             EngineCore* owner = std::exchange(owner_, nullptr);
             return owner->wait_for_request(std::exchange(request_, nullptr), sink, cancellation);
+        }
+
+        void await_admission(const CancellationView& cancellation) {
+            if (owner_ == nullptr || request_ == nullptr) {
+                throw std::logic_error("concurrent submission is empty");
+            }
+            if (request_->consumer_mode != OutputConsumerMode::Streaming) {
+                throw std::invalid_argument(
+                    "await_admission requires a stream-consumed submission");
+            }
+            owner_->await_request_admission(request_, cancellation);
         }
 
     private:
@@ -328,10 +356,33 @@ public:
         return !stopping_ && !failed_;
     }
 
+    // failed_ also ends an orderly stop; execution_failed_ only an execution failure.
+    [[nodiscard]] bool has_failed() const {
+        std::lock_guard lock(queue_mutex_);
+        return execution_failed_;
+    }
+
     void reset_memory_peaks() noexcept {
         try {
             std::scoped_lock lock(execution_mutex_);
             instance_.program->reset_memory_peaks();
+        } catch (...) {}
+    }
+
+    // In the worker's counters and in the published snapshot (the publisher's lock order), so a
+    // reader sees the restarted maxima before the next execution.
+    void reset_execution_maxima() noexcept {
+        const auto restart = [](RuntimeExecutionLatency& e) {
+            for (DurationCounter* counter : {&e.prefill, &e.replay, &e.control, &e.decode}) {
+                counter->max_ns = 0;
+            }
+            for (DurationCounter& counter : e.decode_by_batch) { counter.max_ns = 0; }
+        };
+        try {
+            std::scoped_lock lock(execution_mutex_);
+            restart(cumulative_stats_.execution);
+            std::lock_guard stats_lock(stats_mutex_);
+            restart(published_stats_.execution);
         } catch (...) {}
     }
 
@@ -526,6 +577,8 @@ private:
                     try {
                         if (auto* timing = std::get_if<GenerationTimingObservation>(&event)) {
                             sink->timing(std::move(*timing));
+                        } else if (auto* call = std::get_if<ToolCallDelta>(&event)) {
+                            sink->tool_call(std::move(*call));
                         } else {
                             sink->publish(std::move(std::get<OutputDelta>(event)));
                         }
@@ -548,6 +601,43 @@ private:
             std::lock_guard lock(request->mutex);
             if (request->error != nullptr) { std::rethrow_exception(request->error); }
             return std::move(request->result);
+        }
+    }
+
+    // wait_for_request's first step, read only: until the request crosses the admission boundary
+    // that publishes its GenerationStart, or is answered before it. Nothing is consumed, so
+    // wait_for_request still delivers the start and every later event. An error answered before
+    // admission is rethrown (the later wait rethrows it again); a request answered without
+    // admission and without an error (cancelled in the queue) returns. A cancellation marks the
+    // request and keeps waiting for the worker's answer, as the wait loop does.
+    void await_request_admission(const std::shared_ptr<Request>& request,
+                                 const CancellationView& cancellation) {
+        for (;;) {
+            std::exception_ptr error;
+            bool settled = false;
+            {
+                std::unique_lock lock(request->mutex);
+                request->cv.wait_for(lock, std::chrono::milliseconds(10), [&] {
+                    return request->response_done || request->stream_start.has_value();
+                });
+                settled = request->response_done || request->stream_start.has_value();
+                if (request->response_done && !request->stream_start.has_value()) {
+                    error = request->error;
+                }
+            }
+            if (settled) {
+                if (error != nullptr) { std::rethrow_exception(error); }
+                return;
+            }
+            bool cancel = false;
+            try {
+                cancel = cancellation.requested();
+            } catch (...) { cancel = true; }
+            if (cancel) {
+                request->cancelled.store(true, std::memory_order_release);
+                request_admission_check();
+                queue_cv_.notify_one();
+            }
         }
     }
 
@@ -626,10 +716,11 @@ private:
     void append_output(const std::shared_ptr<Request>& request, PublishedOutput output,
                        std::optional<GenerationTimingObservation> timing = std::nullopt,
                        EnginePhaseScope* phase                           = nullptr) {
-        if (output.empty() && !timing) { return; }
+        if (output.empty() && output.tool_calls().empty() && !timing) { return; }
         if (!request->first_output_timing &&
-            std::any_of(output.begin(), output.end(),
-                        [](const auto& delta) { return !delta.text.empty(); })) {
+            (!output.tool_calls().empty() ||
+             std::any_of(output.begin(), output.end(),
+                         [](const auto& delta) { return !delta.text.empty(); }))) {
             if (phase) { phase->checkpoint(); }
             record_first_output(request);
         }
@@ -642,6 +733,10 @@ private:
                                                                               : request->content;
                 full += delta.text;
                 if (streaming) { request->events.emplace_back(std::move(delta)); }
+            }
+            // The result's calls come from the session at terminal time; only a stream needs the steps.
+            if (streaming) {
+                for (ToolCallDelta& call : output.tool_calls()) { request->events.emplace_back(std::move(call)); }
             }
         }
         if (streaming) { request->cv.notify_one(); }
@@ -839,6 +934,7 @@ private:
         result.timings.prepare_seconds = request->prepare_seconds;
         result.speculative             = std::move(request->speculative_stats);
         result.expert_cache            = request->expert_cache;
+        result.cache_created_prompt_tokens = request->cache_created_prompt_tokens;
         result.thinking                = request->output.thinking_stats();
         result.readout                 = std::move(request->readout);
         result.constrained_draws       = std::move(request->constrained_draws);
@@ -952,6 +1048,9 @@ private:
             request->speculative_stats  = std::move(finished.speculative);
             request->constrained_draws  = std::move(finished.constrained_draws);
             if constexpr (requires { finished.expert_cache; }) { request->expert_cache = finished.expert_cache; }
+            if constexpr (requires { finished.cache_created_prompt_tokens; }) {
+                request->cache_created_prompt_tokens = finished.cache_created_prompt_tokens;
+            }
             request->terminal_reason.reset();
             // A reply that hands the client a tool call is followed by the conversation's next
             // turn once the tool has run: what that turn resumes from is held meanwhile.
@@ -1054,6 +1153,7 @@ private:
         std::array<std::size_t, kMaximumConcurrency> generated_sizes{};
         std::array<bool, kMaximumConcurrency> cancelled{};
         std::array<bool, kMaximumConcurrency> failed{};
+        std::array<PendingRowFailure, kMaximumConcurrency> failures{};
         // A row whose output refused its tokens: released like a cancelled row, failed alone.
         std::array<std::exception_ptr, kMaximumConcurrency> refused{};
         bool generated_staged = false;
@@ -1082,7 +1182,8 @@ private:
                 }
                 if (decode_round) { ++request->host_timing.decode_rounds; }
                 cancelled[row] = cancelled_at_unit_start[lane];
-                failed[row]    = !cancelled[row] && pending.constraint_failed(row);
+                failures[row]  = cancelled[row] ? PendingRowFailure::None : pending.row_failure(row);
+                failed[row]    = failures[row] != PendingRowFailure::None;
                 const std::int32_t raw_count =
                     pending.row_counts().empty() ? 1 : pending.row_counts()[row];
                 if (raw_count <= 0 || raw_count > static_cast<std::int32_t>(pending.row_stride())) {
@@ -1230,10 +1331,21 @@ private:
                 const std::uint32_t lane     = lane_indices[row];
                 const auto& request          = slots_[lane];
                 const std::uint32_t accepted = decisions[row].accepted_tokens;
-                if (failed[row]) {
+                if (failures[row] == PendingRowFailure::ConstraintDeadEnd) {
                     complete_error(request, std::make_exception_ptr(
                                                 RequestError(RequestErrorKind::ConstraintDeadEnd,
                                                              "grammar has no valid next token")));
+                    remove_completed_slot(lane);
+                    continue;
+                }
+                if (failures[row] == PendingRowFailure::NonFiniteLogits) {
+                    // A numerical failure of this request's execution, not of its input.
+                    publish_diagnostic(diagnostics_, DiagnosticLevel::Error,
+                                       "the model produced non-finite logits: failed 1 request; "
+                                       "the Engine keeps serving");
+                    complete_error(request, std::make_exception_ptr(std::runtime_error(
+                                                "the model produced non-finite logits (NaN or "
+                                                "infinity); the request was not completed")));
                     remove_completed_slot(lane);
                     continue;
                 }
@@ -1334,7 +1446,8 @@ private:
         request_admission_check();
     }
 
-    void run_prefill_step(std::uint32_t lane,
+    // Returns whether the unit completed its prompt.
+    bool run_prefill_step(std::uint32_t lane,
                           const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
         nvtx::ScopedRange prefill_range(nvtx::Name::Prefill, nvtx::Category::Prefill);
         EnginePhaseScope setup(*this, EngineHostPhase::CommitOutput);
@@ -1356,8 +1469,10 @@ private:
         if (!request->first_output_timing) {
             record_execution_work(request->prefill_work, progress.timing);
         }
+        const bool complete = progress.complete;
         resolve_prefill_progress(request, std::move(progress), cancelled_at_unit_start);
         publish_runtime_stats();
+        return complete;
     }
 
     void ensure_base_plan(const std::shared_ptr<Request>& request) {
@@ -1935,6 +2050,7 @@ private:
                           const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
         nvtx::ScopedRange decode_range(nvtx::Name::Decode, nvtx::Category::Decode,
                                        static_cast<std::uint64_t>(membership.size));
+        const auto started = Clock::now();
         ProgramCallScope program_call(*this);
         RoundMasks masks;
         bool constrained = false;
@@ -1947,6 +2063,9 @@ private:
             constrained ? &masks : nullptr);
         program_call.finish(pending.execution_timing());
         commit_pending(std::move(pending), membership.lane_span(), true, cancelled_at_unit_start);
+        const std::uint64_t round_ns = elapsed_ns(started, Clock::now());
+        cumulative_stats_.execution.decode.add(round_ns);
+        cumulative_stats_.execution.decode_by_batch[membership.size - 1].add(round_ns);
         publish_runtime_stats();
     }
 
@@ -2098,6 +2217,7 @@ private:
         {
             std::lock_guard lock(queue_mutex_);
             failed_ = true;
+            execution_failed_ |= !shutdown;
             pending.swap(pending_);
         }
         scheduler_ = Scheduling{};
@@ -2209,6 +2329,13 @@ private:
                 }
                 if (stopping_) {
                     lock.unlock();
+                    if (scheduler_.decode_share().share > 0.0) {
+                        // The A/B arm's positive control: how often prefill gave way to decode.
+                        publish_diagnostic(diagnostics_, DiagnosticLevel::Info,
+                                           "decode share: %llu prefill turns yielded",
+                                           static_cast<unsigned long long>(
+                                               scheduler_.decode_share_yields()));
+                    }
                     std::scoped_lock execution_lock(execution_mutex_);
                     fail_all_locked(
                         std::make_exception_ptr(RequestError(RequestErrorKind::Unavailable,
@@ -2286,9 +2413,13 @@ private:
                 }
                 controls = std::move(selected_control);
                 finish_engine_phase(boundary, EngineHostPhase::Boundary);
+                const auto decode_started = Clock::now();
                 if (!controls.empty()) {
                     set_host_work_class(HostWorkClass::Control);
+                    const auto control_started = Clock::now();
                     run_control_batch(controls);
+                    cumulative_stats_.execution.control.add(
+                        elapsed_ns(control_started, Clock::now()));
                     executed = true;
                 }
                 // Control rows become decode-ready next cycle, after reserving their new unit.
@@ -2315,6 +2446,14 @@ private:
                     run_decode_round(decode, cancelled);
                     executed = true;
                 }
+                if (controls.empty() && decode.empty()) {
+                    scheduler_.decode_work_absent();
+                } else {
+                    scheduler_.decode_work_finished(static_cast<std::uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() -
+                                                                             decode_started)
+                            .count()));
+                }
                 if (instance_.program->has_context_transaction()) {
                     set_host_work_class(HostWorkClass::Control);
                     auto progress_boundary = begin_host_phase();
@@ -2334,14 +2473,22 @@ private:
                         prefill_slots[lane].reset();
                     }
                 }
-                if (const auto lane = scheduler_.next_prefill(prefill_slots, max_concurrency_)) {
+                const auto lane = scheduler_.next_prefill(prefill_slots, max_concurrency_);
+                // A protected unit (Replay, a recovering request) never gives way to the decode
+                // share; any other waits while the share still owes Control/Decode time.
+                const bool shared_unit = lane && !slots_[*lane]->is_replaying() &&
+                                         !slots_[*lane]->recovery_pending;
+                if (lane && !(shared_unit && scheduler_.prefill_yields())) {
                     const auto request = slots_[*lane];
                     set_host_work_class(HostWorkClass::Prefill);
                     if (request->is_replaying()) {
+                        const auto replay_started = Clock::now();
                         ProgramCallScope call(*this);
                         auto progress = instance_.program->advance_replay(*request->sequence,
                                                                           &call.failed_timing());
                         call.finish(progress.timing);
+                        cumulative_stats_.execution.replay.add(
+                            elapsed_ns(replay_started, Clock::now()));
                         if (!request->first_output_timing) {
                             record_execution_work(request->replay_work, progress.timing);
                         }
@@ -2355,7 +2502,27 @@ private:
                                                GenerationSchedulingTransition::ReplayComplete);
                         }
                     } else {
-                        run_prefill_step(*lane, snapshot_cancellations());
+                        const auto prefill_started = Clock::now();
+                        const bool complete = run_prefill_step(*lane, snapshot_cancellations());
+                        cumulative_stats_.execution.prefill.add(
+                            elapsed_ns(prefill_started, Clock::now()));
+                        if (shared_unit) {
+                            const BeginSummary& begin = *request->admitted_begin;
+                            const std::uint32_t remaining =
+                                begin.prompt_tokens - begin.reused_prompt_tokens -
+                                request->computed_prompt_tokens;
+                            const bool decode_waiting =
+                                std::any_of(slots_.begin(), slots_.end(), [&](const auto& other) {
+                                    return other && other != request &&
+                                           (other->is_decode_ready() || other->is_control_ready());
+                                });
+                            scheduler_.prefill_unit_finished(
+                                static_cast<std::uint64_t>(
+                                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        Clock::now() - prefill_started)
+                                        .count()),
+                                complete, remaining, decode_waiting);
+                        }
                     }
                     scheduler_.prefill_executed(*lane, max_concurrency_);
                     update_recovery(request);
@@ -2423,6 +2590,7 @@ private:
     bool stopping_ = false;
     bool maintenance_requested_ = false; // guarded by queue_mutex_
     bool failed_   = false;
+    bool execution_failed_ = false; // guarded by queue_mutex_
     std::thread worker_;
 };
 

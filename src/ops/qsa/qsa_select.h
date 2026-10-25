@@ -32,6 +32,13 @@
 //      CTA finishes the column (linear_topk's split-and-merge structure). An 8-CTA cluster per
 //      column exchanging its state through distributed shared memory was measured and dropped
 //      (design §19.3.6 item 2, step Q2: slower at every context).
+//      The sampled route (QsaSelectRoute::Sampled, arXiv 2609.08450) has no histogram pass: every
+//      CTA of a column reads the same strided sample of its scores and takes a key floor about
+//      sqrt(top x 4096) of the column's keys reach, appends its slice's keys at or above the floor
+//      to a global candidate buffer, and the last CTA selects the top among them by the same radix
+//      select. At least `top` candidates put the floor at or below the top-th key, so the ids are
+//      the histogram route's; a sample unlike its column (fewer than `top` candidates, or more than
+//      the buffer's 4,096) sends the last CTA through the histogram route alone.
 // Every launch is stream-ordered (programmatic dependents when captured) and keeps no state
 // between calls, so it captures into CUDA Graphs and replays with new positions.
 
@@ -56,13 +63,21 @@ struct QsaSelectOutput {
     std::int32_t* counts   = nullptr; // [columns]: top, or -1 when the column selects every block
 };
 
+/// The selection's route; both write the same ids and counts. Geometries whose top exceeds 1,024
+/// blocks take the histogram route either way.
+enum class QsaSelectRoute : unsigned char { Histogram, Sampled };
+
+/// The histogram route, or the sampled one under the temporary INFERNIX_TMP_QSA_SAMPLED_SELECT
+/// (until its op bench and long-prompt A/B).
+[[nodiscard]] QsaSelectRoute qsa_select_default_route() noexcept;
+
 /// index_q: BF16 [Di, index_heads, T] from qsa_index_query; pooled_pages: the layer's BF16 pooled
 /// plane holding every block the columns see; `spaces`: the layer's pages outside the pool, whose
 /// pooled keys live in spaces.pooled (design §19.3.11; none by default).
 void qsa_select(const Tensor& index_q, const Tensor& pooled_pages, const QsaBatch& batch,
                 const QsaGeometry& geometry, std::int32_t max_context, void* scratch,
                 std::size_t scratch_bytes, const QsaSelectOutput& output, cudaStream_t stream,
-                const QsaPageSpaces& spaces = {});
+                const QsaPageSpaces& spaces = {}, QsaSelectRoute route = qsa_select_default_route());
 
 /// After qsa_select, the FP32 scores of its last group: column c of the group (c counted from
 /// the group's first column) holds block b at scores[c * stride + b] for b < its block count.

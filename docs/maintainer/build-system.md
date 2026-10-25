@@ -20,8 +20,8 @@ The default configuration is Release. Ninja links and archives share the single-
 | `INFERNIX_BUILD_BENCHMARKS` | OFF | Op, model, Engine and context-cost benchmarks |
 
 Apps or tests enable the internal product support components: media acquisition, prompt input,
-logging and serving. This is one derived condition, not a separate user option. FFmpeg belongs
-to model media decoding and remains required when apps are disabled. Curl and spdlog are needed
+logging and serving. This is one derived condition, not a separate user option. FFmpeg and
+libjpeg belong to model media decoding and remain required when apps are disabled. Curl and spdlog are needed
 only for product support. A Python 3 interpreter is found when tests are configured. The larger Python
 pytest suites and conversion/evaluation scripts run separately from CMake and CTest.
 
@@ -66,7 +66,7 @@ package export or configure-time dependency download.
 
 ## Targets and dependencies
 
-`cmake/Dependencies.cmake` discovers system CUDA, Threads, FFmpeg and conditional curl, and
+`cmake/Dependencies.cmake` discovers system CUDA, Threads, FFmpeg, libjpeg and conditional curl, and
 exposes the repository-pinned JSON/HTTP headers and conditional spdlog library. External include
 requirements follow their consuming targets. `cmake/InfernixTargets.cmake` provides private
 project includes and the two CUDA archive policies.
@@ -119,8 +119,11 @@ the static archive build. Keep this device-link boundary explicit.
 
 `infernix_nvfp4_non_rdc` disables separable compilation and device-symbol resolution. It contains
 the warp-specialized Linear, LinearSwiGLU and causal-attention NVFP4 sources that depend on
-`setmaxnreg` register transfer. Their owning family manifests register these sources into the
-non-RDC target; host launchers connect them to the normal Ops. All three CUDA archive targets
+`setmaxnreg` register transfer, and the f16-accumulate split-register launches (declared
+`extern template` in `f16acc_mma.cuh`, defined in `f16acc_split_registers.cu`; an RDC translation unit
+that would instantiate one fails to compile). Their
+owning family manifests register these sources into the non-RDC target; host launchers connect them to
+the normal Ops. All three CUDA archive targets
 retain `-lineinfo`.
 
 Source-list maintenance must preserve language, architecture, RDC mode, device-link ownership

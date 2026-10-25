@@ -8,6 +8,7 @@
 // - it does not change when every other column changes;
 // - every column of the widest call equals that column projected alone.
 
+#include "ops/op_family.h"
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "core/weight.h"
@@ -665,7 +666,7 @@ int check_head(QType qtype, const char* format) {
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(column_invariant_projections) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;

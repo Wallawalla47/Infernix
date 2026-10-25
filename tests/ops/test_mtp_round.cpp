@@ -1,4 +1,5 @@
 #include "infernix/ops/mtp_round.h"
+#include "ops/op_family.h"
 #include "ops/op_tester.h"
 
 #include <algorithm>
@@ -17,7 +18,8 @@ int run_case(int k, const std::vector<std::int32_t>& accepted, int next_k) {
     const int T               = k + 1;
     constexpr int max_context = 128;
 
-    std::vector<std::int32_t> verify(static_cast<std::size_t>(T * batch));
+    // The round's licensed tokens: its accepted drafts, then the correction or bonus token.
+    std::vector<std::int32_t> tokens(static_cast<std::size_t>(T * batch));
     std::vector<std::int32_t> anchors(static_cast<std::size_t>(batch));
     std::vector<std::int32_t> frontiers(static_cast<std::size_t>(batch));
     std::vector<std::int32_t> budgets(static_cast<std::size_t>(batch));
@@ -38,12 +40,12 @@ int run_case(int k, const std::vector<std::int32_t>& accepted, int next_k) {
             b == batch - 1 ? licensed[static_cast<std::size_t>(b)] : 12 - b;
         rope_deltas[static_cast<std::size_t>(b)] = 3 * b - 2;
         for (int j = 0; j < T; ++j) {
-            verify[static_cast<std::size_t>(b * T + j)] = 1000 + 101 * b + 7 * j;
+            tokens[static_cast<std::size_t>(b * T + j)] = 1000 + 101 * b + 7 * j;
         }
         for (int j = 0; j < T; ++j) {
             expected_alignment[static_cast<std::size_t>(b * T + j)] =
                 j < accepted[static_cast<std::size_t>(b)]
-                    ? verify[static_cast<std::size_t>(b * T + j + 1)]
+                    ? tokens[static_cast<std::size_t>(b * T + j)]
                     : anchors[static_cast<std::size_t>(b)];
         }
         const int budget_extent = std::max(
@@ -61,7 +63,7 @@ int run_case(int k, const std::vector<std::int32_t>& accepted, int next_k) {
         }
     }
 
-    DeviceBuffer d_verify      = to_device(verify);
+    DeviceBuffer d_tokens      = to_device(tokens);
     DeviceBuffer d_anchors     = to_device(anchors);
     DeviceBuffer d_accepted    = to_device(accepted);
     DeviceBuffer d_frontiers   = to_device(frontiers);
@@ -79,7 +81,7 @@ int run_case(int k, const std::vector<std::int32_t>& accepted, int next_k) {
     d_rope_positions.fill(0xcd);
     d_valid.fill(0xcd);
 
-    Tensor t_verify(d_verify.p, DType::I32, {T, batch});
+    Tensor t_tokens(d_tokens.p, DType::I32, {T, batch});
     Tensor t_anchors(d_anchors.p, DType::I32, {batch});
     Tensor t_accepted(d_accepted.p, DType::I32, {batch});
     Tensor t_frontiers(d_frontiers.p, DType::I32, {batch});
@@ -91,7 +93,7 @@ int run_case(int k, const std::vector<std::int32_t>& accepted, int next_k) {
     Tensor t_positions(d_positions.data(), DType::I32, {batch, steps});
     Tensor t_rope_positions(d_rope_positions.data(), DType::I32, {batch, steps});
     Tensor t_valid(d_valid.data(), DType::I32, {batch, steps});
-    ops::mtp_prepare_next_round(t_verify, t_anchors, t_accepted, t_frontiers, t_budgets, t_licensed,
+    ops::mtp_prepare_next_round(t_tokens, t_anchors, t_accepted, t_frontiers, t_budgets, t_licensed,
                                 t_rope_deltas, t_alignment, t_extents, t_positions,
                                 t_rope_positions, t_valid, max_context, next_k, nullptr);
     cuda_synchronize();
@@ -101,7 +103,7 @@ int run_case(int k, const std::vector<std::int32_t>& accepted, int next_k) {
         for (const int invalid_limit : {-1, 0, 6}) {
             bool rejected = false;
             try {
-                ops::mtp_prepare_next_round(t_verify, t_anchors, t_accepted, t_frontiers, t_budgets,
+                ops::mtp_prepare_next_round(t_tokens, t_anchors, t_accepted, t_frontiers, t_budgets,
                                             t_licensed, t_rope_deltas, t_alignment, t_extents,
                                             t_positions, t_rope_positions, t_valid, max_context,
                                             invalid_limit, nullptr);
@@ -109,7 +111,7 @@ int run_case(int k, const std::vector<std::int32_t>& accepted, int next_k) {
             if (!rejected) { ++invalid_failures; }
         }
         for (const int invalid_width : {1, 65}) {
-            auto invalid  = t_verify;
+            auto invalid  = t_tokens;
             invalid.ne[0] = invalid_width;
             bool rejected = false;
             try {
@@ -151,7 +153,7 @@ int run_case(int k, const std::vector<std::int32_t>& accepted, int next_k) {
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(mtp_round) {
     if (cuda_unavailable()) {
         std::cout << "mtp_round: SKIP (CUDA unavailable)\n";
         return 77;

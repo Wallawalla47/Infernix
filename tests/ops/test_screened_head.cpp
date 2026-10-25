@@ -18,6 +18,7 @@
 // - the selection's radix paths: a margin admitting more rows than `rescored`, and fewer than the ranks.
 // Informational: each form's time against the exact head's.
 
+#include "ops/op_family.h"
 #include "infernix/ops/projection_fp32.h"
 #include "infernix/ops/screened_head.h"
 #include "ops/linear/linear_test_common.h"
@@ -829,7 +830,7 @@ void top_case(std::uint64_t seed) {
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(screened_head) {
     if (!infernix::test::linear::cuda_available()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;

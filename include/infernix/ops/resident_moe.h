@@ -27,8 +27,14 @@ namespace infernix::ops {
 /// decoded exactly as code * FP16 group scale and every dot product accumulates in FP32 with the
 /// group scale applied once per 16-weight (Q8), 32-weight (Q4) or 64-weight (Q2) chunk. ids outside [0, E) are a
 /// precondition violation. The oracle is the same formula in FP64 over the decoded weights.
+///
+/// With `valid_columns` (device I32 [T / width], width > 0 dividing T), column t is a row's padding
+/// when t % width >= valid_columns[t / width]: its entries read no expert and their outputs are BF16
+/// zero (a verification round's columns past a row's extent). Every live entry's bits are those of
+/// the unmasked call.
 void resident_moe_experts(const Tensor& x, const Tensor& ids, const Weight& gate_up, const Weight& down,
                           std::int32_t experts, std::int32_t intermediate, void* workspace,
-                          std::size_t workspace_bytes, Tensor& outputs, cudaStream_t stream);
+                          std::size_t workspace_bytes, Tensor& outputs, cudaStream_t stream,
+                          const std::int32_t* valid_columns = nullptr, std::int32_t width = 0);
 
 } // namespace infernix::ops

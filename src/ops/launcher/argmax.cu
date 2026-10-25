@@ -75,22 +75,65 @@ __global__ void argmax_map_kernel(const std::int32_t* row_ids, std::int32_t* out
 
 } // namespace
 
-void argmax_probability_launch(const Tensor& logits, const Tensor& rows, Tensor& probability,
-                               std::int32_t valid_rows, cudaStream_t stream) {
-    const dim3 grid(static_cast<unsigned int>(logits.ne[1]));
-    const auto* selected              = static_cast<const std::int32_t*>(rows.data);
-    auto* out                         = static_cast<float*>(probability.data);
-    const std::int32_t physical_rows  = logits.ne[0];
-    if (logits.dtype == DType::FP32) {
-        CUDA_CHECK(pdl::launch_consumer({grid, dim3(kArgmaxBlock), 0, stream}, argmax_probability_kernel<float>,
-                                        static_cast<const float*>(logits.data), selected, out, valid_rows,
-                                        physical_rows));
-    } else {
-        CUDA_CHECK(pdl::launch_consumer({grid, dim3(kArgmaxBlock), 0, stream},
-                                        argmax_probability_kernel<__nv_bfloat16>,
-                                        static_cast<const __nv_bfloat16*>(logits.data), selected, out, valid_rows,
-                                        physical_rows));
+std::int32_t argmax_probability_tiles(DType logits, std::int32_t physical_rows, std::int32_t valid_rows,
+                                      std::int32_t columns) {
+    // As argmax: FP32 logits and domains of one block take one CTA per column.
+    if (logits == DType::FP32 || div_up(valid_rows, kArgmaxBlock) < 2) { return 0; }
+    return div_up(valid_rows, tiled_block_for(physical_rows, valid_rows, columns) * kArgmaxItemsPerThread);
+}
+
+namespace {
+
+constexpr std::size_t kProbabilityRegionAlign = 256;
+
+std::size_t probability_region(std::size_t bytes) {
+    return round_up(bytes, kProbabilityRegionAlign);
+}
+
+} // namespace
+
+std::size_t argmax_probability_workspace_bytes(std::int32_t tiles, std::int32_t columns) {
+    if (tiles == 0 || columns == 0) { return 0; }
+    const auto partials = static_cast<std::size_t>(tiles) * static_cast<std::size_t>(columns) * sizeof(float);
+    return 2 * probability_region(partials) +
+           probability_region(static_cast<std::size_t>(columns) * sizeof(unsigned int));
+}
+
+void argmax_probability_launch(const Tensor& logits, Tensor& out, Tensor& probability, std::int32_t valid_rows,
+                               DeviceSpan workspace, cudaStream_t stream) {
+    const std::int32_t physical_rows = logits.ne[0];
+    const std::int32_t t_count       = logits.ne[1];
+    auto* rows                       = static_cast<std::int32_t*>(out.data);
+    auto* confidence                 = static_cast<float*>(probability.data);
+    const std::int32_t tiles = argmax_probability_tiles(logits.dtype, physical_rows, valid_rows, t_count);
+    if (tiles == 0) {
+        const dim3 grid(static_cast<unsigned int>(t_count));
+        if (logits.dtype == DType::FP32) {
+            CUDA_CHECK(pdl::launch_consumer({grid, dim3(kArgmaxBlock), 0, stream},
+                                            argmax_probability_column_kernel<float>,
+                                            static_cast<const float*>(logits.data), rows, confidence, valid_rows,
+                                            physical_rows));
+        } else {
+            CUDA_CHECK(pdl::launch_consumer({grid, dim3(kArgmaxBlock), 0, stream},
+                                            argmax_probability_column_kernel<__nv_bfloat16>,
+                                            static_cast<const __nv_bfloat16*>(logits.data), rows, confidence,
+                                            valid_rows, physical_rows));
+        }
+        return;
     }
+    const auto partials = probability_region(static_cast<std::size_t>(tiles) * t_count * sizeof(float));
+    auto* base          = static_cast<unsigned char*>(workspace.data);
+    auto* partial_value = reinterpret_cast<float*>(base);
+    auto* partial_sum   = reinterpret_cast<float*>(base + partials);
+    auto* arrivals      = reinterpret_cast<unsigned int*>(base + 2 * partials);
+    // The atomic winners start from row 0 and every column's arrivals from 0.
+    CUDA_CHECK(cudaMemsetAsync(rows, 0, static_cast<std::size_t>(t_count) * sizeof(std::int32_t), stream));
+    CUDA_CHECK(cudaMemsetAsync(arrivals, 0, static_cast<std::size_t>(t_count) * sizeof(unsigned int), stream));
+    const int block = tiled_block_for(physical_rows, valid_rows, t_count);
+    const dim3 grid(static_cast<unsigned int>(tiles), static_cast<unsigned int>(t_count));
+    CUDA_CHECK(pdl::launch_consumer({grid, dim3(block), 0, stream}, argmax_probability_tiled_kernel,
+                                    static_cast<const __nv_bfloat16*>(logits.data), rows, confidence,
+                                    partial_value, partial_sum, arrivals, valid_rows, physical_rows));
 }
 
 void argmax_map_launch(const Tensor& row_ids, Tensor& out, cudaStream_t stream) {

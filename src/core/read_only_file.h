@@ -34,7 +34,9 @@ public:
     [[nodiscard]] std::uint64_t current_bytes() const noexcept;
     // Unbuffered read of `destination` (4 KiB-aligned offset, size and address) from `offset`;
     // returns the bytes read contiguously from `offset` (fewer only at the end of the file). On
-    // Windows a read of more than 8 MiB keeps up to 16 such blocks in flight.
+    // Windows a read of more than 8 MiB keeps up to 16 such blocks in flight. On a POSIX filesystem
+    // that refuses O_DIRECT (tmpfs, 9p, some FUSE mounts) the file is read through the page cache,
+    // with the same alignment rules.
     std::size_t read_direct(std::uint64_t offset, std::span<std::byte> destination) const;
 
     // Unbuffered reads of `block_bytes` at each offset (read_direct's alignment rules), at most

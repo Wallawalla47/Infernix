@@ -158,6 +158,7 @@ Several workload seeds (`--seeds`) show how much a result depends on the particu
 | `AB_TREATMENT_EXTRA_FLAGS` | none |
 | `AB_ALT_EXTRA_FLAGS` | none (added to the treatment's flags) |
 | `AB_ALT_EXE` | the treatment executable; another build puts a second Infernix build in the alt arm |
+| `AB_TREATMENT_ENV` / `AB_ALT_ENV` / `AB_CONTROL_ENV` | none; `NAME=VALUE ...` set for that arm's serve only (a temporary `INFERNIX_TMP_*` A/B switch). No serve inherits the runner's own `INFERNIX_TMP_*` variables |
 | `AB_CONTROL_LABEL` / `AB_TREATMENT_LABEL` / `AB_ALT_LABEL` | none (the report calls the arms "NInfer + Windows port", "Infernix" and "Infernix, alternative") |
 | `AB_CONTROL_KIND` | `serve`; `strata` runs the control arm as a Strata server (below) |
 | `AB_STRATA_DIR` / `AB_STRATA_CONFIG` | none, required for a Strata control / its `strata-unsloth-ud-q4_k_xl.json` |

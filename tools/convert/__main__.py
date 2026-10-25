@@ -11,7 +11,7 @@ import sys
 from collections.abc import Mapping
 
 from .official_recipes import RECIPES
-from .pipeline import convert
+from .pipeline import DEFAULT_MAX_BUFFERED_BYTES, convert
 from .proposal import DEFAULT_RANKING, add_official_proposal
 from . import qwen4_exp
 from .screen import add_screen_heads
@@ -160,7 +160,15 @@ def main(argv=None):
         type=int,
         default=1,
         help="parallel CPU weight conversion workers (--device cpu only); each of up to "
-        "2 x WORKERS objects in flight is held whole in RAM",
+        "2 x WORKERS objects in flight is held whole in RAM, within --max-buffered-bytes",
+    )
+    parser.add_argument(
+        "--max-buffered-bytes",
+        type=int,
+        default=DEFAULT_MAX_BUFFERED_BYTES,
+        help="with --workers > 1: at most this many bytes of in-flight objects are buffered "
+        "(one larger object still converts, alone); the workers' source reads and temporaries "
+        f"come on top (default {DEFAULT_MAX_BUFFERED_BYTES})",
     )
     parser.add_argument("--rows-per-chunk", type=int, default=512)
     parser.add_argument("--max-file-bytes", type=int, default=32_000_000_000)
@@ -324,6 +332,7 @@ def main(argv=None):
             device=args.device,
             rows_per_chunk=args.rows_per_chunk,
             workers=args.workers,
+            max_buffered_bytes=args.max_buffered_bytes,
             max_file_bytes=args.max_file_bytes,
             progress=progress,
         )

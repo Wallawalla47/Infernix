@@ -51,16 +51,25 @@ struct FastPathConfiguration {
     case FastPath::GdnConvFused:
     case FastPath::QsaPrepareFused:
     case FastPath::Fp8A8Pair:
+    case FastPath::Fp8A8PairBlock32:
     case FastPath::Q4W4A8:
     case FastPath::SampledMtpDrafts:
-    case FastPath::GdnF16Accumulate: return false;
+    case FastPath::GdnF16Accumulate:
+    case FastPath::Q5KSplitMma:
+    case FastPath::Bf16PromptSplit:
+    case FastPath::Fp16GdnState:
+    case FastPath::BlockVerification:
+    case FastPath::UniverTrees:
+    case FastPath::GdnTreeClosedForm: return false;
     case FastPath::ExpertA4Residual:
     case FastPath::ExpertA4Residual3:
+    case FastPath::ExpertA4ResidualDecode:
     case FastPath::BatchedDecode:
     case FastPath::BatchedA8Decode:
     case FastPath::BatchedA4Decode:
     case FastPath::BatchedA4ResidualDecode:
     case FastPath::BatchedA8ResidualDecode:
+    case FastPath::BatchedA8SubsetDecode:
     case FastPath::SingleColumnDecode:
     case FastPath::BatchSplitAttention:
     case FastPath::AdaptiveSpeculation:
@@ -68,8 +77,11 @@ struct FastPathConfiguration {
     case FastPath::Preemption:
     case FastPath::AdaptiveMtp:
     case FastPath::AdaptiveDFlash:
+    case FastPath::DFlash2Pairs:
     case FastPath::IdleWidePrefill:
     case FastPath::GgmlBf16Prefill:
+    case FastPath::F16AccumulatePrefill:
+    case FastPath::RouterMma:
     case FastPath::ScreenedLmHead: return true;
     }
     return false;

@@ -1,4 +1,5 @@
 #include "infernix/ops/silu_mul.h"
+#include "ops/op_family.h"
 #include "ops/op_tester.h"
 
 #include <algorithm>
@@ -141,7 +142,7 @@ int run_edge_case() {
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(silu_mul) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;

@@ -1,44 +1,92 @@
-"""Trace-driven replay of VRAM expert-cache policies for Qwen3.8-Flash-Next decode routing.
+"""Trace-driven replay of VRAM expert-cache policies for decode routing.
 
 Supporting evidence for docs/maintainer/qwen3_8-flash-next-design.md (section 9.4); the starting
 point of milestone M1. Python 3.11 + numpy.
 
-Input: a directory with warmup-trace.npz, a-trace.npz and b-trace.npz, each holding `ids`
-[steps, 48, >=10] int32 with the layer's top-10 expert ids in the first 10 columns, as published in
-https://github.com/hz1ulqu01gmnZH4/qwen38-freetoken
-(experiments/2026-09-22_tg-expert-cache-trace-replay/data).
+Input, either of:
 
-The traces are replayed as one continuous session: `warmup` warms every policy, A and B are scored.
-Accesses are event-atomic: the experts of the current (round, layer) group must be resident
-together, so the current group is never evicted. With --window W, a group is the per-layer union of
-W consecutive tokens, approximating a fully accepted W-token speculative verify window.
+- A directory with warmup-trace.npz, a-trace.npz and b-trace.npz (Qwen3.8-Flash-Next), each holding
+  `ids` [steps, layers, >= top_k] int32 with the layer's top-k expert ids in the first top_k columns,
+  as published in https://github.com/hz1ulqu01gmnZH4/qwen38-freetoken
+  (experiments/2026-09-22_tg-expert-cache-trace-replay/data). The layers come from the arrays;
+  --experts and --top-k (default 512 and 10, Flash-Next's) give the rest.
+- Route traces written by the engine (EngineOptions::route_trace_path, `infernix-serve --route-trace`,
+  `infernix_decode_quality_gen ... route-trace=FILE`; format in src/runtime/expert_offload/
+  route_trace.h), from any model with offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B):
+  layers, experts and top-k come from the header. The decode and verification rounds are replayed in
+  the order given as one session; prefill chunks and forced tokens are served by the prefill stream
+  and are not part of the decode policies' accesses. A group is one (round, layer): the distinct
+  experts the round computes in that layer, rejected draft columns included. The first
+  --warmup-tokens decode tokens warm every policy and are not scored.
+
+With the FreeToken traces, `warmup` warms every policy and A and B are scored. Accesses are
+event-atomic: the experts of the current group must be resident together, so the current group is
+never evicted. With --window W (FreeToken traces only), a group is the per-layer union of W
+consecutive tokens, approximating a fully accepted W-token speculative verify window.
 
 Policies admit every miss ("promotion") unless marked CPU-served, in which case misses are computed
 by the CPU and the policy promotes lazily. Output: hit rate, misses and promotions per token.
 
-    python3 -m tools.expert_cache_replay.replay DIR [--capacities 4008,10200] [--window 1]
+Headroom report (--headroom, route traces only): the engine's own policy (the LFRU with budgeted
+admission, replayed by host_tier.TierSim in full mode: every miss is served from host memory)
+against Belady MIN with bypass (the optimum when misses are served from host memory, as the engine
+serves them) and Belady MIN without bypass (the demand-fetch optimum), per layer group, at each
+--capacities frame count. Hit rates count the distinct experts each scored decode or verification
+round computes per layer. The decision (--decision-frames, default the trace's frames) follows the
+candidate's rule: build cache-policy work only on a gap of >= 3 points between Belady with bypass and
+the engine's policy; a gap under 1 point closes the topic.
+
+Protection arms (--headroom --protection; candidates §13 PUB-22, SeqMoE): the engine's LFRU whose
+evictions spare the experts a routing-sequence predictor expects next (route_predictor.py): the next
+rounds' actual keys (the oracle ceiling, per --protect-horizons) and the engine's causal transition
+predictor (INFERNIX_TMP_ROUTE_PROTECT, on the host, so at the same frames). A/B the switch only when
+the predictor gains >= 3 points over the engine's LFRU; an oracle ceiling under 3 points closes the
+topic.
+
+    py -3.11 -m tools.expert_cache_replay.replay DIR [--capacities 4008,10200] [--window 1]
+    py -3.11 -m tools.expert_cache_replay.replay TRACE [TRACE ...] [--warmup-tokens N]
+    py -3.11 -m tools.expert_cache_replay.replay TRACE [TRACE ...] --headroom [--capacities 3600,4815]
+        [--decision-frames 4815] [--layer-groups 0-19,20-47] [--warmup-tokens N] [--json OUT]
+        [--protection [--protect-horizons 1,8] [--protect-per-layer 20]]
 """
 import argparse
 import heapq
-from collections import OrderedDict, defaultdict
+import json
+import os
+from collections import OrderedDict, defaultdict, namedtuple
 
 import numpy as np
 
-L, E, K = 48, 512, 10
+from . import host_tier as ht
+from . import route_predictor as rpred
+
+Geometry = namedtuple('Geometry', 'layers experts top_k')
+FLASH_NEXT = Geometry(48, 512, 10)
+
+BUILD_GAP_POINTS = 3.0   # the candidate's rule: policy work only on a gap of 3 points or more
+CLOSE_GAP_POINTS = 1.0   # under 1 point the topic closes
 
 
-def load(directory):
-    """Returns [steps, L, K] global expert keys (layer * E + expert) for warmup, a, b."""
+def load(directory, experts=FLASH_NEXT.experts, top_k=FLASH_NEXT.top_k):
+    """Returns the geometry and [steps, L, K] global expert keys (layer * E + expert) for warmup, a, b."""
     seqs = []
+    layers = None
     for n in ('warmup', 'a', 'b'):
-        ids = np.load(f'{directory}/{n}-trace.npz')['ids'][:, :, :K].astype(np.int64)
-        keys = ids + (np.arange(L)[None, :, None] * E)
+        ids = np.load(f'{directory}/{n}-trace.npz')['ids']
+        if layers is None:
+            layers = ids.shape[1]
+        if ids.ndim != 3 or ids.shape[1] != layers or ids.shape[2] < top_k:
+            raise ValueError(f'{directory}/{n}-trace.npz: ids {ids.shape} is not [steps, {layers}, >= {top_k}]')
+        ids = ids[:, :, :top_k].astype(np.int64)
+        if ids.size and (ids.min() < 0 or ids.max() >= experts):
+            raise ValueError(f'{directory}/{n}-trace.npz: expert ids outside 0..{experts - 1}')
+        keys = ids + (np.arange(layers)[None, :, None] * experts)
         seqs.append(keys)
-    return seqs
+    return Geometry(layers, experts, top_k), seqs
 
 
 class Sim:
-    """Base: groups of K keys per (step, layer); the current group is never evicted."""
+    """Base: groups of keys per (step, layer); the current group is never evicted."""
     demand = True   # admit every miss
 
     def __init__(self, cap):
@@ -82,13 +130,14 @@ class LRU(Sim):
 class LRUPerLayer(Sim):
     name = 'LRU, equal per-layer partition'
 
-    def __init__(self, cap):
+    def __init__(self, cap, geo):
         super().__init__(cap)
-        self.c = [OrderedDict() for _ in range(L)]
-        self.q = cap // L
+        self.E = geo.experts
+        self.c = [OrderedDict() for _ in range(geo.layers)]
+        self.q = cap // geo.layers
 
     def step_group(self, g, score):
-        c = self.c[int(g[0]) // E]
+        c = self.c[int(g[0]) // self.E]
         miss = []
         for k in g:
             if k in c:
@@ -289,15 +338,16 @@ class S3FIFO(Sim):
 class DecayedLFU(Sim):
     name = 'decayed global LFU'
 
-    def __init__(self, cap, half=64):
+    def __init__(self, cap, geo, half=64):
         super().__init__(cap)
+        self.E = geo.experts
         self.res = set(); self.cnt = defaultdict(float); self.last = {}; self.t = 0; self.half = half
         self.h = []; self.hq = heapq; self.step = 0
         self.name = f'decayed global LFU (half-life {half} tokens)'
 
     def step_group(self, g, score):
         self.t += 1
-        if int(g[0]) // E == 0: self.step += 1
+        if int(g[0]) // self.E == 0: self.step += 1
         inc = 2.0 ** (self.step / self.half)   # exponential decay by scaling increments
         gs = set(g); miss = []
         for k in g:
@@ -325,10 +375,11 @@ class WTinyLFU(Sim):
     copied into the window, so promotions are still counted on window admission)."""
     name = 'W-TinyLFU (1% window)'
 
-    def __init__(self, cap, win=0.01, age=2048):
+    def __init__(self, cap, geo, win=0.01, age=2048):
         super().__init__(cap)
-        self.wcap = max(K + 1, int(cap * win)); self.w = OrderedDict()
-        self.main = SLRU(cap - self.wcap); self.f = defaultdict(int); self.n = 0; self.age = age * L
+        self.K = geo.top_k
+        self.wcap = max(geo.top_k + 1, int(cap * win)); self.w = OrderedDict()
+        self.main = SLRU(cap - self.wcap); self.f = defaultdict(int); self.n = 0; self.age = age * geo.layers
 
     def _in_main(self, k): return k in self.main.p or k in self.main.m
 
@@ -336,7 +387,7 @@ class WTinyLFU(Sim):
         gs = set(g)
         for k in g:
             self.f[k] += 1; self.n += 1
-        if self.n >= self.age * K:
+        if self.n >= self.age * self.K:
             for k in list(self.f): self.f[k] //= 2
             self.n = 0
         for k in g:
@@ -375,12 +426,14 @@ class StrataExchange(Sim):
     name = 'Strata-style decayed-LFU exchange (CPU-served misses)'
     demand = False
 
-    def __init__(self, cap, seed_counts):
+    def __init__(self, cap, geo, seed_counts):
         super().__init__(cap)
-        order = sorted(range(L * E), key=lambda k: -seed_counts.get(k, 0))
+        self.L, self.E = geo.layers, geo.experts
+        order = sorted(range(self.L * self.E), key=lambda k: -seed_counts.get(k, 0))
         self.res = set(order[:cap]); self.cnt = defaultdict(float); self.step = 0
 
     def step_group(self, g, score):
+        L, E = self.L, self.E
         for k in g:
             self.cnt[k] += 1
             if k in self.res: self.hits += score
@@ -461,9 +514,10 @@ class LazyLRFU(Sim):
     Score: exponentially decayed reference count (half-life in rounds), i.e. LRFU."""
     demand = False
 
-    def __init__(self, cap, seed_counts, half=128, margin=1.0, budget=16):
+    def __init__(self, cap, geo, seed_counts, half=128, margin=1.0, budget=16):
         super().__init__(cap)
-        order = sorted(range(L * E), key=lambda k: -seed_counts.get(k, 0))
+        self.L, self.E = geo.layers, geo.experts
+        order = sorted(range(self.L * self.E), key=lambda k: -seed_counts.get(k, 0))
         self.res = set(order[:cap]); self.s = defaultdict(float); self.step = 0
         self.half, self.margin, self.budget = half, margin, budget
         self.touched = set(); self.name = f'lazy LRFU hl{half} margin{margin} budget{budget}/round'
@@ -474,7 +528,7 @@ class LazyLRFU(Sim):
             self.s[k] += inc; self.touched.add(int(k))
             if k in self.res: self.hits += score
             else: self.miss += score
-        if int(g[0]) // E == L - 1:
+        if int(g[0]) // self.E == self.L - 1:
             self.step += 1
             unit = 2.0 ** (self.step / self.half)
             cands = sorted((k for k in self.touched if k not in self.res), key=lambda k: -self.s[k])[:self.budget]
@@ -544,24 +598,283 @@ def next_uses(groups):
 def to_groups(seq, window):
     groups = []
     for s in range(0, len(seq) - window + 1, window):
-        for layer in range(L):
+        for layer in range(seq.shape[1]):
             groups.append(np.array(list(dict.fromkeys(int(x) for x in seq[s:s + window, layer].reshape(-1))),
                                    dtype=np.int64))
     return groups
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
-    ap.add_argument('traces')
-    ap.add_argument('--capacities', default='4008,6347,8000,10200,12000')
-    ap.add_argument('--window', type=int, default=1)
-    args = ap.parse_args()
-    seqs = load(args.traces)
-    warm = to_groups(seqs[0], args.window)
-    scored = to_groups(seqs[1], args.window) + to_groups(seqs[2], args.window)
+# ---------------------------------------------------------------- engine route traces
+def is_route_trace(path):
+    if not os.path.isfile(path):
+        return False
+    with open(path, 'rb') as f:
+        return f.read(8) == b'NRTRACE1'
+
+
+def read_route_traces(paths):
+    """Parses engine route traces that agree on layers, experts and top-k -> (geometry, traces)."""
+    traces = [ht.read_trace(p) for p in paths]
+    h = traces[0].header
+    geo = Geometry(h['layers'], h['experts'], h['top_k'])
+    for p, t in zip(paths, traces):
+        if (t.header['layers'], t.header['experts'], t.header['top_k']) != tuple(geo):
+            raise ValueError(f'{p}: layers, experts or top_k differ from {paths[0]}')
+    if min(geo) == 0:
+        raise ValueError(f'{paths[0]}: the header has no layers, experts or top_k')
+    return geo, traces
+
+
+def round_keys(r, geo, layer):
+    """The distinct global keys (layer * E + expert) round `r` computes in `layer`, ascending."""
+    ids = r.routes[layer].ravel()
+    ids = np.unique(ids[(ids >= 0) & (ids < geo.experts)]).astype(np.int64)
+    if ids.size == 0:
+        raise ValueError(f'a round routes no valid expert in layer {layer}')
+    return ids + layer * geo.experts
+
+
+def decode_groups(traces, geo, warmup_tokens):
+    """The decode policies' accesses: one group per (decode or verification round, layer), in order.
+    Returns (groups, scored flags, scored tokens, warm-up tokens). A round is scored once the decode
+    tokens before it reach `warmup_tokens`."""
+    groups, scored = [], []
+    seen = tokens = 0
+    for t in traces:
+        for r in t.rounds:
+            if r.kind not in (ht.DECODE, ht.VERIFY):
+                continue
+            score = seen >= warmup_tokens
+            seen += r.tokens
+            tokens += r.tokens if score else 0
+            for layer in range(geo.layers):
+                groups.append(round_keys(r, geo, layer))
+                scored.append(score)
+    return groups, scored, tokens, seen - tokens
+
+
+def engine_rule(rounds):
+    """The engine's admission budgets, read from the recorded ones: (promotions per layer of a
+    prefill chunk wider than ExpertOffload::kServedCallColumns, decode tokens per promotion once the
+    frames are full). Qwen3.8-Flash-Next records 16 per chunk; Qwen3.5-122B-A10B records 0 (its
+    prompt passes stream every missing expert). The decode interval scales with the measured link
+    (ExpertOffload::promotion_interval), so it comes from the last half of the decode rounds, past
+    the fill phase."""
+    chunks = [r.budget for r in rounds if r.kind == ht.PREFILL and r.rows * r.width > 8]
+    prefill = max(chunks) if chunks else ht.PREFILL_PROMOTIONS
+    decode = [r for r in rounds if r.kind in (ht.DECODE, ht.VERIFY)]
+    tail = decode[len(decode) // 2:]
+    budget, tokens = sum(r.budget for r in tail), sum(r.tokens for r in tail)
+    if not tail:
+        interval = ht.PROMOTION_INTERVAL
+    elif budget == 0:
+        interval = 8
+    else:
+        interval = int(min(8, max(1, round(tokens / budget))))
+    return prefill, interval
+
+
+def parse_layer_groups(text, layers):
+    """'0-19,20-47' -> [(name, first, last)]; empty: quarters of the layers."""
+    if not text:
+        q = max(1, layers // 4)
+        bounds = [(i, min(layers, i + q) - 1) for i in range(0, layers, q)]
+    else:
+        bounds = []
+        for part in text.split(','):
+            a, _, b = part.partition('-')
+            bounds.append((int(a), int(b or a)))
+    for a, b in bounds:
+        if not 0 <= a <= b < layers:
+            raise ValueError(f'layer group {a}-{b} is outside 0-{layers - 1}')
+    return [(f'{a}-{b}', a, b) for a, b in bounds]
+
+
+class ArmResult:
+    """Scored hits and misses per layer of one arm."""
+
+    def __init__(self, name, layers):
+        self.name = name
+        self.hits = np.zeros(layers, np.int64)
+        self.keys = np.zeros(layers, np.int64)
+
+    def rate(self, first=0, last=None):
+        last = len(self.keys) - 1 if last is None else last
+        keys = int(self.keys[first:last + 1].sum())
+        return int(self.hits[first:last + 1].sum()) / keys if keys else 0.0
+
+    def misses(self):
+        return int((self.keys - self.hits).sum())
+
+
+def run_decode_arm(sim, groups, scored, geo, name=None):
+    """Steps a replay policy over the decode groups, attributing each scored group's hits to its layer."""
+    out = ArmResult(name or sim.name, geo.layers)
+    for i, g in enumerate(groups):
+        before = sim.hits
+        sim.step_group(g, 1 if scored[i] else 0)
+        if scored[i]:
+            layer = int(g[0]) // geo.experts
+            out.hits[layer] += sim.hits - before
+            out.keys[layer] += len(g)
+    return out
+
+
+def run_engine_arm(traces, geo, frames, warmup_tokens, *, vram_budget='rule', prefill_promotions=None,
+                   promotion_interval=None, name=None, guard=None):
+    """The engine's policy over every round of the traces (host_tier.TierSim, full mode: no SSD tier,
+    the engine's prompt seeding, an empty cache at the start), scored like the decode arms: a scored
+    decode or verification round's computed key is a hit when it is resident in a published frame.
+    `guard`: eviction protection (TierSim.guard; route_predictor)."""
+    header = {'layers': geo.layers, 'experts': geo.experts, 'top_k': geo.top_k}
+    rule = {}
+    if prefill_promotions is not None:
+        rule['prefill_promotions'] = prefill_promotions
+    if promotion_interval is not None:
+        rule['promotion_interval'] = promotion_interval
+    sim = ht.TierSim(header, vram=frames, ram_slots=None, prior='none', vram_budget=vram_budget,
+                     prompt_seed=(ht.PROMPT_SEED_CREDIT, 0, 0), **rule)
+    sim.guard = guard
+    out = ArmResult(name or f'engine LFRU ({vram_budget} budgets)', geo.layers)
+    seen = 0
+    for t in traces:
+        for r in t.rounds:
+            if r.kind in (ht.DECODE, ht.VERIFY):
+                if seen >= warmup_tokens:
+                    for layer in range(geo.layers):
+                        keys = round_keys(r, geo, layer)
+                        out.hits[layer] += int(np.count_nonzero(sim.vram_visible(keys)))
+                        out.keys[layer] += keys.size
+                seen += r.tokens
+            sim.step(r)
+    return out
+
+
+def verdict(gap_points):
+    if gap_points >= BUILD_GAP_POINTS:
+        return f'gap >= {BUILD_GAP_POINTS:g} points: build cache-policy work'
+    if gap_points < CLOSE_GAP_POINTS:
+        return f'gap < {CLOSE_GAP_POINTS:g} point: the cache-policy topic closes'
+    return f'gap below {BUILD_GAP_POINTS:g} points: no cache-policy work'
+
+
+def protection_verdict(gain_points, ceiling_points):
+    """PUB-22's rule: A/B the engine's predictor (INFERNIX_TMP_ROUTE_PROTECT, on the host: no frames)
+    only on a gain of >= 3 points over the engine's LFRU. `ceiling_points`: the oracle's best gain."""
+    if gain_points >= BUILD_GAP_POINTS:
+        return f'predictor gain >= {BUILD_GAP_POINTS:g} points: A/B INFERNIX_TMP_ROUTE_PROTECT'
+    if ceiling_points < BUILD_GAP_POINTS:
+        return (f'oracle protection gains under {BUILD_GAP_POINTS:g} points: no protection predictor can, '
+                f'the topic closes')
+    return (f'predictor gain below {BUILD_GAP_POINTS:g} points: no A/B (a better sequence model might reach '
+            f'the oracle ceiling)')
+
+
+def protection_arms(traces, rounds, geo, cap, args, prefill, interval):
+    """PUB-22's arms at `cap` frames: the engine's LFRU protected by the next rounds' actual keys (one
+    arm per --protect-horizons entry), and by the engine's transition predictor."""
+    arms = []
+    for horizon in (int(x) for x in args.protect_horizons.split(',')):
+        oracle = rpred.NextRoundsOracle(rounds, geo.layers, geo.experts, horizon)
+        arms.append(run_engine_arm(traces, geo, cap, args.warmup_tokens, prefill_promotions=prefill,
+                                   promotion_interval=interval, guard=oracle, name=f'engine LFRU + {oracle.name}'))
+    predictor = rpred.TransitionPredictor(geo.layers, geo.experts, args.protect_per_layer or 2 * geo.top_k)
+    arms.append(run_engine_arm(traces, geo, cap, args.warmup_tokens, prefill_promotions=prefill,
+                               promotion_interval=interval, guard=predictor, name=f'engine LFRU + {predictor.name}'))
+    return arms
+
+
+def headroom(paths, args):
+    geo, traces = read_route_traces(paths)
+    h = traces[0].header
+    rounds = [r for t in traces for r in t.rounds]
+    n = geo.layers * geo.experts
+    recorded = [r.frames for r in rounds if r.frames]
+    trace_frames = h['frames'] or (recorded[0] if recorded else 0)
+    decision = args.decision_frames or trace_frames
+    if not decision:
+        raise SystemExit('the trace records no frame count: pass --decision-frames')
+    if args.capacities:
+        caps = [int(x) for x in args.capacities.split(',')]
+    else:
+        caps = sorted({int(round(decision * f)) for f in (0.5, 0.75, 1.0, 1.25, 1.5)})
+    if decision not in caps:
+        caps = sorted(caps + [decision])
+    caps = [c for c in caps if 0 < c < n]
+    layer_groups = parse_layer_groups(args.layer_groups, geo.layers)
+    prefill, interval = engine_rule(rounds)
+    if args.promotion_interval:
+        interval = args.promotion_interval
+    groups, scored, tokens, warm = decode_groups(traces, geo, args.warmup_tokens)
+    if tokens == 0:
+        raise SystemExit('no scored decode tokens (a decode trace, or fewer --warmup-tokens)')
+    nxt = next_uses(groups)
+    kinds = defaultdict(int)
+    for r in rounds:
+        kinds[ht.KIND_NAMES[r.kind]] += 1
+    print(f'route traces: {len(traces)}, {len(rounds)} rounds ({", ".join(f"{v} {k}" for k, v in kinds.items())}); '
+          f'{geo.layers} layers x {geo.experts} experts, top-{geo.top_k}; captured with {trace_frames} frames'
+          + (f' (per round {min(recorded)}..{max(recorded)})' if recorded else '')
+          + f', {h["lanes"]} lanes, max width {h["max_width"]}, MTP {h["mtp_draft_tokens"]}, '
+          f'n-gram {h["ngram_draft_tokens"]}')
+    print(f'engine rule: {prefill} promotions per layer per prefill chunk; once full, decode promotes one '
+          f'expert per layer every {interval} tokens' + (' (set)' if args.promotion_interval else ' (from the trace)'))
+    print(f'scored: {tokens} decode tokens after {warm} warm-up tokens; mean distinct experts per layer per '
+          f'round {np.mean([len(g) for g, s in zip(groups, scored) if s]):.2f}')
+    names = ['all'] + [g[0] for g in layer_groups]
+    results = []
+    for cap in caps:
+        engine = run_engine_arm(traces, geo, cap, args.warmup_tokens, prefill_promotions=prefill,
+                                promotion_interval=interval)
+        bypass = run_decode_arm(Belady(cap, nxt, True), groups, scored, geo)
+        arms = [engine]
+        if cap == trace_frames:
+            # The budgets the engine applied at its own frame count: ties the replay to the run.
+            arms.append(run_engine_arm(traces, geo, cap, args.warmup_tokens, vram_budget='recorded'))
+        arms += [bypass, run_decode_arm(Belady(cap, nxt, False), groups, scored, geo)]
+        protected = protection_arms(traces, rounds, geo, cap, args, prefill, interval) if args.protection else []
+        arms += protected
+        print(f'\n=== {cap} frames ({cap / n:.1%} of {n} experts)' + (' (decision)' if cap == decision else ''))
+        print(f'{"arm":44s} ' + ' '.join(f'{x:>7s}' for x in names) + f' {"miss/tok":>9s}')
+        rows = []
+        for arm in arms:
+            rates = [arm.rate()] + [arm.rate(a, b) for _, a, b in layer_groups]
+            print(f'{arm.name:44s} ' + ' '.join(f'{100 * x:7.2f}' for x in rates) + f' {arm.misses() / tokens:9.2f}')
+            rows.append({'arm': arm.name, 'hit': dict(zip(names, rates)), 'misses_per_token': arm.misses() / tokens,
+                         'per_layer_hit': [float(x) for x in arm.hits / np.maximum(arm.keys, 1)]})
+        gaps = [100 * (bypass.rate() - engine.rate())] + [100 * (bypass.rate(a, b) - engine.rate(a, b))
+                                                          for _, a, b in layer_groups]
+        print(f'{"gap, Belady with bypass - engine (points)":44s} ' + ' '.join(f'{x:7.2f}' for x in gaps))
+        result = {'frames': cap, 'arms': rows, 'gap_points': dict(zip(names, gaps))}
+        if protected:
+            gains = {arm.name: 100 * (arm.rate() - engine.rate()) for arm in protected}
+            for name, gain in gains.items():
+                print(f'{"gain, " + name:44s} {gain:7.2f}')
+            result['protection_gain_points'] = gains
+        results.append(result)
+    final = next(r for r in results if r['frames'] == decision)
+    gap = final['gap_points']['all']
+    print(f'\ndecision at {decision} frames: {gap:.2f} points -> {verdict(gap)}')
+    report = {'header': h, 'geometry': geo._asdict(), 'engine_rule': {'prefill_promotions': prefill,
+              'promotion_interval': interval}, 'scored_tokens': tokens, 'warmup_tokens': warm,
+              'decision_frames': decision, 'decision_gap_points': gap, 'verdict': verdict(gap), 'results': results}
+    if args.protection:
+        gains = final['protection_gain_points']
+        predictor = next(v for k, v in gains.items() if 'transition' in k)
+        ceiling = max(v for k, v in gains.items() if 'oracle' in k)
+        print(f'protection at {decision} frames: predictor {predictor:.2f} points, oracle ceiling {ceiling:.2f} '
+              f'-> {protection_verdict(predictor, ceiling)}')
+        report.update({'protection_gain_points': predictor, 'protection_ceiling_points': ceiling,
+                       'protection_verdict': protection_verdict(predictor, ceiling)})
+    if args.json:
+        with open(args.json, 'w') as f:
+            json.dump(report, f, indent=1)
+    return 0
+
+
+def policy_table(geo, warm, scored, tokens, capacities):
     groups = warm + scored
     nxt = next_uses(groups)
-    tokens = (len(seqs[1]) // args.window + len(seqs[2]) // args.window) * args.window
     warm_counts = defaultdict(int)
     for g in warm:
         for k in g:
@@ -570,14 +883,13 @@ def main():
     for g in scored:
         for k in g:
             scored_counts[int(k)] += 1
-    print(f'scored tokens {tokens}, window {args.window}, '
-          f'mean distinct experts per layer per window {np.mean([len(g) for g in scored]):.1f}')
-    for cap in (int(x) for x in args.capacities.split(',')):
+    L, E = geo.layers, geo.experts
+    for cap in capacities:
         print(f'\n=== capacity {cap} slots ({cap / (L * E):.1%} of {L * E} experts)')
         print(f'{"policy":66s} {"hit":>6s} {"miss/tok":>9s} {"promo/tok":>9s}')
-        policies = [LRU(cap), LFRU(cap), LFRU(cap, ENGINE_HALVING), LRUPerLayer(cap), SLRU(cap), ARC(cap), LRU2(cap), S3FIFO(cap),
-                    SIEVE(cap), DecayedLFU(cap), WTinyLFU(cap), StrataExchange(cap, warm_counts),
-                    LazyLRFU(cap, warm_counts, 128, 0.5, 32), StaticHindsight(cap, scored_counts),
+        policies = [LRU(cap), LFRU(cap), LFRU(cap, ENGINE_HALVING), LRUPerLayer(cap, geo), SLRU(cap), ARC(cap), LRU2(cap),
+                    S3FIFO(cap), SIEVE(cap), DecayedLFU(cap, geo), WTinyLFU(cap, geo), StrataExchange(cap, geo, warm_counts),
+                    LazyLRFU(cap, geo, warm_counts, 128, 0.5, 32), StaticHindsight(cap, scored_counts),
                     Belady(cap, nxt, False), Belady(cap, nxt, True)]
         for p in policies:
             for i, g in enumerate(groups):
@@ -585,5 +897,64 @@ def main():
             print(f'{p.name:66s} {p.hits / (p.hits + p.miss):6.3f} {p.miss / tokens:9.1f} {p.promo / tokens:9.1f}')
 
 
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
+    ap.add_argument('traces', nargs='+', help='a FreeToken trace directory, or engine route-trace files')
+    ap.add_argument('--capacities', default=None,
+                    help='frame counts (default: 4008,6347,8000,10200,12000 for FreeToken traces; '
+                         'the trace frames x 0.5..1.5 for route traces)')
+    ap.add_argument('--window', type=int, default=1, help='FreeToken traces: tokens per group')
+    ap.add_argument('--experts', type=int, default=FLASH_NEXT.experts, help='FreeToken traces: experts per layer')
+    ap.add_argument('--top-k', type=int, default=FLASH_NEXT.top_k, help='FreeToken traces: routed experts per token')
+    ap.add_argument('--warmup-tokens', type=int, default=0, help='route traces: decode tokens not scored')
+    ap.add_argument('--headroom', action='store_true',
+                    help='route traces: the engine policy against Belady MIN with and without bypass')
+    ap.add_argument('--decision-frames', type=int, default=0, help='headroom: frames of the decision (default: the trace\'s)')
+    ap.add_argument('--layer-groups', default='', help='headroom: layer ranges, e.g. 0-19,20-47 (default: quarters)')
+    ap.add_argument('--promotion-interval', type=int, default=0,
+                    help='headroom: decode tokens per promotion once full (default: from the recorded budgets)')
+    ap.add_argument('--json', default=None, help='headroom: write the results here')
+    ap.add_argument('--protection', action='store_true',
+                    help='headroom: add the eviction-protection arms (candidates §13 PUB-22)')
+    ap.add_argument('--protect-horizons', default='1,8', help='protection: the oracle arms\' horizons in rounds')
+    ap.add_argument('--protect-per-layer', type=int, default=0,
+                    help='protection: experts the predictor protects per layer and lane (default: 2 x top-k; '
+                         'INFERNIX_TMP_ROUTE_PROTECT\'s value)')
+    args = ap.parse_args(argv)
+
+    if all(is_route_trace(p) for p in args.traces):
+        if args.window != 1:
+            raise SystemExit('--window applies to FreeToken traces; route traces record their verify rounds')
+        if args.headroom:
+            return headroom(args.traces, args)
+        geo, traces = read_route_traces(args.traces)
+        groups, flags, tokens, warm_tokens = decode_groups(traces, geo, args.warmup_tokens)
+        first = flags.index(True) if True in flags else len(groups)
+        warm, scored = groups[:first], groups[first:]
+        if not scored:
+            raise SystemExit('no scored decode tokens')
+        frames = traces[0].header['frames']
+        caps = ([int(x) for x in args.capacities.split(',')] if args.capacities
+                else sorted({int(round(frames * f)) for f in (0.5, 0.75, 1.0, 1.25, 1.5)}))
+        print(f'{geo.layers} layers x {geo.experts} experts, top-{geo.top_k}; scored decode tokens {tokens} '
+              f'after {warm_tokens} warm-up tokens, mean distinct experts per layer per round '
+              f'{np.mean([len(g) for g in scored]):.1f}')
+        policy_table(geo, warm, scored, tokens, caps)
+        return 0
+    if len(args.traces) != 1 or not os.path.isdir(args.traces[0]):
+        raise SystemExit('pass one FreeToken trace directory or engine route-trace files')
+    if args.headroom:
+        raise SystemExit('--headroom needs engine route traces (the engine policy replays their prefill rounds)')
+    geo, seqs = load(args.traces[0], args.experts, args.top_k)
+    warm = to_groups(seqs[0], args.window)
+    scored = to_groups(seqs[1], args.window) + to_groups(seqs[2], args.window)
+    tokens = (len(seqs[1]) // args.window + len(seqs[2]) // args.window) * args.window
+    print(f'scored tokens {tokens}, window {args.window}, '
+          f'mean distinct experts per layer per window {np.mean([len(g) for g in scored]):.1f}')
+    policy_table(geo, warm, scored, tokens,
+                 [int(x) for x in (args.capacities or '4008,6347,8000,10200,12000').split(',')])
+    return 0
+
+
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())

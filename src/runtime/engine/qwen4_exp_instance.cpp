@@ -4,6 +4,7 @@
 #include "core/device.h"
 #include "core/host_memory.h"
 #include "core/startup.h"
+#include "core/temporary_switches.h"
 #include "core/vram_budget.h"
 #include "models/load_options.h"
 #include "models/qwen4_exp/load.h"
@@ -20,7 +21,6 @@
 #include <array>
 #include <chrono>
 #include <cstdio>
-#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -49,26 +49,6 @@ std::string device_contributors(std::uint64_t dense, const models::qwen4_exp::Pr
 
 void report(const EngineOptions& options, DiagnosticLevel level, const std::string& text) {
     report_engine(options, level, text);
-}
-
-// The temporary A/B switch INFERNIX_TMP_SCREENED_DRAFT_HEAD (B-03 part a, draft-only): 1 makes the MTP
-// drafter's proposal head (--lm-head-draft) score its rows from the artifact's 2-bit screen and rescore
-// the near-best ones exactly; unset or 0 keeps the exact proposal head. `shown` receives the raw value
-// for the startup log. A value other than 0 or 1 fails startup.
-bool screened_draft_head_switch(std::string& shown) {
-#ifdef _MSC_VER
-#    pragma warning(push)
-#    pragma warning(disable : 4996) // std::getenv: read once at startup
-#endif
-    const char* raw = std::getenv("INFERNIX_TMP_SCREENED_DRAFT_HEAD");
-#ifdef _MSC_VER
-#    pragma warning(pop)
-#endif
-    const std::string value = raw != nullptr ? raw : "";
-    shown                   = value.empty() ? "unset" : value;
-    if (value.empty() || value == "0") { return false; }
-    if (value == "1") { return true; }
-    throw std::invalid_argument("INFERNIX_TMP_SCREENED_DRAFT_HEAD must be 0 or 1, not " + value);
 }
 
 void validate(const EngineOptions& options) {
@@ -154,11 +134,10 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         throw std::invalid_argument("artifact is not Qwen4ExpForCausalLM");
     }
     inspect.complete();
-    // INFERNIX_TMP_SCREENED_DRAFT_HEAD acts on the MTP drafter's proposal head only; its value is in the
-    // startup log so an A/B arm can be checked.
-    std::string switch_value;
-    const bool screened_switch = screened_draft_head_switch(switch_value);
-    report(options, DiagnosticLevel::Info, "temporary switch: INFERNIX_TMP_SCREENED_DRAFT_HEAD=" + switch_value);
+    // The temporary A/B switch INFERNIX_TMP_SCREENED_DRAFT_HEAD (B-03 part a, draft-only; its value is on the
+    // startup `temporary switches |` line): 1 makes the MTP drafter's proposal head (--lm-head-draft) score its
+    // rows from the artifact's 2-bit screen and rescore the near-best ones exactly.
+    const bool screened_switch     = temporary_switches::flag("INFERNIX_TMP_SCREENED_DRAFT_HEAD");
     const bool screened_draft_head = screened_switch && options.purpose == EnginePurpose::Generation &&
                                      options.speculative.backend == SpeculativeBackend::Mtp &&
                                      options.speculative.proposal_head == ProposalHead::Optimized;
@@ -336,6 +315,9 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     // screened-lm-head's graphs likewise, whenever the candidate is asked for (it is qualified nowhere).
     program_options.screened_lm_head = std::find(options.fast_path_candidates.begin(), options.fast_path_candidates.end(),
                                                  FastPath::ScreenedLmHead) != options.fast_path_candidates.end();
+    // fp16-gdn-state's smaller pool likewise (it is qualified nowhere, so only a candidate selects it).
+    program_options.fp16_gdn_state = std::find(options.fast_path_candidates.begin(), options.fast_path_candidates.end(),
+                                               FastPath::Fp16GdnState) != options.fast_path_candidates.end();
     const auto device_plan =
         models::qwen4_exp::Program::plan_device(program_options, plan.config(), plan.public_token_count());
     const std::uint64_t dense = plan.device_bytes();
@@ -363,11 +345,16 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     // The fast paths qualified for this configuration (docs/maintainer/model-quality.md section 6.7).
     const models::qwen4_exp::FastPathSelection fast = models::qwen4_exp::select_fast_paths(instance->parameters, options);
     program_options.fast_paths        = fast.forward();
-    program_options.pair_speculation  = fast.selected(FastPath::AdaptiveSpeculation);
+    // Two-row speculative rounds: MTP's (adaptive-speculation) or DFlash2's (dflash2-pairs); each
+    // applies only to its drafter.
+    program_options.pair_speculation  = fast.selected(FastPath::AdaptiveSpeculation) ||
+                                        fast.selected(FastPath::DFlash2Pairs);
     program_options.free_cache_resume = fast.selected(FastPath::FreeCacheResume);
     program_options.preemption        = fast.selected(FastPath::Preemption);
     program_options.sampled_mtp_drafts = fast.selected(FastPath::SampledMtpDrafts);
     program_options.screened_lm_head   = fast.selected(FastPath::ScreenedLmHead);
+    program_options.fp16_gdn_state     = fast.selected(FastPath::Fp16GdnState);
+    program_options.block_verification = fast.selected(FastPath::BlockVerification);
     program_options.gumbel_sampling    = !options.fast_paths;
     program_options.bf16_logits        = options.logits_dtype == LogitsDtype::BF16;
 

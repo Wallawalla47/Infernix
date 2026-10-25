@@ -41,6 +41,16 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_m
 
     float accum[MT][NT][4] = {};
 
+    // A consumer with its own weight rows (hyper_connection's stream rows) maps the tile's rows.
+    const auto weight_row = [&](int row) -> std::int64_t {
+        if constexpr (requires { epilogue.weight_row(m0, row); }) {
+            static_assert(!bf16_predicated_rows<Schedule>, "mapped weight rows take whole row tiles");
+            return epilogue.weight_row(m0, row);
+        } else {
+            return static_cast<std::int64_t>(m0 + row);
+        }
+    };
+
     auto stage_inputs = [&](int stage, int k_tile) {
         const int k0  = split_begin + k_tile * BK;
         auto* a_stage = As + stage * BM * BK;
@@ -55,11 +65,10 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_m
             if constexpr (bf16_predicated_rows<Schedule> || bf16_predicated_k<Schedule>) {
                 const bool valid = (!bf16_predicated_rows<Schedule> || m0 + row < M) &&
                                    (!bf16_predicated_k<Schedule> || k0 + kk < split_end);
-                const auto source = valid ? static_cast<std::int64_t>(m0 + row) * K + k0 + kk : 0;
+                const auto source = valid ? weight_row(row) * K + k0 + kk : 0;
                 cp_async_zfill<16, Schedule::kWeightCache>(dst, weight + source, valid ? 16 : 0);
             } else {
-                cp_async<16, Schedule::kWeightCache>(
-                    dst, &weight[static_cast<std::int64_t>(m0 + row) * K + k0 + kk]);
+                cp_async<16, Schedule::kWeightCache>(dst, &weight[weight_row(row) * K + k0 + kk]);
             }
         }
 

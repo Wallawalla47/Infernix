@@ -1,4 +1,5 @@
 #include "infernix/ops/token_constraint.h"
+#include "ops/op_family.h"
 #include "ops/op_tester.h"
 
 #include <algorithm>
@@ -334,7 +335,7 @@ int run_validation_cases() {
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(token_constraint) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;

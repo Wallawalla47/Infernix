@@ -1,18 +1,22 @@
 #include <charconv>
 #include "serve/generation_service.h"
 
+#include "core/temporary_switches.h"
 #include "product/media_acquire/acquire.h"
 #include "serve/translate.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <exception>
 #include <iterator>
 #include <mutex>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
+#include <vector>
 
 namespace infernix::serve {
 
@@ -40,9 +44,17 @@ struct RequestLifetime {
     std::chrono::steady_clock::time_point deadline;
 };
 
+std::string vision_overflow_note(const infernix::ContextLengthDetails& details) {
+    if (!details.vision) { return {}; }
+    return " (These are image and video tokens: the prompt's media together exceed the server's per-prompt vision "
+           "budget of " +
+           std::to_string(details.max_context) + " tokens; drop or summarize earlier images.)";
+}
+
 ApiError request_error_to_api_error(const infernix::RequestError& exception,
                                     std::string_view constraint_param,
-                                    std::span<const std::string> tool_schema_params) {
+                                    std::span<const std::string> tool_schema_params,
+                                    std::uint32_t retry_after_seconds) {
     ApiError error;
     error.param   = "messages";
     error.message = exception.what();
@@ -97,12 +109,15 @@ ApiError request_error_to_api_error(const infernix::RequestError& exception,
         error.status = 400;
         error.code   = "context_length_exceeded";
         if (const auto& details = exception.context_length()) {
-            // OpenAI's wording, which agent clients match to compact and retry.
+            // OpenAI's wording, which agent clients match to compact and retry. An aggregate vision
+            // overflow (the prompt's images together over the per-prompt vision budget) answers in the
+            // same form, so a screenshot-heavy session compacts instead of failing on every turn, and
+            // says what the counts are.
             error.context_length = details;
             error.message        = "This model's maximum context length is " + std::to_string(details->max_context) +
                             " tokens. However, your messages resulted in " + (details->exact ? "" : "more than ") +
                             std::to_string(details->prompt_tokens) +
-                            " tokens. Please reduce the length of the messages.";
+                            " tokens. Please reduce the length of the messages." + vision_overflow_note(*details);
         }
         break;
     case infernix::RequestErrorKind::ThinkingBudgetCapacityInsufficient:
@@ -123,12 +138,14 @@ ApiError request_error_to_api_error(const infernix::RequestError& exception,
         error.status = 429;
         error.type   = "rate_limit_error";
         error.code   = "server_overloaded";
+        error.retry_after_seconds = retry_after_seconds;
         break;
     case infernix::RequestErrorKind::QueueTimeout:
         error.param.clear();
         error.status = 503;
         error.type   = "server_error";
         error.code   = "request_queue_timeout";
+        error.retry_after_seconds = retry_after_seconds;
         break;
     case infernix::RequestErrorKind::Cancelled:
         error.param.clear();
@@ -152,7 +169,8 @@ using Clock = std::chrono::steady_clock;
 
 [[noreturn]] void throw_preparation_cancelled();
 
-[[noreturn]] void throw_media_error(const infernix::product::media_acquire::Error& exception) {
+[[noreturn]] void throw_media_error(const infernix::product::media_acquire::Error& exception,
+                                    std::uint32_t retry_after_seconds = 0) {
     ApiError error;
     error.param   = "messages";
     error.message = exception.what();
@@ -176,6 +194,7 @@ using Clock = std::chrono::steady_clock;
         error.status = 503;
         error.type   = "server_error";
         error.code   = "request_queue_timeout";
+        error.retry_after_seconds = retry_after_seconds;
         break;
     case infernix::product::media_acquire::ErrorKind::Cancelled:
         throw_preparation_cancelled();
@@ -202,8 +221,9 @@ using Clock = std::chrono::steady_clock;
 }
 
 infernix::OwnedMedia acquire_media(const ContentPart& part, Clock::time_point deadline,
-                                 const std::function<bool()>& is_cancelled,
-                                 std::size_t& remaining_bytes) {
+                                   const std::function<bool()>& is_cancelled,
+                                   std::size_t& remaining_bytes,
+                                   std::uint32_t retry_after_seconds) {
     if (remaining_bytes == 0) {
         throw_media_error(infernix::product::media_acquire::Error(
             infernix::product::media_acquire::ErrorKind::BudgetExceeded,
@@ -217,7 +237,7 @@ infernix::OwnedMedia acquire_media(const ContentPart& part, Clock::time_point de
     try {
         source_bytes = infernix::product::media_acquire::acquire_bytes(part.source, policy);
     } catch (const infernix::product::media_acquire::Error& exception) {
-        throw_media_error(exception);
+        throw_media_error(exception, retry_after_seconds);
     } catch (const std::invalid_argument& exception) {
         throw_invalid_input(exception, "invalid_media");
     }
@@ -247,16 +267,20 @@ infernix::OwnedMedia acquire_media(const ContentPart& part, Clock::time_point de
 [[noreturn]] void
 throw_request_error(const infernix::RequestError& exception,
                     std::string_view constraint_param               = "structured_outputs.grammar",
-                    std::span<const std::string> tool_schema_params = {}) {
-    throw ApiException(request_error_to_api_error(exception, constraint_param, tool_schema_params));
+                    std::span<const std::string> tool_schema_params = {},
+                    std::uint32_t retry_after_seconds               = 0) {
+    throw ApiException(request_error_to_api_error(exception, constraint_param, tool_schema_params,
+                                                  retry_after_seconds));
 }
 
 void check_preparation_control(Clock::time_point deadline,
-                               const std::function<bool()>& is_cancelled) {
+                               const std::function<bool()>& is_cancelled,
+                               std::uint32_t retry_after_seconds) {
     if (is_cancelled && is_cancelled()) { throw_preparation_cancelled(); }
     if (Clock::now() >= deadline) {
         throw_request_error(infernix::RequestError(RequestErrorKind::QueueTimeout,
-                                                 "inference request expired during preparation"));
+                                                   "inference request expired during preparation"),
+                            "structured_outputs.grammar", {}, retry_after_seconds);
     }
 }
 
@@ -293,6 +317,12 @@ public:
         });
     }
 
+    void tool_call(infernix::ToolCallDelta delta) override {
+        deliver([&] {
+            if (sink_->on_tool_call) { sink_->on_tool_call(delta); }
+        });
+    }
+
     [[nodiscard]] bool disconnected() const noexcept { return disconnected_; }
 
 private:
@@ -307,6 +337,16 @@ private:
     const StreamSink* sink_ = nullptr;
     bool disconnected_      = false;
 };
+
+// A token 4-gram's 64-bit hash (a request-log measurement: collisions are negligible at prompt sizes).
+std::uint64_t token_4gram_hash(const infernix::TokenId* tokens) {
+    std::uint64_t hash = 0x9E3779B97F4A7C15ULL;
+    for (int i = 0; i < 4; ++i) {
+        hash ^= static_cast<std::uint32_t>(tokens[i]) + 0x9E3779B97F4A7C15ULL + (hash << 6) + (hash >> 2);
+        hash *= 0xBF58476D1CE4E5B9ULL;
+    }
+    return hash;
+}
 
 } // namespace
 
@@ -332,6 +372,7 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.vram_past_budget         = options_.vram_past_budget;
     engine_options.expert_tail_skip         = options_.expert_tail_skip;
     engine_options.expert_a4_activations    = options_.expert_a4_activations;
+    engine_options.embedding_host           = options_.embedding_host;
     engine_options.max_concurrency          = options_.max_concurrency;
     engine_options.max_pending_requests     = options_.max_pending_requests;
     engine_options.pending_timeout_ms       = options_.pending_timeout_ms;
@@ -361,6 +402,10 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.startup_observer         = std::move(startup_observer);
     engine_options.diagnostic_observer      = std::move(diagnostic_observer);
     engine_           = std::make_unique<infernix::Engine>(std::move(engine_options));
+    if (!options_.request_log_jsonl.empty()) {
+        prefix_misses_ = std::make_unique<PrefixMissTracker>(
+            [engine = engine_.get()](std::span<const infernix::TokenId> ids) { return engine->detokenize(ids); });
+    }
     request_capacity_ = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
     count_capacity_ = std::make_shared<RequestCapacity>(
@@ -368,19 +413,23 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
 }
 
 std::shared_ptr<RequestLifetime>
-GenerationService::acquire_request_lifetime(DeadlinePolicy deadline_policy) const {
-    return acquire_lifetime(request_capacity_, deadline_policy, "inference request queue is full");
+GenerationService::acquire_request_lifetime(DeadlinePolicy deadline_policy, bool admitted) const {
+    return acquire_lifetime(request_capacity_, deadline_policy, "inference request queue is full",
+                            admitted);
 }
 
 std::shared_ptr<RequestLifetime>
 GenerationService::acquire_lifetime(const std::shared_ptr<RequestCapacity>& capacity,
-                                    DeadlinePolicy deadline_policy,
-                                    const char* full_message) const {
+                                    DeadlinePolicy deadline_policy, const char* full_message,
+                                    bool admitted) const {
     const auto started = Clock::now();
     {
         std::lock_guard lock(capacity->mutex);
-        if (capacity->active >= capacity->maximum) {
-            throw_request_error(infernix::RequestError(RequestErrorKind::Overloaded, full_message));
+        // An admitted request continuing after a server-side tool already holds a slot until its
+        // response is released, so its next generation is never refused by the bound it counts in.
+        if (!admitted && capacity->active >= capacity->maximum) {
+            throw_request_error(infernix::RequestError(RequestErrorKind::Overloaded, full_message),
+                                "structured_outputs.grammar", {}, queue_retry_after_seconds());
         }
         ++capacity->active;
     }
@@ -407,15 +456,25 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
                         DeadlinePolicy::ClientPendingTimeout);
 }
 
+PreparedRequest GenerationService::prepare_continuation(
+    const GenerationRequest& request, GenerationConsumerMode consumer_mode,
+    infernix::GenerationObservationOptions observation, std::function<bool()> is_cancelled) const {
+    return prepare_impl(request, consumer_mode, std::move(observation), std::move(is_cancelled),
+                        options_.allow_prefix_reuse ? CacheParticipation::ReadWrite
+                                                    : CacheParticipation::Disabled,
+                        DeadlinePolicy::ClientPendingTimeout, /*admitted=*/true);
+}
+
 PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request,
                                                 GenerationConsumerMode consumer_mode,
                                                 infernix::GenerationObservationOptions observation,
                                                 std::function<bool()> is_cancelled,
                                                 CacheParticipation cache_participation,
-                                                DeadlinePolicy deadline_policy) const {
+                                                DeadlinePolicy deadline_policy,
+                                                bool admitted) const {
     PreparedRequest prepared;
     prepared.constraint_param               = request.constraint_param;
-    for (const auto& tool : request.tools) prepared.tool_schema_params.push_back(tool.schema_param);
+    prepared.tool_schema_params             = tool_declaration_params(request);
     const ResolvedPromptSemantics semantics = resolve_prompt_semantics(request, options_);
     infernix::RequestOptions request_options  = to_request_options(
         request, options_, semantics, cache_participation == CacheParticipation::ReadWrite);
@@ -428,7 +487,7 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
         const std::invalid_argument error("Vision is disabled for this server");
         throw_invalid_input(error, "vision_disabled");
     }
-    prepared.lifetime = acquire_request_lifetime(deadline_policy);
+    prepared.lifetime = acquire_request_lifetime(deadline_policy, admitted);
 
     try {
         const auto acquisition_started = Clock::now();
@@ -437,23 +496,49 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
         infernix::PromptInput input =
             to_prompt_input(request, semantics, [&](const ContentPart& part) {
                 return acquire_media(part, prepared.lifetime->deadline, is_cancelled,
-                                     remaining_media_bytes);
+                                     remaining_media_bytes, queue_retry_after_seconds());
             });
         prepared.acquisition_seconds =
             std::chrono::duration<double>(Clock::now() - acquisition_started).count();
-        check_preparation_control(prepared.lifetime->deadline, is_cancelled);
+        check_preparation_control(prepared.lifetime->deadline, is_cancelled,
+                                  queue_retry_after_seconds());
         const PreparationControl control{
             .deadline     = prepared.lifetime->deadline,
             .cancellation = CancellationView(is_cancelled),
         };
         infernix::PreparedPrompt prompt = engine_->prepare(std::move(input), control);
-        check_preparation_control(prepared.lifetime->deadline, is_cancelled);
+        check_preparation_control(prepared.lifetime->deadline, is_cancelled,
+                                  queue_retry_after_seconds());
         prepared.enable_thinking = prompt.summary().starts_in_reasoning;
         if (!prepared.enable_thinking) {
             request_options.execution.thinking.budget.reset();
             prepared.thinking_budget.reset();
+        } else if (semantics.enable_thinking != false &&
+                   !request_options.execution.thinking.budget) {
+            // The answer room follows the limit the request actually has: a prompt that leaves
+            // less context than max_tokens would otherwise think to the end of the context.
+            request_options.execution.thinking.budget = thinking_answer_room_budget(
+                options_, effective_output_limit(
+                              request_options.execution.requested_output_tokens,
+                              engine_->options().max_context, prompt.summary().prompt_tokens));
+            prepared.thinking_budget = request_options.execution.thinking.budget;
         }
         prepared.prompt_tokens           = static_cast<int>(prompt.summary().prompt_tokens);
+        // The request log's output-overlap figure (candidates CF-07): the prompt's 4-grams before the
+        // Engine takes the prompt; and its ids for the prefix-miss record (CF-08).
+        if (const auto ids = prompt.token_ids(); !options_.request_log_jsonl.empty()) {
+            prepared.prompt_ids.assign(ids.begin(), ids.end());
+            if (ids.size() >= 4) {
+                prepared.prompt_4grams.reserve(ids.size() - 3);
+                for (std::size_t i = 0; i + 4 <= ids.size(); ++i) {
+                    prepared.prompt_4grams.push_back(token_4gram_hash(ids.data() + i));
+                }
+                std::sort(prepared.prompt_4grams.begin(), prepared.prompt_4grams.end());
+                prepared.prompt_4grams.erase(
+                    std::unique(prepared.prompt_4grams.begin(), prepared.prompt_4grams.end()),
+                    prepared.prompt_4grams.end());
+            }
+        }
         prepared.media                   = prompt.summary().media;
         prepared.preparation             = prompt.preparation_stats();
         prepared.service_prepare_seconds = std::max(
@@ -474,7 +559,8 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
                                               std::move(observation), prepared.lifetime->deadline);
         prepared.sampling   = prepared.generation.resolved_sampling();
     } catch (const ApiException&) { throw; } catch (const infernix::RequestError& exception) {
-        throw_request_error(exception, request.constraint_param, prepared.tool_schema_params);
+        throw_request_error(exception, request.constraint_param, prepared.tool_schema_params,
+                            queue_retry_after_seconds());
     } catch (const std::invalid_argument& exception) {
         throw_invalid_input(exception, "invalid_prompt");
     }
@@ -497,21 +583,34 @@ int GenerationService::count_prompt_tokens(const GenerationRequest& request,
             std::min(options_.max_request_bytes, infernix::kMaximumPromptMediaBytes);
         infernix::PromptInput input =
             to_prompt_input(request, semantics, [&](const ContentPart& part) {
-                return acquire_media(part, deadline, is_cancelled, remaining_media_bytes);
+                return acquire_media(part, deadline, is_cancelled, remaining_media_bytes,
+                                     queue_retry_after_seconds());
             });
-        check_preparation_control(deadline, is_cancelled);
+        check_preparation_control(deadline, is_cancelled, queue_retry_after_seconds());
         const PreparationControl control{
             .deadline     = deadline,
             .cancellation = CancellationView(is_cancelled),
         };
         const int prompt_tokens =
             static_cast<int>(engine_->count_tokens(std::move(input), control));
-        check_preparation_control(deadline, is_cancelled);
+        check_preparation_control(deadline, is_cancelled, queue_retry_after_seconds());
         return prompt_tokens;
     } catch (const ApiException&) { throw; } catch (const infernix::RequestError& exception) {
-        throw_request_error(exception);
+        throw_request_error(exception, "structured_outputs.grammar", {},
+                            queue_retry_after_seconds());
     } catch (const std::invalid_argument& exception) {
         throw_invalid_input(exception, "invalid_prompt");
+    }
+}
+
+void GenerationService::admit(PreparedRequest& prepared, std::function<bool()> is_cancelled) const {
+    infernix::CancellationView cancellation;
+    if (is_cancelled) { cancellation = infernix::CancellationView(std::move(is_cancelled)); }
+    try {
+        prepared.generation.await_admission(cancellation);
+    } catch (const infernix::RequestError& exception) {
+        throw_request_error(exception, prepared.constraint_param, prepared.tool_schema_params,
+                            queue_retry_after_seconds());
     }
 }
 
@@ -533,7 +632,8 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     try {
         result = prepared.generation.wait(public_sink, cancellation);
     } catch (const infernix::RequestError& exception) {
-        throw_request_error(exception, prepared.constraint_param, prepared.tool_schema_params);
+        throw_request_error(exception, prepared.constraint_param, prepared.tool_schema_params,
+                            queue_retry_after_seconds());
     }
     GenerationOutcome outcome;
     outcome.text                = std::move(result.content);
@@ -541,6 +641,18 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.prompt_tokens       = static_cast<int>(result.prompt.prompt_tokens);
     outcome.completion_tokens   = static_cast<int>(result.generated_token_ids.size());
     outcome.generated_token_ids = std::move(result.generated_token_ids);
+    if (!prepared.prompt_4grams.empty() && outcome.generated_token_ids.size() >= 4) {
+        std::uint64_t total = 0, found = 0;
+        for (std::size_t i = 0; i + 4 <= outcome.generated_token_ids.size(); ++i) {
+            ++total;
+            found += std::binary_search(prepared.prompt_4grams.begin(), prepared.prompt_4grams.end(),
+                                        token_4gram_hash(outcome.generated_token_ids.data() + i))
+                         ? 1U
+                         : 0U;
+        }
+        outcome.output_4grams           = total;
+        outcome.output_4grams_in_prompt = found;
+    }
     outcome.reasoning_tokens    = static_cast<int>(result.reasoning_tokens);
     outcome.thinking            = result.thinking;
     outcome.constraint          = result.constraint;
@@ -549,53 +661,31 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.readout             = std::move(result.readout);
     outcome.constrained_draws   = std::move(result.constrained_draws);
 
-    outcome.metrics.prepare_seconds =
-        prepared.service_prepare_seconds + result.timings.prepare_seconds;
-    outcome.metrics.ttft_seconds =
-        outcome.metrics.prepare_seconds +
+    // The serve's preparation precedes the Engine's: the request's preparation, first token and
+    // total include it.
+    outcome.timings = result.timings;
+    outcome.timings.prepare_seconds += prepared.service_prepare_seconds;
+    outcome.timings.first_token_seconds =
+        outcome.timings.prepare_seconds +
         std::max(0.0, result.timings.first_token_seconds - result.timings.prepare_seconds);
-    outcome.metrics.vision_seconds          = result.timings.vision_seconds;
-    outcome.metrics.prefill_seconds                = result.timings.prefill_seconds;
-    outcome.metrics.decode_seconds                 = result.timings.decode_seconds;
-    outcome.metrics.decode_share_seconds           = result.timings.decode_share_seconds;
-    outcome.metrics.prompt_wall_seconds            = result.timings.prompt_wall_seconds;
-    outcome.metrics.generation_wall_seconds        = result.timings.generation_wall_seconds;
-    outcome.metrics.vision_offload_window_seconds  = result.timings.vision_offload_window_seconds;
-    outcome.metrics.vision_offload_evict_seconds   = result.timings.vision_offload_evict_seconds;
-    outcome.metrics.vision_offload_restore_seconds = result.timings.vision_offload_restore_seconds;
-    outcome.metrics.vision_offload_evicted_bytes   = result.timings.vision_offload_evicted_bytes;
-    outcome.metrics.vision_offload_staged_bytes    = result.timings.vision_offload_staged_bytes;
-    outcome.metrics.total_seconds = prepared.service_prepare_seconds + result.timings.total_seconds;
-    outcome.metrics.engine_timing                = result.engine_timing;
-    outcome.metrics.first_output_timing          = std::move(result.first_output_timing);
-    outcome.metrics.scheduling                   = result.scheduling;
-    outcome.metrics.admission                    = result.admission;
-    outcome.metrics.engine_request_id            = result.engine_request_id;
-    outcome.metrics.computed_prefill_tokens      = result.computed_prefill_tokens;
-    outcome.metrics.prefix_cache_hit_tokens      = result.reused_prompt_tokens;
-    outcome.metrics.prefix_reuse_path            = result.prefix_reuse_path;
-    outcome.metrics.speculative_backend          = result.speculative.backend;
-    outcome.metrics.speculative_draft_window     = result.speculative.draft_window;
-    outcome.metrics.speculative_rounds           = result.speculative.rounds;
-    outcome.metrics.speculative_draft_tokens     = result.speculative.drafted_tokens;
-    outcome.metrics.speculative_accepted_tokens  = result.speculative.accepted_tokens;
-    outcome.metrics.speculative_fallback_steps   = result.speculative.fallback_steps;
-    outcome.metrics.expert_cache                 = result.expert_cache;
-    outcome.metrics.ngram_rounds                 = result.speculative.ngram_rounds;
-    outcome.metrics.ngram_drafted_tokens         = result.speculative.ngram_drafted_tokens;
-    outcome.metrics.ngram_accepted_tokens        = result.speculative.ngram_accepted_tokens;
-    outcome.metrics.ngram_archive_rounds         = result.speculative.ngram_archive_rounds;
-    outcome.metrics.ngram_archive_drafted_tokens = result.speculative.ngram_archive_drafted_tokens;
-    outcome.metrics.ngram_archive_accepted_tokens =
-        result.speculative.ngram_archive_accepted_tokens;
-    outcome.metrics.tree_rounds               = result.speculative.tree_rounds;
-    outcome.metrics.tree_side_rounds          = result.speculative.tree_side_rounds;
-    outcome.metrics.tree_side_accepted_tokens = result.speculative.tree_side_accepted_tokens;
-    outcome.metrics.ngram_archive = result.ngram_archive;
-    outcome.metrics.speculative_accepted_per_position =
-        std::move(result.speculative.accepted_per_position);
-    outcome.metrics.speculative_rounds_by_draft_length =
-        std::move(result.speculative.rounds_by_draft_length);
+    outcome.timings.total_seconds += prepared.service_prepare_seconds;
+    outcome.engine_timing               = result.engine_timing;
+    outcome.first_output_timing         = std::move(result.first_output_timing);
+    outcome.scheduling                  = result.scheduling;
+    outcome.admission                   = result.admission;
+    outcome.engine_request_id           = result.engine_request_id;
+    outcome.computed_prefill_tokens     = result.computed_prefill_tokens;
+    outcome.reused_prompt_tokens        = result.reused_prompt_tokens;
+    outcome.cache_created_prompt_tokens = result.cache_created_prompt_tokens;
+    outcome.prefix_reuse_path           = result.prefix_reuse_path;
+    outcome.speculative                 = std::move(result.speculative);
+    outcome.expert_cache                = result.expert_cache;
+    outcome.ngram_archive               = result.ngram_archive;
+    if (prefix_misses_ != nullptr && !prepared.prompt_ids.empty()) {
+        outcome.prefix_miss = prefix_misses_->settle(
+            outcome.engine_request_id, prepared.prompt_ids, outcome.generated_token_ids,
+            outcome.reused_prompt_tokens, outcome.computed_prefill_tokens);
+    }
 
     outcome.tool_calls      = std::move(result.tool_calls);
     outcome.tool_call_parse = result.tool_call_parse;
@@ -603,20 +693,48 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
 }
 
 void GenerationService::warmup() {
-    GenerationRequest request;
-    ChatTurn turn;
-    turn.role = ChatRole::User;
-    ContentPart content;
-    content.kind     = ContentKind::Text;
-    content.text     = "hi";
-    content.type_raw = "text";
-    turn.content.push_back(std::move(content));
-    request.messages.push_back(std::move(turn));
-    request.max_tokens = 4;
-    PreparedRequest prepared =
-        prepare_impl(request, GenerationConsumerMode::Aggregate, {}, {},
-                     CacheParticipation::Disabled, DeadlinePolicy::UnboundedStartup);
-    run(prepared, nullptr);
+    const auto generate = [this](int max_tokens, bool ignore_eos) {
+        GenerationRequest request;
+        ChatTurn turn;
+        turn.role = ChatRole::User;
+        ContentPart content;
+        content.kind     = ContentKind::Text;
+        content.text     = "hi";
+        content.type_raw = "text";
+        turn.content.push_back(std::move(content));
+        request.messages.push_back(std::move(turn));
+        request.max_tokens = max_tokens;
+        request.ignore_eos = ignore_eos;
+        PreparedRequest prepared =
+            prepare_impl(request, GenerationConsumerMode::Aggregate, {}, {},
+                         CacheParticipation::Disabled, DeadlinePolicy::UnboundedStartup);
+        run(prepared, nullptr);
+    };
+    generate(4, false);
+    // TEMPORARY (INFERNIX_TMP_WARMUP_GRAPHS, candidates §7.6 D14): before READY, max-concurrency
+    // requests at the server's default sampling, of staggered lengths (32 + 16 i tokens, end of
+    // sequence ignored), so the decode rounds pass every batch size from 1 to the maximum and back,
+    // each for several rounds: a Program's decode, verification and draft graphs run eagerly once and
+    // are captured on the next round, so a fresh server's first requests replay them instead. The
+    // widths are those the default draft policy picks; requests use no prefix cache. Startup only.
+    if (!temporary_switches::flag("INFERNIX_TMP_WARMUP_GRAPHS")) { return; }
+    const std::uint32_t rows = std::max<std::uint32_t>(1, options_.max_concurrency);
+    std::vector<std::exception_ptr> errors(rows);
+    std::vector<std::thread> threads;
+    threads.reserve(rows);
+    for (std::uint32_t i = 0; i < rows; ++i) {
+        threads.emplace_back([&, i] {
+            try {
+                generate(32 + 16 * static_cast<int>(i), true);
+            } catch (...) {
+                errors[i] = std::current_exception();
+            }
+        });
+    }
+    for (auto& thread : threads) { thread.join(); }
+    for (const auto& error : errors) {
+        if (error) { std::rethrow_exception(error); }
+    }
 }
 
 } // namespace infernix::serve

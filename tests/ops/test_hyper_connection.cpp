@@ -17,8 +17,16 @@
 // intermediates), so |x - ref| <= 2^-8 |ref| + 2^-12 rms(ref), and injects to 1e-5 relative + 1e-6; the
 // composed route rounds Rn, z, m and u to BF16, so its bound is 2^-5 |ref| + 2^-6 rms(ref) and
 // injects to 2^-7 relative + 2^-9.
+//
+// The up projection and collapse of more than 96 columns run as one kernel for Q8 and BF16 W_up (the
+// BF16 one behind INFERNIX_TMP_HC_BF16_UP_COLLAPSE); it claims the bits of the separate linear and
+// collapse, so it is compared with them exactly at T = 97, 128, 129, 192, 256, 300 and 1025 (each tile
+// width, full and partial token tiles), with or without the switch. hyper_connection_inject_mix is
+// compared exactly with hyper_connection_inject then hyper_connection_mix (residual, x and injects).
 
 #include "infernix/ops/hyper_connection.h"
+#include "ops/op_family.h"
+#include "ops/hyper_connection/hyper_connection_up_collapse.h"
 #include "ops/linear/linear_test_common.h"
 #include "ops/op_tester.h"
 
@@ -338,9 +346,115 @@ void compare(const Result& got, const Reference& ref, bool fused, bool inject, c
     }
 }
 
+// The fused up + collapse against the separate linear (A16Only) and collapse, bit for bit. m is of a
+// SiLU output's range and normalized of a normed residual's.
+void up_collapse_bit_identity(Codec codec, cudaStream_t stream) {
+    Problem p                = make_problem(false, codec);
+    const std::string tag    = codec == Codec::Q8 ? "q8 up+collapse" : "bf16 up+collapse";
+    constexpr int kMaxTokens = 1025;
+    infernix::WorkspaceArena ws(std::max<std::size_t>(infernix::ops::linear_workspace_capacity_bytes(
+        p.up_w.qtype, p.up_w.n, p.up_w.k, infernix::ops::LinearPolicy::A16Only, 1, kMaxTokens), 256));
+    for (const int T : {97, 128, 129, 192, 256, 300, kMaxTokens}) {
+        const std::string label = tag + " T=" + std::to_string(T);
+        if (!infernix::ops::detail::hc_up_collapse_supported(p.up_w, kH, kS, T)) {
+            check(false, label + ": the fused route serves this call");
+            continue;
+        }
+        std::uint32_t state = 9000U + static_cast<std::uint32_t>(T);
+        std::vector<std::uint16_t> m(static_cast<std::size_t>(kRank) * T), normalized(static_cast<std::size_t>(kW) * T);
+        for (auto& v : m) { v = t::f32_to_bf16(0.6F + 0.9F * uniform(state)); }
+        for (auto& v : normalized) { v = t::f32_to_bf16(2.0F * uniform(state)); }
+        Device md(m.size() * 2), nd(normalized.size() * 2), ud(static_cast<std::size_t>(kW) * T * 2),
+            composed_d(static_cast<std::size_t>(kH) * T * 2), fused_d(static_cast<std::size_t>(kH) * T * 2);
+        t::cuda_check(cudaMemcpy(md.p, m.data(), m.size() * 2, cudaMemcpyHostToDevice), "m");
+        t::cuda_check(cudaMemcpy(nd.p, normalized.data(), normalized.size() * 2, cudaMemcpyHostToDevice), "normalized");
+        const Tensor mt(md.p, DType::BF16, {kRank, T}), nt(nd.p, DType::BF16, {kW, T});
+        Tensor u(ud.p, DType::BF16, {kW, T}), composed(composed_d.p, DType::BF16, {kH, T}),
+            fused(fused_d.p, DType::BF16, {kH, T});
+        {
+            auto scope = ws.scope();
+            infernix::ops::linear(mt, p.up_w, u, infernix::ops::LinearPolicy::A16Only, ws, stream);
+        }
+        infernix::ops::detail::hc_collapse(u, nt, kS, composed, stream);
+        infernix::ops::detail::hc_up_collapse(mt, p.up_w, nt, kS, fused, stream);
+        t::cuda_check(cudaStreamSynchronize(stream), "sync");
+        std::vector<std::uint16_t> a(static_cast<std::size_t>(kH) * T), b(a.size());
+        t::cuda_check(cudaMemcpy(a.data(), composed_d.p, a.size() * 2, cudaMemcpyDeviceToHost), "composed");
+        t::cuda_check(cudaMemcpy(b.data(), fused_d.p, b.size() * 2, cudaMemcpyDeviceToHost), "fused");
+        std::size_t differ = 0;
+        for (std::size_t i = 0; i < a.size(); ++i) { differ += a[i] != b[i] ? 1U : 0U; }
+        check(differ == 0, label + ": the fused kernel's bits equal the linear + collapse (" + std::to_string(differ) +
+                               " of " + std::to_string(a.size()) + " differ)");
+    }
+}
+
+// hyper_connection_inject_mix against hyper_connection_inject then hyper_connection_mix, bit for bit in
+// the residual, x and the injects: the fused route's widths (one column, the v4 kernels' 2-16 and a
+// second pass at 9) fold the inject, and 17 columns take the two Ops in turn.
+void inject_mix_bit_identity(Codec codec, cudaStream_t stream) {
+    Problem p                = make_problem(true, codec);
+    const std::string tag    = codec == Codec::Q8 ? "q8 inject mix" : "bf16 inject mix";
+    constexpr int kMaxTokens = 17;
+    const std::size_t capacity = infernix::ops::hyper_connection_mix_workspace_capacity_bytes(
+        p.down_w, p.up_w, infernix::ops::LinearPolicy::A16Only, kS, kRank, kMaxTokens);
+    infernix::WorkspaceArena ws(capacity);
+    for (const int T : {1, 2, 5, 8, 9, 16, kMaxTokens}) {
+        const std::string label = tag + " T=" + std::to_string(T);
+        const auto r            = residual(T, 5000U + static_cast<std::uint32_t>(T));
+        std::uint32_t state     = 7000U + static_cast<std::uint32_t>(T);
+        std::vector<std::uint16_t> y(static_cast<std::size_t>(kH) * T);
+        for (auto& v : y) { v = t::f32_to_bf16(uniform(state)); }
+        std::vector<float> pending(static_cast<std::size_t>(kS) * T);
+        for (auto& v : pending) { v = 1.0F + uniform(state); } // 2 sigmoid(.) lies in (0, 2)
+        Device ra(r.size() * 2), rb(r.size() * 2), yd(y.size() * 2), pd(pending.size() * 4);
+        Device xa(static_cast<std::size_t>(kH) * T * 2), xb(static_cast<std::size_t>(kH) * T * 2);
+        Device ia(static_cast<std::size_t>(kS) * T * 4), ib(static_cast<std::size_t>(kS) * T * 4);
+        t::cuda_check(cudaMemcpy(ra.p, r.data(), r.size() * 2, cudaMemcpyHostToDevice), "residual a");
+        t::cuda_check(cudaMemcpy(rb.p, r.data(), r.size() * 2, cudaMemcpyHostToDevice), "residual b");
+        t::cuda_check(cudaMemcpy(yd.p, y.data(), y.size() * 2, cudaMemcpyHostToDevice), "y");
+        t::cuda_check(cudaMemcpy(pd.p, pending.data(), pending.size() * 4, cudaMemcpyHostToDevice), "pending");
+        const Tensor w(p.norm_device->p, DType::BF16, {kW});
+        const Tensor yt(yd.p, DType::BF16, {kH, T}), pt(pd.p, DType::FP32, {kS, T});
+        Tensor Ra(ra.p, DType::BF16, {kW, T}), Rb(rb.p, DType::BF16, {kW, T});
+        Tensor Xa(xa.p, DType::BF16, {kH, T}), Xb(xb.p, DType::BF16, {kH, T});
+        Tensor Ia(ia.p, DType::FP32, {kS, T}), Ib(ib.p, DType::FP32, {kS, T});
+        infernix::ops::hyper_connection_inject(yt, pt, Ra, stream);
+        infernix::ops::hyper_connection_mix(Ra, w, p.down_w, p.up_w, infernix::ops::LinearPolicy::A16Only, kS, kRank,
+                                            kEps, Xa, &Ia, ws, stream);
+        infernix::ops::hyper_connection_inject_mix(yt, pt, Rb, w, p.down_w, p.up_w,
+                                                   infernix::ops::LinearPolicy::A16Only, kS, kRank, kEps, Xb, &Ib, ws,
+                                                   stream);
+        t::cuda_check(cudaStreamSynchronize(stream), "sync");
+        const auto bits = [](const Device& d, std::size_t bytes) {
+            std::vector<unsigned char> out(bytes);
+            t::cuda_check(cudaMemcpy(out.data(), d.p, bytes, cudaMemcpyDeviceToHost), "copy back");
+            return out;
+        };
+        check(bits(ra, r.size() * 2) == bits(rb, r.size() * 2), label + ": the residual equals inject's");
+        check(bits(xa, static_cast<std::size_t>(kH) * T * 2) == bits(xb, static_cast<std::size_t>(kH) * T * 2),
+              label + ": x equals the inject then mix");
+        check(bits(ia, static_cast<std::size_t>(kS) * T * 4) == bits(ib, static_cast<std::size_t>(kS) * T * 4),
+              label + ": the injects equal the inject then mix");
+    }
+    // The mix may not write its injects over the pending ones.
+    {
+        Device rd(static_cast<std::size_t>(kW) * 2), yd(static_cast<std::size_t>(kH) * 2), id(kS * 4),
+            xd(static_cast<std::size_t>(kH) * 2);
+        const Tensor w(p.norm_device->p, DType::BF16, {kW});
+        const Tensor yt(yd.p, DType::BF16, {kH, 1});
+        Tensor R(rd.p, DType::BF16, {kW, 1}), X(xd.p, DType::BF16, {kH, 1}), I(id.p, DType::FP32, {kS, 1});
+        bool threw = false;
+        try {
+            infernix::ops::hyper_connection_inject_mix(yt, I, R, w, p.down_w, p.up_w, infernix::ops::LinearPolicy::A16Only,
+                                                       kS, kRank, kEps, X, &I, ws, stream);
+        } catch (const std::invalid_argument&) { threw = true; }
+        check(threw, tag + ": injects over the pending ones are refused");
+    }
+}
+
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(hyper_connection) {
     try {
         if (!t::linear::cuda_available()) {
             std::printf("SKIP: no CUDA device\n");
@@ -385,6 +499,10 @@ int main() {
             const Result captured = run(p, r5, 5, inject, ws, stream, true, fp32_norm);
             check(captured.x == five.x && captured.inject == five.inject, tag + ": a graph-captured call equals the eager call");
         }
+        up_collapse_bit_identity(Codec::Q8, stream);
+        up_collapse_bit_identity(Codec::Bf16, stream);
+        inject_mix_bit_identity(Codec::Q8, stream);
+        inject_mix_bit_identity(Codec::Bf16, stream);
         // Shapes that disagree are refused.
         {
             Problem p = make_problem(true, Codec::Q8);

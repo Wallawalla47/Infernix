@@ -93,6 +93,9 @@ void validate(const infernix::GenerationResult& result, std::string_view name = 
 
 struct Sink final : infernix::OutputSink {
     std::string content;
+    // The calls as their steps streamed them, and whether each completed.
+    std::vector<infernix::GeneratedToolCall> calls;
+    std::vector<bool> complete;
 
     void start(infernix::GenerationStart) override {}
 
@@ -103,7 +106,34 @@ struct Sink final : infernix::OutputSink {
     void publish(infernix::OutputDelta delta) override {
         if (delta.channel == infernix::OutputChannel::Content) content += delta.text;
     }
+
+    void tool_call(infernix::ToolCallDelta delta) override {
+        if (delta.index == calls.size()) {
+            require(!delta.name.empty(), "a streamed call's first step does not name its tool");
+            calls.push_back({.name = delta.name, .arguments_json = {}});
+            complete.push_back(false);
+        }
+        require(delta.index + 1U == calls.size() && !complete[delta.index] &&
+                    (delta.name.empty() || calls[delta.index].arguments_json.empty()),
+                "streamed call steps are out of order");
+        calls[delta.index].arguments_json += delta.arguments;
+        complete[delta.index] = delta.complete;
+    }
 };
+
+// The streamed steps of every completed call concatenate to the call the result holds.
+void require_streamed_calls(const Sink& sink, const infernix::GenerationResult& result) {
+    require(sink.calls.size() >= result.tool_calls.size() &&
+                sink.calls.size() <= result.tool_calls.size() + 1U,
+            "streamed calls differ in number from the result's");
+    for (std::size_t index = 0; index < result.tool_calls.size(); ++index) {
+        require(sink.complete[index] && sink.calls[index].name == result.tool_calls[index].name &&
+                    sink.calls[index].arguments_json == result.tool_calls[index].arguments_json,
+                "a streamed call differs from the result's");
+    }
+    require(sink.calls.size() == result.tool_calls.size() || !sink.complete.back(),
+            "a streamed call completed but is missing from the result");
+}
 
 void exercise_basic(infernix::Engine& engine, unsigned concurrency, bool speculative) {
     const Json open_schema{
@@ -124,6 +154,7 @@ void exercise_basic(infernix::Engine& engine, unsigned concurrency, bool specula
     require(sink.content == result.content &&
                 result.content.find("<tool_call>") == std::string::npos,
             "default tool framing leaked into the text stream");
+    require_streamed_calls(sink, result);
     for (const auto& call : result.tool_calls)
         require(call.name == "record" && Json::parse(call.arguments_json).is_object(),
                 "default tool output is not a callable argument object");
@@ -138,11 +169,14 @@ void exercise_basic(infernix::Engine& engine, unsigned concurrency, bool specula
         {.role  = infernix::ChatRole::Assistant,
          .parts = {{.kind = infernix::MessagePartKind::Text,
                     .text = "<tool_call>\n<function=record>\n<parameter=custom-key>\nready"}}});
-    const auto completed = engine.generate(engine.prepare(continued), options);
+    Sink continued_sink;
+    const auto completed = engine.generate(engine.prepare(continued), options, &continued_sink);
     require(completed.finish_reason == infernix::FinishReason::StopToken &&
                 !completed.tool_calls.empty() &&
                 Json::parse(completed.tool_calls[0].arguments_json).contains("custom-key"),
             "open-parameter continuation was not completed");
+    // The call the prefix began streams whole, its prefix part included.
+    require_streamed_calls(continued_sink, completed);
 
     std::vector<infernix::GenerationHandle> handles;
     for (unsigned row = 0; row < concurrency; ++row) {
@@ -244,6 +278,8 @@ void exercise(infernix::Engine& engine, unsigned concurrency, bool speculative) 
         validate(result);
         require(sink.content == result.content && sink.content.empty(),
                 "tool framing leaked into text stream");
+        // Strict values stream too: the JSON payload verbatim, the raw string escaped.
+        require_streamed_calls(sink, result);
         if (speculative)
             require(result.speculative.rounds > 0, "tools bypassed speculative backend");
         record(i == 0 ? "cold" : "warm", result, schema);

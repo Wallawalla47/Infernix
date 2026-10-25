@@ -237,6 +237,18 @@ on rejection: r_i(v) = max(p_i(v) - q_i(v), 0)
 on all accept: bonus ~ p_P
 ```
 
+A proposal outside its 16 stored candidates (q = 0, never produced by a contract-conforming draw)
+is always rejected, and its correction is drawn from p_i itself rather than from the residual: the
+draft carries no proposal information. A tree sibling with Q = 0 is rejected the same way and
+leaves the residual unchanged.
+
+The `block-verification` fast-path candidate replaces the token rule on chain rounds with block
+verification (Sun et al., arXiv 2403.10444; `ops::speculative_accept_sparse_drafts`): it accepts
+the longest prefix whose block test passes, judged with the whole chain in view, and corrects
+from the residual max(w p - q, 0) scaled by the prefix's acceptance weight w. The output
+distribution is the same and the expected accepted length at least the token rule's; seeded
+sampled text differs, and greedy rows, tree rows and Gumbel rows are unchanged.
+
 DFlash q is one-hot; DFlash2 q is the retained conditional distribution. This preserves the
 processed target distribution for the verify path. With `--draft-tree-nodes` a DFlash2 round
 instead verifies a tree of proposals built from the same lattice, whose main chain is this path
@@ -326,8 +338,18 @@ has the 27B drafter's mathematics at the geometry above; the fused Ops register 
   prefix cache's state image (the drafter group), with its frontier in the image header; a tap
   inside a layer walk copies the ring as it stood before the span, which only costs acceptance after
   a resume from it.
-- **Rounds.** One-row rounds speculate (two-row rounds only with the `adaptive-speculation` fast
-  path, which applies to MTP today). The drafter always proposes its configured block of K + 1
+- **Rounds.** One-row rounds speculate; two-row rounds only with the `dflash2-pairs` fast path (an
+  unqualified candidate, `--fast-path dflash2-pairs`; `adaptive-speculation` is MTP's), whose rounds
+  of two rows share one proposal and verify one width of at most two drafts per row (2 x 3 columns,
+  inside the column-invariant routes; three drafts reach 8 columns, which cost MTP pair rounds 3.1
+  plain rounds). With `--draft-tokens auto` the width is the k maximizing (both rows' expected tokens
+  with their first k drafts verified) / (1 + 0.1 + 0.47 k) plain two-row rounds, each row's expected
+  tokens from its calibrated drafts as below (a copy row's from its bucket's acceptance; a copy is
+  verified whole), one draft more every 8 pair rounds; a row with fewer drafts is padded with filler
+  columns that cost as much, so both rows verify every draft up to the width
+  ([`draft_length.h`](../../src/runtime/speculative/draft_length.h) `pair_draft_width`). The costs are
+  priors (MTP pair rounds' measured draft cost, one row's proposal share), not yet measured on
+  DFlash2 pairs. Rounds of three or more rows decode plain. The drafter always proposes its configured block of K + 1
   columns (one CUDA Graph per batch size) and the round verifies a prefix of its drafts. K is at
   most 7, the block the drafter was trained with and the widest column-invariant verification.
 - **Draft length.** The selector also writes each draft's temperature-1 probability at its

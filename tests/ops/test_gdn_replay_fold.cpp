@@ -1,3 +1,4 @@
+#include "ops/op_family.h"
 #include "infernix/ops/gated_delta_net.h"
 #include "infernix/ops/gdn_input_proj.h"
 #include "infernix/ops/gdn_replay.h"
@@ -16,12 +17,14 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -792,9 +795,151 @@ int run_record_fold_rounds() {
     return failures;
 }
 
-} // namespace
+// fp16-gdn-state through verification and its fold. From a state FP16 represents exactly, the record reads an
+// FP16 pool exactly (its outputs and records bit-equal the FP32 pool's), and the fold publishes the FP32
+// pool's folded state rounded once to nearest FP16 (saturating), with the same convolution history; the
+// source slot is unchanged. Qwen3.5-27B's 48x48 geometry, one row.
+int run_fp16_state_record_fold() {
+    constexpr FoldProfile kProfile{48, 48, 10240};
+    constexpr std::int32_t kWidth = 8, kSlots = 2, kSource = 0, kDestination = 1, kCommit = 5;
+    const float kScale = 1.0F / std::sqrt(128.0F);
+    const std::size_t qk_elements    = static_cast<std::size_t>(kStateDim) * kQkHeads * kWidth;
+    const std::size_t value_elements = static_cast<std::size_t>(kStateDim) * kProfile.value_heads * kWidth;
+    const std::size_t gate_elements  = static_cast<std::size_t>(kProfile.value_heads) * kWidth;
+    const std::size_t slot_elements  = static_cast<std::size_t>(kStateDim) * kStateDim * kProfile.value_heads;
+    std::vector<std::uint16_t> q_bits(qk_elements), k_bits(qk_elements), v_bits(value_elements);
+    for (std::size_t i = 0; i < qk_elements; ++i) {
+        q_bits[i] = bf16_pattern(4101U + static_cast<std::uint32_t>(i), 0.08F);
+        k_bits[i] = bf16_pattern(4201U + static_cast<std::uint32_t>(i), 0.08F);
+    }
+    for (std::size_t i = 0; i < value_elements; ++i) {
+        v_bits[i] = bf16_pattern(4301U + static_cast<std::uint32_t>(i), 0.5F);
+    }
+    std::vector<float> g_host(gate_elements), beta_host(gate_elements);
+    for (std::size_t i = 0; i < gate_elements; ++i) {
+        g_host[i]    = -0.04F - static_cast<float>(i % 80) / 100.0F;
+        beta_host[i] = 0.08F + static_cast<float>((i * 7) % 80) / 100.0F;
+    }
+    DeviceBuffer dq = to_device(q_bits), dk = to_device(k_bits), dv = to_device(v_bits);
+    DeviceBuffer dg = to_device_f32(g_host), dbeta = to_device_f32(beta_host);
+    DeviceBuffer initial = to_device(std::vector<std::int32_t>{kSource});
+    const Tensor q(dq.p, DType::BF16, {kStateDim, kQkHeads, kWidth, 1});
+    const Tensor k(dk.p, DType::BF16, {kStateDim, kQkHeads, kWidth, 1});
+    const Tensor v(dv.p, DType::BF16, {kStateDim, kProfile.value_heads, kWidth, 1});
+    const Tensor g(dg.p, DType::FP32, {kProfile.value_heads, kWidth, 1});
+    const Tensor beta(dbeta.p, DType::FP32, {kProfile.value_heads, kWidth, 1});
+    const Tensor initial_selector(initial.p, DType::I32, {1});
+    const Tensor valid;
 
-int main(int argc, char** argv) {
+    // One set of records and one pool per state dtype, from identical inputs and initial states.
+    struct Pool {
+        DeviceBuffer record_storage;
+        std::unique_ptr<GdnReplayRecords> records;
+        DeviceBuffer state_storage;
+        std::unique_ptr<LinearAttentionStatePool> states;
+        DeviceBuffer out;
+    };
+    const auto make_pool = [&](DType recurrent) {
+        Pool pool;
+        LayoutBuilder record_builder;
+        const GdnReplayRecordLayout record_layout =
+            plan_gdn_replay_records(record_builder, {.layers          = kProfile.layers,
+                                                     .record_capacity = 1,
+                                                     .width           = kWidth,
+                                                     .conv_channels   = kProfile.conv_channels,
+                                                     .qk_heads        = kQkHeads,
+                                                     .value_heads     = kProfile.value_heads,
+                                                     .key_dim         = kStateDim,
+                                                     .value_dim       = kStateDim});
+        pool.record_storage = DeviceBuffer(record_builder.finish(256));
+        pool.record_storage.fill(0x3c); // the convolution records: the same bytes in both pools
+        pool.records = std::make_unique<GdnReplayRecords>(DeviceSpan{pool.record_storage.p, pool.record_storage.bytes}, record_layout);
+        LayoutBuilder state_builder;
+        const LinearAttentionStatePoolLayout state_layout = plan_linear_attention_state_pool(
+            state_builder, {.layers          = static_cast<std::uint32_t>(kProfile.layers),
+                            .conv_channels   = kProfile.conv_channels,
+                            .conv_width      = 3,
+                            .value_heads     = kProfile.value_heads,
+                            .value_head_dim  = kStateDim,
+                            .key_head_dim    = kStateDim,
+                            .slot_count      = kSlots,
+                            .conv_dtype      = DType::BF16,
+                            .recurrent_dtype = recurrent});
+        pool.state_storage = DeviceBuffer(state_builder.finish(256));
+        pool.state_storage.fill(0);
+        pool.states = std::make_unique<LinearAttentionStatePool>(DeviceSpan{pool.state_storage.p, pool.state_storage.bytes}, state_layout);
+        for (std::int32_t layer = 0; layer < kProfile.layers; ++layer) {
+            std::vector<float> values(slot_elements);
+            for (std::size_t i = 0; i < slot_elements; ++i) {
+                values[i] = fp16_to_f32(f32_to_fp16_saturated(
+                    bf16_to_f32(bf16_pattern(4401U + layer * 101U + static_cast<std::uint32_t>(i), 0.02F))));
+            }
+            const Tensor slot = pool.states->recurrent_slot(static_cast<std::uint32_t>(layer), kSource);
+            if (recurrent == DType::FP32) {
+                cuda_check(cudaMemcpy(slot.data, values.data(), slot.bytes(), cudaMemcpyHostToDevice), "FP32 state");
+            } else {
+                std::vector<std::uint16_t> bits(slot_elements);
+                for (std::size_t i = 0; i < slot_elements; ++i) { bits[i] = f32_to_fp16_saturated(values[i]); }
+                cuda_check(cudaMemcpy(slot.data, bits.data(), slot.bytes(), cudaMemcpyHostToDevice), "FP16 state");
+            }
+        }
+        pool.out = DeviceBuffer(value_elements * kProfile.layers * sizeof(std::uint16_t));
+        for (std::int32_t layer = 0; layer < kProfile.layers; ++layer) {
+            GdnReplayRecordLayer layer_records = pool.records->layer(layer, 1);
+            Tensor out(static_cast<std::uint16_t*>(pool.out.p) + layer * value_elements, DType::BF16,
+                       {kStateDim, kProfile.value_heads, kWidth, 1});
+            ops::gated_delta_net_replay_record(q, k, v, g, beta, kScale,
+                                               pool.states->layer_view(static_cast<std::uint32_t>(layer)).recurrent,
+                                               valid, initial_selector, layer_records.key, layer_records.value,
+                                               layer_records.gate, out, nullptr);
+        }
+        const ops::GdnReplayFoldPlan fold(*pool.records, pool.states->all_layers_view());
+        const std::array rows{ops::GdnReplayFoldRow{kSource, kDestination, kCommit}};
+        fold.execute(rows, nullptr);
+        cuda_synchronize();
+        return pool;
+    };
+    Pool fp32 = make_pool(DType::FP32);
+    Pool fp16 = make_pool(DType::FP16);
+    int failures = 0;
+    if (from_device<std::uint16_t>(fp32.out, fp32.out.bytes / 2) != from_device<std::uint16_t>(fp16.out, fp16.out.bytes / 2)) {
+        std::cerr << "fp16 state record outputs differ from the FP32 pool's\n";
+        ++failures;
+    }
+    if (from_device<std::uint8_t>(fp32.record_storage, fp32.record_storage.bytes) !=
+        from_device<std::uint8_t>(fp16.record_storage, fp16.record_storage.bytes)) {
+        std::cerr << "fp16 state records differ from the FP32 pool's\n";
+        ++failures;
+    }
+    for (std::int32_t layer = 0; layer < kProfile.layers; ++layer) {
+        const auto index = static_cast<std::uint32_t>(layer);
+        const std::vector<float> folded =
+            from_device<float>(fp32.states->recurrent_slot(index, kDestination).data, slot_elements);
+        std::vector<std::uint16_t> rounded(slot_elements);
+        for (std::size_t i = 0; i < slot_elements; ++i) { rounded[i] = f32_to_fp16_saturated(folded[i]); }
+        if (from_device<std::uint16_t>(fp16.states->recurrent_slot(index, kDestination).data, slot_elements) != rounded) {
+            std::cerr << "fp16 state fold is not the FP32 fold rounded once, layer " << layer << '\n';
+            return failures + 1;
+        }
+        const std::vector<float> source = from_device<float>(fp32.states->recurrent_slot(index, kSource).data, slot_elements);
+        std::vector<std::uint16_t> source_bits(slot_elements);
+        for (std::size_t i = 0; i < slot_elements; ++i) { source_bits[i] = f32_to_fp16_saturated(source[i]); }
+        if (from_device<std::uint16_t>(fp16.states->recurrent_slot(index, kSource).data, slot_elements) != source_bits) {
+            std::cerr << "fp16 state fold changed its source slot, layer " << layer << '\n';
+            return failures + 1;
+        }
+        const std::size_t conv_elements = static_cast<std::size_t>(kProfile.conv_channels) * 3;
+        if (from_device<std::uint16_t>(fp32.states->conv_slot(index, kDestination).data, conv_elements) !=
+            from_device<std::uint16_t>(fp16.states->conv_slot(index, kDestination).data, conv_elements)) {
+            std::cerr << "fp16 state fold's convolution history differs, layer " << layer << '\n';
+            return failures + 1;
+        }
+    }
+    std::cout << "fp16 state record-fold exact=" << (failures == 0) << '\n';
+    return failures;
+}
+
+int run_test(int argc, char** argv) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
@@ -905,6 +1050,20 @@ int main(int argc, char** argv) {
     failures += run_case({36, 64, 12288}, 8, 2, {5, 8}, 1887U, false, 16);
     failures += run_record_fold_rounds<16>();
     failures += run_record_fold_rounds<32>();
+    failures += run_fp16_state_record_fold();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_replay_fold\n";
     return failures == 0 ? 0 : 1;
+}
+
+} // namespace
+
+// A CUDA error (an allocation beside other tests included) reports as a failure with its message,
+// not as an abort.
+INFERNIX_OP_TEST(gdn_replay_fold) {
+    try {
+        return run_test(argc, argv);
+    } catch (const std::exception& error) {
+        std::cerr << "gdn_replay_fold: " << error.what() << '\n';
+        return 1;
+    }
 }

@@ -4,6 +4,7 @@
 // |out - ref| <= 2^-8 |ref| + 2^-14 rms(ref). Also: each column of a 16-column call equals that column
 // alone (column invariance), and widths outside 1..16 are refused.
 
+#include "ops/op_family.h"
 #include "infernix/ops/linear_swiglu.h"
 #include "ops/op_tester.h"
 
@@ -40,7 +41,7 @@ float uniform(std::uint32_t& state) {
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(linear_swiglu_bf16_a16) {
     int device_count = 0;
     if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
         std::printf("SKIP: no CUDA device\n");

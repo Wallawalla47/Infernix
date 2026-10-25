@@ -83,8 +83,9 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual, WorkspaceAre
                 cudaStream_t stream);
 
 /// `routes` admits fast-path routes (LinearRoutes): under LinearRoutes::WideDownTile the NVFP4
-/// [5120,17408] A16 calls of 5-16 columns take the 8 K-warp tiles; without a flag every profile
-/// runs its exact route.
+/// [5120,17408] A16 calls of 5-16 columns take the 8 K-warp tiles; under LinearRoutes::Q5KSplit the
+/// Q5 calls of 2-16 columns (every width under A16ColumnInvariant, still column-invariant) take
+/// the 8 K-warp K-split tiles; without a flag every profile runs its exact route.
 void linear_add(const Tensor& x, const Weight& w, Tensor& residual, LinearPolicy policy,
                 WorkspaceArena& ws, cudaStream_t stream, LinearRoutes routes = LinearRoutes::Exact);
 

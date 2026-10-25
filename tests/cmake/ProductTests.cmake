@@ -49,6 +49,10 @@ infernix_add_test(infernix_anthropic_schema_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_anthropic_schema.cpp"
   LIBRARIES infernix_serve)
 
+infernix_add_test(infernix_tool_search_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_tool_search.cpp"
+  LIBRARIES infernix_serve)
+
 infernix_add_test(infernix_serve_options_test NEEDS_SOURCE_DIR
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_serve_options.cpp"
   LIBRARIES infernix_serve)
@@ -59,6 +63,15 @@ infernix_add_test(infernix_request_log_test
 
 infernix_add_test(infernix_metrics_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_metrics.cpp"
+  LIBRARIES infernix_serve)
+infernix_add_test(infernix_metrics_contract_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_metrics_contract.cpp"
+  LIBRARIES infernix_serve)
+infernix_add_test(infernix_prefix_miss_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_prefix_miss.cpp"
+  LIBRARIES infernix_serve)
+infernix_add_test(infernix_reasoning_store_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_reasoning_store.cpp"
   LIBRARIES infernix_serve)
 infernix_add_test(infernix_console_stats_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_console_stats.cpp"

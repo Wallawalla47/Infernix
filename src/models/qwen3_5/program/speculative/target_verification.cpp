@@ -14,8 +14,8 @@ void target_verify_forward(ExecutionCore& execution, TextContext& card, TargetVe
     card.set_gdn_state_action(GdnStateAction::RecordForReplay, frame.replay_records);
     const bool tree = frame.tree_rows.data != nullptr;
     if (tree) {
-        if (frame.proposal_q.data == nullptr || frame.feature_sink == nullptr) {
-            throw std::logic_error("tree verification requires DFlash2 sparse acceptance");
+        if (frame.proposal_q.data == nullptr) {
+            throw std::logic_error("tree verification requires sparse acceptance");
         }
         card.set_verification_tree(&frame.tree_rows, &frame.tree_masks);
     }
@@ -71,16 +71,21 @@ void target_accept(ExecutionCore& execution, Tensor& continuation_hidden_store, 
         Tensor hidden = frame.target_hidden;
         ops::speculative_tree_compact_columns(hidden, hidden.ne[2], none, frame.accepted_path,
                                               frame.accepted_drafts, stream);
-        Tensor features = frame.pending_features;
-        ops::speculative_tree_compact_columns(features, features.ne[2], frame.active_lanes,
-                                              frame.accepted_path, frame.accepted_drafts, stream);
+        // DFlash's pending target features; MTP's drafter reads the compacted target hidden.
+        if (frame.pending_features.data != nullptr) {
+            Tensor features = frame.pending_features;
+            ops::speculative_tree_compact_columns(features, features.ne[2], frame.active_lanes,
+                                                  frame.accepted_path, frame.accepted_drafts, stream);
+        }
     } else if (frame.proposal_q.data != nullptr) {
         ops::speculative_accept_sparse_drafts(
             frame.target_tokens, frame.target_logits, frame.drafts, frame.candidate_ids,
             frame.proposal_q, frame.current_extents, frame.frontiers, frame.anchors,
             frame.licensed_tokens, frame.licensed_counts, frame.accepted_drafts,
             dimension(execution.parameters.model.resources().public_token_count), frame.sampling,
-            {false}, execution.work, execution.device.stream);
+            {.all_rows_greedy_without_penalties = false,
+             .block_verification                = execution.execution_schedule.block_verification},
+            execution.work, execution.device.stream);
     } else {
         ops::speculative_accept_greedy_drafts(
             frame.target_tokens, frame.target_logits, frame.drafts, frame.current_extents,

@@ -26,6 +26,7 @@
 // exactly and scores bit for bit, at the widths of a DFlash2 proposal (16 columns per request) and
 // beyond the 128-column chunk.
 
+#include "ops/op_family.h"
 #include "infernix/ops/linear_topk.h"
 #include "infernix/ops/rg16_linear.h"
 #include "ops/common/canonical_math.h"
@@ -292,6 +293,14 @@ void run(const Matrix& m, int columns, bool with_inf, std::mt19937& rng, const s
     check(bad16 == 0, where + ": BF16 outputs are the oracle's one rounding");
     check(!with_inf || nan_rows == static_cast<std::size_t>(m.rows), where + ": exactly the Inf column is NaN");
     if (w != nullptr) { check_fp64(m, *w, x, columns, emax, got16, where); }
+    // The narrow widths' calls repeat bit for bit, also with a copy streaming beside them (the GEMV
+    // and the streamed GEMV of INFERNIX_TMP_RG16_STREAM; op_tester.h verify_repeatable).
+    if (columns <= 8) {
+        check(infernix::test::verify_repeatable(
+                  where + " repeated", 3, nullptr, [&] { infernix::ops::rg16_linear(tx, w16, out16, arena, nullptr); },
+                  {{d_bf16, expected.size() * sizeof(std::uint16_t)}}) == 0,
+              where + ": repeated calls give the same bits");
+    }
     cudaFree(d_workspace);
     cudaFree(d_bf16);
     cudaFree(d_f32);
@@ -362,7 +371,7 @@ void check_unregistered() {
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(rg16_linear) {
     std::mt19937 rng(20261022);
     check_unregistered();
     {

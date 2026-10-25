@@ -43,7 +43,7 @@ void require_row_pitched_matrix(const Tensor& t, std::int32_t rows, std::int32_t
 
 } // namespace
 
-void mtp_prepare_next_round(const Tensor& verify_ids, const Tensor& next_anchors,
+void mtp_prepare_next_round(const Tensor& licensed_tokens, const Tensor& next_anchors,
                             const Tensor& accepted, const Tensor& updated_frontiers,
                             const Tensor& remaining_budgets, const Tensor& licensed_counts,
                             const Tensor& rope_deltas, Tensor& alignment_ids, Tensor& next_extents,
@@ -51,8 +51,8 @@ void mtp_prepare_next_round(const Tensor& verify_ids, const Tensor& next_anchors
                             Tensor& ar_valid_columns, std::int32_t max_context,
                             std::int32_t next_draft_limit, cudaStream_t stream) {
     constexpr const char* op = "mtp_prepare_next_round";
-    const std::int32_t T     = verify_ids.ne[0];
-    const std::int32_t batch = verify_ids.ne[1];
+    const std::int32_t T     = licensed_tokens.ne[0];
+    const std::int32_t batch = licensed_tokens.ne[1];
     if (T < 2 || T > 64) { throw std::invalid_argument("mtp_prepare_next_round: T must be 2..64"); }
     const auto next_k = next_draft_limit;
     if (next_k < 1 || next_k > 5) {
@@ -62,7 +62,7 @@ void mtp_prepare_next_round(const Tensor& verify_ids, const Tensor& next_anchors
     if (max_context <= 0) {
         throw std::invalid_argument("mtp_prepare_next_round: max_context must be positive");
     }
-    require_matrix(verify_ids, DType::I32, T, batch, op, "verify_ids");
+    require_matrix(licensed_tokens, DType::I32, T, batch, op, "licensed_tokens");
     require_vector(next_anchors, DType::I32, batch, op, "next_anchors");
     require_vector(accepted, DType::I32, batch, op, "accepted");
     require_vector(updated_frontiers, DType::I32, batch, op, "updated_frontiers");
@@ -81,7 +81,7 @@ void mtp_prepare_next_round(const Tensor& verify_ids, const Tensor& next_anchors
             "mtp_prepare_next_round: AR outputs must share one step stride");
     }
     detail::mtp_prepare_next_round_launch(
-        verify_ids, next_anchors, accepted, updated_frontiers, remaining_budgets, licensed_counts,
+        licensed_tokens, next_anchors, accepted, updated_frontiers, remaining_budgets, licensed_counts,
         rope_deltas, alignment_ids, next_extents, ar_positions, ar_rope_positions, ar_valid_columns,
         max_context, next_k, stream);
 }

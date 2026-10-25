@@ -302,7 +302,8 @@ __device__ __forceinline__ void issue_limbs(Sm& sm, int buf, int s0, const LimbC
 // One 8-element chunk of a block as the stage stores it: two code words (byte j of word h is element
 // 4h + j), its sub-scale and scale words. The integers of chunk<F> (ggml_exact.h), decoded with
 // word operations (ggml_dp4a.cuh's byte tricks) for every ggml format. `b` is the block in the
-// stage's raw copy (shared memory at any byte alignment, so words are read byte by byte).
+// stage's raw copy (shared memory at any byte alignment, so words are read byte by byte); `cb` the
+// format's codebook (fast::DeviceCodebook or a CTA's fast::SharedCodebook: the same values).
 struct TileChunk {
     int w[2];
     int sub;
@@ -311,8 +312,8 @@ struct TileChunk {
     std::uint16_t dmin;
 };
 
-template <QType F>
-__device__ __forceinline__ TileChunk tile_chunk(const std::uint8_t* b, int part) {
+template <QType F, class Codebook = fast::DeviceCodebook<F>>
+__device__ __forceinline__ TileChunk tile_chunk(const std::uint8_t* b, int part, const Codebook& cb = Codebook{}) {
     TileChunk o{};
     o.sub = 1;
     if constexpr (F == QType::GGML_IQ3_S) {
@@ -321,14 +322,14 @@ __device__ __forceinline__ TileChunk tile_chunk(const std::uint8_t* b, int part)
         const int i1 = b[2 + 8 * sb + 2 * l] | ((qh << (8 - 2 * l)) & 256);
         const int i2 = b[3 + 8 * sb + 2 * l] | ((qh << (7 - 2 * l)) & 256);
         const unsigned sign = b[74 + 4 * sb + l];
-        o.w[0] = fast::apply_signs4(__ldg(d_iq3s_grid + i1), sign & 0xFU);
-        o.w[1] = fast::apply_signs4(__ldg(d_iq3s_grid + i2), sign >> 4);
+        o.w[0] = fast::apply_signs4(cb.grid32(i1), sign & 0xFU);
+        o.w[1] = fast::apply_signs4(cb.grid32(i2), sign >> 4);
         o.sub  = 2 * ((b[106 + sb / 2] >> (4 * (sb % 2))) & 0xF) + 1;
         o.d    = u16_at(b);
     } else if constexpr (F == QType::GGML_IQ2_S) {
         const int ib = part / 4, l = part % 4;
         const int index = b[2 + 4 * ib + l] | ((b[66 + ib] << (8 - 2 * l)) & 0x300);
-        const std::uint64_t grid = __ldg(reinterpret_cast<const unsigned long long*>(d_iq2s_grid) + index);
+        const std::uint64_t grid = cb.grid64(index);
         const unsigned sign = b[34 + 4 * ib + l];
         o.w[0] = fast::apply_signs4(static_cast<std::uint32_t>(grid), sign & 0xFU);
         o.w[1] = fast::apply_signs4(static_cast<std::uint32_t>(grid >> 32), sign >> 4);
@@ -337,9 +338,9 @@ __device__ __forceinline__ TileChunk tile_chunk(const std::uint8_t* b, int part)
     } else if constexpr (F == QType::GGML_IQ3_XXS) {
         const int ib = part / 4, l = part % 4;
         const std::uint32_t aux = u32_at(b + 66 + 4 * ib);
-        const unsigned sign = __ldg(d_ksigns_iq2xs + ((aux >> (7 * l)) & 127));
-        o.w[0] = fast::apply_signs4(__ldg(d_iq3xxs_grid + b[2 + 8 * ib + 2 * l]), sign & 0xFU);
-        o.w[1] = fast::apply_signs4(__ldg(d_iq3xxs_grid + b[3 + 8 * ib + 2 * l]), sign >> 4);
+        const unsigned sign = cb.sign((aux >> (7 * l)) & 127);
+        o.w[0] = fast::apply_signs4(cb.grid32(b[2 + 8 * ib + 2 * l]), sign & 0xFU);
+        o.w[1] = fast::apply_signs4(cb.grid32(b[3 + 8 * ib + 2 * l]), sign >> 4);
         o.sub  = 2 * static_cast<int>(aux >> 28) + 1;
         o.d    = u16_at(b);
     } else if constexpr (F == QType::GGML_Q2_0) {
@@ -491,16 +492,17 @@ __device__ __forceinline__ void store_chunk(Stage& cs, int dr, int dj, int dp, i
 }
 
 // Decodes stage st (slices kStageSlices st ..) of tile rows row_of(0 .. kTileRows - 1) from global
-// memory into a stage (fast::chunk: the same integers as tile_chunk). Every thread calls it.
-template <QType F, int Threads = kThreads, class RowOf>
-__device__ __forceinline__ void decode_stage(CodeStage& cs, RowOf row_of, int st) {
+// memory into a stage (fast::chunk: the same integers as tile_chunk), with codebook `cb`. Every
+// thread calls it.
+template <QType F, int Threads = kThreads, class RowOf, class Codebook = fast::DeviceCodebook<F>>
+__device__ __forceinline__ void decode_stage(CodeStage& cs, RowOf row_of, int st, const Codebook& cb = Codebook{}) {
     constexpr int kChunks = kTileRows * kStageSlices * 4 / Threads; // 8-element chunks per thread
     static_assert(kChunks * Threads == kTileRows * kStageSlices * 4);
 #pragma unroll
     for (int i = 0; i < kChunks; ++i) {
         const int c  = static_cast<int>(threadIdx.x) + Threads * i;
         const int dr = c / (4 * kStageSlices), dj = (c / 4) % kStageSlices, dp = c % 4;
-        const fast::Chunk ch = fast::chunk<F>(row_of(dr), st * kStageSlices + dj, dp);
+        const fast::Chunk ch = fast::chunk<F>(row_of(dr), st * kStageSlices + dj, dp, cb);
         store_chunk<F>(cs, dr, dj, dp, ch.w0, ch.w1, ch.sub, ch.d, ch.min, ch.dmin);
     }
 }
@@ -546,10 +548,10 @@ __device__ __forceinline__ Stage& stage_of(ResidentShared<Stages, Stage>& sm, in
 // The K loop of compute, accumulating by Mode (Accum; the rows' bases in sm.base for kNarrow and
 // kLimbs); the warps' tiles are warp_tile<Threads>'s layout `Layout`, a warp of an inactive layout
 // slot (512 threads, layout 2) copying and decoding but computing nothing. Source says where the
-// stages come from (StageSource; `plane` for kPlane).
-template <QType F, Accum Mode, int Layout, StageSource Source, int Threads, class Sm, class RowOf>
+// stages come from (StageSource; `plane` for kPlane); kDecode reads codebook `cb`.
+template <QType F, Accum Mode, int Layout, StageSource Source, int Threads, class Sm, class RowOf, class Codebook>
 __device__ __forceinline__ void compute_loop(Sm& sm, RowOf row_of, int slices, const LimbCopies<Threads>& copies,
-                                             Accumulators& acc, const std::uint8_t* plane) {
+                                             Accumulators& acc, const std::uint8_t* plane, const Codebook& cb) {
     constexpr bool Narrow = Mode == Accum::kNarrow;
     constexpr bool Limbs  = Mode == Accum::kLimbs;
     static_assert(!Limbs || kLimbsMode<F, Threads>, "per-limb accumulators: kLimbsMode tiles only");
@@ -629,7 +631,7 @@ __device__ __forceinline__ void compute_loop(Sm& sm, RowOf row_of, int slices, c
                 // Element offset of this chunk within the unit's raw copy.
                 const int e = (s0 + dj - unit * kUnitSlices) * 32 + 8 * dp;
                 const std::uint8_t* block = &sm.raw[ubuf][dr][sm.raw_offset[ubuf][dr]] + e / kBlockElems * kBlockBytes;
-                const TileChunk ch = tile_chunk<F>(block, e % kBlockElems / 8);
+                const TileChunk ch = tile_chunk<F>(block, e % kBlockElems / 8, cb);
                 store_chunk<F>(sm.code, dr, dj, dp, ch.w[0], ch.w[1], ch.sub, ch.d, ch.min_sub, ch.dmin);
             }
             __syncthreads();
@@ -809,14 +811,15 @@ __device__ __forceinline__ void compute_loop(Sm& sm, RowOf row_of, int slices, c
 }
 
 // compute_loop for the CTA's accumulator mode and warp layout (the same for every warp).
-template <QType F, StageSource Source, int Threads, class Sm, class RowOf>
+template <QType F, StageSource Source, int Threads, class Sm, class RowOf, class Codebook = fast::DeviceCodebook<F>>
 __device__ __forceinline__ void dispatch_loop(Sm& sm, RowOf row_of, int slices, const LimbCopies<Threads>& copies,
-                                              int columns, Accum mode, Accumulators& acc, const std::uint8_t* plane) {
+                                              int columns, Accum mode, Accumulators& acc, const std::uint8_t* plane,
+                                              const Codebook& cb = Codebook{}) {
     const auto run = [&](auto layout) {
         constexpr int kLayout = decltype(layout)::value;
         constexpr Accum kInt64 = kLimbsMode<F, Threads> ? Accum::kLimbs : Accum::kNarrow; // row_bases' int64 mode
-        mode == kInt64 ? compute_loop<F, kInt64, kLayout, Source, Threads>(sm, row_of, slices, copies, acc, plane)
-                       : compute_loop<F, Accum::kWide, kLayout, Source, Threads>(sm, row_of, slices, copies, acc, plane);
+        mode == kInt64 ? compute_loop<F, kInt64, kLayout, Source, Threads>(sm, row_of, slices, copies, acc, plane, cb)
+                       : compute_loop<F, Accum::kWide, kLayout, Source, Threads>(sm, row_of, slices, copies, acc, plane, cb);
     };
     if (columns > 32) {
         run(std::integral_constant<int, 0>{});
@@ -834,16 +837,18 @@ __device__ __forceinline__ void dispatch_loop(Sm& sm, RowOf row_of, int slices, 
 // tile's valid columns: the thread's outputs (Accumulators) are those of its warp tile
 // (warp_tile<Threads>(columns)); columns past the valid ones are computed on padding (column limbs
 // that the caller clamps to a valid column) and ignored. Every thread of the CTA (Threads of them)
-// calls it. The outputs are the same integers whichever accumulator the rows' scales allow.
-template <QType F, int Threads = kThreads, class RowOf, class ColumnLimbs>
+// calls it. The outputs are the same integers whichever accumulator the rows' scales allow. The
+// decode reads codebook `cb`: a fast::SharedCodebook the caller loaded before the call is published
+// by row_bases' barrier, before the first decode.
+template <QType F, int Threads = kThreads, class RowOf, class ColumnLimbs, class Codebook = fast::DeviceCodebook<F>>
 __device__ __forceinline__ void compute(Shared& sm, RowOf row_of, int slices, ColumnLimbs limbs, int xsum_offset,
-                                        int columns, Accumulators& acc) {
+                                        int columns, Accumulators& acc, const Codebook& cb = Codebook{}) {
     const LimbCopies<Threads> copies = limb_copies<F, Threads>(limbs, xsum_offset);
     issue_unit<F, Threads>(sm, 0, 0, slices, row_of);
     issue_limbs<F>(sm, 0, 0, copies);
     cp_async_commit();
     const Accum mode = row_bases<F, Threads>(sm, row_of, slices);
-    dispatch_loop<F, StageSource::kDecode>(sm, row_of, slices, copies, columns, mode, acc, nullptr);
+    dispatch_loop<F, StageSource::kDecode>(sm, row_of, slices, copies, columns, mode, acc, nullptr, cb);
 }
 
 // compute over a decoded plane: stage st's image at plane + st * sizeof(CodeStage) (decode_planes);

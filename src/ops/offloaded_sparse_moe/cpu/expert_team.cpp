@@ -29,16 +29,18 @@ inline void cpu_relax() {
 #endif
 }
 
-void pin_current_thread(int cpu) {
+void pin_current_thread(std::uint64_t cpus) {
 #if defined(__linux__)
     cpu_set_t set;
     CPU_ZERO(&set);
-    CPU_SET(cpu, &set);
+    for (int c = 0; c < 64; ++c) {
+        if (((cpus >> c) & 1U) != 0) { CPU_SET(c, &set); }
+    }
     (void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
 #elif defined(_WIN32)
-    if (cpu >= 0 && cpu < 64) { (void)SetThreadAffinityMask(GetCurrentThread(), DWORD_PTR{1} << cpu); }
+    (void)SetThreadAffinityMask(GetCurrentThread(), static_cast<DWORD_PTR>(cpus));
 #else
-    (void)cpu;
+    (void)cpus;
 #endif
 }
 
@@ -69,6 +71,25 @@ CpuExpertTeam::CpuExpertTeam(Options options)
     if (ggml_ && activation_ != ExpertActivation::kA16) {
         throw std::invalid_argument("CpuExpertTeam: GGUF experts take the A16 activation");
     }
+    narrow_a16_ = options.narrow_a16;
+    shared_x_   = options.shared_x;
+    x_owner_.resize(static_cast<std::size_t>(max_jobs_) * kMaxColumns);
+    std::size_t table = 16;
+    while (table < 2 * x_owner_.size()) { table *= 2; }
+    owner_keys_.assign(table, nullptr);
+    owner_vals_.assign(table, 0);
+    owner_used_.assign(x_owner_.size(), 0);
+    if (narrow_a16_ == NarrowA16::kA4Residual &&
+        (activation_ != ExpertActivation::kA16 || ggml_ || shape_ != kFlashNextShape)) {
+        throw std::invalid_argument("CpuExpertTeam: two-term A4 jobs need NVFP4 W4A16 experts of Flash-Next's geometry");
+    }
+    if (narrow_a16_ == NarrowA16::kA4Residual) {
+        constexpr int kTerms = canon::kA4ResidualTerms;
+        xr_.resize(xs_index(max_jobs_, 0) * kTerms);
+        hr_.resize(h_index(max_jobs_, 0) * kTerms);
+        x_scale_.resize(static_cast<std::size_t>(max_jobs_) * kMaxColumns);
+        h_scale_.resize(static_cast<std::size_t>(max_jobs_) * kMaxColumns);
+    }
     if (ggml_) {
         xg_.resize(static_cast<std::size_t>(max_jobs_) * kMaxColumns * kGgmlXSlices);
         hg_.resize(static_cast<std::size_t>(max_jobs_) * kMaxColumns * kGgmlHSlices);
@@ -86,9 +107,9 @@ CpuExpertTeam::CpuExpertTeam(Options options)
     }
     threads_.reserve(static_cast<std::size_t>(workers_ - 1));
     for (int w = 1; w < workers_; ++w) {
-        const int cpu = w < static_cast<int>(options.cpus.size()) ? options.cpus[static_cast<std::size_t>(w)] : -1;
-        threads_.emplace_back([this, w, cpu] {
-            if (cpu >= 0) { pin_current_thread(cpu); }
+        const std::uint64_t cpus = w < static_cast<int>(options.cpus.size()) ? options.cpus[static_cast<std::size_t>(w)] : 0;
+        threads_.emplace_back([this, w, cpus] {
+            if (cpus != 0) { pin_current_thread(cpus); }
             worker_main(w);
         });
     }
@@ -132,7 +153,7 @@ void CpuExpertTeam::work_a16(int w) {
          i = next_quantize_.fetch_add(1, std::memory_order_relaxed)) {
         const int slice = i % kSlices, j = i / (kSlices * kMaxColumns), c = (i / kSlices) % kMaxColumns;
         const CpuExpertJob& job = jobs_[static_cast<std::size_t>(j)];
-        if (c >= job.ncols) { continue; }
+        if (c >= job.ncols || x_owner_[column(j, c)] != static_cast<int>(column(j, c))) { continue; }
         const int emax = canon::a16_column_exponent(job.x[c], hidden);
         if (slice == 0) { x_exp_[column(j, c)] = emax; }
         encode_a16_blocks(job.x[c], emax, slice * slice_blocks, (slice + 1) * slice_blocks,
@@ -148,12 +169,14 @@ void CpuExpertTeam::work_a16(int w) {
         const CpuExpertJob& job = jobs_[static_cast<std::size_t>(j)];
         const canon::A16Block* xb[kMaxColumns];
         std::uint16_t* hv[kMaxColumns];
+        int exps[kMaxColumns];
         for (int c = 0; c < job.ncols; ++c) {
-            xb[c] = &x16_[xs_index(j, c, x_blocks)];
-            hv[c] = &hv_[column(j, c) * intermediate];
+            const int owner = x_owner_[column(j, c)];
+            xb[c]   = &x16_[xs_index(owner / kMaxColumns, owner % kMaxColumns, x_blocks)];
+            exps[c] = x_exp_[static_cast<std::size_t>(owner)];
+            hv[c]   = &hv_[column(j, c) * intermediate];
         }
-        gate_up_units_a16(isa_, shape_, job.record, job.scales, xb, &x_exp_[column(j, 0)], job.ncols, u, u + 1,
-                          hv, prefetch_bytes_);
+        gate_up_units_a16(isa_, shape_, job.record, job.scales, xb, exps, job.ncols, u, u + 1, hv, prefetch_bytes_);
         beat(w);
     }
     barrier();
@@ -178,6 +201,76 @@ void CpuExpertTeam::work_a16(int w) {
         for (int c = 0; c < job.ncols; ++c) { hb[c] = &h16_[h_index(j, c, h_blocks)]; }
         down_rows_a16(isa_, shape_, job.record, job.scales, hb, &h_exp_[column(j, 0)], job.ncols, rg,
                       rg + kRowsPerItem, job.y, prefetch_bytes_);
+        beat(w);
+    }
+}
+
+// The two-term A4 round (NarrowA16::kA4Residual, a4r_expert.h): the A16 round's phases, with x and h
+// encoded as terms under their row scales (each spans a whole column, so every x slice derives it
+// itself and h is encoded in a phase of its own) and the terms' exact sums.
+void CpuExpertTeam::work_a4r(int w) {
+    constexpr int kTerms = canon::kA4ResidualTerms;
+    const int n_jobs = static_cast<int>(jobs_.size());
+    constexpr int kRowsPerItem = 4;
+    const auto column = [](int job, int col) { return static_cast<std::size_t>(job) * kMaxColumns + col; };
+    const auto x_terms = [this](int job, int col) { return &xr_[xs_index(job, col) * kTerms]; };
+    const auto h_terms = [this](int job, int col) { return &hr_[h_index(job, col) * kTerms]; };
+
+    // Phase 0: x terms in slices of a column's blocks; every slice scans the column for its row scale.
+    constexpr int kSlices = 8, kSliceBlocks = kGateUpBlocks / kSlices;
+    static_assert(kGateUpBlocks % kSlices == 0);
+    const int encode_items = n_jobs * kMaxColumns * kSlices;
+    for (int i = next_quantize_.fetch_add(1, std::memory_order_relaxed); i < encode_items;
+         i = next_quantize_.fetch_add(1, std::memory_order_relaxed)) {
+        const int slice = i % kSlices, j = i / (kSlices * kMaxColumns), c = (i / kSlices) % kMaxColumns;
+        const CpuExpertJob& job = jobs_[static_cast<std::size_t>(j)];
+        if (c >= job.ncols || x_owner_[column(j, c)] != static_cast<int>(column(j, c))) { continue; }
+        const float row_scale = a4r_row_scale_of(job.x[c], kHidden);
+        if (slice == 0) { x_scale_[column(j, c)] = row_scale; }
+        encode_a4r_blocks(job.x[c], kGateUpBlocks, row_scale, slice * kSliceBlocks, (slice + 1) * kSliceBlocks,
+                          x_terms(j, c));
+        beat(w);
+    }
+    barrier();
+    // Phase A: gate/up units with SwiGLU, h in BF16.
+    const int unit_items = n_jobs * kHBlocks;
+    for (int i = next_unit_.fetch_add(1, std::memory_order_relaxed); i < unit_items;
+         i = next_unit_.fetch_add(1, std::memory_order_relaxed)) {
+        const int j = i / kHBlocks, u = i % kHBlocks;
+        const CpuExpertJob& job = jobs_[static_cast<std::size_t>(j)];
+        const canon::A4Block* xb[kMaxColumns];
+        std::uint16_t* hv[kMaxColumns];
+        float scales[kMaxColumns];
+        for (int c = 0; c < job.ncols; ++c) {
+            const int owner = x_owner_[column(j, c)];
+            xb[c]     = x_terms(owner / kMaxColumns, owner % kMaxColumns);
+            scales[c] = x_scale_[static_cast<std::size_t>(owner)];
+            hv[c]     = &hv_[column(j, c) * kIntermediate];
+        }
+        gate_up_units_a4r(isa_, job.record, job.scales, xb, scales, job.ncols, u, u + 1, hv, prefetch_bytes_);
+        beat(w);
+    }
+    barrier();
+    // Phase A': each column's h as terms under its row scale.
+    const int h_items = n_jobs * kMaxColumns;
+    for (int i = next_encode_h_.fetch_add(1, std::memory_order_relaxed); i < h_items;
+         i = next_encode_h_.fetch_add(1, std::memory_order_relaxed)) {
+        const int j = i / kMaxColumns, c = i % kMaxColumns;
+        if (c >= jobs_[static_cast<std::size_t>(j)].ncols) { continue; }
+        h_scale_[column(j, c)] = encode_a4r(&hv_[column(j, c) * kIntermediate], kIntermediate, h_terms(j, c));
+        beat(w);
+    }
+    barrier();
+    // Phase B: down row groups.
+    const int row_items = n_jobs * (kDownRowGroups / kRowsPerItem);
+    for (int i = next_rows_.fetch_add(1, std::memory_order_relaxed); i < row_items;
+         i = next_rows_.fetch_add(1, std::memory_order_relaxed)) {
+        const int j = i / (kDownRowGroups / kRowsPerItem), rg = (i % (kDownRowGroups / kRowsPerItem)) * kRowsPerItem;
+        const CpuExpertJob& job = jobs_[static_cast<std::size_t>(j)];
+        const canon::A4Block* hb[kMaxColumns];
+        for (int c = 0; c < job.ncols; ++c) { hb[c] = h_terms(j, c); }
+        down_rows_a4r(isa_, job.record, job.scales, hb, &h_scale_[column(j, 0)], job.ncols, rg, rg + kRowsPerItem,
+                      job.y, prefetch_bytes_);
         beat(w);
     }
 }
@@ -242,7 +335,11 @@ void CpuExpertTeam::work(int w) {
         return;
     }
     if (activation_ == ExpertActivation::kA16) {
-        work_a16(w);
+        if (narrow_a16_ == NarrowA16::kA4Residual) {
+            work_a4r(w);
+        } else {
+            work_a16(w);
+        }
         return;
     }
     const int n_jobs = static_cast<int>(jobs_.size());
@@ -335,6 +432,30 @@ void CpuExpertTeam::run(std::span<const CpuExpertJob> jobs, CpuExpertHeartbeat h
     }
     jobs_      = jobs;
     heartbeat_ = heartbeat;
+    // Each job column's owner: itself, or (INFERNIX_TMP_CPU_SHARED_X) the first column with its x pointer,
+    // found in an open-addressed table of the round's pointers (no allocation on the miss path).
+    const std::size_t mask = owner_keys_.size() - 1;
+    for (std::size_t j = 0; j < jobs.size(); ++j) {
+        for (int c = 0; c < jobs[j].ncols; ++c) {
+            const int self = static_cast<int>(j) * kMaxColumns + c;
+            int owner      = self;
+            if (shared_x_) {
+                const auto key = reinterpret_cast<std::uintptr_t>(jobs[j].x[c]);
+                std::size_t slot = (key >> 4) * 0x9E3779B97F4A7C15ULL >> 20 & mask;
+                while (owner_keys_[slot] != nullptr && owner_keys_[slot] != jobs[j].x[c]) { slot = (slot + 1) & mask; }
+                if (owner_keys_[slot] == nullptr) {
+                    owner_keys_[slot] = jobs[j].x[c];
+                    owner_vals_[slot] = self;
+                    owner_used_[owner_count_++] = static_cast<int>(slot);
+                } else {
+                    owner = owner_vals_[slot];
+                }
+            }
+            x_owner_[static_cast<std::size_t>(self)] = owner;
+        }
+    }
+    for (int i = 0; i < owner_count_; ++i) { owner_keys_[static_cast<std::size_t>(owner_used_[i])] = nullptr; }
+    owner_count_ = 0;
     finished_.store(0, std::memory_order_relaxed);
     next_quantize_.store(0, std::memory_order_relaxed);
     next_unit_.store(0, std::memory_order_relaxed);

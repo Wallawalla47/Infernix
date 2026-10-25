@@ -188,13 +188,15 @@ __device__ __forceinline__ void stage16(uint4* dst, const void* src, bool valid)
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(d), "l"(src), "r"(valid ? 16 : 0) : "memory");
 }
 
+// row_block_offset: the first row block (router-mma computes the rows before it on tensor cores).
 __global__ void __launch_bounds__(kWideThreads, 1)
-    projection_wide_kernel(const bf16* __restrict__ x, int k, int columns, Segments segments, float* __restrict__ out) {
+    projection_wide_kernel(const bf16* __restrict__ x, int k, int columns, Segments segments, float* __restrict__ out,
+                           int row_block_offset) {
     extern __shared__ uint4 stage[]; // [2][rows then columns][kSliceChunks]
     const int chunks       = k / 8;
     const int slices       = (chunks + kSliceChunks - 1) / kSliceChunks;
     const int rows         = total_rows(segments);
-    const int first_row    = static_cast<int>(blockIdx.x) * kWideRows;
+    const int first_row    = (static_cast<int>(blockIdx.x) + row_block_offset) * kWideRows;
     const int first_column = static_cast<int>(blockIdx.y) * kWideColumns;
     const auto issue = [&](int slice, int buffer) {
         uint4* base = stage + buffer * kStageWords;
@@ -508,6 +510,52 @@ void projection_fp32(const Tensor& x, std::span<const Tensor* const> weights, Te
     detail::projection_fp32_route(x, weights, out, detail::ProjectionRoute::Automatic, stream);
 }
 
+void projection_fp32_router_mma(const Tensor& x, std::span<const Tensor* const> weights, Tensor& out,
+                                cudaStream_t stream) {
+    require(x.data != nullptr && x.dtype == DType::BF16 && x.is_contiguous() && x.ne[2] == 1 && x.ne[3] == 1 &&
+                aligned16(x.data),
+            "x must be contiguous, 16-byte aligned BF16 [K, T]");
+    require(out.data != nullptr && out.dtype == DType::FP32 && out.is_contiguous(), "out must be contiguous FP32");
+    const int k = x.ne[0], columns = x.ne[1];
+    require(k > 0 && k <= kMaxK && columns >= kWideMinColumns, "router-mma: K up to 3072 and at least 64 columns");
+    require(!weights.empty() && weights.size() <= kMaxSegments, "between one and four weights");
+    Segments segments{};
+    segments.count = static_cast<int>(weights.size());
+    int rows       = 0;
+    for (std::size_t i = 0; i < weights.size(); ++i) {
+        const Tensor& w = *weights[i];
+        require(w.data != nullptr && w.dtype == DType::BF16 && w.is_contiguous() && w.ne[0] == k && w.ne[1] > 0 &&
+                    w.ne[2] == 1 && w.ne[3] == 1 && aligned16(w.data),
+                "each weight must be contiguous, 16-byte aligned BF16 [K, N]");
+        segments.data[i]  = static_cast<const bf16*>(w.data);
+        segments.begin[i] = rows;
+        rows += w.ne[1];
+    }
+    segments.begin[segments.count] = rows;
+    require(out.ne[0] == rows && out.ne[1] == columns && out.ne[2] == 1 && out.ne[3] == 1,
+            "out must be FP32 [sum N, T]");
+    const int first_rows = weights[0]->ne[1];
+    require(detail::projection_fp32_bf16_wide_mma_supported(first_rows, k) && first_rows % kWideRows == 0,
+            "router-mma: the first weight's rows and K must be multiples of 64");
+    detail::projection_fp32_bf16_wide_mma(x, segments.data[0], first_rows, rows, static_cast<float*>(out.data), stream);
+    if (rows > first_rows) {
+        // The other weights' rows: the wide SIMT kernel's own bits, from the row block after the first weight.
+        static const bool configured = [] {
+            return cudaFuncSetAttribute(projection_wide_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        kWideSharedBytes) == cudaSuccess;
+        }();
+        require(configured, "the wide kernel's shared memory could not be configured");
+        const int offset = first_rows / kWideRows;
+        projection_wide_kernel<<<dim3((rows + kWideRows - 1) / kWideRows - offset, (columns + kWideColumns - 1) / kWideColumns),
+                                 kWideThreads, kWideSharedBytes, stream>>>(
+            static_cast<const bf16*>(x.data), k, columns, segments, static_cast<float*>(out.data), offset);
+    }
+    const cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess) {
+        throw std::runtime_error(std::string("projection_fp32_router_mma: ") + cudaGetErrorString(error));
+    }
+}
+
 void detail::projection_fp32_route(const Tensor& x, const Weight& weight, Tensor& out, ProjectionRoute route,
                                    cudaStream_t stream) {
     require(x.data != nullptr && x.dtype == DType::BF16 && x.is_contiguous() && x.ne[2] == 1 && x.ne[3] == 1,
@@ -586,7 +634,7 @@ void detail::projection_fp32_route(const Tensor& x, std::span<const Tensor* cons
         require(configured, "the wide kernel's shared memory could not be configured");
         projection_wide_kernel<<<dim3((rows + kWideRows - 1) / kWideRows, (columns + kWideColumns - 1) / kWideColumns),
                                  kWideThreads, kWideSharedBytes, stream>>>(
-            static_cast<const bf16*>(x.data), k, columns, segments, static_cast<float*>(out.data));
+            static_cast<const bf16*>(x.data), k, columns, segments, static_cast<float*>(out.data), 0);
     } else if (columns <= kColumns) {
         constexpr int threads = 128, rows_per_warp = 1, rows_per_cta = threads / 32 * rows_per_warp;
         CUDA_CHECK(pdl::launch_consumer({dim3((rows + rows_per_cta - 1) / rows_per_cta, column_groups.y), dim3(threads),

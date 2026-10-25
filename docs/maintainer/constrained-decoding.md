@@ -353,7 +353,10 @@ length and tool-delimiter exclusion still use the constraint-intersection automa
 
 JSON uses the declared field order and admits insignificant whitespace between tokens in runs of at most
 32 characters. A compact-only grammar forces a model that prefers pretty-printed output off its layout:
-Qwen3.8 without thinking then closed the first key empty (`{"":"ok"}`, NInfer #392). String length and pattern grammars
+Qwen3.8 without thinking then closed the first key empty (`{"":"ok"}`, NInfer #392). An object or array
+`const`/`enum` literal admits the same whitespace between its tokens (`LiteralExpression` in the vendored
+`json_schema_converter.cc`); its scalars and keys keep their serialized bytes and the schema's member
+order. String length and pattern grammars
 use canonical JSON escapes; a continuation must be a prefix of this generation language. `pattern`
 searches the string value with classes, groups, alternatives, repetition and `^` / `$` at the ends of
 top-level alternatives. Dot and whitespace classes follow ECMAScript; back-references, zero-width
@@ -384,13 +387,25 @@ allowed_names, Required, None or parallel=false); ordinary Auto with non-strict 
 The non-strict base argument language allows any order and any representable argument name; it does
 not close the argument set from properties or enforce required or value assertions. Complex root
 schemas and open objects do not trigger the strict compiler. Argument values keep the existing
-normalization hints; a repeated argument takes the last value and keeps the first occurrence's
-position, so each key appears once in the published object. Strict arguments generate in declared order
-and forbid repeats.
+normalization hints. A call names each argument once: an open name set has no context-free uniqueness
+rule, so the grammar session carries a companion (`text::GrammarStateConstraint`, the Qwen frontend's
+`ParameterNameConstraint` in `tool_grammar.cpp`) that follows the canonical framing of the tokens the
+matcher accepts and clears, in every lookahead mask, the tokens that would complete a name the call
+has used. It shares the matcher's transaction (lookahead, accept, confirm, discard and the assistant
+continuation) and runs only when a non-strict tool is declared. Strict arguments generate in declared
+order, which forbids repeats already.
+
+Because names never repeat and every value's encoding is known from its parameter before its bytes
+arrive, the output decoder reads constrained calls once as they are generated
+(`ConstrainedToolStream`) and publishes each call's arguments JSON in fragments (`ToolCallDelta`)
+that concatenate to the call's final `arguments_json`: string values as their JSON string, strict JSON
+values verbatim, and a non-strict value whose JSON depends on all of it (a declared non-string type,
+or no declared type) when its parameter closes. The same reader produces the terminal calls, so the
+streamed and aggregate calls cannot differ.
 
 Auto allows zero or more calls; Required at least one; parallel=false limits it to one. OpenAI named
 maps to Required with one name and parallel=false; Anthropic named uses one name and honours
-disable_parallel_tool_use. None keeps the prompt's declarations and forbids generating `<tool_call>`;
+disable_parallel_tool_use. None keeps the prompt's declarations and forbids generating the `<tool_call>` token;
 combined with a content constraint, the content constraint owns the output language. Every choice keeps
 the full declarations and cache-marker positions; none is implemented by editing the prompt's tool list.
 
@@ -404,9 +419,9 @@ Required / named generate calls this turn; after the tool results the next turn 
 the JSON. Every turn still validates against the given JSON schema.
 
 A combination builds one CompiledGrammar and matcher, with the thinking framing outside the union. The
-OutputSession chooses the publication branch at the first committed content character: JSON's first
-characters and `<tool_call>` do not intersect. The JSON branch bypasses tool parsing, so `<tool_call>`
-inside a string stays as written. Preview/discard does not change the branch; a continuation
+OutputSession chooses the publication branch at the first committed content token: the tool branch
+starts with the `<tool_call>` token, which no JSON value starts with. The JSON branch bypasses tool
+parsing, so `<tool_call>` inside a string stays as written. Preview/discard does not change the branch; a continuation
 initializes from its existing content prefix.
 
 Qwen's tool syntax uses the existing `<tool_call>`, `<function=...>`, `<parameter=...>` form. The
@@ -474,20 +489,28 @@ For constrained Chat:
 - an early EOS inside that reasoning branch must be prevented, or a JSON request could "complete
   normally" with only thinking.
 
-The constrained route uses Qwen's canonical reasoning close `\n</think>\n\n`. The close marker and its
-fixed separating newlines are model framing, not user content; grammar and decoder both recognize it,
-and the content bytes after it publish as generated, with no unbounded trimming of leading whitespace.
+The reasoning ends at the model's `</think>` token, recognized by its id, never by its spelling. The
+grammar's reasoning branch is token-level: any token except `</think>` (`ExcludeToken`), then the
+`</think>` token (`Token`) and exactly the separator `\n\n`. The close token and the separator are
+model framing, not user content; grammar and decoder both recognize them by the same rule, and the
+content bytes after the separator publish as generated, with no unbounded trimming of leading
+whitespace. A line break directly before the close token is framing too (the canonical serialization
+is `\n</think>\n\n`) and is not published as reasoning.
 
-Free reasoning must not reach a different phase in decoder and matcher through another early close
-spelling. Model framing rules combine at the token-byte level, across token boundaries and for a token
-that holds both the end of the close and the start of the content.
+Free reasoning cannot reach a different phase in decoder and matcher: `</think>` spelled with ordinary
+tokens is reasoning in both, and the close token without the separator is refused by the grammar. The
+separator is matched at the byte level after the token, so a token that holds both the end of the
+separator and the start of the content is legal.
 
-For example, when a user grammar requires content to start with a space, that space after the canonical
-framing belongs to the content and is kept. JSON mode uses the same boundary rather than relying on
+For example, when a user grammar requires content to start with a space, that space after the
+separator belongs to the content and is kept. JSON mode uses the same boundary rather than relying on
 JSON's ignorable whitespace.
 
-With a content constraint, tool-marker extraction is off and a legal `<tool_call>` string in the
-content publishes as content. Chat content/tool constraints cannot be combined with `output.raw=true` or
+The tool grammars open every call with the model's `<tool_call>` token: Auto's free text is a
+`TokenTagDispatch` on that token, Required and the JSON union start with `Token`, and each further
+call is `\n` and the token. A `<tool_call>` spelled with ordinary tokens is free text, as the output
+decoder reads it. With a content constraint, tool-marker extraction is off and a legal `<tool_call>`
+string in the content publishes as content. Chat content/tool constraints cannot be combined with `output.raw=true` or
 options that publish special-token text; a raw token/text grammar publishes all its new text and hides
 the terminating EOS.
 
@@ -514,9 +537,13 @@ sequence must be the content the caller continues. When the template changes the
 unexplained content framing, request preparation fails, rather than guessing from the user string or
 token length.
 
-Initialization works on byte prefixes: a prompt BPE token may contain bytes outside the content start,
-so the prompt's token sequence is not fed to the matcher. It belongs to the request start, consumes no
-generation budget or RNG and is not repeated during Replay.
+Initialization works on the content prefix, not on the prompt's tokens: a prompt BPE token may contain
+bytes outside the content start, so the prompt's token sequence is not fed to the matcher. Content
+constraints accept the prefix as bytes. A tool grammar is token-level in its free text and call
+openers, so the Frontend gives it the prefix as tokens: each `<tool_call>` the client spelled as the
+`<tool_call>` token (the decoder likewise reads it as the opener the prefix continues), every other
+byte as its byte-level token. It belongs to the request start, consumes no generation budget or RNG
+and is not repeated during Replay.
 
 Only the new suffix is published. Completeness covers "provided content + new suffix": a prefix
 `{"name":` and a suffix `"Shanghai"}` form a complete object without the suffix being JSON on its own.
@@ -664,7 +691,9 @@ beyond the original 20th.
 
 When fewer legal candidates exist than top-k, the support uses the actual count; negative-infinity
 padding is never a samplable token. An empty mask and non-finite model values are reported separately
-and never continue through token 0 or NaN.
+and never continue through token 0 or NaN: a row without a finite selection sets its
+`SamplingConfig::nonfinite` flag and writes token 0 only as an in-range placeholder, and the Program
+reports the row as `PendingRowFailure::NonFiniteLogits`, so the token is never committed.
 
 ### 7.4 P, Q and history
 
@@ -873,7 +902,9 @@ not change the nonterminal/terminal accepted-prefix rules of successful rows.
 
 Non-finite logits, illegal indices or inconsistent mask/position metadata on the device are
 implementation or numerical errors, never interpreted as "the user's grammar has no solution". No path
-normalizes an all-negative-infinity support.
+normalizes an all-negative-infinity support. A row whose logits leave no finite selection carries
+`PendingRowFailure::NonFiniteLogits` instead of the dead-end result through the same per-row path:
+it commits nothing and its request fails with an internal error while the other rows commit.
 
 ### 10.3 Normal completion and explicit interruption
 

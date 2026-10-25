@@ -43,6 +43,7 @@
 #include "core/vmm_arena.h"
 #include "core/vram_budget.h"
 #include "runtime/expert_offload/expert_cache.h"
+#include "runtime/expert_offload/route_predictor.h"
 
 #include <cuda_runtime.h>
 
@@ -227,15 +228,21 @@ public:
     // promotions one layer's routes may start. A non-empty `live` (one flag per column) credits
     // only the flagged columns' experts: a verification round's rejected draft columns neither
     // count as uses nor start promotions (design section 11.3). A layer's landed experts are adopted
-    // first and use up its budget: max(0, per_layer_budget - landed) promotions remain.
+    // first and use up its budget: max(0, per_layer_budget - landed) promotions remain. `lanes` (one
+    // per row of columns / rows; empty: one row) feed the route predictor of INFERNIX_TMP_ROUTE_PROTECT.
     void after_round(cudaStream_t compute, std::int32_t columns, std::size_t per_layer_budget,
-                     std::span<const std::uint8_t> live = {});
+                     std::span<const std::uint8_t> live = {}, std::span<const std::int32_t> lanes = {});
     // At a prompt's end (design §19.3.27): every key with uses[key] > 0 (the prompt's tokens that
-    // routed to it, [layers][experts]) gains `scale * uses[key]` of LFRU count, used now. Nothing is
-    // copied: the credit ranks the decode's admissions and evictions.
-    void seed_prompt(std::span<const std::uint32_t> uses, double scale);
+    // routed to it, [layers][experts]) gains `scale * uses[key]` of LFRU count, used now. With no
+    // budget nothing is copied: the credit ranks the decode's admissions and evictions. A positive
+    // `per_layer_budget` (INFERNIX_TMP_PROMPT_SEED, a temporary A/B) also loads up to that many of each
+    // layer's credited misses that outrank its pool's lowest resident, as a round boundary would (call
+    // between rounds, with the compute stream quiescent).
+    void seed_prompt(std::span<const std::uint32_t> uses, double scale, std::size_t per_layer_budget = 0,
+                     cudaStream_t compute = nullptr);
 
     [[nodiscard]] const Stats& stats() const noexcept { return stats_; }
+    [[nodiscard]] bool frozen() const noexcept { return frozen_; }
     // The layer split of stats().routed and stats().hits: cumulative routed (layer, expert) uses
     // and resident-at-round-start hits per layer, indexed by layer. Exact counters, fixed at
     // construction, so the decode path only adds to them.
@@ -269,6 +276,9 @@ private:
     void release_reservations();
     // Publishes the promotions whose copies have completed.
     void publish_landed();
+    // TEMPORARY (INFERNIX_TMP_REPLAY_BENCH): waits for and publishes every issued load, then holds
+    // the residency fixed (no admission, eviction, landing or prompt seed; hits and routes still count).
+    void freeze(cudaStream_t compute);
     // Issues the pending loads (load_commands_) on the copy stream, after the table update on `compute`.
     void issue_loads(cudaStream_t compute);
     // Moves a pool's kCopy commands to load_commands_ (keys are global, so the pool is the key's).
@@ -335,6 +345,14 @@ private:
     std::vector<std::uint64_t> routed_by_layer_, hits_by_layer_; // per layer, indexed by layer
 
     HostExpertTier* tier_ = nullptr;
+    // TEMPORARY (INFERNIX_TMP_ROUTE_PROTECT=<experts per layer and lane>, candidates §13 PUB-22): the
+    // route predictor whose next keys each layer's evictions spare; null without the switch.
+    std::unique_ptr<expert_cache::RoutePredictor> predictor_;
+    // TEMPORARY (INFERNIX_TMP_REPLAY_BENCH=<rounds>, candidates §8.5 CF-03): the residency freezes at the
+    // first round boundary after that many rounds (-1: never), so A/B arms replaying the same greedy
+    // request see the same hits and misses.
+    std::int64_t freeze_after_ = -1;
+    bool frozen_               = false;
     expert_cache::LfruPolicy::Admissible admissible_;
     DeviceBuffer records_device_;       // tier: const uint8_t* [layers][experts]
     PinnedHostBuffer records_host_{1};

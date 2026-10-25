@@ -1,4 +1,5 @@
 #include "ops/softmax_attention/dense/causal_cache/int8/launch.h"
+#include "core/temporary_switches.h"
 #include "ops/softmax_attention/dense/causal_cache/int8/fast_tiled_launch.cuh"
 #include "ops/softmax_attention/dense/causal_cache/int8/instances.h"
 #include "ops/softmax_attention/dense/causal_cache/int8/plan.h"
@@ -8,17 +9,35 @@
 namespace infernix::ops::detail {
 namespace {
 
+// TEMPORARY (INFERNIX_TMP_INT8_PIPELINED16): Int8KvGroupedInstance::kPipelinable16 rows take the
+// pipelined kernel, until its op bench and the 35B MTP A/B.
+bool int8_pipelined16() {
+    static const bool enabled = temporary_switches::flag("INFERNIX_TMP_INT8_PIPELINED16");
+    return enabled;
+}
+
 template <class G, int Tokens, class Input, bool Writable>
 void grouped(const CausalAttentionOperands& p, Int8KvCacheView<Writable> cache, Input input,
              CausalKvPartition partition, CausalPartialView partial, cudaStream_t stream) {
     using Instance    = Int8KvGroupedInstance<G, Tokens>;
     const auto invoke = [&]<bool MultiBatch, bool Masked>() {
-        if constexpr (Instance::kPipelined)
-            launch_int8_kv_grouped_pipelined<G, Tokens, MultiBatch, Masked>(
-                p, cache, input, partition, partial, stream);
-        else
-            launch_int8_kv_grouped_mma<G, typename Instance::Schedule, MultiBatch, Masked>(
-                p, cache, input, partition, partial, stream);
+        // Each kernel is instantiated only where a row may take it (the pipelined kernel's geometry
+        // asserts).
+        if constexpr (Instance::kPipelined) {
+            launch_int8_kv_grouped_pipelined<G, Tokens, MultiBatch, Masked>(p, cache, input, partition, partial,
+                                                                            stream);
+        } else if constexpr (Instance::kPipelinable16) {
+            if (int8_pipelined16()) {
+                launch_int8_kv_grouped_pipelined<G, Tokens, MultiBatch, Masked>(p, cache, input, partition, partial,
+                                                                                stream);
+            } else {
+                launch_int8_kv_grouped_mma<G, typename Instance::Schedule, MultiBatch, Masked>(
+                    p, cache, input, partition, partial, stream);
+            }
+        } else {
+            launch_int8_kv_grouped_mma<G, typename Instance::Schedule, MultiBatch, Masked>(p, cache, input, partition,
+                                                                                         partial, stream);
+        }
         launch_causal_natural_merge<G, typename Instance::Merge, MultiBatch, Masked, false>(
             p, cache.valid_columns, partition, partial, stream);
     };
@@ -177,6 +196,28 @@ void int8_kv_cached_attention(const Tensor& q, const Tensor& positions, float sc
     else
         execute_grouped(q, positions, scale, view, nullptr, nullptr, nullptr, CausalCachedInput{},
                         plan, workspace, out, stream);
+}
+
+void int8_kv_cached_rows_attention(const Tensor& q, const Tensor& positions, const Tensor& valid,
+                                   const Tensor& rows, float scale, PagedKVBatchLayerView cache,
+                                   CausalAttentionExecutionEnvelope envelope, std::int32_t call_batch,
+                                   WorkspaceArena& workspace, Tensor& out, DeviceExecutionView execution) {
+    auto plan = make_int8_kv_causal_plan(q.ne[1], 1, call_batch, envelope,
+                                         execution.multiprocessor_count);
+    if (plan.family != Int8KvFamily::Grouped || q.ne[2] != 1)
+        throw std::logic_error("INT8 attention: one-column rows take the grouped route");
+    plan.batch = q.ne[3];
+    execute_grouped(q, positions, scale, cache, &valid, &rows, nullptr, CausalCachedInput{}, plan,
+                    workspace, out, execution.stream);
+}
+
+std::size_t int8_kv_cached_rows_workspace_bytes(int heads, int call_batch, int rows,
+                                                CausalAttentionExecutionEnvelope envelope,
+                                                int multiprocessor_count) {
+    const auto plan = make_int8_kv_causal_plan(heads, 1, call_batch, envelope, multiprocessor_count);
+    WorkspaceLayoutBuilder layout;
+    (void)allocate_causal_partials(layout, heads, 1, plan.partition.capacity, rows);
+    return layout.peak_bytes(1);
 }
 
 } // namespace infernix::ops::detail

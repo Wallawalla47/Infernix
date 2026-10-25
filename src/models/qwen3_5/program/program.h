@@ -62,7 +62,7 @@ public:
     [[nodiscard]] std::size_t device_reservation_bytes() const noexcept;
     [[nodiscard]] std::size_t workspace_capacity_bytes() const noexcept;
     [[nodiscard]] std::size_t host_capacity_bytes() const noexcept;
-    // Whether automatic DFlash2 tree widths are active: requested and verifiable by the target.
+    // Whether automatic tree widths are active: requested and verifiable by the target.
     [[nodiscard]] bool draft_tree_auto() const noexcept;
     // The effective prefill chunk, and the width a prefill step takes while no other lane waits
     // to decode (idle-wide-prefill; the chunk when that fast path is off).
@@ -246,7 +246,7 @@ public:
           transaction_(std::exchange(other.transaction_, 0)), rows_(other.rows_),
           row_count_(std::exchange(other.row_count_, 0)), tokens_(other.tokens_),
           row_counts_(other.row_counts_), row_stride_(other.row_stride_), timing_(other.timing_),
-          constraint_failed_(other.constraint_failed_) {
+          row_failures_(other.row_failures_) {
         other.tokens_     = {};
         other.row_counts_ = {};
         other.row_stride_ = 0;
@@ -265,8 +265,9 @@ public:
 
     [[nodiscard]] std::uint32_t row_stride() const noexcept { return row_stride_; }
 
-    [[nodiscard]] bool constraint_failed(std::size_t row) const {
-        return constraint_failed_.at(row);
+    // Why the row cannot commit (None: it can).
+    [[nodiscard]] runtime::PendingRowFailure row_failure(std::size_t row) const {
+        return row_failures_.at(row);
     }
 
     [[nodiscard]] runtime::ExecutionTiming execution_timing() const noexcept { return timing_; }
@@ -280,7 +281,7 @@ private:
     std::span<const std::int32_t> row_counts_;
     std::uint32_t row_stride_ = 0;
     runtime::ExecutionTiming timing_;
-    std::array<bool, kMaximumConcurrency> constraint_failed_{};
+    std::array<runtime::PendingRowFailure, kMaximumConcurrency> row_failures_{};
 
     friend struct detail::ContractAccess;
 };
@@ -329,6 +330,9 @@ struct FinishResult {
     std::vector<ConstrainedDraw> constrained_draws;
     // An artifact with offloaded experts: the request's routed-expert lookups and VRAM hits.
     std::optional<ExpertCacheStats> expert_cache;
+    // With the prefix cache: the prompt tokens past the reused prefix whose state this request's
+    // snapshots made reusable (its deepest snapshot within the prompt).
+    std::optional<std::uint32_t> cache_created_prompt_tokens;
 };
 
 struct AbortResult {
@@ -511,4 +515,8 @@ private:
 // ones for its drafter (auto_ngram_settings), 0 where none was measured faster, and returns the
 // window. Call it before the frontend is made (whether prompts build copy sources follows the window).
 [[nodiscard]] std::uint32_t resolve_auto_ngram(const Model&, EngineOptions&);
+// TEMPORARY (A/B of the MTP drafting package, rank 5 of the 2026-10-21 candidates): the values of the
+// INFERNIX_TMP_QWEN35_MTP_* switches, read once from the environment, and what this configuration's
+// schedule makes of them and of --spec-min-p, for the startup log.
+[[nodiscard]] std::string mtp_draft_switch_report(const execution::Parameters&, const EngineOptions&);
 } // namespace infernix::models::qwen3_5

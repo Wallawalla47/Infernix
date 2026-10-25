@@ -1,3 +1,4 @@
+#include "ops/op_family.h"
 #include "core/weight.h"
 #include "infernix/ops/context_kv_materialize.h"
 
@@ -566,7 +567,7 @@ int run_geometry(int layers, int hidden, double theta) {
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(context_kv_materialize) {
     try {
         if (cuda_unavailable()) {
             std::cout << "context_kv_materialize: SKIP (CUDA unavailable)\n";

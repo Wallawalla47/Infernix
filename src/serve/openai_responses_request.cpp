@@ -3,6 +3,7 @@
 #include "serve/request_validation.h"
 
 #include <algorithm>
+#include <deque>
 #include <iterator>
 #include <optional>
 #include <stdexcept>
@@ -135,8 +136,11 @@ infernix::product::media_acquire::Source parse_image_source(const Json& part) {
         if (!part.at("detail").is_string()) {
             bad_request("input_image.detail must be a string", "input");
         }
-        if (part.at("detail").get<std::string>() != "auto") {
-            bad_request("only input_image detail 'auto' is supported", "input",
+        // 'high' is the model's native full-quality preprocessing, as 'auto' (chat's
+        // image_url.detail too).
+        const std::string& detail = part.at("detail").get_ref<const std::string&>();
+        if (detail != "auto" && detail != "high") {
+            bad_request("only input_image detail 'auto' or 'high' is supported", "input",
                         "image_detail_not_supported");
         }
     }
@@ -647,6 +651,203 @@ private:
     AssistantInputPhase phase = AssistantInputPhase::Empty;
 };
 
+struct ParsedFunctionTool {
+    ToolDefinition definition;
+    Json canonical;
+    std::string engine_name;
+};
+
+ParsedFunctionTool parse_function_tool(
+    const Json& item, std::optional<std::string> wire_namespace,
+    std::string_view namespace_description,
+    std::unordered_map<std::string, OpenAIResponsesFunctionIdentity>& identities,
+    std::string schema_param);
+ParsedFunctionTool
+parse_custom_tool(const Json& item, std::optional<std::string> wire_namespace,
+                  std::string_view namespace_description,
+                  std::unordered_map<std::string, OpenAIResponsesFunctionIdentity>& identities);
+
+// The definitions a tool_search_output or additional_tools Item loads, parsed as request tools.
+std::vector<ToolDefinition>
+parse_loaded_tools(const Json& tools,
+                   std::unordered_map<std::string, OpenAIResponsesFunctionIdentity>& identities) {
+    if (!tools.is_array()) { bad_request("loaded tools must be an array", "input"); }
+    static const std::unordered_set<std::string> namespace_members = {"type", "name", "description",
+                                                                      "tools"};
+    std::vector<ToolDefinition> loaded;
+    const auto add = [&](ParsedFunctionTool parsed) {
+        if (std::any_of(loaded.begin(), loaded.end(), [&](const ToolDefinition& tool) {
+                return tool.name == parsed.definition.name;
+            })) {
+            return;
+        }
+        parsed.definition.deferred     = false;
+        parsed.definition.schema_param = "input";
+        loaded.push_back(std::move(parsed.definition));
+    };
+    for (const Json& tool : tools) {
+        if (!tool.is_object() || !tool.contains("type") || !tool.at("type").is_string()) {
+            bad_request("loaded tools must be objects with a string type", "input");
+        }
+        const std::string type = tool.at("type").get<std::string>();
+        if (type == "function") {
+            add(parse_function_tool(tool, std::nullopt, {}, identities, "input"));
+        } else if (type == "custom") {
+            add(parse_custom_tool(tool, std::nullopt, {}, identities));
+        } else if (type == "namespace") {
+            reject_nonnull_unknown_members(tool, namespace_members, "input");
+            const std::string name = require_namespace_tool_name(tool);
+            std::string description;
+            if (tool.contains("description") && tool.at("description").is_string()) {
+                description = tool.at("description").get<std::string>();
+            }
+            if (!tool.contains("tools") || !tool.at("tools").is_array()) {
+                bad_request("namespace tools must contain a tools array", "input");
+            }
+            for (const Json& nested : tool.at("tools")) {
+                const std::string nested_type =
+                    nested.is_object() && nested.contains("type") && nested.at("type").is_string()
+                        ? nested.at("type").get<std::string>()
+                        : std::string();
+                if (nested_type == "function") {
+                    add(parse_function_tool(nested, name, description, identities, "input"));
+                } else if (nested_type == "custom") {
+                    add(parse_custom_tool(nested, name, description, identities));
+                } else {
+                    bad_request("a loaded namespace may contain only function and custom tools",
+                                "input", "tool_type_not_supported");
+                }
+            }
+        } else {
+            bad_request("loaded tool type '" + type + "' cannot be represented by the Engine",
+                        "input", "tool_type_not_supported");
+        }
+    }
+    return loaded;
+}
+
+std::string parse_search_execution(const Json& item, const char* kind) {
+    if (!item.contains("execution") || item.at("execution").is_null()) { return "server"; }
+    if (!item.at("execution").is_string() ||
+        (item.at("execution") != "server" && item.at("execution") != "client")) {
+        bad_request(std::string(kind) + " execution must be 'server' or 'client'", "input");
+    }
+    return item.at("execution").get<std::string>();
+}
+
+void require_completed_search_item(const Json& item, const char* kind) {
+    if (item.contains("status") && !item.at("status").is_null() &&
+        (!item.at("status").is_string() || item.at("status").get<std::string>() != "completed")) {
+        bad_request(std::string("partial ") + kind + " Items cannot be represented in model history",
+                    "input", "partial_tool_call_not_supported");
+    }
+}
+
+std::optional<std::string> optional_call_id(const Json& item, const char* kind) {
+    if (!item.contains("call_id") || item.at("call_id").is_null()) { return std::nullopt; }
+    if (!item.at("call_id").is_string() || item.at("call_id").get_ref<const std::string&>().empty()) {
+        bad_request(std::string(kind) + ".call_id must be a non-empty string or null", "input");
+    }
+    return item.at("call_id").get<std::string>();
+}
+
+// A tool_search_call is the model's call of the tool_search function. A hosted call has no
+// call_id: its output is the next hosted tool_search_output, matched in order.
+ToolCall parse_tool_search_call_item(
+    const Json& item, Json& canonical,
+    std::unordered_map<std::string, OpenAIResponsesFunctionIdentity>& identities,
+    std::deque<std::string>& pending_hosted) {
+    static const std::unordered_set<std::string> allowed = {"id",        "type",      "call_id",
+                                                            "execution", "arguments", "status"};
+    reject_nonnull_unknown_members(item, allowed, "input");
+    const std::string execution = parse_search_execution(item, "tool_search_call");
+    require_completed_search_item(item, "tool_search_call");
+    if (!item.contains("arguments") || item.at("arguments").is_null()) {
+        bad_request("tool_search_call must contain arguments", "input");
+    }
+    Json arguments = item.at("arguments");
+    if (arguments.is_string()) {
+        arguments = Json::parse(item.at("arguments").get<std::string>(), nullptr, false);
+    }
+    if (arguments.is_discarded() || !arguments.is_object()) {
+        bad_request("tool_search_call arguments must be an object or encode one", "input");
+    }
+    const std::optional<std::string> call_id = optional_call_id(item, "tool_search_call");
+    if (execution == "client" && !call_id) {
+        bad_request("a client tool_search_call must contain a call_id", "input");
+    }
+    const std::string id = item_id(item, "tsc");
+    ToolCall call;
+    call.id   = call_id.value_or(id);
+    call.name = lower_function_identity(
+        OpenAIResponsesFunctionIdentity{.name = kToolSearchFunctionName, .tool_search = true},
+        identities, "input");
+    call.arguments_json = arguments.dump();
+    if (!call_id) { pending_hosted.push_back(call.id); }
+    canonical = {{"id", id},
+                 {"type", "tool_search_call"},
+                 {"execution", execution},
+                 {"call_id", call_id ? Json(*call_id) : Json(nullptr)},
+                 {"status", "completed"},
+                 {"arguments", std::move(arguments)}};
+    return call;
+}
+
+ChatTurn parse_tool_search_output_item(
+    const Json& item, Json& canonical,
+    std::unordered_map<std::string, OpenAIResponsesFunctionIdentity>& identities,
+    std::deque<std::string>& pending_hosted) {
+    static const std::unordered_set<std::string> allowed = {"id",        "type",  "call_id",
+                                                            "execution", "tools", "status"};
+    reject_nonnull_unknown_members(item, allowed, "input");
+    const std::string execution = parse_search_execution(item, "tool_search_output");
+    require_completed_search_item(item, "tool_search_output");
+    if (!item.contains("tools") || !item.at("tools").is_array()) {
+        bad_request("tool_search_output must contain a tools array", "input");
+    }
+    const std::optional<std::string> call_id = optional_call_id(item, "tool_search_output");
+    std::string result_id;
+    if (call_id) {
+        result_id = *call_id;
+    } else if (!pending_hosted.empty()) {
+        result_id = pending_hosted.front();
+        pending_hosted.pop_front();
+    } else {
+        bad_request("a tool_search_output without call_id must follow a hosted tool_search_call",
+                    "input", "invalid_tool_history");
+    }
+    ChatTurn turn = lower_openai_tool_search_output(item.at("tools"), result_id, identities);
+    canonical     = {{"id", item_id(item, "tso")},
+                     {"type", "tool_search_output"},
+                     {"execution", execution},
+                     {"call_id", call_id ? Json(*call_id) : Json(nullptr)},
+                     {"status", "completed"},
+                     {"tools", item.at("tools")}};
+    return turn;
+}
+
+// additional_tools loads its tools at its position, as a developer instruction.
+ChatTurn parse_additional_tools_item(
+    const Json& item, Json& canonical,
+    std::unordered_map<std::string, OpenAIResponsesFunctionIdentity>& identities) {
+    static const std::unordered_set<std::string> allowed = {"id", "type", "role", "tools"};
+    reject_nonnull_unknown_members(item, allowed, "input");
+    if (item.contains("role") && !item.at("role").is_null() && item.at("role") != "developer") {
+        bad_request("additional_tools role must be 'developer'", "input");
+    }
+    if (!item.contains("tools") || !item.at("tools").is_array() || item.at("tools").empty()) {
+        bad_request("additional_tools must contain a non-empty tools array", "input");
+    }
+    ChatTurn turn;
+    turn.role         = ChatRole::Developer;
+    turn.loaded_tools = parse_loaded_tools(item.at("tools"), identities);
+    canonical         = {{"id", item_id(item, "at")},
+                         {"type", "additional_tools"},
+                         {"role", "developer"},
+                         {"tools", item.at("tools")}};
+    return turn;
+}
+
 void parse_input(const Json& input, OpenAIResponsesPromptRequest& out,
                  std::unordered_map<std::string, OpenAIResponsesFunctionIdentity>& identities) {
     Json values;
@@ -661,6 +862,7 @@ void parse_input(const Json& input, OpenAIResponsesPromptRequest& out,
     AssistantInputRun assistant;
     std::size_t breakpoint_count = 0;
     std::unordered_set<std::string> item_ids;
+    std::deque<std::string> pending_hosted_searches;
     for (std::size_t index = 0; index < values.size(); ++index) {
         const Json& item = values.at(index);
         if (!item.is_object()) {
@@ -699,6 +901,18 @@ void parse_input(const Json& input, OpenAIResponsesPromptRequest& out,
                                                               identities, type == "custom_tool_call_output");
             assistant.flush(out.input_turns);
             out.input_turns.push_back(std::move(result));
+        } else if (type == "tool_search_call") {
+            assistant.append_call(parse_tool_search_call_item(item, canonical, identities,
+                                                              pending_hosted_searches));
+        } else if (type == "tool_search_output") {
+            ChatTurn result = parse_tool_search_output_item(item, canonical, identities,
+                                                            pending_hosted_searches);
+            assistant.flush(out.input_turns);
+            out.input_turns.push_back(std::move(result));
+        } else if (type == "additional_tools") {
+            ChatTurn tools = parse_additional_tools_item(item, canonical, identities);
+            assistant.flush(out.input_turns);
+            out.input_turns.push_back(std::move(tools));
         } else if (type == "input_file") {
             bad_request("input_file requires a Files API, which Infernix does not provide", "input",
                         "file_inputs_not_supported");
@@ -719,12 +933,6 @@ struct ParsedPromptFields {
     Json wire_tool_choice    = "auto";
     bool parallel_tool_calls = true;
     std::unordered_map<std::string, OpenAIResponsesFunctionIdentity> tool_identities;
-};
-
-struct ParsedFunctionTool {
-    ToolDefinition definition;
-    Json canonical;
-    std::string engine_name;
 };
 
 ParsedFunctionTool
@@ -777,10 +985,7 @@ parse_function_tool(const Json& item, std::optional<std::string> wire_namespace,
         if (!item.at("defer_loading").is_boolean()) {
             bad_request("function defer_loading must be a boolean", "tools");
         }
-        if (item.at("defer_loading").get<bool>()) {
-            bad_request("deferred tool loading is not supported", "tools",
-                        "deferred_tools_not_supported");
-        }
+        parsed.definition.deferred = item.at("defer_loading").get<bool>();
     }
     if (item.contains("allowed_callers") && !item.at("allowed_callers").is_null()) {
         const Json& callers = item.at("allowed_callers");
@@ -816,7 +1021,7 @@ parse_function_tool(const Json& item, std::optional<std::string> wire_namespace,
         parsed.canonical["allowed_callers"] = item.at("allowed_callers");
     }
     if (item.contains("defer_loading") && !item.at("defer_loading").is_null()) {
-        parsed.canonical["defer_loading"] = false;
+        parsed.canonical["defer_loading"] = parsed.definition.deferred;
     }
     return parsed;
 }
@@ -854,10 +1059,7 @@ parse_custom_tool(const Json& item, std::optional<std::string> wire_namespace,
         if (!item.at("defer_loading").is_boolean()) {
             bad_request("custom tool defer_loading must be a boolean", "tools");
         }
-        if (item.at("defer_loading").get<bool>()) {
-            bad_request("deferred tool loading is not supported", "tools",
-                        "deferred_tools_not_supported");
-        }
+        parsed.definition.deferred = item.at("defer_loading").get<bool>();
     }
 
     Json format = Json{{"type", "text"}};
@@ -903,9 +1105,81 @@ parse_custom_tool(const Json& item, std::optional<std::string> wire_namespace,
     parsed.canonical = {{"type", "custom"}, {"name", identity.name}, {"format", std::move(format)}};
     if (!tool_description.empty()) { parsed.canonical["description"] = std::move(tool_description); }
     if (item.contains("defer_loading") && !item.at("defer_loading").is_null()) {
-        parsed.canonical["defer_loading"] = false;
+        parsed.canonical["defer_loading"] = parsed.definition.deferred;
     }
     return parsed;
+}
+
+// The tool_search tool as the model sees it. A client search shows the client's description and
+// parameters; a hosted one lists the catalog of loadable paths in its description, filled in once
+// every tool is parsed.
+constexpr std::string_view kClientToolSearchDescription =
+    "Search for the tools needed to continue the task. The result loads their definitions, and "
+    "you can call them as soon as it arrives.";
+constexpr std::string_view kClientToolSearchParameters =
+    R"({"type":"object","properties":{"query":{"type":"string","description":"What the needed tools should do."}},"required":["query"]})";
+constexpr std::string_view kHostedToolSearchParameters =
+    R"({"type":"object","properties":{"paths":{"type":"array","items":{"type":"string"},"description":"Names of the namespaces or deferred functions to load."}},"required":["paths"]})";
+
+std::string hosted_tool_search_description(const std::vector<OpenAIResponsesSearchPath>& paths) {
+    std::string text = "Load deferred tools: tools you can call only after they are loaded. Pass "
+                       "the names to load in paths; the result lists the loaded definitions, and "
+                       "you can call them as soon as it arrives.\n\nDeferred tools:";
+    if (paths.empty()) { text += "\n(none)"; }
+    for (const OpenAIResponsesSearchPath& path : paths) {
+        text += "\n- " + path.path;
+        if (path.wire.value("type", "") == "namespace") { text += " (namespace)"; }
+        const std::string description = path.wire.value("description", "");
+        if (!description.empty()) { text += ": " + description; }
+    }
+    return text;
+}
+
+Json parse_tool_search_tool(const Json& item, ParsedPromptFields& out, std::size_t wire_index) {
+    static const std::unordered_set<std::string> allowed = {"type", "execution", "description",
+                                                            "parameters"};
+    reject_nonnull_unknown_members(item, allowed, "tools");
+    std::string execution = "server";
+    if (item.contains("execution") && !item.at("execution").is_null()) {
+        if (!item.at("execution").is_string() ||
+            (item.at("execution") != "server" && item.at("execution") != "client")) {
+            bad_request("tool_search execution must be 'server' or 'client'", "tools");
+        }
+        execution = item.at("execution").get<std::string>();
+    }
+    if (item.contains("description") && !item.at("description").is_null() &&
+        !item.at("description").is_string()) {
+        bad_request("tool_search description must be a string", "tools");
+    }
+    if (item.contains("parameters") && !item.at("parameters").is_null() &&
+        !item.at("parameters").is_object()) {
+        bad_request("tool_search parameters must be a JSON object", "tools");
+    }
+    const bool client = execution == "client";
+    ToolDefinition definition;
+    definition.name = lower_function_identity(
+        OpenAIResponsesFunctionIdentity{.name = kToolSearchFunctionName, .tool_search = true},
+        out.tool_identities, "tools");
+    definition.schema_param = "tools/" + std::to_string(wire_index) + "/parameters";
+    if (client) {
+        definition.description = item.contains("description") && item.at("description").is_string()
+                                     ? item.at("description").get<std::string>()
+                                     : std::string(kClientToolSearchDescription);
+        definition.input_schema_json = item.contains("parameters") && item.at("parameters").is_object()
+                                           ? item.at("parameters").dump()
+                                           : std::string(kClientToolSearchParameters);
+    } else {
+        // The catalog is the description; a client description or schema has no hosted meaning.
+        definition.input_schema_json = std::string(kHostedToolSearchParameters);
+    }
+    out.prompt.generation.tools.push_back(std::move(definition));
+    out.prompt.tool_search = OpenAIResponsesToolSearch{.server = !client};
+
+    Json canonical{{"type", "tool_search"}, {"execution", execution}};
+    for (const char* key : {"description", "parameters"}) {
+        if (item.contains(key) && !item.at(key).is_null()) { canonical[key] = item.at(key); }
+    }
+    return canonical;
 }
 
 void parse_tools(const Json& body, ParsedPromptFields& out) {
@@ -916,13 +1190,19 @@ void parse_tools(const Json& body, ParsedPromptFields& out) {
                                                                       "tools"};
     std::unordered_set<std::string> declared_names;
     std::unordered_set<std::string> namespace_names;
+    std::optional<std::size_t> search_definition;
+    std::vector<OpenAIResponsesSearchPath> search_paths;
+    bool deferred = false;
+    // Adds a declaration and returns its canonical Item with whether it is deferred.
     const auto append_function = [&](ParsedFunctionTool parsed) {
         if (!declared_names.insert(parsed.engine_name).second) {
             bad_request("duplicate function tool identity: " + parsed.engine_name, "tools",
                         "duplicate_tool_name");
         }
+        const bool deferred_tool = parsed.definition.deferred;
+        deferred                 = deferred || deferred_tool;
         out.prompt.generation.tools.push_back(std::move(parsed.definition));
-        return std::move(parsed.canonical);
+        return std::pair<Json, bool>(std::move(parsed.canonical), deferred_tool);
     };
 
     for (const Json& item : body.at("tools")) {
@@ -930,15 +1210,28 @@ void parse_tools(const Json& body, ParsedPromptFields& out) {
             bad_request("tools entries must be objects with a string type", "tools");
         }
         const std::string type = item.at("type").get<std::string>();
-        if (type == "function") {
-            out.wire_tools.push_back(append_function(parse_function_tool(
-                item, std::nullopt, {}, out.tool_identities,
-                "tools/" + std::to_string(out.wire_tools.size()) + "/parameters")));
+        if (type == "function" || type == "custom") {
+            auto [canonical, deferred_tool] = append_function(
+                type == "function"
+                    ? parse_function_tool(item, std::nullopt, {}, out.tool_identities,
+                                          "tools/" + std::to_string(out.wire_tools.size()) +
+                                              "/parameters")
+                    : parse_custom_tool(item, std::nullopt, {}, out.tool_identities));
+            if (deferred_tool) {
+                search_paths.push_back(
+                    OpenAIResponsesSearchPath{.path = item.at("name").get<std::string>(),
+                                              .wire = nlohmann::json::parse(canonical.dump())});
+            }
+            out.wire_tools.push_back(std::move(canonical));
             continue;
         }
-        if (type == "custom") {
-            out.wire_tools.push_back(
-                append_function(parse_custom_tool(item, std::nullopt, {}, out.tool_identities)));
+        if (type == "tool_search") {
+            if (search_definition) {
+                bad_request("only one tool_search tool may be declared", "tools",
+                            "duplicate_tool_name");
+            }
+            out.wire_tools.push_back(parse_tool_search_tool(item, out, out.wire_tools.size()));
+            search_definition = out.prompt.generation.tools.size() - 1U;
             continue;
         }
         if (type != "namespace") {
@@ -967,27 +1260,50 @@ void parse_tools(const Json& body, ParsedPromptFields& out) {
         Json canonical = {
             {"type", "namespace"}, {"name", namespace_name}, {"tools", Json::array()}};
         if (!namespace_description.empty()) { canonical["description"] = namespace_description; }
+        // A hosted search loads the namespace's deferred members together; the listed ones are
+        // callable from the start.
+        Json deferred_members = Json::array();
         for (const Json& nested : item.at("tools")) {
             if (!nested.is_object() || !nested.contains("type") || !nested.at("type").is_string()) {
                 bad_request("namespace tool entries must be objects with a string type", "tools");
             }
             const std::string nested_type = nested.at("type").get<std::string>();
-            if (nested_type == "custom") {
-                canonical["tools"].push_back(append_function(parse_custom_tool(
-                    nested, namespace_name, namespace_description, out.tool_identities)));
-                continue;
-            }
-            if (nested_type != "function") {
+            if (nested_type != "function" && nested_type != "custom") {
                 bad_request("nested tool type '" + nested_type +
                                 "' cannot be represented by the Engine",
                             "tools", "tool_type_not_supported");
             }
-            canonical["tools"].push_back(append_function(parse_function_tool(
-                nested, namespace_name, namespace_description, out.tool_identities,
-                "tools/" + std::to_string(out.wire_tools.size()) + "/tools/" +
-                    std::to_string(canonical["tools"].size()) + "/parameters")));
+            auto [member, deferred_tool] = append_function(
+                nested_type == "custom"
+                    ? parse_custom_tool(nested, namespace_name, namespace_description,
+                                        out.tool_identities)
+                    : parse_function_tool(nested, namespace_name, namespace_description,
+                                          out.tool_identities,
+                                          "tools/" + std::to_string(out.wire_tools.size()) +
+                                              "/tools/" +
+                                              std::to_string(canonical["tools"].size()) +
+                                              "/parameters"));
+            if (deferred_tool) { deferred_members.push_back(member); }
+            canonical["tools"].push_back(std::move(member));
+        }
+        if (!deferred_members.empty()) {
+            Json wire = {{"type", "namespace"}, {"name", namespace_name}};
+            if (!namespace_description.empty()) { wire["description"] = namespace_description; }
+            wire["tools"] = std::move(deferred_members);
+            search_paths.push_back(OpenAIResponsesSearchPath{
+                .path = namespace_name, .wire = nlohmann::json::parse(wire.dump())});
         }
         out.wire_tools.push_back(std::move(canonical));
+    }
+
+    if (deferred && !search_definition) {
+        bad_request("defer_loading=true needs a tool_search tool that can load the deferred tools",
+                    "tools", "tool_search_required");
+    }
+    if (search_definition && out.prompt.tool_search->server) {
+        out.prompt.generation.tools[*search_definition].description =
+            hosted_tool_search_description(search_paths);
+        out.prompt.tool_search->paths = std::move(search_paths);
     }
 }
 
@@ -1208,6 +1524,7 @@ ParsedPromptFields parse_prompt_fields(const Json& body, const RequestLimits& li
     parse_text(body, out.prompt.generation);
     parse_truncation(body);
     parse_preserve_thinking(body, out.prompt);
+    parse_openai_thinking_budget(body, out.prompt.generation);
     out.prompt.generation.max_tokens = limits.default_max_tokens;
     return out;
 }
@@ -1276,6 +1593,7 @@ void validate_common_top_level(const Json& body, bool create) {
                                                                   "prompt_cache_options",
                                                                   "prompt_cache_retention",
                                                                   "reasoning",
+                                                                  "reasoning_budget_tokens",
                                                                   "safety_identifier",
                                                                   "service_tier",
                                                                   "store",
@@ -1283,6 +1601,9 @@ void validate_common_top_level(const Json& body, bool create) {
                                                                   "stream_options",
                                                                   "temperature",
                                                                   "text",
+                                                                  "thinking_budget",
+                                                                  "thinking_budget_tokens",
+                                                                  "thinking_token_budget",
                                                                   "tool_choice",
                                                                   "tools",
                                                                   "top_logprobs",
@@ -1413,7 +1734,10 @@ OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Json& b
         if (*top_p < 0.0 || *top_p > 1.0) { bad_request("top_p must be in [0,1]", "top_p"); }
         out.prompt.generation.sampling.top_p = *top_p;
     }
-    if (const std::optional<int> max_output = optional_int(body, "max_output_tokens")) {
+    // -1 is "no explicit limit", as the field's omission (clients send it for that; OpenAI rejects
+    // it).
+    if (const std::optional<int> max_output = optional_int(body, "max_output_tokens");
+        max_output && *max_output != -1) {
         if (*max_output < 0) {
             bad_request("max_output_tokens must be non-negative", "max_output_tokens");
         }
@@ -1422,6 +1746,61 @@ OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Json& b
     }
     parse_structured_outputs(body, out.prompt.generation);
     return out;
+}
+
+ChatTurn lower_openai_tool_search_output(
+    const RequestJson& tools, std::string call_id,
+    std::unordered_map<std::string, OpenAIResponsesFunctionIdentity>& identities) {
+    ChatTurn turn;
+    turn.role         = ChatRole::Tool;
+    turn.tool_call_id = std::move(call_id);
+    turn.loaded_tools = parse_loaded_tools(tools, identities);
+    if (turn.loaded_tools.empty()) {
+        ContentPart part;
+        part.kind     = ContentKind::Text;
+        part.type_raw = "input_text";
+        part.text     = "No tools were loaded.";
+        turn.content.push_back(std::move(part));
+    }
+    return turn;
+}
+
+OpenAIToolSearchExecution execute_openai_tool_search(const OpenAIResponsesCreateRequest& request,
+                                                     const ToolCall& call) {
+    if (!request.prompt.tool_search || !request.prompt.tool_search->server) {
+        throw std::logic_error("a hosted tool search needs a hosted tool_search tool");
+    }
+    OpenAIToolSearchExecution execution;
+    execution.arguments = nlohmann::json::parse(call.arguments_json, nullptr, false);
+    if (execution.arguments.is_discarded() || !execution.arguments.is_object()) {
+        execution.arguments = nlohmann::json::object();
+    }
+    std::vector<std::string> requested;
+    if (const auto paths = execution.arguments.find("paths"); paths != execution.arguments.end()) {
+        if (paths->is_string()) { requested.push_back(paths->get<std::string>()); }
+        if (paths->is_array()) {
+            for (const nlohmann::json& path : *paths) {
+                if (path.is_string()) { requested.push_back(path.get<std::string>()); }
+            }
+        }
+    }
+    execution.tools = nlohmann::json::array();
+    std::vector<bool> loaded(request.prompt.tool_search->paths.size(), false);
+    for (const std::string& name : requested) {
+        for (std::size_t index = 0; index < loaded.size(); ++index) {
+            const OpenAIResponsesSearchPath& path = request.prompt.tool_search->paths[index];
+            if (!loaded[index] && path.path == name) {
+                loaded[index] = true;
+                execution.tools.push_back(path.wire);
+            }
+        }
+    }
+    // Lowered from the serialized Item, so a client that replays it loads the same tokens.
+    std::unordered_map<std::string, OpenAIResponsesFunctionIdentity> identities =
+        request.tool_identities;
+    execution.turn = lower_openai_tool_search_output(RequestJson::parse(execution.tools.dump()),
+                                                     call.id, identities);
+    return execution;
 }
 
 OpenAIResponsesPromptRequest

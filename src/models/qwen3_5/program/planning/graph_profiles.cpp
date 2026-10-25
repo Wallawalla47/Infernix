@@ -43,13 +43,15 @@ std::vector<GraphExecutionProfile> ordinary_graph_profiles(std::uint32_t capacit
 
 std::vector<GraphExecutionProfile> mtp_graph_profiles(std::uint32_t capacity,
                                                       std::uint32_t draft_window,
-                                                      std::uint32_t neural_drafts) {
+                                                      std::uint32_t neural_drafts, bool chained) {
     if (draft_window == 0 || capacity == 0) { return {}; }
-    // The final AR call can see E+2K. Target verify and MTP attention are update-compatible
-    // across all resource tiers, independently of the selected KV representation.
-    auto profiles = causal_resource_profiles(capacity, 2 * draft_window);
-    if (draft_window != neural_drafts) {
-        // Unequal verification/next-draft widths cannot share equal-width graphs.
+    // The final AR call can see E+K+N (E+2K when the next proposal is no deeper than K). Target
+    // verify and MTP attention are update-compatible across all resource tiers, independently of
+    // the selected KV representation.
+    auto profiles = causal_resource_profiles(capacity, draft_window + std::max(draft_window, neural_drafts));
+    if (draft_window != neural_drafts || chained) {
+        // Unequal verification/next-draft widths cannot share equal-width graphs, and a gated
+        // proposal chain's conditional nodes are not updated across tiers: one executable each.
         for (std::size_t i = 0; i < profiles.size(); ++i) {
             profiles[i].topology_class = static_cast<std::uint32_t>(i);
         }

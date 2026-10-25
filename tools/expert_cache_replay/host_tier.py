@@ -76,6 +76,7 @@ PREFILL_CLOCK_MAX = 16
 DEMOTION_FACTOR = 1.25
 PREFETCH_FACTOR = 1.25
 PREFETCH_MAX = 512
+PROMPT_SEED_CREDIT = 256.0  # ExpertOffload's kPromptSeedCredit: the engine's prompt seeding is (256, 0, 0)
 EARLY_TOKENS = 256  # design §17 H8: the hit rate of the first decode tokens after a prompt
 UNKNOWN_POSITION = 0xFFFFFFFF
 
@@ -237,7 +238,8 @@ class Metrics:
                                      'vram_drops', 'landings_admitted', 'landings_rejected', 'landings_overwritten',
                                      'ram_evictions',
                                      'reserve_slots', 'reserve_landings', 'prefetch_reads',
-                                     'prompt_seeds', 'prompt_seed_promotions'), 0)
+                                     'prompt_seeds', 'prompt_seed_promotions', 'adaptive_admissions',
+                                     'adaptive_swaps'), 0)
 
     def summary(self):
         k = self.by_kind
@@ -275,7 +277,22 @@ class Metrics:
         for name, value in self.events.items():
             out[name] = value
         out['demotions_per_token'] = self.events['demotions'] / gen_tokens if gen_tokens else 0.0
+        # The link's share (candidates D12 + PUB-22, review 2026-10-24 §7.2): every VRAM admission is one
+        # record over the link, a decode miss is served by the CPU or the link.
+        out['decode_vram_misses_per_token'] = (decode_live - decode_hits) / gen_tokens if gen_tokens else 0.0
+        out['promotions_per_token'] = self.events['promotions'] / gen_tokens if gen_tokens else 0.0
         return out
+
+
+def link_charged_speed(s, *, t0_ms, cost_ms, miss_ms, link_gbs, record_bytes=None):
+    """Tokens per second with SSD reads, decode VRAM misses and promotion copies all charged: t0, plus
+    cost_ms per SSD read, miss_ms per decode VRAM miss, and each promotion's record over a link of
+    link_gbs GB/s (a policy that buys hits with copies pays for them here)."""
+    record_bytes = RECORD_BYTES if record_bytes is None else record_bytes
+    promotion_ms = record_bytes / (link_gbs * 1e9) * 1e3
+    ms = (t0_ms + s['reads_per_token'] * cost_ms + s['decode_vram_misses_per_token'] * miss_ms
+          + s['promotions_per_token'] * promotion_ms)
+    return 1000.0 / ms
 
 
 class TierSim:
@@ -283,7 +300,9 @@ class TierSim:
 
     def __init__(self, header, *, vram, ram_slots, policy='lfu:64', mode='exclusive', prior='spread',
                  prior_counts=None, demotion_allowance=DECODE_DEMOTION_ALLOWANCE, reserve=True,
-                 prefetch_after_prefill=False, vram_budget='rule', prompt_seed=None, seed=1):
+                 prefetch_after_prefill=False, vram_budget='rule', prompt_seed=None, seed=1,
+                 prefill_promotions=PREFILL_PROMOTIONS, promotion_interval=PROMOTION_INTERVAL,
+                 vram_policy='lfru'):
         self.L, self.E, self.K = header['layers'], header['experts'], header['top_k']
         self.N = self.L * self.E
         self.V = max(0, min(int(vram), self.N - 1))
@@ -302,6 +321,18 @@ class TierSim:
         if vram_budget not in ('rule', 'recorded'):
             raise ValueError(f'unknown VRAM budget {vram_budget}')
         self.vram_budget = vram_budget
+        # The VRAM policy: the engine's LFRU with its budgets ('lfru'), or Basalt's adaptive tier
+        # ('adaptive[:DECAY,FLOOR,MARGIN,SWAPS]', candidates §7.6 D12): per-key counts decayed by DECAY
+        # each round, a non-resident key a candidate at FLOOR or more, swapped for its layer's least-
+        # counted resident when it leads by MARGIN, at most SWAPS a round by gain (4 x SWAPS after a
+        # round that ranked 2 x SWAPS candidates, back to SWAPS at every request's start).
+        self.adaptive = parse_vram_policy(vram_policy)
+        self.a_count = np.zeros(self.L * self.E, np.float64)
+        self.adaptive_cap = self.adaptive[3] if self.adaptive else 0
+        # The 'rule' budgets: promotions per layer of a prefill chunk (Flash-Next 16, the 122B 0) and
+        # decode tokens per promotion once the frames are full (ExpertOffload::promotion_interval).
+        self.prefill_promotions = int(prefill_promotions)
+        self.promotion_interval = max(1, int(promotion_interval))
         self.allowance_per_decode = demotion_allowance
         self.reserve_on = reserve and not self.full
         self.prefetch_on = prefetch_after_prefill and not self.full
@@ -323,6 +354,11 @@ class TierSim:
         self.v_n = 0
         self.visible = np.zeros(n, np.int64)  # first round a resident key is read from its frame
         self.mark = np.zeros(n, bool)
+        # Eviction protection (candidates §13 PUB-22, replay only): `guard(round index, round)`, when set,
+        # returns the keys a predictor expects the next rounds to compute; at that round's boundary they
+        # are evicted only when no unprotected resident is left.
+        self.guard = None
+        self.guard_mask = np.zeros(n, bool)
         self.promotions = 0
         self.budget_tokens = 0
         # RAM: state, ranking key, lazy heaps per class (or CLOCK queues), pins.
@@ -393,6 +429,10 @@ class TierSim:
         self.v_n -= 1
         self.v_pos[k] = -1
 
+    def vram_visible(self, keys):
+        """Which keys this round reads from a published VRAM frame (resident, copy landed)."""
+        return (self.v_pos[keys] >= 0) & (self.visible[keys] <= self.round)
+
     def _vscore(self, k):
         return self.v_count[k] / (self.v_now - self.v_last[k] + 1)
 
@@ -402,24 +442,26 @@ class TierSim:
         if cand.size == 0:
             return []
         score = self.v_count[cand] / (self.v_now - self.v_last[cand] + 1)
+        guarded = self.guard_mask[cand]
         if need == 1:
-            low = score.min()
-            return [int(cand[score == low].min())]
-        return [int(x) for x in cand[np.lexsort((cand, score))[:need]]]
+            pool = ~guarded if not guarded.all() else np.ones_like(guarded)
+            low = score[pool].min()
+            return [int(cand[pool & (score == low)].min())]
+        return [int(x) for x in cand[np.lexsort((cand, score, guarded))[:need]]]
 
     def _budget(self, r):
         if self.vram_budget == 'recorded':
             return r.budget
         if r.kind == PREFILL:
-            return PREFILL_PROMOTIONS
+            return self.prefill_promotions
         if r.kind == FORCED:
             return DECODE_PROMOTIONS
         filling = self.promotions < self.V if self.full else self.v_n < self.V
         if filling:
             return DECODE_PROMOTIONS * r.tokens
         self.budget_tokens += r.tokens
-        due = self.budget_tokens // PROMOTION_INTERVAL
-        self.budget_tokens %= PROMOTION_INTERVAL
+        due = self.budget_tokens // self.promotion_interval
+        self.budget_tokens %= self.promotion_interval
         return due * DECODE_PROMOTIONS
 
     def _vram_step(self, group, budget):
@@ -472,6 +514,70 @@ class TierSim:
                 admitted += 1
         finally:
             self.mark[group] = False
+
+    def _adaptive_step(self, live_counts, r):
+        """Basalt's adaptive tier at a round boundary (generate.cpp rank_swaps / xq_round, b80e026,
+        bde2328): decay, count the round's live routes, then free frames to the best candidates and
+        swaps by gain, under the round's cap. Admission and eviction take the same paths as LFRU's
+        (the eviction gate, demotions, publication a round later)."""
+        decay, floor, margin, base = self.adaptive
+        if r.kind == PREFILL and r.position == 0:
+            self.adaptive_cap = base
+        self.a_count *= decay
+        for keys, counts in live_counts:
+            self.a_count[keys] += counts
+        if self.V == 0:
+            return
+        events = self._m().events
+        candidates, pairs = [], []
+        for layer in range(self.L):
+            keys = np.arange(layer * self.E, (layer + 1) * self.E)
+            counts = self.a_count[keys]
+            resident = self.v_pos[keys] >= 0
+            mask = ~resident & (counts >= floor)
+            if not self.full:
+                mask &= self.r_state[keys] != 0  # only experts with a host copy
+            cand = keys[mask]
+            if cand.size == 0:
+                continue
+            cand = cand[np.lexsort((cand, -self.a_count[cand]))]
+            candidates.extend(int(k) for k in cand)
+            victims = keys[resident]
+            victims = victims[np.lexsort((victims, self.a_count[victims]))]
+            for k, v in zip(cand, victims):
+                gain = self.a_count[k] - self.a_count[v]
+                if gain < margin:
+                    break
+                pairs.append((-gain, int(k), int(v)))
+        cap = self.adaptive_cap
+        self.adaptive_cap = 4 * base if len(candidates) >= 2 * base else base
+        done = set()
+        # Free frames first, the best candidates of any layer.
+        free = self.V - self.v_n
+        if free > 0:
+            for k in sorted(candidates, key=lambda key: (-self.a_count[key], key))[:min(free, cap)]:
+                self._vram_admit(k, held=False)
+                done.add(k)
+                events['adaptive_admissions'] += 1
+        for _, k, v in sorted(pairs):
+            if len(done) >= cap:
+                break
+            if k in done or self.v_pos[v] < 0 or self.v_pos[k] >= 0:
+                continue
+            action = 'keep' if self.full else self._gate(v)
+            if action is None:
+                events['deferred_admissions'] += 1
+                break
+            self._vram_evict(v)
+            held = False
+            if action == 'demote':
+                self._demote(v)
+                held = True
+            elif action == 'drop':
+                events['vram_drops'] += 1
+            self._vram_admit(k, held)
+            done.add(k)
+            events['adaptive_swaps'] += 1
 
     def _seed_prompt(self, rounds):
         """ExpertResidency::seed_prompt at a prompt's end: each key gains credit x (its counted tokens /
@@ -800,7 +906,7 @@ class TierSim:
         layers_with_reads = 0
         for layer in range(self.L):
             keys = np.unique(computed[layer])
-            in_vram = (self.v_pos[keys] >= 0) & (self.visible[keys] <= self.round)
+            in_vram = self.vram_visible(keys)
             m['computed'] += keys.size
             m['vram_hits'] += int(np.count_nonzero(in_vram))
             if self.full:
@@ -835,10 +941,12 @@ class TierSim:
             weight = 1.0
             m['tokens'] += int(np.count_nonzero(r.live))
         groups = []
+        live_counts = []
         for layer in range(self.L):
             keys, counts = np.unique(live_routes[layer], return_counts=True)
             groups.append(keys)
-            hits = int(np.count_nonzero((self.v_pos[keys] >= 0) & (self.visible[keys] <= self.round)))
+            live_counts.append((keys, counts * weight))
+            hits = int(np.count_nonzero(self.vram_visible(keys)))
             m['live_keys'] += keys.size
             m['live_vram_hits'] += hits
             if early:
@@ -869,9 +977,17 @@ class TierSim:
             if r.kind == PREFILL:
                 self.prefetch_due.add(int(r.lanes[0]))
 
-        budget = self._budget(r)
-        for layer in range(self.L):
-            self._vram_step(groups[layer], budget)
+        if self.adaptive:
+            self._adaptive_step(live_counts, r)
+        else:
+            budget = self._budget(r)
+            guarded = self.guard(self.round, r) if self.guard is not None else None
+            if guarded is not None:
+                self.guard_mask[guarded] = True
+            for layer in range(self.L):
+                self._vram_step(groups[layer], budget)
+            if guarded is not None:
+                self.guard_mask[guarded] = False
         self.protect.clear()
         if r.kind in (DECODE, VERIFY):
             for lane in (int(x) for x in r.lanes):
@@ -907,6 +1023,31 @@ def parse_prompt_seed(text):
 
 def format_prompt_seed(seed):
     return 'none' if seed is None else f'credit {seed[0]:g}, budget {seed[1]}, window {seed[2]}'
+
+
+# Basalt's adaptive-tier defaults (b80e026, bde2328): decay 0.85 per round, candidate floor 2.0, margin 1.5,
+# 96 swaps a round.
+ADAPTIVE_DEFAULTS = (0.85, 2.0, 1.5, 96)
+
+
+def parse_vram_policy(text):
+    """"lfru" -> None (the engine's LFRU), or "adaptive[:DECAY,FLOOR,MARGIN,SWAPS]" -> the four rules."""
+    text = text.strip()
+    if text == 'lfru':
+        return None
+    if text == 'adaptive' or text.startswith('adaptive:'):
+        values = list(ADAPTIVE_DEFAULTS)
+        if text.startswith('adaptive:'):
+            given = [x for x in text[9:].split(',') if x]
+            if len(given) > 4:
+                raise ValueError(f'VRAM policy {text!r}: at most DECAY,FLOOR,MARGIN,SWAPS')
+            for i, x in enumerate(given):
+                values[i] = float(x)
+        decay, floor, margin, swaps = values
+        if not (0.0 < decay <= 1.0 and floor >= 0.0 and margin >= 0.0 and swaps >= 1):
+            raise ValueError(f'VRAM policy {text!r}: DECAY in (0, 1], FLOOR and MARGIN >= 0, SWAPS >= 1')
+        return (decay, floor, margin, int(swaps))
+    raise ValueError(f'unknown VRAM policy {text!r} (lfru, adaptive[:DECAY,FLOOR,MARGIN,SWAPS])')
 
 
 def ram_slots_for_mib(mib):
@@ -965,8 +1106,15 @@ def main(argv=None):
     ap.add_argument('--no-reserve', action='store_true', help='no prompt landing reserve')
     ap.add_argument('--prefetch-after-prefill', action='store_true')
     ap.add_argument('--vram-budget', default='rule', choices=('rule', 'recorded'))
+    ap.add_argument('--vram-policies', default='lfru',
+                    help='";"-separated VRAM policies: lfru (the engine) and adaptive[:DECAY,FLOOR,MARGIN,SWAPS] '
+                         f'(Basalt\'s rules, default {",".join(f"{x:g}" for x in ADAPTIVE_DEFAULTS)}; candidates D12)')
     ap.add_argument('--t0-ms', type=float, default=11.2, help='base decode time per token (plain)')
     ap.add_argument('--cost-ms', type=float, default=0.65, help='exposed time per decode SSD read')
+    ap.add_argument('--miss-ms', type=float, default=0.035,
+                    help='exposed time per decode VRAM miss (CPU or link service), for the link-charged speed')
+    ap.add_argument('--link-gbs', type=float, default=27.5,
+                    help='host-to-device link rate charged to each promotion (PCIe 5.0 x8 here)')
     ap.add_argument('--jobs', type=int, default=1)
     ap.add_argument('--json', default=None)
     ap.add_argument('--validate', action='store_true',
@@ -977,6 +1125,9 @@ def main(argv=None):
                          'already carries that seeding\'s effect on its routes)')
     args = ap.parse_args(argv)
     seeds = [parse_prompt_seed(x) for x in args.prompt_seeds.split(';')]
+    vram_policies = [x.strip() for x in args.vram_policies.split(';') if x.strip()]
+    for vram_policy in vram_policies:
+        parse_vram_policy(vram_policy)
 
     paths = tuple(args.traces)
     traces = _load(paths)
@@ -1027,12 +1178,14 @@ def main(argv=None):
                 for slots, mib in ram:
                     for policy in args.policies.split(','):
                         for seed in seeds:
-                            config = {'vram': vram, 'ram_slots': slots, 'policy': policy, 'mode': mode,
-                                      'prior': prior, 'demotion_allowance': args.demotion_allowance,
-                                      'reserve': not args.no_reserve,
-                                      'prefetch_after_prefill': args.prefetch_after_prefill,
-                                      'vram_budget': args.vram_budget, 'prompt_seed': seed}
-                            jobs.append((paths, config, counts, mib))
+                            for vram_policy in vram_policies:
+                                config = {'vram': vram, 'ram_slots': slots, 'policy': policy, 'mode': mode,
+                                          'prior': prior, 'demotion_allowance': args.demotion_allowance,
+                                          'reserve': not args.no_reserve,
+                                          'prefetch_after_prefill': args.prefetch_after_prefill,
+                                          'vram_budget': args.vram_budget, 'prompt_seed': seed,
+                                          'vram_policy': vram_policy}
+                                jobs.append((paths, config, counts, mib))
     if args.jobs > 1:
         with ProcessPoolExecutor(args.jobs) as pool:
             results = list(pool.map(_job, [(p, c, k) for p, c, k, _ in jobs]))
@@ -1045,23 +1198,28 @@ def main(argv=None):
     for result in results:
         c = result['config']
         cells.setdefault((c['prior'], c['mode'], c['vram'], c['ram_slots'], result['ram_mib'],
-                          format_prompt_seed(c['prompt_seed'])), []).append(result)
+                          format_prompt_seed(c['prompt_seed']), c['vram_policy']), []).append(result)
     verdicts = []
-    for (prior, mode, vram, slots, mib, seed), group in cells.items():
+    for (prior, mode, vram, slots, mib, seed, vram_policy), group in cells.items():
         h_res = None if slots is None else max(0, slots - RAM_EXTRA_SLOTS)
         print(f'\n=== V {vram}, RAM {"all" if slots is None else f"{mib} MiB = {slots} slots (H_res {h_res})"}, '
-              f'fast capacity {"all" if slots is None else vram + h_res}, {mode}, prior {prior}, prompt seed {seed}')
+              f'fast capacity {"all" if slots is None else vram + h_res}, {mode}, prior {prior}, prompt seed {seed}, '
+              f'VRAM policy {vram_policy}')
         print(f'{"policy":9s} {"reads/tok":>9s} {"2nd half":>8s} {"1st half":>8s} {"prefill/1K":>10s} '
               f'{"SSD total":>9s} {"VRAM%":>6s} {"RAM%":>6s} {"demote/tok":>10s} {"deferred":>8s} {"drops":>6s} '
-              f'{"tok/s 2nd":>9s}')
+              f'{"tok/s 2nd":>9s} {"miss/tok":>8s} {"promo/tok":>9s} {"tok/s link":>10s}')
         reads = {}
         for result in group:
             s, s2, s1 = result['total'], result['second_half'], result['first_half']
             speed = 1000.0 / (args.t0_ms + s2['reads_per_token'] * args.cost_ms)
+            linked = link_charged_speed(s2, t0_ms=args.t0_ms, cost_ms=args.cost_ms, miss_ms=args.miss_ms,
+                                        link_gbs=args.link_gbs)
+            result['link_charged_tok_s'] = linked
             print(f'{result["config"]["policy"]:9s} {s["reads_per_token"]:9.2f} {s2["reads_per_token"]:8.2f} '
                   f'{s1["reads_per_token"]:8.2f} {s["prefill_reads_per_1k_tokens"]:10.1f} {s["ssd_reads"]:9d} '
                   f'{100 * s["vram_share"]:6.1f} {100 * s["ram_share"]:6.1f} {s["demotions_per_token"]:10.2f} '
-                  f'{s["deferred_admissions"]:8d} {s["vram_drops"]:6d} {speed:9.1f}')
+                  f'{s["deferred_admissions"]:8d} {s["vram_drops"]:6d} {speed:9.1f} '
+                  f'{s2["decode_vram_misses_per_token"]:8.1f} {s2["promotions_per_token"]:9.2f} {linked:10.1f}')
             reads[result['config']['policy']] = s['ssd_reads']
         verdict = policy_verdict(reads)
         if verdict:

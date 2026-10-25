@@ -3,7 +3,7 @@
 // consumed exactly once with its own block's bytes, and a read past the end throws after the reads
 // in flight have drained, as does a consumer's exception. Calls from several threads on one file
 // read correctly, and every later call does too. FileMapping::None maps nothing and reads the same
-// bytes.
+// bytes. On Linux a tmpfs file (which may refuse O_DIRECT) reads the same way.
 
 #include "test_temp_path.h"
 #include "core/read_only_file.h"
@@ -18,6 +18,10 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#if defined(__linux__)
+#    include <unistd.h>
+#endif
 
 namespace {
 
@@ -156,6 +160,39 @@ void check_large_reads() {
     std::filesystem::remove(path, ignored);
 }
 
+#if defined(__linux__)
+// A file on tmpfs (/dev/shm), which refuses O_DIRECT before Linux 6.6 (as do 9p, some FUSE mounts
+// and Docker bind mounts): the file opens, through the page cache where O_DIRECT is refused, and
+// the same aligned reads return its bytes.
+void check_tmpfs_file() {
+    const std::filesystem::path directory = "/dev/shm";
+    std::error_code error;
+    if (!std::filesystem::is_directory(directory, error)) { return; }
+    const auto path = directory / ("infernix_read_only_file_tmpfs_test_" + std::to_string(::getpid()) + ".bin");
+    {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        if (!out) { return; }
+        std::vector<std::byte> block(kBlock);
+        for (std::uint64_t b = 0; b < kBlocks; ++b) {
+            for (std::size_t k = 0; k < kBlock; ++k) { block[k] = pattern(b, k); }
+            out.write(reinterpret_cast<const char*>(block.data()), static_cast<std::streamsize>(kBlock));
+        }
+    }
+    try {
+        const infernix::ReadOnlyFile file(path, infernix::FileMapping::None);
+        std::mt19937 rng(17);
+        run(file, 65, 4, rng);
+        std::vector<std::byte> storage;
+        const auto one = aligned_ring(storage, 1);
+        check(file.read_direct(7 * kBlock, one) == kBlock && one[0] == pattern(7, 0) && one[4095] == pattern(7, 4095),
+              "read_direct reads a tmpfs file");
+    } catch (const std::exception& failure) {
+        check(false, std::string("a tmpfs file reads: ") + failure.what());
+    }
+    std::filesystem::remove(path, error);
+}
+#endif
+
 } // namespace
 
 int main() {
@@ -201,6 +238,9 @@ int main() {
         check_concurrent_calls(direct);
         check_consume_error(direct);
         check_large_reads();
+#if defined(__linux__)
+        check_tmpfs_file();
+#endif
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         ++failures;

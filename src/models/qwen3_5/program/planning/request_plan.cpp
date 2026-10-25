@@ -359,12 +359,14 @@ UnitDemand ProgramImpl::next_unit(const SequenceState& sequence, const RequestCo
                                                     ngram_draft_window == 0
                                                 ? sequence.mtp_draft_count
                                                 : draft_window});
-        // A DFlash2 tree row verifies its whole tree whatever output budget it has left: a round
-        // widens a row whose neural extent is full to the tree's width (decode.cpp row_extent),
-        // so the unit covers the widest tree that fits before the capacity. Fixed-width rounds
-        // verify no trees (decode.cpp).
-        if (is_masked_draft_backend(speculative_backend) && available >= neural_draft_window &&
-            !execution_schedule.fixed_speculation) {
+        // A tree row verifies its whole tree whatever output budget it has left: a round
+        // widens a row whose neural extent is full (an MTP row: its drafts fill the window) to
+        // the tree's width (decode.cpp), so the unit covers the widest tree that fits before the
+        // capacity. Fixed-width rounds verify no trees (decode.cpp).
+        const bool full_chain = is_masked_draft_backend(speculative_backend) ||
+                                (speculative_backend == SpeculativeBackend::Mtp &&
+                                 sequence.mtp_draft_count == neural_draft_window);
+        if (full_chain && available >= neural_draft_window && !execution_schedule.fixed_speculation) {
             std::uint32_t tree_columns = 0;
             for (const std::uint32_t columns : tree_widths.automatic) {
                 tree_columns = std::max(tree_columns, columns);

@@ -62,6 +62,14 @@ private:
     static constexpr std::size_t kReadThreads      = 8;   // threads of a large call
     static constexpr std::size_t kParallelInFlight = 16;  // blocks in flight per thread of a large call
     static constexpr std::size_t kParallelBlocks = 512; // distinct blocks that make a call large
+    // INFERNIX_TMP_NGRAM_PARALLEL_GATHER (candidates §8.3 GX-08): a RAM-mode call of at least this many
+    // rows gathers them on kReadThreads threads (the same bytes), not one.
+    static constexpr std::size_t kParallelGatherRows = 16384;
+    bool parallel_gather_ = false;
+    // INFERNIX_TMP_NGRAM_SCATTER (candidates BX-04, Basalt edbdde8): a large call's threads read its
+    // blocks in a scattered order (a stride permutation over the sorted blocks) instead of each sweeping
+    // one contiguous range. The rows read and the cache fill are the same.
+    bool scatter_ = false;
 
     // The direct-mapped cache slot of a row.
     static std::size_t slot_of(std::uint32_t row) noexcept {
@@ -82,6 +90,9 @@ private:
     mutable std::vector<std::uint64_t> misses_;
     mutable std::vector<std::uint64_t> offsets_;
     mutable std::vector<std::size_t> first_miss_;
+    // INFERNIX_TMP_NGRAM_SCATTER: the blocks' offsets in reading order, and each one's sorted index.
+    mutable std::vector<std::uint64_t> scattered_offsets_;
+    mutable std::vector<std::size_t> scattered_blocks_;
     mutable Counters counters_;
 };
 

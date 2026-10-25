@@ -153,8 +153,10 @@ constexpr infernix::TokenId kByte98Token = fixture_byte_token(0x98);
 constexpr infernix::TokenId kByteC2Token = fixture_byte_token(0xc2);
 constexpr infernix::TokenId kByteA2Token = fixture_byte_token(0xa2);
 
-// The fixture's added token for the literal reasoning close marker.
+// The fixture's added tokens for the reasoning close and the tool-call opener, as in the models'
+// tokenizers.
 constexpr infernix::TokenId kFixtureThinkCloseToken = 248069;
+constexpr infernix::TokenId kFixtureToolCallToken   = 248058;
 
 std::vector<infernix::TokenId> fixture_tokens(std::string_view text) {
     std::vector<infernix::TokenId> tokens;
@@ -249,8 +251,8 @@ FrontendResources resources(const std::string& chat_template = thinking_toggle_t
          added(31, "assistant\n"), added(32, "\n"), added(248045, "<|im_start|>", true),
          added(248046, "<|im_end|>", true), added(248053, "<|vision_start|>", true),
          added(248054, "<|vision_end|>", true), added(248056, "<|image_pad|>", true),
-         added(248057, "<|video_pad|>", true), added(248068, "<think>"),
-         added(248069, "</think>")});
+         added(248057, "<|video_pad|>", true), added(248058, "<tool_call>"),
+         added(248059, "</tool_call>"), added(248068, "<think>"), added(248069, "</think>")});
     nlohmann::json vocab = nlohmann::json::object();
     for (int value = 0; value <= 255; ++value) {
         const auto byte                = static_cast<std::uint8_t>(value);
@@ -297,6 +299,53 @@ const fi::Tokenizer& fixture_tokenizer() {
         {.tokenizer_json         = fixture.tokenizer_json,
          .tokenizer_config_json  = fixture.tokenizer_config_json,
          .generation_config_json = fixture.generation_config_json});
+    return tokenizer;
+}
+
+// The vocabulary id of the merged "=lookup" symbol in control_spelling_tokenizer().
+constexpr infernix::TokenId kMergedFunctionNameToken = 3005;
+
+// Shaped like the model's tokenizer, unlike the fixture: the control spellings are its only added
+// tokens, and a BPE merge joins the template's "<function=" to the request's tool name.
+const fi::Tokenizer& control_spelling_tokenizer() {
+    static const std::string tokenizer_json = [] {
+        nlohmann::json vocab = nlohmann::json::object();
+        for (int value = 0; value <= 255; ++value) {
+            const auto byte                = static_cast<std::uint8_t>(value);
+            vocab[byte_level_symbol(byte)] = fixture_byte_token(byte);
+        }
+        constexpr std::array<std::array<std::string_view, 2>, 10> rules{{{"l", "o"},
+                                                                         {"lo", "o"},
+                                                                         {"loo", "k"},
+                                                                         {"u", "p"},
+                                                                         {"look", "up"},
+                                                                         {"=", "lookup"},
+                                                                         {"p", "l"},
+                                                                         {"pl", "a"},
+                                                                         {"i", "n"},
+                                                                         {"pla", "in"}}};
+        nlohmann::json merges = nlohmann::json::array();
+        infernix::TokenId id  = 3000;
+        for (const auto& [left, right] : rules) {
+            vocab[std::string(left) + std::string(right)] = id++;
+            merges.push_back(nlohmann::json::array({std::string(left), std::string(right)}));
+        }
+        const nlohmann::json tokens = nlohmann::json::array(
+            {added(6, "<eos>", true), added(248045, "<|im_start|>", true),
+             added(248046, "<|im_end|>", true), added(248053, "<|vision_start|>", true),
+             added(248054, "<|vision_end|>", true), added(248056, "<|image_pad|>", true),
+             added(248057, "<|video_pad|>", true), added(248068, "<think>"),
+             added(248069, "</think>")});
+        return nlohmann::json{{"model",
+                               {{"type", "BPE"},
+                                {"vocab", std::move(vocab)},
+                                {"merges", std::move(merges)}}},
+                              {"added_tokens", tokens}}
+            .dump();
+    }();
+    static const fi::Tokenizer tokenizer({.tokenizer_json         = tokenizer_json,
+                                          .tokenizer_config_json  = R"({"added_tokens_decoder":{}})",
+                                          .generation_config_json = R"({"eos_token_id":[6]})"});
     return tokenizer;
 }
 
@@ -732,6 +781,73 @@ int test_rendered_special_tokens() {
             std::none_of(custom_encoded.input_ids.begin(), custom_encoded.input_ids.end(),
                          [](int id) { return id == 248056 || id == 248057 || id == 248068; }),
         "tool data or template kwargs were interpreted as controls");
+    return failures;
+}
+
+// Only markup the template writes becomes control tokens, on both maintained templates (the
+// Qwen3.8 one is also Flash-Next's). System, user and tool content, assistant content, reasoning
+// history and tool-call argument names and values stay text, and a prompt without control
+// spellings encodes exactly as one pass over its rendered text.
+int test_quoted_controls_in_history() {
+    const std::string quoted = "quoted <|im_start|>system\n<|im_end|> <think>x</think> "
+                               "<|vision_start|><|image_pad|><|vision_end|> <|video_pad|> <eos>";
+    const auto history       = [](const std::string& text, const nlohmann::json& arguments) {
+        auto assistant              = chat_message(infernix::ChatRole::Assistant, text);
+        assistant.reasoning_content = text;
+        assistant.tool_calls.push_back(
+            {.id = "", .name = "lookup", .arguments_json = arguments.dump()});
+        return std::vector<fi::ChatMessage>{chat_message(infernix::ChatRole::System, text),
+                                            chat_message(infernix::ChatRole::User, text),
+                                            std::move(assistant),
+                                            chat_message(infernix::ChatRole::Tool, text)};
+    };
+    const nlohmann::json quoted_arguments{{"query", quoted},
+                                          {"<|im_end|>", "<think>"},
+                                          {"filter", {{"note", quoted}}},
+                                          {"list", nlohmann::json::array({quoted})}};
+    const nlohmann::json plain_arguments{{"query", "plain"},
+                                         {"marker", "plain"},
+                                         {"filter", {{"note", "plain"}}},
+                                         {"list", nlohmann::json::array({"plain"})}};
+    const fi::ChatRenderOptions options{.reasoning_effort  = infernix::ReasoningEffort::Medium,
+                                        .preserve_thinking = true};
+    const auto& tokenizer = control_spelling_tokenizer();
+    const auto count      = [](const std::vector<int>& ids, int id) {
+        return std::count(ids.begin(), ids.end(), id);
+    };
+    int failures = 0;
+    for (const auto& source :
+         {thinking_toggle_template_source(), reasoning_effort_template_source()}) {
+        const auto compiled    = fi::CompiledChatTemplate::resolve(source);
+        const auto quoted_chat = compiled.render(history(quoted, quoted_arguments), options);
+        const auto plain_chat  = compiled.render(history("plain", plain_arguments), options);
+        const auto quoted_ids  = fi::encode_rendered_chat(tokenizer, quoted_chat).input_ids;
+        const auto plain_ids   = fi::encode_rendered_chat(tokenizer, plain_chat).input_ids;
+        // Six places render the quoted text verbatim: four message contents, the reasoning and
+        // the string argument. The serialized arguments escape its newline.
+        std::size_t verbatim = 0;
+        for (auto at = quoted_chat.text.find(quoted); at != std::string::npos;
+             at      = quoted_chat.text.find(quoted, at + quoted.size())) {
+            ++verbatim;
+        }
+        // The template writes five turn openers, four closers and two reasoning openers (the
+        // retained turn and the generation prompt), one reasoning closer and no media markers.
+        for (const auto* ids : {&quoted_ids, &plain_ids}) {
+            failures += check(count(*ids, 248045) == 5 && count(*ids, 248046) == 4 &&
+                                  count(*ids, 248068) == 2 && count(*ids, 248069) == 1 &&
+                                  count(*ids, 248053) == 0 && count(*ids, 248054) == 0 &&
+                                  count(*ids, 248056) == 0 && count(*ids, 248057) == 0 &&
+                                  count(*ids, 6) == 0,
+                              "a quoted control spelling in history became a control token, or a "
+                              "template marker stopped being one");
+        }
+        failures += check(verbatim == 6 && tokenizer.decode(quoted_ids) == quoted_chat.text,
+                          "quoted history content was not rendered or did not round-trip");
+        failures += check(plain_ids == tokenizer.encode(plain_chat.text) &&
+                              count(plain_ids, kMergedFunctionNameToken) == 1,
+                          "a prompt without control spellings no longer encodes as one pass, or "
+                          "a BPE merge across the template/content boundary was split");
+    }
     return failures;
 }
 
@@ -1890,6 +2006,25 @@ int test_media_admission_uses_aggregate_resources(const Frontend& frontend) {
                           (void)processor.process(std::vector<fi::ChatMessage>{internal_message});
                       }),
                       "processor did not enforce the aggregate encoded-media byte budget");
+
+    // The prompt's images together over the vision-token budget (4 tokens each against 5): the
+    // context-overflow form of the vision budget, counted to the item that crossed it (at least 8,
+    // so more than 7), which agent clients compact on; one item over Vision capacity stays a budget
+    // error.
+    fi::ProcessorOptions vision_options;
+    vision_options.max_vision_tokens = 5;
+    fi::Processor vision_budget(fixture_tokenizer(), thinking_toggle_template(), vision_options,
+                                std::make_shared<fi::MediaPreprocessCache>(infernix::kDefaultMediaCacheBytes,
+                                                                           infernix::kDefaultMediaLiveBytes));
+    bool overflow = false;
+    try {
+        (void)vision_budget.process(std::vector<fi::ChatMessage>{internal_message});
+    } catch (const fi::ProcessorError& error) {
+        const auto& details = error.context_length();
+        overflow = error.kind() == fi::ProcessorErrorKind::ContextLengthExceeded && details && details->vision &&
+                   !details->exact && details->prompt_tokens == 7 && details->max_context == 5;
+    }
+    failures += check(overflow, "an aggregate vision-token overflow was not a vision context overflow of 8 > 5");
     return failures;
 }
 
@@ -2268,6 +2403,42 @@ int test_structured_tool_output() {
     return failures;
 }
 
+// A deferred declaration joins the output contract after the listed tools but never the prompt:
+// the tokens equal those of the listed tools alone, and a call to it parses under the default
+// (constrained) tool contract.
+int test_deferred_tool_declarations() {
+    const Frontend frontend = make_frontend(resources());
+    infernix::PromptInput listed;
+    listed.options.enable_thinking = false;
+    listed.messages.push_back({.role  = infernix::ChatRole::User,
+                               .parts = {{.kind = infernix::MessagePartKind::Text, .text = "x"}}});
+    listed.options.tool_jsons.push_back(
+        R"({"type":"function","function":{"name":"listed","parameters":{"type":"object","properties":{}}}})");
+    infernix::PromptInput deferred = listed;
+    deferred.options.deferred_tool_jsons.push_back(
+        R"({"type":"function","function":{"name":"later","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}})");
+    const auto listed_prompt   = frontend.prepare(listed);
+    const auto deferred_prompt = frontend.prepare(deferred);
+    int failures               = check(FrontendFactory::inspect(listed_prompt).token_ids ==
+                                           FrontendFactory::inspect(deferred_prompt).token_ids,
+                                       "a deferred declaration changed the prompt tokens");
+
+    auto session = frontend.make_output_session(deferred_prompt, {},
+                                                infernix::OutputOptions{.tool_name_max_length = 64});
+    const std::string generated =
+        "<tool_call>\n<function=later>\n<parameter=city>\nParis\n</parameter>\n</function>\n"
+        "</tool_call>";
+    const std::vector<infernix::TokenId> tokens = fixture_tokenizer().encode(generated);
+    (void)session.preview_model(tokens, static_cast<std::uint32_t>(tokens.size()),
+                                infernix::FinishReason::OutputLimit);
+    (void)session.commit_preview();
+    const std::vector<infernix::GeneratedToolCall> calls = session.take_tool_calls();
+    failures += check(calls.size() == 1 && calls.front().name == "later" &&
+                          nlohmann::json::parse(calls.front().arguments_json).at("city") == "Paris",
+                      "a call to a deferred declaration was not parsed");
+    return failures;
+}
+
 int test_reasoning_split(const Frontend& frontend) {
     infernix::ChatMessage message;
     message.role = infernix::ChatRole::User;
@@ -2291,20 +2462,36 @@ int test_reasoning_split(const Frontend& frontend) {
               "canonical reasoning close did not publish its exact token execution frontier");
     (void)canonical_session.commit_preview();
 
+    // Tokens 3 and 4 spell "thought</think>\n\nanswer" without the close token: still reasoning.
     auto session = frontend.make_output_session(prompt, {});
     const std::array<infernix::TokenId, 2> tokens{3, 4};
     const auto decision = session.preview_model(tokens, 2, infernix::FinishReason::OutputLimit);
     failures += check(decision.accepted_tokens == 2 &&
                           decision.finish_reason == infernix::FinishReason::OutputLimit &&
                           !decision.prefix_execution_split_after,
-                      "reasoning close inside a mixed token produced an execution frontier");
+                      "a close spelled across ordinary tokens produced an execution frontier");
     const auto output = session.commit_preview();
-    failures += check(channel_text(output, infernix::OutputChannel::Reasoning) == "thought",
-                      "reasoning channel did not remove the close marker");
-    failures += check(channel_text(output, infernix::OutputChannel::Content) == "answer",
-                      "content channel did not strip the post-thinking separator");
+    failures += check(channel_text(output, infernix::OutputChannel::Reasoning) ==
+                              "thought</think>\n\nanswer" &&
+                          channel_text(output, infernix::OutputChannel::Content).empty(),
+                      "a close spelled across ordinary tokens ended the reasoning");
     failures += check(session.reasoning_tokens() == 2,
                       "reasoning token usage did not count accepted reasoning tokens exactly");
+
+    // The close token splits the channels and drops the answer's leading separator.
+    auto closed = frontend.make_output_session(prompt, {});
+    std::vector<infernix::TokenId> close_tokens = fixture_tokens("thought");
+    close_tokens.push_back(kFixtureThinkCloseToken);
+    const auto answer = fixture_tokens("\n\nanswer");
+    close_tokens.insert(close_tokens.end(), answer.begin(), answer.end());
+    (void)closed.preview_model(close_tokens, static_cast<std::uint32_t>(close_tokens.size()),
+                               infernix::FinishReason::OutputLimit);
+    const auto closed_output = closed.commit_preview();
+    failures += check(channel_text(closed_output, infernix::OutputChannel::Reasoning) == "thought" &&
+                          channel_text(closed_output, infernix::OutputChannel::Content) == "answer",
+                      "the close token did not split reasoning and content");
+    failures += check(closed.reasoning_tokens() == 8,
+                      "reasoning usage did not end with the close token");
     return failures;
 }
 
@@ -2320,16 +2507,24 @@ infernix::models::qwen3_5::PreparedPrompt thinking_prompt(const Frontend& fronte
     return frontend.prepare(std::move(input));
 }
 
+template <class Callable>
+bool throws_request_output_error(Callable&& callable) {
+    try {
+        callable();
+    } catch (const infernix::runtime::RequestOutputError&) { return true; } catch (...) {}
+    return false;
+}
+
 int test_constrained_thinking_control(const Frontend& frontend) {
-    auto prompt           = thinking_prompt(frontend);
-    const auto bare_close = frontend.tokenize_text("</think>");
-    auto session          = frontend.make_output_session(
-        prompt, {}, {}, {.budget = static_cast<std::uint32_t>(bare_close.size())},
-        infernix::OutputConstraint::grammar("root ::= \" yes\""));
-    const auto decision = session.preview_model(bare_close, 512, infernix::FinishReason::OutputLimit);
+    const auto grammar = infernix::OutputConstraint::grammar("root ::= \" yes\"");
+    // The budget closes the thinking with the control, whose framing never reaches the content.
+    auto session = frontend.make_output_session(thinking_prompt(frontend), {}, {}, {.budget = 1},
+                                                grammar);
+    const auto decision =
+        session.preview_model(frontend.tokenize_text("x"), 512, infernix::FinishReason::OutputLimit);
     int failures =
         check(decision.continuation == infernix::runtime::ContinuationAction::ApplyTargetControl,
-              "noncanonical close disabled the constrained thinking budget");
+              "the constrained thinking budget did not request its control");
     (void)session.commit_preview();
     const auto control = session.pending_control_tokens();
     if (control.empty()) return failures + check(false, "constrained thinking control is missing");
@@ -2342,18 +2537,52 @@ int test_constrained_thinking_control(const Frontend& frontend) {
     failures +=
         check(channel_text(session.commit_preview(), infernix::OutputChannel::Content) == " yes",
               "constrained content lost its leading space after thinking");
+
+    // The model's close token without a line break before it closes the constrained thinking
+    // (so no budget control is due), and the grammar then requires exactly the separator.
+    auto natural = frontend.make_output_session(thinking_prompt(frontend), {}, {}, {.budget = 2},
+                                                grammar);
+    std::vector<infernix::TokenId> thought = fixture_tokens("x");
+    thought.push_back(kFixtureThinkCloseToken);
+    const auto close = natural.preview_model(thought, 512, infernix::FinishReason::OutputLimit);
+    failures += check(close.continuation == infernix::runtime::ContinuationAction::Decode &&
+                          !close.finished(),
+                      "the constrained close token left the thinking open");
+    const auto thought_output = natural.commit_preview();
+    failures += check(channel_text(thought_output, infernix::OutputChannel::Reasoning) == "x" &&
+                          channel_text(thought_output, infernix::OutputChannel::Content).empty(),
+                      "the constrained close token was published");
+    failures += check(throws_request_output_error([&] {
+                          (void)natural.preview_model(frontend.tokenize_text(" yes"), 512,
+                                                      infernix::FinishReason::OutputLimit);
+                      }),
+                      "the grammar admitted content without the close separator");
+    natural.discard_preview();
+    (void)natural.preview_model(fixture_tokens("\n\n yes"), 512, infernix::FinishReason::OutputLimit);
+    failures +=
+        check(channel_text(natural.commit_preview(), infernix::OutputChannel::Content) == " yes",
+              "the separator after the close token was published or the content lost its space");
+
+    // The close spelled with ordinary tokens is reasoning for both the grammar and the decoder.
+    auto spelled = frontend.make_output_session(thinking_prompt(frontend), {}, {}, {}, grammar);
+    (void)spelled.preview_model(fixture_tokens("x</think>\n\n yes"), 512,
+                                infernix::FinishReason::OutputLimit);
+    const auto spelled_output = spelled.commit_preview();
+    failures += check(channel_text(spelled_output, infernix::OutputChannel::Content).empty() &&
+                          channel_text(spelled_output, infernix::OutputChannel::Reasoning) ==
+                              "x</think>\n\n yes" &&
+                          !spelled.constraint_observation()->complete,
+                      "a close spelled with ordinary tokens ended the constrained thinking");
     return failures;
 }
 
 // A token the grammar refuses fails only its request: the Engine releases that row and keeps
 // serving, so the refusal must surface as a request-scoped runtime::RequestOutputError.
 int test_grammar_refusal_is_request_scoped(const Frontend& frontend) {
-    auto prompt           = thinking_prompt(frontend);
-    const auto bare_close = frontend.tokenize_text("</think>");
-    auto session          = frontend.make_output_session(
-        prompt, {}, {}, {.budget = static_cast<std::uint32_t>(bare_close.size())},
-        infernix::OutputConstraint::grammar("root ::= \" yes\""));
-    (void)session.preview_model(bare_close, 512, infernix::FinishReason::OutputLimit);
+    auto prompt  = thinking_prompt(frontend);
+    auto session = frontend.make_output_session(
+        prompt, {}, {}, {.budget = 1}, infernix::OutputConstraint::grammar("root ::= \" yes\""));
+    (void)session.preview_model(frontend.tokenize_text("x"), 512, infernix::FinishReason::OutputLimit);
     (void)session.commit_preview();
     (void)session.preview_control(session.pending_control_tokens(), 512);
     (void)session.commit_preview();
@@ -2375,54 +2604,70 @@ int test_grammar_refusal_is_request_scoped(const Frontend& frontend) {
     return failures;
 }
 
-int test_reasoning_close_requires_boundary(const Frontend& frontend) {
-    auto prompt  = thinking_prompt(frontend);
-    auto session = frontend.make_output_session(prompt, {});
+// Publishes `tokens` through a fresh session in rounds of `round` tokens (the whole output as one
+// round when zero) and returns the concatenated (reasoning, content) and the calls as
+// "name arguments".
+struct Published {
+    std::string reasoning;
+    std::string content;
+    std::vector<std::string> calls;
 
-    std::vector<infernix::TokenId> quoted = fixture_tokens("discussing ");
-    quoted.push_back(kFixtureThinkCloseToken);
-    const auto quoted_decision =
-        session.preview_model(quoted, 64, infernix::FinishReason::OutputLimit);
-    const auto quoted_output = session.commit_preview();
+    bool operator==(const Published&) const = default;
+};
 
-    int failures = 0;
-    failures +=
-        check(quoted_decision.accepted_tokens == quoted.size() && !quoted_decision.finished(),
-              "a close candidate at a round boundary ended its round early");
-    failures +=
-        check(channel_text(quoted_output, infernix::OutputChannel::Reasoning) == "discussing " &&
-                  channel_text(quoted_output, infernix::OutputChannel::Content).empty(),
-              "a close candidate at a round boundary was not held for its following byte");
+template <class MakeSession>
+Published publish_rounds(MakeSession&& make_session, const std::vector<infernix::TokenId>& tokens,
+                         std::size_t round) {
+    auto session = make_session();
+    Published published;
+    const std::size_t width = round == 0 ? tokens.size() : round;
+    auto budget             = static_cast<std::uint32_t>(tokens.size());
+    for (std::size_t at = 0; at < tokens.size(); at += width) {
+        const std::size_t count = std::min(width, tokens.size() - at);
+        const auto decision     = session.preview_model(
+            std::span<const infernix::TokenId>(tokens.data() + at, count), budget,
+            infernix::FinishReason::OutputLimit);
+        budget -= decision.accepted_tokens;
+        const auto output = session.commit_preview();
+        published.reasoning += channel_text(output, infernix::OutputChannel::Reasoning);
+        published.content += channel_text(output, infernix::OutputChannel::Content);
+        if (decision.finished()) { break; }
+    }
+    for (const auto& call : session.take_tool_calls()) {
+        published.calls.push_back(call.name + " " + call.arguments_json);
+    }
+    return published;
+}
 
-    const auto quoted_tail = fixture_tokens("'; then hidden\n");
-    const auto tail_decision =
-        session.preview_model(quoted_tail, 64, infernix::FinishReason::OutputLimit);
-    const auto tail_output = session.commit_preview();
-    failures += check(channel_text(tail_output, infernix::OutputChannel::Reasoning) ==
-                              "</think>'; then hidden\n" &&
-                          channel_text(tail_output, infernix::OutputChannel::Content).empty(),
-                      "a marker followed by a quote was treated as a reasoning close");
+// The reasoning ends at the model's close token wherever it appears, with or without a line break
+// after it; the close spelled with ordinary tokens, in one token or across several, stays reasoning.
+// Every split of the output into decode rounds publishes the same channels.
+int test_reasoning_close_by_token_identity(const Frontend& frontend) {
+    const auto make_session = [&] { return frontend.make_output_session(thinking_prompt(frontend), {}); };
+    int failures            = 0;
 
-    std::vector<infernix::TokenId> spaced = {kFixtureThinkCloseToken};
-    const auto prose                    = fixture_tokens(" tag ends reasoning.\n");
-    spaced.insert(spaced.end(), prose.begin(), prose.end());
-    const auto spaced_decision = session.preview_model(spaced, 64, infernix::FinishReason::OutputLimit);
-    const auto spaced_output   = session.commit_preview();
-    failures += check(!spaced_decision.finished() &&
-                          channel_text(spaced_output, infernix::OutputChannel::Reasoning) ==
-                              "</think> tag ends reasoning.\n" &&
-                          channel_text(spaced_output, infernix::OutputChannel::Content).empty(),
-                      "a marker quoted in prose and followed by a space closed reasoning");
+    std::vector<infernix::TokenId> tokens = fixture_tokens("discussing the </think>\n\ntag.\n");
+    tokens.push_back(kFixtureThinkCloseToken);
+    const auto answer = fixture_tokens("'; the answer");
+    tokens.insert(tokens.end(), answer.begin(), answer.end());
+    const Published whole = publish_rounds(make_session, tokens, 0);
+    failures += check(whole.reasoning == "discussing the </think>\n\ntag.\n" &&
+                          whole.content == "'; the answer",
+                      "the reasoning did not end exactly at the close token");
+    for (const std::size_t round : {1U, 2U, 3U, 7U}) {
+        failures += check(publish_rounds(make_session, tokens, round) == whole,
+                          "decode rounds changed the reasoning/content split");
+    }
 
-    std::vector<infernix::TokenId> close = {kFixtureThinkCloseToken};
-    const auto answer                  = fixture_tokens("\n\nreal answer");
-    close.insert(close.end(), answer.begin(), answer.end());
-    const auto close_decision = session.preview_model(close, 64, infernix::FinishReason::OutputLimit);
-    const auto close_output   = session.commit_preview();
-    failures +=
-        check(channel_text(close_output, infernix::OutputChannel::Reasoning).empty() &&
-                  channel_text(close_output, infernix::OutputChannel::Content) == "real answer",
-              "the real close did not open the content channel");
+    // Only the token closes: a quoted close spelled with ordinary tokens that is followed by a line
+    // break, even at the end of the turn, stays reasoning.
+    const auto spelled = fixture_tokens("the tag </think>\n\nis framing\n</think>");
+    for (const std::size_t round : {0U, 1U}) {
+        const Published open = publish_rounds(make_session, spelled, round);
+        failures += check(open.reasoning == "the tag </think>\n\nis framing\n</think>" &&
+                              open.content.empty(),
+                          "a close spelled with ordinary tokens ended the reasoning");
+    }
     return failures;
 }
 
@@ -2468,23 +2713,40 @@ int test_reasoning_close_resolves_at_terminal(const Frontend& frontend) {
     return failures;
 }
 
-int test_thinking_budget_ignores_quoted_close(const Frontend& frontend) {
-    auto prompt = thinking_prompt(frontend);
-    auto session =
-        frontend.make_output_session(prompt, {}, {}, infernix::ThinkingControlOptions{.budget = 3});
-
-    const std::vector<infernix::TokenId> tokens{0, kFixtureThinkCloseToken, 0};
-    const auto decision = session.preview_model(tokens, 10, infernix::FinishReason::OutputLimit);
-    const auto output   = session.commit_preview();
+// The thinking budget follows the same close: the spelling from ordinary tokens leaves the thinking
+// open and the budget applies; the close token ends it even with no line break after it.
+int test_thinking_budget_follows_close_token(const Frontend& frontend) {
+    std::vector<infernix::TokenId> spelled = fixture_tokens("x</think>x");
+    auto open_session = frontend.make_output_session(
+        thinking_prompt(frontend), {}, {},
+        infernix::ThinkingControlOptions{.budget = static_cast<std::uint32_t>(spelled.size())});
+    const auto open_decision =
+        open_session.preview_model(spelled, 64, infernix::FinishReason::OutputLimit);
+    const auto open_output = open_session.commit_preview();
 
     int failures = 0;
     failures +=
-        check(!decision.finished() &&
-                  decision.continuation == infernix::runtime::ContinuationAction::ApplyTargetControl,
-              "a quoted close marker suppressed the thinking budget control");
-    failures += check(channel_text(output, infernix::OutputChannel::Reasoning) == "x</think>x" &&
-                          channel_text(output, infernix::OutputChannel::Content).empty(),
-                      "a quoted close marker was not preserved in the reasoning channel");
+        check(!open_decision.finished() &&
+                  open_decision.continuation == infernix::runtime::ContinuationAction::ApplyTargetControl,
+              "a close spelled with ordinary tokens suppressed the thinking budget control");
+    failures += check(channel_text(open_output, infernix::OutputChannel::Reasoning) == "x</think>x" &&
+                          channel_text(open_output, infernix::OutputChannel::Content).empty(),
+                      "a close spelled with ordinary tokens left the reasoning channel");
+
+    auto closed_session = frontend.make_output_session(
+        thinking_prompt(frontend), {}, {}, infernix::ThinkingControlOptions{.budget = 3});
+    const std::vector<infernix::TokenId> tokens{0, kFixtureThinkCloseToken, 0};
+    const auto closed_decision =
+        closed_session.preview_model(tokens, 10, infernix::FinishReason::OutputLimit);
+    const auto closed_output = closed_session.commit_preview();
+    failures += check(!closed_decision.finished() &&
+                          closed_decision.continuation == infernix::runtime::ContinuationAction::Decode &&
+                          closed_session.pending_control_tokens().empty() &&
+                          closed_session.thinking_stats().model_thinking_tokens == 2,
+                      "the close token without a line break left the thinking budget armed");
+    failures += check(channel_text(closed_output, infernix::OutputChannel::Reasoning) == "x" &&
+                          channel_text(closed_output, infernix::OutputChannel::Content) == "x",
+                      "the close token without a line break did not split the channels");
     return failures;
 }
 
@@ -2668,12 +2930,15 @@ int test_open_reasoning_tool_recovery() {
         std::vector<infernix::GeneratedToolCall> calls;
         infernix::ToolCallParseDiagnostics diagnostics;
     };
-    const auto run = [&](const std::string& generated, bool end_with_eos, bool tolerant = true) {
+    // `spelled` writes the markers with ordinary byte tokens instead of the model's tokens.
+    const auto run = [&](const std::string& generated, bool end_with_eos, bool tolerant = true,
+                         bool spelled = false) {
         auto session = frontend.make_output_session(
             prompt, {},
             infernix::OutputOptions{.tool_name_max_length = 64, .tolerant_tool_calls = tolerant}, {},
             {}, free_calls);
-        std::vector<infernix::TokenId> tokens = fixture_tokenizer().encode(generated);
+        std::vector<infernix::TokenId> tokens =
+            spelled ? fixture_tokens(generated) : fixture_tokenizer().encode(generated);
         if (end_with_eos) { tokens.push_back(eos); }
         const auto budget = static_cast<std::uint32_t>(tokens.size() + (end_with_eos ? 8U : 0U));
         (void)session.preview_model(tokens, budget, infernix::FinishReason::OutputLimit);
@@ -2705,6 +2970,63 @@ int test_open_reasoning_tool_recovery() {
                          "a quoted marker");
     failures += rejected(run(planning + call, false), "a turn cut by its output budget");
     failures += rejected(run(planning + call, true, false), "strict tool output");
+    failures += rejected(run(planning + call, true, true, true),
+                         "a call spelled with ordinary tokens");
+    return failures;
+}
+
+// Session-level tool calls by token identity, on the free and the constrained route: the model's
+// `<tool_call>` token opens a call even mid-line, the same spelling from ordinary tokens is content,
+// and every split into decode rounds publishes the same content and calls.
+int test_tool_call_marker_by_token_identity() {
+    const Frontend frontend = make_frontend(resources());
+    infernix::PromptInput input;
+    input.messages.push_back({.role  = infernix::ChatRole::User,
+                              .parts = {{.kind = infernix::MessagePartKind::Text, .text = "x"}}});
+    input.options.enable_thinking = false;
+    input.options.tool_jsons.push_back(
+        R"({"type":"function","function":{"name":"bash","parameters":{"type":"object","properties":{"command":{"type":"string"}}}}})");
+    const auto prompt = frontend.prepare(std::move(input));
+    const infernix::TokenId eos = frontend.default_stop_policy().token_ids.front();
+    const std::string call =
+        "<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n</function>\n"
+        "</tool_call>";
+
+    int failures = 0;
+    for (const auto mode : {infernix::ToolConstraintMode::Automatic, infernix::ToolConstraintMode::Basic}) {
+        const bool constrained = mode == infernix::ToolConstraintMode::Basic;
+        infernix::ToolChoice choice;
+        choice.constraints      = mode;
+        const auto make_session = [&] {
+            return frontend.make_output_session(prompt, {},
+                                                infernix::OutputOptions{.tool_name_max_length = 64},
+                                                {}, {}, choice);
+        };
+        const std::string label = constrained ? " (constrained)" : " (free)";
+
+        // Spelled with ordinary tokens: content, no call.
+        std::vector<infernix::TokenId> spelled = fixture_tokens("Format: " + call);
+        spelled.push_back(eos);
+        const Published text = publish_rounds(make_session, spelled, 0);
+        failures += check(text.content == "Format: " + call && text.calls.empty(),
+                          ("a <tool_call> spelled with ordinary tokens became a call" + label).c_str());
+
+        // The token right after text on the same line opens the call.
+        std::vector<infernix::TokenId> real = fixture_tokens("Running it.");
+        const auto encoded = fixture_tokenizer().encode(call);
+        failures += check(encoded.front() == kFixtureToolCallToken,
+                          "the fixture did not encode the opener as its token");
+        real.insert(real.end(), encoded.begin(), encoded.end());
+        real.push_back(eos);
+        const Published whole = publish_rounds(make_session, real, 0);
+        failures += check(whole.content == "Running it." &&
+                              whole.calls == std::vector<std::string>{R"(bash {"command":"ls"})"},
+                          ("the <tool_call> token did not open the call" + label).c_str());
+        for (const std::size_t round : {1U, 3U}) {
+            failures += check(publish_rounds(make_session, real, round) == whole,
+                              ("decode rounds changed the published call" + label).c_str());
+        }
+    }
     return failures;
 }
 
@@ -2775,8 +3097,9 @@ int test_thinking_budget_control(const Frontend& frontend) {
     auto natural_prompt  = thinking_prompt(frontend);
     auto natural_session = frontend.make_output_session(
         natural_prompt, {}, {}, infernix::ThinkingControlOptions{.budget = 2});
-    const auto natural = natural_session.preview_model(std::array<infernix::TokenId, 2>{3, 4}, 20,
-                                                       infernix::FinishReason::OutputLimit);
+    const auto natural = natural_session.preview_model(
+        std::array<infernix::TokenId, 2>{0, kFixtureThinkCloseToken}, 20,
+        infernix::FinishReason::OutputLimit);
     failures += check(!natural.finished() &&
                           natural.continuation == infernix::runtime::ContinuationAction::Decode,
                       "natural thinking close at the budget boundary requested control");
@@ -2983,19 +3306,31 @@ int test_utf8_and_hidden_eos(const Frontend& frontend) {
                           replacement + "hello",
                       "UTF-8 recovery changed stop-string publication");
 
-    auto repaired_reasoning_prompt  = thinking_prompt(frontend);
-    auto repaired_reasoning_session = frontend.make_output_session(repaired_reasoning_prompt, {});
-    const auto repaired_reasoning_decision = repaired_reasoning_session.preview_model(
-        std::array<infernix::TokenId, 3>{10, 3, 4}, 3, infernix::FinishReason::OutputLimit);
-    failures +=
-        check(repaired_reasoning_decision.finish_reason == infernix::FinishReason::OutputLimit,
-              "UTF-8 recovery changed reasoning termination");
-    const auto repaired_reasoning_output = repaired_reasoning_session.commit_preview();
-    failures += check(channel_text(repaired_reasoning_output, infernix::OutputChannel::Reasoning) ==
-                              replacement + "thought" &&
-                          channel_text(repaired_reasoning_output, infernix::OutputChannel::Content) ==
-                              "answer",
-                      "UTF-8 recovery changed reasoning/content channel routing");
+    // An incomplete code point before the close token, or cut by it, is replaced in the reasoning.
+    for (const bool cut_by_close : {false, true}) {
+        std::vector<infernix::TokenId> repaired{10};
+        if (!cut_by_close) {
+            const auto thought = fixture_tokens("thought");
+            repaired.insert(repaired.end(), thought.begin(), thought.end());
+        }
+        repaired.push_back(kFixtureThinkCloseToken);
+        const auto answer = fixture_tokens("\n\nanswer");
+        repaired.insert(repaired.end(), answer.begin(), answer.end());
+        auto repaired_reasoning_session =
+            frontend.make_output_session(thinking_prompt(frontend), {});
+        const auto repaired_reasoning_decision = repaired_reasoning_session.preview_model(
+            repaired, static_cast<std::uint32_t>(repaired.size()),
+            infernix::FinishReason::OutputLimit);
+        failures +=
+            check(repaired_reasoning_decision.finish_reason == infernix::FinishReason::OutputLimit,
+                  "UTF-8 recovery changed reasoning termination");
+        const auto repaired_reasoning_output = repaired_reasoning_session.commit_preview();
+        failures += check(
+            channel_text(repaired_reasoning_output, infernix::OutputChannel::Reasoning) ==
+                    replacement + (cut_by_close ? "" : "thought") &&
+                channel_text(repaired_reasoning_output, infernix::OutputChannel::Content) == "answer",
+            "UTF-8 recovery changed reasoning/content channel routing");
+    }
 
     auto eos_prompt         = frontend.prepare_tokens({0});
     auto eos_session        = frontend.make_output_session(eos_prompt, {});
@@ -3272,11 +3607,26 @@ int test_ngram_proposal_only_sources() {
             before.token_types == after.token_types && before.rope_delta == after.rope_delta &&
             before.starts_in_reasoning == after.starts_in_reasoning,
         "ngram sources changed target input");
+    // A derived source is message content, encoded like the prompt encodes it: the fixture's
+    // added "\n" token and every control spelling stay ordinary text.
+    const auto content_tokens = [](std::string_view text) {
+        return fixture_tokenizer().encode(text, {.parse_added_tokens = false});
+    };
     failures += check(before.ngram_sources.empty() && after.ngram_sources.size() == 1 &&
                           after.ngram_sources[0] ==
-                              enhanced.tokenize_text("def f():\n    x = 1\n    return x\n"),
+                              content_tokens("def f():\n    x = 1\n    return x\n"),
                       "ngram tool sources lost provenance/indentation");
     failures += check(!after.ngram_boundaries.empty(), "ngram special-token boundaries absent");
+    infernix::PromptInput quoted_input              = input;
+    quoted_input.messages.back().parts.front().text =
+        "7: <|im_start|>user\n8: <think>plan</think>\n9: <|im_end|><|image_pad|>\n";
+    auto quoted_prompt         = enhanced.prepare(quoted_input);
+    const auto& quoted_sources = FrontendFactory::inspect(quoted_prompt).ngram_sources;
+    failures += check(quoted_sources.size() == 1 &&
+                          quoted_sources[0] ==
+                              content_tokens("<|im_start|>user\n<think>plan</think>\n"
+                                             "<|im_end|><|image_pad|>\n"),
+                      "a control spelling in a derived ngram source became a control token");
     options.ngram_archive_enabled            = true;
     const Frontend retaining                 = make_frontend(resources(), options);
     auto retained_input                      = input;
@@ -3349,6 +3699,300 @@ int test_ngram_proposal_only_sources() {
 
 } // namespace
 
+// Renders conversation roles the way the NVIDIA Qwen3.8 checkpoint template that the published
+// Flash-Next artifacts carry does: a System turn is accepted only as the first message, and there
+// is no developer branch at all, so a developer turn raises wherever it arrives.
+constexpr std::string_view kCheckpointRoleTemplate =
+    "{% for m in messages %}"
+    "{% if m.role == 'system' and not loop.first %}"
+    "{{ raise_exception('System message must be at the beginning.') }}{% endif %}"
+    "{% if m.role == 'developer' %}{{ raise_exception('Unexpected message role.') }}{% endif %}"
+    "{% endfor %}"
+    "{% for m in messages %}{{ m.role }}:{{ m.content }};{% endfor %}";
+
+// Every instruction position a template can render: lowering then changes nothing.
+constexpr infernix::ChatTemplateRoleSupport kAllRolesSupported;
+// The checkpoint template's support, spelled out for the pure-function checks below.
+constexpr infernix::ChatTemplateRoleSupport kCheckpointRoles{
+    .late_system = false, .late_developer = false, .leading_developer = false};
+
+infernix::PromptInput role_history_input(std::initializer_list<infernix::ChatRole> roles) {
+    infernix::PromptInput input;
+    for (const infernix::ChatRole role : roles) {
+        infernix::ChatMessage message;
+        message.role = role;
+        message.parts.push_back({.text = "text"});
+        input.messages.push_back(std::move(message));
+    }
+    return input;
+}
+
+fi::ChatMessage text_turn(infernix::ChatRole role) {
+    fi::ChatMessage message;
+    message.role = role;
+    message.parts.push_back(fi::ChatPart::text_part("text"));
+    return message;
+}
+
+int test_chat_template_role_support_probe() {
+    const auto checkpoint = fi::CompiledChatTemplate::resolve(kCheckpointRoleTemplate);
+    const auto thinking   = fi::CompiledChatTemplate::resolve(thinking_toggle_template_source());
+    const auto positional = fi::CompiledChatTemplate::resolve(reasoning_effort_template_source());
+    int failures          = check(checkpoint.role_support() == kCheckpointRoles,
+                      "resolve did not measure the instruction positions the template refuses");
+    failures += check(thinking.role_support() == kAllRolesSupported &&
+                          positional.role_support() == kAllRolesSupported,
+                      "a maintained template that renders instruction turns in place was measured "
+                      "as refusing them");
+    const auto checkpoint_frontend =
+        make_frontend(resources(std::string(kCheckpointRoleTemplate)), false);
+    const auto maintained_frontend = make_frontend(resources(), false);
+    failures += check(
+        checkpoint_frontend.chat_template_role_support() == kCheckpointRoles &&
+            maintained_frontend.chat_template_role_support() == kAllRolesSupported,
+        "Frontend did not expose the template's measured role support");
+    // Capability is measured by rendering each position, so the refusal's wording carries no
+    // weight: a differently worded guard is still found, and only for the position it covers.
+    const auto reworded = fi::CompiledChatTemplate::resolve(
+        "{% for m in messages %}{% if m.role == 'system' and not loop.first %}"
+        "{{ raise_exception('Late system turns are not allowed here.') }}{% endif %}{% endfor %}"
+        "{% for m in messages %}{{ m.role }}:{{ m.content }};{% endfor %}");
+    failures += check(!reworded.role_support().late_system &&
+                          reworded.role_support().late_developer &&
+                          reworded.role_support().leading_developer,
+                      "role support follows one guard phrase instead of what the template renders");
+    // Text that only mentions the guard phrase renders every position, so it lowers nothing. A
+    // template that carries the phrase inertly keeps its real roles.
+    const auto mentioned = fi::CompiledChatTemplate::resolve(
+        "{# System message must be at the beginning #}{% for m in messages %}"
+        "{{ m.role }}:{{ m.content }};{% endfor %}");
+    failures += check(mentioned.role_support() == kAllRolesSupported,
+                      "a template that only mentions the guard phrase lowered roles it could have "
+                      "rendered under their real role");
+    // A template with no System role at all is stating its own rule about instructions rather than
+    // placing one, so preparation reports it as unsupported without lowering anything.
+    const auto no_system = fi::CompiledChatTemplate::resolve(
+        "{% for m in messages %}{% if m.role == 'system' %}"
+        "{{ raise_exception('template declines system') }}{% endif %}{% endfor %}"
+        "{% for m in messages %}{{ m.role }}:{{ m.content }};{% endfor %}");
+    failures += check(!no_system.role_support().leading_system &&
+                          !no_system.role_support().late_system &&
+                          !no_system.role_support().lowers_late_system() &&
+                          no_system.role_support().late_developer,
+                      "a template's own rule about its instruction role was reported as a "
+                      "position preparation could work around");
+    return failures;
+}
+
+int test_instruction_role_lowering() {
+    std::vector<fi::ChatMessage> messages;
+    for (const auto role : {infernix::ChatRole::System, infernix::ChatRole::User,
+                            infernix::ChatRole::Assistant, infernix::ChatRole::System,
+                            infernix::ChatRole::Developer, infernix::ChatRole::User,
+                            infernix::ChatRole::Tool}) {
+        messages.push_back(text_turn(role));
+    }
+    const std::size_t lowered =
+        fi::lower_unsupported_instruction_roles(kCheckpointRoles, messages);
+    int failures = check(lowered == 2 && messages[3].role == infernix::ChatRole::User &&
+                             messages[4].role == infernix::ChatRole::User,
+                         "the late System and developer turns were not lowered to User");
+    failures += check(messages[0].role == infernix::ChatRole::System,
+                      "lowering touched the first message's System role");
+    failures += check(messages[3].parts.size() == 1 && messages[3].parts[0].text == "text",
+                      "lowering changed a lowered turn's text or part count");
+    failures += check(messages[2].role == infernix::ChatRole::Assistant &&
+                          messages[6].role == infernix::ChatRole::Tool,
+                      "lowering touched a non-instruction turn, breaking assistant continuation or "
+                      "the tool-response grouping");
+    // A checkpoint template with no developer branch also refuses the leading developer turn that
+    // the OpenAI Responses `instructions` field and the `developer` role produce; that turn takes
+    // the System role the same instructions hold on such a template.
+    std::vector<fi::ChatMessage> leading = {text_turn(infernix::ChatRole::Developer),
+                                            text_turn(infernix::ChatRole::User)};
+    failures += check(fi::lower_unsupported_instruction_roles(kCheckpointRoles, leading) == 1 &&
+                          leading[0].role == infernix::ChatRole::System,
+                      "a leading developer turn was not lowered to System");
+    // Only the very first message keeps an instruction role: the guard rejects any System after it,
+    // so a second instruction turn inside a leading block also becomes User.
+    std::vector<fi::ChatMessage> block = {text_turn(infernix::ChatRole::System),
+                                          text_turn(infernix::ChatRole::Developer),
+                                          text_turn(infernix::ChatRole::User)};
+    failures += check(fi::lower_unsupported_instruction_roles(kCheckpointRoles, block) == 1 &&
+                          block[0].role == infernix::ChatRole::System &&
+                          block[1].role == infernix::ChatRole::User,
+                      "the first message was lowered or the second instruction turn was left to "
+                      "trip the guard");
+    // A conversation with no leading instruction turn still ends in a mid-conversation System, the
+    // shape an Anthropic request without top-level system carries.
+    std::vector<fi::ChatMessage> no_anchor;
+    for (const auto role : {infernix::ChatRole::User, infernix::ChatRole::Assistant,
+                            infernix::ChatRole::User, infernix::ChatRole::System}) {
+        no_anchor.push_back(text_turn(role));
+    }
+    failures += check(fi::lower_unsupported_instruction_roles(kCheckpointRoles, no_anchor) == 1 &&
+                          no_anchor[3].role == infernix::ChatRole::User,
+                      "lowering was gated on the conversation opening with an instruction turn");
+    // Lowering is per position: a template that only refuses a late System keeps a late developer.
+    std::vector<fi::ChatMessage> mixed = {text_turn(infernix::ChatRole::System),
+                                          text_turn(infernix::ChatRole::User),
+                                          text_turn(infernix::ChatRole::System),
+                                          text_turn(infernix::ChatRole::Developer)};
+    constexpr infernix::ChatTemplateRoleSupport system_only{
+        .late_system = false, .late_developer = true, .leading_developer = true};
+    failures += check(fi::lower_unsupported_instruction_roles(system_only, mixed) == 1 &&
+                          mixed[2].role == infernix::ChatRole::User &&
+                          mixed[3].role == infernix::ChatRole::Developer,
+                      "lowering ignored which instruction positions the template actually refuses");
+    std::vector<fi::ChatMessage> supported;
+    for (const auto role : {infernix::ChatRole::System, infernix::ChatRole::Developer,
+                            infernix::ChatRole::User, infernix::ChatRole::System,
+                            infernix::ChatRole::Developer}) {
+        supported.push_back(text_turn(role));
+    }
+    failures += check(fi::lower_unsupported_instruction_roles(kAllRolesSupported, supported) == 0,
+                      "preparation lowered roles the active template can render");
+    // A template that refuses System at every position is stating its own rule about instructions,
+    // not placing them, so the turn is left for that template to refuse instead of being rewritten
+    // around it. System is the role the Qwen templates use for instructions themselves.
+    std::vector<fi::ChatMessage> declined = {text_turn(infernix::ChatRole::System),
+                                             text_turn(infernix::ChatRole::User),
+                                             text_turn(infernix::ChatRole::System)};
+    constexpr infernix::ChatTemplateRoleSupport no_system_role{
+        .leading_system = false, .late_system = false};
+    failures += check(fi::lower_unsupported_instruction_roles(no_system_role, declined) == 0 &&
+                          declined[0].role == infernix::ChatRole::System &&
+                          declined[2].role == infernix::ChatRole::System,
+                      "preparation rewrote a template's own rule about its instruction role");
+    // The instruction alias still needs a role on a template that has neither System nor developer,
+    // so it takes the one every template renders.
+    std::vector<fi::ChatMessage> alias = {text_turn(infernix::ChatRole::Developer),
+                                          text_turn(infernix::ChatRole::User)};
+    constexpr infernix::ChatTemplateRoleSupport instructionless{
+        .leading_system = false, .late_system = false, .late_developer = false,
+        .leading_developer = false};
+    failures += check(
+        fi::lower_unsupported_instruction_roles(instructionless, alias) == 1 &&
+            alias[0].role == infernix::ChatRole::User,
+        "a leading developer turn had no role to fall back to on a template without either role");
+    return failures;
+}
+
+int test_checkpoint_template_prepare_lowers_instruction_roles() {
+    const auto guarded = make_frontend(resources(std::string(kCheckpointRoleTemplate)), false);
+    std::vector<fi::ChatMessage> history;
+    for (const auto role : {infernix::ChatRole::System, infernix::ChatRole::User,
+                            infernix::ChatRole::Assistant, infernix::ChatRole::System}) {
+        history.push_back(text_turn(role));
+    }
+    int failures =
+        check(throws_invalid_argument([&] {
+                  (void)fi::CompiledChatTemplate::resolve(kCheckpointRoleTemplate).render(history);
+              }),
+              "the checkpoint template rendered a late System turn without lowering");
+    const auto prepared    = guarded.prepare(role_history_input({infernix::ChatRole::System,
+                                                                 infernix::ChatRole::User,
+                                                                 infernix::ChatRole::Assistant,
+                                                                 infernix::ChatRole::System}));
+    const auto& data       = FrontendFactory::inspect(prepared);
+    const auto lowered_ids = fixture_tokenizer().encode(
+        "system:text;user:text;assistant:text;user:text;");
+    failures += check(data.prepare.instruction_role_lowerings == 1 && data.token_ids == lowered_ids,
+                      "preparation did not lower the late System turn to User in place");
+    const auto reported = prepared.preparation_stats();
+    failures += check(reported.instruction_role_lowerings == 1 &&
+                          reported.media_items == data.prepare.media_items &&
+                          reported.tokenize_seconds == data.prepare.tokenize_seconds,
+                      "preparation_stats() dropped or mis-mapped the counter the Engine reports onward");
+    failures += check(guarded.count_tokens(role_history_input({infernix::ChatRole::System,
+                                                                infernix::ChatRole::User,
+                                                                infernix::ChatRole::Assistant,
+                                                                infernix::ChatRole::System})) ==
+                          data.token_ids.size(),
+                      "count_tokens failed where the same guarded generation request succeeded");
+    const auto developer_prepared =
+        guarded.prepare(role_history_input({infernix::ChatRole::System, infernix::ChatRole::User,
+                                            infernix::ChatRole::Assistant,
+                                            infernix::ChatRole::Developer}));
+    failures += check(FrontendFactory::inspect(developer_prepared)
+                          .prepare.instruction_role_lowerings == 1,
+                      "a late developer turn was not lowered like a late System turn");
+    // The OpenAI Responses `instructions` field arrives as a leading developer turn, which this
+    // template cannot render at any position: it renders under the System role instead.
+    const auto leading_prepared = guarded.prepare(
+        role_history_input({infernix::ChatRole::Developer, infernix::ChatRole::User}));
+    const auto& leading_data    = FrontendFactory::inspect(leading_prepared);
+    failures += check(
+        leading_data.prepare.instruction_role_lowerings == 1 &&
+            leading_data.token_ids ==
+                fixture_tokenizer().encode("system:text;user:text;"),
+        "a leading developer turn was not lowered to System, leaving the request to fail the "
+        "template it cannot render");
+    // A conversation that opens with a User turn still has its closing System lowered: the guard
+    // refuses a System anywhere but the first position.
+    const auto unanchored = guarded.prepare(role_history_input({infernix::ChatRole::User,
+                                                                infernix::ChatRole::Assistant,
+                                                                infernix::ChatRole::User,
+                                                                infernix::ChatRole::System}));
+    const auto& unanchored_data = FrontendFactory::inspect(unanchored);
+    failures += check(unanchored_data.prepare.instruction_role_lowerings == 1 &&
+                          unanchored_data.token_ids ==
+                              fixture_tokenizer().encode(
+                                  "user:text;assistant:text;user:text;user:text;"),
+                      "a mid-conversation System was left in place because no instruction turn led "
+                      "the conversation");
+    const auto tolerant   = make_frontend(resources(), false);
+    const auto kept       = tolerant.prepare(role_history_input({infernix::ChatRole::System,
+                                                                 infernix::ChatRole::User,
+                                                                 infernix::ChatRole::Assistant,
+                                                                 infernix::ChatRole::System}));
+    const auto& kept_data = FrontendFactory::inspect(kept);
+    const auto as_user    = tolerant.prepare(role_history_input({infernix::ChatRole::System,
+                                                                  infernix::ChatRole::User,
+                                                                  infernix::ChatRole::Assistant,
+                                                                  infernix::ChatRole::User}));
+    failures += check(kept_data.prepare.instruction_role_lowerings == 0 &&
+                          kept_data.token_ids != FrontendFactory::inspect(as_user).token_ids,
+                      "the maintained template lost the late System turn's role or position");
+    const auto kept_leading = tolerant.prepare(
+        role_history_input({infernix::ChatRole::Developer, infernix::ChatRole::User}));
+    failures += check(FrontendFactory::inspect(kept_leading).prepare.instruction_role_lowerings ==
+                          0,
+                      "the maintained template lost a leading developer turn's role");
+    return failures;
+}
+
+int test_checkpoint_lowering_precedes_leading_instruction_tap() {
+    // The structural tap sits at the boundary after the leading System/Developer block. If role
+    // collection ran before the lowering, the guarded [System, developer, User] history would
+    // place it after the lowered developer turn instead of after the first message; lowering must
+    // therefore precede it, making the prompt identical to the same history already typed as User.
+    const auto guarded = make_frontend(resources(std::string(kCheckpointRoleTemplate)), false);
+    const auto lowered = guarded.prepare(role_history_input({infernix::ChatRole::System,
+                                                             infernix::ChatRole::Developer,
+                                                             infernix::ChatRole::User}));
+    const auto as_user = guarded.prepare(role_history_input({infernix::ChatRole::System,
+                                                             infernix::ChatRole::User,
+                                                             infernix::ChatRole::User}));
+    const auto structural = [](const infernix::models::qwen3_5::PreparedPromptData& data) {
+        std::vector<std::uint32_t> positions;
+        for (const TapHint& hint : data.tap_hints.hints) {
+            if (hint.kind == TapHintKind::Structural) { positions.push_back(hint.position); }
+        }
+        return positions;
+    };
+    const auto& lowered_data = FrontendFactory::inspect(lowered);
+    int failures             = check(
+        lowered_data.prepare.instruction_role_lowerings == 1,
+        "preparation of a guarded leading-block history did not count the lowered developer turn");
+    const auto lowered_taps = structural(lowered_data);
+    const auto as_user_taps = structural(FrontendFactory::inspect(as_user));
+    failures += check(lowered_taps.size() == 1 && lowered_taps == as_user_taps &&
+                          lowered_data.token_ids == FrontendFactory::inspect(as_user).token_ids,
+                      "the leading instruction tap or render still saw the pre-lowering roles");
+    return failures;
+}
+
 int main() {
     const FrontendResources owned = resources();
     const Frontend frontend       = make_frontend(owned);
@@ -3359,6 +4003,7 @@ int main() {
     failures += test_bpe_merge_order();
     failures += test_boundary_aware_tokenization();
     failures += test_rendered_special_tokens();
+    failures += test_quoted_controls_in_history();
     failures += test_repeated_special_tokens_scan_linearly();
     failures += test_bounded_tokenizer_prefix();
     failures += test_context_capacity_guard();
@@ -3390,11 +4035,13 @@ int main() {
     failures += test_same_token_stop_priority(frontend);
     failures += test_terminal_flush(frontend);
     failures += test_structured_tool_output();
+    failures += test_deferred_tool_declarations();
     failures += test_tools_and_json_output();
     failures += test_tool_marker_after_quoted_marker();
     failures += test_open_reasoning_tool_recovery();
+    failures += test_tool_call_marker_by_token_identity();
     failures += test_reasoning_split(frontend);
-    failures += test_reasoning_close_requires_boundary(frontend);
+    failures += test_reasoning_close_by_token_identity(frontend);
     failures += test_reasoning_close_resolves_at_terminal(frontend);
     failures += test_thinking_tokens_without_budget(frontend);
     failures += test_thinking_budget_control(frontend);
@@ -3402,7 +4049,7 @@ int main() {
     failures += test_constrained_thinking_control(frontend);
     failures += test_grammar_refusal_is_request_scoped(frontend);
     failures += test_thinking_budget_message();
-    failures += test_thinking_budget_ignores_quoted_close(frontend);
+    failures += test_thinking_budget_follows_close_token(frontend);
     failures += test_utf8_and_hidden_eos(frontend);
     failures += test_media_cache_reuses_immutable_payload();
     failures += test_media_payload_outlives_frontend_cache();
@@ -3413,5 +4060,9 @@ int main() {
     failures += test_media_preparation_cancellation();
     failures += test_invalid_media_classification();
     failures += test_disabled_vision();
+    failures += test_chat_template_role_support_probe();
+    failures += test_instruction_role_lowering();
+    failures += test_checkpoint_template_prepare_lowers_instruction_roles();
+    failures += test_checkpoint_lowering_precedes_leading_instruction_tap();
     return failures == 0 ? 0 : 1;
 }

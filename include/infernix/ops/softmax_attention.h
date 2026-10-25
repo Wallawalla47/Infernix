@@ -37,6 +37,11 @@ struct CausalAttentionExecutionEnvelope {
     //     E4M3 Tensor Cores.
     // Other routes and cache formats ignore it.
     bool fast_prompt_pv8 = false;
+    // BF16 KV prompt-route launches (more than 256 columns): every query tile's key blocks split
+    // into the equal shares that fill whole waves of the SMs, their FP32 partials merged in split
+    // order, a different softmax merge order (the bf16-prompt-split fast path). The splits take the
+    // prompt split workspace below. Other routes and cache formats ignore it.
+    bool bf16_prompt_split = false;
     // Workspace the FP32 split partials of one prompt-route launch of the fast INT8 or NVFP4
     // prompt kernel, FP8 or K8V4's tiled kernel, or a VQ2 or K4V2 prompt launch may take (the
     // last two plan their splits with the fast INT8 prompt kernel). These kernels split a launch's

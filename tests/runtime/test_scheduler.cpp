@@ -328,6 +328,97 @@ void test_decode_and_control_membership() {
             "compact control membership changed committed control spans or request order");
 }
 
+// The Engine's cycle: one Control/Decode batch, then the prefill turn unless the share yields it.
+// Returns the decode batches each prefill unit was followed by before the next unit ran.
+std::vector<int> decode_batches_between_units(Scheduler& scheduler, std::uint64_t unit_ns,
+                                              std::uint64_t batch_ns, int units,
+                                              std::uint32_t prompt_tokens, std::uint32_t chunk) {
+    std::vector<int> batches;
+    std::uint32_t remaining = prompt_tokens;
+    int since_unit          = 0;
+    for (int cycle = 0; cycle < 100000 && static_cast<int>(batches.size()) < units; ++cycle) {
+        scheduler.decode_work_finished(batch_ns);
+        ++since_unit;
+        if (scheduler.prefill_yields()) { continue; }
+        if (cycle != 0) { batches.push_back(since_unit); }
+        since_unit = 0;
+        remaining -= std::min(remaining, chunk);
+        scheduler.prefill_unit_finished(unit_ns, remaining == 0, remaining, true);
+        if (remaining == 0) { remaining = prompt_tokens; }
+    }
+    return batches;
+}
+
+void test_decode_share() {
+    constexpr std::uint64_t kUnit  = 2'000'000'000; // a 2 s prefill unit
+    constexpr std::uint64_t kBatch = 10'000'000;    // a 10 ms decode round
+    {
+        // Share 0 is the unchanged one batch per unit.
+        Scheduler scheduler;
+        const auto batches = decode_batches_between_units(scheduler, kUnit, kBatch, 8, 1U << 20, 16384);
+        require(std::all_of(batches.begin(), batches.end(), [](int n) { return n == 1; }) &&
+                    scheduler.decode_share_yields() == 0,
+                "share 0 changed the one-batch-per-unit alternation");
+    }
+    {
+        // Share 0.5: 1 s of decode after each 2 s unit (the next cycle's batch included).
+        Scheduler scheduler;
+        scheduler.set_decode_share({.share = 0.5, .min_remaining_tokens = 0});
+        const auto batches = decode_batches_between_units(scheduler, kUnit, kBatch, 8, 1U << 20, 16384);
+        require(batches.size() == 8 &&
+                    std::all_of(batches.begin(), batches.end(), [](int n) { return n == 100; }),
+                "share 0.5 did not buy share * unit wall time of decode per unit");
+    }
+    {
+        // Overshoot is carried: 7 ms rounds against a 1 s share average 1 s per unit.
+        Scheduler scheduler;
+        scheduler.set_decode_share({.share = 0.5, .min_remaining_tokens = 0});
+        const auto batches = decode_batches_between_units(scheduler, kUnit, 7'000'000, 50, 1U << 30, 16384);
+        long total = 0;
+        for (const int n : batches) {
+            require(n == 142 || n == 143, "a unit's decode exceeded its share by more than one batch");
+            total += n;
+        }
+        const double seconds = static_cast<double>(total) * 0.007;
+        require(seconds > 0.99 * 50 && seconds < 1.01 * 50, "carried overshoot drifted from the share");
+    }
+    {
+        // The last unit earns nothing: a 2-chunk prompt yields only after its first unit.
+        Scheduler scheduler;
+        scheduler.set_decode_share({.share = 1.0, .min_remaining_tokens = 0});
+        scheduler.prefill_unit_finished(kUnit, true, 0, true);
+        require(!scheduler.prefill_yields(), "a prompt's last unit bought decode time");
+        // No other lane waiting to decode: nothing to yield to.
+        scheduler.prefill_unit_finished(kUnit, false, 16384, false);
+        require(!scheduler.prefill_yields(), "prefill yielded with no lane waiting to decode");
+        // A cycle without Control/Decode work ends the share (the waiting lane left).
+        scheduler.prefill_unit_finished(kUnit, false, 16384, true);
+        scheduler.decode_work_finished(kBatch);
+        require(scheduler.prefill_yields(), "share 1 did not yield after a non-last unit");
+        scheduler.decode_work_absent();
+        require(!scheduler.prefill_yields(), "the share outlived the decode work it was owed to");
+    }
+    {
+        // Length-aware: only a prompt with at least min_remaining_tokens left yields.
+        Scheduler scheduler;
+        scheduler.set_decode_share({.share = 0.5, .min_remaining_tokens = 32768});
+        scheduler.prefill_unit_finished(kUnit, false, 16384, true);
+        scheduler.decode_work_finished(kBatch);
+        require(!scheduler.prefill_yields(), "a short remainder yielded below the threshold");
+        scheduler.prefill_unit_finished(kUnit, false, 32768, true);
+        scheduler.decode_work_finished(kBatch);
+        require(scheduler.prefill_yields(), "a long remainder did not yield at the threshold");
+    }
+    {
+        Scheduler scheduler;
+        bool rejected = false;
+        try {
+            scheduler.set_decode_share({.share = 1.5, .min_remaining_tokens = 0});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        require(rejected && scheduler.decode_share().share == 0.0, "a share above 1 was accepted");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -339,6 +430,7 @@ int main() {
         test_restore_events();
         test_prefill_replay_round_robin();
         test_decode_and_control_membership();
+        test_decode_share();
         std::cout << "ok\n";
         return 0;
     } catch (const std::exception& error) {

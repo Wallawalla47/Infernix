@@ -12,6 +12,7 @@
 //     destination leaves every state unchanged; untouched slots and guards stay intact.
 
 #include "infernix/ops/ple.h"
+#include "ops/op_family.h"
 
 #include "core/arena.h"
 #include "ops/op_check.h"
@@ -281,7 +282,7 @@ void test_conv(int channels, int taps, int dilation, int sequences, int width, b
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(ple) {
     if (cuda_unavailable()) {
         std::printf("SKIP: no usable CUDA device\n");
         return 77;

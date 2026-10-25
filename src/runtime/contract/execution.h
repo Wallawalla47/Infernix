@@ -3,6 +3,7 @@
 #include "runtime/contract/request.h"
 #include "runtime/contract/timing.h"
 #include <compare>
+#include <cstdint>
 #include <span>
 #include <stdexcept>
 
@@ -22,6 +23,17 @@ public:
 class RequestOutputError : public RecoverableExecutionError {
 public:
     using RecoverableExecutionError::RecoverableExecutionError;
+};
+
+// Why one row of a pending batch cannot commit: the Engine fails that row's request alone (the
+// commit releases it as CommitDisposition::FailedReleased) and commits the other rows.
+enum class PendingRowFailure : std::uint8_t {
+    None,
+    // The row's emitted tokens reach a position where its grammar admits no token.
+    ConstraintDeadEnd,
+    // The round's sampler found no finite logit to select from (ops::SamplingConfig::nonfinite):
+    // the row's tokens are placeholders.
+    NonFiniteLogits,
 };
 
 // Borrowed for one synchronous Program call. Engine maps compact rows to request-owned matchers.

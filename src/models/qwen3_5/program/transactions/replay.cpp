@@ -66,6 +66,8 @@ void ProgramImpl::install_resume_sampling(SequenceState& sequence, RequestContro
             .view({execution::dimension(parameters.model.resources().public_token_count)});
     request.sampling_host.token_counts =
         penalties ? static_cast<std::int32_t*>(counts.data) : nullptr;
+    *nonfinite_flag(sequence.lane)  = 0;
+    request.sampling_host.nonfinite = nonfinite_flag(sequence.lane);
 
     try {
         if (penalties) {

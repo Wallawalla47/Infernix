@@ -77,9 +77,9 @@ struct GroupSlot {
     int rows, n, out_offset, block, row_bytes, format;
 };
 
-__device__ __forceinline__ GroupSlot group_slot(const RowsGroup& g) {
-    const int b = static_cast<int>(blockIdx.x);
-    int i       = 0;
+// The slot of CTA b of the group's prefix (group_slot: b = blockIdx.x).
+__device__ __forceinline__ GroupSlot group_slot_at(const RowsGroup& g, int b) {
+    int i = 0;
 #pragma unroll
     for (int j = 1; j < RowsGroup::kMax; ++j) { i = j < g.count && b >= g.first[j] ? j : i; }
     // Selects with constant indices, so the parameters are read from the constant bank in place.
@@ -92,6 +92,8 @@ __device__ __forceinline__ GroupSlot group_slot(const RowsGroup& g) {
     }
     return s;
 }
+
+__device__ __forceinline__ GroupSlot group_slot(const RowsGroup& g) { return group_slot_at(g, static_cast<int>(blockIdx.x)); }
 
 void require(bool condition, const char* message) {
     if (!condition) { throw std::invalid_argument(std::string("ggml_linear: ") + message); }
@@ -547,6 +549,183 @@ __global__ void __launch_bounds__(kTiledMaxThreads, 2)
     }
 }
 
+// Tiled calls wider than kMmaMaxColumns (two-request MTP and DFlash2 rounds, n-gram copy rounds of 15
+// or 31, the head at those widths) on tensor cores: tiled_mma_body's CTA shape, ring and split, with
+// each warp holding kWideTiles column tiles of 8 (16 columns: one decode of a block feeds both tiles'
+// MMAs, mma_rows::unit_sums_columns); calls of more than 16 columns take ceil(columns / 16) column
+// groups, whose CTAs of one row tile are adjacent (the later ones read the weights from L2). The same
+// integers as every other route. Against the rows kernel's four-column passes, which decoded every
+// block again per pass (2026-10-24, RTX 5090, the IQ3_S import's dense calls): 0.68-0.20x the time at
+// 9 columns, 0.37-0.11x at 31 (candidates ST-01).
+constexpr int kWideTiles   = 2;
+constexpr int kWideColumns = 8 * kWideTiles;
+// CTAs per SM of a format's wide kernel. Min-term formats (Q4_K, Q5_K) carry two tiles' int64 min sums
+// beside the int128 outputs, and at two CTAs (128 registers) Q6_K spilled inside the K loop (8 local
+// accesses per 256-element run; 1 at one CTA): one CTA per SM leaves them every register, the GDN output
+// projection (Q6_K) taking 0.86-0.97x the time at 9-31 columns (2026-10-24, RTX 5090). IQ4_XS (3 accesses at
+// two, 0 at one) keeps tiled_mma_kernel's two: its whole-warp occupancy is the larger term (below).
+template <QType F>
+inline constexpr int kWideMinBlocks = fast::kMin<F> || F == QType::GGML_Q6_K ? 1 : 2;
+// A pair's bound when either format has a min term; a pair without one (Q6_K beside IQ4_XS) is compiled at
+// both and chooses per call (wide_mixed_one_cta).
+template <QType F0, QType F1>
+inline constexpr int kWideMixedMinBlocks = fast::kMin<F0> || fast::kMin<F1> ? 1 : 2;
+
+// A pair without a min term runs either format's body under one register bound (at two CTAs it spilled 44
+// local accesses per run, 8 at one): one CTA per SM when the one-CTA format holds at least half of the
+// group's rows and the call is one column group. GDN q/k/v/z (Q6_K 10,240 of 16,384 rows) took 0.86, 0.85
+// and 0.87x at 9, 12 and 16 columns but 1.05 and 1.13x at 24 and 31 (two column groups, twice the CTAs);
+// attention q/gate/k/v (Q6_K 1,024 of 13,312) 1.09-1.23x at every width (2026-10-24, RTX 5090).
+template <QType F0, QType F1>
+bool wide_mixed_one_cta(const RowsGroup& g, int columns) {
+    std::int64_t one = 0;
+    std::int64_t all = 0;
+    for (int i = 0; i < g.count; ++i) {
+        all += g.rows[i];
+        if ((g.format[i] == 0 ? kWideMinBlocks<F0> : kWideMinBlocks<F1>) == 1) { one += g.rows[i]; }
+    }
+    return columns <= kWideColumns && 2 * one >= all;
+}
+
+std::size_t tiled_wide_shared_bytes(int warps, int split, int stages, int slot_bytes) {
+    const std::size_t rings    = static_cast<std::size_t>(warps) * stages * slot_bytes;
+    const std::size_t partials = split > 1 ? static_cast<std::size_t>(warps / split) * (split - 1) * 32 * 4 * kWideTiles *
+                                                 sizeof(ggml::I128)
+                                           : 0;
+    return rings + partials;
+}
+
+// One CTA of the wide tiled kernel: segment `seg`'s tiles at column group `group` (columns 16 group ..
+// 16 group + 15 of the call).
+template <QType F, bool OutF32>
+__device__ __forceinline__ void tiled_wide_body(const GroupSlot& seg, int group, int slices, const std::int32_t* __restrict__ encoded,
+                                                const std::int32_t* __restrict__ emax, int columns, int split, int stages,
+                                                int slot_bytes, unsigned char* shared) {
+    static_assert(kTiledFormat<F>, "tiled rows: formats of 256-element blocks");
+    constexpr int kBlockBytes = static_cast<int>(ggml_block_bytes(F));
+    constexpr int kRun        = kTiledRun<F>;
+    void* const out = seg.out;
+    const int warps = static_cast<int>(blockDim.x) / 32, warp = static_cast<int>(threadIdx.x) / 32;
+    const int lane = static_cast<int>(threadIdx.x) % 32;
+    const int per_cta = warps / split, slot = warp / split, part = warp % split;
+    const int tiles = (seg.rows + 15) / 16, tile = seg.block * per_cta + slot;
+    const bool active = tile < tiles;
+    const int blocks  = slices / 8;
+    const int mine    = active && part < blocks ? (blocks - part + split - 1) / split : 0;
+    const std::uint8_t* tile_base = seg.weights + static_cast<std::size_t>(active ? tile : 0) * 16 * seg.row_bytes;
+    unsigned char* ring = shared + static_cast<std::size_t>(warp) * stages * slot_bytes;
+    const std::size_t column_words = static_cast<std::size_t>(slices) * (fast::kSliceWords + 1);
+    std::uint64_t policy;
+    asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(policy));
+    const auto issue = [&](int i) {
+        if (i < mine) {
+            const std::uint8_t* src = tile_base + static_cast<std::size_t>(part + i * split) * kRun;
+            unsigned char* dst      = ring + (i % stages) * slot_bytes;
+            for (int c = lane; c < kRun / 16; c += 32) { cp_async16_evict_first(dst + 16 * c, src + 16 * c, policy); }
+        }
+        ggml::tile::cp_async_commit();
+    };
+    // Tile nt's fragments: tiled_mma_body's, for columns col0 + 8 nt .. col0 + 8 nt + 7.
+    const int g = lane / 4, t = lane % 4, col0 = group * kWideColumns;
+    const auto column = [&](int c) {
+        return encoded + static_cast<std::size_t>(min(col0 + c, columns - 1)) * column_words;
+    };
+    const std::int32_t* bcol[kWideTiles];
+    const std::int32_t* xs0[kWideTiles];
+    const std::int32_t* xs1[kWideTiles];
+#pragma unroll
+    for (int nt = 0; nt < kWideTiles; ++nt) {
+        bcol[nt] = column(8 * nt + g) + 2 * t;
+        xs0[nt]  = column(8 * nt + 2 * t) + static_cast<std::size_t>(slices) * fast::kSliceWords;
+        xs1[nt]  = column(8 * nt + 2 * t + 1) + static_cast<std::size_t>(slices) * fast::kSliceWords;
+    }
+    ggml::I128 acc[kWideTiles][4];
+    for (int i = 0; i < stages - 1; ++i) { issue(i); }
+    pdl::wait_for_dependencies();
+    for (int i = 0; i < mine; ++i) {
+        __syncwarp();
+        issue(i + stages - 1);
+        cp_async_wait_upto(stages - 1);
+        __syncwarp();
+        const unsigned char* run = ring + (i % stages) * slot_bytes;
+        ggml::mma_rows::unit_sums_columns<F, kWideTiles>(acc, run + g * kBlockBytes, run + (g + 8) * kBlockBytes, part + i * split,
+                                                         8, bcol, xs0, xs1, t);
+    }
+    ggml::tile::cp_async_wait<0>();
+    if (split > 1) {
+        auto* partial = reinterpret_cast<unsigned long long*>(shared + static_cast<std::size_t>(warps) * stages * slot_bytes);
+        const auto at = [&](int p, int nt, int q) {
+            return partial + (((static_cast<std::size_t>(slot) * (split - 1) + (p - 1)) * kWideTiles + nt) * 32 + lane) * 8 + 2 * q;
+        };
+        if (part > 0) {
+#pragma unroll
+            for (int nt = 0; nt < kWideTiles; ++nt) {
+#pragma unroll
+                for (int q = 0; q < 4; ++q) {
+                    at(part, nt, q)[0] = acc[nt][q].lo;
+                    at(part, nt, q)[1] = static_cast<unsigned long long>(acc[nt][q].hi);
+                }
+            }
+        }
+        __syncthreads();
+        if (part == 0) {
+            for (int p = 1; p < split; ++p) {
+#pragma unroll
+                for (int nt = 0; nt < kWideTiles; ++nt) {
+#pragma unroll
+                    for (int q = 0; q < 4; ++q) {
+                        ggml::add(acc[nt][q], ggml::I128{at(p, nt, q)[0], static_cast<std::int64_t>(at(p, nt, q)[1])});
+                    }
+                }
+            }
+        }
+    }
+    if (part != 0 || !active) { return; }
+#pragma unroll
+    for (int nt = 0; nt < kWideTiles; ++nt) {
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            const int row = tile * 16 + g + 8 * (q >> 1), c = col0 + 8 * nt + 2 * t + (q & 1);
+            if (row < seg.rows && c < columns) {
+                const std::size_t o = static_cast<std::size_t>(c) * seg.n + seg.out_offset + row;
+                if constexpr (OutF32) {
+                    static_cast<float*>(out)[o] = ggml::output_f32(acc[nt][q], emax[c], F);
+                } else {
+                    static_cast<std::uint16_t*>(out)[o] = ggml::output_bf16(acc[nt][q], emax[c], F);
+                }
+            }
+        }
+    }
+}
+
+// CTA b of the launch: column group b % groups of the group's CTA b / groups.
+template <QType F, bool OutF32, int MinBlocks = kWideMinBlocks<F>>
+__global__ void __launch_bounds__(kTiledMaxThreads, MinBlocks)
+    tiled_wide_kernel(RowsGroup grp, int slices, const std::int32_t* __restrict__ encoded, const std::int32_t* __restrict__ emax,
+                      int columns, int split, int stages, int slot_bytes, int groups) {
+    extern __shared__ __align__(16) unsigned char tiled_shared[];
+    const int b = static_cast<int>(blockIdx.x);
+    tiled_wide_body<F, OutF32>(group_slot_at(grp, b / groups), b % groups, slices, encoded, emax, columns, split, stages,
+                               slot_bytes, tiled_shared);
+}
+
+// Two tiled formats in one launch (tiled_mma_mixed_kernel's form). Each CTA's format is one of the two,
+// so the register bound is the min-term one when either has a min term (else MinBlocks: wide_mixed_one_cta).
+template <QType F0, QType F1, bool OutF32, int MinBlocks = kWideMixedMinBlocks<F0, F1>>
+__global__ void __launch_bounds__(kTiledMaxThreads, MinBlocks)
+    tiled_wide_mixed_kernel(RowsGroup grp, int slices, const std::int32_t* __restrict__ encoded,
+                            const std::int32_t* __restrict__ emax, int columns, int split, int stages, int slot_bytes,
+                            int groups) {
+    extern __shared__ __align__(16) unsigned char tiled_shared[];
+    const int b         = static_cast<int>(blockIdx.x);
+    const GroupSlot seg = group_slot_at(grp, b / groups);
+    if (seg.format == 0) {
+        tiled_wide_body<F0, OutF32>(seg, b % groups, slices, encoded, emax, columns, split, stages, slot_bytes, tiled_shared);
+    } else {
+        tiled_wide_body<F1, OutF32>(seg, b % groups, slices, encoded, emax, columns, split, stages, slot_bytes, tiled_shared);
+    }
+}
+
 
 // A decoded plane of one segment (or a slab of its rows): for each tile of kTileRows rows (the last
 // padded with the last row), the images of its K stages in order (ggml::tile::CodeStage, written
@@ -742,27 +921,31 @@ int tiled_resident(Kernel kernel, int threads, std::size_t shared) {
     return resident;
 }
 
+// `groups` column groups of the wide kernel (tiled_wide_kernel, `wide`: its shared memory) multiply the
+// CTAs and warps of a shape.
 template <class Kernel>
-TiledShape tiled_shape(Kernel kernel, int tiles, int blocks, int slot_bytes, const TiledDevice& dev) {
+TiledShape tiled_shape(Kernel kernel, int tiles, int blocks, int slot_bytes, const TiledDevice& dev, int groups = 1,
+                       bool wide = false) {
     for (const TiledShape& s : kTiledShapes) {
-        if (s.split > 1 && tiles * s.split > kTiledWarpBudget && blocks < kTiledMinBlocks * s.split) { continue; }
-        const std::size_t shared = tiled_shared_bytes(s.warps, s.split, s.stages, slot_bytes);
+        if (s.split > 1 && tiles * groups * s.split > kTiledWarpBudget && blocks < kTiledMinBlocks * s.split) { continue; }
+        const std::size_t shared = wide ? tiled_wide_shared_bytes(s.warps, s.split, s.stages, slot_bytes)
+                                        : tiled_shared_bytes(s.warps, s.split, s.stages, slot_bytes);
         if (shared > static_cast<std::size_t>(dev.limit)) { continue; }
         const int per_cta = s.warps / s.split;
-        const int ctas    = (tiles + per_cta - 1) / per_cta;
+        const int ctas    = (tiles + per_cta - 1) / per_cta * groups;
         if (ctas <= tiled_resident(kernel, 32 * s.warps, shared) * dev.sms) { return s; }
     }
     return kTiledManyWaves;
 }
 
 // The rows route (rows_kernel with tiled addressing) takes a single-format tiled group of Q6_K or
-// IQ4_XS at one column and every tiled call wider than kMmaMaxColumns; the MMA route takes the rest
-// and every two-format call of 1-8 columns (one launch). Measured at one column (2026-10-16): the GDN
-// output projection (Q6_K) 13.0 us against 15.5 by MMA, the head 295.5 against 297.5; a 6,144-row
-// Q4_K matrix 11.1 by MMA against 13.3 by rows; GDN q/k/v/z 22.1 in one MMA launch against 26.0 in
-// a rows launch per format.
+// IQ4_XS at one column; the MMA route takes the rest of 1-8 columns and every two-format call of
+// 1-8 columns (one launch), the wide MMA route every tiled call wider. Measured at one column
+// (2026-10-16): the GDN output projection (Q6_K) 13.0 us against 15.5 by MMA, the head 295.5 against
+// 297.5; a 6,144-row Q4_K matrix 11.1 by MMA against 13.3 by rows; GDN q/k/v/z 22.1 in one MMA launch
+// against 26.0 in a rows launch per format.
 bool tiled_rows_route(QType format, int columns) {
-    return columns > kMmaMaxColumns || (columns == 1 && (format == QType::GGML_Q6_K || format == QType::GGML_IQ4_XS));
+    return columns == 1 && (format == QType::GGML_Q6_K || format == QType::GGML_IQ4_XS);
 }
 
 // rows_kernel over a tiled group (launch_narrow_format's rows route, Tiled addressing).
@@ -777,14 +960,8 @@ void launch_rows_tiled(RowsGroup g, int k, const Columns& in, int columns, cudaS
     const dim3 grid(g.first[g.count]);
 #define INFERNIX_GGML_TILED_LANES(LN)                                                                                  \
     case LN:                                                                                                           \
-        if (columns > kColumns && columns <= 2 * kColumns) {                                                           \
-            CUDA_CHECK(pdl::launch_consumer({grid, dim3(kThreads), 0, stream},                                         \
-                                            rows_kernel<F, OutF32, LN, 2 * kColumns, true>, g, row_bytes, slices,       \
-                                            in.encoded, in.emax, columns));                                             \
-        } else {                                                                                                       \
-            CUDA_CHECK(pdl::launch_consumer({grid, dim3(kThreads), 0, stream}, rows_kernel<F, OutF32, LN, kColumns, true>, \
-                                            g, row_bytes, slices, in.encoded, in.emax, columns));                       \
-        }                                                                                                              \
+        CUDA_CHECK(pdl::launch_consumer({grid, dim3(kThreads), 0, stream}, rows_kernel<F, OutF32, LN, kColumns, true>, \
+                                        g, row_bytes, slices, in.encoded, in.emax, columns));                           \
         break;
     switch (lanes) {
         INFERNIX_GGML_TILED_LANES(4)
@@ -816,11 +993,35 @@ void launch_tiled_mma(Kernel kernel, RowsGroup g, int k, const Columns& in, int 
     check_launch("tiled mma");
 }
 
+// launch_tiled_mma for the wide kernel (calls past kMmaMaxColumns): ceil(columns / 16) column groups, a
+// row CTA's groups adjacent in the grid.
+template <class Kernel>
+void launch_tiled_wide(Kernel kernel, RowsGroup g, int k, const Columns& in, int columns, int slot_bytes, cudaStream_t stream) {
+    int tiles = 0;
+    for (int i = 0; i < g.count; ++i) { tiles += (g.rows[i] + 15) / 16; }
+    const int groups      = (columns + kWideColumns - 1) / kWideColumns;
+    const TiledDevice dev = tiled_device();
+    tiled_allow_shared(kernel, dev.limit);
+    const TiledShape shape = tiled_shape(kernel, tiles, k / 256, slot_bytes, dev, groups, true);
+    const int per_cta      = shape.warps / shape.split;
+    g.first[0]             = 0;
+    for (int i = 0; i < g.count; ++i) { g.first[i + 1] = g.first[i] + ((g.rows[i] + 15) / 16 + per_cta - 1) / per_cta; }
+    const std::size_t shared = tiled_wide_shared_bytes(shape.warps, shape.split, shape.stages, slot_bytes);
+    CUDA_CHECK(pdl::launch_consumer({dim3(g.first[g.count] * groups), dim3(32 * shape.warps), shared, stream}, kernel, g, k / 32,
+                                    in.encoded, in.emax, columns, shape.split, shape.stages, slot_bytes, groups));
+    check_launch("tiled wide mma");
+}
+
 template <QType F, bool OutF32>
 void launch_tiled_format(RowsGroup g, int k, const Columns& in, int columns, cudaStream_t stream) {
     if constexpr (!kTiledFormat<F>) {
         throw std::logic_error("ggml_linear: a tiled segment's format has no tiled kernels");
     } else {
+        if (columns > kMmaMaxColumns) {
+            for (int i = 0; i < g.count; ++i) { g.row_bytes[i] = static_cast<int>(k / ggml_block_elems(F) * ggml_block_bytes(F)); }
+            launch_tiled_wide(tiled_wide_kernel<F, OutF32>, g, k, in, columns, kTiledRun<F>, stream);
+            return;
+        }
         if (tiled_rows_route(F, columns)) {
             launch_rows_tiled<F, OutF32>(g, k, in, columns, stream);
             return;
@@ -834,6 +1035,17 @@ void launch_tiled_format(RowsGroup g, int k, const Columns& in, int columns, cud
 // whose format[] holds 0 or 1 and row_bytes[] each segment's rows.
 template <QType F0, QType F1>
 void launch_tiled_mixed_pair(const RowsGroup& g, int k, const Columns& in, int columns, cudaStream_t stream) {
+    if (columns > kMmaMaxColumns) {
+        if constexpr (kWideMixedMinBlocks<F0, F1> > 1) {
+            if (wide_mixed_one_cta<F0, F1>(g, columns)) {
+                launch_tiled_wide(tiled_wide_mixed_kernel<F0, F1, false, 1>, g, k, in, columns,
+                                  std::max(kTiledRun<F0>, kTiledRun<F1>), stream);
+                return;
+            }
+        }
+        launch_tiled_wide(tiled_wide_mixed_kernel<F0, F1, false>, g, k, in, columns, std::max(kTiledRun<F0>, kTiledRun<F1>), stream);
+        return;
+    }
     launch_tiled_mma(tiled_mma_mixed_kernel<F0, F1, false>, g, k, in, columns, std::max(kTiledRun<F0>, kTiledRun<F1>), stream);
 }
 
@@ -1268,10 +1480,12 @@ void ggml_linear(const Tensor& x, std::span<const GgmlSegment> segments, std::sp
             // A call of exactly two mixed-capable formats (BF16 outputs, at most kMax segments of one
             // layout) runs in one launch: row-major segments at verification widths, tiled ones at
             // every narrow width (by MMA whatever tiled_rows_route says of either format alone: GDN
-            // q/k/v/z at one column 21.9 us against 26.0 in a rows launch per format).
+            // q/k/v/z at one column 21.9 us against 26.0 in a rows launch per format; past
+            // kMmaMaxColumns on the wide kernel).
             const GgmlLayout layout0 = pass.front().segment.layout;
             const bool tiled_pass    = layout0 == GgmlLayout::Tiles16;
-            if (dtype == DType::BF16 && count >= (tiled_pass ? 1 : kMmaMinColumns) && count <= kMmaMaxColumns &&
+            const int mixed_max      = tiled_pass ? kEncodeColumns : kMmaMaxColumns;
+            if (dtype == DType::BF16 && count >= (tiled_pass ? 1 : kMmaMinColumns) && count <= mixed_max &&
                 pass.size() <= static_cast<std::size_t>(RowsGroup::kMax)) {
                 QType f0 = pass.front().segment.format, f1 = f0;
                 bool ok = true;

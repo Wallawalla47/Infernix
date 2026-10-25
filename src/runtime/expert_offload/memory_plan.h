@@ -57,7 +57,8 @@ struct HostMemoryDemand {
 // 0.5 GiB below it on an RTX 5090); the ledger keeps this much further below it.
 inline constexpr std::uint64_t kPinRoomMarginBytes = 1ULL << 30;
 // What this process may still page-lock: the adapter's shared system memory less what is in use and
-// the margin (Windows WDDM); empty where the snapshot does not know the shared size.
+// the margin (Windows WDDM, and WSL2 through DXCore); empty where the snapshot does not know the
+// shared size (native Linux).
 [[nodiscard]] std::optional<std::uint64_t> pin_room(const VramSnapshot& snapshot);
 
 enum class ExpertPlacement : std::uint8_t {

@@ -1,3 +1,4 @@
+#include "ops/op_family.h"
 #include "core/weight.h"
 #include "core/device.h"
 #include "core/decode_graph.h"
@@ -871,7 +872,7 @@ int run_fp8() {
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(gdn_input_proj) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;

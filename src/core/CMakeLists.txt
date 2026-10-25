@@ -9,16 +9,20 @@ add_library(infernix_core STATIC
   arena.cu
   block_copy.cu
   copy_batch.cpp
+  cpu_topology.cpp
   evictable_weight_pool.cu
   vmm_arena.cu
   device.cu
   direct_read_queue.cpp
   dtype.cpp
+  gpu_telemetry.cpp
   host_load.cpp
   host_memory.cpp
   host_worker_pool.cpp
   link_probe.cu
+  machine_calibration.cpp
   power_throttling.cpp
+  temporary_switches.cpp
   vram_budget.cpp
   gdn_replay_records.cpp
   cyclic_kv_cache.cpp
@@ -38,4 +42,8 @@ target_link_libraries(infernix_core PUBLIC infernix_cuda_runtime CUDA::nvtx3 CUD
 if(WIN32)
   # DXGI: the OS video-memory budget and display outputs of the CUDA adapter (vram_budget.cpp).
   target_link_libraries(infernix_core PRIVATE dxgi)
+else()
+  # DXCore under WSL2: the Windows adapter's shared system memory (vram_budget.cpp).
+  target_sources(infernix_core PRIVATE dxcore_adapter.cpp)
+  target_link_libraries(infernix_core PRIVATE ${CMAKE_DL_LIBS})
 endif()

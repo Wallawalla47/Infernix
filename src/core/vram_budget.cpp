@@ -15,7 +15,9 @@
 #include <windows.h>
 #include <dxgi1_6.h>
 #else
-#include <dlfcn.h>
+#    include "core/dxcore_adapter.h"
+
+#    include <dlfcn.h>
 #endif
 
 namespace infernix {
@@ -122,6 +124,8 @@ public:
         }
         nvml_ = std::make_unique<Nvml>(props_);
 #ifdef _WIN32
+        int devices      = 0;
+        several_devices_ = cudaGetDeviceCount(&devices) == cudaSuccess && devices > 1;
         budget_event_ = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
         open_adapter();
         if (past_budget) {
@@ -133,6 +137,10 @@ public:
         }
 #else
         (void)past_budget;
+        // CUDA's LUID is valid where its node mask is set; otherwise the only NVIDIA adapter.
+        dxcore_ = DxcoreAdapter::open(props_.luidDeviceNodeMask != 0
+                                          ? reinterpret_cast<const unsigned char*>(props_.luid)
+                                          : nullptr);
 #endif
     }
 
@@ -172,7 +180,13 @@ public:
                 out.has_budget   = true;
                 out.local_budget = info.Budget;
                 out.local_usage  = info.CurrentUsage;
-                if (allowance_ != 0) { // free memory as cudaMemGetInfo derives it, from the wider budget
+                // Free memory as cudaMemGetInfo derives it on one visible device (budget less
+                // usage), from the wider budget past it. With several CUDA devices visible,
+                // cudaMemGetInfo fell below the budget less usage and stopped following allocations
+                // once 64 GiB of host memory was page-locked, so every frame chunk looked spilled
+                // and the expert cache started empty (RTX 5090 beside an RTX 3090, mdbro's fork,
+                // 2026-10-11): the budget less usage is read directly there too.
+                if (allowance_ != 0 || several_devices_) {
                     out.budget_allowance = allowance_;
                     out.local_budget += allowance_;
                     out.device_free = out.local_budget > out.local_usage
@@ -185,6 +199,12 @@ public:
                 out.nonlocal_usage = info.CurrentUsage;
             }
             out.outputs = outputs_;
+        }
+#else
+        std::uint64_t nonlocal = 0;
+        if (dxcore_ != nullptr && dxcore_->nonlocal_usage(nonlocal)) {
+            out.shared_system  = dxcore_->shared_system();
+            out.nonlocal_usage = nonlocal;
         }
 #endif
         const int active = nvml_->display_active();
@@ -255,9 +275,13 @@ private:
     int outputs_            = -1;
     HANDLE budget_event_    = nullptr;
     DWORD budget_cookie_    = 0;
+#else
+    std::unique_ptr<DxcoreAdapter> dxcore_; // WSL2 only
 #endif
     int device_ = 0;
     std::uint64_t allowance_ = 0; // past the budget (measured at open); 0: the OS budget as reported
+    bool several_devices_ =
+        false; // more than one CUDA device visible (Windows: free memory from DXGI)
     cudaDeviceProp props_{};
     std::unique_ptr<Nvml> nvml_;
     std::mutex mutex_;

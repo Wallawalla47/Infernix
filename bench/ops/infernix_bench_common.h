@@ -14,6 +14,7 @@
 #include "../common/fixture_data.cuh"
 #include "core/arena.h"
 #include "core/device.h"
+#include "roofline.h"
 
 #include <cuda_runtime.h>
 
@@ -28,8 +29,6 @@
 #include <vector>
 
 namespace infernix::bench {
-
-constexpr double kRooflineGBs = 1792.0; // RTX 5090 GDDR7 bandwidth roofline.
 
 inline std::uint16_t f32_to_bf16(float f) {
     std::uint32_t u;
@@ -80,7 +79,7 @@ inline DeviceBuffer make_zeros(std::size_t bytes) {
 // cudaDeviceProp memory-clock fields were removed in CUDA 13; the in-process
 // GB/s is informational anyway (ncu is the acceptance gate), so report against
 // the known RTX 5090 roofline constant.
-inline double device_peak_bw_gbs(int /*dev*/ = 0) { return kRooflineGBs; }
+inline double device_peak_bw_gbs(int /*dev*/ = 0) { return roofline::kDramSpecGBs; }
 
 struct ColdTiming {
     double median_us = 0.0;
@@ -523,7 +522,8 @@ inline void print_result(const char* tag, const Result& r) {
     std::printf(
         "%-32s median=%8.2f us  min=%8.2f us  p95=%8.2f us  %8.1f GB/s  (%.1f%% of %.0f GB/s "
         "roofline)\n",
-        tag, r.median_us, r.min_us, r.p95_us, r.gbs, r.gbs / kRooflineGBs * 100.0, kRooflineGBs);
+        tag, r.median_us, r.min_us, r.p95_us, r.gbs, r.gbs / roofline::kDramSpecGBs * 100.0,
+        roofline::kDramSpecGBs);
 }
 
 } // namespace infernix::bench

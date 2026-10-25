@@ -1,3 +1,4 @@
+#include "ops/op_family.h"
 #include "core/weight.h"
 #include "infernix/ops/attn_input_proj.h"
 #include "infernix/ops/weight_input.h"
@@ -724,7 +725,7 @@ int run_weight_inputs() {
 
 } // namespace
 
-int main(int argc, char** argv) {
+INFERNIX_OP_TEST(attn_input_proj) {
     const bool dflash2_only = argc == 2 && std::string(argv[1]) == "--dflash2-only";
     const bool inputs_only  = argc == 2 && std::string(argv[1]) == "--weight-inputs-only";
     if (argc != 1 && !dflash2_only && !inputs_only) {

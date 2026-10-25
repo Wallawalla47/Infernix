@@ -55,6 +55,8 @@ enum class ComponentSelection : std::uint8_t {
     Fold,
     Recurrent,
     All,
+    // A K=7 verification tree's record, walk against closed form (gdn-tree-closed-form); not in all.
+    Tree,
 };
 
 enum class ValidSelection : std::uint8_t {
@@ -119,7 +121,8 @@ ComponentSelection parse_component(std::string_view value) {
     if (value == "fold") return ComponentSelection::Fold;
     if (value == "recurrent") return ComponentSelection::Recurrent;
     if (value == "all") return ComponentSelection::All;
-    throw std::invalid_argument("--component must be fold, recurrent, or all");
+    if (value == "tree") return ComponentSelection::Tree;
+    throw std::invalid_argument("--component must be fold, recurrent, all, or tree");
 }
 
 ValidSelection parse_valid(std::string_view value) {
@@ -132,9 +135,10 @@ ValidSelection parse_valid(std::string_view value) {
 void print_help(const char* program) {
     std::printf("Usage: %s [options]\n\n"
                 "  --profile 27b|35b|all       Registered all-layer geometry (default all).\n"
-                "  --component fold|recurrent|all\n"
-                "                              Measured component (default all).\n"
-                "  --width T                   One physical width in [2,16].\n"
+                "  --component fold|recurrent|all|tree\n"
+                "                              Measured component (default all; tree: a K=7 tree's\n"
+                "                              record, walk and closed form, at 12 and 16 columns).\n"
+                "  --width T                   One physical width in [2,16] (tree: [9,16]).\n"
                 "  --batch B                   One active row count in [1,8].\n"
                 "  --commits one|dense|mixed|all\n"
                 "                              Commit policy (default all).\n"
@@ -388,6 +392,41 @@ DeviceBuffer make_i32(const std::vector<std::int32_t>& values) {
     return result;
 }
 
+// A K=7 verification tree of `width` columns (9..16): the main chain 0..7, then side columns below
+// the early main columns and their side columns, in the builder's draw order. Only the fields the
+// GDN record reads are filled (parents, depths, children).
+ops::SpeculativeTreeRow bench_tree_row(std::int32_t width) {
+    static constexpr std::int8_t kParents[16] = {-1, 0, 1, 2, 3, 4, 5, 6, 0, 1, 8, 2, 3, 9, 4, 12};
+    ops::SpeculativeTreeRow row{};
+    row.nodes      = width;
+    row.main_depth = 7;
+    row.tree       = 1;
+    for (int c = 0; c < ops::kSpeculativeTreeMaxNodes; ++c) {
+        row.parent[c]       = -1;
+        row.first_child[c]  = -1;
+        row.next_sibling[c] = -1;
+    }
+    for (int c = 0; c < width; ++c) {
+        const int parent = kParents[c];
+        row.parent[c]    = static_cast<std::int8_t>(parent);
+        row.depth[c]     = static_cast<std::int8_t>(parent < 0 ? 0 : row.depth[parent] + 1);
+        if (parent < 0) { continue; }
+        if (row.first_child[parent] < 0) {
+            row.first_child[parent] = static_cast<std::int8_t>(c);
+            continue;
+        }
+        int sibling = row.first_child[parent], index = 1;
+        while (row.next_sibling[sibling] >= 0) {
+            sibling = row.next_sibling[sibling];
+            ++index;
+        }
+        row.next_sibling[sibling] = static_cast<std::int8_t>(c);
+        row.sibling_index[c]      = static_cast<std::int8_t>(index);
+    }
+    for (int c = 0; c < width; ++c) { row.paths += row.first_child[c] < 0 ? 1 : 0; }
+    return row;
+}
+
 class RecurrentResources {
 public:
     RecurrentResources(const Profile& profile, std::int32_t width, std::int32_t batch,
@@ -429,6 +468,31 @@ public:
         Tensor out(record_out_.p, DType::BF16, {kStateDim, profile_.value_heads, width_, batch_});
         ops::gated_delta_net_replay_record(q, k, v, g, beta, scale(), states, valid, initial,
                                            key_record, value_record, gate_record, out, stream);
+    }
+
+    // The verification-tree record of every row's bench_tree_row (all columns live).
+    void launch_tree(cudaStream_t stream, ops::GdnTreeRecordRoute route) {
+        if (tree_rows_.p == nullptr) {
+            std::vector<ops::SpeculativeTreeRow> rows(static_cast<std::size_t>(batch_), bench_tree_row(width_));
+            tree_rows_ = DeviceBuffer(rows.size() * sizeof(ops::SpeculativeTreeRow));
+            tree_rows_.copy_from_host(rows.data(), tree_rows_.bytes);
+            tree_valid_ = make_i32(std::vector<std::int32_t>(static_cast<std::size_t>(batch_), width_));
+        }
+        Tensor q(q_.p, DType::BF16, {kStateDim, kQkHeads, width_, batch_});
+        Tensor k(k_.p, DType::BF16, {kStateDim, kQkHeads, width_, batch_});
+        Tensor v(v_.p, DType::BF16, {kStateDim, profile_.value_heads, width_, batch_});
+        Tensor g(g_.p, DType::FP32, {profile_.value_heads, width_, batch_});
+        Tensor beta(beta_.p, DType::FP32, {profile_.value_heads, width_, batch_});
+        Tensor states(record_states_.p, DType::FP32, {kStateDim, kStateDim, profile_.value_heads, batch_});
+        Tensor valid(tree_valid_.p, DType::I32, {batch_});
+        Tensor initial(record_initial_.p, DType::I32, {batch_});
+        Tensor trees(tree_rows_.p, DType::I32, {ops::kSpeculativeTreeRowWords, batch_});
+        Tensor key_record(key_record_.p, DType::BF16, {kStateDim, kQkHeads, width_, batch_});
+        Tensor value_record(value_record_.p, DType::BF16, {kStateDim, profile_.value_heads, width_, batch_});
+        Tensor gate_record(gate_record_.p, DType::FP32, {2, profile_.value_heads, width_, batch_});
+        Tensor out(record_out_.p, DType::BF16, {kStateDim, profile_.value_heads, width_, batch_});
+        ops::gated_delta_net_replay_record(q, k, v, g, beta, scale(), states, valid, initial, trees, key_record,
+                                           value_record, gate_record, out, stream, route);
     }
 
 private:
@@ -490,6 +554,8 @@ private:
     DeviceBuffer key_record_;
     DeviceBuffer value_record_;
     DeviceBuffer gate_record_;
+    DeviceBuffer tree_rows_;
+    DeviceBuffer tree_valid_;
 };
 
 Measurement measure_fold(const FoldResources& resources,
@@ -562,8 +628,38 @@ void print_result(const Profile& profile, std::int32_t width, std::int32_t batch
                 ns_per_transition);
 }
 
+// gdn-tree-closed-form's decider: the walk's measured 0.73 / 0.95 ms per round (12 / 16 columns,
+// B = 1, all 48 layers of the 27B) is what the closed form must beat, layer by layer.
+void run_tree_point(const Profile& profile, std::int32_t width, std::int32_t batch, bench::L2FlushBuffer& flush,
+                    const Options& options) {
+    RecurrentResources resources(profile, width, batch, ValidSelection::Dense);
+    for (const auto route : {ops::GdnTreeRecordRoute::Walk, ops::GdnTreeRecordRoute::ClosedForm}) {
+        const Measurement measurement =
+            measure_component([&](cudaStream_t stream) { resources.launch_tree(stream, route); }, flush,
+                              options.warmup, options.repeat);
+        std::printf("component=tree form=%-6s profile=%-8s T=%2d B=%d gpu_warm=%8.2f us gpu_cold=%8.2f us "
+                    "host_submit=%7.2f us per_round_all_layers_cold=%8.1f us\n",
+                    route == ops::GdnTreeRecordRoute::Walk ? "walk" : "closed", profile.name, width, batch,
+                    measurement.warm.median_us, measurement.cold.median_us, measurement.host_median_us,
+                    measurement.cold.median_us * profile.layers);
+    }
+}
+
 int run(const Options& options) {
     bench::L2FlushBuffer flush(options.flush_bytes);
+    if (options.component == ComponentSelection::Tree) {
+        const std::vector<std::int32_t> widths =
+            options.exact_width != 0 ? std::vector<std::int32_t>{options.exact_width} : std::vector<std::int32_t>{12, 16};
+        const std::vector<std::int32_t> batches =
+            options.exact_batch != 0 ? std::vector<std::int32_t>{options.exact_batch} : std::vector<std::int32_t>{1, 4};
+        for (const Profile& profile : selected_profiles(options.profiles)) {
+            for (const std::int32_t width : widths) {
+                if (width < 9) { throw std::invalid_argument("--component tree needs a width of 9..16"); }
+                for (const std::int32_t batch : batches) { run_tree_point(profile, width, batch, flush, options); }
+            }
+        }
+        return 0;
+    }
     for (const Profile& profile : selected_profiles(options.profiles)) {
         for (const std::int32_t width : selected_widths(profile, options.exact_width)) {
             const bool run_fold = options.component == ComponentSelection::Fold ||

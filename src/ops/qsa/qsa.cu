@@ -4,6 +4,8 @@
 
 #include "infernix/ops/qsa.h"
 #include "infernix/ops/rope.h"
+#include "infernix/ops/sigmoid_mul.h"
+#include "ops/common/math.cuh"
 
 #include "core/paged_kv_storage.h"
 #include "core/pdl.cuh"
@@ -857,7 +859,8 @@ __global__ void __launch_bounds__(kAttentionThreads, 1)
     if constexpr (Tile::kVq) { cp_wait<0>(); } // the codebook copy of a split without tiles
 }
 
-__global__ void merge_kernel(const float* __restrict__ partial, int heads, int splits, bf16* __restrict__ out) {
+__global__ void merge_kernel(const float* __restrict__ partial, int heads, int splits, bf16* __restrict__ out,
+                             const bf16* __restrict__ gate) {
     pdl::enter();
     const int head = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
     float m = -INFINITY;
@@ -873,7 +876,11 @@ __global__ void merge_kernel(const float* __restrict__ partial, int heads, int s
         l += w * slot[kHeadDim + 1];
         acc += w * slot[d];
     }
-    out[(static_cast<std::size_t>(t) * heads + head) * kHeadDim + d] = __float2bfloat16_rn(l > 0.0F ? acc / l : 0.0F);
+    const std::size_t at = (static_cast<std::size_t>(t) * heads + head) * kHeadDim + d;
+    bf16 o               = __float2bfloat16_rn(l > 0.0F ? acc / l : 0.0F);
+    // The output gate (qsa_attention's output_gate): sigmoid_mul's element, on the rounded output.
+    if (gate != nullptr) { o = __float2bfloat16_rn(__bfloat162float(o) * sigmoid(__bfloat162float(gate[at]))); }
+    out[at] = o;
 }
 
 // Calls of at most this many columns: decode, one row's verification, up to eight plain lanes.
@@ -1076,9 +1083,12 @@ std::size_t qsa_attention_workspace_bytes(const QsaGeometry& geometry, std::int3
 void qsa_attention(const Tensor& q, const Tensor& index_q, const QsaKVLayer& layer,
                    const QsaBatch& batch, const QsaGeometry& geometry, float scale,
                    std::int32_t max_context, void* workspace, std::size_t workspace_bytes,
-                   Tensor& out, cudaStream_t stream, const QsaAppend* append) {
+                   Tensor& out, cudaStream_t stream, const QsaAppend* append, const Tensor* output_gate) {
     require_geometry(geometry);
     const int columns = q.ne[2];
+    require(output_gate == nullptr || (contiguous(*output_gate, DType::BF16) &&
+                                       output_gate->ne[0] == kHeadDim * geometry.heads && output_gate->ne[1] == columns),
+            "output gate must be BF16 [head_dim * heads, T]");
     require_batch(batch, columns);
     require(contiguous(q, DType::BF16) && q.ne[0] == kHeadDim && q.ne[1] == geometry.heads &&
                 contiguous(index_q, DType::BF16) && index_q.ne[0] == kIndexDim &&
@@ -1153,6 +1163,10 @@ void qsa_attention(const Tensor& q, const Tensor& index_q, const QsaKVLayer& lay
         detail::qsa_prompt_attention(q, layer, batch, geometry, scale, ws.selected, ws.counts, out, stream,
                                      vq_args);
         commit();
+        if (output_gate != nullptr) {
+            Tensor gated = out.view({kHeadDim * geometry.heads, columns});
+            sigmoid_mul(*output_gate, gated, stream);
+        }
         return;
     }
     const dim3 grid(splits, geometry.kv_heads, columns);
@@ -1227,10 +1241,15 @@ void qsa_attention(const Tensor& q, const Tensor& index_q, const QsaKVLayer& lay
         const cudaError_t error =
             pdl::launch_consumer({dim3(geometry.heads, columns), dim3(kHeadDim), 0, stream}, merge_kernel,
                                  static_cast<const float*>(ws.partial), geometry.heads, splits,
-                                 static_cast<bf16*>(out.data));
+                                 static_cast<bf16*>(out.data),
+                                 output_gate != nullptr ? static_cast<const bf16*>(output_gate->data) : nullptr);
         if (error != cudaSuccess) { throw std::runtime_error(std::string("qsa merge: ") + cudaGetErrorString(error)); }
     }
     commit();
+    if (output_gate != nullptr && splits == 1) {
+        Tensor gated = out.view({kHeadDim * geometry.heads, columns});
+        sigmoid_mul(*output_gate, gated, stream);
+    }
 }
 
 } // namespace infernix::ops

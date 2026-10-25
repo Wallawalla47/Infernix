@@ -311,16 +311,15 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
             }
         }
     }
-    // The draft-confidence gate exists only on Qwen3.8-Flash-Next's one-row MTP rounds; another
-    // model refuses it rather than ignoring a tuning value.
+    // The draft-confidence cut exists on Qwen3.8-Flash-Next's one-row MTP and DFlash2 rounds and on
+    // Qwen3.5's one-row MTP rounds; another combination refuses it rather than ignoring a tuning value.
     if (const auto& p = options.speculative.draft_min_p) {
         if (!(*p >= 0.0F && *p <= 1.0F)) {
             throw std::invalid_argument("speculative draft_min_p (--spec-min-p) must be in [0,1]");
         }
-        if (!qwen4_exp || (options.speculative.backend != SpeculativeBackend::Mtp &&
-                           options.speculative.backend != SpeculativeBackend::DFlash2)) {
-            throw std::invalid_argument(
-                "--spec-min-p applies to Qwen3.8-Flash-Next with --spec mtp or dflash2 only");
+        const bool mtp = options.speculative.backend == SpeculativeBackend::Mtp;
+        if (qwen4_exp ? !mtp && options.speculative.backend != SpeculativeBackend::DFlash2 : !mtp) {
+            throw std::invalid_argument("--spec-min-p applies to --spec mtp (and dflash2 on Qwen3.8-Flash-Next) only");
         }
     }
     if (cache.enabled) {
@@ -589,6 +588,12 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
                            "disabled), so every round drafts %u, its fastest fixed length",
                            options.speculative.backend == SpeculativeBackend::Mtp ? "adaptive-mtp" : "adaptive-dflash",
                            fixed);
+    }
+    // TEMPORARY (MTP drafting package A/B): what the switches resolved to (their values are in the
+    // startup log's temporary switches line).
+    if (options.speculative.backend == SpeculativeBackend::Mtp) {
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info, "mtp drafting | %s",
+                           models::qwen3_5::mtp_draft_switch_report(instance->parameters, options).c_str());
     }
     const auto signature = models::qwen3_5::prefill_signature(*instance->model);
     auto context_cost    = resolve_context_machine_cost(

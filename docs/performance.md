@@ -40,7 +40,9 @@ use INT8 group-64 KV. Each model page records its build and run conditions.
 | How long does the full fixed request set take? | Corpus makespan, Corpus decode, Requests/s |
 | What aggregate decode rate is sustained at a full batch? | Steady decode |
 
-These rates use different time boundaries. Server TTFT is an internal phase sum; external
+These rates use different time boundaries. Server TTFT is the server's logged first-token time
+(`request_done.timings_seconds.ttft`: preparation, queue wait and every prompt phase; corpus result
+schema 9, which does not mix with the earlier phase sum); external
 streaming TTFT has its [own benchmark contract](../tools/bench/ttft/README.md). Stochastic runs
 can generate different token totals even with the same prompts and seeds. Output-limit and
 repetition samples remain labeled in the measured corpus; throughput alone does not establish

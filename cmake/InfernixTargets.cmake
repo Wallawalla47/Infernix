@@ -23,7 +23,7 @@ endfunction()
 # Runtime DLL staging for the apps and tests.
 #
 # infernix / infernix-serve (and fully-linked test binaries) statically import the
-# FFmpeg + libcurl runtime DLLs (avutil/avcodec/avformat/swscale/swresample/libcurl
+# FFmpeg + libjpeg + libcurl runtime DLLs (avutil/avcodec/avformat/swscale/swresample/jpeg62/libcurl
 # plus their own deps, e.g. z.dll). The vcpkg IMPORTED_LINK_DEPENDENT_LIBRARIES hook
 # does not reliably stage them into the output tree, and the Windows loader will not
 # search the vcpkg bin dir when the exe is launched directly -- it only searches the
@@ -31,13 +31,13 @@ endfunction()
 # before main (0xC0000135). Stage the full closure next to each binary so it runs
 # standalone.
 
-# Collect the FFMPEG + libcurl runtime DLLs from the vcpkg bin tree into <out_var>.
+# Collect the FFMPEG + libjpeg + libcurl runtime DLLs from the vcpkg bin tree into <out_var>.
 function(infernix_runtime_dll_list out_var)
   set(_list "")
   if(WIN32 AND DEFINED FFMPEG_VCPKG_TREE)
     foreach(_infernix_dll_glob
       "avutil-*.dll" "avcodec-*.dll" "avformat-*.dll" "swscale-*.dll"
-      "swresample-*.dll" "libcurl*.dll" "z.dll")
+      "swresample-*.dll" "libcurl*.dll" "z.dll" "jpeg62.dll")
       file(GLOB _infernix_dlls "${FFMPEG_VCPKG_TREE}/bin/${_infernix_dll_glob}")
       list(APPEND _list ${_infernix_dlls})
     endforeach()

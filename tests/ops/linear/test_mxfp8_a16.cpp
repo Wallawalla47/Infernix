@@ -4,6 +4,7 @@
 // computed alone equals the same column in calls of every route's widths); acceptance of the
 // column-invariant policy and refusal of malformed weights.
 
+#include "ops/op_family.h"
 #include "core/weight.h"
 #include "ops/dirty_shared_memory.h"
 #include "ops/linear/linear_test_common.h"
@@ -350,7 +351,7 @@ int mxfp8_contract() {
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(linear_mxfp8_a16) {
     if (!infernix::test::linear::cuda_available()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;

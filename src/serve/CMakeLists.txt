@@ -13,14 +13,20 @@ add_library(infernix_serve STATIC
   anthropic_messages_request.cpp
   anthropic_messages_response.cpp
   anthropic_messages_http.cpp
+  anthropic_tool_search.cpp
+  tool_search.cpp
+  server_tools.cpp
   openai_responses_store.cpp
   translate.cpp
   generation_service.cpp
+  prefix_miss.cpp
+  reasoning_store.cpp
   request_events.cpp
   console_stats.cpp
   operational_log.cpp
   request_log.cpp
   metrics.cpp
+  metrics_json.cpp
   http_server.cpp
   openai_responses_http.cpp
   serve_options.cpp
@@ -29,4 +35,4 @@ add_library(infernix_serve STATIC
 infernix_internal_includes(infernix_serve)
 target_link_libraries(infernix_serve
   PUBLIC infernix_engine Threads::Threads infernix::json infernix::httplib
-  PRIVATE infernix_product_config infernix_media_acquire infernix_product_logging infernix_grammar infernix_cuda_runtime)
+  PRIVATE infernix_product_config infernix_media_acquire infernix_product_logging infernix_grammar infernix_text infernix_cuda_runtime)

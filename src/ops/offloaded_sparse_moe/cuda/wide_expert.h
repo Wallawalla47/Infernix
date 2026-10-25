@@ -22,7 +22,9 @@
 // of x and h, split into byte limbs, times the doubled E2M1 codes on integer tensor cores, two MMAs
 // per 16-element block, folded into the exact int64 sum with the block scale. It gives the
 // narrow route's and the CPU engine's bits, so a W4A16 expert's output never depends on how many
-// other columns share its call.
+// other columns share its call. Their A4 residual fast paths (WideA16::kA4Residual, kA4Residual3)
+// run the grouped GEMM of wide_expert.cuh on two or three NVFP4 terms per x and h row instead, at
+// either registered geometry (A4Planes); their narrow experts, GPU or CPU-served, stay exact.
 
 #include "infernix/ops/offloaded_sparse_moe.h"
 
@@ -112,19 +114,23 @@ static_assert(nvfp4_record_bytes(kFlashNextShape) == kRecordBytes &&
 inline constexpr int kRingColumns      = 64;
 inline constexpr int kA16ActBytes      = 48;
 inline constexpr int kRingCounterSlots = 3; // one per concurrent pass phase (All, Resident, Staged)
+// The A4 residual routes keep the ring: it computes the narrow experts only, which are exact on
+// every W4A16 route, and their wide experts take the residual GEMM beside it.
 [[nodiscard]] inline bool ring_call(const ExpertShape& shape, ExpertActivation activation, WideA16 wide_a16,
                                     int columns) {
-    return shape == kQwen3_5_122BShape && activation == ExpertActivation::kA16 && wide_a16 == WideA16::kExact &&
+    return shape == kQwen3_5_122BShape && activation == ExpertActivation::kA16 &&
+           (wide_a16 == WideA16::kExact || wide_a16 == WideA16::kA4Residual || wide_a16 == WideA16::kA4Residual3) &&
            columns <= kRingColumns;
 }
 
 // Whether a call of this bank's arithmetic exists at `shape`: every bank at Flash-Next's geometry;
-// another registered geometry for NVFP4 W4A16 banks on the exact and lossless routes.
+// another registered geometry for NVFP4 W4A16 banks on the exact, A4 residual and lossless routes.
 [[nodiscard]] inline bool shape_supported(const ExpertShape& shape, ExpertActivation activation, WideA16 wide_a16,
                                           bool ggml) {
     if (shape == kFlashNextShape) { return true; }
     return registered_shape(shape) && activation == ExpertActivation::kA16 && !ggml &&
-           (wide_a16 == WideA16::kExact || wide_a16 == WideA16::kLossless);
+           (wide_a16 == WideA16::kExact || wide_a16 == WideA16::kA4Residual || wide_a16 == WideA16::kA4Residual3 ||
+            wide_a16 == WideA16::kLossless);
 }
 
 // The x column of a call's dispatch entry: routed entries are t * top_k + slot, a shared job's
@@ -141,12 +147,46 @@ INFERNIX_WIDE_HD constexpr int entry_column(int entry, int top_k, int shared_fir
 INFERNIX_WIDE_HD constexpr int plane_block(int b) { return (b & ~3) | ((b & 1) << 1) | ((b & 2) >> 1); }
 
 // A4 residual planes of W4A16 experts (WideA16::kA4Residual: two terms per x and h row; kA4Residual3:
-// three): a row holds its first term's A4 row (the W4A4 plane layout above), then each further term's,
-// all scaled by one FP32 row scale. Two terms per side gave 33-35 % at 32K-64K prefill on recipe C; three,
-// about a quarter of their error, 26-27 % (design §19.3.23).
+// three): a row holds its first term's A4 row (the W4A4 plane layout above: codes in plane_block
+// order, then one E4M3 scale byte per 16-element block), then each further term's, all scaled by one
+// FP32 row scale. Two terms per side gave 33-35 % at 32K-64K prefill on recipe C; three, about a
+// quarter of their error, 26-27 % (design §19.3.23).
 inline constexpr int kMaxResidualTerms = 3;
-INFERNIX_WIDE_HD constexpr int x_terms_row_bytes(int terms) { return terms * kXRowBytes; }
-INFERNIX_WIDE_HD constexpr int h_terms_row_bytes(int terms) { return terms * kHRowStride; }
+
+// The term rows of an expert geometry G (w4a4_expert.h). An x term row is kXCodeBytes code bytes then
+// kXScaleBytes scale bytes; an h term row kHCodeBytes code bytes then a scale map of whole 16-byte TMA
+// boxes, kHTermStride apart. Flash-Next's h terms keep its narrow h block row stride (kHRowStride), the
+// layout its qualified kernels were timed with; another geometry packs them (Qwen3.5-122B-A10B: 576
+// bytes, 512 code bytes and 64 scale bytes).
+template <class G>
+struct A4Planes {
+    static constexpr int kXCodeBytes     = G::kHidden / 2;
+    static constexpr int kXScaleBytes    = G::kHidden / 16;
+    static constexpr int kXRowBytes      = kXCodeBytes + kXScaleBytes;
+    static constexpr int kHCodeBytes     = G::kIntermediate / 2;
+    static constexpr int kHScaleBytes    = G::kIntermediate / 16;
+    static constexpr int kHScaleMapBytes = (kHScaleBytes + 15) / 16 * 16;
+    static constexpr int kHTermStride    = G::kHidden == kHidden && G::kIntermediate == kIntermediate
+                                               ? kHRowStride
+                                               : (kHCodeBytes + kHScaleMapBytes + 15) / 16 * 16;
+    static INFERNIX_WIDE_HD constexpr int x_terms_row_bytes(int terms) { return terms * kXRowBytes; }
+    static INFERNIX_WIDE_HD constexpr int h_terms_row_bytes(int terms) { return terms * kHTermStride; }
+    static_assert(kXRowBytes % 16 == 0 && kXCodeBytes % 16 == 0 && kHCodeBytes % 16 == 0, "TMA needs 16-byte rows");
+    static_assert(kHTermStride % 16 == 0 && kHTermStride >= kHCodeBytes + kHScaleMapBytes);
+    static_assert(G::kHidden % 128 == 0 && G::kIntermediate % 128 == 0, "whole 128-element K tiles");
+};
+static_assert(A4Planes<FlashNextExperts>::kXRowBytes == kXRowBytes &&
+              A4Planes<FlashNextExperts>::kHTermStride == kHRowStride &&
+              A4Planes<FlashNextExperts>::kHScaleMapBytes == kHScaleMapBytes);
+static_assert(A4Planes<Qwen3_5_122BExperts>::kXRowBytes == 1728 && A4Planes<Qwen3_5_122BExperts>::kHTermStride == 576);
+
+// The term row bytes of a bank's geometry (registered_shape), for the workspace layout.
+[[nodiscard]] inline int x_terms_row_bytes(const ExpertShape& shape, int terms) {
+    return with_expert_geometry(shape, [&]<class G>() { return A4Planes<G>::x_terms_row_bytes(terms); });
+}
+[[nodiscard]] inline int h_terms_row_bytes(const ExpertShape& shape, int terms) {
+    return with_expert_geometry(shape, [&]<class G>() { return A4Planes<G>::h_terms_row_bytes(terms); });
+}
 
 // The x and h term counts of an A4 residual route (kA4Residual two each, kA4Residual3 three each);
 // {0, 0} for another route.
@@ -164,6 +204,7 @@ struct ResidualTerms {
 // 15-18 % faster; the walk's MoE groups reach it from 14,336-token prompts).
 inline constexpr int kGgmlBf16Experts         = 32;
 inline constexpr int kGgmlBf16MinColumns      = 14336;
+static_assert(MoeGgmlTiles{}.plane_min_columns == kGgmlBf16MinColumns, "MoeGgmlTiles' default is the measured threshold");
 inline constexpr std::size_t kGgmlCodeStageBytes = 6144;
 inline constexpr std::size_t kGgmlBf16GateUpImages = static_cast<std::size_t>(2 * kIntermediate / 64) * (kHidden / 64);
 inline constexpr std::size_t kGgmlBf16DownImages   = static_cast<std::size_t>(kHidden / 64) * (kIntermediate / 64);
@@ -187,10 +228,10 @@ struct ExpertsWorkspace {
     std::uint8_t* h_rows;         // [entries][a16_h_row_bytes(shape)]: BF16 h, rewritten as limbs for wide entries
     std::int32_t* x_emax;         // [columns]: column exponent of each token's x
     std::int32_t* h_emax;         // [entries]: column exponent of each wide entry's h
-    // W4A16, A4 residual (h_rows holds the BF16 h)
-    std::uint8_t* x_terms_plane;  // [entries][x_terms_row_bytes(x terms)]
+    // W4A16, A4 residual (h_rows holds the BF16 h; x_emax and h_emax serve a ring call's narrow experts)
+    std::uint8_t* x_terms_plane;  // [entries][x_terms_row_bytes(shape, x terms)]
     float* x_row_scale;           // [columns]
-    std::uint8_t* h_terms_plane;  // [entries][h_terms_row_bytes(h terms)]
+    std::uint8_t* h_terms_plane;  // [entries][h_terms_row_bytes(shape, h terms)]
     float* h_row_scale;           // [entries]
     // GGUF banks, kGgmlBf16 in calls of kGgmlBf16MinColumns or more (else null): kGgmlBf16PlaneBytes
     std::uint8_t* ggml_planes;
@@ -237,6 +278,7 @@ struct Call {
     std::uint16_t* outputs                    = nullptr; // BF16 [H, entries]
     const void* descriptors                   = nullptr;
     std::int32_t passes                       = 0;
+    std::int32_t mean_job_columns             = 0; // entries / max_jobs (INFERNIX_TMP_WIDE_EXPERT_T64's rule)
     bool a16                                  = false;
     // W4A16 (wide_expert_a16.cuh)
     const std::uint8_t* x_limbs = nullptr; // [T][kA16XRowBytes]
@@ -248,7 +290,7 @@ struct Call {
     bool a4_residual                = false;
     ResidualTerms terms;
     const float* x_row_scale        = nullptr; // [T]
-    std::uint8_t* h_terms_plane     = nullptr; // [entries][h_terms_row_bytes(terms.h)]
+    std::uint8_t* h_terms_plane     = nullptr; // [entries][h_terms_row_bytes(shape, terms.h)]
     float* h_row_scale              = nullptr; // [entries]
 };
 

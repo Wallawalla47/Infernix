@@ -159,7 +159,9 @@ are never stored: `A16ColumnInvariant` (one A16 schedule at every width, the exa
 `AllowA4Residual` (A16, or NVFP4 activations as a sum of residual NVFP4 terms, which a projection
 permitted A4 may take under the `batched-a4-residual-decode` fast path) and `AllowA8Residual` (A16,
 or FP8 activations as two E4M3 terms, which an FP8 input projection or gate/up permitted A8 may
-take under `batched-a8-residual-decode`; output and down projections stay A16).
+take under `batched-a8-residual-decode`; output and down projections stay A16). Under
+`batched-a8-subset-decode` a chosen subset of the projections permitted A8 keeps one-term `AllowA8`
+in wide rounds.
 
 The reader, binder, native parameter preparation, capacity queries, warmup and execution each check
 the contracts they consume. The executable scope is determined by the actual consumers. The
@@ -320,8 +322,11 @@ nonterminal -> accepted_tokens == produced_tokens
 terminal    -> accepted_tokens may be a produced prefix
 ```
 
-Cancelled rows use zero accepted tokens. The whole PendingBatch must be consumed; pending state cannot
-be abandoned row by row.
+Cancelled rows use zero accepted tokens. A row the Program reports as failed
+(`PendingBatch::row_failure`: a grammar dead end, or logits without a finite selection, whose tokens
+are placeholders) also commits zero tokens: the commit releases it as `FailedReleased` and the Engine
+fails only its request. The whole PendingBatch must be consumed; pending state cannot be abandoned row
+by row.
 
 ### 5.3 Output order
 

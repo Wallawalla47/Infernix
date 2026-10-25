@@ -1,4 +1,5 @@
 #include "infernix/ops/state_codec.h"
+#include "ops/op_family.h"
 #include "ops/op_tester.h"
 
 #include <cfloat>
@@ -158,7 +159,7 @@ int reject_unsupported() {
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(state_codec) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;

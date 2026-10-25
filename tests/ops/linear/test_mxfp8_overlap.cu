@@ -8,6 +8,7 @@
 // calls (design §6.1.2, 2026-10-20). The serialized outputs' hashes are printed so that two builds or
 // producers can be compared bit for bit.
 
+#include "ops/op_family.h"
 #include "infernix/ops/linear.h"
 #include "infernix/ops/offloaded_sparse_moe.h"
 #include "ops/linear/linear_test_common.h"
@@ -296,7 +297,7 @@ Result run(moe::ExpertActivation activation, int columns, int repeats, const Pro
 
 } // namespace
 
-int main(int argc, char** argv) {
+INFERNIX_OP_TEST(mxfp8_moe_overlap) {
     const int repeats = argc > 1 ? std::max(1, std::atoi(argv[1])) : 200;
     try {
         const DeviceMxfp8 gate_up(infernix::test::linear::make_mxfp8_weight(1280, 2560, 7001U));

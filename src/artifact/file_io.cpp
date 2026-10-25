@@ -149,6 +149,11 @@ std::size_t InputFile::read_direct(std::uint64_t offset, std::span<std::byte> de
 #else
     if (direct_fd_ < 0) {
         direct_fd_ = ::open(path_.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
+        // A filesystem without direct I/O (tmpfs, 9p, some FUSE mounts and Docker bind mounts)
+        // refuses O_DIRECT: the same aligned reads then go through a buffered descriptor.
+        if (direct_fd_ < 0 && (errno == EINVAL || errno == EOPNOTSUPP)) {
+            direct_fd_ = ::fcntl(fd_, F_DUPFD_CLOEXEC, 0);
+        }
         if (direct_fd_ < 0) { fail(path_, "open direct"); }
     }
     // One pread may return less than requested before the end of the file (FUSE and network

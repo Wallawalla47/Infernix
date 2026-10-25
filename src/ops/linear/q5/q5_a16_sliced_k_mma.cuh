@@ -8,6 +8,9 @@ namespace infernix::ops::detail {
 template <int BlockRows>
 struct Q5IdentityRows {
     static constexpr int kOutputRowsPerCta = BlockRows;
+    // The same rows at other block rows (the pipelined one-wave route, sliced_k_pipelined.cuh).
+    template <int Rows>
+    using Rebind = Q5IdentityRows<Rows>;
 
     __host__ __device__ int output_rows(int rows) const { return rows; }
 

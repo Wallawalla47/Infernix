@@ -2,6 +2,7 @@
 // lossless_ops_oracle.py's exact results: run as python lossless_ops_oracle.py <this executable>, which
 // passes the case file (per case: op, dims, inputs, expected bits). Every output must match.
 
+#include "ops/op_family.h"
 #include "core/arena.h"
 #include "core/device.h"
 #include "infernix/ops/lossless_ops.h"
@@ -112,7 +113,7 @@ PackedPlane pack_plane(int codec, const std::vector<std::uint32_t>& codes, const
 
 } // namespace
 
-int main(int argc, char** argv) {
+INFERNIX_OP_TEST(lossless_ops) {
     if (argc != 2) {
         std::cerr << "usage: test_lossless_ops <cases.bin> (run through lossless_ops_oracle.py)\n";
         return 2;

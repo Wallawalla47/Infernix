@@ -1,4 +1,5 @@
 #include "infernix/ops/rows.h"
+#include "ops/op_family.h"
 #include "ops/op_tester.h"
 
 #include <cstddef>
@@ -72,7 +73,7 @@ int split_case(const std::vector<std::int32_t>& widths, std::int32_t tokens, std
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(rows) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;

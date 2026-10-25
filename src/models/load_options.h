@@ -38,6 +38,9 @@ struct LoadOptions {
     // screened-lm-head fast path's candidate). An artifact without the screen is refused.
     bool screened_draft_head = false;
     bool screened_lm_head    = false;
+    // Qwen3.5 (EngineOptions::embedding_host): the token embedding stays in pinned host memory, gathered
+    // zero-copy, as an artifact with offloaded experts already keeps it.
+    bool embedding_host = false;
 
     bool operator==(const LoadOptions&) const = default;
 
@@ -103,7 +106,8 @@ struct LoadOptions {
             .expert_a4_activations    = options.expert_a4_activations,
             .draft_model              = options.speculative.draft_model,
             .screened_lm_head         = std::find(options.fast_path_candidates.begin(), options.fast_path_candidates.end(),
-                                                  FastPath::ScreenedLmHead) != options.fast_path_candidates.end()};
+                                                  FastPath::ScreenedLmHead) != options.fast_path_candidates.end(),
+            .embedding_host           = options.embedding_host};
 }
 
 } // namespace infernix::models

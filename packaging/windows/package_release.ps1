@@ -26,8 +26,9 @@ $dllPackages = [ordered]@{
     '^(avcodec|avformat|avutil|swresample|swscale)-\d+\.dll$' = 'ffmpeg'
     '^libcurl\.dll$'                                          = 'curl'
     '^z\.dll$'                                                = 'zlib'
+    '^jpeg62\.dll$'                                           = 'libjpeg-turbo'
 }
-$packageLicence = @{ ffmpeg = 'FFmpeg-LICENSE.txt'; curl = 'curl-LICENSE.txt'; zlib = 'zlib-LICENSE.txt' }
+$packageLicence = @{ ffmpeg = 'FFmpeg-LICENSE.txt'; curl = 'curl-LICENSE.txt'; zlib = 'zlib-LICENSE.txt'; 'libjpeg-turbo' = 'libjpeg-turbo-LICENSE.txt' }
 
 # Licences of the code compiled into the executables (see THIRD_PARTY_NOTICES.md).
 $compiled = [ordered]@{

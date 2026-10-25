@@ -36,6 +36,11 @@ render_tool_call_fallback(const RequestLogContext& context, const GenerationOutc
 [[nodiscard]] OperationalRecord render_response_failure(std::uint64_t request_id,
                                                         const RequestFailure& failure);
 [[nodiscard]] OperationalRecord render_throughput(const ThroughputReport& report);
+// The startup note that a request without an output limit stops at --default-max-tokens, when the
+// per-request context is at least kOutputLimitNoteRatio times that limit; empty otherwise.
+inline constexpr std::uint32_t kOutputLimitNoteRatio = 4;
+[[nodiscard]] std::optional<OperationalRecord> render_output_limit_note(std::uint32_t max_context,
+                                                                        int default_max_tokens);
 
 // Process-wide switch for colouring the operational stats lines. The serve sets this
 // from --log-colours (default off) before logging starts; the [timestamp] [level]
@@ -65,6 +70,8 @@ public:
                       bool auth_enabled) const;
     void server_stopped() const;
     void server_failure(bool serving, std::string_view detail) const;
+    // The Engine failed while serving; the server stops and exits with kEngineFailureExitStatus.
+    void engine_failure_exit(int status) const;
     // Writes a record rendered elsewhere, such as the stop policy's (serve/stop_control.h).
     void write(OperationalRecord record) const;
 

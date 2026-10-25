@@ -43,11 +43,49 @@ using Json   = nlohmann::json;
 using Clock  = std::chrono::steady_clock;
 namespace fi = frontend;
 
-constexpr std::string_view kThinkClose = "</think>";
 constexpr std::string_view kThinkingControl =
     "\n\n Considering the limited time by the user, I have to give the solution based on the "
     "thinking directly now.\n</think>\n\n";
 static_assert(kThinkingControl.ends_with(fi::kCanonicalReasoningCloseSerialization));
+
+// The output phases are marked by the identity of these added tokens, so the tokenizer must hold
+// each as an ordinary (non-special) added token: generation and constraints read them as text.
+fi::OutputMarkerTokens output_marker_tokens(const fi::Tokenizer& tokenizer) {
+    const auto added_text_token = [&](std::string_view content) {
+        const fi::AddedToken* token = tokenizer.find_added_token(content);
+        if (token == nullptr || token->special) {
+            throw std::invalid_argument("Qwen tokenizer must define " + std::string(content) +
+                                        " as an added non-special token");
+        }
+        return static_cast<TokenId>(token->id);
+    };
+    return fi::OutputMarkerTokens{.reasoning_close = added_text_token(fi::kReasoningCloseMarker),
+                                  .tool_call       = added_text_token(fi::kToolCallOpen)};
+}
+
+// A tool grammar reads its free text and call openers as tokens, so the assistant prefix it
+// continues is accepted as tokens: each `<tool_call>` the client spelled as the call opener, every
+// other byte as its byte-level token, which keeps the prefix's exact bytes.
+std::vector<std::int32_t> tool_continuation_tokens(const fi::Tokenizer& tokenizer,
+                                                   TokenId tool_call, std::string_view text) {
+    std::vector<std::int32_t> tokens;
+    tokens.reserve(text.size());
+    for (std::size_t at = 0; at < text.size();) {
+        if (text.substr(at).starts_with(fi::kToolCallOpen)) {
+            tokens.push_back(tool_call);
+            at += fi::kToolCallOpen.size();
+            continue;
+        }
+        const int byte = tokenizer.byte_token_id(static_cast<std::uint8_t>(text[at]));
+        if (byte < 0) {
+            throw std::invalid_argument("Qwen tokenizer has no byte-level token for a continuation "
+                                        "byte");
+        }
+        tokens.push_back(byte);
+        ++at;
+    }
+    return tokens;
+}
 constexpr double kRescaleFactor = 1.0 / 255.0;
 constexpr double kVideoFps      = 2.0;
 constexpr int kVideoMinFrames   = 4;
@@ -631,6 +669,7 @@ public:
             throw std::invalid_argument(
                 "Frontend requires the parsed model tokenizer and public token domain");
         }
+        markers               = output_marker_tokens(*tokenizer);
         ngram_sources_enabled = options.ngram_sources_enabled;
         ngram_archive_enabled = options.ngram_archive_enabled;
         if (ngram_archive_enabled) {
@@ -669,11 +708,18 @@ public:
         }
         const std::string exact =
             tokenizer->decode(encoded, fi::DecodeOptions{.skip_special_tokens = false});
-        const std::string presented =
-            tokenizer->decode(encoded, fi::DecodeOptions{.skip_special_tokens = true});
-        if (exact != control_suffix || presented.find(kThinkClose) == std::string::npos) {
+        // The control closes the thinking as the model does: by the close token, then the
+        // separator. A close spelled earlier in a message would close it there instead.
+        const auto close = std::find(encoded.begin(), encoded.end(), markers.reasoning_close);
+        if (exact != control_suffix || close == encoded.end()) {
             throw std::invalid_argument(std::string("Qwen tokenizer cannot present the ") +
                                         control_name);
+        }
+        if (std::find(close + 1, encoded.end(), markers.reasoning_close) != encoded.end() ||
+            tokenizer->decode(std::span<const int>(close + 1, encoded.end())) !=
+                fi::kReasoningCloseSeparator) {
+            throw std::invalid_argument(std::string(control_name) +
+                                        " may contain </think> only as its final close");
         }
         for (const TokenId token : encoded) {
             if (std::find(defaults.token_ids.begin(), defaults.token_ids.end(), token) !=
@@ -687,6 +733,7 @@ public:
 
     fi::CompiledChatTemplate chat_template;
     std::shared_ptr<const fi::Tokenizer> tokenizer;
+    fi::OutputMarkerTokens markers;
     fi::ProcessorOptions processor;
     std::shared_ptr<fi::MediaPreprocessCache> media_cache;
     StopPolicy defaults;
@@ -767,6 +814,7 @@ PromptPreparationStats PreparedPrompt::preparation_stats() const noexcept {
         .media_singleflight_waits      = stats.media_singleflight_waits,
         .built_patch_bytes             = stats.built_patch_bytes,
         .reused_patch_bytes            = stats.reused_patch_bytes,
+        .instruction_role_lowerings    = stats.instruction_role_lowerings,
     };
 }
 
@@ -782,6 +830,10 @@ Frontend::~Frontend()                              = default;
 
 const ModelSamplingDefaults& Frontend::sampling_defaults() const noexcept {
     return impl_->sampling;
+}
+
+ChatTemplateRoleSupport Frontend::chat_template_role_support() const noexcept {
+    return impl_->chat_template.role_support();
 }
 
 Frontend make_frontend(const FrontendResources& resources, FrontendOptions options) {
@@ -839,12 +891,8 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     if (cache_hints.markers.size() > kMaximumExplicitPromptCacheMarkers) {
         throw std::invalid_argument("PromptInput supports at most four explicit cache markers");
     }
-    std::vector<ChatRole> message_roles;
-    message_roles.reserve(input.messages.size());
-    for (const ChatMessage& message : input.messages) { message_roles.push_back(message.role); }
-    const auto tool_call_output = fi::build_tool_call_output_contract(options.tool_jsons);
-    const std::optional<std::uint32_t> leading_boundary =
-        leading_instruction_boundary(message_roles);
+    const auto tool_call_output =
+        fi::build_tool_call_output_contract(options.tool_jsons, options.deferred_tool_jsons);
     std::vector<PromptCacheMarker> rendered_markers = cache_hints.markers;
     std::optional<std::size_t> engine_tool_marker_index;
     if (cache_hints.allow_engine_automatic_shared_prefixes && !options.tool_jsons.empty()) {
@@ -858,6 +906,20 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     }
     const std::size_t message_count       = input.messages.size();
     std::vector<fi::ChatMessage> messages = convert_messages(std::move(input.messages));
+    // A checkpoint template can refuse an instruction role in a position an agent client
+    // legitimately uses: the NVIDIA Qwen3.8 template raises for a System message that is not the
+    // first and has no developer branch at all. Lower only the positions the active template
+    // actually refuses, so a maintained template still renders every turn under its real role, and
+    // the leading System turn of an ordinary conversation stays byte-identical. Roles collected
+    // below reflect the lowering, keeping ngram sources, tap hints and block keys consistent with
+    // the render.
+    const std::size_t role_lowerings =
+        fi::lower_unsupported_instruction_roles(impl_->chat_template.role_support(), messages);
+    std::vector<ChatRole> message_roles;
+    message_roles.reserve(messages.size());
+    for (const fi::ChatMessage& message : messages) { message_roles.push_back(message.role); }
+    const std::optional<std::uint32_t> leading_boundary =
+        leading_instruction_boundary(message_roles);
     const bool has_media =
         std::any_of(messages.begin(), messages.end(),
                     [](const fi::ChatMessage& message) { return message.has_media(); });
@@ -868,6 +930,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     auto prepared              = std::make_unique<PreparedPromptData>();
     PreparedPromptData& result = *prepared;
     result.tool_call_output    = tool_call_output;
+    result.prepare.instruction_role_lowerings  = role_lowerings;
     if (impl_->ngram_sources_enabled) {
         result.ngram_boundaries = impl_->ngram_boundaries;
         std::size_t remaining   = impl_->max_context;
@@ -881,7 +944,10 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
                 for (const auto& source : fi::ngram_numbered_sources(part.text)) {
                     fi::check_preparation_control(control, "ngram proposal sources");
                     if (remaining == 0) { break; }
-                    auto tokens = impl_->tokenizer->encode(source, {.max_tokens = remaining});
+                    // Tool text is message content: the prompt encodes it without added-token
+                    // matching, so a control spelling in the source stays text here as well.
+                    auto tokens = impl_->tokenizer->encode(
+                        source, {.parse_added_tokens = false, .max_tokens = remaining});
                     fi::check_preparation_control(control, "ngram proposal sources");
                     remaining -= tokens.size();
                     result.ngram_sources.push_back(std::move(tokens));
@@ -1027,6 +1093,8 @@ std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl
     fi::check_preparation_control(control);
     const PromptOptions options           = input.options;
     std::vector<fi::ChatMessage> messages = convert_messages(std::move(input.messages));
+    // Same role lowering as prepare(), so counting never fails where generation succeeds.
+    (void)fi::lower_unsupported_instruction_roles(impl_->chat_template.role_support(), messages);
     const bool has_media =
         std::any_of(messages.begin(), messages.end(),
                     [](const fi::ChatMessage& message) { return message.has_media(); });
@@ -1104,6 +1172,11 @@ PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids,
 std::vector<TokenId> Frontend::tokenize_text(std::string_view text) const {
     if (impl_ == nullptr) { throw std::logic_error("frontend is empty"); }
     return impl_->tokenizer->encode(text);
+}
+
+std::string Frontend::detokenize(std::span<const TokenId> token_ids) const {
+    if (impl_ == nullptr) { throw std::logic_error("frontend is empty"); }
+    return impl_->tokenizer->decode(token_ids);
 }
 
 ChatTokens Frontend::tokenize_chat(PromptInput input) const {
@@ -1184,9 +1257,11 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
                                "one output language");
         }
         try {
-            const auto close = prompt.data_->starts_in_reasoning
-                                   ? fi::kCanonicalReasoningCloseSerialization
-                                   : std::string_view{};
+            const text::ReasoningFraming close{
+                .close_token = prompt.data_->starts_in_reasoning
+                                   ? std::optional<std::int32_t>(impl_->markers.reasoning_close)
+                                   : std::nullopt,
+                .separator   = fi::kReasoningCloseSeparator};
             if (tool_constraint) {
                 for (const auto& tool : tool_contract->tools) {
                     if (tool.name.size() > output.tool_name_max_length ||
@@ -1198,8 +1273,11 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
                                            "tool name is outside the output contract: " +
                                                tool.name);
                 }
-                matcher = fi::compile_tool_grammar(impl_->grammars(), *tool_contract, close,
-                                                   prompt.data_->continuation_content, constraint);
+                matcher = fi::compile_tool_grammar(
+                    impl_->grammars(), *tool_contract, impl_->markers.tool_call, close,
+                    tool_continuation_tokens(*impl_->tokenizer, impl_->markers.tool_call,
+                                             prompt.data_->continuation_content),
+                    constraint);
             } else {
                 matcher = impl_->grammars().compile(*constraint, close,
                                                     prompt.data_->continuation_content);
@@ -1210,7 +1288,7 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
                                error.what());
         }
     }
-    return OutputSession(impl_->tokenizer, std::move(policy), output,
+    return OutputSession(impl_->tokenizer, impl_->markers, std::move(policy), output,
                          prompt.data_->starts_in_reasoning, thinking,
                          impl_->thinking_control_tokens, std::move(tool_contract),
                          std::move(matcher), prompt.data_->continuation_content, combined);

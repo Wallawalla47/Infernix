@@ -85,6 +85,22 @@ struct MtpBatchContext {
     qwen3_5::MtpDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
     std::uint32_t neural_proposal_drafts = 0;
+    // The round proposes through the gated chain (one row; detail::mtp_chained_round): Finish's
+    // proposal steps are captured as a chain whose gates read the ingress proposal limit and, with
+    // ExecutionSchedule::mtp_gate, each draft's probability. neural_proposal_drafts is then the window.
+    bool proposal_chain = false;
+    // ExecutionSchedule::mtp_step_chain (any row count): Finish is captured as the step chain, the
+    // alignment then each draft behind launch_graph_gate_rows (the ingress proposal limits and step
+    // threshold, the previous draft's probability).
+    bool step_chain = false;
+    // A tree round: each row's chain (its MTP drafts, chain_drafts long) gains side leaves on the
+    // device (ops::candidate_chain_tree) and the round verifies the tree at its width, whose rows
+    // hold at most tree_paths root-to-leaf paths.
+    bool tree                  = false;
+    std::uint32_t chain_drafts = 0;
+    std::uint32_t tree_paths   = 0;
+    // Tree families: every round publishes its proposal's ranking log-probabilities for the next.
+    bool tree_proposals = false;
 };
 
 struct DFlashBatchContext {
@@ -102,8 +118,9 @@ struct DFlashBatchContext {
     std::span<float> host_confidence{};
     bool ngram                           = false;
     std::uint32_t neural_proposal_drafts = 0;
-    // A DFlash2 tree round: the drafter's lattice becomes a per-row draft tree verified at the
-    // round's width, whose rows hold at most tree_paths root-to-leaf paths.
+    // A tree round: the drafter's proposal (DFlash2's lattice, DFlash's independent positions)
+    // becomes a per-row draft tree verified at the round's width, whose rows hold at most
+    // tree_paths root-to-leaf paths.
     bool tree                = false;
     std::uint32_t tree_paths = 0;
 };
@@ -150,7 +167,7 @@ struct TargetVerifyFrameView {
     DFlashFeatureSink* feature_sink        = nullptr;
     // Tree verification: each row's device-built tree (I32 [words,B]) and its ancestor masks
     // (I32 [W,B]), the accepted-path and branch outputs, and the lane-owned pending DFlash
-    // features compacted with the path. Empty tree_rows is chain verification.
+    // features compacted with the path (none for MTP). Empty tree_rows is chain verification.
     Tensor tree_rows;
     Tensor tree_masks;
     Tensor accepted_path;

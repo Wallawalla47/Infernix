@@ -6,6 +6,7 @@
 // public input.  The test never reproduces the device RNG algorithm or uses another
 // production path as a golden.
 #include "infernix/ops/sampling.h"
+#include "ops/op_family.h"
 #include "ops/op_tester.h"
 
 #include <algorithm>
@@ -14,6 +15,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <random>
 #include <stdexcept>
@@ -46,7 +48,7 @@ bool same_config(const ops::SamplingConfig& a, const ops::SamplingConfig& b) {
            a.min_p == b.min_p && a.presence_penalty == b.presence_penalty &&
            a.frequency_penalty == b.frequency_penalty && a.seed == b.seed &&
            a.token_counts == b.token_counts && a.mask.words == b.mask.words &&
-           a.mask.stride == b.mask.stride;
+           a.mask.stride == b.mask.stride && a.nonfinite == b.nonfinite;
 }
 
 std::vector<std::uint16_t> bf16_bits(const std::vector<float>& values) {
@@ -712,6 +714,86 @@ int grammar_mask_contract() {
     return failures;
 }
 
+// A row without a finite selection (an all-NaN column, an infinite greedy winner, a sampled column
+// with no finite candidate) sets its SamplingConfig::nonfinite flag and publishes token 0, on the
+// single-block route and on the real-vocabulary multi-block route; finite rows of the same launch
+// keep their oracle tokens and leave their flags clear. The Op never traps.
+int nonfinite_contract() {
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float inf = std::numeric_limits<float>::infinity();
+    struct Shape {
+        int physical_rows;
+        int token_domain;
+    };
+    int failures = 0;
+    for (const Shape shape : {Shape{64, 64}, Shape{248320, 248077}}) {
+        constexpr int batch = 5;
+        const int rows      = shape.physical_rows;
+        const int domain    = shape.token_domain;
+        std::vector<float> logits(static_cast<std::size_t>(rows) * batch, -4.0f);
+        const auto at = [&](int row, int token) -> float& {
+            return logits[static_cast<std::size_t>(row) * rows + token];
+        };
+        const int greedy_token  = domain / 3;
+        const int sampled_token = domain - 5;
+        at(0, greedy_token) = 6.0f; // greedy, finite
+        for (int token = 0; token < rows; ++token) {
+            at(1, token) = nan; // greedy, every logit NaN
+            at(2, token) = nan; // sampled, no finite candidate
+        }
+        at(3, sampled_token) = 6.0f; // sampled top-1, finite
+        at(4, 7)             = inf;  // greedy, an infinite winner
+        if (rows > domain) {
+            at(0, domain) = 100.0f; // rows past the token domain take no part
+            at(3, domain) = 100.0f;
+        }
+
+        std::vector<ops::SamplingConfig> configs(batch);
+        configs[2].temperature = 0.8f;
+        configs[2].top_k       = 4;
+        configs[2].seed        = 31337;
+        configs[3].temperature = 0.8f;
+        configs[3].top_k       = 1;
+        configs[3].seed        = 4242;
+
+        const std::vector<std::uint16_t> input_bits = bf16_bits(logits);
+        DeviceBuffer device_logits                  = to_device(input_bits);
+        GuardedDeviceBuffer device_out(static_cast<std::size_t>(batch) * sizeof(std::int32_t));
+        GuardedDeviceBuffer device_flags(static_cast<std::size_t>(batch) * sizeof(std::int32_t));
+        const std::vector<int> zeros(static_cast<std::size_t>(batch), 0);
+        const std::vector<int> sentinel(static_cast<std::size_t>(batch), -777777);
+        device_out.copy_from_host(sentinel.data(), sentinel.size() * sizeof(std::int32_t));
+        device_flags.copy_from_host(zeros.data(), zeros.size() * sizeof(std::int32_t));
+        for (int row = 0; row < batch; ++row) {
+            configs[static_cast<std::size_t>(row)].nonfinite =
+                static_cast<std::int32_t*>(device_flags.data()) + row;
+        }
+        DeviceBuffer device_configs = to_device(configs);
+        const std::vector<int> positions{3, 5, 7, 9, 11};
+        DeviceBuffer device_positions = to_device(positions);
+
+        Tensor logits_tensor(device_logits.p, DType::BF16, {rows, batch});
+        Tensor out_tensor(device_out.data(), DType::I32, {batch});
+        Tensor positions_tensor(device_positions.p, DType::I32, {batch});
+        const std::size_t workspace_bytes =
+            ops::sampling_workspace_capacity_bytes(domain, batch, batch);
+        WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
+        ops::sample(logits_tensor, out_tensor, domain,
+                    static_cast<const ops::SamplingConfig*>(device_configs.p), positions_tensor,
+                    ops::kSamplePurposeDecode, workspace, nullptr);
+        cuda_synchronize();
+
+        failures += verify_exact("sample non-finite rows publish token 0, finite rows the oracle",
+                                 from_device<int>(device_out.data(), batch),
+                                 {greedy_token, 0, 0, sampled_token, 0});
+        failures += verify_exact("sample non-finite flags mark exactly the failed rows",
+                                 from_device<int>(device_flags.data(), batch), {0, 1, 1, 0, 1});
+        failures += device_out.verify_guards("sample non-finite output");
+        failures += device_flags.verify_guards("sample non-finite flags");
+    }
+    return failures;
+}
+
 int workspace_route_rng_contract() {
     std::vector<float> column(257, -100.0f);
     for (int i = 0; i < 4; ++i) { column[i] = static_cast<float>(i) * 0.25f; }
@@ -795,7 +877,7 @@ int increment_counts_contract() {
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(sampling) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
@@ -828,6 +910,7 @@ int main() {
     failures += fp32_gumbel_route_contract();
     failures += increment_counts_contract();
     failures += grammar_mask_contract();
+    failures += nonfinite_contract();
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " sample public contract\n";
     return failures == 0 ? 0 : 1;

@@ -12,6 +12,7 @@
 #include "core/tensor.h"
 #include "models/qwen4_exp/expert_offload.h"
 #include "models/qwen4_exp/execution/parameters.h"
+#include "models/qwen4_exp/execution/activation_scan.h"
 #include "models/qwen4_exp/execution/fast_path_flags.h"
 #include "infernix/ops/offloaded_sparse_moe.h"
 #include "infernix/ops/qsa.h"
@@ -20,6 +21,7 @@
 
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
 #include <vector>
@@ -77,6 +79,9 @@ struct ForwardExperts {
     // Mapped word a call that could not serve an expert writes (ops::MoeExpertSource::error); the
     // Program checks it after each synchronization. Null: none.
     std::uint32_t* error = nullptr;
+    // TEMPORARY (INFERNIX_TMP_REPLAY_BENCH): device word the CPU waits add their nanoseconds to
+    // (ops::MoeExpertSource::wait_ns). Null: not counted.
+    unsigned long long* wait_ns = nullptr;
     // Prefill chunks stage their next pass of misses on this stream while one pass computes.
     cudaStream_t overlap_stream = nullptr;
     std::array<cudaEvent_t, 5> overlap_events{};
@@ -234,6 +239,10 @@ struct MtpCall {
     const ops::SamplingConfig* sample_configs = nullptr;
     std::uint32_t draft_step                  = 0;
     Tensor sample_rows, sample_logprobs, draft_candidates, draft_q;
+    // TEMPORARY (INFERNIX_TMP_MTP_RUNNER_UP, candidates GX-09): an argmax draft's second-ranked head
+    // row (I32 [T]; the proposal head's row, not its token), for the runner-up rate draft trees need.
+    // Unscreened, unsampled drafts only.
+    Tensor runner_up;
     // Cells whose next token is an image token take its visual embedding (prompt cells only).
     const VisionInput* vision = nullptr;
 };
@@ -356,9 +365,17 @@ private:
     void lossless_head(const Tensor& residuals, Tensor& logits);
     // The block's mixed input (into `into` when given, else the workspace).
     Tensor mix(const HyperConnectionParameters& p, const Tensor& residual, Tensor* inject, Tensor* into = nullptr);
+    // The attention half's inject (y with its coefficients `pending`) into the residual, then the MLP
+    // half's mix: one Op that folds the inject into the fused mixer's reads under the temporary
+    // INFERNIX_TMP_HC_INJECT_FOLD (candidates §7.3 D6), else the two Ops in turn. Same bits either way.
+    // `inject` receives the MLP half's coefficients and must not be `pending`.
+    Tensor inject_mix(const HyperConnectionParameters& p, const Tensor& y, const Tensor& pending, Tensor& residual,
+                      Tensor* inject, Tensor* into = nullptr);
     // The layer's token mixer (GDN or QSA attention) over its mixed input.
     Tensor mixer(std::uint32_t layer, const ForwardBatch& batch, const Tensor& xa);
     Tensor gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index, const ForwardBatch& batch);
+    // INFERNIX_TMP_ACTIVATION_SCAN: scans a prefill call's projection input (no-op when off).
+    void scan_input(const Tensor& x, std::uint32_t layer, ActivationScan::Site site);
     // One QSA block's attention through `layer` and `tails`. Index keys go to `key_records` when
     // set (verification and MTP catch-up: tails unchanged) or advance the tails when update_tails;
     // kv_only stops after the K/V and index-key writes and returns an empty tensor.
@@ -384,9 +401,9 @@ private:
                Tensor* residual = nullptr);
     void wait_layer(const ForwardBatch& batch, std::size_t entry);
     void mtp_block(const MtpCall& call, Tensor& residual);
-    // The dense projections' route flags for the current call: ggml-bf16-prefill's only in eager
-    // calls (prefill chunks, forced tokens), so decode and verification rounds keep the exact GGUF
-    // route whatever their column count.
+    // The dense projections' route flags for the current call: ggml-bf16-prefill's and
+    // f16-accumulate-prefill's only in eager calls (prefill chunks, forced tokens), so decode and
+    // verification rounds keep the exact GGUF, FP8 and MXFP8 routes whatever their column count.
     [[nodiscard]] ops::LinearRoutes dense_routes() const noexcept;
 
     const Parameters& parameters_;
@@ -401,6 +418,9 @@ private:
     ForwardFastPaths fast_;
     ops::PreparedRope rope_; // the text rotation (YaRN-scaled when the factor is above 1)
     std::vector<std::uint32_t> draft_taps_; // the DFlash2 drafter's target layers (empty without it)
+    // INFERNIX_TMP_ACTIVATION_SCAN (activation_scan.h): null when off; the layer mixer() last entered.
+    std::unique_ptr<ActivationScan> scan_;
+    std::uint32_t scan_layer_ = 0;
     bool eager_chunk_ = false;
     // A gated call's layer routing on the host: the dispatch offsets (pinned I32 [E + 1]), the
     // event that lands them, and the per-expert columns and CPU marks derived from them.

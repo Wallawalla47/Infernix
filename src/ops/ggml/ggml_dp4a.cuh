@@ -285,6 +285,59 @@ __device__ __forceinline__ Slice slice(const std::uint8_t* row, int s) {
     return o;
 }
 
+// The codebooks a chunk decode reads (F's grid; IQ3_XXS's sign table too): the device tables by
+// __ldg (DeviceCodebook) or a CTA's copy in shared memory (SharedCodebook), the same values, so a
+// decode gives the same integers from either. Formats without a table read neither.
+template <QType F>
+inline constexpr int kGridWords = F == QType::GGML_IQ3_S     ? 512
+                                  : F == QType::GGML_IQ3_XXS ? 256
+                                  : F == QType::GGML_IQ2_S   ? 2048 // 1,024 eight-byte entries
+                                                             : 0;
+template <QType F>
+inline constexpr int kSignBytes = F == QType::GGML_IQ3_XXS ? 128 : 0;
+
+template <QType F>
+struct DeviceCodebook {
+    __device__ __forceinline__ std::uint32_t grid32(int i) const {
+        if constexpr (F == QType::GGML_IQ3_XXS) {
+            return __ldg(d_iq3xxs_grid + i);
+        } else {
+            return __ldg(d_iq3s_grid + i);
+        }
+    }
+    __device__ __forceinline__ std::uint64_t grid64(int i) const {
+        return __ldg(reinterpret_cast<const unsigned long long*>(d_iq2s_grid) + i);
+    }
+    __device__ __forceinline__ unsigned sign(int i) const { return __ldg(d_ksigns_iq2xs + i); }
+};
+
+// F's codebook in shared memory (2 KiB IQ3_S, 1.1 KiB IQ3_XXS, 8 KiB IQ2_S; 16 bytes otherwise).
+template <QType F>
+struct SharedCodebook {
+    alignas(16) std::uint32_t grid[kGridWords<F> > 0 ? kGridWords<F> : 2];
+    std::uint8_t signs[kSignBytes<F> > 0 ? kSignBytes<F> : 8];
+
+    // Copies the device tables. Every thread of the CTA (Threads of them) calls it; the caller's next
+    // barrier publishes the copy.
+    template <int Threads>
+    __device__ __forceinline__ void load() {
+        if constexpr (kGridWords<F> > 0) {
+            const std::uint32_t* src = F == QType::GGML_IQ3_S     ? d_iq3s_grid
+                                       : F == QType::GGML_IQ3_XXS ? d_iq3xxs_grid
+                                                                  : reinterpret_cast<const std::uint32_t*>(d_iq2s_grid);
+            for (int i = static_cast<int>(threadIdx.x); i < kGridWords<F>; i += Threads) { grid[i] = __ldg(src + i); }
+        }
+        if constexpr (kSignBytes<F> > 0) {
+            for (int i = static_cast<int>(threadIdx.x); i < kSignBytes<F>; i += Threads) { signs[i] = __ldg(d_ksigns_iq2xs + i); }
+        }
+    }
+    __device__ __forceinline__ std::uint32_t grid32(int i) const { return grid[i]; }
+    __device__ __forceinline__ std::uint64_t grid64(int i) const {
+        return *reinterpret_cast<const unsigned long long*>(grid + 2 * i);
+    }
+    __device__ __forceinline__ unsigned sign(int i) const { return signs[i]; }
+};
+
 // Chunk p (elements 8p..8p+7, words 2p and 2p+1 of slice()'s q) of slice s of a row of F blocks,
 // with the sub-scale of the slice half that holds it and the slice's scale words: the integers of
 // slice(), decoded from the 2-byte-aligned loads of the chunk's bytes alone.
@@ -296,8 +349,8 @@ struct Chunk {
     std::uint16_t dmin;
 };
 
-template <QType F>
-__device__ __forceinline__ Chunk chunk(const std::uint8_t* row, int s, int p) {
+template <QType F, class Codebook = DeviceCodebook<F>>
+__device__ __forceinline__ Chunk chunk(const std::uint8_t* row, int s, int p, const Codebook& cb = Codebook{}) {
     Chunk o;
     o.sub  = 1;
     o.min  = 0;
@@ -371,7 +424,7 @@ __device__ __forceinline__ Chunk chunk(const std::uint8_t* row, int s, int p) {
         const int qh = b[66 + ib], sc = b[74 + ib];
         o.sub = 2 * (p < 2 ? sc & 0xF : sc >> 4) + 1;
         const int index = b[2 + 4 * ib + p] | ((qh << (8 - 2 * p)) & 0x300);
-        const std::uint64_t grid = __ldg(reinterpret_cast<const unsigned long long*>(d_iq2s_grid) + index);
+        const std::uint64_t grid = cb.grid64(index);
         const unsigned sign      = b[34 + 4 * ib + p];
         o.w0 = apply_signs4(static_cast<std::uint32_t>(grid), sign & 0xFU);
         o.w1 = apply_signs4(static_cast<std::uint32_t>(grid >> 32), sign >> 4);
@@ -382,9 +435,9 @@ __device__ __forceinline__ Chunk chunk(const std::uint8_t* row, int s, int p) {
         const std::uint32_t aux = ld_u32_a2(b + 66 + 4 * ib);
         o.sub = 2 * static_cast<int>(aux >> 28) + 1;
         const std::uint32_t qs = ld_u16(b + 2 + 8 * ib + 2 * p);
-        const unsigned sign    = __ldg(d_ksigns_iq2xs + ((aux >> (7 * p)) & 127));
-        o.w0 = apply_signs4(__ldg(d_iq3xxs_grid + (qs & 0xFF)), sign & 0xFU);
-        o.w1 = apply_signs4(__ldg(d_iq3xxs_grid + (qs >> 8)), sign >> 4);
+        const unsigned sign    = cb.sign((aux >> (7 * p)) & 127);
+        o.w0 = apply_signs4(cb.grid32(qs & 0xFF), sign & 0xFU);
+        o.w1 = apply_signs4(cb.grid32(qs >> 8), sign >> 4);
     } else if constexpr (F == QType::GGML_IQ3_S) {
         const std::uint8_t* b = row + (s / 8) * 110;
         const int sb = s % 8;
@@ -395,8 +448,8 @@ __device__ __forceinline__ Chunk chunk(const std::uint8_t* row, int s, int p) {
         const int i1 = (qs & 0xFF) | ((qh << (8 - 2 * p)) & 256);
         const int i2 = (qs >> 8) | ((qh << (7 - 2 * p)) & 256);
         const unsigned sign = b[74 + 4 * sb + p];
-        o.w0 = apply_signs4(__ldg(d_iq3s_grid + i1), sign & 0xFU);
-        o.w1 = apply_signs4(__ldg(d_iq3s_grid + i2), sign >> 4);
+        o.w0 = apply_signs4(cb.grid32(i1), sign & 0xFU);
+        o.w1 = apply_signs4(cb.grid32(i2), sign >> 4);
     }
     return o;
 }

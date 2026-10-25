@@ -108,14 +108,14 @@ inline constexpr int fp8_tma_scratch_bytes = [] {
 }();
 
 template <class Schedule, bool FullTokens, class Output, class Epilogue, bool SplitK = false,
-          class RowPolicy = Fp8IdentityRows, class Scale = __nv_bfloat16>
+          class RowPolicy = Fp8IdentityRows, class Scale = __nv_bfloat16, bool InPlace = false>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a8_tma_mma_kernel(
 #ifdef _WIN32
     // MSVC cannot pass the over-aligned (alignas(128)) CUtensorMap struct by value as a
     // __grid_constant__ parameter (C2719), so on Windows the descriptors are pointer-passed from
-    // the staging buffer.
-    const Fp8TmaDescriptors* descriptors_pointer,
+    // the staging buffer (or, InPlace, read from the parameter words).
+    const __grid_constant__ TmaDescriptorParameter<Fp8TmaDescriptors, InPlace> descriptors_pointer,
 #else
     const __grid_constant__ Fp8TmaDescriptors descriptors,
 #endif
@@ -170,8 +170,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a8_tma
 #ifdef _WIN32
             // A staged tensor map was written through the generic proxy; each 128-byte map needs
             // its own acquire for the TMA (tensormap) proxy before its first use.
-            acquire_staged_tensor_map(&descriptors.activation);
-            acquire_staged_tensor_map(&descriptors.weight);
+            acquire_staged_tensor_map<InPlace>(&descriptors.activation);
+            acquire_staged_tensor_map<InPlace>(&descriptors.weight);
 #endif
             for (int kt = 0; kt < tiles_k; ++kt) {
                 const int stage = kt % S;
@@ -276,8 +276,9 @@ __global__ void fp8_a8_tma_split_k_reduce(Fp8A8OperandsT<Scale> p, const float* 
                 }
                 const int parent  = row_policy.weight_row(row_begin, local_row, p.rows);
                 const float scale = p.x_scales[token];
-                sum.x             = sum.x * scale * fp8_widen(p.scales[parent]);
-                sum.y             = sum.y * scale * fp8_widen(p.scales[parent + 1]);
+                // Rounded products, then the epilogue's add, as in fp8_finish_mma_tile.
+                sum.x = __fmul_rn(__fmul_rn(sum.x, scale), fp8_widen(p.scales[parent]));
+                sum.y = __fmul_rn(__fmul_rn(sum.y, scale), fp8_widen(p.scales[parent + 1]));
                 return sum;
             };
             float2 value;
@@ -320,55 +321,54 @@ void launch_fp8_a8_tma_mma(const Fp8A8OperandsT<Scale>& p, Output output, Epilog
     const Fp8TmaDescriptors descriptors{
         fp8_tma_map(p.x, p.tokens, p.k, Schedule::kBlockTokens, Schedule::kBlockK),
         fp8_tma_map(p.codes, p.rows, p.k, weight_span, Schedule::kBlockK)};
-#ifdef _WIN32
-    // Staged once: every token-slice launch below reads the same copy, in stream order.
-    const Fp8TmaDescriptors* staged = fp8_tma_descriptor_staging().stage(descriptors, stream);
-#endif
-    for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
-        const int blocks  = p.rows / Schedule::kBlockRows * div_up(count, Schedule::kBlockTokens);
-        const auto plan   = fp8_tma_split_k_plan<Schedule>(blocks, p.k);
-        const auto launch = [&]<bool Full, bool Split>() {
-            constexpr auto kernel =
-                fp8_a8_tma_mma_kernel<Schedule, Full, Output, Epilogue, Split, RowPolicy, Scale>;
-            constexpr int bytes =
-                fp8_tma_scratch_bytes<Schedule, Epilogue> + Schedule::kBarrierBytes;
-            const int dynamic = fp8_prepare_shared<bytes, kernel, true>();
-            const int grid    = Split ? plan.full_tiles + plan.split_ctas : blocks;
-#ifdef _WIN32
-            kernel<<<grid, Schedule::kThreads, dynamic, stream>>>(
-                staged, p, output, epilogue, row_policy, offset, count, plan, partials);
-#else
-            kernel<<<grid, Schedule::kThreads, dynamic, stream>>>(
-                descriptors, p, output, epilogue, row_policy, offset, count, plan, partials);
-#endif
-            CUDA_CHECK(cudaGetLastError());
-            if constexpr (Split) {
-                fp8_a8_tma_split_k_reduce<Schedule>
-                    <<<plan.tail_tiles * Schedule::kReductionBlocks, 256, 0, stream>>>(
-                        p, partials, output, epilogue, row_policy, plan, offset, count);
+    const auto launch_slices = [&]<bool InPlace>(std::bool_constant<InPlace>, const auto& parameter) {
+        for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
+            const int blocks  = p.rows / Schedule::kBlockRows * div_up(count, Schedule::kBlockTokens);
+            const auto plan   = fp8_tma_split_k_plan<Schedule>(blocks, p.k);
+            const auto launch = [&]<bool Full, bool Split>() {
+                constexpr auto kernel = fp8_a8_tma_mma_kernel<Schedule, Full, Output, Epilogue, Split,
+                                                              RowPolicy, Scale, InPlace>;
+                constexpr int bytes =
+                    fp8_tma_scratch_bytes<Schedule, Epilogue> + Schedule::kBarrierBytes;
+                const int dynamic = fp8_prepare_shared<bytes, kernel, true>();
+                const int grid    = Split ? plan.full_tiles + plan.split_ctas : blocks;
+                kernel<<<grid, Schedule::kThreads, dynamic, stream>>>(
+                    parameter, p, output, epilogue, row_policy, offset, count, plan, partials);
                 CUDA_CHECK(cudaGetLastError());
+                if constexpr (Split) {
+                    fp8_a8_tma_split_k_reduce<Schedule>
+                        <<<plan.tail_tiles * Schedule::kReductionBlocks, 256, 0, stream>>>(
+                            p, partials, output, epilogue, row_policy, plan, offset, count);
+                    CUDA_CHECK(cudaGetLastError());
+                }
+            };
+            if constexpr (Schedule::kSplitWaveCtas > 0) {
+                static_assert(
+                    (!RowPolicy::kPaired && requires { epilogue.apply(0, 0, 0.0f); }) ||
+                        (RowPolicy::kPaired && requires { epilogue.apply_pair(0, 0, 0.0f, 0.0f); }),
+                    "FP8 TMA split-K requires a scalar or paired epilogue after reduction");
+                if (plan.split_ctas) {
+                    if (!partials || reinterpret_cast<std::uintptr_t>(partials) % 16)
+                        throw std::invalid_argument("FP8 TMA split-K requires aligned caller partials");
+                    if (count % Schedule::kBlockTokens == 0)
+                        launch.template operator()<true, true>();
+                    else
+                        launch.template operator()<false, true>();
+                    return;
+                }
             }
-        };
-        if constexpr (Schedule::kSplitWaveCtas > 0) {
-            static_assert(
-                (!RowPolicy::kPaired && requires { epilogue.apply(0, 0, 0.0f); }) ||
-                    (RowPolicy::kPaired && requires { epilogue.apply_pair(0, 0, 0.0f, 0.0f); }),
-                "FP8 TMA split-K requires a scalar or paired epilogue after reduction");
-            if (plan.split_ctas) {
-                if (!partials || reinterpret_cast<std::uintptr_t>(partials) % 16)
-                    throw std::invalid_argument("FP8 TMA split-K requires aligned caller partials");
-                if (count % Schedule::kBlockTokens == 0)
-                    launch.template operator()<true, true>();
-                else
-                    launch.template operator()<false, true>();
-                return;
-            }
-        }
-        if (count % Schedule::kBlockTokens == 0)
-            launch.template operator()<true, false>();
-        else
-            launch.template operator()<false, false>();
-    });
+            if (count % Schedule::kBlockTokens == 0)
+                launch.template operator()<true, false>();
+            else
+                launch.template operator()<false, false>();
+        });
+    };
+#ifdef _WIN32
+    // Staged once: every token-slice launch reads the same copy, in stream order.
+    with_tma_descriptor_parameter(fp8_tma_descriptor_staging(), descriptors, stream, launch_slices);
+#else
+    launch_slices(std::false_type{}, descriptors);
+#endif
 }
 
 } // namespace infernix::ops::detail

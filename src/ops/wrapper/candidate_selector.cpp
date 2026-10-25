@@ -167,6 +167,125 @@ void candidate_selector_tree(const Tensor& candidate_ids, const Tensor& unary_sc
         column_candidates, proposal_q, tree_rows, tree_masks, valid_columns, scratch, stream);
 }
 
+void candidate_tree(const Tensor& candidate_ids, const Tensor& unary_scores,
+                    const Tensor& base_positions, const Tensor& current_extents,
+                    const SamplingConfig* configs, SpeculativeTreeShape shape, Tensor& drafts,
+                    Tensor& column_candidates, Tensor& proposal_q, Tensor& tree_rows,
+                    Tensor& tree_masks, Tensor& valid_columns, cudaStream_t stream) {
+    validate_speculative_tree_shape(shape);
+    const std::int32_t batch_size = candidate_ids.ne[2];
+    const std::int32_t kSteps     = candidate_ids.ne[1];
+    const std::int32_t columns    = shape.nodes - 1;
+    if (kSteps != shape.main_depth) {
+        throw std::invalid_argument("candidate_tree: K must equal the tree's main depth");
+    }
+    if (batch_size < 1 || batch_size > 8) {
+        throw std::invalid_argument("candidate_tree: B must be in [1,8]");
+    }
+    require_tensor(candidate_ids, DType::I32, kCandidates, kSteps, batch_size, 1, "candidate_ids");
+    require_tensor(unary_scores, DType::FP32, kCandidates, kSteps, batch_size, 1, "unary_scores");
+    require_tensor(base_positions, DType::I32, batch_size, 1, 1, 1, "base_positions");
+    require_tensor(current_extents, DType::I32, batch_size, 1, 1, 1, "current_extents");
+    require_tensor(drafts, DType::I32, columns, batch_size, 1, 1, "drafts");
+    require_tensor(column_candidates, DType::I32, kCandidates, columns, batch_size, 1,
+                   "column_candidates");
+    require_tensor(proposal_q, DType::FP32, kCandidates, columns, batch_size, 1, "proposal_q");
+    validate_speculative_tree_rows(tree_rows, batch_size, "candidate_tree");
+    require_tensor(tree_masks, DType::I32, shape.nodes, batch_size, 1, 1, "tree_masks");
+    require_tensor(valid_columns, DType::I32, batch_size, 1, 1, 1, "valid_columns");
+    if (!aligned_to(configs, alignof(SamplingConfig))) {
+        throw std::invalid_argument("candidate_tree: invalid configs");
+    }
+    const std::array<const Tensor*, 4> operands{&candidate_ids, &unary_scores, &base_positions,
+                                                &current_extents};
+    const std::array<const Tensor*, 6> outputs{&drafts,    &column_candidates, &proposal_q,
+                                               &tree_rows, &tree_masks,        &valid_columns};
+    const Range config_range{configs, static_cast<std::size_t>(batch_size) * sizeof(SamplingConfig),
+                             "configs"};
+    for (std::size_t first = 0; first < outputs.size(); ++first) {
+        const Range range{outputs[first]->data, outputs[first]->bytes(), "output"};
+        bool overlap = overlaps(range, config_range);
+        for (const Tensor* other : operands) {
+            overlap = overlap || overlaps(range, Range{other->data, other->bytes(), "operand"});
+        }
+        for (std::size_t second = first + 1; second < outputs.size(); ++second) {
+            overlap = overlap ||
+                      overlaps(range, Range{outputs[second]->data, outputs[second]->bytes(), "output"});
+        }
+        if (overlap) {
+            throw std::invalid_argument("candidate_tree: outputs overlap each other or an operand");
+        }
+    }
+    detail::candidate_tree_launch(candidate_ids, unary_scores, base_positions, current_extents,
+                                  configs, shape, drafts, column_candidates, proposal_q, tree_rows,
+                                  tree_masks, valid_columns, stream);
+}
+
+void candidate_chain_tree(const Tensor& candidate_ids, const Tensor& laws, const Tensor& scores,
+                          const Tensor& base_positions, const Tensor& current_extents,
+                          const SamplingConfig* configs, SpeculativeTreeShape shape, Tensor& drafts,
+                          Tensor& column_candidates, Tensor& proposal_q, Tensor& tree_rows,
+                          Tensor& tree_masks, Tensor& valid_columns, cudaStream_t stream) {
+    validate_speculative_tree_shape(shape);
+    const std::int32_t batch_size = candidate_ids.ne[2];
+    const std::int32_t kSteps     = candidate_ids.ne[1];
+    const std::int32_t columns    = shape.nodes - 1;
+    const std::int32_t ranks      = scores.ne[0];
+    if (kSteps != shape.main_depth) {
+        throw std::invalid_argument("candidate_chain_tree: K must equal the tree's main depth");
+    }
+    if (shape.transport) {
+        // UniVer needs a node's deterministic children fixed before its draw; a proposed chain was
+        // drawn before any sibling.
+        throw std::invalid_argument("candidate_chain_tree: a proposed chain cannot build transport trees");
+    }
+    if (batch_size < 1 || batch_size > 8) {
+        throw std::invalid_argument("candidate_chain_tree: B must be in [1,8]");
+    }
+    if (ranks < 1 || ranks > kCandidates) {
+        throw std::invalid_argument("candidate_chain_tree: scores must hold 1..16 ranks");
+    }
+    require_tensor(candidate_ids, DType::I32, kCandidates, kSteps, batch_size, 1, "candidate_ids");
+    require_tensor(laws, DType::FP32, kCandidates, kSteps, batch_size, 1, "laws");
+    require_tensor(scores, DType::FP32, ranks, kSteps, batch_size, 1, "scores");
+    require_tensor(base_positions, DType::I32, batch_size, 1, 1, 1, "base_positions");
+    require_tensor(current_extents, DType::I32, batch_size, 1, 1, 1, "current_extents");
+    require_tensor(drafts, DType::I32, columns, batch_size, 1, 1, "drafts");
+    require_tensor(column_candidates, DType::I32, kCandidates, columns, batch_size, 1,
+                   "column_candidates");
+    require_tensor(proposal_q, DType::FP32, kCandidates, columns, batch_size, 1, "proposal_q");
+    validate_speculative_tree_rows(tree_rows, batch_size, "candidate_chain_tree");
+    require_tensor(tree_masks, DType::I32, shape.nodes, batch_size, 1, 1, "tree_masks");
+    require_tensor(valid_columns, DType::I32, batch_size, 1, 1, 1, "valid_columns");
+    if (!aligned_to(configs, alignof(SamplingConfig))) {
+        throw std::invalid_argument("candidate_chain_tree: invalid configs");
+    }
+    const std::array<const Tensor*, 5> operands{&candidate_ids, &laws, &scores, &base_positions,
+                                                &current_extents};
+    const std::array<const Tensor*, 6> outputs{&drafts,    &column_candidates, &proposal_q,
+                                               &tree_rows, &tree_masks,        &valid_columns};
+    const Range config_range{configs, static_cast<std::size_t>(batch_size) * sizeof(SamplingConfig),
+                             "configs"};
+    for (std::size_t first = 0; first < outputs.size(); ++first) {
+        const Range range{outputs[first]->data, outputs[first]->bytes(), "output"};
+        bool overlap = overlaps(range, config_range);
+        for (const Tensor* other : operands) {
+            overlap = overlap || overlaps(range, Range{other->data, other->bytes(), "operand"});
+        }
+        for (std::size_t second = first + 1; second < outputs.size(); ++second) {
+            overlap = overlap ||
+                      overlaps(range, Range{outputs[second]->data, outputs[second]->bytes(), "output"});
+        }
+        if (overlap) {
+            throw std::invalid_argument(
+                "candidate_chain_tree: outputs overlap each other or an operand");
+        }
+    }
+    detail::chain_tree_launch(candidate_ids, laws, scores, base_positions, current_extents, configs,
+                              shape, drafts, column_candidates, proposal_q, tree_rows, tree_masks,
+                              valid_columns, stream);
+}
+
 void candidate_selector_path(const Tensor& candidate_ids, const Tensor& unary_scores,
                              const Tensor& projected_hidden, const Tensor& anchors,
                              const Tensor& predecessor_codebook, const Tensor& successor_codebook,

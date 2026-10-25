@@ -1,4 +1,5 @@
 #include "infernix/ops/causal_conv1d_silu.h"
+#include "ops/op_family.h"
 #include "ops/op_tester.h"
 
 #include <cuda_runtime.h>
@@ -793,7 +794,7 @@ int split_snapshot_case(std::int32_t rows2, std::int32_t width, const std::vecto
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(causal_conv1d_silu) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;

@@ -6,6 +6,8 @@
 #include "infernix/ops/resident_moe.h"
 
 #include "core/device.h"
+#include "core/pdl.cuh"
+#include "core/temporary_switches.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -126,13 +128,29 @@ __device__ float row_dot(const Bank& bank, std::int64_t row, const float* x, int
     return sum;
 }
 
+// A padding column's entry (resident_moe_experts' valid_columns): uniform across the CTA.
+__device__ __forceinline__ bool padding(const std::int32_t* __restrict__ valid, int width, int t) {
+    return valid != nullptr && t % width >= valid[t / width];
+}
+
+// TEMPORARY (INFERNIX_TMP_RESIDENT_MOE_PDL, candidates §2.3 W5): the two kernels are programmatic
+// dependents in captured graphs. gate/up waits at once (its expert comes from the router before it)
+// and triggers after its loop; the down kernel then reads its entry's expert (written by the router,
+// which completed before any gate/up wait returned) and prefetches its rows into L2 before waiting
+// for gate/up's h. Eager launches stay serialized; the waits and the trigger are no-ops there. Same
+// products, same bits.
+__device__ __forceinline__ void prefetch_l2(const void* p) { asm volatile("prefetch.global.L2 [%0];" ::"l"(p)); }
+
 template <class Codec>
 __global__ void __launch_bounds__(kThreads)
     gate_up_kernel(const bf16* __restrict__ x, const std::int32_t* __restrict__ ids, int top_k, int hidden,
-                   int intermediate, Bank bank, float* __restrict__ h) {
+                   int intermediate, Bank bank, float* __restrict__ h, const std::int32_t* __restrict__ valid,
+                   int width) {
     __shared__ __align__(16) float xs[kMaxHidden];
+    pdl::wait_for_dependencies();
     const int entry = static_cast<int>(blockIdx.y);
     const int t     = entry / top_k;
+    if (padding(valid, width, t)) { return; } // its h is never read
     const int e     = ids[entry];
     for (int i = static_cast<int>(threadIdx.x); i < bank.padded_k; i += kThreads) {
         xs[staged_index<Codec>(i)] = i < hidden ? __bfloat162float(x[static_cast<std::int64_t>(t) * hidden + i]) : 0.0F;
@@ -147,14 +165,38 @@ __global__ void __launch_bounds__(kThreads)
         const float u = row_dot<Codec>(bank, base + intermediate + r, xs, lane);
         if (lane == 0) { h[static_cast<std::int64_t>(entry) * intermediate + r] = g / (1.0F + __expf(-g)) * u; }
     }
+    // After the loop (the trigger-after-the-loop form): the down kernel's CTAs then launch beside the
+    // last gate/up CTAs, not beside the whole grid.
+    pdl::trigger_dependents();
 }
 
 template <class Codec>
 __global__ void __launch_bounds__(kThreads)
-    down_kernel(const float* __restrict__ h, const std::int32_t* __restrict__ ids, int hidden, int intermediate,
-                Bank bank, bf16* __restrict__ out) {
+    down_kernel(const float* __restrict__ h, const std::int32_t* __restrict__ ids, int top_k, int hidden,
+                int intermediate, Bank bank, bf16* __restrict__ out, const std::int32_t* __restrict__ valid,
+                int width, bool prefetch) {
     __shared__ __align__(16) float hs[kMaxIntermediate];
     const int entry = static_cast<int>(blockIdx.y);
+    if (prefetch) {
+        // This CTA's rows of its expert's down bank, one 128-byte line per thread (immutable weights;
+        // the expert id is the router's).
+        const int row_bytes = bank.padded_k / Codec::kCodes * 16;
+        const int lines     = (row_bytes + 127) / 128;
+        const int first_row = static_cast<int>(blockIdx.x) * kDownRowsPerCta;
+        const int rows      = min(kDownRowsPerCta, hidden - first_row);
+        const auto* base    = bank.codes + (static_cast<std::int64_t>(ids[entry]) * hidden + first_row) * row_bytes;
+        for (int i = static_cast<int>(threadIdx.x); i < rows * lines; i += kThreads) {
+            prefetch_l2(base + static_cast<std::int64_t>(i / lines) * row_bytes + (i % lines) * 128);
+        }
+    }
+    pdl::wait_for_dependencies();
+    if (padding(valid, width, entry / top_k)) {
+        for (int r = static_cast<int>(blockIdx.x) * kDownRowsPerCta + static_cast<int>(threadIdx.x);
+             r < min(hidden, (static_cast<int>(blockIdx.x) + 1) * kDownRowsPerCta); r += kThreads) {
+            out[static_cast<std::int64_t>(entry) * hidden + r] = __float2bfloat16_rn(0.0F);
+        }
+        return;
+    }
     const int e     = ids[entry];
     for (int i = static_cast<int>(threadIdx.x); i < bank.padded_k; i += kThreads) {
         hs[staged_index<Codec>(i)] = i < intermediate ? h[static_cast<std::int64_t>(entry) * intermediate + i] : 0.0F;
@@ -175,16 +217,23 @@ Bank bank_of(const Weight& w) {
 
 template <class Codec>
 void launch(const Tensor& x, const Tensor& ids, const Weight& gate_up, const Weight& down, int top_k, int hidden,
-            int intermediate, float* h, Tensor& outputs, cudaStream_t stream) {
+            int intermediate, float* h, Tensor& outputs, cudaStream_t stream, const std::int32_t* valid, int width) {
     const int entries = ids.ne[0] * ids.ne[1];
-    gate_up_kernel<Codec><<<dim3((intermediate + kGateRowsPerCta - 1) / kGateRowsPerCta, entries), kThreads, 0,
-                            stream>>>(static_cast<const bf16*>(x.data), static_cast<const std::int32_t*>(ids.data),
-                                      top_k, hidden, intermediate, bank_of(gate_up), h);
-    CUDA_CHECK(cudaGetLastError());
-    down_kernel<Codec><<<dim3((hidden + kDownRowsPerCta - 1) / kDownRowsPerCta, entries), kThreads, 0, stream>>>(
-        h, static_cast<const std::int32_t*>(ids.data), hidden, intermediate, bank_of(down),
-        static_cast<bf16*>(outputs.data));
-    CUDA_CHECK(cudaGetLastError());
+    static const bool pdl_chain = temporary_switches::flag("INFERNIX_TMP_RESIDENT_MOE_PDL");
+    const auto dependency       = pdl_chain ? pdl::Dependency::Programmatic : pdl::Dependency::Serialized;
+    const bool prefetch         = pdl_chain && pdl::graph_dependent(stream);
+    CUDA_CHECK(pdl::launch_with(dependency,
+                                {dim3((intermediate + kGateRowsPerCta - 1) / kGateRowsPerCta, entries), dim3(kThreads), 0,
+                                 stream},
+                                gate_up_kernel<Codec>, static_cast<const bf16*>(x.data),
+                                static_cast<const std::int32_t*>(ids.data), top_k, hidden, intermediate,
+                                bank_of(gate_up), h, valid, width));
+    CUDA_CHECK(pdl::launch_with(dependency,
+                                {dim3((hidden + kDownRowsPerCta - 1) / kDownRowsPerCta, entries), dim3(kThreads), 0,
+                                 stream},
+                                down_kernel<Codec>, static_cast<const float*>(h),
+                                static_cast<const std::int32_t*>(ids.data), top_k, hidden, intermediate,
+                                bank_of(down), static_cast<bf16*>(outputs.data), valid, width, prefetch));
 }
 
 bool row_split(const Weight& w, QType qtype) {
@@ -200,8 +249,11 @@ std::size_t resident_moe_workspace_bytes(std::int32_t pairs, std::int32_t interm
 
 void resident_moe_experts(const Tensor& x, const Tensor& ids, const Weight& gate_up, const Weight& down,
                           std::int32_t experts, std::int32_t intermediate, void* workspace,
-                          std::size_t workspace_bytes, Tensor& outputs, cudaStream_t stream) {
+                          std::size_t workspace_bytes, Tensor& outputs, cudaStream_t stream,
+                          const std::int32_t* valid_columns, std::int32_t width) {
     const int hidden = x.ne[0], columns = x.ne[1], top_k = ids.ne[0];
+    require(valid_columns == nullptr || (width > 0 && columns % width == 0),
+            "a padding mask needs a width dividing the columns");
     require(x.dtype == DType::BF16 && x.is_contiguous() && ids.dtype == DType::I32 && ids.is_contiguous() &&
                 outputs.dtype == DType::BF16 && outputs.is_contiguous(),
             "x, ids and outputs must be contiguous BF16/I32/BF16");
@@ -221,13 +273,13 @@ void resident_moe_experts(const Tensor& x, const Tensor& ids, const Weight& gate
     auto* h = static_cast<float*>(workspace);
     if (row_split(gate_up, QType::Q4_G64_FP16) && row_split(down, QType::Q4_G64_FP16)) {
         require(gate_up.padded_shape[1] % 64 == 0 && down.padded_shape[1] % 64 == 0, "Q4 rows must hold whole groups");
-        launch<Q4>(x, ids, gate_up, down, top_k, hidden, intermediate, h, outputs, stream);
+        launch<Q4>(x, ids, gate_up, down, top_k, hidden, intermediate, h, outputs, stream, valid_columns, width);
     } else if (row_split(gate_up, QType::Q8_G32_FP16) && row_split(down, QType::Q8_G32_FP16)) {
         require(gate_up.padded_shape[1] % 32 == 0 && down.padded_shape[1] % 32 == 0, "Q8 rows must hold whole groups");
-        launch<Q8>(x, ids, gate_up, down, top_k, hidden, intermediate, h, outputs, stream);
+        launch<Q8>(x, ids, gate_up, down, top_k, hidden, intermediate, h, outputs, stream, valid_columns, width);
     } else if (row_split(gate_up, QType::Q2_G64_FP16) && row_split(down, QType::Q2_G64_FP16)) {
         require(gate_up.padded_shape[1] % 64 == 0 && down.padded_shape[1] % 64 == 0, "Q2 rows must hold whole groups");
-        launch<Q2>(x, ids, gate_up, down, top_k, hidden, intermediate, h, outputs, stream);
+        launch<Q2>(x, ids, gate_up, down, top_k, hidden, intermediate, h, outputs, stream, valid_columns, width);
     } else {
         throw std::invalid_argument("resident_moe_experts: banks must be row-split Q2_G64_FP16, Q4_G64_FP16 or Q8_G32_FP16");
     }

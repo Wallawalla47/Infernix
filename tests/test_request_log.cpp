@@ -320,6 +320,7 @@ int main() {
     prepared.preparation.media_items                   = 1;
     prepared.preparation.media_cache_misses            = 1;
     prepared.preparation.built_patch_bytes             = 49152;
+    prepared.preparation.instruction_role_lowerings    = 2;
 
     const RequestLogMetadata metadata{
         .http_request_id                   = "req_wire_923",
@@ -328,6 +329,7 @@ int main() {
         .stream                            = false,
         .output_tokens_explicit            = true,
         .preserve_thinking_semantic_change = true,
+        .label                             = "bench fl02/a",
     };
     const RequestLogContext context =
         make_request_log_context(7, "openai_chat_completions", request, metadata, prepared);
@@ -351,6 +353,8 @@ int main() {
     failures += check(started.at("request").at("http_request_id") == "req_wire_923" &&
                           started.at("request").at("response_id") == "chatcmpl_wire_471",
                       "public wire identities were not preserved in the start record");
+    failures += check(started.at("request").at("label") == "bench fl02/a",
+                      "request label missing from the start record");
     failures += check(started.at("request").at("requested_output_tokens") == 4096,
                       "request output budget missing");
     failures += check(started.at("request").at("enable_thinking") == true,
@@ -371,6 +375,8 @@ int main() {
                           started.at("preparation_seconds").at("tokenize") == 0.02 &&
                           started.at("preparation_seconds").at("cache_misses") == 1,
                       "request-scoped media preparation diagnostics missing");
+    failures += check(started.at("preparation_seconds").at("instruction_role_lowerings") == 2,
+                      "instruction role lowering count missing from the preparation block");
 
     ApiError preparation_error;
     preparation_error.status             = 400;
@@ -383,6 +389,7 @@ int main() {
     RequestLogMetadata rejected_metadata = metadata;
     rejected_metadata.http_request_id    = "req_rejected_812";
     rejected_metadata.response_id.clear();
+    rejected_metadata.label.clear();
     const RequestRejectionLogContext rejected_context = make_request_rejection_log_context(
         8, "anthropic_messages", rejected_request, rejected_metadata, preparation_error);
     const Json rejected =
@@ -393,6 +400,7 @@ int main() {
     failures += check(rejected.at("request").at("request_id") == 8 &&
                           rejected.at("request").at("http_request_id") == "req_rejected_812" &&
                           rejected.at("request").at("response_id") == "" &&
+                          rejected.at("request").at("label").is_null() &&
                           rejected.at("request").at("media_item_count") == 1 &&
                           rejected.at("request").at("message_count") == 2,
                       "preparation rejection request shape missing");
@@ -423,42 +431,48 @@ int main() {
     outcome.prompt_tokens                   = 401;
     outcome.completion_tokens               = 1024;
     outcome.finish_reason                   = infernix::FinishReason::OutputLimit;
-    outcome.metrics.prepare_seconds         = 0.1234567890123;
-    outcome.metrics.ttft_seconds            = 0.3580246791357;
-    outcome.metrics.vision_seconds          = 0.0;
-    outcome.metrics.prefill_seconds         = 0.2345678901234;
-    outcome.metrics.decode_seconds          = 5.3456789012345;
-    outcome.metrics.total_seconds           = 5.7037035803702;
-    outcome.metrics.prefix_cache_hit_tokens = 101;
-    outcome.metrics.computed_prefill_tokens = 300;
-    outcome.metrics.prefix_reuse_path       = infernix::PrefixReusePath::HybridSnapshot;
-    outcome.metrics.engine_timing           = {
-                  .queue_wait_seconds                   = 0.001,
-                  .engine_boundary_exposed_seconds      = 0.001,
-                  .program_submit_exposed_seconds       = 0.002,
-                  .program_post_exposed_seconds         = 0.003,
-                  .engine_commit_output_exposed_seconds = 0.004,
-                  .engine_maintenance_exposed_seconds   = 0.005,
-                  .device_wait_exposed_seconds          = 0.3,
-                  .decode_host_exposed_seconds          = 0.01,
-                  .decode_device_wait_exposed_seconds   = 0.2,
-                  .prefill_units                        = 4,
-                  .decode_rounds                        = 2,
-                  .control_units                        = 1,
+    outcome.timings.prepare_seconds         = 0.1234567890123;
+    outcome.timings.first_token_seconds     = 0.3580246791357;
+    outcome.timings.vision_seconds          = 0.0;
+    outcome.timings.prefill_seconds         = 0.2345678901234;
+    outcome.timings.decode_seconds          = 5.3456789012345;
+    outcome.timings.total_seconds           = 5.7037035803702;
+    outcome.reused_prompt_tokens            = 101;
+    outcome.computed_prefill_tokens         = 300;
+    outcome.prefix_reuse_path               = infernix::PrefixReusePath::HybridSnapshot;
+    outcome.engine_timing                   = {
+        .queue_wait_seconds                   = 0.001,
+        .engine_boundary_exposed_seconds      = 0.001,
+        .program_submit_exposed_seconds       = 0.002,
+        .program_post_exposed_seconds         = 0.003,
+        .engine_commit_output_exposed_seconds = 0.004,
+        .engine_maintenance_exposed_seconds   = 0.005,
+        .device_wait_exposed_seconds          = 0.3,
+        .decode_host_exposed_seconds          = 0.01,
+        .decode_device_wait_exposed_seconds   = 0.2,
+        .prefill_units                        = 4,
+        .decode_rounds                        = 2,
+        .control_units                        = 1,
     };
-    outcome.metrics.speculative_backend               = infernix::SpeculativeBackend::Mtp;
-    outcome.metrics.speculative_draft_window          = 3;
-    outcome.metrics.speculative_rounds                = 300;
-    outcome.metrics.speculative_draft_tokens          = 900;
-    outcome.metrics.speculative_accepted_tokens       = 720;
-    outcome.metrics.speculative_fallback_steps        = 2;
-    outcome.metrics.speculative_accepted_per_position = {290, 240, 190};
-    outcome.metrics.engine_request_id                 = 991;
-    outcome.metrics.ngram_archive_rounds              = 7;
-    outcome.metrics.tree_side_accepted_tokens         = 11;
-    outcome.metrics.ngram_archive_drafted_tokens      = 441;
-    outcome.metrics.ngram_archive_accepted_tokens     = 400;
-    outcome.metrics.ngram_archive                     = {.enabled       = true,
+    outcome.speculative.backend                   = infernix::SpeculativeBackend::Mtp;
+    outcome.speculative.draft_window              = 3;
+    outcome.speculative.rounds                    = 300;
+    outcome.speculative.drafted_tokens            = 900;
+    outcome.speculative.accepted_tokens           = 720;
+    outcome.speculative.fallback_steps            = 2;
+    outcome.speculative.accepted_per_position     = {290, 240, 190};
+    outcome.speculative.round_steps               = {{.drafted = 3, .accepted = 3},
+                                                     {.drafted = 3, .accepted = 0},
+                                                     {.drafted = 5, .accepted = 3, .ngram = true}};
+    outcome.output_4grams                         = 37;
+    outcome.output_4grams_in_prompt               = 9;
+    outcome.engine_request_id                     = 991;
+    outcome.speculative.ngram_archive_rounds      = 7;
+    outcome.speculative.tree_side_accepted_tokens = 11;
+    outcome.speculative.ngram_archive_drafted_tokens  = 441;
+    outcome.speculative.ngram_archive_accepted_tokens = 400;
+    outcome.speculative.ngram_gate_rejections         = 5;
+    outcome.ngram_archive                             = {.enabled       = true,
                                                          .bound         = true,
                                                          .published     = true,
                                                          .generation    = 3,
@@ -466,12 +480,12 @@ int main() {
                                                          .session_bytes = 1024,
                                                          .total_bytes   = 4096,
                                                          .sampling_seed = 0};
-    outcome.metrics.scheduling                        = {
-                               .preemptions          = 3,
-                               .snapshot_restores    = 1,
-                               .replay_restores      = 2,
-                               .replayed_tokens      = 640,
-                               .paused_ns            = 123456789012345ULL,
+    outcome.scheduling                                = {
+        .preemptions       = 3,
+        .snapshot_restores = 1,
+        .replay_restores   = 2,
+        .replayed_tokens   = 640,
+        .paused_ns         = 123456789012345ULL,
     };
     outcome.thinking = infernix::ThinkingBudgetStats{.configured_budget     = 256,
                                                    .model_thinking_tokens = 256,
@@ -483,6 +497,23 @@ int main() {
                           done.at("request").at("http_request_id") == "req_wire_923" &&
                           done.at("request").at("response_id") == "chatcmpl_wire_471",
                       "terminal log cannot be joined to the same public request and response");
+    failures += check(done.at("prefix_miss").is_null(), "a request without a miss record logged one");
+    GenerationOutcome missed = outcome;
+    missed.prefix_miss       = PrefixMiss{.kind                      = PrefixMiss::Kind::Diverged,
+                                          .earlier_engine_request_id = 990,
+                                          .earlier_context_tokens    = 9000,
+                                          .common_prefix_tokens      = 6000,
+                                          .reused_tokens             = 5952,
+                                          .computed_prefill_tokens   = 6100,
+                                          .lost_reuse_tokens         = 48,
+                                          .earlier = PrefixMissWindow{.first = 5936, .token_ids = {1, 2}, .text = "ab"},
+                                          .current = PrefixMissWindow{.first = 5936, .token_ids = {1, 3}, .text = "ac"}};
+    const Json miss = Json::parse(format_request_done_json("serve-test", 3000, context, missed)).at("prefix_miss");
+    failures += check(miss.at("kind") == "diverged" && miss.at("earlier_engine_request_id") == 990 &&
+                          miss.at("common_prefix_tokens") == 6000 && miss.at("lost_reuse_tokens") == 48 &&
+                          miss.at("earlier").at("first") == 5936 && miss.at("current").at("text") == "ac" &&
+                          miss.at("current").at("token_ids") == Json::array({1, 3}),
+                      "prefix-miss record lost its fields");
     failures +=
         check(done.at("generation").at("engine_request_id") == 991 &&
                   done.at("generation").at("scheduling") == Json{{"preemptions", 3},
@@ -499,8 +530,8 @@ int main() {
     auto cancelled                            = outcome;
     cancelled.finish_reason                   = infernix::FinishReason::Cancelled;
     cancelled.completion_tokens               = 0;
-    cancelled.metrics.computed_prefill_tokens = 128;
-    cancelled.metrics.prefill_seconds         = 0.25;
+    cancelled.computed_prefill_tokens         = 128;
+    cancelled.timings.prefill_seconds         = 0.25;
     const Json cancelled_done =
         Json::parse(format_request_done_json("server-test", 123456789, context, cancelled));
     failures += check(cancelled_done.at("result").at("computed_prefill_tokens") == 128,
@@ -527,15 +558,17 @@ int main() {
                   done.at("result").at("tool_call_parse").at("fallback_reason") == "none",
               "default tool-call parse diagnostics missing");
     failures += check(done.at("timings_seconds").at("decode").get<double>() ==
-                          outcome.metrics.decode_seconds,
+                          outcome.timings.decode_seconds,
                       "decode time lost precision");
-    failures +=
-        check(done.at("timings_seconds").at("ttft").get<double>() == outcome.metrics.ttft_seconds,
-              "TTFT missing or lost precision");
+    failures += check(done.at("timings_seconds").at("ttft").get<double>() ==
+                          outcome.timings.first_token_seconds,
+                      "TTFT missing or lost precision");
     failures += check(done.at("speculative").at("backend") == "mtp", "speculative backend missing");
     failures += check(done.at("speculative").at("tree_side_accepted_tokens") == 11 &&
                           done.at("speculative").at("tree_rounds") == 0,
                       "speculative tree counters missing");
+    failures += check(done.at("speculative").at("ngram_gate_rejections") == 5,
+                      "n-gram agreement gate counter missing");
     failures += check(done.at("speculative").at("ngram_archive_accepted_tokens") == 400 &&
                           done.at("speculative").at("ngram_archive").at("generation") == 3 &&
                           done.at("speculative").at("ngram_archive").at("bound") == true &&
@@ -549,6 +582,12 @@ int main() {
     failures +=
         check(done.at("speculative").at("accepted_per_position") == Json::array({290, 240, 190}),
               "speculative position counts missing");
+    failures += check(done.at("speculative").at("round_steps") ==
+                              Json::array({Json::array({3, 3, 0}), Json::array({3, 0, 0}), Json::array({5, 3, 1})}) &&
+                          done.at("speculative").at("accepted_length_histogram") == Json::array({1, 0, 0, 2}) &&
+                          done.at("speculative").at("output_4grams") == 37 &&
+                          done.at("speculative").at("output_4grams_in_prompt") == 9,
+                      "speculation round detail or prompt overlap missing");
     failures += check(
         done.at("engine_timing").at("queue_wait_seconds") == 0.001 &&
             std::abs(done.at("engine_timing").at("host_exposed_seconds").at("total").get<double>() -
@@ -560,7 +599,7 @@ int main() {
     auto observed                        = outcome;
     observed.generated_token_ids         = {17, 151645};
     observed.completion_tokens           = 2;
-    observed.metrics.first_output_timing = infernix::GenerationFirstOutputTiming{
+    observed.first_output_timing         = infernix::GenerationFirstOutputTiming{
         .elapsed_seconds         = 0.312345678901234,
         .initial_binding_seconds = 0.023456789012345,
         .engine                  = {.queue_wait_seconds             = 0.001,
@@ -581,7 +620,7 @@ int main() {
                                     .paused_ns       = 123456789},
         .computed_prefill_tokens = 192,
     };
-    const auto& first = *observed.metrics.first_output_timing;
+    const auto& first = *observed.first_output_timing;
     const Json observed_done =
         Json::parse(format_request_done_json("serve-test", 3001, context, observed));
     const auto& first_json = observed_done.at("first_output_timing");
@@ -590,10 +629,9 @@ int main() {
                               Json::array({17, 151645}) &&
                           observed_done.at("result").at("completion_tokens") == 2,
                       "request diagnostics lost exact generated token IDs or schema version");
-    observed.metrics.admission = {.preferred_reused_tokens = 19057,
-                                  .source_wait_seconds     = 0.25,
-                                  .fallback_reason =
-                                      infernix::AdmissionFallbackReason::SourceInvalid};
+    observed.admission = {.preferred_reused_tokens = 19057,
+                          .source_wait_seconds     = 0.25,
+                          .fallback_reason = infernix::AdmissionFallbackReason::SourceInvalid};
     const auto admission_done =
         Json::parse(format_request_done_json("serve-test", 3002, context, observed));
     failures +=
@@ -900,6 +938,67 @@ int main() {
                          .get<double>() -
                      50.0) < 1.0e-12,
         "throughput Host work deltas or normalization are incorrect");
+
+    // The device's NVML readings: end-of-interval readings, the interval's energy and limited time,
+    // joules per decode token only for a pure decode interval; null without NVML.
+    failures += check(throughput_json.at("gpu").is_null() && pretty_throughput.find("gpu") == std::string::npos,
+                      "an interval without NVML readings reported a device");
+    {
+        ThroughputReport gpu = single_decode;
+        gpu.gpu_previous     = {.valid                = true,
+                                .has_energy           = true,
+                                .energy_millijoules   = 1'000'000,
+                                .has_violations       = true,
+                                .power_violation_ns   = 1'000'000'000,
+                                .thermal_violation_ns = 0};
+        gpu.gpu_current      = {.valid                = true,
+                                .sm_clock_mhz         = 2805,
+                                .memory_clock_mhz     = 14001,
+                                .temperature_c        = 61,
+                                .power_watts          = 412.6,
+                                .has_energy           = true,
+                                .energy_millijoules   = 3'050'084,
+                                .clock_event_reasons  = 0x5, // idle, power cap
+                                .has_violations       = true,
+                                .power_violation_ns   = 1'500'008'400,
+                                .thermal_violation_ns = 0};
+        const Json json = Json::parse(format_throughput_json("serve-test", 5002, gpu)).at("gpu");
+        failures += check(json.at("sm_clock_mhz") == 2805 && json.at("memory_clock_mhz") == 14001 &&
+                              json.at("temperature_c") == 61 &&
+                              json.at("clock_event_reasons") == Json::array({"idle", "sw-power-cap"}) &&
+                              std::abs(json.at("energy_joules").get<double>() - 2050.084) < 1e-9 &&
+                              std::abs(json.at("average_power_watts").get<double>() - 2050.084 / 5.000168) < 1e-9 &&
+                              std::abs(json.at("joules_per_decode_token").get<double>() - 2050.084 / 1025.0) < 1e-12 &&
+                              std::abs(json.at("power_violation_fraction").get<double>() - 0.5000084 / 5.000168) < 1e-12 &&
+                              json.at("thermal_violation_fraction") == 0.0,
+                          "throughput GPU readings or interval deltas mismatch");
+        ThroughputReport mixed      = gpu;
+        mixed.computed_prefill_tokens = 10;
+        failures += check(Json::parse(format_throughput_json("serve-test", 5003, mixed))
+                              .at("gpu")
+                              .at("joules_per_decode_token")
+                              .is_null(),
+                          "an interval with prefill reported joules per decode token");
+        ThroughputReport reloaded             = gpu;
+        reloaded.gpu_current.energy_millijoules = 10;
+        failures += check(Json::parse(format_throughput_json("serve-test", 5004, reloaded))
+                              .at("gpu")
+                              .at("energy_joules")
+                              .is_null(),
+                          "an energy counter that went backwards gave an interval delta");
+        const std::string pretty = render_throughput(gpu).message;
+        failures += check(pretty.find(" | gpu 2805/14001 MHz 413 W 61 C avg 410 W 2.00 J/tok limited sw-power-cap "
+                                      "power-capped 10.0%") != std::string::npos,
+                          ("pretty throughput lacks the device readings: " + pretty).c_str());
+    }
+
+    const auto limit_note = render_output_limit_note(262144, 8192);
+    failures += check(limit_note && limit_note->message.find(
+                                        "8,192 tokens of its 262,144 context") != std::string::npos,
+                      "no output-limit note at 32 times the default limit");
+    failures +=
+        check(render_output_limit_note(32768, 8192) && !render_output_limit_note(32767, 8192),
+              "the output-limit note does not start at exactly four times the default limit");
 
     ThroughputReport zero_rounds;
     const Json zero_rounds_json =

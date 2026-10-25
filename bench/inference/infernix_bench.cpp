@@ -1,11 +1,15 @@
 #include "infernix_bench_support.h"
 
+#include "core/gpu_telemetry.h"
+#include "core/link_probe.h"
 #include "infernix/engine.h"
 
 #include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -14,6 +18,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -54,6 +59,38 @@ void require_cuda(cudaError_t status, const char* operation) {
     }
 }
 
+// The pinned host-to-device rate on the loaded Engine's device (its context and flags already
+// set); 0 when the probe buffers cannot be allocated.
+double measure_h2d(int device) {
+    require_cuda(cudaSetDevice(device), "cudaSetDevice");
+    void* host   = nullptr;
+    void* target = nullptr;
+    if (cudaHostAlloc(&host, infernix::bench::kH2dProbeBytes, cudaHostAllocDefault) !=
+        cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0.0;
+    }
+    double rate = 0.0;
+    if (cudaMalloc(&target, infernix::bench::kH2dProbeBytes) == cudaSuccess) {
+        std::memset(host, 0, infernix::bench::kH2dProbeBytes);
+        rate = infernix::measure_h2d_bytes_per_second(host, target, infernix::bench::kH2dProbeBytes,
+                                                      3);
+        require_cuda(cudaFree(target), "cudaFree");
+    } else {
+        (void)cudaGetLastError();
+    }
+    require_cuda(cudaFreeHost(host), "cudaFreeHost");
+    return rate;
+}
+
+void fill_pcie_link(infernix::bench::BenchMachine& machine, int device) {
+    const infernix::GpuPcieLink link = infernix::GpuTelemetry(device).pcie_link();
+    machine.pcie_generation          = link.generation;
+    machine.pcie_width               = link.width;
+    machine.pcie_max_generation      = link.max_generation;
+    machine.pcie_max_width           = link.max_width;
+}
+
 bool has_decode_tests(const std::vector<infernix::bench::BenchTest>& tests) {
     for (const auto& test : tests) {
         if (test.has_decode()) { return true; }
@@ -63,12 +100,19 @@ bool has_decode_tests(const std::vector<infernix::bench::BenchTest>& tests) {
 
 infernix::RequestOptions
 benchmark_request(const infernix::bench::BenchTest& test,
-                  const std::optional<infernix::OutputConstraint>& constraint) {
+                  const std::optional<infernix::OutputConstraint>& constraint,
+                  const infernix::bench::BenchEnvironment& env, std::uint64_t seed) {
     infernix::RequestOptions options;
     options.execution.requested_output_tokens = test.requested_output_tokens();
     options.execution.allow_prefix_reuse      = false;
-    options.execution.sampling.temperature    = 0.0F;
-    options.stop.include_model_defaults       = false;
+    options.execution.sampling.temperature    = env.temperature.value_or(0.0F);
+    if (env.temperature) {
+        options.execution.sampling.top_p = env.top_p;
+        options.execution.sampling.top_k = env.top_k;
+        options.execution.sampling.min_p = env.min_p;
+        options.execution.sampling.seed  = seed;
+    }
+    options.stop.include_model_defaults       = env.stop_at_eos;
     options.output.raw                        = true;
     options.output.preserve_special_tokens    = true;
     if (constraint) {
@@ -83,7 +127,7 @@ benchmark_request(const infernix::bench::BenchTest& test,
 void run_repetition(infernix::Engine& engine, const infernix::bench::BenchEnvironment& env,
                     const infernix::bench::BenchTest& test,
                     const std::vector<infernix::TokenId>& corpus,
-                    infernix::bench::TestResult* measured = nullptr) {
+                    infernix::bench::TestResult* measured = nullptr, std::uint64_t seed = 0) {
     const int prompt_tokens = test.kind == infernix::bench::TestKind::Decode
                                   ? infernix::bench::kDecodeSeedTokens
                                   : test.n_prompt;
@@ -103,7 +147,7 @@ void run_repetition(infernix::Engine& engine, const infernix::bench::BenchEnviro
             env.constraint.has_value() && (!env.mixed_constraints || row % 2 == 0);
         handles.push_back(
             engine.submit(std::move(prompts[row]),
-                          benchmark_request(test, constrained ? env.constraint : std::nullopt),
+                          benchmark_request(test, constrained ? env.constraint : std::nullopt, env, seed + row),
                           infernix::OutputConsumerMode::Aggregate, {.phase_timings = true}));
     }
     for (auto& handle : handles) { generated.push_back(handle.wait()); }
@@ -119,7 +163,9 @@ void run_repetition(infernix::Engine& engine, const infernix::bench::BenchEnviro
         const bool grammar_done = constrained &&
                                   result.finish_reason == infernix::FinishReason::StopToken &&
                                   count <= test.requested_output_tokens();
-        if (!at_limit && !grammar_done) {
+        const bool eos_done = env.stop_at_eos && result.finish_reason == infernix::FinishReason::StopToken &&
+                              count <= test.requested_output_tokens();
+        if (!at_limit && !grammar_done && !eos_done) {
             throw std::runtime_error(test.label +
                                      " did not finish at its output limit or grammar EOS");
         }
@@ -171,9 +217,22 @@ int main(int argc, char** argv) {
     }
 
     try {
-        const std::vector<infernix::TokenId> corpus =
-            infernix::bench::load_corpus_ids(options.corpus_path);
-        const std::vector<infernix::bench::BenchTest> tests = infernix::bench::expand_tests(options);
+        const bool exact_prompt = !options.prompt_ids_path.empty();
+        std::vector<infernix::TokenId> corpus = exact_prompt ? infernix::bench::load_prompt_ids(options.prompt_ids_path)
+                                                             : infernix::bench::load_corpus_ids(options.corpus_path);
+        // --corpus-offset: every prompt starts that far into the corpus (wrapping round its end).
+        std::rotate(corpus.begin(),
+                    corpus.begin() + static_cast<std::ptrdiff_t>(options.corpus_offset % corpus.size()),
+                    corpus.end());
+        std::vector<infernix::bench::BenchTest> tests = infernix::bench::expand_tests(options);
+        if (exact_prompt) {
+            // Each -n N prefills the whole prompt, then decodes N tokens.
+            const int prompt_tokens = static_cast<int>(corpus.size());
+            for (auto& test : tests) {
+                test = {infernix::bench::TestKind::PrefillDecode, prompt_tokens, test.n_gen,
+                        "ids" + std::to_string(prompt_tokens) + "+tg" + std::to_string(test.n_gen)};
+            }
+        }
         if (options.profile_measured && (tests.size() != 1 || options.repetitions != 1)) {
             throw std::invalid_argument(
                 "--profile-measured requires exactly one benchmark test and -r 1");
@@ -213,10 +272,12 @@ int main(int argc, char** argv) {
         engine_options.vram_past_budget    = options.vram_past_budget;
         engine_options.expert_tail_skip    = options.expert_tail_skip;
         engine_options.expert_a4_activations = options.expert_a4_activations;
+        engine_options.embedding_host        = options.embedding_host;
         engine_options.context_cache.enabled            = false;
         engine_options.context_cache.host_capacity_bytes = 0;
         engine_options.speculative                       = options.speculative;
         engine_options.use_cuda_graph                    = options.use_cuda_graph;
+        engine_options.route_trace_path                  = options.route_trace_path;
 
         infernix::bench::BenchEnvironment env;
         env.artifact_path            = options.artifact_path;
@@ -243,6 +304,15 @@ int main(int argc, char** argv) {
         env.warmup                   = options.warmup;
         env.corpus_path              = options.corpus_path;
         env.corpus_tokens            = corpus.size();
+        env.corpus_offset            = options.corpus_offset;
+        env.prompt_ids_path          = options.prompt_ids_path;
+        env.temperature              = options.temperature;
+        env.top_p                    = options.top_p;
+        env.top_k                    = options.top_k;
+        env.min_p                    = options.min_p;
+        env.seed                     = options.seed;
+        env.stop_at_eos              = options.stop_at_eos;
+        env.route_trace_path         = options.route_trace_path;
         env.concurrency              = options.concurrency;
         env.constraint_file          = options.constraint_file;
         env.constraint               = options.constraint;
@@ -260,10 +330,18 @@ int main(int argc, char** argv) {
                 infernix::bench::decode_graph_prime_output_tokens(options.speculative);
         }
 
+        // Before the model loads, so the buffer never adds to the loaded model's RAM pressure.
+        env.machine.ram_read_threads          = std::max(1U, std::thread::hardware_concurrency());
+        env.machine.ram_read_bytes_per_second = infernix::bench::measure_ram_read_bytes_per_second(
+            infernix::bench::kRamProbeBytes, env.machine.ram_read_threads);
+
         std::cerr << "[infernix_bench] loading " << options.artifact_path
                   << " (max_context=" << max_context
                   << ", kv_cache=" << infernix::bench::kv_cache_name(options.kv_cache) << ")\n";
         infernix::Engine engine(std::move(engine_options));
+        if (!options.profile_measured) {
+            env.machine.h2d_bytes_per_second = measure_h2d(options.device);
+        }
         env.prefill_chunk = engine.options().prefill_chunk; // the model's default when unset
         // auto resolves to a ceiling, or on Qwen3.5/3.6 without adaptive-mtp to a fixed length.
         env.speculative.draft_tokens      = engine.options().speculative.draft_tokens;
@@ -286,26 +364,39 @@ int main(int argc, char** argv) {
             result.test        = test;
             result.concurrency = env.concurrency;
             engine.reset_memory_peaks();
+            // Sampled requests: row k of measured repetition r draws with seed + r * concurrency + k;
+            // warm-ups with seeds a million further on.
             for (int warmup = 0; warmup < options.warmup; ++warmup) {
-                run_repetition(engine, env, test, corpus);
+                run_repetition(engine, env, test, corpus, nullptr,
+                               env.seed + 1000000ULL + static_cast<std::uint64_t>(warmup) * env.concurrency);
             }
             result.reps.reserve(static_cast<std::size_t>(options.repetitions) * env.concurrency);
+            // The measured repetitions' execution units: maxima restarted after the warm-ups.
+            engine.reset_execution_maxima();
+            const infernix::RuntimeStats before = engine.runtime_stats();
             if (options.profile_measured) {
                 require_cuda(cudaDeviceSynchronize(), "profile pre-boundary synchronize");
                 require_cuda(cudaProfilerStart(), "cudaProfilerStart");
             }
             for (int repetition = 0; repetition < options.repetitions; ++repetition) {
-                run_repetition(engine, env, test, corpus, &result);
+                run_repetition(engine, env, test, corpus, &result,
+                               env.seed + static_cast<std::uint64_t>(repetition) * env.concurrency);
             }
             if (options.profile_measured) {
                 require_cuda(cudaDeviceSynchronize(), "profile post-boundary synchronize");
                 require_cuda(cudaProfilerStop(), "cudaProfilerStop");
             }
+            // memory_summary waits for the worker's boundary, so the runtime stats are the runs'
+            // last.
             const infernix::MemorySummary memory    = engine.memory_summary();
+            result.execution = infernix::bench::execution_delta(before.execution,
+                                                                engine.runtime_stats().execution);
             result.workspace_peak_bytes           = memory.workspace_logical_peak_bytes;
             result.workspace_allocator_peak_bytes = memory.workspace.peak_used_bytes;
             results.push_back(std::move(result));
         }
+        // Right after the measured runs: an idle GPU lowers its link generation.
+        fill_pcie_link(env.machine, options.device);
 
         std::string report;
         switch (options.output) {

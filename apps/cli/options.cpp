@@ -132,6 +132,7 @@ constexpr std::array kCliOptions{
     CliOption{"--lossless", false},
     CliOption{"--fast-path", true, true},
     CliOption{"--expert-a4-activations", false},
+    CliOption{"--embedding-host", false},
     CliOption{"--stop-token-id", true, true},
     CliOption{"--stop", true, true},
     CliOption{"--reasoning-stop", true, true},
@@ -187,7 +188,7 @@ std::string usage_text(const char* argv0) {
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
            "       [--chat-template FILE] [--ngram-volume FILE] [--ngram-residency auto|ram|volume]\n"
-           "       [--expert-state FILE|off] [--expert-stripe FILE] [--expert-a4-activations]\n"
+           "       [--expert-state FILE|off] [--expert-stripe FILE] [--expert-a4-activations] [--embedding-host]\n"
            "       [--ram-headroom-mib N] [--expert-ram-mib N|auto] [--expert-pin-mib N|auto]\n"
            "       [--grammar-file FILE | --json-object | --json-schema-file FILE |\n"
            "        --regex PATTERN | --choice TEXT ...]\n"
@@ -295,6 +296,12 @@ std::string usage_text(const char* argv0) {
            "                           the activation scales NVIDIA calibrated for them.\n"
            "                           Changes the output. No other artifact supports it\n"
            "                           (default: 16-bit activations, as NVIDIA serves it)\n"
+           "  --embedding-host         Qwen3.5-family artifacts: keep the token embedding in\n"
+           "                           pinned host memory, read zero-copy, so its VRAM\n"
+           "                           (1.18 GiB on the 27B) goes to the KV and prefix\n"
+           "                           caches. Same output; prompts read their rows over\n"
+           "                           PCIe (default: in VRAM; offloaded-expert artifacts\n"
+           "                           always keep it in host memory)\n"
            "\n"
            "SPECULATIVE DECODING (off by default)\n"
            "  --spec mtp|dflash|dflash2 speculative backend\n"
@@ -310,9 +317,10 @@ std::string usage_text(const char* argv0) {
            "  --draft-model FILE       Qwen3.8-Flash-Next dflash2: the DFlash2 drafter's\n"
            "                           companion artifact (Qwen3.5/3.6 artifacts bundle theirs)\n"
            "  --lm-head-draft          use the optimized proposal head\n"
-           "  --spec-min-p P           Qwen3.8-Flash-Next mtp: verify drafts only up to the\n"
-           "                           first below probability P, 0-1 (default 0.5 with\n"
-           "                           --draft-tokens auto, else 0 = all)\n"
+           "  --spec-min-p P           mtp (and Qwen3.8-Flash-Next dflash2): one-request rounds\n"
+           "                           verify drafts only up to the first below probability P,\n"
+           "                           0-1 (Flash-Next default 0.5 with --draft-tokens auto,\n"
+           "                           else 0 = all; Qwen3.5/3.6 default 0)\n"
            "  --draft-tree-nodes auto|N\n"
            "                           dflash2: verify a small tree of alternative drafts each\n"
            "                           round instead of a single draft, so more drafted tokens\n"
@@ -564,6 +572,8 @@ Options parse_options(int argc, char** argv) {
             options.fast_path_candidates.push_back(*path);
         } else if (arg == "--expert-a4-activations") {
             options.expert_a4_activations = true;
+        } else if (arg == "--embedding-host") {
+            options.embedding_host = true;
         } else if (arg == "--stop-token-id") {
             const std::uint32_t token = parse_u32(value(arg), "stop-token-id", true);
             if (token > static_cast<std::uint32_t>(std::numeric_limits<TokenId>::max())) {

@@ -8,6 +8,7 @@
 //   - the int64 row sums against an independent binary64 evaluation of the decoded operands,
 //     which is exact while |S| < 2^53, and the BF16 outputs against an FP64 expert oracle.
 
+#include "ops/op_family.h"
 #include "ops/common/canonical_math.h"
 #include "ops/offloaded_sparse_moe/cpu/w4a4_expert.h"
 #include "ops/offloaded_moe_fixtures.h"
@@ -400,7 +401,7 @@ void test_golden() {
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(offloaded_moe_cpu) {
     test_e4m3();
     test_e2m1();
     test_bf16_round();

@@ -17,6 +17,8 @@
 #include "ops/softmax_attention/dense/causal_cache/vq2/launch.h"
 #include "ops/softmax_attention/dense/causal_cache/column_invariant.h"
 #include "core/arena.h"
+#include "core/temporary_switches.h"
+#include "ops/kv_cache/append/launch.h"
 
 #include <algorithm>
 #include <cmath>
@@ -288,6 +290,74 @@ StagedColumns stage_columns(Allocator& allocator, AttentionHeadGeometry geometry
     return out;
 }
 
+// INFERNIX_TMP_VERIFY_ROWS_ATTENTION (candidates §10.3 KW-01): a column-invariant round appends all
+// of its columns' K/V in one launch, then attends every column as a row of one-column calls over
+// the appended keys, up to kRowsPerCall rows per launch, instead of one append-and-attend call per
+// column. Each row keeps the key partition and merge order its one-column call plans (for the
+// round's batch), and a row reads only keys at or before its own position, which the append wrote
+// exactly as the fused one-column append writes them; so every column's bits are unchanged. The
+// formats whose appended rows are independent per token take it; the VQ2 and K4V2 exact window
+// keeps the column order.
+constexpr std::int32_t kRowsPerCall = kMaximumBatchSize;
+
+bool verify_rows_attention(KvCacheStorage storage) {
+    switch (storage) {
+    case KvCacheStorage::BFloat16:
+    case KvCacheStorage::Int8Group64:
+    case KvCacheStorage::Fp8E4M3Row256:
+    case KvCacheStorage::Nvfp4Group16:
+    case KvCacheStorage::Fp8KeyNvfp4Value:
+        return temporary_switches::flag("INFERNIX_TMP_VERIFY_ROWS_ATTENTION");
+    default:
+        return false;
+    }
+}
+
+std::size_t cached_rows_workspace_bytes(KvCacheStorage storage, std::int32_t heads,
+                                        std::int32_t call_batch, std::int32_t rows,
+                                        CausalAttentionExecutionEnvelope envelope, int sms) {
+    switch (storage) {
+    case KvCacheStorage::BFloat16:
+        return detail::bf16_kv_cached_rows_workspace_bytes(heads, call_batch, rows, envelope, sms);
+    case KvCacheStorage::Int8Group64:
+        return detail::int8_kv_cached_rows_workspace_bytes(heads, call_batch, rows, envelope, sms);
+    case KvCacheStorage::Fp8E4M3Row256:
+        return detail::fp8_kv_cached_rows_workspace_bytes(heads, call_batch, rows, envelope, sms);
+    case KvCacheStorage::Nvfp4Group16:
+        return detail::nvfp4_kv_cached_rows_workspace_bytes(heads, call_batch, rows, envelope, sms);
+    case KvCacheStorage::Fp8KeyNvfp4Value:
+        return detail::k8v4_kv_cached_rows_workspace_bytes(heads, call_batch, rows, envelope, sms);
+    default:
+        throw std::logic_error("causal_softmax_attention: rows variant on an unsupported format");
+    }
+}
+
+void cached_rows_attention(KvCacheStorage storage, const Tensor& q, const Tensor& positions,
+                           const Tensor& valid, const Tensor& rows, float scale,
+                           PagedKVBatchLayerView cache, CausalAttentionExecutionEnvelope envelope,
+                           std::int32_t call_batch, WorkspaceArena& workspace, Tensor& out,
+                           DeviceExecutionView execution) {
+    switch (storage) {
+    case KvCacheStorage::BFloat16:
+        return detail::bf16_kv_cached_rows_attention(q, positions, valid, rows, scale, cache,
+                                                     envelope, call_batch, workspace, out, execution);
+    case KvCacheStorage::Int8Group64:
+        return detail::int8_kv_cached_rows_attention(q, positions, valid, rows, scale, cache,
+                                                     envelope, call_batch, workspace, out, execution);
+    case KvCacheStorage::Fp8E4M3Row256:
+        return detail::fp8_kv_cached_rows_attention(q, positions, valid, rows, scale, cache,
+                                                    envelope, call_batch, workspace, out, execution);
+    case KvCacheStorage::Nvfp4Group16:
+        return detail::nvfp4_kv_cached_rows_attention(q, positions, valid, rows, scale, cache,
+                                                      envelope, call_batch, workspace, out, execution);
+    case KvCacheStorage::Fp8KeyNvfp4Value:
+        return detail::k8v4_kv_cached_rows_attention(q, positions, valid, rows, scale, cache,
+                                                     envelope, call_batch, workspace, out, execution);
+    default:
+        throw std::logic_error("causal_softmax_attention: rows variant on an unsupported format");
+    }
+}
+
 // Column `column`'s B rows of a staged tensor whose rows are `row_bytes` long.
 void* column_rows(const Tensor& staged, std::int32_t column, std::int32_t batch,
                   std::size_t row_bytes) {
@@ -353,7 +423,15 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
     column.column_invariant                 = false;
     WorkspaceLayoutBuilder layout;
     (void)stage_columns(layout, geometry, max_width, batch_size, true);
-    if (const std::size_t one = routes(1, 1, column); one != 0) { (void)layout.alloc_bytes(one); }
+    std::size_t one = routes(1, 1, column);
+    if (verify_rows_attention(cache_storage)) {
+        // The rows variant: the round's table rows beside the widest rows call's partials.
+        (void)layout.alloc(DType::I32, {max_width * batch_size});
+        const std::int32_t rows = std::min(kRowsPerCall, max_width * batch_size);
+        one = std::max(one, cached_rows_workspace_bytes(cache_storage, q_heads, batch_size, rows,
+                                                        column, execution.multiprocessor_count));
+    }
+    if (one != 0) { (void)layout.alloc_bytes(one); }
     return layout.peak_bytes(1);
 }
 
@@ -418,12 +496,49 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
             {v.data, staged.v.data, static_cast<std::int32_t>(kb)},
             {positions.data, staged.positions.data, static_cast<std::int32_t>(pb)},
         };
+        CausalAttentionExecutionEnvelope column_envelope = envelope;
+        column_envelope.column_invariant                 = false;
+        if (verify_rows_attention(cache.storage)) {
+            // The rows variant: q and positions column-major (K/V are appended in place), every
+            // column's table row, one append of the whole round, then the rows calls.
+            const detail::CausalColumnPermutation gathered[] = {inputs[0], inputs[3]};
+            detail::causal_columns_permute_launch(gathered, 2, width, batch, true, stream);
+            if (masked) {
+                detail::causal_column_valid_launch(valid_columns, staged.valid, width, batch, stream);
+            }
+            const std::int32_t rows = width * batch;
+            Tensor table_rows       = workspace.alloc(DType::I32, {rows});
+            detail::causal_column_table_rows_launch(kv_table_rows, table_rows, width, batch, stream);
+            detail::kv_cache_append_batch_launch(k, v, positions, valid_columns, kv_table_rows,
+                                                 cache, stream);
+            for (std::int32_t first = 0; first < rows; first += kRowsPerCall) {
+                const std::int32_t count = std::min(kRowsPerCall, rows - first);
+                const Tensor call_q(static_cast<unsigned char*>(staged.q.data) + first * qb,
+                                    DType::BF16, {kHeadDim, geometry.query_heads, 1, count});
+                const Tensor call_positions(static_cast<std::int32_t*>(staged.positions.data) + first,
+                                            DType::I32, {1, count});
+                const Tensor call_rows(static_cast<std::int32_t*>(table_rows.data) + first,
+                                       DType::I32, {count});
+                Tensor call_valid;
+                if (masked) {
+                    call_valid = Tensor(static_cast<std::int32_t*>(staged.valid.data) + first,
+                                        DType::I32, {count});
+                }
+                Tensor call_out(static_cast<unsigned char*>(staged.out.data) + first * qb,
+                                DType::BF16, {kHeadDim, geometry.query_heads, 1, count});
+                cached_rows_attention(cache.storage, call_q, call_positions, call_valid, call_rows,
+                                      scale, cache, column_envelope, batch, workspace, call_out,
+                                      execution);
+            }
+            const detail::CausalColumnPermutation output{staged.out.data, out.data,
+                                                         static_cast<std::int32_t>(qb)};
+            detail::causal_columns_permute_launch(&output, 1, width, batch, false, stream);
+            return;
+        }
         detail::causal_columns_permute_launch(inputs, 4, width, batch, true, stream);
         if (masked) {
             detail::causal_column_valid_launch(valid_columns, staged.valid, width, batch, stream);
         }
-        CausalAttentionExecutionEnvelope column_envelope = envelope;
-        column_envelope.column_invariant                 = false;
         for (std::int32_t column = 0; column < width; ++column) {
             const Tensor column_q(column_rows(staged.q, column, batch, qb), DType::BF16,
                                   {kHeadDim, geometry.query_heads, 1, batch});

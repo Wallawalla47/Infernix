@@ -281,6 +281,133 @@ __device__ __forceinline__ void unit_sums(I128 (&acc)[4], const std::uint8_t* rg
         }
 }
 
+// unit_sums over NT column tiles of 8 at once (the wide tiled route, calls of 9-31 columns). Each chunk of
+// rows g and g + 8 is decoded once and
+// multiplies every tile's B fragments (bcol[nt], xs0[nt], xs1[nt] as unit_sums' for tile nt's columns),
+// so a call of 9-16 columns reads and decodes its weights once instead of in four-column passes. Every
+// tile's integers are unit_sums'.
+template <QType F, int NT>
+__device__ __forceinline__ void unit_sums_columns(I128 (*acc)[4], const std::uint8_t* rg, const std::uint8_t* rg8, int u,
+                                                  int unit_slices, const std::int32_t* const* bcol,
+                                                  const std::int32_t* const* xs0, const std::int32_t* const* xs1, int t) {
+    namespace fast             = ggml::fast;
+    constexpr int kBlockElems  = static_cast<int>(ggml_block_elems(F));
+    constexpr int kBlockBytes  = static_cast<int>(ggml_block_bytes(F));
+    constexpr int kBlockSlices = tile::kBlockSlices<F>;
+    for (int b0 = 0; b0 < unit_slices; b0 += kBlockSlices) {
+        int sum[NT][3][4];
+        long long mt[NT][4];
+#pragma unroll
+        for (int nt = 0; nt < NT; ++nt) {
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                sum[nt][0][q] = sum[nt][1][q] = sum[nt][2][q] = 0;
+                mt[nt][q]                                     = 0;
+            }
+        }
+        std::uint16_t d[2] = {0, 0}, dmin[2] = {0, 0};
+#pragma unroll
+        for (int j = 0; j < kBlockSlices; ++j) {
+            const int e  = (b0 + j) * 32 + 8 * t; // element of the unit
+            const int s  = u * (kUnitElems / 32) + b0 + j;
+            const tile::TileChunk cg = tile::tile_chunk<F>(rg + e / kBlockElems * kBlockBytes, e % kBlockElems / 8);
+            const tile::TileChunk ch = tile::tile_chunk<F>(rg8 + e / kBlockElems * kBlockBytes, e % kBlockElems / 8);
+            if constexpr (tile::kHalfSub<F>) {
+                const int packed = (cg.sub & 0xFFFF) | (ch.sub << 16);
+                const int other  = __shfl_xor_sync(0xFFFFFFFFU, packed, 2);
+                const int og = static_cast<short>(other & 0xFFFF), oh = other >> 16;
+#pragma unroll
+                for (int nt = 0; nt < NT; ++nt) {
+                    const std::int32_t* bs = bcol[nt] + static_cast<std::size_t>(s) * fast::kSliceWords;
+                    int2 b[3];
+#pragma unroll
+                    for (int l = 0; l < 3; ++l) { b[l] = __ldg(reinterpret_cast<const int2*>(bs + 8 * l)); }
+#pragma unroll
+                    for (int h = 0; h < 2; ++h) {
+                        const bool mine = (t >> 1) == h;
+                        int p[3][4];
+#pragma unroll
+                        for (int l = 0; l < 3; ++l) {
+                            tile::mma_k32(p[l], mine ? cg.w[0] : 0, mine ? ch.w[0] : 0, mine ? cg.w[1] : 0, mine ? ch.w[1] : 0,
+                                          b[l].x, b[l].y);
+                        }
+                        const int sg = mine ? cg.sub : og, sh = mine ? ch.sub : oh;
+#pragma unroll
+                        for (int l = 0; l < 3; ++l) {
+                            sum[nt][l][0] += sg * p[l][0];
+                            sum[nt][l][1] += sg * p[l][1];
+                            sum[nt][l][2] += sh * p[l][2];
+                            sum[nt][l][3] += sh * p[l][3];
+                        }
+                    }
+                }
+            } else {
+#pragma unroll
+                for (int nt = 0; nt < NT; ++nt) {
+                    const std::int32_t* bs = bcol[nt] + static_cast<std::size_t>(s) * fast::kSliceWords;
+                    int2 b[3];
+#pragma unroll
+                    for (int l = 0; l < 3; ++l) { b[l] = __ldg(reinterpret_cast<const int2*>(bs + 8 * l)); }
+                    int p[3][4];
+#pragma unroll
+                    for (int l = 0; l < 3; ++l) { tile::mma_k32(p[l], cg.w[0], ch.w[0], cg.w[1], ch.w[1], b[l].x, b[l].y); }
+#pragma unroll
+                    for (int l = 0; l < 3; ++l) {
+                        if constexpr (tile::kUnitSub<F>) {
+#pragma unroll
+                            for (int q = 0; q < 4; ++q) { sum[nt][l][q] += p[l][q]; }
+                        } else {
+                            sum[nt][l][0] += cg.sub * p[l][0];
+                            sum[nt][l][1] += cg.sub * p[l][1];
+                            sum[nt][l][2] += ch.sub * p[l][2];
+                            sum[nt][l][3] += ch.sub * p[l][3];
+                        }
+                    }
+                }
+            }
+            if constexpr (fast::kMin<F>) {
+#pragma unroll
+                for (int nt = 0; nt < NT; ++nt) {
+                    const int xa = __ldg(xs0[nt] + s), xb = __ldg(xs1[nt] + s);
+                    mt[nt][0] += static_cast<long long>(cg.min_sub) * xa;
+                    mt[nt][1] += static_cast<long long>(cg.min_sub) * xb;
+                    mt[nt][2] += static_cast<long long>(ch.min_sub) * xa;
+                    mt[nt][3] += static_cast<long long>(ch.min_sub) * xb;
+                }
+            }
+            if (j == kBlockSlices - 1) {
+                d[0]    = cg.d;
+                d[1]    = ch.d;
+                dmin[0] = cg.dmin;
+                dmin[1] = ch.dmin;
+            }
+        }
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            std::int64_t mant, min_mant = 0;
+            int shift, min_shift = 0;
+            bool negative;
+            f16_parts(d[h], mant, shift, negative);
+            if (negative) { mant = -mant; }
+            if constexpr (fast::kMin<F>) {
+                f16_parts(dmin[h], min_mant, min_shift, negative);
+                min_mant = negative ? min_mant : -min_mant; // the min term is subtracted
+            }
+#pragma unroll
+            for (int nt = 0; nt < NT; ++nt) {
+#pragma unroll
+                for (int c = 0; c < 2; ++c) {
+                    const int q = 2 * h + c;
+                    const long long p = (static_cast<long long>(sum[nt][0][q]) << 16) +
+                                        (static_cast<long long>(sum[nt][1][q]) << 8) + sum[nt][2][q];
+                    add_shifted(acc[nt][q], mant * p, shift);
+                    if constexpr (fast::kMin<F>) { add_shifted(acc[nt][q], min_mant * mt[nt][q], min_shift); }
+                }
+            }
+        }
+    }
+}
+
 // accumulate over units first, first + step, ... (< units) of the K = slices * 32 elements, the
 // rows' bytes staged through `st` (this warp's); `issued`: issue_first_unit already ran. Formats as
 // accumulate.

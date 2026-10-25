@@ -51,6 +51,8 @@ struct Sink : infernix::OutputSink {
 
     void timing(infernix::GenerationTimingObservation) override {}
 
+    void tool_call(infernix::ToolCallDelta) override {}
+
     void publish(infernix::OutputDelta delta) override { bytes += delta.text.size(); }
 };
 } // namespace

@@ -57,6 +57,7 @@ void ProgramImpl::dflash2_propose(std::span<const std::uint32_t> lanes, const st
         dflash_host(dflash_io_.slots)[b]     = static_cast<std::int32_t>(lanes[b]);
         configs[b]                           = lane.sampling;
         configs[b].mask                      = {};
+        configs[b].nonfinite                 = nullptr; // a draft's selection never fails the request
     }
     upload_pinned(dflash_device_.p, dflash_host_.data(), 4ULL * dflash_io_.ids, s);
     upload_pinned(configs_.p, configs, sizeof(ops::SamplingConfig) * batch, s);
@@ -100,7 +101,8 @@ void ProgramImpl::dflash2_propose(std::span<const std::uint32_t> lanes, const st
 std::pair<std::size_t, std::size_t> ProgramImpl::dflash2_verify_planes(std::int32_t batch, std::int32_t K) {
     const cudaStream_t s     = device_.stream;
     constexpr std::int32_t C = ops::kSparseSpeculativeCandidates;
-    bool copies              = false;
+    // INFERNIX_TMP_NGRAM_CHAIN: row 0's copied tail after its drafter drafts is a copy too.
+    bool copies              = chain_tail_ > 0;
     for (std::int32_t b = 0; b < batch; ++b) { copies = copies || (from_ngram_[b] && !drafts_[b].empty()); }
     // Row b's plane j stands at (b * K + j) * C in both layouts when K is the proposal's.
     if (!copies && K == dflash_k_) { return {dflash_io_.candidates, dflash_io_.q}; }
@@ -122,11 +124,25 @@ std::pair<std::size_t, std::size_t> ProgramImpl::dflash2_verify_planes(std::int3
             upload_pinned(dflash_device(dflash_io_.verify_q + row), host_q + row, 4ULL * C * n, s);
             continue;
         }
-        const std::size_t from = static_cast<std::size_t>(b) * dflash_k_ * C;
+        const std::size_t from     = static_cast<std::size_t>(b) * dflash_k_ * C;
+        const std::int32_t neural  = n - (b == 0 ? chain_tail_ : 0);
         CUDA_CHECK(cudaMemcpyAsync(dflash_device(dflash_io_.verify_candidates + row), dflash_device(dflash_io_.candidates + from),
-                                   4ULL * C * n, cudaMemcpyDeviceToDevice, s));
+                                   4ULL * C * neural, cudaMemcpyDeviceToDevice, s));
         CUDA_CHECK(cudaMemcpyAsync(dflash_device(dflash_io_.verify_q + row), dflash_device(dflash_io_.q + from),
-                                   4ULL * C * n, cudaMemcpyDeviceToDevice, s));
+                                   4ULL * C * neural, cudaMemcpyDeviceToDevice, s));
+        if (neural < n) {
+            // The chained tail one-hot at its copied tokens, after the drafter's planes.
+            const std::size_t tail = row + static_cast<std::size_t>(neural) * C;
+            for (std::int32_t j = neural; j < n; ++j) {
+                const std::int32_t token = drafts_[b][static_cast<std::size_t>(j)];
+                for (std::int32_t c = 0; c < C; ++c) {
+                    host_candidates[row + j * C + c] = (token + c) % token_domain_;
+                    host_q[row + j * C + c]          = c == 0 ? 1.0F : 0.0F;
+                }
+            }
+            upload_pinned(dflash_device(dflash_io_.verify_candidates + tail), host_candidates + tail, 4ULL * C * (n - neural), s);
+            upload_pinned(dflash_device(dflash_io_.verify_q + tail), host_q + tail, 4ULL * C * (n - neural), s);
+        }
     }
     return {dflash_io_.verify_candidates, dflash_io_.verify_q};
 }

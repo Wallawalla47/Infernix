@@ -507,6 +507,45 @@ int exercise_coalesce(const char* artifact, std::uint32_t shared_tokens, bool co
     return failures;
 }
 
+// A burst of identical prompts (NInfer #414 shipped exactly this failure: every request failed and
+// the engine stayed unavailable): four copies of one prompt at C = 4 with MTP, at a length that is
+// not a block multiple, submitted together, so later copies coalesce on the first one's snapshot or
+// endpoint while it is still being published (candidates §13 NN-05). Every request completes, each
+// generates what the prompt generates alone (greedy on the reproducible route, which no other
+// request, batch or cache state changes), and the engine serves the prompt again afterwards.
+int exercise_identical_burst(const char* artifact) {
+    const std::vector<infernix::TokenId> prompt = synthetic_tokens(2 * kPrefillChunk + kBlock / 2 + 37, 13);
+    infernix::EngineOptions options =
+        hybrid_options(artifact, infernix::SpeculativeBackend::Mtp, 16384, 1ULL << 30, 8);
+    options.max_concurrency      = 4;
+    options.max_pending_requests = 4;
+    options.fast_paths           = false;
+    options.fast_path_candidates.clear();
+    std::vector<infernix::TokenId> alone;
+    {
+        infernix::Engine engine(options);
+        alone = engine.generate(engine.prepare_tokens(prompt), greedy(32)).generated_token_ids;
+    }
+    infernix::Engine engine(options);
+    std::vector<infernix::GenerationHandle> burst;
+    for (int i = 0; i < 4; ++i) { burst.push_back(engine.submit(engine.prepare_tokens(prompt), greedy(32))); }
+    int failures = 0;
+    for (std::size_t i = 0; i < burst.size(); ++i) {
+        const infernix::GenerationResult result = burst[i].wait();
+        if (result.generated_token_ids != alone) {
+            std::cerr << "identical burst: request " << i << " generated " << result.generated_token_ids.size()
+                      << " tokens unlike the prompt alone (reused " << result.reused_prompt_tokens << ")\n";
+            ++failures;
+        }
+    }
+    const infernix::GenerationResult after = engine.generate(engine.prepare_tokens(prompt), greedy(32));
+    if (after.generated_token_ids != alone) {
+        std::cerr << "identical burst: the engine served the prompt differently after the burst\n";
+        ++failures;
+    }
+    return failures;
+}
+
 // Two requests submitted together with unrelated prompts: the second is admitted between the
 // first one's prefill chunks, so their chunks interleave on shared execution scalars. Each must
 // generate what it generates alone. The second stops after its first token so the first decodes
@@ -555,6 +594,8 @@ public:
     }
 
     void timing(infernix::GenerationTimingObservation) override {}
+
+    void tool_call(infernix::ToolCallDelta) override {}
 
     void publish(infernix::OutputDelta) override {}
 
@@ -881,7 +922,7 @@ int main() {
     }
     const char* selected            = std::getenv("INFERNIX_HYBRID_REAL_SCENARIO");
     const std::string_view scenario = selected != nullptr && *selected != '\0' ? selected : "all";
-    constexpr std::array<std::string_view, 16> kScenarios{"all",
+    constexpr std::array<std::string_view, 17> kScenarios{"all",
                                                           "issue29",
                                                           "restore-exact",
                                                           "restore-exact-mtp",
@@ -894,6 +935,7 @@ int main() {
                                                           "coalesce",
                                                           "coalesce-vision",
                                                           "interleaved",
+                                                          "identical-burst",
                                                           "cancel-prefill",
                                                           "cancel-prefill-dflash2"};
     if (std::find(kScenarios.begin(), kScenarios.end(), scenario) == kScenarios.end()) {
@@ -918,6 +960,7 @@ int main() {
         if (all || scenario == "vision") { failures += exercise_vision(artifact); }
         if (all || scenario == "persist") { failures += exercise_persist(artifact); }
         if (all || scenario == "interleaved") { failures += exercise_interleaved(artifact); }
+        if (all || scenario == "identical-burst") { failures += exercise_identical_burst(artifact); }
         if (all || scenario == "cancel-prefill") {
             failures += exercise_cancel_prefill(artifact, infernix::SpeculativeBackend::None);
         }

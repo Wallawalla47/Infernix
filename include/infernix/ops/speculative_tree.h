@@ -34,6 +34,12 @@ inline constexpr int kSpeculativeTreeMaxPathLength = 16;
  *
  * tree is 0 for a chain row (a row of a tree round whose extent is below the tree's: its live
  * columns are its chain prefix and no other column is used) and 1 for a tree row.
+ *
+ * transport is 1 for a tree row built for UniVer verification (SpeculativeTreeShape::transport,
+ * sampled rows only): each node's children are its law's top ranks in rank order followed by at
+ * most one draw from the law restricted to the other ranks (bit c of `sampled` marks column c as
+ * such a draw), and speculative_accept_sparse_tree verifies the row by the transport rule. It is 0
+ * for the without-replacement trees (sampled == 0).
  */
 struct SpeculativeTreeRow {
     std::int32_t nodes;
@@ -48,10 +54,14 @@ struct SpeculativeTreeRow {
     std::int8_t path_length[kSpeculativeTreeMaxPaths];
     std::int8_t owned_from[kSpeculativeTreeMaxPaths];
     std::int8_t path_columns[kSpeculativeTreeMaxPaths][kSpeculativeTreeMaxPathLength];
+    std::int32_t transport;
+    std::uint32_t sampled;
+    std::int32_t reserved[2]; // keeps rows a multiple of 16 bytes apart
 };
 
 static_assert(offsetof(SpeculativeTreeRow, path_columns) % 16 == 0,
               "path column rows load as 16-byte vectors");
+static_assert(sizeof(SpeculativeTreeRow) % 16 == 0, "every row's path columns stay 16-byte aligned");
 
 /** I32 words per SpeculativeTreeRow; tree-row tensors are I32 [kSpeculativeTreeRowWords, B]. */
 inline constexpr int kSpeculativeTreeRowWords =
@@ -67,6 +77,9 @@ struct SpeculativeTreeShape {
     std::int32_t nodes      = 0;
     std::int32_t main_depth = 0;
     std::int32_t paths      = 0;
+    // Sampled tree rows are built for UniVer verification (SpeculativeTreeRow::transport; the
+    // univer-trees fast path) instead of by without-replacement draws. Greedy rows are unchanged.
+    bool transport = false;
 };
 
 /** Throws std::invalid_argument unless the shape is within the limits above. */
@@ -118,10 +131,27 @@ void speculative_prepare_tree_verify_inputs(const Tensor& anchors, const Tensor&
  * its ancestors and itself, excluding the anchor. The emitted sequence has the processed target
  * distribution of a chain round.
  *
+ * A sampled row with tree_rows[b].transport == 1 is verified by UniVer (Weng, Hu, Yairi, arXiv
+ * 2605.04543, Algorithm 1). With p_v the processed target of column v, q_v its law over the
+ * candidates (stored by its children), D_v its deterministic children and u its residual draw
+ * (sampled bit), q'_v = q_v / R_v on the candidates outside D_v (R_v their q_v mass), or 0 without
+ * a residual draw. Allocation, parents before children, from pt(anchor) = 1:
+ *   Z_v = 1 - pt_v + sum_x max(pt_v p_v(x) - q'_v(x), 0);  a_u = min(1, pt_v p_v(u) / q'_v(u));
+ *   a_d = pt_v p_v(d) (1 - a_u) / Z_v for d in D_v;  reject_v = (1 - a_u)(1 - pt_v) / Z_v;
+ *   pt_c = a_c / (1 - sum of the a of c's earlier siblings) for each child c in sibling order;
+ *   threshold_v = pt_v at a leaf, else 1 - reject_v / (1 - sum over v's children of a_c).
+ * Decision: the first column in post-order (children's subtrees in sibling order, then the node)
+ * whose uniform (seed, L+depth(v)+1, kSamplePurposeSpeculativeAccept, v) is below its threshold
+ * ends the path there: a leaf emits the bonus from p_v as above, any other node the correction
+ * from max(pt_v p_v - q'_v, 0) over the tokens that are not its children (correction key above).
+ * The emitted sequence again has the processed target distribution.
+ *
  * Outputs follow speculative_accept_sparse_drafts along the accepted path c_0=0,c_1..c_A:
  * licensed_tokens[0:A] = drafts[c_i-1], then the terminal token; accepted_path[i,b] = c_i for
  * i<=A and -1 beyond; accepted_branch[b] is the first i with c_i != i when the path leaves the main
  * chain (its drafts i..A lie on a side branch), 0 when it stays on it, and -1 for a chain row.
+ * Non-finite logits are reported as speculative_accept_sparse_drafts reports them, over the
+ * path's columns c_0..c_A.
  */
 void speculative_accept_sparse_tree(const Tensor& target_tokens, const Tensor& logits,
                                     const Tensor& drafts, const Tensor& candidate_ids,

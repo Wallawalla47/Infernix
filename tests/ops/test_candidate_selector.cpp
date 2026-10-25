@@ -1,4 +1,5 @@
 #include "infernix/ops/candidate_selector.h"
+#include "ops/op_family.h"
 
 #include "ops/op_tester.h"
 #include "core/decode_graph.h"
@@ -631,7 +632,7 @@ int run(bool ties = false, bool dependent = false) {
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(candidate_selector) {
     try {
         if (cuda_unavailable()) {
             std::cout << "SKIP: no usable CUDA device\n";

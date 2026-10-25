@@ -13,6 +13,7 @@
 #include "infernix/ops/rmsnorm_pack_tail.h"
 #include "infernix/ops/linear_topk.h"
 #include "infernix/ops/target_logprobs.h"
+#include "infernix/ops/top_logprobs.h"
 #include "infernix/ops/candidate_selector.h"
 #include "infernix/ops/attn_input_proj.h"
 #include "infernix/ops/embedding.h"
@@ -308,6 +309,46 @@ struct SelectorOperand {
     }
 };
 
+// A DFlash2 tree round's builder (ops::candidate_selector_tree) for the frame's rows [row, row +
+// batch) over the lattice of k positions (candidates and scores [top_k,k,B], selector projections
+// [rank,k,B]): each row's tree, tree row, ancestor masks, extent and live columns land in `into`, its
+// verification frame.
+void build_dflash2_tree(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& frame,
+                        qwen3_5::DFlashDecodeState* into, int row, int batch, int k, const Tensor& candidates,
+                        const Tensor& scores, const Tensor& projected) {
+    if (into == nullptr || !into->tree_rows.data || !into->tree_masks.data) {
+        throw std::logic_error("a DFlash2 tree round needs its verification frame");
+    }
+    auto& work                          = state.execution.work;
+    const cudaStream_t stream           = state.execution.device.stream;
+    const DraftParameters& weights      = *state.execution.parameters.draft;
+    const ops::SamplingConfig* sampling = sampling_from(frame, row);
+    const SelectorOperand tree_anchors(work, frame.anchors.slice(0, row, batch), stream);
+    const SelectorOperand tree_frontiers(work, frame.execution_frontiers.slice(0, row, batch), stream);
+    const SelectorOperand drafts(work, into->draft_tokens.slice(1, row, batch), stream);
+    const SelectorOperand column_candidates(work, into->candidate_ids.slice(2, row, batch), stream);
+    const SelectorOperand proposal_q(work, into->proposal_q.slice(2, row, batch), stream);
+    const SelectorOperand tree_rows(work, into->tree_rows.slice(1, row, batch), stream);
+    const SelectorOperand tree_masks(work, into->tree_masks.slice(1, row, batch), stream);
+    const SelectorOperand extents(work, into->proposal_extents.slice(0, row, batch), stream);
+    const SelectorOperand valid(work, into->target_valid_columns.slice(0, row, batch), stream);
+    const ops::SpeculativeTreeShape shape{into->draft_tokens.ne[0] + 1, k, static_cast<std::int32_t>(state.tree_paths),
+                                          state.execution.execution_schedule.univer_trees};
+    Tensor drafts_view            = drafts.view;
+    Tensor column_candidates_view = column_candidates.view;
+    Tensor proposal_q_view        = proposal_q.view;
+    Tensor tree_rows_view         = tree_rows.view;
+    Tensor tree_masks_view        = tree_masks.view;
+    Tensor valid_view             = valid.view;
+    ops::candidate_selector_tree(candidates, scores, projected, tree_anchors.view, weights.selector->predecessor_codebook,
+                                 weights.selector->successor_codebook, tree_frontiers.view, extents.view, sampling, shape,
+                                 drafts_view, column_candidates_view, proposal_q_view, tree_rows_view, tree_masks_view,
+                                 valid_view, work, stream);
+    for (const SelectorOperand* output : {&drafts, &column_candidates, &proposal_q, &tree_rows, &tree_masks, &valid}) {
+        output->finish(stream);
+    }
+}
+
 // The DFlash2 proposal of the frame's rows [row, row + batch).
 // into is the frame that receives a proposal drafted at the drafter's own width when it differs
 // from the drafter's frame: the leading min(K, frame width) drafts (and their sparse laws) are
@@ -439,40 +480,19 @@ void propose_dflash2_rows(DFlashBatchContext& state, qwen3_5::DFlashDecodeState&
             work.alloc(DType::BF16, {dimension(config.dflash2->selector_rank), mask_columns});
         project(hidden, weights.selector->hidden_projection, projected, work, stream);
         if (state.tree) {
-            if (into == nullptr || !into->tree_rows.data || !into->tree_masks.data) {
-                throw std::logic_error("a DFlash2 tree round needs its verification frame");
-            }
-            const SelectorOperand tree_anchors(work, anchors, stream);
-            const SelectorOperand tree_frontiers(work, frontiers, stream);
-            const SelectorOperand drafts(work, into->draft_tokens.slice(1, row, batch), stream);
-            const SelectorOperand column_candidates(work, into->candidate_ids.slice(2, row, batch),
-                                                    stream);
-            const SelectorOperand proposal_q(work, into->proposal_q.slice(2, row, batch), stream);
-            const SelectorOperand tree_rows(work, into->tree_rows.slice(1, row, batch), stream);
-            const SelectorOperand tree_masks(work, into->tree_masks.slice(1, row, batch), stream);
-            const SelectorOperand extents(work, into->proposal_extents.slice(0, row, batch), stream);
-            const SelectorOperand valid(work, into->target_valid_columns.slice(0, row, batch), stream);
-            const ops::SpeculativeTreeShape shape{into->draft_tokens.ne[0] + 1, k,
-                                                  static_cast<std::int32_t>(state.tree_paths)};
-            Tensor drafts_view            = drafts.view;
-            Tensor column_candidates_view = column_candidates.view;
-            Tensor proposal_q_view        = proposal_q.view;
-            Tensor tree_rows_view         = tree_rows.view;
-            Tensor tree_masks_view        = tree_masks.view;
-            Tensor valid_view             = valid.view;
-            ops::candidate_selector_tree(
-                candidates, scores.view({dimension(config.dflash2->selector_top_k), k, batch}),
-                projected.view({dimension(config.dflash2->selector_rank), k, batch}),
-                tree_anchors.view, weights.selector->predecessor_codebook,
-                weights.selector->successor_codebook, tree_frontiers.view, extents.view, sampling,
-                shape, drafts_view, column_candidates_view, proposal_q_view, tree_rows_view,
-                tree_masks_view, valid_view, work, stream);
-            for (const SelectorOperand* output :
-                 {&drafts, &column_candidates, &proposal_q, &tree_rows, &tree_masks, &valid}) {
-                output->finish(stream);
-            }
+            build_dflash2_tree(state, frame, into, row, batch, k, candidates,
+                               scores.view({dimension(config.dflash2->selector_top_k), k, batch}),
+                               projected.view({dimension(config.dflash2->selector_rank), k, batch}));
             work.reset();
             return;
+        }
+        // INFERNIX_TMP_TREE_ROUND_WIDTH: a proposal graph keeps the block's lattice, from which the
+        // round's verification builds its tree once its width is chosen (build_dflash2_tree).
+        if (confidence != nullptr && frame.block_scores.data) {
+            CUDA_CHECK(cudaMemcpyAsync(frame.block_scores.slice(2, row, batch).data, scores.data, scores.bytes(),
+                                       cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(frame.block_projected.slice(2, row, batch).data, projected.data,
+                                       projected.bytes(), cudaMemcpyDeviceToDevice, stream));
         }
         const SelectorOperand path_anchors(work, anchors, stream);
         const SelectorOperand path_frontiers(work, frontiers, stream);
@@ -504,6 +524,75 @@ void propose_dflash2_rows(DFlashBatchContext& state, qwen3_5::DFlashDecodeState&
             copy_leading_columns(proposal_q, destination_q, batch, stream);
         }
         work.reset();
+    }
+}
+
+// A DFlash tree round's proposal of the frame's rows [row, row + batch_size): the head's sixteen
+// most probable tokens at each of the k positions (proposal_hidden, BF16 [hidden, k*B]) and their
+// log-probabilities are the independent positions' candidates and edges, from which each row's
+// draft tree is built into `into`, its verification frame, as a DFlash2 tree round builds its tree
+// from the lattice. A greedy row's main chain is the chain round's argmax proposal.
+void propose_dflash_tree(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& frame,
+                         std::int32_t row, std::int32_t batch_size, std::uint32_t k,
+                         const Tensor& proposal_hidden, qwen3_5::DFlashDecodeState* into) {
+    if (into == nullptr || !into->tree_rows.data || !into->tree_masks.data ||
+        !into->candidate_ids.data || !into->proposal_q.data) {
+        throw std::logic_error("a DFlash tree round needs its verification frame");
+    }
+    const auto& target              = state.execution.parameters.model.config().text;
+    auto& work                      = state.execution.work;
+    const cudaStream_t stream       = state.execution.device.stream;
+    const auto steps                = static_cast<std::int32_t>(k);
+    const std::int32_t mask_columns = steps * batch_size;
+    const bool full_head            = state.execution.proposal_head == ProposalHead::Full;
+    if (!full_head && !state.execution.parameters.proposal.has_value()) {
+        throw std::logic_error("optimized DFlash proposal head is unavailable");
+    }
+    const auto* proposal = full_head ? nullptr : &*state.execution.parameters.proposal;
+    const std::int32_t rows =
+        full_head ? dimension(target.vocab_size) : dimension(proposal->rows);
+    Tensor logits = work.alloc(DType::BF16, {rows, mask_columns});
+    project(proposal_hidden, full_head ? state.execution.parameters.draft->output_head : proposal->head,
+            logits, work, stream);
+    // A shortlist head's rows all take part; a full head's rows past the public vocabulary do not.
+    const bool shortlist     = proposal != nullptr && proposal->token_ids;
+    const std::int32_t valid = shortlist ? rows
+                                         : dimension(state.execution.parameters.model.resources()
+                                                         .public_token_count);
+    constexpr std::int32_t kCandidates = ops::kSparseSpeculativeCandidates;
+    Tensor candidates = work.alloc(DType::I32, {kCandidates, steps, batch_size});
+    Tensor scores     = work.alloc(DType::FP32, {kCandidates, steps, batch_size});
+    Tensor flat_candidates = candidates.view({kCandidates, mask_columns});
+    Tensor flat_scores     = scores.view({kCandidates, mask_columns});
+    ops::top_logprobs(logits, valid, flat_candidates, flat_scores, stream);
+    if (shortlist) {
+        Tensor ids = candidates.view({kCandidates * mask_columns});
+        ops::proposal_remap_token_ids(ids, static_cast<const std::int32_t*>(proposal->token_ids->data),
+                                      dimension(proposal->rows), stream);
+    }
+    const SelectorOperand frontiers(work, frame.execution_frontiers.slice(0, row, batch_size), stream);
+    const SelectorOperand drafts(work, into->draft_tokens.slice(1, row, batch_size), stream);
+    const SelectorOperand column_candidates(work, into->candidate_ids.slice(2, row, batch_size), stream);
+    const SelectorOperand proposal_q(work, into->proposal_q.slice(2, row, batch_size), stream);
+    const SelectorOperand tree_rows(work, into->tree_rows.slice(1, row, batch_size), stream);
+    const SelectorOperand tree_masks(work, into->tree_masks.slice(1, row, batch_size), stream);
+    const SelectorOperand extents(work, into->proposal_extents.slice(0, row, batch_size), stream);
+    const SelectorOperand valid_columns(work, into->target_valid_columns.slice(0, row, batch_size), stream);
+    const ops::SpeculativeTreeShape shape{into->draft_tokens.ne[0] + 1, steps,
+                                          static_cast<std::int32_t>(state.tree_paths),
+                                          state.execution.execution_schedule.univer_trees};
+    Tensor drafts_view            = drafts.view;
+    Tensor column_candidates_view = column_candidates.view;
+    Tensor proposal_q_view        = proposal_q.view;
+    Tensor tree_rows_view         = tree_rows.view;
+    Tensor tree_masks_view        = tree_masks.view;
+    Tensor valid_view             = valid_columns.view;
+    ops::candidate_tree(candidates, scores, frontiers.view, extents.view, sampling_from(frame, row),
+                        shape, drafts_view, column_candidates_view, proposal_q_view, tree_rows_view,
+                        tree_masks_view, valid_view, stream);
+    for (const SelectorOperand* output :
+         {&drafts, &column_candidates, &proposal_q, &tree_rows, &tree_masks, &valid_columns}) {
+        output->finish(stream);
     }
 }
 
@@ -650,6 +739,11 @@ void propose_dflash_rows(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& 
                                                      static_cast<std::int32_t>(k) * batch_size});
         ops::rmsnorm(packed, state.execution.parameters.draft->final_norm, config.rms_norm_eps,
                      false, proposal_hidden, state.execution.device.stream);
+        if (state.tree) {
+            propose_dflash_tree(state, frame, row, batch_size, k, proposal_hidden, into);
+            state.execution.work.reset();
+            return;
+        }
         // A proposal for another frame is staged at the drafter's width, then copied.
         Tensor staged_drafts =
             into != nullptr
@@ -752,8 +846,14 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         const bool forward       = phase == SpeculativePhase::Forward;
         const bool propose       = phase == SpeculativePhase::Propose;
         const bool verify        = phase == SpeculativePhase::Verify;
-        if ((propose || verify) && (state.ngram || state.tree || !frame.block_drafts.data ||
-                                    k > static_cast<std::uint32_t>(frame.block_drafts.ne[0]))) {
+        // INFERNIX_TMP_TREE_ROUND_WIDTH: a split tree family's Verify builds the tree from the block's
+        // lattice, at its own width.
+        const bool tree_verify = verify && state.tree;
+        if ((propose || verify) &&
+            (state.ngram || (state.tree && !tree_verify) || !frame.block_drafts.data ||
+             (tree_verify ? !frame.block_scores.data ||
+                                state.neural_proposal_drafts != static_cast<std::uint32_t>(frame.block_drafts.ne[0])
+                          : k > static_cast<std::uint32_t>(frame.block_drafts.ne[0])))) {
             throw std::logic_error("an adaptive-dflash phase needs a neural round and its block");
         }
         // Verify uploads the controls again: the host wrote the round's extents, valid columns and
@@ -843,7 +943,18 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
             }
             return;
         }
-        if (verify) {
+        if (tree_verify) {
+            // The block's lattice builds each row's tree at the round's width; its main chain is the
+            // proposal's (the same counter keys).
+            const auto block = static_cast<std::int32_t>(state.neural_proposal_drafts);
+            build_dflash2_tree(state, frame, &frame, 0, batch_size, block,
+                               frame.block_candidates.slice(2, 0, batch_size),
+                               frame.block_scores.slice(2, 0, batch_size),
+                               frame.block_projected.slice(2, 0, batch_size));
+            ops::speculative_prepare_tree_verify_inputs(anchors, drafts, frontiers,
+                                                        frame.tree_rows.slice(1, 0, batch_size), verify_ids,
+                                                        target_positions, target_rope, state.execution.device.stream);
+        } else if (verify) {
             // The round's leading k drafts of the block (and their laws), at its own width.
             copy_leading_columns(frame.block_drafts.slice(1, 0, batch_size)
                                      .view({1, frame.block_drafts.ne[0], batch_size}),
@@ -954,6 +1065,10 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
             nvtx::ScopedRange target_range(nvtx::Name::DecodeDFlashTarget, nvtx::Category::DFlash,
                                            static_cast<std::uint64_t>(width) * batch_size);
             const bool tree_round = state.tree;
+            // DFlash's chain rounds keep their deterministic-draft verifier; its tree rounds carry
+            // the tree's sparse laws, as every DFlash2 round does.
+            const bool sparse =
+                tree_round || state.execution.parameters.model.config().draft->dflash2.has_value();
             TargetVerifyFrameView verify_view{
                 .ids                     = verify_ids,
                 .cache_positions         = target_positions,
@@ -967,11 +1082,12 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                 .target_tokens           = target_tokens,
                 .drafts                  = drafts,
                 .current_extents         = extents,
-                .candidate_ids           = frame.candidate_ids.data
+                .candidate_ids           = sparse && frame.candidate_ids.data
                                                ? frame.candidate_ids.slice(2, 0, batch_size)
                                                : Tensor{},
-                .proposal_q =
-                    frame.proposal_q.data ? frame.proposal_q.slice(2, 0, batch_size) : Tensor{},
+                .proposal_q              = sparse && frame.proposal_q.data
+                                               ? frame.proposal_q.slice(2, 0, batch_size)
+                                               : Tensor{},
                 .frontiers       = frontiers,
                 .anchors         = anchors,
                 .licensed_tokens = licensed_tokens,

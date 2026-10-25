@@ -7,6 +7,7 @@
 // A16 kernel's outputs came out wrong in such overlaps (2026-10-20: written but corrupted, a warp's
 // MMA fragment at a time).
 
+#include "ops/op_family.h"
 #include "infernix/ops/linear.h"
 #include "infernix/ops/offloaded_sparse_moe.h"
 #include "ops/linear/linear_test_common.h"
@@ -262,7 +263,7 @@ int run(moe::ExpertActivation activation, int columns, const DeviceWeight& gate_
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(fp8_moe_overlap) {
     try {
         namespace lt = infernix::test::linear;
         const DeviceWeight gate_up(lt::make_fp8_weight(1280, moe::kHidden, 7101U));

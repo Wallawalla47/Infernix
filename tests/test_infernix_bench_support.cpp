@@ -100,6 +100,30 @@ int test_cli_contract() {
     }, "missing benchmark YaRN factor");
     failures += expect(qb::usage_text("infernix_bench").find("--rope-yarn-factor") != std::string::npos,
                        "benchmark help includes YaRN");
+    // Exact prompts and sampling (the Basalt fixture runs, tools/bench/basalt_parity.py).
+    const auto fixture = parse_for_test({"infernix_bench", "--weights", "model.ninfer", "--prompt-ids", "conv.ids",
+                                         "-n", "1200", "--temperature", "0.6", "--top-p", "0.95", "--top-k", "20",
+                                         "--seed", "7", "--stop-at-eos", "--route-trace", "routes.bin"});
+    failures += expect(fixture.prompt_ids_path == "conv.ids" && fixture.temperature == 0.6F && fixture.top_p == 0.95F &&
+                           fixture.top_k == 20 && !fixture.min_p && fixture.seed == 7 && fixture.stop_at_eos &&
+                           fixture.route_trace_path == "routes.bin",
+                       "exact-prompt and sampling options");
+    for (const auto& flags : std::vector<std::vector<std::string>>{{"--prompt-ids", "a.ids", "-p", "512"},
+                                                                    {"--prompt-ids", "a.ids", "-pg", "512,64"},
+                                                                    {"--prompt-ids", "a.ids"},
+                                                                    {"--prompt-ids", "a.ids", "-n", "8", "--corpus-offset", "3"},
+                                                                    {"--top-k", "20"},
+                                                                    {"--temperature", "2.5"},
+                                                                    {"--top-p", "1.5", "--temperature", "1"},
+                                                                    {"--seed", "-1"}}) {
+        failures += expect_throws<std::invalid_argument>(
+            [&] {
+                std::vector<std::string> arguments{"infernix_bench", "--weights", "model.ninfer"};
+                arguments.insert(arguments.end(), flags.begin(), flags.end());
+                (void)parse_for_test(std::move(arguments));
+            },
+            "invalid exact-prompt or sampling options");
+    }
     const qb::BenchOptions parsed = parse_for_test({
         "infernix_bench",
         "--weights",
@@ -502,7 +526,59 @@ int test_report_contract() {
 
     failures += expect(report.at("config").at("rope_yarn_factor") == 2.5,
                        "report preserves runtime YaRN factor");
-    failures += expect(report.at("schema_version") == 24, "report schema v24");
+    failures += expect(report.at("schema_version") == 25, "report schema v25");
+    failures += expect(report.at("machine").at("pcie_generation").is_null() &&
+                           report.at("machine").at("h2d_gbps").is_null() &&
+                           report.at("machine").at("ram_read_gbps").is_null(),
+                       "an unmeasured machine reports nulls, not zeros");
+    auto machine_env                              = env;
+    machine_env.machine.pcie_generation           = 5;
+    machine_env.machine.pcie_width                = 8;
+    machine_env.machine.pcie_max_generation       = 5;
+    machine_env.machine.pcie_max_width            = 16;
+    machine_env.machine.h2d_bytes_per_second      = 27.5e9;
+    machine_env.machine.ram_read_bytes_per_second = 70.31e9;
+    machine_env.machine.ram_read_threads          = 32;
+    const Json machine = Json::parse(qb::format_json(machine_env, "infernix_bench", results)).at("machine");
+    failures += expect(machine.at("pcie_generation") == 5 && machine.at("pcie_width") == 8 &&
+                           machine.at("pcie_max_width") == 16 &&
+                           std::abs(machine.at("h2d_gbps").get<double>() - 27.5) < 1e-6 &&
+                           std::abs(machine.at("ram_read_gbps").get<double>() - 70.31) < 1e-6 &&
+                           machine.at("ram_read_threads") == 32,
+                       "report records the machine's link and rates in GB/s");
+    failures += expect(qb::format_table(machine_env, results)
+                               .find("machine:    PCIe 5 x8 (max 5 x16), H2D 27.5 GB/s, RAM read 70.3 GB/s") !=
+                           std::string::npos,
+                       "table names the machine's link and rates");
+    {
+        infernix::RuntimeExecutionLatency before, after;
+        before.decode = {.count = 4, .total_ns = 40'000'000, .max_ns = 9'000'000};
+        after         = before;
+        after.decode.add(3'000'000);
+        after.decode.add(5'000'000);
+        after.decode.max_ns      = 5'000'000; // restarted after the warm-ups
+        after.decode_by_batch[1] = {.count = 2, .total_ns = 8'000'000, .max_ns = 5'000'000};
+        auto timed               = results;
+        timed[0].execution       = qb::execution_delta(before, after);
+        const Json e             = Json::parse(qb::format_json(env, "infernix_bench", timed))
+                                       .at("tests")
+                                       .at(0)
+                                       .at("execution");
+        failures += expect(e.at("decode").at("count") == 2 &&
+                               std::abs(e.at("decode").at("mean_ms").get<double>() - 4.0) < 1e-9 &&
+                               std::abs(e.at("decode").at("max_ms").get<double>() - 5.0) < 1e-9 &&
+                               e.at("prefill").at("count") == 0 &&
+                               e.at("prefill").at("mean_ms").is_null() &&
+                               e.at("decode_by_batch").size() == 1 &&
+                               e.at("decode_by_batch").at(0).at("batch") == 2 &&
+                               e.at("decode_by_batch").at(0).at("count") == 2,
+                           "report gives the measured runs' executions: counts and means as "
+                           "differences, the maxima restarted");
+    }
+    failures += expect(qb::measure_ram_read_bytes_per_second(1 << 20, 2) > 0.0 &&
+                           qb::measure_ram_read_bytes_per_second(1 << 20, 0) == 0.0 &&
+                           qb::measure_ram_read_bytes_per_second(4, 2) == 0.0,
+                       "RAM read probe measures a buffer and refuses empty work");
     failures += expect(report.at("config").at("speculative_backend") == "mtp" &&
                            report.at("config").at("draft_tokens") == 5,
                        "report identifies its backend and window");

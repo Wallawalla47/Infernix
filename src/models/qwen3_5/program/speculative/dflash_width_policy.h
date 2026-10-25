@@ -67,6 +67,8 @@ struct DFlashWidthCosts {
 struct DFlashLaneDraftState {
     runtime::speculative::DraftCalibration calibration;
     std::uint32_t rounds = 0; // choices made, for the probe period
+    // INFERNIX_TMP_DRAFT_PROCESS_STATS: the calibration was seeded from the policy's process-wide one.
+    bool pooled = false;
 
     DFlashLaneDraftState() { calibration.reset(); }
 
@@ -111,8 +113,14 @@ public:
     // A verified row: its first `verified` drafts were checked and the first `accepted` of them taken.
     static void observe(DFlashLaneDraftState& state, std::span<const float> probabilities,
                         std::uint32_t verified, std::uint32_t accepted) noexcept;
+    // observe, and with INFERNIX_TMP_DRAFT_PROCESS_STATS the process-wide calibration a request's first
+    // choice seeds its state from (candidates VS-2; draft-only).
+    void learn(DFlashLaneDraftState& state, std::span<const float> probabilities, std::uint32_t verified,
+               std::uint32_t accepted) noexcept;
 
 private:
+    bool pool_ = false;
+    runtime::speculative::DraftCalibration pooled_;
     std::uint32_t ceiling_   = 0;
     std::uint32_t max_batch_ = 0;
     DFlashWidthCosts costs_;

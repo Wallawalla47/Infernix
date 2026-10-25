@@ -8,6 +8,7 @@
 #include "core/cyclic_kv_cache.h"
 #include "infernix_bench_common.h"
 #include "ops/softmax_attention/sliding_window/launch.h"
+#include "roofline.h"
 
 #include <cuda_profiler_api.h>
 #include <cuda_bf16.h>
@@ -28,6 +29,7 @@
 #include <vector>
 
 using namespace infernix;
+namespace roofline = infernix::bench::roofline;
 
 namespace {
 
@@ -37,8 +39,6 @@ constexpr std::int32_t kKvHeads    = 8;
 constexpr float kScale             = 0.08838834764831844055F;
 constexpr ops::AttentionHeadGeometry kGeometry{kHeadDim, kQueryHeads, kKvHeads};
 constexpr std::size_t kFlushBytes   = std::size_t{256} << 20;
-constexpr double kDenseBf16TcTflops = 209.5;
-constexpr double kRtx5090DramGBs    = 1792.0;
 
 enum class Execution : std::uint8_t { Eager, Graph, Both };
 enum class CacheMode : std::uint8_t { Cold, Warm, Both };
@@ -345,18 +345,19 @@ void report(const Result& result) {
     const double seconds = result.timing.median_us * 1.0e-6;
     const double gbps    = result.useful_bytes / seconds / 1.0e9;
     const double tflops  = result.useful_flops / seconds / 1.0e12;
-    std::printf("entry=sliding_window execution=%-5s cache=%-4s W=%d T=%2d B=%d L=%6d "
-                "max_L=%d key_block=%d reduce_warps=%d route=%s splits=%d graph_nodes=%zu "
-                "graph_calls=%d workspace=%8zu "
-                "median=%9.3f us min=%9.3f us p95=%9.3f us "
-                "useful=%8.1f GB/s (%5.1f%% of %.0f) math=%7.2f TFLOP/s (%5.1f%% of %.1f)\n",
-                execution_name(result.execution), cache_name(result.cache), result.window,
-                result.tokens, result.batch, result.context, result.envelope_max, result.key_block,
-                result.reduce_warps, ops::detail::sliding_window_attention_route_name(result.route),
-                result.split_capacity, result.graph_nodes, result.graph_calls,
-                result.workspace_bytes, result.timing.median_us, result.timing.min_us,
-                result.timing.p95_us, gbps, gbps / kRtx5090DramGBs * 100.0, kRtx5090DramGBs, tflops,
-                tflops / kDenseBf16TcTflops * 100.0, kDenseBf16TcTflops);
+    std::printf(
+        "entry=sliding_window execution=%-5s cache=%-4s W=%d T=%2d B=%d L=%6d "
+        "max_L=%d key_block=%d reduce_warps=%d route=%s splits=%d graph_nodes=%zu "
+        "graph_calls=%d workspace=%8zu "
+        "median=%9.3f us min=%9.3f us p95=%9.3f us "
+        "useful=%8.1f GB/s (%5.1f%% of %.0f) math=%7.2f TFLOP/s (%5.1f%% of %.1f)\n",
+        execution_name(result.execution), cache_name(result.cache), result.window, result.tokens,
+        result.batch, result.context, result.envelope_max, result.key_block, result.reduce_warps,
+        ops::detail::sliding_window_attention_route_name(result.route), result.split_capacity,
+        result.graph_nodes, result.graph_calls, result.workspace_bytes, result.timing.median_us,
+        result.timing.min_us, result.timing.p95_us, gbps, gbps / roofline::kDramSpecGBs * 100.0,
+        roofline::kDramSpecGBs, tflops, tflops / roofline::kBf16Fp32AccumulateTFLOPs * 100.0,
+        roofline::kBf16Fp32AccumulateTFLOPs);
 }
 
 void write_csv(const Options& options, const std::vector<Result>& results) {

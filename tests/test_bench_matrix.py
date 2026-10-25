@@ -7,16 +7,17 @@ from tools.bench.run_infernix_bench_matrix import BenchCase, load_bench_report, 
 
 
 @pytest.mark.parametrize("ngram_enabled", [False, True])
-def test_schema_v20_report_is_flattened_for_matrix_summary(tmp_path, ngram_enabled) -> None:
+def test_schema_v25_report_is_flattened_for_matrix_summary(tmp_path, ngram_enabled) -> None:
     report_path = tmp_path / "report.json"
     report_path.write_text(
         json.dumps(
             {
-                "schema_version": 21,
+                "schema_version": 25,
                 "artifact_type": "infernix_bench_report",
                 "tool": "infernix_bench",
                 "artifact": {"path": "model.ninfer"},
                 "environment": {"gpu_name": "RTX 5090"},
+                "machine": {"pcie_generation": 5, "pcie_width": 8, "h2d_gbps": 27.5, "ram_read_gbps": None},
                 "load": {
                     "architecture": "Qwen3_5ForCausalLM",
                     "name": "Qwen3.8-27B",
@@ -126,9 +127,15 @@ def test_schema_v20_report_is_flattened_for_matrix_summary(tmp_path, ngram_enabl
     assert row["decode_engine_tok_s_mean"] == 7.5
     assert row["spec_fallback_steps"] == 3
     assert row["spec_accepted_per_position"] == "[1,1,1,1,1]"
+    assert (row["pcie_generation"], row["pcie_width"], row["h2d_gbps"], row["ram_read_gbps"]) == (
+        5,
+        8,
+        27.5,
+        None,
+    )
 
 
-@pytest.mark.parametrize("version", [20, 22])
+@pytest.mark.parametrize("version", [21, 24])
 def test_matrix_rejects_different_report_schema(tmp_path, version) -> None:
     report_path = tmp_path / "report.json"
     report_path.write_text(json.dumps({"schema_version": version,

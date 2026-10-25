@@ -8,6 +8,7 @@
 
 #include "ops/linear/bf16/bf16_instances.cuh"
 #include "ops/linear/bf16/bf16_launch.cuh"
+#include "ops/linear/bf16/bf16_a16_tma_mma.cuh"
 #include "ops/linear/common/epilogue.cuh"
 
 namespace infernix::ops::detail {
@@ -25,6 +26,24 @@ struct ProjectionFp32Output {
 using HeadSchedule = Bf16A16SlicedR32T16W4;
 
 } // namespace
+
+bool projection_fp32_bf16_wide_mma_supported(int rows, int k) noexcept {
+    return rows > 0 && rows % Bf16A16TmaR64T64K64S3::kBlockRows == 0 && k % Bf16A16TmaR64T64K64S3::kBlockK == 0;
+}
+
+// 64-token tiles up to 8,192 columns (a 512-row router's 4K chunk is 512 CTAs, 1.5 waves at two per SM), then
+// 128-token tiles.
+void projection_fp32_bf16_wide_mma(const Tensor& x, const void* weight, int rows, int out_rows, float* out,
+                                   cudaStream_t stream) {
+    const Bf16A16Operands p{static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(weight),
+                            rows, static_cast<int>(x.ne[0]), static_cast<int>(x.ne[1])};
+    const ProjectionFp32Output output{out, out_rows};
+    if (p.tokens <= 8192) {
+        launch_bf16_a16_tma_mma<Bf16A16TmaR64T64K64S3>(p, output, LinearIdentityEpilogue{}, stream);
+    } else {
+        launch_bf16_a16_tma_mma<Bf16A16TmaR64T128K64S2>(p, output, LinearIdentityEpilogue{}, stream);
+    }
+}
 
 bool projection_fp32_bf16_mma_supported(int rows, int k, int columns) noexcept {
     return columns >= 1 && columns <= kProjectionMmaMaxColumns && rows % HeadSchedule::kBlockRows == 0 &&

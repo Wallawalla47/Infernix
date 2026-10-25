@@ -16,6 +16,20 @@
 
 namespace infernix::runtime {
 
+// Decode share between prefill units (temporary switches INFERNIX_TMP_DECODE_SHARE and
+// INFERNIX_TMP_DECODE_SHARE_MIN_TOKENS). Each cycle runs one Control/Decode batch before its
+// prefill turn. After an ordinary prefill unit of wall time P that leaves at least
+// `min_remaining_tokens` of its prompt (counted at unit boundaries) while another lane waits to
+// decode, prefill turns yield until Control/Decode work has had share * P of wall time (the next
+// cycle's batch included), so decode gets share / (1 + share) of the wall time while a long prompt
+// prefills; share 0 is today's one batch per unit. A prompt's last unit earns no share. Only whole
+// units interleave, so every prompt keeps its chunk grid and every output bit is unchanged.
+// Replay and recovering requests never yield.
+struct DecodeShare {
+    double share                       = 0.0; // in [0, 1]
+    std::uint32_t min_remaining_tokens = 0;
+};
+
 // Membership and fairness only. Native stores own every physical reservation.
 template <class Request>
 class Scheduler {
@@ -134,6 +148,48 @@ public:
     void prefill_executed(std::uint32_t lane, std::uint32_t concurrency) noexcept {
         prefill_cursor_ = (lane + 1U) % concurrency;
     }
+
+    // Decode share between prefill units (DecodeShare).
+    void set_decode_share(DecodeShare policy) {
+        if (!(policy.share >= 0.0 && policy.share <= 1.0)) {
+            throw std::invalid_argument("decode share must lie in [0, 1]");
+        }
+        decode_share_ = policy;
+        decode_owed_ns_ = 0;
+    }
+
+    [[nodiscard]] const DecodeShare& decode_share() const noexcept { return decode_share_; }
+
+    // `remaining_tokens`: the prompt tokens still to prefill after the unit; `decode_waiting`:
+    // whether another lane is ready for Control/Decode work.
+    void prefill_unit_finished(std::uint64_t wall_ns, bool complete, std::uint32_t remaining_tokens,
+                               bool decode_waiting) noexcept {
+        if (decode_share_.share <= 0.0 || complete || !decode_waiting ||
+            remaining_tokens < decode_share_.min_remaining_tokens) {
+            decode_owed_ns_ = 0;
+            return;
+        }
+        // A batch's overshoot past the previous unit's share (at most one batch) is carried, so the
+        // long-run split follows the share.
+        decode_owed_ns_ = std::min<std::int64_t>(decode_owed_ns_, 0) +
+                          static_cast<std::int64_t>(decode_share_.share * static_cast<double>(wall_ns));
+    }
+
+    void decode_work_finished(std::uint64_t wall_ns) noexcept {
+        if (decode_owed_ns_ > 0) { decode_owed_ns_ -= static_cast<std::int64_t>(wall_ns); }
+    }
+
+    // A cycle without Control/Decode work ends the share: nothing it could buy is waiting.
+    void decode_work_absent() noexcept { decode_owed_ns_ = 0; }
+
+    // Whether this cycle's (unprotected) prefill turn gives way to further Control/Decode batches.
+    [[nodiscard]] bool prefill_yields() noexcept {
+        if (decode_owed_ns_ <= 0) { return false; }
+        ++decode_share_yields_;
+        return true;
+    }
+
+    [[nodiscard]] std::uint64_t decode_share_yields() const noexcept { return decode_share_yields_; }
 
     // Queue/capacity changes start a bounded pass. Ordinary decode cycles only continue
     // an unfinished pass; they do not restart failed admission checks.
@@ -255,6 +311,9 @@ public:
 
 private:
     std::uint32_t prefill_cursor_      = 0;
+    DecodeShare decode_share_;
+    std::int64_t decode_owed_ns_       = 0;
+    std::uint64_t decode_share_yields_ = 0;
     std::uint64_t scan_after_          = 0;
     std::uint64_t admission_scan_head_ = 0;
     std::vector<std::uint64_t> admission_scan_remaining_;

@@ -56,8 +56,15 @@ PendingBatch ProgramImpl::wrap_pending(std::span<const std::uint32_t> lanes,
         // A row verifies at most 64 positions: 63 drafts and the bonus.
         const std::uint64_t reached =
             count >= 64 ? ~std::uint64_t{0} : (std::uint64_t{1} << count) - 1U;
-        ContractAccess::constraint_failed(pending, row,
-                                          (grammar_dead_positions[row] & reached) != 0);
+        // The round has synchronized, so the sampler's flag is final; it is cleared for the
+        // lane's next round. Placeholder tokens make any grammar verdict on them meaningless.
+        std::int32_t* const nonfinite = nonfinite_flag(lanes[row]);
+        ContractAccess::row_failure(pending, row,
+                                    std::exchange(*nonfinite, 0) != 0
+                                        ? runtime::PendingRowFailure::NonFiniteLogits
+                                    : (grammar_dead_positions[row] & reached) != 0
+                                        ? runtime::PendingRowFailure::ConstraintDeadEnd
+                                        : runtime::PendingRowFailure::None);
     }
     return pending;
 }
@@ -384,9 +391,9 @@ CommitResult ProgramImpl::commit(PendingBatch&& pending,
     const auto input_rows       = ContractAccess::rows(pending);
     const std::size_t row_count = input_rows.size();
     for (std::size_t row = 0; row < row_count; ++row) { members[row] = input_rows[row]; }
-    std::array<bool, kMaximumConcurrency> constraint_failed{};
+    std::array<bool, kMaximumConcurrency> row_failed{};
     for (std::size_t row = 0; row < row_count; ++row) {
-        constraint_failed[row] = pending.constraint_failed(row);
+        row_failed[row] = pending.row_failure(row) != runtime::PendingRowFailure::None;
     }
     const bool valid = valid_pending(pending);
     ContractAccess::consume(pending);
@@ -425,7 +432,7 @@ CommitResult ProgramImpl::commit(PendingBatch&& pending,
             pending_kinds[row]                      = candidate.kind;
             const runtime::CommitDecision& decision = decisions[row];
             if ((decision.cancelled && decision.failed) ||
-                (!decision.cancelled && decision.failed != constraint_failed[row]) ||
+                (!decision.cancelled && decision.failed != row_failed[row]) ||
                 ((decision.cancelled || decision.failed) &&
                  (decision.accepted_tokens != 0 || !decision.terminal)) ||
                 (!(decision.cancelled || decision.failed) &&
@@ -544,7 +551,7 @@ FinishResult ProgramImpl::finish(SequenceHandle handle) noexcept {
     try {
         device.synchronize();
         // The prefix cache retains the finished context: its blocks and an endpoint snapshot.
-        hybrid_finish_lane(sequences[lane], true);
+        hybrid_finish_lane(sequences[lane], true, &out.cache_created_prompt_tokens);
         clear_lane(sequences[lane], request);
         out.status = runtime::ConsumeStatus::Consumed;
     } catch (...) { clear_lane(sequences[lane], request); }

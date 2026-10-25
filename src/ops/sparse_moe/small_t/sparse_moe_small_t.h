@@ -35,6 +35,10 @@ struct SparseMoeSmallTPlan {
     SparseMoeSmallTD4Schedule d4_schedule = SparseMoeSmallTD4Schedule::Rows1;
     // The router reduces each token as the decode router does (request-invariant exact route).
     bool column_invariant = false;
+    // L2 hints (INFERNIX_TMP_SMALL_T_L2_HINTS, candidates §10.3 KW-06): the decode route's next
+    // consumer warm from SparseMoeHints for D4's tail, as T = 1 takes it. No numeric effect.
+    const void* next_weight_prefetch       = nullptr;
+    std::size_t next_weight_prefetch_bytes = 0;
 };
 
 struct SparseMoeSmallTWorkspace {
@@ -61,7 +65,7 @@ SparseMoeSmallTWorkspace allocate_sparse_moe_small_t_workspace(Arena& arena, std
 [[nodiscard]] std::size_t sparse_moe_small_t_workspace_bytes(std::int32_t tokens);
 [[nodiscard]] SparseMoeSmallTPlan
 resolve_sparse_moe_small_t_plan(std::int32_t tokens, QType routed_gate_up, QType routed_down,
-                                bool column_invariant = false);
+                                bool column_invariant = false, const SparseMoeHints& hints = {});
 
 void sparse_moe_small_t_launch(const Tensor& x, const SparseMoeWeights& weights,
                                Tensor& destination, const SparseMoeSmallTPlan& plan,

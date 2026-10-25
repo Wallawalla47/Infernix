@@ -85,25 +85,48 @@ void launch_bf16_kv_merge(const CausalAttentionOperands& p, Bf16KvCacheView<Writ
     if (partition.capacity > S::kThreads)
         throw std::invalid_argument("BF16 merge capacity exceeds the reduction block");
     const dim3 grid(G::QHeads, div_up(G::kHeadDim, S::kDChunk), p.width * p.batch);
-    bf16_kv_merge_kernel<G, S, MultiBatch, Masked><<<grid, S::kThreads, 0, stream>>>(
-        partials.acc, partials.maximum, partials.sum, p.positions, cache.valid_columns, p.width,
-        p.batch, p.visible_capacity, partition, p.out);
-    CUDA_CHECK(cudaGetLastError());
+    // A captured merge launches as a programmatic dependent of the grouped kernel, which triggers it
+    // once its KV loop ends (as the other formats' merges, 6049964f); eager launches serialize.
+    CUDA_CHECK(pdl::launch_consumer(pdl::LaunchConfig{grid, dim3(S::kThreads), 0, stream},
+                                    bf16_kv_merge_kernel<G, S, MultiBatch, Masked>,
+                                    static_cast<const float*>(partials.acc), static_cast<const float*>(partials.maximum),
+                                    static_cast<const float*>(partials.sum), p.positions, cache.valid_columns,
+                                    p.width, p.batch, p.visible_capacity, partition, p.out));
 }
 
+// splits > 1 (the bf16-prompt-split fast path): the key blocks of every CTA in `splits` equal
+// shares, their partials in `partial` (causal_partial_index over p.width columns), then the merge.
 template <class Geometry, class Schedule>
 void launch_bf16_kv_tiled_mma(const CausalAttentionOperands& p, Bf16KvReadView cache,
-                              cudaStream_t stream) {
+                              cudaStream_t stream, int splits = 1, CausalPartialView partial = {}) {
     validate_bf16_kv_operands<Geometry>(p, cache);
     if (p.batch != 1)
         throw std::invalid_argument("BF16 tiled attention requires a complete single-row query");
+    if (splits < 1 || splits > 8 || (splits > 1 && (!partial.acc || !partial.maximum || !partial.sum)))
+        throw std::invalid_argument("BF16 tiled attention: invalid prompt split");
     const auto launch = [&]<class Metadata>(Metadata metadata) {
+        if (splits > 1) {
+            constexpr auto kernel = bf16_kv_tiled_mma_kernel<Geometry, Schedule, Metadata, true>;
+            const int bytes =
+                bf16_kv_dynamic_shared<bf16_kv_tiled_shared_bytes<Geometry, Schedule>, kernel>();
+            const dim3 grid(div_up(p.width, Schedule::kQueryRows), Geometry::QHeads, splits);
+            kernel<<<grid, Schedule::kThreads, bytes, stream>>>(p.q, cache.keys, cache.values, metadata,
+                                                                p.positions, p.scale, p.out, p.width,
+                                                                partial);
+            CUDA_CHECK(cudaGetLastError());
+            bf16_kv_prompt_merge_kernel<Geometry, Metadata>
+                <<<dim3(Geometry::QHeads, p.width), Geometry::kHeadDim, 0, stream>>>(partial, metadata, splits,
+                                                                                     p.width, p.out);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
         constexpr auto kernel = bf16_kv_tiled_mma_kernel<Geometry, Schedule, Metadata>;
         const int bytes =
             bf16_kv_dynamic_shared<bf16_kv_tiled_shared_bytes<Geometry, Schedule>, kernel>();
         const dim3 grid(div_up(p.width, Schedule::kQueryRows), Geometry::QHeads);
         kernel<<<grid, Schedule::kThreads, bytes, stream>>>(p.q, cache.keys, cache.values, metadata,
-                                                            p.positions, p.scale, p.out, p.width);
+                                                            p.positions, p.scale, p.out, p.width,
+                                                            CausalPartialView{});
         CUDA_CHECK(cudaGetLastError());
     };
     if (!cache.table_rows) {

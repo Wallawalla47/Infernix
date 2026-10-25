@@ -77,6 +77,14 @@ struct Q6MmaDecodeAtom {
                                                                  int lane) {
         const float scale =
             __half2float(__ushort_as_half(*reinterpret_cast<const std::uint16_t*>(scale_ptr)));
+        return decode_pair_scaled(staged_codes, staged_high, scale, staged_group_index, lane);
+    }
+
+    // scale = 1 yields the integer codes, exact in BF16, for kernels that apply the group scale to
+    // the FP32 partial sum instead (decode_eight takes 1 the same way).
+    static __device__ __forceinline__ __nv_bfloat162
+    decode_pair_scaled(const std::uint8_t* staged_codes, const std::uint8_t* staged_high,
+                       float scale, std::int64_t staged_group_index, int lane) {
         const std::uint8_t packed =
             staged_codes[staged_group_index * Q6RowSplitStorage::kCodeBytesPerGroup + lane];
         const std::uint8_t high_byte =

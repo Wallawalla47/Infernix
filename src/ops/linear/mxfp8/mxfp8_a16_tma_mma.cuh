@@ -197,10 +197,10 @@ __device__ __forceinline__ void mxfp8_cp_async_arrive(std::uint64_t* barrier) {
     asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];\n" ::"r"(smem_addr(barrier)) : "memory");
 }
 
-template <class Schedule, bool FullTokens, class Output, class Epilogue>
+template <class Schedule, bool FullTokens, class Output, class Epilogue, bool InPlace = false>
 __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void mxfp8_a16_tma_mma_kernel(
 #ifdef _WIN32
-    const Mxfp8TmaDescriptors* descriptors_pointer,
+    const __grid_constant__ TmaDescriptorParameter<Mxfp8TmaDescriptors, InPlace> descriptors_pointer,
 #else
     const __grid_constant__ Mxfp8TmaDescriptors descriptors,
 #endif
@@ -292,9 +292,9 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     } else if (threadIdx.x < Schedule::kProducerThreads) {
         if (threadIdx.x == 0) {
 #ifdef _WIN32
-            acquire_staged_tensor_map(&descriptors.activation);
-            acquire_staged_tensor_map(&descriptors.weight);
-            acquire_staged_tensor_map(&descriptors.scale);
+            acquire_staged_tensor_map<InPlace>(&descriptors.activation);
+            acquire_staged_tensor_map<InPlace>(&descriptors.weight);
+            acquire_staged_tensor_map<InPlace>(&descriptors.scale);
 #endif
             const auto load_weights = [&](int kt, int stage) {
                 fp8_tma_load(weight + stage * Schedule::kWeightStageBytes, &descriptors.weight, kt * BK, row_begin,
@@ -362,7 +362,8 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
 // dependents, so their weight streams start under the kernel before; wider calls launch serialized,
 // so nothing launched beside them takes their SMs. The cp.async producer reads only the weights and
 // scales before its PDL wait. The TMA producer also reads its tensor maps there, so it is
-// programmatic only where they cannot change under it: by value (Linux) or, on Windows, a captured
+// programmatic only where they cannot change under it: by value (Linux, or Windows parameter words read
+// in place, INFERNIX_TMP_TMA_PARAM_WORDS) or, on Windows, a captured
 // launch's own staged copy (an eager Windows launch reads the one staging buffer the staging kernel
 // has just stored into, core/tma_descriptor_staging.cuh).
 inline constexpr int kMxfp8ProgrammaticTokens = 16;
@@ -398,37 +399,39 @@ void launch_mxfp8_a16_tma_mma(const Mxfp8Operands& p, Output output, Epilogue ep
 #ifdef _WIN32
         cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
         CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
-        const bool fixed_maps = capture == cudaStreamCaptureStatusActive;
+        const bool captured = capture == cudaStreamCaptureStatusActive;
 #else
-        constexpr bool fixed_maps = true;
+        constexpr bool captured = true;
 #endif
-        const pdl::Dependency dependency = fixed_maps && p.tokens <= kMxfp8ProgrammaticTokens
-                                               ? pdl::Dependency::Programmatic
-                                               : pdl::Dependency::Serialized;
         const Mxfp8TmaDescriptors descriptors{
             fp8_a16_tma_activation_map(p.x, p.tokens, p.k, Schedule::kBlockTokens, 64),
             fp8_tma_map(p.codes, p.rows, p.k, Schedule::kBlockRows, Schedule::kBlockK),
             mxfp8_scale_tma_map(p.scales, p.rows, p.k, Schedule::kBlockRows, Schedule::kBlockK)};
+        const auto launch_slices = [&]<bool InPlace>(std::bool_constant<InPlace>, const auto& parameter) {
+            // Maps read in place are by value, as on Linux.
+            const bool fixed_maps            = InPlace || captured;
+            const pdl::Dependency dependency = fixed_maps && p.tokens <= kMxfp8ProgrammaticTokens
+                                                   ? pdl::Dependency::Programmatic
+                                                   : pdl::Dependency::Serialized;
+            for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
+                const int blocks  = p.rows / Schedule::kBlockRows * div_up(count, Schedule::kBlockTokens);
+                const auto launch = [&]<bool Full>() {
+                    constexpr auto kernel = mxfp8_a16_tma_mma_kernel<Schedule, Full, Output, Epilogue, InPlace>;
+                    const int dynamic = fp8_prepare_shared<Mxfp8TmaLayout<Schedule>::kSharedBytes, kernel, true>();
+                    const pdl::LaunchConfig config{dim3(blocks), dim3(Schedule::kThreads),
+                                                   static_cast<std::size_t>(dynamic), stream};
+                    CUDA_CHECK(
+                        pdl::launch_with(dependency, config, kernel, parameter, p, output, epilogue, offset, count));
+                };
+                count % Schedule::kBlockTokens == 0 ? launch.template operator()<true>()
+                                                    : launch.template operator()<false>();
+            });
+        };
 #ifdef _WIN32
-        const Mxfp8TmaDescriptors* staged = mxfp8_tma_descriptor_staging().stage(descriptors, stream);
-#endif
-        for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
-            const int blocks  = p.rows / Schedule::kBlockRows * div_up(count, Schedule::kBlockTokens);
-            const auto launch = [&]<bool Full>() {
-                constexpr auto kernel = mxfp8_a16_tma_mma_kernel<Schedule, Full, Output, Epilogue>;
-                const int dynamic     = fp8_prepare_shared<Mxfp8TmaLayout<Schedule>::kSharedBytes, kernel, true>();
-                const pdl::LaunchConfig config{dim3(blocks), dim3(Schedule::kThreads),
-                                               static_cast<std::size_t>(dynamic), stream};
-#ifdef _WIN32
-                CUDA_CHECK(pdl::launch_with(dependency, config, kernel, staged, p, output, epilogue, offset, count));
+        with_tma_descriptor_parameter(mxfp8_tma_descriptor_staging(), descriptors, stream, launch_slices);
 #else
-                CUDA_CHECK(
-                    pdl::launch_with(dependency, config, kernel, descriptors, p, output, epilogue, offset, count));
+        launch_slices(std::false_type{}, descriptors);
 #endif
-            };
-            count % Schedule::kBlockTokens == 0 ? launch.template operator()<true>()
-                                                : launch.template operator()<false>();
-        });
     }
 }
 

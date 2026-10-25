@@ -32,7 +32,8 @@ infernix_add_test(infernix_qwen3_5_mtp_confidence_policy_test SOURCES
 # exhaustive evaluation, row limits, probes and calibration updates.
 infernix_add_test(infernix_qwen3_5_dflash_width_policy_test SOURCES
   "${CMAKE_CURRENT_LIST_DIR}/test_dflash_width_policy.cpp"
-  "${PROJECT_SOURCE_DIR}/src/models/qwen3_5/program/speculative/dflash_width_policy.cpp")
+  "${PROJECT_SOURCE_DIR}/src/models/qwen3_5/program/speculative/dflash_width_policy.cpp"
+  LIBRARIES infernix_core)
 
 infernix_add_test(infernix_ngram_graph_planning_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ngram_graph_planning.cpp"
@@ -133,7 +134,7 @@ add_executable(infernix_qwen3_5_speculation_invariance_real_test
 infernix_test_includes(infernix_qwen3_5_speculation_invariance_real_test)
 target_link_libraries(infernix_qwen3_5_speculation_invariance_real_test PRIVATE infernix_engine)
 add_test(NAME infernix_qwen3_5_speculation_invariance_real_test
-  COMMAND infernix_qwen3_5_speculation_invariance_real_test mtp dflash2 dflash2-ngram)
+  COMMAND infernix_qwen3_5_speculation_invariance_real_test mtp mtp-cut mtp-sampled dflash2 dflash2-ngram)
 set_tests_properties(infernix_qwen3_5_speculation_invariance_real_test PROPERTIES SKIP_RETURN_CODE 77)
 
 infernix_add_test(infernix_qwen3_5_readout_real_test
@@ -187,6 +188,16 @@ add_test(NAME infernix_qwen3_5_dflash2_block_ngram_greedy_real_test
 # batch rounds) beside one-row block rounds.
 add_test(NAME infernix_qwen3_5_dflash2_block_batch_greedy_real_test
   COMMAND infernix_qwen3_5_dflash2_tree_greedy_real_test int8 block 160 0 dflash2 auto 2)
+# MTP trees (the NVFP4 27B): leaves on a 3-draft chain, 8 columns, one stream and two at once.
+add_test(NAME infernix_qwen3_5_mtp_tree_greedy_real_test
+  COMMAND infernix_qwen3_5_dflash2_tree_greedy_real_test int8 8 160 3 mtp)
+add_test(NAME infernix_qwen3_5_mtp_tree_batch_greedy_real_test
+  COMMAND infernix_qwen3_5_dflash2_tree_greedy_real_test int8 8 160 3 mtp 0 2)
+# DFlash trees (the 35B-A3B): 16-column trees at K=7, one stream and two at once.
+add_test(NAME infernix_qwen3_5_dflash_tree_greedy_real_test
+  COMMAND infernix_qwen3_5_dflash2_tree_greedy_real_test int8 16 160 7 dflash)
+add_test(NAME infernix_qwen3_5_dflash_tree_batch_greedy_real_test
+  COMMAND infernix_qwen3_5_dflash2_tree_greedy_real_test int8 16 160 7 dflash 0 2)
 
 foreach(kv IN ITEMS k8v4 nvfp4 vq2 k4v2)
   add_test(NAME infernix_qwen3_5_dflash2_tree_greedy_${kv}_real_test
@@ -200,6 +211,10 @@ set_tests_properties(${infernix_qwen3_5_tree_real_tests}
   infernix_qwen3_5_dflash_block_greedy_real_test
   infernix_qwen3_5_dflash2_block_ngram_greedy_real_test
   infernix_qwen3_5_dflash2_block_batch_greedy_real_test
+  infernix_qwen3_5_dflash_tree_greedy_real_test
+  infernix_qwen3_5_dflash_tree_batch_greedy_real_test
+  infernix_qwen3_5_mtp_tree_greedy_real_test
+  infernix_qwen3_5_mtp_tree_batch_greedy_real_test
   PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real")
 infernix_add_test(infernix_qwen3_5_dflash_prefill_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_dflash_prefill_real.cpp"

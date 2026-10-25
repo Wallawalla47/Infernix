@@ -44,6 +44,7 @@ TreeWidthController::TreeWidthController(
     }
     std::sort(tree_widths_.begin(), tree_widths_.end());
     gains_.resize(tree_widths_.size());
+    miss_recovery_.resize(tree_widths_.size());
 }
 
 std::size_t TreeWidthController::context_bucket(std::uint32_t context) noexcept {
@@ -62,7 +63,7 @@ double TreeWidthController::gain(std::uint32_t columns) const {
     return g.rows >= kMinimumGainRows && g.chain > 0 ? g.tokens / g.chain : 0.0;
 }
 
-std::uint32_t TreeWidthController::choose(std::uint32_t batch_size, std::uint32_t context) {
+std::uint32_t TreeWidthController::explore(std::uint32_t batch_size, std::uint32_t context) {
     if (batch_size == 0 || batch_size > kMaximumConcurrency) {
         throw std::invalid_argument("tree width controller: invalid batch size");
     }
@@ -83,17 +84,75 @@ std::uint32_t TreeWidthController::choose(std::uint32_t batch_size, std::uint32_
     for (std::size_t j = 0; j < candidates.size(); ++j) {
         if (round - cell.timings[j].measured > kStaleRounds) { return candidates[j]; }
     }
+    return 0;
+}
+
+std::uint32_t TreeWidthController::choose(std::uint32_t batch_size, std::uint32_t context) {
+    return choose(batch_size, context, {});
+}
+
+bool TreeWidthController::automatic(std::uint32_t batch_size) const noexcept {
+    return batch_size != 0 && batch_size <= kMaximumConcurrency && candidates_[batch_size - 1U].size() > 1;
+}
+
+TreeWidthController::RoundEstimate TreeWidthController::estimate(const RoundRow& row) noexcept {
+    RoundEstimate e;
+    double reach = 1.0;
+    for (const float p : row.probabilities) {
+        reach *= std::clamp(static_cast<double>(p), 0.0, 1.0);
+        e.chain += reach;
+    }
+    e.miss = 1.0 - reach;
+    return e;
+}
+
+std::uint32_t TreeWidthController::choose(std::uint32_t batch_size, std::uint32_t context,
+                                          std::span<const RoundRow> rows) {
+    if (const std::uint32_t explored = explore(batch_size, context); explored != 0) { return explored; }
+    const std::vector<std::uint32_t>& candidates = candidates_[batch_size - 1U];
+    const Cell& cell                             = cells_[batch_size - 1U][context_bucket(context)];
+    // A tree block round's own estimate (INFERNIX_TMP_TREE_ROUND_WIDTH) once every width it compares
+    // is calibrated; otherwise the gain measured over earlier rounds.
+    bool per_round = !rows.empty() && chain_tokens_.ready();
+    std::vector<double> tokens(candidates.size(), 0.0);
+    for (std::size_t j = 0; per_round && j < candidates.size(); ++j) {
+        const Calibration* alpha = nullptr;
+        if (j > 0) {
+            const auto it = std::find(tree_widths_.begin(), tree_widths_.end(), candidates[j]);
+            alpha         = &miss_recovery_[static_cast<std::size_t>(it - tree_widths_.begin())];
+            per_round     = alpha->ready();
+        }
+        for (const RoundRow& row : rows) {
+            const RoundEstimate e = estimate(row);
+            tokens[j] += chain_tokens_.ratio() * e.chain + (alpha != nullptr && row.tree ? alpha->ratio() * e.miss : 0.0);
+        }
+    }
     std::size_t best = 0;
     double best_rate = 0.0;
     for (std::size_t j = 0; j < candidates.size(); ++j) {
         const double seconds = cell.timings[j].seconds;
-        const double rate    = seconds > 0.0 ? gain(candidates[j]) / seconds : 0.0;
+        const double value   = per_round ? tokens[j] : gain(candidates[j]);
+        const double rate    = seconds > 0.0 ? value / seconds : 0.0;
         if (rate > best_rate) {
             best_rate = rate;
             best      = j;
         }
     }
     return candidates[best];
+}
+
+void TreeWidthController::observe_round_row(const RoundRow& row, std::span<const std::int32_t> path,
+                                            std::uint32_t columns) {
+    if (path.empty() || path[0] != 0) {
+        throw std::invalid_argument("tree width controller: a path starts at the anchor column");
+    }
+    const RoundEstimate e = estimate(row);
+    const double chain    = row_tokens(path, chain_columns_);
+    chain_tokens_.add(chain, e.chain);
+    if (!row.tree) { return; }
+    for (std::size_t w = 0; w < tree_widths_.size() && tree_widths_[w] <= columns; ++w) {
+        miss_recovery_[w].add(row_tokens(path, tree_widths_[w]) - chain, e.miss);
+    }
 }
 
 void TreeWidthController::observe_tree_row(std::span<const std::int32_t> path,

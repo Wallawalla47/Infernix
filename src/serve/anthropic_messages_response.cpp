@@ -40,17 +40,6 @@ std::string event(const char* type, Json payload) {
     return std::string("event: ") + type + "\ndata: " + payload.dump() + "\n\n";
 }
 
-std::vector<ToolCall> materialize_tool_calls(const GenerationOutcome& outcome) {
-    std::vector<ToolCall> result;
-    result.reserve(outcome.tool_calls.size());
-    for (const infernix::GeneratedToolCall& call : outcome.tool_calls) {
-        result.push_back(ToolCall{.id             = random_identifier("toolu_"),
-                                  .name           = call.name,
-                                  .arguments_json = call.arguments_json});
-    }
-    return result;
-}
-
 OrderedJson parse_tool_input(const ToolCall& call) {
     OrderedJson input = OrderedJson::parse(call.arguments_json, nullptr, false);
     if (input.is_discarded() || !input.is_object()) {
@@ -59,10 +48,57 @@ OrderedJson parse_tool_input(const ToolCall& call) {
     return input;
 }
 
+// A single-generation response: every call is a client call.
+AnthropicResponseSegment client_segment(const GenerationOutcome& outcome) {
+    AnthropicResponseSegment segment;
+    segment.outcome = &outcome;
+    segment.calls   = identify_anthropic_tool_calls(outcome, {});
+    segment.search_results.resize(segment.calls.size());
+    return segment;
+}
+
+void validate_segment(const AnthropicResponseSegment& segment) {
+    if (segment.outcome == nullptr || segment.calls.size() != segment.outcome->tool_calls.size() ||
+        segment.search_results.size() != segment.calls.size()) {
+        throw std::logic_error("Anthropic response segment does not match its generation");
+    }
+}
+
+// A generation's calls in call order, then the results of the searches among them: the order in
+// which the server ran them, and the one history lowering reads back as one generation.
+std::vector<OrderedJson> call_blocks_json(const AnthropicResponseSegment& segment) {
+    std::vector<OrderedJson> blocks;
+    for (std::size_t index = 0; index < segment.calls.size(); ++index) {
+        const ToolCall& call = segment.calls[index];
+        blocks.push_back(OrderedJson{{"type", segment.search_results[index] ? "server_tool_use" : "tool_use"},
+                                     {"id", call.id},
+                                     {"name", call.name},
+                                     {"input", parse_tool_input(call)}});
+    }
+    for (std::size_t index = 0; index < segment.calls.size(); ++index) {
+        if (const auto& result = segment.search_results[index]) {
+            blocks.push_back(OrderedJson{{"type", "tool_search_tool_result"},
+                                         {"tool_use_id", segment.calls[index].id},
+                                         {"content", *result}});
+        }
+    }
+    return blocks;
+}
+
 struct StopPresentation {
-    const char* reason = "end_turn";
+    std::string reason = "end_turn";
     Json sequence      = nullptr;
 };
+
+StopPresentation stop_presentation(const GenerationOutcome& outcome);
+
+// A response that ran searches may end for a reason of its own: `pause_turn` when it reached the
+// generation limit, `max_tokens` when the output budget ran out after a search.
+StopPresentation stop_presentation(const GenerationOutcome& outcome,
+                                   std::optional<std::string_view> stop_reason) {
+    if (stop_reason) { return StopPresentation{.reason = std::string(*stop_reason)}; }
+    return stop_presentation(outcome);
+}
 
 StopPresentation stop_presentation(const GenerationOutcome& outcome) {
     if (!outcome.tool_calls.empty() && (outcome.finish_reason == infernix::FinishReason::StopToken ||
@@ -90,11 +126,17 @@ StopPresentation stop_presentation(const GenerationOutcome& outcome) {
 
 Json final_usage(const GenerationOutcome& outcome) {
     const int prompt = std::max(0, outcome.prompt_tokens);
-    const int cached = static_cast<int>(std::min<std::uint64_t>(
-        outcome.metrics.prefix_cache_hit_tokens, static_cast<std::uint64_t>(prompt)));
+    const int cached = static_cast<int>(
+        std::min<std::uint64_t>(outcome.reused_prompt_tokens, static_cast<std::uint64_t>(prompt)));
+    // As in the Anthropic API, input_tokens counts the prompt tokens neither read from the cache nor
+    // written to it; creation is unknown (null) without the prefix cache.
+    std::optional<int> created;
+    if (const auto& written = outcome.cache_created_prompt_tokens) {
+        created = static_cast<int>(std::min<std::uint64_t>(*written, static_cast<std::uint64_t>(prompt - cached)));
+    }
     return Json{
-        {"input_tokens", prompt - cached},
-        {"cache_creation_input_tokens", nullptr},
+        {"input_tokens", prompt - cached - created.value_or(0)},
+        {"cache_creation_input_tokens", created ? Json(*created) : Json(nullptr)},
         {"cache_read_input_tokens", cached},
         {"cache_creation", nullptr},
         {"output_tokens", std::max(0, outcome.completion_tokens)},
@@ -130,6 +172,16 @@ void require_prefix(std::string_view complete, std::string_view streamed, const 
     }
 }
 
+bool is_search_tool(std::span<const AnthropicToolSearch> searches, std::string_view name) {
+    return std::any_of(searches.begin(), searches.end(),
+                       [&](const AnthropicToolSearch& search) { return search.name == name; });
+}
+
+// `srvtoolu_` for the request's search tools, which Infernix executes, and `toolu_` for client tools.
+std::string anthropic_call_id(std::span<const AnthropicToolSearch> searches, std::string_view name) {
+    return random_identifier(is_search_tool(searches, name) ? "srvtoolu_" : "toolu_");
+}
+
 } // namespace
 
 std::string new_anthropic_request_id() { return random_identifier("req_"); }
@@ -148,7 +200,7 @@ ApiError normalize_anthropic_error(ApiError error) {
         error.param   = {};
         error.message = "prompt is too long: " + std::string(details->exact ? "" : "more than ") +
                         std::to_string(details->prompt_tokens) + " tokens > " + std::to_string(details->max_context) +
-                        " maximum";
+                        " maximum" + vision_overflow_note(*details);
     }
     if (error.code == "server_overloaded" || error.status == 429) {
         error.status = 529;
@@ -252,29 +304,53 @@ std::optional<std::string> decode_thinking_signature(std::string_view signature)
     return out;
 }
 
+std::vector<ToolCall> identify_anthropic_tool_calls(const GenerationOutcome& outcome,
+                                                    std::span<const AnthropicToolSearch> searches) {
+    std::vector<ToolCall> result;
+    result.reserve(outcome.tool_calls.size());
+    for (const infernix::GeneratedToolCall& call : outcome.tool_calls) {
+        result.push_back(ToolCall{.id             = anthropic_call_id(searches, call.name),
+                                  .name           = call.name,
+                                  .arguments_json = call.arguments_json});
+    }
+    return result;
+}
+
 std::string make_anthropic_messages_response(const AnthropicResponseIdentity& identity,
                                              const GenerationOutcome& outcome, bool hide_thinking) {
+    const AnthropicResponseSegment segment = client_segment(outcome);
+    return make_anthropic_messages_response(identity, std::span(&segment, 1), outcome,
+                                            std::nullopt, hide_thinking);
+}
+
+std::string make_anthropic_messages_response(const AnthropicResponseIdentity& identity,
+                                             std::span<const AnthropicResponseSegment> segments,
+                                             const GenerationOutcome& totals,
+                                             std::optional<std::string_view> stop_reason,
+                                             bool hide_thinking) {
+    if (segments.empty()) { throw std::logic_error("Anthropic response has no generation"); }
     OrderedJson content = OrderedJson::array();
-    if (!outcome.reasoning.empty()) {
-        // Claude clients expect a non-empty opaque value. Summarized display uses the response
-        // identity, so Thinking introduces no independent state. Omitted display makes the
-        // signature the only carrier of the reasoning, restored when the client returns the block.
-        content.push_back(
-            OrderedJson{{"type", "thinking"},
-                        {"thinking", hide_thinking ? std::string() : outcome.reasoning},
-                        {"signature", hide_thinking ? encode_thinking_signature(outcome.reasoning)
-                                                    : identity.message_id}});
+    for (const AnthropicResponseSegment& segment : segments) {
+        validate_segment(segment);
+        const GenerationOutcome& outcome = *segment.outcome;
+        if (!outcome.reasoning.empty()) {
+            // Claude clients expect a non-empty opaque value. Summarized display uses the response
+            // identity, so Thinking introduces no independent state. Omitted display makes the
+            // signature the only carrier of the reasoning, restored when the client returns the
+            // block.
+            content.push_back(OrderedJson{
+                {"type", "thinking"},
+                {"thinking", hide_thinking ? std::string() : outcome.reasoning},
+                {"signature", hide_thinking ? encode_thinking_signature(outcome.reasoning)
+                                            : identity.message_id}});
+        }
+        if (!outcome.text.empty()) {
+            content.push_back(OrderedJson{{"type", "text"}, {"text", outcome.text}});
+        }
+        for (OrderedJson& block : call_blocks_json(segment)) { content.push_back(std::move(block)); }
     }
-    if (!outcome.text.empty()) {
-        content.push_back(OrderedJson{{"type", "text"}, {"text", outcome.text}});
-    }
-    for (const ToolCall& call : materialize_tool_calls(outcome)) {
-        content.push_back(OrderedJson{{"type", "tool_use"},
-                                      {"id", call.id},
-                                      {"name", call.name},
-                                      {"input", parse_tool_input(call)}});
-    }
-    const StopPresentation stop = stop_presentation(outcome);
+    const GenerationOutcome& final_outcome = *segments.back().outcome;
+    const StopPresentation stop            = stop_presentation(final_outcome, stop_reason);
     OrderedJson response{{"id", identity.message_id},
                          {"type", "message"},
                          {"role", "assistant"},
@@ -282,10 +358,10 @@ std::string make_anthropic_messages_response(const AnthropicResponseIdentity& id
                          {"content", std::move(content)},
                          {"stop_reason", stop.reason},
                          {"stop_sequence", stop.sequence},
-                         {"usage", final_usage(outcome)}};
-    if (outcome.constraint)
-        response["constraint"] = product::constraint_observation_json(outcome.constraint);
-    response["timings"] = timings_json(outcome_timings(outcome));
+                         {"usage", final_usage(totals)}};
+    if (final_outcome.constraint)
+        response["constraint"] = product::constraint_observation_json(final_outcome.constraint);
+    response["timings"] = timings_json(outcome_timings(totals));
     return response.dump();
 }
 
@@ -294,8 +370,10 @@ std::string make_anthropic_count_tokens_response(int input_tokens) {
 }
 
 AnthropicMessagesStream::AnthropicMessagesStream(AnthropicResponseIdentity identity,
-                                                 int input_tokens, bool hide_thinking)
-    : identity_(std::move(identity)), input_tokens_(input_tokens), hide_thinking_(hide_thinking) {}
+                                                 int input_tokens, bool hide_thinking,
+                                                 std::vector<AnthropicToolSearch> searches)
+    : identity_(std::move(identity)), searches_(std::move(searches)), input_tokens_(input_tokens),
+      hide_thinking_(hide_thinking) {}
 
 std::string AnthropicMessagesStream::start() { return start_with_cache(std::nullopt); }
 
@@ -389,8 +467,9 @@ std::vector<std::string> AnthropicMessagesStream::close_text() {
         event("content_block_stop", Json{{"type", "content_block_stop"}, {"index", text_index_}})};
 }
 
-std::vector<std::string> AnthropicMessagesStream::finish(const GenerationOutcome& outcome) {
-    if (!started_ || finished_) { throw std::logic_error("invalid Anthropic stream finish state"); }
+// Streams what the deltas have not shown of a generation's output and closes its blocks. The next
+// generation's deltas open new blocks.
+std::vector<std::string> AnthropicMessagesStream::close_generation(const GenerationOutcome& outcome) {
     require_prefix(outcome.reasoning, reasoning_, "reasoning");
     require_prefix(outcome.text, content_, "content");
 
@@ -406,14 +485,89 @@ std::vector<std::string> AnthropicMessagesStream::finish(const GenerationOutcome
     if (!content_suffix.empty()) { append(events, content_delta(content_suffix)); }
     append(events, close_thinking());
     append(events, close_text());
+    reasoning_.clear();
+    content_.clear();
+    return events;
+}
 
-    for (const ToolCall& call : materialize_tool_calls(outcome)) {
+std::vector<std::string> AnthropicMessagesStream::tool_call_delta(const infernix::ToolCallDelta& delta) {
+    const bool opens = delta.index == calls_.size();
+    if (!started_ || finished_ || (opens && delta.name.empty()) ||
+        (!opens && (delta.index + 1U != calls_.size() || calls_.back().complete || !delta.name.empty()))) {
+        throw std::logic_error("invalid Anthropic tool-call delta state");
+    }
+    std::vector<std::string> events;
+    if (opens) {
+        append(events, close_thinking());
+        append(events, close_text());
+        calls_.push_back(StreamedCall{
+            .call  = ToolCall{.id = anthropic_call_id(searches_, delta.name), .name = delta.name},
+            .index = next_index_++});
+        const char* type = is_search_tool(searches_, delta.name) ? "server_tool_use" : "tool_use";
+        events.push_back(event("content_block_start",
+                               Json{{"type", "content_block_start"},
+                                    {"index", calls_.back().index},
+                                    {"content_block", Json{{"type", type},
+                                                           {"id", calls_.back().call.id},
+                                                           {"name", delta.name},
+                                                           {"input", Json::object()}}}}));
+    }
+    StreamedCall& call = calls_.back();
+    call.call.arguments_json += delta.arguments;
+    if (!delta.arguments.empty()) {
+        events.push_back(event("content_block_delta",
+                               Json{{"type", "content_block_delta"},
+                                    {"index", call.index},
+                                    {"delta", Json{{"type", "input_json_delta"},
+                                                   {"partial_json", delta.arguments}}}}));
+    }
+    if (delta.complete) {
+        call.complete = true;
+        events.push_back(event("content_block_stop",
+                               Json{{"type", "content_block_stop"}, {"index", call.index}}));
+    }
+    return events;
+}
+
+std::vector<ToolCall> AnthropicMessagesStream::identify_calls(const GenerationOutcome& outcome) const {
+    std::vector<ToolCall> calls = identify_anthropic_tool_calls(outcome, searches_);
+    for (std::size_t index = 0; index < calls.size() && index < calls_.size(); ++index) {
+        calls[index].id = calls_[index].call.id;
+    }
+    return calls;
+}
+
+std::vector<std::string> AnthropicMessagesStream::call_blocks(const AnthropicResponseSegment& segment) {
+    validate_segment(segment);
+    std::vector<std::string> events;
+    if (!calls_.empty()) {
+        // Streamed calls are the segment's, and at most one more that the turn's end cut: its block
+        // closes now.
+        bool matches = calls_.size() == segment.calls.size() ||
+                       (calls_.size() == segment.calls.size() + 1U && !calls_.back().complete);
+        for (std::size_t position = 0; matches && position < segment.calls.size(); ++position) {
+            const ToolCall& call = segment.calls[position];
+            matches = calls_[position].complete && calls_[position].call.id == call.id &&
+                      calls_[position].call.name == call.name &&
+                      calls_[position].call.arguments_json == call.arguments_json;
+        }
+        if (!matches) { throw std::logic_error("streamed Anthropic tool calls do not match terminal output"); }
+        if (!calls_.back().complete) {
+            events.push_back(event("content_block_stop",
+                                   Json{{"type", "content_block_stop"}, {"index", calls_.back().index}}));
+        }
+    }
+    // Free tool output's calls arrive whole.
+    for (std::size_t position = calls_.empty() ? 0 : segment.calls.size(); position < segment.calls.size();
+         ++position) {
+        const ToolCall& call = segment.calls[position];
         (void)parse_tool_input(call);
         const int index = next_index_++;
+        const char* type = segment.search_results[position] ? "server_tool_use" : "tool_use";
         events.push_back(
             event("content_block_start", Json{{"type", "content_block_start"},
                                               {"index", index},
-                                              {"content_block", Json{{"type", "tool_use"},
+                                              {"content_block", Json{{"type", type},
                                                                      {"id", call.id},
                                                                      {"name", call.name},
                                                                      {"input", Json::object()}}}}));
@@ -425,14 +579,55 @@ std::vector<std::string> AnthropicMessagesStream::finish(const GenerationOutcome
         events.push_back(
             event("content_block_stop", Json{{"type", "content_block_stop"}, {"index", index}}));
     }
+    calls_.clear();
+    // A search result arrives whole, as Anthropic streams it: one start event carrying the content.
+    for (std::size_t position = 0; position < segment.calls.size(); ++position) {
+        const auto& result = segment.search_results[position];
+        if (!result) { continue; }
+        const int index = next_index_++;
+        events.push_back(event("content_block_start",
+                               Json{{"type", "content_block_start"},
+                                    {"index", index},
+                                    {"content_block",
+                                     Json{{"type", "tool_search_tool_result"},
+                                          {"tool_use_id", segment.calls[position].id},
+                                          {"content", Json::parse(result->dump())}}}}));
+        events.push_back(
+            event("content_block_stop", Json{{"type", "content_block_stop"}, {"index", index}}));
+    }
+    return events;
+}
 
-    const StopPresentation stop = stop_presentation(outcome);
+std::vector<std::string> AnthropicMessagesStream::segment(const AnthropicResponseSegment& segment) {
+    if (!started_ || finished_) { throw std::logic_error("invalid Anthropic stream segment state"); }
+    validate_segment(segment);
+    std::vector<std::string> events = close_generation(*segment.outcome);
+    append(events, call_blocks(segment));
+    return events;
+}
+
+std::vector<std::string> AnthropicMessagesStream::finish(const GenerationOutcome& outcome) {
+    AnthropicResponseSegment segment{.outcome = &outcome, .calls = identify_calls(outcome), .search_results = {}};
+    segment.search_results.resize(segment.calls.size());
+    return finish(segment, outcome, std::nullopt);
+}
+
+std::vector<std::string> AnthropicMessagesStream::finish(const AnthropicResponseSegment& final_segment,
+                                                         const GenerationOutcome& totals,
+                                                         std::optional<std::string_view> stop_reason) {
+    if (!started_ || finished_) { throw std::logic_error("invalid Anthropic stream finish state"); }
+    validate_segment(final_segment);
+    const GenerationOutcome& outcome = *final_segment.outcome;
+    std::vector<std::string> events  = close_generation(outcome);
+    append(events, call_blocks(final_segment));
+
+    const StopPresentation stop = stop_presentation(outcome, stop_reason);
     Json terminal{{"type", "message_delta"},
                   {"delta", Json{{"stop_reason", stop.reason}, {"stop_sequence", stop.sequence}}},
-                  {"usage", final_usage(outcome)}};
+                  {"usage", final_usage(totals)}};
     if (outcome.constraint)
         terminal["constraint"] = product::constraint_observation_json(outcome.constraint);
-    terminal["timings"] = timings_json(outcome_timings(outcome));
+    terminal["timings"] = timings_json(outcome_timings(totals));
     events.push_back(event("message_delta", std::move(terminal)));
     events.push_back(event("message_stop", Json{{"type", "message_stop"}}));
     finished_ = true;

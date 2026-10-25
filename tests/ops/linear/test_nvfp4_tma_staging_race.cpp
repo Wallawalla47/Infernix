@@ -9,6 +9,7 @@
 // isolated (synced) reference: any divergence means a launch read a stale or foreign descriptor.
 // It covers both staging sites: the plain Linear TMA (launch_tma) and the fused LinearSwiGLU TMA.
 
+#include "ops/op_family.h"
 #include "core/arena.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
@@ -204,7 +205,7 @@ int run_swiglu_race() {
 }
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(nvfp4_tma_staging_race) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;

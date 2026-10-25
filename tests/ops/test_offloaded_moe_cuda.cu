@@ -11,6 +11,7 @@
 //   - the E2M1 decoders (scalar on host and device, four codes at once on the device) against the
 //     E2M1 table, exhaustively.
 
+#include "ops/op_family.h"
 #include "ops/common/canonical_math.h"
 #include "ops/offloaded_sparse_moe/cpu/w4a4_expert.h"
 #include "ops/offloaded_sparse_moe/cuda/narrow_expert.h"
@@ -274,7 +275,7 @@ void test_e2m1_decode() {
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(offloaded_moe_cuda) {
     if (infernix::test::cuda_unavailable()) {
         std::printf("SKIP: no usable CUDA device\n");
         return 77;

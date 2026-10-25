@@ -1,6 +1,6 @@
 """Exact oracle for the lossless route's correctly rounded functions (src/ops/lossless/cr_math.cuh).
 
-Writes test vectors and runs the CUDA test on them: python lossless_cr_oracle.py <test executable>.
+Writes test vectors and runs the CUDA test on them: python lossless_cr_oracle.py <family executable> lossless_cr_math.
 Each expected value is the function evaluated with Python's decimal module at 60 significant digits
 (its exp, ln and sqrt are correctly rounded at that precision) and rounded to binary32 or BF16 (round to
 nearest, ties to even, subnormals, overflow to infinity) with exact rational arithmetic. 60 digits put
@@ -182,18 +182,18 @@ def write_vectors(path: Path) -> None:
 
 
 def main() -> int:
-    """lossless_cr_oracle.py <test executable> [vector file]: a given vector file is written once and
+    """lossless_cr_oracle.py <family executable> <test name> [vector file]: a given vector file is written once and
     reused afterwards (the vectors are deterministic)."""
-    exe = sys.argv[1]
-    if len(sys.argv) > 2:
-        path = Path(sys.argv[2])
+    command = sys.argv[1:3]  # the family executable and the test name (tests/ops/op_family.h)
+    if len(sys.argv) > 3:
+        path = Path(sys.argv[3])
         if not path.is_file():
             write_vectors(path)
-        return subprocess.run([exe, str(path)], check=False).returncode
+        return subprocess.run([*command, str(path)], check=False).returncode
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "cr_vectors.bin"
         write_vectors(path)
-        return subprocess.run([exe, str(path)], check=False).returncode
+        return subprocess.run([*command, str(path)], check=False).returncode
 
 
 if __name__ == "__main__":

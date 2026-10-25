@@ -4,9 +4,11 @@
 // adapters normalize before this layer and render IDs, usage, and response events after it.
 
 #include "infernix/engine.h"
+#include "serve/prefix_miss.h"
 #include "serve/request.h"
 #include "serve/serve_options.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -24,51 +26,6 @@ namespace infernix::serve {
 struct RequestLifetime;
 struct RequestCapacity;
 
-struct GenerationMetrics {
-    std::uint64_t engine_request_id            = 0;
-    std::uint32_t computed_prefill_tokens      = 0;
-    double prepare_seconds                     = 0.0;
-    double ttft_seconds                        = 0.0;
-    double vision_seconds                      = 0.0;
-    double prefill_seconds                     = 0.0;
-    double decode_seconds                      = 0.0;
-    double decode_share_seconds                = 0.0;
-    double prompt_wall_seconds                 = 0.0;
-    double generation_wall_seconds             = 0.0;
-    double total_seconds                       = 0.0;
-    double vision_offload_window_seconds       = 0.0;
-    double vision_offload_evict_seconds        = 0.0;
-    double vision_offload_restore_seconds      = 0.0;
-    std::uint64_t vision_offload_evicted_bytes = 0;
-    std::uint64_t vision_offload_staged_bytes  = 0;
-    infernix::GenerationEngineTiming engine_timing;
-    std::optional<infernix::GenerationFirstOutputTiming> first_output_timing;
-    infernix::GenerationSchedulingStats scheduling;
-    infernix::GenerationAdmissionStats admission;
-
-    SpeculativeBackend speculative_backend    = SpeculativeBackend::None;
-    std::uint32_t speculative_draft_window    = 0;
-    std::uint64_t speculative_rounds          = 0;
-    std::uint64_t speculative_draft_tokens    = 0;
-    std::uint64_t speculative_accepted_tokens = 0;
-    std::uint64_t speculative_fallback_steps  = 0;
-    std::vector<std::uint64_t> speculative_accepted_per_position;
-    std::vector<std::uint64_t> speculative_rounds_by_draft_length;
-    std::optional<infernix::ExpertCacheStats> expert_cache;
-    std::uint64_t ngram_rounds                  = 0;
-    std::uint64_t ngram_drafted_tokens          = 0;
-    std::uint64_t ngram_accepted_tokens         = 0;
-    std::uint64_t ngram_archive_rounds          = 0;
-    std::uint64_t ngram_archive_drafted_tokens  = 0;
-    std::uint64_t ngram_archive_accepted_tokens = 0;
-    std::uint64_t tree_rounds                   = 0;
-    std::uint64_t tree_side_rounds              = 0;
-    std::uint64_t tree_side_accepted_tokens     = 0;
-    NgramArchiveStats ngram_archive;
-    std::uint32_t prefix_cache_hit_tokens     = 0;
-    infernix::PrefixReusePath prefix_reuse_path = infernix::PrefixReusePath::Root;
-};
-
 struct GenerationOutcome {
     std::string text;
     std::string reasoning;
@@ -84,7 +41,29 @@ struct GenerationOutcome {
     std::optional<std::string> matched_stop_string;
     std::optional<infernix::PromptReadout> readout;
     std::vector<infernix::ConstrainedDraw> constrained_draws;
-    GenerationMetrics metrics;
+    // The Engine's measurements (infernix::GenerationResult's fields). timings counts the serve's
+    // own preparation too: prepare_seconds, first_token_seconds (the request's TTFT) and
+    // total_seconds include it.
+    std::uint64_t engine_request_id       = 0;
+    std::uint32_t computed_prefill_tokens = 0;
+    std::uint32_t reused_prompt_tokens    = 0;
+    std::optional<std::uint32_t> cache_created_prompt_tokens;
+    infernix::PrefixReusePath prefix_reuse_path = infernix::PrefixReusePath::Root;
+    infernix::GenerationTimings timings;
+    infernix::GenerationEngineTiming engine_timing;
+    std::optional<infernix::GenerationFirstOutputTiming> first_output_timing;
+    infernix::GenerationSchedulingStats scheduling;
+    infernix::GenerationAdmissionStats admission;
+    infernix::SpeculativeStats speculative;
+    NgramArchiveStats ngram_archive;
+    std::optional<infernix::ExpertCacheStats> expert_cache;
+    // With the request JSONL: the output's token 4-grams and those that also occur in the prompt
+    // (the room copy proposals from the prompt would have); unset without the log or a prompt
+    // 4-gram.
+    std::optional<std::uint64_t> output_4grams;
+    std::optional<std::uint64_t> output_4grams_in_prompt;
+    // With the request JSONL: why a large re-prefill missed the prefix cache (prefix_miss.h).
+    std::optional<PrefixMiss> prefix_miss;
 };
 
 // A transport may report an interrupted stream through a callback or is_cancelled().
@@ -100,6 +79,8 @@ struct StreamSink {
     std::function<void(const infernix::GenerationTimingObservation& timing)> on_timing;
     std::function<void(const std::string& delta_text)> on_content;
     std::function<void(const std::string& delta_text)> on_reasoning;
+    // A constrained call's next step (infernix::ToolCallDelta), after the content before it.
+    std::function<void(const infernix::ToolCallDelta& delta)> on_tool_call;
     std::function<bool()> is_cancelled;
 };
 
@@ -108,11 +89,19 @@ enum class GenerationConsumerMode : std::uint8_t {
     Streaming,
 };
 
-// Translate Engine request failures into the shared protocol-neutral HTTP error contract.
+// Translate Engine request failures into the shared protocol-neutral HTTP error contract. A
+// queue-pressure answer (429 overloaded, 503 queue timeout) carries retry_after_seconds as its
+// Retry-After.
 ApiError
 request_error_to_api_error(const infernix::RequestError& exception,
                            std::string_view constraint_param = "structured_outputs.grammar",
-                           std::span<const std::string> tool_schema_params = {});
+                           std::span<const std::string> tool_schema_params = {},
+                           std::uint32_t retry_after_seconds               = 0);
+
+// The sentence a context-overflow message appends for an aggregate vision overflow
+// (ContextLengthDetails::vision): its counts are image tokens against the per-prompt vision budget.
+// Empty for a text overflow.
+[[nodiscard]] std::string vision_overflow_note(const infernix::ContextLengthDetails& details);
 
 // Preparation ends by synchronously submitting the owning prompt to the Engine FIFO. The returned
 // request keeps its ingress/response lifetime reservation until the HTTP response is released and
@@ -134,6 +123,10 @@ struct PreparedRequest {
     std::optional<infernix::ReasoningEffort> reasoning_effort;
     std::optional<bool> preserve_thinking;
     std::shared_ptr<RequestLifetime> lifetime;
+    // With the request JSONL: the prompt's token 4-grams (hashed, sorted, unique), for the outcome's
+    // output-overlap figure, and its token ids, for the prefix-miss record; empty otherwise.
+    std::vector<std::uint64_t> prompt_4grams;
+    std::vector<infernix::TokenId> prompt_ids;
 };
 
 class GenerationService {
@@ -157,7 +150,12 @@ public:
 
     [[nodiscard]] infernix::RuntimeStats runtime_stats() const { return engine_->runtime_stats(); }
 
+    void reset_execution_maxima() noexcept { engine_->reset_execution_maxima(); }
+
     [[nodiscard]] bool is_available() const { return engine_->is_available(); }
+
+    // An Engine-wide execution failure, as opposed to an orderly stop.
+    [[nodiscard]] bool has_failed() const { return engine_->has_failed(); }
 
     [[nodiscard]] infernix::MediaCacheSummary media_cache_summary() const {
         return engine_->media_cache_summary();
@@ -165,6 +163,10 @@ public:
 
     [[nodiscard]] infernix::ModelSamplingDefaults sampling_defaults() const {
         return engine_->sampling_defaults();
+    }
+
+    [[nodiscard]] infernix::ChatTemplateRoleSupport chat_template_role_support() const {
+        return engine_->chat_template_role_support();
     }
 
     // Artifact-tokenizer encoding of raw text, with no template or special token added.
@@ -176,12 +178,26 @@ public:
                                           GenerationConsumerMode consumer_mode,
                                           infernix::GenerationObservationOptions observation = {},
                                           std::function<bool()> is_cancelled = {}) const;
+    // The next generation of an admitted request that executed a server-side tool (tool search):
+    // the HTTP request still holds its ingress slot, so the continuation takes another without
+    // the queue bound refusing it, and gets a fresh pending deadline.
+    [[nodiscard]] PreparedRequest
+    prepare_continuation(const GenerationRequest& req, GenerationConsumerMode consumer_mode,
+                         infernix::GenerationObservationOptions observation = {},
+                         std::function<bool()> is_cancelled = {}) const;
     [[nodiscard]] int count_prompt_tokens(const GenerationRequest& req,
                                           std::function<bool()> is_cancelled = {}) const;
 
     // Consumes prepared.generation. A PreparedRequest is single-use.
     GenerationOutcome run(PreparedRequest& prepared, const StreamSink* sink,
                           std::function<bool()> is_cancelled = {});
+
+    // A streaming route calls it before committing its response: blocks until the Engine admits the
+    // request, so that the queue's own answers (a queue timeout, an orderly stop) still reach the
+    // client as a plain HTTP status, as on the non-streaming routes; after admission only
+    // mid-generation failures remain, which belong in the stream. Throws the ApiException run()
+    // would; a request cancelled while queued returns, and run() gives its answer.
+    void admit(PreparedRequest& prepared, std::function<bool()> is_cancelled = {}) const;
 
     void warmup();
 
@@ -203,15 +219,24 @@ private:
     prepare_impl(const GenerationRequest& req, GenerationConsumerMode consumer_mode,
                  infernix::GenerationObservationOptions observation,
                  std::function<bool()> is_cancelled, CacheParticipation cache_participation,
-                 DeadlinePolicy deadline_policy) const;
+                 DeadlinePolicy deadline_policy, bool admitted = false) const;
     [[nodiscard]] std::shared_ptr<RequestLifetime>
-    acquire_request_lifetime(DeadlinePolicy deadline_policy) const;
+    acquire_request_lifetime(DeadlinePolicy deadline_policy, bool admitted) const;
     [[nodiscard]] std::shared_ptr<RequestLifetime>
     acquire_lifetime(const std::shared_ptr<RequestCapacity>& capacity,
-                     DeadlinePolicy deadline_policy, const char* full_message) const;
+                     DeadlinePolicy deadline_policy, const char* full_message,
+                     bool admitted = false) const;
+
+    // The Retry-After of a queue-pressure answer: the admission window (--pending-timeout-ms), at
+    // least 1 s.
+    [[nodiscard]] std::uint32_t queue_retry_after_seconds() const noexcept {
+        return std::max<std::uint32_t>(1, (options_.pending_timeout_ms + 999U) / 1000U);
+    }
 
     ServeOptions options_;
     std::unique_ptr<infernix::Engine> engine_;
+    // The recent contexts behind GenerationOutcome::prefix_miss (with the request JSONL only).
+    std::unique_ptr<PrefixMissTracker> prefix_misses_;
     std::shared_ptr<RequestCapacity> request_capacity_;
     // Token counting runs the whole preparation path on handler threads, so it has its own bound:
     // a flood of counts is rejected before it can occupy the threads generation prepares on.

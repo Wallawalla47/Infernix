@@ -1,3 +1,4 @@
+#include "ops/op_family.h"
 #include "core/weight.h"
 #include "infernix/ops/dynamic_grouped_conv.h"
 #include "core/decode_graph.h"
@@ -315,7 +316,7 @@ int run_geometry(std::int32_t hidden) {
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(dynamic_grouped_conv_prepare) {
     try {
         if (cuda_unavailable()) {
             std::cout << "SKIP: no usable CUDA device\n";

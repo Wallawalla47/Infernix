@@ -17,9 +17,11 @@
 // Gumbel-max keyed by (seed, position, token) (ops::SamplingConfig::gumbel_max), so a verify column
 // returns the token plain sampling draws there.
 //
-// INFERNIX_TEST_ARTIFACT names the artifact; the arguments name one or more drafters (mtp, dflash,
-// dflash2 or dflash2-ngram: DFlash2 with n-gram copy proposals); the artifact must hold them. One Engine
+// INFERNIX_TEST_ARTIFACT names the artifact; the arguments name one or more drafters (mtp, mtp-cut: MTP
+// with --spec-min-p 0.5, mtp-sampled: MTP with the sampled-mtp-drafts candidate, dflash, dflash2 or
+// dflash2-ngram: DFlash2 with n-gram copy proposals); the artifact must hold them. One Engine
 // decodes plainly, then one per drafter decodes the same requests (one plain run serves every drafter).
+// The requests end with a raw one-token prompt, which must also verify drafts.
 namespace {
 
 constexpr std::uint32_t kOutputTokens = 200;
@@ -61,9 +63,14 @@ infernix::EngineOptions reproducible_options(const std::filesystem::path& artifa
     options.max_concurrency = 1;
     options.prefill_chunk   = 1024;
     options.enable_vision   = false;
-    if (drafter == "mtp") {
+    if (drafter == "mtp" || drafter == "mtp-cut" || drafter == "mtp-sampled") {
         options.speculative.backend      = infernix::SpeculativeBackend::Mtp;
         options.speculative.draft_tokens = 3;
+        // The draft-confidence cut verifies only the drafts before the first below 0.5 (the
+        // others are padding of the fixed width); sampled drafts verify by sparse rejection
+        // sampling, which under Gumbel-max draws keeps plain sampling's tokens.
+        if (drafter == "mtp-cut") { options.speculative.draft_min_p = 0.5F; }
+        if (drafter == "mtp-sampled") { options.fast_path_candidates = {infernix::FastPath::SampledMtpDrafts}; }
     } else if (drafter == "dflash") {
         options.speculative.backend      = infernix::SpeculativeBackend::DFlash;
         options.speculative.draft_tokens = 7;
@@ -72,7 +79,7 @@ infernix::EngineOptions reproducible_options(const std::filesystem::path& artifa
         options.speculative.draft_tokens = 7;
         if (drafter == "dflash2-ngram") { options.speculative.ngram_draft_tokens = 16; }
     } else if (drafter != "none") {
-        throw std::invalid_argument("the drafter must be mtp, dflash, dflash2 or dflash2-ngram");
+        throw std::invalid_argument("the drafter must be mtp, mtp-cut, mtp-sampled, dflash, dflash2 or dflash2-ngram");
     }
     return options;
 }
@@ -87,15 +94,28 @@ std::vector<std::string> prompts() {
     };
 }
 
-std::vector<std::vector<infernix::TokenId>> decode(const std::filesystem::path& artifact, std::string_view drafter) {
+struct Decoded {
+    std::vector<std::vector<infernix::TokenId>> tokens; // three per prompt, then the one-token prompt's
+    std::uint64_t one_token_drafts = 0;                 // drafts verified for the one-token prompt
+};
+
+Decoded decode(const std::filesystem::path& artifact, std::string_view drafter) {
     infernix::Engine engine(reproducible_options(artifact, drafter));
-    std::vector<std::vector<infernix::TokenId>> out;
+    Decoded out;
     for (const auto& text : prompts()) {
-        out.push_back(engine.generate(engine.prepare(prompt(text)), request(0.0F, 0)).generated_token_ids);
+        out.tokens.push_back(engine.generate(engine.prepare(prompt(text)), request(0.0F, 0)).generated_token_ids);
         for (std::uint64_t seed : {11ULL, 12ULL}) {
-            out.push_back(engine.generate(engine.prepare(prompt(text)), request(1.0F, seed)).generated_token_ids);
+            out.tokens.push_back(
+                engine.generate(engine.prepare(prompt(text)), request(1.0F, seed)).generated_token_ids);
         }
     }
+    // A one-token prompt speculates like any other (Strata aece46db: there, position 0 meant "no
+    // speculation", so such a prompt never drafted).
+    const std::vector<infernix::TokenId> first = engine.tokenize_text("Once");
+    require(!first.empty(), "the tokenizer encoded no token");
+    const infernix::GenerationResult one = engine.generate(engine.prepare_tokens({first.front()}), request(0.0F, 0));
+    out.tokens.push_back(one.generated_token_ids);
+    out.one_token_drafts = one.speculative.drafted_tokens + one.speculative.ngram_drafted_tokens;
     return out;
 }
 
@@ -109,18 +129,22 @@ int main(int argc, char** argv) {
     }
     try {
         require(argc >= 2,
-                "usage: infernix_qwen3_5_speculation_invariance_real_test mtp|dflash|dflash2|dflash2-ngram...");
+                "usage: infernix_qwen3_5_speculation_invariance_real_test "
+                "mtp|mtp-cut|mtp-sampled|dflash|dflash2|dflash2-ngram...");
         // Plain decoding once, then each drafter against it.
-        const auto plain = decode(artifact, "none");
-        int failed_drafters = 0;
+        const auto plain_run = decode(artifact, "none");
+        const auto& plain    = plain_run.tokens;
+        int failed_drafters  = 0;
         for (int a = 1; a < argc; ++a) {
             const std::string_view drafter = argv[a];
-            const auto speculative         = decode(artifact, drafter);
+            const auto speculative_run     = decode(artifact, drafter);
+            const auto& speculative        = speculative_run.tokens;
             require(plain.size() == speculative.size(), "result counts differ");
             int failures = 0;
             for (std::size_t i = 0; i < plain.size(); ++i) {
-                const char* kind = i % 3 == 0 ? "greedy" : "sampled";
-                std::size_t same = 0;
+                const bool one_token = i + 1 == plain.size();
+                const char* kind     = one_token ? "one-token greedy" : i % 3 == 0 ? "greedy" : "sampled";
+                std::size_t same     = 0;
                 while (same < plain[i].size() && same < speculative[i].size() && plain[i][same] == speculative[i][same]) {
                     ++same;
                 }
@@ -129,6 +153,11 @@ int main(int argc, char** argv) {
                           << " (" << same << " of " << plain[i].size() << "/" << speculative[i].size()
                           << " tokens agree)\n";
                 failures += ok ? 0 : 1;
+            }
+            std::cout << drafter << " one-token prompt: " << speculative_run.one_token_drafts << " drafts verified\n";
+            if (speculative_run.one_token_drafts == 0) {
+                std::cerr << "FAIL " << drafter << ": a one-token prompt verified no drafts\n";
+                ++failures;
             }
             if (failures != 0) {
                 std::cerr << "FAIL " << drafter << ": " << failures << " requests differ from plain decoding\n";

@@ -9,6 +9,7 @@
 // runs, at every width 1-8, must return its bits, including columns of a wide dynamic range and a
 // non-finite column (NaN outputs).
 
+#include "ops/op_family.h"
 #include "core/ggml_format.h"
 #include "ops/common/canonical_math.h"
 #include "ops/fp8_block/fp8_exact.h"
@@ -313,11 +314,54 @@ void rates(bool fp8) {
     }
 }
 
+// --columns: one expert call on one thread at 1-8 columns, every supported ISA, for the GGUF pairs of the
+// IQ3_S and IQ4_XS imports (candidates §14 SR-03: the 256-bit routes take columns four at a time, so 5-8
+// decode every slice twice). Prints µs per call and per column; information only.
+void columns() {
+    std::mt19937 rng(20261024);
+    const int H = moe::kHidden, I = moe::kIntermediate;
+    for (const auto& [gu, down] : {std::pair{QType::GGML_IQ3_S, QType::GGML_IQ4_NL},
+                                   std::pair{QType::GGML_IQ4_XS, QType::GGML_IQ4_NL}}) {
+        const moe::GgmlExpertFormat f{.gate_up = gu, .down = down, .gate_row_bytes = row_bytes(gu, H),
+                                      .down_row_bytes = row_bytes(down, I)};
+        std::vector<std::uint8_t> record(2ULL * I * f.gate_row_bytes + static_cast<std::size_t>(H) * f.down_row_bytes);
+        random_rows(gu, 2 * I, H, rng, record.data());
+        random_rows(down, H, I, rng, record.data() + 2ULL * I * f.gate_row_bytes);
+        std::vector<std::uint16_t> x(static_cast<std::size_t>(H) * moe::kMaxColumns);
+        std::normal_distribution<float> normal(0.0F, 1.0F);
+        for (auto& v : x) { v = bf16(normal(rng)); }
+        std::vector<std::uint16_t> y(static_cast<std::size_t>(H) * moe::kMaxColumns);
+        for (const auto isa : {moe::CpuIsa::kAvx2, moe::CpuIsa::kAvxVnni, moe::CpuIsa::kAvx512Vnni}) {
+            if (!moe::cpu_isa_supported(isa)) { continue; }
+            for (int ncols = 1; ncols <= moe::kMaxColumns; ++ncols) {
+                const std::uint16_t* xp[moe::kMaxColumns];
+                std::uint16_t* yp[moe::kMaxColumns];
+                for (int c = 0; c < ncols; ++c) {
+                    xp[c] = x.data() + static_cast<std::size_t>(c) * H;
+                    yp[c] = y.data() + static_cast<std::size_t>(c) * H;
+                }
+                moe::ggml_expert_forward(isa, record.data(), f, ncols, xp, yp);
+                constexpr int kRepeats = 30;
+                const auto t0 = std::chrono::steady_clock::now();
+                for (int i = 0; i < kRepeats; ++i) { moe::ggml_expert_forward(isa, record.data(), f, ncols, xp, yp); }
+                const double us =
+                    std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / kRepeats;
+                std::printf("columns pair (%d, %d) %-12s ncols %d: %8.1f us per call, %7.1f us per column\n",
+                            static_cast<int>(gu), static_cast<int>(down), moe::cpu_isa_name(isa), ncols, us, us / ncols);
+            }
+        }
+    }
+}
+
 } // namespace
 
-int main(int argc, char** argv) {
+INFERNIX_OP_TEST(offloaded_moe_ggml_cpu) {
     if (argc > 1 && std::string(argv[1]) == "--rates") {
         rates(argc > 2 && std::string(argv[2]) == "fp8");
+        return 0;
+    }
+    if (argc > 1 && std::string(argv[1]) == "--columns") {
+        columns();
         return 0;
     }
     // --isa NAME (cpu_isa_name, e.g. avx512-vnni): only that ISA's kernels against the oracle and the

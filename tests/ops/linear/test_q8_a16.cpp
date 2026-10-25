@@ -1,3 +1,4 @@
+#include "ops/op_family.h"
 #include "ops/linear/linear_test_common.h"
 #include "ops/op_tester.h"
 
@@ -180,7 +181,7 @@ int q8_a16_column_invariance() {
 }
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(linear_q8_a16) {
     if (!infernix::test::linear::cuda_available()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;

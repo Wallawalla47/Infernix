@@ -1,3 +1,4 @@
+#include "ops/op_family.h"
 #include "core/weight.h"
 #include "infernix/ops/linear.h"
 
@@ -643,7 +644,7 @@ int run_new_bf16(int selected_n = 0, int selected_k = 0) {
 
 } // namespace
 
-int main(int argc, char** argv) {
+INFERNIX_OP_TEST(linear_bf16_a16) {
     if (infernix::test::cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;

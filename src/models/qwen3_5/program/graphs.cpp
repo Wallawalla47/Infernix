@@ -9,6 +9,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -200,7 +201,7 @@ void ProgramImpl::prepare_graphs() {
             }
             cache.page_pool().zero_pages(pages, device.stream);
         };
-    // capture_tree selects a DFlash2 tree round: rows whose whole tree fits verify a tree of
+    // capture_tree selects a tree round: rows whose whole tree fits verify a tree of
     // capture_drafts + 1 columns built from capture_proposal_drafts main-chain proposals.
     const auto prepare_representative = [&](std::uint32_t frontier, std::uint32_t batch_size,
                                             std::uint32_t capture_drafts,
@@ -283,10 +284,17 @@ void ProgramImpl::prepare_graphs() {
             }
         }
         if (io.mtp_decode) {
-            *mtp_host_ingress          = {};
-            *mtp_host_egress           = {};
-            const std::uint32_t extent = std::min(capture_drafts, capacity - frontier - 1U);
+            *mtp_host_ingress = {};
+            *mtp_host_egress  = {};
+            // A tree family's representative rows verify the whole tree where it fits, built on
+            // one-hot proposals of the window's chain (the sparse planes at the chain length).
+            const bool tree_row        = capture_tree && capacity - frontier - 1U >= capture_drafts;
+            const std::uint32_t extent = tree_row ? capture_drafts
+                                         : capture_tree
+                                             ? std::min(neural_draft_window, capacity - frontier - 1U)
+                                             : std::min(capture_drafts, capacity - frontier - 1U);
             const std::uint32_t width  = capture_drafts + 1U;
+            const std::uint32_t sparse = capture_tree ? neural_draft_window : capture_drafts;
             for (std::uint32_t row = 0; row < batch_size; ++row) {
                 mtp_host_ingress->anchors[row] = 0;
                 mtp_host_ingress->base_frontiers[row] =
@@ -299,10 +307,29 @@ void ProgramImpl::prepare_graphs() {
                 for (std::uint32_t step = 0; step < capture_drafts; ++step) {
                     mtp_host_ingress->current_drafts[row * capture_drafts + step] = 0;
                 }
+                // The deepest proposal any round may run, and (sampled-mtp-drafts) one-hot
+                // proposals of the representative drafts.
+                mtp_host_ingress->proposal_limits[row] = static_cast<std::int32_t>(neural_draft_window);
+                mtp_host_ingress->step_threshold       = 0.0; // the step chain's every gate passes
+                if (execution_schedule.sampled_mtp_drafts && sparse <= kMtpDecodeMaximumDrafts) {
+                    for (std::uint32_t step = 0; step < sparse; ++step) {
+                        const auto base = (row * sparse + step) * kMtpSparseSlots;
+                        for (std::uint32_t slot = 0; slot < kMtpSparseSlots; ++slot) {
+                            mtp_host_ingress->current_candidates[base + slot] = static_cast<TokenId>(slot);
+                            mtp_host_ingress->current_q[base + slot]          = slot == 0 ? 1.0F : 0.0F;
+                        }
+                        const auto scores = (row * sparse + step) * kMtpSampledDraftRanks;
+                        for (std::int32_t rank = 0; rank < kMtpSampledDraftRanks; ++rank) {
+                            mtp_host_ingress->current_scores[scores + static_cast<std::uint32_t>(rank)] =
+                                rank == 0 ? 0.0F : -std::numeric_limits<float>::infinity();
+                        }
+                    }
+                }
                 for (std::uint32_t column = 0; column < width; ++column) {
+                    // The device adds a tree column's depth to the anchor position.
+                    const std::uint32_t offset = tree_row ? 0U : std::min(column, extent);
                     mtp_host_ingress->target_rope_positions[row * width + column] =
-                        checked_i32(frontier + std::min(column, extent),
-                                    "graph representative MTP RoPE position");
+                        checked_i32(frontier + offset, "graph representative MTP RoPE position");
                 }
                 mtp_host_ingress->text_kv_table_rows[row]      = static_cast<std::int32_t>(row);
                 mtp_host_ingress->mtp_kv_table_rows[row]       = static_cast<std::int32_t>(row);
@@ -460,15 +487,18 @@ void ProgramImpl::prepare_graphs() {
         // through the record view of the same width. Every MTP round proposes the next round's
         // drafts at its neural family's draft length (copy rounds at the configured neural
         // depth); a batch>1 DFlash ngram round also runs the
-        // drafter so rows without a copy keep their neural proposal. A DFlash2 tree family serves
+        // drafter so rows without a copy keep their neural proposal. A tree family serves
         // only the batch sizes that may verify its width, and an adaptive-mtp single-row family
         // only one row. Chain families serve every batch size:
         // a round with a constrained row verifies the chain whatever the tree table selects.
+        // With the proposal chain a neural family's one-row rounds propose through the gated chain
+        // at the configured depth (the round's limit stops them), its other rounds at its length.
+        const bool chain = execution_schedule.mtp_proposal_chain;
         for (SpeculativeRoundFamily& round : round_families) {
             const bool ngram                  = round.shape.kind == SpeculativeRoundKind::Ngram;
             const bool tree                   = round.shape.kind == SpeculativeRoundKind::Tree;
             const std::uint32_t verify_drafts = round.shape.verify_drafts;
-            const std::uint32_t ar_depth = mtp_proposal_drafts(round.shape, neural_draft_window);
+            const std::uint32_t ar_depth = mtp_family_proposal_drafts(round.shape, neural_draft_window, chain);
             const auto serves            = [&](std::uint32_t batch) {
                 return round_shape_serves(round.shape, tree_widths, batch);
             };
@@ -480,10 +510,11 @@ void ProgramImpl::prepare_graphs() {
             // The DFlash drafter proposes at its own width, a neural family (the configured one or
             // adaptive-dflash's batch-only one) at the family's, and a copy family's batched rows
             // without a copy at the batch length where one is set; a split family's representative
-            // verifies its own width of the proposal graph's block.
+            // verifies its own width of the proposal graph's block (a split tree family,
+            // INFERNIX_TMP_TREE_ROUND_WIDTH, builds its tree from the block, the drafter's window).
             const bool split                    = round.shape.split;
             const std::uint32_t proposal_drafts =
-                mtp || split || round.shape.kind == SpeculativeRoundKind::Neural ? verify_drafts
+                mtp || (split && !tree) || round.shape.kind == SpeculativeRoundKind::Neural ? verify_drafts
                 : ngram && dflash_batch_drafts != 0                             ? dflash_batch_drafts
                                                                                 : neural_draft_window;
             const auto forward_phase            = split ? SpeculativePhase::Verify : SpeculativePhase::Forward;
@@ -494,7 +525,8 @@ void ProgramImpl::prepare_graphs() {
             auto& forward_family = round.forward;
             auto& finish_family  = round.finish;
             const auto forward_profiles =
-                mtp     ? mtp_graph_profiles(capacity, verify_drafts, ar_depth)
+                mtp     ? mtp_graph_profiles(capacity, verify_drafts, ar_depth,
+                                             mtp_chained_round(round.shape, 1U, chain))
                 : split ? dflash_verify_graph_profiles(capacity, verify_drafts)
                         : dflash_graph_profiles(speculative_backend, capacity, verify_drafts);
             // DFlash acceptance has no context-dependent nodes or resource envelope.
@@ -502,7 +534,7 @@ void ProgramImpl::prepare_graphs() {
                 mtp ? forward_profiles : std::vector<GraphExecutionProfile>{{0, capacity - 1}};
             validate_graph_profiles(forward_profiles, capacity - 1, "speculative forward");
             validate_graph_profiles(finish_profiles, capacity - 1, "speculative finish");
-            const auto mtp_context = [&] {
+            const auto mtp_context = [&](std::uint32_t batch) {
                 execution::ExecutionCore core = execution_core();
                 core.replay_records           = round_replay_records(verify_drafts);
                 execution::MtpBatchContext state{core,
@@ -512,7 +544,13 @@ void ProgramImpl::prepare_graphs() {
                                                  *mtp_host_ingress,
                                                  *mtp_host_egress,
                                                  state_images->continuation_hidden_store()};
-                state.neural_proposal_drafts = ar_depth;
+                state.neural_proposal_drafts = mtp_proposal_drafts(round.shape, neural_draft_window, batch, chain);
+                state.proposal_chain         = mtp_chained_round(round.shape, batch, chain);
+                state.step_chain             = execution_schedule.mtp_step_chain && !tree;
+                state.tree                   = tree;
+                state.chain_drafts           = neural_draft_window;
+                state.tree_paths             = draft_tree_paths;
+                state.tree_proposals         = mtp_tree_rounds;
                 return state;
             };
             const auto dflash_context = [&] {
@@ -553,7 +591,7 @@ void ProgramImpl::prepare_graphs() {
                                  std::uint32_t min_frontier, std::uint32_t max_frontier,
                                  DecodeGraphExecutable* executable) {
                 if (mtp) {
-                    auto state = mtp_context();
+                    auto state = mtp_context(static_cast<std::uint32_t>(batch));
                     execution::mtp_decode_batch(state, batch, verify_drafts,
                                                 mtp_envelopes(max_frontier), executable, phase);
                 } else {
@@ -570,7 +608,7 @@ void ProgramImpl::prepare_graphs() {
                 const auto low   = profile.min_execution_frontier;
                 const auto high  = profile.max_execution_frontier;
                 if (mtp) {
-                    auto state = mtp_context();
+                    auto state = mtp_context(profile.batch_size);
                     execution::capture_mtp_decode_batch(state, batch, verify_drafts,
                                                         mtp_envelopes(high), profile.definition,
                                                         phase);

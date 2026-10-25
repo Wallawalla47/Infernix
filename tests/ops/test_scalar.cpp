@@ -2,6 +2,7 @@
 // transitions.  Expected values are computed directly from the logical input
 // state; no launcher or kernel implementation is used as an oracle.
 #include "infernix/ops/scalar.h"
+#include "ops/op_family.h"
 #include "ops/op_tester.h"
 
 #include <cstdint>
@@ -126,7 +127,7 @@ int increment_i64_contract(cudaStream_t stream) {
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(scalar) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;

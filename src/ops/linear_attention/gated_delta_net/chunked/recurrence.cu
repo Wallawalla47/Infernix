@@ -2,6 +2,10 @@
 #include "ops/common/math.cuh"
 #include "ops/common/mma.cuh"
 
+#include <cuda_fp16.h>
+
+#include <type_traits>
+
 namespace infernix::ops::detail::gated_delta_net::chunked {
 namespace {
 
@@ -67,16 +71,6 @@ __device__ __forceinline__ void load_f16_b(const float* p, int k, int n, int lan
     b0 = pack_f16x2_sat(p[value_index<DV>(k + 2 * t, col)], p[value_index<DV>(k + 2 * t + 1, col)]);
     b1 =
         pack_f16x2_sat(p[value_index<DV>(k + 2 * t + 8, col)], p[value_index<DV>(k + 2 * t + 9, col)]);
-}
-
-// D = A B in FP16 from a zero accumulator (mma_f16_f16acc accumulates into D).
-__device__ __forceinline__ void mma_f16_f16acc_zero(unsigned& d0, unsigned& d1, unsigned a0,
-                                                    unsigned a1, unsigned a2, unsigned a3,
-                                                    unsigned b0, unsigned b1) {
-    asm("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
-        "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%8,%8};\n"
-        : "=r"(d0), "=r"(d1)
-        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(0));
 }
 
 // The k16 products an FP16 partial sum spans before its FP32 carry (measured 2026-10-16 against
@@ -193,11 +187,33 @@ __device__ __forceinline__ void store_output(const Arguments& args, float (&acc)
     }
 }
 
-// Fp16 selects GdnChunkArithmetic::Fp16Accumulate (launch.h); without it the exact arithmetic.
-template <int DV, bool Fp16 = false>
+// fp16-gdn-state: the recurrent kernels' clamp (gated_delta_net/common.cuh), so a stored state
+// saturates at FP16's largest finite magnitude instead of overflowing.
+__device__ __forceinline__ float saturate_fp16_state(float value) {
+    constexpr float kMaximum = 65504.0f;
+    return value == value ? fminf(fmaxf(value, -kMaximum), kMaximum) : value;
+}
+
+__device__ __forceinline__ float stored_state(float value) { return value; }
+__device__ __forceinline__ float stored_state(__half value) { return __half2float(value); }
+
+template <class State>
+__device__ __forceinline__ State state_to_store(float value) {
+    if constexpr (std::is_same_v<State, float>) {
+        return value;
+    } else {
+        return __float2half_rn(saturate_fp16_state(value));
+    }
+}
+
+// Fp16 selects GdnChunkArithmetic::Fp16Accumulate (launch.h); without it the exact arithmetic. State is
+// the stored state's element type (float, or __half under fp16-gdn-state).
+template <int DV, bool Fp16 = false, class State = float>
 __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurrence_kernel(
     Arguments args, const QkChunk* __restrict__ qk_workspace,
     const ControlChunk* __restrict__ control_workspace) {
+    const State* __restrict__ state_in = static_cast<const State*>(args.state_in);
+    State* __restrict__ state_out      = static_cast<State*>(args.state_out);
     constexpr int kWarps = kThreads<DV> / 32;
     constexpr int NT     = DV / 8;
     constexpr int MW     = NT < kWarps ? kWarps / NT : 1;
@@ -223,10 +239,10 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
         for (int mi = 0; mi < MPW; ++mi) {
             const int key    = (m_start + mi * MW) * 16 + g;
             const int value  = value_start + n * 8 + t * 2;
-            state[ni][mi][0] = args.state_in[state_base + value * kStateDim + key];
-            state[ni][mi][1] = args.state_in[state_base + (value + 1) * kStateDim + key];
-            state[ni][mi][2] = args.state_in[state_base + value * kStateDim + key + 8];
-            state[ni][mi][3] = args.state_in[state_base + (value + 1) * kStateDim + key + 8];
+            state[ni][mi][0] = stored_state(state_in[state_base + value * kStateDim + key]);
+            state[ni][mi][1] = stored_state(state_in[state_base + (value + 1) * kStateDim + key]);
+            state[ni][mi][2] = stored_state(state_in[state_base + value * kStateDim + key + 8]);
+            state[ni][mi][3] = stored_state(state_in[state_base + (value + 1) * kStateDim + key + 8]);
         }
     }
     load_stage<DV>(sm.stage[0], args, qk_workspace, control_workspace, head, value_start, 0, tid);
@@ -479,31 +495,38 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
         for (int mi = 0; mi < MPW; ++mi) {
             const int key                                        = (m_start + mi * MW) * 16 + g;
             const int value                                      = value_start + n * 8 + t * 2;
-            args.state_out[state_base + value * kStateDim + key] = state[ni][mi][0];
-            args.state_out[state_base + (value + 1) * kStateDim + key]     = state[ni][mi][1];
-            args.state_out[state_base + value * kStateDim + key + 8]       = state[ni][mi][2];
-            args.state_out[state_base + (value + 1) * kStateDim + key + 8] = state[ni][mi][3];
+            state_out[state_base + value * kStateDim + key]           = state_to_store<State>(state[ni][mi][0]);
+            state_out[state_base + (value + 1) * kStateDim + key]     = state_to_store<State>(state[ni][mi][1]);
+            state_out[state_base + value * kStateDim + key + 8]       = state_to_store<State>(state[ni][mi][2]);
+            state_out[state_base + (value + 1) * kStateDim + key + 8] = state_to_store<State>(state[ni][mi][3]);
         }
     }
 }
 
-template <int DV, bool Fp16>
+template <int DV, bool Fp16, class State>
 void launch(const Arguments& args, const QkChunk* qk, const ControlChunk* control,
             cudaStream_t stream) {
     constexpr int shared_bytes = sizeof(RecurrenceShared<DV>);
-    CUDA_CHECK(cudaFuncSetAttribute(chunk_recurrence_kernel<DV, Fp16>,
+    CUDA_CHECK(cudaFuncSetAttribute(chunk_recurrence_kernel<DV, Fp16, State>,
                                     cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes));
-    chunk_recurrence_kernel<DV, Fp16>
+    chunk_recurrence_kernel<DV, Fp16, State>
         <<<args.value_heads*(kStateDim / DV), kThreads<DV>, shared_bytes, stream>>>(args, qk,
                                                                                     control);
     CUDA_CHECK(cudaGetLastError());
 }
 
+template <int DV, class State>
+void dispatch_state(const Arguments& args, const QkChunk* qk, const ControlChunk* control,
+                    cudaStream_t stream, bool fp16) {
+    if (fp16) return launch<DV, true, State>(args, qk, control, stream);
+    return launch<DV, false, State>(args, qk, control, stream);
+}
+
 template <int DV>
 void dispatch(const Arguments& args, const QkChunk* qk, const ControlChunk* control,
               cudaStream_t stream, bool fp16) {
-    if (fp16) return launch<DV, true>(args, qk, control, stream);
-    return launch<DV, false>(args, qk, control, stream);
+    if (args.fp16_state) return dispatch_state<DV, __half>(args, qk, control, stream, fp16);
+    return dispatch_state<DV, float>(args, qk, control, stream, fp16);
 }
 
 } // namespace

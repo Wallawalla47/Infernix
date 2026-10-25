@@ -213,6 +213,11 @@ struct DirectReadQueue::Impl {
         flags |= O_DIRECT;
 #    endif
         f.fd = ::open(path.c_str(), flags);
+#    ifdef O_DIRECT
+        // A filesystem without direct I/O (tmpfs, 9p, some FUSE mounts and Docker bind mounts)
+        // refuses O_DIRECT: the same aligned reads then go through the page cache.
+        if (f.fd < 0 && (errno == EINVAL || errno == EOPNOTSUPP)) { f.fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC); }
+#    endif
         if (f.fd < 0) { throw std::system_error(errno, std::generic_category(), "DirectReadQueue: open " + path.string()); }
         struct stat st {};
         if (::fstat(f.fd, &st) != 0) {

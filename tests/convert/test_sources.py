@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import struct
 
+import pytest
 import torch
 from safetensors.torch import save_file
 
@@ -163,3 +164,22 @@ def test_row_fp8_modelopt_per_tensor_scale_replicates_rows(tmp_path):
             codes.view(torch.float8_e4m3fn).float() * 0.25
         )
         assert torch.equal(source.values().reshape(2, 3).float(), expected)
+
+
+def test_shards_without_index_are_discovered(tmp_path):
+    first = torch.arange(6, dtype=torch.float32).to(torch.bfloat16).reshape(2, 3)
+    second = torch.arange(4, dtype=torch.int32)
+    save_file({"a.weight": first}, str(tmp_path / "model-00001-of-00002.safetensors"))
+    save_file({"b.weight": second}, str(tmp_path / "model-00002-of-00002.safetensors"))
+    with SafetensorsSource(tmp_path) as store:
+        assert sorted(store.weight_map) == ["a.weight", "b.weight"]
+        assert store.describe("b.weight").file.name == "model-00002-of-00002.safetensors"
+        assert torch.equal(store.read_flat("a.weight"), first.reshape(-1))
+        assert torch.equal(store.read_flat("b.weight"), second)
+
+
+def test_shards_without_index_reject_duplicate_tensors(tmp_path):
+    save_file({"a.weight": torch.zeros(2)}, str(tmp_path / "model-00001-of-00002.safetensors"))
+    save_file({"a.weight": torch.ones(2)}, str(tmp_path / "model-00002-of-00002.safetensors"))
+    with pytest.raises(ValueError, match="'a.weight' is in both"):
+        SafetensorsSource(tmp_path)

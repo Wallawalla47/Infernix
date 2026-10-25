@@ -25,10 +25,51 @@ std::size_t MtpConfidencePolicy::bucket(float q) noexcept {
     return b;
 }
 
-double MtpConfidencePolicy::acceptance(float q) const noexcept {
-    const std::size_t b = bucket(q);
-    const double prior  = 0.5 * (kEdges[b] + kEdges[b + 1]);
+double MtpConfidencePolicy::bucket_acceptance(std::size_t b) const noexcept {
+    const double prior = 0.5 * (kEdges[b] + kEdges[b + 1]);
     return (accepted_[b] + kPriorWeight * prior) / (tested_[b] + kPriorWeight);
+}
+
+double MtpConfidencePolicy::acceptance(float q) const noexcept { return bucket_acceptance(bucket(q)); }
+
+double MtpConfidencePolicy::step_threshold(std::uint32_t batch_size) const noexcept {
+    const double c = column_cost(batch_size);
+    double best    = 0.0;
+    for (std::size_t b = 0; b < kBuckets; ++b) { best = std::max(best, bucket_acceptance(b)); }
+    for (std::size_t b = 0; b < kBuckets; ++b) {
+        if (bucket_acceptance(b) * best > c) { return kEdges[b]; }
+    }
+    return 2.0;
+}
+
+bool MtpDraftRegime::draft(std::uint32_t batch_size) noexcept {
+    if (batch_size == 0 || batch_size > kMaximumConcurrency) { return true; }
+    Batch& batch            = batches_[batch_size - 1U];
+    const Regime& free      = batch.regimes[0];
+    const Regime& drafting  = batch.regimes[1];
+    const std::uint32_t at  = batch.round++;
+    bool draft              = true;
+    if (free.cycles < kMinCycles || drafting.cycles < kMinCycles) {
+        draft = (at / kProbeRounds) % 2U == 0U;
+    } else {
+        // Tokens per second, cross-multiplied (both regimes hold seconds).
+        const bool drafting_faster = drafting.tokens * free.seconds >= free.tokens * drafting.seconds;
+        const bool probe           = at % kProbePeriod >= kProbePeriod - kProbeRounds;
+        draft                      = drafting_faster != probe;
+    }
+    ++rounds_;
+    if (!draft) { ++draft_free_; }
+    return draft;
+}
+
+void MtpDraftRegime::observe(std::uint32_t batch_size, bool previous, bool drafted, std::uint32_t tokens,
+                             double seconds) noexcept {
+    if (batch_size == 0 || batch_size > kMaximumConcurrency || previous != drafted || !(seconds > 0.0)) { return; }
+    Regime& regime = batches_[batch_size - 1U].regimes[drafted ? 1 : 0];
+    if (regime.cycles >= kMinCycles && seconds * regime.cycles > kGapRatio * regime.seconds) { return; }
+    regime.tokens  = kDecay * regime.tokens + static_cast<double>(tokens);
+    regime.seconds = kDecay * regime.seconds + seconds;
+    regime.cycles  = kDecay * regime.cycles + 1.0;
 }
 
 void MtpConfidencePolicy::observe(std::span<const float> q, std::uint32_t extent, std::uint32_t accepted) noexcept {

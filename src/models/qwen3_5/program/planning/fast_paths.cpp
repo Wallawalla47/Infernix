@@ -268,6 +268,16 @@ constexpr std::array kQualified{
     Qualification{FastPath::AdaptiveDFlash, {16, ActivationClass::A16, KvCacheStorage::Fp8KeyNvfp4Value}},
     Qualification{FastPath::AdaptiveDFlash, {16, ActivationClass::A16, KvCacheStorage::Vq2}},
     Qualification{FastPath::AdaptiveDFlash, {16, ActivationClass::A16, KvCacheStorage::Q4KeyVq2Value}},
+    // batched-a8-decode (wide rounds' FP8 projections at the artifact's single-term 8-bit activations,
+    // ahead of the two-term residual profile) by the owner's decision (2026-10-24), although it failed its
+    // decode gate in the speculative arm on INT8 (model-quality.md 6.7): every KV format.
+    Qualification{FastPath::BatchedA8Decode, {24, ActivationClass::A4, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::BatchedA8Decode, {24, ActivationClass::A4, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::BatchedA8Decode, {24, ActivationClass::A4, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::BatchedA8Decode, {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::BatchedA8Decode, {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::BatchedA8Decode, {24, ActivationClass::A4, KvCacheStorage::Vq2}},
+    Qualification{FastPath::BatchedA8Decode, {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value}},
 };
 
 const char* kv_name(KvCacheStorage kv) {
@@ -347,7 +357,8 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
     case FastPath::BatchSplitAttention:
     case FastPath::Preemption: return true;
     case FastPath::BatchedA8Decode:
-    case FastPath::BatchedA8ResidualDecode: return configuration.activations != ActivationClass::A16;
+    case FastPath::BatchedA8ResidualDecode:
+    case FastPath::BatchedA8SubsetDecode: return configuration.activations != ActivationClass::A16;
     case FastPath::BatchedA4Decode:
     case FastPath::BatchedA4ResidualDecode: return configuration.activations == ActivationClass::A4;
     case FastPath::AdaptiveSpeculation: return options.speculative.backend != SpeculativeBackend::None;
@@ -383,16 +394,64 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
     // there, which lets the gate name it while its fast run prefills at --fast-chunk.
     case FastPath::IdleWidePrefill: return true;
     // The FP8 sites of the Qwen3.8-27B recipes already permit single-term A8 at prefill widths.
-    case FastPath::Fp8A8Pair: return false;
+    case FastPath::Fp8A8Pair:
+    case FastPath::Fp8A8PairBlock32: return false;
     // The W4A8 gate/up kernel runs only on groupwise Q4 weights (the text MLP's linear_swiglu).
     case FastPath::Q4W4A8: return configuration.q4_gate_up;
+    // The offloaded experts' wide calls (Qwen3.5-122B-A10B: every offloaded bank is NVFP4 W4A16, its
+    // shared expert one more job of the call). Not qualified for any Qwen3.5 configuration: it runs
+    // only as a --fast-path candidate.
     case FastPath::ExpertA4Residual:
-    case FastPath::ExpertA4Residual3: return false; // Qwen3.8-Flash-Next's W4A16 experts only
-    case FastPath::SampledMtpDrafts: return false; // Qwen3.8-Flash-Next's MTP drafter only
+    case FastPath::ExpertA4Residual3: return configuration.offloaded_experts;
+    // The narrow form is Flash-Next's geometry only (its CPU engine and narrow A4 kernels).
+    case FastPath::ExpertA4ResidualDecode: return false;
+    // Qwen3.8-Flash-Next's two-row DFlash2 rounds; Qwen3.5's several-row DFlash2 rounds are
+    // adaptive-speculation's.
+    case FastPath::DFlash2Pairs: return false;
+    // MTP rounds with resident experts and no n-gram copies (its sparse proposal rides the MTP
+    // drafts' window; --ngram-draft-tokens auto keeps copies off beside MTP); qualified nowhere on
+    // Qwen3.5 yet, so it runs only as a candidate.
+    case FastPath::SampledMtpDrafts:
+        return options.speculative.backend == SpeculativeBackend::Mtp && !configuration.offloaded_experts &&
+               options.speculative.ngram_draft_tokens == 0;
     // Every Text GDN layer normalizes Q/K, and its chunked calls serve prefill.
     case FastPath::GdnF16Accumulate: return true;
+    // The groupwise recipes' Q5 output and down projections; their artifacts compute with 16-bit
+    // activations (on an A16 artifact without Q5 linear_add weights the path changes nothing).
+    case FastPath::Q5KSplitMma: return configuration.activations == ActivationClass::A16;
     case FastPath::GgmlBf16Prefill: return false; // Qwen3.8-Flash-Next's GGUF imports only
-    case FastPath::ScreenedLmHead: return false;  // Qwen3.8-Flash-Next's screened head only
+    // Qwen3.8-Flash-Next's FP8 and MXFP8 dense projections only (the Qwen3.8-27B FP8 sites already take
+    // single-term A8 at prefill widths).
+    case FastPath::F16AccumulatePrefill: return false;
+    // BF16 KV prompt attention; qualified nowhere yet, so it runs only as a candidate.
+    case FastPath::Bf16PromptSplit: return configuration.kv == KvCacheStorage::BFloat16;
+    // The offloaded MoE layers' BF16 router (the Qwen3.5-122B-A10B: 256 experts plus the shared expert's
+    // score at H 3,072); the resident MoE models route their prefill through SparseMoe's own MMA router.
+    case FastPath::RouterMma: return configuration.offloaded_experts;
+    case FastPath::ScreenedLmHead: return false; // Qwen3.8-Flash-Next's screened head only
+    // Every Qwen3.5 artifact has GDN layers; qualified nowhere yet, so it runs only as a candidate.
+    case FastPath::Fp16GdnState: return true;
+    // Chains whose drafts carry their proposal laws: DFlash2's, and MTP's under sampled-mtp-drafts
+    // (without it MTP drafts argmax chains, which the block rule cannot improve and the greedy-draft
+    // verifier serves). Qualified nowhere yet, so it runs only as a candidate.
+    case FastPath::BlockVerification:
+        return options.speculative.backend == SpeculativeBackend::DFlash2 ||
+               options.speculative.backend == SpeculativeBackend::Mtp;
+    // Fixed-table tree rounds whose drafter builds the tree (DFlash2, DFlash): automatic widths
+    // derive a narrower width's tokens from the wider tree's walk, which UniVer's decision does not
+    // share, and MTP's chain is drawn before its siblings. Qualified nowhere yet: a candidate only.
+    case FastPath::UniverTrees:
+        return (options.speculative.backend == SpeculativeBackend::DFlash2 ||
+                options.speculative.backend == SpeculativeBackend::DFlash) &&
+               !options.speculative.draft_tree_auto &&
+               std::any_of(options.speculative.draft_tree_nodes.begin(),
+                           options.speculative.draft_tree_nodes.end(), [](std::uint32_t n) { return n != 0; });
+    // Every engine with tree rounds, fixed or automatic: only their GDN records change. Qualified
+    // nowhere yet: a candidate only (op bench against the walk first).
+    case FastPath::GdnTreeClosedForm:
+        return options.speculative.draft_tree_auto ||
+               std::any_of(options.speculative.draft_tree_nodes.begin(),
+                           options.speculative.draft_tree_nodes.end(), [](std::uint32_t n) { return n != 0; });
     }
     return false;
 }

@@ -6,6 +6,7 @@
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/q5/q5_operands.h"
 #include "ops/linear/q5/q5_a16_mma.cuh"
+#include "core/temporary_switches.h"
 
 namespace infernix::ops::detail {
 
@@ -24,14 +25,18 @@ void launch_q5_a16_mma(const Q5LinearOperands& operands, Output output, Epilogue
         const bool full = operands.rows % Schedule::kBlockRows == 0 &&
                           count % Schedule::kBlockTokens == 0 && operands.k == operands.padded_k &&
                           operands.k % Schedule::kBlockK == 0;
+        const auto launch = [&]<bool Full, bool Fp32Scale>() {
+            q5_a16_mma_kernel<Schedule, Full, Fp32Scale><<<grid, Schedule::kThreads, 0, stream>>>(
+                x, operands.codes, operands.high, operands.scales, output, epilogue, operands.rows,
+                operands.k, count, operands.padded_k, offset);
+        };
+        const bool fp32_scale = temporary_switches::q56_fp32_scale();
         if (full) {
-            q5_a16_mma_kernel<Schedule, true><<<grid, Schedule::kThreads, 0, stream>>>(
-                x, operands.codes, operands.high, operands.scales, output, epilogue, operands.rows,
-                operands.k, count, operands.padded_k, offset);
+            fp32_scale ? launch.template operator()<true, true>()
+                       : launch.template operator()<true, false>();
         } else {
-            q5_a16_mma_kernel<Schedule, false><<<grid, Schedule::kThreads, 0, stream>>>(
-                x, operands.codes, operands.high, operands.scales, output, epilogue, operands.rows,
-                operands.k, count, operands.padded_k, offset);
+            fp32_scale ? launch.template operator()<false, true>()
+                       : launch.template operator()<false, false>();
         }
         CUDA_CHECK(cudaGetLastError());
     });

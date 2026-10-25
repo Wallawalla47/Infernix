@@ -1,4 +1,5 @@
 #include "infernix/ops/rmsnorm_rope.h"
+#include "ops/op_family.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
 #include "infernix/ops/rmsnorm.h"
@@ -557,7 +558,7 @@ int run_text_wide_case(int query_heads, int key_heads, int tokens, std::uint32_t
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(rmsnorm_rope) {
     if (cuda_unavailable()) {
         std::cout << "rmsnorm_rope: SKIP (CUDA unavailable)\n";
         return 77;

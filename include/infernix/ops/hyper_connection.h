@@ -42,14 +42,25 @@ namespace infernix::ops {
 /// registered geometry (S = 4, H = 2560, rank a multiple of 8 up to 512) at T <= 16 run two fused
 /// kernels with every intermediate (Rn, z, m, u) in FP32, so a column's result does not depend on
 /// T within 1..16. Other weights and wider calls run the norm, linear (with `policy`), gates,
-/// linear and collapse steps with BF16 intermediates; with a Q8_G32_FP16 RowSplit W_up and 4 streams,
-/// calls of more than 96 columns compute the up linear and the collapse in one kernel that keeps u
-/// on chip, with the same bits as the separate steps. `workspace` is caller-owned transient
+/// linear and collapse steps with BF16 intermediates; with a Q8_G32_FP16 RowSplit W_up (or a BF16 one
+/// under the temporary INFERNIX_TMP_HC_BF16_UP_COLLAPSE) and 4 streams, calls of more than 96 columns
+/// compute the up linear and the collapse in one kernel that keeps u on chip, with the same bits as the
+/// separate steps. `workspace` is caller-owned transient
 /// storage of hyper_connection_mix_workspace_capacity_bytes; it must not overlap any operand.
 void hyper_connection_mix(const Tensor& residual, const Tensor& norm_weight, const Weight& down,
                           const Weight& up, LinearPolicy policy, std::int32_t streams,
                           std::int32_t rank, float eps, Tensor& x, Tensor* inject,
                           WorkspaceArena& workspace, cudaStream_t stream);
+
+/// hyper_connection_inject(y, pending_inject, residual) then hyper_connection_mix(residual, ...), with
+/// the same bits in x, inject and the residual (updated in place). Where the fused route serves the
+/// mix (T <= 16), the inject folds into its reads of the residual, which its second kernel writes
+/// back, so no separate inject runs; elsewhere the two Ops run in turn. `inject` (the mix's output)
+/// must not be `pending_inject`. Workspace: hyper_connection_mix_workspace_capacity_bytes.
+void hyper_connection_inject_mix(const Tensor& y, const Tensor& pending_inject, Tensor& residual,
+                                 const Tensor& norm_weight, const Weight& down, const Weight& up,
+                                 LinearPolicy policy, std::int32_t streams, std::int32_t rank, float eps,
+                                 Tensor& x, Tensor* inject, WorkspaceArena& workspace, cudaStream_t stream);
 
 /// The workspace hyper_connection_mix needs for every T in [1, max_tokens].
 [[nodiscard]] std::size_t hyper_connection_mix_workspace_capacity_bytes(

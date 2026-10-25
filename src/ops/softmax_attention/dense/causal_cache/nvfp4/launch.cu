@@ -186,4 +186,26 @@ void nvfp4_kv_cached_attention(const Tensor& q, const Tensor& positions, float s
                         plan, workspace, out, stream);
 }
 
+void nvfp4_kv_cached_rows_attention(const Tensor& q, const Tensor& positions, const Tensor& valid,
+                                    const Tensor& rows, float scale, PagedKVBatchLayerView cache,
+                                    CausalAttentionExecutionEnvelope envelope, std::int32_t call_batch,
+                                    WorkspaceArena& workspace, Tensor& out, DeviceExecutionView execution) {
+    auto plan = make_nvfp4_kv_causal_plan(q.ne[1], 1, call_batch, envelope,
+                                          execution.multiprocessor_count);
+    if (plan.family != Nvfp4KvFamily::Grouped || q.ne[2] != 1)
+        throw std::logic_error("NVFP4 attention: one-column rows take the grouped route");
+    plan.batch = q.ne[3];
+    execute_grouped(q, positions, scale, cache, &valid, &rows, nullptr, CausalCachedInput{}, plan,
+                    workspace, out, execution.stream);
+}
+
+std::size_t nvfp4_kv_cached_rows_workspace_bytes(int heads, int call_batch, int rows,
+                                                 CausalAttentionExecutionEnvelope envelope,
+                                                 int multiprocessor_count) {
+    const auto plan = make_nvfp4_kv_causal_plan(heads, 1, call_batch, envelope, multiprocessor_count);
+    WorkspaceLayoutBuilder layout;
+    (void)allocate_causal_partials(layout, heads, 1, plan.partition.capacity, rows);
+    return layout.peak_bytes(1);
+}
+
 } // namespace infernix::ops::detail

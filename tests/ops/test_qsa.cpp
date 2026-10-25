@@ -33,6 +33,7 @@
 //     bytes; the tails exactly; every other cache byte untouched; and bit for bit: W = 8 against
 //     eight W = 1 calls, B = 4 against four B = 1 calls, K/V-only and in-place calls, page spaces and
 //     CUDA Graph replay over new device rows and positions.
+#include "ops/op_family.h"
 #include "core/arena.h"
 #include "core/paged_kv_cache.h"
 #include "core/paged_kv_storage.h"
@@ -41,6 +42,7 @@
 #include "infernix/ops/qsa.h"
 #include "ops/host_parallel.h"
 #include "ops/op_tester.h"
+#include "ops/qsa/qsa_prompt.h"
 #include "ops/softmax_attention/oracle.h"
 
 #include <cuda_fp16.h>
@@ -58,6 +60,7 @@
 #include <map>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <random>
 #include <set>
 #include <string>
@@ -130,6 +133,16 @@ void expect(bool ok, const std::string& what) {
         ++g_failures;
     }
 }
+
+// TEMPORARY (INFERNIX_TMP_QSA_PROMPT_V2): its scope runs the prompt kernel's other variant (the split
+// K/V stage or the combined gather) than the process's setting, which it restores.
+struct OtherPromptVariant {
+    bool was = ops::detail::qsa_prompt_v2();
+    OtherPromptVariant() { ops::detail::qsa_prompt_set_v2(!was); }
+    ~OtherPromptVariant() { ops::detail::qsa_prompt_set_v2(was); }
+    OtherPromptVariant(const OtherPromptVariant&)            = delete;
+    OtherPromptVariant& operator=(const OtherPromptVariant&) = delete;
+};
 
 // ----------------------------------------------------------------------------------- values
 
@@ -1194,6 +1207,20 @@ void test_attention(KvCacheStorage storage, const AttentionCase& c, std::uint32_
     synchronize("attention");
     const auto got = t::from_device_bf16(dout, static_cast<std::size_t>(kD) * kHeads * columns);
     const std::string tag = std::string("qsa_attention ") + storage_name(storage) + " " + c.name;
+    // The prompt kernel's temporary split stage (INFERNIX_TMP_QSA_PROMPT_V2) and its combined gather
+    // give the same bits (calls off the one-stage prompt route run the same kernel either way).
+    {
+        const OtherPromptVariant other;
+        DeviceBuffer dother(static_cast<std::size_t>(kD) * kHeads * columns * 2);
+        Tensor other_out(dother.p, DType::BF16, {kD, kHeads, columns});
+        ops::qsa_attention(Tensor(dq.p, DType::BF16, {kD, kHeads, columns}),
+                           Tensor(diq.p, DType::BF16, {kDi, kIndexHeads, columns}), layer, batch, kGeometry,
+                           1.0F / 16.0F, max_context, workspace.p, workspace_bytes, other_out, nullptr);
+        synchronize("attention, other prompt variant");
+        const std::size_t n = static_cast<std::size_t>(kD) * kHeads * columns;
+        expect(download<std::uint16_t>(dother, n) == download<std::uint16_t>(dout, n),
+               tag + ": the prompt kernel's split stage and combined gather give the same bits");
+    }
     // Width invariance inside the unsplit class: the row's last 100 columns as a call of their own
     // (also unsplit) give the same bits; the prefix cache resumes rely on it.
     if (rows == 1 && width >= 186) {
@@ -1322,12 +1349,19 @@ void test_attention(KvCacheStorage storage, const AttentionCase& c, std::uint32_
         moved_batch.block_tables  = Tensor(dmoved.p, DType::I32, {pages_per_row, rows});
         DeviceBuffer dspaced(static_cast<std::size_t>(kD) * kHeads * columns * 2);
         Tensor spaced_out(dspaced.p, DType::BF16, {kD, kHeads, columns});
-        ops::qsa_attention(Tensor(dq.p, DType::BF16, {kD, kHeads, columns}),
-                           Tensor(diq.p, DType::BF16, {kDi, kIndexHeads, columns}), spaced, moved_batch, kGeometry,
-                           1.0F / 16.0F, max_context, workspace.p, workspace_bytes, spaced_out, nullptr);
-        synchronize("attention over page spaces");
-        const auto spaced_got = t::from_device_bf16(dspaced, static_cast<std::size_t>(kD) * kHeads * columns);
-        expect(spaced_got == got, tag + ": pages in host and lent spaces give the pool's bits");
+        // Both prompt variants: the split stage's gathers translate the page spaces too.
+        for (const bool other_variant : {false, true}) {
+            std::optional<OtherPromptVariant> other;
+            if (other_variant) { other.emplace(); }
+            ops::qsa_attention(Tensor(dq.p, DType::BF16, {kD, kHeads, columns}),
+                               Tensor(diq.p, DType::BF16, {kDi, kIndexHeads, columns}), spaced, moved_batch,
+                               kGeometry, 1.0F / 16.0F, max_context, workspace.p, workspace_bytes, spaced_out,
+                               nullptr);
+            synchronize("attention over page spaces");
+            const auto spaced_got = t::from_device_bf16(dspaced, static_cast<std::size_t>(kD) * kHeads * columns);
+            expect(spaced_got == got, tag + ": pages in host and lent spaces give the pool's bits" +
+                                          (other_variant ? " (other prompt variant)" : ""));
+        }
         cudaFreeHost(host_mem);
     }
     std::vector<double> ref(got.size());
@@ -1376,6 +1410,90 @@ void test_attention(KvCacheStorage storage, const AttentionCase& c, std::uint32_
             });
     }
     g_failures += t::verify_reduction(tag, got, ref, kAttentionCriterion);
+}
+
+// TEMPORARY (INFERNIX_TMP_QSA_PROMPT_V2): the prompt kernel's split stage against its combined gather,
+// bit for bit, at the real prefill shape: one 4,096-column chunk whose first column is at `start`
+// (0: a 4K prompt, dense columns, the dense/selected boundary and lists off the tile grid; 28,672: the
+// last chunk of a 32K prompt, every column on 2,048 selected tokens plus its tail), scattered pages.
+// The FP64 oracle qualifies the combined gather in test_attention at narrower widths; equal bits
+// carry it over.
+void test_prompt_variants(KvCacheStorage storage, int start, std::uint32_t seed) {
+    constexpr int kWidth = 4096;
+    std::mt19937 rng(seed);
+    const auto layout     = infernix::paged_kv_storage_layout(storage, kD);
+    const int context     = start + kWidth;
+    const int pages       = (context + kPage - 1) / kPage;
+    const int max_context = pages * kPage;
+    std::vector<std::int32_t> tables(pages);
+    std::iota(tables.begin(), tables.end(), 0);
+    std::shuffle(tables.begin(), tables.end(), rng);
+    const StoredVector key_plane(layout.key, pages, rng), value_plane(layout.value, pages, rng);
+    const auto pooled = grid_bf16(rng, static_cast<std::size_t>(kSlotWidth) * kPage * pages);
+    const auto q      = random_bf16(rng, static_cast<std::size_t>(kD) * kHeads * kWidth, 1.0);
+    const auto iq     = grid_bf16(rng, static_cast<std::size_t>(kDi) * kIndexHeads * kWidth);
+    std::vector<std::int32_t> positions(kWidth), table_rows{0}, tail_slots{0};
+    std::iota(positions.begin(), positions.end(), start);
+
+    DeviceBuffer dk = upload(key_plane.data), dv = upload(value_plane.data);
+    DeviceBuffer dks, dvs;
+    if (layout.key.has_scale()) { dks = upload(key_plane.scales); }
+    if (layout.value.has_scale()) { dvs = upload(value_plane.scales); }
+    DeviceBuffer dpooled = upload(pooled), dq = upload(q), diq = upload(iq), dtables = upload(tables);
+    DeviceBuffer dpos = upload(positions), drows = upload(table_rows), dslots = upload(tail_slots);
+    ops::QsaKVLayer layer;
+    layer.kv.storage      = storage;
+    layer.kv.head_dim     = kD;
+    layer.kv.num_kv_heads = kKvHeads;
+    const auto plane      = [&](const DeviceBuffer& b, DType dtype, int leading) {
+        return Tensor(b.p, dtype, {leading, kPage, kKvHeads, pages});
+    };
+    layer.kv.k_pages = plane(dk, layout.key.data_dtype, layout.key.data_leading_extent);
+    layer.kv.v_pages = plane(dv, layout.value.data_dtype, layout.value.data_leading_extent);
+    if (layout.key.has_scale()) {
+        layer.kv.k_scale_pages = plane(dks, layout.key.scale_dtype, layout.key.scale_leading_extent);
+    }
+    if (layout.value.has_scale()) {
+        layer.kv.v_scale_pages = plane(dvs, layout.value.scale_dtype, layout.value.scale_leading_extent);
+    }
+    layer.pooled_pages = Tensor(dpooled.p, DType::BF16, {kSlotWidth, kPage, 1, pages});
+    const ops::QsaBatch batch{.block_tables = Tensor(dtables.p, DType::I32, {pages, 1}),
+                              .table_rows   = Tensor(drows.p, DType::I32, {1}),
+                              .positions    = Tensor(dpos.p, DType::I32, {kWidth}),
+                              .tail_slots   = Tensor(dslots.p, DType::I32, {1}),
+                              .batch        = 1,
+                              .width        = kWidth};
+    const std::size_t workspace_bytes = ops::qsa_attention_workspace_bytes(kGeometry, kWidth, max_context, storage);
+    DeviceBuffer workspace(workspace_bytes);
+    const std::size_t elements = static_cast<std::size_t>(kD) * kHeads * kWidth;
+    const auto run = [&](bool split) {
+        const bool was = ops::detail::qsa_prompt_v2();
+        ops::detail::qsa_prompt_set_v2(split);
+        DeviceBuffer dout(elements * 2);
+        Tensor out(dout.p, DType::BF16, {kD, kHeads, kWidth});
+        ops::qsa_attention(Tensor(dq.p, DType::BF16, {kD, kHeads, kWidth}),
+                           Tensor(diq.p, DType::BF16, {kDi, kIndexHeads, kWidth}), layer, batch, kGeometry,
+                           1.0F / 16.0F, max_context, workspace.p, workspace_bytes, out, nullptr);
+        synchronize("attention, prompt variant");
+        ops::detail::qsa_prompt_set_v2(was);
+        return download<std::uint16_t>(dout, elements);
+    };
+    const auto combined = run(false), split = run(true);
+    std::size_t first_difference = elements;
+    for (std::size_t i = 0; i < elements && first_difference == elements; ++i) {
+        if (combined[i] != split[i]) { first_difference = i; }
+    }
+    const bool finite = std::all_of(combined.begin(), combined.end(),
+                                    [](std::uint16_t h) { return (h & 0x7f80U) != 0x7f80U; });
+    const std::string tag = std::string("qsa_attention ") + storage_name(storage) + " prompt W=4096 from " +
+                            std::to_string(start);
+    expect(finite, tag + ": finite output");
+    expect(first_difference == elements,
+           tag + ": the split stage gives the combined gather's bits" +
+               (first_difference == elements
+                    ? std::string()
+                    : " (first difference at column " + std::to_string(first_difference / (kD * kHeads)) +
+                          ", head " + std::to_string(first_difference / kD % kHeads) + ")"));
 }
 
 // ----------------------------------------------------------------------------------- prepare
@@ -2079,6 +2197,9 @@ void run_storage_part(KvCacheStorage storage, std::uint32_t prepare_seed) {
                                    {"prompt W=43 B=1 class edge (170 SMs)", 43, {7000}}};
     std::uint32_t seed = 31;
     for (const auto& c : cases) { test_attention(storage, c, seed++); }
+    // The real prefill chunk of a 4K and a 32K prompt in both prompt variants (temporary A/B).
+    test_prompt_variants(storage, 0, 91);
+    test_prompt_variants(storage, 28672, 92);
     expect(ops::qsa_prepare_supports(storage), std::string("qsa_prepare supports ") + storage_name(storage));
     test_prepare(storage, prepare_seed);
 }
@@ -2101,7 +2222,7 @@ void run_vq_part(KvCacheStorage storage) {
 
 } // namespace
 
-int main(int argc, char** argv) {
+INFERNIX_OP_TEST(qsa) {
     // --part selects one independent part, so CTest runs them concurrently: `index` (index queries,
     // pooled keys, the YaRN prepare), one KV storage (`bf16`, `int8`, `fp8`, `nvfp4`, `k8v4`:
     // attention and the fused prepare) or one vector-quantized storage (`vq2`, `k4v2`). Each case

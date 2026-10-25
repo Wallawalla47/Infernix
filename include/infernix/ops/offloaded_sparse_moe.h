@@ -10,6 +10,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 namespace infernix::ops {
 
@@ -140,6 +141,10 @@ struct MoeCpuChannel {
     // misses / pcie_divisor of a call's misses stay on the GPU stage (0: the CPU takes up to
     // max_jobs of them), so the CPU and the PCIe stage share the call's misses.
     std::int32_t pcie_divisor           = 3;
+    // When > 0, (misses * pcie_share) >> 8 of them stay on the GPU stage instead of misses /
+    // pcie_divisor (a share in 256ths: Strata's measured link share, a temporary A/B of the Flash-Next
+    // design §19.3.12 divisor rule). One-column calls with a one-column divisor keep theirs.
+    std::int32_t pcie_share             = 0;
     // One-column calls (plain decode) use this divisor instead (0: pcie_divisor). When
     // one_column_divisor_device is set, they read it there at execution instead (a device I32 the
     // caller rewrites between rounds, so captured graphs follow it: Qwen4Exp's plain decode by
@@ -151,6 +156,9 @@ struct MoeCpuChannel {
     // to wide_jobs <= kMaxCpuJobs CPU-served misses.
     std::int32_t wide_from              = 0;
     std::int32_t wide_jobs              = 0;
+    // The arithmetic the service computes W4A16 jobs with (CpuMissService::Options::narrow_a16);
+    // moe_experts requires it to equal the source's narrow_a16, so a CPU-served miss keeps the GPU's bits.
+    offloaded_moe::NarrowA16 narrow_a16 = offloaded_moe::NarrowA16::kExact;
 };
 
 /// Device memory a call warms into L2 while it waits for its CPU-served misses (design §19.3.3
@@ -185,12 +193,38 @@ struct MoeFetchChannel {
 /// storage layouts §9). gate_up_format == NVFP4_MUL selects the NVFP4 record and its
 /// routes. Both banks run exact A16 arithmetic on every column count, so their outputs depend on
 /// neither placement nor batch.
+// TEMPORARY (A/B of the GGUF banks' prefill expert tiles, docs/maintainer/qwen3_8-flash-next-design.md
+// §19.3.29): the defaults are the measured routing; from_environment() reads the switches once.
+// - INFERNIX_TMP_IQ_STAGE_DECODE_MIN_COLUMNS / _MAX_COLUMNS: ggml-bf16-prefill calls
+//   (WideA16::kGgmlBf16) of [min, max) columns run the BF16 stage-decode tiles (each K stage's codes
+//   decoded into shared memory, no planes: the planes' bits) instead of the exact tiles or the
+//   planes. Unset: no call (min = max = INT32_MAX).
+// - INFERNIX_TMP_IQ_PLANE_MIN_COLUMNS: ggml-bf16-prefill calls of at least this many columns carve
+//   the planes (the workspace layout reads from_environment()'s, every call the same) and, unless
+//   stage_decode takes them, run on them; below it the exact tiles. Default 14,336
+//   (offloaded_moe::wide::kGgmlBf16MinColumns); lower only to time the planes at narrower calls.
+// - INFERNIX_TMP_GGML_SHARED_CODEBOOKS=1: the exact gate/up tiles and the plane decode read the
+//   codebooks from shared memory (the same bits).
+struct MoeGgmlTiles {
+    std::int32_t stage_decode_min_columns = INT32_MAX;
+    std::int32_t stage_decode_max_columns = INT32_MAX;
+    std::int32_t plane_min_columns        = 14336;
+    bool shared_codebooks                 = false;
+
+    [[nodiscard]] bool stage_decode(std::int32_t columns) const noexcept {
+        return columns >= stage_decode_min_columns && columns < stage_decode_max_columns;
+    }
+    // Read once (core/temporary_switches.h, which the startup log lists).
+    [[nodiscard]] static const MoeGgmlTiles& from_environment();
+};
+
 struct MoeGgmlBank {
     QType gate_up_format       = QType::NVFP4_MUL;
     QType down_format          = QType::NVFP4_MUL;
     std::uint32_t gate_row_bytes = 0;
     std::uint32_t down_row_bytes = 0;
     std::uint64_t record_bytes = 0; // bytes a stage copies: the record rounded up to 16 (within its stride)
+    MoeGgmlTiles tiles;             // the prefill tiles' TEMPORARY switches (default: the measured routing)
 };
 
 struct MoeExpertSource {
@@ -212,6 +246,10 @@ struct MoeExpertSource {
     // How long the CPU wait and the fetch poller wait on a heartbeat that stands still (GPU time)
     // before they write kErrorHostSilent / kErrorFetchSilent.
     std::uint64_t heartbeat_timeout_ns = offloaded_moe::kHeartbeatTimeoutNs;
+    // TEMPORARY (INFERNIX_TMP_REPLAY_BENCH): optional device word; each call's CPU wait adds the GPU
+    // nanoseconds it waited for the host's answer (the replay bench's waits, subtracted from its
+    // round time).
+    unsigned long long* wait_ns = nullptr;
     std::uint64_t record_stride      = 0;
     const offloaded_moe::ExpertScales* scales = nullptr;
     // The layer's expert arithmetic: W4A4 with stored input scales (§16.2), or W4A16 for experts
@@ -221,6 +259,11 @@ struct MoeExpertSource {
     // W4A16 experts' wide route: exact (default) or the two-term A4 fast path (design §19.3.23); the
     // workspace must be sized for the same choice. Narrow routes and W4A4 experts ignore it.
     offloaded_moe::WideA16 wide_a16 = offloaded_moe::WideA16::kExact;
+    // W4A16 experts' narrow route (experts of at most kMaxColumns columns in the call): exact (default)
+    // or expert-a4-residual-decode's two-term A4 with exact sums (offloaded_moe::NarrowA16; NVFP4 banks
+    // at Flash-Next's geometry, any wide route but kLossless). The workspace is the one wide_a16 sizes;
+    // a CPU channel must carry the same choice. W4A4 experts ignore it.
+    offloaded_moe::NarrowA16 narrow_a16 = offloaded_moe::NarrowA16::kExact;
     // With kLossless: the design reference's expert activations (offloaded_moe::LosslessExpertDesign).
     offloaded_moe::LosslessExpertDesign lossless_design = offloaded_moe::LosslessExpertDesign::kNone;
     std::uint8_t* staging_base  = nullptr;
@@ -265,8 +308,8 @@ struct MoeExpertSource {
     std::uint64_t frame_stride = 0;
     MoeGgmlBank ggml;
     // The bank's expert geometry (offloaded_moe::ExpertShape): Qwen3.8-Flash-Next's H 2560 / I 640
-    // for every bank, or Qwen3.5-122B-A10B's H 3072 / I 1024 for NVFP4 W4A16 banks on the exact and
-    // lossless routes. x and outputs have shape.hidden rows; the CPU channel's service serves the
+    // for every bank, or Qwen3.5-122B-A10B's H 3072 / I 1024 for NVFP4 W4A16 banks on the exact, A4
+    // residual and lossless routes. x and outputs have shape.hidden rows; the CPU channel's service serves the
     // same geometry.
     offloaded_moe::ExpertShape shape = offloaded_moe::kFlashNextShape;
     // The layer's shared expert as the call's last job (design §8.6; NVFP4 W4A16 banks): expert

@@ -53,6 +53,19 @@ int main() {
         infernix::ContextLengthDetails{.prompt_tokens = 512, .max_context = 128, .exact = false}));
     failures += check(bounded.message.find("resulted in more than 512 tokens.") != std::string::npos,
                       "a bounded recount claimed an exact prompt length");
+    // The prompt's images together over the vision budget answer as a context overflow (agent clients
+    // compact on it), with a note on what the counts are; a single item over capacity stays 400.
+    const infernix::serve::ApiError vision = infernix::serve::request_error_to_api_error(infernix::RequestError(
+        infernix::ContextLengthDetails{.prompt_tokens = 40'959, .max_context = 32'768, .exact = false, .vision = true}));
+    failures += check(vision.status == 400 && vision.code == "context_length_exceeded" && vision.context_length &&
+                          vision.context_length->vision &&
+                          vision.message.starts_with("This model's maximum context length is 32768 tokens. However, "
+                                                     "your messages resulted in more than 40959 tokens. Please reduce "
+                                                     "the length of the messages. (") &&
+                          vision.message.find("vision budget of 32768 tokens") != std::string::npos,
+                      "an aggregate vision overflow did not answer in the context-overflow form");
+    failures += check(counted.message.find("vision") == std::string::npos,
+                      "a text context overflow carried the vision note");
     const infernix::serve::ApiError thinking_capacity = infernix::serve::request_error_to_api_error(
         infernix::RequestError(infernix::RequestErrorKind::ThinkingBudgetCapacityInsufficient,
                              "thinking control suffix does not fit"));

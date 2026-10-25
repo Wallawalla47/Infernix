@@ -112,14 +112,15 @@ void accept_greedy_drafts(const Tensor& target_tokens, const Tensor& logits, con
                                   static_cast<unsigned int>(batch));
     CUDA_CHECK(pdl::launch_consumer(
         {dim3(batched_group_grid), dim3(kSamplerGroupBlock), 0, stream},
-        speculative_sampling_group_finalize_kernel<false>,
+        speculative_sampling_group_finalize_kernel<Logit, false>,
         static_cast<const std::int32_t*>(target_tokens.data),
         static_cast<const std::int32_t*>(drafts.data), nullptr, nullptr,
         static_cast<const std::int32_t*>(current_extents.data),
         static_cast<std::int32_t*>(lengths.data), static_cast<std::int32_t*>(anchors.data),
         static_cast<std::int32_t*>(licensed_tokens.data),
         static_cast<std::int32_t*>(licensed_counts.data), static_cast<std::int32_t*>(accepted.data),
-        configs, token_domain, cols, partial_blocks, groups, scratch, layout.bytes));
+        configs, token_domain, cols, partial_blocks, groups, scratch, layout.bytes,
+        static_cast<const Logit*>(logits.data), physical_rows));
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -128,17 +129,18 @@ void accept_sparse_drafts(const Tensor& target_tokens, const Tensor& logits, con
                           const Tensor& candidate_ids, const Tensor& proposal_q, const Tensor& current_extents,
                           Tensor& round_lengths, Tensor& round_anchors, Tensor& licensed_tokens,
                           Tensor& licensed_counts, Tensor& accepted_drafts, std::int32_t token_domain,
-                          const SamplingConfig* configs, bool raw_greedy, DeviceSpan workspace,
-                          cudaStream_t stream) {
+                          const SamplingConfig* configs, bool raw_greedy, bool block_verification,
+                          DeviceSpan workspace, cudaStream_t stream) {
     const std::int32_t batch = drafts.ne[1];
     const std::int32_t k     = drafts.ne[0];
     const std::int32_t cols  = k + 1;
     if (raw_greedy) {
-        speculative_accept_sparse_warp_greedy_kernel<<<1, 32 * batch, 0, stream>>>(
-            static_cast<const int*>(target_tokens.data), static_cast<const int*>(drafts.data),
-            static_cast<const int*>(current_extents.data), static_cast<int*>(round_lengths.data),
-            static_cast<int*>(round_anchors.data), static_cast<int*>(licensed_tokens.data),
-            static_cast<int*>(licensed_counts.data), static_cast<int*>(accepted_drafts.data), k);
+        speculative_accept_sparse_warp_greedy_kernel<Logit><<<1, 32 * batch, 0, stream>>>(
+            static_cast<const int*>(target_tokens.data), static_cast<const Logit*>(logits.data),
+            static_cast<const int*>(drafts.data), static_cast<const int*>(current_extents.data),
+            static_cast<int*>(round_lengths.data), static_cast<int*>(round_anchors.data),
+            static_cast<int*>(licensed_tokens.data), static_cast<int*>(licensed_counts.data),
+            static_cast<int*>(accepted_drafts.data), configs, logits.ne[0], k);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
@@ -162,7 +164,9 @@ void accept_sparse_drafts(const Tensor& target_tokens, const Tensor& logits, con
                           static_cast<unsigned int>(batch));
 
     CUDA_CHECK(pdl::launch_consumer({dim3(group_grid), dim3(kSamplerGroupBlock), 0, stream},
-                                    speculative_sampling_group_finalize_kernel<true>,
+                                    block_verification
+                                        ? speculative_sampling_group_finalize_kernel<Logit, true, true>
+                                        : speculative_sampling_group_finalize_kernel<Logit, true, false>,
                                     static_cast<const std::int32_t*>(target_tokens.data),
                                     static_cast<const std::int32_t*>(drafts.data),
                                     static_cast<const std::int32_t*>(candidate_ids.data),
@@ -174,7 +178,8 @@ void accept_sparse_drafts(const Tensor& target_tokens, const Tensor& logits, con
                                     static_cast<std::int32_t*>(licensed_counts.data),
                                     static_cast<std::int32_t*>(accepted_drafts.data), configs,
                                     token_domain, cols, partial_blocks, groups, scratch,
-                                    layout.bytes));
+                                    layout.bytes, static_cast<const Logit*>(logits.data),
+                                    logits.ne[0]));
 
     CUDA_CHECK(cudaGetLastError());
 }
@@ -204,16 +209,17 @@ void speculative_accept_sparse_drafts_launch(
     const Tensor& candidate_ids, const Tensor& proposal_q, const Tensor& current_extents,
     Tensor& round_lengths, Tensor& round_anchors, Tensor& licensed_tokens, Tensor& licensed_counts,
     Tensor& accepted_drafts, std::int32_t token_domain, const SamplingConfig* configs,
-    bool raw_greedy, DeviceSpan workspace, cudaStream_t stream) {
+    bool raw_greedy, bool block_verification, DeviceSpan workspace, cudaStream_t stream) {
     if (logits.dtype == DType::FP32) {
         accept_sparse_drafts<float>(target_tokens, logits, drafts, candidate_ids, proposal_q, current_extents,
                                     round_lengths, round_anchors, licensed_tokens, licensed_counts,
-                                    accepted_drafts, token_domain, configs, raw_greedy, workspace, stream);
+                                    accepted_drafts, token_domain, configs, raw_greedy, block_verification,
+                                    workspace, stream);
     } else {
         accept_sparse_drafts<__nv_bfloat16>(target_tokens, logits, drafts, candidate_ids, proposal_q,
                                             current_extents, round_lengths, round_anchors, licensed_tokens,
                                             licensed_counts, accepted_drafts, token_domain, configs, raw_greedy,
-                                            workspace, stream);
+                                            block_verification, workspace, stream);
     }
 }
 
@@ -249,13 +255,14 @@ void accept_sparse_tree(const Tensor& target_tokens, const Tensor& logits, const
     const std::int32_t cols  = drafts.ne[0] + 1;
     const auto* trees        = static_cast<const SpeculativeTreeRow*>(tree_rows.data);
     if (raw_greedy) {
-        speculative_accept_tree_warp_greedy_kernel<<<1, 32 * batch, 0, stream>>>(
-            static_cast<const int*>(target_tokens.data), static_cast<const int*>(drafts.data),
-            static_cast<const int*>(current_extents.data), static_cast<int*>(round_lengths.data),
-            static_cast<int*>(round_anchors.data), static_cast<int*>(licensed_tokens.data),
-            static_cast<int*>(licensed_counts.data), static_cast<int*>(accepted_drafts.data),
-            static_cast<int*>(accepted_path.data), static_cast<int*>(accepted_branch.data), trees,
-            cols);
+        speculative_accept_tree_warp_greedy_kernel<Logit><<<1, 32 * batch, 0, stream>>>(
+            static_cast<const int*>(target_tokens.data), static_cast<const Logit*>(logits.data),
+            static_cast<const int*>(drafts.data), static_cast<const int*>(current_extents.data),
+            static_cast<int*>(round_lengths.data), static_cast<int*>(round_anchors.data),
+            static_cast<int*>(licensed_tokens.data), static_cast<int*>(licensed_counts.data),
+            static_cast<int*>(accepted_drafts.data), static_cast<int*>(accepted_path.data),
+            static_cast<int*>(accepted_branch.data), trees, configs, static_cast<int>(logits.ne[0]),
+            static_cast<int>(cols));
         CUDA_CHECK(cudaGetLastError());
         return;
     }
@@ -279,7 +286,7 @@ void accept_sparse_tree(const Tensor& target_tokens, const Tensor& logits, const
     const dim3 group_grid(static_cast<unsigned int>(groups), static_cast<unsigned int>(cols),
                           static_cast<unsigned int>(batch));
     CUDA_CHECK(pdl::launch_consumer({dim3(group_grid), dim3(kSamplerGroupBlock), 0, stream},
-                                    speculative_tree_sampling_group_finalize_kernel,
+                                    speculative_tree_sampling_group_finalize_kernel<Logit>,
                                     static_cast<const std::int32_t*>(target_tokens.data),
                                     static_cast<const std::int32_t*>(drafts.data),
                                     static_cast<const std::int32_t*>(candidate_ids.data),
@@ -293,7 +300,8 @@ void accept_sparse_tree(const Tensor& target_tokens, const Tensor& logits, const
                                     static_cast<std::int32_t*>(accepted_path.data),
                                     static_cast<std::int32_t*>(accepted_branch.data), configs,
                                     token_domain, partial_blocks, groups, scratch, layout.bytes,
-                                    trees, static_cast<int>(cols)));
+                                    trees, static_cast<int>(cols), static_cast<const Logit*>(logits.data),
+                                    logits.ne[0]));
     CUDA_CHECK(cudaGetLastError());
 }
 

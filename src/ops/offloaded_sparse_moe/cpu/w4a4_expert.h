@@ -37,7 +37,8 @@ static_assert(kRecordBytes == 675 * 4096);
 
 // The expert geometries this Op computes in the `nvfp4_expert_rg16_v1` layout: Qwen3.8-Flash-Next's
 // H 2560 / I 640 (every bank and arithmetic; the constants above), and Qwen3.5-122B-A10B's
-// H 3072 / I 1024 (W4A16 banks only: the exact narrow, wide and CPU routes and the reference route).
+// H 3072 / I 1024 (W4A16 banks only: the exact narrow, wide and CPU routes, the A4 residual wide routes
+// and the reference route).
 // The record is the gate/up matrix (2I rows, interleaved gate/up, of H) then the down matrix
 // (H rows of I), each as row-group-major 144-byte units.
 template <int Hidden, int Intermediate>
@@ -128,6 +129,15 @@ enum class ExpertActivation : std::uint8_t { kA4, kA16 };
 // value (an NVFP4 bank's multipliers in ExpertScales::alpha_*), every projection's exact sum correctly
 // rounded to BF16, h = bf16(bf16(silu(y_gate)) y_up) (ops::lossless_linear_tiles).
 enum class WideA16 : std::uint8_t { kExact, kA4Residual, kA4Residual3, kGgmlBf16, kLossless };
+
+// The narrow route of 16-bit-activation experts (calls of at most kMaxColumns columns per expert:
+// decode and verification) and of the CPU engine: kExact, the exact limb arithmetic of §16.2.1;
+// kA4Residual (NVFP4 W4A16 banks at Flash-Next's geometry, the expert-a4-residual-decode fast path),
+// each x and h row as two NVFP4 terms with one FP32 row scale (canon::a4r_block_terms, the wide
+// route's encoding) and the terms' products summed exactly in int64 (canon::a4r_row_output), so the
+// GPU narrow kernels and the CPU engine give the same bits and an expert's output does not depend
+// on where it is computed. Wide calls follow WideA16.
+enum class NarrowA16 : std::uint8_t { kExact, kA4Residual };
 
 // The design reference's routed-expert activations (kLossless only; docs/maintainer/lossless-route.md §3b):
 // none (the lossless route's x as stored), or a W4A4 bank's declared A4 inputs, each column quantized with

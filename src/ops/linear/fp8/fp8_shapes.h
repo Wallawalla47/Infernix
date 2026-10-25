@@ -1,8 +1,11 @@
 #pragma once
+#include "ops/linear/f16acc/f16acc_plan.h"
 #include "ops/linear/fp8/fp8_launch.h"
 #include "ops/linear/fp8/fp8_a8_plan.h"
 
 namespace infernix::ops::detail {
+using Fp8F16Launch = void (*)(const Tensor&, const Weight&, Tensor&, F16AccumulateWorkspace, cudaStream_t);
+
 struct Fp8LinearShape {
     std::int32_t n, k;
     Fp8Launch a16;
@@ -16,7 +19,23 @@ struct Fp8LinearShape {
     // where the problem registers none.
     void (*pair)(const Tensor&, const Weight&, Tensor&, Fp8A8PairWorkspace, cudaStream_t) = nullptr;
     std::int32_t pair_min_tokens = 0;
+    // fp8-a8-pair-block32 (LinearRoutes::Fp8A8PairBlock32): the two-term route with per-32-value
+    // block scales, admitted where the column-scaled pair is (pair_min_tokens) and taking precedence
+    // over it; null where the problem registers none.
+    void (*pair_block32)(const Tensor&, const Weight&, Tensor&, Fp8A8PairBlock32Workspace,
+                         cudaStream_t) = nullptr;
+    // f16-accumulate-prefill (LinearRoutes::F16Accumulate, ops/linear/f16acc/f16acc_plan.h): FP16
+    // Tensor Cores with FP16 chunk sums and an FP32 carry, selected at T >= f16_min_tokens when the flag
+    // is set and no single-term A8 route is selected; it takes precedence over both pair routes. Null
+    // where the problem registers none.
+    Fp8F16Launch f16 = nullptr;
+    std::int32_t f16_min_tokens = 0;
 };
+
+// The f16-accumulate route's admission on every problem that registers it: prefill widths, where the
+// encoder's extra pass over x is small beside the GEMM. Not yet timed: the op bench (linear_bench
+// --routes f16) sets it per problem, as each kPairMinTokens was set.
+inline constexpr std::int32_t kFp8F16MinTokens = 256;
 
 extern const Fp8LinearShape kFp8N14336K5120;
 extern const Fp8LinearShape kFp8N16384K5120;

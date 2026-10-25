@@ -1,4 +1,5 @@
 #include "infernix/ops/sliding_window_attention.h"
+#include "ops/op_family.h"
 
 #include "core/decode_graph.h"
 #include "core/device.h"
@@ -386,7 +387,7 @@ int qualify() {
 }
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(sliding_window_attention) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: CUDA device unavailable\n";
         return 77;

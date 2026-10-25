@@ -15,7 +15,12 @@
 //            before the pause, completes at full length and reports a replay restore; the tokens
 //            after the pause may differ from the solo run (prefill arithmetic), which is reported.
 //
-//   infernix_qwen4_exp_preemption_real_test [--mtp] [--plain]   (default: both modes)
+// The DFlash2 mode (INFERNIX_QWEN4_DFLASH2 names the drafter companion) adds dflash2-pairs: the two
+// residents decode in two-row DFlash2 rounds until the pause, so the exact scenario also checks that
+// pair rounds and the drafter's ring across a pause and resume keep each request's solo tokens.
+//
+//   infernix_qwen4_exp_preemption_real_test [--mtp] [--plain] [--dflash2]
+//   (default: plain and MTP, and DFlash2 when INFERNIX_QWEN4_DFLASH2 is set)
 
 #include "kv_cache_storage.h"
 #include "infernix/engine.h"
@@ -65,8 +70,13 @@ std::size_t common_prefix(const std::vector<infernix::TokenId>& a, const std::ve
                                     a.begin());
 }
 
-int run_mode(const char* artifact, const char* ngram, bool mtp) {
-    std::printf("== %s\n", mtp ? "MTP drafter (--spec mtp, 3 drafts)" : "plain decode");
+enum class Mode { Plain, Mtp, DFlash2Pairs };
+
+int run_mode(const char* artifact, const char* ngram, Mode mode, const char* drafter = nullptr) {
+    const bool mtp = mode != Mode::Plain; // the drafter modes share their prompts
+    std::printf("== %s\n", mode == Mode::Mtp            ? "MTP drafter (--spec mtp, 3 drafts)"
+                           : mode == Mode::DFlash2Pairs ? "DFlash2 drafter (--spec dflash2, 3 drafts) with dflash2-pairs"
+                                                        : "plain decode");
     infernix::EngineOptions options;
     options.artifact_path = artifact;
     if (ngram != nullptr) { options.ngram_volume_path = ngram; }
@@ -88,9 +98,15 @@ int run_mode(const char* artifact, const char* ngram, bool mtp) {
     options.fast_paths           = false;
     options.fast_path_candidates = {infernix::FastPath::Preemption,
                                     infernix::FastPath::FreeCacheResume};
-    if (mtp) {
+    if (mode == Mode::Mtp) {
         options.speculative.backend      = infernix::SpeculativeBackend::Mtp;
         options.speculative.draft_tokens = 3;
+    }
+    if (mode == Mode::DFlash2Pairs) {
+        options.speculative.backend      = infernix::SpeculativeBackend::DFlash2;
+        options.speculative.draft_tokens = 3;
+        options.speculative.draft_model  = drafter;
+        options.fast_path_candidates.push_back(infernix::FastPath::DFlash2Pairs);
     }
     infernix::Engine engine(options);
     const auto prompt_a = synthetic_tokens(kPrompt, mtp ? 11U : 1U);
@@ -149,20 +165,28 @@ int main(int argc, char** argv) {
         std::printf("SKIP: INFERNIX_QWEN4_ARTIFACT is not set\n");
         return 77;
     }
-    const char* ngram = std::getenv("INFERNIX_QWEN4_NGRAM");
-    bool plain = true, mtp = true;
+    const char* ngram   = std::getenv("INFERNIX_QWEN4_NGRAM");
+    const char* drafter = std::getenv("INFERNIX_QWEN4_DFLASH2");
+    const bool has_drafter = drafter != nullptr && *drafter != '\0';
+    bool plain = true, mtp = true, dflash2 = has_drafter;
     if (argc > 1) {
-        plain = mtp = false;
+        plain = mtp = dflash2 = false;
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
             if (arg == "--plain") { plain = true; }
             if (arg == "--mtp") { mtp = true; }
+            if (arg == "--dflash2") { dflash2 = true; }
         }
+    }
+    if (dflash2 && !has_drafter) {
+        std::fprintf(stderr, "FAIL: --dflash2 needs INFERNIX_QWEN4_DFLASH2 (the DFlash2 drafter companion)\n");
+        return 1;
     }
     try {
         int failures = 0;
-        if (plain) { failures += run_mode(artifact, ngram, false); }
-        if (mtp) { failures += run_mode(artifact, ngram, true); }
+        if (plain) { failures += run_mode(artifact, ngram, Mode::Plain); }
+        if (mtp) { failures += run_mode(artifact, ngram, Mode::Mtp); }
+        if (dflash2) { failures += run_mode(artifact, ngram, Mode::DFlash2Pairs, drafter); }
         std::printf(failures == 0 ? "all preemption checks passed\n" : "%d preemption check(s) failed\n", failures);
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& e) {

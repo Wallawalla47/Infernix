@@ -2,10 +2,22 @@
 
 // Row/tokens tiled Q6 x BF16 MMA. Scaled weights are materialized as BF16;
 // accumulation is FP32. N/K/T stay runtime values and the launcher owns bounds.
+// Fp32Scale (temporary switch INFERNIX_TMP_Q56_FP32_SCALE) instead materializes the integer codes
+// (exact in BF16) and applies each 64-group scale to the group's FP32 partial sum.
 #include "ops/common/mma.cuh"
 #include "ops/linear/q6/q6_schedule.cuh"
 
 namespace infernix::ops::detail {
+
+// The MMA target: a group's partial sums when the scale is applied in FP32, else the accumulator.
+template <bool Partial, class Sums>
+__device__ __forceinline__ Sums& q6_mma_sums(Sums& partial, Sums& accum) {
+    if constexpr (Partial) {
+        return partial;
+    } else {
+        return accum;
+    }
+}
 
 // XOR swizzle for a [rows][64] BF16 tile. The eight 16-byte column groups are
 // permuted by the low row bits so ldmatrix reads do not repeatedly hit the same
@@ -15,7 +27,7 @@ __device__ __forceinline__ int q6_mma_swizzle_k64(int row, int col) {
 }
 
 // clang-format off
-template <class Schedule, bool Full, class Output, class Epilogue>
+template <class Schedule, bool Full, bool Fp32Scale, class Output, class Epilogue>
 __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm)
 void q6_a16_mma_kernel(
     const __nv_bfloat16* __restrict__ x,
@@ -61,16 +73,24 @@ void q6_a16_mma_kernel(
     const int col0 = static_cast<int>(blockIdx.y) * BN;
 
     float accum[MT][NT][4];
+    float partial[MT][NT][4]; // Fp32Scale only: the current 64-group's unscaled sums
 #pragma unroll
     for (int mi = 0; mi < MT; ++mi) {
 #pragma unroll
         for (int ni = 0; ni < NT; ++ni) {
-            accum[mi][ni][0] = 0.0f;
-            accum[mi][ni][1] = 0.0f;
-            accum[mi][ni][2] = 0.0f;
-            accum[mi][ni][3] = 0.0f;
+#pragma unroll
+            for (int v = 0; v < 4; ++v) {
+                accum[mi][ni][v]   = 0.0f;
+                partial[mi][ni][v] = 0.0f;
+            }
         }
     }
+    auto& sums = q6_mma_sums<Fp32Scale>(partial, accum);
+    // Fp32Scale: the scales of this thread's fragment rows (mma_row and mma_row + 8 of each MMA
+    // row tile) for the tile's groups, read before the stage can be refilled.
+    float group_scales[MT][2][GPB];
+    constexpr int kGroupSteps = Q6RowSplitStorage::kGroupK / 16;
+    static_assert(KSUB == GPB * kGroupSteps, "Q6 MMA K steps must tile whole groups");
 
     const int k_tiles = padded_k / BK;
 
@@ -235,11 +255,52 @@ void q6_a16_mma_kernel(
                                                         ? ((scale_group + group) & 1) *
                                                               Q6RowSplitStorage::kScaleBytesPerGroup
                                                         : 0)];
-                const __nv_bfloat162 weights = Q6MmaDecodeAtom::decode_pair(
-                    Cr[stage], Hr[stage], scale_ptr, staged_group, lane);
+                const __nv_bfloat162 weights =
+                    Fp32Scale ? Q6MmaDecodeAtom::decode_pair_scaled(Cr[stage], Hr[stage], 1.0f,
+                                                                    staged_group, lane)
+                              : Q6MmaDecodeAtom::decode_pair(Cr[stage], Hr[stage], scale_ptr,
+                                                             staged_group, lane);
                 const int shared_col =
                     q6_mma_swizzle_k64(local_row, group * Q6RowSplitStorage::kGroupK + 2 * lane);
                 store_vec(&dst[shared_col], weights);
+            }
+        }
+    };
+
+    auto load_group_scales = [&](int stage, int k_tile) {
+        const int scale_group = (k_tile * BK) / Q6RowSplitStorage::kGroupK;
+#pragma unroll
+        for (int mi = 0; mi < MT; ++mi) {
+#pragma unroll
+            for (int half = 0; half < 2; ++half) {
+                const int local_row = warp_row * WM + mi * 16 + mma_row + 8 * half;
+#pragma unroll
+                for (int group = 0; group < GPB; ++group) {
+                    const int offset = Schedule::kScaleLoadMode == Q6ScaleLoad::Pair32
+                                           ? ((scale_group + group) & 1) *
+                                                 Q6RowSplitStorage::kScaleBytesPerGroup
+                                           : 0;
+                    group_scales[mi][half][group] =
+                        __half2float(__ushort_as_half(*reinterpret_cast<const std::uint16_t*>(
+                            &Sr[stage][(local_row * GPB + group) * SB + offset])));
+                }
+            }
+        }
+    };
+
+    // Fp32Scale: after the group's last K step, accum += partial * scale (one rounding), and the
+    // partial restarts.
+    auto fold_group = [&](int group) {
+#pragma unroll
+        for (int mi = 0; mi < MT; ++mi) {
+#pragma unroll
+            for (int ni = 0; ni < NT; ++ni) {
+#pragma unroll
+                for (int v = 0; v < 4; ++v) {
+                    accum[mi][ni][v] =
+                        fmaf(partial[mi][ni][v], group_scales[mi][v >> 1][group], accum[mi][ni][v]);
+                    partial[mi][ni][v] = 0.0f;
+                }
             }
         }
     };
@@ -270,6 +331,7 @@ void q6_a16_mma_kernel(
         __syncthreads();
 
         decode_weight(stage, k_tile);
+        if constexpr (Fp32Scale) { load_group_scales(stage, k_tile); }
         __syncthreads();
 
         if constexpr (BS == 1) {
@@ -309,11 +371,14 @@ void q6_a16_mma_kernel(
                 for (int mi = 0; mi < MT; ++mi) {
 #pragma unroll
                     for (int ni = 0; ni < NT; ++ni) {
-                        mma_bf16(accum[mi][ni][0], accum[mi][ni][1], accum[mi][ni][2],
-                                 accum[mi][ni][3], a_frag[current][mi][0], a_frag[current][mi][1],
+                        mma_bf16(sums[mi][ni][0], sums[mi][ni][1], sums[mi][ni][2],
+                                 sums[mi][ni][3], a_frag[current][mi][0], a_frag[current][mi][1],
                                  a_frag[current][mi][2], a_frag[current][mi][3],
                                  b_frag[current][ni][0], b_frag[current][ni][1]);
                     }
+                }
+                if constexpr (Fp32Scale) {
+                    if ((ki + 1) % kGroupSteps == 0) { fold_group(ki / kGroupSteps); }
                 }
             }
         } else {
@@ -326,10 +391,13 @@ void q6_a16_mma_kernel(
                 for (int mi = 0; mi < MT; ++mi) {
 #pragma unroll
                     for (int ni = 0; ni < NT; ++ni) {
-                        mma_bf16(accum[mi][ni][0], accum[mi][ni][1], accum[mi][ni][2],
-                                 accum[mi][ni][3], a_frag[mi][0], a_frag[mi][1], a_frag[mi][2],
+                        mma_bf16(sums[mi][ni][0], sums[mi][ni][1], sums[mi][ni][2],
+                                 sums[mi][ni][3], a_frag[mi][0], a_frag[mi][1], a_frag[mi][2],
                                  a_frag[mi][3], b_frag[ni][0], b_frag[ni][1]);
                     }
+                }
+                if constexpr (Fp32Scale) {
+                    if ((ki + 1) % kGroupSteps == 0) { fold_group(ki / kGroupSteps); }
                 }
             }
         }

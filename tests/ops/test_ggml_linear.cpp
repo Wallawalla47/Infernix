@@ -13,6 +13,7 @@
 // bound instead. The row gathers must return each element's decoded value (exact in binary32)
 // rounded once to BF16.
 
+#include "ops/op_family.h"
 #include "core/device.h"
 #include "core/ggml_format.h"
 #include "infernix/ops/ggml_linear.h"
@@ -832,7 +833,7 @@ void run_ple(int heads, int width, int columns, Scales scales, std::mt19937& rng
 
 } // namespace
 
-int main(int argc, char** argv) {
+INFERNIX_OP_TEST(ggml_linear) {
     if (argc > 1 && std::string(argv[1]) == "--bench") {
         bool tiled = false, bf16 = false;
         for (int i = 3; i < argc; ++i) {
@@ -875,19 +876,29 @@ int main(int argc, char** argv) {
                                                  {QType::GGML_Q4_K, QType::GGML_Q5_K},   {QType::GGML_IQ4_XS, QType::GGML_Q4_K}};
         for (const auto& [q0, q1] : mixed) {
             for (const int columns : {1, 3, 5, 8}) { run_mixed(q0, q1, 66, 2560, columns, rng); }
-            for (const int columns : {1, 2, 4, 8}) { run_mixed(q0, q1, 66, 2560, columns, rng, true); }
+            for (const int columns : {1, 2, 4, 8, 9, 16, 31}) { run_mixed(q0, q1, 66, 2560, columns, rng, true); }
         }
         // Tiled mixed launches of 800 and 250 tiles (one-block rows): the unsplit and 4-way shapes.
         run_mixed(QType::GGML_Q6_K, QType::GGML_IQ4_XS, 12800, 256, 2, rng, true);
         run_mixed(QType::GGML_Q4_K, QType::GGML_Q6_K, 4000, 256, 5, rng, true);
-        // ggml_tiles16_v1: every tiled format and route (the rows kernel at one column and past eight,
-        // the MMA tiles between, the prefill planes from 32 columns), partial tiles, one-block rows,
-        // the input permutation, FP32 outputs and the scale spans of every accumulator; one-block rows
-        // of 200 to 3,000 tiles reach every CTA shape of the occupancy rule (on an RTX 5090: 4 warps
-        // split 4, 2 split 2, 4 unsplit, 2 unsplit, and the many-wave 4 unsplit).
+        // ggml_tiles16_v1: every tiled format and route (the rows kernel at one column, the MMA tiles
+        // to eight, the wide 16-column tiles past eight, the prefill planes from 32 columns), partial
+        // tiles, one-block rows, the input permutation, FP32 outputs and the scale spans of every
+        // accumulator; one-block rows of 200 to 3,000 tiles reach every CTA shape of the occupancy rule
+        // (on an RTX 5090: 4 warps split 4, 2 split 2, 4 unsplit, 2 unsplit, and the many-wave 4
+        // unsplit). The wide tiles: one and two column groups, a partial last tile of columns, the CTA
+        // shapes at 9 and 24 columns, FP32 outputs.
         for (const QType q : {QType::GGML_Q4_K, QType::GGML_Q5_K, QType::GGML_Q6_K, QType::GGML_IQ4_XS}) {
-            for (const int columns : {1, 2, 3, 4, 5, 8, 9, 17}) { run_tiled(q, 45, 2560, columns, false, false, rng, Scales::Narrow); }
+            for (const int columns : {1, 2, 3, 4, 5, 8, 9, 12, 16, 17, 24, 31}) {
+                run_tiled(q, 45, 2560, columns, false, false, rng, Scales::Narrow);
+            }
             for (const int tiles : {200, 400, 800, 2200, 3000}) { run_tiled(q, 16 * tiles - 5, 256, 2, false, false, rng, Scales::Wide); }
+            for (const int tiles : {200, 800, 3000}) {
+                run_tiled(q, 16 * tiles - 5, 256, 9, false, false, rng, Scales::Wide);
+                run_tiled(q, 16 * tiles - 5, 256, 24, false, true, rng, Scales::Wide);
+            }
+            run_tiled(q, 37, 6144, 13, true, false, rng, Scales::Wider);
+            run_tiled(q, 61, 2560, 16, false, true, rng, Scales::Edge);
             run_tiled(q, 37, 6144, 5, true, false, rng, Scales::Wide);
             run_tiled(q, 37, 6144, 1, true, true, rng, Scales::Wide);
             run_tiled(q, 20, 256, 2, false, false, rng, Scales::Wide); // one block per row: idle split warps

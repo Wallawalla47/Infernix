@@ -96,7 +96,8 @@ public:
     DirectReadQueue(const DirectReadQueue&)            = delete;
     DirectReadQueue& operator=(const DirectReadQueue&) = delete;
 
-    // Opens a file for unbuffered reads (no write sharing); throws std::system_error.
+    // Opens a file for unbuffered reads (no write sharing; buffered on a POSIX filesystem that
+    // refuses O_DIRECT); throws std::system_error.
     std::uint32_t open(const std::filesystem::path& path);
     [[nodiscard]] std::uint64_t file_bytes(std::uint32_t file) const;
 

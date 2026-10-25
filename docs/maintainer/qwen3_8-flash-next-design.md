@@ -985,6 +985,11 @@ Each exchange has the same structure:
 
 - **Device → host.** The writer thread stores the payload, executes `fence.sc.sys`
   (`__threadfence_system()`), then `st.release.sys` of `seq`.
+- **Payload written by several threads of one CTA.** The writers need no fence of their own: after
+  a barrier of the writers, the publishing thread's one `fence.sc.sys` is cumulative over the
+  stores it synchronized with, so it covers them (the CPU miss plan, `cpu_plan_body`; its earlier
+  serial body fenced in every writer). No fence follows the
+  `seq` store: a strong system-scope store becomes visible without one.
 - **Payload written by an earlier kernel.** Payloads written by an earlier kernel of the round
   (`x_host` by K5b) are fenced with `fence.sc.sys` by each writing thread before that kernel ends.
   The later publisher's release then covers them.
@@ -7280,7 +7285,11 @@ measured results are under "Status" at the end of this section.
   at 75.15 GiB in 1.32 GiB chunks, identical for `cudaHostAlloc` mapped and unmapped and for
   `VirtualAlloc` + `cudaHostRegister`, with 5-6 GiB of RAM still free. Many machines report half of
   RAM, which would break full mode on a 96 GB machine as well. `pin room = shared − NON_LOCAL usage −
-  1 GiB` (`kPinRoomMarginBytes`); without DXGI (Linux) there is no limit beyond RAM.
+  1 GiB` (`kPinRoomMarginBytes`). WSL2 runs on the Windows driver and inherits the limit (FreeToken
+  review FT-02, 2026-10-24): when `/dev/dxg` exists `core/dxcore_adapter` reads the same two facts
+  through DXCore (`libdxcore.so`: `SharedSystemMemory`, the NON_LOCAL `AdapterMemoryBudget` usage)
+  for the CUDA adapter's LUID, else the only hardware NVIDIA adapter. Native Linux has no limit
+  beyond RAM.
 - **Unpinned records** `program/host_expert_tier.{h,cpp}`. The experts' RAM past the pinned part is a
   fixed set of records in pageable memory kept resident (`core::ResidentHostBuffer`: the hard minimum
   working set raised by its size plus `VirtualLock`; Linux `mlock`; a refused lock only warns). The
@@ -9266,6 +9275,25 @@ from the committed window.
     partition. W = 6-8 used 28-21 splits before and now use 33, which also makes C = 6-8 plain
     decode invariant.
 
+**Split K/V stage for the one-stage prompt kernel (built 2026-10-23, TEMPORARY switch
+`INFERNIX_TMP_QSA_PROMPT_V2=1`, not yet measured).**
+- **Why.** The one-stage kernel (every prefill chunk: 85+ columns at 2 KV heads) gathers each tile
+  and then waits for it, so a warp's whole gather latency sits in front of its MMAs; only the other
+  CTA's warps hide it (two warps per scheduler, one for `bf16`). The 2026-10-14 pp32768 profile (the
+  strata-nvfp4 review) has the kernel at 2.15 ms per 4,096-column call against ~1.2 ms of MMA at
+  peak, 6.8 % of the kernel time.
+- **Change.** The same stage holds keys and values in separate regions, so each warp gathers tile
+  i + Warps's keys (with their scales and FP8 parity word) as soon as tile i's scores are taken, and
+  its values as soon as tile i's P × V is done; the next tile's list and page-table reads run while
+  tile i's keys land, and the first tile's gather is issued before the query rows. Shared memory and
+  occupancy are unchanged (the values' parity word uses the spare word of the 16-byte slot).
+- **Bits.** The tiles, their order per warp, every arithmetic step and the warp merge are the
+  combined kernel's. `test_qsa` compares the two variants bit for bit on every prompt case (with page
+  spaces) and on a 4,096-column chunk at 4K and at 32K for `bf16`, `int8`, `fp8`, `nvfp4` and `k8v4`.
+  `vq2` and `k4v2` keep the combined gather (their tiles expand keys and values together).
+- **Decide with** the op bench (`--prompt-v2 0,1,1,0`) at 4,096 columns over 4K-128K, then
+  pp4096 / pp32768 ABBA; adopt (and remove the switch) on a consistent gain.
+
 ### 19.3.16 Decode misses between the CPU and the link (2026-10-06)
 
 **Profile** (nsys, Gold `283613d8b`, int8 KV, 8K context, 128 tokens; `fn/rigs/prof/analyze_critical.py`
@@ -10051,6 +10079,33 @@ match that build's. On 2026-10-16 the policy replaced its floor-relative budgets
 (KL 1.5e-3, top-1 0.5 points, decode TV 4e-3); re-scored, two terms pass on the same six formats
 (INT8 KL bound 0.60 of the budget) and BF16 still fails (4.5 times it).
 
+*Where the arithmetic depends on the call (2026-10-23).* CPU-served misses have at most eight columns
+(`kMaxCpuColumns`, `MoeCpuChannel::max_job_columns`), so they are narrow jobs, which every GPU route
+computes exactly too: under `expert-a4-residual` an expert's result depends on its column count in
+the call, never on its placement. The 0.33-nat resumed-against-cold difference of `decide_real`
+(FP4-Local, 2026-10-21) is that width dependence: a resumed prompt's shorter prefill calls give
+experts fewer columns.
+
+**Two-term A4 for narrow W4A16 expert calls (fast path `expert-a4-residual-decode`): candidate,
+unqualified (2026-10-23).** FP4-Local's default 16-bit experts decode 19 % slower than its A4 mode
+(tg256 110 against 135, MTP 150-162 against 216; attribution unmeasured). The path gives experts of at
+most eight columns the same two terms per x and h row (`canon::a4r_block_terms`, bit for bit
+`quantize_nvfp4_terms_k16`'s encoding with the wide route's row scale, `canonical_math.h`) and sums the
+terms' products exactly: S = Σ_t Σ_b P_{t,b} Sw_b Sa_{t,b} in int64 (|S| < 2^56), y = bf16(((fl32(S) ·
+2^-20) · r) · α) (`NarrowA16::kA4Residual`). The GPU narrow kernels (`gate_up_kernel_a4r`,
+`down_kernel_a4r` in moe_layer.cu: the W4A4 kernels' half2 unit products, both terms against one
+converted weight word, one pass per column, two gate/up CTAs per SM at 50.0 KB; h in BF16 through the
+workspace's h rows, encoded by each down CTA since its row scale spans all 640 elements) and the CPU
+engine (`a4r_expert.h`: the W4A4 row sums over two terms per column, four columns per weight pass;
+the team's `work_a4r`) give the same bits, and `moe_experts` refuses a CPU channel whose service
+computes another narrow arithmetic than the call, so placement never changes a result. Its CPU cost is
+two byte products per weight against W4A16's three and W4A4's one. Alone it splits the arithmetic by
+width the other way; beside `expert-a4-residual` every width takes the same terms and only the
+summation differs (exact against the tensor core's FP32 order). Op checks: `test_offloaded_moe_a4r_cpu`
+(encoding against a binary64 oracle, exact row sums, ISAs, team, FP64 expert, error against the exact
+route), the W4A16 layer cases of `test_offloaded_moe_wide` (N1, N2) and `test_offloaded_moe_layer`
+(every placement and CPU share). Not yet built, gated or timed.
+
 **The prefill hyper-connection up projection fused with its collapse: adopted (bit-exact).** For
 Q8_G32_FP16 W_up and more than 96 columns, one Q8 MMA tile computes 16 features x 4 streams of u
 (a row policy maps the tile's rows to W_up rows s·H + d) and collapses them in its epilogue, so u
@@ -10820,6 +10875,25 @@ corpus in 49,152-token windows at 8,192-token chunks (MoE groups of two chunks b
 - The BF16 expert route below 14,336 columns (above).
 - A two-limb expert codec: not built once the BF16 tiles measured faster than the exact tiles from
   14K columns.
+
+**Stage-decode expert tiles (2026-10-23; built, not yet compiled or measured).** The planes' fixed
+cost per expert and call is what keeps the BF16 expert route above 14,336 columns, so
+`ggml_gate_up_decode` / `ggml_down_decode` (`ggml_expert.cuh`, on `ggml_bf16_tile.cuh`'s
+`compute_decode`) run the same tiles without planes: each CTA copies its 128 rows' raw GGUF bytes 256
+elements of K at a time (cp.async, double-buffered) and decodes every K stage into shared memory
+(`tile_chunk`, codebooks in shared memory) as BF16 pairs already in the k16 fragment order, with
+d · sub per row and half in FP32, then runs the planes' `slice_step` on them. The codes, scales, B
+and accumulation order are the planes', so every output is the planes' bits at any width
+(`run_stage_decode`: the planes' 16,384-column call against the stage decode's call and its
+4,096-, 8,192- and 12,288-column prefixes); the route stays `ggml-bf16-prefill`. A pass runs all
+its wide jobs in one launch per projection (no 32-job sub-batches), and a job's last tile takes 64
+columns when at most 64 entries remain. TEMPORARY switches (`MoeGgmlTiles`, in the startup log's `temporary switches | ...` line):
+`INFERNIX_TMP_IQ_STAGE_DECODE_MIN_COLUMNS` / `_MAX_COLUMNS` (calls of [min, max) columns take the
+stage decode; unset: none), `INFERNIX_TMP_IQ_PLANE_MIN_COLUMNS` (the planes' threshold, default
+14,336; lowered only to time the planes at narrower calls) and `INFERNIX_TMP_GGML_SHARED_CODEBOOKS=1`
+(the exact gate/up tiles and the plane decode read their codebooks from shared memory; the plane
+decode then takes five stages per CTA; the same bits). The planes stay carved from 14,336 columns
+whichever route a call takes, so both arms of an A/B hold the same memory.
 
 **Pitfall.** With about 79 GiB of RAM free, the n-gram table's automatic residency flipped between
 runs (read from its volume, or 27.8 GiB pinned while the first test ran), costing that test 25 %;

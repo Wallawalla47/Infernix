@@ -1,4 +1,5 @@
 #include "serve/generation_service.h"
+#include "serve/http_server.h"
 #include "serve/openai_chat.h"
 #include "serve/openai_common.h"
 #include "serve/translate.h"
@@ -182,6 +183,24 @@ int test_standard_field_policy() {
     const OpenAIChatRequest zero        = parse(zero_limit);
     failures += check(zero.output_tokens_explicit && zero.generation.max_tokens == 0,
                       "an explicit zero output limit reaches Engine's no-generation path");
+
+    for (const char* key : {"max_completion_tokens", "max_tokens"}) {
+        Json unlimited               = base_request();
+        unlimited[key]               = -1;
+        const OpenAIChatRequest open = parse(unlimited);
+        failures += check(!open.output_tokens_explicit &&
+                              open.generation.max_tokens == limits().default_max_tokens,
+                          std::string(key) + " -1 takes the omitted-limit path");
+        unlimited[key] = -2;
+        failures += check(api_error([&] { (void)parse(unlimited); }).param == key,
+                          std::string(key) + " below -1 rejected");
+    }
+    Json fallback                     = base_request();
+    fallback["max_completion_tokens"] = -1;
+    fallback["max_tokens"]            = 9;
+    const OpenAIChatRequest legacy    = parse(fallback);
+    failures += check(legacy.output_tokens_explicit && legacy.generation.max_tokens == 9,
+                      "max_completion_tokens -1 leaves the legacy max_tokens in force");
     return failures;
 }
 
@@ -640,8 +659,14 @@ int test_messages_and_media() {
                       "image and video compatibility inputs normalize to Engine media");
 
     body["messages"][0]["content"][0]["image_url"]["detail"] = "high";
-    failures += check(api_error([&] { (void)parse(body); }).code == "image_detail_not_supported",
-                      "explicit image preprocessing detail rejected");
+    failures += check(parse(body).generation.media_item_count() == 2,
+                      "image detail 'high' takes the native preprocessing, as 'auto'");
+    for (const char* detail : {"low", "original", "medium"}) {
+        body["messages"][0]["content"][0]["image_url"]["detail"] = detail;
+        failures +=
+            check(api_error([&] { (void)parse(body); }).code == "image_detail_not_supported",
+                  std::string("image preprocessing detail '") + detail + "' rejected");
+    }
 
     auto content_rejected = [&](const char* role, const char* type) {
         Json invalid                   = base_request();
@@ -846,6 +871,40 @@ int test_reasoning_and_extensions() {
     body["chat_template_kwargs"]["enable_thinking"] = false;
     failures += check(api_error([&] { (void)parse(body); }).code == "conflicting_template_option",
                       "conflicting thinking aliases rejected");
+
+    // A per-request thinking budget under any of the names clients send: N caps thinking, 0 turns it
+    // off, -1 leaves the server default; two different values, or 0 with enable_thinking, conflict.
+    for (const char* name : {"thinking_budget_tokens", "thinking_token_budget", "thinking_budget",
+                             "reasoning_budget_tokens"}) {
+        body       = base_request();
+        body[name] = 2048;
+        const GenerationRequest budgeted = parse(body).generation;
+        failures += check(budgeted.thinking_budget == 2048u && !budgeted.enable_thinking.has_value(),
+                          std::string(name) + " did not set the request's thinking budget");
+    }
+    body                           = base_request();
+    body["thinking_budget_tokens"] = 0;
+    failures += check(parse(body).generation.enable_thinking == false && !parse(body).generation.thinking_budget,
+                      "a thinking budget of 0 did not disable thinking");
+    body["thinking_budget_tokens"] = -1;
+    failures += check(!parse(body).generation.thinking_budget && !parse(body).generation.enable_thinking,
+                      "a thinking budget of -1 did not leave the server default");
+    body["thinking_budget_tokens"] = -2;
+    failures += check(api_error([&] { (void)parse(body); }).param == "thinking_budget_tokens",
+                      "a negative thinking budget below -1 was accepted");
+    body                           = base_request();
+    body["thinking_budget_tokens"] = 512;
+    body["thinking_budget"]        = 1024;
+    failures += check(api_error([&] { (void)parse(body); }).code == "conflicting_template_option",
+                      "two different thinking budgets were accepted");
+    body["thinking_budget"] = 512;
+    failures += check(parse(body).generation.thinking_budget == 512u, "agreeing thinking budget aliases rejected");
+    body                    = base_request();
+    body["enable_thinking"] = true;
+    body["thinking_budget"] = 0;
+    failures += check(api_error([&] { (void)parse(body); }).code == "conflicting_template_option",
+                      "a thinking budget of 0 overrode enable_thinking true");
+
     body                         = base_request();
     body["chat_template_kwargs"] = Json{{"future", 1}};
     failures +=
@@ -911,11 +970,12 @@ GenerationOutcome sample_outcome() {
     outcome.completion_tokens                   = 7;
     outcome.reasoning_tokens                    = 3;
     outcome.finish_reason                       = infernix::FinishReason::StopToken;
-    outcome.metrics.prefix_cache_hit_tokens     = 12;
-    outcome.metrics.prompt_wall_seconds         = 0.04;
-    outcome.metrics.generation_wall_seconds     = 0.03;
-    outcome.metrics.speculative_draft_tokens    = 9;
-    outcome.metrics.speculative_accepted_tokens = 6;
+    outcome.reused_prompt_tokens                = 12;
+    outcome.timings.prompt_wall_seconds         = 0.04;
+    outcome.timings.generation_wall_seconds     = 0.03;
+    outcome.speculative.drafted_tokens          = 9;
+    outcome.speculative.accepted_tokens         = 6;
+    outcome.expert_cache = infernix::ExpertCacheStats{.routed = 480, .hits = 432};
     return outcome;
 }
 
@@ -945,6 +1005,17 @@ int test_aggregate_response() {
             response["timings"]["predicted_per_second"] == 200.0 &&
             response["timings"]["draft_n"] == 9 && response["timings"]["draft_n_accepted"] == 6,
         "aggregate timings use exact cache and N-1 generation intervals");
+    failures += check(response["timings"]["expert_routed_n"] == 480 &&
+                          response["timings"]["expert_hit_n"] == 432,
+                      "aggregate timings carry the request's expert-cache lookups and hits");
+    {
+        GenerationOutcome dense = sample_outcome();
+        dense.expert_cache.reset();
+        const Json plain = Json::parse(make_chat_completion_response(identity(), dense));
+        failures += check(!plain["timings"].contains("expert_routed_n") &&
+                              !plain["timings"].contains("expert_hit_n"),
+                          "timings omit the expert fields without an expert cache");
+    }
 
     outcome.text.clear();
     outcome.tool_calls.push_back(infernix::GeneratedToolCall{
@@ -1047,6 +1118,42 @@ int test_stream_response() {
     const auto partial_events  = interrupted.finish(tool_outcome);
     failures += check(parse_sse(partial_events[1])["choices"][0]["finish_reason"] == "length",
                       "streamed completed call hid a later truncation");
+
+    // A constrained call streams as it is generated: its first chunk opens it (id, type, name), later
+    // ones carry argument fragments by index, and finish does not repeat it.
+    OpenAIChatStream streamed(identity(), false);
+    (void)streamed.start();
+    const Json opened = parse_sse(streamed.tool_call_delta({.index = 0, .name = "Edit", .arguments = R"({"file_)"}));
+    const Json extended =
+        parse_sse(streamed.tool_call_delta({.index = 0, .arguments = R"(path":"/tmp/probe.cpp"})", .complete = true}));
+    const Json& open_call = opened["choices"][0]["delta"]["tool_calls"][0];
+    const Json& next_call = extended["choices"][0]["delta"]["tool_calls"][0];
+    failures += check(open_call["index"] == 0 && open_call["id"].get<std::string>().starts_with("call_") &&
+                          open_call["type"] == "function" && open_call["function"]["name"] == "Edit" &&
+                          open_call["function"]["arguments"] == R"({"file_)" && next_call["index"] == 0 &&
+                          !next_call.contains("id") && !next_call["function"].contains("name") &&
+                          next_call["function"]["arguments"] == R"(path":"/tmp/probe.cpp"})",
+                      "a streamed call's chunks lost its OpenAI shape");
+    tool_outcome.finish_reason = infernix::FinishReason::StopToken;
+    const auto streamed_events = streamed.finish(tool_outcome);
+    failures += check(streamed_events.size() == 2 &&
+                          parse_sse(streamed_events[0])["choices"][0]["finish_reason"] == "tool_calls",
+                      "finish repeated a streamed call or lost its finish reason");
+    // A call the output limit cut keeps what it streamed; a streamed call must match the result's.
+    OpenAIChatStream cut(identity(), false);
+    (void)cut.start();
+    (void)cut.tool_call_delta({.index = 0, .name = "Edit", .arguments = R"({"file_path":"/tmp/probe.cpp"})", .complete = true});
+    (void)cut.tool_call_delta({.index = 1, .name = "Edit", .arguments = R"({"file_pa)"});
+    tool_outcome.finish_reason = infernix::FinishReason::OutputLimit;
+    const auto cut_events      = cut.finish(tool_outcome);
+    failures += check(parse_sse(cut_events[0])["choices"][0]["finish_reason"] == "length",
+                      "a cut streamed call changed the finish reason");
+    OpenAIChatStream diverged(identity(), false);
+    (void)diverged.start();
+    (void)diverged.tool_call_delta({.index = 0, .name = "Edit", .arguments = "{}", .complete = true});
+    failures += check(throws_logic([&] { (void)diverged.finish(tool_outcome); }) &&
+                          throws_logic([&] { (void)streamed.tool_call_delta({.index = 3, .name = "Edit"}); }),
+                      "stream encoder accepted streamed calls that differ from the result");
     return failures;
 }
 
@@ -1189,6 +1296,38 @@ int test_common_objects() {
         ApiError{.status = 400, .message = "bad", .param = "messages", .code = "invalid"}));
     failures += check(error["error"]["param"] == "messages" && error["error"]["code"] == "invalid",
                       "OpenAI common error shape remains stable");
+
+    // A queue-pressure answer is a plain retryable status carrying the admission window as
+    // Retry-After, on both surfaces; other answers send none.
+    const infernix::RequestError expired(infernix::RequestErrorKind::QueueTimeout,
+                                         "inference request expired while waiting for admission");
+    const ApiError queue_answer =
+        request_error_to_api_error(expired, "structured_outputs.grammar", {}, 30);
+    failures += check(queue_answer.status == 503 && queue_answer.code == "request_queue_timeout" &&
+                          queue_answer.retry_after_seconds == 30,
+                      "a queue timeout maps to 503 with its Retry-After");
+    const ApiError overloaded = request_error_to_api_error(
+        infernix::RequestError(infernix::RequestErrorKind::Overloaded, "full"),
+        "structured_outputs.grammar", {}, 30);
+    failures += check(overloaded.status == 429 && overloaded.retry_after_seconds == 30,
+                      "an overloaded answer maps to 429 with its Retry-After");
+    const ApiError cancelled = request_error_to_api_error(
+        infernix::RequestError(infernix::RequestErrorKind::Cancelled, "gone"),
+        "structured_outputs.grammar", {}, 30);
+    failures +=
+        check(cancelled.retry_after_seconds == 0, "only queue-pressure answers carry Retry-After");
+    {
+        httplib::Response openai;
+        write_openai_error(openai, queue_answer);
+        httplib::Response anthropic;
+        write_anthropic_error(anthropic, queue_answer, "req_test");
+        httplib::Response plain;
+        write_openai_error(plain, request_error_to_api_error(expired));
+        failures += check(openai.status == 503 && openai.get_header_value("Retry-After") == "30" &&
+                              anthropic.get_header_value("Retry-After") == "30" &&
+                              !plain.has_header("Retry-After"),
+                          "the error writers send Retry-After exactly when the answer carries one");
+    }
     return failures;
 }
 
@@ -1240,6 +1379,28 @@ int test_assistant_continuation_mode() {
     return failures;
 }
 
+// Agent clients such as Claude Code mix developer and system turns into the transcript's middle;
+// the parser must keep every role where it arrived and leave rendering decisions to preparation.
+int test_late_system_and_developer_roles_parse() {
+    Json body        = base_request();
+    body["messages"] = Json::array({Json{{"role", "system"}, {"content", "lead rules"}},
+                                    Json{{"role", "user"}, {"content", "run it"}},
+                                    Json{{"role", "developer"}, {"content", "mid policy"}},
+                                    Json{{"role", "user"}, {"content", "and now?"}}});
+    const GenerationRequest request = parse(body).generation;
+    int failures = check(request.messages.size() == 4 &&
+                             request.messages[0].role == infernix::ChatRole::System &&
+                             request.messages[1].role == infernix::ChatRole::User &&
+                             request.messages[2].role == infernix::ChatRole::Developer &&
+                             request.messages[3].role == infernix::ChatRole::User,
+                         "a mid-transcript developer or system turn lost its parse-time role");
+    const infernix::PromptInput prepared = prompt(request);
+    failures += check(prepared.messages.size() == 4 &&
+                          prepared.messages[2].role == infernix::ChatRole::Developer,
+                      "PromptInput lowering hoisted or renamed the mid-transcript developer turn");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -1258,6 +1419,7 @@ int main() {
     failures += test_stream_observations();
     failures += test_common_objects();
     failures += test_assistant_continuation_mode();
+    failures += test_late_system_and_developer_roles_parse();
     if (failures == 0) { std::cout << "OpenAI Chat protocol tests passed\n"; }
     return failures == 0 ? 0 : 1;
 }

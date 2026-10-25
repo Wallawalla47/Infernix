@@ -1,9 +1,11 @@
 #include "models/qwen3_5/program/offload.h"
 
 #include "core/device.h"
+#include "core/temporary_switches.h"
 #include "infernix/types.h"
 #include "runtime/contract/execution.h"
 
+#include <algorithm>
 #include <array>
 #include <span>
 #include <stdexcept>
@@ -43,10 +45,11 @@ runtime::expert_offload::OffloadSetup offload_setup(const execution::Parameters&
     setup.chunk                     = geometry.chunk;
     setup.walk_max_tokens           = geometry.walk_max_tokens;
     setup.speculative               = geometry.speculative;
+    setup.mtp_draft_tokens          = geometry.mtp_draft_tokens;
+    setup.ngram_draft_tokens        = geometry.ngram_draft_tokens;
     setup.graph_bound               = geometry.graph_bound;
     // The Program captures every executable right after start() (program_impl.cpp prepare_graphs).
     setup.eager_graphs              = true;
-    setup.one_column_divisor_device = geometry.one_column_divisor_device;
     setup.device                    = geometry.device;
     return setup;
 }
@@ -59,6 +62,9 @@ std::uint64_t ProgramOffload::fixed_bytes(const execution::Parameters& parameter
 ProgramOffload::ProgramOffload(const execution::Parameters& parameters, const OffloadGeometry& geometry,
                                expert_offload::OffloadOptions options, Diagnostic diagnostic)
     : parameters_(parameters), wide_pass_bytes_(geometry.wide_pass_bytes),
+      wide_ladder_(temporary_switches::flag("INFERNIX_TMP_PROMPT_SIZED_LOAN") ? geometry.wide_pass_ladder
+                                                                             : decltype(geometry.wide_pass_ladder){}),
+      expert_wide_(geometry.expert_wide), router_mma_(geometry.router_mma),
       engine_(offload_setup(parameters, geometry), std::move(options), std::move(diagnostic)) {}
 
 ProgramOffload::~ProgramOffload() {
@@ -92,6 +98,8 @@ void ProgramOffload::build_experts() {
         experts_.sources.push_back(source);
     }
     experts_.tail_skip_rank = engine_.tail_skip_rank();
+    experts_.wide_a16       = expert_wide_;
+    experts_.router_mma     = router_mma_;
     experts_.route_log     = engine_.route_log();
     experts_.route_stride  = engine_.route_stride();
     experts_.landing       = engine_.landing_table();
@@ -114,8 +122,15 @@ void ProgramOffload::build_experts() {
 
 std::uint64_t ProgramOffload::wide_bytes(std::int32_t columns) const {
     // The planner's full-width pass (0 on the lossless route, whose layers run their own path): one
-    // size for every wide pass, so a prompt's passes reuse one lease.
-    return columns > execution::kOffloadedMoeStaticColumns ? wide_pass_bytes_ : 0;
+    // size for every wide pass, so a prompt's passes reuse one lease. TEMPORARY (INFERNIX_TMP_PROMPT_SIZED_LOAN,
+    // candidates BX-01, Flash-Next's default), until its A/B: the ladder's first width holding the pass, so a
+    // short prompt no longer evicts a whole chunk's workspace of experts (a wider later pass's lease
+    // replaces the held one, wide_workspace).
+    if (columns <= execution::kOffloadedMoeStaticColumns) { return 0; }
+    for (const auto& [width, bytes] : wide_ladder_) {
+        if (columns <= width) { return std::min<std::uint64_t>(bytes, wide_pass_bytes_); }
+    }
+    return wide_pass_bytes_;
 }
 
 DeviceSpan ProgramOffload::wide_workspace(std::uint64_t bytes, cudaStream_t compute) {
@@ -183,33 +198,50 @@ void ProgramOffload::return_stream(cudaStream_t compute) {
 
 void ProgramOffload::end_pass(cudaStream_t compute, const execution::OffloadedCall& call, PassKind kind,
                               std::uint32_t lane, std::int32_t columns, std::uint32_t position, bool prompt_end,
-                              const std::string& model) {
+                              const std::string& model, bool continuing) {
     using Offload = runtime::expert_offload::ExpertOffload;
     if (call.streamed) { engine_.stream()->end(); }
     engine_.check_error(model);
     const bool prompt            = kind == PassKind::Prompt;
-    const std::size_t promotions = !prompt ? Offload::kDecodePromotionsPerLayer
+    const bool silent            = prompt && continuing;
+    const std::size_t promotions = silent    ? 0
+                                   : !prompt ? Offload::kDecodePromotionsPerLayer
                                    : columns <= Offload::kServedCallColumns
                                        ? engine_.decode_budget(static_cast<std::uint32_t>(columns))
                                        : 0;
     const auto lane_id = static_cast<std::int32_t>(lane);
-    if (prompt) { engine_.note_prompt_routes(lane, columns); }
+    if (prompt && !silent) { engine_.note_prompt_routes(lane, columns); }
+    if (silent) { silent_columns_.assign(static_cast<std::size_t>(columns), 0); }
     engine_.after_call(compute, columns, static_cast<std::uint32_t>(columns), promotions,
                        {.kind     = prompt ? runtime::expert_offload::RouteTraceKind::PrefillChunk
                                          : runtime::expert_offload::RouteTraceKind::ForcedTokens,
                         .rows     = 1,
                         .width    = columns,
                         .position = position,
-                        .lanes    = std::span<const std::int32_t>(&lane_id, 1)});
-    if (prompt && prompt_end) { engine_.seed_prompt(lane); }
+                        .lanes    = std::span<const std::int32_t>(&lane_id, 1)},
+                       silent ? std::span<const std::uint8_t>(silent_columns_) : std::span<const std::uint8_t>{});
+    if (prompt && prompt_end && !silent) { engine_.seed_prompt(lane, compute); }
+}
+
+bool ProgramOffload::continuing_prompt(std::uint32_t reused, std::uint32_t prompt) {
+    static const double fraction = [] {
+        const auto value      = temporary_switches::value("INFERNIX_TMP_CONTINUING_PROMPT");
+        const double parsed   = value ? std::stod(*value) : 0.0;
+        if (value && !(parsed > 0.0 && parsed <= 1.0)) {
+            throw std::invalid_argument("INFERNIX_TMP_CONTINUING_PROMPT must be a fraction in (0, 1]");
+        }
+        return parsed;
+    }();
+    return fraction > 0.0 && prompt != 0 && static_cast<double>(reused) >= fraction * static_cast<double>(prompt);
 }
 
 void ProgramOffload::abandon_pass(const execution::OffloadedCall& call) noexcept {
     if (call.streamed && engine_.stream() != nullptr) { engine_.stream()->end(); }
 }
 
-void ProgramOffload::begin_round(cudaStream_t compute) {
+void ProgramOffload::begin_round(cudaStream_t compute, std::int32_t position) {
     engine_.settle(compute);
+    if (position >= 0) { engine_.set_plain_position(position, compute); }
     engine_.before_round(compute, /*landing=*/true);
 }
 

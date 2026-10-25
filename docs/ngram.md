@@ -151,6 +151,8 @@ for every previous span.
 Tool results containing at least three consecutively numbered lines can provide an additional
 de-numbered source. Recognized separators include colon-space, tab, an arrow and pipe-space;
 an optional `L` prefix is supported. Indentation, CRLF and terminal newlines are preserved.
+Like message content in the prompt, the source is tokenized as ordinary text: a control-token
+spelling in it stays text.
 The original tool message, target tokens, positions and prefix-cache identity are unchanged.
 Plain tool results and earlier generated edits can match directly without normalization.
 This is protocol-neutral and does not require Kilo-, Codex- or Claude-specific engine paths.

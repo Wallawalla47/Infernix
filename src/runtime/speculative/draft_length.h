@@ -80,4 +80,29 @@ struct DraftCalibration {
     return best;
 }
 
+// The drafts per row, in [least, most], a two-row round verifies (Qwen3.8-Flash-Next dflash2-pairs):
+// maximizing (tokens_a[k] + tokens_b[k]) / (1 + proposal + per_draft * k), costs in plain two-row
+// rounds. The round verifies both rows over 1 + k columns whatever their own draft counts (a row with
+// fewer is padded with filler columns of the same cost), so the width is the one choice and each row
+// verifies every draft it has up to k: tokens_r[k] is row r's expected tokens with that prefix verified
+// (expected_draft_tokens for a drafter row), non-decreasing in k, for k in [0, most]. `least` is the
+// longest proposal the round must verify whole (an n-gram copy row's).
+[[nodiscard]] inline std::int32_t pair_draft_width(std::span<const double> tokens_a, std::span<const double> tokens_b,
+                                                   std::int32_t least, std::int32_t most, double per_draft,
+                                                   double proposal) noexcept {
+    most = std::min({most, static_cast<std::int32_t>(tokens_a.size()) - 1, static_cast<std::int32_t>(tokens_b.size()) - 1});
+    least = std::clamp(least, 0, std::max(most, 0));
+    std::int32_t best = least;
+    double best_score = -1.0;
+    for (std::int32_t k = least; k <= most; ++k) {
+        const auto at     = static_cast<std::size_t>(k);
+        const double score = (tokens_a[at] + tokens_b[at]) / (1.0 + proposal + per_draft * k);
+        if (score > best_score) {
+            best_score = score;
+            best       = k;
+        }
+    }
+    return best;
+}
+
 } // namespace infernix::runtime::speculative

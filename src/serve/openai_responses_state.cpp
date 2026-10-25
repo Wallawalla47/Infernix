@@ -178,6 +178,21 @@ resolve_openai_responses_prompt(const OpenAIResponsesPromptRequest& request,
     resolved.generation.messages.insert(resolved.generation.messages.end(),
                                         std::make_move_iterator(context.begin()),
                                         std::make_move_iterator(context.end()));
+    // A tool that a tool_search_output or additional_tools Item loaded stays callable in later
+    // turns: it is declared for parsing and constraints without a place in the tool list.
+    std::vector<ToolDefinition>& tools = resolved.generation.tools;
+    for (const ChatTurn& turn : resolved.generation.messages) {
+        for (const ToolDefinition& loaded : turn.loaded_tools) {
+            if (std::none_of(tools.begin(), tools.end(), [&](const ToolDefinition& tool) {
+                    return tool.name == loaded.name;
+                })) {
+                ToolDefinition declaration = loaded;
+                declaration.deferred       = true;
+                declaration.cache_boundary_after.reset();
+                tools.push_back(std::move(declaration));
+            }
+        }
+    }
     apply_openai_prompt_cache_policy(resolved.generation, request.cache_policy);
     return resolved;
 }

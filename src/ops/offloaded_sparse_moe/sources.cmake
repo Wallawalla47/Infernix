@@ -4,6 +4,7 @@
 add_library(infernix_offloaded_moe_cpu STATIC
   "${CMAKE_CURRENT_LIST_DIR}/cpu/w4a4_expert.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/cpu/w4a16_expert.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/cpu/a4r_expert.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/cpu/ggml_expert.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/cpu/fp8_expert.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/cpu/expert_team.cpp")

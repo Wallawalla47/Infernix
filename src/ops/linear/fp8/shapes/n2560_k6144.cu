@@ -5,6 +5,7 @@
 #include "ops/linear/fp8/fp8_shapes.h"
 #include "ops/linear/fp8/fp8_launch.cuh"
 #include "ops/linear/fp8/fp8_a8_pair_tma_mma.cuh"
+#include "ops/linear/f16acc/f16acc_mma.cuh"
 
 namespace infernix::ops::detail {
 namespace {
@@ -37,8 +38,16 @@ bool uses_a8(std::int32_t, std::int32_t) { return false; }
 // The pair route's admission (2026-10-15 sweep, RTX 5090): 1.05-1.97 times the exact route up to
 // T=512, 0.64-1.00 beyond except T=1040-1088 (1.18-1.19).
 constexpr std::int32_t kPairMinTokens = 513;
+
+// f16-accumulate-prefill: the exact route's tiles at the same widths (not yet swept for this route).
+void launch_f16(const Tensor& x, const Weight& weight, Tensor& out, F16AccumulateWorkspace scratch,
+                cudaStream_t stream) {
+    if (x.ne[1] <= 1536) return fp8_linear_f16acc<Geometry, Fp8A16RingT64R128>(x, weight, out, scratch, stream);
+    fp8_linear_f16acc<Geometry, RingT128R128>(x, weight, out, scratch, stream);
+}
 } // namespace
 
 const Fp8LinearShape kFp8N2560K6144{2560,    6144, launch_a16, nullptr, uses_a8, nullptr,
-                                    /*invariant*/ nullptr, launch_fp8_a8_pair<Geometry>, kPairMinTokens};
+                                    /*invariant*/ nullptr, launch_fp8_a8_pair<Geometry>, kPairMinTokens,
+                                    launch_fp8_a8_pair_block32<Geometry>, launch_f16, kFp8F16MinTokens};
 } // namespace infernix::ops::detail

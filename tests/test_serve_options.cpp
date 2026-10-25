@@ -158,6 +158,9 @@ int main() {
     failures += check(parse({"infernix-serve", "model.ninfer", "--expert-a4-activations"}).expert_a4_activations &&
                           !parse({"infernix-serve", "model.ninfer"}).expert_a4_activations,
                       "--expert-a4-activations did not parse (default off)");
+    failures += check(parse({"infernix-serve", "model.ninfer", "--embedding-host"}).embedding_host &&
+                          !parse({"infernix-serve", "model.ninfer"}).embedding_host,
+                      "--embedding-host did not parse (default off)");
 
     const auto mtp_ngram = parse({"infernix-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens",
                                   "3", "--ngram-draft-tokens", "15"});
@@ -260,8 +263,6 @@ int main() {
              {"--draft-tree-nodes", "12x"},
              {"--draft-tree-nodes", "12", "--draft-tree-paths", "1"},
              {"--draft-tree-nodes", "12", "--draft-tree-paths", "9"},
-             {"--draft-tree-nodes", "12", "--spec", "dflash"},
-             {"--draft-tree-nodes", "auto", "--spec", "dflash"},
              {"--draft-tree-nodes", "Auto"}}) {
         std::vector<std::string> arguments{"infernix-serve", "model.ninfer",   "--spec",
                                            "dflash2",      "--draft-tokens", "7"};
@@ -271,6 +272,15 @@ int main() {
             (void)parse(arguments);
         } catch (const std::invalid_argument&) { rejected = true; }
         failures += check(rejected, "unsupported tree table admitted");
+    }
+    // DFlash v1 rounds verify trees too (ops::candidate_tree over the head's independent positions).
+    for (const char* table : {"12", "auto"}) {
+        bool admitted = true;
+        try {
+            (void)parse({"infernix-serve", "model.ninfer", "--spec", "dflash2", "--draft-tokens", "7",
+                         "--draft-tree-nodes", table, "--spec", "dflash"});
+        } catch (const std::invalid_argument&) { admitted = false; }
+        failures += check(admitted, (std::string("a DFlash tree table was refused: ") + table).c_str());
     }
     const ServeOptions defaults = parse({"infernix-serve", "model.ninfer"});
     failures += check(defaults.speculative.ngram_draft_tokens == 0,
@@ -828,33 +838,39 @@ int main() {
         to_request_options(request, thinking_budget, semantics, thinking_budget.allow_prefix_reuse)
                 .execution.thinking.budget == 37,
         "thinking-enabled request did not inherit the server budget");
-    // Without a budget, thinking leaves the answer a quarter of max_tokens (at least 256, at most
-    // half) from max_tokens 1024; below that, or with --no-thinking-answer-room, it may use all.
+    // Without a budget, thinking leaves the answer a quarter of the effective output limit (at
+    // least 256, at most half) from a limit of 1024; below that, or with
+    // --no-thinking-answer-room, it may use all. The limit is max_tokens, or the room the prompt
+    // leaves in the context when that is less.
     {
-        GenerationRequest capped;
-        capped.max_tokens            = 8192;
-        const auto capped_semantics  = resolve_prompt_semantics(capped, defaults);
-        failures += check(to_request_options(capped, defaults, capped_semantics, true).execution.thinking.budget == 6144U,
+        failures += check(thinking_answer_room_budget(defaults, 8192) == 6144U,
                           "a thinking request without a budget did not leave a quarter of max_tokens to answer");
-        capped.max_tokens = 1024;
-        failures += check(to_request_options(capped, defaults, capped_semantics, true).execution.thinking.budget == 768U,
+        failures += check(thinking_answer_room_budget(defaults, 1024) == 768U,
                           "the answer room did not keep its 256-token minimum");
-        capped.max_tokens = 1023;
+        failures += check(!thinking_answer_room_budget(defaults, 1023),
+                          "the answer room applied below an output limit of 1024");
+        // Claude Code sends max_tokens 32,000; a 250,000-token prompt at 262,144 context leaves
+        // 12,145 tokens, so thinking must close at 9,109, not at 24,000 (past the context end).
+        const std::uint32_t long_prompt = effective_output_limit(32000, 262144, 250000);
+        failures += check(long_prompt == 12145U && thinking_answer_room_budget(defaults, long_prompt) == 9109U,
+                          "the answer room followed max_tokens instead of the room the context leaves");
+        failures += check(effective_output_limit(8192, 262144, 1000) == 8192U &&
+                              effective_output_limit(8192, 8192, 8192) == 1U &&
+                              effective_output_limit(8192, 8192, 8193) == 0U,
+                          "the effective output limit did not match Engine's context capacity");
+        failures += check(!thinking_answer_room_budget(defaults, effective_output_limit(32000, 262144, 261500)),
+                          "the answer room applied when the context leaves less than 1024 tokens");
+        GenerationRequest capped;
+        capped.max_tokens           = 8192;
+        const auto capped_semantics = resolve_prompt_semantics(capped, defaults);
         failures += check(!to_request_options(capped, defaults, capped_semantics, true).execution.thinking.budget,
-                          "the answer room applied below max_tokens 1024");
-        capped.max_tokens          = 8192;
-        capped.thinking_budget     = 7000;
+                          "the answer room was set before the prompt length was known");
+        capped.thinking_budget = 7000;
         failures += check(to_request_options(capped, defaults, capped_semantics, true).execution.thinking.budget == 7000U,
-                          "the answer room overrode the request's own budget");
-        capped.thinking_budget.reset();
+                          "the request's own budget did not reach Engine options");
         const auto no_room = parse({"infernix-serve", "model.ninfer", "--no-thinking-answer-room"});
-        failures += check(!no_room.thinking_answer_room &&
-                              !to_request_options(capped, no_room, capped_semantics, true).execution.thinking.budget,
+        failures += check(!no_room.thinking_answer_room && !thinking_answer_room_budget(no_room, 8192),
                           "--no-thinking-answer-room did not let thinking use all of max_tokens");
-        capped.enable_thinking     = false;
-        const auto off_semantics   = resolve_prompt_semantics(capped, defaults);
-        failures += check(!to_request_options(capped, defaults, off_semantics, true).execution.thinking.budget,
-                          "a non-thinking request got an answer-room budget");
     }
     request.enable_thinking = false;
     const auto non_thinking = resolve_prompt_semantics(request, thinking_budget);

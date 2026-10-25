@@ -15,7 +15,7 @@
 
 namespace infernix::bench {
 
-inline constexpr int kSchemaVersion                   = 24;
+inline constexpr int kSchemaVersion                   = 25;
 inline constexpr std::string_view kArtifactType       = "infernix_bench_report";
 inline constexpr std::string_view kDefaultCorpusPath  = "bench/fixtures/bench_corpus.ids";
 inline constexpr int kDecodeSeedTokens                = 1;
@@ -63,7 +63,24 @@ struct BenchOptions {
     bool vram_past_budget = false;
     std::uint32_t expert_tail_skip = 0; // EngineOptions::expert_tail_skip
     bool expert_a4_activations     = false; // EngineOptions::expert_a4_activations
+    bool embedding_host            = false; // EngineOptions::embedding_host
     std::string corpus_path{kDefaultCorpusPath};
+    // Prompts start this many tokens into the corpus (wrapping), so A/B blocks can vary them.
+    std::size_t corpus_offset = 0;
+    // --prompt-ids: one exact prompt for every test (comma- or space-separated ids, such as a chat-templated
+    // fixture); each -n N then prefills it and decodes N tokens. Empty: corpus slices.
+    std::string prompt_ids_path;
+    // Sampling: the bench is greedy unless --temperature is given; measured repetition r draws with seed + r
+    // (warm-ups with seed + 1000 + w). Unset fields keep the model's defaults.
+    std::optional<float> temperature;
+    std::optional<float> top_p;
+    std::optional<std::int32_t> top_k;
+    std::optional<float> min_p;
+    std::uint64_t seed = 1;
+    // --stop-at-eos: the model's stop tokens end a request, which may then finish before its limit.
+    bool stop_at_eos = false;
+    // --route-trace: EngineOptions::route_trace_path (Flash-Next / offloaded experts).
+    std::string route_trace_path;
     std::string constraint_file;
     std::optional<OutputConstraint> constraint;
     std::uint32_t concurrency = 1;
@@ -108,7 +125,14 @@ struct TestResult {
     std::vector<double> repetition_wall_seconds;
     std::size_t workspace_peak_bytes           = 0;
     std::size_t workspace_allocator_peak_bytes = 0;
+    // The measured repetitions' Engine execution units (RuntimeStats::execution over them: counts
+    // and totals as differences, maxima restarted after the warm-ups).
+    RuntimeExecutionLatency execution;
 };
+
+// RuntimeStats::execution from `before` to `after`, the maxima `after`'s.
+[[nodiscard]] RuntimeExecutionLatency execution_delta(const RuntimeExecutionLatency& before,
+                                                      const RuntimeExecutionLatency& after);
 
 struct Stats {
     double mean   = 0.0;
@@ -116,11 +140,34 @@ struct Stats {
     int count     = 0;
 };
 
+// The machine around the GPU, so that reports from different machines compare: the PCIe link read
+// right after the measured runs (an idle GPU lowers it), the pinned host-to-device rate measured
+// once the model has loaded (none under --profile-measured, which keeps the profiled launches the
+// run's own), and a RAM read rate measured before it loads. 0: unknown or not measured.
+struct BenchMachine {
+    std::uint32_t pcie_generation     = 0;
+    std::uint32_t pcie_width          = 0;
+    std::uint32_t pcie_max_generation = 0;
+    std::uint32_t pcie_max_width      = 0;
+    double h2d_bytes_per_second       = 0.0; // kH2dProbeBytes pinned copies (core/link_probe)
+    double ram_read_bytes_per_second =
+        0.0; // every hardware thread reading its share of kRamProbeBytes
+    std::uint32_t ram_read_threads = 0;
+};
+
+inline constexpr std::size_t kH2dProbeBytes = 64ULL << 20;
+inline constexpr std::size_t kRamProbeBytes = 512ULL << 20;
+
+// The best of three passes in which `threads` threads each sum their share of a `bytes` pageable
+// buffer (written first); 0 when either is 0.
+[[nodiscard]] double measure_ram_read_bytes_per_second(std::size_t bytes, std::uint32_t threads);
+
 struct BenchEnvironment {
     std::string gpu_name;
     std::string cuda_runtime_version;
     std::string cuda_driver_version;
     int device_id = 0;
+    BenchMachine machine;
 
     std::string artifact_path;
     std::uint64_t artifact_file_size_bytes = 0;
@@ -152,6 +199,15 @@ struct BenchEnvironment {
     int warmup                                     = 0;
     std::string corpus_path;
     std::size_t corpus_tokens = 0;
+    std::size_t corpus_offset = 0;
+    std::string prompt_ids_path; // the exact prompt (BenchOptions::prompt_ids_path)
+    std::optional<float> temperature;
+    std::optional<float> top_p;
+    std::optional<std::int32_t> top_k;
+    std::optional<float> min_p;
+    std::uint64_t seed       = 1;
+    bool stop_at_eos         = false;
+    std::string route_trace_path;
     std::uint32_t concurrency = 1;
     std::string constraint_file;
     std::optional<OutputConstraint> constraint;
@@ -168,6 +224,8 @@ std::uint32_t resolve_max_context(const std::vector<BenchTest>& tests,
 void validate_prompt_lengths(const std::vector<BenchTest>& tests, std::size_t corpus_tokens);
 
 std::vector<TokenId> load_corpus_ids(const std::string& path);
+// --prompt-ids: comma- or whitespace-separated ids.
+std::vector<TokenId> load_prompt_ids(const std::string& path);
 std::vector<TokenId> prompt_slice(const std::vector<TokenId>& corpus, int n_prompt);
 std::string decode_path_name(bool use_cuda_graph, const SpeculativeOptions& speculative);
 std::uint32_t decode_graph_prime_output_tokens(const SpeculativeOptions& speculative);

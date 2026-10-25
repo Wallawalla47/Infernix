@@ -18,6 +18,8 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <string>
+#include <utility>
 #include <vector>
 
 namespace infernix::models::qwen3_5::detail {
@@ -54,7 +56,33 @@ struct SpeculativeRoundShape {
     return shape.kind == SpeculativeRoundKind::Neural ? shape.verify_drafts : neural_draft_window;
 }
 
-// The DFlash2 tree widths (columns per row, anchor included) each batch size's all-neural rounds
+// Whether a round of the family with `batch_size` rows proposes through the gated proposal chain
+// (ExecutionSchedule::mtp_proposal_chain): a one-row neural round then proposes up to the
+// configured window, and the device stops it at the round's proposal limit (the draft-length
+// policy's choice) and, with mtp_gate, after the first draft below --spec-min-p, so its verify width
+// (the family) and its proposal depth are chosen apart.
+[[nodiscard]] inline bool mtp_chained_round(const SpeculativeRoundShape& shape, std::uint32_t batch_size,
+                                            bool chain) noexcept {
+    return chain && shape.kind == SpeculativeRoundKind::Neural && batch_size == 1U;
+}
+
+// The drafts a round of the family with `batch_size` rows proposes (its graph's proposal steps).
+[[nodiscard]] inline std::uint32_t mtp_proposal_drafts(const SpeculativeRoundShape& shape,
+                                                       std::uint32_t neural_draft_window,
+                                                       std::uint32_t batch_size, bool chain) noexcept {
+    return mtp_chained_round(shape, batch_size, chain) ? neural_draft_window
+                                                       : mtp_proposal_drafts(shape, neural_draft_window);
+}
+
+// The deepest proposal of any of the family's rounds, which its graph profiles and attention
+// envelopes cover.
+[[nodiscard]] inline std::uint32_t mtp_family_proposal_drafts(const SpeculativeRoundShape& shape,
+                                                              std::uint32_t neural_draft_window,
+                                                              bool chain) noexcept {
+    return mtp_proposal_drafts(shape, neural_draft_window, 1U, chain);
+}
+
+// The tree widths (columns per row, anchor included) each batch size's all-neural rounds
 // may verify. A fixed table gives a batch size one tree width or the chain; automatic mode lets
 // rounds of up to automatic_max_batch rows choose between the chain and every automatic width.
 struct TreeWidthPlan {
@@ -174,6 +202,9 @@ struct WorkspacePlan {
     // 0 otherwise.
     std::size_t text_prefill_wide = 0;
     std::size_t mtp_prefill_wide  = 0;
+    // With lent passes: the wider of the two plans at widths 512, 1,024, ... below the chunk, then the chunk
+    // (ascending), so a pass can borrow what its width needs (INFERNIX_TMP_PROMPT_SIZED_LOAN).
+    std::vector<std::pair<std::int32_t, std::size_t>> prefill_wide_ladder;
     std::size_t ordinary_round   = 0;
     std::size_t mtp_prefill      = 0;
     std::size_t mtp_round        = 0;
@@ -192,7 +223,7 @@ struct SequencePlanningInputs {
     std::vector<SpeculativeRoundShape> round_shapes;
     // adaptive-dflash: the configuration's measured round costs (with split round shapes).
     DFlashWidthCosts dflash_width_costs;
-    // DFlash2 tree verification: the tree widths of each batch size and the most root-to-leaf
+    // Tree verification: the tree widths of each batch size and the most root-to-leaf
     // paths a tree row may hold.
     TreeWidthPlan tree_widths;
     std::uint32_t draft_tree_paths          = 0;
@@ -224,7 +255,7 @@ struct SequencePlanImpl {
     std::uint32_t neural_draft_window       = 0;
     std::vector<SpeculativeRoundShape> round_shapes;
     DFlashWidthCosts dflash_width_costs;
-    // DFlash2 tree verification: the tree widths of each batch size and the most root-to-leaf
+    // Tree verification: the tree widths of each batch size and the most root-to-leaf
     // paths a tree row may hold.
     TreeWidthPlan tree_widths;
     std::uint32_t draft_tree_paths          = 0;
@@ -274,6 +305,35 @@ idle_prefill_widths_impl(const execution::Parameters& parameters, const EngineOp
                                                            EngineOptions& options);
 // qwen3_5::resolve_auto_ngram (program.h).
 [[nodiscard]] std::uint32_t resolve_auto_ngram_impl(const Model& model, EngineOptions& options);
+
+// TEMPORARY A/B switches of the Qwen3.5 MTP drafting package (rank 5 of the 2026-10-21 candidates),
+// read once from the environment ("1" sets a flag); each defaults to today's behaviour:
+//   INFERNIX_TMP_QWEN35_MTP_PROBS       resident targets' drafts carry their drafter probability
+//                                       (ExecutionSchedule::mtp_draft_confidence) with nothing reading it,
+//                                       which isolates its cost; the cut, gate and calibrated extents imply it
+//   INFERNIX_TMP_QWEN35_MTP_GATE        the proposal chain stops at --spec-min-p on the device (mtp_gate)
+//   INFERNIX_TMP_QWEN35_MTP_CALIBRATED  one-row rounds verify their calibrated extent (mtp_calibrated_extent)
+//   INFERNIX_TMP_QWEN35_MTP_DRAFT_LOG   a file path: one line per verified MTP row (the offline cut replay)
+// and of the offloaded-expert drafter's round cost (candidates §11 OR-09; output-neutral):
+//   INFERNIX_TMP_QWEN35_MTP_PAD_MASK    the drafter's resident MoE skips each row's padding columns
+//                                       (mtp_drafter_mask)
+//   INFERNIX_TMP_QWEN35_MTP_STEP_GATE   offloaded MTP rounds propose through the step chain, whose device gate
+//                                       stops where no later draft could be verified (mtp_step_chain)
+//   INFERNIX_TMP_QWEN35_MTP_SKIP_ROUNDS with the step chain, rounds also run without drafting (the drafter's
+//                                       KV only) while that measures faster (mtp_draft_regime)
+struct MtpDraftSwitches {
+    bool probabilities = false;
+    bool gate          = false;
+    bool calibrated    = false;
+    bool pad_mask      = false;
+    bool step_gate     = false;
+    bool skip_rounds   = false;
+    std::string draft_log;
+};
+[[nodiscard]] const MtpDraftSwitches& mtp_draft_switches();
+// qwen3_5::mtp_draft_switch_report (program.h).
+[[nodiscard]] std::string mtp_draft_switch_report_impl(const execution::Parameters& parameters,
+                                                       const EngineOptions& options);
 [[nodiscard]] std::unique_ptr<SequencePlanImpl>
 finalize_sequence_plan_impl(std::unique_ptr<qwen3_5::detail::SequencePlannerImpl> planner,
                             std::uint32_t main_page_groups);

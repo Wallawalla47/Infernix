@@ -24,10 +24,19 @@
 
 #include "models/qwen4_exp/program/program_impl.h"
 
+#include "core/temporary_switches.h"
+
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
 #include <cstring>
+#include <exception>
+#include <span>
 #include <stdexcept>
+#include <string>
+#include <thread>
 #include <utility>
+#include <vector>
 
 namespace infernix::models::qwen4_exp::detail {
 
@@ -152,14 +161,79 @@ void ProgramImpl::walk_begin(Lane& lane, std::uint32_t index, std::size_t end) {
     if (cpu_service_) { cpu_service_->wake(); }
     residency_->before_round(s, /*landing=*/false, /*walking=*/false, kStreamReadSlots);
     expert_stream_->begin(ring_span(), residency_->host_table(), s, /*gated=*/false, /*ssd=*/true);
+    // INFERNIX_TMP_NGRAM_FIRST_SPAN_ASYNC (candidates §8.3 GX-08): when the previous span prefetched
+    // nothing for this one (the prompt's first span), chunk 0 reads its rows here, then a worker reads
+    // chunks 1..n-1's into their host slots while this thread stages and launches them. Only the worker
+    // touches the volume until it ends; chunk c waits for its rows before its upload.
+    const bool async_rows = ngram_first_span_async_ && n > 1 &&
+                            !walk_prefetched(index, walk_.first_call, 0, walk_.begins[0], walk_.widths[0]);
+    std::atomic<std::size_t> rows_ready{1};
+    std::exception_ptr rows_error;
+    std::thread rows_worker;
+    NgramVolume::Counters rows_before{};
+    const auto join_rows = [&] {
+        if (!rows_worker.joinable()) { return; }
+        rows_worker.join();
+        const NgramVolume::Counters& after = volume_.counters();
+        lane.ngram.rows += after.rows - rows_before.rows;
+        lane.ngram.hits += after.hits - rows_before.hits;
+        lane.ngram.reads += after.reads - rows_before.reads;
+        lane.ngram.read_ns += after.read_ns - rows_before.read_ns;
+        if (rows_error) { std::rethrow_exception(rows_error); }
+    };
+    struct JoinOnExit {
+        std::thread& worker;
+        ~JoinOnExit() {
+            if (worker.joinable()) { worker.join(); }
+        }
+    } join_on_exit{rows_worker};
     for (std::size_t c = 0; c < n; ++c) {
         const std::int32_t b = walk_.begins[c], w = walk_.widths[c];
-        // Rows the previous span prefetched already stand at this chunk's slot.
-        const bool prefetched = walk_prefetched(index, walk_.first_call, c, b, w);
+        // Rows the previous span prefetched (or this span's worker read) already stand at this
+        // chunk's slot.
+        const bool from_worker = async_rows && c > 0;
+        if (from_worker) {
+            for (std::size_t ready = rows_ready.load(std::memory_order_acquire); ready <= c;
+                 ready             = rows_ready.load(std::memory_order_acquire)) {
+                rows_ready.wait(ready, std::memory_order_acquire);
+            }
+            if (rows_error) { join_rows(); }
+        }
+        const bool prefetched = from_worker || walk_prefetched(index, walk_.first_call, c, b, w);
         {
             const nvtx::ScopedRange rows_range(nvtx::Name::PrefillPleRows, nvtx::Category::Prefill,
                                                static_cast<std::uint64_t>(w));
             stage_sequence(index, b, w, lane.history, !prefetched);
+        }
+        if (async_rows && c == 0) {
+            rows_before = volume_.counters();
+            rows_worker = std::thread([&, host_area] {
+                try {
+                    const std::int32_t context = static_cast<std::int32_t>(c_.ple.ngram.ngram_size) - 1;
+                    const std::size_t heads    = hash_.heads();
+                    const std::size_t row_bytes = ngram_table().row_bytes;
+                    std::vector<std::int32_t> window;
+                    std::vector<std::uint32_t> ids;
+                    for (std::size_t k = 1; k < n; ++k) {
+                        const std::int32_t from = walk_.begins[k], count = walk_.widths[k];
+                        window.clear();
+                        for (std::int32_t p = from - context; p < from + count; ++p) {
+                            window.push_back(p < 0 ? static_cast<std::int32_t>(c_.eos_token_id)
+                                                   : lane.history[static_cast<std::size_t>(p)]);
+                        }
+                        ids.resize(static_cast<std::size_t>(count) * heads);
+                        hash_.row_ids(window, static_cast<std::size_t>(count), ids.data());
+                        std::byte* rows = host_area + k * walk_.io_stride + io_layout_.ngram;
+                        volume_.read_rows(ids, std::span<std::byte>(rows, static_cast<std::size_t>(count) * heads * row_bytes));
+                        rows_ready.store(k + 1, std::memory_order_release);
+                        rows_ready.notify_all();
+                    }
+                } catch (...) {
+                    rows_error = std::current_exception();
+                    rows_ready.store(n, std::memory_order_release);
+                    rows_ready.notify_all();
+                }
+            });
         }
         std::optional<execution::MtpChunk> chunk = stage_mtp_chunk(lane, index, b, w);
         const execution::VisionInput* vision     = stage_vision(lane, static_cast<std::uint32_t>(b), w);
@@ -174,7 +248,7 @@ void ProgramImpl::walk_begin(Lane& lane, std::uint32_t index, std::size_t end) {
         } else {
             std::memcpy(host_slot, io_host_.data(), io_layout_.bytes);
         }
-        CUDA_CHECK(cudaMemcpyAsync(slot, host_slot, io_layout_.bytes, cudaMemcpyHostToDevice, s));
+        upload_pinned(slot, host_slot, io_layout_.bytes, s); // not behind the ring's copies (W7)
         if (chunk) {
             chunk->ids              = rebase_tensor(chunk->ids, slot);
             chunk->positions        = rebase_tensor(chunk->positions, slot);
@@ -201,6 +275,7 @@ void ProgramImpl::walk_begin(Lane& lane, std::uint32_t index, std::size_t end) {
             if (walk_.groups[g].second == c + 1) { walk_moe(g, 0); }
         }
     }
+    join_rows();
     walk_.next_layer = 1;
     walk_prefetch_   = WalkPrefetch{}; // consumed; the slots now hold this span's chunks
     ++walk_spans_;
@@ -410,13 +485,33 @@ void ProgramImpl::walk_enqueue(std::uint32_t to_layer) {
     walk_.next_layer = std::max(walk_.next_layer, to_layer);
 }
 
+std::uint32_t ProgramImpl::walk_step_tokens_from_environment() {
+    return static_cast<std::uint32_t>(
+        temporary_switches::integer("INFERNIX_TMP_DECODE_SHARE_WALK_TOKENS", 0, 0, kWalkMaxTokens));
+}
+
+// The layers one walk step enqueues: about one call's work (walk_begin), or with the walk-step switch
+// while another lane decodes, about walk_step_tokens_ tokens' (at least one layer).
+std::uint32_t ProgramImpl::walk_step_layers(std::uint32_t index) const noexcept {
+    if (walk_step_tokens_ == 0) { return walk_.layers_per_step; }
+    bool decoding = false;
+    for (std::uint32_t i = 0; i < options_.max_concurrency; ++i) {
+        if (i != index && lanes_[i].phase == Phase::Decode) { decoding = true; }
+    }
+    if (!decoding) { return walk_.layers_per_step; }
+    std::uint64_t tokens = 0;
+    for (const auto w : walk_.widths) { tokens += static_cast<std::uint64_t>(w); }
+    const std::uint64_t layers = tokens == 0 ? 1 : static_cast<std::uint64_t>(c_.num_hidden_layers) * walk_step_tokens_ / tokens;
+    return static_cast<std::uint32_t>(std::clamp<std::uint64_t>(layers, 1, walk_.layers_per_step));
+}
+
 PrefillProgress ProgramImpl::walk_step(Lane& lane, std::uint32_t index, Clock::time_point start) {
     const std::uint32_t L = c_.num_hidden_layers;
     std::uint32_t tokens  = 0;
     for (const auto w : walk_.widths) { tokens += static_cast<std::uint32_t>(w); }
     // The first step already ran layer 0 while staging.
     const std::uint32_t to =
-        std::min(L, walk_.next_layer + walk_.layers_per_step - (walk_.steps == 0 ? 1U : 0U));
+        std::min(L, walk_.next_layer + walk_step_layers(index) - (walk_.steps == 0 ? 1U : 0U));
     if (walk_.steps > 0) {
         // A step boundary, before the step's calls: a decode or verification round of another lane
         // since the last step closed the tier's round when it settled, and the tier answers fetch
@@ -481,8 +576,7 @@ PrefillProgress ProgramImpl::walk_step(Lane& lane, std::uint32_t index, Clock::t
                                                 static_cast<std::uint64_t>(width));
         // The route log holds the span's last chunk (every chunk routes nearly every expert).
         trace_round(RouteTraceKind::PrefillChunk, 1, width, tokens, 0, static_cast<std::uint32_t>(begin));
-        note_prompt_routes(lane, width);
-        residency_->after_round(device_.stream, width, 0);
+        apply_prompt_routes(lane, width, 0);
         apply_vram_target(false);
     }
     // A walk promotes no experts (its routes still count toward the cache's scores). Between spans

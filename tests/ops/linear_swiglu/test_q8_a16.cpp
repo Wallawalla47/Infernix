@@ -1,3 +1,4 @@
+#include "ops/op_family.h"
 #include "core/arena.h"
 #include "core/weight.h"
 #include "infernix/ops/linear_swiglu.h"
@@ -88,7 +89,7 @@ int flash_next_shared() {
     return failures;
 }
 
-int main() {
+INFERNIX_OP_TEST(linear_swiglu_q8_a16) {
     using namespace infernix;
     using namespace infernix::test::linear_swiglu;
 

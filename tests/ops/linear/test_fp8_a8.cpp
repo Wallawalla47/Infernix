@@ -1,3 +1,4 @@
+#include "ops/op_family.h"
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "core/weight.h"
@@ -218,10 +219,14 @@ int run_fp8_a8() {
         const std::size_t a16 = ops::linear_workspace_capacity_bytes(
             QType::FP8_E4M3FN_ROW_BF16, problem.rows, problem.input_rows,
             ops::LinearPolicy::A16Only, 1, 2048);
+        // A16Only still sizes the flagged routes (pair, pair block32, FP16 accumulate) its interval
+        // reaches: the query does not see the route flags (fp8_linear_workspace_capacity_bytes).
+        const std::size_t flagged_routes = ops::linear_workspace_capacity_bytes(
+            QType::FP8_E4M3FN_ROW_BF16, problem.rows, problem.input_rows, ops::LinearPolicy::A16Only, 2048, 2048);
         if ((one != 0) != problem.a8_at_one || (two != 0) != problem.a8_at_two ||
             early_interval != 0 || forty_eight <= two || hot_interval != forty_eight ||
             exact_1024 <= forty_eight || exact_1048 <= exact_1024 || spanning != exact_1048 ||
-            a16 != 0) {
+            a16 != flagged_routes) {
             std::cerr << "FP8 A8 workspace interval contract mismatch for N=" << problem.rows
                       << " K=" << problem.input_rows << '\n';
             ++failures;
@@ -247,8 +252,13 @@ int run_fp8_a8() {
 // the epilogue's single BF16 rounding of the FP32 sum of both terms (at most 2^-9 relative, RMS
 // about 1.1e-3) is the A16 route's own error, so the route sits at the A16 route's error against
 // the 3.9e-3 budget, not above it.
+//
+// fp8-a8-pair-block32 (LinearRoutes::Fp8A8PairBlock32) runs the same problems at the same widths
+// with s1 and s2 chosen per 32-value block of K instead of per column, and the block-scaled MMA
+// applying them; the derivation holds per block, so every value within 2^14 of its block's maximum
+// is carried exactly (pair_block32_quantizer_exact) and the route meets the same criterion.
 // Each problem's pair admission (its ops/linear/fp8/shapes kPairMinTokens: the width from which
-// the pair route is faster than the exact route).
+// the pair route is faster than the exact route; the block32 route shares it).
 struct PairProblem {
     std::int32_t n, k, min_tokens;
 };
@@ -257,46 +267,100 @@ constexpr std::array<PairProblem, 5> kFlashNextProblems{{{16384, 2560, 33},
                                                          {2560, 6144, 513},
                                                          {1280, 2560, 1025},
                                                          {2560, 640, 513}}};
-constexpr ops::LinearRoutes kPair = ops::LinearRoutes::Fp8A8Pair;
-// The width at which the route moves from 64- to 128-column tiles (fp8_a8_pair_tma_mma.cuh
+constexpr ops::LinearRoutes kPair        = ops::LinearRoutes::Fp8A8Pair;
+constexpr ops::LinearRoutes kPairBlock32 = ops::LinearRoutes::Fp8A8PairBlock32;
+// The width at which both routes move from 64- to 128-column tiles (fp8_a8_pair_tma_mma.cuh
 // kFp8A8PairNarrowTokens).
 constexpr std::int32_t kPairNarrowTokens = 256;
 
-int run_flash_next_fp8_a8_pair() {
-    int failures       = 0;
-    std::uint32_t seed = 941U;
+// The two pair routes, each with its label and seed offset.
+struct PairRoute {
+    const char* label;
+    ops::LinearRoutes routes;
+    std::uint32_t seed_offset;
+};
+constexpr std::array<PairRoute, 2> kPairRoutes{{{"FP8_A8Pair", kPair, 0U},
+                                                {"FP8_A8PairBlock32", kPairBlock32, 1000U}}};
+
+int run_flash_next_fp8_a8_pair(const PairRoute& route) {
+    const ops::LinearRoutes routes = route.routes;
+    const std::string label        = route.label;
+    int failures                   = 0;
+    std::uint32_t seed             = 941U + route.seed_offset;
     for (const auto& [n, k, min_tokens] : kFlashNextProblems) {
         std::vector<Invocation> calls;
         // Below the admission (the exact route), the admission, the tile seams and the bulk.
         for (const int t : {1, min_tokens - 1, min_tokens, min_tokens + 1, 63, 64, 65, 128,
                             kPairNarrowTokens - 1, kPairNarrowTokens, kPairNarrowTokens + 1, 384,
                             385, 1024, 2049})
-            calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, false, kPair});
+            calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, false, routes});
         for (const int t : {min_tokens, std::max(min_tokens, kPairNarrowTokens) + 1})
-            calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true, kPair});
+            calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true, routes});
         // These problems register no single-term A8 route, so the wider permissions run the pair.
         const std::int32_t wide = std::max(min_tokens, 129);
-        calls.push_back({wide, CallForm::Policy, ops::LinearPolicy::AllowA8, false, kPair});
-        calls.push_back({wide, CallForm::Policy, ops::LinearPolicy::AllowA4, false, kPair});
-        failures += run_shape("FP8_A8Pair Flash-Next", ActivationCompute::A16, make_fp8_weight,
+        calls.push_back({wide, CallForm::Policy, ops::LinearPolicy::AllowA8, false, routes});
+        calls.push_back({wide, CallForm::Policy, ops::LinearPolicy::AllowA4, false, routes});
+        failures += run_shape(label + " Flash-Next", ActivationCompute::A16, make_fp8_weight,
                               {n, k, seed++, Comparison::Sampled, true, calls});
     }
     // A column the first term represents to FP32 rounding (alternating +-0.25: a near-zero second
     // term), and columns with only the last 16 channels set (the K tail of the 640-channel down),
     // each at its problem's admission and in the 128-column tiles.
-    const auto pattern_calls = [](std::int32_t min_tokens) {
+    const auto pattern_calls = [routes](std::int32_t min_tokens) {
         return std::vector<Invocation>{
-            {min_tokens, CallForm::Policy, ops::LinearPolicy::A16Only, false, kPair},
+            {min_tokens, CallForm::Policy, ops::LinearPolicy::A16Only, false, routes},
             {std::max(min_tokens, kPairNarrowTokens) + 44, CallForm::Policy,
-             ops::LinearPolicy::A16Only, false, kPair},
+             ops::LinearPolicy::A16Only, false, routes},
         };
     };
-    failures += run_shape("FP8_A8Pair Flash-Next cancellation", ActivationCompute::A16,
+    failures += run_shape(label + " Flash-Next cancellation", ActivationCompute::A16,
                           make_fp8_weight,
-                          {16384, 2560, 947U, Comparison::Sampled, true, pattern_calls(17),
+                          {16384, 2560, 947U + route.seed_offset, Comparison::Sampled, true,
+                           pattern_calls(17), ActivationPattern::Cancellation});
+    failures += run_shape(label + " Flash-Next K tail", ActivationCompute::A16, make_fp8_weight,
+                          {2560, 640, 949U + route.seed_offset, Comparison::Sampled, true,
+                           pattern_calls(513), ActivationPattern::KTail});
+    return failures;
+}
+
+// fp8-a8-pair-block32 on NVIDIA FP4-Local's MXFP8 problems: the same two-term activation, the weight's
+// UE8M0 group scales as the block-scaled MMA's weight scales. The represented weights (codes x their
+// group's power of two) enter the MMA exactly and the products are exact, so the derivation above holds
+// per 32-value block and the route meets the A16 criterion against the FP64 oracle of the represented
+// weights. Admissions are mxfp8_shapes.h's kMxfp8PairMinTokens* (recipe C's per [N,K], untimed).
+int run_flash_next_mxfp8_pair_block32() {
+    constexpr std::array<PairProblem, 5> kMxfp8Problems{{{16384, 2560, 33},
+                                                         {13952, 2560, 97},
+                                                         {2560, 6144, 513},
+                                                         {1280, 2560, 1025},
+                                                         {2560, 640, 513}}};
+    int failures       = 0;
+    std::uint32_t seed = 2941U;
+    for (const auto& [n, k, min_tokens] : kMxfp8Problems) {
+        std::vector<Invocation> calls;
+        for (const int t : {1, min_tokens - 1, min_tokens, min_tokens + 1, 64, 65, kPairNarrowTokens,
+                            kPairNarrowTokens + 1, 385, 1024, 2049})
+            calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, false, kPairBlock32});
+        for (const int t : {min_tokens, std::max(min_tokens, kPairNarrowTokens) + 1})
+            calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true, kPairBlock32});
+        // The column-invariant policy keeps the exact route whatever the flag.
+        calls.push_back({std::max(min_tokens, 129), CallForm::Policy, ops::LinearPolicy::A16ColumnInvariant, false,
+                         kPairBlock32});
+        failures += run_shape("MXFP8_A8PairBlock32 FP4-Local", ActivationCompute::A16, make_mxfp8_weight,
+                              {n, k, seed++, Comparison::Sampled, true, calls});
+    }
+    const auto pattern_calls = [](std::int32_t min_tokens) {
+        return std::vector<Invocation>{
+            {min_tokens, CallForm::Policy, ops::LinearPolicy::A16Only, false, kPairBlock32},
+            {std::max(min_tokens, kPairNarrowTokens) + 44, CallForm::Policy, ops::LinearPolicy::A16Only, false,
+             kPairBlock32},
+        };
+    };
+    failures += run_shape("MXFP8_A8PairBlock32 FP4-Local cancellation", ActivationCompute::A16, make_mxfp8_weight,
+                          {16384, 2560, 2947U, Comparison::Sampled, true, pattern_calls(33),
                            ActivationPattern::Cancellation});
-    failures += run_shape("FP8_A8Pair Flash-Next K tail", ActivationCompute::A16, make_fp8_weight,
-                          {2560, 640, 949U, Comparison::Sampled, true, pattern_calls(513),
+    failures += run_shape("MXFP8_A8PairBlock32 FP4-Local K tail", ActivationCompute::A16, make_mxfp8_weight,
+                          {2560, 640, 2949U, Comparison::Sampled, true, pattern_calls(513),
                            ActivationPattern::KTail});
     return failures;
 }
@@ -353,10 +417,10 @@ std::vector<std::uint16_t> outlier_activations(std::int32_t k, std::int32_t t, s
     return bits;
 }
 
-int run_flash_next_pair_outliers() {
+int run_flash_next_pair_outliers(const PairRoute& route) {
     constexpr test::ReductionCriterion kA16Criterion{1.0 / 256.0, 1.0 / 256.0, 2.0 / 256.0};
     int failures       = 0;
-    std::uint32_t seed = 971U;
+    std::uint32_t seed = 971U + route.seed_offset;
     for (const auto& [n, k, min_tokens] : kFlashNextProblems) {
         DeviceProblem problem(n, k, seed++);
         std::vector<std::int32_t> rows;
@@ -373,7 +437,7 @@ int run_flash_next_pair_outliers() {
             DeviceBuffer x(bits.size() * sizeof(std::uint16_t));
             x.copy_from_host(bits.data(), bits.size() * sizeof(std::uint16_t));
             const auto output =
-                run_linear(problem.view, x, t, ops::LinearPolicy::A16Only, kPair);
+                run_linear(problem.view, x, t, ops::LinearPolicy::A16Only, route.routes);
             const auto row_count = static_cast<std::int32_t>(rows.size());
             std::vector<double> reference(static_cast<std::size_t>(row_count) * t);
             cpu_linear_gemm_fp64(oracle_weight.data(), values.data(), reference.data(), row_count,
@@ -383,8 +447,9 @@ int run_flash_next_pair_outliers() {
                 for (std::int32_t r = 0; r < row_count; ++r)
                     actual[static_cast<std::size_t>(token) * row_count + r] = test::bf16_to_f32(
                         output[static_cast<std::size_t>(token) * n + rows[static_cast<std::size_t>(r)]]);
-            const std::string label = "FP8_A8Pair outliers [" + std::to_string(n) + "," +
-                                      std::to_string(k) + "] T=" + std::to_string(t);
+            const std::string label = std::string(route.label) + " outliers [" +
+                                      std::to_string(n) + "," + std::to_string(k) +
+                                      "] T=" + std::to_string(t);
             failures += test::verify_reduction(label, actual, reference, kA16Criterion);
         }
     }
@@ -498,32 +563,134 @@ int pair_quantizer_exact() {
     return failures;
 }
 
-// The pair route is deterministic: repeated calls on one input give the same bits, in both tile
-// widths of every problem.
-int pair_deterministic() {
+// The block32 quantizer against the exact oracle: decoded with its UE8M0 block scales (word
+// (k_tile, token) at k_tile * stride + token, block 4 * k_tile + j in byte j), the two terms equal
+// the BF16 activation exactly wherever a value lies within 2^14 of its 32-value block's maximum, and
+// stay within 2^-20 of the block maximum below that. No scale byte is 0xFF (NaN in UE8M0).
+int check_pair_block32_quantizer(std::int32_t n, std::int32_t k, std::int32_t tokens,
+                                 const std::vector<std::uint16_t>& bits) {
+    DeviceBuffer x(bits.size() * sizeof(std::uint16_t));
+    x.copy_from_host(bits.data(), bits.size() * sizeof(std::uint16_t));
+    const std::size_t capacity =
+        ops::detail::fp8_a8_pair_block32_workspace_capacity_bytes(tokens, k);
+    DeviceArena arena(capacity);
+    const auto workspace = ops::detail::allocate_fp8_a8_pair_block32_workspace(arena, tokens, k);
+    Weight weight{};
+    weight.k = k;
+    weight.n = n;
+    ops::detail::launch_fp8_a8_pair_block32_quantize(Tensor(x.p, DType::BF16, {k, tokens}), weight,
+                                                     workspace, nullptr);
+    test::cuda_check(cudaDeviceSynchronize(), "pair block32 quantize");
+    const auto host = [&](const void* device, std::size_t size) {
+        std::vector<std::uint8_t> out(size);
+        test::cuda_check(cudaMemcpy(out.data(), device, size, cudaMemcpyDeviceToHost),
+                         "pair block32 quantize copy");
+        return out;
+    };
+    const std::size_t codes = static_cast<std::size_t>(k) * tokens;
+    const std::int32_t stride = ops::detail::fp8_a8_pair_block32_scale_stride(tokens);
+    const std::size_t scale_bytes = static_cast<std::size_t>(k / 128) * stride * 4;
+    const auto hi = host(workspace.codes_hi, codes), lo = host(workspace.codes_lo, codes);
+    const auto s_hi = host(workspace.block_scales_hi, scale_bytes);
+    const auto s_lo = host(workspace.block_scales_lo, scale_bytes);
+    int mismatches = 0;
+    for (std::int32_t token = 0; token < tokens; ++token) {
+        for (std::int32_t block = 0; block < k / 32; ++block) {
+            const std::size_t at_scale =
+                (static_cast<std::size_t>(block / 4) * stride + token) * 4 + block % 4;
+            const int byte_hi = s_hi[at_scale], byte_lo = s_lo[at_scale];
+            if ((byte_hi == 0xFF || byte_lo == 0xFF) && mismatches++ < 3) {
+                std::cerr << "FP8 A8 pair block32 quantizer K=" << k << " token " << token
+                          << " block " << block << ": a NaN scale byte\n";
+            }
+            double maximum = 0.0;
+            for (int i = 0; i < 32; ++i)
+                maximum = std::max(maximum, std::fabs(static_cast<double>(test::bf16_to_f32(
+                                                bits[static_cast<std::size_t>(token) * k +
+                                                     block * 32 + i]))));
+            for (int i = 0; i < 32; ++i) {
+                const std::size_t at = static_cast<std::size_t>(token) * k + block * 32 + i;
+                const double value   = test::bf16_to_f32(bits[at]);
+                const double decoded = e4m3_value(hi[at]) * std::ldexp(1.0, byte_hi - 127) +
+                                       e4m3_value(lo[at]) * std::ldexp(1.0, byte_lo - 127);
+                const bool in_range = std::fabs(value) >= std::ldexp(maximum, -14);
+                const bool ok       = in_range ? decoded == value
+                                               : std::fabs(decoded - value) <= std::ldexp(maximum, -20);
+                if (!ok && mismatches++ < 3) {
+                    std::cerr << "FP8 A8 pair block32 quantizer K=" << k << " T=" << tokens
+                              << " token " << token << " channel " << block * 32 + i << ": "
+                              << value << " decodes to " << decoded << '\n';
+                }
+            }
+        }
+    }
+    return mismatches != 0 ? 1 : 0;
+}
+
+// The columns of pair_quantizer_exact, plus one whose first block holds a value 2^20 above every
+// other value of the column (a massive activation: only that block's other values fall below 2^14 of
+// their maximum), at T = 40 and at T = 41 (a scale stride with padding); then the block32 outlier
+// test's own activations.
+int pair_block32_quantizer_exact() {
     int failures       = 0;
-    std::uint32_t seed = 991U;
+    std::uint32_t seed = 1972U; // run_flash_next_pair_outliers' block32 activation seeds
+    for (const auto& [n, k, min_tokens] : kFlashNextProblems) {
+        for (const std::int32_t tokens : {40, 41}) {
+            std::vector<std::uint16_t> bits(static_cast<std::size_t>(k) * tokens);
+            std::uint32_t state = 1013U * static_cast<std::uint32_t>(k);
+            for (std::int32_t token = 0; token < tokens; ++token) {
+                for (std::int32_t channel = 0; channel < k; ++channel) {
+                    state = state * 1664525U + 1013904223U;
+                    const float unit =
+                        static_cast<float>(static_cast<std::int32_t>(state >> 9) - (1 << 22)) /
+                        static_cast<float>(1 << 22);
+                    float value = std::ldexp(unit, token % 9 - 4);
+                    if (channel % 61 == 7) value *= 256.0F;
+                    if (token == 5) value = 0.0F;
+                    if (token == 6) value = std::ldexp(unit, channel % 2 ? 120 : -120);
+                    if (token == 7 && channel % 32 == 3) value = std::ldexp(unit, -20 - 4);
+                    if (token == 8) value = channel == 5 ? std::ldexp(1.5F, 20) : unit;
+                    bits[static_cast<std::size_t>(token) * k + channel] = test::f32_to_bf16(value);
+                }
+            }
+            failures += check_pair_block32_quantizer(n, k, tokens, bits);
+        }
+        for (const std::int32_t t : {min_tokens, std::max(min_tokens, kPairNarrowTokens) + 44})
+            failures += check_pair_block32_quantizer(n, k, t, outlier_activations(k, t, seed));
+        ++seed;
+    }
+    return failures;
+}
+
+// Each pair route is deterministic: repeated calls on one input give the same bits, in both tile
+// widths of every problem (test_fp8_a8_pair_repeat.cu repeats them thousands of times).
+int pair_deterministic(const PairRoute& route) {
+    int failures       = 0;
+    std::uint32_t seed = 991U + route.seed_offset;
     for (const auto& [n, k, min_tokens] : kFlashNextProblems) {
         DeviceProblem problem(n, k, seed++);
         for (const std::int32_t t : {std::max(min_tokens, 200), std::max(min_tokens, 1024)}) {
             const std::vector<std::uint16_t> bits = outlier_activations(k, t, seed);
             DeviceBuffer x(bits.size() * sizeof(std::uint16_t));
             x.copy_from_host(bits.data(), bits.size() * sizeof(std::uint16_t));
-            const auto first = run_linear(problem.view, x, t, ops::LinearPolicy::A16Only, kPair);
+            const auto first =
+                run_linear(problem.view, x, t, ops::LinearPolicy::A16Only, route.routes);
             for (int repeat = 0; repeat < 4; ++repeat) {
-                const auto again = run_linear(problem.view, x, t, ops::LinearPolicy::A16Only, kPair);
+                const auto again =
+                    run_linear(problem.view, x, t, ops::LinearPolicy::A16Only, route.routes);
                 int differing    = 0;
                 for (std::size_t i = 0; i < first.size(); ++i) {
                     if (first[i] == again[i]) continue;
                     if (differing++ < 4) {
-                        std::cerr << "FP8_A8Pair [" << n << "," << k << "] T=" << t << " repeat "
-                                  << repeat << ": token " << i / n << " row " << i % n
-                                  << " changed\n";
+                        std::cerr << route.label << " [" << n << "," << k << "] T=" << t
+                                  << " repeat " << repeat << ": token " << i / n << " row "
+                                  << i % n << " changed\n";
                     }
                 }
                 if (differing != 0) {
-                    std::cerr << "FP8_A8Pair [" << n << "," << k << "] T=" << t << ": " << differing
-                              << " of " << first.size() << " outputs differ between calls\n";
+                    std::cerr << route.label << " [" << n << "," << k << "] T=" << t << ": "
+                              << differing << " of " << first.size()
+                              << " outputs differ between calls\n";
                     ++failures;
                     break;
                 }
@@ -533,13 +700,13 @@ int pair_deterministic() {
     return failures;
 }
 
-// Admission seams: below its problem's admission the flag runs the exact route bit for bit, and a
-// problem that registers no pair route (the Qwen3.8-27B FP8 problems) ignores the flag at every
-// width. The capacity query covers the pair route from its admission.
+// Admission seams: below its problem's admission each pair flag runs the exact route bit for bit,
+// and a problem that registers no pair route (the Qwen3.8-27B FP8 problems) ignores both flags at
+// every width. Where both flags are set the block32 route runs (its precedence). The capacity query
+// covers both pair routes from their admission.
 int pair_admission_seams() {
     int failures = 0;
-    const auto compare = [&](const DeviceProblem& problem, std::int32_t t,
-                             ops::LinearPolicy policy) {
+    const auto activation = [](const DeviceProblem& problem, std::int32_t t) {
         std::vector<std::uint16_t> bits(static_cast<std::size_t>(problem.view.k) * t);
         for (std::size_t i = 0; i < bits.size(); ++i) {
             const auto hashed = static_cast<std::uint32_t>(i) * 2654435761U;
@@ -548,11 +715,28 @@ int pair_admission_seams() {
         }
         DeviceBuffer x(bits.size() * sizeof(std::uint16_t));
         x.copy_from_host(bits.data(), bits.size() * sizeof(std::uint16_t));
+        return x;
+    };
+    const auto compare = [&](const DeviceProblem& problem, std::int32_t t,
+                             ops::LinearPolicy policy) {
+        const DeviceBuffer x = activation(problem, t);
         const auto exact = run_linear(problem.view, x, t, policy, ops::LinearRoutes::Exact);
-        const auto flag  = run_linear(problem.view, x, t, policy, kPair);
-        if (exact != flag) {
+        for (const PairRoute& route : kPairRoutes) {
+            if (exact != run_linear(problem.view, x, t, policy, route.routes)) {
+                std::cerr << "FP8 [" << problem.view.n << "," << problem.view.k << "] T=" << t
+                          << ": the " << route.label << " flag changed a width it does not serve\n";
+                ++failures;
+            }
+        }
+    };
+    const auto precedence = [&](const DeviceProblem& problem, std::int32_t t) {
+        const DeviceBuffer x = activation(problem, t);
+        const auto block32   = run_linear(problem.view, x, t, ops::LinearPolicy::A16Only, kPairBlock32);
+        const auto both      = run_linear(problem.view, x, t, ops::LinearPolicy::A16Only,
+                                          kPair | kPairBlock32);
+        if (block32 != both) {
             std::cerr << "FP8 [" << problem.view.n << "," << problem.view.k << "] T=" << t
-                      << ": the fp8-a8-pair flag changed a width it does not serve\n";
+                      << ": with both pair flags the block32 route does not take precedence\n";
             ++failures;
         }
     };
@@ -561,12 +745,15 @@ int pair_admission_seams() {
         DeviceProblem problem(n, k, seed++);
         compare(problem, min_tokens - 1, ops::LinearPolicy::A16Only);
         compare(problem, 1, ops::LinearPolicy::A16Only);
+        precedence(problem, min_tokens);
+        precedence(problem, std::max(min_tokens, kPairNarrowTokens) + 1);
         const auto capacity = [n = n, k = k](std::int32_t first, std::int32_t last) {
             return ops::linear_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16, n, k,
                                                         ops::LinearPolicy::A16Only, first, last);
         };
         const std::size_t planes = 2U * static_cast<std::size_t>(k) * 4096U;
-        if (capacity(1, min_tokens - 1) != 0 || capacity(min_tokens, min_tokens) == 0 ||
+        // Below the pair routes only the FP16-accumulate route (where registered) may need workspace.
+        if (capacity(1, min_tokens - 1) > capacity(min_tokens, min_tokens) || capacity(min_tokens, min_tokens) == 0 ||
             capacity(1, 4096) < planes || capacity(4096, 4096) != capacity(1, 4096)) {
             std::cerr << "FP8 A8 pair workspace contract mismatch for [" << n << "," << k << "]\n";
             ++failures;
@@ -582,15 +769,19 @@ int pair_admission_seams() {
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(linear_fp8_a8) {
     if (!infernix::test::linear::cuda_available()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
     try {
-        const int failures = run_fp8_a8() + run_flash_next_fp8_a8_pair() + pair_quantizer_exact() +
-                             pair_deterministic() + run_flash_next_pair_outliers() +
-                             pair_admission_seams();
+        int failures = run_fp8_a8() + pair_quantizer_exact() + pair_block32_quantizer_exact();
+        for (const PairRoute& route : kPairRoutes) {
+            failures += run_flash_next_fp8_a8_pair(route) + pair_deterministic(route) +
+                        run_flash_next_pair_outliers(route);
+        }
+        failures += pair_admission_seams();
+        failures += run_flash_next_mxfp8_pair_block32();
         std::cout << (failures == 0 ? "OK" : "FAIL") << " FP8 A8 Linear\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

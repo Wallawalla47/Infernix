@@ -364,7 +364,7 @@ int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shap
                                                     t, "reference")));
         };
         try {
-            ops::linear_add(input, weight, residual_out, shape.policy, workspace, nullptr);
+            ops::linear_add(input, weight, residual_out, shape.policy, workspace, nullptr, shape.routes);
             test::cuda_check(cudaDeviceSynchronize(), "synchronize linear_add");
             verify_result();
             if ((t == 128 && format == WeightFormat::Q5G64F16S) ||
@@ -375,7 +375,7 @@ int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shap
                 cudaGraphExec_t executable;
                 CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
                 CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
-                ops::linear_add(input, weight, residual_out, graph_policy, workspace, stream);
+                ops::linear_add(input, weight, residual_out, graph_policy, workspace, stream, shape.routes);
                 CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
                 CUDA_CHECK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
                 for (int replay = 0; replay < 3; ++replay) {
@@ -409,7 +409,7 @@ int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shap
                 CUDA_CHECK(cudaGraphDestroy(graph));
                 CUDA_CHECK(cudaStreamDestroy(stream));
                 output.copy_from_host(residual.data(), output.bytes());
-                ops::linear_add(input, weight, residual_out, rerun_policy, workspace, nullptr);
+                ops::linear_add(input, weight, residual_out, rerun_policy, workspace, nullptr, shape.routes);
                 test::cuda_check(cudaDeviceSynchronize(), "synchronize permissive A16 linear_add");
                 verify_result();
             }

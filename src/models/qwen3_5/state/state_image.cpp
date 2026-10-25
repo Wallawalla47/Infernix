@@ -19,7 +19,7 @@ constexpr std::size_t kStateImageAlignment = 256;
 // The packed form of a recurrent Host format; absent for the exact one.
 std::optional<ops::PackedStateFormat> packed_format(RecurrentHostFormat format) {
     switch (format) {
-    case RecurrentHostFormat::Fp32: return std::nullopt;
+    case RecurrentHostFormat::Exact: return std::nullopt;
     case RecurrentHostFormat::Fp24: return ops::PackedStateFormat::Fp24;
     case RecurrentHostFormat::Bf16: return ops::PackedStateFormat::Bf16;
     }
@@ -58,7 +58,8 @@ bool same_linear_spec(const LinearAttentionStatePoolSpec& left,
     return left.layers == right.layers && left.conv_channels == right.conv_channels &&
            left.conv_width == right.conv_width && left.value_heads == right.value_heads &&
            left.value_head_dim == right.value_head_dim && left.key_head_dim == right.key_head_dim &&
-           left.slot_count == right.slot_count && left.conv_dtype == right.conv_dtype;
+           left.slot_count == right.slot_count && left.conv_dtype == right.conv_dtype &&
+           left.recurrent_dtype == right.recurrent_dtype;
 }
 
 bool same_dflash_spec(const std::optional<DFlashLocalStateSpec>& left,
@@ -118,6 +119,7 @@ StateImageHostLayout plan_host_state_image(const StateImageSpec& spec) {
         spec.linear.value_heads <= 0 || spec.linear.value_head_dim <= 0 ||
         spec.linear.key_head_dim <= 0 || spec.linear.slot_count <= 0 ||
         (spec.linear.conv_dtype != DType::BF16 && spec.linear.conv_dtype != DType::FP32) ||
+        (spec.linear.recurrent_dtype != DType::FP16 && spec.linear.recurrent_dtype != DType::FP32) ||
         spec.hidden <= 0) {
         throw std::invalid_argument("StateImage host geometry is invalid");
     }
@@ -132,7 +134,7 @@ StateImageHostLayout plan_host_state_image(const StateImageSpec& spec) {
     const Tensor conv_slot(nullptr, spec.linear.conv_dtype,
                            {spec.linear.conv_channels, spec.linear.conv_width});
     const Tensor recurrent_slot(
-        nullptr, DType::FP32,
+        nullptr, spec.linear.recurrent_dtype,
         {spec.linear.key_head_dim, spec.linear.value_head_dim, spec.linear.value_heads});
     const Tensor hidden_slot(nullptr, DType::BF16, {spec.hidden});
     host.linear_conv_layer_bytes = conv_slot.bytes();
@@ -140,6 +142,9 @@ StateImageHostLayout plan_host_state_image(const StateImageSpec& spec) {
                                                "StateImage host convolution bytes overflow"),
                                    kStateImageAlignment, "StateImage host convolution");
     const std::optional<ops::PackedStateFormat> packed = packed_format(spec.recurrent_host);
+    if (packed && spec.linear.recurrent_dtype != DType::FP32) {
+        throw std::invalid_argument("StateImage packs only an FP32 recurrent state for the Host");
+    }
     host.linear_recurrent_layer_bytes =
         packed ? ops::packed_state_bytes(recurrent_slot.numel(), *packed) : recurrent_slot.bytes();
     host.linear_recurrent =

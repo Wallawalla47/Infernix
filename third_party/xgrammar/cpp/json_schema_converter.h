@@ -433,6 +433,14 @@ class JSONSchemaConverter {
   int32_t AddSubGrammar(const Grammar& grammar);
 
   int32_t WhitespaceExpression();
+  /*!
+   * \brief A const/enum JSON literal. With any_whitespace an object or array literal admits the
+   * document's formatting whitespace between its tokens (members in the schema's order); strings,
+   * numbers, booleans and null stay verbatim. Without it, the compact serialization.
+   */
+  int32_t LiteralExpression(const picojson::value& value);
+  /*! \brief LiteralExpression of a serialized JSON value (ConstSpec/EnumSpec). */
+  int32_t LiteralExpression(const std::string& json_value);
   int32_t FormattingExpression(const std::string& expression);
   int32_t NextSeparatorExpression(bool is_end = false);
   int32_t KeyPatternExpression();

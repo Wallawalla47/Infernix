@@ -110,6 +110,7 @@ def test_result_record_parses_request_host_exposure() -> None:
         },
         "timings_seconds": {
             "prepare": 0.1,
+            "ttft": 0.35,
             "vision": 0.0,
             "prefill": 0.2,
             "decode": 0.4,
@@ -144,8 +145,10 @@ def test_result_record_parses_request_host_exposure() -> None:
     record = build_result_record(
         spec, "measured-prefill-bindings", payload, response, event
     )
-    assert record["schema_version"] == 8
+    assert record["schema_version"] == 9
     assert record["kv_dtype"] == "fp8"
+    # Server TTFT is the server's logged first-token time, not the phase sum (0.3 s here).
+    assert record["metrics"]["server_ttft_ms"] == pytest.approx(350.0)
     assert record["metrics"]["engine_host_exposed_ms"] == pytest.approx(15.0)
     assert record["metrics"]["decode_host_us_per_round"] == pytest.approx(5000.0)
     assert record["metrics"]["decode_device_wait_us_per_round"] == pytest.approx(

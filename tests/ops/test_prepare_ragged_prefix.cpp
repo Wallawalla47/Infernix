@@ -1,4 +1,5 @@
 #include "infernix/ops/prepare_ragged_prefix.h"
+#include "ops/op_family.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
 #include "ops/op_tester.h"
@@ -115,7 +116,7 @@ int run_case(int rows, int width, int batch, bool padded, int mode, bool replay)
 }
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(prepare_ragged_prefix) {
     if (cuda_unavailable()) return 77;
     try {
         int failures = 0;

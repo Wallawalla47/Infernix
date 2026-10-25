@@ -259,9 +259,9 @@ public:
                        std::vector<DeviceKVPageLease>& source);
     void dematerialize_one(DeviceKVPageReservation& reservation, DeviceKVPageLease&& page);
 
-    void zero_pages(std::span<const DeviceKVPageHandle> pages, cudaStream_t stream = nullptr) const;
+    void zero_pages(std::span<const DeviceKVPageHandle> pages, cudaStream_t stream) const;
     TransferWork copy_page(DeviceKVPageHandle source, DeviceKVPageHandle destination,
-                           cudaStream_t stream = nullptr) const;
+                           cudaStream_t stream) const;
 
     // One run assumes contiguous Host records and contiguous Device page IDs. Before Device
     // allocation, sum this work over known Host runs as a nominal transfer estimate.
@@ -270,10 +270,10 @@ public:
 
     TransferWork copy_to_host(std::span<const DeviceKVPageHandle> source,
                               HostKVAllocationView destination,
-                              cudaStream_t stream = nullptr) const;
+                              cudaStream_t stream) const;
     TransferWork copy_from_host(HostKVAllocationConstView source,
                                 std::span<const DeviceKVPageHandle> destination,
-                                cudaStream_t stream = nullptr) const;
+                                cudaStream_t stream) const;
     // Record-addressed forms for caller-owned pinned host memory: page i is packed with `layout`
     // at records[i]. Runs of consecutive physical pages whose records advance by one constant
     // pitch are copied as one strided transfer per plane. A strided transfer must stay inside one
@@ -284,7 +284,7 @@ public:
     std::uint32_t copy_to_host_records(std::span<const DeviceKVPageHandle> source,
                                        std::span<std::byte* const> records,
                                        std::span<const std::uint32_t> record_groups,
-                                       const HostKVPageLayout& layout, cudaStream_t stream = nullptr) const;
+                                       const HostKVPageLayout& layout, cudaStream_t stream) const;
     // The same restricted to planes [plane_begin, plane_end), so a capture can copy a model
     // layer's planes as soon as the layer's last writer has run.
     std::uint32_t copy_to_host_records(std::span<const DeviceKVPageHandle> source,
@@ -296,7 +296,7 @@ public:
                                          std::span<const std::uint32_t> record_groups,
                                          std::span<const DeviceKVPageHandle> destination,
                                          const HostKVPageLayout& layout,
-                                         cudaStream_t stream = nullptr) const;
+                                         cudaStream_t stream) const;
     // The same restricted to planes [plane_begin, plane_end), so a caller can order the planes a
     // consumer needs first (a model's per-layer planes) ahead of the rest.
     std::uint32_t copy_from_host_records(std::span<const std::byte* const> records,

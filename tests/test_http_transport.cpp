@@ -164,6 +164,27 @@ int test_ngram_identity() {
     return failures;
 }
 
+int test_request_label() {
+    using namespace infernix::serve;
+    int failures = 0;
+    httplib::Request request;
+    failures += check(request_label(request).empty(), "absent label header gave a label");
+    request.set_header("X-Infernix-Request-Label", "bench fl02/a");
+    failures += check(request_label(request) == "bench fl02/a", "valid label was not read");
+    request.set_header("x-infernix-request-label", "second");
+    failures += check(request_label(request).empty(), "repeated label header accepted");
+    for (const std::string& value : {std::string{}, std::string(129, 'x'), std::string("tab\there"),
+                                     std::string("caf\xc3\xa9")}) {
+        request.headers.clear();
+        request.set_header("x-infernix-request-label", value);
+        failures += check(request_label(request).empty(), "malformed label accepted");
+    }
+    request.headers.clear();
+    request.set_header("x-infernix-request-label", std::string(128, 'x'));
+    failures += check(request_label(request).size() == 128, "128-character label rejected");
+    return failures;
+}
+
 int test_ngram_generation() {
     using namespace infernix;
     using namespace infernix::serve;
@@ -364,7 +385,7 @@ int test_inherited_socket_liveness() {
 } // namespace
 
 int main() {
-    int failures = test_ngram_identity() + test_ngram_generation() + test_sse_transport() +
+    int failures = test_ngram_identity() + test_request_label() + test_ngram_generation() + test_sse_transport() +
                    test_sse_response_headers() + test_prompt_json_member_order() +
                    test_schema_number_precision();
 #if defined(__linux__) || defined(_WIN32)

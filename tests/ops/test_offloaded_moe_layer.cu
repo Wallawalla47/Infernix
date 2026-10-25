@@ -12,10 +12,13 @@
 // location, nor the staging pass a job falls in, nor a CPU-served share may change an output bit.
 // moe_dispatch has its own exact oracle (test_dispatch). Layers of W4A16 experts (§16.2.1) run the
 // same configurations against expert_forward_a16, which every W4A16 output equals bit for bit (its
-// wide route is exact as well).
+// wide route is exact as well), and with the two-term narrow route (expert-a4-residual-decode) against
+// expert_forward_a4r for experts of at most eight columns: the placement invariance of that path.
+#include "ops/op_family.h"
 #include "infernix/ops/hyper_connection.h"
 #include "infernix/ops/offloaded_sparse_moe.h"
 #include "ops/offloaded_moe_fixtures.h"
+#include "ops/offloaded_sparse_moe/cpu/a4r_expert.h"
 #include "ops/offloaded_sparse_moe/cpu/fetch_channel.h"
 #include "ops/offloaded_sparse_moe/cpu/miss_service.h"
 #include "ops/offloaded_sparse_moe/cpu/w4a16_expert.h"
@@ -33,7 +36,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <random>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -67,11 +72,14 @@ template <class T> T* device_copy(const std::vector<T>& v) {
     return p;
 }
 
-std::vector<std::uint16_t> cpu_column(const fixtures::Expert& e, const std::uint16_t* x, moe::ExpertActivation activation) {
+std::vector<std::uint16_t> cpu_column(const fixtures::Expert& e, const std::uint16_t* x, moe::ExpertActivation activation,
+                                      bool two_term = false) {
     std::vector<std::uint16_t> y(moe::kHidden);
     const std::uint16_t* xp[1] = {x};
     std::uint16_t* yp[1]       = {y.data()};
-    if (activation == moe::ExpertActivation::kA16) {
+    if (two_term) {
+        moe::expert_forward_a4r(moe::best_cpu_isa(), e.record.data(), e.scales, 1, xp, yp);
+    } else if (activation == moe::ExpertActivation::kA16) {
         moe::expert_forward_a16(moe::best_cpu_isa(), moe::kFlashNextShape, e.record.data(), e.scales, 1, xp, yp);
     } else {
         moe::expert_forward(moe::best_cpu_isa(), e.record.data(), e.scales, 1, xp, yp);
@@ -177,10 +185,14 @@ private:
     std::thread thread_;
 };
 
+// With narrow == kA4Residual (W4A16 only; expert-a4-residual-decode) the GPU narrow kernels and every
+// CPU service compute experts of at most eight columns with the two-term arithmetic, so those outputs
+// equal expert_forward_a4r's for every placement, staging pass and CPU share (the wide ones stay exact).
 void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
-                moe::ExpertActivation activation = moe::ExpertActivation::kA4) {
+                moe::ExpertActivation activation = moe::ExpertActivation::kA4,
+                moe::NarrowA16 narrow = moe::NarrowA16::kExact) {
     const bool a16 = activation == moe::ExpertActivation::kA16;
-    if (a16) { std::printf("--- W4A16 experts\n"); }
+    if (a16) { std::printf("--- W4A16 experts%s\n", narrow == moe::NarrowA16::kA4Residual ? ", two-term narrow route" : ""); }
     std::mt19937 rng(seed);
     const std::size_t stride = moe::kRecordBytes;
     std::vector<fixtures::Expert> bank;
@@ -266,11 +278,16 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
     cuda_check(cudaMemcpy(ids.data(), d_ids, ids.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost), "cudaMemcpy");
 
     // Expected outputs: column t * k + slot = expert ids[slot, t] applied to x[:, t].
+    // Under the two-term narrow route an expert of at most eight columns takes the two-term arithmetic.
+    std::vector<int> id_columns(static_cast<std::size_t>(experts), 0);
+    for (const std::int32_t id : ids) { ++id_columns[static_cast<std::size_t>(id)]; }
     std::vector<std::uint16_t> expected(static_cast<std::size_t>(moe::kHidden) * top_k * columns);
     for (int t = 0; t < columns; ++t) {
         for (int s = 0; s < top_k; ++s) {
-            const auto y = cpu_column(bank[ids[static_cast<std::size_t>(t) * top_k + s]],
-                                      &x[static_cast<std::size_t>(t) * moe::kHidden], activation);
+            const int id = ids[static_cast<std::size_t>(t) * top_k + s];
+            const bool two_term = a16 && narrow == moe::NarrowA16::kA4Residual &&
+                                  id_columns[static_cast<std::size_t>(id)] <= moe::kMaxColumns;
+            const auto y = cpu_column(bank[id], &x[static_cast<std::size_t>(t) * moe::kHidden], activation, two_term);
             std::memcpy(&expected[(static_cast<std::size_t>(t) * top_k + s) * moe::kHidden], y.data(),
                         moe::kHidden * sizeof(std::uint16_t));
         }
@@ -285,37 +302,48 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
     std::uint16_t* d_out = nullptr;
     cuda_check(cudaMalloc(&d_out, expected.size() * sizeof(std::uint16_t)), "cudaMalloc");
     std::vector<moe::CpuMissService::Layer> layers{{.records = host, .record_stride = stride, .scales = scales.data()}};
-    moe::CpuMissService service_two(layers, {.workers = 2, .max_jobs = 2, .max_columns = 64, .cpus = {}, .activation = activation});
-    moe::CpuMissService service_eight(layers, {.workers = 4, .max_jobs = 8, .max_columns = 64, .cpus = {}, .activation = activation});
+    moe::CpuMissService service_two(layers, {.workers = 2, .max_jobs = 2, .max_columns = 64, .cpus = {}, .activation = activation, .narrow_a16 = narrow});
+    moe::CpuMissService service_eight(layers, {.workers = 4, .max_jobs = 8, .max_columns = 64, .cpus = {}, .activation = activation, .narrow_a16 = narrow});
     // The largest cap with every miss offered to the CPU, and a cap whose jobs are limited to two columns.
     moe::CpuMissService service_all(layers, {.workers = 6, .max_jobs = moe::kMaxCpuJobs, .max_columns = 64,
-                                             .pcie_divisor = 0, .cpus = {}, .activation = activation});
+                                             .pcie_divisor = 0, .cpus = {}, .activation = activation, .narrow_a16 = narrow});
     moe::CpuMissService service_narrow(layers, {.workers = 6, .max_jobs = 24, .max_columns = 64, .pcie_divisor = 2,
-                                                .max_job_columns = 2, .cpus = {}, .activation = activation});
+                                                .max_job_columns = 2, .cpus = {}, .activation = activation, .narrow_a16 = narrow});
     // A GGUF import's decode split: one-column calls keep every miss on the link (d = 1), wider calls d = 2.
     moe::CpuMissService service_one(layers, {.workers = 6, .max_jobs = 16, .max_columns = 64, .pcie_divisor = 2,
-                                             .one_column_divisor = 1, .cpus = {}, .activation = activation});
+                                             .one_column_divisor = 1, .cpus = {}, .activation = activation, .narrow_a16 = narrow});
+    // Strata's link share (INFERNIX_TMP_LINK_SHARE): the link keeps (M * 77) >> 8 (0.30) of the misses
+    // in place of M / 2, and one-column calls with their divisor keep theirs.
+    moe::CpuMissService service_share(layers, {.workers = 6, .max_jobs = 24, .max_columns = 64, .pcie_divisor = 2,
+                                               .pcie_share = 77, .cpus = {}, .activation = activation,
+                                               .narrow_a16 = narrow});
+    moe::CpuMissService service_share_one(layers, {.workers = 6, .max_jobs = 24, .max_columns = 64, .pcie_divisor = 2,
+                                                   .one_column_divisor = 1, .pcie_share = 77, .cpus = {},
+                                                   .activation = activation, .narrow_a16 = narrow});
     // Prefill CPU assist (P7): calls of at least 9 columns take up to 256 CPU-served misses.
     moe::CpuMissService service_assist(layers, {.workers = 6, .max_jobs = 8, .max_columns = 255, .pcie_divisor = 4,
-                                                .wide_from = 9, .wide_jobs = moe::kMaxCpuJobs, .cpus = {}, .activation = activation});
+                                                .wide_from = 9, .wide_jobs = moe::kMaxCpuJobs, .cpus = {}, .activation = activation, .narrow_a16 = narrow});
     // A prefill call's CPU share (design §19.3.12): calls up to a chunk of 4,096 columns, every narrow
     // miss offered (no PCIe share), up to every expert of the layer.
     moe::CpuMissService service_wide(layers, {.workers = 6, .max_jobs = 8, .max_columns = moe::kMaxCpuCallColumns,
                                               .pcie_divisor = 0, .wide_from = 256, .wide_jobs = moe::kMaxCpuJobs,
-                                              .cpus = {}, .activation = activation});
+                                              .cpus = {}, .activation = activation, .narrow_a16 = narrow});
     // SSD tier (design §19.3.7): services that read SSD-only records through a provider.
     CopiedRecords copied;
     copied.bank   = host;
     copied.stride = stride;
     moe::CpuMissService service_ssd_all(layers, {.workers = 6, .max_jobs = moe::kMaxCpuJobs, .max_columns = 64,
-                                                 .pcie_divisor = 0, .cpus = {}, .activation = activation, .records = &copied});
-    moe::CpuMissService service_ssd8(layers, {.workers = 4, .max_jobs = 8, .max_columns = 64, .cpus = {}, .activation = activation,
+                                                 .pcie_divisor = 0, .cpus = {}, .activation = activation, .narrow_a16 = narrow, .records = &copied});
+    moe::CpuMissService service_ssd8(layers, {.workers = 4, .max_jobs = 8, .max_columns = 64, .cpus = {}, .activation = activation, .narrow_a16 = narrow,
                                               .records = &copied});
-    // The CPU's share of the misses (design §19.3.5 S3): want = min(cap, M - M / divisor) of the misses
-    // with at most max_job_columns columns, so the number served is min(want, eligible misses). The
-    // divisor is one_column_divisor (when set) in a one-column call.
-    const auto divisor_of = [&](const auto& channel) {
-        return columns == 1 && channel.one_column_divisor > 0 ? channel.one_column_divisor : channel.pcie_divisor;
+    // The CPU's share of the misses (design §19.3.5 S3): want = min(cap, M - kept) of the misses with
+    // at most max_job_columns columns, so the number served is min(want, eligible misses). The link
+    // keeps M / one_column_divisor in a one-column call (when set), else (M * pcie_share) >> 8 with a
+    // share, else M / pcie_divisor (none for 0).
+    const auto kept_of = [&](const auto& channel, int misses) {
+        if (columns == 1 && channel.one_column_divisor > 0) { return misses / channel.one_column_divisor; }
+        if (channel.pcie_share > 0) { return (misses * channel.pcie_share) >> 8; }
+        return channel.pcie_divisor > 0 ? misses / channel.pcie_divisor : 0;
     };
     std::vector<int> expert_columns(experts, 0);
     for (const std::int32_t id : ids) { ++expert_columns[id]; }
@@ -364,8 +392,7 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
         }
         const int cap  = channel.wide_from > 0 && columns >= channel.wide_from ? channel.wide_jobs : channel.max_jobs;
         const int take = std::min(cap, ssd_misses);
-        const int d    = divisor_of(channel);
-        const int want = std::min(cap - take, d > 0 ? misses - misses / d : misses);
+        const int want = std::min(cap - take, misses - kept_of(channel, misses));
         return take + std::min(want, eligible);
     };
     // Narrow SSD-only experts no CPU job takes (no service, a call wider than its columns, or past
@@ -402,8 +429,7 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
         int misses = 0;
         for (const std::int32_t e : jobs) { misses += miss(e) ? 1 : 0; }
         const int cap  = channel.wide_from > 0 && columns >= channel.wide_from ? channel.wide_jobs : channel.max_jobs;
-        const int d    = divisor_of(channel);
-        const int want = std::min(cap, d > 0 ? misses - misses / d : misses);
+        const int want = std::min(cap, misses - kept_of(channel, misses));
         int n = 0;
         for (int width = 1; width <= channel.max_job_columns && n < want; ++width) {
             for (const std::int32_t e : jobs) {
@@ -418,9 +444,9 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
     // Outputs with the CPU engine's bits: every W4A16 output (its wide route is exact too), and the
     // W4A4 narrow route's (design §8.5): an expert with at most eight columns, or one whose gate and
     // up projections keep separate input scales (the fixture's every third expert).
-    std::vector<std::uint8_t> narrow(static_cast<std::size_t>(top_k) * columns);
-    for (std::size_t i = 0; i < narrow.size(); ++i) {
-        narrow[i] = a16 || expert_columns[ids[i]] <= moe::kMaxCpuColumns || ids[i] % 3 == 0;
+    std::vector<std::uint8_t> exact_outputs(static_cast<std::size_t>(top_k) * columns);
+    for (std::size_t i = 0; i < exact_outputs.size(); ++i) {
+        exact_outputs[i] = a16 || expert_columns[ids[i]] <= moe::kMaxCpuColumns || ids[i] % 3 == 0;
     }
     std::vector<std::uint16_t> placed;
     // The fork stream and its events, for the one-pass decode/verification route.
@@ -434,6 +460,8 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
                                 Config{64, nullptr, true}, Config{64, &service_two, true}, Config{3, nullptr, true},
                                 Config{3, &service_all}, Config{64, &service_all, true}, Config{64, &service_narrow},
                                 Config{64, &service_narrow, true}, Config{64, &service_one}, Config{64, &service_one, true},
+                                Config{64, &service_share}, Config{64, &service_share, true}, Config{3, &service_share},
+                                Config{64, &service_share_one}, Config{64, &service_share_one, true},
                                 Config{64, nullptr, true, true},
                                 Config{64, &service_narrow, true, true}, Config{3, nullptr, false, true},
                                 Config{64, &service_assist}, Config{3, &service_assist}, Config{0, &service_assist},
@@ -490,6 +518,7 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
                                             .cpu = config.service != nullptr ? config.service->channel(0)
                                                                              : infernix::ops::MoeCpuChannel{}};
         source.activation           = activation;
+        source.narrow_a16           = narrow;
         source.heartbeat_timeout_ns = config.fetch == Responder::Mode::kSilent ? kSilentHeartbeatTimeoutNs : kTestHeartbeatTimeoutNs;
         if (config.service != nullptr) {
             // The CPU wait warms these into L2 while the host works; no output may change.
@@ -638,12 +667,13 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
         if (placed.empty()) { placed = got; }
         long mismatches = 0, moved = 0;
         for (std::size_t i = 0; i < got.size(); ++i) {
-            mismatches += narrow[i / moe::kHidden] && got[i] != expected[i];
+            mismatches += exact_outputs[i / moe::kHidden] && got[i] != expected[i];
             moved += got[i] != placed[i];
         }
         std::printf("E=%d T=%d k=%d staging slots %2d%s%s%s, CPU jobs %d (served %llu): %ld narrow-route outputs "
                     "differ from the CPU engine, %ld outputs from the first placement, of %zu\n",
-                    experts, columns, top_k, slots, config.fork ? " (fork)" : "", config.streamed ? " (streamed)" : "",
+                    experts, columns, top_k, slots, config.fork ? " (fork)" : "",
+                    config.streamed ? " (streamed)" : "",
                     config.fetched ? (config.overlap ? " (host table, SSD-only experts fetched, overlap)"
                                                      : " (host table, SSD-only experts fetched)")
                     : config.ssd != 0 ? " (host table, SSD-only experts)"
@@ -865,7 +895,7 @@ void test_tail_skip(int experts, int columns, int top_k, int rank, std::uint32_t
     Tensor tx(d_x, DType::BF16, {moe::kHidden, columns});
     Tensor out(d_out, DType::BF16, {moe::kHidden, top_k * columns});
     for (const bool fork : {false, true}) {
-        for (const bool fused : {false, true}) {
+        for (const bool fused : {false, true}) { // the fused plan or the plan kernel
             infernix::ops::moe_dispatch(routing, experts, dispatch, nullptr, nullptr);
             cuda_check(cudaMemset(d_out, 0xFF, expected.size() * sizeof(std::uint16_t)), "cudaMemset");
             infernix::ops::MoeExpertSource source{.frame_base    = d_frame_base,
@@ -1272,9 +1302,60 @@ void test_service_column_bound() {
     std::printf("CPU miss service: column counts outside 1..%d refused\n", moe::kMaxCpuColumns);
 }
 
+// A service thread that stops on an exception (here: a request for a layer it does not have)
+// reports it once through on_failure, with the request it was serving, and failure() keeps the
+// same text; the request is never answered.
+void test_service_failure_reported() {
+    std::mt19937 rng(509);
+    const fixtures::Expert expert = fixtures::random_expert(rng, false);
+    std::uint8_t* host            = nullptr;
+    cuda_check(cudaHostAlloc(reinterpret_cast<void**>(&host), moe::kRecordBytes, cudaHostAllocMapped), "cudaHostAlloc");
+    std::memcpy(host, expert.record.data(), moe::kRecordBytes);
+    const std::vector<moe::ExpertScales> scales{expert.scales};
+    std::vector<moe::CpuMissService::Layer> layers{{.records = host, .record_stride = moe::kRecordBytes,
+                                                    .scales = scales.data()}};
+    std::atomic<int> reports{0};
+    std::mutex mutex;
+    std::string reported;
+    {
+        moe::CpuMissService service(layers, {.workers     = 2,
+                                             .max_jobs    = 2,
+                                             .max_columns = 64,
+                                             .cpus        = {},
+                                             .on_failure  = [&](const std::string& why) {
+                                                 const std::lock_guard<std::mutex> lock(mutex);
+                                                 reported = why;
+                                                 reports.fetch_add(1);
+                                             }});
+        const infernix::ops::MoeCpuChannel channel = service.channel(0);
+        moe::MissRequest& request                  = *channel.request;
+        request.layer                              = 5;
+        request.jobs                               = 1;
+        request.tiered                             = 0;
+        request.expert[0]                          = 0;
+        request.ncols[0]                           = 1;
+        for (int c = 0; c < moe::kMaxCpuColumns; ++c) { request.column[0][c] = 0; }
+        std::atomic_thread_fence(std::memory_order_release);
+        *reinterpret_cast<volatile std::uint32_t*>(&request.sequence) = 1;
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (reports.load() == 0 && std::chrono::steady_clock::now() < until) { std::this_thread::yield(); }
+        const std::string why = service.failure();
+        check(reports.load() == 1, "a stopped service reports its failure once");
+        {
+            const std::lock_guard<std::mutex> lock(mutex);
+            check(!why.empty() && reported == why, "on_failure carries failure()'s text");
+        }
+        check(why.find("serving layer 5 (1 experts)") != std::string::npos, "the failure names the request it was serving");
+        check(*reinterpret_cast<const volatile std::uint32_t*>(channel.done) == 0, "the failed request is not answered");
+    }
+    check(reports.load() == 1, "the failure is reported once, also through the service's destruction");
+    cudaFreeHost(host);
+    std::printf("CPU miss service: a stopped service reports its failure\n");
+}
+
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(offloaded_moe_layer) {
     if (infernix::test::cuda_unavailable()) {
         std::printf("SKIP: no usable CUDA device\n");
         return 77;
@@ -1288,6 +1369,7 @@ int main() {
         test_route_dispatch(9, 3, 3, 239);     // few experts: lanes past E in every selection
         for (const int columns : {1, 5}) { test_combine_inject(columns, 10, 4, 300U + columns); }
         test_service_column_bound();
+        test_service_failure_reported();
         test_layer(12, 1, 10, 7);  // decode: one column, ten experts
         test_layer(24, 8, 10, 11); // the widest forked call: more jobs than one 3-slot pass
         test_layer(9, 5, 3, 13);   // several columns per expert: several passes per job
@@ -1311,6 +1393,15 @@ int main() {
         test_layer(9, 12, 3, 71, kA16);
         test_layer(96, 10, 10, 59, kA16);
         test_layer(512, 512, 10, 61, kA16);
+        // The two-term narrow route (expert-a4-residual-decode): GPU kernels and CPU-served misses alike,
+        // for every placement, staging pass, CPU share and SSD-tier read of the configurations above.
+        constexpr auto kTwoTerm = moe::NarrowA16::kA4Residual;
+        test_layer(12, 1, 10, 81, kA16, kTwoTerm);
+        test_layer(24, 8, 10, 83, kA16, kTwoTerm);
+        test_layer(9, 5, 3, 87, kA16, kTwoTerm);
+        test_layer(9, 12, 3, 89, kA16, kTwoTerm);
+        test_layer(96, 10, 10, 91, kA16, kTwoTerm);
+        test_layer(512, 512, 10, 93, kA16, kTwoTerm);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL: %s\n", e.what());
         return 1;

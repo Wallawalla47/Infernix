@@ -23,6 +23,10 @@ inline constexpr std::uint32_t kDFlashDecodeMaximumDrafts = 15;
 inline constexpr std::uint32_t kDFlashDecodeMaximumWidth  = kDFlashDecodeMaximumDrafts + 1;
 inline constexpr std::uint32_t kDFlashVerifyMaximumDrafts = 63;
 inline constexpr std::uint32_t kDFlashVerifyMaximumWidth  = kDFlashVerifyMaximumDrafts + 1;
+// sampled-mtp-drafts: a draft is drawn from the draft head's most probable ranks (Qwen3.8-Flash-Next's
+// kSampledDraftRanks), its proposal spread over the sparse acceptance's candidates.
+inline constexpr std::int32_t kMtpSampledDraftRanks = 4;
+inline constexpr std::uint32_t kMtpSparseSlots      = ops::kSparseSpeculativeCandidates;
 
 namespace execution {
 struct OffloadedExperts;
@@ -44,6 +48,13 @@ struct RoundStateSpec {
     // adaptive-dflash: the drafter's whole block (its draft count K), which a round's proposal graph
     // drafts before the round's width is chosen; 0 without it.
     std::uint32_t block_drafts = 0;
+    // Tree rounds of a DFlash drafter: its frame carries the sparse laws and tree tables that a
+    // DFlash2 frame always has.
+    bool tree = false;
+    // INFERNIX_TMP_TREE_ROUND_WIDTH: the DFlash2 selector rank of the block's lattice, which the
+    // proposal graph keeps for a split tree family's builder (block_scores, block_projected); 0
+    // without it.
+    std::int32_t block_lattice_rank = 0;
 };
 
 struct PrefillRoundHost {
@@ -83,6 +94,22 @@ struct MtpDecodeIngress {
     std::array<std::int32_t, kMaximumConcurrency> state_destination_slots{};
     std::array<std::int32_t, kMaximumConcurrency> rope_deltas{};
     std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
+    // The proposal chain (ExecutionSchedule::mtp_proposal_chain): the most drafts each row's round
+    // proposes, which the chain's device gates read (row 0: chained rounds have one row).
+    std::array<std::int32_t, kMaximumConcurrency> proposal_limits{};
+    // The step chain (ExecutionSchedule::mtp_step_chain): its gates' probability threshold for the
+    // round (MtpConfidencePolicy::step_threshold); a row's next drafts end at its first one below it.
+    double step_threshold = 0.0;
+    // sampled-mtp-drafts only (the round copies these planes only then): each current draft's 16
+    // candidates and its proposal q, row-major per row at the round's draft width k (a tree round's
+    // at its chain length):
+    //   current_candidates/q[(row * k + step) * kMtpSparseSlots + slot].
+    alignas(16) std::array<TokenId, kMaximumConcurrency * kMtpDecodeMaximumDrafts * kMtpSparseSlots> current_candidates{};
+    alignas(16) std::array<float, kMaximumConcurrency * kMtpDecodeMaximumDrafts * kMtpSparseSlots> current_q{};
+    // Tree rounds: each chain draft's ranking log-probabilities (its proposal's ranks), as the
+    // sparse planes at the chain length:
+    //   current_scores[(row * k + step) * kMtpSampledDraftRanks + rank].
+    alignas(16) std::array<float, kMaximumConcurrency * kMtpDecodeMaximumDrafts * kMtpSampledDraftRanks> current_scores{};
 };
 
 struct MtpDecodeEgress {
@@ -93,8 +120,20 @@ struct MtpDecodeEgress {
     std::array<TokenId, kMaximumConcurrency * kMtpDecodeMaximumDrafts> next_drafts{};
     std::array<std::int32_t, kMaximumConcurrency> next_extents{};
     // The drafter's probability of each next draft, as next_drafts (written only with
-    // ExecutionSchedule::mtp_draft_confidence).
+    // ExecutionSchedule::mtp_draft_confidence; stale past a step the proposal chain skipped).
     std::array<float, kMaximumConcurrency * kMtpDecodeMaximumDrafts> next_probabilities{};
+    // sampled-mtp-drafts only (the round copies these planes only then): each next draft's
+    // candidates and proposal q, step-major as next_drafts with the slots innermost:
+    //   next_candidates/q[(step * B + row) * kMtpSparseSlots + slot], B the frame's row capacity.
+    std::array<TokenId, kMaximumConcurrency * kMtpDecodeMaximumDrafts * kMtpSparseSlots> next_candidates{};
+    std::array<float, kMaximumConcurrency * kMtpDecodeMaximumDrafts * kMtpSparseSlots> next_q{};
+    // Tree rounds (written with the sparse planes): each next draft's ranking log-probabilities,
+    // step-major as next_q: next_scores[(step * B + row) * kMtpSampledDraftRanks + rank].
+    alignas(16) std::array<float, kMaximumConcurrency * kMtpDecodeMaximumDrafts * kMtpSampledDraftRanks> next_scores{};
+    // A tree round's accepted path per row at the round's width and the depth where it left the
+    // chain (ops::speculative_accept_sparse_tree).
+    std::array<std::int32_t, kMaximumConcurrency * kMtpVerifyMaximumWidth> accepted_path{};
+    std::array<std::int32_t, kMaximumConcurrency> accepted_branch{};
 };
 
 // Prefill binds the current chunk independently of the compact decode batch.
@@ -189,6 +228,12 @@ struct MtpDecodeStateLayout {
     TensorRegion ar_positions;
     TensorRegion ar_rope_positions;
     TensorRegion ar_valid_columns;
+    // Tree rounds: each row's device-built tree (ops::SpeculativeTreeRow), its I32 [W,B] ancestor
+    // masks and each verified column's I32/FP32 [16,W-1,B] candidates and law.
+    std::optional<TensorRegion> tree_rows;
+    std::optional<TensorRegion> tree_masks;
+    std::optional<TensorRegion> tree_candidates;
+    std::optional<TensorRegion> tree_q;
 };
 
 struct DFlashDecodeStateLayout {
@@ -207,7 +252,7 @@ struct DFlashDecodeStateLayout {
     TensorRegion target_logits;
     TensorRegion target_hidden;
     TensorRegion target_continuation_hidden;
-    // DFlash2 tree rounds: each row's device-built tree (ops::SpeculativeTreeRow) and its I32
+    // Tree rounds: each row's device-built tree (ops::SpeculativeTreeRow) and its I32
     // [W,B] ancestor masks.
     std::optional<TensorRegion> tree_rows;
     std::optional<TensorRegion> tree_masks;
@@ -218,6 +263,10 @@ struct DFlashDecodeStateLayout {
     std::optional<TensorRegion> block_candidates;
     std::optional<TensorRegion> block_q;
     std::optional<TensorRegion> block_confidence;
+    // INFERNIX_TMP_TREE_ROUND_WIDTH (RoundStateSpec::block_lattice_rank): the block's DFlash2 lattice
+    // beside block_candidates, FP32 [16,K,B] candidate scores and BF16 [rank,K,B] selector projections.
+    std::optional<TensorRegion> block_scores;
+    std::optional<TensorRegion> block_projected;
 };
 
 // Constrained-generation controls (TokenConstraint): each lane's permitted sets, the per-column
@@ -319,12 +368,32 @@ struct MtpDecodeState {
     Tensor state_destination_slots;
     Tensor rope_deltas;
     const ops::SamplingConfig* sampling = nullptr;
+    Tensor proposal_limits;
+    const double* step_threshold = nullptr; // MtpDecodeIngress::step_threshold
+    // sampled-mtp-drafts: I32/FP32 [16,K,C] (empty in a view wider than the MTP draft window, which
+    // only n-gram copy rounds take, and those run without sampled drafts; a tree round's view is
+    // at its chain length).
+    Tensor current_candidates;
+    Tensor current_q;
+    Tensor current_scores; // tree rounds: FP32 [kMtpSampledDraftRanks,K,C]
     Tensor licensed_tokens;
     Tensor licensed_counts;
     Tensor accepted_drafts;
     Tensor next_drafts;
     Tensor next_extents;
     Tensor next_probabilities; // FP32, as next_drafts
+    // sampled-mtp-drafts: I32/FP32 [16,C,steps], step-major as next_drafts.
+    Tensor next_candidates;
+    Tensor next_q;
+    Tensor next_scores; // FP32 [kMtpSampledDraftRanks,C,steps]
+    // Tree rounds (empty without tree families): the round's tree rows, ancestor masks, column
+    // candidates and laws ([16,W-1,C]), and the accepted path (I32 [W,C]) and branch depth ([C]).
+    Tensor tree_rows;
+    Tensor tree_masks;
+    Tensor tree_candidates;
+    Tensor tree_q;
+    Tensor accepted_path;
+    Tensor accepted_branch;
     Tensor verify_ids;
     Tensor target_positions;
     Tensor target_argmax;
@@ -348,8 +417,9 @@ struct MtpDecodeState {
     // The frame viewed for a round that verifies k drafts per row and proposes next_k: every round
     // tensor becomes a dense [k+1,C] (or [k,C]) view of the native storage (target_logits: the rows
     // its verify_columns hold at that width, at most C) and the step-major AR tensors keep their row
-    // stride.
-    [[nodiscard]] MtpDecodeState narrowed(std::uint32_t k, std::uint32_t next_k) const;
+    // stride. A tree round (chain != 0) views its current sparse planes at its chain length.
+    [[nodiscard]] MtpDecodeState narrowed(std::uint32_t k, std::uint32_t next_k,
+                                          std::uint32_t chain = 0) const;
 };
 
 struct DFlashDecodeState {
@@ -394,6 +464,8 @@ struct DFlashDecodeState {
     Tensor block_candidates;
     Tensor block_q;
     Tensor block_confidence;
+    Tensor block_scores;    // INFERNIX_TMP_TREE_ROUND_WIDTH; empty without it
+    Tensor block_projected; // INFERNIX_TMP_TREE_ROUND_WIDTH; empty without it
     // The columns target_logits holds (RoundStateSpec::verify_columns).
     std::int32_t verify_columns = 0;
 

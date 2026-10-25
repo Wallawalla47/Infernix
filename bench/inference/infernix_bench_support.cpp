@@ -7,14 +7,17 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <iterator>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <system_error>
+#include <thread>
 
 namespace infernix::bench {
 namespace {
@@ -77,6 +80,25 @@ std::uint32_t parse_u32(std::string_view text, const char* label, bool allow_zer
         throw std::invalid_argument(std::string("invalid ") + label + ": " + std::string(text));
     }
     return static_cast<std::uint32_t>(value);
+}
+
+float parse_float_in(std::string_view text, const char* label, float lo, float hi) {
+    if (text.empty()) { throw std::invalid_argument(std::string(label) + " is empty"); }
+    float value       = 0.0F;
+    const auto result = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (result.ec != std::errc{} || result.ptr != text.data() + text.size() || !(value >= lo && value <= hi)) {
+        throw std::invalid_argument(std::string("invalid ") + label + ": " + std::string(text));
+    }
+    return value;
+}
+
+std::uint64_t parse_u64(std::string_view text, const char* label) {
+    std::uint64_t value = 0;
+    const auto result   = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (text.empty() || result.ec != std::errc{} || result.ptr != text.data() + text.size()) {
+        throw std::invalid_argument(std::string("invalid ") + label + ": " + std::string(text));
+    }
+    return value;
 }
 
 KvCacheStorage parse_kv_cache(std::string_view text) {
@@ -343,6 +365,67 @@ std::string mib_or_auto(const std::optional<std::uint64_t>& bytes) {
     return bytes ? std::to_string(*bytes >> 20) : std::string("auto");
 }
 
+// The machine block's numbers: 0 (unknown or not measured) is null; rates in GB/s (10^9).
+std::string count_or_null(std::uint32_t value) {
+    return value == 0 ? "null" : std::to_string(value);
+}
+
+std::string gbps_or_null(double bytes_per_second) {
+    return bytes_per_second > 0.0 ? number(bytes_per_second * 1e-9) : "null";
+}
+
+std::string machine_json(const BenchMachine& m) {
+    return "{\"pcie_generation\": " + count_or_null(m.pcie_generation) +
+           ", \"pcie_width\": " + count_or_null(m.pcie_width) +
+           ", \"pcie_max_generation\": " + count_or_null(m.pcie_max_generation) +
+           ", \"pcie_max_width\": " + count_or_null(m.pcie_max_width) +
+           ", \"h2d_gbps\": " + gbps_or_null(m.h2d_bytes_per_second) +
+           ", \"ram_read_gbps\": " + gbps_or_null(m.ram_read_bytes_per_second) +
+           ", \"ram_read_threads\": " + count_or_null(m.ram_read_threads) + "}";
+}
+
+// One kind's executions: count, mean and maximum in milliseconds (null without executions).
+std::string duration_json(const DurationCounter& d) {
+    const auto ms = [](double ns) { return number(ns * 1e-6); };
+    if (d.count == 0) { return "{\"count\": 0, \"mean_ms\": null, \"max_ms\": null}"; }
+    return "{\"count\": " + std::to_string(d.count) +
+           ", \"mean_ms\": " + ms(static_cast<double>(d.total_ns) / static_cast<double>(d.count)) +
+           ", \"max_ms\": " + ms(static_cast<double>(d.max_ns)) + "}";
+}
+
+// The test's executions by kind, and its decode rounds by batch size (sizes that ran).
+std::string execution_json(const RuntimeExecutionLatency& e) {
+    std::string out = "{\"prefill\": " + duration_json(e.prefill) +
+                      ", \"replay\": " + duration_json(e.replay) +
+                      ", \"control\": " + duration_json(e.control) +
+                      ", \"decode\": " + duration_json(e.decode) + ", \"decode_by_batch\": [";
+    bool first      = true;
+    for (std::size_t b = 0; b < e.decode_by_batch.size(); ++b) {
+        if (e.decode_by_batch[b].count == 0) { continue; }
+        out += std::string(first ? "" : ", ") + "{\"batch\": " + std::to_string(b + 1) + ", " +
+               duration_json(e.decode_by_batch[b]).substr(1);
+        first = false;
+    }
+    return out + "]}";
+}
+
+std::string machine_text(const BenchMachine& m) {
+    const auto link = [](std::uint32_t generation, std::uint32_t width) {
+        return (generation == 0 ? std::string("?") : std::to_string(generation)) + " x" +
+               (width == 0 ? std::string("?") : std::to_string(width));
+    };
+    const auto rate = [](double bytes_per_second) {
+        if (bytes_per_second <= 0.0) { return std::string("-"); }
+        std::ostringstream out;
+        out << std::fixed << std::setprecision(1) << bytes_per_second * 1e-9 << " GB/s";
+        return out.str();
+    };
+    return "PCIe " + link(m.pcie_generation, m.pcie_width) + " (max " +
+           link(m.pcie_max_generation, m.pcie_max_width) + "), H2D " +
+           rate(m.h2d_bytes_per_second) + ", RAM read " + rate(m.ram_read_bytes_per_second) + " (" +
+           std::to_string(m.ram_read_threads) + " threads)";
+}
+
 } // namespace
 
 std::uint32_t BenchTest::requested_output_tokens() const {
@@ -368,6 +451,17 @@ std::string usage_text(std::string_view program) {
         << "Options:\n"
         << "  --weights <path>            required .ninfer artifact\n"
         << "  --corpus <path>             token-id corpus (default: " << kDefaultCorpusPath << ")\n"
+        << "  --corpus-offset <n>         prompts start n tokens into the corpus, wrapping (default: 0)\n"
+        << "  --prompt-ids <path>         one exact prompt (comma- or space-separated token ids, e.g. a\n"
+           "                             chat-templated fixture) for every test; each -n N prefills it\n"
+           "                             and decodes N tokens (no -p / -pg)\n"
+        << "  --temperature <f>           sample at this temperature (default: greedy); with --top-p,\n"
+           "  --top-p <f> --top-k <n>    --top-k and --min-p (each unset: the model's default)\n"
+           "  --min-p <f>\n"
+        << "  --seed <n>                  row k of measured repetition r samples with seed\n"
+           "                             n + r * concurrency + k (default: 1)\n"
+        << "  --stop-at-eos               the model's stop tokens end a request (it may end early)\n"
+        << "  --route-trace <path>        write the expert route trace (offloaded experts)\n"
         << "  --ngram-volume <path>       Qwen3.8-Flash-Next n-gram volume: the artifact's, or any FP8,\n"
         << "                              IQ4_NL, BF16 or NVFP4 volume of the table (default: <weights>.ngram)\n"
         << "  --ngram-residency <mode>    Qwen3.8-Flash-Next n-gram table: auto, ram (all of it in pinned\n"
@@ -389,6 +483,8 @@ std::string usage_text(std::string_view program) {
         << "  --expert-a4-activations     nvidia/Qwen3.8-Flash-Next-FP4-Local only: routed experts with 4-bit\n"
         << "                              (NVFP4) activations, using the activation scales NVIDIA calibrated\n"
         << "                              for them (changes the output; default: 16-bit, as NVIDIA serves it)\n"
+        << "  --embedding-host            Qwen3.5-family artifacts: the token embedding in pinned host memory,\n"
+        << "                              read zero-copy (its VRAM goes to the KV cache; same output)\n"
         << "  --concurrency <1..8>     simultaneous requests per repetition (default: 1)\n"
         << "  --grammar-file <path>      constrain output with GBNF\n"
         << "  --json-object              constrain output to a JSON object\n"
@@ -475,6 +571,25 @@ BenchOptions parse_args(int argc, char** argv) {
             saw_artifact          = true;
         } else if (arg == "--corpus") {
             options.corpus_path = value("--corpus");
+        } else if (arg == "--corpus-offset") {
+            options.corpus_offset =
+                static_cast<std::size_t>(parse_nonnegative(value("--corpus-offset"), "corpus offset"));
+        } else if (arg == "--prompt-ids") {
+            options.prompt_ids_path = value("--prompt-ids");
+        } else if (arg == "--temperature") {
+            options.temperature = parse_float_in(value("--temperature"), "temperature", 0.0F, 2.0F);
+        } else if (arg == "--top-p") {
+            options.top_p = parse_float_in(value("--top-p"), "top-p", 0.0F, 1.0F);
+        } else if (arg == "--top-k") {
+            options.top_k = static_cast<std::int32_t>(parse_u32(value("--top-k"), "top-k", true));
+        } else if (arg == "--min-p") {
+            options.min_p = parse_float_in(value("--min-p"), "min-p", 0.0F, 1.0F);
+        } else if (arg == "--seed") {
+            options.seed = parse_u64(value("--seed"), "seed");
+        } else if (arg == "--stop-at-eos") {
+            options.stop_at_eos = true;
+        } else if (arg == "--route-trace") {
+            options.route_trace_path = value("--route-trace");
         } else if (arg == "--ngram-volume") {
             options.ngram_volume_path = value("--ngram-volume");
         } else if (arg == "--ngram-residency") {
@@ -499,6 +614,8 @@ BenchOptions parse_args(int argc, char** argv) {
             options.expert_tail_skip = parse_u32(value("--expert-tail-skip"), "expert-tail-skip");
         } else if (arg == "--expert-a4-activations") {
             options.expert_a4_activations = true;
+        } else if (arg == "--embedding-host") {
+            options.embedding_host = true;
         } else if (arg == "--expert-ram-mib") {
             const std::string text = value("--expert-ram-mib");
             if (text == "auto") {
@@ -663,6 +780,13 @@ BenchOptions parse_args(int argc, char** argv) {
     if (options.prefill_chunk % kPrefillChunkAlignment != 0) {
         throw std::invalid_argument("--prefill-chunk must be a multiple of 128");
     }
+    if (!options.prompt_ids_path.empty() &&
+        (!options.n_prompt.empty() || !options.prompt_gen.empty() || options.n_gen.empty() || options.corpus_offset != 0)) {
+        throw std::invalid_argument("--prompt-ids takes -n N tests only, without --corpus-offset");
+    }
+    if (!options.temperature && (options.top_p || options.top_k || options.min_p)) {
+        throw std::invalid_argument("--top-p, --top-k and --min-p need --temperature");
+    }
     product::validate_speculative_cli_options(options.speculative);
     return options;
 }
@@ -742,6 +866,19 @@ std::vector<TokenId> load_corpus_ids(const std::string& path) {
         ids.push_back(static_cast<TokenId>(parsed));
     }
     if (ids.empty()) { throw std::invalid_argument("corpus ids file is empty: " + path); }
+    return ids;
+}
+
+std::vector<TokenId> load_prompt_ids(const std::string& path) {
+    std::ifstream input(existing_read_path(path));
+    if (!input) { throw std::runtime_error("failed to open prompt ids file: " + path); }
+    std::vector<TokenId> ids;
+    std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    std::replace(text.begin(), text.end(), ',', ' ');
+    std::istringstream words(text);
+    std::string word;
+    while (words >> word) { ids.push_back(static_cast<TokenId>(parse_nonnegative(word, "prompt token id"))); }
+    if (ids.empty()) { throw std::invalid_argument("prompt ids file is empty: " + path); }
     return ids;
 }
 
@@ -869,6 +1006,7 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << "  gpu:        " << env.gpu_name << " (device " << env.device_id << ")\n"
         << "  cuda:       runtime " << env.cuda_runtime_version << ", driver "
         << env.cuda_driver_version << '\n'
+        << "  machine:    " << machine_text(env.machine) << '\n'
         << "  artifact:   " << env.artifact_path << " (" << env.artifact_file_size_bytes
         << " bytes)\n"
         << "  load:       " << env.load.load_seconds << " s, upload " << env.load.upload_seconds
@@ -891,8 +1029,8 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << " original_int8_prefill_kernel=" << (env.original_int8_prefill_kernel ? "on" : "off")
         << " prefill_split_workspace_mib=" << env.prefill_split_workspace_mib
         << " original_nvfp4_prefill_kernel=" << (env.original_nvfp4_prefill_kernel ? "on" : "off")
-        << " fast_paths=" << fast_path_list(env)
-        << " expert_tail_skip=" << env.expert_tail_skip
+        << " fast_paths=" << fast_path_list(env) << " temporary_switches=\""
+        << env.load.temporary_switches << '"' << " expert_tail_skip=" << env.expert_tail_skip
         << " expert_a4_activations=" << (env.expert_a4_activations ? "on" : "off")
         << " ngram_volume=" << (env.ngram_volume_path.empty() ? "default" : env.ngram_volume_path)
         << " ngram_residency=" << ngram_residency_name(env.ngram_residency)
@@ -982,6 +1120,7 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "\", \"cuda_runtime_version\": \"" << json_escape(env.cuda_runtime_version)
         << "\", \"cuda_driver_version\": \"" << json_escape(env.cuda_driver_version)
         << "\", \"device_id\": " << env.device_id << "},\n"
+        << "  \"machine\": " << machine_json(env.machine) << ",\n"
         << "  \"artifact\": {\"path\": \"" << json_escape(env.artifact_path)
         << "\", \"file_size_bytes\": " << env.artifact_file_size_bytes << "},\n"
         << "  \"load\": {\n"
@@ -1043,6 +1182,7 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "    \"original_nvfp4_prefill_kernel\": "
         << (env.original_nvfp4_prefill_kernel ? "true" : "false") << ",\n"
         << "    \"fast_paths\": \"" << fast_path_list(env) << "\",\n"
+        << "    \"temporary_switches\": \"" << json_escape(env.load.temporary_switches) << "\",\n"
         << "    \"expert_tail_skip\": " << env.expert_tail_skip << ",\n"
         << "    \"expert_a4_activations\": " << (env.expert_a4_activations ? "true" : "false") << ",\n"
         << "    \"ngram_volume\": \"" << json_escape(env.ngram_volume_path) << "\",\n"
@@ -1074,7 +1214,18 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "    \"repetitions\": " << env.repetitions << ",\n"
         << "    \"warmup\": " << env.warmup << ",\n"
         << "    \"corpus_path\": \"" << json_escape(env.corpus_path) << "\",\n"
-        << "    \"corpus_tokens\": " << env.corpus_tokens << "\n"
+        << "    \"corpus_tokens\": " << env.corpus_tokens << ",\n"
+        << "    \"corpus_offset\": " << env.corpus_offset << ",\n"
+        << "    \"prompt_ids_path\": "
+        << (env.prompt_ids_path.empty() ? std::string("null") : "\"" + json_escape(env.prompt_ids_path) + "\"") << ",\n"
+        << "    \"sampling\": {\"temperature\": " << (env.temperature ? number(*env.temperature) : "0")
+        << ", \"top_p\": " << (env.top_p ? number(*env.top_p) : "null")
+        << ", \"top_k\": " << (env.top_k ? std::to_string(*env.top_k) : "null")
+        << ", \"min_p\": " << (env.min_p ? number(*env.min_p) : "null") << ", \"seed\": " << env.seed << "},\n"
+        << "    \"stop_at_eos\": " << (env.stop_at_eos ? "true" : "false") << ",\n"
+        << "    \"route_trace_path\": "
+        << (env.route_trace_path.empty() ? std::string("null") : "\"" + json_escape(env.route_trace_path) + "\"")
+        << "\n"
         << "  },\n"
         << "  \"tests\": [\n";
 
@@ -1104,7 +1255,8 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         append_stat(out, "total_seconds", total_time_series(result), "      ");
         out << ",\n      \"workspace_peak_bytes\": " << result.workspace_peak_bytes
             << ",\n      \"workspace_allocator_peak_bytes\": "
-            << result.workspace_allocator_peak_bytes << ",\n";
+            << result.workspace_allocator_peak_bytes << ",\n"
+            << "      \"execution\": " << execution_json(result.execution) << ",\n";
         append_speculative_json(out, aggregate_speculative(result), "      ");
         out << ",\n      \"repetition_wall_seconds\": [";
         for (std::size_t r = 0; r < result.repetition_wall_seconds.size(); ++r) {
@@ -1297,6 +1449,61 @@ std::uint64_t file_size_or_zero(const std::string& path) {
     std::error_code error;
     const auto size = std::filesystem::file_size(path, error);
     return error ? 0 : static_cast<std::uint64_t>(size);
+}
+
+RuntimeExecutionLatency execution_delta(const RuntimeExecutionLatency& before,
+                                        const RuntimeExecutionLatency& after) {
+    const auto delta = [](const DurationCounter& b, const DurationCounter& a) {
+        return DurationCounter{a.count - b.count, a.total_ns - b.total_ns, a.max_ns};
+    };
+    RuntimeExecutionLatency out;
+    out.prefill = delta(before.prefill, after.prefill);
+    out.replay  = delta(before.replay, after.replay);
+    out.control = delta(before.control, after.control);
+    out.decode  = delta(before.decode, after.decode);
+    for (std::size_t b = 0; b < out.decode_by_batch.size(); ++b) {
+        out.decode_by_batch[b] = delta(before.decode_by_batch[b], after.decode_by_batch[b]);
+    }
+    return out;
+}
+
+double measure_ram_read_bytes_per_second(std::size_t bytes, std::uint32_t threads) {
+    const std::size_t words = bytes / sizeof(std::uint64_t);
+    if (words == 0 || threads == 0) { return 0.0; }
+    std::vector<std::uint64_t> data(words);
+    // One cache line per thread's sum, so the threads do not share a line.
+    std::vector<std::uint64_t> sums(static_cast<std::size_t>(threads) * 8, 0);
+    const auto run = [&](auto&& work) {
+        std::vector<std::thread> workers;
+        workers.reserve(threads);
+        for (std::uint32_t t = 0; t < threads; ++t) {
+            const std::size_t begin = words * t / threads;
+            const std::size_t end   = words * (t + 1) / threads;
+            workers.emplace_back([&work, &sums, t, begin, end] { work(sums[t * 8], begin, end); });
+        }
+        for (std::thread& worker : workers) { worker.join(); }
+    };
+    run([&](std::uint64_t&, std::size_t begin, std::size_t end) {
+        for (std::size_t i = begin; i < end; ++i) { data[i] = i; }
+    });
+    double best = 0.0;
+    for (int pass = 0; pass < 3; ++pass) {
+        const auto started = std::chrono::steady_clock::now();
+        run([&](std::uint64_t& sum, std::size_t begin, std::size_t end) {
+            std::uint64_t local = 0;
+            for (std::size_t i = begin; i < end; ++i) { local += data[i]; }
+            sum = local;
+        });
+        const double seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        if (seconds > 0.0) {
+            best = std::max(best, static_cast<double>(words * sizeof(std::uint64_t)) / seconds);
+        }
+    }
+    // The sums are read, so the passes are not optimized away.
+    volatile std::uint64_t sink = 0;
+    for (std::uint32_t t = 0; t < threads; ++t) { sink = sink + sums[t * 8]; }
+    return best;
 }
 
 } // namespace infernix::bench

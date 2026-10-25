@@ -47,6 +47,11 @@ public:
     // Which missing keys may be admitted (the SSD tier: only keys with a host copy can be loaded).
     // Every routed key counts as used either way.
     using Admissible = std::function<bool(std::uint32_t)>;
+    // TEMPORARY (INFERNIX_TMP_ROUTE_PROTECT, candidates §13 PUB-22): the keys a route predictor expects
+    // next (RoutePredictor). A step given one evaluates it once, when it first needs a victim, and
+    // evicts its residents only when no other resident is left (tools/expert_cache_replay's
+    // TierSim.guard).
+    using Guard = std::function<std::span<const std::uint32_t>()>;
 
     // halving_period > 0 halves every count each that many ticks (design §9.3).
     LfruPolicy(std::uint32_t num_keys, std::uint32_t capacity, std::uint32_t halving_period = 0);
@@ -66,15 +71,22 @@ public:
     // replace. An unlimited budget reproduces the replay tool's on-demand LFRU exactly. With
     // `admissible`, misses it rejects stay non-resident (out.misses still lists them). With
     // `evictable` (the SSD tier's eviction gate) admission is always the budgeted one-victim loop,
-    // and it stops at the first victim the gate refuses.
+    // and it stops at the first victim the gate refuses. With `guard`, its keys are evicted last.
     void step(std::span<const std::uint32_t> group, Step& out,
               std::size_t admission_budget = static_cast<std::size_t>(-1), const Admissible* admissible = nullptr,
-              const Admissible* evictable = nullptr);
+              const Admissible* evictable = nullptr, const Guard* guard = nullptr);
 
     // Prompt seeding (design §19.3.27): adds amounts[i] to keys[i]'s count and marks it used now,
     // with no clock tick (the prompt's prefill calls ticked already) and no admission: the credit
     // ranks later admissions and evictions.
     void credit(std::span<const std::uint32_t> keys, std::span<const double> amounts);
+    // Prompt seeding's promotions (design §19.3.27; INFERNIX_TMP_PROMPT_SEED's budget, a temporary
+    // A/B): of `keys`, the non-resident ones (only those `admissible` accepts, when given) become
+    // resident best score first, each only if it outranks the victim it replaces (the lowest resident
+    // outside `keys`; with `evictable`, stopping at the first victim it refuses), at most `budget`.
+    // Counts and the clock are unchanged. out.admitted and out.victims list them.
+    void admit(std::span<const std::uint32_t> keys, std::size_t budget, Step& out,
+               const Admissible* admissible = nullptr, const Admissible* evictable = nullptr);
 
     // Promote a non-resident key (for example a staged prefetch whose frame changes role).
     // Returns the victim, or nothing when the pool still has room.
@@ -104,6 +116,10 @@ private:
     void erase(std::uint32_t key);
     void select_victims(std::size_t need, std::span<const std::uint32_t> protect,
                         std::vector<std::uint32_t>& out);
+    // Budgeted admission of `candidates` (non-resident keys): best score first, each only if it
+    // outranks the victim (outside `protect`) it replaces; appends to out.admitted and out.victims.
+    void admit_ranked(std::span<const std::uint32_t> protect, std::span<const std::uint32_t> candidates,
+                      std::size_t budget, const Admissible* evictable, Step& out);
 
     std::uint32_t capacity_;
     std::uint32_t halving_period_;
@@ -123,6 +139,12 @@ private:
     std::vector<std::uint32_t> candidates_;
     std::vector<std::uint32_t> ranked_; // scratch: budgeted admission's candidates, best first
     std::vector<std::uint32_t> victim_; // scratch: one victim at a time
+    // The current step's guard (INFERNIX_TMP_ROUTE_PROTECT): its keys once evaluated, flagged in guarded_.
+    const Guard* guard_ = nullptr;
+    bool guard_ready_   = false;
+    std::vector<std::uint32_t> guard_keys_;
+    std::vector<std::uint8_t> guarded_;
+    std::vector<std::pair<double, std::uint32_t>> guarded_scratch_;
 };
 
 // What a warm start needs (design §19.3.5 S4b): every key's LFRU count, and the resident keys,
@@ -208,12 +230,20 @@ public:
     CacheController(std::uint32_t num_keys, std::uint32_t frames, std::uint32_t slack_frames,
                     std::uint32_t rounds_in_flight, std::uint32_t max_frames = 0, std::uint32_t halving_period = 0);
 
-    // The route log of one layer call. `round_started` is the agent's latest sample.
+    // The route log of one layer call. `round_started` is the agent's latest sample. `guard` as for
+    // LfruPolicy::step.
     void on_route(std::span<const std::uint32_t> group, std::uint64_t round_started,
                   std::vector<Command>& out, std::size_t admission_budget = static_cast<std::size_t>(-1),
-                  const LfruPolicy::Admissible* admissible = nullptr, const LfruPolicy::Admissible* evictable = nullptr);
+                  const LfruPolicy::Admissible* admissible = nullptr, const LfruPolicy::Admissible* evictable = nullptr,
+                  const LfruPolicy::Guard* guard = nullptr);
     // A prompt's weighted routes at its end (LfruPolicy::credit); issues no command.
     void credit(std::span<const std::uint32_t> keys, std::span<const double> amounts) { policy_.credit(keys, amounts); }
+    // Promotions at a prompt's end (LfruPolicy::admit): admits up to `budget` of the credited `keys`,
+    // retires their victims' frames and loads them into free frames (the rest queue). Returns the
+    // number admitted.
+    std::size_t admit_credited(std::span<const std::uint32_t> keys, std::size_t budget, std::uint64_t round_started,
+                               std::vector<Command>& out, const LfruPolicy::Admissible* admissible = nullptr,
+                               const LfruPolicy::Admissible* evictable = nullptr);
     // The SSD tier's demotion (design §19.3.7 T4/T7): after on_route evicted an expert and before
     // on_quiescent, its retired frame is held while its record is copied to RAM; release_held frees
     // it once the copy completed and loads queued experts into free frames.

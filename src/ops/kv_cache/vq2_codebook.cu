@@ -9,4 +9,9 @@ __device__ std::int8_t g_kv_cache_vq2_codebook[kKVCacheVq2Patterns * 8] = {
 #include "ops/kv_cache/vq2_codebook.inc"
 };
 
+// Every entry is a small integer, so each FP32 value is exact.
+__device__ __align__(16) float g_kv_cache_vq2_codebook_f32[kKVCacheVq2Patterns * 8] = {
+#include "ops/kv_cache/vq2_codebook.inc"
+};
+
 } // namespace infernix::ops

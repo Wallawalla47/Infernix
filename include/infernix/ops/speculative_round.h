@@ -16,6 +16,11 @@ struct SpeculativeAcceptExecutionEnvelope {
     // When false, the general route remains valid for any supported mixture of greedy and
     // stochastic rows.
     bool all_rows_greedy_without_penalties = false;
+    // speculative_accept_sparse_drafts: sampled rows (temperature > 0 without Gumbel sampling)
+    // accept their drafts by block verification (Sun et al., arXiv 2403.10444) instead of token by
+    // token. The output distribution is the same and the expected accepted length at least the
+    // token rule's; the drawn text differs. Greedy and Gumbel rows are unchanged.
+    bool block_verification = false;
 };
 
 // Caller-owned transient capacity for every draft-count and batch-size pair in the inclusive
@@ -110,6 +115,9 @@ void speculative_overlay_copy_proposals(const Tensor& copy_rows, const Tensor& c
  *
  * Numeric:
  *   Sampling filtering, penalties, normalization, and RNG semantics are those of sampling.h.
+ *   A verification column the Op selects from without a finite selection (sampling.h) sets
+ *   *configs[b].nonfinite and selects token 0. On the raw target_tokens route a reached column
+ *   (0..A) whose target's logit is not finite sets *configs[b].nonfinite; tokens are unchanged.
  *
  * Effects:
  *   For each row, let A be the accepted draft count and L=A+1. licensed_tokens[0:A,b] receives
@@ -148,6 +156,13 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
  *   using sampling.h penalties and filters. A live draft d is accepted with probability
  *   min(1,p(d)/q(d)); first rejection samples normalized max(p-q,0). After accepting all
  *   P drafts, the terminal token is sampled from target column P.
+ *   With envelope.block_verification a non-Gumbel positive-temperature row instead runs block
+ *   verification over its P drafts (with p_c, q_c column c's laws and d_c its draft):
+ *     w_0 = 1, w_i = min(w_{i-1} p_{i-1}(d_{i-1}) / q_{i-1}(d_{i-1}), 1) (0 when q is 0);
+ *     h_i = S_i / (S_i + 1 - w_i), S_i = sum_x max(w_i p_i(x) - q_i(x), 0), for i < P; h_P = w_P;
+ *   the accepted count A is the largest i with u_i <= h_i (u_i the token rule's accept uniform
+ *   at position L+i), else 0; the terminal is drawn from normalized max(w_A p_A - q_A, 0) when
+ *   A < P (correction) and from p_P when A = P (bonus), with the token rule's keys.
  *
  * Logical shapes and registered profile:
  *   All Tensor storage is contiguous. target_tokens/licensed_tokens are I32 [K+1,B].
@@ -165,7 +180,10 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
  *   a dense vocabulary distribution. Target logits are interpreted through sampling.h. Column i's
  *   penalty overlay is drafts[0..i-1], because the column is consumed only after that prefix was
  *   accepted. RNG purposes are the existing speculative accept/correction/bonus domains and use
- *   logical positions derived from the old round length.
+ *   logical positions derived from the old round length. A live column the Op selects from
+ *   without a finite selection (sampling.h) sets *configs[b].nonfinite and selects token 0. On
+ *   the raw target_tokens route a reached column (0..A) whose target's logit is not finite sets
+ *   *configs[b].nonfinite; tokens are unchanged.
  *
  * Effects:
  *   Let A be the accepted draft count and L=A+1. licensed_tokens[0:A,b] receives accepted drafts,

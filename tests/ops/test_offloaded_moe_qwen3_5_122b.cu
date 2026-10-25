@@ -14,6 +14,7 @@
 // staging pass, the call width or the CPU's share; the combine against its FP32 formula evaluated in
 // FP64 within its rounding bound.
 
+#include "ops/op_family.h"
 #include "infernix/ops/offloaded_sparse_moe.h"
 #include "ops/offloaded_moe_fixtures.h"
 #include "ops/offloaded_sparse_moe/cpu/miss_service.h"
@@ -494,7 +495,7 @@ void run(int columns, std::mt19937& rng) {
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(offloaded_moe_qwen3_5_122b) {
     std::mt19937 rng(20261022);
     // Decode (1), MTP and verification widths (2, 3, 5, 8: the narrow ring's 1-, 2-, 4- and 8-column
     // variants), mixed calls (24 and 64, the ring's widest: some experts above eight columns, others

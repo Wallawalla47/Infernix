@@ -249,12 +249,15 @@ infernix::product::media_acquire::Source parse_media_url(const Json& part, const
             if (!value.at("detail").is_string()) {
                 bad_request("image_url.detail must be a string", "messages");
             }
+            // 'high' (sent by native OpenAI clients such as Codex) asks for full-quality
+            // preprocessing, which the model's native frontend already is; 'low' and other profiles
+            // it cannot apply.
             const std::string detail = value.at("detail").get<std::string>();
-            if (detail != "auto") {
+            if (detail != "auto" && detail != "high") {
                 bad_request(
                     "image_url.detail='" + detail +
                         "' requests an explicit preprocessing profile that Infernix's fixed Vision "
-                        "frontend cannot apply; use 'auto'",
+                        "frontend cannot apply; use 'auto' or 'high'",
                     "messages", "image_detail_not_supported");
             }
         }
@@ -881,11 +884,17 @@ void parse_response_observations(const Json& body, OpenAIChatRequest& output) {
     output.return_progress   = get_bool(body, "return_progress", false);
 }
 
+// -1 is "no explicit limit", as the field's omission (clients send it for that; OpenAI rejects it).
+std::optional<int> output_limit_field(const Json& body, const char* key) {
+    const std::optional<int> limit = optional_int(body, key);
+    return limit == -1 ? std::nullopt : limit;
+}
+
 void parse_output_limit(const Json& body, const RequestLimits& limits, OpenAIChatRequest& output) {
-    std::optional<int> limit = optional_int(body, "max_completion_tokens");
+    std::optional<int> limit = output_limit_field(body, "max_completion_tokens");
     const char* param        = "max_completion_tokens";
     if (!limit) {
-        limit = optional_int(body, "max_tokens");
+        limit = output_limit_field(body, "max_tokens");
         param = "max_tokens";
     }
     if (limit) {
@@ -931,6 +940,7 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
     output.generation.enable_thinking           = template_options.enable_thinking;
     output.generation.preserve_thinking         = template_options.preserve_thinking;
     output.generation.chat_template_kwargs_json = template_options.kwargs_json;
+    parse_openai_thinking_budget(body, output.generation);
     if (body.contains("response_format") && !body["response_format"].is_null())
         parse_json_output_format(body["response_format"], output.generation, "response_format",
                                  JsonFormatProtocol::Chat);

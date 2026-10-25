@@ -1,3 +1,4 @@
+#include "ops/op_family.h"
 #include "core/weight.h"
 #include "infernix/ops/linear_add.h"
 #include "core/device.h"
@@ -271,7 +272,7 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(linear_add_nvfp4) {
     if (infernix::test::cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;

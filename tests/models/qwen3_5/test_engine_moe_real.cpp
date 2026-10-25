@@ -293,8 +293,28 @@ int exercise_maximum_configuration(const char* artifact) {
         const auto run = [&] {
             return engine.generate(engine.prepare_tokens(long_prompt), greedy_options(4, false)).generated_token_ids;
         };
-        const std::vector<infernix::TokenId> grown = run();
-        const auto between                          = engine.memory_summary().expert_cache;
+        const auto short_run = [&] {
+            return engine.generate(engine.prepare_tokens(prompt), greedy_options(16, false)).generated_token_ids;
+        };
+        const std::vector<infernix::TokenId> short_before = short_run();
+        const std::vector<infernix::TokenId> grown        = run();
+        const auto between                                = engine.memory_summary().expert_cache;
+        // After the release shrank the pool back to its base, the KV table row the long request used
+        // still names its pages past a short request's own, the top ones now unmapped (candidates
+        // OR-14). A short request on that row must neither fault (a read of an unmapped page past its
+        // length) nor change its bits (a read of a stale mapped one) against the same request before
+        // the pool grew.
+        if (between->kv_backed_pages != 512) {
+            std::cerr << "122B elastic KV: the long request's release left " << between->kv_backed_pages
+                      << " pages backed, not the base 512, so the post-shrink table check did not run\n";
+            return 1;
+        }
+        const std::vector<infernix::TokenId> short_after = short_run();
+        if (short_after.size() != 16 || short_after != short_before) {
+            std::cerr << "122B elastic KV: a short request after the shrink differs from the same request before the "
+                         "growth (a kernel read table entries past its row's pages)\n";
+            return 1;
+        }
         const std::vector<infernix::TokenId> again = run();
         const auto final_cache                      = engine.memory_summary().expert_cache;
         std::cout << "elastic KV: " << between->kv_backed_pages << " pages backed after the first long request, "

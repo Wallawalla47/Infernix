@@ -11,6 +11,7 @@
 // One case leaves stale window slots behind on purpose. After a wide call, the window committed
 // from staging is checked byte for byte.
 
+#include "ops/op_family.h"
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/paged_kv_cache.h"
@@ -505,7 +506,7 @@ int run_call(const Geometry& g, KvCacheStorage storage, const Call& c, const std
 
 } // namespace
 
-int main(int argc, char** argv) {
+INFERNIX_OP_TEST(vq_attention) {
     if (cuda_unavailable()) {
         std::cout << "SKIP no CUDA device\n";
         return 77;

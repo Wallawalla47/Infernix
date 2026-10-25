@@ -20,4 +20,19 @@ void candidate_selector_tree_launch(const Tensor& candidate_ids, const Tensor& u
                                     Tensor& column_candidates, Tensor& proposal_q,
                                     Tensor& tree_rows, Tensor& tree_masks, Tensor& valid_columns,
                                     const SelectorWorkspace& workspace, cudaStream_t stream);
+
+// The per-row tree build over independent positions: unary_scores are the edges.
+void candidate_tree_launch(const Tensor& candidate_ids, const Tensor& unary_scores,
+                           const Tensor& base_positions, const Tensor& current_extents,
+                           const SamplingConfig* configs, SpeculativeTreeShape shape,
+                           Tensor& drafts, Tensor& column_candidates, Tensor& proposal_q,
+                           Tensor& tree_rows, Tensor& tree_masks, Tensor& valid_columns,
+                           cudaStream_t stream);
+
+// The leaf extension of a proposed chain (candidate_chain_tree).
+void chain_tree_launch(const Tensor& candidate_ids, const Tensor& laws, const Tensor& scores,
+                       const Tensor& base_positions, const Tensor& current_extents,
+                       const SamplingConfig* configs, SpeculativeTreeShape shape, Tensor& drafts,
+                       Tensor& column_candidates, Tensor& proposal_q, Tensor& tree_rows,
+                       Tensor& tree_masks, Tensor& valid_columns, cudaStream_t stream);
 }

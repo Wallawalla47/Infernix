@@ -1,3 +1,4 @@
+#include "ops/op_family.h"
 #include "core/weight.h"
 #include "infernix/ops/linear_add.h"
 #include "core/device.h"
@@ -268,7 +269,7 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
 
 } // namespace
 
-int main(int argc, char** argv) {
+INFERNIX_OP_TEST(linear_add_fp8) {
     const bool wide_only = argc == 2 && std::string_view(argv[1]) == "--wide-only";
     if (argc != 1 && !wide_only) {
         std::cerr << "usage: " << argv[0] << " [--wide-only]\n";

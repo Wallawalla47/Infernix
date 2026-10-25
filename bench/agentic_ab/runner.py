@@ -65,6 +65,20 @@ TREATMENT_EXTRA_FLAGS = os.environ.get("AB_TREATMENT_EXTRA_FLAGS", "").split()
 # What the alt arm adds to the treatment's flags, and the build it runs (default the treatment's).
 ALT_EXTRA_FLAGS = os.environ.get("AB_ALT_EXTRA_FLAGS", "").split()
 ALT_EXE = os.environ.get("AB_ALT_EXE") or TREATMENT_EXE
+# Environment variables set for one arm's serve only ("NAME=VALUE NAME=VALUE"), e.g. a temporary
+# INFERNIX_TMP_* switch; every arm's serve starts without the INFERNIX_TMP_* variables it does not set.
+def _arm_env(name):
+    pairs = {}
+    for item in os.environ.get(name, "").split():
+        key, sep, value = item.partition("=")
+        if not sep or not key:
+            raise SystemExit("%s entries must be NAME=VALUE: %r" % (name, item))
+        pairs[key] = value
+    return pairs
+
+
+ARM_ENV = {"treatment": _arm_env("AB_TREATMENT_ENV"), "alt": _arm_env("AB_ALT_ENV"),
+           "control": _arm_env("AB_CONTROL_ENV")}
 # How the report names the alt arm.
 ALT_LABEL = os.environ.get("AB_ALT_LABEL", "")
 CONTROL_LABEL = os.environ.get("AB_CONTROL_LABEL", "")
@@ -256,9 +270,11 @@ def read_server_start(path):
 
 
 class Serve:
-    def __init__(self, exe, model, flags, request_log, serve_log):
+    def __init__(self, exe, model, flags, request_log, serve_log, env=None):
         self.exe, self.model, self.flags = exe, model, flags
         self.request_log, self.serve_log = request_log, serve_log
+        self.env = {k: v for k, v in os.environ.items() if not k.upper().startswith("INFERNIX_TMP_")}
+        self.env.update(env or {})
         self.proc = None
 
     def start(self, load_timeout=600):
@@ -274,10 +290,12 @@ class Serve:
         for n, v in self.flags:
             args += [n] if v is None else [n, v]
         args += ["--request-log-jsonl", self.request_log]
-        log("launch: %s" % subprocess.list2cmdline(args))
+        switches = " ".join("%s=%s" % kv for kv in sorted(self.env.items())
+                            if kv[0].upper().startswith("INFERNIX_TMP_"))
+        log("launch: %s%s" % (subprocess.list2cmdline(args), " (env %s)" % switches if switches else ""))
         with open(self.serve_log, "w", encoding="utf-8") as sf:
             self.proc = subprocess.Popen(args, cwd=os.path.dirname(self.request_log), stdout=sf,
-                                         stderr=subprocess.STDOUT,
+                                         stderr=subprocess.STDOUT, env=self.env,
                                          creationflags=CREATE_NEW_PROCESS_GROUP)
         deadline = time.time() + load_timeout
         while time.time() < deadline:
@@ -775,7 +793,7 @@ def calibrate_ctx(model, ctrl_flags, bat_ctx, run_dir):
     for ctx in [bat_ctx] + [c for c in CTX_FALLBACKS if c < bat_ctx]:
         probe = Serve(CONTROL_EXE, model, set_flag(ctrl_flags, "--max-context", str(ctx)),
                       os.path.join(run_dir, "calibration_%d.jsonl" % ctx),
-                      os.path.join(run_dir, "calibration_%d_serve.log" % ctx))
+                      os.path.join(run_dir, "calibration_%d_serve.log" % ctx), ARM_ENV["control"])
         log("calibration: control at --max-context %d" % ctx)
         try:
             probe.start()
@@ -798,7 +816,7 @@ def run_arm(name, exe, model, flags, plan, run_dir, ctx):
         flags, exe = serve.flags, "Strata " + STRATA_CONFIG
     else:
         serve = Serve(exe, model, flags, os.path.join(arm_dir, "request_log.jsonl"),
-                      os.path.join(arm_dir, "serve.log")).start()
+                      os.path.join(arm_dir, "serve.log"), ARM_ENV[name]).start()
     start = read_server_start(serve.request_log)
     wall, client = None, None
     try:
@@ -814,7 +832,7 @@ def run_arm(name, exe, model, flags, plan, run_dir, ctx):
     if strata:
         write_strata_log(arm_dir)
     with open(os.path.join(arm_dir, "arm.json"), "w", encoding="utf-8") as f:
-        json.dump({"arm": name, "exe": exe, "flags": flags, "wall_seconds": wall,
+        json.dump({"arm": name, "exe": exe, "flags": flags, "env": ARM_ENV[name], "wall_seconds": wall,
                    "failures": client.failures if client else []}, f, indent=1)
     return start, (client.failures if client else [("arm", "did not run")])
 

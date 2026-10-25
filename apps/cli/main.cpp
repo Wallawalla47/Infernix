@@ -152,6 +152,8 @@ public:
 
     void timing(infernix::GenerationTimingObservation) override {}
 
+    void tool_call(infernix::ToolCallDelta) override {}
+
     void publish(infernix::OutputDelta delta) override {
         std::ostream& output =
             delta.channel == infernix::OutputChannel::Reasoning ? std::cerr : std::cout;
@@ -389,6 +391,7 @@ int main(int argc, char** argv) {
         engine_options.vram_past_budget         = cli.vram_past_budget;
         engine_options.expert_tail_skip         = cli.expert_tail_skip;
         engine_options.expert_a4_activations    = cli.expert_a4_activations;
+        engine_options.embedding_host           = cli.embedding_host;
         engine_options.prefill_chunk            = cli.prefill_chunk;
         engine_options.kv_cache                 = cli.kv_cache;
         engine_options.logits_dtype             = cli.logits_dtype;
@@ -412,6 +415,8 @@ int main(int argc, char** argv) {
 
         infernix::Engine engine(std::move(engine_options));
         startup_log.engine_ready(engine.load_summary());
+        startup_log.chat_template_roles(engine.chat_template_role_support(),
+                                        cli.chat_template_path.string());
         engine.reset_memory_peaks();
 
         infernix::PreparedPrompt prompt = engine.prepare(std::move(input));

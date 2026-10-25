@@ -25,6 +25,19 @@ bool uses_pair(const Fp8LinearShape& shape, LinearPolicy policy, LinearRoutes ro
     return has_route(routes, LinearRoutes::Fp8A8Pair) && shape.pair != nullptr &&
            tokens >= shape.pair_min_tokens && !(allows_a8(policy) && shape.uses_a8(tokens, tokens));
 }
+
+// fp8-a8-pair-block32 takes the column-scaled pair's admission and precedence over it.
+bool uses_pair_block32(const Fp8LinearShape& shape, LinearPolicy policy, LinearRoutes routes,
+                       std::int32_t tokens) {
+    return has_route(routes, LinearRoutes::Fp8A8PairBlock32) && shape.pair_block32 != nullptr &&
+           tokens >= shape.pair_min_tokens && !(allows_a8(policy) && shape.uses_a8(tokens, tokens));
+}
+
+// The FP16-accumulate route likewise replaces only an A16 route, and takes precedence over both pairs.
+bool uses_f16(const Fp8LinearShape& shape, LinearPolicy policy, LinearRoutes routes, std::int32_t tokens) {
+    return has_route(routes, LinearRoutes::F16Accumulate) && shape.f16 != nullptr &&
+           tokens >= shape.f16_min_tokens && !(allows_a8(policy) && shape.uses_a8(tokens, tokens));
+}
 } // namespace
 
 bool fp8_linear_column_invariant_route(std::int32_t n, std::int32_t k) noexcept {
@@ -48,12 +61,20 @@ std::size_t fp8_linear_workspace_capacity_bytes(std::int32_t n, std::int32_t k, 
                                              ? shape.partial_capacity_bytes(max_tokens)
                                              : 0)
                                    : 0;
-    // The query does not see the route flags, so it also covers the pair route wherever the
-    // interval reaches it.
-    const std::size_t pair = shape.pair != nullptr && max_tokens >= shape.pair_min_tokens
-                                 ? fp8_a8_pair_workspace_capacity_bytes(max_tokens, k)
-                                 : 0;
-    return std::max(single, pair);
+    // The query does not see the route flags, so it also covers both pair routes and the FP16 route
+    // wherever the interval reaches them.
+    const bool pair_reached = max_tokens >= shape.pair_min_tokens;
+    const std::size_t pair  = shape.pair != nullptr && pair_reached
+                                  ? fp8_a8_pair_workspace_capacity_bytes(max_tokens, k)
+                                  : 0;
+    const std::size_t pair_block32 =
+        shape.pair_block32 != nullptr && pair_reached
+            ? fp8_a8_pair_block32_workspace_capacity_bytes(max_tokens, k)
+            : 0;
+    const std::size_t f16 = shape.f16 != nullptr && max_tokens >= shape.f16_min_tokens
+                                ? f16_accumulate_workspace_capacity_bytes(max_tokens, k)
+                                : 0;
+    return std::max({single, pair, pair_block32, f16});
 }
 
 void fp8_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPolicy policy,
@@ -69,6 +90,20 @@ void fp8_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPoli
         if (shape.invariant == nullptr)
             throw std::invalid_argument("fp8 linear: the shape registers no column-invariant route");
         return shape.invariant(x, weight, out, stream);
+    }
+    if (uses_f16(shape, policy, routes, x.ne[1])) {
+        if (workspace == nullptr)
+            throw std::invalid_argument("fp8 f16-accumulate linear requires caller workspace");
+        auto scope         = workspace->scope();
+        const auto scratch = allocate_f16_accumulate_workspace(*workspace, x.ne[1], weight.k);
+        return shape.f16(x, weight, out, scratch, stream);
+    }
+    if (uses_pair_block32(shape, policy, routes, x.ne[1])) {
+        if (workspace == nullptr)
+            throw std::invalid_argument("fp8 A8 pair block32 linear requires caller workspace");
+        auto scope         = workspace->scope();
+        const auto scratch = allocate_fp8_a8_pair_block32_workspace(*workspace, x.ne[1], weight.k);
+        return shape.pair_block32(x, weight, out, scratch, stream);
     }
     if (uses_pair(shape, policy, routes, x.ne[1])) {
         if (workspace == nullptr)

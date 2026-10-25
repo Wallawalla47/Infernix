@@ -75,6 +75,11 @@ struct ReadOnlyFile::Impl {
 
     explicit Impl(const std::filesystem::path& path, FileMapping map) {
         fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
+        // A filesystem without direct I/O (tmpfs, 9p, some FUSE mounts and Docker bind mounts)
+        // refuses O_DIRECT: the same aligned reads, AIO included, then go through the page cache.
+        if (fd < 0 && (errno == EINVAL || errno == EOPNOTSUPP)) {
+            fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        }
         if (fd < 0) {
             throw std::system_error(errno, std::generic_category(), "open " + path.string());
         }

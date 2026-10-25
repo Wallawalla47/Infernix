@@ -1,4 +1,5 @@
 #include "infernix/ops/gelu.h"
+#include "ops/op_family.h"
 #include "ops/op_tester.h"
 
 #include <cmath>
@@ -81,7 +82,7 @@ int run_edge_case(ops::GeluMode mode, const char* label) {
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(gelu) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;

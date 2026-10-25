@@ -7,6 +7,7 @@
 // kSamplePurposeDecode; the verification of a round with frontier L keys column c at L + c + 1. Both
 // name the produced token's position, so the same Gumbel noise decides both.
 
+#include "ops/op_family.h"
 #include "infernix/ops/sampling.h"
 #include "infernix/ops/speculative_round.h"
 #include "ops/op_tester.h"
@@ -208,7 +209,7 @@ int distribution_case(std::mt19937& rng) {
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(gumbel_speculation) {
     if (cuda_unavailable()) {
         std::cout << "gumbel_speculation: SKIP (CUDA unavailable)\n";
         return 77;

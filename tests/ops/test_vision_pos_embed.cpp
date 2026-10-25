@@ -1,4 +1,5 @@
 #include "infernix/ops/vision_pos_embed.h"
+#include "ops/op_family.h"
 #include "ops/op_tester.h"
 
 #include <algorithm>
@@ -113,7 +114,7 @@ int run_case(std::int32_t patches, std::uint32_t seed) {
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(vision_pos_embed) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;

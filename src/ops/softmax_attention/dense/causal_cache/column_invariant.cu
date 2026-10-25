@@ -16,6 +16,13 @@ __global__ void column_valid_kernel(const std::int32_t* counts, std::int32_t* fl
     flags[index]     = column < counts[row] ? 1 : 0;
 }
 
+__global__ void column_table_rows_kernel(const std::int32_t* table_rows, std::int32_t* rows,
+                                         std::int32_t width, std::int32_t batch) {
+    const int index = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (index >= width * batch) return;
+    rows[index] = table_rows == nullptr ? 0 : table_rows[index % batch];
+}
+
 struct PermutationBatch {
     CausalColumnPermutation tensors[4];
 };
@@ -74,6 +81,17 @@ void causal_column_valid_launch(const Tensor& counts, Tensor& flags, std::int32_
     column_valid_kernel<<<1, 1024, 0, stream>>>(static_cast<const std::int32_t*>(counts.data),
                                                 static_cast<std::int32_t*>(flags.data), width,
                                                 batch);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void causal_column_table_rows_launch(const Tensor& table_rows, Tensor& rows, std::int32_t width,
+                                     std::int32_t batch, cudaStream_t stream) {
+    if (width <= 0 || batch <= 0 || width * batch > 1024 || rows.data == nullptr) {
+        throw std::invalid_argument("causal column table rows: invalid round shape");
+    }
+    column_table_rows_kernel<<<1, 1024, 0, stream>>>(
+        static_cast<const std::int32_t*>(table_rows.data), static_cast<std::int32_t*>(rows.data),
+        width, batch);
     CUDA_CHECK(cudaGetLastError());
 }
 

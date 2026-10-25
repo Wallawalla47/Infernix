@@ -29,11 +29,11 @@ GenerationOutcome outcome(int prompt, std::uint32_t cache_hit, int completion, d
     GenerationOutcome result;
     result.prompt_tokens                   = prompt;
     result.completion_tokens               = completion;
-    result.metrics.prefix_cache_hit_tokens = cache_hit;
-    result.metrics.ttft_seconds            = ttft;
-    result.metrics.prefill_seconds         = prefill_seconds;
-    result.metrics.decode_seconds          = decode_seconds;
-    result.metrics.decode_share_seconds    = decode_seconds;
+    result.reused_prompt_tokens            = cache_hit;
+    result.timings.first_token_seconds     = ttft;
+    result.timings.prefill_seconds         = prefill_seconds;
+    result.timings.decode_seconds          = decode_seconds;
+    result.timings.decode_share_seconds    = decode_seconds;
     return result;
 }
 
@@ -44,16 +44,16 @@ int main() {
 
     // Engine speculative totals include n-gram rounds; the model drafter gets only the remainder.
     GenerationOutcome mixed                     = outcome(1000, 600, 101, 0.25, 0.2, 2.0);
-    mixed.metrics.decode_share_seconds          = 0.8;
-    mixed.metrics.speculative_backend           = infernix::SpeculativeBackend::DFlash2;
-    mixed.metrics.speculative_rounds            = 30;
-    mixed.metrics.speculative_draft_tokens      = 300;
-    mixed.metrics.speculative_accepted_tokens   = 150;
-    mixed.metrics.ngram_rounds                  = 10;
-    mixed.metrics.ngram_drafted_tokens          = 100;
-    mixed.metrics.ngram_accepted_tokens         = 70;
-    mixed.metrics.ngram_archive_drafted_tokens  = 40;
-    mixed.metrics.ngram_archive_accepted_tokens = 10;
+    mixed.timings.decode_share_seconds              = 0.8;
+    mixed.speculative.backend                       = infernix::SpeculativeBackend::DFlash2;
+    mixed.speculative.rounds                        = 30;
+    mixed.speculative.drafted_tokens                = 300;
+    mixed.speculative.accepted_tokens               = 150;
+    mixed.speculative.ngram_rounds                  = 10;
+    mixed.speculative.ngram_drafted_tokens          = 100;
+    mixed.speculative.ngram_accepted_tokens         = 70;
+    mixed.speculative.ngram_archive_drafted_tokens  = 40;
+    mixed.speculative.ngram_archive_accepted_tokens = 10;
     const ConsoleRequestSample sample           = make_console_request_sample(mixed);
     failures += check(sample.computed_prefill_tokens == 400,
                       "computed prefill must exclude cache-hit prompt tokens");
@@ -69,11 +69,11 @@ int main() {
                       "a request with model drafts must name its drafter");
 
     GenerationOutcome ngram_only                = outcome(10, 0, 5, 0.1, 0.01, 0.1);
-    ngram_only.metrics.speculative_backend      = infernix::SpeculativeBackend::Mtp;
-    ngram_only.metrics.speculative_rounds       = 2;
-    ngram_only.metrics.speculative_draft_tokens = 8;
-    ngram_only.metrics.ngram_rounds             = 2;
-    ngram_only.metrics.ngram_drafted_tokens     = 8;
+    ngram_only.speculative.backend              = infernix::SpeculativeBackend::Mtp;
+    ngram_only.speculative.rounds               = 2;
+    ngram_only.speculative.drafted_tokens       = 8;
+    ngram_only.speculative.ngram_rounds         = 2;
+    ngram_only.speculative.ngram_drafted_tokens = 8;
     failures += check(make_console_request_sample(ngram_only).speculative_backend ==
                           infernix::SpeculativeBackend::None,
                       "a request without model drafts must not name a drafter");
@@ -97,7 +97,7 @@ int main() {
     ConsoleStatsTotals batched;
     for (int index = 0; index < 2; ++index) {
         GenerationOutcome lane             = outcome(10, 0, 51, 0.1, 0.01, 1.0);
-        lane.metrics.decode_share_seconds  = 0.5;
+        lane.timings.decode_share_seconds  = 0.5;
         batched.add(make_console_request_sample(lane));
     }
     failures += check(batched.sum.decode_tokens == 100 && batched.sum.decode_seconds == 1.0,
@@ -109,11 +109,11 @@ int main() {
     // not the 2.0 of counting the two rounds equally.
     ConsoleStatsTotals weighted;
     GenerationOutcome long_lane            = outcome(10, 0, 3, 0.1, 0.01, 4.0);
-    long_lane.metrics.decode_share_seconds = 1.0 + 3.0 / 3.0;
+    long_lane.timings.decode_share_seconds = 1.0 + 3.0 / 3.0;
     weighted.add(make_console_request_sample(long_lane));
     for (int index = 0; index < 2; ++index) {
         GenerationOutcome short_lane            = outcome(10, 0, 2, 0.1, 0.01, 3.0);
-        short_lane.metrics.decode_share_seconds = 3.0 / 3.0;
+        short_lane.timings.decode_share_seconds = 3.0 / 3.0;
         weighted.add(make_console_request_sample(short_lane));
     }
     failures += check(std::abs(weighted.sum.decode_round_seconds / weighted.sum.decode_seconds -
@@ -191,7 +191,7 @@ int main() {
     experts.recent_window = 10;
     for (const auto& [routed, hits] : {std::pair<std::uint64_t, std::uint64_t>{1000, 900}, {3000, 1500}}) {
         GenerationOutcome request    = outcome(1000, 0, 11, 0.1, 0.05, 0.5);
-        request.metrics.expert_cache = infernix::ExpertCacheStats{.routed = routed, .hits = hits};
+        request.expert_cache         = infernix::ExpertCacheStats{.routed = routed, .hits = hits};
         experts.session.add(make_console_request_sample(request));
     }
     experts.session.add(make_console_request_sample(outcome(1000, 0, 11, 0.1, 0.05, 0.5)));

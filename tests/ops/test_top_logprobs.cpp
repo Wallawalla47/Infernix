@@ -1,4 +1,5 @@
 #include "infernix/ops/top_logprobs.h"
+#include "ops/op_family.h"
 #include "ops/op_tester.h"
 
 #include <algorithm>
@@ -204,7 +205,7 @@ int run_validation_cases() {
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(top_logprobs) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;

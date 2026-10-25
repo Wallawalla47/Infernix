@@ -227,7 +227,8 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
             throw std::invalid_argument(
                 "linear_add: Q5 requires 16-byte x/residual/code/high/scale alignment");
         }
-        detail::q5_linear_add_dispatch(x, w, residual_out, ws, stream, column_invariant(policy));
+        detail::q5_linear_add_dispatch(x, w, residual_out, ws, stream, column_invariant(policy),
+                                       has_route(routes, LinearRoutes::Q5KSplit));
         return;
     }
 

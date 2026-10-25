@@ -1006,8 +1006,8 @@ draft, higher for later ones), and an MTP round averaged 0.75. Two changes targe
   combines to 0. Live columns' bits are unchanged, so the exact route's
   invariance and the committed text are unaffected.
 - **Confidence gate.** Each MTP proposal step also writes the drafter's probability of its draft
-  (`ops::argmax_probability`, one deterministic softmax pass over the proposal head's rows, into the
-  round's egress). Before the next round, each row keeps the prefix that maximizes expected committed
+  (`ops::argmax_with_probability`: the argmax's own pass over the proposal head's rows also sums the
+  softmax denominator in one deterministic order, into the round's egress). Before the next round, each row keeps the prefix that maximizes expected committed
   tokens per unit of round time, `(1 + Σ_j Π_{i≤j} a(q_i)) / (1 + c·e)` (`MtpConfidencePolicy`):
   a(q) is the acceptance learned per probability bucket (prior: the bucket's midpoint), c the cost of
   one verified draft column relative to a round without drafts, fitted from consecutive rounds'
@@ -1021,6 +1021,21 @@ draft, higher for later ones), and an MTP round averaged 0.75. Two changes targe
   skipping the drafter in rounds the rule expects to leave empty would need the MTP layer's KV
   appended without its MoE and head, a separate round kind. `auto` keeps the no-drafter choice.
   DFlash2 with the forced adaptive policy and `auto`: 68.8 / 69.1 tok/s sampled, below plain.
+- **The drafter's round cost (candidates §11 OR-09, unmeasured; three output-neutral switches, read in
+  `models/qwen3_5/program/planning/startup.h`).** The drafter's MoE is resident here (`resident_moe`),
+  but each round still runs the alignment over every verify column, then each draft step's layer and
+  proposal head:
+  - `INFERNIX_TMP_QWEN35_MTP_PAD_MASK`: the alignment's padding columns (past a row's licensed tokens)
+    route no resident expert.
+  - `INFERNIX_TMP_QWEN35_MTP_STEP_GATE`: Finish is captured as a step chain (the alignment, then each draft
+    behind a device gate), whose gates stop where no later draft could be verified. The threshold
+    (`MtpConfidencePolicy::step_threshold`) is the lowest bucket edge below which every bucket's
+    acceptance times the best bucket's is at most the column cost; a row's drafts end at its first
+    one below it.
+  - `INFERNIX_TMP_QWEN35_MTP_SKIP_ROUNDS` (with the step chain): `MtpDraftRegime` runs rounds without
+    drafting (the alignment's KV only) while their measured tokens per second beat drafting rounds',
+    probing the other regime 4 rounds in 32; the release log reports "MTP draft-free rounds: X of Y".
+    The aim is greedy decode at plain speed without unloading the drafter, and the sampled gain kept.
 - **DFlash2.** The adaptive-dflash policy already chooses each round's verify width from the
   block's per-draft probabilities after a split proposal (a host wait that costs nothing next to a
   14 ms round). It is not qualified here, so the A/B forces it (`adaptive-speculation`,
@@ -1114,6 +1129,15 @@ draft, higher for later ones), and an MTP round averaged 0.75. Two changes targe
 - `prompt-pv8` at group 16;
 - `decode-split64`;
 - a BF16-MMA expert wide route (approximate, prefill only);
+- `expert-a4-residual` (and its three-term form): implemented as an unqualified candidate
+  (`--fast-path`). The routed and shared experts' wide calls run Flash-Next's grouped mxf4nvf4 GEMM
+  on two (three) NVFP4 terms per x and h row at this geometry (`wide_expert.h` A4Planes,
+  `wide_expert.cuh` ScheduleResidual: Flash-Next's 64 x 128 tile, two stages, two CTAs a SM; warps
+  skip 16-column MMA tiles past a tile's valid columns). Narrow experts (the narrow ring included)
+  and CPU-served misses stay exact, so a column's result depends on its expert's column count in the
+  call, not on where its record was read. Op oracle: `test_offloaded_moe_a4_residual_122b`;
+  speed: `infernix_offloaded_moe_wide_bench --geometry 122b --activation a16x2` against `a16`, then
+  pp4096/pp32768 with and without the path;
 - `expert-tail-skip` remains an approximate opt-in.
 
 Each needs model-quality §6's kernel-based gate on every KV format and a resolved speedup.

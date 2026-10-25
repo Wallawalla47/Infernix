@@ -35,6 +35,7 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -208,9 +209,18 @@ struct SequenceState {
     std::uint32_t mtp_kv_valid            = 0;
     std::uint32_t dflash_context_frontier = 0;
     std::array<TokenId, qwen3_5::kMtpDecodeMaximumDrafts> mtp_drafts{};
-    // The drafter's probability of each draft (ops::argmax_probability; 1 where none was computed),
-    // the confidence policy's input (MtpConfidencePolicy).
+    // The drafter's probability of each draft (ops::argmax_with_probability; 1 where none was
+    // computed), the input of the confidence policy (MtpConfidencePolicy) and of the cut.
     std::array<float, qwen3_5::kMtpDecodeMaximumDrafts> mtp_draft_probabilities{};
+    // sampled-mtp-drafts: each draft's sparse proposal (candidates and q), present when
+    // mtp_draft_proposals (drafts of a decode round; the prompt's argmax drafts verify one-hot).
+    std::array<std::array<TokenId, qwen3_5::kMtpSparseSlots>, qwen3_5::kMtpDecodeMaximumDrafts> mtp_draft_candidates{};
+    std::array<std::array<float, qwen3_5::kMtpSparseSlots>, qwen3_5::kMtpDecodeMaximumDrafts> mtp_draft_q{};
+    // MTP trees: each draft's ranking log-probabilities (its proposal's ranks), present with the
+    // proposals of a decode round of an engine with tree families.
+    std::array<std::array<float, qwen3_5::kMtpSampledDraftRanks>, qwen3_5::kMtpDecodeMaximumDrafts>
+        mtp_draft_scores{};
+    bool mtp_draft_proposals      = false;
     std::uint32_t mtp_draft_count = 0;
     // adaptive-mtp: the request's learned draft acceptance and draft-length memory. It moves with
     // the sequence into a paused request's ResumeState and back at its resume binding.
@@ -334,6 +344,8 @@ struct HybridLaneState {
     std::uint32_t last_capture = 0;
     // Deepest snapshot frontier known on this path (reused or created by this sequence).
     std::uint32_t deepest_snapshot = 0;
+    // The prompt's length (the bound of the prompt tokens a finish reports as made reusable).
+    std::uint32_t prompt_tokens = 0;
     // The snapshot this sequence resumed from (invalid: root). Once the sequence publishes a
     // deeper snapshot, its lineage resumes from that one and this one is superseded.
     runtime::prefix_cache::SnapshotRef resume_snapshot;
@@ -449,11 +461,13 @@ public:
     const ExecutionSchedule execution_schedule;
     const std::uint32_t draft_window;
     const std::uint32_t neural_draft_window;
-    // DFlash2 tree verification: the tree widths each batch size may verify and the most
+    // Tree verification: the tree widths each batch size may verify and the most
     // root-to-leaf paths a tree row holds. In automatic mode tree_controller picks each
     // all-neural round's width.
     const TreeWidthPlan tree_widths;
     const std::uint32_t draft_tree_paths;
+    // MTP with tree families: every round publishes its proposal's ranking scores for the next.
+    const bool mtp_tree_rounds;
     std::optional<TreeWidthController> tree_controller;
     // The adaptive-mtp draft-length policy (FastPath::AdaptiveMtp): present when the plan captures
     // a neural MTP family per draft length; each all-neural MTP round then runs the length it picks.
@@ -476,12 +490,32 @@ public:
     // Confidence-gated MTP extents (ExecutionSchedule::mtp_draft_confidence): each row verifies the
     // prefix of its drafts the policy picks from their drafter probabilities; the last MTP round's
     // start, batch size and verified draft columns close its cycle for the policy's cost fit.
+    // On resident targets the policy serves one-row rounds' calibrated extents
+    // (ExecutionSchedule::mtp_calibrated_extent), with its prior column cost the configuration's
+    // measured verified-draft cost (dflash_width_costs).
     std::optional<MtpConfidencePolicy> mtp_confidence;
     struct MtpConfidenceRound {
         std::chrono::steady_clock::time_point start{};
         std::uint32_t batch   = 0; // 0: none yet
         std::uint32_t columns = 0;
+        bool drafted          = true; // a draft-free round's cycle (MtpDraftRegime) teaches no cost
     } mtp_confidence_round;
+    // TEMPORARY (INFERNIX_TMP_QWEN35_MTP_SKIP_ROUNDS; ExecutionSchedule::mtp_draft_regime): whether
+    // each MTP round drafts, and the last round's start, batch size, regimes and committed tokens,
+    // which close its cycle for the regime's measurement.
+    std::optional<MtpDraftRegime> mtp_regime;
+    struct MtpRegimeRound {
+        std::chrono::steady_clock::time_point start{};
+        std::uint32_t batch = 0; // 0: none yet
+        bool previous       = true;
+        bool drafted        = true;
+        std::uint32_t tokens = 0;
+    } mtp_regime_round;
+    // TEMPORARY (INFERNIX_TMP_QWEN35_MTP_DRAFT_LOG): one line per MTP row that held drafts, and the
+    // start-to-start cycle of the round before (0 for the first).
+    std::unique_ptr<std::ofstream> mtp_draft_log;
+    std::chrono::steady_clock::time_point mtp_draft_log_start{};
+    double mtp_draft_log_cycle = 0.0;
     const std::uint32_t ngram_draft_window;
     // Rounds of several rows propose copies of at most this many drafts.
     const std::uint32_t ngram_batch_window;
@@ -558,6 +592,12 @@ public:
     ops::SamplingMask fill_grammar_mask(runtime::TokenMaskProvider*, std::size_t row,
                                         std::span<const TokenId> drafts);
     Tensor token_counts;
+    // Per lane: the sampler's non-finite flag (ops::SamplingConfig::nonfinite), written by the
+    // round's kernels through the host mapping and read once the round has synchronized.
+    PinnedHostBuffer nonfinite_flags{sizeof(std::int32_t) * kMaximumConcurrency};
+    [[nodiscard]] std::int32_t* nonfinite_flag(std::uint32_t lane) const noexcept {
+        return static_cast<std::int32_t*>(nonfinite_flags.data()) + lane;
+    }
 
     VisionHandoffState vision_handoff;
     std::array<SequenceState, kMaximumConcurrency> sequences;
@@ -878,8 +918,10 @@ public:
                                                                 std::uint32_t columns);
     // Terminal publication: committed blocks and, when useful, an endpoint snapshot whose image
     // moves out of the lane; the snapshot the lane resumed from is superseded once a deeper one
-    // exists. The caller then clears the lane.
-    void hybrid_finish_lane(SequenceState& sequence, bool endpoint) noexcept;
+    // exists. The caller then clears the lane. `created` (a publishing lane): the prompt tokens past
+    // its resume frontier its snapshots made reusable.
+    void hybrid_finish_lane(SequenceState& sequence, bool endpoint,
+                            std::optional<std::uint32_t>* created = nullptr) noexcept;
     // The publication of hybrid_finish_lane without the release: returns the snapshot now at the
     // lane's committed frontier (created or an identical existing one), invalid when none was
     // published, for a tool-call hold.

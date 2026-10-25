@@ -1,6 +1,6 @@
 """Exact oracle for the lossless route's elementwise and row operations (include/infernix/ops/lossless_ops.h).
 
-Writes test cases and runs the CUDA test on them: python lossless_ops_oracle.py <test executable>.
+Writes test cases and runs the CUDA test on them: python lossless_ops_oracle.py <family executable> lossless_ops.
 Every expected value follows docs/maintainer/lossless-route.md §2 and §2a step by step: sums exact (fractions),
 transcendental functions correctly rounded (decimal at 60 digits, lossless_cr_oracle.py), every
 intermediate rounded to the dtype the specification gives it. Standard library only.
@@ -1273,18 +1273,18 @@ def write_cases(path: Path) -> None:
 
 
 def main() -> int:
-    """lossless_ops_oracle.py <test executable> [case file]: a given case file is written once and
+    """lossless_ops_oracle.py <family executable> <test name> [case file]: a given case file is written once and
     reused afterwards (the cases are deterministic)."""
-    exe = sys.argv[1]
-    if len(sys.argv) > 2:
-        path = Path(sys.argv[2])
+    command = sys.argv[1:3]  # the family executable and the test name (tests/ops/op_family.h)
+    if len(sys.argv) > 3:
+        path = Path(sys.argv[3])
         if not path.is_file():
             write_cases(path)
-        return subprocess.run([exe, str(path)], check=False).returncode
+        return subprocess.run([*command, str(path)], check=False).returncode
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "ops_cases.bin"
         write_cases(path)
-        return subprocess.run([exe, str(path)], check=False).returncode
+        return subprocess.run([*command, str(path)], check=False).returncode
 
 
 if __name__ == "__main__":

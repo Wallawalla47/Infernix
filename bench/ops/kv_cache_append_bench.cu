@@ -8,7 +8,9 @@
 #include "core/cyclic_kv_cache.h"
 #include "core/paged_kv_cache.h"
 #include "core/paged_kv_storage.h"
+#include "core/temporary_switches.h"
 #include "infernix_bench_common.h"
+#include "roofline.h"
 
 #include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
@@ -27,6 +29,7 @@
 #include <vector>
 
 using namespace infernix;
+namespace roofline = infernix::bench::roofline;
 
 namespace {
 
@@ -35,11 +38,10 @@ constexpr std::int32_t kPrefixHeadDim       = 128;
 constexpr std::int32_t kPrefixKvHeads       = 8;
 constexpr std::int32_t kPagedPrefixCapacity = 4096;
 constexpr std::size_t kFlushBytes           = std::size_t{256} << 20;
-constexpr double kRtx5090DramGBs            = 1792.0;
 
 enum class Mode : std::uint8_t { Full, Prefix, All };
 enum class FullGeometryChoice : std::uint8_t { Kv4, Kv2, All };
-enum class KvChoice : std::uint8_t { Bf16, Int8, Fp8, Nvfp4, K8V4, All };
+enum class KvChoice : std::uint8_t { Bf16, Int8, Fp8, Nvfp4, K8V4, Vq2, K4V2, All };
 enum class LayoutChoice : std::uint8_t { Paged, Cyclic, All };
 enum class Execution : std::uint8_t { Eager, Graph, Both };
 enum class CacheMode : std::uint8_t { Cold, Warm, Both };
@@ -100,7 +102,7 @@ struct Result {
                  "error: %s\n"
                  "usage: infernix_kv_cache_append_bench [--mode full|prefix|all] "
                  "[--full-geometry d256-kv4|d256-kv2|all] "
-                 "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4|all] "
+                 "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2|all] "
                  "[--layout paged|cyclic|all] [--tokens T,...] [--counts C,...] "
                  "[--cyclic-capacity 2048|4096] [--batch B] "
                  "[--context L] [--execution eager|graph|both] [--cache cold|warm|both] "
@@ -179,10 +181,14 @@ Options parse_options(int argc, char** argv) {
                 options.kv = KvChoice::Nvfp4;
             else if (value == "k8v4")
                 options.kv = KvChoice::K8V4;
+            else if (value == "vq2")
+                options.kv = KvChoice::Vq2;
+            else if (value == "k4v2")
+                options.kv = KvChoice::K4V2;
             else if (value == "all")
                 options.kv = KvChoice::All;
             else
-                usage("--kv-dtype expects bf16, int8, fp8, nvfp4, k8v4, or all");
+                usage("--kv-dtype expects bf16, int8, fp8, nvfp4, k8v4, vq2, k4v2, or all");
         } else if (argument == "--layout") {
             const std::string_view value(next("--layout requires a value"));
             if (value == "paged")
@@ -291,6 +297,14 @@ std::size_t full_scale_bytes(const FullGeometry& geometry, const PagedKVVectorLa
            dtype_size(layout.scale_dtype);
 }
 
+// One window plane of a vector-quantized format: `slot_bytes` per slot and KV head (1 byte for the
+// other formats, which have none).
+std::size_t window_bytes(KvCacheStorage storage, const FullGeometry& geometry, std::size_t slot_bytes) {
+    return kv_storage_has_exact_window(storage)
+               ? slot_bytes * static_cast<std::size_t>(kKVWindowSlots) * geometry.kv_heads
+               : std::size_t{1};
+}
+
 PagedKVLayerView make_full_view(DeviceBuffer& k, DeviceBuffer& v, DeviceBuffer& k_scale,
                                 DeviceBuffer& v_scale, DeviceBuffer& block_table,
                                 const FullGeometry& geometry, KvCacheStorage storage,
@@ -344,11 +358,28 @@ public:
                                     ? full_scale_bytes(geometry, storage_layout_.value, padded_)
                                     : std::size_t{1})),
           block_table_(static_cast<std::size_t>(padded_ / kPagedKVPageSize) * sizeof(std::int32_t)),
+          window_k_(bench::make_zeros(window_bytes(storage, geometry, kFullHeadDim))),
+          window_v_(bench::make_zeros(window_bytes(storage, geometry, kFullHeadDim))),
+          window_k_scales_(bench::make_zeros(window_bytes(storage, geometry, kKVWindowGroups * 2))),
+          window_v_scales_(bench::make_zeros(window_bytes(storage, geometry, kKVWindowGroups * 2))),
+          window_tags_(bench::make_zeros(window_bytes(storage, geometry, 2 * 4))),
           k_tensor_(k_.p, DType::BF16, {kFullHeadDim, geometry.kv_heads, tokens}),
           v_tensor_(v_.p, DType::BF16, {kFullHeadDim, geometry.kv_heads, tokens}),
           positions_tensor_(positions_.p, DType::I32, {tokens}),
           cache_view_(make_full_view(cache_k_, cache_v_, cache_k_scale_, cache_v_scale_,
                                      block_table_, geometry, storage, padded_)) {
+        // The vector-quantized formats append with their exact window (one sequence's slots), as
+        // the engine runs them.
+        if (kv_storage_has_exact_window(storage)) {
+            const std::int32_t heads = geometry.kv_heads;
+            cache_view_.window       = PagedKVWindowView{
+                      .k_codes  = Tensor(window_k_.p, DType::I8, {kFullHeadDim, kKVWindowSlots, heads, 1}),
+                      .v_codes  = Tensor(window_v_.p, DType::I8, {kFullHeadDim, kKVWindowSlots, heads, 1}),
+                      .k_scales = Tensor(window_k_scales_.p, DType::FP16, {kKVWindowGroups, kKVWindowSlots, heads, 1}),
+                      .v_scales = Tensor(window_v_scales_.p, DType::FP16, {kKVWindowGroups, kKVWindowSlots, heads, 1}),
+                      .tags     = Tensor(window_tags_.p, DType::I32, {2, kKVWindowSlots, heads, 1}),
+            };
+        }
         std::vector<std::int32_t> host_positions(static_cast<std::size_t>(tokens));
         for (std::int32_t token = 0; token < tokens; ++token) {
             host_positions[static_cast<std::size_t>(token)] = context + token;
@@ -382,6 +413,11 @@ private:
     DeviceBuffer cache_k_scale_;
     DeviceBuffer cache_v_scale_;
     DeviceBuffer block_table_;
+    DeviceBuffer window_k_;
+    DeviceBuffer window_v_;
+    DeviceBuffer window_k_scales_;
+    DeviceBuffer window_v_scales_;
+    DeviceBuffer window_tags_;
     Tensor k_tensor_;
     Tensor v_tensor_;
     Tensor positions_tensor_;
@@ -532,6 +568,10 @@ const char* storage_name(KvCacheStorage storage) {
         return "nvfp4";
     case KvCacheStorage::Fp8KeyNvfp4Value:
         return "k8v4";
+    case KvCacheStorage::Vq2:
+        return "vq2";
+    case KvCacheStorage::Q4KeyVq2Value:
+        return "k4v2";
     }
     return "unknown";
 }
@@ -600,7 +640,8 @@ void report(const Result& result) {
                 result.committed, result.max_count, result.graph_nodes, result.graph_calls,
                 result.timing.median_us, result.timing.min_us, result.timing.p95_us,
                 result.logical_cache_bytes, result.physical_cache_bytes, result.key_vector_bytes,
-                result.value_vector_bytes, gbps, gbps / kRtx5090DramGBs * 100.0, kRtx5090DramGBs);
+                result.value_vector_bytes, gbps, gbps / roofline::kDramSpecGBs * 100.0,
+                roofline::kDramSpecGBs);
 }
 
 void write_csv(const Options& options, const std::vector<Result>& results) {
@@ -671,8 +712,12 @@ std::vector<KvCacheStorage> selected_storages(KvChoice choice) {
     if (choice == KvChoice::Fp8) return {KvCacheStorage::Fp8E4M3Row256};
     if (choice == KvChoice::Nvfp4) return {KvCacheStorage::Nvfp4Group16};
     if (choice == KvChoice::K8V4) return {KvCacheStorage::Fp8KeyNvfp4Value};
-    return {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
-            KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value};
+    if (choice == KvChoice::Vq2) return {KvCacheStorage::Vq2};
+    if (choice == KvChoice::K4V2) return {KvCacheStorage::Q4KeyVq2Value};
+    return {KvCacheStorage::BFloat16,     KvCacheStorage::Int8Group64,
+            KvCacheStorage::Fp8E4M3Row256, KvCacheStorage::Nvfp4Group16,
+            KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2,
+            KvCacheStorage::Q4KeyVq2Value};
 }
 
 template <class Case>
@@ -747,6 +792,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         const Options options = parse_options(argc, argv);
+        std::printf("# %s\n", temporary_switches::describe().c_str());
         cudaStream_t stream   = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         bench::L2FlushBuffer flush(kFlushBytes);

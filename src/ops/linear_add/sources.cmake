@@ -16,6 +16,7 @@ target_sources(infernix_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/q4/q4_linear_add.cu"
   "${CMAKE_CURRENT_LIST_DIR}/q5/q5_linear_add_gemm_mma.cu"
   "${CMAKE_CURRENT_LIST_DIR}/q5/q5_linear_add_sliced_k_mma.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/q5/q5_linear_add_ksplit_mma.cu"
   "${CMAKE_CURRENT_LIST_DIR}/q5/q5_linear_add_gemm_simt.cu"
   "${CMAKE_CURRENT_LIST_DIR}/q5/q5_linear_add_plan.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/q8/q8_linear_add_gemm_mma.cu"

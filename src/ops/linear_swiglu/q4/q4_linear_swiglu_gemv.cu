@@ -38,13 +38,24 @@ static_assert(kBytesPerGroup == 2 * kVecBytes);
 static_assert(kGroups % kGroupsPerWarpTile == 0);
 static_assert(kVecsPerWarpTile == 32);
 
+// Each m16 row tile of a CTA holds eight gate rows and the matching eight up rows, so a fragment's
+// top and bottom halves meet in the SwiGLU epilogue. The release kernel runs one tile (16 block
+// rows); the pipelined one-wave route may take two (Rebind<32>).
+template <int BlockRows = 16>
 struct Q4SwiGluSmallTRows {
-    static constexpr int kOutputRowsPerCta = 8;
+    static_assert(BlockRows % 16 == 0);
+    static constexpr int kOutputRowsPerCta = BlockRows / 2;
+    template <int Rows>
+    using Rebind = Q4SwiGluSmallTRows<Rows>;
 
     __host__ __device__ int output_rows(int rows) const { return rows / 2; }
 
     __device__ __forceinline__ int weight_row(int output_row0, int local_row) const {
-        return output_row0 + (local_row & 7) + (local_row >= 8 ? kIntermediate : 0);
+        return output_row(output_row0, local_row) + ((local_row & 8) != 0 ? kIntermediate : 0);
+    }
+
+    __device__ __forceinline__ int output_row(int output_row0, int local_row) const {
+        return output_row0 + (local_row >> 4) * 8 + (local_row & 7);
     }
 };
 
@@ -75,7 +86,7 @@ void launch_small_t_active(const Tensor& x, const Weight& w, Tensor& out, cudaSt
     launch_q4_a16_sliced_k_mma<Schedule>(
         q4_linear_operands(x, w),
         LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), kIntermediate},
-        Q4SwiGluSmallTEpilogue{}, stream, Q4SwiGluSmallTRows{});
+        Q4SwiGluSmallTEpilogue{}, stream, Q4SwiGluSmallTRows<>{});
 }
 
 template <std::size_t... Offsets>

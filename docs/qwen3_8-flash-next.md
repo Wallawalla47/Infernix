@@ -319,7 +319,10 @@ Its qualified fast paths (2026-10-21; on by default, `--reproducible` turns them
 the request-coupling paths (two-row MTP rounds: two concurrent requests decode 84 -> 126 tok/s with
 16-bit and 125 -> 162 with 4-bit expert activations; free cache resume; preemption), sampled MTP
 drafts, and `expert-a4-residual` for long prefills with 16-bit expert activations, on every KV
-format ([model quality §6.7](maintainer/model-quality.md#67-fast-path-registry)). Its exact route is
+format ([model quality §6.7](maintainer/model-quality.md#67-fast-path-registry)).
+`--fast-path expert-a4-residual-decode` (a candidate, not yet qualified or timed) takes the same two
+NVFP4 terms in decode and verification calls with 16-bit expert activations, on the GPU and for
+CPU-served misses alike (exact sums, so where an expert runs changes no bit). Its exact route is
 deterministic and gives each request the same bits alone and with up to eight concurrent requests.
 
 ## Run
@@ -382,7 +385,10 @@ infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8
     12,432 against 12,288), plus its 40 MiB context ring per lane.
   - Greedy output is the same as without it when one request runs at a time; sampling keeps the
     sampler's distribution. With two or more requests decoding together, rounds decode without
-    drafts (as MTP's do without `adaptive-speculation`).
+    drafts (as MTP's do without `adaptive-speculation`), except under the default fast path
+    `dflash2-pairs`: rounds of two requests share one proposal and verify up to two drafts each (with
+    `auto`, the number both requests' calibrated drafts make fastest). It is on by the owner's decision
+    ahead of its quality gate; `--disable-fast-paths` or `--reproducible` turns it off.
 - `--spec mtp --draft-tokens auto --lm-head-draft` drafts with the model's MTP layer.
   - `auto`: each round drafts the number of tokens, 0 to 7, the request's recent acceptance makes
     worthwhile (down to none on text it predicts poorly), and verifies them up to the first the
@@ -449,7 +455,10 @@ infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8
   benchmarks need (`infernix_bench` always starts that way). Output is the same either way: where an
   expert is computed never changes a bit.
 - The `infernix-serve` statistics panel's `experts` column shows the expert cache's hit rate over
-  the session and the last ten requests.
+  the session and the last ten requests. Each Chat Completions and Anthropic response's `timings`
+  carries the request's `expert_routed_n` and `expert_hit_n`, and `/metrics` exports the cache's
+  frames and its cumulative routed, hit, promotion, landing and CPU-served counts
+  ([serving](serving.md#live-metrics)).
 - After each request the engine logs two Debug lines (`--log-level debug`): the expert cache's
   hit rate, and the request's n-gram row traffic (`n-gram rows: N requested, H% host-cache hits,
   R NVMe reads, T ms of reads`, and with speculation `; G gated rounds: R NVMe reads (T ms) behind the gate, the GPU
@@ -534,11 +543,46 @@ The quality change against the FP8 table has not been measured yet.
 The conversion above stores [qwen3_8.jinja](../tools/chat_templates/qwen3_8.jinja), the template
 Qwen3.8-27B uses; Flash-Next's own template is Qwen3.8-27B's. Among its Infernix changes, it keeps
 a System or developer message after the first turn in place, as serving documents (Claude Code's
-normal mode sends them). Artifacts converted without it, including the published
-Flash-Next artifacts, store the checkpoint's template, which rejects such a message with
-"System message must be at the beginning". Start them with
+normal mode sends them), and opens the conversation under either role. Artifacts converted without
+it, including the published Flash-Next artifacts, store the checkpoint's template, which raises
+"System message must be at the beginning" for a System message after the first turn and
+"Unexpected message role." for a developer message at any position.
+
+While it loads a template, Infernix measures what that template actually renders: small probe
+conversations decide, separately, whether it accepts a System message after the first turn, a
+developer message after the first turn, and a leading developer message. A template that renders
+all three keeps every role, and a template that cannot render its own probes is treated as keeping
+every role. Detection reads the rendered result rather than the template source, so a reworded or
+commented guard changes nothing. One rule is deliberate: `system` is the role these templates use
+for instructions themselves, so a template that refuses a system turn at every position is stating
+its own rule, and such a request fails as that template asks instead of being rewritten around it.
+
+Where a probe says the active template cannot render a role at its position, `infernix-serve` and
+`infernix` lower that turn's role instead of failing: a System or developer message after the
+first turn becomes a User message, a leading developer message becomes a System message, and a
+leading System message is never touched (so the ordinary single leading System block, the
+conversation's prefix-cache anchor, stays byte-identical). The text, the number of turns and their
+positions stay as they arrived, only the role changes, so such a request never fails on the
+template. Each generation request shows its lowered turns as `instruction_role_lowerings` in the
+preparation block of `--request-log-jsonl`, and both programs state once at startup which roles
+the loaded template lowers. One consequence to know: a lowered turn counts as a user query for a
+template that takes its thinking history from the last user turn, so `preserve_thinking: false` can
+then drop earlier `<think>` blocks that `qwen3_8.jinja` keeps. Passing
 `--chat-template tools/chat_templates/qwen3_8.jinja` (the file is also in the Windows release
-zip's `chat_templates` folder).
+zip's `chat_templates` folder) stays the quality-preferred way to run: it renders every turn under
+its real role.
+
+### Claude Code auto mode
+
+Claude Code's auto mode adds requests of its own beside the conversation. Its server-side review
+sends a `safeguards` object, which Infernix ignores like any field it does not implement; a
+reviewed response that carries no `safeguard_results`, which Infernix never sends, makes Claude
+Code classify locally for the rest of that session, so the review costs at most one request per
+session and `CLAUDE_CODE_AUTO_MODE_SERVER=0` skips it. Auto mode also puts System turns into the
+middle of the conversation, which the role lowering above accepts: Infernix answers those requests
+with the turn rendered under the User role instead of refusing them, so the client has no reason
+to stop sending them. The classifier works with `--no-thinking`; give it a model with
+`CLAUDE_CODE_AUTO_MODE_MODEL`.
 
 ## Prefix cache
 
@@ -628,8 +672,9 @@ can cost a whole record; keeping the artifact and the `.ngram` volume on a datas
 
 The GPU reads RAM experts only from page-locked (pinned) memory, and Windows page-locks at most
 the adapter's shared system memory for it: on an RTX 5090 with 95.8 GiB of RAM page-locking stopped
-at 76.0 GiB of a reported 76.6 GiB (80 % of RAM there; many machines report half of RAM). The RAM
-ledger reads that size and its current use at startup and keeps 1 GiB below it. Every other pin
+at 76.0 GiB of a reported 76.6 GiB (80 % of RAM there; many machines report half of RAM). WSL2
+inherits the limit from the Windows driver. The RAM ledger reads that size and its current use at
+startup (through DXGI on Windows, DXCore under WSL2) and keeps 1 GiB below it. Every other pin
 comes first (the embedding, the prefix cache's Host tier, the Program's buffers); the experts pin
 what is left, and their RAM beyond it holds **unpinned records**:
 
@@ -710,6 +755,9 @@ headroom 256 (auto); expert frames 9300 (23.95 GiB); 380 free after startup
   - If Windows lowers the budget later, the cache shrinks by the same amount.
   - The cost: memory past the budget may be moved to system memory if another program needs VRAM,
     which slows decode until the cache shrinks. It is off by default.
+- With more than one CUDA device visible (Windows), free VRAM is read as the Windows budget less this
+  process's usage: there CUDA's own free figure stopped following allocations, so the cache would size
+  to almost nothing. `CUDA_VISIBLE_DEVICES` naming one device restores the single-device reading.
 - <a id="expert-tail-skip"></a>**`--expert-tail-skip R`** (approximate, off by default) trades
   quality for decode speed. Each token routes 10 experts, ranked by router weight (rank 0 the
   largest). In a decode or verification round, an expert missing from VRAM that every token of the

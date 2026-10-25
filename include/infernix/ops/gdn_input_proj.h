@@ -82,8 +82,14 @@ void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& valu
  * mutually non-overlapping.
  *
  * The policy-bearing form uses caller-owned call-scoped transient storage sized by
- * gdn_input_proj_workspace_capacity_bytes(). A16 requires zero bytes. The convenience overload
- * selects A16Only and requires no transient workspace.
+ * gdn_input_proj_workspace_capacity_bytes(). A16 requires zero bytes, except that the MXFP8
+ * [16384,2560] query also covers its LinearRoutes::F16Accumulate route from that route's admission
+ * width (the query takes no route flags). With that flag (and any policy but A16ColumnInvariant), the
+ * MXFP8 parent runs linear's f16-accumulate-prefill route for the shape (include/infernix/ops/linear.h)
+ * at the same widths, so qkv and z still hold the bits of linear's rows under the same flag; every
+ * other parent ignores that flag, and LinearRoutes::Q8SlicedK acts as in the routes overload below.
+ * The convenience overload selects A16Only and requires no
+ * transient workspace.
  */
 [[nodiscard]] std::size_t
 gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int32_t parent_rows,
@@ -91,7 +97,8 @@ gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int32_t parent_
                                         std::int32_t min_tokens, std::int32_t max_tokens);
 
 void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Tensor& qkv, Tensor& z,
-                    LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream);
+                    LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream,
+                    LinearRoutes routes = LinearRoutes::Exact);
 
 /**
  * Whether a single parent has a dedicated column-invariant route (NVFP4, FP8, MXFP8 and Q8
@@ -326,8 +333,8 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z
                                 cudaStream_t stream);
 
 /**
- * Verification-tree form of the single-parent record-producing Op (FP8 and NVFP4 parents) over a
- * width T in [2,32]. tree_rows is I32 [kSpeculativeTreeRowWords,B]: column c of row b convolves
+ * Verification-tree form of the single-parent record-producing Op (FP8, NVFP4 and Q8 parents)
+ * over a width T in [2,32]. tree_rows is I32 [kSpeculativeTreeRowWords,B]: column c of row b convolves
  * the projected inputs of its three nearest ancestors in that row's tree (conv history past the
  * anchor) and its own, in the chain form's order, so each column sees the inputs of its own root
  * path and a chain row gets the chain form over its valid prefix. Records hold every column's

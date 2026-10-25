@@ -58,6 +58,16 @@ __device__ __forceinline__ void mma_f16_f16acc(unsigned& c0, unsigned& c1, unsig
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
+// D = A B in FP16 from a zero accumulator (mma_f16_f16acc accumulates into D): the first k16 step of
+// an FP16 partial sum.
+__device__ __forceinline__ void mma_f16_f16acc_zero(unsigned& d0, unsigned& d1, unsigned a0, unsigned a1,
+                                                    unsigned a2, unsigned a3, unsigned b0, unsigned b1) {
+    asm("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
+        "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%8,%8};\n"
+        : "=r"(d0), "=r"(d1)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(0));
+}
+
 __device__ __forceinline__ void mma_s8(int& c0, int& c1, int& c2, int& c3, unsigned a0, unsigned a1,
                                        unsigned a2, unsigned a3, unsigned b0, unsigned b1) {
     asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
@@ -85,13 +95,18 @@ __device__ __forceinline__ void mma_u8s8_k32(int& c0, int& c1, int& c2, int& c3,
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
-// Block-scaled E4M3 with FP32 accumulation, the full FP8 rate on RTX 5090. sfa and sfb are
-// UE8M0 scales (byte 0, 0x7f is exactly 1) applied to every row of A and column of B.
-__device__ __forceinline__ void mma_fp8_e4m3_scaled(float& c0, float& c1, float& c2, float& c3,
-                                                    unsigned a0, unsigned a1, unsigned a2,
-                                                    unsigned a3, unsigned b0, unsigned b1,
-                                                    unsigned sfa, unsigned sfb) {
-    constexpr unsigned short kScaleBlockId  = 0;
+// Block-scaled E4M3 with FP32 accumulation, the full FP8 rate on RTX 5090: each k32 product is
+// scaled by A's and B's UE8M0 scales (0x7f is exactly 1). ByteA / ByteB select the byte of sfa / sfb
+// that holds the scale. Thread selector 0: the A scale of row ((lane & 1) << 3) | (lane >> 2) comes
+// from that lane's word (lanes with lane & 3 < 2), B's of column lane >> 2 from lanes with lane & 3 == 0.
+template <unsigned short ByteA, unsigned short ByteB>
+__device__ __forceinline__ void mma_fp8_e4m3_block_scaled(float& c0, float& c1, float& c2,
+                                                          float& c3, unsigned a0, unsigned a1,
+                                                          unsigned a2, unsigned a3, unsigned b0,
+                                                          unsigned b1, unsigned sfa, unsigned sfb) {
+    static_assert(ByteA < 4 && ByteB < 4);
+    constexpr unsigned short kScaleByteA    = ByteA;
+    constexpr unsigned short kScaleByteB    = ByteB;
     constexpr unsigned short kScaleThreadId = 0;
     asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X."
                  "m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 "
@@ -99,8 +114,16 @@ __device__ __forceinline__ void mma_fp8_e4m3_scaled(float& c0, float& c1, float&
                  "{%10}, {%11,%12}, {%13}, {%14,%15};\n"
                  : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(sfa),
-                   "h"(kScaleBlockId), "h"(kScaleThreadId), "r"(sfb), "h"(kScaleBlockId),
+                   "h"(kScaleByteA), "h"(kScaleThreadId), "r"(sfb), "h"(kScaleByteB),
                    "h"(kScaleThreadId));
+}
+
+// Block-scaled E4M3 with sfa and sfb in byte 0, applied to every row of A and column of B.
+__device__ __forceinline__ void mma_fp8_e4m3_scaled(float& c0, float& c1, float& c2, float& c3,
+                                                    unsigned a0, unsigned a1, unsigned a2,
+                                                    unsigned a3, unsigned b0, unsigned b1,
+                                                    unsigned sfa, unsigned sfb) {
+    mma_fp8_e4m3_block_scaled<0, 0>(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1, sfa, sfb);
 }
 
 // On RTX 5090, block-scaled FP8 avoids the plain form's half-rate FP32 accumulation.

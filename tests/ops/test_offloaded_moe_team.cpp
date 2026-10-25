@@ -2,6 +2,7 @@
 // §10.3): any worker count, job mix and ISA gives the single-thread expert_forward bits, and the
 // team survives many rounds with workers spinning and parking. Host-only: needs no GPU.
 
+#include "ops/op_family.h"
 #include "ops/offloaded_sparse_moe/cpu/expert_team.h"
 #include "ops/offloaded_moe_fixtures.h"
 
@@ -136,7 +137,7 @@ void test_many_rounds_with_parking() {
 
 } // namespace
 
-int main(int argc, char** argv) {
+INFERNIX_OP_TEST(offloaded_moe_team) {
     g_quick = argc > 1 && std::string(argv[1]) == "--quick";
     test_worker_counts();
     test_worker_counts_a16(moe::kFlashNextShape);

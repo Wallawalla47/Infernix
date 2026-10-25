@@ -40,7 +40,7 @@ struct PlannedPool {
 
 PlannedPool plan_pool(bool dflash, std::int32_t slots = 4, bool dflash2 = false,
                       bool window = false,
-                      q36::RecurrentHostFormat recurrent_host = q36::RecurrentHostFormat::Fp32) {
+                      q36::RecurrentHostFormat recurrent_host = q36::RecurrentHostFormat::Exact) {
     q36::StateImageSpec spec{
         .linear =
             {
@@ -409,6 +409,42 @@ void test_packed_recurrent(q36::RecurrentHostFormat format, infernix::DeviceCont
     expect(unsegmented_rejected, "an unsegmented copy of a packed Host form was accepted");
 }
 
+// fp16-gdn-state: an FP16 recurrent pool keeps its own bytes on the Host (half the FP32 pool's), and the
+// Host packings, which round an FP32 state, refuse it.
+void test_fp16_recurrent_pool() {
+    const auto spec = [](infernix::DType recurrent, q36::RecurrentHostFormat host) {
+        q36::StateImageSpec value{
+            .linear = {.layers          = 2,
+                       .conv_channels   = 5,
+                       .conv_width      = 3,
+                       .value_heads     = 2,
+                       .value_head_dim  = 4,
+                       .key_head_dim    = 3,
+                       .slot_count      = 4,
+                       .conv_dtype      = infernix::DType::BF16,
+                       .recurrent_dtype = recurrent},
+            .hidden = 7,
+        };
+        value.recurrent_host = host;
+        return value;
+    };
+    infernix::LayoutBuilder fp32_builder, fp16_builder;
+    const auto fp32 = q36::plan_state_image_device_pool(fp32_builder, spec(infernix::DType::FP32, q36::RecurrentHostFormat::Exact));
+    const auto fp16 = q36::plan_state_image_device_pool(fp16_builder, spec(infernix::DType::FP16, q36::RecurrentHostFormat::Exact));
+    expect(fp32.host.linear_recurrent_layer_bytes == 3U * 4U * 2U * 4U &&
+               fp16.host.linear_recurrent_layer_bytes == fp32.host.linear_recurrent_layer_bytes / 2U &&
+               !fp16.recurrent_staging,
+           "StateImage FP16 recurrent pool's Host bytes");
+    for (const auto host : {q36::RecurrentHostFormat::Fp24, q36::RecurrentHostFormat::Bf16}) {
+        bool refused = false;
+        try {
+            infernix::LayoutBuilder builder;
+            (void)q36::plan_state_image_device_pool(builder, spec(infernix::DType::FP16, host));
+        } catch (const std::invalid_argument&) { refused = true; }
+        expect(refused, "StateImage packed an FP16 recurrent pool");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -460,6 +496,7 @@ int main() {
     test_segmented_roundtrip(true, device, true);
     test_packed_recurrent(q36::RecurrentHostFormat::Fp24, device);
     test_packed_recurrent(q36::RecurrentHostFormat::Bf16, device);
+    test_fp16_recurrent_pool();
 
     return failures == 0 ? 0 : 1;
 }

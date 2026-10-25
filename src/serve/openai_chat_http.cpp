@@ -35,12 +35,25 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         write_openai_error(res, exception.error());
         return;
     }
+    // Tool-call turns sent back without their reasoning: counted, and with --restore-tool-reasoning
+    // given the reasoning this server generated for them.
+    const ReasoningRestore reasoning =
+        options_.restore_tool_reasoning
+            ? reasoning_store_.restore(request.generation.messages)
+            : ReasoningRestore{.missing = count_missing_reasoning(request.generation.messages)};
+    metrics_.reasoning(reasoning.missing, reasoning.restored);
+    const auto remember_reasoning = [this](const GenerationOutcome& outcome, const std::vector<std::string>& ids) {
+        if (options_.restore_tool_reasoning && !outcome.tool_calls.empty()) {
+            reasoning_store_.remember(ids, outcome.reasoning);
+        }
+    };
 
     const std::uint64_t req_id = ++request_seq_;
     RequestLogMetadata metadata{.http_request_id        = res.get_header_value("x-request-id"),
                                 .model                  = request.model,
                                 .stream                 = request.stream,
-                                .output_tokens_explicit = request.output_tokens_explicit};
+                                .output_tokens_explicit = request.output_tokens_explicit,
+                                .label                  = request_label(req)};
     PreparedRequest prepared;
     try {
         infernix::GenerationObservationOptions observation{
@@ -96,9 +109,11 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         }
         lifecycle->done(outcome);
         try {
-            set_ngram_generation_header(res, outcome.metrics.ngram_archive);
-            set_owned_json_content(res, make_chat_completion_response(identity, outcome),
+            set_ngram_generation_header(res, outcome.ngram_archive);
+            std::vector<std::string> call_ids;
+            set_owned_json_content(res, make_chat_completion_response(identity, outcome, &call_ids),
                                    prepared.lifetime);
+            remember_reasoning(outcome, call_ids);
         } catch (const std::exception& exception) {
             lifecycle->response_failure(make_internal_request_failure(
                 RequestFailurePhase::ResponseRender, exception.what()));
@@ -108,6 +123,27 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             error.message = exception.what();
             write_openai_error(res, error);
         }
+        return;
+    }
+
+    // The SSE response cannot be taken back once committed: wait for the Engine's admission first,
+    // so the queue's own answers (a queue timeout, an orderly stop) are a plain HTTP status here as
+    // on the non-streaming branch; after it only mid-generation failures remain, which belong in
+    // the stream.
+    try {
+        service_->admit(prepared, [&req] { return client_disconnected(req); });
+    } catch (const ApiException& exception) {
+        lifecycle->failure(make_generation_request_failure(exception.error()));
+        write_openai_error(res, exception.error());
+        return;
+    } catch (const std::exception& exception) {
+        lifecycle->failure(
+            make_internal_request_failure(RequestFailurePhase::Generation, exception.what()));
+        ApiError error;
+        error.status  = 500;
+        error.type    = "internal_error";
+        error.message = exception.what();
+        write_openai_error(res, error);
         return;
     }
 
@@ -122,8 +158,8 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         prepare_sse_response(res);
         res.set_chunked_content_provider(
             "text/event-stream",
-            [this, stream, encoder, lifecycle, return_progress,
-             timings_per_token](std::size_t, httplib::DataSink& sink) -> bool {
+            [this, stream, encoder, lifecycle, return_progress, timings_per_token,
+             remember_reasoning](std::size_t, httplib::DataSink& sink) -> bool {
                 if (stream->started.exchange(true, std::memory_order_acq_rel)) {
                     sink.done();
                     return true;
@@ -187,6 +223,9 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                     output.on_reasoning = [&](const std::string& text) {
                         render_and_write(transport, [&] { return encoder->reasoning_delta(text); });
                     };
+                    output.on_tool_call = [&](const infernix::ToolCallDelta& delta) {
+                        render_and_write(transport, [&] { return encoder->tool_call_delta(delta); });
+                    };
                     output.is_cancelled = [&] { return transport.poll(); };
 
                     outcome = service_->run(stream->prepared, &output);
@@ -225,7 +264,8 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 std::vector<std::string> terminal;
                 try {
                     terminal = encoder->finish(outcome);
-                    if (auto comment = ngram_generation_comment(outcome.metrics.ngram_archive);
+                    remember_reasoning(outcome, encoder->tool_call_ids());
+                    if (auto comment = ngram_generation_comment(outcome.ngram_archive);
                         !comment.empty()) {
                         terminal.insert(terminal.begin(), std::move(comment));
                     }

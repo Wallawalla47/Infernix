@@ -1,4 +1,5 @@
 #include "infernix/ops/layer_norm.h"
+#include "ops/op_family.h"
 #include "ops/norm_test_common.h"
 
 #include <algorithm>
@@ -96,7 +97,7 @@ int run_case(const char* label, std::int32_t rows, std::uint32_t seed, bool near
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(layer_norm) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;

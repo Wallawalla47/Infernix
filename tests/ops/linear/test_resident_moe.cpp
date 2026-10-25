@@ -3,7 +3,9 @@
 // (H = 2560, I = 640, top-10) and the Qwen3.5-122B-A10B drafter's (H = 3072, I = 1024, top-8). Criterion: the BF16 output rounding plus the FP32 accumulation of
 // both projections (h is FP32), sum |D h| * (I + H) * 2^-23 for the accumulation part.
 #include "infernix/ops/resident_moe.h"
+#include "ops/op_family.h"
 #include "ops/linear/linear_test_common.h"
+#include "ops/op_tester.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -176,9 +178,81 @@ void run_case(QType qtype, std::int32_t experts, std::int32_t columns, std::uint
     cudaFree(ws);
 }
 
+// The padding mask (valid_columns): rows of `width` columns, each live for its first valid[row];
+// every live entry's output bits equal the unmasked call's, every padding entry's output is zero.
+void masked_case(QType qtype, std::int32_t experts, std::int32_t width, const std::vector<std::int32_t>& valid,
+                 std::uint32_t seed, Shape shape) {
+    const std::int32_t H = shape.hidden, I = shape.intermediate, K = shape.top_k;
+    const auto columns   = width * static_cast<std::int32_t>(valid.size());
+    const auto gate_up = qw::make_patterned_weight(qtype, experts * 2 * I, H, seed,
+                                                   {qw::RowSplitScalePattern::Small, qw::RowSplitCodePattern::Hashed});
+    const auto down    = qw::make_patterned_weight(qtype, experts * H, I, seed + 1,
+                                                   {qw::RowSplitScalePattern::Small, qw::RowSplitCodePattern::Hashed});
+    void* gu_payload = nullptr;
+    void* dn_payload = nullptr;
+    cudaMalloc(&gu_payload, gate_up.payload.size());
+    cudaMalloc(&dn_payload, down.payload.size());
+    cudaMemcpy(gu_payload, gate_up.payload.data(), gate_up.payload.size(), cudaMemcpyHostToDevice);
+    cudaMemcpy(dn_payload, down.payload.data(), down.payload.size(), cudaMemcpyHostToDevice);
+    const infernix::Weight gu_weight = gate_up.device_weight(gu_payload);
+    const infernix::Weight dn_weight = down.device_weight(dn_payload);
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> n(0.0F, 1.0F);
+    std::vector<std::uint16_t> x(static_cast<std::size_t>(H) * columns);
+    for (auto& v : x) { v = bf16_bits(n(rng)); }
+    std::uniform_int_distribution<std::int32_t> pick(0, experts - 1);
+    std::vector<std::int32_t> ids(static_cast<std::size_t>(K) * columns);
+    for (auto& id : ids) { id = pick(rng); }
+    auto* dx    = device(x);
+    auto* dids  = device(ids);
+    auto* dvalid = device(valid);
+    const std::size_t out_bytes = sizeof(std::uint16_t) * H * K * columns;
+    void *plain = nullptr, *masked = nullptr, *ws = nullptr;
+    cudaMalloc(&plain, out_bytes);
+    cudaMalloc(&masked, out_bytes);
+    cudaMemset(masked, 0xFF, out_bytes); // padding outputs must be written
+    const std::size_t ws_bytes = infernix::ops::resident_moe_workspace_bytes(K * columns, I);
+    cudaMalloc(&ws, ws_bytes);
+    Tensor tx(dx, DType::BF16, {H, columns}), tids(dids, DType::I32, {K, columns});
+    Tensor tplain(plain, DType::BF16, {H, K * columns}), tmasked(masked, DType::BF16, {H, K * columns});
+    infernix::ops::resident_moe_experts(tx, tids, gu_weight, dn_weight, experts, I, ws, ws_bytes, tplain, nullptr);
+    infernix::ops::resident_moe_experts(tx, tids, gu_weight, dn_weight, experts, I, ws, ws_bytes, tmasked, nullptr,
+                                        dvalid, width);
+    if (cudaDeviceSynchronize() != cudaSuccess) { throw std::runtime_error("masked resident_moe_experts failed"); }
+    std::vector<std::uint16_t> a(out_bytes / 2), b(out_bytes / 2);
+    cudaMemcpy(a.data(), plain, out_bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(b.data(), masked, out_bytes, cudaMemcpyDeviceToHost);
+    long live_diff = 0, padding_nonzero = 0;
+    for (std::int32_t t = 0; t < columns; ++t) {
+        const bool live = t % width < valid[static_cast<std::size_t>(t / width)];
+        for (std::size_t i = static_cast<std::size_t>(t) * K * H; i < static_cast<std::size_t>(t + 1) * K * H; ++i) {
+            if (live) {
+                live_diff += a[i] != b[i] ? 1 : 0;
+            } else {
+                padding_nonzero += b[i] != 0 ? 1 : 0;
+            }
+        }
+    }
+    check(live_diff == 0, "masked call: live entries bit-identical to the unmasked call");
+    check(padding_nonzero == 0, "masked call: padding entries are BF16 zero");
+    // The masked call repeats bit for bit (op_tester.h verify_repeatable).
+    check(infernix::test::verify_repeatable(
+              "resident_moe masked", 3, nullptr,
+              [&] {
+                  infernix::ops::resident_moe_experts(tx, tids, gu_weight, dn_weight, experts, I, ws, ws_bytes, tmasked,
+                                                      nullptr, dvalid, width);
+              },
+              {{masked, out_bytes}}) == 0,
+          "masked call: repeated calls give the same bits");
+    for (void* p : {gu_payload, dn_payload, static_cast<void*>(dx), static_cast<void*>(dids), static_cast<void*>(dvalid),
+                    plain, masked, ws}) {
+        cudaFree(p);
+    }
+}
+
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(resident_moe) {
     if (!cuda_available()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
@@ -193,6 +267,9 @@ int main() {
         run_case(QType::Q4_G64_FP16, 10, 1, 15, kQwen3_5_122B);
         run_case(QType::Q4_G64_FP16, 12, 4, 17, kQwen3_5_122B);
         run_case(QType::Q8_G32_FP16, 9, 2, 19, kQwen3_5_122B);
+        // The 122B drafter's alignment: rows of three columns with 1, 3 and 2 live (OR-09's mask).
+        masked_case(QType::Q4_G64_FP16, 12, 3, {1, 3, 2}, 21, kQwen3_5_122B);
+        masked_case(QType::Q8_G32_FP16, 9, 2, {1, 0}, 23, kQwen3_5_122B);
     } catch (const std::exception& e) {
         std::cerr << "FAIL: " << e.what() << "\n";
         return 1;

@@ -10,8 +10,10 @@
 #include "infernix/ops/linear_add.h"
 
 #include "core/device.h"
+#include "core/temporary_switches.h"
 #include "infernix_bench_common.h"
 #include "quantized_weight.cuh"
+#include "roofline.h"
 
 #include <cuda_runtime.h>
 
@@ -26,6 +28,7 @@
 #include <vector>
 
 using namespace infernix;
+namespace roofline = infernix::bench::roofline;
 
 namespace {
 
@@ -33,7 +36,6 @@ constexpr std::int32_t kRows           = 5120;
 constexpr std::size_t kDefaultFlushMiB = 256;
 constexpr int kDefaultWarmup           = 5;
 constexpr int kDefaultRepeat           = 50;
-constexpr double kDramSpecGBs          = 1792.0;
 
 struct Options {
     std::int32_t hidden = 0;
@@ -44,6 +46,10 @@ struct Options {
     bool profile              = false;
     std::uint64_t flush_bytes = kDefaultFlushMiB << 20;
     std::string csv_out;
+    // a16 (A16Only, batched-decode's routes) or invariant (A16ColumnInvariant, the default
+    // route's decode and verification); exact or q5-ksplit (LinearRoutes::Q5KSplit).
+    ops::LinearPolicy policy = ops::LinearPolicy::A16Only;
+    ops::LinearRoutes routes = ops::LinearRoutes::Exact;
 };
 
 std::vector<std::int32_t> parse_tokens(std::string_view raw) {
@@ -74,6 +80,8 @@ void usage(const char* argv0) {
                 "  --execution MODE   eager (default) or graph; time one complete public Op.\n"
                 "  --flush-mib N      L2 eviction buffer size (default %zu MiB).\n"
                 "  --csv-out PATH     Write all measurement rows as CSV.\n"
+                "  --policy P         a16 (default) or invariant (the column-invariant policy).\n"
+                "  --routes R         exact (default) or q5-ksplit (the q5-ksplit-mma fast path).\n"
                 "  --profile          Report the public shape and workspace query for one T.\n",
                 argv0, kDefaultWarmup, kDefaultRepeat, kDefaultFlushMiB);
 }
@@ -109,6 +117,24 @@ Options parse_options(int argc, char** argv) {
                 << 20;
         } else if (argument == "--csv-out") {
             options.csv_out = std::string(next("--csv-out value"));
+        } else if (argument == "--policy") {
+            const std::string value(next("--policy value"));
+            if (value == "a16") {
+                options.policy = ops::LinearPolicy::A16Only;
+            } else if (value == "invariant") {
+                options.policy = ops::LinearPolicy::A16ColumnInvariant;
+            } else {
+                throw std::invalid_argument("--policy must be a16 or invariant");
+            }
+        } else if (argument == "--routes") {
+            const std::string value(next("--routes value"));
+            if (value == "exact") {
+                options.routes = ops::LinearRoutes::Exact;
+            } else if (value == "q5-ksplit") {
+                options.routes = ops::LinearRoutes::Q5KSplit;
+            } else {
+                throw std::invalid_argument("--routes must be exact or q5-ksplit");
+            }
         } else if (argument == "--profile") {
             options.profile = true;
         } else if (argument == "--help" || argument == "-h") {
@@ -196,10 +222,13 @@ int main(int argc, char** argv) {
         }
 
         std::printf("# execution=%s warmup=%d repeat=%d flush_bytes=%llu workspace_sweep_bytes=%zu "
-                    "op=linear_add qtype=q5_g64_fp16 rows=%d k=%d\n",
+                    "op=linear_add qtype=q5_g64_fp16 rows=%d k=%d policy=%s routes=%s %s\n",
                     options.graph ? "graph" : "eager", options.warmup, options.repeat,
                     static_cast<unsigned long long>(options.flush_bytes), workspace_capacity, kRows,
-                    options.hidden);
+                    options.hidden,
+                    options.policy == ops::LinearPolicy::A16Only ? "a16" : "invariant",
+                    options.routes == ops::LinearRoutes::Exact ? "exact" : "q5-ksplit",
+                    temporary_switches::describe(temporary_switches::Scope::Qwen3_5).c_str());
 
         std::vector<Row> rows;
         rows.reserve(options.tokens.size());
@@ -211,8 +240,8 @@ int main(int argc, char** argv) {
                 residual_initial.restore(prepare_stream);
             };
             const auto body = [&](cudaStream_t launch_stream) {
-                ops::linear_add(x, packed.weight, out, ops::LinearPolicy::A16Only, workspace,
-                                launch_stream);
+                ops::linear_add(x, packed.weight, out, options.policy, workspace,
+                                launch_stream, options.routes);
             };
 
             bench::TimedGraph graph;
@@ -275,7 +304,7 @@ int main(int argc, char** argv) {
                              row.timing.median_us, row.timing.min_us, row.timing.p95_us,
                              static_cast<unsigned long long>(row.weight_bytes),
                              static_cast<unsigned long long>(row.logical_bytes),
-                             row.projection_flops, gbs, gbs / kDramSpecGBs * 100.0,
+                             row.projection_flops, gbs, gbs / roofline::kDramSpecGBs * 100.0,
                              row.projection_flops / seconds / 1.0e12, row.workspace_sweep_bytes,
                              row.workspace_exact_bytes, row.workspace_used_bytes);
             }

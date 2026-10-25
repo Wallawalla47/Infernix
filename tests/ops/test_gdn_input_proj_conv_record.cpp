@@ -1,6 +1,8 @@
+#include "ops/op_family.h"
 #include "core/weight.h"
 #include "core/device.h"
 #include "infernix/ops/gdn_input_proj.h"
+#include "infernix/ops/speculative_tree.h"
 
 #include "ops/input_projection_test_common.h"
 
@@ -403,6 +405,108 @@ int run_q8() {
     return failures;
 }
 
+// The Q8 parent's verification-tree form (the 35B-A3B's DFlash trees): the projection materialized
+// into the record, then the tree convolution. A chain-shaped tree row is the chain form over its
+// valid prefix, so at batch sizes where the record form also composes from the materialized
+// projection every output equals the record form's bit for bit, idle columns included. Branched
+// rows are the projected tree convolution's (test_speculative_tree).
+int run_q8_tree() {
+    constexpr std::int32_t kHidden   = 2048;
+    constexpr std::int32_t kValueRows = 4096;
+    constexpr std::int32_t kZRows    = 4096;
+    constexpr std::int32_t kChannels = kQueryRows + kKeyRows + kValueRows;
+    constexpr std::int32_t kSlots    = 8;
+    DevicePackedWeight parent(
+        quantized_weight::make_patterned_weight(QType::Q8_G32_FP16, 12288, kHidden, 1601U));
+    int failures = 0;
+    struct Shape {
+        std::int32_t width;
+        std::vector<std::int32_t> valid;
+    };
+    for (const Shape& shape : {Shape{9, {9, 4}}, Shape{16, {16, 11, 1}}, Shape{24, {16, 7}}}) {
+        const std::int32_t width   = shape.width;
+        const auto batch           = static_cast<std::int32_t>(shape.valid.size());
+        const std::int32_t columns = width * batch;
+        const std::string label =
+            "Q8 tree B=" + std::to_string(batch) + " T=" + std::to_string(width);
+        const std::vector<float> activation = make_bf16_activation(kHidden, columns, 1610U + width);
+        const auto conv_bits =
+            make_bf16_bits(static_cast<std::size_t>(kChannels) * 4, 1620U + width, -0.02F, 0.02F);
+        const auto state_bits = make_bf16_bits(static_cast<std::size_t>(kChannels) * 3 * kSlots,
+                                               1630U + width, -0.05F, 0.05F);
+        std::vector<std::int32_t> initial(static_cast<std::size_t>(batch));
+        std::vector<ops::SpeculativeTreeRow> rows(static_cast<std::size_t>(batch));
+        for (std::int32_t b = 0; b < batch; ++b) {
+            initial[static_cast<std::size_t>(b)] = (b * 3 + 5) % kSlots;
+            const std::int32_t nodes           = shape.valid[static_cast<std::size_t>(b)];
+            ops::SpeculativeTreeRow& row       = rows[static_cast<std::size_t>(b)];
+            row                                = {};
+            row.nodes                          = nodes;
+            row.main_depth                     = nodes - 1;
+            row.paths                          = 1;
+            row.tree                           = 1;
+            for (int c = 0; c < ops::kSpeculativeTreeMaxNodes; ++c) {
+                const bool live     = c < nodes;
+                row.parent[c]       = static_cast<std::int8_t>(live ? c - 1 : -1);
+                row.depth[c]        = static_cast<std::int8_t>(live ? c : 0);
+                row.first_child[c]  = static_cast<std::int8_t>(c + 1 < nodes ? c + 1 : -1);
+                row.next_sibling[c] = -1;
+            }
+            row.path_length[0] = static_cast<std::int8_t>(nodes);
+            for (int c = 0; c < nodes; ++c) row.path_columns[0][c] = static_cast<std::int8_t>(c);
+        }
+        DeviceBuffer device_x = to_device_bf16(activation), device_conv = to_device(conv_bits),
+                     device_state = to_device(state_bits), device_valid = to_device(shape.valid),
+                     device_initial = to_device(initial), device_rows = to_device(rows);
+        Tensor x(device_x.p, DType::BF16, {kHidden, width, batch});
+        Tensor conv(device_conv.p, DType::BF16, {kChannels, 4});
+        Tensor state(device_state.p, DType::BF16, {kChannels, 3, kSlots});
+        Tensor valid(device_valid.p, DType::I32, {batch});
+        Tensor initial_slots(device_initial.p, DType::I32, {batch});
+        Tensor tree_rows(device_rows.p, DType::I32, {ops::kSpeculativeTreeRowWords, batch});
+        struct Outputs {
+            GuardedBf16Tensor record, query, key, value, z;
+        };
+        const auto run = [&](bool tree) {
+            Outputs out{GuardedBf16Tensor(kChannels, columns), GuardedBf16Tensor(kQueryRows, columns),
+                        GuardedBf16Tensor(kKeyRows, columns), GuardedBf16Tensor(kValueRows, columns),
+                        GuardedBf16Tensor(kZRows, columns)};
+            Tensor record(out.record.data(), DType::BF16, {kChannels, width, batch});
+            Tensor q(out.query.data(), DType::BF16, {kQueryRows, width, batch});
+            Tensor k(out.key.data(), DType::BF16, {kKeyRows, width, batch});
+            Tensor v(out.value.data(), DType::BF16, {kValueRows, width, batch});
+            Tensor z(out.z.data(), DType::BF16, {kZRows, width, batch});
+            const std::size_t bytes = ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
+                kQueryRows, kKeyRows, kValueRows, batch, width, width);
+            WorkspaceArena workspace(std::max<std::size_t>(256, bytes));
+            if (tree) {
+                ops::gdn_input_proj_conv_record(x, parent.view(), conv, state, valid, initial_slots,
+                                                tree_rows, record, q, k, v, z,
+                                                ops::LinearPolicy::A16Only, workspace, nullptr);
+            } else {
+                ops::gdn_input_proj_conv_record(x, parent.view(), conv, state, valid, initial_slots,
+                                                record, q, k, v, z, workspace, nullptr);
+            }
+            cuda_synchronize();
+            return out;
+        };
+        Outputs chain = run(false);
+        Outputs tree  = run(true);
+        failures += verify_equal(label + " record", chain.record.bits(), tree.record.bits());
+        failures += verify_equal(label + " query", chain.query.bits(), tree.query.bits());
+        failures += verify_equal(label + " key", chain.key.bits(), tree.key.bits());
+        failures += verify_equal(label + " value", chain.value.bits(), tree.value.bits());
+        failures += verify_equal(label + " z", chain.z.bits(), tree.z.bits());
+        for (GuardedBf16Tensor* guarded :
+             {&tree.record, &tree.query, &tree.key, &tree.value, &tree.z}) {
+            failures += guarded->verify_guards(label + " tree output");
+        }
+        failures += verify_preserved(label + " state", device_state, state_bits);
+    }
+    failures += parent.verify_preserved("Q8 tree parent weight");
+    return failures;
+}
+
 int run_nvfp4() {
     constexpr std::int32_t kHidden    = 5120;
     constexpr std::int32_t kValueRows = 6144;
@@ -534,7 +638,7 @@ int run_fp8(const Fp8Parent& shape, std::uint32_t weight_seed) {
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(gdn_input_proj_conv_record) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
@@ -543,6 +647,7 @@ int main() {
     int failures = test_record_capacity_domain();
     failures += run_q4_q5();
     failures += run_q8();
+    failures += run_q8_tree();
     failures += run_nvfp4();
     failures += run_fp8(kFp8RowBf16, 1701U);
     failures += run_fp8(kFp8RowF32, 1703U);

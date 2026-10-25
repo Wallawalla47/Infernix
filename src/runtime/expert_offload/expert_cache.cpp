@@ -79,6 +79,30 @@ void LfruPolicy::select_victims(std::size_t need, std::span<const std::uint32_t>
     }
     need = std::min(need, n - protected_residents);
     if (need == 0) { return; }
+    if (guard_ != nullptr) {
+        if (!guard_ready_) {
+            const std::span<const std::uint32_t> keys = (*guard_)();
+            guard_keys_.assign(keys.begin(), keys.end());
+            if (guarded_.size() != count_.size()) { guarded_.assign(count_.size(), 0); }
+            for (std::uint32_t k : guard_keys_) { guarded_[k] = 1; }
+            guard_ready_ = true;
+        }
+        // Unguarded residents first, (score, key) ascending; then the guarded ones.
+        scratch_.clear();
+        guarded_scratch_.clear();
+        for (std::size_t i = 0; i < n; ++i) {
+            if (scores[i] == kProtected) { continue; }
+            (guarded_[residents_[i]] != 0 ? guarded_scratch_ : scratch_).emplace_back(scores[i], residents_[i]);
+        }
+        const std::size_t first = std::min(need, scratch_.size());
+        std::partial_sort(scratch_.begin(), scratch_.begin() + static_cast<std::ptrdiff_t>(first), scratch_.end());
+        for (std::size_t i = 0; i < first; ++i) { out.push_back(scratch_[i].second); }
+        const std::size_t rest = need - first;
+        std::partial_sort(guarded_scratch_.begin(), guarded_scratch_.begin() + static_cast<std::ptrdiff_t>(rest),
+                          guarded_scratch_.end());
+        for (std::size_t i = 0; i < rest; ++i) { out.push_back(guarded_scratch_[i].second); }
+        return;
+    }
     if (need == 1) {
         // The lowest (score, key) outside `protect`, as the partial sort below would order them: the
         // minimum score, then the lowest key holding it (finite scores never equal +infinity).
@@ -100,7 +124,21 @@ void LfruPolicy::select_victims(std::size_t need, std::span<const std::uint32_t>
 }
 
 void LfruPolicy::step(std::span<const std::uint32_t> group, Step& out, std::size_t admission_budget,
-                      const Admissible* admissible, const Admissible* evictable) {
+                      const Admissible* admissible, const Admissible* evictable, const Guard* guard) {
+    // The guard holds for this step only.
+    struct GuardScope {
+        LfruPolicy& p;
+        GuardScope(LfruPolicy& policy, const Guard* g) : p(policy) {
+            p.guard_       = g;
+            p.guard_ready_ = false;
+        }
+        ~GuardScope() {
+            for (std::uint32_t k : p.guard_keys_) { p.guarded_[k] = 0; }
+            p.guard_keys_.clear();
+            p.guard_       = nullptr;
+            p.guard_ready_ = false;
+        }
+    } guard_scope(*this, guard);
     out.hits.clear();
     out.misses.clear();
     out.admitted.clear();
@@ -144,17 +182,22 @@ void LfruPolicy::step(std::span<const std::uint32_t> group, Step& out, std::size
         }
         return;
     }
+    admit_ranked(group, *misses, admission_budget, evictable, out);
+}
+
+void LfruPolicy::admit_ranked(std::span<const std::uint32_t> protect, std::span<const std::uint32_t> candidates,
+                              std::size_t budget, const Admissible* evictable, Step& out) {
     // Budgeted admission: best candidates first, each only if it outranks the victim it replaces.
-    ranked_.assign(misses->begin(), misses->end());
+    ranked_.assign(candidates.begin(), candidates.end());
     std::sort(ranked_.begin(), ranked_.end(), [this](std::uint32_t a, std::uint32_t b) {
         const double sa = score(a), sb = score(b);
         return sa != sb ? sa > sb : a < b;
     });
     for (std::uint32_t k : ranked_) {
-        if (out.admitted.size() >= admission_budget) { break; }
+        if (out.admitted.size() >= budget) { break; }
         if (residents_.size() >= capacity_) {
             victim_.clear();
-            select_victims(1, group, victim_);
+            select_victims(1, protect, victim_);
             if (victim_.empty() || !(score(k) > score(victim_[0]))) { break; }
             if (evictable != nullptr && !(*evictable)(victim_[0])) { break; } // the tier's demotion allowance is spent
             erase(victim_[0]);
@@ -163,6 +206,21 @@ void LfruPolicy::step(std::span<const std::uint32_t> group, Step& out, std::size
         insert(k);
         out.admitted.push_back(k);
     }
+}
+
+void LfruPolicy::admit(std::span<const std::uint32_t> keys, std::size_t budget, Step& out, const Admissible* admissible,
+                       const Admissible* evictable) {
+    out.hits.clear();
+    out.misses.clear();
+    out.admitted.clear();
+    out.victims.clear();
+    if (budget == 0) { return; }
+    candidates_.clear();
+    for (std::uint32_t k : keys) {
+        if (!resident(k) && (admissible == nullptr || (*admissible)(k))) { candidates_.push_back(k); }
+    }
+    if (candidates_.empty()) { return; }
+    admit_ranked(keys, candidates_, budget, evictable, out);
 }
 
 void LfruPolicy::credit(std::span<const std::uint32_t> keys, std::span<const double> amounts) {
@@ -434,8 +492,9 @@ void CacheController::drain_queue(std::vector<Command>& out) {
 
 void CacheController::on_route(std::span<const std::uint32_t> group, std::uint64_t round_started,
                                std::vector<Command>& out, std::size_t admission_budget,
-                               const LfruPolicy::Admissible* admissible, const LfruPolicy::Admissible* evictable) {
-    policy_.step(group, step_, admission_budget, admissible, evictable);
+                               const LfruPolicy::Admissible* admissible, const LfruPolicy::Admissible* evictable,
+                               const LfruPolicy::Guard* guard) {
+    policy_.step(group, step_, admission_budget, admissible, evictable, guard);
     for (std::uint32_t v : step_.victims) {
         if (table_[v].state == ResidencyState::kAbsent) { continue; } // was still queued
         frames_.retire(make_absent(v, out), round_started);
@@ -447,6 +506,25 @@ void CacheController::on_route(std::span<const std::uint32_t> group, std::uint64
         }
     }
     drain_queue(out);
+}
+
+std::size_t CacheController::admit_credited(std::span<const std::uint32_t> keys, std::size_t budget,
+                                            std::uint64_t round_started, std::vector<Command>& out,
+                                            const LfruPolicy::Admissible* admissible,
+                                            const LfruPolicy::Admissible* evictable) {
+    policy_.admit(keys, budget, step_, admissible, evictable);
+    for (std::uint32_t v : step_.victims) {
+        if (table_[v].state == ResidencyState::kAbsent) { continue; } // was still queued
+        frames_.retire(make_absent(v, out), round_started);
+    }
+    for (std::uint32_t k : step_.admitted) {
+        if (!is_queued_[k]) {
+            queued_.push_back(k);
+            is_queued_[k] = 1;
+        }
+    }
+    drain_queue(out);
+    return step_.admitted.size();
 }
 
 void CacheController::release_held(std::uint32_t frame, std::vector<Command>& out) {

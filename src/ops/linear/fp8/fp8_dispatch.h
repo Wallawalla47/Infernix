@@ -13,7 +13,7 @@
 namespace infernix::ops::detail {
 
 // The capacity of every route the problem may select over the interval, including the
-// fp8-a8-pair route (the query takes no route flags).
+// fp8-a8-pair and f16-accumulate-prefill routes (the query takes no route flags).
 [[nodiscard]] std::size_t fp8_linear_workspace_capacity_bytes(std::int32_t output_rows,
                                                               std::int32_t input_rows,
                                                               LinearPolicy policy,

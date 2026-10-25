@@ -3,8 +3,10 @@
 
 #include "core/weight.h"
 #include "infernix/ops/attn_input_proj.h"
+#include "infernix/ops/linear.h"
 
 #include "core/device.h"
+#include "core/temporary_switches.h"
 #include "direct_bf16_weight.cuh"
 #include "infernix_bench_common.h"
 #include "quantized_weight.cuh"
@@ -42,6 +44,7 @@ struct Options {
     Format format                  = Format::All;
     ops::LinearPolicy nvfp4_policy = ops::LinearPolicy::AllowA4;
     ops::LinearPolicy fp8_policy   = ops::LinearPolicy::AllowA8;
+    ops::LinearPolicy q4q5_policy  = ops::LinearPolicy::A16Only;
     CacheMode cache                = CacheMode::Cold;
     std::vector<std::int32_t> tokens{1, 2, 4, 8, 12, 16, 32, 64, 128, 256, 512, 1024};
     int warmup   = 5;
@@ -76,6 +79,7 @@ struct Measurement {
                  "usage: infernix_attn_input_proj_bench "
                  "[--format q4q5|q8-qgkv|q8-qkv|q8-dflash2-qkv|bf16|nvfp4|fp8|all] "
                  "[--nvfp4-policy a16|a4|invariant] [--fp8-policy a16|a8|a8r|invariant] "
+                 "[--q4q5-policy a16|invariant] "
                  "[--tokens T,...] [--cache cold|warm|both] [--execution eager|graph] "
                  "[--warmup N] [--repeat N] [--profile] [--csv-out PATH]\n",
                  message);
@@ -149,6 +153,14 @@ Options parse_options(int argc, char** argv) {
                 options.nvfp4_policy = ops::LinearPolicy::A16ColumnInvariant;
             else
                 usage("--nvfp4-policy expects a16, a4 or invariant");
+        } else if (argument == "--q4q5-policy") {
+            const std::string_view value(next("--q4q5-policy requires a value"));
+            if (value == "a16")
+                options.q4q5_policy = ops::LinearPolicy::A16Only;
+            else if (value == "invariant")
+                options.q4q5_policy = ops::LinearPolicy::A16ColumnInvariant;
+            else
+                usage("--q4q5-policy expects a16 or invariant");
         } else if (argument == "--fp8-policy") {
             const std::string_view value(next("--fp8-policy requires a value"));
             if (value == "a16")
@@ -324,12 +336,14 @@ void run_q4q5(const Options& options, bench::L2FlushBuffer& flush, cudaStream_t 
         Tensor tk(k.p, DType::BF16, {kv_rows, tokens});
         Tensor tv(v.p, DType::BF16, {kv_rows, tokens});
         const auto launch = [&](cudaStream_t launch_stream) {
-            ops::attn_input_proj(x, qk.weight, gv.weight, tq, tg, tk, tv, launch_stream);
+            ops::attn_input_proj(x, qk.weight, gv.weight, tq, tg, tk, tv, options.q4q5_policy,
+                                 launch_stream);
         };
+        const char* policy = policy_name(options.q4q5_policy);
         const CacheState profile_cache =
             options.cache == CacheMode::Cold ? CacheState::Cold : CacheState::Warm;
         if (options.profile) {
-            profile_public(launch, "q4q5", "a16", profile_cache, flush, stream, options.warmup,
+            profile_public(launch, "q4q5", policy, profile_cache, flush, stream, options.warmup,
                            options.graph);
             continue;
         }
@@ -341,7 +355,7 @@ void run_q4q5(const Options& options, bench::L2FlushBuffer& flush, cudaStream_t 
             if ((options.cache == CacheMode::Cold && cache != CacheState::Cold) ||
                 (options.cache == CacheMode::Warm && cache != CacheState::Warm))
                 continue;
-            append_result(results, "q4q5", "a16", tokens, cache, 0, logical, flops,
+            append_result(results, "q4q5", policy, tokens, cache, 0, logical, flops,
                           measure_public(launch, cache, flush, stream, options.warmup,
                                          options.repeat, options.graph));
         }
@@ -491,8 +505,8 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaGetDevice(&device));
         cudaDeviceProp props{};
         CUDA_CHECK(cudaGetDeviceProperties(&props, device));
-        std::printf("# gpu=%s sm=%d%d cuda_runtime=%d\n", props.name, props.major, props.minor,
-                    CUDART_VERSION);
+        std::printf("# gpu=%s sm=%d%d cuda_runtime=%d %s\n", props.name, props.major, props.minor,
+                    CUDART_VERSION, temporary_switches::describe(temporary_switches::Scope::Qwen3_5).c_str());
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         bench::L2FlushBuffer flush(kFlushBytes);

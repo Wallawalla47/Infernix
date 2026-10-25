@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/gpu_telemetry.h"
 #include "serve/generation_service.h"
 #include "serve/request.h"
 
@@ -13,6 +14,7 @@ namespace infernix::serve {
 struct RequestLogContext {
     std::uint64_t id = 0;
     std::string http_request_id;
+    std::string label; // X-Infernix-Request-Label (empty: none)
     std::string response_id;
     std::string protocol;
     std::string model;
@@ -41,6 +43,7 @@ struct RequestLogMetadata {
     bool stream                            = false;
     bool output_tokens_explicit            = false;
     bool preserve_thinking_semantic_change = false;
+    std::string label;
 };
 
 // A parsed generation request that failed during synchronous preparation. It intentionally has a
@@ -48,6 +51,7 @@ struct RequestLogMetadata {
 struct RequestRejectionLogContext {
     std::uint64_t id = 0;
     std::string http_request_id;
+    std::string label;
     std::string response_id;
     std::string protocol;
     std::string model;
@@ -94,6 +98,26 @@ struct RequestFailure {
     std::string machine_message;
 };
 
+// The terminal finish reason as it appears in the request log and the metrics JSON.
+// One spelling for every writer; changing a string changes an external contract.
+[[nodiscard]] inline const char* finish_reason_name(infernix::FinishReason reason) noexcept {
+    switch (reason) {
+    case infernix::FinishReason::None:
+        return "none";
+    case infernix::FinishReason::OutputLimit:
+        return "output_limit";
+    case infernix::FinishReason::ContextCapacity:
+        return "context_capacity";
+    case infernix::FinishReason::StopToken:
+        return "stop_token";
+    case infernix::FinishReason::StopString:
+        return "stop_string";
+    case infernix::FinishReason::Cancelled:
+        return "cancelled";
+    }
+    return "unknown";
+}
+
 struct ThroughputReport {
     double interval_seconds               = 0.0;
     std::uint64_t computed_prefill_tokens = 0;
@@ -103,7 +127,22 @@ struct ThroughputReport {
     infernix::RuntimeStats previous;
     infernix::RuntimeStats current;
     bool final_interval = false;
+    // The device's NVML readings at the interval's start and end (clocks, power, temperature and
+    // reasons are the end's; energy and the policy violations are the interval's deltas).
+    infernix::GpuTelemetrySample gpu_previous;
+    infernix::GpuTelemetrySample gpu_current;
 };
+
+// A throughput interval's device figures from its two NVML readings; absent ones are nullopt.
+struct GpuInterval {
+    std::optional<double> energy_joules;
+    std::optional<double> average_power_watts;
+    // Energy per committed decode token, in an interval that computed no prefill tokens.
+    std::optional<double> joules_per_decode_token;
+    std::optional<double> power_violation_fraction;
+    std::optional<double> thermal_violation_fraction;
+};
+[[nodiscard]] GpuInterval gpu_interval(const ThroughputReport& report);
 
 RequestLogContext make_request_log_context(std::uint64_t id, std::string protocol,
                                            const GenerationRequest& request,

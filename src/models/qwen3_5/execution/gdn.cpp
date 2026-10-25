@@ -125,7 +125,7 @@ void gdn_projection_record(const Tensor& hidden, const GdnParameters& parameters
     if (tree_rows != nullptr) {
         const auto* single = std::get_if<LinearParameters>(&parameters.projection);
         if (single == nullptr) {
-            throw std::invalid_argument("DFlash2 tree verification needs a single GDN parent");
+            throw std::invalid_argument("tree verification needs a single GDN parent");
         }
         ops::gdn_input_proj_conv_record(hidden, single->weight, parameters.convolution, conv_states,
                                         valid_columns, initial_slots, *tree_rows, conv_record,

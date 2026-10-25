@@ -69,14 +69,15 @@ __global__ void speculative_sample_sparse_drafts_kernel(const std::int32_t* rows
     }
     for (int j = 0; j < support; ++j) { q[j] = weight(j) / mass; }
     const float u = sampling_uniform(cfg.seed, positions[t], kSamplePurposeDFlash2Proposal, draw);
-    int pick      = support - 1;
+    // A draw past the rounded cumulative mass falls back to the last candidate with q > 0: a tail
+    // weight that underflowed has q = 0 and is never drawn (verification would reject it).
+    int pick         = 0;
     float cumulative = 0.0F;
     for (int j = 0; j < support; ++j) {
+        if (!(q[j] > 0.0F)) { continue; }
         cumulative += q[j];
-        if (u < cumulative) {
-            pick = j;
-            break;
-        }
+        pick = j;
+        if (u < cumulative) { break; }
     }
     drafts[t] = cand[pick];
 }

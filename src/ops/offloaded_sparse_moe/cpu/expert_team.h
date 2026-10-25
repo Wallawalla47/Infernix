@@ -8,11 +8,12 @@
 // encoding in a phase of its own, since h's column exponent spans all units), then the down row
 // groups. Sums are exact int64, so the output bits do not depend on N, the ISA, which worker took
 // which item, or the order in which workers finish; they equal expert_forward's (A16:
-// expert_forward_a16's).
+// expert_forward_a16's; two-term A4, NarrowA16::kA4Residual: expert_forward_a4r's).
 //
 // The calling thread is worker 0 and starts computing at once. Idle workers spin for a bounded
 // time, then park on a futex (std::atomic::wait).
 
+#include "ops/offloaded_sparse_moe/cpu/a4r_expert.h"
 #include "ops/offloaded_sparse_moe/cpu/ggml_expert.h"
 #include "ops/offloaded_sparse_moe/cpu/w4a16_expert.h"
 #include "ops/offloaded_sparse_moe/cpu/w4a4_expert.h"
@@ -53,11 +54,19 @@ public:
         int spin_iterations = 1 << 16; // pause-loop iterations before parking
         int prefetch_bytes  = kDefaultPrefetchBytes; // calibrated on the target (§14.2)
         ExpertActivation activation = ExpertActivation::kA4; // of every job's expert
+        // The arithmetic of kA16 jobs: exact, or the two-term A4 of expert-a4-residual-decode
+        // (a4r_expert.h; NVFP4 banks at Flash-Next's geometry), which must equal the GPU calls' choice.
+        NarrowA16 narrow_a16 = NarrowA16::kExact;
         bool ggml = false; // jobs may be GGUF records (ggml_expert.h; activation kA16)
         // Every job's expert geometry: Flash-Next's for every bank, or another registered one
         // (w4a4_expert.h) for NVFP4 A16 banks.
         ExpertShape shape = kFlashNextShape;
-        std::vector<int> cpus;         // optional: CPU of worker i (worker 0 is the caller, not pinned)
+        // Optional: the logical CPUs (a mask, bit i: CPU i) worker i may run on; 0 or a missing entry
+        // leaves it unpinned (worker 0 is the caller, not pinned here).
+        std::vector<std::uint64_t> cpus;
+        // TEMPORARY (INFERNIX_TMP_CPU_SHARED_X, which the callers read: this archive needs no core): encode each
+        // distinct x column once per round instead of once per job.
+        bool shared_x = false;
     };
 
     explicit CpuExpertTeam(Options options);
@@ -73,6 +82,7 @@ public:
     [[nodiscard]] int workers() const { return workers_; }
     [[nodiscard]] CpuIsa isa() const { return isa_; }
     [[nodiscard]] ExpertActivation activation() const { return activation_; }
+    [[nodiscard]] NarrowA16 narrow_a16() const { return narrow_a16_; }
     [[nodiscard]] const ExpertShape& shape() const { return shape_; }
 
 private:
@@ -80,6 +90,7 @@ private:
     void worker_main(int w);
     void work(int w);
     void work_a16(int w);
+    void work_a4r(int w);
     void work_ggml(int w);
     void barrier();
     // Worker 0's beat after an item.
@@ -100,6 +111,19 @@ private:
     std::vector<canon::A16Block> h16_; // A16 jobs: [job][col][shape_.h_blocks()]
     std::vector<std::uint16_t> hv_;    // A16 jobs: BF16 h [job][col][shape_.intermediate]
     std::vector<int> x_exp_, h_exp_;   // A16 jobs: column exponents [job][col]
+    // Two-term A4 jobs (narrow_a16 kA4Residual): x and h terms [job][col][term][blocks] and row
+    // scales [job][col]; h in BF16 is hv_.
+    std::vector<canon::A4Block> xr_, hr_;
+    std::vector<float> x_scale_, h_scale_;
+    // TEMPORARY (INFERNIX_TMP_CPU_SHARED_X), until its A/B: A16 and two-term A4 rounds encode each distinct
+    // x column once; x_owner_[job * kMaxColumns + col] is the first job column with the same x pointer
+    // (in a decode round one token's column feeds every routed expert the CPU serves).
+    bool shared_x_ = false;
+    std::vector<int> x_owner_;
+    std::vector<const std::uint16_t*> owner_keys_; // the round's x pointers (power-of-two table, null: free)
+    std::vector<int> owner_vals_, owner_used_;
+    int owner_count_ = 0;
+    NarrowA16 narrow_a16_ = NarrowA16::kExact;
     std::vector<CpuLimbSlice> xg_, hg_; // ggml jobs: [job][col][kGgmlXSlices], [job][col][kGgmlHSlices]
     ExpertActivation activation_;
     bool ggml_ = false;

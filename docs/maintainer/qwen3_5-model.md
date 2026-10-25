@@ -269,7 +269,9 @@ output head. Backend selection, draft width and proposal-head choice are fixed a
 ## Vision and multimodal positions
 
 The current native processor uses 16×16 spatial patches, pairs of frames, and 2×2 spatial merge.
-It consumes bytes already acquired by the CLI or server, decodes images/video frames, resizes to
+It consumes bytes already acquired by the CLI or server, decodes images/video frames (JPEG images
+through libjpeg with Pillow's settings, so their pixels equal the Hugging Face processor's input;
+other images and every video through FFmpeg, chroma interpolated bilinearly), resizes to
 merge-aligned dimensions, normalizes RGB and packs BF16 patch rows. Each row contains
 `3 * 2 * 16 * 16 = 1536` values in the defined channel/temporal/spatial order. Images repeat their
 frame to supply the temporal pair.

@@ -24,8 +24,8 @@ bool allows(const std::vector<std::uint32_t>& words, int token) {
 }
 
 auto compile(infernix::text::GrammarCompiler& compiler, const std::string& source,
-             std::string_view close, std::string_view continuation) {
-    return compiler.compile(infernix::OutputConstraint::grammar(source), close, continuation);
+             const infernix::text::ReasoningFraming& reasoning, std::string_view continuation) {
+    return compiler.compile(infernix::OutputConstraint::grammar(source), reasoning, continuation);
 }
 
 void consume(infernix::text::GrammarSession& session, std::string_view text) {
@@ -211,7 +211,9 @@ int main() {
         for (int byte = 0; byte < 256; ++byte) { vocab.emplace_back(1, static_cast<char>(byte)); }
         vocab.emplace_back();                        // EOS
         vocab.emplace_back();                        // Forbidden special token
-        vocab.emplace_back("\n</think>\n\n answer"); // One token crosses the channel boundary.
+        vocab.emplace_back("\n</think>\n\n answer"); // The close spelled by one ordinary token.
+        vocab.emplace_back("</think>");              // The model's close token.
+        vocab.emplace_back("\n answer");             // Ends the separator and starts the content.
         infernix::text::GrammarCompiler compiler(std::move(vocab), {256}, 4 * 1024 * 1024);
 
         auto observed = compiler.compile(infernix::OutputConstraint::regex("a+"), {}, {});
@@ -284,12 +286,27 @@ int main() {
         consume(*repeat, "c!");
         require(allows(mask(*repeat), 256), "continuation and bounded repetition");
 
-        auto thinking = compile(compiler, "root ::= \" answer\"", "\n</think>\n\n", {});
-        consume(*thinking, "reason\n<other>\n");
-        require(allows(mask(*thinking), 258), "cross-boundary token not admitted");
+        // Only the close token's identity ends the reasoning: its spelling in ordinary tokens is
+        // reasoning, and the token must be followed by the separator.
+        const infernix::text::ReasoningFraming framing{.close_token = 259, .separator = "\n\n"};
+        auto thinking = compile(compiler, "root ::= \" answer\"", framing, {});
+        consume(*thinking, "reason\n</think>\n\n answer");
+        require(!allows(mask(*thinking), 256), "a spelled close ended the reasoning");
+        require(allows(mask(*thinking), 258), "a spelled close token was not admitted as reasoning");
         thinking->accept(258);
         thinking->confirm();
-        require(allows(mask(*thinking), 256), "thinking wrapper did not reach content completion");
+        require(!allows(mask(*thinking), 256), "a token spelling the close ended the reasoning");
+        require(allows(mask(*thinking), 259), "the close token was not admitted");
+        thinking->accept(259);
+        thinking->confirm();
+        require(!allows(mask(*thinking), ' ') && !allows(mask(*thinking), 259) &&
+                    !allows(mask(*thinking), 256),
+                "the close token admitted content, a second close or EOS before its separator");
+        consume(*thinking, "\n");
+        require(allows(mask(*thinking), 260), "a token ending the separator was not admitted");
+        thinking->accept(260);
+        thinking->confirm();
+        require(allows(mask(*thinking), 256), "thinking framing did not reach content completion");
 
         for (const auto& source : {"bad grammar", "root ::= missing", "root ::= Token(256)",
                                    "root ::= Regex(\".*\")", "root[temperature=0.5] ::= \"a\""}) {

@@ -1,3 +1,4 @@
+#include "ops/op_family.h"
 #include "core/device.h"
 #include "infernix/ops/position.h"
 #include "ops/op_tester.h"
@@ -134,7 +135,7 @@ int lane_offset_case(int width, int batch, int axes, bool in_place) {
 
 } // namespace
 
-int main() {
+INFERNIX_OP_TEST(position) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;

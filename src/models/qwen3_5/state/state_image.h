@@ -33,16 +33,17 @@ struct KVWindowStateSpec {
     std::int32_t kv_heads = 0;
 };
 
-// The Host form of the FP32 linear-attention recurrent state: exact, or packed by
-// ops::pack_fp32_state (a Host copy then restores a rounded state).
-enum class RecurrentHostFormat : std::uint8_t { Fp32, Fp24, Bf16 };
+// The Host form of the linear-attention recurrent state: the pool's own bytes (exact: FP32, or FP16
+// under fp16-gdn-state), or an FP32 pool's state packed by ops::pack_fp32_state (a Host copy then
+// restores a rounded state).
+enum class RecurrentHostFormat : std::uint8_t { Exact, Fp24, Bf16 };
 
 struct StateImageSpec {
     LinearAttentionStatePoolSpec linear;
     std::int32_t hidden = 0;
     std::optional<DFlashLocalStateSpec> dflash_local;
     std::optional<KVWindowStateSpec> kv_window;
-    RecurrentHostFormat recurrent_host = RecurrentHostFormat::Fp32;
+    RecurrentHostFormat recurrent_host = RecurrentHostFormat::Exact;
 };
 
 struct StateImageHostLayout {
@@ -158,32 +159,32 @@ public:
 
     [[nodiscard]] const StateImageHostLayout& host_layout() const noexcept { return host_layout_; }
 
-    void zero_slot(std::int32_t slot, cudaStream_t stream = nullptr);
-    void zero_all(cudaStream_t stream = nullptr);
-    void copy_slot(std::int32_t source, std::int32_t destination, cudaStream_t stream = nullptr);
+    void zero_slot(std::int32_t slot, cudaStream_t stream);
+    void zero_all(cudaStream_t stream);
+    void copy_slot(std::int32_t source, std::int32_t destination, cudaStream_t stream);
     void copy_dflash_local(std::int32_t source, std::int32_t destination,
-                           cudaStream_t stream = nullptr);
+                           cudaStream_t stream);
     // Whether a fork must copy sequence-local components before its first step (DFlash local
     // state, the KV window), and that copy.
     [[nodiscard]] bool has_fork_local() const noexcept {
         return dflash_local_.has_value() || kv_window_.has_value();
     }
     void copy_fork_local(std::int32_t source, std::int32_t destination,
-                         cudaStream_t stream = nullptr);
+                         cudaStream_t stream);
     void copy_to_host(std::int32_t source, HostStateImageView destination,
-                      cudaStream_t stream = nullptr) const;
+                      cudaStream_t stream) const;
     void copy_from_host(HostStateImageConstView source, std::int32_t destination,
-                        cudaStream_t stream = nullptr);
+                        cudaStream_t stream);
     // Segmented host images: the packed host image byte o lives at
     // segments[o / segment_bytes] + o % segment_bytes (fixed-size slabs of a shared pinned pool).
     // A packed recurrent Host form is packed and unpacked through the Device staging buffers:
     // every copy to the Host runs on one stream and every copy from it on another. The unsegmented
     // copies above support only the exact form. Each returns the copy calls it issued.
     std::uint32_t copy_to_host_segments(std::int32_t source, std::span<std::byte* const> segments,
-                                        std::size_t segment_bytes, cudaStream_t stream = nullptr) const;
+                                        std::size_t segment_bytes, cudaStream_t stream) const;
     std::uint32_t copy_from_host_segments(std::span<const std::byte* const> segments,
                                           std::size_t segment_bytes, std::int32_t destination,
-                                          cudaStream_t stream = nullptr);
+                                          cudaStream_t stream);
     // One part of the image, so a restore can land the state a forward pass reads first ahead of
     // the rest.
     std::uint32_t copy_from_host_segments(std::span<const std::byte* const> segments,

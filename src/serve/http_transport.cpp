@@ -155,6 +155,16 @@ NgramSessionHints resolve_ngram_session(const httplib::Request& request, const R
     return ambiguous ? NgramSessionHints{} : hints;
 }
 
+std::string request_label(const httplib::Request& request) {
+    constexpr const char* kHeader = "x-infernix-request-label";
+    if (request.get_header_value_count(kHeader) != 1) { return {}; }
+    std::string label = request.get_header_value(kHeader);
+    const bool valid  = !label.empty() && label.size() <= 128 &&
+                       std::all_of(label.begin(), label.end(),
+                                   [](unsigned char c) { return c >= 32 && c < 127; });
+    return valid ? label : std::string{};
+}
+
 bool client_disconnected(const httplib::Request& request) { return request.is_connection_closed(); }
 
 void prepare_sse_response(httplib::Response& response) {
