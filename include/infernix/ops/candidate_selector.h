@@ -35,7 +35,9 @@ namespace infernix::ops {
  * A row with configs[b].temperature<=0 selects the lowest candidate rank attaining max(edge) and
  * writes its exact one-hot distribution. A positive-temperature row writes the FP32 softmax of
  * edge/temperature, then draws a candidate with counter key
- * (configs[b].seed,base_positions[b]+i,kSamplePurposeDFlash2Proposal). The selected global id is
+ * (configs[b].seed,base_positions[b]+i,kSamplePurposeDFlash2Proposal,i): the step i keeps a later
+ * round's draft at the same position (a smaller step) off this uniform, which block verification's
+ * outcome depends on. The selected global id is
  * written to drafts[i,b] and becomes the next predecessor. The Op ignores all other
  * SamplingConfig fields and never updates token_counts.
  *
@@ -106,7 +108,7 @@ void candidate_selector_tree(const Tensor& candidate_ids, const Tensor& unary_sc
  * base_positions, current_extents, configs, shape, the draws, their counter keys and every output
  * are as candidate_selector_tree's. The main chain is the path walk over these edges: a greedy row
  * takes each position's lowest rank attaining its maximum score, a sampled row draws from the
- * position's law with (seed, base+i, kSamplePurposeDFlash2Proposal, 0). No workspace.
+ * position's law with (seed, base+i, kSamplePurposeDFlash2Proposal, i). No workspace.
  */
 void candidate_tree(const Tensor& candidate_ids, const Tensor& unary_scores,
                     const Tensor& base_positions, const Tensor& current_extents,

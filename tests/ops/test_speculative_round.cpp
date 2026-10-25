@@ -279,13 +279,14 @@ struct SparseAcceptSuite {
         return value ^ (value >> 31);
     }
 
-    float oracle_uniform(std::uint64_t seed, int position, int purpose) {
+    float oracle_uniform(std::uint64_t seed, int position, int purpose, std::uint32_t sub = 0) {
         std::uint64_t key = seed;
         key               = oracle_splitmix64(key ^
                                               (static_cast<std::uint64_t>(static_cast<std::uint32_t>(position)) *
                                  0xD1B54A32D192ED03ull));
         key               = oracle_splitmix64(
-            key ^ (static_cast<std::uint64_t>(static_cast<std::uint32_t>(purpose)) << 21));
+            key ^ (static_cast<std::uint64_t>(static_cast<std::uint32_t>(purpose)) << 21) ^
+            (static_cast<std::uint64_t>(sub) * 0x2545F4914F6CDD1Dull));
         const std::uint32_t bits = static_cast<std::uint32_t>(key >> 40);
         return static_cast<float>(bits) * (1.0f / 16777216.0f);
     }
@@ -501,7 +502,8 @@ struct SparseAcceptSuite {
                 const double denominator = s + 1.0 - weight;
                 threshold                = denominator > 0.0 ? s / denominator : 1.0;
             }
-            if (oracle_uniform(config.seed, length + i, ops::kSamplePurposeSpeculativeAccept) <= threshold) {
+            if (oracle_uniform(config.seed, length + i, ops::kSamplePurposeSpeculativeBlockAccept,
+                               static_cast<std::uint32_t>(i)) <= threshold) {
                 tau             = i;
                 accepted_weight = weight;
             }
@@ -1918,6 +1920,175 @@ int block_distribution_case(int k) {
     return failures;
 }
 
+// Block verification chained over rounds under one seed per sequence, its drafts drawn by
+// speculative_sample_sparse_drafts with the step as `draw`, as sampled MTP rounds draw them: every
+// emitted token must be an independent draw from the target. Each round starts inside the previous
+// round's drafts and prefix tests, so a key a later round met again (a draft or prefix-test uniform the
+// previous outcome depended on) would bias these laws; with every draft keyed (position, 0) the most
+// probable token's frequency falls from 0.600 to about 0.573, about 12 sigma of the pooled bound here.
+int block_chain_distribution_case(int k) {
+    constexpr int batch = 8, sequences = 8192, positions_checked = 12;
+    constexpr int S     = ops::kSparseSpeculativeCandidates;
+    const int width     = k + 1;
+    const std::array<float, 4> requested{0.6F, 0.25F, 0.1F, 0.05F};
+    std::array<double, 4> probabilities{};
+    double total = 0;
+    for (int id = 0; id < 4; ++id) {
+        probabilities[id] = std::exp(bf16_to_f32(f32_to_bf16(std::log(requested[id]))));
+        total += probabilities[id];
+    }
+    for (auto& probability : probabilities) { probability /= total; }
+    std::vector<std::uint16_t> logits(static_cast<std::size_t>(kSparsePhysicalRows) * width * batch,
+                                      f32_to_bf16(-std::numeric_limits<float>::infinity()));
+    for (int row = 0; row < width * batch; ++row) {
+        for (int id = 0; id < 4; ++id) {
+            logits[static_cast<std::size_t>(row) * kSparsePhysicalRows + id] = f32_to_bf16(std::log(requested[id]));
+        }
+    }
+    // The draft head's top rows in descending order: q = (0.3, 0.4, 0.2, 0.1) over tokens 0..3.
+    constexpr int n = 4;
+    const std::array<std::int32_t, n> head_rows{1, 0, 2, 3};
+    const std::array<float, n> head_q{0.4F, 0.3F, 0.2F, 0.1F};
+    std::vector<std::int32_t> rows(static_cast<std::size_t>(n) * batch);
+    std::vector<float> logprobs(rows.size());
+    for (int t = 0; t < batch; ++t) {
+        for (int j = 0; j < n; ++j) {
+            rows[static_cast<std::size_t>(t) * n + j]     = head_rows[j];
+            logprobs[static_cast<std::size_t>(t) * n + j] = std::log(head_q[j]);
+        }
+    }
+    DeviceContext context;
+    auto d_logits  = to_device(logits);
+    auto d_rows    = to_device(rows);
+    auto d_lp      = to_device(logprobs);
+    auto d_zero    = to_device(std::vector<int>(static_cast<std::size_t>(width) * batch, 0));
+    auto d_extents = to_device(std::vector<int>(batch, k));
+    auto d_history = to_device(std::vector<int>(static_cast<std::size_t>(batch) * kSparseTokenDomain, 0));
+    DeviceBuffer d_positions(4ULL * batch), d_lengths(4ULL * batch), d_anchors(4ULL * batch);
+    DeviceBuffer d_step_drafts(4ULL * batch), d_step_candidates(4ULL * S * batch), d_step_q(4ULL * S * batch);
+    DeviceBuffer d_drafts(4ULL * k * batch), d_candidates(4ULL * S * k * batch), d_q(4ULL * S * k * batch);
+    std::vector<ops::SamplingConfig> configs(batch);
+    for (int row = 0; row < batch; ++row) {
+        configs[row].temperature  = 1;
+        configs[row].top_k        = 4;
+        configs[row].top_p        = 1;
+        configs[row].token_counts = static_cast<int*>(d_history.p) + row * kSparseTokenDomain;
+    }
+    auto d_configs = to_device(configs);
+    GuardedDeviceBuffer licensed(4ULL * width * batch), counts(4ULL * batch), accepted(4ULL * batch);
+    Tensor head(d_rows.p, DType::I32, {n, batch}), head_logprobs(d_lp.p, DType::FP32, {n, batch});
+    Tensor positions(d_positions.p, DType::I32, {batch});
+    Tensor step_drafts(d_step_drafts.p, DType::I32, {batch}), step_candidates(d_step_candidates.p, DType::I32, {S, batch});
+    Tensor step_q(d_step_q.p, DType::FP32, {S, batch}), no_confidence;
+    Tensor target(d_zero.p, DType::I32, {width, batch});
+    Tensor target_logits(d_logits.p, DType::BF16, {kSparsePhysicalRows, width, batch});
+    Tensor drafts(d_drafts.p, DType::I32, {k, batch});
+    Tensor candidates(d_candidates.p, DType::I32, {S, k, batch});
+    Tensor proposal_q(d_q.p, DType::FP32, {S, k, batch});
+    Tensor extents(d_extents.p, DType::I32, {batch});
+    Tensor lengths(d_lengths.p, DType::I32, {batch});
+    Tensor anchors(d_anchors.p, DType::I32, {batch});
+    Tensor output(licensed.data(), DType::I32, {width, batch});
+    Tensor output_counts(counts.data(), DType::I32, {batch});
+    Tensor output_accepted(accepted.data(), DType::I32, {batch});
+    const ops::SpeculativeAcceptExecutionEnvelope envelope{.all_rows_greedy_without_penalties = false,
+                                                           .block_verification                = true};
+    GuardedDeviceBuffer scratch(ops::speculative_accept_sparse_drafts_workspace_capacity_bytes(
+        kSparseTokenDomain, envelope, k, k, batch, batch));
+    WorkspaceArena workspace(DeviceSpan{scratch.data(), scratch.bytes()});
+    // One step's [batch] draws into column `step` of the round's [k, batch] operands.
+    const auto place = [&](int step, std::size_t element, const DeviceBuffer& from, DeviceBuffer& into) {
+        CUDA_CHECK(cudaMemcpy2DAsync(static_cast<char*>(into.p) + step * element, k * element, from.p, element,
+                                     element, batch, cudaMemcpyDeviceToDevice, context.stream));
+    };
+    std::vector<std::array<std::uint64_t, 4>> marginal(positions_checked);
+    std::array<std::uint64_t, 16> pairs{};
+    std::uint64_t rounds = 0, emitted = 0;
+    int failures = 0;
+    for (int group = 0; group < sequences / batch; ++group) {
+        for (int row = 0; row < batch; ++row) configs[row].seed = 5100001ULL + group * batch + row;
+        d_configs.copy_from_host(configs.data(), configs.size() * sizeof(configs[0]));
+        std::vector<int> host_lengths(batch, 100);
+        const std::vector<int> initial_anchors(batch, 0);
+        d_lengths.copy_from_host(host_lengths.data(), host_lengths.size() * sizeof(int));
+        d_anchors.copy_from_host(initial_anchors.data(), initial_anchors.size() * sizeof(int));
+        std::vector<std::vector<int>> text(batch);
+        while (std::any_of(text.begin(), text.end(),
+                           [&](const std::vector<int>& t) { return static_cast<int>(t.size()) < positions_checked; })) {
+            for (int step = 0; step < k; ++step) {
+                std::vector<int> at(batch);
+                for (int row = 0; row < batch; ++row) at[row] = host_lengths[row] + 1 + step;
+                CUDA_CHECK(cudaMemcpyAsync(d_positions.p, at.data(), 4ULL * batch, cudaMemcpyHostToDevice,
+                                           context.stream));
+                ops::speculative_sample_sparse_drafts(head, head_logprobs, nullptr,
+                                                      static_cast<const ops::SamplingConfig*>(d_configs.p), positions,
+                                                      static_cast<std::uint32_t>(step), step_drafts, step_candidates,
+                                                      step_q, no_confidence, context.stream);
+                place(step, sizeof(int), d_step_drafts, d_drafts);
+                place(step, sizeof(int) * S, d_step_candidates, d_candidates);
+                place(step, sizeof(float) * S, d_step_q, d_q);
+            }
+            ops::speculative_accept_sparse_drafts(target, target_logits, drafts, candidates, proposal_q, extents,
+                                                  lengths, anchors, output, output_counts, output_accepted,
+                                                  kSparseTokenDomain, static_cast<const ops::SamplingConfig*>(d_configs.p),
+                                                  envelope, workspace, context.stream);
+            context.synchronize();
+            const auto tokens = read<int>(licensed, static_cast<std::size_t>(width) * batch);
+            const auto sizes  = read<int>(counts, batch);
+            const auto after  = from_device<int>(d_lengths, batch);
+            for (int row = 0; row < batch; ++row) {
+                const int size = sizes[row];
+                if (size < 1 || size > width || after[row] != host_lengths[row] + size) {
+                    ++failures;
+                    continue;
+                }
+                for (int i = 0; i < size; ++i) text[row].push_back(tokens[static_cast<std::size_t>(row) * width + i]);
+                ++rounds;
+                emitted += static_cast<std::uint64_t>(size);
+            }
+            host_lengths = after;
+        }
+        for (const auto& t : text) {
+            for (int position = 0; position < positions_checked; ++position) {
+                const int token = t[static_cast<std::size_t>(position)];
+                if (token < 0 || token >= 4) {
+                    ++failures;
+                    continue;
+                }
+                ++marginal[static_cast<std::size_t>(position)][static_cast<std::size_t>(token)];
+                if (position % 2 == 1) ++pairs[static_cast<std::size_t>(t[position - 1] * 4 + token)];
+            }
+        }
+    }
+    const auto within = [](std::uint64_t observed, double samples, double probability) {
+        const double expected = samples * probability;
+        return std::abs(static_cast<double>(observed) - expected) <=
+               6 * std::sqrt(samples * probability * (1 - probability)) + 2;
+    };
+    std::array<std::uint64_t, 4> pooled{};
+    for (const auto& at : marginal) {
+        for (int id = 0; id < 4; ++id) {
+            pooled[id] += at[id];
+            failures += within(at[id], sequences, probabilities[id]) ? 0 : 1;
+        }
+    }
+    const double pooled_samples = static_cast<double>(sequences) * positions_checked;
+    const double pair_samples   = static_cast<double>(sequences) * (positions_checked / 2);
+    for (int id = 0; id < 4; ++id) {
+        failures += within(pooled[id], pooled_samples, probabilities[id]) ? 0 : 1;
+        for (int other = 0; other < 4; ++other) {
+            failures += within(pairs[id * 4 + other], pair_samples, probabilities[id] * probabilities[other]) ? 0 : 1;
+        }
+    }
+    failures += scratch.verify_guards("block chain workspace");
+    failures += licensed.verify_guards("block chain output");
+    std::cout << "block chain distribution K=" << k << " sequences=" << sequences
+              << " tokens/round=" << static_cast<double>(emitted) / static_cast<double>(rounds) << " pooled=";
+    for (const auto count : pooled) { std::cout << count << ','; }
+    std::cout << " failures=" << failures << '\n';
+    return failures;
+}
+
 int onehot_distribution_case(int k, bool graph, bool mtp_onehot = false, int forced_prefix = 0) {
     if (forced_prefix < 0 || forced_prefix >= k) {
         throw std::invalid_argument("distribution prefix must leave at least one stochastic draft");
@@ -2587,6 +2758,7 @@ INFERNIX_OP_TEST(speculative_round) {
     // block-verification: its output distribution, then its sampled rows against the block rule's
     // host oracle, greedy rows unchanged.
     for (const int k : {1, 3, 7}) failures += block_distribution_case(k);
+    for (const int k : {4, 7}) failures += block_chain_distribution_case(k);
     for (const int k : {1, 3, 7, 15, 31}) {
         for (const int batch : {1, 8}) {
             SparseAcceptSuite suite(k, batch);

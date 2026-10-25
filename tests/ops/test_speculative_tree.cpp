@@ -1236,8 +1236,9 @@ int check_transport_row(const std::string& label, const TreeBuildCase& t, const 
                 mass += column_q(c, i);
                 if (i < rank) before += column_q(c, i);
             }
+            // A main-chain draft (step v) carries its step; a side child its (parent, sibling) index.
             const std::uint32_t key = j == 0 && c == v + 1 && v < kSteps
-                                          ? 0U
+                                          ? static_cast<std::uint32_t>(v)
                                           : (static_cast<std::uint32_t>(v + 1) << 5) | static_cast<std::uint32_t>(j);
             const double goal = host_uniform(t.configs[static_cast<std::size_t>(r)].seed,
                                              t.positions[static_cast<std::size_t>(r)] + row.depth[v], 5, key) *
@@ -1742,9 +1743,10 @@ int candidate_tree_case(int width, int max_paths, bool transport = false) {
                     mass += got.q[at * kCandidates + j];
                     if (j < rank) before += got.q[at * kCandidates + j];
                 }
+                // Main-chain draft c - 1 carries its step as the sub-key.
                 const double goal =
                     host_uniform(configs[static_cast<std::size_t>(r)].seed,
-                                 positions[static_cast<std::size_t>(r)] + c - 1, 5, 0U);
+                                 positions[static_cast<std::size_t>(r)] + c - 1, 5, static_cast<std::uint32_t>(c - 1));
                 ok = ok && goal >= before / mass - 1e-5 &&
                      goal < (before + got.q[at * kCandidates + rank]) / mass + 1e-5;
             }

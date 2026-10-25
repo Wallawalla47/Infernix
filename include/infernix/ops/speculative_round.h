@@ -160,9 +160,13 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
  *   verification over its P drafts (with p_c, q_c column c's laws and d_c its draft):
  *     w_0 = 1, w_i = min(w_{i-1} p_{i-1}(d_{i-1}) / q_{i-1}(d_{i-1}), 1) (0 when q is 0);
  *     h_i = S_i / (S_i + 1 - w_i), S_i = sum_x max(w_i p_i(x) - q_i(x), 0), for i < P; h_P = w_P;
- *   the accepted count A is the largest i with u_i <= h_i (u_i the token rule's accept uniform
- *   at position L+i), else 0; the terminal is drawn from normalized max(w_A p_A - q_A, 0) when
- *   A < P (correction) and from p_P when A = P (bonus), with the token rule's keys.
+ *   the accepted count A is the largest i with u_i <= h_i, else 0, where u_i is
+ *   (seed, L+i, kSamplePurposeSpeculativeBlockAccept, i): A depends on every u_i, so the keys are
+ *   unique to the round (the token rule's (seed, L+i, kSamplePurposeSpeculativeAccept, 0) recur in
+ *   the next round). The terminal is drawn from normalized max(w_A p_A - q_A, 0) when A < P
+ *   (correction) and from p_P when A = P (bonus), with the token rule's keys. The drafts must be
+ *   drawn with keys a later round does not reuse either (candidate_selector_path's and
+ *   speculative_sample_sparse_drafts' step sub-keys), since A depends on every draft of the round.
  *
  * Logical shapes and registered profile:
  *   All Tensor storage is contiguous. target_tokens/licensed_tokens are I32 [K+1,B].
@@ -179,8 +183,8 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
  *   proposal_q is consumed directly; it is not reconstructed from selector scores or expanded to
  *   a dense vocabulary distribution. Target logits are interpreted through sampling.h. Column i's
  *   penalty overlay is drafts[0..i-1], because the column is consumed only after that prefix was
- *   accepted. RNG purposes are the existing speculative accept/correction/bonus domains and use
- *   logical positions derived from the old round length. A live column the Op selects from
+ *   accepted. RNG purposes are the speculative accept (block accept under block verification),
+ *   correction and bonus domains and use logical positions derived from the old round length. A live column the Op selects from
  *   without a finite selection (sampling.h) sets *configs[b].nonfinite and selects token 0. On
  *   the raw target_tokens route a reached column (0..A) whose target's logit is not finite sets
  *   *configs[b].nonfinite; tokens are unchanged.

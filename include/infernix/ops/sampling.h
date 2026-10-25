@@ -20,6 +20,10 @@ enum SamplePurpose : std::int32_t {
     kSamplePurposeDFlash2Proposal       = 5,
     // SamplingConfig::gumbel_max: the Gumbel noise of a token, keyed by the produced token's position.
     kSamplePurposeGumbel = 6,
+    // Block verification's prefix tests, keyed by (L + i, purpose, i) for prefix i of the round at
+    // committed length L: block verification reads every prefix's uniform, so a later round must not
+    // meet one again (the token rule reads only up to its first rejection).
+    kSamplePurposeSpeculativeBlockAccept = 7,
 };
 
 // Borrowed round operand. Positions are contiguous packed vocabulary masks; null disables it.

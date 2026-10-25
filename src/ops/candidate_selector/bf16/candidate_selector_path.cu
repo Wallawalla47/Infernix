@@ -36,9 +36,13 @@ struct alignas(16) SelectorShared {
     unsigned long long seed;
 };
 
-// The probabilities written here are the same FP32 values consumed by the draw.
-__device__ int draw_rank(float edge, float temperature, unsigned long long seed, int position,
+// The probabilities written here are the same FP32 values consumed by the draw. Draft `step` of a
+// round at base position `base` draws with (seed, base + step, DFlash2Proposal, step): the step keeps
+// a later round, whose drafts at the same position have smaller steps, from meeting the uniform again
+// (block verification reads every draft of its round), as sampled MTP drafts' `draw` does.
+__device__ int draw_rank(float edge, float temperature, unsigned long long seed, int base, int step,
                          float* q) {
+    const int position = base + step;
     const int lane      = threadIdx.x & 31;
     const float maximum = warp_max(edge);
     if (temperature <= 0.0F) {
@@ -52,7 +56,8 @@ __device__ int draw_rank(float edge, float temperature, unsigned long long seed,
     const float probability = weight / warp_sum(weight);
     if (lane < kCandidates) q[lane] = probability;
     float uniform =
-        lane == 0 ? sampling_uniform(seed, position, kSamplePurposeDFlash2Proposal, 0U) : 0.0F;
+        lane == 0 ? sampling_uniform(seed, position, kSamplePurposeDFlash2Proposal, static_cast<unsigned>(step))
+                  : 0.0F;
     uniform          = __shfl_sync(kFullWarpMask, uniform, 0);
     float cumulative = probability;
 #pragma unroll
@@ -118,8 +123,8 @@ __global__ __launch_bounds__(512, 1) void selector_walk_kernel(DeviceArgs a) {
         score_row(a, column, shared);
         if (warp == 0) {
             const float edge   = lane < kCandidates ? shared.edge[lane] : -CUDART_INF_F;
-            const int selected = draw_rank(edge, shared.temperature, shared.seed,
-                                           shared.base_position + step, a.q + column * kCandidates);
+            const int selected = draw_rank(edge, shared.temperature, shared.seed, shared.base_position, step,
+                                           a.q + column * kCandidates);
             if (a.confidence != nullptr) { write_confidence(edge, selected, a.confidence + column); }
             if (lane == 0) {
                 shared.predecessor = a.ids[column * kCandidates + selected];
@@ -160,8 +165,7 @@ __global__ __launch_bounds__(32) void selector_lattice_walk_kernel(DeviceArgs a,
                             kCandidates +
                         lane]
                 : -CUDART_INF_F;
-        int selected =
-            draw_rank(edge, temperature, seed, position + step, a.q + column * kCandidates);
+        int selected = draw_rank(edge, temperature, seed, position, step, a.q + column * kCandidates);
         if (a.confidence != nullptr) { write_confidence(edge, selected, a.confidence + column); }
         predecessor_rank = selected;
         if (lane == 0) a.drafts[column] = a.ids[column * kCandidates + selected];
@@ -340,8 +344,7 @@ __global__ __launch_bounds__(32) void selector_tree_build_kernel(TreeArgs a, con
         if (transport) {
             selected = draw_untaken(edge, p, 0U, true, seed, position + step, 0U); // published below
         } else {
-            selected = draw_rank(edge, temperature, seed, position + step,
-                                 a.q + (q_base + column - 1) * kCandidates);
+            selected = draw_rank(edge, temperature, seed, position, step, a.q + (q_base + column - 1) * kCandidates);
             publish_column(column, step, selected, nullptr);
         }
         __syncwarp();
@@ -450,10 +453,10 @@ __global__ __launch_bounds__(32) void selector_tree_build_kernel(TreeArgs a, con
                 const bool last = j == children[v] - 1;
                 int selected    = 0;
                 if (last) {
-                    // A main column's only child keeps the chain's key; a node's other last
-                    // children take the sibling key, so no two draws share a uniform.
+                    // A main column's only child keeps the chain's key (its step, draw_rank's sub-key);
+                    // a node's other last children take the sibling key, so no two draws share a uniform.
                     const unsigned id = j == 0 && c == v + 1 && v < k
-                                            ? 0U
+                                            ? static_cast<unsigned>(step)
                                             : (static_cast<unsigned>(v + 1) << 5) | static_cast<unsigned>(j);
                     selected = draw_untaken(edge, p, used, false, seed, position + step, id);
                     sampled |= 1U << c;

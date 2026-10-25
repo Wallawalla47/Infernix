@@ -247,7 +247,13 @@ verification (Sun et al., arXiv 2403.10444; `ops::speculative_accept_sparse_draf
 the longest prefix whose block test passes, judged with the whole chain in view, and corrects
 from the residual max(w p - q, 0) scaled by the prefix's acceptance weight w. The output
 distribution is the same and the expected accepted length at least the token rule's; seeded
-sampled text differs, and greedy rows, tree rows and Gumbel rows are unchanged.
+sampled text differs, and greedy rows, tree rows and Gumbel rows are unchanged. The accepted prefix
+depends on every draft and every prefix test of the round, so neither may meet the next round,
+which starts inside this round's drafts, again: the prefix tests draw with their own purpose and the
+prefix length as sub-key, and the path's draft at step i with sub-key i (sampled MTP drafts already
+carry their step). Until 2026-10-25 the path drew every step with sub-key 0, so a chained DFlash2
+sampled run under block verification was biased (a replay of the keys over four-token laws moved the
+most probable token's frequency from 0.600 to 0.573); its earlier A/B results ran on that form.
 
 DFlash q is one-hot; DFlash2 q is the retained conditional distribution. This preserves the
 processed target distribution for the verify path. With `--draft-tree-nodes` a DFlash2 round

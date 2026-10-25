@@ -317,9 +317,11 @@ __device__ __forceinline__ void speculative_sparse_warp_accept(
 // column c, p_0 = 1 and p_i = min(p_{i-1} P_{i-1}(d_{i-1}) / Q_{i-1}(d_{i-1}), 1) (0 for a draft
 // outside its candidates, which was not drawn from Q). Each prefix i < extent passes when
 // eta_i <= S_i / (S_i + 1 - p_i), S_i = sum_x max(p_i P_i(x) - Q_i(x), 0) over column i's support,
-// and the full chain when eta_extent <= p_extent; eta_i is the token rule's uniform (seed, L+i,
-// SpeculativeAccept, 0). The longest passing prefix tau is accepted: a bonus from P_extent when it
-// is the chain, else a correction from max(p_tau P_tau - Q_tau, 0) with the token rule's keys.
+// and the full chain when eta_extent <= p_extent; eta_i is (seed, L+i, SpeculativeBlockAccept, i),
+// unique to the round, since tau depends on every eta_i and the token rule's (seed, L+i,
+// SpeculativeAccept, 0) would meet the next round again. The longest passing prefix tau is accepted:
+// a bonus from P_extent when it is the chain, else a correction from max(p_tau P_tau - Q_tau, 0) with
+// the token rule's keys.
 __device__ __forceinline__ void speculative_sparse_warp_block_accept(
     SamplingWorkspace workspace, const int* drafts, const int* candidate_ids,
     const float* proposal_q, const SamplingConfig& cfg, int k, int row, int extent, int* lengths,
@@ -366,8 +368,8 @@ __device__ __forceinline__ void speculative_sparse_warp_block_accept(
             const float denom = s + 1.0f - p;
             threshold         = denom > 0.0f ? s / denom : 1.0f;
         }
-        const float eta =
-            sampling_uniform(cfg.seed, old_length + i, kSamplePurposeSpeculativeAccept, 0);
+        const float eta = sampling_uniform(cfg.seed, old_length + i, kSamplePurposeSpeculativeBlockAccept,
+                                           static_cast<unsigned>(i));
         if (eta <= threshold) {
             tau   = i;
             p_tau = p;

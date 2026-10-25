@@ -187,11 +187,13 @@ std::uint64_t splitmix64(std::uint64_t value) {
     return value ^ (value >> 31);
 }
 
-float oracle_uniform(std::uint64_t seed, std::int32_t position) {
+// The draw of draft `step` of a round at base position `base`: (seed, base + step, proposal, step).
+float oracle_uniform(std::uint64_t seed, std::int32_t base, std::int32_t step) {
     std::uint64_t key = seed;
-    key = splitmix64(key ^ (static_cast<std::uint64_t>(static_cast<std::uint32_t>(position)) *
+    key = splitmix64(key ^ (static_cast<std::uint64_t>(static_cast<std::uint32_t>(base + step)) *
                             0xD1B54A32D192ED03ULL));
-    key = splitmix64(key ^ (static_cast<std::uint64_t>(ops::kSamplePurposeDFlash2Proposal) << 21));
+    key = splitmix64(key ^ (static_cast<std::uint64_t>(ops::kSamplePurposeDFlash2Proposal) << 21) ^
+                     (static_cast<std::uint64_t>(static_cast<std::uint32_t>(step)) * 0x2545F4914F6CDD1DULL));
     const std::uint32_t bits = static_cast<std::uint32_t>(key >> 40);
     return static_cast<float>(bits) * (1.0F / 16777216.0F);
 }
@@ -233,7 +235,7 @@ WalkResult walk_oracle(const std::vector<std::int32_t>& candidate_ids,
                     result.probabilities[candidate_offset(batch, step, candidate)] /= sum;
                 }
                 const double uniform =
-                    oracle_uniform(configs[batch].seed, base_positions[batch] + step);
+                    oracle_uniform(configs[batch].seed, base_positions[batch], step);
                 double lower      = 0.0;
                 double cumulative = 0.0;
                 selected          = kCandidates - 1;
@@ -335,7 +337,7 @@ int verify_draws(const std::string& label, int batch, const std::vector<int>& id
             }
             if (std::abs(mass - 1.0) > 2.0e-6) ++failures;
             const float uniform = configs[b].temperature > 0
-                                      ? oracle_uniform(configs[b].seed, positions[b] + i)
+                                      ? oracle_uniform(configs[b].seed, positions[b], i)
                                       : 0.0F;
             float cumulative    = 0;
             int selected        = kCandidates - 1;
