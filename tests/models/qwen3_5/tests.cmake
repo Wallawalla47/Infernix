@@ -111,8 +111,16 @@ infernix_add_test(infernix_qwen3_5_invariance_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_invariance_real.cpp"
   LIBRARIES infernix_engine)
 
+# A continuation resumed from the prefix cache after speculative decoding against a cold run (the
+# artifact must hold both drafters).
+infernix_add_test(infernix_qwen3_5_resume_cold_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_resume_cold_real.cpp"
+  LIBRARIES infernix_engine
+  ARGS mtp dflash2)
+
 set_tests_properties(
   infernix_qwen3_5_hybrid_prefix_real_test infernix_qwen3_5_invariance_real_test
+  infernix_qwen3_5_resume_cold_real_test
   PROPERTIES SKIP_RETURN_CODE 77)
 
 infernix_add_test(infernix_qwen3_5_score_real_test

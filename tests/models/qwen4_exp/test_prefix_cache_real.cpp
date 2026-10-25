@@ -24,6 +24,8 @@
 //   one context  (MTP mode, own Engine with kv_capacity = max_context) A recomputed cached prefix
 //                replaces the cached copies instead of pinning them beside its pages: the request
 //                completes, equals its cold run, and the Engine keeps serving.
+//   burst        (MTP mode, own Engines, default route, INT8 and FP8 KV) Four rounds of four identical chat
+//                prompts at C = 4: every request reaches its limit and the Engine keeps serving.
 //
 //   infernix_qwen4_exp_prefix_cache_real_test [--mtp] [--plain]   (default: both modes)
 
@@ -31,6 +33,7 @@
 #include "kv_cache_storage.h"
 #include "infernix/engine.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -368,6 +371,67 @@ int run_persistence(const char* artifact, const char* ngram) {
     return failures;
 }
 
+// The identical burst (candidates §15 NN-08; NInfer #414, root cause by oldfencetried on 2026-10-25: the worker
+// reserves resident permits before fresh admission, so an exact hit could pin a resident writer's partial tail
+// page while that writer still held its permit, its next write became a copy-on-write beyond its reservation,
+// and the exception failed the whole Engine). Four rounds of four copies of one chat prompt whose length is not a
+// page multiple, submitted together at C = 4 with MTP 3 on the default route, with INT8 and FP8 KV: every request
+// reaches its output limit and the Engine serves the prompt again afterwards.
+int run_identical_burst(const char* artifact, const char* ngram) {
+    constexpr std::uint32_t kOutputs = 64;
+    int failures                     = 0;
+    for (const auto kv : {infernix::KvCacheStorage::Int8Group64, infernix::KvCacheStorage::Fp8E4M3Row256}) {
+        const char* label = kv == infernix::KvCacheStorage::Int8Group64 ? "int8" : "fp8";
+        std::printf("== identical burst (%s KV, C = 4, MTP 3, default route)\n", label);
+        infernix::EngineOptions options;
+        options.artifact_path = artifact;
+        if (ngram != nullptr) { options.ngram_volume_path = ngram; }
+        options.max_context                       = 4096;
+        options.kv_capacity                       = infernix::KvCapacityPolicy::explicit_capacity(4 * 4096);
+        options.kv_cache                          = kv;
+        options.max_concurrency                   = 4;
+        options.max_pending_requests              = 4;
+        options.context_cache.host_capacity_bytes = 1ULL << 30;
+        options.speculative.backend               = infernix::SpeculativeBackend::Mtp;
+        options.speculative.draft_tokens          = 3;
+        infernix::Engine engine(std::move(options));
+        infernix::PromptInput input;
+        infernix::ChatMessage user;
+        user.role = infernix::ChatRole::User;
+        std::string text = rules_text() + "Which shelf takes colour 4, and why?";
+        user.parts.push_back(infernix::MessagePart{.kind = infernix::MessagePartKind::Text, .text = text, .media = {}});
+        input.messages.push_back(user);
+        input.options.enable_thinking = false;
+        std::uint32_t prompt_tokens   = engine.generate(engine.prepare(input), greedy(1, false)).prompt.prompt_tokens;
+        if (prompt_tokens % 64 == 0) {
+            input.messages.front().parts.front().text += " Thanks.";
+            prompt_tokens = engine.generate(engine.prepare(input), greedy(1, false)).prompt.prompt_tokens;
+        }
+        failures += check(prompt_tokens % 64 != 0, "the prompt (" + std::to_string(prompt_tokens) +
+                                                        " tokens) is not a page multiple");
+        for (int round = 0; round < 4; ++round) {
+            std::vector<infernix::GenerationHandle> burst;
+            for (int i = 0; i < 4; ++i) { burst.push_back(engine.submit(engine.prepare(input), greedy(kOutputs, true))); }
+            int complete = 0;
+            std::uint32_t reused = 0;
+            for (auto& handle : burst) {
+                const infernix::GenerationResult result = handle.wait();
+                complete += result.finish_reason == infernix::FinishReason::OutputLimit &&
+                                    result.generated_token_ids.size() == kOutputs
+                                ? 1
+                                : 0;
+                reused = std::max(reused, result.reused_prompt_tokens);
+            }
+            failures += check(complete == 4, "round " + std::to_string(round) + ": " + std::to_string(complete) +
+                                                 " of 4 identical requests reached their limit (most reused " +
+                                                 std::to_string(reused) + ")");
+        }
+        const infernix::GenerationResult after = engine.generate(engine.prepare(input), greedy(kOutputs, true));
+        failures += check(after.generated_token_ids.size() == kOutputs, "the Engine serves the prompt after the burst");
+    }
+    return failures;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -389,6 +453,7 @@ int main(int argc, char** argv) {
         if (plain) { failures += run_mode(artifact, ngram, false); }
         if (mtp) { failures += run_mode(artifact, ngram, true); }
         if (mtp) { failures += run_one_context(artifact, ngram); }
+        if (mtp) { failures += run_identical_burst(artifact, ngram); }
         if (plain) { failures += run_persistence(artifact, ngram); }
         std::printf(failures == 0 ? "qwen4_exp prefix cache checks passed\n" : "FAIL: %d checks failed\n", failures);
         return failures == 0 ? 0 : 1;

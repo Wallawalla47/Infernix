@@ -282,6 +282,9 @@ INFERNIX_TEST_ARTIFACT=$PWD/out/qwen3_8_27b_nvfp4.ninfer \
 
 INFERNIX_TEST_ARTIFACT=$PWD/out/qwen3_6_35b_a3b.infernix \
   ./build/tests/infernix_qwen3_5_invariance_real_test mtp
+
+INFERNIX_TEST_ARTIFACT=$PWD/out/qwen3_8_27b_nvfp4.ninfer \
+  ctest --test-dir build -R infernix_qwen3_5_resume_cold_real_test --output-on-failure
 ```
 
 The invariance entry checks the exact route's request invariance with sampled decoding: each
@@ -289,6 +292,14 @@ request alone against all four at once in reverse submission order, a warm off-g
 the cold request, and a KV pool for two extents serving four requests without preemption. Its
 positional speculation is `none`, `mtp`, `dflash` or `dflash2` (the artifact must hold that
 drafter).
+
+The resume entries (`infernix_qwen3_5_resume_cold_real_test` and
+`infernix_qwen4_exp_resume_cold_real_test`, arguments `mtp dflash2`) decode 256 tokens with the
+drafter, then compare the continuation resumed from the prefix cache with a cold run: on the
+reproducible route the tokens and the teacher-forced log-probabilities of the 16 tokens past the
+decoded text are bit-identical; on the default route, which resumes from the decode-computed
+endpoint, the mean log-probability difference stays within max(0.1, 4 x) that of a resume from a
+prefill-made state. The Qwen4Exp entry runs DFlash2 only with `INFERNIX_QWEN4_DFLASH2`.
 
 The agent entry checks multi-turn continuation and branching. The preemption entry exercises
 Replay recovery and cancellation while paused or replaying; `INFERNIX_PREEMPTION_REAL_SCENARIO`

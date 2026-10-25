@@ -126,6 +126,14 @@ infernix_add_test(infernix_qwen4_exp_prefix_cache_real_test
   LIBRARIES infernix_engine)
 set_tests_properties(infernix_qwen4_exp_prefix_cache_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
+# A continuation resumed after speculative decoding against a cold run, MTP and DFlash2 (INFERNIX_QWEN4_DFLASH2),
+# on the reproducible route (bit-identical) and the default route (a teacher-forced log-probability bound).
+infernix_add_test(infernix_qwen4_exp_resume_cold_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_resume_cold_real.cpp"
+  LIBRARIES infernix_engine
+  ARGS mtp dflash2)
+set_tests_properties(infernix_qwen4_exp_resume_cold_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
+
 # A long prompt's layer walk while another lane decodes, with SSD-only experts (issue #5): both
 # requests complete with their solo ids and no call reports a silent host.
 infernix_add_test(infernix_qwen4_exp_walk_interleave_real_test

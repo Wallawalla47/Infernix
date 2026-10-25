@@ -510,9 +510,11 @@ int exercise_coalesce(const char* artifact, std::uint32_t shared_tokens, bool co
 // A burst of identical prompts (NInfer #414 shipped exactly this failure: every request failed and
 // the engine stayed unavailable): four copies of one prompt at C = 4 with MTP, at a length that is
 // not a block multiple, submitted together, so later copies coalesce on the first one's snapshot or
-// endpoint while it is still being published (candidates §13 NN-05). Every request completes, each
-// generates what the prompt generates alone (greedy on the reproducible route, which no other
-// request, batch or cache state changes), and the engine serves the prompt again afterwards.
+// endpoint while it is still being published (candidates §13 NN-05). Four rounds (§15 NN-08: NInfer's
+// failure came from an exact hit pinning a resident writer's partial tail page, which later rounds
+// meet once the earlier rounds' entries exist). Every request completes, each generates what the
+// prompt generates alone (greedy on the reproducible route, which no other request, batch or cache
+// state changes), and the engine serves the prompt again afterwards.
 int exercise_identical_burst(const char* artifact) {
     const std::vector<infernix::TokenId> prompt = synthetic_tokens(2 * kPrefillChunk + kBlock / 2 + 37, 13);
     infernix::EngineOptions options =
@@ -527,15 +529,18 @@ int exercise_identical_burst(const char* artifact) {
         alone = engine.generate(engine.prepare_tokens(prompt), greedy(32)).generated_token_ids;
     }
     infernix::Engine engine(options);
-    std::vector<infernix::GenerationHandle> burst;
-    for (int i = 0; i < 4; ++i) { burst.push_back(engine.submit(engine.prepare_tokens(prompt), greedy(32))); }
     int failures = 0;
-    for (std::size_t i = 0; i < burst.size(); ++i) {
-        const infernix::GenerationResult result = burst[i].wait();
-        if (result.generated_token_ids != alone) {
-            std::cerr << "identical burst: request " << i << " generated " << result.generated_token_ids.size()
-                      << " tokens unlike the prompt alone (reused " << result.reused_prompt_tokens << ")\n";
-            ++failures;
+    for (int round = 0; round < 4; ++round) {
+        std::vector<infernix::GenerationHandle> burst;
+        for (int i = 0; i < 4; ++i) { burst.push_back(engine.submit(engine.prepare_tokens(prompt), greedy(32))); }
+        for (std::size_t i = 0; i < burst.size(); ++i) {
+            const infernix::GenerationResult result = burst[i].wait();
+            if (result.generated_token_ids != alone) {
+                std::cerr << "identical burst: round " << round << " request " << i << " generated "
+                          << result.generated_token_ids.size() << " tokens unlike the prompt alone (reused "
+                          << result.reused_prompt_tokens << ")\n";
+                ++failures;
+            }
         }
     }
     const infernix::GenerationResult after = engine.generate(engine.prepare_tokens(prompt), greedy(32));
