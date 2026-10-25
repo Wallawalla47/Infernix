@@ -25,9 +25,6 @@ tags:
 
 # Qwen3.8-Flash-Next NVIDIA FP4-Local for Infernix
 
-> **Preliminary support:** this checkpoint runs and its quality gates passed, but I am still working
-> on optimisations, so its speeds will change.
-
 > **AI disclaimer:** this artifact, its conversion recipe, the engine that runs it and most of this
 > card were made with AI (mostly Claude Opus 5.5). It is hobby work and is likely to be neither
 > complete nor entirely accurate.
@@ -102,12 +99,16 @@ and no tensor rounded.
 ## Run
 
 ```text
-infernix Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-00001-of-00003.infernix \
+infernix-serve Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-00001-of-00003.infernix \
   --ngram-volume Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix.ngram --kv-dtype int8 \
-  --max-context 16384 --prompt "..."
+  --max-context 262144 --max-concurrency 2 \
+  --spec dflash2 --draft-model Qwen3.8-Flash-Next-DFlash2-Infernix.infernix --draft-tokens auto --lm-head-draft
 ```
 
-`infernix-serve` takes the same arguments. See the
+The DFlash2 drafter is
+[Qwen3.8-Flash-Next-DFlash2-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-DFlash2-Infernix);
+`--lm-head-draft` decodes 3.0 % faster than drafting with this model's BF16 text head. `infernix`
+takes the same arguments. See the
 [Qwen3.8-Flash-Next guide](https://github.com/Wallawalla47/Infernix/blob/main/docs/qwen3_8-flash-next.md#nvidia-fp4-local-checkpoint)
 for the options, KV formats and requirements.
 
@@ -124,9 +125,11 @@ for the official FP8 conversion and 3.5114 for NVIDIA's NVFP4 Dense8.
 | Decode, plain | 110 tok/s | 135 tok/s |
 | Decode, MTP | 150-162 tok/s | 216 tok/s |
 
-These figures predate later changes and will move as the optimisation work continues. The 2026-10-24
-version changes only the vision MLPs and adds the head screens: its text path gives the previous version's
-logits bit for bit, and it scores the same 3.4865.
+Decode with the DFlash2 drafter (`--draft-tokens auto --lm-head-draft`, 2026-10-25, one request, INT8
+KV, 384-token continuations of 1,280-token slices of code and docs): 220 tok/s on code (greedy), 147
+tok/s on docs (sampled at temperature 1). The 2026-10-24 version changes only the vision MLPs and adds
+the head screens: its text path gives the previous version's logits bit for bit, and it scores the
+same 3.4865.
 
 ## License
 

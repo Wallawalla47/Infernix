@@ -259,9 +259,6 @@ drafter does not change).
 
 ### NVIDIA FP4-Local checkpoint
 
-> **Preliminary support:** this checkpoint runs and its quality gates passed, but optimisation is still in
-> progress, so its speeds will change.
-
 Recipe `qwen3_8_flash_next_fp4_local` imports
 [nvidia/Qwen3.8-Flash-Next-FP4-Local](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local),
 NVIDIA's quantization-aware distillation of the model, bit-exactly
@@ -384,6 +381,10 @@ infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8
     (0.6 was the best fixed cut, still below `auto` on docs).
   - The drafter takes less VRAM than MTP's: 9,070 cached experts against 8,740 on Dense8 (IQ3_S:
     12,432 against 12,288), plus its 40 MiB context ring per lane.
+  - `--lm-head-draft` (the 178 MB proposal head) decodes faster than the full head on every
+    conversion measured (2026-10-25, the same workload, one request; two on Dense8 docs): Dense8
+    (8-bit head) 1.5 %, FP4-Local (BF16 head, as FP8's and the bit-exact conversion's) 3.0 %, IQ3_S
+    1.5 %, each better in every setting.
   - Greedy output is the same as without it when one request runs at a time; sampling keeps the
     sampler's distribution. With two or more requests decoding together, rounds decode without
     drafts (as MTP's do without `adaptive-speculation`), except under the default fast path

@@ -89,7 +89,8 @@ infernix-serve Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix-00001-of-00003.in
   `--spec-min-p P` then verifies the drafts only up to the first whose probability is below P.
 - `--lm-head-draft` scores the drafts with the main artifact's small proposal head (the 131,072
   most frequent tokens, 4-bit) instead of its full output head; the figures below use it. Every
-  Infernix Flash-Next artifact listed above has one.
+  Infernix Flash-Next artifact listed above has one. It decodes faster than the full head on every
+  conversion measured (2026-10-25, one request): Dense8 1.5 %, FP4-Local 3.0 %, IQ3_S 1.5 %.
 - `--ngram-draft-tokens 7` (copy proposals) works beside it, as with MTP.
 - The same options work with the one-shot CLI (`infernix`) and `infernix_bench`.
 

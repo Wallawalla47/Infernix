@@ -24,9 +24,6 @@ tags:
 
 # Ornith-1.5-122B NVFP4 for Infernix
 
-> **Preliminary support:** this model runs and is verified, but I am still working on optimisations,
-> so its speeds will change.
-
 > **AI disclaimer:** this artifact, its conversion recipe, the engine that runs it and most of this
 > card were made with AI (mostly Claude Opus 5.5). It is hobby work and is likely to be neither
 > complete nor entirely accurate.
@@ -83,24 +80,27 @@ mismatch.
 ```text
 infernix Ornith-1.5-122B-NVFP4-Infernix-00001-of-00003.infernix \
   --prompt "Explain why the sky is blue." --max-context 8192 --max-new 256
-infernix-serve Ornith-1.5-122B-NVFP4-Infernix-00001-of-00003.infernix --max-context 32768
+infernix-serve Ornith-1.5-122B-NVFP4-Infernix-00001-of-00003.infernix --max-context 262144 --kv-dtype int8 --spec mtp --draft-tokens auto
 ```
 
 - **Context memory:** only the first 32,768 tokens of KV are held at startup; longer contexts take
   their KV from the expert cache as they grow and give it back when they end.
-- **Speculation:** `--spec mtp --draft-tokens 2` verifies only the drafts the drafter is confident
-  enough of to pay for their experts; `--spec dflash2` uses the DFlash2 drafter. `--draft-tokens auto`
-  decodes without a drafter on this model.
+- **Speculation (recommended: `--spec mtp --draft-tokens auto`):** two MTP drafts each round, verified
+  only when the drafter is confident enough of them to pay for their experts; 14 % faster than plain
+  decode at one request (geometric mean over greedy and sampled prompts), about 6 % slower while two
+  requests decode together. `--spec dflash2` uses the DFlash2 drafter; with `--draft-tokens auto` it
+  decodes without it, as its per-round policy tied MTP at one request and lost 16 % to plain decode at
+  two. `--lm-head-draft` gains nothing here.
 - `--reproducible` runs the bit-exact route, `--lossless` the correctly rounded one (about 5 tok/s).
 
-## Speed (RTX 5090, i9-13900K, 96 GB DDR5, PCIe 5.0 x8, bf16 KV, one request)
+## Speed (RTX 5090, i9-13900K, 96 GB DDR5, PCIe 5.0 x8, one request)
 
 | Measure | Result |
 |---|---:|
-| Plain decode, greedy (tg256 after a 512-token prompt) | 90-97 tok/s |
-| Plain decode, the sampled request with the card's settings | 74-78 tok/s |
-| MTP with 2 drafts, the same sampled request | 78-81 tok/s |
-| Prefill, 4K / 32K prompt | 1,750 / 6,500 tok/s |
+| Decode, INT8 KV, 1,280-token prompts, greedy: plain / `--spec mtp --draft-tokens auto` | 69-81 / 77-103 tok/s |
+| The same, sampled at temperature 1.0 | 64-74 / 66-91 tok/s |
+| Plain decode, greedy, BF16 KV (tg256 after a 512-token prompt) | 90-97 tok/s |
+| Prefill, BF16 KV, 4K / 32K prompt | 1,750 / 6,500 tok/s |
 
 Decode depends on the text, through the share of its experts already in VRAM (74-80 % hit rate),
 because it is bound by the bytes of the missing experts. Quality has not been measured beyond the
