@@ -281,8 +281,8 @@ std::int64_t unix_time_now() {
         .count();
 }
 
-void validate_openai_model(std::string_view requested, std::string_view available) {
-    if (requested == available) { return; }
+std::string resolve_openai_model(std::string_view requested, std::string_view available, bool any_name) {
+    if (requested == available || (any_name && !requested.empty())) { return std::string(available); }
     ApiError error;
     error.status  = 404;
     error.type    = "invalid_request_error";

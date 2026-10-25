@@ -100,6 +100,10 @@ struct ServeOptions {
     // history renders as generated and keeps its prefix-cache match. Off by default: it changes the
     // history the client sent.
     bool restore_tool_reasoning = false;
+    // --any-model-name: the OpenAI routes serve a request whatever non-empty model name it gives (a
+    // client's hard-coded or default name) and report the served model's name; off, any name but the
+    // public model ID is a 404 model_not_found.
+    bool any_model_name = false;
     // --claude-code-prompt as-sent|local: Anthropic Messages from Claude Code keep its System prompt,
     // or have its Claude-specific parts replaced by a short local-agent preamble.
     ClaudeCodePrompt claude_code_prompt = ClaudeCodePrompt::AsSent;

@@ -364,7 +364,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         limits.default_max_tokens = options_.default_max_tokens;
         const auto body           = parse_json_body(req);
         request                   = parse_openai_responses_create_request(body, limits);
-        validate_openai_model(request.prompt.model, public_model_id_);
+        request.prompt.model = resolve_openai_model(request.prompt.model, public_model_id_, options_.any_model_name);
         resolved = resolve_openai_responses_prompt(request.prompt, openai_responses_store_);
         resolved.generation.ngram_session = resolve_ngram_session(req, body, options_);
     } catch (const ApiException& exception) {
@@ -706,7 +706,7 @@ void HttpServer::handle_response_input_tokens(const httplib::Request& req, httpl
         limits.default_max_tokens = options_.default_max_tokens;
         OpenAIResponsesPromptRequest request =
             parse_openai_responses_input_tokens_request(parse_json_body(req), limits);
-        validate_openai_model(request.model, public_model_id_);
+        request.model = resolve_openai_model(request.model, public_model_id_, options_.any_model_name);
         OpenAIResponsesResolvedPrompt resolved =
             resolve_openai_responses_prompt(request, openai_responses_store_);
         const int tokens = service_->count_prompt_tokens(

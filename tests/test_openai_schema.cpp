@@ -1403,8 +1403,30 @@ int test_late_system_and_developer_roles_parse() {
 
 } // namespace
 
+// The request `model`: the public model ID alone by default (404 model_not_found otherwise), any
+// non-empty name under --any-model-name; the served name is the public model ID either way.
+int test_model_resolution() {
+    int failures = 0;
+    failures += check(resolve_openai_model("qwen", "qwen", false) == "qwen" &&
+                          resolve_openai_model("qwen", "qwen", true) == "qwen",
+                      "the public model ID was not served as itself");
+    const ApiError other = api_error([] { (void)resolve_openai_model("gpt-4o-mini", "qwen", false); });
+    failures += check(other.status == 404 && other.code == "model_not_found" && other.param == "model" &&
+                          other.type == "invalid_request_error" &&
+                          other.message.find("gpt-4o-mini") != std::string::npos,
+                      "another model name was not a 404 model_not_found by default");
+    failures += check(resolve_openai_model("gpt-4o-mini", "qwen", true) == "qwen" &&
+                          resolve_openai_model("openai/qwen-alias", "qwen", true) == "qwen",
+                      "--any-model-name did not serve another name as the public model ID");
+    const ApiError empty = api_error([] { (void)resolve_openai_model("", "qwen", true); });
+    failures += check(empty.status == 404 && empty.code == "model_not_found",
+                      "--any-model-name served an empty model name");
+    return failures;
+}
+
 int main() {
     int failures = 0;
+    failures += test_model_resolution();
     failures += test_request_envelope_and_sampling();
     failures += test_standard_field_policy();
     failures += test_prompt_cache_boundaries();

@@ -359,6 +359,10 @@ int main() {
                   resolve_public_model_id(model_alias, "artifact-model") == "deployment-alias",
               "explicit model id did not override the artifact identity");
 
+    failures += check(!parse({"infernix-serve", "model.ninfer"}).any_model_name &&
+                          parse({"infernix-serve", "model.ninfer", "--any-model-name"}).any_model_name,
+                      "--any-model-name is not an opt-in flag");
+
     const ServeOptions context_cost =
         parse({"infernix-serve", "model.ninfer", "--context-cost-presets", "local-costs.json"});
     failures += check(context_cost.context_cost_presets == "local-costs.json",

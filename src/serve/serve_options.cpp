@@ -111,6 +111,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--preserve-thinking", false},
     ServeOptionArity{"--tolerant-tool-calls", false},
     ServeOptionArity{"--restore-tool-reasoning", false},
+    ServeOptionArity{"--any-model-name", false},
     ServeOptionArity{"--cors", false},
     ServeOptionArity{"--usage-chunk-choice", false},
     ServeOptionArity{"--temperature"},
@@ -336,6 +337,9 @@ std::string serve_usage_text(const char* argv0) {
            "                             the thinking-budget message and lets the model answer\n"
            "  --model-id ID              override the artifact metadata.name reported by\n"
            "                             the server\n"
+           "  --any-model-name           serve OpenAI requests whatever model name they\n"
+           "                             give, reporting the served model's name (off: any\n"
+           "                             other name is 404 model_not_found)\n"
            "  --chat-template FILE       replace the artifact frontend chat template at\n"
            "                             startup; must match a template the target accepts\n"
            "  --claude-code-prompt as-sent|local\n"
@@ -1007,6 +1011,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.tolerant_tool_calls = true;
         } else if (arg == "--restore-tool-reasoning") {
             options.restore_tool_reasoning = true;
+        } else if (arg == "--any-model-name") {
+            options.any_model_name = true;
         } else if (arg == "--cors") {
             options.enable_cors = true;
         } else if (arg == "--usage-chunk-choice") {

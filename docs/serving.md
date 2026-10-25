@@ -330,7 +330,11 @@ and availability failures retain their dedicated codes. Internal invariant failu
 relabeled as client input errors.
 
 The request `model` must equal the public model ID: the artifact `metadata.name` by default
-(falling back to its architecture name when absent), or the explicit `--model-id` override.
+(falling back to its architecture name when absent), or the explicit `--model-id` override. With
+`--any-model-name` any non-empty name is served (a client's hard-coded or default name, such as
+`gpt-4o-mini`), on Chat Completions, Responses, Responses input tokens and decide; the response and
+the request log report the public model ID, as OpenAI reports the snapshot an alias resolved to.
+`/v1/models` and `/v1/models/{id}` still list and retrieve only the public model ID.
 Reasoning is returned separately as `reasoning_content`; answer text remains in `content`.
 
 For non-strict tools, a direct top-level tool-parameter
@@ -797,7 +801,7 @@ wire response contains typed `output` Items.
 
 | Field | Infernix Responses Core contract |
 |---|---|
-| `model` | required non-empty string; must equal the artifact-derived public model ID or explicit `--model-id` override |
+| `model` | required non-empty string; must equal the artifact-derived public model ID or explicit `--model-id` override (any non-empty name with `--any-model-name`) |
 | `input` | string or typed Item array; it may be omitted or empty only when `previous_response_id` already supplies a user query |
 | `instructions` | optional string, inserted before the reconstructed conversation for this request only |
 | `previous_response_id` | optional ID of a retained local Response |
@@ -1498,6 +1502,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--port N` | listen port | `8080` |
 | `--api-key KEY` | required bearer or `x-api-key` value | unset |
 | `--model-id ID` | override the public OpenAI model alias | artifact `metadata.name`, or architecture name |
+| `--any-model-name` | serve OpenAI-route requests whatever non-empty `model` they name, reporting the public model ID (see Chat Completions) | off: other names are 404 `model_not_found` |
 | `--chat-template FILE` | replace the artifact's chat template at startup; it must be one the target accepts | artifact template |
 | `--claude-code-prompt as-sent\|local` | Anthropic Messages from Claude Code: use its System prompt as sent, or replace its Claude-specific parts with a short local-agent preamble ([Anthropic Messages](#anthropic-messages)) | `as-sent` |
 | `--rope-yarn-factor F` | startup-fixed runtime YaRN factor, finite `[1,4]`; extends allowed ceiling only | `1` |

@@ -30,7 +30,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         const auto body                  = parse_json_body(req);
         request                          = parse_chat_completion_request(body, limits);
         request.generation.ngram_session = resolve_ngram_session(req, body, options_);
-        validate_openai_model(request.model, public_model_id_);
+        request.model = resolve_openai_model(request.model, public_model_id_, options_.any_model_name);
     } catch (const ApiException& exception) {
         write_openai_error(res, exception.error());
         return;

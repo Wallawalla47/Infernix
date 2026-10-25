@@ -68,7 +68,9 @@ void HttpServer::handle_decide(const httplib::Request& req, httplib::Response& r
     std::vector<std::optional<DecideSchedule>> schedules;
     try {
         request = parse_decide_request(parse_json_body(req), decide_labels_.size());
-        if (!request.model.empty()) { validate_openai_model(request.model, public_model_id_); }
+        if (!request.model.empty()) {
+            request.model = resolve_openai_model(request.model, public_model_id_, options_.any_model_name);
+        }
         const DecideEncoder encode = [this](std::string_view text) {
             return service_->tokenize_text(text);
         };
