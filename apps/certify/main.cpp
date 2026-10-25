@@ -22,10 +22,23 @@
 //                    [--prefix-reuse [--warm-tokens N]] [--kv-tokens N]
 //   route options: [--reproducible] [--fast-path NAME]... [--kv-dtype K] [--logits-dtype fp32|bf16]
 //                  [--prefill-chunk N] [--ngram-volume FILE] [--expert-a4-activations]
+//
+// llama.cpp's KL-divergence measurement (IQS-3; llama_kld.h): the same exact reference as llama-perplexity's
+// `_logits_` base file, which llama-perplexity --kl-divergence scores llama.cpp against, and arms that score
+// Infernix against it with llama.cpp's own definitions and summary.
+//   infernix-certify reference <artifact> --format llama-kld --out FILE (--text F [--context N] [--chunks N] |
+//                    --tokens-from BASE) [--design --kv-dtype K] [--logits-dtype fp32|bf16]
+//   infernix-certify prefill   <artifact> --llama-base FILE --out PREFIX [route options | --lossless [--noise-seed N]]
+//   infernix-certify decode    <artifact> --llama-base FILE --out PREFIX [route options] [--spec ...]
+//   infernix-certify llama-compare --llama-base FILE --logits OTHER --out PREFIX
+//   --text is tokenized whole and cut into --context-token chunks (default 512, the first --chunks, default 100;
+//   0 takes every whole chunk), as llama-perplexity cuts its -f file; --tokens-from takes another base file's
+//   tokens (llama.cpp's tokenization). llama-compare scores a base file llama-perplexity saved of its own logits.
 
 #include "infernix_build_id.h"
 #include "distribution.h"
 #include "iqs_corpus.h"
+#include "llama_kld.h"
 #include "infernix/engine.h"
 #include "product/logits_options.h"
 #include "product/speculative_options.h"
@@ -44,7 +57,9 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -57,6 +72,7 @@ using infernix::TokenId;
 using nlohmann::json;
 namespace perplexity = infernix::perplexity;
 namespace certify    = infernix::certify;
+namespace llama      = infernix::certify::llama;
 
 // IQS-2 metrics: KL over the reference's 256 most probable tokens plus one bucket for the rest, in
 // prefill (scoring candidates) and decode (observed tokens).
@@ -91,6 +107,14 @@ struct Options {
     std::vector<std::uint32_t> windows;
     std::uint32_t capture_tokens = 512;
     std::uint32_t capture_every  = 16;
+    // llama.cpp's KL-divergence format: reference --format llama-kld, the arms' --llama-base, llama-compare.
+    std::string format = "iqs";
+    std::filesystem::path text;
+    std::filesystem::path tokens_from;
+    std::uint32_t context = 512;
+    std::uint32_t chunks  = 100;
+    std::filesystem::path llama_base;
+    std::filesystem::path logits_file;
 };
 
 template <class Integer>
@@ -136,9 +160,15 @@ std::vector<std::uint32_t> parse_list(std::string_view list) {
 }
 
 Options parse(int argc, char** argv) {
-    if (argc < 3) { throw std::invalid_argument("usage: infernix-certify reference|verify|prefill|decode <artifact> ..."); }
-    Options out{.command = argv[1], .artifact = argv[2]};
-    for (int i = 3; i < argc; ++i) {
+    if (argc < 3) {
+        throw std::invalid_argument("usage: infernix-certify reference|verify|prefill|decode|capture|mask <artifact> ... | "
+                                    "llama-compare ...");
+    }
+    Options out{.command = argv[1]};
+    // llama-compare reads two base files and runs no engine.
+    const bool artifact = out.command != "llama-compare";
+    if (artifact) { out.artifact = argv[2]; }
+    for (int i = artifact ? 3 : 2; i < argc; ++i) {
         const std::string_view option = argv[i];
         const auto value              = [&]() -> std::string_view {
             if (++i >= argc) { throw std::invalid_argument(std::string(option) + " needs a value"); }
@@ -204,6 +234,21 @@ Options parse(int argc, char** argv) {
             out.capture_tokens = parse_integer<std::uint32_t>(value(), "tokens");
         } else if (option == "--every") {
             out.capture_every = parse_integer<std::uint32_t>(value(), "every");
+        } else if (option == "--format") {
+            out.format = value();
+            if (out.format != "iqs" && out.format != "llama-kld") { throw std::invalid_argument("--format takes iqs or llama-kld"); }
+        } else if (option == "--text") {
+            out.text = std::string(value());
+        } else if (option == "--tokens-from") {
+            out.tokens_from = std::string(value());
+        } else if (option == "--context") {
+            out.context = parse_integer<std::uint32_t>(value(), "context");
+        } else if (option == "--chunks") {
+            out.chunks = parse_integer<std::uint32_t>(value(), "chunks");
+        } else if (option == "--llama-base") {
+            out.llama_base = std::string(value());
+        } else if (option == "--logits") {
+            out.logits_file = std::string(value());
         } else {
             throw std::invalid_argument("unknown option " + std::string(option));
         }
@@ -261,9 +306,8 @@ json load_json(const infernix::Engine& engine) {
 }
 
 json provenance(const Options& options, const certify::Corpus* corpus) {
-    json out{{"tool", "infernix-certify"},
-             {"command", options.command},
-             {"artifact", artifact_path(options.artifact)}};
+    json out{{"tool", "infernix-certify"}, {"command", options.command}};
+    if (!options.artifact.empty()) { out["artifact"] = artifact_path(options.artifact); }
 #ifdef INFERNIX_BUILD_ID
     out["build"] = INFERNIX_BUILD_ID;
 #endif
@@ -808,15 +852,389 @@ int run_decode(const Options& options) {
     return 0;
 }
 
+// ---------------------------------------------------------------------------- llama.cpp's KL divergence
+
+std::string read_file(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) { throw std::runtime_error("cannot read " + path.string()); }
+    return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+
+// The scored positions of a chunk whose logits llama.cpp's rows hold: n_ctx/2 .. n_ctx-2 (scored position r
+// predicts token r + 1).
+std::vector<std::uint32_t> llama_positions(const llama::BaseHeader& header) {
+    std::vector<std::uint32_t> out;
+    for (std::uint32_t r = header.first_row(); r + 1 < header.context; ++r) { out.push_back(r); }
+    return out;
+}
+
+// An arm's outputs: PREFIX.positions.csv (written as it goes), PREFIX.summary.txt (llama.cpp's summary, also
+// printed) and PREFIX.json.
+void finish_llama_arm(const Options& options, json meta, const llama::Summary& summary, const llama::PositionWriter& rows) {
+    const std::string text = summary.text();
+    std::ofstream out(std::filesystem::path(options.out.string() + ".summary.txt"), std::ios::binary);
+    out << text;
+    if (!out) { throw std::runtime_error("cannot write " + options.out.string() + ".summary.txt"); }
+    std::cout << text;
+    meta["rows"]    = rows.rows();
+    meta["summary"] = summary.to_json();
+    write_json(std::filesystem::path(options.out.string() + ".json"), meta);
+}
+
+void llama_base_json(json& meta, const Options& options, const llama::BaseHeader& header) {
+    meta["llama_base"] = std::filesystem::absolute(options.llama_base).string();
+    meta["context"]    = header.context;
+    meta["chunks"]     = header.chunks;
+    meta["vocab"]      = header.vocab;
+}
+
+int run_llama_reference(const Options& options) {
+    if (options.out.empty()) { throw std::invalid_argument("reference needs --out"); }
+    if (options.text.empty() == options.tokens_from.empty()) {
+        throw std::invalid_argument("reference --format llama-kld takes exactly one of --text and --tokens-from");
+    }
+    if (!options.design && options.kv != "bf16") {
+        throw std::invalid_argument("the lossless reference uses bf16 KV; a KV format's codec needs --design");
+    }
+    const auto started = std::chrono::steady_clock::now();
+    llama::BaseHeader header;
+    if (!options.tokens_from.empty()) {
+        header = llama::BaseReader(options.tokens_from).header();
+    } else {
+        header.context = options.context;
+    }
+    if (header.context < 4 || header.context % 128 != 0) {
+        throw std::invalid_argument("the llama-kld context must be a multiple of 128");
+    }
+    infernix::Engine engine(reference_engine(options, header.context));
+    if (!options.text.empty()) {
+        const std::vector<TokenId> tokens = engine.tokenize_text(read_file(options.text));
+        const std::size_t whole           = tokens.size() / header.context;
+        const std::size_t chunks          = options.chunks == 0 ? whole : std::min<std::size_t>(options.chunks, whole);
+        if (chunks == 0 || (options.chunks != 0 && chunks < options.chunks)) {
+            throw std::runtime_error(options.text.string() + " holds " + std::to_string(whole) + " chunks of " +
+                                     std::to_string(header.context) + " tokens");
+        }
+        header.chunks = static_cast<std::int32_t>(chunks);
+        header.tokens.assign(tokens.begin(), tokens.begin() + static_cast<std::ptrdiff_t>(chunks * header.context));
+    }
+    const std::vector<std::uint32_t> positions = llama_positions(header);
+    std::optional<llama::BaseWriter> writer;
+    for (std::int32_t c = 0; c < header.chunks; ++c) {
+        const std::span<const TokenId> chunk = header.chunk(static_cast<std::size_t>(c));
+        const infernix::ScoreResult scored =
+            engine.score_tokens(std::vector<TokenId>(chunk.begin(), chunk.end()), 1, infernix::ScoreOptions{.logits_positions = positions});
+        const std::size_t vocab = scored.logits.size() / positions.size();
+        if (!writer) {
+            if (header.vocab != 0 && static_cast<std::size_t>(header.vocab) != vocab) {
+                throw std::runtime_error(options.tokens_from.string() + " has a vocabulary of " + std::to_string(header.vocab) +
+                                         ", the artifact " + std::to_string(vocab));
+            }
+            header.vocab = static_cast<std::int32_t>(vocab);
+            writer.emplace(options.out, header);
+        }
+        for (std::size_t k = 0; k < positions.size(); ++k) {
+            writer->write_row(std::span<const float>(scored.logits.data() + k * vocab, vocab));
+        }
+        std::cerr << "llama-kld reference chunk " << c + 1 << "/" << header.chunks << '\n';
+    }
+    writer->finish();
+    json meta            = provenance(options, nullptr);
+    meta["format"]       = "llama-kld";
+    meta["route"]        = options.design ? "design" : "lossless";
+    meta["kv_dtype"]     = options.design ? options.kv : "bf16";
+    meta["logits_dtype"] = options.logits;
+    meta["noise_seed"]   = options.noise_seed;
+    meta["source"]       = options.text.empty() ? json{{"tokens_from", std::filesystem::absolute(options.tokens_from).string()}}
+                                                : json{{"text", std::filesystem::absolute(options.text).string()}};
+    meta["context"]      = header.context;
+    meta["chunks"]       = header.chunks;
+    meta["vocab"]        = header.vocab;
+    meta["load"]         = load_json(engine);
+    meta["seconds"]      = seconds_since(started);
+    write_json(std::filesystem::path(options.out.string() + ".json"), meta);
+    return 0;
+}
+
+int run_llama_prefill(const Options& options) {
+    if (options.out.empty()) { throw std::invalid_argument("prefill needs --out"); }
+    llama::BaseReader base(options.llama_base);
+    const llama::BaseHeader& header = base.header();
+    const auto started              = std::chrono::steady_clock::now();
+    infernix::EngineOptions engine_options;
+    if (options.lossless) {
+        engine_options = reference_engine(options, header.context);
+    } else {
+        if (options.design || options.noise_seed != 0) {
+            throw std::invalid_argument("--design and --noise-seed score the exact route: add --lossless");
+        }
+        apply_route(options, engine_options);
+        engine_options.purpose     = infernix::EnginePurpose::CausalScoring;
+        engine_options.max_context = (header.context + 127) / 128 * 128;
+        engine_options.kv_capacity = infernix::KvCapacityPolicy::explicit_capacity(engine_options.max_context);
+    }
+    infernix::Engine engine(engine_options);
+    const std::vector<std::uint32_t> positions = llama_positions(header);
+    const std::size_t words                    = header.row_words();
+    llama::Summary summary;
+    llama::PositionWriter rows(std::filesystem::path(options.out.string() + ".positions.csv"));
+    for (std::int32_t c = 0; c < header.chunks; ++c) {
+        const std::vector<std::uint16_t> base_rows = base.next_chunk();
+        const std::span<const TokenId> chunk       = header.chunk(static_cast<std::size_t>(c));
+        const infernix::ScoreResult scored =
+            engine.score_tokens(std::vector<TokenId>(chunk.begin(), chunk.end()), 1, infernix::ScoreOptions{.logits_positions = positions});
+        if (scored.logits.size() != positions.size() * static_cast<std::size_t>(header.vocab)) {
+            throw std::runtime_error("the artifact's vocabulary differs from the base file's " + std::to_string(header.vocab));
+        }
+        for (std::size_t k = 0; k < positions.size(); ++k) {
+            const std::uint32_t r          = positions[k];
+            const llama::Position position = llama::compare_logits(
+                std::span<const float>(scored.logits.data() + k * static_cast<std::size_t>(header.vocab), static_cast<std::size_t>(header.vocab)),
+                std::span<const std::uint16_t>(base_rows.data() + k * words, words), chunk[r + 1]);
+            summary.add(position);
+            rows.add(static_cast<std::uint32_t>(c), r, position);
+        }
+        std::cerr << "llama-kld prefill chunk " << c + 1 << "/" << header.chunks << '\n';
+    }
+    base.finish();
+    json meta             = provenance(options, nullptr);
+    meta["arm"]           = "llama_prefill";
+    meta["route"]         = options.lossless ? (options.noise_seed != 0 ? "noise_twin" : (options.design ? "design" : "lossless"))
+                                             : (options.reproducible ? "reproducible" : "default");
+    meta["noise_seed"]    = options.noise_seed;
+    meta["noise_units"]   = options.noise_units;
+    meta["noise_scale"]   = options.noise_scale;
+    meta["kv_dtype"]      = options.kv;
+    meta["logits_dtype"]  = options.logits;
+    meta["prefill_chunk"] = engine.options().prefill_chunk;
+    llama_base_json(meta, options, header);
+    meta["load"]    = load_json(engine);
+    meta["seconds"] = seconds_since(started);
+    finish_llama_arm(options, std::move(meta), summary, rows);
+    return 0;
+}
+
+// The decode path (llama-perplexity -b 1's counterpart): each chunk's scored tokens forced through it in requests
+// of kMaximumConstraintSteps steps, each request's first step (its prompt's prefill) unscored, so every scored
+// distribution comes from a decode step. A step observes the tokens of the KL sum (base log-probability above
+// -16, kl_support), most probable first, kMaximumObservedTokens - 1 per request besides the target: a step with
+// more repeats the identical request with the next tokens, and every repeat must reproduce the first one's
+// target and largest log-probabilities bit for bit.
+int run_llama_decode(const Options& options) {
+    if (options.out.empty()) { throw std::invalid_argument("decode needs --out"); }
+    if (options.concurrency != 1 || options.prefix_reuse) {
+        throw std::invalid_argument("the llama-kld decode arm repeats identical single requests: no --concurrency or --prefix-reuse");
+    }
+    llama::BaseReader base(options.llama_base);
+    const llama::BaseHeader& header = base.header();
+    const auto started              = std::chrono::steady_clock::now();
+    infernix::EngineOptions engine_options;
+    apply_route(options, engine_options);
+    engine_options.max_context                       = (header.context + 127) / 128 * 128;
+    engine_options.kv_capacity                       = infernix::KvCapacityPolicy::explicit_capacity(engine_options.max_context);
+    engine_options.max_concurrency                   = 1;
+    engine_options.pending_timeout_ms                = 3'600'000;
+    engine_options.context_cache.enabled             = false;
+    engine_options.context_cache.host_capacity_bytes = 0;
+    engine_options.speculative                       = options.speculative;
+    if (options.speculative.backend != infernix::SpeculativeBackend::None) {
+        engine_options.speculative.proposal_head = infernix::ProposalHead::Optimized;
+    }
+    infernix::Engine engine(engine_options);
+    constexpr std::uint32_t kSteps = infernix::kMaximumConstraintSteps;
+    constexpr std::size_t kSlice   = infernix::kMaximumObservedTokens - 1;
+    const std::size_t words        = header.row_words();
+    const std::uint32_t first      = header.first_row() + 1; // the first scored token
+    llama::Summary summary;
+    llama::PositionWriter rows(std::filesystem::path(options.out.string() + ".positions.csv"));
+    std::uint64_t requests = 0, observed_tokens = 0;
+    double prefill_seconds = 0, decode_seconds = 0;
+    struct Step {
+        TokenId target = 0;
+        std::span<const std::uint16_t> row;
+        std::vector<TokenId> support;   // ascending
+        std::vector<TokenId> order;     // the support without the target, most probable first
+        std::vector<float> log_probs;   // the evaluated run's, in the support's order
+        float target_log_prob = 0, top_log_prob = 0;
+    };
+    for (std::int32_t c = 0; c < header.chunks; ++c) {
+        const std::vector<std::uint16_t> base_rows = base.next_chunk();
+        const std::span<const TokenId> chunk       = header.chunk(static_cast<std::size_t>(c));
+        // A request forces tokens start - 1 .. start + count - 1 and scores start .. start + count - 1.
+        for (std::uint32_t start = first; start < header.context; start += kSteps - 1) {
+            const std::uint32_t count = std::min(kSteps - 1, header.context - start);
+            std::vector<Step> steps(count);
+            std::size_t passes = 1;
+            for (std::uint32_t k = 0; k < count; ++k) {
+                Step& step  = steps[k];
+                const std::uint32_t r = start + k - 1; // the row of the position predicting token start + k
+                step.target = chunk[start + k];
+                step.row    = std::span<const std::uint16_t>(base_rows.data() + (r - header.first_row()) * words, words);
+                step.support = llama::kl_support(step.row, header.vocab);
+                for (const TokenId token : step.support) {
+                    if (token != step.target) { step.order.push_back(token); }
+                }
+                std::stable_sort(step.order.begin(), step.order.end(), [&](TokenId a, TokenId b) {
+                    return llama::row_log_prob(step.row, a) > llama::row_log_prob(step.row, b);
+                });
+                step.log_probs.assign(step.support.size(), 0.0F);
+                passes = std::max(passes, (step.order.size() + kSlice - 1) / kSlice);
+            }
+            for (std::size_t pass = 0; pass < passes; ++pass) {
+                infernix::RequestOptions request;
+                request.execution.requested_output_tokens = count + 1;
+                request.execution.sampling.temperature    = 0.0F;
+                request.execution.allow_prefix_reuse      = false;
+                request.stop.include_model_defaults       = false;
+                request.execution.constraint.steps.push_back({chunk[start - 1]});
+                request.execution.constraint.observe.push_back({chunk[start - 1]});
+                std::vector<std::span<const TokenId>> slices(count);
+                for (std::uint32_t k = 0; k < count; ++k) {
+                    const Step& step        = steps[k];
+                    const std::size_t begin = std::min(step.order.size(), pass * kSlice);
+                    const std::size_t end   = std::min(step.order.size(), begin + kSlice);
+                    slices[k]               = std::span<const TokenId>(step.order.data() + begin, end - begin);
+                    std::vector<TokenId> observe{step.target};
+                    observe.insert(observe.end(), slices[k].begin(), slices[k].end());
+                    request.execution.constraint.steps.push_back({step.target});
+                    request.execution.constraint.observe.push_back(std::move(observe));
+                }
+                const infernix::GenerationResult result = engine.generate(
+                    engine.prepare_tokens(std::vector<TokenId>(chunk.begin(), chunk.begin() + (start - 1)), false), std::move(request));
+                if (result.constrained_draws.size() != count + 1) {
+                    throw std::runtime_error("chunk " + std::to_string(c) + " forced " + std::to_string(result.constrained_draws.size()) +
+                                             " of " + std::to_string(count + 1) + " tokens");
+                }
+                ++requests;
+                prefill_seconds += result.timings.prefill_seconds;
+                decode_seconds += result.timings.decode_share_seconds;
+                for (std::uint32_t k = 0; k < count; ++k) {
+                    Step& step                            = steps[k];
+                    const infernix::ConstrainedDraw& draw = result.constrained_draws[k + 1];
+                    if (draw.observed_logprobs.size() != slices[k].size() + 1) {
+                        throw std::runtime_error("a decode step reported the wrong observation count");
+                    }
+                    if (pass == 0) {
+                        step.target_log_prob = draw.observed_logprobs[0];
+                        step.top_log_prob    = draw.top_logprob;
+                    } else if (std::memcmp(&step.target_log_prob, &draw.observed_logprobs[0], sizeof(float)) != 0 ||
+                               std::memcmp(&step.top_log_prob, &draw.top_logprob, sizeof(float)) != 0) {
+                        throw std::runtime_error("chunk " + std::to_string(c) + " token " + std::to_string(start + k) +
+                                                 ": a repeated identical request decoded different logits");
+                    }
+                    for (std::size_t j = 0; j < slices[k].size(); ++j) {
+                        const auto at = std::lower_bound(step.support.begin(), step.support.end(), slices[k][j]);
+                        step.log_probs[static_cast<std::size_t>(at - step.support.begin())] = draw.observed_logprobs[j + 1];
+                    }
+                    observed_tokens += slices[k].size() + 1;
+                }
+            }
+            for (std::uint32_t k = 0; k < count; ++k) {
+                Step& step = steps[k];
+                const auto target = std::lower_bound(step.support.begin(), step.support.end(), step.target);
+                if (target != step.support.end() && *target == step.target) {
+                    step.log_probs[static_cast<std::size_t>(target - step.support.begin())] = step.target_log_prob;
+                }
+                // The base's most probable token is in the support; the evaluated run's is it when it holds the
+                // step's largest log-probability.
+                const TokenId top  = llama::base_top(step.row, header.vocab);
+                const auto top_at  = std::lower_bound(step.support.begin(), step.support.end(), top);
+                const bool same    = step.log_probs[static_cast<std::size_t>(top_at - step.support.begin())] == step.top_log_prob;
+                const llama::Position position =
+                    llama::compare_observed(step.row, step.support, step.log_probs, step.target_log_prob, same, step.target);
+                summary.add(position);
+                rows.add(static_cast<std::uint32_t>(c), start + k - 1, position);
+            }
+        }
+        std::cerr << "llama-kld decode chunk " << c + 1 << "/" << header.chunks << " (" << requests << " requests)\n";
+    }
+    base.finish();
+    json meta                  = provenance(options, nullptr);
+    meta["arm"]                = "llama_decode";
+    meta["route"]              = options.reproducible ? "reproducible" : "default";
+    meta["kv_dtype"]           = options.kv;
+    meta["logits_dtype"]       = options.logits;
+    meta["spec"]               = infernix::product::speculative_backend_name(options.speculative.backend);
+    meta["requests"]           = requests;
+    meta["observed_tokens"]    = observed_tokens;
+    meta["prefill_seconds"]    = prefill_seconds;
+    meta["decode_seconds"]     = decode_seconds;
+    llama_base_json(meta, options, header);
+    meta["load"]    = load_json(engine);
+    meta["seconds"] = seconds_since(started);
+    finish_llama_arm(options, std::move(meta), summary, rows);
+    return 0;
+}
+
+// Another base file (llama-perplexity --kl-divergence-base of llama.cpp's own logits, the same tokens) against
+// --llama-base, by the arms' definitions: its log-probabilities are its codes' (those more than 16 below its
+// maximum read as its floor).
+int run_llama_compare(const Options& options) {
+    if (options.out.empty() || options.llama_base.empty() || options.logits_file.empty()) {
+        throw std::invalid_argument("llama-compare needs --llama-base, --logits and --out");
+    }
+    llama::BaseReader base(options.llama_base);
+    llama::BaseReader other(options.logits_file);
+    const llama::BaseHeader& header = base.header();
+    const llama::BaseHeader& theirs = other.header();
+    if (header.context != theirs.context || header.vocab != theirs.vocab || header.chunks != theirs.chunks) {
+        throw std::runtime_error("the base files hold different chunk geometries or vocabularies");
+    }
+    const auto mismatch = std::mismatch(header.tokens.begin(), header.tokens.end(), theirs.tokens.begin());
+    if (mismatch.first != header.tokens.end()) {
+        throw std::runtime_error("the base files hold different tokens (first at index " +
+                                 std::to_string(mismatch.first - header.tokens.begin()) + ")");
+    }
+    const auto started      = std::chrono::steady_clock::now();
+    const std::size_t words = header.row_words();
+    llama::Summary summary;
+    llama::PositionWriter rows(std::filesystem::path(options.out.string() + ".positions.csv"));
+    std::vector<float> log_probs;
+    for (std::int32_t c = 0; c < header.chunks; ++c) {
+        const std::vector<std::uint16_t> base_rows  = base.next_chunk();
+        const std::vector<std::uint16_t> other_rows = other.next_chunk();
+        const std::span<const TokenId> chunk        = header.chunk(static_cast<std::size_t>(c));
+        for (std::uint32_t k = 0; k < header.rows_per_chunk(); ++k) {
+            const std::span<const std::uint16_t> row(base_rows.data() + k * words, words);
+            const std::span<const std::uint16_t> evaluated(other_rows.data() + k * words, words);
+            const TokenId target                   = chunk[header.first_row() + k + 1];
+            const std::vector<TokenId> support     = llama::kl_support(row, header.vocab);
+            log_probs.resize(support.size());
+            for (std::size_t j = 0; j < support.size(); ++j) { log_probs[j] = llama::row_log_prob(evaluated, support[j]); }
+            const bool same = llama::base_top(evaluated, header.vocab) == llama::base_top(row, header.vocab);
+            const llama::Position position =
+                llama::compare_observed(row, support, log_probs, llama::row_log_prob(evaluated, target), same, target);
+            summary.add(position);
+            rows.add(static_cast<std::uint32_t>(c), header.first_row() + k, position);
+        }
+    }
+    base.finish();
+    other.finish();
+    json meta      = provenance(options, nullptr);
+    meta["arm"]    = "llama_compare";
+    meta["logits"] = std::filesystem::absolute(options.logits_file).string();
+    llama_base_json(meta, options, header);
+    meta["seconds"] = seconds_since(started);
+    finish_llama_arm(options, std::move(meta), summary, rows);
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     try {
         const Options options = parse(argc, argv);
-        if (options.command == "reference") { return run_reference(options); }
+        const bool llama_format = options.format == "llama-kld";
+        if (llama_format && options.command != "reference") { throw std::invalid_argument("--format belongs to reference"); }
+        if (!options.llama_base.empty() && options.command != "prefill" && options.command != "decode" &&
+            options.command != "llama-compare") {
+            throw std::invalid_argument("--llama-base belongs to prefill, decode and llama-compare");
+        }
+        if (options.command == "reference") { return llama_format ? run_llama_reference(options) : run_reference(options); }
         if (options.command == "verify") { return run_verify(options); }
-        if (options.command == "prefill") { return run_prefill(options); }
-        if (options.command == "decode") { return run_decode(options); }
+        if (options.command == "prefill") { return options.llama_base.empty() ? run_prefill(options) : run_llama_prefill(options); }
+        if (options.command == "decode") { return options.llama_base.empty() ? run_decode(options) : run_llama_decode(options); }
+        if (options.command == "llama-compare") { return run_llama_compare(options); }
         if (options.command == "capture") { return run_capture(options, options.capture_tokens, options.capture_every); }
         if (options.command == "mask") { return run_mask(options); }
         throw std::invalid_argument("unknown command " + options.command);

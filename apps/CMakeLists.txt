@@ -63,6 +63,7 @@ infernix_stage_runtime_dlls(infernix-perplexity)
 add_executable(infernix-certify
   certify/main.cpp
   certify/iqs_corpus.cpp
+  certify/llama_kld.cpp
   perplexity/distribution.cpp)
 infernix_internal_includes(infernix-certify)
 target_include_directories(infernix-certify PRIVATE

@@ -133,6 +133,30 @@ def qwen3_8_27b_q6(model, recipe, sources):
     _dense_groupwise(model, recipe, Q8, gate_up=Q6)
 
 
+def qwen3_5_gguf_q8_0(model, recipe, sources):
+    """A llama.cpp Q8_0 GGUF of a Qwen3.5 dense model, bit-exact (``tools.convert --gguf``,
+    ``qwen3_5_gguf``): every Q8_0 matrix, the token embedding and the head included, as the
+    identical ``q8_g32_fp16`` words, and every other tensor as its exact BF16 or FP32 value, the GDN
+    gating projections as separate BF16 parents as the official recipes keep them. llama.cpp runs
+    the same weights from the GGUF, so a comparison of the two engines compares their arithmetic."""
+
+    if "num_experts" in model.config:
+        raise ValueError("this recipe requires Qwen3.5 Dense mathematics")
+    for name, parameter in model.parameters.items():
+        if name.endswith(("/gdn/a_projection", "/gdn/b_projection")):
+            recipe.separate(name)
+            continue
+        if not (parameter.projection or name == "text/token_embedding"):
+            continue
+        try:
+            stored = parameter.source.read_encoded(0, 1).format
+        except (TypeError, ValueError):  # no encoded rows (None, or a checkpoint's BF16 matrix)
+            stored = None
+        if stored != Q8:
+            raise ValueError(f"{name}: this recipe stores the Q8_0 matrices of a GGUF import (tools.convert --gguf)")
+        recipe.assign(name, format=Q8, method=import_encoded)
+
+
 def qwen3_6_35b_a3b(model, recipe, sources):
     if "num_experts" not in model.config:
         raise ValueError("this official recipe requires Qwen3.5 MoE mathematics")
@@ -712,6 +736,7 @@ RECIPES = {
     "qwen3_8_27b_nvfp4": qwen3_8_27b_nvfp4,
     "qwen3_8_27b_nvfp4_nvidia": qwen3_8_27b_nvfp4_nvidia,
     "qwen3_8_27b_nvfp4_orcarouter": qwen3_8_27b_nvfp4_orcarouter,
+    "qwen3_5_gguf_q8_0": qwen3_5_gguf_q8_0,
     "qwen3_6_35b_a3b": qwen3_6_35b_a3b,
     "qwen3_5_moe_nvfp4_modelopt": qwen3_5_moe_nvfp4_modelopt,
     "qwen3_8_flash_next_nvfp4": qwen3_8_flash_next_nvfp4,

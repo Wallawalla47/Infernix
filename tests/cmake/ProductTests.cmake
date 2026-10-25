@@ -23,6 +23,14 @@ infernix_add_test(infernix_perplexity_evaluation_test
 target_include_directories(infernix_perplexity_evaluation_test PRIVATE
   ${PROJECT_SOURCE_DIR}/apps/perplexity)
 
+infernix_add_test(infernix_llama_kld_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_llama_kld.cpp"
+          ${PROJECT_SOURCE_DIR}/apps/certify/llama_kld.cpp
+  LIBRARIES infernix_core infernix::json)
+
+target_include_directories(infernix_llama_kld_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/apps/certify)
+
 infernix_add_test(infernix_cli_options_test NEEDS_SOURCE_DIR
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_cli_options.cpp" ${PROJECT_SOURCE_DIR}/apps/cli/options.cpp
   LIBRARIES infernix_runtime_support infernix_product_config infernix_product_logging)

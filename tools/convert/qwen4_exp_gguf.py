@@ -26,15 +26,13 @@ value, so the BF16 bindings hold exactly what the mmproj holds.
 
 from __future__ import annotations
 
-from math import prod
 from pathlib import Path
 from typing import Mapping
 
 import numpy as np
 import torch
 
-from tools.artifact.codecs.ggml import (BY_GGML_ID, GGML_TYPES, GGUF_BF16, GGUF_F16, GGUF_F32, GGUF_Q8_0, decode_q8_0,
-                                        decode_values, require_finite_scales)
+from tools.artifact.codecs.ggml import BY_GGML_ID, GGML_TYPES, require_finite_scales
 from tools.artifact.layouts import ggml_expert_geometry
 from tools.flash_next.ngram import head_tables, layer_multipliers
 
@@ -43,111 +41,13 @@ from .methods import PrepareRequest, PreparedMethod
 from .model import Model, Parameter
 from .qwen3_5 import vision_config
 from .resources import load_resources
+from .sources.gguf_logical import ggml_or_plain, head_rows, permute_vector, plain
 from .sources.gguf_raw import GgufStore
-from .sources.logical import EncodedRows, LogicalSource, select_rows, transpose_source
+from .sources.logical import select_rows, transpose_source
 from .sources.safetensors import SafetensorsSource
 
 NGRAM_TABLE = "per_layer_token_embd.weight"
 IQ4_NL_ROW_FORMAT = "iq4_nl"
-
-
-# ---------------------------------------------------------------------------- sources
-
-
-def ggml_matrix(store: GgufStore, name: str, shape: tuple[int, int]) -> LogicalSource:
-    """A quantized 2-D GGUF tensor: exact values, and its stored rows as EncodedRows."""
-
-    t = store.tensor(name)
-    if t.shape != tuple(shape):
-        raise ValueError(f"{name}: GGUF shape {t.shape} differs from {shape}")
-    k = shape[1]
-
-    if t.ggml_type == GGUF_Q8_0:
-        def encoded(begin: int, end: int) -> EncodedRows:
-            codes, scales = decode_q8_0(np.ascontiguousarray(store.raw(name, begin, end)), end - begin, k)
-            if (codes == -128).any():
-                raise ValueError(f"{name}: Q8_0 code -128 has no q8_g32_fp16 encoding")
-            return EncodedRows("q8_g32_fp16", torch.from_numpy(codes.copy()).reshape(end - begin, k // 32, 32),
-                               torch.from_numpy(scales.copy()).view(torch.float16))
-
-        def values(begin: int, end: int) -> torch.Tensor:
-            rows = encoded(begin // k, -(-end // k))
-            v = rows.codes.to(torch.float64) * rows.scales.to(torch.float64)[..., None]
-            flat = v.reshape(-1)
-            start = begin - begin // k * k
-            return flat[start : start + end - begin]
-
-        return LogicalSource(tuple(shape), f"{store.path}:{name}", values, encoded)
-
-    if t.ggml_type not in BY_GGML_ID:
-        raise ValueError(f"{name}: GGUF type {t.ggml_type} is not a ggml block format this importer stores")
-    fmt = BY_GGML_ID[t.ggml_type]
-
-    def encoded(begin: int, end: int) -> EncodedRows:
-        rows = np.array(store.raw(name, begin, end))  # a private copy of the stored bytes
-        return EncodedRows(fmt.name, torch.from_numpy(rows), torch.empty(0, dtype=torch.uint8))
-
-    def values(begin: int, end: int) -> torch.Tensor:
-        first, last = begin // k, -(-end // k)
-        rows = np.ascontiguousarray(store.raw(name, first, last))
-        flat = torch.from_numpy(decode_values(fmt, rows, last - first, k)).reshape(-1)
-        start = begin - first * k
-        return flat[start : start + end - begin]
-
-    return LogicalSource(tuple(shape), f"{store.path}:{name}", values, encoded)
-
-
-def plain(store: GgufStore, name: str, shape: tuple[int, ...], *, minus_one: bool = False,
-          bf16_exact: bool = True) -> LogicalSource:
-    """An F32/F16/BF16 GGUF tensor's exact values (binary64), optionally g - 1; when ``bf16_exact``
-    every value must be a BF16 value, so a BF16 binding stores exactly what the GGUF holds."""
-
-    t = store.tensor(name)
-    if t.ggml_type not in (GGUF_F32, GGUF_F16, GGUF_BF16):
-        raise ValueError(f"{name}: expected an F32, F16 or BF16 tensor")
-    if prod(t.shape) != prod(shape):
-        raise ValueError(f"{name}: GGUF shape {t.shape} differs from {shape}")
-    cache: list[torch.Tensor] = []
-
-    def read(begin: int, end: int) -> torch.Tensor:
-        if not cache:
-            v = torch.from_numpy(store.plain(name).reshape(-1).astype(np.float64))
-            if minus_one:
-                v = v - 1.0  # exact in binary64
-            if bf16_exact and not torch.equal(v.to(torch.bfloat16).to(torch.float64), v):
-                raise ValueError(f"{name}: a value is not exact in BF16" + (" after undoing +1" if minus_one else ""))
-            cache.append(v)
-        return cache[0][begin:end]
-
-    return LogicalSource(tuple(shape), f"{store.path}:{name}" + (" - 1" if minus_one else ""), read)
-
-
-def head_rows(source: LogicalSource, heads: int, rows_per_head: int, key_heads: int, row_offset: int = 0) -> LogicalSource:
-    """Rows of ``heads`` value heads in Hugging Face order from ggml's tiled order.
-
-    Hugging Face head h = kk * R + r (key head kk, R value heads per key head) is ggml slot
-    g = r * key_heads + kk (llama.cpp ``_LinearAttentionVReorderBase``; its graph pairs value slot g
-    with key head g % key_heads)."""
-
-    per_key = heads // key_heads
-    ranges = []
-    for h in range(heads):
-        g = (h % per_key) * key_heads + h // per_key
-        first = row_offset + g * rows_per_head
-        ranges.append((first, first + rows_per_head))
-    return select_rows(source, tuple(ranges))
-
-
-def permute_vector(source: LogicalSource, heads: int, key_heads: int) -> LogicalSource:
-    """A per-value-head vector (one element per head) in Hugging Face order."""
-
-    per_key = heads // key_heads
-    order = [(h % per_key) * key_heads + h // per_key for h in range(heads)]
-
-    def read(begin: int, end: int) -> torch.Tensor:
-        return source.values()[order][begin:end]
-
-    return LogicalSource(source.shape, f"heads({source.label})", read)
 
 
 # ---------------------------------------------------------------------------- expert banks
@@ -371,16 +271,6 @@ class _Builder:
         taps = c["ple_conv_kernel_size"]
         conv = plain(self.store, blk + "ple_conv1d.weight", (width, taps))
         self.add(p + "convolution", transpose_source(conv, (1, 0), (taps, width)))
-
-
-def ggml_or_plain(store: GgufStore, name: str, shape: tuple[int, int]) -> LogicalSource:
-    """A 2-D GGUF tensor: stored rows for ggml formats and Q8_0, exact values for BF16/F32/F16 (a
-    BF16 binding: every value must be a BF16 value, so an F32 matrix is never rounded silently)."""
-
-    t = store.tensor(name)
-    if t.ggml_type in (GGUF_F32, GGUF_F16, GGUF_BF16):
-        return plain(store, name, shape)
-    return ggml_matrix(store, name, shape)
 
 
 class Bf16ExactSource:
