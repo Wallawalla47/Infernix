@@ -138,7 +138,7 @@ enum class GdnTreeRecordRoute : std::uint8_t {
     Walk,
     // FastPath::GdnTreeClosedForm: every column from the row's initial state and its ancestors'
     // deltas in closed form (one solve level per depth), FP32 in another order: within rounding of
-    // the walk and the FP64 recurrence, not bit-identical.
+    // the walk and the FP64 recurrence, not bit-identical. Rows wider than 16 columns walk (Walk's bits).
     ClosedForm,
 };
 

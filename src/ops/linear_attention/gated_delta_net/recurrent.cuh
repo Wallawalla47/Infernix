@@ -90,15 +90,20 @@ __device__ __forceinline__ RawQkLane load_raw_qk_lane(const __nv_bfloat16* base,
     return out;
 }
 
+// The L2 normalization's scale of a warp's 128 values, 1 / sqrt(sum of squares + eps), in every lane.
+__device__ __forceinline__ float qk_inverse_norm(const float (&value)[kQkPerLane], int lane) {
+    float sum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < kQkPerLane; ++i) { sum += value[i] * value[i]; }
+    sum       = warp_reduce_sum(sum);
+    float inv = lane == 0 ? rsqrtf(sum + kQkL2NormEps) : 0.0f;
+    return __shfl_sync(kFullWarpMask, inv, 0);
+}
+
 template <bool Normalize>
 __device__ __forceinline__ void normalize_qk_lane(float (&value)[kQkPerLane], int lane) {
     if constexpr (Normalize) {
-        float sum = 0.0f;
-#pragma unroll
-        for (int i = 0; i < kQkPerLane; ++i) { sum += value[i] * value[i]; }
-        sum       = warp_reduce_sum(sum);
-        float inv = lane == 0 ? rsqrtf(sum + kQkL2NormEps) : 0.0f;
-        inv       = __shfl_sync(kFullWarpMask, inv, 0);
+        const float inv = qk_inverse_norm(value, lane);
 #pragma unroll
         for (int i = 0; i < kQkPerLane; ++i) { value[i] *= inv; }
     }

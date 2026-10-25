@@ -2009,6 +2009,12 @@ std::vector<ops::SpeculativeTreeRow> nested_gdn_rows() {
             host_row({-1, 0, 1, 2, 3, 4, 5, 6, 0, 8, 8, 10, 10, 12, 5, 14}, 7, true)};
 }
 
+// Rows wider than 16 columns, which the closed form's route walks: a 24-column K=15 tree with side
+// chains below main columns 0, 2 and 5 and below a side column, and a 20-column chain row.
+std::vector<ops::SpeculativeTreeRow> wide_gdn_rows() {
+    return {host_row(branched_parents(15, {{0, 3}, {2, 2}, {5, 1}, {16, 2}}), 15, true), chain_row(19, 15)};
+}
+
 int gdn_record_case(int value_heads, const std::vector<ops::SpeculativeTreeRow>& rows, int n) {
     constexpr int dim = 128, qk_heads = 16, slots = 4;
     const int batch = static_cast<int>(rows.size());
@@ -2242,6 +2248,10 @@ int gdn_record_case(int value_heads, const std::vector<ops::SpeculativeTreeRow>&
     }
     std::cout << label << " closed form: " << differing << " of " << outputs
               << " outputs differ from the walk's bits; worst relative error against FP64 " << worst << '\n';
+    // Rows wider than the closed form's 16 columns walk under its route.
+    if (n > 16) {
+        failures += verify_exact((label + " closed form route above 16 columns walks").c_str(), closed.out, tree.out);
+    }
     return failures;
 }
 
@@ -2302,6 +2312,8 @@ INFERNIX_OP_TEST(speculative_tree) {
         failures += gdn_record_case(48, gdn_rows(4, 9), 9);
         failures += gdn_record_case(32, gdn_rows(4, 9), 9);
         failures += gdn_record_case(48, nested_gdn_rows(), 16);
+        failures += gdn_record_case(48, wide_gdn_rows(), 24);
+        failures += gdn_record_case(32, wide_gdn_rows(), 24);
     } catch (const std::exception& error) {
         std::cerr << "speculative tree test threw: " << error.what() << '\n';
         return 1;

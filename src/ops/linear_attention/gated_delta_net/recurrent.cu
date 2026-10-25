@@ -261,8 +261,8 @@ void launch_recurrent_tree_record(const Tensor& q, const Tensor& k, const Tensor
             scale,
         };
         const auto* trees = static_cast<const SpeculativeTreeRow*>(tree_rows.data);
-        if (closed_form) {
-            // FastPath::GdnTreeClosedForm (tree_closed_form.cuh).
+        if (closed_form && q.ne[2] <= kTreeClosedFormColumns) {
+            // FastPath::GdnTreeClosedForm (tree_closed_form.cuh); wider rows walk, which is faster there.
             CUDA_CHECK(pdl::launch_consumer({grid, block, 0, stream}, recurrent_tree_closed_form_kernel<State>,
                                             access, trees));
         } else {

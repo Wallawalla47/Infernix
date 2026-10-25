@@ -136,9 +136,10 @@ void print_help(const char* program) {
     std::printf("Usage: %s [options]\n\n"
                 "  --profile 27b|35b|all       Registered all-layer geometry (default all).\n"
                 "  --component fold|recurrent|all|tree\n"
-                "                              Measured component (default all; tree: a K=7 tree's\n"
-                "                              record, walk and closed form, at 12 and 16 columns).\n"
-                "  --width T                   One physical width in [2,16] (tree: [9,16]).\n"
+                "                              Measured component (default all; tree: a K=7 or K=15\n"
+                "                              tree's record, walk and closed form, at 12, 16, 20 and\n"
+                "                              24 columns and 1-4 rows).\n"
+                "  --width T                   One physical width in [2,16] (tree: [9,32]).\n"
                 "  --batch B                   One active row count in [1,8].\n"
                 "  --commits one|dense|mixed|all\n"
                 "                              Commit policy (default all).\n"
@@ -163,7 +164,8 @@ Options parse_options(int argc, char** argv) {
         } else if (argument == "--component") {
             options.component = parse_component(next("component"));
         } else if (argument == "--width") {
-            options.exact_width = parse_i32(next("width"), "width", 2, 16);
+            // The tree component checks its own range (9..32); the others' profiles stop at 16.
+            options.exact_width = parse_i32(next("width"), "width", 2, 32);
         } else if (argument == "--batch") {
             options.exact_batch = parse_i32(next("batch"), "batch", 1, 8);
         } else if (argument == "--commits") {
@@ -200,6 +202,7 @@ std::vector<Profile> selected_profiles(ProfileSelection selection) {
 
 std::vector<std::int32_t> selected_widths(const Profile& profile, std::int32_t exact_width) {
     if (exact_width == 0) return profile.widths;
+    if (exact_width > 16) { throw std::invalid_argument("--width above 16 is for --component tree only"); }
     return {exact_width};
 }
 
@@ -392,14 +395,18 @@ DeviceBuffer make_i32(const std::vector<std::int32_t>& values) {
     return result;
 }
 
-// A K=7 verification tree of `width` columns (9..16): the main chain 0..7, then side columns below
-// the early main columns and their side columns, in the builder's draw order. Only the fields the
-// GDN record reads are filled (parents, depths, children).
+// A K=7 verification tree of `width` columns (9..16), or a K=15 one of 17..32: the main chain, then
+// side columns below the early main columns and their side columns, in the builder's draw order. Only
+// the fields the GDN record reads are filled (parents, depths, children).
 ops::SpeculativeTreeRow bench_tree_row(std::int32_t width) {
-    static constexpr std::int8_t kParents[16] = {-1, 0, 1, 2, 3, 4, 5, 6, 0, 1, 8, 2, 3, 9, 4, 12};
+    static constexpr std::int8_t kParents7[16]  = {-1, 0, 1, 2, 3, 4, 5, 6, 0, 1, 8, 2, 3, 9, 4, 12};
+    static constexpr std::int8_t kParents15[32] = {-1, 0, 1,  2,  3,  4, 5, 6,  7, 8, 9,  10, 11, 12, 13, 14,
+                                                   0,  1, 16, 2,  3,  18, 4, 17, 5, 6, 21, 7,  8,  9,  24, 10};
+    const bool wide              = width > 16;
+    const std::int8_t* kParents  = wide ? kParents15 : kParents7;
     ops::SpeculativeTreeRow row{};
     row.nodes      = width;
-    row.main_depth = 7;
+    row.main_depth = wide ? 15 : 7;
     row.tree       = 1;
     for (int c = 0; c < ops::kSpeculativeTreeMaxNodes; ++c) {
         row.parent[c]       = -1;
@@ -493,6 +500,15 @@ public:
         Tensor out(record_out_.p, DType::BF16, {kStateDim, profile_.value_heads, width_, batch_});
         ops::gated_delta_net_replay_record(q, k, v, g, beta, scale(), states, valid, initial, trees, key_record,
                                            value_record, gate_record, out, stream, route);
+    }
+
+    // FNV-1a over the outputs' bytes, to compare two forms' bits across runs.
+    [[nodiscard]] std::uint64_t output_hash() const {
+        std::vector<std::uint8_t> bytes(record_out_.bytes);
+        record_out_.copy_to_host(bytes.data(), bytes.size());
+        std::uint64_t hash = 1469598103934665603ULL;
+        for (const std::uint8_t byte : bytes) { hash = (hash ^ byte) * 1099511628211ULL; }
+        return hash;
     }
 
 private:
@@ -637,11 +653,13 @@ void run_tree_point(const Profile& profile, std::int32_t width, std::int32_t bat
         const Measurement measurement =
             measure_component([&](cudaStream_t stream) { resources.launch_tree(stream, route); }, flush,
                               options.warmup, options.repeat);
+        CUDA_CHECK(cudaDeviceSynchronize());
         std::printf("component=tree form=%-6s profile=%-8s T=%2d B=%d gpu_warm=%8.2f us gpu_cold=%8.2f us "
-                    "host_submit=%7.2f us per_round_all_layers_cold=%8.1f us\n",
+                    "host_submit=%7.2f us per_round_all_layers_cold=%8.1f us out=%016llx\n",
                     route == ops::GdnTreeRecordRoute::Walk ? "walk" : "closed", profile.name, width, batch,
                     measurement.warm.median_us, measurement.cold.median_us, measurement.host_median_us,
-                    measurement.cold.median_us * profile.layers);
+                    measurement.cold.median_us * profile.layers,
+                    static_cast<unsigned long long>(resources.output_hash()));
     }
 }
 
@@ -649,12 +667,16 @@ int run(const Options& options) {
     bench::L2FlushBuffer flush(options.flush_bytes);
     if (options.component == ComponentSelection::Tree) {
         const std::vector<std::int32_t> widths =
-            options.exact_width != 0 ? std::vector<std::int32_t>{options.exact_width} : std::vector<std::int32_t>{12, 16};
-        const std::vector<std::int32_t> batches =
-            options.exact_batch != 0 ? std::vector<std::int32_t>{options.exact_batch} : std::vector<std::int32_t>{1, 4};
+            options.exact_width != 0 ? std::vector<std::int32_t>{options.exact_width}
+                                     : std::vector<std::int32_t>{12, 16, 20, 24};
+        const std::vector<std::int32_t> batches = options.exact_batch != 0
+                                                      ? std::vector<std::int32_t>{options.exact_batch}
+                                                      : std::vector<std::int32_t>{1, 2, 3, 4};
         for (const Profile& profile : selected_profiles(options.profiles)) {
             for (const std::int32_t width : widths) {
-                if (width < 9) { throw std::invalid_argument("--component tree needs a width of 9..16"); }
+                if (width < 9 || width > 32) {
+                    throw std::invalid_argument("--component tree needs a width of 9..32");
+                }
                 for (const std::int32_t batch : batches) { run_tree_point(profile, width, batch, flush, options); }
             }
         }

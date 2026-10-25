@@ -206,13 +206,18 @@ branch state from the initial state along its root path. Replay is exact: every 
 the chain recurrence of its root path, bit for bit. The persistent recurrent and convolution state
 is not modified by verification (ReplaySSM record mode), so rejected branches need no rollback.
 
-The `gdn-tree-closed-form` fast-path candidate (`ops::GdnTreeRecordRoute::ClosedForm`; TreeWY,
+The `gdn-tree-closed-form` fast path (on by default on the NVFP4 27B and the 35B-A3B; `ops::GdnTreeRecordRoute::ClosedForm`; TreeWY,
 arXiv 2608.20961) replaces the walk's W dependent steps: along a column's root path the transition
 unrolls to `s_c = exp(G_c) s_0 + sum_a exp(G_c - G_a) u_a k_a^T` (G the summed gates), so each
 column's delta `u_c` needs only its ancestors' deltas and `s_0 k_c` (one solve level per depth), and
-its output `scale (exp(G_c) s_0 q_c + sum_a exp(G_c - G_a) (k_a . q_c) u_a)`. A CTA computes its 16
-state rows against every column at once and follows the tree's ancestor pairs for the rest. FP32 in
-another order than the walk, its outputs are within BF16 rounding of the FP64 recurrence but not
+its output `scale (exp(G_c) s_0 q_c + sum_a exp(G_c - G_a) (k_a . q_c) u_a)`. It runs on the walk's
+grid with at least the walk's occupancy: each warp of a CTA holds four of the tile's 16 state rows (the
+walk's registers), forms `s_0 k_c` and `s_0 q_c` for them and every column in one transposed reduction
+per eight columns, and solves its rows' deltas on its own, one warp barrier per depth level; keys and
+queries stay in shared memory as raw BF16 with one normalization scale per column (11.7 KiB, six CTAs
+per SM); root paths and summed gates take one thread per column. It serves rows of up to 16 columns;
+wider rows (K = 15 trees, whose solve runs up to 16 levels deep) walk, which measured faster there. FP32
+in another order than the walk, its outputs are within BF16 rounding of the FP64 recurrence but not
 bit-identical; the records are the same copies.
 
 A tree widens the verification block, which selects other GEMM tiles and attention routes, so the
