@@ -2,7 +2,6 @@
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
 
 #include "core/device.h"
-#include "core/temporary_switches.h"
 #include "ops/common/math.cuh"
 #include "ops/common/warp.cuh"
 #include "ops/linear/nvfp4/nvfp4_a16_slice_ring_mma.cuh"
@@ -53,7 +52,10 @@ constexpr auto kLaunchers = make_launchers(std::make_index_sequence<1>{});
 
 void nvfp4_linear_swiglu_invariant_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                           cudaStream_t stream) {
-    if (x.ne[1] >= 17 && temporary_switches::nvfp4_a16_tile()) {
+    // From 17 columns (the reproducible route's verification of the NVFP4 27B MLP) the slice-major ring tile,
+    // bit-identical to the sliced-K tiles: 0.47-0.71x their time at 17-129 columns; the reproducible route's
+    // DFlash2 decode +19 % (2026-10-25).
+    if (x.ne[1] >= 17) {
         nvfp4_linear_swiglu_invariant_ring_launch(x, weight, out, stream);
         return;
     }

@@ -104,10 +104,6 @@ infernix_add_family_op_test(infernix_fp8_row_f32_test FAMILY projection
 infernix_add_family_op_test(infernix_rg16_linear_test FAMILY projection
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_rg16_linear.cu"
   LIBRARIES infernix_ops)
-# TEMPORARY with INFERNIX_TMP_RG16_STREAM: the streamed GEMV's widths against the same exact oracle.
-add_test(NAME infernix_rg16_linear_stream_test COMMAND ${infernix_rg16_linear_test_COMMAND})
-set_tests_properties(infernix_rg16_linear_stream_test
-  PROPERTIES ENVIRONMENT "INFERNIX_TMP_RG16_STREAM=1" SKIP_RETURN_CODE 77)
 # GGUF block projections against an independent exact oracle (every ggml format, K, width).
 infernix_add_family_op_test(infernix_ggml_linear_test FAMILY projection
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ggml_linear.cpp"

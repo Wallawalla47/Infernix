@@ -102,8 +102,20 @@ constexpr std::array kQualified{
     Qualification{FastPath::Fp8A8Pair, {DenseKernels::Fp8Row, false, KvCacheStorage::Q4KeyVq2Value}},
     // INT8 KV by the owner's decision (2026-10-24), although its decode tail failed (above): every KV format.
     Qualification{FastPath::Fp8A8Pair, {DenseKernels::Fp8Row, false, KvCacheStorage::Int8Group64}},
-    // fp8-a8-pair-block32 (the same terms with per-32-value block scales) has no entry: it runs only as
-    // a --fast-path candidate until its op determinism, speed and INT8 decode gate are measured.
+    // fp8-a8-pair-block32: the same terms with per-32-value block scales, wherever fp8-a8-pair is registered
+    // (the dispatch takes it first), by the owner's decision of 2026-10-25 (a path tied in speed with the default
+    // but more precise becomes the default ahead of its gate). Not less precise anywhere: a value is carried
+    // exactly within 2^14 of its 32-value block's maximum instead of its column's (test_fp8_a8.cpp's
+    // derivation), the same E4M3 products and FP32 sums. Speed: recipe C, INT8 KV, pp4096 and pp16384 within
+    // 0.03 % of the pair route (4 blocks each, the control's repeat within 0.2 %); the op within +-2 % at the five
+    // Flash-Next FP8 problems; determinism: every call and graph replay reproduces its bits (2026-10-25).
+    Qualification{FastPath::Fp8A8PairBlock32, {DenseKernels::Fp8Row, false, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::Fp8A8PairBlock32, {DenseKernels::Fp8Row, false, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::Fp8A8PairBlock32, {DenseKernels::Fp8Row, false, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::Fp8A8PairBlock32, {DenseKernels::Fp8Row, false, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::Fp8A8PairBlock32, {DenseKernels::Fp8Row, false, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::Fp8A8PairBlock32, {DenseKernels::Fp8Row, false, KvCacheStorage::Vq2}},
+    Qualification{FastPath::Fp8A8PairBlock32, {DenseKernels::Fp8Row, false, KvCacheStorage::Q4KeyVq2Value}},
     // NVIDIA NVFP4 Dense8: sampled MTP drafts (2026-10-17). They change no logit, so the gate is the
     // sampler's distribution (2,000 seeded requests per arm, chi-square per position against plain
     // decoding, INT8 KV) and greedy identity (INT8, NVFP4), which no KV format affects; speed on
@@ -428,6 +440,15 @@ constexpr std::array kQualified{
     Qualification{FastPath::DFlash2Pairs, {DenseKernels::Mxfp8, true, KvCacheStorage::Fp8KeyNvfp4Value}},
     Qualification{FastPath::DFlash2Pairs, {DenseKernels::Mxfp8, true, KvCacheStorage::Vq2}},
     Qualification{FastPath::DFlash2Pairs, {DenseKernels::Mxfp8, true, KvCacheStorage::Q4KeyVq2Value}},
+    // On by the owner's decision of 2026-10-25 (a new path measured faster goes on by default before its
+    // quality gate; the owner may turn it off once the gating regime is settled), in the configuration
+    // measured, each against the default route (ABBA, RTX 5090, 2026-10-25):
+    // NVIDIA FP4-Local, INT8 KV: screened-lm-head, plain decode (pp1024+tg256) +7.5 % (4 of 4 blocks, worst
+    // +7.2 %), MTP 3 with --lm-head-draft +3.7 % (4 of 4, worst +3.3 %); it runs where the artifact carries the
+    // LM head's screen (select_fast_paths). f16-accumulate-prefill, pp32768 +5.3 % with the route's row raster
+    // and B fragments (3 of 3), pp4096 neutral.
+    Qualification{FastPath::ScreenedLmHead, {DenseKernels::Mxfp8, false, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::F16AccumulatePrefill, {DenseKernels::Mxfp8, false, KvCacheStorage::Int8Group64}},
 };
 
 const char* dense_name(DenseKernels dense) {
@@ -562,9 +583,9 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
     // Every Flash-Next artifact's BF16 router (512 experts plus the shared expert's score).
     case FastPath::RouterMma: return true;
     // Generation's head through its 2-bit screen (a GGUF import's head has no exact rescore). The head
-    // is not part of the configuration: the loader refuses an artifact without the screen
+    // is not part of the configuration: as a candidate the loader refuses an artifact without the screen
     // (--screen-heads) or with a head other than BF16 or row-split q8_g32_fp16 (every non-GGUF recipe
-    // stores one of those).
+    // stores one of those); qualified, it runs where the loader bound the screen (select_fast_paths).
     case FastPath::ScreenedLmHead:
         return options.purpose == EnginePurpose::Generation && configuration.dense != DenseKernels::Ggml;
     // Every Flash-Next artifact's 36 GDN layers.
@@ -647,8 +668,11 @@ FastPathSelection select_fast_paths(const execution::Parameters& parameters, con
         const bool candidate = std::find(options.fast_path_candidates.begin(),
                                          options.fast_path_candidates.end(),
                                          path) != options.fast_path_candidates.end();
+        // A qualified screened-lm-head needs the screen the loader bound (artifacts converted with
+        // --screen-heads); without it the configuration keeps the exact head.
         const bool qualified = options.fast_paths && fast_path_applies(path, out.configuration, options) &&
-                               fast_path_qualified(path, out.configuration);
+                               fast_path_qualified(path, out.configuration) &&
+                               (path != FastPath::ScreenedLmHead || parameters.output_head_screen.has_value());
         if (candidate || qualified) { out.paths.push_back(path); }
     }
     return out;

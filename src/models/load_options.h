@@ -33,11 +33,14 @@ struct LoadOptions {
     bool stream_experts = false;
     // Qwen4Exp DFlash2: the companion artifact of the drafter (SpeculativeOptions::draft_model).
     std::filesystem::path draft_model;
-    // Qwen4Exp: bind the artifact's 2-bit screen of the proposal head (the MTP drafter's screened draft
-    // head, the temporary switch INFERNIX_TMP_SCREENED_DRAFT_HEAD) or of the LM head (the
-    // screened-lm-head fast path's candidate). An artifact without the screen is refused.
-    bool screened_draft_head = false;
-    bool screened_lm_head    = false;
+    // Qwen4Exp: the artifact's 2-bit screens (--screen-heads), each bound when present for its consumer (an
+    // artifact without them loads as before): the MTP drafter's proposal head (Generation with --spec mtp
+    // --lm-head-draft) and the LM head (Generation with fast paths, where screened-lm-head may be selected).
+    // screened_lm_head (the fast path asked for as a candidate) needs the LM head's screen: an artifact
+    // without it is refused.
+    bool proposal_head_screen = false;
+    bool lm_head_screen       = false;
+    bool screened_lm_head     = false;
     // Qwen3.5 (EngineOptions::embedding_host): the token embedding stays in pinned host memory, gathered
     // zero-copy, as an artifact with offloaded experts already keeps it.
     bool embedding_host = false;
@@ -105,6 +108,14 @@ struct LoadOptions {
             .reference_kv             = options.reference ? options.kv_cache : KvCacheStorage::BFloat16,
             .expert_a4_activations    = options.expert_a4_activations,
             .draft_model              = options.speculative.draft_model,
+            // The screens are Qwen4Exp's (a Qwen3.5 Program compares these options with its loaded ones).
+            .proposal_head_screen     = architecture == Architecture::Qwen4Exp &&
+                                    options.purpose == EnginePurpose::Generation &&
+                                    options.speculative.backend == SpeculativeBackend::Mtp &&
+                                    options.speculative.proposal_head == ProposalHead::Optimized,
+            .lm_head_screen           = architecture == Architecture::Qwen4Exp &&
+                                    options.purpose == EnginePurpose::Generation && options.fast_paths &&
+                                    !options.lossless,
             .screened_lm_head         = std::find(options.fast_path_candidates.begin(), options.fast_path_candidates.end(),
                                                   FastPath::ScreenedLmHead) != options.fast_path_candidates.end(),
             .embedding_host           = options.embedding_host};

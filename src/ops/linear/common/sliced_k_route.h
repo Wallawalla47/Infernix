@@ -4,17 +4,18 @@
 // Q4/Q5/Q6 RowSplit sliced-K launches take, and the CTA shape (block rows, cp.async ring depth) of
 // a pipelined launch.
 //
-// The route is a temporary A/B switch, read once per process from the environment
-// (core/temporary_switches.h; the startup log lists it):
-// - Release (the default): today's sliced-K kernels.
-// - Pipelined (INFERNIX_TMP_GW_SLICED_PIPELINE=1): the pipelined kernel at the schedule's own
-//   block rows, with a 1-4 slot ring in dynamic shared memory sized for the launch and a
-//   vectorised A decode.
-// - OneWave (INFERNIX_TMP_GW_ONE_WAVE=1, which implies the pipelined kernel): block rows may also
-//   double, so a call whose CTAs need a second wave at the schedule's rows can fit one.
-// Every shape keeps the schedule's K warps and reduction, so a pipelined launch returns the
-// release kernel's bits. INFERNIX_TMP_GW_SHAPE=<rows>x<stages> (for example 32x3) forces one shape
-// wherever it is admissible, for the op sweeps that tune the rule.
+// The routes:
+// - OneWave (every launch): the pipelined kernel, whose block rows may also double, so a call whose
+//   CTAs need a second wave at the schedule's rows can fit one. The column-invariant GEMVs it serves
+//   ran 15-33 % faster; the reproducible route's decode +14.6 % on the groupwise 27B (MTP 3), the
+//   default route's unchanged (2026-10-25).
+// - Pipelined: the pipelined kernel at the schedule's own block rows, with a 1-4 slot ring in dynamic
+//   shared memory sized for the launch and a vectorised A decode.
+// - Release: the original sliced-K kernels.
+// Every shape keeps the schedule's K warps and reduction, so each route returns the release kernel's
+// bits; Pipelined and Release remain for the tests that check it. INFERNIX_TMP_GW_SHAPE=<rows>x<stages>
+// (for example 32x3, a temporary switch) forces one shape wherever it is admissible, for the op sweeps
+// that tune the rule.
 
 #include <cstddef>
 #include <cstdint>

@@ -1,5 +1,4 @@
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_plan.h"
-#include "core/temporary_switches.h"
 #include "ops/linear/nvfp4/nvfp4_a16_slice_ring_mma.cuh"
 #include "ops/linear/nvfp4/nvfp4_template_launch.cuh"
 #include "ops/linear/nvfp4/nvfp4_instances.cuh"
@@ -134,7 +133,10 @@ void launch_matrix(const Tensor& x, const Weight& weight, Tensor& residual, bool
 
 void nvfp4_linear_add_invariant_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                        cudaStream_t stream) {
-    if (x.ne[1] >= 17 && temporary_switches::nvfp4_a16_tile()) {
+    // The slice-major ring tile, bit-identical to the sliced-K tiles, where it is faster (2026-10-25): [5120,6144]
+    // from 17 columns (0.45-0.68x), [5120,17408] from 32 (1.23x at 17, 1.06x at 24, 0.93x at 32, 0.52-0.85x
+    // beyond); the reproducible route's DFlash2 decode +19 %.
+    if (x.ne[1] >= (weight.k == 17408 ? 32 : 17)) {
         nvfp4_linear_add_invariant_ring_launch(x, weight, residual, stream);
         return;
     }

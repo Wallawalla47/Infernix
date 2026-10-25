@@ -10901,7 +10901,7 @@ every arm above passes `--ngram-residency volume`. The `ggml_gate_up_bf16` insta
 (half sub-scales) holds 40 bytes of stack for loop invariants outside its MMA loop (allow-listed,
 like the exact `gate_up_tile_ggml`'s 40 bytes).
 
-### 19.3.30 Screened heads: a 2-bit screen of the draft and LM heads (2026-10-23, built, not measured)
+### 19.3.30 Screened heads: a 2-bit screen of the draft and LM heads (2026-10-23, measured 2026-10-25)
 
 Basalt's two-stage heads (B-03): every row of a vocabulary head is scored from a 2-bit copy and only the
 rows near each column's best are computed with the head itself. The MTP drafter's proposal head
@@ -10944,9 +10944,12 @@ They are the artifact's last objects; the loader binds a copy only for the path 
   which are exact.
 
 **Where it runs.**
-- `INFERNIX_TMP_SCREENED_DRAFT_HEAD=1` (temporary A/B switch, default off, value in the startup log):
-  the MTP drafter's draft head with `--lm-head-draft`. Draft-only: verification is unchanged.
-- `--fast-path screened-lm-head` (unqualified candidate): decode and verification rounds of at most 16
+- The MTP drafter's draft head with `--lm-head-draft`, whenever the artifact carries the proposal head's
+  screen (and the head is `q4_g64_fp16` at H 2,560). Draft-only: verification is unchanged, greedy text
+  is the same, a seeded sampled request may draw other text (the drafts and their laws differ).
+- `screened-lm-head` (fast path; on by default for NVIDIA FP4-Local with INT8 KV, where it was measured
+  faster, by the owner's decision ahead of its quality gate; elsewhere `--fast-path screened-lm-head`;
+  it runs only where the loader bound the LM head's screen): decode and verification rounds of at most 16
   columns whose every row is greedy, without penalties, grammar or token constraint; other rounds keep
   the exact head and the two kinds keep their own graphs (request-coupling). Rows outside the selection
   keep screen scores, which only an argmax reads there. Sampled rows are excluded because their
@@ -10954,9 +10957,12 @@ They are the artifact's last objects; the loader binds a copy only for the path 
   about half a logit), which no cheap certified bound limits; Basalt's approximate tail cost KLD
   +0.0017.
 
-**Estimates (not measured).** Draft step: 94 MB instead of 178 MB, about −0.05 ms of 0.24 ms, plus two
-small launches; Basalt's figures give struct text +2-3 %. Verification on FP4-Local: about 0.18 GB
-instead of 1.27 GB per round, about −0.6 ms. A/B plan: `.local/review-2026-10-22/impl/b03-screen.md`.
+**Measured (ABBA, RTX 5090, NVIDIA FP4-Local, INT8 KV, 2026-10-25).** The screened draft head, MTP 3 with
+`--lm-head-draft`: decode +1.6 % (4 of 4 blocks, worst +1.2 %); with automatic draft lengths +6.3 % pooled,
+but that bench's control repeat itself moved +3.6 % (the lengths vary between runs). screened-lm-head:
+plain decode (pp1024+tg256) +7.5 % (4 of 4, worst +7.2 %), MTP 3 +3.7 % (4 of 4, worst +3.3 %). The
+estimates were draft step 94 MB instead of 178 MB and verification about 0.18 GB instead of 1.27 GB per
+round.
 
 ---
 

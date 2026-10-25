@@ -211,8 +211,11 @@ int main() {
                       "gdn-f16-accumulate applies everywhere and keeps a request invariant");
     failures += check(q::fast_path_applies(FastPath::Fp16GdnState, int8_24, options) &&
                           !q::couples_requests(FastPath::Fp16GdnState) &&
-                          !q::fast_path_qualified(FastPath::Fp16GdnState, int8_24),
-                      "fp16-gdn-state applies everywhere, keeps a request invariant and is qualified nowhere");
+                          q::fast_path_qualified(FastPath::Fp16GdnState, int8_24) &&
+                          !q::fast_path_qualified(FastPath::Fp16GdnState,
+                                                  {24, ActivationClass::A4, KvCacheStorage::BFloat16}),
+                      "fp16-gdn-state applies everywhere, keeps a request invariant and is qualified where it "
+                      "was measured faster (the 27Bs with INT8 KV)");
     failures += check(!q::fast_path_qualified(FastPath::IdleWidePrefill,
                                               {24, ActivationClass::A16, KvCacheStorage::Int8Group64}),
                       "idle-wide-prefill is not qualified at 16-bit activations");
@@ -428,15 +431,20 @@ int main() {
                       "and is qualified nowhere");
     failures += check(infernix::parse_fast_path("gdn-tree-closed-form") == FastPath::GdnTreeClosedForm,
                       "gdn-tree-closed-form parses");
-    // q5-ksplit-mma: the 16-bit-activation (groupwise) artifacts' Q5 residual projections; not yet
-    // gated, so nowhere qualified, and it keeps a request invariant.
+    // q5-ksplit-mma: the 16-bit-activation (groupwise) artifacts' Q5 residual projections, on by the owner's
+    // decision where it measured faster (the groupwise 27B, INT8 KV) ahead of its gate; it keeps a request
+    // invariant. fp16-gdn-state likewise there.
     failures += check(q::fast_path_applies(FastPath::Q5KSplitMma, groupwise, options),
                       "q5-ksplit-mma must apply to the groupwise configuration");
     failures += check(!q::fast_path_applies(FastPath::Q5KSplitMma,
                                             {24, ActivationClass::A4, KvCacheStorage::Int8Group64}, options),
                       "q5-ksplit-mma must not apply to 4-bit-activation artifacts");
-    failures += check(!q::fast_path_qualified(FastPath::Q5KSplitMma, groupwise),
-                      "q5-ksplit-mma is not qualified anywhere");
+    failures += check(q::fast_path_qualified(FastPath::Q5KSplitMma, groupwise) &&
+                          !q::fast_path_qualified(FastPath::Q5KSplitMma,
+                                                  {24, ActivationClass::A16, KvCacheStorage::BFloat16, true}),
+                      "q5-ksplit-mma is qualified where it was measured faster only");
+    failures += check(q::fast_path_qualified(FastPath::Fp16GdnState, groupwise),
+                      "fp16-gdn-state is qualified on the groupwise 27B with INT8 KV");
     failures += check(!q::couples_requests(FastPath::Q5KSplitMma),
                       "q5-ksplit-mma must not couple requests");
 

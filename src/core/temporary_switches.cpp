@@ -22,13 +22,10 @@ constexpr Registration kSwitches[] = {
     // Q5/Q6 prefill MMA (q5/q6_a16_mma, the sparse-MoE qx_down): integer codes into the MMA, each
     // 64-group scale on its FP32 partial (ops/linear/q5/q5_mma_launch.cuh). Bit-changing, default 0.
     {"INFERNIX_TMP_Q56_FP32_SCALE", Scope::Qwen3_5, Kind::Flag},
-    // Groupwise Q4/Q5/Q6 sliced-K kernels (ops/linear/common/sliced_k_route.cpp): the pipelined kernel,
-    // its one-wave block rows and a forced <rows>x<stages> shape. Same bits.
-    {"INFERNIX_TMP_GW_SLICED_PIPELINE", Scope::Qwen3_5, Kind::Flag},
-    {"INFERNIX_TMP_GW_ONE_WAVE", Scope::Qwen3_5, Kind::Flag},
+    // Groupwise Q4/Q5/Q6 sliced-K kernels (ops/linear/common/sliced_k_route.cpp): a forced <rows>x<stages>
+    // shape of the one-wave pipelined kernel. Same bits.
     {"INFERNIX_TMP_GW_SHAPE", Scope::Qwen3_5, Kind::Value},
-    // NVFP4 A16 slice ring tile and batched-a8-subset-decode's scope (nvfp4_a16_tile, a8_subset).
-    {"INFERNIX_TMP_NVFP4_A16_TILE", Scope::Qwen3_5, Kind::Flag},
+    // batched-a8-subset-decode's scope (a8_subset).
     {"INFERNIX_TMP_A8_SUBSET_MIN_COLUMNS", Scope::Qwen3_5, Kind::Value},
     {"INFERNIX_TMP_A8_SUBSET_CLASSES", Scope::Qwen3_5, Kind::Value},
     {"INFERNIX_TMP_A8_SUBSET_LAYERS", Scope::Qwen3_5, Kind::Value},
@@ -87,9 +84,6 @@ constexpr Registration kSwitches[] = {
     // chunks read on a worker while its first chunk runs (prefill_walk.cpp). Same bits.
     {"INFERNIX_TMP_NGRAM_PARALLEL_GATHER", Scope::Qwen4Exp, Kind::Flag},
     {"INFERNIX_TMP_NGRAM_FIRST_SPAN_ASYNC", Scope::Qwen4Exp, Kind::Flag},
-    // The MTP drafter's proposal head (--lm-head-draft) from the artifact's 2-bit screen, rescoring the
-    // near-best rows exactly (runtime/engine/qwen4_exp_instance.cpp; candidates B-03). Draft-only.
-    {"INFERNIX_TMP_SCREENED_DRAFT_HEAD", Scope::Qwen4Exp, Kind::Flag},
     // Debug diagnostic: the prefill projection inputs' FP16 headroom scan, written to this path
     // (models/qwen4_exp/execution/activation_scan.cpp).
     {"INFERNIX_TMP_ACTIVATION_SCAN", Scope::Qwen4Exp, Kind::Value},
@@ -134,11 +128,6 @@ constexpr Registration kSwitches[] = {
     // gains, and the round's measured costs (models/qwen3_5/program/decode.cpp tree block rounds;
     // candidates §13 PUB-03). Exact: a width depends on the main chain's draws only.
     {"INFERNIX_TMP_TREE_ROUND_WIDTH", Scope::Qwen3_5, Kind::Flag},
-    // nvfp4_rg16_v1 projections of one to eight columns (the Qwen3.5-122B head's decode and verification
-    // calls): the streamed GEMV, one CTA per SM with the encode folded in and units kept in flight across
-    // row groups (ops/offloaded_sparse_moe/cuda/rg16_linear.cu stream_kernel; candidates §11 OR-10). Same
-    // bits (exact sums).
-    {"INFERNIX_TMP_RG16_STREAM", Scope::All, Kind::Flag},
     // =<rounds>: the replay bench (candidates §8.5 CF-03). The expert residency freezes after that many
     // rounds (its loads landed, then no admission, eviction, landing or prompt seed); Flash-Next's MTP
     // width cost keeps its prior, so greedy rounds repeat across runs; its release log reports the
@@ -209,12 +198,6 @@ constexpr Registration kSwitches[] = {
     // gate, key, value and index parts directly, without the [13952,T] result and its split_rows copy
     // (ops::linear_qsa_group; models/qwen4_exp/execution/forward.cpp; candidates §7 D7). Same bits.
     {"INFERNIX_TMP_QSA_GROUP_DIRECT", Scope::Qwen4Exp, Kind::Flag},
-    // f16-accumulate-prefill (Q8, FP8, MXFP8): calls of at least <value> tokens walk the rows of a token tile
-    // before the next (ops/linear/f16acc/f16acc_mma.cuh F16AccRowFast). Same bits.
-    {"INFERNIX_TMP_F16ACC_ROW_FAST", Scope::All, Kind::Value},
-    // f16-accumulate-prefill: B fragments by ldmatrix over a permuted FP16 activation (f16acc_mma.cuh,
-    // f16acc_encode.cu). Changes the route's bits within its bound.
-    {"INFERNIX_TMP_F16ACC_LDMATRIX_B", Scope::All, Kind::Flag},
     // f16-accumulate-prefill on Q8 (Dense8): past 8,192 tokens only the problems measured faster take the route
     // (ops/linear/q8/q8_f16acc.cu q8_f16acc_admits).
     {"INFERNIX_TMP_Q8_F16ACC_ADMIT", Scope::Qwen4Exp, Kind::Flag},
@@ -474,11 +457,6 @@ bool A8Subset::covers(A8SubsetClass kind, std::int32_t layer) const noexcept {
         if (layer >= first && layer <= last) { return true; }
     }
     return false;
-}
-
-bool nvfp4_a16_tile() {
-    static const bool on = flag("INFERNIX_TMP_NVFP4_A16_TILE");
-    return on;
 }
 
 bool q56_fp32_scale() {

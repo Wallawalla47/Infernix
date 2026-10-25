@@ -1255,7 +1255,7 @@ void Forward::mtp_block(const MtpCall& call, Tensor& rows) {
         const auto& head            = parameters_.draft_head;
         const std::int32_t rows_out = head.rows ? head.rows->weight.n : dim(config_.vocab_size);
         const std::int32_t valid    = head.rows ? rows_out : dim(parameters_.model.resources().public_token_count);
-        // INFERNIX_TMP_SCREENED_DRAFT_HEAD (its screen bound): the proposal head's rows scored from their 2-bit
+        // With the proposal head's screen bound (--screen-heads artifacts): the rows scored from their 2-bit
         // copy and the near-best ones exactly (ops::screened_head_top), so the draft is the exact head's
         // argmax unless the screen misses it, and a sampled draft's ranks carry exact logits with an
         // approximate normalizer. Draft-only: verification is unchanged.

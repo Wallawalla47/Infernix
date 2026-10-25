@@ -672,7 +672,7 @@ bool check_decode_widths(const q4::execution::Parameters& parameters, DeviceCont
 // converted with --proposal --screen-heads), over real hidden states: the final mixer's output at every
 // position of TOKENS' prefill. Per position: the screened LM head's argmax (ops::screened_head_logits,
 // the screened-lm-head fast path) against the exact head's, and the screened proposal head's draft and
-// four ranks (ops::screened_head_top, INFERNIX_TMP_SCREENED_DRAFT_HEAD) against the exact proposal
+// four ranks (ops::screened_head_top, the MTP drafter's screened head) against the exact proposal
 // head's; the normalizer's error is reported. The policy is the Forward's (margin 5, 64 rows). Fails
 // when either agreement is below 99.5 % (Basalt reports 99.93 % for its draft screen).
 bool check_screened_heads(const q4::execution::Parameters& parameters, DeviceContext& device,
@@ -875,10 +875,10 @@ int main(int argc, char** argv) {
                 if (jobs.empty()) { throw std::invalid_argument("--screened-heads needs a token list before it"); }
                 jobs.back().screened_heads = true;
                 // Bind the proposal head (the MTP drafter's, --lm-head-draft) and both 2-bit screens.
-                load.speculative         = SpeculativeBackend::Mtp;
-                load.proposal_head       = ProposalHead::Optimized;
-                load.screened_draft_head = true;
-                load.screened_lm_head    = true;
+                load.speculative          = SpeculativeBackend::Mtp;
+                load.proposal_head        = ProposalHead::Optimized;
+                load.proposal_head_screen = true;
+                load.screened_lm_head     = true;
                 continue;
             }
             if (jobs.empty() || i + 1 >= argc) { throw std::invalid_argument(arg + " needs a token list before it and a value"); }

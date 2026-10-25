@@ -4,7 +4,6 @@
 #include "core/device.h"
 #include "core/host_memory.h"
 #include "core/startup.h"
-#include "core/temporary_switches.h"
 #include "core/vram_budget.h"
 #include "models/load_options.h"
 #include "models/qwen4_exp/load.h"
@@ -134,22 +133,9 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         throw std::invalid_argument("artifact is not Qwen4ExpForCausalLM");
     }
     inspect.complete();
-    // The temporary A/B switch INFERNIX_TMP_SCREENED_DRAFT_HEAD (B-03 part a, draft-only; its value is on the
-    // startup `temporary switches |` line): 1 makes the MTP drafter's proposal head (--lm-head-draft) score its
-    // rows from the artifact's 2-bit screen and rescore the near-best ones exactly.
-    const bool screened_switch     = temporary_switches::flag("INFERNIX_TMP_SCREENED_DRAFT_HEAD");
-    const bool screened_draft_head = screened_switch && options.purpose == EnginePurpose::Generation &&
-                                     options.speculative.backend == SpeculativeBackend::Mtp &&
-                                     options.speculative.proposal_head == ProposalHead::Optimized;
-    if (screened_switch && !screened_draft_head) {
-        report(options, DiagnosticLevel::Warning,
-               "INFERNIX_TMP_SCREENED_DRAFT_HEAD=1 has no effect: it screens the MTP drafter's proposal head "
-               "(--spec mtp --lm-head-draft)");
-    }
     const auto qwen4_load = [&](bool stream_experts) {
-        auto load                = models::load_options(options, models::Architecture::Qwen4Exp);
-        load.stream_experts      = stream_experts;
-        load.screened_draft_head = screened_draft_head;
+        auto load           = models::load_options(options, models::Architecture::Qwen4Exp);
+        load.stream_experts = stream_experts;
         return load;
     };
     auto plan = models::qwen4_exp::plan_load(reader, qwen4_load(false));
@@ -312,9 +298,12 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         options.speculative.backend == SpeculativeBackend::Mtp &&
         (options.fast_paths || std::find(options.fast_path_candidates.begin(), options.fast_path_candidates.end(),
                                          FastPath::SampledMtpDrafts) != options.fast_path_candidates.end());
-    // screened-lm-head's graphs likewise, whenever the candidate is asked for (it is qualified nowhere).
-    program_options.screened_lm_head = std::find(options.fast_path_candidates.begin(), options.fast_path_candidates.end(),
-                                                 FastPath::ScreenedLmHead) != options.fast_path_candidates.end();
+    // screened-lm-head's graphs likewise: asked for as a candidate, or with fast paths where the loader bound the
+    // LM head's screen (the path is qualified per configuration).
+    program_options.screened_lm_head =
+        std::find(options.fast_path_candidates.begin(), options.fast_path_candidates.end(),
+                  FastPath::ScreenedLmHead) != options.fast_path_candidates.end() ||
+        (options.fast_paths && plan.has_output_head_screen());
     // fp16-gdn-state's smaller pool likewise (it is qualified nowhere, so only a candidate selects it).
     program_options.fp16_gdn_state = std::find(options.fast_path_candidates.begin(), options.fast_path_candidates.end(),
                                                FastPath::Fp16GdnState) != options.fast_path_candidates.end();

@@ -984,8 +984,7 @@ workspace capacity queried for the requested interval. `--policy invariant` meas
 column-invariant route (the default route's decode and verification; `a16`, the default, is
 batched-decode's), and `--routes q5-ksplit` passes `LinearRoutes::Q5KSplit` (the unqualified
 `q5-ksplit-mma` fast path: eight K warps, pairwise reduction). The header line reports the
-groupwise sliced-K switches (`INFERNIX_TMP_GW_SLICED_PIPELINE`, `INFERNIX_TMP_GW_ONE_WAVE`,
-`INFERNIX_TMP_GW_SHAPE`, from `temporary_switches::describe()`); the Q4 LinearSwiGLU, GDN and
+groupwise sliced-K shape switch (`INFERNIX_TMP_GW_SHAPE`, from `temporary_switches::describe()`); the Q4 LinearSwiGLU, GDN and
 attention input benches report them too and take `--policy invariant` (`--q4q5-policy invariant`
 for the input projections).
 

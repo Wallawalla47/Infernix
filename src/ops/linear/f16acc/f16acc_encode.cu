@@ -45,11 +45,11 @@ __device__ __forceinline__ float f16acc_block_max(float value, float* warp_maxim
     return result;
 }
 
-// Four BF16 values (8 bytes) per vector; Threads * Vectors vectors cover the column. Permuted (the
-// ldmatrix B route, f16acc_mma.cuh): within each 16-value block, values 4q, 4q + 1 go to positions 2q, 2q + 1
+// Four BF16 values (8 bytes) per vector; Threads * Vectors vectors cover the column. Each 16-value block is
+// written in the ldmatrix B route's order (f16acc_mma.cuh): values 4q, 4q + 1 go to positions 2q, 2q + 1
 // and 4q + 2, 4q + 3 to 8 + 2q, 9 + 2q, so an m16n8k16 A fragment's slots (2t, 2t + 1) and (2t + 8, 2t + 9)
 // hold values 4t .. 4t + 3, the four codes one ldmatrix lane receives of a weight row.
-template <int K, int Threads, bool Permuted>
+template <int K, int Threads>
 __global__ __launch_bounds__(Threads) void f16acc_encode_kernel(const __nv_bfloat16* __restrict__ input,
                                                                 __half* __restrict__ output,
                                                                 float* __restrict__ inverses) {
@@ -88,26 +88,18 @@ __global__ __launch_bounds__(Threads) void f16acc_encode_kernel(const __nv_bfloa
         const __half2 low  = __floats2half2_rn(values[item][0] * scale, values[item][1] * scale);
         const __half2 high = __floats2half2_rn(values[item][2] * scale, values[item][3] * scale);
         const int vector = tid + item * Threads;
-        if constexpr (Permuted) {
-            // Vector v = 4 * block + q: its two pairs are words q and 4 + q of the block's eight.
-            auto* words = reinterpret_cast<unsigned*>(destination);
-            const int block = vector >> 2, q = vector & 3;
-            words[block * 8 + q]     = *reinterpret_cast<const unsigned*>(&low);
-            words[block * 8 + 4 + q] = *reinterpret_cast<const unsigned*>(&high);
-        } else {
-            uint2 packed;
-            packed.x            = *reinterpret_cast<const unsigned*>(&low);
-            packed.y            = *reinterpret_cast<const unsigned*>(&high);
-            destination[vector] = packed;
-        }
+        // Vector v = 4 * block + q: its two pairs are words q and 4 + q of the block's eight.
+        auto* words     = reinterpret_cast<unsigned*>(destination);
+        const int block = vector >> 2, q = vector & 3;
+        words[block * 8 + q]     = *reinterpret_cast<const unsigned*>(&low);
+        words[block * 8 + 4 + q] = *reinterpret_cast<const unsigned*>(&high);
     }
     if (tid == 0) { inverses[column] = f16acc_power(-exponent); }
 }
 
 template <int K, int Threads>
-void launch_encode(const Tensor& x, F16AccumulateWorkspace workspace, cudaStream_t stream, bool permuted) {
-    const auto kernel = permuted ? f16acc_encode_kernel<K, Threads, true> : f16acc_encode_kernel<K, Threads, false>;
-    CUDA_CHECK(pdl::launch_consumer({dim3(x.ne[1]), dim3(Threads), 0, stream}, kernel,
+void launch_encode(const Tensor& x, F16AccumulateWorkspace workspace, cudaStream_t stream) {
+    CUDA_CHECK(pdl::launch_consumer({dim3(x.ne[1]), dim3(Threads), 0, stream}, f16acc_encode_kernel<K, Threads>,
                                     static_cast<const __nv_bfloat16*>(x.data), workspace.x, workspace.inverses));
 }
 
@@ -210,8 +202,7 @@ __global__ __launch_bounds__(kScanThreads) void f16acc_scan_kernel(const __nv_bf
 
 } // namespace
 
-void launch_f16_accumulate_encode(const Tensor& x, F16AccumulateWorkspace workspace, cudaStream_t stream,
-                                  bool permuted) {
+void launch_f16_accumulate_encode(const Tensor& x, F16AccumulateWorkspace workspace, cudaStream_t stream) {
     if (workspace.x == nullptr || workspace.inverses == nullptr) {
         throw std::invalid_argument("f16 accumulate encode requires caller workspace");
     }
@@ -219,9 +210,9 @@ void launch_f16_accumulate_encode(const Tensor& x, F16AccumulateWorkspace worksp
         throw std::invalid_argument("f16 accumulate encode: x must be BF16 [K, T]");
     }
     switch (x.ne[0]) {
-    case 640: return launch_encode<640, 160>(x, workspace, stream, permuted);
-    case 2560: return launch_encode<2560, 128>(x, workspace, stream, permuted);
-    case 6144: return launch_encode<6144, 256>(x, workspace, stream, permuted);
+    case 640: return launch_encode<640, 160>(x, workspace, stream);
+    case 2560: return launch_encode<2560, 128>(x, workspace, stream);
+    case 6144: return launch_encode<6144, 256>(x, workspace, stream);
     default: throw std::invalid_argument("f16 accumulate encode: unsupported K");
     }
 }

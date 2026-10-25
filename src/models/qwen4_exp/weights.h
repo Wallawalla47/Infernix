@@ -105,8 +105,8 @@ struct DFlash2Weights {
 struct ProposalWeights {
     WeightId head;      // [rows, H]
     WeightId token_ids; // I32 [rows]: each row's token id
-    // The converter's 2-bit copy of its rows (screen/proposal_head, q2_g64_fp16 [rows, H]), bound with
-    // the screened draft head only (LoadOptions::screened_draft_head); invalid otherwise.
+    // The converter's 2-bit copy of its rows (screen/proposal_head, q2_g64_fp16 [rows, H]), bound for the
+    // MTP drafter when present (LoadOptions::proposal_head_screen); invalid otherwise.
     WeightId screen;
 };
 
@@ -134,7 +134,8 @@ struct TextWeights {
     WeightId token_embedding; // BF16, pinned host memory
     WeightId output_head;
     // The converter's 2-bit copy of output_head (screen/output_head, q2_g64_fp16 [V, H]), bound for the
-    // screened-lm-head fast path only (LoadOptions::screened_lm_head); invalid otherwise.
+    // screened-lm-head fast path when present and the head is one it rescores (LoadOptions::lm_head_screen,
+    // screened_lm_head); invalid otherwise.
     WeightId output_head_screen;
     HyperConnectionWeights final_mixer;
     std::vector<BlockWeights> layers;

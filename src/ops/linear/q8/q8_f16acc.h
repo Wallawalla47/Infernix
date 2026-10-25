@@ -27,8 +27,8 @@ inline constexpr std::int32_t kQ8F16MinTokens = 256;
 
 // Whether a call of `tokens` columns on [n, k] takes the route: a registered problem from
 // kQ8F16MinTokens columns. TEMPORARY (INFERNIX_TMP_Q8_F16ACC_ADMIT=1), until its A/B: past 8,192 tokens
-// only the problems the row-fast route measured faster than the exact one (with
-// INFERNIX_TMP_F16ACC_ROW_FAST at 32,768 tokens: [13952,2560] 0.79x, [2560,2560] 0.85x, [2560,640] 0.98x).
+// only the problems the row-fast raster measured faster than the exact one (at 32,768 tokens: [13952,2560]
+// 0.79x, [2560,2560] 0.85x, [2560,640] 0.98x; Q8 has since kept its own rasters, f16acc_mma.cuh).
 [[nodiscard]] bool q8_f16acc_admits(std::int32_t n, std::int32_t k, std::int32_t tokens) noexcept;
 
 // The encoded activation a call of up to max_tokens columns needs (0 when the route cannot run).

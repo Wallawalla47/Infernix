@@ -17,9 +17,9 @@
 // and the epilogue skips absent row groups). Both routes form the same exact S, so outputs depend
 // on neither the route, nor T, nor the passes.
 //
-// TEMPORARY (INFERNIX_TMP_RG16_STREAM, candidates §11 OR-10): the narrow width's streamed GEMV, for
-// the head's decode and verification calls (the 122B head took 337 µs a token at 1.27 TB/s, against
-// 260 µs at the DRAM roofline). One 1,024-thread CTA per SM; each warp keeps the next kDepth units'
+// The narrow widths' streamed GEMV (candidates §11 OR-10), for the head's decode and verification calls
+// (the 122B head took 337 µs a token at 1.27 TB/s, against 260 µs at the DRAM roofline; with the stream the
+// 122B's decode is +0.9 %, 5 of 6 ABBA blocks ahead and one tied, 2026-10-25). One 1,024-thread CTA per SM; each warp keeps the next kDepth units'
 // words of its row-group sequence in registers (three words a block, issued a block ahead of their
 // use across row-group boundaries), so a warp holds kDepth × 144 bytes in flight instead of an
 // unrolled loop's few blocks; the CTA encodes the call's columns into shared memory itself (the
@@ -31,7 +31,6 @@
 #include "core/device.h"
 #include "core/layout.h"
 #include "core/pdl.cuh"
-#include "core/temporary_switches.h"
 #include "ops/common/canonical_math.h"
 #include "ops/offloaded_sparse_moe/cuda/wide_expert_a16.cuh"
 
@@ -287,7 +286,7 @@ __global__ void __launch_bounds__(kThreads) narrow_kernel(const Act* __restrict_
     }
 }
 
-// The streamed GEMV (INFERNIX_TMP_RG16_STREAM): one CTA of kStreamWarps warps per SM, so the encoded
+// The streamed GEMV: one CTA of kStreamWarps warps per SM, so the encoded
 // columns are copied once per SM, and kStreamDepth units in flight per warp (three words a lane per
 // unit, at most 64 registers a thread). A depth divides 24, so whole depths make every row group's
 // blocks (kStreamed: matrices of whole 24-block multiples, the head's 192 among them).
@@ -590,11 +589,6 @@ bool dispatch_stream(const Tensor& x, const Weight& weight, int n, void* out, cu
     return at.template operator()<4>();
 }
 
-bool stream_route() {
-    static const bool enabled = temporary_switches::flag("INFERNIX_TMP_RG16_STREAM");
-    return enabled;
-}
-
 template <class D, bool F32>
 void dispatch_narrow(const NarrowPlan& plan, const Weight& weight, int n, void* out, cudaStream_t stream) {
     if (n == 1) { return launch_narrow<D, 1, F32>(plan, weight, n, out, stream); }
@@ -638,8 +632,8 @@ void run(const Tensor& x, const Weight& weight, Tensor& out, WorkspaceArena& wor
     const bool f32    = out.dtype == DType::FP32;
     auto scope        = workspace.scope();
     if (columns <= D::kNarrow) {
-        if (stream_route() && (f32 ? dispatch_stream<D, true>(x, weight, columns, out.data, stream)
-                                   : dispatch_stream<D, false>(x, weight, columns, out.data, stream))) {
+        if (f32 ? dispatch_stream<D, true>(x, weight, columns, out.data, stream)
+                : dispatch_stream<D, false>(x, weight, columns, out.data, stream)) {
             return;
         }
         const NarrowPlan plan = carve_narrow<D>(workspace, columns);

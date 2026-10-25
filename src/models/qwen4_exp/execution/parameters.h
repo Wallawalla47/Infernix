@@ -116,8 +116,8 @@ struct DFlash2Parameters {
 struct DraftHeadParameters {
     std::optional<LinearParameters> rows; // the proposal head (q4/q8 [rows, H]); empty = text head
     Tensor token_ids;                     // I32 [rows]
-    // The rows' 2-bit screen (q2_g64_fp16 [rows, H]) when bound (INFERNIX_TMP_SCREENED_DRAFT_HEAD): the
-    // drafts then come from ops::screened_head_top.
+    // The rows' 2-bit screen (q2_g64_fp16 [rows, H]) when the artifact has one (--screen-heads) and the
+    // proposal head can be screened: the drafts then come from ops::screened_head_top.
     std::optional<Weight> screen;
 };
 

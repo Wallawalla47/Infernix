@@ -196,13 +196,15 @@ Accuracy accuracy(const Problem& p, const DeviceProblem& problem, const std::vec
     return out;
 }
 
-// Both routes at the admission, a partial tile, a bulk width and across the 4,096-column tile seam.
+// Both routes at the admission, a partial tile, a bulk width and across the 4,096-column tile seam; MXFP8 also
+// past its row-fast raster's 8,192 columns (f16acc_mma.cuh kF16AccRowFastTokens) with a partial tile.
 int run_accuracy() {
     int failures       = 0;
     std::uint32_t seed = 4201U;
     for (const Problem& p : kProblems) {
         const DeviceProblem problem(make_weight(p, seed++));
-        for (const std::int32_t t : {kAdmission, 300, 1024, 4097}) {
+        for (const std::int32_t t : {kAdmission, 300, 1024, 4097, 8229}) {
+            if (t == 8229 && p.qtype != QType::FP8_E4M3FN_G32_E8M0) { continue; }
             failures += accuracy(p, problem, transformer_activations(p.k, t, seed), t, "f16-accumulate").failures;
         }
     }
@@ -244,7 +246,13 @@ double f16_value(std::uint16_t bits) {
 
 // The encoder against the exact oracle: each inverse is a power of two putting the column maximum in
 // [1, 2) (a zero column: 1); decoded with it, every value within 2^16 of its column maximum is exact
-// and every other one within 2^-25 of the maximum.
+// and every other one within 2^-25 of the maximum. Each 16-value block is stored in the ldmatrix B order:
+// value 4q + r at 2q + r (r < 2) or 8 + 2q + r - 2.
+std::size_t encoded_position(std::int32_t channel) {
+    const std::int32_t value = channel % 16, q = value / 4, r = value % 4;
+    return static_cast<std::size_t>(channel - value + (r < 2 ? 2 * q + r : 8 + 2 * q + r - 2));
+}
+
 int check_encoder(std::int32_t k, std::int32_t t, const std::vector<std::uint16_t>& bits) {
     const DeviceBuffer x = upload(bits);
     DeviceArena arena(ops::detail::f16_accumulate_workspace_capacity_bytes(t, k));
@@ -275,7 +283,8 @@ int check_encoder(std::int32_t k, std::int32_t t, const std::vector<std::uint16_
         for (std::int32_t channel = 0; channel < k; ++channel) {
             const std::size_t at = static_cast<std::size_t>(token) * k + channel;
             const double value   = test::bf16_to_f32(bits[at]);
-            const double decoded = f16_value(encoded[at]) * inverse;
+            const double decoded = f16_value(encoded[static_cast<std::size_t>(token) * k + encoded_position(channel)]) *
+                                   inverse;
             const bool ok        = std::fabs(value) >= std::ldexp(maximum, -16)
                                        ? decoded == value
                                        : std::fabs(decoded - value) <= std::ldexp(maximum, -25);

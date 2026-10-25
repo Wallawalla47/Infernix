@@ -278,6 +278,16 @@ constexpr std::array kQualified{
     Qualification{FastPath::BatchedA8Decode, {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value}},
     Qualification{FastPath::BatchedA8Decode, {24, ActivationClass::A4, KvCacheStorage::Vq2}},
     Qualification{FastPath::BatchedA8Decode, {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value}},
+    // On by the owner's decision of 2026-10-25 (a new path measured faster goes on by default before its
+    // quality gate; the owner may turn it off once the gating regime is settled), in the configuration
+    // measured, each against the default route (ABBA, RTX 5090, 2026-10-25, MTP 3, pp1280+tg256):
+    // groupwise 27B, INT8 KV: q5-ksplit-mma decode +4.5 % (3 of 3 blocks, +4.48 to +4.54 %), fp16-gdn-state
+    // decode +0.7 % (3 of 3, at least +0.70 %); pp4096 neutral for both. NVFP4 27B, INT8 KV: fp16-gdn-state
+    // decode +0.7 % (3 of 3, at least +0.67 %), pp8192 neutral. Not the 35B-A3B (fp16-gdn-state one block
+    // -3 %, q5-ksplit-mma neutral).
+    Qualification{FastPath::Q5KSplitMma, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, true}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A16, KvCacheStorage::Int8Group64, true}},
+    Qualification{FastPath::Fp16GdnState, {24, ActivationClass::A4, KvCacheStorage::Int8Group64}},
 };
 
 const char* kv_name(KvCacheStorage kv) {
@@ -429,7 +439,7 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
     // score at H 3,072); the resident MoE models route their prefill through SparseMoe's own MMA router.
     case FastPath::RouterMma: return configuration.offloaded_experts;
     case FastPath::ScreenedLmHead: return false; // Qwen3.8-Flash-Next's screened head only
-    // Every Qwen3.5 artifact has GDN layers; qualified nowhere yet, so it runs only as a candidate.
+    // Every Qwen3.5 artifact has GDN layers; qualified on the 27Bs with INT8 KV (kQualified).
     case FastPath::Fp16GdnState: return true;
     // Chains whose drafts carry their proposal laws: DFlash2's, and MTP's under sampled-mtp-drafts
     // (without it MTP drafts argmax chains, which the block rule cannot improve and the greedy-draft

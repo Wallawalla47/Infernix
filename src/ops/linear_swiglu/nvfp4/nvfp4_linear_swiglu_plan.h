@@ -21,9 +21,8 @@ void nvfp4_linear_swiglu_decode_launch(const Tensor& x, const Weight& weight, Te
 void nvfp4_linear_swiglu_small_t_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                         cudaStream_t stream);
 // A16ColumnInvariant: the sliced-K arithmetic of 8 K-warps for every T, so a column's arithmetic
-// does not depend on the call's other columns. Calls of 17+ columns run the slice-major ring tile
-// under INFERNIX_TMP_NVFP4_A16_TILE (temporary_switches::nvfp4_a16_tile), else the sliced-K tiles;
-// the two give the same bits (both are exposed for that test).
+// does not depend on the call's other columns. Calls of 17+ columns run the slice-major ring tile,
+// narrower ones the sliced-K tiles; the two give the same bits (both are exposed for that test).
 void nvfp4_linear_swiglu_invariant_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                           cudaStream_t stream);
 void nvfp4_linear_swiglu_invariant_sliced_launch(const Tensor& x, const Weight& weight, Tensor& out,

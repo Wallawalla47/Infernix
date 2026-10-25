@@ -1,5 +1,5 @@
 // The slice-major ring tile (ops/linear/nvfp4/nvfp4_a16_slice_ring_mma.cuh), which serves the
-// column-invariant NVFP4 A16 projections from 17 columns under INFERNIX_TMP_NVFP4_A16_TILE, at the
+// column-invariant NVFP4 A16 projections from 17 columns (32 for the [5120,17408] down projection), at the
 // NVFP4 27B's MLP shapes (gate/up linear_swiglu [34816,5120], down linear_add [5120,17408]) and the
 // [5120,6144] output projection:
 //

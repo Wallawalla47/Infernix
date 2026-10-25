@@ -44,13 +44,6 @@ enum class Scope : std::uint8_t {
 // ---------------------------------------------------------------------------------------------
 // Switches with a structured value, parsed once here for every reader.
 
-// INFERNIX_TMP_NVFP4_A16_TILE=1: calls of 17 or more columns of the column-invariant NVFP4 A16
-// projections linear_swiglu [34816,5120] and linear_add [5120,6144|17408] (the reproducible route's
-// decode and verification of the NVFP4 27B MLP) run on the slice-major ring tile
-// (ops/linear/nvfp4/nvfp4_a16_slice_ring_mma.cuh), bit-identical to the sliced-K tiles they replace.
-// 0 (the default) keeps the sliced-K tiles.
-[[nodiscard]] bool nvfp4_a16_tile();
-
 // INFERNIX_TMP_Q56_FP32_SCALE=1: the Q5/Q6 prefill MMA kernels (q5/q6_a16_mma and the sparse-MoE
 // qx_down) feed the integer codes to the MMA and apply each 64-group scale to that group's FP32
 // partial sum, as the Q4 gate/up kernel does, instead of rounding q x scale to BF16. Default off.
@@ -59,8 +52,7 @@ enum class Scope : std::uint8_t {
 
 // INFERNIX_TMP_GW_SHAPE=<rows>x<stages>: the groupwise sliced-K pipelined kernel's forced block rows
 // (16, 32 or 64) and ring stages (1-4) instead of choose_sliced_k_shape's (ops/linear/common/
-// sliced_k_route.h); unset (0x0) keeps the rule. INFERNIX_TMP_GW_SLICED_PIPELINE and
-// INFERNIX_TMP_GW_ONE_WAVE are flags read there.
+// sliced_k_route.h); unset (0x0) keeps the rule.
 struct GwShape {
     int block_rows = 0;
     int stages     = 0;

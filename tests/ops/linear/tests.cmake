@@ -39,7 +39,7 @@ infernix_add_family_op_test(infernix_linear_nvfp4_a16_test FAMILY linear
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_nvfp4_a16.cpp"
   LIBRARIES infernix_linear_test_support)
 
-# The column-invariant NVFP4 A16 slice ring tile (INFERNIX_TMP_NVFP4_A16_TILE): bit for bit the
+# The column-invariant NVFP4 A16 slice ring tile (from 17 columns, 32 at K=17408): bit for bit the
 # sliced-K tiles at the 27B MLP shapes, repeatable over dirty shared memory, and the FP64 oracle.
 infernix_add_family_op_test(infernix_nvfp4_a16_slice_ring_test FAMILY linear
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_nvfp4_a16_slice_ring.cpp" "${CMAKE_CURRENT_LIST_DIR}/../dirty_shared_memory.cu"
@@ -81,14 +81,6 @@ infernix_add_family_op_test(infernix_linear_mxfp8_a16_test FAMILY linear
 infernix_add_family_op_test(infernix_linear_f16_accumulate_test FAMILY linear
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_f16_accumulate.cpp"
   LIBRARIES infernix_linear_test_support)
-# TEMPORARY with INFERNIX_TMP_F16ACC_ROW_FAST=1 (every call row-fast) and INFERNIX_TMP_F16ACC_LDMATRIX_B (the
-# permuted activation and ldmatrix B fragments): the same checks on each variant.
-add_test(NAME infernix_linear_f16_accumulate_row_fast_test COMMAND ${infernix_linear_f16_accumulate_test_COMMAND})
-set_tests_properties(infernix_linear_f16_accumulate_row_fast_test
-  PROPERTIES ENVIRONMENT "INFERNIX_TMP_F16ACC_ROW_FAST=1" SKIP_RETURN_CODE 77)
-add_test(NAME infernix_linear_f16_accumulate_ldmatrix_b_test COMMAND ${infernix_linear_f16_accumulate_test_COMMAND})
-set_tests_properties(infernix_linear_f16_accumulate_ldmatrix_b_test
-  PROPERTIES ENVIRONMENT "INFERNIX_TMP_F16ACC_LDMATRIX_B=1" SKIP_RETURN_CODE 77)
 
 # FP4-Local's MXFP8 shared expert on its own stream beside the offloaded routed experts, as the
 # Qwen4Exp decode overlaps them: every output equals the serialized run's bits.

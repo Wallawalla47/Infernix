@@ -294,7 +294,7 @@ void run(const Matrix& m, int columns, bool with_inf, std::mt19937& rng, const s
     check(!with_inf || nan_rows == static_cast<std::size_t>(m.rows), where + ": exactly the Inf column is NaN");
     if (w != nullptr) { check_fp64(m, *w, x, columns, emax, got16, where); }
     // The narrow widths' calls repeat bit for bit, also with a copy streaming beside them (the GEMV
-    // and the streamed GEMV of INFERNIX_TMP_RG16_STREAM; op_tester.h verify_repeatable).
+    // and the streamed GEMV; op_tester.h verify_repeatable).
     if (columns <= 8) {
         check(infernix::test::verify_repeatable(
                   where + " repeated", 3, nullptr, [&] { infernix::ops::rg16_linear(tx, w16, out16, arena, nullptr); },

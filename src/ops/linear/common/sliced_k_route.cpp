@@ -12,22 +12,17 @@ namespace infernix::ops::detail {
 namespace {
 
 struct Environment {
-    SlicedKRoute route = SlicedKRoute::Release;
+    SlicedKRoute route = SlicedKRoute::OneWave;
     SlicedKShape forced;
 };
 
-// Read once. An invalid value throws from temporary_switches::describe(), which the Engine and the
-// op benches call at startup; a launch then falls back to the release route.
+// Read once. An invalid shape throws from temporary_switches::describe(), which the Engine and the op
+// benches call at startup.
 const Environment& environment() {
     static const Environment value = [] {
         Environment out;
-        const bool pipeline = temporary_switches::flag("INFERNIX_TMP_GW_SLICED_PIPELINE");
-        const bool one_wave = temporary_switches::flag("INFERNIX_TMP_GW_ONE_WAVE");
-        const auto shape    = temporary_switches::gw_shape();
-        out.forced          = {shape.block_rows, shape.stages};
-        out.route           = one_wave   ? SlicedKRoute::OneWave
-                              : pipeline ? SlicedKRoute::Pipelined
-                                         : SlicedKRoute::Release;
+        const auto shape = temporary_switches::gw_shape();
+        out.forced       = {shape.block_rows, shape.stages};
         return out;
     }();
     return value;

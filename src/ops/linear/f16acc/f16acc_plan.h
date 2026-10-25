@@ -77,10 +77,9 @@ inline std::size_t f16_accumulate_workspace_capacity_bytes(std::int32_t tokens, 
     return layout.peak_bytes(1);
 }
 
-// Writes x16 and the column inverses of every column of x (BF16 [K, T], K in {640, 2560, 6144}). `permuted`:
-// each 16-value block in the ldmatrix B route's order (INFERNIX_TMP_F16ACC_LDMATRIX_B, f16acc_mma.cuh).
-void launch_f16_accumulate_encode(const Tensor& x, F16AccumulateWorkspace workspace, cudaStream_t stream,
-                                  bool permuted = false);
+// Writes x16 and the column inverses of every column of x (BF16 [K, T], K in {640, 2560, 6144}), each 16-value
+// block in the ldmatrix B route's order (f16acc_encode.cu, f16acc_mma.cuh).
+void launch_f16_accumulate_encode(const Tensor& x, F16AccumulateWorkspace workspace, cudaStream_t stream);
 
 // What the FP16 encoding does to one projection input over the calls a scan has seen
 // (launch_f16_accumulate_scan accumulates into it on the device; zero-initialize it first). Every
