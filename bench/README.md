@@ -175,7 +175,7 @@ remains neural-only unless its cases explicitly request ngram.
 
 The teacher-forced decode measurement of the
 [acceptance policy](../docs/maintainer/model-quality.md#6-numerical-acceptance-policy-and-fast-paths) is
-`infernix-certify decode` (IQS-2): it forces each corpus window's continuation through the production
+`infernix-certify decode`: it forces each corpus window's continuation through the production
 decode path, one constrained step per token, every step observing the reference's 256 most probable
 tokens (`TokenConstraint::observe`), at one request, under concurrency, from a warm prefix, under a short
 KV pool and with speculation (usage at the top of `apps/certify/main.cpp`).

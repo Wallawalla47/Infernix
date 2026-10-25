@@ -1,4 +1,4 @@
-"""IQS-3 pilot statistics (tools/quality/llama_kld.py): bootstrap intervals over chunks, the weighted median,
+"""llama.cpp-format KLD statistics (tools/quality/llama_kld.py): bootstrap intervals over chunks, the weighted median,
 paired differences, and llama-perplexity's printout."""
 
 from __future__ import annotations

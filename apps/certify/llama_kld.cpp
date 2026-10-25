@@ -308,7 +308,7 @@ nlohmann::json Summary::to_json() const {
                                 {"1.0", percentile(kld, 0.010F)},  {"0.1", percentile(kld, 0.001F)}};
     out["max_kld"]           = kld.back();
     out["min_kld"]           = kld.front();
-    // IQS-3's clipped mean: min(KL, 0.1 nats) averaged over every position.
+    // The clipped mean: min(KL, 0.1 nats) averaged over every position.
     out["clipped_mean_kld"]  = clipped / static_cast<double>(count_);
     out["rms_p_diff"]        = std::sqrt(p_diff_mse.first);
     out["median_p_diff"]     = median(p_diff);

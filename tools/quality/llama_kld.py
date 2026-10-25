@@ -1,7 +1,7 @@
-"""IQS-3 pilot statistics over llama.cpp-format arms (infernix-certify --llama-base, llama-compare).
+"""Statistics over llama.cpp-format arms (infernix-certify --llama-base, llama-compare).
 
 An arm's rows (PREFIX.positions.csv: chunk, position, kld, p_diff, same_top, nll, nll_base) hold llama.cpp's
-per-position values against one base file. This tool reports, per arm, the gate statistics of the proposal
+per-position values against one base file. This tool reports, per arm, the statistics
 (median KL, clipped mean KL, top-1 flips, mean dNLL) and llama.cpp's headline ones, each with a 95 % percentile
 bootstrap interval over chunks (the resampling unit: 10,000 resamples, seed fixed), and paired differences of
 arms scored on the same positions. It also reads llama-perplexity's final summary, so its printout can be set

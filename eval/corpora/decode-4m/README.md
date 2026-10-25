@@ -12,8 +12,8 @@ positions. It holds four UTF-8 streams, one per domain:
 | `zhwiki` | Chinese Wikipedia articles of at least 2,000 characters the prefill corpus does not use | 4.3 MB |
 | `sglang` | SGLang runtime sources (`python/sglang/srt`) | 4.6 MB |
 
-Each stream is sized to about 1.3 million Qwen3.8 tokens. It was the corpus of the decode gate that
-IQS-1 replaced on 2026-10-22 (1,024 segments of 512-, 2,048- and 8,192-token prompts with 64 forced
+Each stream is sized to about 1.3 million Qwen3.8 tokens. It was the corpus of the decode gate
+replaced on 2026-10-22 (1,024 segments of 512-, 2,048- and 8,192-token prompts with 64 forced
 tokens, about 3.7 million tokens); its SGLang stream is one of the IQS-1 corpus's code sources.
 
 `manifest.json` records the streams. `provenance/*.jsonl` records each stream's source and pinned

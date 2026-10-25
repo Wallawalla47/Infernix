@@ -23,7 +23,7 @@
 //   route options: [--reproducible] [--fast-path NAME]... [--kv-dtype K] [--logits-dtype fp32|bf16]
 //                  [--prefill-chunk N] [--ngram-volume FILE] [--expert-a4-activations]
 //
-// llama.cpp's KL-divergence measurement (IQS-3; llama_kld.h): the same exact reference as llama-perplexity's
+// llama.cpp's KL-divergence measurement (llama_kld.h): the same exact reference as llama-perplexity's
 // `_logits_` base file, which llama-perplexity --kl-divergence scores llama.cpp against, and arms that score
 // Infernix against it with llama.cpp's own definitions and summary.
 //   infernix-certify reference <artifact> --format llama-kld --out FILE (--text F [--context N] [--chunks N] |

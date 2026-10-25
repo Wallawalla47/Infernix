@@ -1,7 +1,7 @@
 #pragma once
 
 // llama.cpp's KL-divergence measurement (tools/perplexity/perplexity.cpp of build b10221), reproduced so
-// that Infernix and llama.cpp are scored by one definition (IQS-3, docs/maintainer/model-quality.md): the
+// that Infernix and llama.cpp are scored by one definition: the
 // `_logits_` base file llama-perplexity --kl-divergence-base writes and reads, the per-position values its
 // --kl-divergence mode computes against a base row, and its final summary, printed in its format.
 //
