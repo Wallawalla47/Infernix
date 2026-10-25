@@ -1,15 +1,18 @@
-"""Statistics over llama.cpp-format arms (infernix-certify --llama-base, llama-compare).
+"""Statistics over llama.cpp-format arms (infernix-certify --llama-base, llama-rows, llama-compare).
 
-An arm's rows (PREFIX.positions.csv: chunk, position, kld, p_diff, same_top, nll, nll_base) hold llama.cpp's
-per-position values against one base file. This tool reports, per arm, the statistics
-(median KL, clipped mean KL, top-1 flips, mean dNLL) and llama.cpp's headline ones, each with a 95 % percentile
-bootstrap interval over chunks (the resampling unit: 10,000 resamples, seed fixed), and paired differences of
-arms scored on the same positions. It also reads llama-perplexity's final summary, so its printout can be set
-beside ours line by line (the statistics port's check).
+An arm's rows (PREFIX.positions.csv: chunk, position, kld, p_diff, same_top, nll, nll_base, kld_top) hold
+llama.cpp's per-position values against one base file. This tool reports, per arm, the statistics people
+publish from llama-perplexity --kl-divergence: perplexity (and the ln ratio to the base's), mean KLD, KLD at
+the 99.9th percentile and the top-1 agreement ("Same top p"), each with a 95 % percentile bootstrap interval
+over chunks (the resampling unit: 10,000 resamples, seed fixed), and paired differences of arms scored on the
+same positions. kld_top, the decode arms' form of the KL (the observed tokens plus one bucket), is reported
+as mean_kld_top where an arm has it. It also reads llama-perplexity's final summary, so its printout can be
+set beside ours line by line (the statistics port's check) or stand for an engine that only prints one.
 
   table ARM... [--json OUT]           one row per arm
   paired A B                          A - B per statistic, resampling both on the same chunks
   printout-diff OURS THEIRS           llama-perplexity summaries (text files) side by side, value by value
+  head BASE N OUT                     a base file of BASE's first N chunks
 """
 
 from __future__ import annotations
@@ -23,11 +26,12 @@ from pathlib import Path
 
 import numpy as np
 
-CLIP = 0.1
 RESAMPLES = 10_000
 SEED = 20261025
-GATED = ("median_kld", "clipped_kld", "flip_rate", "mean_dnll")
-REPORTED = ("mean_kld", "p99_kld", "p999_kld", "rms_p_diff")
+# The published statistics, in the order a report shows them.
+METRICS = ("ppl", "ln_ppl_ratio", "mean_kld", "p999_kld", "same_top")
+EXTRA = ("mean_kld_top",)
+COLUMNS = ("chunk", "position", "kld", "p_diff", "same_top", "nll", "nll_base", "kld_top")
 
 
 @dataclass
@@ -41,6 +45,7 @@ class Arm:
     same_top: np.ndarray
     nll: np.ndarray
     nll_base: np.ndarray
+    kld_top: np.ndarray  # NaN where the source has no observed form (a full-vocabulary engine tool)
 
     @property
     def name(self) -> str:
@@ -50,24 +55,35 @@ class Arm:
 def load(prefix: Path) -> Arm:
     prefix = Path(prefix)
     meta = json.loads(Path(str(prefix) + ".json").read_text(encoding="utf-8"))
-    data = np.loadtxt(Path(str(prefix) + ".positions.csv"), delimiter=",", skiprows=1, ndmin=2)
+    path = Path(str(prefix) + ".positions.csv")
+    with path.open(encoding="utf-8") as f:
+        header = f.readline().strip().split(",")
+    if tuple(header) != COLUMNS:
+        raise ValueError(f"{path}: columns {header}, expected {list(COLUMNS)}")
+    data = np.loadtxt(path, delimiter=",", skiprows=1, ndmin=2)
     if data.size == 0:
         raise ValueError(f"{prefix}: no positions")
     return Arm(prefix, meta, data[:, 0].astype(np.int64), data[:, 1].astype(np.int64), data[:, 2], data[:, 3],
-               data[:, 4].astype(bool), data[:, 5], data[:, 6])
+               data[:, 4].astype(bool), data[:, 5], data[:, 6], data[:, 7])
 
 
-def _values(arm: Arm) -> dict[str, np.ndarray]:
-    return {"kld": arm.kld, "clipped": np.minimum(arm.kld, CLIP), "flip": (~arm.same_top).astype(np.float64),
-            "dnll": arm.nll - arm.nll_base, "p_diff2": arm.p_diff.astype(np.float64) ** 2}
+def write_positions(prefix: Path, chunk, position, kld, p_diff, same_top, nll, nll_base, kld_top=None) -> None:
+    """An arm's rows from another tool's per-position values (an adapter's), in the certify format."""
+    n = len(kld)
+    kld_top = np.full(n, np.nan) if kld_top is None else kld_top
+    rows = np.column_stack([chunk, position, kld, p_diff, np.asarray(same_top, dtype=int), nll, nll_base, kld_top])
+    np.savetxt(str(prefix) + ".positions.csv", rows, delimiter=",", header=",".join(COLUMNS), comments="",
+               fmt=["%d", "%d", "%.9g", "%.9g", "%d", "%.9g", "%.9g", "%.9g"])
 
 
 def point(arm: Arm) -> dict[str, float]:
-    v = _values(arm)
-    return {"median_kld": float(np.median(arm.kld)), "clipped_kld": float(v["clipped"].mean()),
-            "flip_rate": float(v["flip"].mean()), "mean_dnll": float(v["dnll"].mean()),
-            "mean_kld": float(arm.kld.mean()), "p99_kld": float(np.quantile(arm.kld, 0.99)),
-            "p999_kld": float(np.quantile(arm.kld, 0.999)), "rms_p_diff": float(np.sqrt(v["p_diff2"].mean()))}
+    """The statistics as llama-perplexity prints them (its 99.9 % interpolates between order statistics)."""
+    out = {"ppl": float(np.exp(arm.nll.mean())), "ln_ppl_ratio": float((arm.nll - arm.nll_base).mean()),
+           "mean_kld": float(arm.kld.mean()), "p999_kld": float(np.quantile(arm.kld, 0.999)),
+           "same_top": float(arm.same_top.mean())}
+    if not np.isnan(arm.kld_top).any():
+        out["mean_kld_top"] = float(arm.kld_top.mean())
+    return out
 
 
 def _weights(chunk: np.ndarray, resamples: int, seed: int) -> tuple[np.ndarray, np.ndarray]:
@@ -97,35 +113,46 @@ def resampled(arm: Arm, weights: np.ndarray, inverse: np.ndarray) -> dict[str, n
     """Every statistic per resample."""
     n = weights.shape[1]
     counts = weights @ np.bincount(inverse, minlength=n).astype(np.float64)
-    v = _values(arm)
 
     def mean(x):
         return (weights @ np.bincount(inverse, weights=x, minlength=n)) / counts
 
-    return {"median_kld": _weighted_quantiles(arm.kld, inverse, weights, 0.5), "clipped_kld": mean(v["clipped"]),
-            "flip_rate": mean(v["flip"]), "mean_dnll": mean(v["dnll"]), "mean_kld": mean(arm.kld),
-            "p99_kld": _weighted_quantiles(arm.kld, inverse, weights, 0.99),
-            "p999_kld": _weighted_quantiles(arm.kld, inverse, weights, 0.999),
-            "rms_p_diff": np.sqrt(mean(v["p_diff2"]))}
+    out = {"ppl": np.exp(mean(arm.nll)), "ln_ppl_ratio": mean(arm.nll - arm.nll_base), "mean_kld": mean(arm.kld),
+           "p999_kld": _weighted_quantiles(arm.kld, inverse, weights, 0.999),
+           "same_top": mean(arm.same_top.astype(np.float64))}
+    if not np.isnan(arm.kld_top).any():
+        out["mean_kld_top"] = mean(arm.kld_top)
+    return out
+
+
+def _interval(estimate: float, draws: np.ndarray) -> dict[str, float]:
+    return {"value": estimate, "low": float(np.quantile(draws, 0.025)), "high": float(np.quantile(draws, 0.975))}
 
 
 def table(arm: Arm, resamples: int = RESAMPLES, seed: int = SEED) -> dict[str, dict[str, float]]:
     weights, inverse = _weights(arm.chunk, resamples, seed)
     draws = resampled(arm, weights, inverse)
-    estimate = point(arm)
-    return {m: {"value": estimate[m], "low": float(np.quantile(draws[m], 0.025)),
-                "high": float(np.quantile(draws[m], 0.975))} for m in GATED + REPORTED}
+    return {m: _interval(v, draws[m]) for m, v in point(arm).items()}
+
+
+def same_positions(a: Arm, b: Arm) -> bool:
+    return np.array_equal(a.chunk, b.chunk) and np.array_equal(a.position, b.position)
 
 
 def paired(a: Arm, b: Arm, resamples: int = RESAMPLES, seed: int = SEED) -> dict[str, dict[str, float]]:
     """A - B on the same positions: both resampled with the same chunk draws."""
-    if not (np.array_equal(a.chunk, b.chunk) and np.array_equal(a.position, b.position)):
+    if not same_positions(a, b):
         raise ValueError(f"{a.name} and {b.name} hold different positions")
     weights, inverse = _weights(a.chunk, resamples, seed)
     da, db = resampled(a, weights, inverse), resampled(b, weights, inverse)
     pa, pb = point(a), point(b)
-    return {m: {"value": pa[m] - pb[m], "low": float(np.quantile(da[m] - db[m], 0.025)),
-                "high": float(np.quantile(da[m] - db[m], 0.975))} for m in GATED + REPORTED}
+    return {m: _interval(pa[m] - pb[m], da[m] - db[m]) for m in pa if m in pb}
+
+
+def identical(a: Arm, b: Arm) -> bool:
+    """Whether two arms scored every position to the same values (a path that changed nothing there)."""
+    return same_positions(a, b) and all(np.array_equal(x, y, equal_nan=True) for x, y in
+                                        ((a.kld, b.kld), (a.nll, b.nll), (a.same_top, b.same_top), (a.kld_top, b.kld_top)))
 
 
 # ------------------------------------------------------------------------- llama-perplexity's printout
@@ -154,12 +181,56 @@ def parse_printout(text: str) -> dict[str, tuple[float, float | None]]:
     return out
 
 
+def printout_point(text: str) -> dict[str, dict[str, float]]:
+    """An engine that only prints llama-perplexity's summary: its statistics with llama.cpp's own ± (one
+    standard error, shown as value +- 1.96 se), the 99.9 % without an interval."""
+    parsed = parse_printout(text)
+    if "Mean KLD" not in parsed:
+        raise ValueError("no KL-divergence summary in the printout")
+
+    def row(value: float, se: float | None) -> dict[str, float]:
+        if se is None:
+            return {"value": value, "low": float("nan"), "high": float("nan")}
+        return {"value": value, "low": value - 1.96 * se, "high": value + 1.96 * se}
+
+    ppl, ppl_se = parsed["Mean PPL(Q)"]
+    ratio, ratio_se = parsed["Mean ln(PPL(Q)/PPL(base))"]
+    kld, kld_se = parsed["Mean KLD"]
+    top, top_se = parsed["Same top p"]
+    return {"ppl": row(ppl, ppl_se), "ln_ppl_ratio": row(ratio, ratio_se), "mean_kld": row(kld, kld_se),
+            "p999_kld": row(parsed["99.9% KLD"][0], None), "same_top": row(top / 100, (top_se or 0) / 100)}
+
+
 def printout_diff(ours: str, theirs: str) -> list[tuple[str, tuple | None, tuple | None, bool]]:
     a, b = parse_printout(ours), parse_printout(theirs)
     rows = []
     for label in list(dict.fromkeys(list(b) + list(a))):
         rows.append((label, a.get(label), b.get(label), a.get(label) == b.get(label)))
     return rows
+
+
+def head(base: Path, chunks: int, out: Path) -> None:
+    """A base file of the first `chunks` chunks (llama-perplexity's KL mode scores every chunk its base holds)."""
+    with Path(base).open("rb") as f:
+        magic = f.read(8)
+        if magic != b"_logits_":
+            raise ValueError(f"{base} is not a llama.cpp _logits_ file")
+        context, vocab, total = np.frombuffer(f.read(12), dtype="<i4")
+        if not 0 < chunks <= total:
+            raise ValueError(f"{base} holds {total} chunks")
+        tokens = f.read(4 * int(context) * int(total))
+        row_bytes = 2 * (2 * ((int(vocab) + 1) // 2) + 4)
+        rows = int(context) - 1 - int(context) // 2
+        with Path(out).open("wb") as g:
+            g.write(magic + np.array([context, vocab, chunks], dtype="<i4").tobytes())
+            g.write(tokens[: 4 * int(context) * chunks])
+            remaining = rows * row_bytes * chunks
+            while remaining:
+                block = f.read(min(remaining, 1 << 26))
+                if not block:
+                    raise ValueError(f"{base} is truncated")
+                g.write(block)
+                remaining -= len(block)
 
 
 def _format(row: dict[str, float]) -> str:
@@ -178,7 +249,14 @@ def main(argv: list[str] | None = None) -> int:
     d = sub.add_parser("printout-diff")
     d.add_argument("ours", type=Path)
     d.add_argument("theirs", type=Path)
+    h = sub.add_parser("head")
+    h.add_argument("base", type=Path)
+    h.add_argument("chunks", type=int)
+    h.add_argument("out", type=Path)
     args = parser.parse_args(argv)
+    if args.command == "head":
+        head(args.base, args.chunks, args.out)
+        return 0
     if args.command == "table":
         results = {}
         for prefix in args.arms:
@@ -187,8 +265,9 @@ def main(argv: list[str] | None = None) -> int:
                                  "route": arm.meta.get("route"), "arm": arm.meta.get("arm"), **table(arm)}
             row = results[arm.name]
             print(f"{arm.name} ({row['positions']} positions, {row['chunks']} chunks)")
-            for m in GATED + REPORTED:
-                print(f"  {m:12s} {_format(row[m])}")
+            for m in METRICS + EXTRA:
+                if m in row:
+                    print(f"  {m:13s} {_format(row[m])}")
         if args.json:
             args.json.write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
         return 0
@@ -196,7 +275,7 @@ def main(argv: list[str] | None = None) -> int:
         a, b = load(args.a), load(args.b)
         print(f"{a.name} - {b.name}")
         for m, row in paired(a, b).items():
-            print(f"  {m:12s} {_format(row)}")
+            print(f"  {m:13s} {_format(row)}")
         return 0
     rows = printout_diff(args.ours.read_text(encoding="utf-8"), args.theirs.read_text(encoding="utf-8"))
     for label, ours, theirs, same in rows:

@@ -104,6 +104,14 @@ void check_file(const std::filesystem::path& directory) {
         }
     }
     reader.finish();
+    // Rows read in any order through a stream of their own.
+    std::ifstream in(path, std::ios::binary);
+    std::vector<std::uint16_t> row(header.row_words());
+    for (const auto& [c, k] : {std::pair{1U, 2U}, std::pair{0U, 0U}, std::pair{1U, 0U}}) {
+        llama::BaseReader::read_row(in, header, c, k, row);
+        require(row == written[c * 3 + k], "a row read by its offset is the row written there");
+    }
+    in.close();
     // A truncated file is refused when it is opened.
     std::filesystem::resize_file(path, std::filesystem::file_size(path) - 2);
     bool refused = false;
@@ -161,8 +169,9 @@ void check_positions() {
         const std::vector<double> q = log_softmax(evaluated);
         std::vector<float> observed;
         for (const TokenId token : support) { observed.push_back(static_cast<float>(q[static_cast<std::size_t>(token)])); }
-        const llama::Position from_observed = llama::compare_observed(
-            base, support, observed, static_cast<float>(q[static_cast<std::size_t>(target)]), full.same_top, target);
+        const llama::Position from_observed =
+            llama::compare_observed(base, static_cast<std::int32_t>(vocab), support, observed,
+                                    static_cast<float>(q[static_cast<std::size_t>(target)]), full.same_top, target);
         require(close(from_observed.kld, want.kld, 1e-4, 5e-6), "observed KL matches the definition");
         require(close(from_observed.p_diff, want.p_diff, 1e-5, 1e-7) && from_observed.same_top == full.same_top,
                 "observed values match");
@@ -176,6 +185,74 @@ void check_positions() {
     std::vector<float> other = logits;
     other[3]                 = 4.0F; // the evaluated run's top is now 7
     require(!llama::compare_logits(other, base_tie, 3).same_top, "a different top token is a flip");
+}
+
+// The decode path's observed form (bucket_row, compare_bucket) against its definition in binary64: the KL sum's
+// terms over the observed tokens plus P log(P / Q') for the rest, P the rest's base mass and Q' the evaluated
+// mass outside the observed tokens of the sum.
+void check_bucket() {
+    std::mt19937 rng(4);
+    for (const std::size_t vocab : {std::size_t{3000}, std::size_t{200}}) {
+        for (int trial = 0; trial < 6; ++trial) {
+            const std::vector<float> reference = random_logits(rng, vocab, trial % 2 == 0 ? 3.0F : 1.0F);
+            std::vector<float> evaluated       = reference;
+            std::normal_distribution<float> noise(0.0F, trial < 3 ? 0.02F : 0.5F);
+            for (float& value : evaluated) { value += noise(rng); }
+            const std::vector<std::uint16_t> base = encoded(reference);
+            const TokenId target                  = static_cast<TokenId>(rng() % vocab);
+            const llama::BucketRow row            = llama::bucket_row(base, static_cast<std::int32_t>(vocab), target);
+
+            require(row.tokens.size() == std::min(vocab, llama::kObservedTokens) && row.tokens[0] == target,
+                    "the target leads the observed tokens");
+            const auto code = [&](TokenId t) { return base[4 + static_cast<std::size_t>(t)]; };
+            bool ordered = true;
+            for (std::size_t k = 2; k < row.tokens.size(); ++k) {
+                const TokenId a = row.tokens[k - 1], b = row.tokens[k];
+                ordered = ordered && (code(a) > code(b) || (code(a) == code(b) && a < b));
+            }
+            std::vector<TokenId> sorted = row.tokens;
+            std::sort(sorted.begin(), sorted.end());
+            require(ordered && std::adjacent_find(sorted.begin(), sorted.end()) == sorted.end(),
+                    "the others follow by code, distinct");
+            std::uint16_t lowest_taken = 65535;
+            for (std::size_t k = 1; k < row.tokens.size(); ++k) { lowest_taken = std::min(lowest_taken, code(row.tokens[k])); }
+            bool most_probable = true;
+            for (TokenId t = 0; t < static_cast<TokenId>(vocab); ++t) {
+                if (std::find(row.tokens.begin(), row.tokens.end(), t) == row.tokens.end()) { most_probable = most_probable && code(t) <= lowest_taken; }
+            }
+            require(most_probable, "no unobserved token is more probable than an observed one");
+            require(row.top == llama::base_top(base, static_cast<std::int32_t>(vocab)) &&
+                        row.tokens[row.tokens[0] == row.top ? 0 : 1] == row.top,
+                    "the base's top leads the others");
+
+            const std::vector<double> q = log_softmax(evaluated);
+            std::vector<float> observed;
+            for (const TokenId token : row.tokens) { observed.push_back(static_cast<float>(q[static_cast<std::size_t>(token)])); }
+            double kl = 0, support = 0, observed_base = 0, observed_q = 0;
+            for (std::size_t i = 0; i < vocab; ++i) {
+                const double p = llama::row_log_prob(base, static_cast<TokenId>(i));
+                if (p > -16.0) { support += std::exp(p); }
+            }
+            for (const TokenId token : row.tokens) {
+                const double p = llama::row_log_prob(base, token);
+                if (p > -16.0) {
+                    kl += std::exp(p) * (p - q[static_cast<std::size_t>(token)]);
+                    observed_base += std::exp(p);
+                    observed_q += std::exp(q[static_cast<std::size_t>(token)]);
+                }
+            }
+            const double rest_base = support - observed_base, rest = 1 - observed_q;
+            if (rest_base > 1e-12 && rest > 0) { kl += rest_base * std::log(rest_base / rest); }
+            const llama::Position bucket = llama::compare_bucket(row, observed, true);
+            const llama::Position full   = llama::compare_logits(evaluated, base, target);
+            require(close(bucket.kld, kl, 1e-4, 5e-6) && bucket.kld_top == bucket.kld, "the observed form matches its definition");
+            require(bucket.kld <= full.kld + 5e-6, "the observed form is a lower bound of the KL sum");
+            // compare_logits takes binary32 log-probabilities l - (max + L), as llama.cpp does: ~1e-6 nats apart.
+            require(close(full.kld_top, kl, 1e-4, 5e-6), "compare_logits reports the observed form too");
+            require(bucket.nll == full.nll || close(bucket.nll, full.nll, 1e-6, 1e-6), "the observed NLL is the target's");
+            if (vocab <= llama::kObservedTokens) { require(close(bucket.kld, full.kld, 1e-4, 5e-6), "observing every token leaves no bucket"); }
+        }
+    }
 }
 
 void check_summary() {
@@ -216,6 +293,7 @@ int main() {
         check_encoding();
         check_file(std::filesystem::temp_directory_path());
         check_positions();
+        check_bucket();
         check_summary();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

@@ -454,6 +454,11 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     summary.fast_path_configuration = models::qwen4_exp::describe(fast.configuration);
     for (const FastPath path : fast.paths) { summary.fast_paths.emplace_back(fast_path_name(path)); }
     summary.fast_paths_disabled = !options.fast_paths;
+    for (const FastPath path : kFastPaths) {
+        if (models::qwen4_exp::fast_path_applies(path, fast.configuration, options)) {
+            summary.fast_paths_applicable.emplace_back(fast_path_name(path));
+        }
+    }
     // Tail skip makes the output depend on which experts the cache holds.
     summary.request_invariant = fast.request_invariant() && options.expert_tail_skip == 0;
 

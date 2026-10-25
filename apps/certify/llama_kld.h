@@ -38,6 +38,8 @@ struct BaseHeader {
     [[nodiscard]] std::span<const TokenId> chunk(std::size_t index) const {
         return std::span<const TokenId>(tokens).subspan(index * context, context);
     }
+    // The byte offset of chunk `chunk`'s row `row` (0 .. rows_per_chunk() - 1) in the file.
+    [[nodiscard]] std::uint64_t row_offset(std::size_t chunk, std::size_t row) const noexcept;
 };
 
 // One row as llama.cpp's writer encodes a logits row (its log_softmax with a uint16 output).
@@ -71,6 +73,9 @@ public:
     [[nodiscard]] std::vector<std::uint16_t> next_chunk();
     // Throws unless every chunk has been read and nothing follows.
     void finish();
+    // Chunk `chunk`'s row `row` read through its own stream (any order; one stream per thread).
+    static void read_row(std::ifstream& in, const BaseHeader& header, std::size_t chunk, std::size_t row,
+                         std::span<std::uint16_t> out);
 
 private:
     std::filesystem::path path_;
@@ -86,6 +91,10 @@ struct Position {
     bool same_top    = false; // the evaluated and base most probable tokens agree (each: lowest id among equals)
     float nll        = 0.0F;  // -log q(target)
     float nll_base   = 0.0F;  // -log p_base(target)
+    // The decode path's form of kld (compare_bucket): the same sum over the target and the base's most
+    // probable tokens, the rest of the sum's tokens as one bucket. A lower bound of kld (the log-sum
+    // inequality); every arm reports it, so the decode arms' approximation is measured on the prompt arms.
+    double kld_top   = 0.0;
 };
 
 // From the evaluated run's whole logits row, in llama.cpp's arithmetic.
@@ -97,10 +106,34 @@ struct Position {
 [[nodiscard]] TokenId base_top(std::span<const std::uint16_t> base, std::int32_t vocab);
 
 // From the evaluated run's log-probabilities of kl_support's tokens (in its order) and of the target, and
-// whether its most probable token is base_top: what a decode-path observation or another base file gives.
-[[nodiscard]] Position compare_observed(std::span<const std::uint16_t> base, std::span<const TokenId> support,
-                                        std::span<const float> log_probs, float target_log_prob, bool same_top,
-                                        TokenId target);
+// whether its most probable token is base_top: what another base file gives (llama-compare).
+[[nodiscard]] Position compare_observed(std::span<const std::uint16_t> base, std::int32_t vocab,
+                                        std::span<const TokenId> support, std::span<const float> log_probs,
+                                        float target_log_prob, bool same_top, TokenId target);
+
+// Most tokens a decode step observes (the Engine's kMaximumObservedTokens): the target and the base's 255
+// most probable others.
+inline constexpr std::size_t kObservedTokens = 256;
+
+// What a decode step needs of its base row: the tokens it observes (the target first, then the base's most
+// probable others by code, the lowest id first among equal codes, at most kObservedTokens in all), their
+// base log-probabilities, the base probability mass of the KL sum's tokens (base log-probability above -16)
+// and the base's most probable token.
+struct BucketRow {
+    TokenId target = 0;
+    TokenId top    = 0;
+    double support_mass = 0.0;
+    std::vector<TokenId> tokens;
+    std::vector<float> log_probs;
+};
+
+[[nodiscard]] BucketRow bucket_row(std::span<const std::uint16_t> base, std::int32_t vocab, TokenId target);
+
+// From the evaluated log-probabilities of row.tokens (in its order) and whether its most probable token is
+// row.top: llama.cpp's terms for the observed tokens of the KL sum, plus one term P log(P / Q) for the rest
+// of its tokens (P their base mass, Q the evaluated mass outside the observed tokens; none when either is not
+// positive). kld and kld_top both hold that value; nll, p_diff and same_top are exact.
+[[nodiscard]] Position compare_bucket(const BucketRow& row, std::span<const float> log_probs, bool same_top);
 
 // llama.cpp's accumulation and final summary ("====== Perplexity statistics ======" onwards).
 class Summary {
@@ -118,7 +151,8 @@ private:
     std::vector<float> kld_, p_diff_;
 };
 
-// One row per position for the paired statistics (tools/quality): chunk, position, and Position's fields.
+// One row per position for the paired statistics (tools/quality/llama_kld.py): chunk, position, and
+// Position's fields (kld, p_diff, same_top, nll, nll_base, kld_top).
 class PositionWriter {
 public:
     explicit PositionWriter(const std::filesystem::path& path);

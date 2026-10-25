@@ -29,11 +29,18 @@
 //   infernix-certify reference <artifact> --format llama-kld --out FILE (--text F [--context N] [--chunks N] |
 //                    --tokens-from BASE) [--design --kv-dtype K] [--logits-dtype fp32|bf16]
 //   infernix-certify prefill   <artifact> --llama-base FILE --out PREFIX [route options | --lossless [--noise-seed N]]
-//   infernix-certify decode    <artifact> --llama-base FILE --out PREFIX [route options] [--spec ...]
+//   infernix-certify decode    <artifact> --llama-base FILE --out PREFIX [route options] [--concurrency N] [--spec ...]
 //   infernix-certify llama-compare --llama-base FILE --logits OTHER --out PREFIX
-//   --text is tokenized whole and cut into --context-token chunks (default 512, the first --chunks, default 100;
-//   0 takes every whole chunk), as llama-perplexity cuts its -f file; --tokens-from takes another base file's
-//   tokens (llama.cpp's tokenization). llama-compare scores a base file llama-perplexity saved of its own logits.
+//   infernix-certify llama-rows --llama-base FILE --rows ROWS|- --out PREFIX [--label TEXT] [--chunks N]
+//   [--threads N]: the CPU threads of the per-row arithmetic (default half the hardware threads).
+//   --text is tokenized whole and cut into --context-token chunks (default 512; the first --chunks N, default
+//   every whole chunk), as llama-perplexity cuts its -f file; an arm's --chunks N scores the base's first N; --tokens-from takes another base file's
+//   tokens (llama.cpp's tokenization). prefill scores each chunk in one pass (the prompt path, llama-perplexity
+//   -b n_ctx); decode prefills each chunk's first half and forces the rest through the decode path, one request
+//   per chunk (Basalt's ppl_gate protocol). llama-compare scores a base file llama-perplexity saved of its own
+//   logits; llama-rows scores another engine's logits rows (binary32, the base's rows in order), as an adapter in
+//   tools/quality/engines streams them. Every arm writes PREFIX.positions.csv, PREFIX.summary.txt
+//   (llama-perplexity's summary) and PREFIX.json.
 
 #include "infernix_build_id.h"
 #include "distribution.h"
@@ -65,6 +72,11 @@
 #include <string_view>
 #include <thread>
 #include <vector>
+
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
 
 namespace {
 
@@ -112,9 +124,14 @@ struct Options {
     std::filesystem::path text;
     std::filesystem::path tokens_from;
     std::uint32_t context = 512;
-    std::uint32_t chunks  = 100;
+    std::uint32_t chunks  = 0; // the reference's chunks, or the first chunks an arm scores; 0: all
     std::filesystem::path llama_base;
     std::filesystem::path logits_file;
+    // llama-rows: another engine's logits (--rows FILE, or - for standard input) and what produced them (--label).
+    std::filesystem::path rows_file;
+    std::string label;
+    // The llama-kld arms' CPU threads for the per-row arithmetic (default: half the hardware threads).
+    std::uint32_t threads = std::max(1U, std::thread::hardware_concurrency() / 2);
 };
 
 template <class Integer>
@@ -162,11 +179,11 @@ std::vector<std::uint32_t> parse_list(std::string_view list) {
 Options parse(int argc, char** argv) {
     if (argc < 3) {
         throw std::invalid_argument("usage: infernix-certify reference|verify|prefill|decode|capture|mask <artifact> ... | "
-                                    "llama-compare ...");
+                                    "llama-compare ... | llama-rows ...");
     }
     Options out{.command = argv[1]};
-    // llama-compare reads two base files and runs no engine.
-    const bool artifact = out.command != "llama-compare";
+    // llama-compare and llama-rows read files and run no engine.
+    const bool artifact = out.command != "llama-compare" && out.command != "llama-rows";
     if (artifact) { out.artifact = argv[2]; }
     for (int i = artifact ? 3 : 2; i < argc; ++i) {
         const std::string_view option = argv[i];
@@ -249,6 +266,12 @@ Options parse(int argc, char** argv) {
             out.llama_base = std::string(value());
         } else if (option == "--logits") {
             out.logits_file = std::string(value());
+        } else if (option == "--rows") {
+            out.rows_file = std::string(value());
+        } else if (option == "--label") {
+            out.label = std::string(value());
+        } else if (option == "--threads") {
+            out.threads = std::max(1U, parse_integer<std::uint32_t>(value(), "threads"));
         } else {
             throw std::invalid_argument("unknown option " + std::string(option));
         }
@@ -301,6 +324,7 @@ json load_json(const infernix::Engine& engine) {
                 {"prefill_signature", load.prefill_signature},
                 {"fast_paths", load.fast_paths},
                 {"fast_path_configuration", load.fast_path_configuration},
+                {"fast_paths_applicable", load.fast_paths_applicable},
                 {"request_invariant", load.request_invariant},
                 {"load_seconds", load.load_seconds}};
 }
@@ -888,6 +912,14 @@ void llama_base_json(json& meta, const Options& options, const llama::BaseHeader
     meta["vocab"]      = header.vocab;
 }
 
+// The chunks an arm scores: the base's first --chunks N, or all of them.
+std::int32_t arm_chunks(const Options& options, const llama::BaseHeader& header) {
+    if (options.chunks > static_cast<std::uint32_t>(header.chunks)) {
+        throw std::invalid_argument("--chunks " + std::to_string(options.chunks) + ": the base holds " + std::to_string(header.chunks));
+    }
+    return options.chunks == 0 ? header.chunks : static_cast<std::int32_t>(options.chunks);
+}
+
 int run_llama_reference(const Options& options) {
     if (options.out.empty()) { throw std::invalid_argument("reference needs --out"); }
     if (options.text.empty() == options.tokens_from.empty()) {
@@ -956,6 +988,33 @@ int run_llama_reference(const Options& options) {
     return 0;
 }
 
+// Runs body(i) for every i in [0, count) on up to `threads` threads.
+template <class Body>
+void parallel_for(std::size_t count, std::uint32_t threads, const Body& body) {
+    const std::size_t workers = std::min<std::size_t>(std::max<std::uint32_t>(threads, 1), count);
+    if (workers <= 1) {
+        for (std::size_t i = 0; i < count; ++i) { body(i); }
+        return;
+    }
+    std::atomic<std::size_t> next{0};
+    std::vector<std::exception_ptr> errors(workers);
+    std::vector<std::thread> pool;
+    for (std::size_t w = 0; w < workers; ++w) {
+        pool.emplace_back([&, w] {
+            try {
+                for (std::size_t i = next++; i < count; i = next++) { body(i); }
+            } catch (...) {
+                errors[w] = std::current_exception();
+                next      = count;
+            }
+        });
+    }
+    for (std::thread& thread : pool) { thread.join(); }
+    for (const std::exception_ptr& error : errors) {
+        if (error) { std::rethrow_exception(error); }
+    }
+}
+
 int run_llama_prefill(const Options& options) {
     if (options.out.empty()) { throw std::invalid_argument("prefill needs --out"); }
     llama::BaseReader base(options.llama_base);
@@ -978,7 +1037,8 @@ int run_llama_prefill(const Options& options) {
     const std::size_t words                    = header.row_words();
     llama::Summary summary;
     llama::PositionWriter rows(std::filesystem::path(options.out.string() + ".positions.csv"));
-    for (std::int32_t c = 0; c < header.chunks; ++c) {
+    const std::int32_t chunks = arm_chunks(options, header);
+    for (std::int32_t c = 0; c < chunks; ++c) {
         const std::vector<std::uint16_t> base_rows = base.next_chunk();
         const std::span<const TokenId> chunk       = header.chunk(static_cast<std::size_t>(c));
         const infernix::ScoreResult scored =
@@ -986,19 +1046,26 @@ int run_llama_prefill(const Options& options) {
         if (scored.logits.size() != positions.size() * static_cast<std::size_t>(header.vocab)) {
             throw std::runtime_error("the artifact's vocabulary differs from the base file's " + std::to_string(header.vocab));
         }
+        const auto vocab = static_cast<std::size_t>(header.vocab);
+        std::vector<llama::Position> scored_rows(positions.size());
+        parallel_for(positions.size(), options.threads, [&](std::size_t k) {
+            scored_rows[k] = llama::compare_logits(std::span<const float>(scored.logits.data() + k * vocab, vocab),
+                                                   std::span<const std::uint16_t>(base_rows.data() + k * words, words),
+                                                   chunk[positions[k] + 1]);
+        });
         for (std::size_t k = 0; k < positions.size(); ++k) {
-            const std::uint32_t r          = positions[k];
-            const llama::Position position = llama::compare_logits(
-                std::span<const float>(scored.logits.data() + k * static_cast<std::size_t>(header.vocab), static_cast<std::size_t>(header.vocab)),
-                std::span<const std::uint16_t>(base_rows.data() + k * words, words), chunk[r + 1]);
-            summary.add(position);
-            rows.add(static_cast<std::uint32_t>(c), r, position);
+            summary.add(scored_rows[k]);
+            rows.add(static_cast<std::uint32_t>(c), positions[k], scored_rows[k]);
         }
-        std::cerr << "llama-kld prefill chunk " << c + 1 << "/" << header.chunks << '\n';
+        if ((c + 1) % 20 == 0 || c + 1 == chunks) { std::cerr << "llama-kld prefill chunk " << c + 1 << "/" << chunks << '\n'; }
     }
-    base.finish();
+    if (chunks == header.chunks) { base.finish(); }
     json meta             = provenance(options, nullptr);
     meta["arm"]           = "llama_prefill";
+    meta["chunks_scored"] = chunks;
+    meta["kld_definition"] = "full";
+    meta["fast_path_candidates"] = json::array();
+    for (const infernix::FastPath path : options.candidates) { meta["fast_path_candidates"].push_back(infernix::fast_path_name(path)); }
     meta["route"]         = options.lossless ? (options.noise_seed != 0 ? "noise_twin" : (options.design ? "design" : "lossless"))
                                              : (options.reproducible ? "reproducible" : "default");
     meta["noise_seed"]    = options.noise_seed;
@@ -1014,151 +1081,158 @@ int run_llama_prefill(const Options& options) {
     return 0;
 }
 
-// The decode path (llama-perplexity -b 1's counterpart): each chunk's scored tokens forced through it in requests
-// of kMaximumConstraintSteps steps, each request's first step (its prompt's prefill) unscored, so every scored
-// distribution comes from a decode step. A step observes the tokens of the KL sum (base log-probability above
-// -16, kl_support), most probable first, kMaximumObservedTokens - 1 per request besides the target: a step with
-// more repeats the identical request with the next tokens, and every repeat must reproduce the first one's
-// target and largest log-probabilities bit for bit.
+// The decode path (protocol D; Basalt's ppl_gate, llama-perplexity -b 1's counterpart for the scored half): each
+// chunk in one request whose prompt is its first half (n_ctx/2 tokens, prefilled), forcing tokens n_ctx/2 ..
+// n_ctx-1 through the decode path, so every scored distribution and the scored half's KV and state come from
+// decode (or verification) steps, as in a generation. The first forced token's distribution is the prompt's
+// and unscored. A step observes the target and the base's 255 most probable tokens; the rest of the KL sum's
+// tokens are one bucket (compare_bucket), so kld is kld_top here: llama.cpp's KL less its unobserved tail,
+// which the prompt arms measure (their kld against their kld_top). --concurrency N runs N chunks at once.
 int run_llama_decode(const Options& options) {
     if (options.out.empty()) { throw std::invalid_argument("decode needs --out"); }
-    if (options.concurrency != 1 || options.prefix_reuse) {
-        throw std::invalid_argument("the llama-kld decode arm repeats identical single requests: no --concurrency or --prefix-reuse");
+    if (options.prefix_reuse) {
+        throw std::invalid_argument("the llama-kld decode arm forces each chunk in one request: no --prefix-reuse");
     }
     llama::BaseReader base(options.llama_base);
-    const llama::BaseHeader& header = base.header();
-    const auto started              = std::chrono::steady_clock::now();
+    const llama::BaseHeader& header    = base.header();
+    const std::uint32_t half           = header.first_row();
+    const std::uint32_t steps          = header.context - half;
+    const std::uint32_t rows_per_chunk = header.rows_per_chunk();
+    if (steps > infernix::kMaximumConstraintSteps) {
+        throw std::invalid_argument("the decode arm forces " + std::to_string(steps) + " tokens per chunk; the Engine allows " +
+                                    std::to_string(infernix::kMaximumConstraintSteps));
+    }
+    static_assert(llama::kObservedTokens <= infernix::kMaximumObservedTokens);
+    const auto started = std::chrono::steady_clock::now();
     infernix::EngineOptions engine_options;
     apply_route(options, engine_options);
-    engine_options.max_context                       = (header.context + 127) / 128 * 128;
-    engine_options.kv_capacity                       = infernix::KvCapacityPolicy::explicit_capacity(engine_options.max_context);
-    engine_options.max_concurrency                   = 1;
-    engine_options.pending_timeout_ms                = 3'600'000;
+    engine_options.max_context = (header.context + 127) / 128 * 128;
+    engine_options.kv_capacity = infernix::KvCapacityPolicy::explicit_capacity(
+        options.kv_tokens != 0 ? options.kv_tokens : engine_options.max_context * options.concurrency);
+    engine_options.max_concurrency    = options.concurrency;
+    engine_options.pending_timeout_ms = 3'600'000;
+    // The chunks share no prefix: the context cache would only take memory.
     engine_options.context_cache.enabled             = false;
     engine_options.context_cache.host_capacity_bytes = 0;
     engine_options.speculative                       = options.speculative;
     if (options.speculative.backend != infernix::SpeculativeBackend::None) {
+        // The optimized proposal head (--lm-head-draft), as the served configurations run it.
         engine_options.speculative.proposal_head = infernix::ProposalHead::Optimized;
     }
     infernix::Engine engine(engine_options);
-    constexpr std::uint32_t kSteps = infernix::kMaximumConstraintSteps;
-    constexpr std::size_t kSlice   = infernix::kMaximumObservedTokens - 1;
-    const std::size_t words        = header.row_words();
-    const std::uint32_t first      = header.first_row() + 1; // the first scored token
+    const std::size_t words = header.row_words();
+    struct ChunkResult {
+        std::vector<llama::Position> positions;
+        double prefill_seconds = 0, decode_seconds = 0;
+    };
+    std::vector<ChunkResult> results(static_cast<std::size_t>(arm_chunks(options, header)));
+    // Each lane reads its chunk's rows in blocks and selects their observed tokens on its share of the threads.
+    constexpr std::size_t kBlock       = 64;
+    const std::uint32_t lane_threads   = std::max<std::uint32_t>(1, options.threads / options.concurrency);
+    std::atomic<std::size_t> next{0}, finished{0};
+    std::vector<std::exception_ptr> errors(options.concurrency);
+    std::vector<std::thread> lanes;
+    for (std::uint32_t lane = 0; lane < options.concurrency; ++lane) {
+        lanes.emplace_back([&, lane] {
+            try {
+                std::ifstream in(options.llama_base, std::ios::binary);
+                if (!in) { throw std::runtime_error("cannot read " + options.llama_base.string()); }
+                std::vector<std::uint16_t> block(kBlock * words);
+                for (std::size_t c = next++; c < results.size(); c = next++) {
+                    const std::span<const TokenId> chunk = header.chunk(c);
+                    std::vector<llama::BucketRow> buckets(rows_per_chunk);
+                    for (std::size_t first = 0; first < rows_per_chunk; first += kBlock) {
+                        const std::size_t count = std::min<std::size_t>(kBlock, rows_per_chunk - first);
+                        for (std::size_t k = 0; k < count; ++k) {
+                            llama::BaseReader::read_row(in, header, c, first + k,
+                                                        std::span<std::uint16_t>(block.data() + k * words, words));
+                        }
+                        parallel_for(count, lane_threads, [&](std::size_t k) {
+                            // Row first + k predicts token half + 1 + first + k.
+                            buckets[first + k] = llama::bucket_row(std::span<const std::uint16_t>(block.data() + k * words, words),
+                                                                   header.vocab, chunk[half + 1 + first + k]);
+                        });
+                    }
+                    infernix::RequestOptions request;
+                    request.execution.requested_output_tokens = steps;
+                    request.execution.sampling.temperature    = 0.0F;
+                    request.execution.allow_prefix_reuse      = false;
+                    request.stop.include_model_defaults       = false;
+                    request.execution.constraint.steps.push_back({chunk[half]});
+                    request.execution.constraint.observe.emplace_back();
+                    for (std::uint32_t k = 0; k < rows_per_chunk; ++k) {
+                        request.execution.constraint.steps.push_back({chunk[half + 1 + k]});
+                        request.execution.constraint.observe.push_back(buckets[k].tokens);
+                    }
+                    const infernix::GenerationResult result =
+                        engine.submit(engine.prepare_tokens(std::vector<TokenId>(chunk.begin(), chunk.begin() + half), false),
+                                      std::move(request))
+                            .wait();
+                    if (result.constrained_draws.size() != steps) {
+                        throw std::runtime_error("chunk " + std::to_string(c) + " forced " + std::to_string(result.constrained_draws.size()) +
+                                                 " of " + std::to_string(steps) + " tokens");
+                    }
+                    ChunkResult& out = results[c];
+                    out.positions.resize(rows_per_chunk);
+                    for (std::uint32_t k = 0; k < rows_per_chunk; ++k) {
+                        const llama::BucketRow& row           = buckets[k];
+                        const infernix::ConstrainedDraw& draw = result.constrained_draws[k + 1];
+                        if (draw.observed_logprobs.size() != row.tokens.size()) {
+                            throw std::runtime_error("a decode step reported the wrong observation count");
+                        }
+                        // The base's most probable token is the target or the first other.
+                        const std::size_t top = row.tokens[0] == row.top ? 0 : 1;
+                        if (row.tokens[top] != row.top) { throw std::logic_error("the observed tokens do not lead with the base's top"); }
+                        const bool same_top = std::memcmp(&draw.observed_logprobs[top], &draw.top_logprob, sizeof(float)) == 0;
+                        out.positions[k]    = llama::compare_bucket(row, draw.observed_logprobs, same_top);
+                    }
+                    out.prefill_seconds = result.timings.prefill_seconds;
+                    out.decode_seconds  = result.timings.decode_share_seconds;
+                    const std::size_t total = ++finished;
+                    if (total % 10 == 0 || total == results.size()) {
+                        std::cerr << "llama-kld decode " << total << "/" << results.size() << " chunks\n";
+                    }
+                }
+            } catch (...) {
+                errors[lane] = std::current_exception();
+                next         = results.size();
+            }
+        });
+    }
+    for (std::thread& lane : lanes) { lane.join(); }
+    for (const std::exception_ptr& error : errors) {
+        if (error) { std::rethrow_exception(error); }
+    }
     llama::Summary summary;
     llama::PositionWriter rows(std::filesystem::path(options.out.string() + ".positions.csv"));
-    std::uint64_t requests = 0, observed_tokens = 0;
     double prefill_seconds = 0, decode_seconds = 0;
-    struct Step {
-        TokenId target = 0;
-        std::span<const std::uint16_t> row;
-        std::vector<TokenId> support;   // ascending
-        std::vector<TokenId> order;     // the support without the target, most probable first
-        std::vector<float> log_probs;   // the evaluated run's, in the support's order
-        float target_log_prob = 0, top_log_prob = 0;
-    };
-    for (std::int32_t c = 0; c < header.chunks; ++c) {
-        const std::vector<std::uint16_t> base_rows = base.next_chunk();
-        const std::span<const TokenId> chunk       = header.chunk(static_cast<std::size_t>(c));
-        // A request forces tokens start - 1 .. start + count - 1 and scores start .. start + count - 1.
-        for (std::uint32_t start = first; start < header.context; start += kSteps - 1) {
-            const std::uint32_t count = std::min(kSteps - 1, header.context - start);
-            std::vector<Step> steps(count);
-            std::size_t passes = 1;
-            for (std::uint32_t k = 0; k < count; ++k) {
-                Step& step  = steps[k];
-                const std::uint32_t r = start + k - 1; // the row of the position predicting token start + k
-                step.target = chunk[start + k];
-                step.row    = std::span<const std::uint16_t>(base_rows.data() + (r - header.first_row()) * words, words);
-                step.support = llama::kl_support(step.row, header.vocab);
-                for (const TokenId token : step.support) {
-                    if (token != step.target) { step.order.push_back(token); }
-                }
-                std::stable_sort(step.order.begin(), step.order.end(), [&](TokenId a, TokenId b) {
-                    return llama::row_log_prob(step.row, a) > llama::row_log_prob(step.row, b);
-                });
-                step.log_probs.assign(step.support.size(), 0.0F);
-                passes = std::max(passes, (step.order.size() + kSlice - 1) / kSlice);
-            }
-            for (std::size_t pass = 0; pass < passes; ++pass) {
-                infernix::RequestOptions request;
-                request.execution.requested_output_tokens = count + 1;
-                request.execution.sampling.temperature    = 0.0F;
-                request.execution.allow_prefix_reuse      = false;
-                request.stop.include_model_defaults       = false;
-                request.execution.constraint.steps.push_back({chunk[start - 1]});
-                request.execution.constraint.observe.push_back({chunk[start - 1]});
-                std::vector<std::span<const TokenId>> slices(count);
-                for (std::uint32_t k = 0; k < count; ++k) {
-                    const Step& step        = steps[k];
-                    const std::size_t begin = std::min(step.order.size(), pass * kSlice);
-                    const std::size_t end   = std::min(step.order.size(), begin + kSlice);
-                    slices[k]               = std::span<const TokenId>(step.order.data() + begin, end - begin);
-                    std::vector<TokenId> observe{step.target};
-                    observe.insert(observe.end(), slices[k].begin(), slices[k].end());
-                    request.execution.constraint.steps.push_back({step.target});
-                    request.execution.constraint.observe.push_back(std::move(observe));
-                }
-                const infernix::GenerationResult result = engine.generate(
-                    engine.prepare_tokens(std::vector<TokenId>(chunk.begin(), chunk.begin() + (start - 1)), false), std::move(request));
-                if (result.constrained_draws.size() != count + 1) {
-                    throw std::runtime_error("chunk " + std::to_string(c) + " forced " + std::to_string(result.constrained_draws.size()) +
-                                             " of " + std::to_string(count + 1) + " tokens");
-                }
-                ++requests;
-                prefill_seconds += result.timings.prefill_seconds;
-                decode_seconds += result.timings.decode_share_seconds;
-                for (std::uint32_t k = 0; k < count; ++k) {
-                    Step& step                            = steps[k];
-                    const infernix::ConstrainedDraw& draw = result.constrained_draws[k + 1];
-                    if (draw.observed_logprobs.size() != slices[k].size() + 1) {
-                        throw std::runtime_error("a decode step reported the wrong observation count");
-                    }
-                    if (pass == 0) {
-                        step.target_log_prob = draw.observed_logprobs[0];
-                        step.top_log_prob    = draw.top_logprob;
-                    } else if (std::memcmp(&step.target_log_prob, &draw.observed_logprobs[0], sizeof(float)) != 0 ||
-                               std::memcmp(&step.top_log_prob, &draw.top_logprob, sizeof(float)) != 0) {
-                        throw std::runtime_error("chunk " + std::to_string(c) + " token " + std::to_string(start + k) +
-                                                 ": a repeated identical request decoded different logits");
-                    }
-                    for (std::size_t j = 0; j < slices[k].size(); ++j) {
-                        const auto at = std::lower_bound(step.support.begin(), step.support.end(), slices[k][j]);
-                        step.log_probs[static_cast<std::size_t>(at - step.support.begin())] = draw.observed_logprobs[j + 1];
-                    }
-                    observed_tokens += slices[k].size() + 1;
-                }
-            }
-            for (std::uint32_t k = 0; k < count; ++k) {
-                Step& step = steps[k];
-                const auto target = std::lower_bound(step.support.begin(), step.support.end(), step.target);
-                if (target != step.support.end() && *target == step.target) {
-                    step.log_probs[static_cast<std::size_t>(target - step.support.begin())] = step.target_log_prob;
-                }
-                // The base's most probable token is in the support; the evaluated run's is it when it holds the
-                // step's largest log-probability.
-                const TokenId top  = llama::base_top(step.row, header.vocab);
-                const auto top_at  = std::lower_bound(step.support.begin(), step.support.end(), top);
-                const bool same    = step.log_probs[static_cast<std::size_t>(top_at - step.support.begin())] == step.top_log_prob;
-                const llama::Position position =
-                    llama::compare_observed(step.row, step.support, step.log_probs, step.target_log_prob, same, step.target);
-                summary.add(position);
-                rows.add(static_cast<std::uint32_t>(c), start + k - 1, position);
-            }
+    for (std::size_t c = 0; c < results.size(); ++c) {
+        for (std::uint32_t k = 0; k < rows_per_chunk; ++k) {
+            summary.add(results[c].positions[k]);
+            rows.add(static_cast<std::uint32_t>(c), half + k, results[c].positions[k]);
         }
-        std::cerr << "llama-kld decode chunk " << c + 1 << "/" << header.chunks << " (" << requests << " requests)\n";
+        prefill_seconds += results[c].prefill_seconds;
+        decode_seconds += results[c].decode_seconds;
     }
-    base.finish();
-    json meta                  = provenance(options, nullptr);
-    meta["arm"]                = "llama_decode";
-    meta["route"]              = options.reproducible ? "reproducible" : "default";
-    meta["kv_dtype"]           = options.kv;
-    meta["logits_dtype"]       = options.logits;
-    meta["spec"]               = infernix::product::speculative_backend_name(options.speculative.backend);
-    meta["requests"]           = requests;
-    meta["observed_tokens"]    = observed_tokens;
-    meta["prefill_seconds"]    = prefill_seconds;
-    meta["decode_seconds"]     = decode_seconds;
+    const infernix::RuntimeStats stats = engine.runtime_stats();
+    json meta                = provenance(options, nullptr);
+    meta["arm"]              = "llama_decode";
+    meta["chunks_scored"]    = results.size();
+    meta["kld_definition"]   = "observed_bucket";
+    meta["route"]            = options.reproducible ? "reproducible" : "default";
+    meta["fast_path_candidates"] = json::array();
+    for (const infernix::FastPath path : options.candidates) { meta["fast_path_candidates"].push_back(infernix::fast_path_name(path)); }
+    meta["kv_dtype"]         = options.kv;
+    meta["logits_dtype"]     = options.logits;
+    meta["concurrency"]      = options.concurrency;
+    meta["spec"]             = infernix::product::speculative_backend_name(options.speculative.backend);
+    meta["draft_tokens"]     = options.speculative.draft_tokens_auto ? json("auto") : json(options.speculative.draft_tokens);
+    meta["ngram_draft_tokens"] = options.speculative.ngram_draft_tokens_auto ? json("auto")
+                                                                             : json(options.speculative.ngram_draft_tokens);
+    meta["draft_model"]      = options.speculative.draft_model.string();
+    meta["preemptions"]      = stats.preemptions;
+    meta["prefill_seconds"]  = prefill_seconds;
+    meta["decode_seconds"]   = decode_seconds;
     llama_base_json(meta, options, header);
     meta["load"]    = load_json(engine);
     meta["seconds"] = seconds_since(started);
@@ -1189,23 +1263,25 @@ int run_llama_compare(const Options& options) {
     const std::size_t words = header.row_words();
     llama::Summary summary;
     llama::PositionWriter rows(std::filesystem::path(options.out.string() + ".positions.csv"));
-    std::vector<float> log_probs;
     for (std::int32_t c = 0; c < header.chunks; ++c) {
         const std::vector<std::uint16_t> base_rows  = base.next_chunk();
         const std::vector<std::uint16_t> other_rows = other.next_chunk();
         const std::span<const TokenId> chunk        = header.chunk(static_cast<std::size_t>(c));
-        for (std::uint32_t k = 0; k < header.rows_per_chunk(); ++k) {
+        std::vector<llama::Position> positions(header.rows_per_chunk());
+        parallel_for(positions.size(), options.threads, [&](std::size_t k) {
             const std::span<const std::uint16_t> row(base_rows.data() + k * words, words);
             const std::span<const std::uint16_t> evaluated(other_rows.data() + k * words, words);
-            const TokenId target                   = chunk[header.first_row() + k + 1];
-            const std::vector<TokenId> support     = llama::kl_support(row, header.vocab);
-            log_probs.resize(support.size());
+            const TokenId target               = chunk[header.first_row() + k + 1];
+            const std::vector<TokenId> support = llama::kl_support(row, header.vocab);
+            std::vector<float> log_probs(support.size());
             for (std::size_t j = 0; j < support.size(); ++j) { log_probs[j] = llama::row_log_prob(evaluated, support[j]); }
             const bool same = llama::base_top(evaluated, header.vocab) == llama::base_top(row, header.vocab);
-            const llama::Position position =
-                llama::compare_observed(row, support, log_probs, llama::row_log_prob(evaluated, target), same, target);
-            summary.add(position);
-            rows.add(static_cast<std::uint32_t>(c), header.first_row() + k, position);
+            positions[k]    = llama::compare_observed(row, header.vocab, support, log_probs, llama::row_log_prob(evaluated, target),
+                                                      same, target);
+        });
+        for (std::uint32_t k = 0; k < header.rows_per_chunk(); ++k) {
+            summary.add(positions[k]);
+            rows.add(static_cast<std::uint32_t>(c), header.first_row() + k, positions[k]);
         }
     }
     base.finish();
@@ -1213,6 +1289,68 @@ int run_llama_compare(const Options& options) {
     json meta      = provenance(options, nullptr);
     meta["arm"]    = "llama_compare";
     meta["logits"] = std::filesystem::absolute(options.logits_file).string();
+    llama_base_json(meta, options, header);
+    meta["seconds"] = seconds_since(started);
+    finish_llama_arm(options, std::move(meta), summary, rows);
+    return 0;
+}
+
+// Another engine's logits (an adapter's, tools/quality/engines): binary32 rows of the base's vocabulary, the base's
+// rows in order (chunk by chunk, positions n_ctx/2 .. n_ctx-2) for its first --chunks N (default all), from --rows
+// FILE or - (standard input, as an adapter streams them), each scored as the prompt arms score Infernix's.
+int run_llama_rows(const Options& options) {
+    if (options.out.empty() || options.llama_base.empty() || options.rows_file.empty()) {
+        throw std::invalid_argument("llama-rows needs --llama-base, --rows and --out");
+    }
+    llama::BaseReader base(options.llama_base);
+    const llama::BaseHeader& header = base.header();
+    const std::int32_t chunks       = arm_chunks(options, header);
+    std::ifstream file;
+    std::istream* in = &std::cin;
+    if (options.rows_file == "-") {
+#ifdef _WIN32
+        if (_setmode(_fileno(stdin), _O_BINARY) == -1) { throw std::runtime_error("cannot read standard input as binary"); }
+#endif
+        std::ios::sync_with_stdio(false);
+    } else {
+        file.open(options.rows_file, std::ios::binary);
+        if (!file) { throw std::runtime_error("cannot read " + options.rows_file.string()); }
+        in = &file;
+    }
+    const auto started                         = std::chrono::steady_clock::now();
+    const std::vector<std::uint32_t> positions = llama_positions(header);
+    const auto vocab                           = static_cast<std::size_t>(header.vocab);
+    const std::size_t words                    = header.row_words();
+    llama::Summary summary;
+    llama::PositionWriter rows(std::filesystem::path(options.out.string() + ".positions.csv"));
+    std::vector<float> logits(positions.size() * vocab);
+    for (std::int32_t c = 0; c < chunks; ++c) {
+        const std::vector<std::uint16_t> base_rows = base.next_chunk();
+        const std::span<const TokenId> chunk       = header.chunk(static_cast<std::size_t>(c));
+        in->read(reinterpret_cast<char*>(logits.data()), static_cast<std::streamsize>(logits.size() * sizeof(float)));
+        if (!*in) { throw std::runtime_error("the rows end in chunk " + std::to_string(c) + " of " + std::to_string(chunks)); }
+        std::vector<llama::Position> scored(positions.size());
+        parallel_for(positions.size(), options.threads, [&](std::size_t k) {
+            const std::span<const float> row(logits.data() + k * vocab, vocab);
+            if (!std::all_of(row.begin(), row.end(), [](float value) { return std::isfinite(value) || value == -INFINITY; })) {
+                throw std::runtime_error("chunk " + std::to_string(c) + " row " + std::to_string(k) + " holds a NaN or +inf logit");
+            }
+            scored[k] = llama::compare_logits(row, std::span<const std::uint16_t>(base_rows.data() + k * words, words),
+                                              chunk[positions[k] + 1]);
+        });
+        for (std::size_t k = 0; k < positions.size(); ++k) {
+            summary.add(scored[k]);
+            rows.add(static_cast<std::uint32_t>(c), positions[k], scored[k]);
+        }
+    }
+    if (in->peek() != std::char_traits<char>::eof()) { throw std::runtime_error("the rows hold more than the base's chunks"); }
+    if (chunks == header.chunks) { base.finish(); }
+    json meta             = provenance(options, nullptr);
+    meta["arm"]           = "llama_rows";
+    meta["kld_definition"] = "full";
+    meta["label"]         = options.label;
+    meta["rows"]          = options.rows_file == "-" ? "-" : std::filesystem::absolute(options.rows_file).string();
+    meta["chunks_scored"] = chunks;
     llama_base_json(meta, options, header);
     meta["seconds"] = seconds_since(started);
     finish_llama_arm(options, std::move(meta), summary, rows);
@@ -1227,14 +1365,15 @@ int main(int argc, char** argv) {
         const bool llama_format = options.format == "llama-kld";
         if (llama_format && options.command != "reference") { throw std::invalid_argument("--format belongs to reference"); }
         if (!options.llama_base.empty() && options.command != "prefill" && options.command != "decode" &&
-            options.command != "llama-compare") {
-            throw std::invalid_argument("--llama-base belongs to prefill, decode and llama-compare");
+            options.command != "llama-compare" && options.command != "llama-rows") {
+            throw std::invalid_argument("--llama-base belongs to prefill, decode, llama-compare and llama-rows");
         }
         if (options.command == "reference") { return llama_format ? run_llama_reference(options) : run_reference(options); }
         if (options.command == "verify") { return run_verify(options); }
         if (options.command == "prefill") { return options.llama_base.empty() ? run_prefill(options) : run_llama_prefill(options); }
         if (options.command == "decode") { return options.llama_base.empty() ? run_decode(options) : run_llama_decode(options); }
         if (options.command == "llama-compare") { return run_llama_compare(options); }
+        if (options.command == "llama-rows") { return run_llama_rows(options); }
         if (options.command == "capture") { return run_capture(options, options.capture_tokens, options.capture_every); }
         if (options.command == "mask") { return run_mask(options); }
         throw std::invalid_argument("unknown command " + options.command);

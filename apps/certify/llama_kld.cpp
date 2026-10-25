@@ -150,7 +150,17 @@ Position compare_logits(std::span<const float> logits, std::span<const std::uint
     }
     const float p_base = std::exp(-nll_base);
     const float p      = std::exp(-nll);
-    return Position{.kld = sum, .p_diff = p - p_base, .same_top = imax == imax_base, .nll = nll, .nll_base = nll_base};
+    const BucketRow row = bucket_row(base, static_cast<std::int32_t>(n_vocab), target);
+    std::vector<float> log_probs(row.tokens.size());
+    for (std::size_t k = 0; k < row.tokens.size(); ++k) {
+        log_probs[k] = logits[static_cast<std::size_t>(row.tokens[k])] - max_logit;
+    }
+    return Position{.kld      = sum,
+                    .p_diff   = p - p_base,
+                    .same_top = imax == imax_base,
+                    .nll      = nll,
+                    .nll_base = nll_base,
+                    .kld_top  = compare_bucket(row, log_probs, imax == imax_base).kld};
 }
 
 std::vector<TokenId> kl_support(std::span<const std::uint16_t> base, std::int32_t vocab) {
@@ -176,7 +186,7 @@ TokenId base_top(std::span<const std::uint16_t> base, std::int32_t vocab) {
     return top;
 }
 
-Position compare_observed(std::span<const std::uint16_t> base, std::span<const TokenId> support,
+Position compare_observed(std::span<const std::uint16_t> base, std::int32_t vocab, std::span<const TokenId> support,
                           std::span<const float> log_probs, float target_log_prob, bool same_top, TokenId target) {
     if (support.size() != log_probs.size()) { throw std::invalid_argument("one log-probability per support token is required"); }
     const float nll      = -target_log_prob;
@@ -189,7 +199,82 @@ Position compare_observed(std::span<const std::uint16_t> base, std::span<const T
     }
     const float p_base = std::exp(-nll_base);
     const float p      = std::exp(-nll);
-    return Position{.kld = sum, .p_diff = p - p_base, .same_top = same_top, .nll = nll, .nll_base = nll_base};
+    // The decode path's form from the same values: the target's log-probability, and the support's for the
+    // others (an observed token outside the support is outside both sums, so its value is never read).
+    const BucketRow row = bucket_row(base, vocab, target);
+    std::vector<float> observed(row.tokens.size(), 0.0F);
+    observed[0] = target_log_prob;
+    for (std::size_t k = 1; k < row.tokens.size(); ++k) {
+        const auto at = std::lower_bound(support.begin(), support.end(), row.tokens[k]);
+        if (at != support.end() && *at == row.tokens[k]) { observed[k] = log_probs[static_cast<std::size_t>(at - support.begin())]; }
+    }
+    return Position{.kld      = sum,
+                    .p_diff   = p - p_base,
+                    .same_top = same_top,
+                    .nll      = nll,
+                    .nll_base = nll_base,
+                    .kld_top  = compare_bucket(row, observed, same_top).kld};
+}
+
+BucketRow bucket_row(std::span<const std::uint16_t> base, std::int32_t vocab, TokenId target) {
+    require_row(base, static_cast<std::size_t>(vocab));
+    if (target < 0 || target >= vocab) { throw std::invalid_argument("target outside the vocabulary"); }
+    const std::uint16_t* code = codes(base);
+    BucketRow out{.target = target, .top = base_top(base, vocab)};
+    for (TokenId i = 0; i < vocab; ++i) {
+        const float p_log_base = row_log_prob(base, i);
+        if (p_log_base > -16.F) { out.support_mass += std::exp(p_log_base); }
+    }
+    // The most probable others: the highest codes, the lowest id first among equal codes. A count per code finds
+    // the lowest code taken; every higher code is taken, and that code's lowest ids fill the rest.
+    const std::size_t take = std::min(static_cast<std::size_t>(vocab) - 1, kObservedTokens - 1);
+    std::vector<std::uint32_t> count(65536, 0);
+    for (TokenId i = 0; i < vocab; ++i) {
+        if (i != target) { ++count[code[i]]; }
+    }
+    std::size_t above = 0;
+    std::uint32_t lowest = 65535;
+    while (above + count[lowest] < take) { above += count[lowest--]; }
+    std::size_t at_lowest = take - above;
+    std::vector<TokenId> others;
+    others.reserve(take);
+    for (TokenId i = 0; i < vocab; ++i) {
+        if (i == target) { continue; }
+        if (code[i] > lowest || (code[i] == lowest && at_lowest > 0 && at_lowest-- > 0)) { others.push_back(i); }
+    }
+    std::sort(others.begin(), others.end(), [&](TokenId a, TokenId b) { return code[a] != code[b] ? code[a] > code[b] : a < b; });
+    out.tokens.reserve(take + 1);
+    out.tokens.push_back(target);
+    out.tokens.insert(out.tokens.end(), others.begin(), others.end());
+    out.log_probs.reserve(out.tokens.size());
+    for (const TokenId token : out.tokens) { out.log_probs.push_back(row_log_prob(base, token)); }
+    return out;
+}
+
+Position compare_bucket(const BucketRow& row, std::span<const float> log_probs, bool same_top) {
+    if (log_probs.size() != row.tokens.size() || row.tokens.empty()) {
+        throw std::invalid_argument("one log-probability per observed token is required");
+    }
+    const float nll      = -log_probs[0];
+    const float nll_base = -row.log_probs[0];
+    double sum = 0, observed_base = 0, observed = 0;
+    for (std::size_t k = 0; k < row.tokens.size(); ++k) {
+        const float p_log_base = row.log_probs[k];
+        if (p_log_base > -16.F) {
+            const float p_base = std::exp(p_log_base);
+            sum += p_base * (p_log_base - log_probs[k]);
+            observed_base += p_base;
+            observed += std::exp(static_cast<double>(log_probs[k]));
+        }
+    }
+    // The rest of the KL sum's tokens as one bucket. Its evaluated mass is bounded by everything outside the
+    // observed tokens, which only lowers the term, so the sum stays a lower bound of llama.cpp's.
+    const double rest_base = row.support_mass - observed_base;
+    const double rest      = 1.0 - observed;
+    if (rest_base > 0 && rest > 0) { sum += rest_base * std::log(rest_base / rest); }
+    const float p_base = std::exp(-nll_base);
+    const float p      = std::exp(-nll);
+    return Position{.kld = sum, .p_diff = p - p_base, .same_top = same_top, .nll = nll, .nll_base = nll_base, .kld_top = sum};
 }
 
 void Summary::add(const Position& value) {
@@ -390,15 +475,30 @@ void BaseReader::finish() {
     }
 }
 
+std::uint64_t BaseHeader::row_offset(std::size_t chunk, std::size_t row) const noexcept {
+    return sizeof kMagic + 3 * sizeof(std::int32_t) + tokens.size() * sizeof(TokenId) +
+           (static_cast<std::uint64_t>(chunk) * rows_per_chunk() + row) * row_words() * sizeof(std::uint16_t);
+}
+
+void BaseReader::read_row(std::ifstream& in, const BaseHeader& header, std::size_t chunk, std::size_t row,
+                          std::span<std::uint16_t> out) {
+    if (chunk >= static_cast<std::size_t>(header.chunks) || row >= header.rows_per_chunk() || out.size() != header.row_words()) {
+        throw std::out_of_range("llama base row outside the file");
+    }
+    in.seekg(static_cast<std::streamoff>(header.row_offset(chunk, row)));
+    in.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(out.size() * sizeof(std::uint16_t)));
+    if (!in) { throw std::runtime_error("truncated llama base row (chunk " + std::to_string(chunk) + ")"); }
+}
+
 PositionWriter::PositionWriter(const std::filesystem::path& path) : out_(path) {
     if (!out_) { throw std::runtime_error("cannot write " + path.string()); }
-    out_ << "chunk,position,kld,p_diff,same_top,nll,nll_base\n";
+    out_ << "chunk,position,kld,p_diff,same_top,nll,nll_base,kld_top\n";
     out_.precision(9);
 }
 
 void PositionWriter::add(std::uint32_t chunk, std::uint32_t position, const Position& value) {
     out_ << chunk << ',' << position << ',' << value.kld << ',' << value.p_diff << ',' << (value.same_top ? 1 : 0) << ','
-         << value.nll << ',' << value.nll_base << '\n';
+         << value.nll << ',' << value.nll_base << ',' << value.kld_top << '\n';
     ++rows_;
 }
 

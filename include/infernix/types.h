@@ -896,7 +896,9 @@ inline constexpr std::uint32_t kMaximumReadoutTokens = 256;
 
 // Constrained generation limits: output steps, tokens one step may permit, and distinct
 // multi-token sets one request may use (a one-token step forces that token and needs no set).
-inline constexpr std::uint32_t kMaximumConstraintSteps   = 64;
+// 4096 steps let one request force the scored half of an 8192-token llama.cpp KL-divergence chunk
+// through the decode path (infernix-certify decode --llama-base).
+inline constexpr std::uint32_t kMaximumConstraintSteps   = 4096;
 inline constexpr std::uint32_t kMaximumConstraintChoices = 16;
 inline constexpr std::uint32_t kMaximumConstraintSets    = 4;
 // Most tokens one constrained step may observe.
@@ -2137,6 +2139,9 @@ struct LoadSummary {
     std::string fast_path_configuration;
     std::vector<std::string> fast_paths;
     bool fast_paths_disabled = false;
+    // Every fast path whose kernels run in this configuration with these options, qualified or not:
+    // the ones EngineOptions::fast_path_candidates may name (the quality tools measure each alone).
+    std::vector<std::string> fast_paths_applicable;
     // The temporary A/B switches (INFERNIX_TMP_*) this process read, as "NAME=value | ...".
     std::string temporary_switches;
     // Whether a request's output depends only on the request, the artifact, the options and the
