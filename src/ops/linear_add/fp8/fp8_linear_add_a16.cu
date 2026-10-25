@@ -8,6 +8,7 @@
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/fp8/fp8_a16_simt.cuh"
 #include "ops/linear/fp8/fp8_a16_ring_mma.cuh"
+#include "ops/linear/fp8/fp8_a16_tma_mma.cuh"
 
 #include <stdexcept>
 
@@ -42,20 +43,26 @@ void launch_matrix(const Tensor& x, const Weight& weight, Tensor& residual, cuda
         if (x.ne[1] <= 8) return sliced.template operator()<8, 8, 2>();
     }
     if (x.ne[1] <= 16) return sliced.template operator()<16, 8, 2>();
-    // Wider verification rows stream both operands through the ring GEMM. 32-column tiles keep every SM busy
-    // through 192 columns, where the stream rather than BF16 Tensor Core work sets the time; the
+    // Wider verification rows stream both operands through the ring GEMM's consumers. 32-column tiles keep every
+    // SM busy through 192 columns, where the stream rather than BF16 Tensor Core work sets the time; the
     // 64-column tile then holds the Tensor Core limit beyond 192, except where its tile count
-    // would add a wave (257..384 columns).
+    // would add a wave (257..384 columns). Up to 64 columns the cp.async producer stages the tiles; beyond, the
+    // fenced TMA producer (the same consumers and bits), which measured 5-9 % faster from 96 columns at K 17408
+    // and 4-8 % from 192 at K 6144 (equal at 96-128), and 11-17 % slower at K 6144 up to 64 (fp8_linear_add_bench,
+    // RTX 5090, 2026-10-25; the cp.async producer of 4b5eae7a had cost 6-11 % at those widths, candidates CF-05).
     const auto ring = [&]<class Schedule>() {
         launch_fp8_a16_ring_mma<Fp8ScheduleInstance<Schedule, K>>(operands, output, epilogue,
                                                                  stream);
     };
+    const auto tma = [&]<class Schedule>() {
+        launch_fp8_a16_tma_mma<Fp8ScheduleInstance<Schedule, K>>(operands, output, epilogue, stream);
+    };
     const int tokens = x.ne[1];
     if (tokens <= 64) return ring.template operator()<Fp8A16RingT32R64>();
     if (tokens <= 128 || (tokens > 256 && tokens <= 384))
-        return ring.template operator()<Fp8A16RingT32R128>();
-    if (tokens <= 192) return ring.template operator()<Fp8A16RingT32R64S3>();
-    ring.template operator()<Fp8A16RingT64R128>();
+        return tma.template operator()<Fp8A16RingT32R128>();
+    if (tokens <= 192) return tma.template operator()<Fp8A16RingT32R64S3>();
+    tma.template operator()<Fp8A16RingT64R128>();
 }
 
 void fp8_linear_add_invariant_launch(const Tensor& x, const Weight& weight, Tensor& residual,

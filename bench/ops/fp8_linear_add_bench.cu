@@ -4,6 +4,7 @@
 #include "infernix/ops/linear_add.h"
 
 #include "core/device.h"
+#include "core/temporary_switches.h"
 #include "infernix_bench_common.h"
 #include "quantized_weight.cuh"
 #include "roofline.h"
@@ -154,6 +155,7 @@ void write_csv(const Options& options, const std::vector<Result>& results,
 int main(int argc, char** argv) {
     try {
         const Options options = parse_options(argc, argv);
+        std::printf("# %s\n", temporary_switches::describe(temporary_switches::Scope::Qwen3_5).c_str());
         const auto [min_it, max_it] =
             std::minmax_element(options.t_sweep.begin(), options.t_sweep.end());
         const std::int32_t min_t = *min_it;
