@@ -223,7 +223,8 @@ void lossless_router(const Tensor& logits, int experts, int top_k, Tensor& weigh
 
 /**
  * The routed experts' columns: C = lossless_moe_columns(T, top_k, E) gathered columns, each expert's
- * (slot, column) pairs in its own run of whole 64-column tiles. lossless_moe_route fills tile_experts
+ * (slot, column) pairs in its own run of whole 64-column tiles; C = 64 floor((N + 63 min(E, N)) / 64)
+ * for N = top_k T pairs, the most the padded runs can take. lossless_moe_route fills tile_experts
  * (I32 [C / 64]: the tile's expert, -1 unused), slot_column (I32 [top_k, T]: where each pair's column
  * went) and column_token (I32 [C]: the source column, -1 padding), with counts (I32 [E]) as scratch;
  * lossless_moe_gather copies x (BF16 [H, T]) into gathered (BF16 [H, C]), padding zero, for

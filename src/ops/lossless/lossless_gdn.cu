@@ -166,8 +166,11 @@ __device__ __forceinline__ std::size_t state_offset(const int* slots, int b, int
     return slots != nullptr ? static_cast<std::size_t>(slots[b]) * kDk * kDv * value_heads : 0;
 }
 
-// blockIdx.y: the sequence (columns [b width, (b + 1) width)).
-__global__ __launch_bounds__(kThreads) void gated_delta_rule_kernel(const std::uint16_t* query, const std::uint16_t* key,
+// blockIdx.y: the sequence (columns [b width, (b + 1) width)). Two CTAs per SM (at most 128 registers; the
+// staged tokens take about 44 KB of shared memory each): the 27B's 48 value heads are 192 CTAs, one wave on
+// 170 SMs, not 1.13 waves at one CTA per SM.
+constexpr int kMinCtasPerSm = 2;
+__global__ __launch_bounds__(kThreads, kMinCtasPerSm) void gated_delta_rule_kernel(const std::uint16_t* query, const std::uint16_t* key,
                                                                     const std::uint16_t* value, const float* g,
                                                                     const std::uint16_t* beta, const float* state_in,
                                                                     float* state_out, const int* source_slots,

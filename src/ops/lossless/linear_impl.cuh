@@ -10,6 +10,7 @@
 #include "ops/lossless/wide.cuh"
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -1224,18 +1225,57 @@ __global__ __launch_bounds__(kThreads, 2) void lossless_gemm_kernel(const GemmAr
                     }
                 }
             }
-            // Terms into the accumulators.
+            // Terms into the accumulators. A term's shift is kShiftTop - down - (its column's exponent gap) - (its
+            // row's), and usually lies in [0, 63], where the add is branch-free; a warp with any other shift
+            // (bits dropped below the unit, or the 2^64 placement) takes add_shifted. The check needs only the
+            // gaps' bounds over the thread's 2 columns and 8 rows.
+            int col_lo = INT_MAX, col_hi = INT_MIN, row_lo = INT_MAX, row_hi = INT_MIN;
+#pragma unroll
+            for (int half = 0; half < 2; ++half) {
+                const int t   = warp_m * 16 + group + half * 8;
+                const int gap = sh.col_emax[t] - sh.exps[t];
+                col_lo        = min(col_lo, gap);
+                col_hi        = max(col_hi, gap);
+            }
 #pragma unroll
             for (int j = 0; j < kRowTiles; ++j) {
 #pragma unroll
-                for (int v = 0; v < 4; ++v) {
-                    const int t = warp_m * 16 + group + (v >> 1) * 8;
-                    const int r = warp_n * kWarpRows + j * 8 + 2 * tig + (v & 1);
-                    const long long term = S[j][v] * static_cast<long long>(sh.scale_m[r][g]);
-                    const int shift =
-                        F::kShiftTop - (sh.col_emax[t] - sh.exps[t]) - (sh.row_emax[r] - sh.scale_e[r][g]) - down;
+                for (int odd = 0; odd < 2; ++odd) {
+                    const int r   = warp_n * kWarpRows + j * 8 + 2 * tig + odd;
+                    const int gap = sh.row_emax[r] - sh.scale_e[r][g];
+                    row_lo        = min(row_lo, gap);
+                    row_hi        = max(row_hi, gap);
+                }
+            }
+            const bool in_range = F::kShiftTop - down - col_hi - row_hi >= 0 && F::kShiftTop - down - col_lo - row_lo <= 63;
+            const auto add_terms = [&](auto add) {
+#pragma unroll
+                for (int j = 0; j < kRowTiles; ++j) {
+#pragma unroll
+                    for (int v = 0; v < 4; ++v) {
+                        const int t = warp_m * 16 + group + (v >> 1) * 8;
+                        const int r = warp_n * kWarpRows + j * 8 + 2 * tig + (v & 1);
+                        add(j, v, S[j][v] * static_cast<long long>(sh.scale_m[r][g]),
+                            F::kShiftTop - (sh.col_emax[t] - sh.exps[t]) - (sh.row_emax[r] - sh.scale_e[r][g]) - down);
+                    }
+                }
+            };
+            if (__all_sync(0xFFFFFFFFU, in_range)) {
+                add_terms([&](int j, int v, long long term, int shift) {
+                    lossless::add_shifted_in_range(acc[j][v], term, shift);
+                });
+            } else {
+                add_terms([&](int j, int v, long long term, int shift) {
                     add_shifted(acc[j][v], term, shift, dropped[j][v]);
-                    if constexpr (F::kOffset) {
+                });
+            }
+            if constexpr (F::kOffset) {
+#pragma unroll
+                for (int j = 0; j < kRowTiles; ++j) {
+#pragma unroll
+                    for (int v = 0; v < 4; ++v) {
+                        const int t = warp_m * 16 + group + (v >> 1) * 8;
+                        const int r = warp_n * kWarpRows + j * 8 + 2 * tig + (v & 1);
                         // The min term: the group's activation sum on this pass's grid times -mant(dmin) min_sub.
                         const long long o = sh.off.xsum[t][g][down != 0 ? 1 : 0] *
                                             static_cast<long long>(sh.off.off_m[r][g]);

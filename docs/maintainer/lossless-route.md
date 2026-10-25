@@ -189,7 +189,8 @@ the GPU only.
 **Sparse MoE** (`lossless_router`, `lossless_moe_route`, `lossless_moe_gather`, `lossless_moe_combine`,
 `include/infernix/ops/lossless_ops.h`): the softmax correctly rounded per element (certified in double,
 otherwise double-double); each (slot, column) placed in its expert's run of whole tiles (placement is
-free: no column's result depends on it), the grouped projections, then per column the experts in
+free: no column's result depends on it; N pairs take at most 64 floor((N + 63 min(E, N)) / 64) gathered
+columns, 512 for one decoded column), the grouped projections, then per column the experts in
 ascending id summed in BF16 as `index_add_` does, the shared expert and the residual.
 
 **RoPE** (`lossless_rope_frequencies`, `lossless_rope_table`, `lossless_rope_apply`): inv_freq and the
@@ -197,8 +198,9 @@ angles correctly rounded per operation, cos and sin correctly rounded binary32 (
 certified, otherwise a double-double reduction with pi/2 in four pieces and Taylor sums), one table per
 window shared by every attention layer.
 
-**Gated delta rule** (`lossless_gated_delta_rule`): four CTAs per value head (32 state columns each) run
-the recurrence token by token, a column's 128 state rows on 8 threads (16 each, in registers); each
+**Gated delta rule** (`lossless_gated_delta_rule`): four CTAs per value head (32 state columns each, two
+CTAs per SM, so the 27B's 192 CTAs are one wave) run the recurrence token by token, a column's 128 state
+rows on 8 threads (16 each, in registers); each
 binary32 sum is exact in a 320-bit accumulator, the 8 partial sums added exactly, and rounded once.
 
 **Flash-Next operations** (`lossless_flash.cu`): the grouped RMSNorm (`lossless_rmsnorm_grouped`), the
@@ -211,7 +213,8 @@ ties to the lower block); a sum with an Inf or NaN term takes IEEE binary32 arit
 
 **Attention** (`lossless_attention`): each 64-element block of a q or k row on a 29-bit integer grid
 below its largest exponent, so a score is exact int64 block sums placed in an int128 (a pair whose row
-has an element off its grid is scored product by product instead); the exact maximum, fp32(s - m)
+has an element off its grid is scored product by product instead); the exact maximum (pass A, its own
+kernel with only the q and k tiles in shared memory), then (pass B, scores recomputed) fp32(s - m)
 exact, p correctly rounded; sum p exact, and sum p v from p on a 2^-48 grid and v on its channel's
 grid, the dropped bits bounded; the quotient rounded to BF16 when its error interval allows, else the
 query is recomputed exactly (every score and sum exact, the rounding decided by exact comparisons). With

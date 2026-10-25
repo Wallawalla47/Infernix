@@ -284,6 +284,18 @@ def cases(rng: random.Random):
         ids += rng.sample(range(256) if t % 3 else range(12), 8)
     x = [random_bf16(rng, 4) for _ in range(64 * cols)]
     yield MOE_ROUTE, [256, 8, cols], [ids, x], [1]
+    # The gathered-column bound at its extremes: one decoded column (8 runs of one pair: 512 columns, all
+    # used by runs), every expert hit once (256 runs of one pair fill all 256 tiles), and runs of whole
+    # tiles (8 experts, 64 pairs each).
+    for experts, top_k, cols, pick in ((256, 8, 1, None), (256, 8, 32, "distinct"), (8, 8, 64, "all")):
+        if pick == "distinct":
+            ids = [e for e in range(256)]
+        elif pick == "all":
+            ids = [e for _ in range(cols) for e in range(8)]
+        else:
+            ids = rng.sample(range(experts), top_k)
+        x = [random_bf16(rng, 4) for _ in range(64 * cols)]
+        yield MOE_ROUTE, [experts, top_k, cols], [ids, x], [1]
     yield from flash_cases(rng)
     yield from state_cases(rng)
     yield from flash_state_cases(rng)

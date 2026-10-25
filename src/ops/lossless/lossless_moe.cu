@@ -6,6 +6,7 @@
 
 #include <cuda_bf16.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -283,7 +284,12 @@ void lossless_router(const Tensor& logits, int experts, int top_k, Tensor& weigh
 }
 
 std::int32_t lossless_moe_columns(std::int32_t columns, std::int32_t top_k, std::int32_t experts) {
-    return (columns * top_k + kTile - 1) / kTile * kTile + experts * kTile;
+    // Each expert hit pads its run by at most kTile - 1 columns and at most min(experts, entries)
+    // experts are hit, so the padded runs fit in the whole tiles of entries + (kTile - 1) runs. One
+    // decoded column (8 of 256 experts) gathers 512 columns, not a tile per expert (16,448).
+    const std::int32_t entries = columns * top_k;
+    const std::int32_t runs    = std::min(experts, entries);
+    return (entries + (kTile - 1) * runs) / kTile * kTile;
 }
 
 void lossless_moe_route(const Tensor& ids, int experts, Tensor& counts, Tensor& tile_experts, Tensor& slot_column,

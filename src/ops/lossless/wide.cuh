@@ -105,6 +105,16 @@ __device__ __forceinline__ void add_shifted(I128& acc, long long term, int shift
     acc.lo = sum;
 }
 
+// add_shifted for 0 <= shift <= 63 (nothing dropped), branch-free: (term >> 1) >> (63 - shift) is
+// term >> (64 - shift), and the sign at shift 0.
+__device__ __forceinline__ void add_shifted_in_range(I128& acc, long long term, int shift) {
+    const unsigned long long lo  = static_cast<unsigned long long>(term) << shift;
+    const long long hi           = (term >> 1) >> (63 - shift);
+    const unsigned long long sum = acc.lo + lo;
+    acc.hi += hi + (sum < acc.lo ? 1 : 0);
+    acc.lo = sum;
+}
+
 __device__ __forceinline__ I128 add_i128(I128 a, I128 b) {
     const unsigned long long lo = a.lo + b.lo;
     return {lo, a.hi + b.hi + (lo < a.lo ? 1 : 0)};

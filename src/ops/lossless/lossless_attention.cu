@@ -9,6 +9,7 @@
 #include <cuda_bf16.h>
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -20,10 +21,11 @@
 // Keys come from the call's own K/V (a window: query column t at position t) or from the paged cache
 // (sequences of `width` columns at their given positions, each reading its keys 0..position through its
 // block table row). A sequence's query rows are its (column, head) pairs, those of one KV head together.
-// Main kernel, one CTA per 16 query rows of one KV head, key tiles of 32; when a call has few CTAs, the
-// keys split into ranges over more CTAs (pass A's partial maxima, then pass B from the overall maximum into
-// partial int128 sums, then a combine kernel adds them and rounds), which changes no result: every sum is
-// exact.
+// Main kernels, one CTA per 16 query rows of one KV head, key tiles of 32: pass A (each query's maximum
+// over the CTA's key range, its own launch with only the q and k tiles in shared memory, several CTAs per
+// SM), then pass B from the maximum, rounded in place. When a call has few CTAs, the keys split into ranges
+// over more CTAs (pass A's partial maxima, then pass B from the overall maximum into partial int128 sums,
+// then a combine kernel adds them and rounds), which changes no result: every sum is exact.
 //  - each 64-element block of a q or k row is put on a grid of 29-bit integers M 2^(e - e_b + 21) relative
 //    to its largest exponent e_b; a block's score part sum_d X_q X_k is exact in two int64 halves and placed
 //    in an int128 at 2^(e_qb + e_kb) relative to the rows' largest block exponents, so a score is exact
@@ -67,7 +69,11 @@ constexpr int kPage         = 64;  // paged cache: positions per page (kPagedKVP
 constexpr int kTargetCtas   = 384; // key ranges split until a call has about this many CTAs
 constexpr int kMinSplitKeys = 256; // ... of at least this many keys each
 constexpr int kMaximaKeys   = 64;  // keys per warp item of the maxima kernel
-enum Mode { kFull, kMaxima, kSums };
+// kMaxima: pass A over the CTA's key range, its partial maximum stored (launched with only pass A's shared
+// memory, kPassASmem, and at most 128 registers: two CTAs per SM). kSums: pass B from the ranges' maxima into
+// partial sums (the split route; combine_kernel rounds). kFinal: pass B from the one range's maximum, rounded
+// in place (a call of one range per CTA).
+enum Mode { kMaxima, kSums, kFinal };
 
 void require(bool condition, const char* message) {
     if (!condition) { throw std::invalid_argument(std::string("lossless_attention: ") + message); }
@@ -341,13 +347,11 @@ constexpr int kPBits    = 48;        // p on a grid of 2^-48 (two 24-bit halves)
 // A q or k row in shared memory is padded by one word: a row's 16 threads read 16 rows at one element.
 constexpr int kRowStride = kDim + 1;
 
+// Pass A's members first: the maxima kernel (kMaxima) is launched with only that prefix
+// (kPassASmem), so several of its CTAs fit an SM.
 struct Shared {
     int xq[kQueries][kRowStride]; // query grid integers (0 off the grid)
     int xk[kKeys][kRowStride];    // key grid integers
-    int vg[kKeys][kDim];     // value grid integers: M 2^(e - vmax_c + 21), rounded below the grid
-    float p[kQueries][kKeys];
-    int ph[kQueries][kKeys]; // p 2^48 = ph 2^24 + pl
-    int pl[kQueries][kKeys];
     std::int16_t qb[kQueries][kBlocks];
     std::int16_t kb[kKeys][kBlocks];
     int qmax[kQueries];
@@ -357,9 +361,15 @@ struct Shared {
     int kmax[kKeys];         // the key row's largest exponent field, or kNonFinite
     int koff[kKeys];
     int klo[kKeys];          // a two-limb codec row's down (its low limb's place below xk's), else 0
+    // Pass B only.
+    int vg[kKeys][kDim];     // value grid integers: M 2^(e - vmax_c + 21), rounded below the grid
+    float p[kQueries][kKeys];
+    int ph[kQueries][kKeys]; // p 2^48 = ph 2^24 + pl
+    int pl[kQueries][kKeys];
     int vmax[kDim];
     int vinexact[kDim];      // a value element of the channel was rounded to its grid
 };
+constexpr int kPassASmem = static_cast<int>(offsetof(Shared, vg));
 
 // One warp encodes a 64-element block (lane: elements 2 lane, 2 lane + 1; src null: zeros): its largest
 // exponent field e_b, the grid integers M 2^(e - e_b + 21), whether an element fell off the grid.
@@ -637,7 +647,7 @@ __device__ __forceinline__ void add_low_limbs(const Shared& sh, int i, int sub, 
 // blockIdx: x = sequence b's 16-row tile, y = KV head, z = key range. Row r of the tile is the sequence's
 // (column, head) pair p = 16 tile + r: column b width + p / G, head kvh G + p % G (G = heads / kv_heads).
 template <int M>
-__global__ __launch_bounds__(kThreads) void attention_kernel(const Args args) {
+__global__ __launch_bounds__(kThreads, M == kMaxima ? 2 : 1) void attention_kernel(const Args args) {
     extern __shared__ __align__(16) unsigned char raw[];
     Shared& sh    = *reinterpret_cast<Shared*>(raw);
     const int tid = static_cast<int>(threadIdx.x), lane = tid & 31, warp = tid >> 5;
@@ -657,9 +667,11 @@ __global__ __launch_bounds__(kThreads) void attention_kernel(const Args args) {
         sh.qoff[tid] = 0;
         sh.qpos[tid] = row_active(tid) ? position(args, row_column(tid)) : -1;
     }
-    for (int d = tid; d < kDim; d += kThreads) {
-        sh.vmax[d]     = max(args.vmax[(static_cast<std::size_t>(b) * args.kv_heads + kvh) * kDim + d], 1);
-        sh.vinexact[d] = 0;
+    if constexpr (M != kMaxima) { // pass B's members lie past kPassASmem
+        for (int d = tid; d < kDim; d += kThreads) {
+            sh.vmax[d]     = max(args.vmax[(static_cast<std::size_t>(b) * args.kv_heads + kvh) * kDim + d], 1);
+            sh.vinexact[d] = 0;
+        }
     }
     __syncthreads();
     for (int idx = tid; idx < kQueries * kDim; idx += kThreads) {
@@ -803,7 +815,7 @@ __global__ __launch_bounds__(kThreads) void attention_kernel(const Args args) {
         const int j = j0 + sub + 16 * half;
         return active && j < key_end && visible(args, c, j) && pair_rep(args, c, j) == rep;
     };
-    if constexpr (M != kSums) {
+    if constexpr (M == kMaxima) {
         // Pass A: each query's exact maximum (each thread: keys sub and sub + 16 of every tile).
         for (int j0 = key_begin; j0 < key_end; j0 += kKeys) {
             for (int rep = 0; rep < reps; ++rep) {
@@ -861,7 +873,7 @@ __global__ __launch_bounds__(kThreads) void attention_kernel(const Args args) {
         }
         return;
     }
-    if constexpr (M == kSums) {
+    if constexpr (M == kSums || M == kFinal) {
         // The overall maximum from every range's (each of the row's 16 threads alike).
         if (active) {
             for (int s = 0; s < args.splits; ++s) {
@@ -886,7 +898,8 @@ __global__ __launch_bounds__(kThreads) void attention_kernel(const Args args) {
     I128 den{0ULL, 0LL};
     float den_err = 0.0F;
     double p_err  = 0.0; // the p grid's dropped bits (each below 2^-49), summed over this thread's keys
-    const bool work = active && !nan && (M == kFull || !fail);
+    // A row pass A flagged takes the exact fallback: its sums are not formed.
+    const bool work = active && !nan && !fail;
     for (int j0 = key_begin; j0 < key_end; j0 += kKeys) {
         for (int rep = 0; rep < reps; ++rep) {
             bool want[2] = {work && pair_wanted(j0, 0, rep), work && pair_wanted(j0, 1, rep)};
@@ -1859,10 +1872,9 @@ std::size_t call_bytes(int heads, int kv_heads, int width, int sequences, int ke
         2 * align256(static_cast<std::size_t>(sequences) * kv_heads * kDim * sizeof(int)) +
         align256((columns * heads + 31) / 32 * 4) +
         align256(static_cast<std::size_t>(fallback_warps(key_capacity)) * key_capacity * sizeof(float));
-    if (split_route(ctas)) {
-        bytes += align256(splits * columns * heads * sizeof(PartialMax)) +
-                 align256(splits * columns * heads * sizeof(PartialSum));
-    }
+    // Pass A's partial maxima (one range per row without the split route), and the split route's sums.
+    bytes += align256(splits * columns * heads * sizeof(PartialMax));
+    if (split_route(ctas)) { bytes += align256(splits * columns * heads * sizeof(PartialSum)); }
     return bytes;
 }
 
@@ -1870,10 +1882,32 @@ template <int M>
 void configure() {
     static const bool configured = [] {
         CUDA_CHECK(cudaFuncSetAttribute(attention_kernel<M>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        static_cast<int>(sizeof(Shared))));
+                                        M == kMaxima ? kPassASmem : static_cast<int>(sizeof(Shared))));
         return true;
     }();
     (void)configured;
+}
+
+// Pass A over every range, then pass B: into partial sums and their combine (the split route), or rounded in
+// place (one range per CTA).
+void launch_passes(const Args& args, const Geometry& g, cudaStream_t stream) {
+    constexpr int kSmem = static_cast<int>(sizeof(Shared));
+    const dim3 grid(static_cast<unsigned>(args.sequences * g.tiles), static_cast<unsigned>(args.kv_heads),
+                    static_cast<unsigned>(g.splits));
+    configure<kMaxima>();
+    attention_kernel<kMaxima><<<grid, kThreads, kPassASmem, stream>>>(args);
+    CUDA_CHECK(cudaGetLastError());
+    if (g.split) {
+        configure<kSums>();
+        attention_kernel<kSums><<<grid, kThreads, kSmem, stream>>>(args);
+        CUDA_CHECK(cudaGetLastError());
+        combine_kernel<<<dim3(static_cast<unsigned>(args.columns), static_cast<unsigned>(args.heads)), kDim, 0, stream>>>(args);
+        CUDA_CHECK(cudaGetLastError());
+    } else {
+        configure<kFinal>();
+        attention_kernel<kFinal><<<grid, kThreads, kSmem, stream>>>(args);
+        CUDA_CHECK(cudaGetLastError());
+    }
 }
 
 // Carves the workspace (call_bytes' order) and runs the kernels; args holds everything but the geometry
@@ -1905,10 +1939,8 @@ void run(Args args, int max_keys, void* workspace, cudaStream_t stream, bool pac
     const int warps = fallback_warps(args.key_capacity);
     auto* pstore    = static_cast<float*>(take(static_cast<std::size_t>(warps) * args.key_capacity * sizeof(float)));
     const std::size_t partials = static_cast<std::size_t>(g.splits) * args.columns * args.heads;
-    if (g.split) {
-        args.pmax = static_cast<PartialMax*>(take(partials * sizeof(PartialMax)));
-        args.psum = static_cast<PartialSum*>(take(partials * sizeof(PartialSum)));
-    }
+    args.pmax = static_cast<PartialMax*>(take(partials * sizeof(PartialMax)));
+    if (g.split) { args.psum = static_cast<PartialSum*>(take(partials * sizeof(PartialSum))); }
     std::int16_t *kpack = nullptr, *kblk = nullptr, *vpack = nullptr;
     std::uint8_t* koff  = nullptr;
     std::uint32_t* vround = nullptr;
@@ -1940,23 +1972,7 @@ void run(Args args, int max_keys, void* workspace, cudaStream_t stream, bool pac
         args.vpack  = vpack;
         args.vround = vround;
     }
-    constexpr int kSmem = static_cast<int>(sizeof(Shared));
-    const dim3 grid(static_cast<unsigned>(args.sequences * g.tiles), static_cast<unsigned>(args.kv_heads),
-                    static_cast<unsigned>(g.splits));
-    if (!g.split) {
-        configure<kFull>();
-        attention_kernel<kFull><<<grid, kThreads, kSmem, stream>>>(args);
-        CUDA_CHECK(cudaGetLastError());
-    } else {
-        configure<kMaxima>();
-        configure<kSums>();
-        attention_kernel<kMaxima><<<grid, kThreads, kSmem, stream>>>(args);
-        CUDA_CHECK(cudaGetLastError());
-        attention_kernel<kSums><<<grid, kThreads, kSmem, stream>>>(args);
-        CUDA_CHECK(cudaGetLastError());
-        combine_kernel<<<dim3(static_cast<unsigned>(args.columns), static_cast<unsigned>(args.heads)), kDim, 0, stream>>>(args);
-        CUDA_CHECK(cudaGetLastError());
-    }
+    launch_passes(args, g, stream);
     attention_fallback_kernel<<<warps / 8, 256, 0, stream>>>(FallbackArgs{args, pstore, warps});
     CUDA_CHECK(cudaGetLastError());
 }
@@ -1975,9 +1991,8 @@ std::size_t codec_call_bytes(int heads, int kv_heads, int columns, int reps) {
                         2 * align256(static_cast<std::size_t>(kv_heads) * kDim * sizeof(int)) + align256((calls + 31) / 32 * 4) +
                         3 * align256(rows * kDim * sizeof(std::int32_t)) + align256(rows * kBlocks * sizeof(std::int16_t)) +
                         align256(rows) + align256(rows * (kDim / 32) * sizeof(std::uint32_t));
-    if (split_route(ctas)) {
-        bytes += align256(splits * calls * sizeof(PartialMax)) + align256(splits * calls * sizeof(PartialSum));
-    }
+    bytes += align256(splits * calls * sizeof(PartialMax));
+    if (split_route(ctas)) { bytes += align256(splits * calls * sizeof(PartialSum)); }
     return bytes;
 }
 
@@ -2001,10 +2016,8 @@ void run_codec(Args args, void* workspace, cudaStream_t stream) {
     args.vinexact = static_cast<int*>(take(channels));
     args.flagged  = static_cast<std::uint32_t*>(take(flag_bytes));
     const std::size_t partials = static_cast<std::size_t>(g.splits) * args.columns * args.heads;
-    if (g.split) {
-        args.pmax = static_cast<PartialMax*>(take(partials * sizeof(PartialMax)));
-        args.psum = static_cast<PartialSum*>(take(partials * sizeof(PartialSum)));
-    }
+    args.pmax = static_cast<PartialMax*>(take(partials * sizeof(PartialMax)));
+    if (g.split) { args.psum = static_cast<PartialSum*>(take(partials * sizeof(PartialSum))); }
     const std::size_t rows = static_cast<std::size_t>(reps) * codec_rows(args.columns, args.kv_heads);
     auto* kpack  = static_cast<std::int32_t*>(take(rows * kDim * sizeof(std::int32_t)));
     auto* klow   = static_cast<std::int32_t*>(take(rows * kDim * sizeof(std::int32_t)));
@@ -2029,22 +2042,7 @@ void run_codec(Args args, void* workspace, cudaStream_t stream) {
     args.kblk    = kblk;
     args.koff    = koff;
     args.vround  = vround;
-    constexpr int kSmem = static_cast<int>(sizeof(Shared));
-    const dim3 grid(static_cast<unsigned>(g.tiles), static_cast<unsigned>(args.kv_heads), static_cast<unsigned>(g.splits));
-    if (!g.split) {
-        configure<kFull>();
-        attention_kernel<kFull><<<grid, kThreads, kSmem, stream>>>(args);
-        CUDA_CHECK(cudaGetLastError());
-    } else {
-        configure<kMaxima>();
-        configure<kSums>();
-        attention_kernel<kMaxima><<<grid, kThreads, kSmem, stream>>>(args);
-        CUDA_CHECK(cudaGetLastError());
-        attention_kernel<kSums><<<grid, kThreads, kSmem, stream>>>(args);
-        CUDA_CHECK(cudaGetLastError());
-        combine_kernel<<<dim3(static_cast<unsigned>(args.columns), static_cast<unsigned>(args.heads)), kDim, 0, stream>>>(args);
-        CUDA_CHECK(cudaGetLastError());
-    }
+    launch_passes(args, g, stream);
     codec_fallback_kernel<<<kCodecFallbackWarps / 8, 256, 0, stream>>>(args, kCodecFallbackWarps);
     CUDA_CHECK(cudaGetLastError());
 }
