@@ -45,6 +45,8 @@ and the chunk size only picks the scatter. So:
 | `infernix_decode_quality_gen` / `infernix_decode_quality_judge` | end-to-end greedy decode through the production speculative path, judged token by token against a reference ([benchmarks](../../bench/README.md#decode-quality)) |
 | `infernix-certify` | IQS-2's references, noise twins, teacher-forced prefill and decode arms and G1 captures (6.6) |
 | `tools/quality/iqs.py`, `certify.py`, `iqs_e2e.py`, `shadow/` | IQS-2's decisions and certificate, the certification run, its end-to-end checks and its reference conformance (6.6) |
+| `infernix-certify reference --format llama-kld`, `prefill`/`decode --llama-base`, `llama-compare` | the exact reference as llama.cpp's `_logits_` base file, which `llama-perplexity --kl-divergence` scores llama.cpp against, and Infernix arms scored against it with llama.cpp's definitions and summary (`apps/certify/llama_kld.h`); the IQS-3 pilot's cross-engine measurement |
+| `tools/quality/llama_kld.py` | those arms' chunk-bootstrap intervals, paired differences, and llama-perplexity's printout read line by line |
 
 Perplexity scoring runs prefill only; decode kernels, speculative verification and n-gram drafting
 need the decode tools. The generator uses only Engine API that NInfer also has, so the

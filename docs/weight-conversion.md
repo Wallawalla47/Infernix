@@ -347,6 +347,38 @@ values. To preserve existing compatible encoded words, also provide `read_encode
 `EncodedRows`, and the format's required divisor accessors. Their definitions are in
 [`sources/logical.py`](../tools/convert/sources/logical.py).
 
+## Import a GGUF bit-exactly
+
+`--gguf` imports a llama.cpp GGUF's stored blocks as they are, with no dequantization and
+re-quantization, so the artifact runs exactly the weights llama.cpp runs from that file. Two
+architectures are supported: Qwen3.8-Flash-Next (see
+[its guide](qwen3_8-flash-next.md#gguf-import-ista-daslab-gsq-rco-iq3_s)), and Qwen3.5 dense
+(`qwen35`) GGUFs in `Q8_0`, text only. For the second, `--model` needs only the checkpoint's
+config and tokenizer files:
+
+```bash
+python -m tools.convert --model /path/to/Qwen3.8-27B-config-only \
+  --gguf /path/to/Qwen3.8-27B-Q8_0.gguf --recipe qwen3_5_gguf_q8_0 \
+  --device cpu --out out/qwen3_8_27b_gguf_q8_0.infernix
+```
+
+Each Q8_0 block becomes the identical `q8_g32_fp16` word, including the token embedding and
+the head. The F32 gating projections and every vector keep their exact values.
+[`tools/convert/qwen3_5_gguf.py`](../tools/convert/qwen3_5_gguf.py) undoes llama.cpp's export
+transforms and checks each one: the `+1` on the norms, the gated delta-net's tiled value-head
+order (rows and whole output-projection column blocks), `-exp(A_log)`, and the squeezed
+convolution. The GGUF's metadata must agree with the config. The MTP block and any mmproj are
+not imported, and the recipe refuses other ggml formats.
+
+This was checked on bartowski's Qwen3.8-27B `Q8_0` against Qwen's BF16 checkpoint:
+
+- Sampled rows of every matrix role equal llama.cpp's Q8_0 quantization of the checkpoint's
+  rows in Hugging Face order.
+- `A_log` and `dt_bias` are exact on all 48 delta-net layers.
+- The norms, convolutions and gating projections of seven layers are exact, except two gamma
+  elements below 2^-16 that llama.cpp's binary32 `1 + g` rounded. The import keeps the GGUF's
+  values there.
+
 ## Convert from a GGUF quant instead of the full checkpoint
 
 The base `--model` checkpoint only needs to supply `config.json` and the frontend

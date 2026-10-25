@@ -72,3 +72,15 @@ def test_task_audit_is_paired_non_inferiority_on_the_items_that_differ() -> None
     # a route that loses 25 items it used to answer fails, whatever it gains back by chance
     worse = [False] * 25 + base[25:]
     assert not iqs_e2e.paired_loss(base, worse, 0.05)["passed"]
+
+
+def test_golden_hashes_are_recorded_then_disclosed(tmp_path) -> None:
+    # A build may change the reproducible route's bits by a declared numerics change (model-quality.md 6.1):
+    # a changed hash is reported with the new hashes, never failed.
+    store = tmp_path / "golden.json"
+    first = iqs_e2e.golden(store, "a.infernix", ["x", "y"])["golden"]
+    assert first["recorded"] and store.is_file()
+    assert iqs_e2e.golden(store, "a.infernix", ["x", "y"])["golden"]["equal"]
+    changed = iqs_e2e.golden(store, "a.infernix", ["x", "z"])["golden"]
+    assert not changed["equal"] and changed["changed"] == [1] and changed["hashes"] == ["x", "z"]
+    assert "passed" not in changed
