@@ -370,7 +370,10 @@ doubled or dropped `<` or a leaked `<|im_start|>` before it, `<=NAME>`, `<functi
 (`<invoke:NAME>`) and a bare `<NAME>` (closed by `</function>` or `</NAME>`). The forms without
 the `function`/`invoke` keyword followed by `=` or a space are calls only when `NAME` is a declared
 tool; for any other name, or with no tools declared, the region stays text. `<function =NAME>` is
-ordinary markup in both modes. A repaired opener reports `tolerant_recovered`.
+ordinary markup in both modes. Inside a call, a parameter opener that lost its keyword, `<=NAME>`
+(where the next `<parameter=NAME>` belongs, or first in the call), reads as `<parameter=NAME>` when
+the call's tool declares `NAME`; otherwise it stays text of the value it follows, and the strict
+parser keeps it as value text too. A repaired opener reports `tolerant_recovered`.
 
 Tolerant mode also recovers calls the model wrote inside its thinking when it ends the turn with
 its stop token without closing the thinking, so no call reached the answer. If, from some marker to

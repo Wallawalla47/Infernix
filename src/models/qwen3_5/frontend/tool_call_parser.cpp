@@ -650,7 +650,8 @@ private:
         // leaking the raw region to content would turn a valid call into prose.
         // A drifted opener without its keyword is too weak a signal for that: it is a call only for
         // a declared name.
-        if (find_tool_contract(contract_, call.name) == nullptr) {
+        current_tool_ = find_tool_contract(contract_, call.name);
+        if (current_tool_ == nullptr) {
             if (!tolerant_) { return FallbackReason::UndeclaredTool; }
             if (declared_only) { return FallbackReason::MalformedStructure; }
             call.repaired = true;
@@ -689,6 +690,11 @@ private:
         } else if (starts_with_at(text_, pos, "<param")) {
             header_begin = pos + 6;
             param_close  = "</param>";
+        } else if (std::size_t damaged_end = 0; damaged_param_open_at(pos, damaged_end)) {
+            // Tolerant: `<=NAME>` reads as `<parameter=NAME>` (its header is "=NAME").
+            header_begin  = pos + 1;
+            param_close   = "</parameter>";
+            call.repaired = true;
         } else {
             return FallbackReason::MalformedStructure;
         }
@@ -750,9 +756,25 @@ private:
     bool closes_parameter(std::size_t pos) const {
         skip_format_whitespace(text_, pos);
         std::size_t tag_end = 0;
-        return pos >= text_.size() || is_param_open_at(text_, pos, tag_end) ||
+        return pos >= text_.size() || is_param_open_at(text_, pos, tag_end) || damaged_param_open_at(pos, tag_end) ||
                starts_with_at(text_, pos, "</function>") || starts_with_at(text_, pos, "</invoke>") ||
                (!bare_close_.empty() && starts_with_at(text_, pos, bare_close_));
+    }
+
+    // Tolerant: a parameter opener that lost its keyword, `<=NAME>`, for a parameter the call's tool
+    // declares (Strata PR #3960: drifting low-bit quants write it after a `</parameter>`). Without
+    // the repair the previous `</parameter>` is followed by no grammar token, so the next parameter
+    // ends up inside the previous value. A name the tool does not declare stays value text.
+    bool damaged_param_open_at(std::size_t pos, std::size_t& tag_end) const {
+        if (!tolerant_ || current_tool_ == nullptr || !starts_with_at(text_, pos, "<=")) { return false; }
+        const std::size_t limit = std::min(text_.size(), pos + 2 + max_name_length_ + 1);
+        std::size_t end         = pos + 2;
+        while (end < limit && text_[end] != '>' && text_[end] != '<' && text_[end] != '\n') { ++end; }
+        if (end >= limit || text_[end] != '>' || end == pos + 2) { return false; }
+        const std::string_view name = extract_name_from_tag_header(text_.substr(pos + 1, end - pos - 1));
+        if (name.empty() || find_parameter_contract(*current_tool_, name) == nullptr) { return false; }
+        tag_end = end;
+        return true;
     }
 
     bool find_parameter_close(std::size_t value_begin, std::size_t& value_end,
@@ -792,6 +814,8 @@ private:
     bool tolerant_ = false;
     // The current call's `</NAME>` when it opened as a bare `<NAME>` (tolerant), else empty.
     std::string bare_close_;
+    // The current call's declared tool, or null for an undeclared name.
+    const Contract::Tool* current_tool_ = nullptr;
 };
 
 GeneratedToolCall normalize_raw_tool_call(const RawToolCall& raw, const Contract& contract,
