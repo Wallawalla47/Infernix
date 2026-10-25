@@ -4,7 +4,7 @@
 #include "core/pdl.cuh"
 
 // Implements: include/infernix/ops/speculative_round.h
-// Match: contiguous request-major state and BF16 verification logits.
+// Match: contiguous request-major state and FP32 or BF16 verification logits.
 // Algorithm assumptions: small vocabularies use one cooperative block; the
 // registered full-vocabulary stochastic route uses the sampling partial/group
 // pipeline and caller-owned workspace. Sparse acceptance and emission use one warp per request.
@@ -16,6 +16,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 namespace infernix::ops {
 
@@ -272,8 +273,9 @@ __device__ __forceinline__ void speculative_sparse_warp_accept(
 // collapses to `u < p_i(drafts[i])`. Launch with a single block of kSamplerBlock
 // threads; only thread 0 performs the sequential accept/commit while the whole
 // block cooperates on the per-column truncated-distribution build.
+template <class Logit>
 __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_drafts_kernel(
-    const std::int32_t* target_tokens, const __nv_bfloat16* logits, const std::int32_t* drafts,
+    const std::int32_t* target_tokens, const Logit* logits, const std::int32_t* drafts,
     const std::int32_t* current_extents, std::int32_t* lengths, std::int32_t* anchors,
     std::int32_t* licensed_tokens, std::int32_t* licensed_counts, std::int32_t* accepted,
     const SamplingConfig* configs, std::int32_t token_domain, std::int32_t physical_rows,
@@ -287,8 +289,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
     const std::int32_t* row_targets = target_tokens + row * cols;
     const std::int32_t* row_drafts  = drafts + row * k;
     std::int32_t* row_tokens        = licensed_tokens + row * cols;
-    const __nv_bfloat16* row_logits =
-        logits + static_cast<std::int64_t>(row) * cols * physical_rows;
+    const Logit* row_logits = logits + static_cast<std::int64_t>(row) * cols * physical_rows;
     const bool penalties = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
 
     if (!(cfg.temperature > 0.0f) && !penalties && cfg.mask.words == nullptr) {
@@ -337,7 +338,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
             float best_value        = -CUDART_INF_F;
             int best_index          = INT_MAX;
             for (int v = tid; v < token_domain; v += blockDim.x) {
-                const float value = sampling_adjusted_logit(__bfloat162float(row_logits[base + v]),
+                const float value = sampling_adjusted_logit(sampling_logit(row_logits[base + v]),
                                                             v, cfg, row_drafts, i);
                 if (sampling_better(value, v, best_value, best_index)) {
                     best_value = value;
@@ -440,8 +441,9 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
     }
 }
 
+template <class Logit>
 __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_topk_kernel(
-    const __nv_bfloat16* logits, const std::int32_t* drafts, const std::int32_t* current_extents,
+    const Logit* logits, const std::int32_t* drafts, const std::int32_t* current_extents,
     const SamplingConfig* configs, std::int32_t token_domain, std::int32_t physical_rows,
     std::int32_t cols, std::int32_t k, SamplingWorkspace workspace,
     std::size_t workspace_row_stride) {
@@ -471,21 +473,25 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_to
     const std::int64_t base        = (static_cast<std::int64_t>(row) * cols + col) * physical_rows;
     const std::int32_t* row_drafts = drafts + row * k;
     const int tile_start           = partial * kSamplerPartialTileItems;
-    if (!penalties) {
-        unsigned int keys[kSamplerItemsPerThread];
+    // BF16 logits without penalties: 32-bit tile keys (16 value bits, 16 tile-index bits). FP32
+    // logits take the 64-bit keys below, which also carry the mask (masked rows rank below all).
+    if constexpr (std::is_same_v<Logit, __nv_bfloat16>) {
+        if (!penalties) {
+            unsigned int keys[kSamplerItemsPerThread];
 #pragma unroll
-        for (int item = 0; item < kSamplerItemsPerThread; ++item) {
-            const int tile_index = item * blockDim.x + threadIdx.x;
-            const int v          = tile_start + tile_index;
-            keys[item]           = (v < token_domain &&
-                          (!cfg.mask.words ||
-                           (cfg.mask.words[col * cfg.mask.stride + v / 32] & (1u << (v % 32)))))
-                                       ? sampling_bf16_tile_sort_key(logits[base + v], tile_index)
-                                       : 0u;
+            for (int item = 0; item < kSamplerItemsPerThread; ++item) {
+                const int tile_index = item * blockDim.x + threadIdx.x;
+                const int v          = tile_start + tile_index;
+                keys[item]           = (v < token_domain &&
+                              (!cfg.mask.words ||
+                               (cfg.mask.words[col * cfg.mask.stride + v / 32] & (1u << (v % 32)))))
+                                           ? sampling_bf16_tile_sort_key(logits[base + v], tile_index)
+                                           : 0u;
+            }
+            sampling_store_bf16_tile_topk(keys, cap, tile_start, workspace, col, partial,
+                                          topk_storage.bf16);
+            return;
         }
-        sampling_store_bf16_tile_topk(keys, cap, tile_start, workspace, col, partial,
-                                      topk_storage.bf16);
-        return;
     }
 
     unsigned long long keys[kSamplerItemsPerThread];
@@ -496,9 +502,8 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_to
     for (int item = 0; item < kSamplerItemsPerThread; ++item) {
         const int v = tile_start + item * blockDim.x + threadIdx.x;
         if (v < token_domain) {
-            const __nv_bfloat16 raw = logits[base + v];
-            keys[item]              = sampling_sort_key(
-                sampling_adjusted_logit(__bfloat162float(raw), v, cfg, row_drafts, col), v);
+            keys[item] = sampling_sort_key(
+                sampling_adjusted_logit(sampling_logit(logits[base + v]), v, cfg, row_drafts, col), v);
         } else {
             keys[item] = 0ull;
         }
@@ -1004,8 +1009,9 @@ __global__ __launch_bounds__(256) void speculative_accept_tree_warp_greedy_kerne
     speculative_tree_chain_path(row, columns, accepted, accepted_path, accepted_branch);
 }
 
+template <class Logit>
 __launch_bounds__(kSamplerBlock) __global__ void speculative_tree_sampling_partial_topk_kernel(
-    const __nv_bfloat16* logits, const std::int32_t* drafts, const std::int32_t* current_extents,
+    const Logit* logits, const std::int32_t* drafts, const std::int32_t* current_extents,
     const SamplingConfig* configs, std::int32_t token_domain, std::int32_t physical_rows,
     SamplingWorkspace workspace, std::size_t workspace_row_stride, const SpeculativeTreeRow* trees,
     int cols) {
@@ -1034,31 +1040,36 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_tree_sampling_parti
     const int cap           = greedy ? 1 : sampling_candidate_cap(cfg, token_domain);
     const std::int64_t base = (static_cast<std::int64_t>(row) * cols + col) * physical_rows;
     const int tile_start    = partial * kSamplerPartialTileItems;
-    if (!penalties) {
-        unsigned int keys[kSamplerItemsPerThread];
+    // BF16 logits without penalties: 32-bit tile keys (16 value bits, 16 tile-index bits). FP32
+    // logits take the 64-bit keys below (raw values without penalties, as the BF16 route).
+    if constexpr (std::is_same_v<Logit, __nv_bfloat16>) {
+        if (!penalties) {
+            unsigned int keys[kSamplerItemsPerThread];
 #pragma unroll
-        for (int item = 0; item < kSamplerItemsPerThread; ++item) {
-            const int tile_index = item * blockDim.x + threadIdx.x;
-            const int v          = tile_start + tile_index;
-            keys[item] =
-                v < token_domain ? sampling_bf16_tile_sort_key(logits[base + v], tile_index) : 0u;
+            for (int item = 0; item < kSamplerItemsPerThread; ++item) {
+                const int tile_index = item * blockDim.x + threadIdx.x;
+                const int v          = tile_start + tile_index;
+                keys[item] =
+                    v < token_domain ? sampling_bf16_tile_sort_key(logits[base + v], tile_index) : 0u;
+            }
+            sampling_store_bf16_tile_topk(keys, cap, tile_start, workspace, col, partial,
+                                          topk_storage.bf16);
+            return;
         }
-        sampling_store_bf16_tile_topk(keys, cap, tile_start, workspace, col, partial,
-                                      topk_storage.bf16);
-        return;
     }
 
-    if (threadIdx.x == 0)
-        overlay_len = speculative_tree_overlay(tree, drafts + row * k, col, overlay);
-    __syncthreads();
+    if (penalties) {
+        if (threadIdx.x == 0) overlay_len = speculative_tree_overlay(tree, drafts + row * k, col, overlay);
+        __syncthreads();
+    }
     unsigned long long keys[kSamplerItemsPerThread];
 #pragma unroll
     for (int item = 0; item < kSamplerItemsPerThread; ++item) {
         const int v = tile_start + item * blockDim.x + threadIdx.x;
         if (v < token_domain) {
-            const __nv_bfloat16 raw = logits[base + v];
-            keys[item]              = sampling_sort_key(
-                sampling_adjusted_logit(__bfloat162float(raw), v, cfg, overlay, overlay_len), v);
+            const float raw = sampling_logit(logits[base + v]);
+            keys[item]      = sampling_sort_key(
+                penalties ? sampling_adjusted_logit(raw, v, cfg, overlay, overlay_len) : raw, v);
         } else {
             keys[item] = 0ull;
         }

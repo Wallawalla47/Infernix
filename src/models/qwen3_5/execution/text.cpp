@@ -764,13 +764,13 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
                          "ordinary decode Linear Attention destination slots");
     require_tensor_shape(hidden, DType::BF16, {dimension(config_.hidden_size), batch},
                          "ordinary decode hidden");
-    require_tensor_shape(logits, execution_schedule_.lossless ? DType::FP32 : DType::BF16,
-                         {dimension(config_.vocab_size), batch}, "ordinary decode logits");
+    require_tensor_shape(logits, execution_schedule_.logits, {dimension(config_.vocab_size), batch},
+                         "ordinary decode logits");
 
     cudaStream_t stream = ctx_.stream;
     work_.reset();
     if (execution_schedule_.lossless) {
-        // The cache form, one column per lane; FP32 logits.
+        // The cache form, one column per lane; logits in the schedule's dtype.
         Tensor x = work_.alloc(DType::BF16, {dimension(config_.hidden_size), batch});
         ops::embedding(ids, *embed_, x, stream);
         const Tensor rope_table = lossless_rope_window(config_, rope_positions, work_, stream);
@@ -838,7 +838,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
                          "target verify batch Linear Attention destination slots");
     require_tensor_shape(hidden, DType::BF16, {dimension(config_.hidden_size), width, batch},
                          "target verify batch hidden");
-    require_tensor_shape(logits, DType::BF16, {dimension(config_.vocab_size), width, batch},
+    require_tensor_shape(logits, execution_schedule_.logits, {dimension(config_.vocab_size), width, batch},
                          "target verify batch logits");
     require_tensor_shape(target_tokens, DType::I32, {width, batch}, "target verify batch tokens");
 
@@ -1570,7 +1570,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 Tensor last_xf = xf.slice(1, len - 1, 1);
                 Tensor logits  = matrix_window(io_.logits, 1);
                 if (execution_schedule_.lossless) {
-                    lossless_head(last_xf, lm_head_->weight, logits, work_, s); // FP32 logits
+                    lossless_head(last_xf, lm_head_->weight, logits, work_, s); // correctly rounded logits
                 } else {
                     project(last_xf, *lm_head_, logits, work_, s);
                 }
@@ -1643,7 +1643,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                     mtp_input_embeddings_ptr = &mtp_input_embeddings;
                 }
                 if (is_last && mtp_proposal_extent_ != 0) {
-                    Tensor logits = matrix_window(io_.logits, 1);
+                    Tensor logits = qwen3_5::mtp_draft_logits(io_);
                     Tensor draft0 = io_.mtp->draft_tokens.slice(0, 0, 1);
                     mtp_prefill_chunk(mtp_ids, xf, mtp_input_embeddings_ptr, positions,
                                       rope_positions, chunk_envelope, true, &io_.mtp->ar_hidden,

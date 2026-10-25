@@ -45,9 +45,14 @@ void bf16_general_gemm(const Tensor& x, const Weight& weight, Tensor& out, cudaS
     const std::int32_t T = x.ne[1];
     const dim3 grid(static_cast<unsigned>((N + kTileN - 1) / kTileN),
                     static_cast<unsigned>((T + kTileT - 1) / kTileT));
-    bf16_general_gemm_kernel<<<grid, kThreads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(weight.qdata),
-        static_cast<__nv_bfloat16*>(out.data), N, K, T);
+    const auto* xs = static_cast<const __nv_bfloat16*>(x.data);
+    const auto* ws = static_cast<const __nv_bfloat16*>(weight.qdata);
+    if (out.dtype == DType::FP32) {
+        bf16_general_gemm_kernel<<<grid, kThreads, 0, stream>>>(xs, ws, static_cast<float*>(out.data), N, K, T);
+    } else {
+        bf16_general_gemm_kernel<<<grid, kThreads, 0, stream>>>(xs, ws, static_cast<__nv_bfloat16*>(out.data), N,
+                                                                K, T);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

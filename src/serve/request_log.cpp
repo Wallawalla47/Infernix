@@ -1,6 +1,7 @@
 #include "serve/request_log.h"
 #include "product/constraint_observation.h"
 #include "product/logging/pretty_format.h"
+#include "product/logits_options.h"
 #include "product/speculative_options.h"
 
 #include <spdlog/logger.h>
@@ -568,6 +569,7 @@ std::string format_server_start_json(
              {"lossless", engine_options.lossless},
              {"log_stats_interval_ms", options.log_stats_interval_ms},
              {"kv_cache", kv_cache_name(engine_options.kv_cache)},
+             {"logits_dtype", product::logits_dtype_name(engine_options.logits_dtype)},
              {"vision", engine_options.enable_vision},
              {"cuda_graph", engine_options.use_cuda_graph},
              {"prefix_reuse", options.allow_prefix_reuse},

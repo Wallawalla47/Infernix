@@ -45,6 +45,7 @@ struct Options {
     int device                   = 0;
 
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
+    LogitsDtype logits_dtype = LogitsDtype::FP32;
     // INT8 KV prefills with the fast prompt kernel unless the original kernel is selected.
     bool original_int8_prefill_kernel = false;
     std::uint32_t prefill_split_workspace_mib = kDefaultPrefillSplitWorkspaceMiB;

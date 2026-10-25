@@ -1,6 +1,7 @@
 #include "infernix_bench_support.h"
 #include "product/constraint_observation.h"
 #include "product/speculative_options.h"
+#include "product/logits_options.h"
 #include "product/rope_yarn_options.h"
 
 #include <algorithm>
@@ -410,6 +411,8 @@ std::string usage_text(std::string_view program) {
         << "  --prefill-chunk <tokens>    multiple of " << kPrefillChunkAlignment
         << " (default: 16384 for Qwen3.8-Flash-Next, 1024 otherwise)\n"
         << "  --kv-dtype <bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2>  KV cache storage (default: bf16)\n"
+        << "  --logits-dtype <fp32|bf16>  the head's logits (default: fp32; bf16 rounds each once,\n"
+        << "                              as Transformers returns them, for comparisons)\n"
         << "  --use-original-int8-prefill-kernel  original INT8-KV prompt kernel at the\n"
         << "                              requested chunk (default: fast kernel, wave-aligned\n"
         << "                              chunks); requires --kv-dtype int8\n"
@@ -589,6 +592,8 @@ BenchOptions parse_args(int argc, char** argv) {
             }
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_cache(value("--kv-dtype"));
+        } else if (arg == "--logits-dtype") {
+            options.logits_dtype = product::parse_logits_dtype(value("--logits-dtype"));
         } else if (arg == "--use-original-int8-prefill-kernel") {
             options.original_int8_prefill_kernel = true;
         } else if (arg == "--prefill-split-workspace-mib") {
@@ -896,6 +901,7 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << " expert_pin_mib=" << mib_or_auto(env.expert_pin_bytes)
         << " rope_yarn_factor=" << env.rope_yarn_factor
         << " kv_cache=" << kv_cache_name(env.kv_cache)
+        << " logits_dtype=" << product::logits_dtype_name(env.logits_dtype)
         << " spec=" << product::speculative_backend_name(env.speculative.backend)
         << " draft_tokens=" << env.speculative.draft_tokens
         << " draft_auto=" << (env.speculative.draft_tokens_auto ? "on" : "off")
@@ -1047,6 +1053,7 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "    \"expert_pin_mib\": "
         << (env.expert_pin_bytes ? std::to_string(*env.expert_pin_bytes >> 20) : "null") << ",\n"
         << "    \"kv_cache\": \"" << kv_cache_name(env.kv_cache) << "\",\n"
+        << "    \"logits_dtype\": \"" << product::logits_dtype_name(env.logits_dtype) << "\",\n"
         << "    \"speculative_backend\": \""
         << product::speculative_backend_name(env.speculative.backend) << "\",\n"
         << "    \"draft_tokens\": " << env.speculative.draft_tokens << ",\n"
@@ -1155,7 +1162,7 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
            "constraint_choices,mixed_constraints,rope_yarn_factor,"
            "speculative_"
            "backend,draft_tokens,ngram_draft_tokens,ngram_min_match,spec_min_p,"
-           "proposal_head,decode_path,kv_cache,kv_payload_bytes,load_host_to_device_bytes,"
+           "proposal_head,decode_path,kv_cache,logits_dtype,kv_payload_bytes,load_host_to_device_bytes,"
            "weights_capacity_bytes,sequence_capacity_bytes,workspace_capacity_bytes,"
            "workspace_general_capacity_bytes,vision_handoff_capacity_bytes,"
            "cuda_graph_allowance_bytes,"
@@ -1193,7 +1200,8 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
             << (env.speculative.draft_min_p ? product::draft_min_p_text(env.speculative) : "") << ','
             << proposal_head_name(env.speculative.proposal_head) << ','
             << decode_path_name(env.use_cuda_graph, env.speculative) << ','
-            << kv_cache_name(env.kv_cache) << ',' << env.memory.kv_payload_bytes << ','
+            << kv_cache_name(env.kv_cache) << ',' << product::logits_dtype_name(env.logits_dtype) << ','
+            << env.memory.kv_payload_bytes << ','
             << env.load.host_to_device_bytes << ',' << env.memory.weights.capacity_bytes << ','
             << env.memory.sequence.capacity_bytes << ',' << env.memory.workspace.capacity_bytes
             << ','

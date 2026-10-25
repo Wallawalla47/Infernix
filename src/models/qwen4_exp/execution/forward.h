@@ -259,7 +259,7 @@ public:
     Forward(const Forward&)            = delete;
     Forward& operator=(const Forward&) = delete;
 
-    // FP32 logits [V, n] of batch.logit_columns.
+    // FP32 logits [V, n] of batch.logit_columns (or BF16 on the lossless route: head_logits_dtype).
     void run(const ForwardBatch& batch, Tensor& logits, const ForwardTap* tap = nullptr);
 
     // The steps run() composes, for a layer walk over a prefill span (design §19.3.8 F4): the
@@ -294,7 +294,7 @@ public:
     // Runs the MTP drafter (requires MTP parameters and state).
     void run_mtp(const MtpCall& call);
 
-    // FP32 logits [V, n] of n final residuals (BF16 [S*H, n], ForwardBatch::residual_out): the final
+    // FP32 logits [V, n] (or BF16 on the lossless route) of n final residuals (BF16 [S*H, n], ForwardBatch::residual_out): the final
     // mixer and the LM head, as finish() applies them to a call's logit columns. Teacher-forced
     // scoring runs it in tiles over a prompt's saved residuals. Uses the workspace (no call open).
     void head_logits(const Tensor& residuals, Tensor& logits);
@@ -313,6 +313,10 @@ public:
                                                          std::int32_t max_context, KvCacheStorage storage);
 
 private:
+    // Head logits are FP32, or BF16 on the lossless route (lossless_linear rounds each exact sum once).
+    [[nodiscard]] bool head_logits_dtype(const Tensor& logits) const noexcept {
+        return logits.dtype == DType::FP32 || (config_.lossless && logits.dtype == DType::BF16);
+    }
     void ple(const PleParameters& p, Tensor& residual, const ForwardBatch& batch);
     // The call's PLE embedding (BF16 [embed, T]): its n-gram rows, decoded exactly and rounded to BF16.
     Tensor ple_embedding(const PleParameters& p, const ForwardBatch& batch);

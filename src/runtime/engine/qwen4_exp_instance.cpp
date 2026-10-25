@@ -329,6 +329,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.preemption        = fast.selected(FastPath::Preemption);
     program_options.sampled_mtp_drafts = fast.selected(FastPath::SampledMtpDrafts);
     program_options.gumbel_sampling    = !options.fast_paths;
+    program_options.bf16_logits        = options.logits_dtype == LogitsDtype::BF16;
 
     StartupPhaseScope program(options.startup_observer, StartupPhase::ProgramInitialize);
     instance->program =

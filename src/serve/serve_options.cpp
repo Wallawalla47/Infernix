@@ -1,5 +1,6 @@
 #include "serve/serve_options.h"
 #include "product/config/config_file.h"
+#include "product/logits_options.h"
 #include "product/speculative_options.h"
 
 #include <algorithm>
@@ -82,6 +83,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--expert-ram-mib"},
     ServeOptionArity{"--expert-pin-mib"},
     ServeOptionArity{"--kv-dtype"},
+    ServeOptionArity{"--logits-dtype"},
     ServeOptionArity{"--spec"},
     ServeOptionArity{"--draft-tokens"},
     ServeOptionArity{"--draft-model"},
@@ -291,7 +293,7 @@ std::string serve_usage_text(const char* argv0) {
            "                             policy; startup lists them; docs/serving.md)\n"
            "  --lossless                 run the lossless route: every operation of the\n"
            "                             model correctly rounded at its own BF16 points\n"
-           "                             (FP32 logits), so the output depends on the\n"
+           "                             (logits as --logits-dtype), so the output depends on the\n"
            "                             request and the artifact alone; text with\n"
            "                             --kv-dtype bf16, no speculation; slower\n"
            "                             (docs/maintainer/lossless-route.md)\n"
@@ -394,6 +396,10 @@ std::string serve_usage_text(const char* argv0) {
            "  --kv-dtype T               KV storage: bf16 (default) | int8 | fp8 | nvfp4 | k8v4 |\n"
            "                             vq2 | k4v2; bf16 stores K as BF16 and V as FP16 (exact\n"
            "                             for 2^-17 <= |v| < 2^16), with --lossless V as BF16\n"
+           "  --logits-dtype T           fp32 (default) | bf16: the head's logits the sampler,\n"
+           "                             greedy choice, draft acceptance and constraints read;\n"
+           "                             bf16 rounds each once, as Transformers returns them\n"
+           "                             (near-equal logits then tie), for comparisons\n"
            "  --no-prefix-reuse          disable the prefix cache: every request starts from\n"
            "                             the root and a preempted request recovers by\n"
            "                             replay; cannot be combined with any option below\n"
@@ -890,6 +896,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
+        } else if (arg == "--logits-dtype") {
+            options.logits_dtype = product::parse_logits_dtype(require_value("--logits-dtype"));
         } else if (arg == "--spec") {
             options.speculative.backend =
                 product::parse_speculative_backend(require_value("--spec"));

@@ -98,8 +98,27 @@ Q8Launch select_q8_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
     return select_q8_a16_launch(n, k, t, routes);
 }
 
+namespace {
+// FP32 output (a vocabulary head's logits): the [248320, 5120] head's own family, else the
+// runtime-shape schedules; only those launches write FP32.
+Q8Launch select_q8_fp32_launch(std::int32_t n, std::int32_t k, std::int32_t t, LinearPolicy policy) {
+    if (!valid_linear_policy(policy)) throw std::invalid_argument("q8 linear: unsupported policy");
+    if (t <= 0) throw std::invalid_argument("q8 linear: T must be positive");
+    if (n <= 0 || k <= 0) throw std::invalid_argument("q8 linear: unsupported shape");
+    const bool head = n == Q8N248320K5120::kOutputRows && k == Q8N248320K5120::kInputRows;
+    if (column_invariant(policy)) {
+        return head ? select_q8_n248320_k5120_invariant(t) : select_q8_generic_invariant(t);
+    }
+    return head ? select_q8_n248320_k5120(t) : select_q8_generic(n, k, t);
+}
+} // namespace
+
 void q8_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
                  LinearRoutes routes, cudaStream_t stream) {
+    if (out.dtype == DType::FP32) {
+        select_q8_fp32_launch(w.n, w.k, x.ne[1], policy)(x, w, out, stream);
+        return;
+    }
     select_q8_launch(w.n, w.k, x.ne[1], policy, routes)(x, w, out, stream);
 }
 

@@ -3133,9 +3133,12 @@ LFRU promotes heavily, so misses and promotions together move 0.2-0.4 GB per tok
   97.1 % hits with no promotions, against LFRU's 93.3 % with 2.6 K promotions. That is
   memorization of one sequence, not tracking a drifting working set, so LFRU stays. The tg128
   numbers above come from that replay effect, so only the 512-token figure is a fair decode number.
-- **Sampling logits.** Generation samples BF16-rounded logits through the existing sampler, whose
-  top-k path keys on BF16; FP32 and BF16 logits measured equal in perplexity (§16.5). An FP32 sampler
-  is a backlog item for exact greedy ties.
+- **Sampling logits.** Generation samples, verifies drafts and reads the prompt frontier from the
+  FP32 logits (since 2026-10-24; before, a BF16 copy, which FP32 and BF16 measured equal in
+  perplexity, §16.5). BF16 rounding turns near-equal logits into exact ties, which greedy selection
+  breaks by token id; the FP32 sampler, argmax and acceptance kernels take the same multi-block and
+  tiled routes as BF16. `--logits-dtype bf16` (2026-10-25, for comparisons) keeps that BF16 copy: the FP32
+  sums rounded once, or on the lossless route the head's exact sums correctly rounded to BF16 directly.
 - **KV append.** Decode appends all sequences' K/V through device-chosen table rows
   (`kv_cache_append_batch`) so a round has no host-dependent value and can be a CUDA graph.
 

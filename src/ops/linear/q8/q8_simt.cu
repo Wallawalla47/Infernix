@@ -3,18 +3,19 @@
 #include "ops/linear/q8/q8_launch.h"
 
 namespace infernix::ops::detail {
+// The runtime-shape pair: FP32 or BF16 output (a vocabulary head's FP32 logits take them).
 void launch_q8_a16_simt_r8_t4(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
-    launch_q8_a16_simt<q8_instances::SimtR8T4>(
-        q8_linear_operands(x, w),
-        LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), out.ne[0]},
-        LinearIdentityEpilogue{}, stream);
+    with_linear_output(out, out.ne[0], [&](auto output) {
+        launch_q8_a16_simt<q8_instances::SimtR8T4>(q8_linear_operands(x, w), output, LinearIdentityEpilogue{},
+                                                   stream);
+    });
 }
 
 void launch_q8_a16_simt_r8_t8(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
-    launch_q8_a16_simt<q8_instances::SimtR8T8>(
-        q8_linear_operands(x, w),
-        LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), out.ne[0]},
-        LinearIdentityEpilogue{}, stream);
+    with_linear_output(out, out.ne[0], [&](auto output) {
+        launch_q8_a16_simt<q8_instances::SimtR8T8>(q8_linear_operands(x, w), output, LinearIdentityEpilogue{},
+                                                   stream);
+    });
 }
 
 void launch_q8_a16_simt_r1_t4_w8(const Tensor& x, const Weight& w, Tensor& out,

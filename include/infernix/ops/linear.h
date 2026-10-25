@@ -122,6 +122,12 @@ enum class LinearRoutes : std::uint8_t {
                                                  std::int32_t input_rows) noexcept;
 
 /**
+ * Whether the format writes an FP32 `out` (a vocabulary head's logits): Q6_G64_FP16, Q8_G32_FP16, BF16,
+ * FP8_E4M3FN_ROW_BF16 and nvfp4_rg16_v1. The other formats refuse one.
+ */
+[[nodiscard]] bool linear_fp32_output(QType qtype) noexcept;
+
+/**
  * @brief Applies a bias-free matrix projection independently to every input column.
  *
  * @details The ideal mathematical result is
@@ -133,11 +139,15 @@ enum class LinearRoutes : std::uint8_t {
  * @f]
  *
  * `out` stores a BF16 approximation of this ideal result under the named numerical criterion for
- * the selected private activation-compute path.
+ * the selected private activation-compute path, or, for an FP32 `out`, the FP32 sum itself (the
+ * same computation without the final rounding to BF16).
  *
  * @par Logical tensors and layout
  * `x` is contiguous, non-null, 16-byte-aligned BF16 `[K,T]`, `w` has logical shape `[N,K]`, and
- * `out` is contiguous, non-null, 16-byte-aligned BF16 `[N,T]`. Every logical extent is positive;
+ * `out` is contiguous, non-null, 16-byte-aligned BF16 or FP32 `[N,T]`. FP32 output serves vocabulary
+ * heads (BF16 logits tie near-equal tokens): Q6 and Q8 at every registered problem (Q8 problems other
+ * than `[248320,5120]` run the runtime-shape schedules), BF16 on its runtime-shape route, FP8
+ * `[248320,5120]`, and `nvfp4_rg16_v1`; other formats refuse it. Every logical extent is positive;
  * in particular, `T=0` is invalid rather than a no-op. Dimension zero is stored fastest. The Op has
  * no bias, activation, residual addition, or transpose mode.
  *
@@ -162,7 +172,7 @@ enum class LinearRoutes : std::uint8_t {
  * dense NVFP4_MUL matrix in QuantLayout::Rg16 (`nvfp4_rg16_v1`, Qwen3.5-122B-A10B's head
  * `[248320,3072]`) runs rg16_linear at every positive T under every policy: the canonical W4A16
  * product with exact sums, so it is column-invariant and needs the workspace overload. FP32
- * is unsupported.
+ * weights are unsupported.
  *
  * @par Numerical contract
  * Test fixture code materializes the persistent weight as its logical FP32 dequantized matrix.
@@ -207,8 +217,8 @@ enum class LinearRoutes : std::uint8_t {
  *
  * @param[in] x Contiguous, non-null, 16-byte-aligned BF16 input matrix `[K,T]`.
  * @param[in] w Logical weight matrix `[N,K]` in a registered persistent format and layout.
- * @param[out] out Contiguous, non-null, 16-byte-aligned BF16 output matrix `[N,T]`. It must not
- * overlap `x` or any weight plane.
+ * @param[out] out Contiguous, non-null, 16-byte-aligned BF16 or FP32 output matrix `[N,T]`. It must
+ * not overlap `x` or any weight plane.
  * @param[in] policy Permitted private activation-compute profiles.
  * @param[in,out] workspace Caller-owned transient arena.
  * @param[in] stream CUDA stream on which execution is enqueued.
@@ -226,7 +236,7 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
  *
  * @param[in] x Contiguous BF16 input matrix `[K,T]`.
  * @param[in] w Logical weight matrix `[N,K]` in a registered persistent format and layout.
- * @param[out] out Contiguous BF16 output matrix `[N,T]`.
+ * @param[out] out Contiguous BF16 or FP32 output matrix `[N,T]`.
  * @param[in] stream CUDA stream on which execution is enqueued.
  */
 void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);

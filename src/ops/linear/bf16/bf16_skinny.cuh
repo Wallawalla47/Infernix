@@ -13,6 +13,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <type_traits>
 
 namespace infernix::ops::detail {
 
@@ -50,10 +51,10 @@ __device__ __forceinline__ void skinny_accumulate(const __nv_bfloat16* __restric
 // instance (2 warps, 1 row per warp, Preload = chunks per lane) serves weights of at most
 // kSkinnySmallNRows rows, such as the Qwen4Exp GDN control [96, 2560]: its grid spreads over N / 2
 // CTAs instead of N / 16, and each lane issues all of its chunk loads before the first FMA.
-template <int Tokens, int Warps, int RowsPerWarp, int Preload>
+template <int Tokens, int Warps, int RowsPerWarp, int Preload, class Out>
 __global__ void __launch_bounds__(Warps * 32)
     bf16_skinny_gemv_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight,
-                            __nv_bfloat16* __restrict__ out, std::int32_t N, std::int32_t K) {
+                            Out* __restrict__ out, std::int32_t N, std::int32_t K) {
     const std::int32_t lane   = static_cast<std::int32_t>(threadIdx.x % 32);
     const std::int32_t warp   = static_cast<std::int32_t>(threadIdx.x / 32);
     const std::int32_t chunks = K / 8;
@@ -95,7 +96,11 @@ __global__ void __launch_bounds__(Warps * 32)
             float v = sums[r][t];
             for (int offset = 16; offset > 0; offset >>= 1) { v += __shfl_xor_sync(0xFFFFFFFFU, v, offset); }
             if (lane == 0 && first + r < N) {
-                out[static_cast<std::int64_t>(t) * N + first + r] = __float2bfloat16_rn(v);
+                if constexpr (std::is_same_v<Out, float>) {
+                    out[static_cast<std::int64_t>(t) * N + first + r] = v;
+                } else {
+                    out[static_cast<std::int64_t>(t) * N + first + r] = __float2bfloat16_rn(v);
+                }
             }
         }
     }
@@ -105,9 +110,16 @@ template <int Tokens, int Warps, int RowsPerWarp, int Preload>
 void launch_bf16_skinny_gemv(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     constexpr std::int32_t rows_per_block = Warps * RowsPerWarp;
     const dim3 grid(static_cast<unsigned>((weight.n + rows_per_block - 1) / rows_per_block));
-    bf16_skinny_gemv_kernel<Tokens, Warps, RowsPerWarp, Preload><<<grid, Warps * 32, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(weight.qdata),
-        static_cast<__nv_bfloat16*>(out.data), weight.n, weight.k);
+    const auto* xs = static_cast<const __nv_bfloat16*>(x.data);
+    const auto* ws = static_cast<const __nv_bfloat16*>(weight.qdata);
+    // FP32 output: a vocabulary head's logits (the runtime-shape fallback is its BF16 route).
+    if (out.dtype == DType::FP32) {
+        bf16_skinny_gemv_kernel<Tokens, Warps, RowsPerWarp, Preload><<<grid, Warps * 32, 0, stream>>>(
+            xs, ws, static_cast<float*>(out.data), weight.n, weight.k);
+    } else {
+        bf16_skinny_gemv_kernel<Tokens, Warps, RowsPerWarp, Preload><<<grid, Warps * 32, 0, stream>>>(
+            xs, ws, static_cast<__nv_bfloat16*>(out.data), weight.n, weight.k);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

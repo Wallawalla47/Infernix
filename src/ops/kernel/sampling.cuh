@@ -1,16 +1,13 @@
 #pragma once
 
 // Implements: include/infernix/ops/sampling.h
-// Match: contiguous BF16 logits, physical stride >= token domain, and at most
-// sixteen columns on the multi-block route; FP32 logits (the lossless route's) take the
-// single-block route.
+// Match: contiguous FP32 or BF16 logits, physical stride >= token domain, and at most
+// sixteen columns on the multi-block route.
 // Algorithm assumptions: 256-thread/2-item partial tiles feed bounded top-20
 // group merges through caller-owned workspace; unsupported finite geometries
 // use the semantically identical single-block fallback.
 
 #include "ops/kernel/sampling_device.cuh"
-
-#include <type_traits>
 
 namespace infernix::ops {
 
@@ -71,12 +68,9 @@ __launch_bounds__(kSamplerBlock) __global__
 
     const int partial_blocks = div_up(token_domain, kSamplerPartialTileItems);
     const int group_count    = sampler_group_count(partial_blocks);
-    // No-op when the scratch/group path owns this shape (see sample_batch_launch; BF16 only).
-    if constexpr (!std::is_same_v<Logit, float>) {
-        if (sampler_multiblock_ok(token_domain, static_cast<int>(gridDim.x), partial_blocks,
-                                  group_count)) {
-            return;
-        }
+    // No-op when the scratch/group path owns this shape (see sample_batch_launch).
+    if (sampler_multiblock_ok(token_domain, static_cast<int>(gridDim.x), partial_blocks, group_count)) {
+        return;
     }
 
     __shared__ float cand_val[kSamplerCandidateCap];
@@ -115,8 +109,9 @@ __launch_bounds__(kSamplerBlock) __global__
     if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
 }
 
+template <class Logit>
 __launch_bounds__(kSamplerBlock) __global__
-    void sampling_partial_topk_kernel(const __nv_bfloat16* logits, const SamplingConfig* cfg_ptr,
+    void sampling_partial_topk_kernel(const Logit* logits, const SamplingConfig* cfg_ptr,
                                       std::int32_t token_domain, std::int32_t physical_rows,
                                       SamplingWorkspace workspace) {
     const int col            = static_cast<int>(blockIdx.y);
@@ -137,7 +132,7 @@ __launch_bounds__(kSamplerBlock) __global__
     for (int item = 0; item < kSamplerItemsPerThread; ++item) {
         const int v = tile_start + item * blockDim.x + threadIdx.x;
         if (v < token_domain) {
-            const float raw = __bfloat162float(logits[base + v]);
+            const float raw = sampling_logit(logits[base + v]);
             const float x =
                 (penalties || cfg.mask.words) ? sampling_adjusted_logit(raw, v, cfg) : raw;
             keys[item]      = sampling_sort_key(x, v);

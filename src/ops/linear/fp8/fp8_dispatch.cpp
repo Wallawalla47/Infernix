@@ -61,6 +61,10 @@ void fp8_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPoli
     validate_fp8_weight(weight, "fp8 linear");
     if (x.ne[1] <= 0) throw std::invalid_argument("fp8 linear: T must be positive");
     const auto& shape = resolve_shape(weight.n, weight.k, policy);
+    // FP32 output: the vocabulary head's A16 and column-invariant routes only.
+    if (out.dtype == DType::FP32 && &shape != &kFp8N248320K5120) {
+        throw std::invalid_argument("fp8 linear: FP32 output needs the [248320, 5120] head");
+    }
     if (column_invariant(policy)) {
         if (shape.invariant == nullptr)
             throw std::invalid_argument("fp8 linear: the shape registers no column-invariant route");

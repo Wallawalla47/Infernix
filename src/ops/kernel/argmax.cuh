@@ -1,7 +1,7 @@
 #pragma once
 
 // Implements: include/infernix/ops/argmax.h
-// Match: contiguous BF16 [physical_rows,C], valid_rows <= physical_rows, with
+// Match: contiguous FP32 or BF16 [physical_rows,C], valid_rows <= physical_rows, with
 // tuned routes qualified for the 248077-row and 131072-row vocabularies.
 // Algorithm assumptions: one CTA reduces each blockDim.x-row tile and an atomic
 // winner selects the exact value/lower-id maximum per column.
@@ -122,8 +122,9 @@ __launch_bounds__(kArgmaxBlock) __global__
     if (threadIdx.x == 0) { probability[t] = 1.0F / sums[0]; }
 }
 
+template <class Logit>
 __launch_bounds__(kArgmaxBlock) __global__
-    void argmax_tiled_atomic_kernel(const __nv_bfloat16* logits, std::int32_t* out,
+    void argmax_tiled_atomic_kernel(const Logit* logits, std::int32_t* out,
                                     std::int32_t valid_rows, std::int32_t physical_rows) {
     pdl::enter();
     const std::int32_t t    = static_cast<std::int32_t>(blockIdx.y);
@@ -139,9 +140,10 @@ __launch_bounds__(kArgmaxBlock) __global__
             best_index = row;
         }
     };
-    // Each thread reads 8 contiguous rows per 16-byte load when every column starts 16-byte aligned
-    // (giveen/ninfer-ext 98a5904cb); the winner is the same value/lower-id maximum either way.
-    constexpr int kVectorRows = 8;
+    // Each thread reads contiguous rows per 16-byte load (8 BF16 or 4 FP32) when every column starts
+    // 16-byte aligned (giveen/ninfer-ext 98a5904cb); the winner is the same value/lower-id maximum
+    // either way.
+    constexpr int kVectorRows = 16 / static_cast<int>(sizeof(Logit));
     if (physical_rows % kVectorRows == 0 && (reinterpret_cast<std::uintptr_t>(logits) & 15U) == 0) {
 #pragma unroll
         for (int group = 0; group < kArgmaxItemsPerThread / kVectorRows; ++group) {
@@ -150,12 +152,12 @@ __launch_bounds__(kArgmaxBlock) __global__
                                  kVectorRows;
             if (v + kVectorRows <= valid_rows) {
                 const uint4 packed = __ldg(reinterpret_cast<const uint4*>(logits + base + v));
-                const auto* rows   = reinterpret_cast<const __nv_bfloat16*>(&packed);
+                const auto* rows   = reinterpret_cast<const Logit*>(&packed);
 #pragma unroll
-                for (int k = 0; k < kVectorRows; ++k) { consider(v + k, __bfloat162float(rows[k])); }
+                for (int k = 0; k < kVectorRows; ++k) { consider(v + k, argmax_logit(rows[k])); }
             } else {
                 for (std::int32_t row = v; row < valid_rows; ++row) {
-                    consider(row, __bfloat162float(logits[base + row]));
+                    consider(row, argmax_logit(logits[base + row]));
                 }
             }
         }
@@ -163,7 +165,7 @@ __launch_bounds__(kArgmaxBlock) __global__
 #pragma unroll
         for (int item = 0; item < kArgmaxItemsPerThread; ++item) {
             const std::int32_t v = tile_start + threadIdx.x + item * blockDim.x;
-            if (v < valid_rows) { consider(v, __bfloat162float(logits[base + v])); }
+            if (v < valid_rows) { consider(v, argmax_logit(logits[base + v])); }
         }
     }
 
@@ -172,7 +174,7 @@ __launch_bounds__(kArgmaxBlock) __global__
 
     int current = out[t];
     while (true) {
-        const float current_value = __bfloat162float(logits[base + current]);
+        const float current_value = argmax_logit(logits[base + current]);
         if (!argmax_better(best_value, best_index, current_value, current)) { break; }
         const int observed = atomicCAS(reinterpret_cast<int*>(out + t), current, best_index);
         if (observed == current) { break; }

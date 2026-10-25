@@ -48,6 +48,31 @@ void validate_spec(const RoundStateSpec& spec) {
     }
     (void)checked_i32(static_cast<std::uint64_t>(spec.draft_window) + 1ULL,
                       "RoundState draft window exceeds int32");
+    if (spec.logits != DType::FP32 && spec.logits != DType::BF16) {
+        throw std::invalid_argument("RoundState logits must be FP32 or BF16");
+    }
+    if (spec.verify_columns != 0 &&
+        (spec.verify_columns < spec.draft_window + 1U ||
+         spec.verify_columns > (spec.draft_window + 1U) * spec.batch_capacity)) {
+        throw std::invalid_argument("RoundState verify columns lie outside [K+1, (K+1)B]");
+    }
+}
+
+// The columns the verification logits hold.
+std::int32_t verify_columns(const RoundStateSpec& spec) {
+    return static_cast<std::int32_t>(spec.verify_columns != 0 ? spec.verify_columns
+                                                              : (spec.draft_window + 1U) * spec.batch_capacity);
+}
+
+// The verification logits (`dtype`) of a round `width` columns wide, as [rows, width, B']: every row up
+// to `rows` such a round holds within the storage's `columns` columns (a family that serves fewer rows
+// holds fewer).
+Tensor verify_logits_view(void* data, DType dtype, std::int32_t vocab, std::int32_t width, std::int32_t rows,
+                          std::int32_t columns) {
+    if (width > columns) {
+        throw std::logic_error("the verification logits hold fewer columns than the round width");
+    }
+    return Tensor(data, dtype, {vocab, width, std::min(rows, columns / width)});
 }
 
 } // namespace
@@ -62,7 +87,7 @@ RoundStateLayout begin_round_state_layout(LayoutBuilder& builder, const RoundSta
             builder.add(sizeof(OrdinaryDecodeIngress), 256, "ordinary decode ingress");
         ordinary.egress = builder.add(sizeof(OrdinaryDecodeEgress), 256, "ordinary decode egress");
         ordinary.logits = add_tensor(
-            builder, spec.fp32_logits ? DType::FP32 : DType::BF16,
+            builder, spec.logits,
             {spec.output_rows, checked_i32(spec.batch_capacity, "RoundState batch capacity")},
             "ordinary decode logits");
         ordinary.hidden =
@@ -77,8 +102,8 @@ RoundStateLayout begin_round_state_layout(LayoutBuilder& builder, const RoundSta
     }
     layout.rope_delta = add_tensor(builder, DType::I32, {1}, "step rope delta");
     if (!spec.causal_scoring) {
-        layout.logits = add_tensor(builder, spec.fp32_logits ? DType::FP32 : DType::BF16, {spec.output_rows, 1},
-                                   "step logits");
+        // The MTP drafter's prefill proposal reuses this storage as BF16 (mtp_draft_logits).
+        layout.logits = add_tensor(builder, spec.logits, {spec.output_rows, 1}, "step logits");
     }
     layout.text_kv_table_row = add_tensor(builder, DType::I32, {1}, "step Text KV table row");
     if (!spec.causal_scoring) {
@@ -177,9 +202,8 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
             add_tensor(builder, DType::I32, {columns, batch}, "MTP decode target positions");
         decode.target_argmax =
             add_tensor(builder, DType::I32, {columns, batch}, "MTP decode target argmax");
-        decode.target_logits =
-            add_tensor(builder, DType::BF16, {layout.spec.output_rows, columns, batch},
-                       "MTP decode target logits");
+        decode.target_logits = add_tensor(builder, layout.spec.logits, {layout.spec.output_rows, verify_columns(layout.spec)},
+                                          "MTP decode target logits");
         decode.target_hidden = add_tensor(
             builder, DType::BF16, {layout.spec.hidden, columns, batch}, "MTP decode target hidden");
         decode.target_continuation_hidden =
@@ -241,9 +265,8 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
             add_tensor(builder, DType::I32, {columns, batch}, "DFlash target verify ids");
         decode.target_argmax =
             add_tensor(builder, DType::I32, {columns, batch}, "DFlash target argmax");
-        decode.target_logits =
-            add_tensor(builder, DType::BF16, {layout.spec.output_rows, columns, batch},
-                       "DFlash target logits");
+        decode.target_logits = add_tensor(builder, layout.spec.logits, {layout.spec.output_rows, verify_columns(layout.spec)},
+                                          "DFlash target logits");
         decode.target_hidden = add_tensor(
             builder, DType::BF16, {layout.spec.hidden, columns, batch}, "DFlash target hidden");
         decode.target_continuation_hidden = add_tensor(
@@ -349,7 +372,9 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
     verify_ids       = layout.verify_ids.bind(backing);
     target_positions = layout.target_positions.bind(backing);
     target_argmax    = layout.target_argmax.bind(backing);
-    target_logits    = layout.target_logits.bind(backing);
+    const Tensor logits_storage = layout.target_logits.bind(backing);
+    verify_columns   = logits_storage.ne[1];
+    target_logits    = verify_logits_view(logits_storage.data, logits_storage.dtype, logits_storage.ne[0], width, batch, verify_columns);
     target_hidden    = layout.target_hidden.bind(backing);
     target_continuation_hidden = layout.target_continuation_hidden.bind(backing);
     proposal_logits            = layout.proposal_logits.bind(backing);
@@ -383,10 +408,11 @@ MtpDecodeState MtpDecodeState::narrowed(std::uint32_t k, std::uint32_t next_k) c
     }
     result.current_drafts =
         Tensor(current_drafts.data, DType::I32, {static_cast<std::int32_t>(k), rows});
-    for (Tensor* tensor :
-         {&result.target_hidden, &result.target_logits, &result.alignment_hidden}) {
+    for (Tensor* tensor : {&result.target_hidden, &result.alignment_hidden}) {
         *tensor = Tensor(tensor->data, tensor->dtype, {tensor->ne[0], width, rows});
     }
+    result.target_logits =
+        verify_logits_view(target_logits.data, target_logits.dtype, target_logits.ne[0], width, rows, verify_columns);
     const auto steps = static_cast<std::int32_t>(std::max(1U, next_k - 1U));
     for (Tensor* tensor :
          {&result.ar_positions, &result.ar_rope_positions, &result.ar_valid_columns}) {
@@ -419,9 +445,9 @@ DFlashDecodeState DFlashDecodeState::narrowed(std::uint32_t k) const {
         result.tree_masks = Tensor(tree_masks.data, tree_masks.dtype, {width, rows});
     }
     result.draft_tokens = Tensor(draft_tokens.data, draft_tokens.dtype, {drafts, rows});
-    for (Tensor* tensor : {&result.target_hidden, &result.target_logits}) {
-        *tensor = Tensor(tensor->data, tensor->dtype, {tensor->ne[0], width, rows});
-    }
+    result.target_hidden = Tensor(target_hidden.data, target_hidden.dtype, {target_hidden.ne[0], width, rows});
+    result.target_logits =
+        verify_logits_view(target_logits.data, target_logits.dtype, target_logits.ne[0], width, rows, verify_columns);
     for (Tensor* tensor : {&result.candidate_ids, &result.proposal_q}) {
         if (tensor->data) {
             *tensor = Tensor(tensor->data, tensor->dtype,
@@ -501,7 +527,9 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
     draft_tokens               = layout.draft_tokens.bind(backing);
     verify_ids                 = layout.verify_ids.bind(backing);
     target_argmax              = layout.target_argmax.bind(backing);
-    target_logits              = layout.target_logits.bind(backing);
+    const Tensor logits_storage = layout.target_logits.bind(backing);
+    verify_columns             = logits_storage.ne[1];
+    target_logits = verify_logits_view(logits_storage.data, logits_storage.dtype, logits_storage.ne[0], width, batch, verify_columns);
     target_hidden              = layout.target_hidden.bind(backing);
     target_continuation_hidden = layout.target_continuation_hidden.bind(backing);
     if (layout.block_drafts) { block_drafts = layout.block_drafts->bind(backing); }

@@ -344,6 +344,7 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.lossless                      = options_.lossless;
     engine_options.fast_path_candidates          = options_.fast_path_candidates;
     engine_options.kv_cache                  = options_.kv_cache;
+    engine_options.logits_dtype              = options_.logits_dtype;
     engine_options.enable_vision             = options_.enable_vision;
     engine_options.vision_offload            = options_.vision_offload;
     engine_options.vision_max_merged_tokens  = options_.vision_max_merged_tokens;

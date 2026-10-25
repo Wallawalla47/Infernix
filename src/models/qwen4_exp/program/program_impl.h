@@ -322,7 +322,7 @@ struct DeviceLayout {
     std::optional<DFlash2Config> dflash2_config;
     // Causal scoring: the window's final residuals (BF16 [S*H, max_context]), one tile's FP32 logits
     // and its targets, log-probabilities and distributions (ProgramImpl::causal_score).
-    std::size_t score_residuals = 0, score_logits = 0, score_io = 0;
+    std::size_t score_residuals = 0, score_logits = 0, score_logits16 = 0, score_io = 0;
     ProgramDevicePlan bytes;
 };
 
@@ -565,13 +565,16 @@ public:
         if (d.io.block_rope + 12ULL * lanes > d.io.ngram || d.io.columns + 4ULL * columns > d.io.ngram) {
             throw std::logic_error("Qwen4Exp: decode io must precede the n-gram rows");
         }
-        d.logits32     = sizeof(float) * c.vocab_size * lanes * W;
-        // The sampler's copy: BF16, or on the lossless route FP32.
-        d.logits16     = (c.lossless ? 4ULL : 2ULL) * c.vocab_size * lanes * W;
+        // The head's FP32 logits, which the sampler, verification, constraints and the prompt readout read; with
+        // BF16 logits their BF16 rounding beside them (the lossless head writes only that).
+        const bool bf16_head = o.bf16_logits && c.lossless;
+        d.logits32     = bf16_head ? 0 : sizeof(float) * c.vocab_size * lanes * W;
+        d.logits16     = o.bf16_logits ? 2ULL * c.vocab_size * lanes * W : 0;
         d.token_counts = 4ULL * static_cast<std::size_t>(d.token_domain) * lanes;
         if (o.causal_scoring) {
             d.score_residuals = align(2ULL * width * o.max_context);
-            d.score_logits    = align(sizeof(float) * c.vocab_size * kScoreTileColumns);
+            d.score_logits    = bf16_head ? 0 : align(sizeof(float) * c.vocab_size * kScoreTileColumns);
+            d.score_logits16  = o.bf16_logits ? align(2ULL * c.vocab_size * kScoreTileColumns) : 0;
             d.score_io        = align(4ULL * kScoreIoWords);
         }
 
@@ -714,7 +717,8 @@ public:
                4ULL * d.mtp_io.words + 4ULL * d.dflash_io.words + kGateStatsBytes * lanes +
                (o.ngram_table && o.ngram_table->fp8_scale ? sizeof(std::uint16_t) : 0) +
                (o.ngram_table && o.ngram_table->nvfp4_scale ? sizeof(std::uint32_t) : 0) + constraint_bytes(lanes, W) +
-               grammar_mask_bytes(d.token_domain, lanes, W) + d.score_residuals + d.score_logits + d.score_io;
+               grammar_mask_bytes(d.token_domain, lanes, W) + d.score_residuals + d.score_logits + d.score_logits16 +
+               d.score_io;
         b.residency            = ExpertResidency::table_bytes(expert_layout(c), d.columns);
         b.expert_record_stride = d.record_stride;
         b.expert_frame_bytes   = d.frame_bytes;
@@ -919,6 +923,7 @@ public:
         if (options_.causal_scoring) {
             allocate(score_residuals_, plan_.score_residuals, allocated);
             allocate(score_logits_, plan_.score_logits, allocated);
+            allocate(score_logits16_, plan_.score_logits16, allocated);
             allocate(score_io_, plan_.score_io, allocated);
             score_host_ = PinnedHostBuffer(plan_.score_io);
         }
@@ -2073,8 +2078,9 @@ public:
         if (last) {
             const std::uint32_t lanes[] = {index};
             const std::int32_t positions[] = {begin + width - 1};
-            sample(lanes, positions);
+            // The readout reads the logits before the sampler's constraints mask them.
             if (!lane.readout.empty()) { out.readout = read_prompt_frontier(lane); }
+            sample(lanes, positions);
             {
                 const nvtx::ScopedRange residency_range(nvtx::Name::PrefillResidency, nvtx::Category::Moe,
                                                         static_cast<std::uint64_t>(width));
@@ -3882,8 +3888,29 @@ private:
             const auto* positions = reinterpret_cast<const std::int32_t*>(host_io() + io_layout_.positions);
             fb.lossless_keys      = *std::max_element(positions, positions + cols) + 1;
         }
-        Tensor logits(logits32_.p, DType::FP32, {vocab_, logit_columns});
+        Tensor logits = head_logits(logit_columns);
         forward_->run(fb, logits);
+        round_logits(logit_columns, device_.stream);
+    }
+
+    // The head's logits of `columns` columns as the Forward writes them: FP32 (logits32_), or with BF16 logits on
+    // the lossless route BF16 (logits16_, each exact sum correctly rounded).
+    Tensor head_logits(std::int32_t columns) {
+        if (options_.bf16_logits && c_.lossless) { return Tensor(logits16_.p, DType::BF16, {vocab_, columns}); }
+        return Tensor(logits32_.p, DType::FP32, {vocab_, columns});
+    }
+    // The logits the sampler, verification, constraints and the prompt readout read, `columns` columns: FP32, or
+    // BF16 (ProgramOptions::bf16_logits).
+    Tensor read_logits(std::int32_t columns) {
+        if (options_.bf16_logits) { return Tensor(logits16_.p, DType::BF16, {vocab_, columns}); }
+        return Tensor(logits32_.p, DType::FP32, {vocab_, columns});
+    }
+    // BF16 logits off the lossless route: the head's FP32 sums of `columns` columns rounded once to BF16.
+    void round_logits(std::int32_t columns, cudaStream_t s) {
+        if (!options_.bf16_logits || c_.lossless || columns == 0) { return; }
+        const Tensor wide(logits32_.p, DType::FP32, {vocab_, columns});
+        Tensor narrow(logits16_.p, DType::BF16, {vocab_, columns});
+        ops::cast_fp32_to_bf16(wide, narrow, s);
     }
 
     // A call's inputs as the Forward reads them from a staged io image at `base` (the io, or one
@@ -4011,14 +4038,13 @@ private:
         GateRelease release_gate{gated ? this : nullptr, word, io_prefix(batch * W) - io_layout_.ngram};
         residency_->enqueue_route_download(s, batch * W);
 
-        // Acceptance on the device, from BF16-rounded logits as in plain decode (design 16.5).
-        Tensor wide(logits32_.p, DType::FP32, {vocab_, batch * W});
-        Tensor narrow(logits16_.p, DType::BF16, {vocab_, batch * W});
-        ops::cast_fp32_to_bf16(wide, narrow, s);
+        // Acceptance on the device, from the logits plain decode samples (FP32, or BF16: design 16.5); the
+        // constraints mask them in place.
+        Tensor logits = read_logits(batch * W);
         Tensor target(spec_device(spec_layout_.target), DType::I32, {batch * W});
-        ops::argmax(narrow, target, token_domain_, s);
+        ops::argmax(logits, target, token_domain_, s);
         const bool constrained = stage_constraints(lanes, W);
-        if (constrained) { constrain(narrow, &target); }
+        if (constrained) { constrain(logits, &target); }
         auto* configs = static_cast<ops::SamplingConfig*>(host_configs_.data());
         for (std::int32_t b = 0; b < batch; ++b) {
             configs[b]      = lanes_[lanes[b]].sampling;
@@ -4049,7 +4075,7 @@ private:
             Tensor candidates(dflash_device(at_candidates), DType::I32, {C, K, batch});
             Tensor q(dflash_device(at_q), DType::FP32, {C, K, batch});
             auto scope = work_->scope();
-            ops::speculative_accept_sparse_drafts(target.view({W, batch}), narrow.view({vocab_, W, batch}), drafts,
+            ops::speculative_accept_sparse_drafts(target.view({W, batch}), logits.view({vocab_, W, batch}), drafts,
                                                   candidates, q, extents, lengths, anchors, licensed, counts, accepted,
                                                   token_domain_, static_cast<const ops::SamplingConfig*>(configs_.p),
                                                   ops::SpeculativeAcceptExecutionEnvelope{}, *work_, s);
@@ -4086,13 +4112,13 @@ private:
             Tensor candidates(mtp_device(mtp_io_.verify_candidates), DType::I32, {C, K, batch});
             Tensor q(mtp_device(mtp_io_.verify_q), DType::FP32, {C, K, batch});
             auto scope = work_->scope();
-            ops::speculative_accept_sparse_drafts(target.view({W, batch}), narrow.view({vocab_, W, batch}), drafts,
+            ops::speculative_accept_sparse_drafts(target.view({W, batch}), logits.view({vocab_, W, batch}), drafts,
                                                   candidates, q, extents, lengths, anchors, licensed, counts, accepted,
                                                   token_domain_, static_cast<const ops::SamplingConfig*>(configs_.p),
                                                   ops::SpeculativeAcceptExecutionEnvelope{}, *work_, s);
         } else {
             auto scope = work_->scope();
-            ops::speculative_accept_greedy_drafts(target.view({W, batch}), narrow.view({vocab_, W, batch}), drafts,
+            ops::speculative_accept_greedy_drafts(target.view({W, batch}), logits.view({vocab_, W, batch}), drafts,
                                                   extents, lengths, anchors, licensed, counts, accepted,
                                                   token_domain_, static_cast<const ops::SamplingConfig*>(configs_.p),
                                                   *work_, s);
@@ -4669,23 +4695,15 @@ private:
         }
     }
 
-    // Samples the next token of each row from logits32_ (row b = column b) into pending_tokens_.
+    // Samples the next token of each row from read_logits (row b = column b) into pending_tokens_.
     // `before_wait` runs on the host after the sampling work is queued, before its wait.
     void sample(std::span<const std::uint32_t> lanes, std::span<const std::int32_t> positions,
                 const std::function<void()>& before_wait = {}) {
         const cudaStream_t s = device_.stream;
         const auto batch     = static_cast<std::int32_t>(lanes.size());
-        Tensor wide(logits32_.p, DType::FP32, {vocab_, batch});
-        Tensor narrow(logits16_.p, DType::BF16, {vocab_, batch});
-        // The sampler reads BF16 logits; BF16 and FP32 logits measured equal in perplexity
-        // (design §16.5). The lossless route samples a copy of its FP32 logits (a constraint masks the
-        // sampler's copy in place; the prompt readout reads the logits).
-        if (c_.lossless) {
-            narrow = Tensor(logits16_.p, DType::FP32, {vocab_, batch});
-            CUDA_CHECK(cudaMemcpyAsync(narrow.data, wide.data, wide.bytes(), cudaMemcpyDeviceToDevice, s));
-        } else {
-            ops::cast_fp32_to_bf16(wide, narrow, s);
-        }
+        // The sampler reads the FP32 logits, or BF16 (design §16.5); a constraint masks them in place (the prompt
+        // readout has read them first).
+        Tensor logits = read_logits(batch);
         auto* configs = static_cast<ops::SamplingConfig*>(host_configs_.data());
         auto* sample_positions = reinterpret_cast<std::int32_t*>(host_io() + io_layout_.positions);
         for (std::int32_t b = 0; b < batch; ++b) {
@@ -4696,12 +4714,12 @@ private:
         upload_pinned(configs_.p, configs, sizeof(ops::SamplingConfig) * batch, s);
         upload_pinned(sample_pos_.p, sample_positions, 4ULL * batch, s);
         const bool constrained = stage_constraints(lanes, 1);
-        if (constrained) { constrain(narrow, nullptr); }
+        if (constrained) { constrain(logits, nullptr); }
         Tensor out(sampled_.p, DType::I32, {batch});
         Tensor logical(sample_pos_.p, DType::I32, {batch});
         {
             auto scope = work_->scope();
-            ops::sample(narrow, out, token_domain_, static_cast<const ops::SamplingConfig*>(configs_.p), logical,
+            ops::sample(logits, out, token_domain_, static_cast<const ops::SamplingConfig*>(configs_.p), logical,
                         ops::kSamplePurposeDecode, *work_, s);
         }
         CUDA_CHECK(cudaMemcpyAsync(host_sampled_.data(), sampled_.p, 4ULL * batch, cudaMemcpyDeviceToHost, s));
@@ -5058,7 +5076,7 @@ private:
     // ---- causal scoring (score.cpp) ----
     // While a scored prompt prefills, each call's final residuals land in score_residuals_ at its
     // first position (score_column_: forward_call's; a layer walk's chunks carry their own).
-    DeviceBuffer score_residuals_, score_logits_, score_io_;
+    DeviceBuffer score_residuals_, score_logits_, score_logits16_, score_io_;
     PinnedHostBuffer score_host_{1};
     bool scoring_                = false;
     std::int32_t score_column_   = 0;

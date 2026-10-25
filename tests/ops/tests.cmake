@@ -186,6 +186,8 @@ infernix_add_op_test(infernix_gumbel_speculation_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gumbel_speculation.cpp"
   LIBRARIES infernix_ops)
 set_tests_properties(infernix_speculative_tree_test PROPERTIES TIMEOUT 600)
+add_test(NAME infernix_speculative_tree_fp32_test COMMAND infernix_speculative_tree_test --fp32-logits)
+set_tests_properties(infernix_speculative_tree_fp32_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
 
 infernix_add_op_test(infernix_attn_input_proj_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_attn_input_proj.cpp"
@@ -265,6 +267,16 @@ foreach(mode IN ITEMS ngram-only onehot-distribution mtp-onehot mtp-distribution
     PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 240)
 endforeach()
 set_tests_properties(infernix_speculative_wide_accept_test PROPERTIES TIMEOUT 600)
+# The acceptance suites on FP32 verification logits (every vocabulary head writes FP32).
+add_test(NAME infernix_speculative_round_fp32_test COMMAND infernix_speculative_round_test --fp32-logits)
+set_tests_properties(infernix_speculative_round_fp32_test PROPERTIES SKIP_RETURN_CODE 77)
+foreach(mode IN ITEMS ngram-only mtp-onehot onehot-distribution mtp-distribution)
+  string(REPLACE "-" "_" test_suffix "${mode}")
+  add_test(NAME infernix_speculative_${test_suffix}_fp32_test
+    COMMAND infernix_speculative_round_test --fp32-logits --${mode})
+  set_tests_properties(infernix_speculative_${test_suffix}_fp32_test
+    PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 240)
+endforeach()
 set_tests_properties(infernix_speculative_wide_distribution_test PROPERTIES TIMEOUT 900 RUN_SERIAL TRUE)
 
 # The wide sweep, one entry per width and layer profile plus the batched cases: together they run

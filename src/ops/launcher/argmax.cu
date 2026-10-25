@@ -1,5 +1,5 @@
 // Implements: include/infernix/ops/argmax.h
-// Match: validated contiguous BF16 logits and I32 output.
+// Match: validated contiguous FP32 or BF16 logits and I32 output.
 // Algorithm assumptions: one tile uses a direct reduction; larger domains use
 // zero-initialized atomic winners across route-selected row tiles.
 #include "ops/launcher/argmax.h"
@@ -33,37 +33,37 @@ int tiled_block_for(std::int32_t physical_rows, std::int32_t valid_rows, std::in
     return kArgmaxBlock;
 }
 
+template <class Logit>
 void argmax_tiled_atomic_launch(const Tensor& logits, Tensor& out, std::int32_t valid_rows,
                                 int block, cudaStream_t stream);
+
+template <class Logit>
+void argmax_typed(const Tensor& logits, Tensor& out, std::int32_t valid_rows, cudaStream_t stream) {
+    const std::int32_t physical_rows = logits.ne[0];
+    const std::int32_t t_count       = logits.ne[1];
+    // One CTA per column up to one block of rows; the tiled kernel beyond (each CTA covers
+    // kArgmaxItemsPerThread rows per thread).
+    if (div_up(valid_rows, kArgmaxBlock) < 2) {
+        argmax_kernel<<<static_cast<unsigned int>(t_count), kArgmaxBlock, 0, stream>>>(
+            static_cast<const Logit*>(logits.data), static_cast<std::int32_t*>(out.data), valid_rows,
+            physical_rows);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    argmax_tiled_atomic_launch<Logit>(logits, out, valid_rows, tiled_block_for(physical_rows, valid_rows, t_count),
+                                      stream);
+}
 
 } // namespace
 
 void argmax_launch(const Tensor& logits, Tensor& out, std::int32_t valid_rows,
                    cudaStream_t stream) {
-    const std::int32_t physical_rows = logits.ne[0];
-    const std::int32_t t_count       = logits.ne[1];
-    if (t_count == 0) { return; }
-
-    // FP32 logits (the lossless route): one CTA per column.
+    if (logits.ne[1] == 0) { return; }
     if (logits.dtype == DType::FP32) {
-        argmax_kernel<<<static_cast<unsigned int>(t_count), kArgmaxBlock, 0, stream>>>(
-            static_cast<const float*>(logits.data), static_cast<std::int32_t*>(out.data), valid_rows,
-            physical_rows);
-        CUDA_CHECK(cudaGetLastError());
-        return;
+        argmax_typed<float>(logits, out, valid_rows, stream);
+    } else {
+        argmax_typed<__nv_bfloat16>(logits, out, valid_rows, stream);
     }
-    // One CTA per column up to one block of rows; the tiled kernel beyond (each CTA covers
-    // kArgmaxItemsPerThread rows per thread).
-    if (div_up(valid_rows, kArgmaxBlock) < 2) {
-        argmax_kernel<<<static_cast<unsigned int>(t_count), kArgmaxBlock, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(logits.data), static_cast<std::int32_t*>(out.data),
-            valid_rows, physical_rows);
-        CUDA_CHECK(cudaGetLastError());
-        return;
-    }
-
-    argmax_tiled_atomic_launch(logits, out, valid_rows,
-                               tiled_block_for(physical_rows, valid_rows, t_count), stream);
 }
 
 namespace {
@@ -103,6 +103,7 @@ void argmax_map_launch(const Tensor& row_ids, Tensor& out, cudaStream_t stream) 
 
 namespace {
 
+template <class Logit>
 void argmax_tiled_atomic_launch(const Tensor& logits, Tensor& out, std::int32_t valid_rows,
                                 int block, cudaStream_t stream) {
     const std::int32_t physical_rows = logits.ne[0];
@@ -117,8 +118,8 @@ void argmax_tiled_atomic_launch(const Tensor& logits, Tensor& out, std::int32_t 
         const dim3 grid(static_cast<unsigned int>(tiled_blocks),
                         static_cast<unsigned int>(token_count));
         CUDA_CHECK(pdl::launch_consumer(
-            {dim3(grid), dim3(block), 0, stream}, argmax_tiled_atomic_kernel,
-            static_cast<const __nv_bfloat16*>(logits_slice.data),
+            {dim3(grid), dim3(block), 0, stream}, argmax_tiled_atomic_kernel<Logit>,
+            static_cast<const Logit*>(logits_slice.data),
             static_cast<std::int32_t*>(out_slice.data), valid_rows, physical_rows));
         CUDA_CHECK(cudaGetLastError());
     });

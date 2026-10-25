@@ -197,6 +197,7 @@ int main(int argc, char** argv) {
         engine_options.prefill_chunk                     = options.prefill_chunk;
         engine_options.original_int8_prefill_kernel      = options.original_int8_prefill_kernel;
         engine_options.kv_cache                          = options.kv_cache;
+        engine_options.logits_dtype                      = options.logits_dtype;
         engine_options.rope_yarn_factor                  = options.rope_yarn_factor;
         engine_options.original_nvfp4_prefill_kernel     = options.original_nvfp4_prefill_kernel;
         engine_options.fast_paths                        = options.fast_paths;
@@ -235,6 +236,7 @@ int main(int argc, char** argv) {
         env.expert_ram_bytes             = options.expert_ram_bytes;
         env.expert_pin_bytes             = options.expert_pin_bytes;
         env.kv_cache                 = options.kv_cache;
+        env.logits_dtype             = options.logits_dtype;
         env.speculative              = options.speculative;
         env.use_cuda_graph           = options.use_cuda_graph;
         env.repetitions              = options.repetitions;

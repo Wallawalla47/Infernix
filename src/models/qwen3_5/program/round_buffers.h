@@ -35,8 +35,12 @@ struct RoundStateSpec {
     std::uint32_t draft_window   = 0;
     SpeculativeBackend backend   = SpeculativeBackend::None;
     bool causal_scoring          = false;
-    // The lossless route: the step and ordinary decode logits are FP32.
-    bool fp32_logits             = false;
+    // The most target columns one speculative round verifies (each round family's width times the
+    // most rows it serves): the FP32 verification logits hold that many columns. 0: every row at the
+    // widest width, (draft_window + 1) * batch_capacity.
+    std::uint32_t verify_columns = 0;
+    // The main-head logits' dtype (ExecutionSchedule::logits): FP32 or BF16.
+    DType logits                 = DType::FP32;
     // adaptive-dflash: the drafter's whole block (its draft count K), which a round's proposal graph
     // drafts before the round's width is chosen; 0 without it.
     std::uint32_t block_drafts = 0;
@@ -146,6 +150,8 @@ struct DFlashDecodeEgress {
     std::array<std::int32_t, kMaximumConcurrency> accepted_branch{};
 };
 
+// Every main-head logits buffer (the step, ordinary decode and verification frames) holds
+// RoundStateSpec::logits: the head's FP32 sums by default, or BF16. The drafters' proposal logits are BF16.
 struct OrdinaryDecodeStateLayout {
     LayoutRegion ingress;
     LayoutRegion egress;
@@ -333,13 +339,16 @@ struct MtpDecodeState {
     Tensor ar_positions;
     Tensor ar_rope_positions;
     Tensor ar_valid_columns;
+    // The columns target_logits holds (RoundStateSpec::verify_columns).
+    std::int32_t verify_columns = 0;
 
     MtpDecodeState() = default;
     MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& layout,
                    std::uint32_t batch_capacity, std::uint32_t draft_window);
     // The frame viewed for a round that verifies k drafts per row and proposes next_k: every round
-    // tensor becomes a dense [k+1,C] (or [k,C]) view of the native storage and the step-major AR
-    // tensors keep their row stride.
+    // tensor becomes a dense [k+1,C] (or [k,C]) view of the native storage (target_logits: the rows
+    // its verify_columns hold at that width, at most C) and the step-major AR tensors keep their row
+    // stride.
     [[nodiscard]] MtpDecodeState narrowed(std::uint32_t k, std::uint32_t next_k) const;
 };
 
@@ -385,12 +394,15 @@ struct DFlashDecodeState {
     Tensor block_candidates;
     Tensor block_q;
     Tensor block_confidence;
+    // The columns target_logits holds (RoundStateSpec::verify_columns).
+    std::int32_t verify_columns = 0;
 
     DFlashDecodeState() = default;
     DFlashDecodeState(DeviceSpan backing, const DFlashDecodeStateLayout& layout,
                       std::uint32_t batch_capacity, std::uint32_t draft_window);
-    // The same storage viewed as a dense round of k drafts per row, for every row capacity; the
-    // append-context geometry keeps its native width. k equal to the native width is identity.
+    // The same storage viewed as a dense round of k drafts per row, for every row capacity
+    // (target_logits: the rows its verify_columns hold at that width); the append-context geometry
+    // keeps its native width. k equal to the native width is identity.
     [[nodiscard]] DFlashDecodeState narrowed(std::uint32_t k) const;
 };
 
@@ -444,6 +456,12 @@ struct RoundState {
     RoundState() = default;
     RoundState(DeviceSpan backing, const RoundStateLayout& layout);
 };
+
+// The MTP drafter's BF16 [rows,1] prefill and bridge proposal logits: the step logits' storage (FP32 or
+// BF16), whose sample (the proposal's anchor) has been taken when the drafter writes it.
+[[nodiscard]] inline Tensor mtp_draft_logits(const RoundState& io) {
+    return Tensor(io.logits.data, DType::BF16, {io.logits.ne[0], 1});
+}
 
 // Applies the staged constraint descriptors to `logits` ([rows,C], or [rows,K+1,B] viewed as
 // C = (K+1)*B columns) before a sampler or acceptance reads it; `argmax` (I32, C elements, or

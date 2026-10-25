@@ -68,7 +68,7 @@ infernix_add_test(infernix_qwen3_5_reasoning_loop_test
 
 infernix_add_test(infernix_qwen3_5_runtime_mechanisms_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_runtime_mechanisms.cpp"
-  LIBRARIES infernix_engine infernix_core)
+  LIBRARIES infernix_engine infernix_core infernix::json)
 
 infernix_add_test(infernix_qwen3_5_state_image_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_state_image.cpp"

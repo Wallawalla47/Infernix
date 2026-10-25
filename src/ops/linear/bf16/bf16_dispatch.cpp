@@ -57,6 +57,13 @@ Bf16Launch select_bf16_launch(std::int32_t n, std::int32_t k, std::int32_t t, Li
 
 void bf16_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPolicy policy,
                    cudaStream_t stream) {
+    // FP32 output (a vocabulary head's logits): the runtime-shape fallback, the one route writing FP32.
+    if (out.dtype == DType::FP32) {
+        if (!valid_linear_policy(policy) || column_invariant(policy))
+            throw std::invalid_argument("bf16 linear: unsupported policy");
+        select_bf16_general_launch(x.ne[1])(x, weight, out, stream);
+        return;
+    }
     select_bf16_launch(weight.n, weight.k, x.ne[1], policy)(x, weight, out, stream);
 }
 } // namespace infernix::ops::detail

@@ -200,16 +200,8 @@ PromptReadout ProgramImpl::read_prompt_frontier(const Lane& lane) {
     const std::size_t n = lane.readout.size();
     if (n == 0 || n > kMaximumReadoutTokens) { throw std::invalid_argument("prompt readout names an invalid token count"); }
     const cudaStream_t s = device_.stream;
-    // The sampler read these logits rounded to BF16 (and masked them for a constrained request):
-    // round the unmasked FP32 column again. The lossless route reads its FP32 logits, which the sampler
-    // only copied.
-    Tensor wide(logits32_.p, DType::FP32, {vocab_, 1});
-    Tensor narrow(logits16_.p, DType::BF16, {vocab_, 1});
-    if (c_.lossless) {
-        narrow = wide;
-    } else {
-        ops::cast_fp32_to_bf16(wide, narrow, s);
-    }
+    // The logits the sampler reads next (before its constraints mask them).
+    Tensor logits = read_logits(1);
     auto scope          = work_->scope();
     const auto count    = static_cast<std::int32_t>(n);
     Tensor ids          = work_->alloc(DType::I32, {count, 1});
@@ -217,8 +209,8 @@ PromptReadout ProgramImpl::read_prompt_frontier(const Lane& lane) {
     Tensor top_id       = work_->alloc(DType::I32, {1, 1});
     Tensor top_logprob  = work_->alloc(DType::FP32, {1, 1});
     CUDA_CHECK(cudaMemcpyAsync(ids.data, lane.readout.data(), 4ULL * n, cudaMemcpyHostToDevice, s));
-    ops::target_logprobs(narrow, ids, token_domain_, logprobs, s);
-    ops::top_logprobs(narrow, token_domain_, top_id, top_logprob, s);
+    ops::target_logprobs(logits, ids, token_domain_, logprobs, s);
+    ops::top_logprobs(logits, token_domain_, top_id, top_logprob, s);
     PromptReadout readout;
     readout.logprobs.resize(n);
     CUDA_CHECK(cudaMemcpyAsync(readout.logprobs.data(), logprobs.data, 4ULL * n, cudaMemcpyDeviceToHost, s));

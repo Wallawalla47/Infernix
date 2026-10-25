@@ -3,8 +3,9 @@
 // General-purpose BF16 x BF16 GEMM fallback for shapes the specialised bf16 linear path does not
 // tile (for example a full-precision vocab projection kept as BF16 by a QAT checkpoint). Computes
 // out[T, N] = x[T, K] * weight[N, K]^T with an fp32 accumulation and a BF16 store, matching the
-// contiguous token-major layout of the specialised kernels. Tiling is fixed and the extents are
-// runtime, so any (N, K, T) is handled without a per-shape instantiation.
+// contiguous token-major layout of the specialised kernels (or an FP32 store: Out = float, a vocabulary
+// head's logits). Tiling is fixed and the extents are runtime, so any (N, K, T) is handled without a
+// per-shape instantiation.
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -20,9 +21,14 @@ constexpr std::int32_t kThreadCols    = kThreads / 16;      // 16
 constexpr std::int32_t kRowsPerThread = kTileN / 16;        // 2
 constexpr std::int32_t kColsPerThread = kTileT / kThreadCols;  // 2
 
+// An output element from its FP32 sum: rounded to BF16, or the sum itself.
+__device__ __forceinline__ void bf16_linear_store(__nv_bfloat16* out, float value) { *out = __float2bfloat16_rn(value); }
+__device__ __forceinline__ void bf16_linear_store(float* out, float value) { *out = value; }
+
+template <class Out>
 __global__ void bf16_general_gemm_kernel(const __nv_bfloat16* __restrict__ x,
                                          const __nv_bfloat16* __restrict__ weight,
-                                         __nv_bfloat16* __restrict__ out, std::int32_t N,
+                                         Out* __restrict__ out, std::int32_t N,
                                          std::int32_t K, std::int32_t T) {
     __shared__ __nv_bfloat16 ws[kTileN][kTileK + 1];
     __shared__ __nv_bfloat16 wx[kTileT][kTileK + 1];
@@ -82,10 +88,7 @@ __global__ void bf16_general_gemm_kernel(const __nv_bfloat16* __restrict__ x,
 #pragma unroll
             for (std::int32_t cc = 0; cc < kColsPerThread; ++cc) {
                 const std::int32_t col = token0 + tcol * kColsPerThread + cc;
-                if (col < T) {
-                    out[static_cast<std::int64_t>(col) * N + row] =
-                        __float2bfloat16_rn(accum[rr][cc]);
-                }
+                if (col < T) { bf16_linear_store(&out[static_cast<std::int64_t>(col) * N + row], accum[rr][cc]); }
             }
         }
     }

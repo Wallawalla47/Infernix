@@ -103,7 +103,7 @@ void speculative_overlay_copy_proposals(const Tensor& copy_rows, const Tensor& c
  *
  * Logical shapes:
  *   All Tensor storage is contiguous. target_tokens/licensed_tokens are I32 [K+1,B], drafts is
- *   I32 [K,B], logits is BF16 [physical_rows,K+1,B], and current_extents/lengths/anchors/
+ *   I32 [K,B], logits is FP32 or BF16 [physical_rows,K+1,B], and current_extents/lengths/anchors/
  *   licensed_counts/accepted are I32 [B]. token_domain is in [1,physical_rows], K>=1, B>=1, and
  *   configs points to a device-resident SamplingConfig[B]. Tensor arguments, configs, and
  *   configs[b].token_counts do not overlap except for the explicitly mutated objects.
@@ -151,7 +151,7 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
  *
  * Logical shapes and registered profile:
  *   All Tensor storage is contiguous. target_tokens/licensed_tokens are I32 [K+1,B].
- *   logits is BF16 [248320,K+1,B]; drafts is I32 [K,B]; candidate_ids is I32 [16,K,B];
+ *   logits is FP32 or BF16 [248320,K+1,B]; drafts is I32 [K,B]; candidate_ids is I32 [16,K,B];
  *   proposal_q is FP32 [16,K,B]. current_extents, round_lengths, round_anchors,
  *   licensed_counts, and accepted_drafts are I32 [B].
  *   The registered domain is token_domain=248077 and K=1..63 at B=1..8. Each live draft

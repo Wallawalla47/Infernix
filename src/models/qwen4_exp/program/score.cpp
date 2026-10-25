@@ -2,7 +2,7 @@
 // prompt is prefilled on lane 0 through the generation path itself (expert cache, SSD tier, expert
 // streaming and layer walks included), every call keeping its final residuals; the final mixer and the
 // LM head then run over the saved residuals in tiles of kScoreTileColumns, producing each target's
-// log-probability, the top_k distribution and the candidates' log-probabilities from FP32 logits.
+// log-probability, the top_k distribution and the candidates' log-probabilities from its logits (FP32, or BF16).
 
 #include "models/qwen4_exp/program/program_impl.h"
 
@@ -10,7 +10,11 @@
 #include "infernix/ops/top_logprobs.h"
 
 #include <algorithm>
+#include <cstdint>
+#include <cstring>
 #include <stdexcept>
+#include <utility>
+#include <vector>
 
 namespace infernix::models::qwen4_exp::detail {
 
@@ -94,8 +98,18 @@ ScoreResult ProgramImpl::causal_score(PreparedPrompt&& prompt, std::uint32_t fir
                             static_cast<std::size_t>(columns) * per_position, host + candidates_at);
             }
             CUDA_CHECK(cudaMemcpyAsync(io, host, 4ULL * kScoreIoWords, cudaMemcpyHostToDevice, s));
-            Tensor logits(score_logits_.p, DType::FP32, {vocab_, columns});
-            forward_->head_logits(score_residuals(static_cast<std::int32_t>(first), columns), logits);
+            // The head's logits: FP32, or BF16 (the lossless head writes BF16 directly; elsewhere each FP32 sum
+            // rounds once).
+            const bool bf16 = options_.bf16_logits;
+            Tensor logits   = bf16 ? Tensor(score_logits16_.p, DType::BF16, {vocab_, columns})
+                                   : Tensor(score_logits_.p, DType::FP32, {vocab_, columns});
+            if (bf16 && !c_.lossless) {
+                Tensor wide(score_logits_.p, DType::FP32, {vocab_, columns});
+                forward_->head_logits(score_residuals(static_cast<std::int32_t>(first), columns), wide);
+                ops::cast_fp32_to_bf16(wide, logits, s);
+            } else {
+                forward_->head_logits(score_residuals(static_cast<std::int32_t>(first), columns), logits);
+            }
             Tensor targets(io + targets_at, DType::I32, {1, columns});
             Tensor logprobs(io + logprobs_at, DType::FP32, {1, columns});
             ops::target_logprobs(logits, targets, token_domain_, logprobs, s);
@@ -110,16 +124,31 @@ ScoreResult ProgramImpl::causal_score(PreparedPrompt&& prompt, std::uint32_t fir
                 ops::target_logprobs(logits, ids, token_domain_, values, s);
             }
             CUDA_CHECK(cudaMemcpyAsync(host, io, score_io_.bytes, cudaMemcpyDeviceToHost, s));
-            // ScoreOptions::logits_positions in this tile: the whole FP32 logits column.
+            // ScoreOptions::logits_positions in this tile: the whole logits column (BF16 widened exactly).
+            const auto vocab = static_cast<std::size_t>(vocab_);
+            std::vector<std::pair<std::size_t, std::vector<std::uint16_t>>> bf16_columns;
             for (const std::uint32_t position : options.logits_positions) {
                 if (position < done || position >= done + static_cast<std::size_t>(columns)) { continue; }
                 const std::size_t base = output.logits.size();
-                output.logits.resize(base + static_cast<std::size_t>(vocab_));
-                CUDA_CHECK(cudaMemcpyAsync(output.logits.data() + base,
-                                           static_cast<const float*>(score_logits_.p) + (position - done) * static_cast<std::size_t>(vocab_),
-                                           static_cast<std::size_t>(vocab_) * sizeof(float), cudaMemcpyDeviceToHost, s));
+                output.logits.resize(base + vocab);
+                if (bf16) {
+                    bf16_columns.emplace_back(base, std::vector<std::uint16_t>(vocab));
+                    CUDA_CHECK(cudaMemcpyAsync(bf16_columns.back().second.data(),
+                                               static_cast<const std::uint16_t*>(score_logits16_.p) + (position - done) * vocab,
+                                               vocab * sizeof(std::uint16_t), cudaMemcpyDeviceToHost, s));
+                } else {
+                    CUDA_CHECK(cudaMemcpyAsync(output.logits.data() + base,
+                                               static_cast<const float*>(score_logits_.p) + (position - done) * vocab,
+                                               vocab * sizeof(float), cudaMemcpyDeviceToHost, s));
+                }
             }
             device_.synchronize();
+            for (const auto& [base, raw] : bf16_columns) {
+                for (std::size_t v = 0; v < vocab; ++v) {
+                    const std::uint32_t bits = std::uint32_t{raw[v]} << 16U;
+                    std::memcpy(&output.logits[base + v], &bits, sizeof(bits));
+                }
+            }
             const auto* floats = reinterpret_cast<const float*>(host);
             output.logprobs.insert(output.logprobs.end(), floats + logprobs_at, floats + logprobs_at + columns);
             output.top_ids.insert(output.top_ids.end(), host + top_ids_at,

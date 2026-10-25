@@ -22,6 +22,7 @@
 #include "infernix/ops/linear_topk.h"
 #include "infernix/ops/gdn_gating_proj.h"
 #include "infernix/ops/gdn_input_proj.h"
+#include "infernix/ops/linear.h"
 #include "infernix/ops/linear_add.h"
 #include "infernix/ops/linear_swiglu.h"
 #include "infernix/ops/sampling.h"
@@ -423,7 +424,9 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                                          .draft_window   = plan.draft_window,
                                          .backend        = plan.speculative_backend,
                                          .causal_scoring = plan.causal_scoring,
-                                         .fp32_logits    = plan.execution_schedule.lossless,
+                                         .verify_columns = verify_column_capacity(plan.round_shapes, plan.tree_widths,
+                                                                                  plan.max_concurrency),
+                                         .logits         = plan.execution_schedule.logits,
                                          .block_drafts   = plan_has_split(plan) ? plan.neural_draft_window : 0U});
     out.prefill_hidden =
         add_tensor(builder, DType::BF16, {dimension(config.hidden_size), effective_prefill_chunk},
@@ -708,7 +711,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             plan.execution_schedule.lossless_keys != 0 ? &lossless_shape : nullptr;
         if (plan.execution_schedule.lossless) {
             // The chunk's rotary table and (cache form) state slots, then the widest layer
-            // (execution/lossless.cpp's own allocations), the hidden output and the head's FP32 logits.
+            // (execution/lossless.cpp's own allocations), the hidden output and the head's logits.
             (void)text_prefill.alloc_bytes(execution::lossless_rope_window_bytes(config, width));
             if (lossless_cache != nullptr) { matrix(text_prefill, DType::I32, 2, 1); }
             for (std::size_t layer = 0; layer < parameters.text.layers.size(); ++layer) {
@@ -734,9 +737,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
 
     if (plan.causal_scoring) {
         WorkspaceLayoutBuilder causal_score;
-        // The lossless route's logits are FP32.
-        matrix(causal_score, plan.execution_schedule.lossless ? DType::FP32 : DType::BF16,
-               dimension(config.vocab_size), static_cast<std::int32_t>(kCausalScoreTile));
+        matrix(causal_score, plan.execution_schedule.logits, dimension(config.vocab_size),
+               static_cast<std::int32_t>(kCausalScoreTile));
         matrix(causal_score, DType::I32, 1, static_cast<std::int32_t>(kCausalScoreTile));
         matrix(causal_score, DType::FP32, 1, static_cast<std::int32_t>(kCausalScoreTile));
         // Top tokens and candidates: ids and log-probabilities of each.
@@ -1125,6 +1127,13 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("max_concurrency must be in [1,8]");
     }
+    // FP32 logits off the lossless route need a head format ops::linear writes FP32 for (the lossless head
+    // writes either dtype for every format).
+    if (options.logits_dtype == LogitsDtype::FP32 && !options.lossless &&
+        !ops::linear_fp32_output(parameters.text.output_head.weight.qtype)) {
+        throw std::invalid_argument("text/output_head: FP32 logits need a q6_g64_fp16, q8_g32_fp16, bf16, "
+                                    "fp8_e4m3fn_row_bf16 or nvfp4_rg16_v1 head (or --logits-dtype bf16)");
+    }
     const std::uint32_t logical_pages = page_count(options.max_context);
     const std::uint32_t minimum_pages = std::max(logical_pages, options.max_concurrency);
     const std::uint64_t maximum_pages64 =
@@ -1306,9 +1315,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                 // batch-only family every other batch size.
                 std::uint32_t batch_sizes = 0;
                 for (std::uint32_t b = 1; b <= impl->max_concurrency; ++b) {
-                    batch_sizes += (shape.kind != SpeculativeRoundKind::Tree ||
-                                    impl->tree_widths.tree(b, shape.verify_drafts + 1U)) &&
-                                   (!shape.single_row || b == 1U) && (!shape.batch_only || b > 1U);
+                    batch_sizes += round_shape_serves(shape, impl->tree_widths, b);
                 }
                 const std::uint64_t forward = graph_topology_classes(profiles);
                 executables += (forward + (mtp ? forward : 1U)) * batch_sizes;
@@ -1403,7 +1410,8 @@ ExecutionSchedule execution_schedule(const execution::Parameters& parameters,
                                            ? static_cast<std::int32_t>(options.max_context)
                                            : 0,
             .lossless_design         = {.active = options.reference, .kv = options.kv_cache},
-            .gumbel_sampling         = !options.fast_paths || options.lossless};
+            .gumbel_sampling         = !options.fast_paths || options.lossless,
+            .logits                  = options.logits_dtype == LogitsDtype::BF16 ? DType::BF16 : DType::FP32};
 }
 // The fast INT8, NVFP4, VQ2 and K4V2 prompt kernels and the MXFP8 tiled kernel of FP8 and K8V4 KV
 // run one 128-row CTA of one query head per SM; BF16 KV and the original INT8 and NVFP4 kernels use

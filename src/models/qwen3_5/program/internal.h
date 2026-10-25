@@ -66,7 +66,7 @@ struct ExecutionSchedule {
     // gdn-f16-accumulate: the chunked GDN calls' arithmetic.
     ops::GdnChunkArithmetic gdn_arithmetic = ops::GdnChunkArithmetic::Exact;
     // The lossless route (EngineOptions::lossless, docs/maintainer/lossless-route.md): every layer
-    // execution::lossless_layer, FP32 logits. A CausalScoring Program scores each window in one pass (the
+    // execution::lossless_layer, the head's exact sums correctly rounded to `logits`. A CausalScoring Program scores each window in one pass (the
     // window form, lossless_keys 0); a Generation Program runs prefill chunks and decode rounds through
     // the KV cache (the lossless bf16 profile) and the recurrent state slots (the cache form, keys up to
     // lossless_keys, max_context) without speculation; decode rounds run as the CUDA Graphs of the
@@ -79,6 +79,8 @@ struct ExecutionSchedule {
     // The reproducible and lossless routes: sampled requests draw by Gumbel-max
     // (ops::SamplingConfig::gumbel_max), so speculation returns plain sampling's text.
     bool gumbel_sampling = false;
+    // Every main-head logits buffer's dtype (EngineOptions::logits_dtype): FP32, or BF16.
+    DType logits = DType::FP32;
 
     // Whether a decode or verification call of `columns` columns runs batched-decode's route: its
     // projections' column-count routes (Parameters::decode_text without column invariance) and the

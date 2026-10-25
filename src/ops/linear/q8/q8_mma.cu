@@ -3,12 +3,13 @@
 #include "ops/linear/q8/q8_launch.h"
 
 namespace infernix::ops::detail {
+// The runtime-shape schedules: FP32 or BF16 output (a vocabulary head's FP32 logits take them).
 #define INFERNIX_Q8_MMA_LAUNCHER(Name, Schedule)                                                     \
     void Name(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {                \
-        launch_q8_a16_mma<q8_instances::Schedule>(                                                 \
-            q8_linear_operands(x, w),                                                              \
-            LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), out.ne[0]},                    \
-            LinearIdentityEpilogue{}, stream);                                                     \
+        with_linear_output(out, out.ne[0], [&](auto output) {                                      \
+            launch_q8_a16_mma<q8_instances::Schedule>(q8_linear_operands(x, w), output,           \
+                                                      LinearIdentityEpilogue{}, stream);           \
+        });                                                                                        \
     }
 
 INFERNIX_Q8_MMA_LAUNCHER(launch_q8_a16_mma_r32_t64, MmaR32T64)

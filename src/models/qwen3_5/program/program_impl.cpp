@@ -439,10 +439,9 @@ ScoreResult ProgramImpl::causal_score(PreparedPromptData&& prompt, std::uint32_t
             const auto columns = static_cast<std::int32_t>(staged_columns);
             // The staged columns' first scored position.
             const std::size_t first_position = output.logprobs.size();
-            // The lossless route scores from the correctly rounded FP32 logits.
-            const bool lossless = execution_schedule.lossless;
-            Tensor logits       = work.alloc(lossless ? DType::FP32 : DType::BF16,
-                                             {dimension(parameters.model.config().text.vocab_size), columns});
+            // The head's logits in the schedule's dtype (on the lossless route each exact sum correctly rounded to it).
+            Tensor logits = work.alloc(execution_schedule.logits,
+                                       {dimension(parameters.model.config().text.vocab_size), columns});
             Tensor target_ids = work.alloc(DType::I32, {1, columns});
             Tensor logprobs   = work.alloc(DType::FP32, {1, columns});
             const auto distribution = [&](DType dtype, std::uint32_t rows) {
@@ -454,7 +453,7 @@ ScoreResult ProgramImpl::causal_score(PreparedPromptData&& prompt, std::uint32_t
             Tensor candidate_ids      = distribution(DType::I32, per_position);
             Tensor candidate_logprobs = distribution(DType::FP32, per_position);
             Tensor hidden             = score_hidden->slice(1, 0, columns);
-            if (lossless) {
+            if (execution_schedule.lossless) {
                 execution::lossless_head(hidden, parameters.text.output_head.weight, logits, work, device.stream);
             } else {
                 execution::project(hidden, parameters.text.output_head, logits, work, device.stream);
@@ -492,23 +491,24 @@ ScoreResult ProgramImpl::causal_score(PreparedPromptData&& prompt, std::uint32_t
                                            device.stream));
             }
             // ScoreOptions::logits_positions in this tile: the whole logits column as scoring computed it
-            // (FP32 on the lossless route; BF16 elsewhere, widened exactly).
-            const std::size_t vocab = static_cast<std::size_t>(logits.ne[0]);
+            // (BF16 logits widened exactly).
+            const std::size_t vocab  = static_cast<std::size_t>(logits.ne[0]);
+            const bool bf16_logits   = logits.dtype == DType::BF16;
             std::vector<std::pair<std::size_t, std::vector<std::uint16_t>>> bf16_columns;
             for (const std::uint32_t position : options.logits_positions) {
                 if (position < first_position || position >= first_position + staged_columns) { continue; }
                 const std::size_t column = position - first_position;
                 const std::size_t base   = output.logits.size();
                 output.logits.resize(base + vocab);
-                if (lossless) {
-                    CUDA_CHECK(cudaMemcpyAsync(output.logits.data() + base,
-                                               static_cast<const float*>(logits.data) + column * vocab,
-                                               vocab * sizeof(float), cudaMemcpyDeviceToHost, device.stream));
-                } else {
+                if (bf16_logits) {
                     bf16_columns.emplace_back(base, std::vector<std::uint16_t>(vocab));
                     CUDA_CHECK(cudaMemcpyAsync(bf16_columns.back().second.data(),
                                                static_cast<const std::uint16_t*>(logits.data) + column * vocab,
                                                vocab * sizeof(std::uint16_t), cudaMemcpyDeviceToHost, device.stream));
+                } else {
+                    CUDA_CHECK(cudaMemcpyAsync(output.logits.data() + base,
+                                               static_cast<const float*>(logits.data) + column * vocab,
+                                               vocab * sizeof(float), cudaMemcpyDeviceToHost, device.stream));
                 }
             }
             device.synchronize();

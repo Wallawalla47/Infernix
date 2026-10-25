@@ -337,11 +337,12 @@ void ProgramImpl::walk_moe(std::size_t g, std::uint32_t l) {
     const bool prompt_end = walk_.end_call == lanes_[walk_.lane].calls.size();
     for (std::size_t c = first; c < end; ++c) {
         const bool logits_here = prompt_end && c + 1 == walk_.widths.size();
-        Tensor logits(logits32_.p, DType::FP32, {vocab_, 1});
+        Tensor logits                 = head_logits(1);
         execution::ForwardBatch chunk = walk_batch(c);
         Tensor chunk_residual         = walk_residual(c, c + 1);
         forward_->begin_call(chunk, logits_here ? &logits : nullptr);
         forward_->finish(chunk, chunk_residual, logits_here ? &logits : nullptr);
+        if (logits_here) { round_logits(1, device_.stream); }
         walk_capture(c, L); // the chunk's end in the MTP block
     }
 }

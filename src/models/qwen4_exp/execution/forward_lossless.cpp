@@ -2,7 +2,8 @@
 // §3a): every operation of Transformers' modeling_qwen4_exp.py correctly rounded: the exact projections of
 // lossless_linear over each weight's exact value, the hyper-connection mixes and injections, PLE, the gated
 // delta rule, QSA attention (the indexer's pooled-key scores selecting each query's blocks), the router with
-// BF16 weights, the offloaded experts' lossless pass, and FP32 logits. Two forms:
+// BF16 weights, the offloaded experts' lossless pass, and the logits (each exact sum correctly rounded to FP32,
+// or to BF16 with BF16 logits). Two forms:
 //  - a scored window (ForwardBatch::lossless_keys 0): one sequence in one call from zero state over its own
 //    keys, writing nothing to the KV cache or the recurrent states;
 //  - the cache form (generation): prefill chunks and decode rounds continue their sequences, K/V and pooled

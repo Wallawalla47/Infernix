@@ -31,7 +31,7 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
     Tensor position_view = state.execution.io.mtp->target_positions.slice(0, 0, 1);
     ops::set_i32_scalar(position_view, position, state.execution.device.stream);
     Tensor mtp_hidden         = state.execution.io.mtp->ar_hidden;
-    Tensor logits             = state.execution.io.logits.slice(1, 0, 1);
+    Tensor logits             = mtp_draft_logits(state.execution.io);
     Tensor draft0             = state.execution.io.mtp->draft_tokens.slice(0, 0, 1);
     Tensor rope_position_view = state.execution.work.alloc(DType::I32, {1, 3});
     CUDA_CHECK(cudaMemcpyAsync(rope_position_view.data, rope_position.data(),

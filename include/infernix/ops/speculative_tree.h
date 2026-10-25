@@ -99,8 +99,8 @@ void speculative_prepare_tree_verify_inputs(const Tensor& anchors, const Tensor&
 /**
  * Op: speculative_accept_sparse_tree
  *
- * Tree form of speculative_accept_sparse_drafts over W = logits.ne[1] columns. logits is BF16
- * [248320,W,B], target_tokens I32 [W,B], drafts I32 [W-1,B], candidate_ids I32 [16,W-1,B],
+ * Tree form of speculative_accept_sparse_drafts over W = logits.ne[1] columns. logits is FP32 or
+ * BF16 [248320,W,B], target_tokens I32 [W,B], drafts I32 [W-1,B], candidate_ids I32 [16,W-1,B],
  * proposal_q FP32 [16,W-1,B] (the full proposal law of each column's parent), current_extents/
  * round_lengths/round_anchors/licensed_counts/accepted_drafts/accepted_branch I32 [B],
  * licensed_tokens I32 [W,B], accepted_path I32 [W,B], tree_rows I32 [kSpeculativeTreeRowWords,B].

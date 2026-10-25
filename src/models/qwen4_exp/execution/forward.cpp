@@ -203,7 +203,7 @@ void Forward::begin_call(const ForwardBatch& batch, const Tensor* logits) {
         throw std::invalid_argument("Qwen4Exp forward: verification records do not match the call");
     }
     if (batch.batch <= 0 || batch.width <= 0 || batch.batch * batch.width != T ||
-        (logits != nullptr && (logits->dtype != DType::FP32 || logits->ne[1] != batch.logit_columns.ne[0] ||
+        (logits != nullptr && (!head_logits_dtype(*logits) || logits->ne[1] != batch.logit_columns.ne[0] ||
                                logits->ne[0] != dim(config_.vocab_size)))) {
         throw std::invalid_argument("Qwen4Exp forward: batch geometry is invalid");
     }
@@ -459,10 +459,10 @@ void Forward::finish(const ForwardBatch& batch, Tensor& residual, Tensor* logits
 
 void Forward::head_logits(const Tensor& residuals, Tensor& logits) {
     if (residuals.dtype != DType::BF16 || residuals.ne[0] != dim(config_.residual_width()) ||
-        logits.dtype != DType::FP32 || logits.ne[0] != dim(config_.vocab_size) ||
+        !head_logits_dtype(logits) || logits.ne[0] != dim(config_.vocab_size) ||
         logits.ne[1] != residuals.ne[1]) {
-        throw std::invalid_argument(
-            "Qwen4Exp forward: head logits need BF16 [S*H, n] residuals and FP32 [V, n] logits");
+        throw std::invalid_argument("Qwen4Exp forward: head logits need BF16 [S*H, n] residuals and FP32 [V, n] "
+                                    "logits (or BF16 on the lossless route)");
     }
     work_.reset();
     auto scope           = work_.scope();

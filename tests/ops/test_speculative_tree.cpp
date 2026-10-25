@@ -27,6 +27,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace infernix;
@@ -55,6 +56,20 @@ std::vector<T> read_buffer(const GuardedDeviceBuffer& buffer, std::size_t count)
 template <typename T>
 void write_buffer(GuardedDeviceBuffer& buffer, const std::vector<T>& values) {
     buffer.copy_from_host(values.data(), values.size() * sizeof(T));
+}
+
+// The verification logits' dtype: FP32 under --fp32-logits (the fixtures' BF16 values widened exactly),
+// else BF16.
+DType g_logits_dtype = DType::BF16;
+
+void write_logits(GuardedDeviceBuffer& buffer, const std::vector<std::uint16_t>& bits) {
+    if (g_logits_dtype == DType::BF16) {
+        write_buffer(buffer, bits);
+        return;
+    }
+    std::vector<float> wide(bits.size());
+    for (std::size_t i = 0; i < bits.size(); ++i) { wide[i] = bf16_to_f32(bits[i]); }
+    write_buffer(buffer, wide);
 }
 
 std::vector<std::uint16_t> random_bf16(std::size_t count, std::uint32_t seed, float lo, float hi) {
@@ -435,7 +450,7 @@ struct AcceptBuffers {
 
     AcceptBuffers(int nodes, int rows)
         : n(nodes), k(nodes - 1), batch(rows), targets(sizeof(int) * nodes * rows),
-          logits(static_cast<std::size_t>(kPhysicalRows) * nodes * rows * 2),
+          logits(static_cast<std::size_t>(kPhysicalRows) * nodes * rows * sizeof(float)),
           drafts(sizeof(int) * (nodes - 1) * rows),
           candidates(sizeof(int) * kCandidates * (nodes - 1) * rows),
           q(sizeof(float) * kCandidates * (nodes - 1) * rows), extents(sizeof(int) * rows),
@@ -446,7 +461,7 @@ struct AcceptBuffers {
 
     Tensor t_targets() { return Tensor(targets.data(), DType::I32, {n, batch}); }
 
-    Tensor t_logits() { return Tensor(logits.data(), DType::BF16, {kPhysicalRows, n, batch}); }
+    Tensor t_logits() { return Tensor(logits.data(), g_logits_dtype, {kPhysicalRows, n, batch}); }
 
     Tensor t_drafts() { return Tensor(drafts.data(), DType::I32, {k, batch}); }
 
@@ -698,7 +713,7 @@ int chain_equivalence_case() {
         for (int r = 0; r < batch; ++r)
             lengths[static_cast<std::size_t>(r)] = 100 + 37 * r + static_cast<int>(trial);
         for (AcceptBuffers* side : {&tree, &chain}) {
-            write_buffer(side->logits, logits);
+            write_logits(side->logits, logits);
             write_buffer(side->targets, targets);
             write_buffer(side->drafts, drafts);
             write_buffer(side->candidates, candidates);
@@ -783,7 +798,7 @@ int distribution_case(int m) {
             candidates[column * kCandidates + j] = ids[static_cast<std::size_t>(j)];
             proposal[column * kCandidates + j]   = q[static_cast<std::size_t>(j)];
         }
-    write_buffer(b.logits, logits);
+    write_logits(b.logits, logits);
     write_buffer(b.candidates, candidates);
     write_buffer(b.q, proposal);
     b.targets.fill(0);
@@ -1489,12 +1504,31 @@ int gdn_record_case(int value_heads, const std::vector<ops::SpeculativeTreeRow>&
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
     int failures = 0;
+    // --fp32-logits: the acceptance cases on FP32 verification logits.
+    if (argc == 2 && std::string_view(argv[1]) == "--fp32-logits") {
+        g_logits_dtype = DType::FP32;
+        try {
+            failures += greedy_tree_case();
+            failures += chain_equivalence_case();
+            for (int m = 1; m <= 4; ++m) failures += distribution_case(m);
+        } catch (const std::exception& error) {
+            std::cerr << "speculative tree FP32 test threw: " << error.what() << '\n';
+            return 1;
+        }
+        std::cout << (failures == 0 ? "speculative tree FP32 acceptance passed\n"
+                                    : "speculative tree FP32 acceptance failed\n");
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc != 1) {
+        std::cerr << "usage: infernix_speculative_tree_test [--fp32-logits]\n";
+        return 2;
+    }
     try {
         failures += prepare_inputs_case();
         failures += compact_columns_case(false);

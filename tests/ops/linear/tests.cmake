@@ -69,6 +69,12 @@ infernix_add_op_test(infernix_linear_bf16_a16_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_bf16_a16.cpp"
   LIBRARIES infernix_linear_test_support)
 
+# FP32 vocabulary-head logits through ops::linear: Q6, Q8, row-FP8 and BF16 heads on every route, against
+# FP64 and the same call's BF16 output.
+infernix_add_op_test(infernix_linear_fp32_head_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_linear_fp32_head.cpp"
+  LIBRARIES infernix_linear_test_support)
+
 # FP32 projections (router and lm_head logits), BF16 and q8_g32_fp16 weights, against FP64.
 infernix_add_op_test(infernix_projection_fp32_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_projection_fp32.cpp"

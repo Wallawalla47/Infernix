@@ -469,11 +469,8 @@ void ProgramImpl::prepare_graphs() {
             const bool tree                   = round.shape.kind == SpeculativeRoundKind::Tree;
             const std::uint32_t verify_drafts = round.shape.verify_drafts;
             const std::uint32_t ar_depth = mtp_proposal_drafts(round.shape, neural_draft_window);
-            const bool single_row        = round.shape.single_row;
-            const bool batch_only        = round.shape.batch_only;
             const auto serves            = [&](std::uint32_t batch) {
-                return (!tree || tree_widths.tree(batch, verify_drafts + 1U)) &&
-                       (!single_row || batch == 1U) && (!batch_only || batch > 1U);
+                return round_shape_serves(round.shape, tree_widths, batch);
             };
             bool used = false;
             for (std::uint32_t batch = 1; batch <= max_concurrency; ++batch) {

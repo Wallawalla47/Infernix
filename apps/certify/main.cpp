@@ -8,6 +8,7 @@
 //
 //   infernix-certify reference <artifact> --corpus M --set S --out REF [--design --kv-dtype K]
 //                    [--noise-seed N [--noise-units LIST] [--noise-scale S]] [--windows i,j,...]
+//                    [--logits-dtype fp32|bf16] (the head's exact sums correctly rounded to it; default fp32)
 //   infernix-certify verify    <artifact> --reference REF [--windows i,j,...]
 //   infernix-certify capture   <artifact> --corpus M --set S --out PREFIX --windows i,j [--tokens N] [--every K]
 //   infernix-certify mask      <artifact> --corpus M --set S --out FILE.json
@@ -19,13 +20,14 @@
 //                    [--concurrency N] [--spec mtp|dflash|dflash2] [--draft-tokens N|auto]
 //                    [--ngram-draft-tokens N|auto] [--draft-tree-nodes auto|LIST] [--draft-model FILE]
 //                    [--prefix-reuse [--warm-tokens N]] [--kv-tokens N]
-//   route options: [--reproducible] [--fast-path NAME]... [--kv-dtype K] [--prefill-chunk N]
-//                  [--ngram-volume FILE] [--expert-a4-activations]
+//   route options: [--reproducible] [--fast-path NAME]... [--kv-dtype K] [--logits-dtype fp32|bf16]
+//                  [--prefill-chunk N] [--ngram-volume FILE] [--expert-a4-activations]
 
 #include "infernix_build_id.h"
 #include "distribution.h"
 #include "iqs_corpus.h"
 #include "infernix/engine.h"
+#include "product/logits_options.h"
 #include "product/speculative_options.h"
 
 #include <nlohmann/json.hpp>
@@ -74,6 +76,7 @@ struct Options {
     std::uint32_t noise_units  = 0xFFU; // the operation groups the noise applies to (ops::LosslessNoiseUnit)
     float noise_scale          = 1.0F;  // its strength
     std::string kv             = "bf16";
+    std::string logits         = "fp32"; // --logits-dtype, every route and reference
     bool reproducible          = false;
     std::vector<infernix::FastPath> candidates;
     std::optional<std::uint32_t> prefill_chunk;
@@ -161,6 +164,9 @@ Options parse(int argc, char** argv) {
             out.noise_scale = std::stof(std::string(value()));
         } else if (option == "--kv-dtype") {
             out.kv = value();
+        } else if (option == "--logits-dtype") {
+            out.logits = std::string(value());
+            (void)infernix::product::parse_logits_dtype(out.logits);
         } else if (option == "--reproducible") {
             out.reproducible = true;
         } else if (option == "--fast-path") {
@@ -275,6 +281,7 @@ json provenance(const Options& options, const certify::Corpus* corpus) {
 void apply_route(const Options& options, infernix::EngineOptions& engine_options) {
     engine_options.artifact_path         = options.artifact;
     engine_options.kv_cache              = kv_storage(options.kv);
+    engine_options.logits_dtype          = infernix::product::parse_logits_dtype(options.logits);
     engine_options.fast_paths            = !options.reproducible;
     engine_options.fast_path_candidates  = options.candidates;
     engine_options.expert_a4_activations = options.expert_a4_activations;
@@ -352,6 +359,7 @@ infernix::EngineOptions reference_engine(const Options& options, std::uint32_t w
     engine_options.max_context           = window_tokens;
     engine_options.kv_capacity           = infernix::KvCapacityPolicy::explicit_capacity(window_tokens);
     engine_options.kv_cache              = options.design ? kv_storage(options.kv) : infernix::KvCacheStorage::BFloat16;
+    engine_options.logits_dtype          = infernix::product::parse_logits_dtype(options.logits);
     engine_options.prefill_chunk         = window_tokens;
     engine_options.lossless              = true;
     engine_options.reference             = options.design;
@@ -453,6 +461,7 @@ int run_reference(const Options& options) {
     json meta          = provenance(options, &corpus);
     meta["route"]      = options.design ? "design" : "lossless";
     meta["kv_dtype"]   = options.design ? options.kv : "bf16";
+    meta["logits_dtype"] = options.logits;
     meta["noise_seed"] = options.noise_seed;
     meta["expert_a4_activations"] = options.expert_a4_activations;
     meta["windows"]    = window_list;
@@ -472,6 +481,7 @@ int run_verify(Options options) {
     options.set        = meta.at("corpus").at("set").get<std::string>();
     options.design     = meta.at("route") == "design";
     options.kv         = meta.at("kv_dtype").get<std::string>();
+    options.logits     = meta.value("logits_dtype", std::string("fp32"));
     options.noise_seed = meta.at("noise_seed").get<std::uint64_t>();
     options.expert_a4_activations = meta.value("expert_a4_activations", false);
     if (options.windows.empty()) { options.windows = {0}; }
@@ -614,6 +624,7 @@ int run_prefill(const Options& options) {
     meta["noise_scale"]      = options.noise_scale;
     meta["windows"]          = options.windows;
     meta["kv_dtype"]         = options.kv;
+    meta["logits_dtype"]     = options.logits;
     meta["reference"]        = reference_paths(options);
     meta["prefill_chunk"]    = engine.options().prefill_chunk;
     meta["load"]             = load_json(engine);
@@ -767,6 +778,7 @@ int run_decode(const Options& options) {
     meta["arm"]                  = "decode";
     meta["route"]                = options.reproducible ? "reproducible" : "default";
     meta["kv_dtype"]             = options.kv;
+    meta["logits_dtype"]         = options.logits;
     meta["reference"]            = reference_paths(options);
     meta["windows"]              = options.windows;
     meta["concurrency"]          = options.concurrency;

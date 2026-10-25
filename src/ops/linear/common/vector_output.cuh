@@ -7,6 +7,7 @@ namespace infernix::ops::detail {
 template <class Output>
 __device__ __forceinline__ void linear_store_bf16_vector(Output output, int row, int token,
                                                          uint4 values) {
+    static_assert(!requires { Output::kFp32; }, "a BF16-rounded vector cannot fill an FP32 output");
     if constexpr (requires { output.store_vector(row, token, values); }) {
         output.store_vector(row, token, values);
     } else {

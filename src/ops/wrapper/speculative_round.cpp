@@ -67,6 +67,13 @@ void require_matrix(const Tensor& t, DType dtype, std::int32_t rows, std::int32_
     }
 }
 
+// Verification logits: FP32 or BF16.
+void require_logits_dtype(const Tensor& t, const char* op) {
+    if (t.dtype != DType::FP32 && t.dtype != DType::BF16) {
+        throw std::invalid_argument(std::string(op) + ": logits must be FP32 or BF16");
+    }
+}
+
 void require_tensor3(const Tensor& t, DType dtype, std::int32_t n0, std::int32_t n1,
                      std::int32_t n2, const char* op, const char* name) {
     require_dtype(t, dtype, op, name);
@@ -221,7 +228,7 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
         throw std::invalid_argument("speculative_accept_greedy_drafts: B must be >=1");
     }
     require_matrix(target_tokens, DType::I32, k + 1, batch, op, "target_tokens");
-    require_dtype(logits, DType::BF16, op, "logits");
+    require_logits_dtype(logits, op);
     if (logits.ne[0] <= 0 || logits.ne[1] != k + 1 || logits.ne[2] != batch || logits.ne[3] != 1) {
         throw std::invalid_argument(
             "speculative_accept_greedy_drafts: logits must be [physical_rows,K+1,B]");
@@ -269,7 +276,8 @@ void speculative_accept_sparse_drafts(
         throw std::invalid_argument("speculative_accept_sparse_drafts: B must be 1..8");
     }
     require_matrix(target_tokens, DType::I32, columns, batch, op, "target_tokens");
-    require_tensor3(logits, DType::BF16, kSparsePhysicalRows, columns, batch, op, "logits");
+    require_logits_dtype(logits, op);
+    require_tensor3(logits, logits.dtype, kSparsePhysicalRows, columns, batch, op, "logits");
     require_matrix(drafts, DType::I32, k, batch, op, "drafts");
     require_tensor3(candidate_ids, DType::I32, kSparseCandidates, k, batch, op, "candidate_ids");
     require_tensor3(proposal_q, DType::FP32, kSparseCandidates, k, batch, op, "proposal_q");
@@ -351,7 +359,8 @@ void speculative_accept_sparse_tree(const Tensor& target_tokens, const Tensor& l
             "speculative_accept_sparse_tree: drafts must be [W-1,B] with W<=32 and B in [1,8]");
     }
     require_matrix(target_tokens, DType::I32, columns, batch, op, "target_tokens");
-    require_tensor3(logits, DType::BF16, kSparsePhysicalRows, columns, batch, op, "logits");
+    require_logits_dtype(logits, op);
+    require_tensor3(logits, logits.dtype, kSparsePhysicalRows, columns, batch, op, "logits");
     require_matrix(drafts, DType::I32, k, batch, op, "drafts");
     require_tensor3(candidate_ids, DType::I32, kSparseCandidates, k, batch, op, "candidate_ids");
     require_tensor3(proposal_q, DType::FP32, kSparseCandidates, k, batch, op, "proposal_q");

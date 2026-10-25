@@ -2,6 +2,7 @@
 #include "models/qwen3_5/state/decoder_state.h"
 #include "models/qwen3_5/program/speculative/mtp_alignment.h"
 #include "models/qwen3_5/program/round_buffers.h"
+#include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/program/vision_control.h"
 
 #include "models/qwen3_5/program/ledger_splits.h"
@@ -271,6 +272,70 @@ void test_round_layout() {
             expect(rejected, "invalid narrowed frame width rejected");
         }
     }
+    // FP32 verification logits sized to the rounds served: a 64-column family of one row beside
+    // 32-column families of eight hold 256 columns, viewed as every row a round of that width fits.
+    {
+        infernix::LayoutBuilder sized_builder;
+        auto sized_layout = q36::begin_round_state_layout(
+            sized_builder, {.hidden         = 32,
+                            .output_rows    = 128,
+                            .batch_capacity = 8,
+                            .draft_window   = 63,
+                            .backend        = infernix::SpeculativeBackend::DFlash2,
+                            .verify_columns = 256});
+        q36::complete_round_state_layout(sized_builder, sized_layout);
+        const auto bytes = sized_builder.finish(256);
+        expect(sized_layout.dflash_decode->target_logits.region.bytes == 128U * 256U * sizeof(float),
+               "verification logits hold the served columns in FP32");
+        std::vector<std::byte> storage(bytes + 255);
+        const auto address = (reinterpret_cast<std::uintptr_t>(storage.data()) + 255) & ~std::uintptr_t(255);
+        q36::RoundState sized({reinterpret_cast<void*>(address), bytes}, sized_layout);
+        const auto& decode = *sized.dflash_decode;
+        expect(decode.target_logits.dtype == infernix::DType::FP32 && decode.target_logits.ne[1] == 64 &&
+                   decode.target_logits.ne[2] == 4,
+               "native verification logits view the rows its storage holds");
+        for (const auto [k, rows] : std::vector<std::pair<unsigned, int>>{{63, 4}, {31, 8}, {15, 8}, {3, 8}}) {
+            const auto narrow = decode.narrowed(k);
+            expect(narrow.target_logits.ne[1] == static_cast<int>(k + 1) && narrow.target_logits.ne[2] == rows &&
+                       narrow.target_hidden.ne[2] == 8,
+                   "narrowed verification logits hold every row their width fits, at most the capacity");
+        }
+        // --logits-dtype bf16: the same columns in BF16, every view of them BF16.
+        infernix::LayoutBuilder bf16_builder;
+        auto bf16_layout = q36::begin_round_state_layout(
+            bf16_builder, {.hidden         = 32,
+                           .output_rows    = 128,
+                           .batch_capacity = 8,
+                           .draft_window   = 63,
+                           .backend        = infernix::SpeculativeBackend::DFlash2,
+                           .verify_columns = 256,
+                           .logits         = infernix::DType::BF16});
+        q36::complete_round_state_layout(bf16_builder, bf16_layout);
+        const auto bf16_bytes = bf16_builder.finish(256);
+        expect(bf16_layout.dflash_decode->target_logits.region.bytes == 128U * 256U * 2U &&
+                   bf16_layout.logits.region.bytes >= 128U * 2U,
+               "BF16 verification and step logits");
+        std::vector<std::byte> bf16_storage(bf16_bytes + 255);
+        const auto bf16_address =
+            (reinterpret_cast<std::uintptr_t>(bf16_storage.data()) + 255) & ~std::uintptr_t(255);
+        q36::RoundState bf16_round({reinterpret_cast<void*>(bf16_address), bf16_bytes}, bf16_layout);
+        expect(bf16_round.logits.dtype == infernix::DType::BF16 &&
+                   bf16_round.dflash_decode->target_logits.dtype == infernix::DType::BF16 &&
+                   bf16_round.dflash_decode->narrowed(31).target_logits.dtype == infernix::DType::BF16 &&
+                   bf16_round.dflash_decode->narrowed(31).target_logits.ne[2] == 8,
+               "BF16 logits views keep their dtype at every width");
+        bool rejected = false;
+        try {
+            infernix::LayoutBuilder invalid;
+            (void)q36::begin_round_state_layout(invalid, {.hidden         = 32,
+                                                          .output_rows    = 128,
+                                                          .batch_capacity = 8,
+                                                          .draft_window   = 63,
+                                                          .backend        = infernix::SpeculativeBackend::DFlash2,
+                                                          .verify_columns = 63});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        expect(rejected, "verify columns below the widest round are rejected");
+    }
     infernix::LayoutBuilder mtp_copy_builder;
     auto mtp_copy_layout = q36::begin_round_state_layout(
         mtp_copy_builder, {.hidden         = 32,
@@ -341,6 +406,29 @@ void test_round_layout() {
                    frame.next_drafts.nb[1] == mtp_batch.mtp_decode->next_drafts.nb[1],
                "MTP frame narrowed above one request");
     }
+}
+
+// The verification logits hold each round family's width times the most rows it serves.
+void test_verify_column_capacity() {
+    using q36::detail::SpeculativeRoundKind;
+    using q36::detail::SpeculativeRoundShape;
+    q36::detail::TreeWidthPlan trees;
+    trees.automatic           = {16};
+    trees.automatic_max_batch = 2;
+    const std::vector<SpeculativeRoundShape> shapes{
+        {SpeculativeRoundKind::Neural, 3},
+        {SpeculativeRoundKind::Ngram, 31},
+        {.kind = SpeculativeRoundKind::Ngram, .verify_drafts = 63, .single_row = true},
+        {SpeculativeRoundKind::Tree, 15}};
+    expect(q36::detail::verify_column_capacity(shapes, trees, 8) == 256,
+           "batched 32-column copies of eight rows decide the verify columns");
+    expect(q36::detail::verify_column_capacity(shapes, trees, 1) == 64,
+           "one row: the widest family decides the verify columns");
+    expect(q36::detail::verify_column_capacity({{SpeculativeRoundKind::Neural, 3},
+                                                {.kind = SpeculativeRoundKind::Neural, .verify_drafts = 15, .batch_only = true}},
+                                               trees, 1) == 4,
+           "a batch-only family serves no single row");
+    expect(q36::detail::verify_column_capacity({}, trees, 8) == 0, "no speculative rounds, no verify columns");
 }
 
 void test_mtp_alignment() {
@@ -453,6 +541,7 @@ int main() {
     test_execution_timing_domains();
     test_decoder_layout();
     test_round_layout();
+    test_verify_column_capacity();
     test_mtp_alignment();
     test_vision_control();
     test_ledger_splits();

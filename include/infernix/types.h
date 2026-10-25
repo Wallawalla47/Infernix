@@ -49,6 +49,16 @@ enum class KvCacheStorage : std::uint8_t {
     Q4KeyVq2Value,
 };
 
+// The vocabulary head's logits (EngineOptions::logits_dtype), which the sampler, greedy argmax, draft
+// acceptance, constraints and scoring read.
+enum class LogitsDtype : std::uint8_t {
+    // The head's sums without a final rounding (the default).
+    FP32,
+    // Each logit rounded once to BF16, the dtype Hugging Face Transformers returns them in: near-equal
+    // logits become exact ties, which selection breaks by token id. For comparisons.
+    BF16,
+};
+
 // A fast path: a route whose arithmetic differs from the default route's, run only under
 // EngineOptions::fast_paths and only for the configurations it is qualified for
 // (docs/maintainer/model-quality.md section 6.7 lists each with its evidence).
@@ -584,7 +594,8 @@ struct EngineOptions {
     // reference on Qwen3.5/3.6/3.8 (Qwen3_5ForCausalLM and Qwen3_5MoeForCausalLM): the model's
     // Hugging Face forward operation by operation, each correctly rounded to the dtype it has
     // there (weights decoded exactly, sums exact, transcendental functions correctly rounded), so
-    // every output is a function of the request and the artifact alone; FP32 logits, no fast path.
+    // every output is a function of the request and the artifact alone; logits in logits_dtype (each
+    // exact sum correctly rounded to it), no fast path.
     // CausalScoring scores each window in one pass (prefill_chunk covering max_context); Generation
     // (Qwen3.5/3.6/3.8 and Qwen3.8-Flash-Next) takes text requests with bf16 KV (V stored as BF16) and
     // no speculation.
@@ -623,6 +634,9 @@ struct EngineOptions {
     // Each must apply to the configuration (its kernel must run in it).
     std::vector<FastPath> fast_path_candidates;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
+    // The head's logits on every route (--logits-dtype): FP32, or BF16 for comparisons with engines and
+    // references that round them; a startup choice (the round buffers and CUDA Graphs are planned for it).
+    LogitsDtype logits_dtype           = LogitsDtype::FP32;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;
@@ -1621,8 +1635,8 @@ struct ScoreResult {
     std::vector<float> top_logprobs;
     // Position-major (scored positions x candidates_per_position), in the candidates' order.
     std::vector<float> candidate_logprobs;
-    // One vocabulary-sized row per ScoreOptions::logits_positions entry, in that order: the logits as
-    // scoring computed them (FP32 on the lossless route; elsewhere their stored precision widened exactly).
+    // One vocabulary-sized row per ScoreOptions::logits_positions entry, in that order: the FP32 logits
+    // as scoring computed them.
     std::vector<float> logits;
 };
 

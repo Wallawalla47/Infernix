@@ -91,7 +91,9 @@ Notation: `bf16(v)` and `fp32(v)` are the correctly rounded value of the exact r
 **Head.** `norm(h)`, then logits `fp32(h W_head)` (each an exact sum rounded to binary32: the scoring
 and sampling inputs). Transformers returns the head's output in BF16, and training's loss upcasts
 those values; the route keeps the exact sum rounded once to FP32 instead (owner's decision,
-2026-10-21). The logits feed nothing inside the model, so no layer is calibrated to their rounding,
+2026-10-21). `--logits-dtype bf16` (every route, 2026-10-25) gives Transformers' own dtype: each exact
+sum correctly rounded to BF16 (once, not through FP32), for comparisons with references and engines
+that round the logits. The logits feed nothing inside the model, so no layer is calibrated to their rounding,
 and a BF16 rounding of logits of magnitude 8-32 (rms error 0.02-0.04) would add a KL of roughly
 1.5e-4 to 6.5e-4 per position (an estimate) to every gate measured against the route. llama.cpp's
 KL baselines also use FP32 logits.

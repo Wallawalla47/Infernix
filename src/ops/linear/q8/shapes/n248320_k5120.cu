@@ -20,11 +20,11 @@ using C40 =
 } // namespace
 
 Q8Launch select_q8_n248320_k5120(std::int32_t tokens) {
-    if (tokens <= 8) return launch_q8_a16_sliced<Geometry, 8, C8>;
-    if (tokens <= 16) return launch_q8_a16_sliced<Geometry, 16, C16>;
-    if (tokens <= 24) return launch_q8_a16_sliced<Geometry, 24, C24>;
-    if (tokens <= 32) return launch_q8_a16_sliced<Geometry, 32, C32>;
-    if (tokens <= 33) return launch_q8_a16_sliced<Geometry, 40, C40>;
+    if (tokens <= 8) return launch_q8_a16_sliced_logits<Geometry, 8, C8>;
+    if (tokens <= 16) return launch_q8_a16_sliced_logits<Geometry, 16, C16>;
+    if (tokens <= 24) return launch_q8_a16_sliced_logits<Geometry, 24, C24>;
+    if (tokens <= 32) return launch_q8_a16_sliced_logits<Geometry, 32, C32>;
+    if (tokens <= 33) return launch_q8_a16_sliced_logits<Geometry, 40, C40>;
     if (tokens <= 48) return launch_q8_a16_mma_r64x16_t48_k128_a1;
     if (tokens <= 64) return launch_q8_a16_mma_r64x32_t64_k128_a1;
     if (tokens <= 96) return launch_q8_a16_mma_r64_t96;
@@ -34,9 +34,9 @@ Q8Launch select_q8_n248320_k5120(std::int32_t tokens) {
 Q8Launch select_q8_n248320_k5120_invariant(std::int32_t tokens) {
     // The tiles run 8 K-warps over the same K slices and reduce them in the same order, and the
     // MMA's columns are independent; wider calls run as 32-column slices.
-    if (tokens <= 8) return launch_q8_a16_sliced<Geometry, 8, C8>;
-    if (tokens <= 16) return launch_q8_a16_sliced<Geometry, 16, C16>;
-    return launch_q8_a16_sliced<Geometry, 32, C32>;
+    if (tokens <= 8) return launch_q8_a16_sliced_logits<Geometry, 8, C8>;
+    if (tokens <= 16) return launch_q8_a16_sliced_logits<Geometry, 16, C16>;
+    return launch_q8_a16_sliced_logits<Geometry, 32, C32>;
 }
 
 } // namespace infernix::ops::detail

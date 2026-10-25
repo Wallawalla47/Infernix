@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/tensor.h"
 #include "ops/common/memory.cuh"
 #include <cuda_bf16.h>
 
@@ -25,6 +26,30 @@ struct LinearBf16Output {
         store_vec(at(row, token), values);
     }
 };
+
+// The FP32 sum itself, unrounded (vocabulary heads: BF16 logits tie near-equal tokens). Kernels that
+// round to BF16 before storing (linear_store_bf16_vector) cannot take it.
+struct LinearFp32Output {
+    static constexpr bool kFp32 = true;
+    float* data;
+    std::int32_t rows;
+
+    __device__ __forceinline__ float* at(int row, int token) const {
+        return data + static_cast<std::int64_t>(token) * rows + row;
+    }
+
+    __device__ __forceinline__ void store(int row, int token, float value) const { *at(row, token) = value; }
+};
+
+// Runs `launch` with the output view of `out`: FP32 or BF16 [rows, T].
+template <class Launch>
+void with_linear_output(Tensor& out, std::int32_t rows, Launch&& launch) {
+    if (out.dtype == DType::FP32) {
+        launch(LinearFp32Output{static_cast<float*>(out.data), rows});
+    } else {
+        launch(LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), rows});
+    }
+}
 
 struct LinearBf16StridedOutput {
     __nv_bfloat16* data;

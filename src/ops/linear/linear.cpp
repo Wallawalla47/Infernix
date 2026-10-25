@@ -53,8 +53,11 @@ void validate_linear_policy(LinearPolicy policy) {
 
 void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& out,
                                LinearPolicy policy) {
-    if (x.dtype != DType::BF16 || out.dtype != DType::BF16) {
-        throw std::invalid_argument("linear: x/out must be BF16");
+    if (x.dtype != DType::BF16 || (out.dtype != DType::BF16 && out.dtype != DType::FP32)) {
+        throw std::invalid_argument("linear: x must be BF16 and out BF16 or FP32");
+    }
+    if (out.dtype == DType::FP32 && !linear_fp32_output(w.qtype)) {
+        throw std::invalid_argument("linear: FP32 output needs a Q6, Q8, BF16, row FP8 or nvfp4_rg16 weight");
     }
     (void)checked_numel(x, "x");
     (void)checked_numel(out, "out");
@@ -119,6 +122,12 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
 }
 
 } // namespace
+
+// The formats a vocabulary head is stored in.
+bool linear_fp32_output(QType qtype) noexcept {
+    return qtype == QType::Q6_G64_FP16 || qtype == QType::Q8_G32_FP16 || qtype == QType::BF16 ||
+           qtype == QType::FP8_E4M3FN_ROW_BF16 || qtype == QType::NVFP4_MUL;
+}
 
 bool linear_column_invariant_route(QType qtype, std::int32_t output_rows,
                                    std::int32_t input_rows) noexcept {

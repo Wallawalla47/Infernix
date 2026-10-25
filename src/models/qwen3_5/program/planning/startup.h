@@ -90,7 +90,36 @@ struct TreeWidthPlan {
         return out;
     }
 };
-inline constexpr std::uint32_t kCausalScoreTile = 1024;
+
+// Whether the round family of `shape` serves rounds of batch_size rows: a tree family only the batch
+// sizes that may verify its width, a single-row family one row, a batch-only family every other batch
+// size. Chain families serve every batch size: a round with a constrained row verifies the chain
+// whatever the tree table selects.
+[[nodiscard]] inline bool round_shape_serves(const SpeculativeRoundShape& shape, const TreeWidthPlan& tree_widths,
+                                             std::uint32_t batch_size) noexcept {
+    return (shape.kind != SpeculativeRoundKind::Tree || tree_widths.tree(batch_size, shape.verify_drafts + 1U)) &&
+           (!shape.single_row || batch_size == 1U) && (!shape.batch_only || batch_size > 1U);
+}
+
+// The most target columns one round verifies (RoundStateSpec::verify_columns): each family's width
+// times the most rows it serves; 0 without speculative rounds.
+[[nodiscard]] inline std::uint32_t verify_column_capacity(const std::vector<SpeculativeRoundShape>& shapes,
+                                                          const TreeWidthPlan& tree_widths,
+                                                          std::uint32_t max_concurrency) noexcept {
+    std::uint32_t columns = 0;
+    for (const SpeculativeRoundShape& shape : shapes) {
+        for (std::uint32_t batch = max_concurrency; batch != 0; --batch) {
+            if (round_shape_serves(shape, tree_widths, batch)) {
+                columns = std::max(columns, (shape.verify_drafts + 1U) * batch);
+                break;
+            }
+        }
+    }
+    return columns;
+}
+
+// The columns one causal-scoring tile holds; its logits are [vocabulary, tile].
+inline constexpr std::uint32_t kCausalScoreTile = 512;
 
 struct DFlashPersistentLayout {
     std::optional<qwen3_5::PagedKVCacheLayout> full;

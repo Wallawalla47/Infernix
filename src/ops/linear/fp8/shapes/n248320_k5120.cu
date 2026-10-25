@@ -17,10 +17,12 @@ void launch_tile(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_
                                               Cache::ca, Cache::cg, Fp8ActivationStage::ActiveOnly,
                                               Stages, (ActiveTokens > 16 ? 2 : 1)>;
     static_assert((Geometry::kInputRows % Schedule::kBlockK) == 0);
-    const LinearBf16Output output{static_cast<__nv_bfloat16*>(out.data), Geometry::kOutputRows};
-    launch_fp8_a16_sliced_k_mma<Fp8ScheduleInstance<Schedule, Geometry::kInputRows, ActiveTokens>>(
-        fp8_a16_operands(x, weight), output, LinearIdentityEpilogue{}, stream, {},
-        pdl::Dependency::Programmatic);
+    // FP32 or BF16 logits by out's dtype.
+    with_linear_output(out, Geometry::kOutputRows, [&](auto output) {
+        launch_fp8_a16_sliced_k_mma<Fp8ScheduleInstance<Schedule, Geometry::kInputRows, ActiveTokens>>(
+            fp8_a16_operands(x, weight), output, LinearIdentityEpilogue{}, stream, {},
+            pdl::Dependency::Programmatic);
+    });
 }
 
 // Up to 64 columns the sliced-K schedules stream the weight faster than the MMA schedules: on the
@@ -49,10 +51,10 @@ using Tail96  = Fp8A16MmaSchedule<64, 96, 64, 64, 16, 2, 2>;
 
 template <class Schedule>
 void launch_schedule(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
-    launch_fp8_a16_mma<Fp8ScheduleInstance<Schedule, 5120>>(
-        fp8_a16_operands(x, weight),
-        LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), weight.n}, LinearIdentityEpilogue{},
-        stream);
+    with_linear_output(out, weight.n, [&](auto output) {
+        launch_fp8_a16_mma<Fp8ScheduleInstance<Schedule, 5120>>(fp8_a16_operands(x, weight), output,
+                                                                LinearIdentityEpilogue{}, stream);
+    });
 }
 
 void launch_tail(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {

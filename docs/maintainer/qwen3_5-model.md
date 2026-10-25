@@ -223,7 +223,14 @@ relationship. Router loss coefficients and training-only outputs add no inferenc
 
 Text prefill gathers embedding columns, replaces media placeholders with Vision outputs, and runs
 the configured blocks in chunks. It preserves state and positions across chunks. Final offset
-RMSNorm and the full output head produce the target distribution. Ordinary decode repeats this
+RMSNorm and the full output head produce the target distribution as FP32 logits, the head's sums
+without a BF16 rounding: the sampler, greedy argmax, draft acceptance, constraints and scoring read
+them on every route (since 2026-10-24; `--logits-dtype bf16` rounds each once to BF16 instead, for
+comparisons). BF16 logits turned near-equal tokens into exact ties, which
+greedy selection breaks by token id: against the lossless reference (64 IQS-1 windows, BF16 KV) the
+groupwise Qwen3.8-27B's default prefill top-1 flips were 1.53x the noise twin's with BF16 logits and
+0.74x with FP32 (median KL 1.40x to 0.53x), the 35B-A3B's 1.06x and 0.94x. The drafters' proposal
+logits stay BF16. Ordinary decode repeats this
 schedule for one new token. CUDA Graph replay uses the same selected model implementation.
 
 MTP is a one-layer predictor conditioned on a final-normalized target hidden state h_t and the
