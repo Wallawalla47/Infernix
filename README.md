@@ -323,10 +323,13 @@ Infernix runs three routes:
   not on the build, the prefill chunk, prefill or decode, other requests or the prefix cache; it is slower
   than the other routes
   ([definition](docs/maintainer/lossless-route.md)).
-- **The reproducible route** (`--reproducible`) gives bit-identical output from run to run and from
-  release to release. It is also request-invariant (other requests, concurrency, prefix-cache state
-  and memory pressure do not change a request's output), and speculation does not change it: a
-  sampled request draws each token by Gumbel-max keyed by its seed, position and token, so drafts
+- **The reproducible route** (`--reproducible`) gives bit-identical output from run to run on a given
+  engine build and GPU: the same request (input, sampling parameters and seed) with the same artifact and
+  options always gives the same output. It is request-invariant (other requests, concurrency,
+  prefix-cache state and memory pressure do not change a request's output), and speculation does not
+  change it, but another engine version may give other bits (a precision or correctness fix can change
+  them; the lossless route's bits never change). A sampled request on it draws each token by
+  Gumbel-max keyed by its seed, position and token, so drafts
   are verified against the token plain decoding would draw.
 - **Fast paths** (on by default) are faster kernels and scheduling choices that change the
   arithmetic. Each one runs only for the kernels it was qualified on, only after passing the quality

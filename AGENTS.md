@@ -108,10 +108,14 @@ inputs are independently decoded with their stored scales. Qualify production ro
 against that oracle, not another kernel or plausible model output. Private arithmetic need not
 reproduce unfused materializations unless an intermediate is an observable semantic boundary.
 [Op development](docs/maintainer/op-development.md) defines the full qualification contract.
-The reproducible route (`--reproducible`) stays bit-exact from release to release and
-request-invariant on every artifact (other requests, concurrency, cache state and resource
-pressure do not change a request's output); a change that alters it for speed ships as a fast
-path, qualified under the
+The reproducible route (`--reproducible`) is deterministic and request-invariant on every artifact:
+for a given engine build, artifact, options and GPU, a request (its input, sampling parameters and
+seed) always gives the same output, whatever other requests, concurrency, cache state and resource
+pressure. Its bits are not promised across engine versions: a change may alter them (a fix, a precision
+change or a speed change) while the route stays deterministic and request-invariant and every changed Op
+meets its criterion against its oracle; say so where it lands. A change that would make a request's output
+depend on other requests or on scheduling, or that only a model-level quality gate can approve, ships as a
+fast path, qualified under the
 [numerical acceptance policy](docs/maintainer/model-quality.md#6-numerical-acceptance-policy-and-fast-paths)
 for the kernels it changes (a configuration is the set of kernels an artifact runs, so artifacts
 with the same kernels share a qualification) and registered only where it is measured faster.

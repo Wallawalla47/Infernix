@@ -42,7 +42,8 @@ enum class LinearPolicy : std::uint8_t {
 /**
  * @brief The fast-path routes a projection may select (a set of flags).
  *
- * Exact (no flag) keeps each registered problem's output bits fixed from release to release. Each
+ * Exact (no flag) is each registered problem's reproducible-route arithmetic (deterministic, and
+ * column-invariant under A16ColumnInvariant; a new version may change its bits within the Op's criterion). Each
  * flag admits one fast path's routes for the problems that register them, whose arithmetic differs;
  * a Model sets a flag only where its fast path is qualified (docs/maintainer/model-quality.md
  * section 6.7). A problem with no route for a set flag runs its exact route.

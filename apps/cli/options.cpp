@@ -278,7 +278,7 @@ std::string usage_text(const char* argv0) {
            "                           slows 1-2K-token chunks over long context (64: up\n"
            "                           to 27% slower attention; 0: no splitting)\n"
            "  --reproducible           run the reproducible route: the same bits on every\n"
-           "                           run and release, whatever else is running.\n"
+           "                           run of this build, whatever else is running.\n"
            "                           Without it, every path qualified and measured\n"
            "                           faster for this artifact's kernels and KV type\n"
            "                           runs (within Infernix's numerical quality policy;\n"

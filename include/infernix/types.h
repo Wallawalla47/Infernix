@@ -763,8 +763,10 @@ struct EngineOptions {
     // and KV format): routes whose arithmetic differs from the reproducible route but whose measured cost
     // stays within Infernix's numerical acceptance policy (docs/maintainer/model-quality.md
     // section 6; the registry is 6.7). LoadSummary::fast_paths reports the selection. False
-    // (--reproducible) runs the reproducible route, which is bit-exact from release to release; the
-    // lossless route (`lossless`) requires it.
+    // (--reproducible) runs the reproducible route: on a given engine build and GPU a request's output
+    // depends only on the request (with its seed), the artifact and these options, not on other requests,
+    // concurrency, cache state or resource pressure; other engine versions may give other bits. The
+    // lossless route (`lossless`), whose bits never change, requires it.
     bool fast_paths                    = true;
     // Qualification only (the quality tools, never a product route): also run these fast paths
     // whether or not they are qualified for this configuration, so their cost can be measured.

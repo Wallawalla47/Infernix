@@ -499,10 +499,12 @@ model-level claim follows [Model-level numerical quality](model-quality.md): sev
 sizes, KL divergence to the lossless-route reference, and the decode-quality judge for decode
 paths.
 
-The oracle leaves private arithmetic free, but the product does not: the exact route's output is
-bit-exact from release to release ([acceptance policy](model-quality.md#6-numerical-acceptance-policy-and-fast-paths)).
-A schedule or route change that alters an exact-route Op's output bits for speed is a fast path
-(`infernix::FastPath`). The Op exposes it through an envelope or policy field named for the path
+The oracle leaves private arithmetic free, and a new version may change an exact-route Op's output bits,
+for speed as well as precision, while the Op still meets its criterion against its oracle and keeps its
+determinism and column invariance (the release says so;
+[acceptance policy](model-quality.md#6-numerical-acceptance-policy-and-fast-paths)). A schedule or route
+change that would fall below that criterion, or make a column's bits depend on the call's other columns or on
+scheduling, is a fast path (`infernix::FastPath`). The Op exposes it through an envelope or policy field named for the path
 (for example `CausalAttentionExecutionEnvelope::decode_split64`) that model planning sets from the
 configuration's fast-path selection (`models/qwen3_5/program/planning/fast_paths.h`), sizes its
 workspace from the same field, and qualifies it in its suite against the same oracle and criterion

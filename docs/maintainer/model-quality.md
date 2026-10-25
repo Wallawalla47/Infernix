@@ -335,7 +335,9 @@ their evidence. `tools/quality/iqs.py` implements the decisions; its constants a
 - **The reproducible route** (called the exact route until 2026-10-21; the dated records below keep
   that name) is what runs with `--reproducible` (`EngineOptions::fast_paths`
   false). For a fixed artifact, Engine options (including the prefill chunk and the seed) and
-  request, its output is bit-identical from run to run and **from release to release**, and it is
+  request, its output is bit-identical from run to run **on a given engine build and GPU** (another
+  engine version may give other bits: a fix, a precision change or a speed change may alter them, and
+  says so where it lands), and it is
   **request-invariant** on every artifact: concurrency, the other requests, lane assignment,
   prefix-cache contents and resource pressure do not change a request's output. Qwen3.5 decodes and
   verifies every projection under `LinearPolicy::A16ColumnInvariant`: on the problem's dedicated
@@ -374,13 +376,16 @@ their evidence. `tools/quality/iqs.py` implements the decisions; its constants a
   Prompt and decode need not agree with each other. An option
   whose effect depends on load (lossy Host-tier prefix state, whose use depends on eviction) is
   refused with `--reproducible` at startup, never silently overridden. A
-  change that alters any exact-route output bit is a *numerics change*. It is allowed only to fix
-  a defect or to improve precision, and only when the configuration's prefill and decode arms (6.6),
-  run once on the reproducible route for that change, pass against the stored reference R(A, K) with
-  point estimates of mean KL and flip rate no higher than the previous build's, and the corpus NLL does not rise; the release note declares it and the
+  change that alters any exact-route output bit is a *numerics change*: a defect fix, a precision change
+  or a speed change (the owner's decision of 2026-10-25). It keeps the route deterministic and
+  request-invariant, every Op it changes meets its criterion against its oracle
+  ([op development](op-development.md)), and the configuration's prefill and decode arms (6.6) run once
+  on the reproducible route for that change against the stored reference R(A, K), recorded beside the
+  previous build's (a fix or precision change does not raise the point estimates of mean KL or flip rate,
+  or the corpus NLL; a speed change records what it costs); the release note declares it and the
   golden reproducible hashes are recorded again (6.8 records each one). The reference runs its own
-  kernels on every model, so an exact-route change leaves it unchanged. Speed alone never justifies
-  an exact-route numerics change: a faster route whose arithmetic differs is a fast path. Prompt
+  kernels on every model, so an exact-route change leaves it unchanged. A faster route that couples
+  requests or falls below an Op's criterion is a fast path instead. Prompt
   attention on the exact route runs P×V in FP16 for every
   KV format; until 2026-10-13 NVFP4, K8V4 and VQ2 KV defaulted to their 8-bit forms, which are now
   the prompt-pv8 fast path. The fast INT8 and NVFP4 prompt kernels, measured when adopted, remain
@@ -479,7 +484,7 @@ the test that verifies it.
 | G1 | Reference correctness: `--lossless` computes the publisher's model exactly, every tensor the reference implementation materializes correctly rounded to the precision it has there | the exact-arithmetic shadow of the publisher's code against `--lossless`, bit for bit (block B); exact oracles for every lossless kernel; the lossless route's invariance |
 | G2 | Declared-design correctness: each declared lossy step (activation quantizer, KV codec) is applied exactly as specified | exact oracles for each codec and quantizer, byte-identical to the production encoders |
 | G3 | Path fidelity: every shipped path stays within the budgets of 6.3 against its reference, in every domain of the corpus | teacher-forced arms (blocks D, E) |
-| G4 | Exactness and invariance: `--lossless` and `--reproducible` outputs depend only on the request and the artifact (not on other requests, concurrency, the prefix cache, preemption, the chunk schedule or speculation, greedy or seeded sampling); `--reproducible` outputs are bit-identical across releases unless a release note says otherwise; the default route is deterministic run to run for the same workload | bitwise tests with negative controls (`infernix_qwen3_5_invariance_real_test`, `tools/quality/iqs_e2e.py identity`); golden reproducible hashes per release |
+| G4 | Exactness and invariance: `--lossless` and `--reproducible` outputs depend only on the request and the artifact (not on other requests, concurrency, the prefix cache, preemption, the chunk schedule or speculation, greedy or seeded sampling); `--reproducible` outputs are bit-identical from run to run of a build (another engine version may give other bits, which its change notes); the default route is deterministic run to run for the same workload | bitwise tests with negative controls (`infernix_qwen3_5_invariance_real_test`, `tools/quality/iqs_e2e.py identity`); golden reproducible hashes per release |
 | G5 | End-to-end conformance: speculative decoding preserves the target distribution; production serving equals the isolated run on the reproducible route; termination, output length, grammar and tool calls behave as specified | `iqs_e2e.py specdist`, `identity`, `longgen`; the functional real tests |
 | D | Disclosure: the design error of every declared design and every KV format is measured and published; a KV format is supported for an attention family only within its class ceiling (6.5) | design reference against lossless, per release of the format or artifact |
 
