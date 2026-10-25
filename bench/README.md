@@ -297,7 +297,9 @@ and is not a runtime input.
 ## Linear Op benchmark
 
 `infernix_linear_bench` measures only the public pure `linear()` contract. It supports Q4, Q5, Q6,
-Q8, registered BF16 weights, the registered NVFP4 problems, and the registered FP8 problems.
+Q8, registered BF16 weights, the registered NVFP4 problems, the registered FP8 problems, and
+`--qtype rg16`: a dense `nvfp4_mul` matrix in `nvfp4_rg16_v1` at its registered shapes (the
+Qwen3.5-122B head, NVIDIA FP4-Local's vision MLP and merger), the canonical W4A16 projection.
 Existing formats use `--policy a16`; NVFP4 additionally supports `--policy a4`, and
 FP8 supports `--policy a8`. Each permission lets the production resolver select the qualified
 route for the exact geometry and T. LinearAdd, LinearSwiGLU,
@@ -353,8 +355,12 @@ matrix:
 ```bash
 ./build/bench/infernix_linear_bench --suite qwen3_6_27b
 ./build/bench/infernix_linear_bench --suite qwen3_6_35b_a3b
+./build/bench/infernix_linear_bench --suite flash_next_vision
 ./build/bench/infernix_linear_bench --suite all
 ```
+
+`flash_next_vision` times Qwen3.8-Flash-Next's vision MLP and merger at image widths (4 to 16,384
+columns) both as BF16 (every Flash-Next artifact but FP4-Local) and as `rg16` (FP4-Local).
 
 When a point group includes `T=1`, `T1_lin_x` reports the calculated ratio
 `T * median(T=1) / median(T)`. It is a scaling reference from one public `T=1` benchmark point,

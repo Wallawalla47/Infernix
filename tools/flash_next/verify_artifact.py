@@ -12,10 +12,12 @@ Every logical parameter the recipe stores as the checkpoint has it must equal th
   codes and BF16 tile scales);
 - every FP8 row-scaled projection's E4M3FN codes and BF16 row scales, and every MXFP8 projection's
   E4M3FN codes and UE8M0 group scales (``fp8_e4m3fn_g32_e8m0``);
+- every dense ``nvfp4_mul`` matrix's E2M1 codes, E4M3 block scales and FP32 multiplier, decoded from
+  ``nvfp4_rg16_v1`` (FP4-Local's weight-only NVFP4 vision MLPs and merger);
 - every BF16 and FP32 tensor bit for bit, and every FP32 widening of a BF16 tensor exactly;
-- every tensor stored as the BF16 rounding of exact source values (FP4-Local's small MXFP8 classes
-  and vision tower) as that one rounding; the values it does not hold exactly (the weight-only NVFP4
-  vision matrices) are counted per tensor (``rounded``), not as mismatches;
+- every tensor stored as the BF16 rounding of exact source values (FP4-Local's small MXFP8 classes:
+  GDN a/b and the vision attention) as that one rounding; values it does not hold exactly are
+  counted per tensor (``rounded``), not as mismatches;
 - the n-gram volume's header, geometry and id, and its rows (all of them, or a sample): FP8 rows
   equal the checkpoint's FP8 words, or its BF16 table's per-tensor quantization; the BF16 rows of an
   artifact bound to a BF16 volume equal its BF16 table, or quantize to its FP8 table's words
@@ -46,7 +48,7 @@ import numpy as np
 from tools.artifact.codecs.fp8_b128 import decode_expert as decode_fp8_expert
 from tools.artifact.codecs.fp8_g32 import decode_fp8_group_scaled_words
 from tools.artifact.codecs.fp8_row import decode_fp8_row_scaled_words
-from tools.artifact.codecs.nvfp4_expert import decode_nvfp4_expert_bank_words
+from tools.artifact.codecs.nvfp4_expert import decode_nvfp4_expert_bank_words, decode_nvfp4_rg16_words
 from tools.artifact.layouts import fp8_expert_geometry
 from tools.artifact.reader import Artifact
 from tools.convert import qwen4_exp
@@ -116,6 +118,22 @@ def verify_fp8_groups(artifact, store, binding, parameter) -> bool:
         codes.append(c[begin // k : end // k])
         scales.append(s[begin // k : end // k])
     return torch.equal(torch.cat(codes), expected.codes) and torch.equal(torch.cat(scales), expected.scales)
+
+
+def verify_rg16(artifact, store, binding, parameter) -> bool:
+    """A dense ``nvfp4_rg16_v1`` matrix bound whole: its codes, E4M3 block scales and FP32 multiplier
+    word equal the checkpoint's (the source's ``nvfp4_mul`` encoded rows)."""
+
+    if "object" not in binding:
+        return False
+    obj = artifact.object(binding["object"])
+    if obj.layout != "nvfp4_rg16_v1" or tuple(obj.shape) != parameter.shape:
+        return False
+    words = decode_nvfp4_rg16_words(artifact.read_object(obj.id), obj.shape)
+    expected = parameter.source_factory(store, "nvfp4_mul").read_encoded(0, parameter.shape[0])
+    multiplier = words["multiplier"].reshape(1).view(torch.uint8).numpy().tobytes()
+    return (torch.equal(words["codes"], expected.codes) and torch.equal(words["scales"], expected.scales)
+            and multiplier == expected.weight_multiplier)
 
 
 def verify_bank(artifact, store, binding, prefix, shape, packed) -> int:
@@ -240,9 +258,11 @@ def main() -> int:
         text = artifact.directory.components["text"]["config"]
         components = tuple(artifact.directory.components)
         model = qwen4_exp.build_model(store, components=components, ngram_format=text["ngram_table"]["format"])
-        # The proposal head (--lm-head-draft) is built from a frequency ranking, outside the logical model.
-        bindings = {k: v for k, v in artifact.directory.bindings.items() if not k.startswith("proposal/")}
-        report["proposal_bindings"] = len(artifact.directory.bindings) - len(bindings)
+        # The proposal head (--lm-head-draft) is built from a frequency ranking, and the heads' 2-bit screens
+        # (--screen-heads) from the LM head, outside the logical model.
+        bindings = {k: v for k, v in artifact.directory.bindings.items() if not k.startswith(("proposal/", "screen/"))}
+        report["proposal_bindings"] = sum(1 for k in artifact.directory.bindings if k.startswith("proposal/"))
+        report["screen_bindings"] = sum(1 for k in artifact.directory.bindings if k.startswith("screen/"))
         if set(model.parameters) != set(bindings):
             missing = sorted(set(model.parameters) - set(bindings))[:5]
             extra = sorted(set(bindings) - set(model.parameters))[:5]
@@ -272,6 +292,11 @@ def main() -> int:
             if formats == {_FP8_GROUPS}:
                 report["tensors"] += 1
                 if not verify_fp8_groups(artifact, store, binding, parameter):
+                    report["tensor_mismatches"].append(name)
+                continue
+            if formats == {"nvfp4_mul"}:
+                report["tensors"] += 1
+                if not verify_rg16(artifact, store, binding, parameter):
                     report["tensor_mismatches"].append(name)
                 continue
             fmt, stored = _binding_values(artifact, binding)

@@ -259,12 +259,6 @@ struct Call {
                            std::int32_t top_k, std::int32_t max_jobs, std::int32_t pass_jobs,
                            const ExpertsWorkspace& workspace, Tensor& outputs, cudaStream_t stream);
 
-// Every column's x limbs and column exponent, the exact wide route's A operand, for BF16 x
-// [shape.hidden, T]: limbs [T][a16_x_row_bytes(shape)] and emax [T] (the dense rg16 projection reuses
-// it).
-void encode_x_limbs(const ExpertShape& shape, const Tensor& x, std::uint8_t* limbs, std::int32_t* emax,
-                    cudaStream_t stream);
-
 // Computes the wide experts among the jobs of `pass`, whose records job_records holds by then:
 // the gate/up GEMM with SwiGLU and the encoding of h (A4, or the W4A16 limbs), then the down GEMM
 // into `outputs`.

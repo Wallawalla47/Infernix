@@ -173,6 +173,9 @@ struct ForwardBatch {
     // A generation round (decode or verification), not a prefill chunk, forced token or scored
     // position: the only calls ForwardExperts::tail_skip_rank applies to.
     bool decode_round = false;
+    // The screened-lm-head fast path's round (Parameters::output_head_screen bound, at most 16 logit
+    // columns): the head's logits come from ops::screened_head_logits.
+    bool screened_head = false;
     Tensor residual_out;                   // when set: BF16 [S*H, T] copy of the final residual
     // DFlash2 target features (docs/maintainer/dflash.md): when set, BF16 [taps * H, n] receives,
     // for the call's last n columns, the stream mean of each tapped layer's completed residual

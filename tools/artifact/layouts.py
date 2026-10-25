@@ -460,7 +460,8 @@ def expert_bank_geometry(
 
 
 def rg16_matrix_geometry(format: str | Nvfp4MulFormat, shape: Sequence[int]) -> Rg16MatrixGeometry:
-    """Geometry of one dense ``nvfp4_mul`` matrix in ``nvfp4_rg16_v1`` (the output head)."""
+    """Geometry of one dense ``nvfp4_mul`` matrix in ``nvfp4_rg16_v1`` (Qwen3.5-122B's output head,
+    NVIDIA FP4-Local's vision MLPs and merger)."""
 
     spec = _format(format)
     if not isinstance(spec, Nvfp4MulFormat):

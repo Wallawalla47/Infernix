@@ -5,6 +5,8 @@
 //   ./build/bench/infernix_linear_bench --qtype q4 --n 4096 --k 5120 --sweep 1:32:1
 //   ./build/bench/infernix_linear_bench --qtype fp8 --policy a8 --n 14336 --k 5120 --t 1
 //   ./build/bench/infernix_linear_bench --suite qwen3_6_27b
+//   ./build/bench/infernix_linear_bench --suite flash_next_vision
+//   ./build/bench/infernix_linear_bench --qtype rg16 --n 1152 --k 4304 --sweep 1024:16384:1024
 //   ncu --profile-from-start off ./build/bench/infernix_linear_bench \
 //       --qtype q4 --n 4096 --k 5120 --t 8 --profile
 
@@ -56,6 +58,9 @@ constexpr int kDefaultRepeat                       = 20;
 enum class TClass : std::uint8_t {
     Continuous,
     VisionStep4,
+    // A whole image's patches (the tower's MLP) or merged tokens (its merger): 256 patches is the
+    // smallest image, 16,384 a 4K-token one.
+    VisionTower,
 };
 
 struct SuiteEntry {
@@ -95,6 +100,19 @@ constexpr SuiteEntry kQwen35bEntries[] = {
     {"35b.vision_fc2", QType::Q5_G64_FP16, 1152, 4304, TClass::VisionStep4},
     {"35b.vision_merger_fc1", QType::Q8_G32_FP16, 4608, 4608, TClass::VisionStep4},
     {"35b.vision_merger_fc2", QType::Q8_G32_FP16, 2048, 4608, TClass::VisionStep4},
+};
+
+// Qwen3.8-Flash-Next's vision MLP and merger: BF16 in every artifact but NVIDIA FP4-Local, whose
+// matrices are its checkpoint's NVFP4 words in nvfp4_rg16_v1 (the canonical W4A16 projection).
+constexpr SuiteEntry kFlashNextVisionEntries[] = {
+    {"fn.vision_fc1", QType::BF16, 4304, 1152, TClass::VisionTower},
+    {"fn.vision_fc2", QType::BF16, 1152, 4304, TClass::VisionTower},
+    {"fn.vision_merger_fc1", QType::BF16, 4608, 4608, TClass::VisionTower},
+    {"fn.vision_merger_fc2", QType::BF16, 2560, 4608, TClass::VisionTower},
+    {"fp4local.vision_fc1", QType::NVFP4_MUL, 4304, 1152, TClass::VisionTower},
+    {"fp4local.vision_fc2", QType::NVFP4_MUL, 1152, 4304, TClass::VisionTower},
+    {"fp4local.vision_merger_fc1", QType::NVFP4_MUL, 4608, 4608, TClass::VisionTower},
+    {"fp4local.vision_merger_fc2", QType::NVFP4_MUL, 2560, 4608, TClass::VisionTower},
 };
 
 struct Sweep {
@@ -233,6 +251,8 @@ const char* qtype_name(QType qtype) {
         return "NVFP4";
     case QType::FP8_E4M3FN_ROW_BF16:
         return "FP8";
+    case QType::NVFP4_MUL:
+        return "RG16";
     default:
         break;
     }
@@ -256,6 +276,7 @@ QType parse_qtype(std::string_view text) {
     if (value == "bf16") { return QType::BF16; }
     if (value == "nvfp4") { return QType::NVFP4; }
     if (value == "fp8" || value == "fp8_e4m3fn_row_bf16") { return QType::FP8_E4M3FN_ROW_BF16; }
+    if (value == "rg16" || value == "nvfp4_mul") { return QType::NVFP4_MUL; }
     throw std::invalid_argument("unknown qtype: " + std::string(text));
 }
 
@@ -323,10 +344,11 @@ Sweep parse_sweep(std::string_view text) {
 void usage(const char* argv0) {
     std::fprintf(stderr,
                  "Usage:\n"
-                 "  %s --qtype Q4|Q5|Q6|Q8|BF16|NVFP4|FP8 --n N --k K --t T [options]\n"
-                 "  %s --qtype Q4|Q5|Q6|Q8|BF16|NVFP4|FP8 --n N --k K --sweep START:END[:STEP] "
+                 "  %s --qtype Q4|Q5|Q6|Q8|BF16|NVFP4|FP8|RG16 --n N --k K --t T [options]\n"
+                 "  %s --qtype Q4|Q5|Q6|Q8|BF16|NVFP4|FP8|RG16 --n N --k K --sweep START:END[:STEP] "
                  "[options]\n"
-                 "  %s --suite qwen3_6_27b|qwen3_6_35b_a3b|all [options]\n\n"
+                 "  %s --suite qwen3_6_27b|qwen3_6_35b_a3b|flash_next_vision|all [options]\n\n"
+                 "RG16 is a dense nvfp4_mul matrix in nvfp4_rg16_v1 (registered [N,K] only).\n"
                  "Options:\n"
                  "  --policy a16|a8|a4|invariant  Activation-compute policy (default a16).\n"
                  "  --routes exact|fast Route set (default exact; fast admits fast-path routes).\n"
@@ -414,8 +436,9 @@ Options parse_args(int argc, char** argv) {
         throw std::invalid_argument("--t and --sweep are mutually exclusive");
     }
     if (opt.have_suite) {
-        if (opt.suite != "qwen3_6_27b" && opt.suite != "qwen3_6_35b_a3b" && opt.suite != "all") {
-            throw std::invalid_argument("--suite must be qwen3_6_27b, qwen3_6_35b_a3b, or all");
+        if (opt.suite != "qwen3_6_27b" && opt.suite != "qwen3_6_35b_a3b" && opt.suite != "flash_next_vision" &&
+            opt.suite != "all") {
+            throw std::invalid_argument("--suite must be qwen3_6_27b, qwen3_6_35b_a3b, flash_next_vision, or all");
         }
         if (opt.have_qtype || opt.have_n || opt.have_k || opt.have_t || opt.have_sweep) {
             throw std::invalid_argument("--suite cannot be combined with an explicit point");
@@ -441,7 +464,8 @@ Options parse_args(int argc, char** argv) {
 const std::vector<std::int32_t>& default_t_values(TClass t_class) {
     static const std::vector<std::int32_t> continuous{1, 16, 128, 1024};
     static const std::vector<std::int32_t> vision{4, 128, 1024};
-    return t_class == TClass::Continuous ? continuous : vision;
+    static const std::vector<std::int32_t> tower{4, 64, 256, 1024, 4096, 16384};
+    return t_class == TClass::Continuous ? continuous : t_class == TClass::VisionTower ? tower : vision;
 }
 
 bool same_point(const BenchPoint& a, const BenchPoint& b) {
@@ -482,6 +506,9 @@ std::vector<BenchPoint> expand_points(const Options& opt) {
         }
         if (opt.suite == "qwen3_6_35b_a3b" || opt.suite == "all") {
             append_suite(points, kQwen35bEntries);
+        }
+        if (opt.suite == "flash_next_vision" || opt.suite == "all") {
+            append_suite(points, kFlashNextVisionEntries);
         }
         return points;
     }
@@ -532,6 +559,11 @@ LinearBenchWeight make_weight(QType qtype, std::int32_t n, std::int32_t k) {
     }
     if (qtype == QType::FP8_E4M3FN_ROW_BF16) {
         bench::PackedQuantizedWeight packed = bench::make_fp8_weight(n, k);
+        const std::uint64_t model_bytes     = packed.model_weight_bytes();
+        return {std::move(packed.storage), packed.weight, model_bytes};
+    }
+    if (qtype == QType::NVFP4_MUL) {
+        bench::PackedQuantizedWeight packed = bench::make_nvfp4_rg16_weight(n, k);
         const std::uint64_t model_bytes     = packed.model_weight_bytes();
         return {std::move(packed.storage), packed.weight, model_bytes};
     }
@@ -621,6 +653,13 @@ double registered_tensor_peak_tflops(const BenchPoint& point, const char*& profi
     if (point.qtype == QType::BF16 && point.policy == LinearPolicy::A16Only &&
         bf16_vision_problem && point.t > 8) {
         profile = "BF16_F32ACC";
+        return kRtx5090Bf16Fp32AccumulateTFLOPs;
+    }
+    // The canonical W4A16 wide route (beyond the GEMV's 8 columns, 4 at K 4304 and 4608): two
+    // m16n8k32 integer MMAs per 16-element block issue in a BF16 m16n8k16's time, so its MMA peak is
+    // the BF16 one's.
+    if (point.qtype == QType::NVFP4_MUL && point.t > (point.k >= 4304 ? 4 : 8)) {
+        profile = "INT8_LIMB_A16";
         return kRtx5090Bf16Fp32AccumulateTFLOPs;
     }
     profile = "";

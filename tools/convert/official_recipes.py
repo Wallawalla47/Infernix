@@ -564,15 +564,21 @@ def qwen3_8_flash_next_fp4_local(model, recipe, sources):
       shared-expert projections keep their E4M3FN codes and UE8M0 group scales
       (``fp8_e4m3fn_g32_e8m0``, W8A16).
     - The GDN a/b projections (MXFP8, a parameter of their own) and the vision attention become
-      their exact BF16 values; the vision MLPs and merger (weight-only NVFP4) their BF16 rounding,
-      the conversion's only rounding of a main-model or vision weight.
+      their exact BF16 values.
+    - The vision MLPs and merger (weight-only NVFP4) keep their words as dense ``nvfp4_mul``
+      matrices in ``nvfp4_rg16_v1`` (``_fp4_local_vision``), run with the canonical W4A16
+      arithmetic, so no main-model or vision weight is rounded.
     - Every BF16 or FP32 tensor keeps its dtype; the NVFP4 n-gram table is written verbatim to its
       own volume with its FP32 multiplier.
     - The MTP drafter is re-quantized as recipes A-C build it (``_flash_next_drafter``) from its
       weight-only NVFP4 experts' exact values and its BF16 dense projections.
 
     The QSA query/gate/key/value and indexer projections form one MXFP8 parent [13952, 2560], which
-    the model runs as one projection (the builder's grouping, as recipe A's)."""
+    the model runs as one projection (the builder's grouping, as recipe A's).
+
+    The published conversion also passes ``--proposal --screen-heads``: the proposal head, then the
+    2-bit screens of the LM head and the proposal head (tools/convert/screen.py, 273 MB), extra objects
+    after every other, so the tensors this recipe assigns keep their bytes."""
 
     from .expert_banks import ExpertBankSource, import_expert_bank, weight_only_bank
 
@@ -615,7 +621,31 @@ def qwen3_8_flash_next_fp4_local(model, recipe, sources):
             )
     # The banks keep their activation scales and permit 4-bit activations; 16-bit is the default.
     model.config["expert_a4_activations"] = "optional"
+    _fp4_local_vision(model, recipe, base)
     _flash_next_drafter(model, recipe)
+
+
+# FP4-Local's weight-only NVFP4 vision matrices: each layer's MLP and the merger.
+_FP4_LOCAL_VISION_NVFP4 = ("/mlp/fc1", "/mlp/fc2", "/merger/fc1", "/merger/fc2")
+
+
+def _fp4_local_vision(model, recipe, base):
+    """FP4-Local's vision MLPs ([4304, 1152], [1152, 4304]) and merger ([4608, 4608], [2560, 4608]):
+    NVIDIA's E2M1 codes, E4M3 block scales and FP32 ``weight_scale_2`` words as dense ``nvfp4_mul``
+    matrices in ``nvfp4_rg16_v1``, run with 16-bit activations by the canonical W4A16 projection
+    (rg16_linear), as the Qwen3.5-122B head. Each matrix is its own parent, so the artifact's other
+    objects keep their order and bytes. Without the vision component this assigns nothing."""
+
+    for name in model.parameters:
+        if name.startswith("vision/") and name.endswith(_FP4_LOCAL_VISION_NVFP4):
+            recipe.assign(
+                name,
+                format="nvfp4_mul",
+                layout="nvfp4_rg16_v1",
+                method=import_encoded,
+                source=model.source(name, base, "nvfp4_mul"),
+                activation_policy="A16Only",
+            )
 
 
 def qwen3_8_flash_next_gsq_rco_iq3s(model, recipe, sources):

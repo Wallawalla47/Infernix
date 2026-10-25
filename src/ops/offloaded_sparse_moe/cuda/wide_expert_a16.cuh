@@ -20,6 +20,12 @@
 // k16 ones, 128-element stages (the per-row copies, not the tensor pipe, bounded 64-element ones),
 // sixteen 32 x 16 consumer warps. Entry-major x planes read through tensor maps made the GEMMs only
 // ~1.4 % faster and cost a per-entry x encoding (0.25 ms per 4K call) and 8x the x workspace.
+//   - A matrix whose rows are not whole 128-row blocks or whose K is not whole 128-element stages
+//     (the dense rg16 projections of Qwen3.8-Flash-Next FP4-Local's vision tower, 4304 rows or K;
+//     rg16_linear.cu) runs partial last blocks: the producer copies only the row groups and units
+//     that exist, its limb rows are zero past K, so the stale units of a short stage multiply zero
+//     activations (exact zeros), and its epilogue skips the absent row groups. Expert matrices are
+//     whole blocks and compile to the same code as before.
 
 #include "ops/offloaded_sparse_moe/cuda/wide_expert.cuh"
 
@@ -106,14 +112,70 @@ __device__ __forceinline__ unsigned a16_codes(const std::uint8_t* unit, int r, i
     return canon::e2m1_x2_quad((word >> (r < 8 ? 0 : 4)) & 0x0F0F0F0FU);
 }
 
+// The A operand's encoders (x and h of the expert route, wide_expert.cu; the columns of a dense rg16
+// projection, rg16_linear.cu). One 16-element block b of a row into its limb-plane row: the canonical
+// X (canon::a16_value; zero in a non-finite column) as H1 = X >> 14, L1 = (X >> 3) & 255 and
+// H0 | L0 << 4 with H0 = (X >> 11) & 7, L0 = X & 7, in K tile b / 4 at block offset 16 (b % 4).
+template <class Byte>
+__device__ __forceinline__ uint4 pack16(const Byte (&b)[16]) {
+    unsigned w[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        w[i] = static_cast<unsigned>(static_cast<std::uint8_t>(b[4 * i])) |
+               (static_cast<unsigned>(static_cast<std::uint8_t>(b[4 * i + 1])) << 8) |
+               (static_cast<unsigned>(static_cast<std::uint8_t>(b[4 * i + 2])) << 16) |
+               (static_cast<unsigned>(static_cast<std::uint8_t>(b[4 * i + 3])) << 24);
+    }
+    return make_uint4(w[0], w[1], w[2], w[3]);
+}
+
+__device__ __forceinline__ void store_a16_block(std::uint8_t* row, int b, const std::uint16_t (&v)[16], int emax) {
+    std::uint8_t high[16], low[16], small[16];
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+        const std::int32_t x = emax == canon::kA16NonFinite ? 0 : canon::a16_value(v[j], emax);
+        high[j]  = static_cast<std::uint8_t>(x >> 14);
+        low[j]   = static_cast<std::uint8_t>((x >> 3) & 255);
+        small[j] = static_cast<std::uint8_t>(((x >> 11) & 7) | ((x & 7) << 4));
+    }
+    std::uint8_t* at                              = row + (b / 4) * kA16LimbTileBytes + 16 * (b % 4);
+    *reinterpret_cast<uint4*>(at)                 = pack16(high);
+    *reinterpret_cast<uint4*>(at + kA16KTile)     = pack16(low);
+    *reinterpret_cast<uint4*>(at + 2 * kA16KTile) = pack16(small);
+}
+
+__device__ __forceinline__ void unpack16(const uint4 v0, const uint4 v1, std::uint16_t (&v)[16]) {
+    const unsigned words[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
+#pragma unroll
+    for (int w = 0; w < 8; ++w) {
+        v[2 * w]     = static_cast<std::uint16_t>(words[w] & 0xFFFFU);
+        v[2 * w + 1] = static_cast<std::uint16_t>(words[w] >> 16);
+    }
+}
+
+// The largest magnitude's bits of 16 BF16 values (their column-exponent key, canon::a16_column_exponent).
+__device__ __forceinline__ unsigned a16_key(const std::uint16_t (&v)[16]) {
+    unsigned key = 0;
+#pragma unroll
+    for (int j = 0; j < 16; ++j) { key = max(key, static_cast<unsigned>(v[j] & 0x7FFFU)); }
+    return key;
+}
+
+__device__ __forceinline__ int a16_emax(unsigned key) {
+    return key >= 0x7F80U ? canon::kA16NonFinite : max(static_cast<int>(key >> 7), 1);
+}
+
 template <class Shape, class Epilogue>
 __global__ __launch_bounds__(ScheduleA16::kThreads, ScheduleA16::kMinBlocksPerSm) void grouped_kernel_a16(
     const Call call, const std::int32_t pass, const Epilogue epilogue) {
     using S                  = ScheduleA16;
-    constexpr int kRowBlocks = Shape::kRowGroups / S::kRowGroups;
-    constexpr int kKTiles    = Shape::kBlocks / S::kUnitsPerKTile;
+    constexpr int kRowBlocks = (Shape::kRowGroups + S::kRowGroups - 1) / S::kRowGroups;
+    constexpr int kKTiles    = (Shape::kBlocks + S::kUnitsPerKTile - 1) / S::kUnitsPerKTile;
     constexpr int kRowBytes  = Shape::kRowBytes;
-    static_assert(Shape::kRowGroups % S::kRowGroups == 0 && Shape::kBlocks % S::kUnitsPerKTile == 0);
+    // Row groups of the last row block and units of the last K tile (8 for whole blocks and stages).
+    constexpr int kLastGroups = Shape::kRowGroups - (kRowBlocks - 1) * S::kRowGroups;
+    constexpr int kLastUnits  = Shape::kBlocks - (kKTiles - 1) * S::kUnitsPerKTile;
+    static_assert(kRowBytes >= kKTiles * S::kStageRowBytes, "the limb rows hold whole stages, zero past K");
 
     extern __shared__ __align__(128) unsigned char shared_bytes[];
     auto& shared = *reinterpret_cast<StorageA16*>(shared_bytes);
@@ -144,6 +206,9 @@ __global__ __launch_bounds__(ScheduleA16::kThreads, ScheduleA16::kMinBlocksPerSm
             const int columns = min(S::kBlockTokens, call.dispatch.offsets[expert + 1] - first);
             const std::uint8_t* matrix = call.job_records[job] + Shape::kOffset +
                                          static_cast<std::size_t>(row_block) * S::kRowGroups * Shape::kBlocks * kUnitBytes;
+            // The row groups of this block that exist (fewer only in a partial last block).
+            const int groups =
+                kLastGroups == S::kRowGroups || row_block + 1 < kRowBlocks ? S::kRowGroups : kLastGroups;
             // The limb row of each of this lane's tile columns (two per lane): x by token, h by entry.
             const std::uint8_t* rows[S::kBlockTokens / 32];
 #pragma unroll
@@ -165,11 +230,16 @@ __global__ __launch_bounds__(ScheduleA16::kThreads, ScheduleA16::kMinBlocksPerSm
 #pragma unroll 1
             for (int k_tile = 0; k_tile < kKTiles; ++k_tile, ++it) {
                 const int stage = it % S::kStages;
+                // A row group's unit bytes in this K tile (fewer only in a partial last stage; the
+                // consumers' products with the stage's stale units are exact zeros, since the limb
+                // rows are zero there).
+                const int run = kLastUnits == S::kUnitsPerKTile || k_tile + 1 < kKTiles
+                                    ? S::kUnitRunBytes
+                                    : kLastUnits * static_cast<int>(kUnitBytes);
                 if (lane == 0) {
                     cta_mbarrier_wait(&shared.empty[stage], 1U ^ ((static_cast<unsigned>(it) / S::kStages) & 1U));
                     cta_mbarrier_arrive_expect_tx(&shared.full[stage],
-                                                  static_cast<std::uint32_t>(columns * S::kStageRowBytes +
-                                                                             S::kRowGroups * S::kUnitRunBytes));
+                                                  static_cast<std::uint32_t>(columns * S::kStageRowBytes + groups * run));
                 }
                 __syncwarp();
 #pragma unroll
@@ -179,11 +249,11 @@ __global__ __launch_bounds__(ScheduleA16::kThreads, ScheduleA16::kMinBlocksPerSm
                                   rows[i] + k_tile * S::kStageRowBytes, S::kStageRowBytes, &shared.full[stage]);
                     }
                 }
-                if (lane < S::kRowGroups) {
+                if (lane < groups) {
                     bulk_load(shared.b_units[stage] + lane * S::kUnitRunBytes,
                               matrix + (static_cast<std::size_t>(lane) * Shape::kBlocks +
                                         static_cast<std::size_t>(k_tile) * S::kUnitsPerKTile) * kUnitBytes,
-                              S::kUnitRunBytes, &shared.full[stage]);
+                              static_cast<std::uint32_t>(run), &shared.full[stage]);
                 }
             }
         }

@@ -3,6 +3,7 @@
 #include "models/registry.h"
 #include "infernix/types.h"
 
+#include <algorithm>
 #include <filesystem>
 #include <string_view>
 
@@ -32,6 +33,11 @@ struct LoadOptions {
     bool stream_experts = false;
     // Qwen4Exp DFlash2: the companion artifact of the drafter (SpeculativeOptions::draft_model).
     std::filesystem::path draft_model;
+    // Qwen4Exp: bind the artifact's 2-bit screen of the proposal head (the MTP drafter's screened draft
+    // head, the temporary switch INFERNIX_TMP_SCREENED_DRAFT_HEAD) or of the LM head (the
+    // screened-lm-head fast path's candidate). An artifact without the screen is refused.
+    bool screened_draft_head = false;
+    bool screened_lm_head    = false;
 
     bool operator==(const LoadOptions&) const = default;
 
@@ -95,7 +101,9 @@ struct LoadOptions {
             .reference                = options.reference,
             .reference_kv             = options.reference ? options.kv_cache : KvCacheStorage::BFloat16,
             .expert_a4_activations    = options.expert_a4_activations,
-            .draft_model              = options.speculative.draft_model};
+            .draft_model              = options.speculative.draft_model,
+            .screened_lm_head         = std::find(options.fast_path_candidates.begin(), options.fast_path_candidates.end(),
+                                                  FastPath::ScreenedLmHead) != options.fast_path_candidates.end()};
 }
 
 } // namespace infernix::models

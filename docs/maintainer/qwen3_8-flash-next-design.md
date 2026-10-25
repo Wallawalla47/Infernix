@@ -603,6 +603,7 @@ and the tensor dtypes before the recipe is frozen.
 | Router, shared-expert gate, GDN `a`/`b`, QSA indexer projection | BF16 | BF16 | BF16 | Small (3% of dense bytes), and routing- or selection-sensitive |
 | MTP dense (its QSA block, HC, shared expert, projections) | BF16 | `q8_g32_fp16` (option H13 adopted); router and shared-expert gate stay BF16 | Same | Affects only acceptance; halves the drafter's dense bytes per step |
 | Proposal head (`--proposal`, for `--lm-head-draft`) | `lm_head` rows of the 131,072 most frequent tokens | `q4_g64_fp16`, 178 MB | Same | Draft head of the MTP drafter only |
+| Head screens (`--screen-heads`, §19.3.30) | `lm_head`, and the proposal head's rows | `q2_g64_fp16` (`grouped_mse_norm`), 178.8 + 94.4 MB | Same | Screened heads only; the artifact's last objects |
 | Token embedding | BF16 | BF16, **host-resident** (§6.3) | Same | Saves 1.27 GB of VRAM, about 480 frames |
 | Norms, `A_log`, `dt_bias`, conv weights | BF16 / FP32 | Direct | Direct | — |
 | Vision | BF16 | BF16 | BF16 | Not on the decode path; both deployed artifacts contain it. With `--vision-offload` (on by default for this model) the weights stay in pinned host RAM and stream per encode window; only the output handoff and oversize windows borrow frames (§9.2, §19.3.2). |
@@ -728,7 +729,7 @@ is served with: **16-bit activations everywhere** (NVIDIA's serving sets
 | MTP routed experts (512) | Weight-only ModelOpt NVFP4 (`weight_scale` stored directly) | `q4_g64_fp16` (MSE) from their exact values (`nvfp4_values_source`, the multiplier applied, not a rounded divisor), as recipes A-C's drafter | Affects only acceptance |
 | MTP dense | BF16 | `q8_g32_fp16`; router and shared-expert gate BF16 (recipe A's drafter) | As recipes A-C |
 | Vision attention (qkv, proj) | MXFP8 | Exact BF16 values | Exact |
-| Vision MLPs and merger | Weight-only NVFP4 (`W4A16_NVFP4`) | BF16, `bf16_rn(e2m1 · e4m3 · weight_scale_2)` rounded once from binary64 (`cast_direct`'s single rounding) | The conversion's only rounding of a non-drafter weight; not on the decode path |
+| Vision MLPs and merger | Weight-only NVFP4 (`W4A16_NVFP4`) | **Exact import** as dense `nvfp4_mul` matrices in `nvfp4_rg16_v1` (codes, E4M3 scales, `weight_scale_2` as the multiplier), `A16Only`, run by the canonical W4A16 projection (`rg16_linear`: exact sums, one rounding; the 122B head's arithmetic) | No non-drafter weight is rounded; 0.17 GB instead of 0.60 GB of BF16 in RAM and per offload window. Until 2026-10-23 the recipe stored their BF16 rounding (`bf16_rn(e2m1 · e4m3 · weight_scale_2)`): about 93 % of a matrix's values were inexact (verify report of the 2026-10-20 conversion) |
 
 **NVFP4-CSF.** Per matrix, the fixed stream holds `rows / 16` slabs of `16 · (1 + columns / 2)` bytes:
 the slab's 16 row bases (at most 240), then each row's `columns / 2` bytes of 4-bit offsets (the even
@@ -739,6 +740,21 @@ the restored scales meet ModelOpt's `amax / (6 · weight_scale_2)` rule at the m
 exact by construction (every scale a stored byte, or a base plus an offset); the converter validates the
 format's invariants and the restored words as E4M3FN scales, and `verify_artifact` compares the
 stored banks with the restored words.
+
+**Vision MLPs and merger (2026-10-23).** The tower's four weight-only NVFP4 matrices per layer and
+merger, fc1 [4304, 1152], fc2 [1152, 4304], merger fc1 [4608, 4608] and fc2 [2560, 4608], are
+`nvfp4_rg16_v1` matrices (each its own parent; `verify_artifact` compares their words) and run
+through `ops::linear` on `rg16_linear`, the Qwen3.5-122B head's canonical W4A16 projection: a dp4a
+GEMV through 8 columns (4 at K 4304 and 4608) and the wide expert route's integer tensor-core kernel
+beyond, in passes of 4,096 columns whose encoded activations (3 bytes per element) bound its workspace
+at 14-57 MB per projection. fc1's rows and fc2's K are not whole 128-row blocks and 128-element
+stages; the kernel runs partial last ones (limb rows zero past K). The sums are exact, so each
+projection's output depends on neither the call's width nor the offload placement; the tower's
+output differs from the BF16-rounded weights' by design. The weights shrink from 601.5 MB to 169.2 MB (the whole tower
+from 897.9 MB to 465.5 MB pinned, and each offload window streams 15.7 ms less at 27.6 GB/s); the
+offload staging aligns every object to 16 bytes, since an `nvfp4_rg16_v1` payload ends 4 bytes past a
+256-byte boundary. Speed against the BF16 tensor-core routes is unmeasured
+(`infernix_linear_bench --suite flash_next_vision`).
 
 **Why A16 by default.** The model card describes QAD as quantizing the weights in each forward pass,
 and NVIDIA's recommended vLLM serving on both RTX PRO 6000 and DGX Spark forces BF16 activations for
@@ -10810,6 +10826,63 @@ runs (read from its volume, or 27.8 GiB pinned while the first test ran), costin
 every arm above passes `--ngram-residency volume`. The `ggml_gate_up_bf16` instance of the IQ formats
 (half sub-scales) holds 40 bytes of stack for loop invariants outside its MMA loop (allow-listed,
 like the exact `gate_up_tile_ggml`'s 40 bytes).
+
+### 19.3.30 Screened heads: a 2-bit screen of the draft and LM heads (2026-10-23, built, not measured)
+
+Basalt's two-stage heads (B-03): every row of a vocabulary head is scored from a 2-bit copy and only the
+rows near each column's best are computed with the head itself. The MTP drafter's proposal head
+(`q4_g64_fp16`, 131,072 rows, 178 MB, about 0.11 ms of a 0.24 ms draft step) and the verification head
+(FP4-Local's and FP8's BF16 `lm_head`, 1.27 GB per round; Dense8's 8-bit one, 636 MB) both read every
+row once per call.
+
+**The copies** (`--screen-heads`, `tools/convert/screen.py`): `screen/output_head` [248,320, 2,560]
+(178.8 MB) and, with `--proposal`, `screen/proposal_head` [131,072, 2,560] (94.4 MB), both
+`q2_g64_fp16` in `row_split_k128_v1` (codes {-2, -1, 0, 1}, one binary16 scale per 64: 2.25 bits a
+weight, against Basalt's 2.5 with a scale per 32), from `lm_head`'s source values by `grouped_mse_norm`:
+`grouped_mse`'s codes, each scale times sqrt(|w|² / <w, ŵ>). A least-squares copy is shrunk toward zero by
+its own factor in every group; the stretch removes that row-to-row bias (Basalt's `fit_group<true>`).
+They are the artifact's last objects; the loader binds a copy only for the path that reads it.
+
+**The Op** (`ops::screened_head_top` and `ops::screened_head_logits`, `src/ops/screened_head/`):
+- **Screen.** One persistent CTA per SM over 16-row items, four warps splitting K, a four-stage
+  cp.async ring of 11.5 KB items (the codes in 656-byte rows so a quad's words fall on distinct
+  banks), int8 m16n8k32 MMAs: the row-split packing's four codes per byte become A fragments with two
+  integer instructions per four codes once the K order inside each 16-weight word is permuted, which
+  the column's int8 copy (per 64-group, FP32 scale, made per CTA) absorbs; levels c + 2 in [0, 3] and
+  an exact −2Σq correction. Each CTA keeps every column's best eight rows (and, for drafts, an online
+  softmax partial). A column's scores, lists and partials depend on it alone (a fixed grid). The CTAs
+  take 16-row items round-robin, so more than eight near-best rows in one CTA (adjacent tokens such as
+  the digits fall in one item) leave its lower ones out of the candidates: a known miss mode, which
+  the real-artifact check measures.
+- **Selection.** One CTA per column: the rows within 5 logits of the best screen score, at most 64,
+  the best first and at least the ranks needed, by 8-bit radix selection on (score, row) keys when the
+  count is out of bounds; deterministic.
+- **Exact rows.** The proposal head's and an 8-bit head's rows by warps in `projection_fp32`'s narrow
+  order; a BF16 head's through `projection_fp32`'s own tensor-core tile over the listed rows (the
+  sliced-K kernel's `weight_row` / `skip_tile` hooks), so a rescored (row, column) carries the exact
+  head's bits.
+- **Drafts.** The top form returns the top 1 or 4 rows by their exact BF16 logits (argmax and
+  `top_logprobs`' tie rule) with log-probabilities whose normalizer counts the other rows at their
+  screen scores raised by v / 2: the fit leaves e = s + eps with eps about independent of s, so
+  E[exp(e) | s] = exp(s + v / 2), and v is the mean (e - s)^2 over the rescored rows outside the four
+  best (a CPU model of the op test's fixture, 65,536 rows: worst 0.12-0.13 nats instead of the screen
+  terms' 0.43-0.47, which undercount the tail). The sampled drafts' laws use only rank differences,
+  which are exact.
+
+**Where it runs.**
+- `INFERNIX_TMP_SCREENED_DRAFT_HEAD=1` (temporary A/B switch, default off, value in the startup log):
+  the MTP drafter's draft head with `--lm-head-draft`. Draft-only: verification is unchanged.
+- `--fast-path screened-lm-head` (unqualified candidate): decode and verification rounds of at most 16
+  columns whose every row is greedy, without penalties, grammar or token constraint; other rounds keep
+  the exact head and the two kinds keep their own graphs (request-coupling). Rows outside the selection
+  keep screen scores, which only an argmax reads there. Sampled rows are excluded because their
+  softmax over every row (and top-p / min-p cuts near its tail) would read the screen's error (rms
+  about half a logit), which no cheap certified bound limits; Basalt's approximate tail cost KLD
+  +0.0017.
+
+**Estimates (not measured).** Draft step: 94 MB instead of 178 MB, about −0.05 ms of 0.24 ms, plus two
+small launches; Basalt's figures give struct text +2-3 %. Verification on FP4-Local: about 0.18 GB
+instead of 1.27 GB per round, about −0.6 ms. A/B plan: `.local/review-2026-10-22/impl/b03-screen.md`.
 
 ---
 

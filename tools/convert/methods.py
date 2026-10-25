@@ -25,7 +25,7 @@ from tools.artifact.schema import TensorSpec
 from tools.artifact.tensor_output import TensorOutput
 
 from .quantization.fp8_row import quantize_bf16_rows
-from .quantization.groupwise import quantize_matrix, quantize_matrix_mse
+from .quantization.groupwise import quantize_matrix, quantize_matrix_mse, quantize_matrix_mse_norm
 from .quantization.nvfp4 import E2M1_MAX, quantize_nvfp4, quantize_nvfp4_mse, weight_divisor
 from .sources.logical import EncodedRows, LogicalSource
 
@@ -293,6 +293,33 @@ def grouped_mse(request: PrepareRequest) -> PreparedMethod:
     return request.job(produce=produce)
 
 
+def grouped_mse_norm(request: PrepareRequest) -> PreparedMethod:
+    """``grouped_mse``'s codes with each group's scale stretched to keep the group's norm
+    (``quantize_matrix_mse_norm``): the 2-bit screens of a vocabulary head (--screen-heads)."""
+    if (
+        not isinstance(get_format(request.target.format), QuantFormat)
+        or len(request.target.shape) != 2
+    ):
+        raise ValueError("grouped_mse_norm requires a grouped-integer matrix target")
+    _preflight(request)
+    n, k = request.target.shape
+
+    def produce(output):
+        for begin in range(0, n, request.rows_per_chunk):
+            end = min(n, begin + request.rows_per_chunk)
+            values = request.values(begin * k, end * k).reshape(end - begin, k)
+            if not values.dtype.is_floating_point:
+                raise TypeError(
+                    "grouped_mse_norm source must provide floating-point values"
+                )
+            encoded = quantize_matrix_mse_norm(
+                values, request.target.format, device=request.device
+            )
+            output.write_codes(begin, encoded.codes, encoded.scales)
+
+    return request.job(produce=produce)
+
+
 def fp8_row_maxabs(request: PrepareRequest) -> PreparedMethod:
     """Round inputs to BF16, then quantize to FP8 codes with BF16 row scales."""
     if request.target.format != "fp8_e4m3fn_row_bf16" or len(request.target.shape) != 2:
@@ -524,6 +551,7 @@ METHODS: dict[str, Method] = {
     "cast_direct": cast_direct,
     "grouped_absmax": grouped_absmax,
     "grouped_mse": grouped_mse,
+    "grouped_mse_norm": grouped_mse_norm,
     "fp8_row_maxabs": fp8_row_maxabs,
     "import_encoded": import_encoded,
     "import_ggml_rows": import_ggml_rows,

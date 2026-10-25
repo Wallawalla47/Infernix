@@ -110,7 +110,8 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
         detail::mxfp8_dispatch(x, w, out, policy, stream);
         return;
     case QType::NVFP4_MUL:
-        // A dense nvfp4_rg16_v1 matrix: the canonical W4A16 projection (exact sums), every policy.
+        // A dense nvfp4_rg16_v1 matrix (the 122B head, FP4-Local's vision MLP and merger): the
+        // canonical W4A16 projection (exact sums), every policy.
         if (w.layout != QuantLayout::Rg16 || workspace == nullptr) { break; }
         rg16_linear(x, w, out, *workspace, stream);
         return;

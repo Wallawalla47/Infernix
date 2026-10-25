@@ -169,10 +169,11 @@ enum class LinearRoutes : std::uint8_t {
  * each at every positive T. Text and MTP packed-weight problems accept every positive column
  * extent T. Registered packed-weight Vision problems accept raw-patch P in `{4,8,...,131072}` or
  * merged-token V in `[1,32768]`; a matrix column does not inherently represent a text token. A
- * dense NVFP4_MUL matrix in QuantLayout::Rg16 (`nvfp4_rg16_v1`, Qwen3.5-122B-A10B's head
- * `[248320,3072]`) runs rg16_linear at every positive T under every policy: the canonical W4A16
- * product with exact sums, so it is column-invariant and needs the workspace overload. FP32
- * weights are unsupported.
+ * dense NVFP4_MUL matrix in QuantLayout::Rg16 (`nvfp4_rg16_v1`: Qwen3.5-122B-A10B's head
+ * `[248320,3072]`; Qwen3.8-Flash-Next FP4-Local's Vision MLP `[4304,1152]`, `[1152,4304]` and
+ * merger `[4608,4608]`, `[2560,4608]`) runs rg16_linear at every positive T under every policy: the
+ * canonical W4A16 product with exact sums, so it is column-invariant and needs the workspace
+ * overload. FP32 is unsupported.
  *
  * @par Numerical contract
  * Test fixture code materializes the persistent weight as its logical FP32 dequantized matrix.

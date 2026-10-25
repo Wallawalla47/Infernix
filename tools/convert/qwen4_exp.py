@@ -32,7 +32,8 @@ from .sources.modelopt import (
     dequantize_fp8_block128,
     fp8_block_matrix_raw,
     fp8_block_matrix_words,
-    nvfp4_values_source,
+    NVFP4_MUL_FORMAT,
+    nvfp4_mul_matrix_source,
 )
 from .sources.safetensors import SafetensorsSource, tensor_source
 
@@ -320,22 +321,23 @@ class _Qwen4ExpBuilder(_Builder):
         self.model.add(Parameter(name, tuple(shape), factory(store), factory, tuple(inputs), "bf16",
                                  residency=name.split("/", 1)[0]))
 
-    def add_nvfp4_values(self, name, store, leaf, shape, *, inputs=()):
-        """A weight-only ModelOpt NVFP4 matrix read through its exact values (multiplier semantics;
-        recipes cast or quantize them): the FP4-Local vision MLPs and MTP experts."""
+    def add_nvfp4_mul(self, name, store, leaf, shape, *, inputs=()):
+        """A weight-only ModelOpt NVFP4 matrix with its multiplier semantics: the FP4-Local vision MLPs
+        and merger, which the recipe imports exactly as ``nvfp4_mul`` words, and the MTP experts,
+        which it re-quantizes from their exact values."""
 
         def factory(selected, format=None):
             self.validate_source(selected, store, name)
-            if format is not None:
-                raise ValueError(f"{name}: a weight-only NVFP4 matrix is converted through its values")
-            return nvfp4_values_source(selected, leaf, tuple(shape))
+            if format not in (None, NVFP4_MUL_FORMAT):
+                raise ValueError(f"{name}: a weight-only NVFP4 matrix is read as its values or its {NVFP4_MUL_FORMAT} words")
+            return nvfp4_mul_matrix_source(selected, leaf, tuple(shape))
 
         self.model.add(Parameter(name, tuple(shape), factory(store), factory, tuple(inputs), "bf16",
                                  residency=name.split("/", 1)[0]))
 
     def add(self, name, store, source_name, shape, **options):
         # A vision tower stored as ModelOpt NVFP4 (FP4-Local's MLPs and merger: weight-only, a FP32
-        # multiplier) reads its exact values; every other tensor takes the shared source rules (MXFP8
+        # multiplier) keeps its words; every other tensor takes the shared source rules (MXFP8
         # matrices, FP4-Local's vision attention included, are recognized there).
         prefix = source_name.removesuffix(".weight")
         if (
@@ -346,7 +348,7 @@ class _Qwen4ExpBuilder(_Builder):
             and store.has(prefix + ".weight_scale_2")
             and store.describe(source_name).dtype == "U8"
         ):
-            self.add_nvfp4_values(name, store, prefix, shape, inputs=options.get("inputs", ()))
+            self.add_nvfp4_mul(name, store, prefix, shape, inputs=options.get("inputs", ()))
             return
         super().add(name, store, source_name, shape, **options)
 
@@ -424,7 +426,7 @@ class _Qwen4ExpBuilder(_Builder):
             # [E, 2I, H] (the gate rows first) and down_proj [E, H, I].
             fused = store.has(sp + "experts.gate_up_proj")
             nvfp4 = not fused and store.describe(sp + "experts.0.gate_proj.weight").dtype == "U8"
-            per_expert = self.add_nvfp4_values if nvfp4 else self.add_fp8_block
+            per_expert = self.add_nvfp4_mul if nvfp4 else self.add_fp8_block
             gate_up, downs = [], []
             for expert in range(e):
                 ep, leaf = p + f"experts/{expert}/", sp + f"experts.{expert}."

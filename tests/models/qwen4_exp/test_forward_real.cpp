@@ -8,8 +8,13 @@
 //       [--dump-from P] [TOKENS --dump-logits OUT.bin [--chunk N] [--kv KV] [--dump-from P]]...
 //   infernix_qwen4_exp_forward_real_test TOKENS --cpu-columns [--kv KV]
 //   infernix_qwen4_exp_forward_real_test TOKENS --decode-widths [--kv KV]
+//   infernix_qwen4_exp_forward_real_test TOKENS --screened-heads [--kv KV]
 //
 // KV is a KV-cache storage: bf16 (default), int8, fp8, nvfp4 or k8v4.
+//
+// With --screened-heads (an artifact converted with --proposal --screen-heads) the test compares the
+// screened LM head and the screened proposal head with the exact heads at every position of TOKENS
+// (check_screened_heads).
 //
 // With --cpu-columns the test checks that calls the Program serves with the CPU expert service
 // (decode widths, and prefill calls up to 255 columns with the assist) give the GPU route's logits
@@ -49,6 +54,9 @@
 #include "models/qwen4_exp/program/prefix/state_image.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
 #include "models/qwen4_exp/program/rope_positions.h"
+#include "infernix/ops/hyper_connection.h"
+#include "infernix/ops/projection_fp32.h"
+#include "infernix/ops/screened_head.h"
 #include "ops/offloaded_sparse_moe/cpu/miss_service.h"
 
 #include <cuda_bf16.h>
@@ -660,6 +668,154 @@ bool check_decode_widths(const q4::execution::Parameters& parameters, DeviceCont
     return ok;
 }
 
+// --screened-heads (B-03): the screened heads on the artifact's own heads and 2-bit screens (an artifact
+// converted with --proposal --screen-heads), over real hidden states: the final mixer's output at every
+// position of TOKENS' prefill. Per position: the screened LM head's argmax (ops::screened_head_logits,
+// the screened-lm-head fast path) against the exact head's, and the screened proposal head's draft and
+// four ranks (ops::screened_head_top, INFERNIX_TMP_SCREENED_DRAFT_HEAD) against the exact proposal
+// head's; the normalizer's error is reported. The policy is the Forward's (margin 5, 64 rows). Fails
+// when either agreement is below 99.5 % (Basalt reports 99.93 % for its draft screen).
+bool check_screened_heads(const q4::execution::Parameters& parameters, DeviceContext& device,
+                          const q4::NgramVolume& volume, const std::vector<std::int32_t>& tokens, std::int32_t context,
+                          KvCacheStorage kv) {
+    if (!parameters.output_head_screen || !parameters.draft_head.rows || !parameters.draft_head.screen ||
+        (parameters.output_head_q8 && parameters.output_head_q8->is_ggml())) {
+        throw std::invalid_argument("--screened-heads needs the proposal head, both 2-bit screens and a BF16 or Q8 head");
+    }
+    const auto& c       = parameters.model.config().text;
+    const auto n        = static_cast<std::int32_t>(tokens.size());
+    const auto W        = static_cast<std::int32_t>(c.residual_width());
+    const auto H        = static_cast<std::int32_t>(c.hidden_size);
+    const auto V        = static_cast<std::int32_t>(c.vocab_size);
+    const auto valid    = static_cast<std::int32_t>(parameters.model.resources().public_token_count);
+    const auto& draft   = parameters.draft_head;
+    const std::int32_t R = draft.rows->weight.n;
+    const ops::ScreenedHeadPolicy policy{.margin = 5.0F, .rescored = 64};
+    Harness harness(parameters, device, context, n, 1, kv);
+    auto call = make_call(c, volume, {tokens}, 0, n, {0}, {0});
+    DeviceBuffer residuals(static_cast<std::size_t>(W) * n * 2);
+    call.batch.residual_out = Tensor(residuals.p, DType::BF16, {W, n});
+    DeviceBuffer last(static_cast<std::size_t>(V) * 4);
+    Tensor last_logits(last.p, DType::FP32, {V, 1});
+    run_call(harness, device, call.batch, last_logits);
+    device.synchronize();
+    // The final mixer over every position, once: both heads read the same hidden states.
+    const auto& mixer = parameters.final_mixer;
+    const std::size_t mix_bytes = ops::hyper_connection_mix_workspace_capacity_bytes(
+        mixer.down.weight, mixer.up.weight, mixer.down.policy, static_cast<std::int32_t>(c.hc.streams),
+        static_cast<std::int32_t>(c.hc.rank), n);
+    WorkspaceArena work(mix_bytes + ops::screened_head_workspace_bytes(V, ops::kScreenedHeadMaxColumns, policy) + (16ULL << 20));
+    DeviceBuffer hidden(static_cast<std::size_t>(H) * n * 2);
+    Tensor x(hidden.p, DType::BF16, {H, n});
+    {
+        auto scope = work.scope();
+        ops::hyper_connection_mix(call.batch.residual_out, mixer.norm, mixer.down.weight, mixer.up.weight, mixer.down.policy,
+                                  static_cast<std::int32_t>(c.hc.streams), static_cast<std::int32_t>(c.hc.rank),
+                                  c.rms_norm_eps, x, nullptr, work, device.stream);
+        device.synchronize();
+    }
+    std::vector<std::int32_t> ids(static_cast<std::size_t>(R));
+    check(cudaMemcpy(ids.data(), draft.token_ids.data, ids.size() * 4, cudaMemcpyDeviceToHost), "token ids");
+    const auto bf16 = [](float v) {
+        std::uint32_t u;
+        std::memcpy(&u, &v, 4);
+        u = (u + 0x7FFFU + ((u >> 16) & 1U)) & 0xFFFF0000U;
+        float out;
+        std::memcpy(&out, &u, 4);
+        return out;
+    };
+    // Column t's first k rows of `logits` [rows, cols] by (BF16 value desc, row asc) among [0, limit).
+    const auto top = [&](const std::vector<float>& logits, std::int32_t rows, std::int32_t t, std::int32_t limit, int k) {
+        std::vector<int> index(static_cast<std::size_t>(limit));
+        std::iota(index.begin(), index.end(), 0);
+        const float* column = logits.data() + static_cast<std::size_t>(t) * rows;
+        std::partial_sort(index.begin(), index.begin() + k, index.end(), [&](int a, int b) {
+            const float va = bf16(column[a]), vb = bf16(column[b]);
+            return va > vb || (va == vb && a < b);
+        });
+        index.resize(static_cast<std::size_t>(k));
+        return index;
+    };
+    // The argmax over [0, limit) of column t's BF16 values, the lowest row on ties (ops::argmax's rule).
+    const auto argmax = [&](const std::vector<float>& logits, std::int32_t rows, std::int32_t t, std::int32_t limit) {
+        const float* column = logits.data() + static_cast<std::size_t>(t) * rows;
+        int best            = 0;
+        for (int r = 1; r < limit; ++r) {
+            if (bf16(column[r]) > bf16(column[best])) { best = r; }
+        }
+        return best;
+    };
+    std::int64_t positions = 0, verify_same = 0, draft_same = 0, ranks_same = 0;
+    double normalizer_sum = 0.0, normalizer_worst = 0.0;
+    DeviceBuffer exact_buffer(static_cast<std::size_t>(V) * ops::kScreenedHeadMaxColumns * 4);
+    DeviceBuffer screened_buffer(static_cast<std::size_t>(V) * ops::kScreenedHeadMaxColumns * 4);
+    DeviceBuffer outputs(4096);
+    for (std::int32_t first = 0; first < n; first += ops::kScreenedHeadMaxColumns) {
+        const std::int32_t cols = std::min(ops::kScreenedHeadMaxColumns, n - first);
+        const Tensor xs(static_cast<std::byte*>(hidden.p) + static_cast<std::size_t>(first) * H * 2, DType::BF16, {H, cols});
+        auto scope = work.scope();
+        // The LM head: exact (the text head's projection) against screened.
+        Tensor exact(exact_buffer.p, DType::FP32, {V, cols}), screened(screened_buffer.p, DType::FP32, {V, cols});
+        if (parameters.output_head_q8) {
+            ops::projection_fp32(xs, parameters.output_head_q8->weight, exact, device.stream);
+            ops::screened_head_logits(xs, Tensor{}, parameters.output_head_q8->weight, *parameters.output_head_screen, valid,
+                                      policy, screened, work, device.stream);
+        } else {
+            const Tensor* head[] = {&parameters.output_head};
+            ops::projection_fp32(xs, head, exact, device.stream);
+            ops::screened_head_logits(xs, parameters.output_head, Weight{}, *parameters.output_head_screen, valid, policy,
+                                      screened, work, device.stream);
+        }
+        device.synchronize();
+        const auto exact_host    = to_float(exact_buffer, static_cast<std::size_t>(V) * cols);
+        const auto screened_host = to_float(screened_buffer, static_cast<std::size_t>(V) * cols);
+        // The proposal head: exact logits, and the screened draft (one rank with tokens) and four ranks.
+        Tensor proposal(exact_buffer.p, DType::FP32, {R, cols});
+        ops::projection_fp32(xs, draft.rows->weight, proposal, device.stream);
+        auto* words = static_cast<std::byte*>(outputs.p);
+        Tensor rows1(words, DType::I32, {1, cols}), lp1(words + 256, DType::FP32, {1, cols}), drafts(words + 512, DType::I32, {cols});
+        Tensor rows4(words + 1024, DType::I32, {4, cols}), lp4(words + 2048, DType::FP32, {4, cols});
+        Tensor none;
+        ops::screened_head_top(xs, draft.rows->weight, *draft.screen, R, policy, rows1, lp1, draft.token_ids, drafts, work,
+                               device.stream);
+        ops::screened_head_top(xs, draft.rows->weight, *draft.screen, R, policy, rows4, lp4, none, none, work, device.stream);
+        device.synchronize();
+        const auto proposal_host = to_float(exact_buffer, static_cast<std::size_t>(R) * cols);
+        std::vector<std::int32_t> got_rows4(static_cast<std::size_t>(4) * cols), got_drafts(static_cast<std::size_t>(cols));
+        std::vector<float> got_lp1(static_cast<std::size_t>(cols));
+        check(cudaMemcpy(got_rows4.data(), rows4.data, got_rows4.size() * 4, cudaMemcpyDeviceToHost), "ranks");
+        check(cudaMemcpy(got_drafts.data(), drafts.data, got_drafts.size() * 4, cudaMemcpyDeviceToHost), "drafts");
+        check(cudaMemcpy(got_lp1.data(), lp1.data, got_lp1.size() * 4, cudaMemcpyDeviceToHost), "log-probabilities");
+        for (std::int32_t t = 0; t < cols; ++t) {
+            ++positions;
+            verify_same += argmax(exact_host, V, t, valid) == argmax(screened_host, V, t, valid);
+            const auto best = top(proposal_host, R, t, R, 4);
+            draft_same += got_drafts[t] == ids[best[0]];
+            bool ranks = true;
+            for (int j = 0; j < 4; ++j) { ranks = ranks && got_rows4[static_cast<std::size_t>(t) * 4 + j] == best[j]; }
+            ranks_same += ranks;
+            // The normalizer: the draft's log-probability against the exact one over every proposal row.
+            const float* column = proposal_host.data() + static_cast<std::size_t>(t) * R;
+            double peak = -INFINITY, sum = 0.0;
+            for (std::int32_t r = 0; r < R; ++r) { peak = std::max(peak, static_cast<double>(bf16(column[r]))); }
+            for (std::int32_t r = 0; r < R; ++r) { sum += std::exp(static_cast<double>(bf16(column[r])) - peak); }
+            const double exact_logprob = bf16(column[best[0]]) - (peak + std::log(sum));
+            const double error         = std::fabs(static_cast<double>(got_lp1[t]) - exact_logprob);
+            normalizer_sum += error;
+            normalizer_worst = std::max(normalizer_worst, error);
+        }
+    }
+    const double verify_rate = 100.0 * verify_same / positions, draft_rate = 100.0 * draft_same / positions;
+    std::printf("screened heads over %lld positions: LM head argmax same as the exact head %.3f%%; draft same as the "
+                "exact proposal head's argmax %.3f%%, all four ranks %.3f%%; draft log-probability error mean %.4f, "
+                "worst %.4f nats\n",
+                static_cast<long long>(positions), verify_rate, draft_rate, 100.0 * ranks_same / positions,
+                normalizer_sum / positions, normalizer_worst);
+    const bool ok = verify_rate >= 99.5 && draft_rate >= 99.5;
+    std::printf(ok ? "screened heads agree with the exact heads\n" : "FAIL: a screened head disagrees too often\n");
+    return ok;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -675,8 +831,9 @@ int main(int argc, char** argv) {
         std::int32_t chunk     = 256;
         std::int32_t dump_from = 0;
         KvCacheStorage kv      = KvCacheStorage::BFloat16;
-        bool cpu_columns   = false;
-        bool decode_widths = false;
+        bool cpu_columns    = false;
+        bool decode_widths  = false;
+        bool screened_heads = false;
     };
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     try {
@@ -712,6 +869,16 @@ int main(int argc, char** argv) {
             if (arg == "--decode-widths") {
                 if (jobs.empty()) { throw std::invalid_argument("--decode-widths needs a token list before it"); }
                 jobs.back().decode_widths = true;
+                continue;
+            }
+            if (arg == "--screened-heads") {
+                if (jobs.empty()) { throw std::invalid_argument("--screened-heads needs a token list before it"); }
+                jobs.back().screened_heads = true;
+                // Bind the proposal head (the MTP drafter's, --lm-head-draft) and both 2-bit screens.
+                load.speculative         = SpeculativeBackend::Mtp;
+                load.proposal_head       = ProposalHead::Optimized;
+                load.screened_draft_head = true;
+                load.screened_lm_head    = true;
                 continue;
             }
             if (jobs.empty() || i + 1 >= argc) { throw std::invalid_argument(arg + " needs a token list before it and a value"); }
@@ -857,6 +1024,7 @@ int main(int argc, char** argv) {
             return check_cpu_columns(parameters, device, volume, tokens, context, job.kv) ? 0 : 1;
         }
         if (job.decode_widths) { return check_decode_widths(parameters, device, volume, tokens, context, job.kv) ? 0 : 1; }
+        if (job.screened_heads) { return check_screened_heads(parameters, device, volume, tokens, context, job.kv) ? 0 : 1; }
         Harness harness(parameters, device, context, n, 3, job.kv);
         DeviceBuffer logits(vocab * 2 * sizeof(float));
         print_memory("harness");

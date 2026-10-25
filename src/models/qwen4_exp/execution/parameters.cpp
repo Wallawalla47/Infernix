@@ -285,6 +285,7 @@ Parameters::Parameters(const Model& source) : model(source) {
     } else {
         output_head = prepare.tensor(w.output_head);
     }
+    if (w.output_head_screen.valid()) { output_head_screen = prepare.linear({w.output_head_screen}).weight; }
     final_mixer     = prepare.hc(w.final_mixer);
 
     const auto banks = source.expert_banks();
@@ -405,6 +406,7 @@ Parameters::Parameters(const Model& source) : model(source) {
     if (w.proposal) {
         draft_head.rows      = prepare.linear({w.proposal->head});
         draft_head.token_ids = prepare.tensor(w.proposal->token_ids);
+        if (w.proposal->screen.valid()) { draft_head.screen = prepare.linear({w.proposal->screen}).weight; }
     }
     if (w.vision) {
         vision = with_context("vision", [&] { return prepare.vision(*w.vision); });

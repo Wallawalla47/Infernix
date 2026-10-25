@@ -17,6 +17,7 @@ The storage registry contains exactly these identities:
 | `row_scale_v1` | tensor layout | `fp8_e4m3fn_row_bf16` | rank 2 `[N,K]` | 256 bytes |
 | `g32_scale_rows16_v1` | tensor layout | `fp8_e4m3fn_g32_e8m0` | rank 2 `[N,K]`, `N % 16 == 0`, `K % 32 == 0` | 256 bytes |
 | `nvfp4_expert_rg16_v1` | tensor layout | `nvfp4_mul` | rank 3 `[E,H,I]`, `H % 16 == 0`, `I % 16 == 0` | 4096 bytes |
+| `nvfp4_rg16_v1` | tensor layout | `nvfp4_mul` | rank 2 `[N,K]`, `N % 16 == 0`, `K % 16 == 0` | 256 bytes |
 | `ggml_rows_v1` | tensor layout | every `ggml_*` format | rank 2 `[N,K]`, `K` whole blocks | 256 bytes |
 | `ggml_tiles16_v1` | tensor layout | `ggml_q4_k`, `ggml_q5_k`, `ggml_q6_k`, `ggml_iq4_xs` | rank 2 `[N,K]`, `K` whole blocks | 256 bytes |
 | `ggml_expert_iq4_nl_v1`, `ggml_expert_q2_0_v1` | tensor layout | `ggml_iq2_s`, `ggml_iq3_xxs`, `ggml_iq3_s`, `ggml_iq4_xs` | rank 3 `[E,H,I]`, whole blocks | 4096 bytes |
@@ -404,6 +405,24 @@ down multipliers at `multiplier_offset + 12e`, `+ 4` and `+ 8`. They are ModelOp
 The layout has no row views: a binding addresses the complete bank, and consumers obtain the record
 and multiplier planes from `expert_bank_planes`. Activation input scales are separate model-role
 tensors.
+
+### 6.1 `nvfp4_rg16_v1`
+
+`nvfp4_rg16_v1` stores one dense `nvfp4_mul` matrix `[N,K]` as an expert record stores each of its
+matrices, so the canonical W4A16 routes read it as they read an expert (Qwen3.5-122B-A10B's output
+head; NVIDIA FP4-Local's vision MLPs and merger):
+
+```text
+row_groups        = N / 16               blocks = K / 16
+unit_plane_bytes  = row_groups * blocks * 144
+multiplier_offset = align_up(unit_plane_bytes, 256)
+payload_bytes     = multiplier_offset + 4
+```
+
+Row group `rg` stores its `blocks` units (§6's 144-byte unit) in increasing block order: unit
+`(rg, b)` begins at `(rg * blocks + b) * 144`. Zero bytes pad the unit plane to the multiplier, one
+little-endian FP32 word (ModelOpt's `weight_scale_2`, copied unchanged). A binding addresses the
+complete matrix: the layout has no row views.
 
 ## 7. `ggml_rows_v1`
 

@@ -1,6 +1,7 @@
 """Exact reading of NVIDIA's Qwen3.8-Flash-Next-FP4-Local tensor encodings (design §6.1.2): the
 NVFP4-CSF compressed expert scales, the MXFP8 projections (``fp8_e4m3fn_g32_e8m0``) and the weight-only
-NVFP4 vision and MTP matrices, and the conversion of each into the artifact."""
+NVFP4 vision and MTP matrices, and the conversion of each into the artifact (the vision MLPs and merger
+word for word as dense ``nvfp4_mul`` matrices in ``nvfp4_rg16_v1``)."""
 
 from __future__ import annotations
 
@@ -26,7 +27,7 @@ from tools.convert.pipeline import convert
 from tools.convert.recipe import Recipe
 from tools.convert.sources.compressed_tensors import matrix_source
 from tools.convert.sources.logical import select_rows
-from tools.convert.sources.modelopt import csf_scale_words, nvfp4_matrix_words, nvfp4_values_source
+from tools.convert.sources.modelopt import csf_scale_words, nvfp4_matrix_words, nvfp4_mul_matrix_source
 from tools.convert.sources.safetensors import SafetensorsSource
 
 MXFP8 = "fp8_e4m3fn_g32_e8m0"
@@ -115,10 +116,15 @@ def test_weight_only_nvfp4_values_use_the_multiplier_exactly(tmp_path):
     multiplier = Fraction(float(torch.tensor(1.0 / 7.0, dtype=torch.float32)))
     e2m1 = [0, 0.5, 1, 1.5, 2, 3, 4, 6]
     with SafetensorsSource(tmp_path) as store:
-        source = nvfp4_values_source(store, leaf, (n, k))
+        source = nvfp4_mul_matrix_source(store, leaf, (n, k))
         values = source.values()
         assert values.dtype == torch.float64
         assert source.values(5 * k + 3, 9 * k + 1).equal(values[5 * k + 3 : 9 * k + 1])
+        # The stored words, unchanged: codes, block scales and the multiplier's FP32 word.
+        rows = source.read_encoded(5, 9)
+        assert rows.format == "nvfp4_mul" and rows.weight_divisor is None
+        assert torch.equal(rows.codes, codes[5:9]) and torch.equal(rows.scales, scales[5:9])
+        assert rows.weight_multiplier == torch.tensor(1.0 / 7.0, dtype=torch.float32).reshape(1).view(torch.uint8).numpy().tobytes()
     for row, col in ((0, 0), (3, 17), (31, 63)):
         nibble = (int(codes[row, col // 2]) >> (4 * (col % 2))) & 15
         code = Fraction(e2m1[nibble & 7]) * (-1 if nibble & 8 else 1)
@@ -223,6 +229,78 @@ def test_grouped_mxfp8_rows_and_bf16_values_convert_exactly(tmp_path):
     assert len(cast) == 1
     stored = torch.frombuffer(bytearray(cast[0]), dtype=torch.bfloat16).reshape(16, 64)
     assert torch.equal(stored.to(torch.float64), fp8_group_values(*words[a]))  # MXFP8 values are BF16 values
+
+
+def test_vision_nvfp4_matrices_convert_word_for_word(tmp_path):
+    """The recipe's vision rule (official_recipes._fp4_local_vision) through the converter: each
+    weight-only NVFP4 vision matrix becomes a dense nvfp4_mul matrix in nvfp4_rg16_v1 whose E2M1
+    codes, E4M3 block scales (plain, or restored from NVFP4-CSF) and FP32 multiplier word are the
+    checkpoint's, at a K of an odd block count (as fc2's 4304) and over several 16-row chunks; its
+    represented weights are the checkpoint's exact values; its Use runs 16-bit activations; a BF16
+    neighbour keeps its bytes; verify_artifact's check accepts it."""
+
+    from tools.artifact.codecs.nvfp4_expert import decode_nvfp4_rg16_words, dequantize_nvfp4_mul
+    from tools.convert.official_recipes import _fp4_local_vision
+    from tools.convert.qwen4_exp import _Qwen4ExpBuilder
+    from tools.flash_next.verify_artifact import verify_rg16
+
+    rng = np.random.default_rng(11)
+    fc1, fc2 = "model.visual.blocks.0.mlp.linear_fc1", "model.visual.merger.linear_fc2"
+    matrices = {fc1: (48, 80), fc2: (32, 64)}  # K 80: five blocks, a partial 128-element stage
+    names = {fc1: "vision/layers/0/mlp/fc1", fc2: "vision/merger/fc2"}
+    tensors, words = {}, {}
+    for leaf, (n, k) in matrices.items():
+        codes = rng.integers(0, 256, size=(n, k // 2), dtype=np.uint8)
+        scales = rng.integers(0x20, 0x7E, size=(n, k // 16), dtype=np.uint8)
+        scales[0, 0], scales[-1, -1] = 0x00, 0x7E  # a zero scale and the largest finite one
+        multiplier = torch.tensor(np.float32(rng.uniform(1e-4, 1e-2)))  # not a power of two
+        tensors[leaf + ".weight"] = torch.from_numpy(codes)
+        tensors[leaf + ".weight_scale_2"] = multiplier
+        if leaf == fc2:  # the scales in NVFP4-CSF, as the checkpoint stores its experts'
+            bases = np.clip(np.median(scales, axis=1).astype(np.int64) - 7, 0, 240).astype(np.uint8)
+            fixed, exceptions = _csf_encode(scales, bases)
+            tensors[leaf + ".weight_scale.nvfp4_csf_fixed"] = torch.from_numpy(fixed.reshape(-1))
+            tensors[leaf + ".weight_scale.nvfp4_csf_exceptions"] = torch.from_numpy(exceptions.astype(np.uint32))
+        else:
+            tensors[leaf + ".weight_scale"] = torch.from_numpy(scales).view(torch.float8_e4m3fn)
+        words[leaf] = (torch.from_numpy(codes), torch.from_numpy(scales), multiplier)
+    bias = torch.from_numpy(rng.standard_normal(48).astype(np.float32)).to(torch.bfloat16)
+    tensors[fc1 + ".bias"] = bias
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    save_file(tensors, str(source_dir / "model.safetensors"))
+    (source_dir / "config.json").write_text("{}", encoding="utf-8")
+    e2m1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+                        dtype=torch.float64)
+    with SafetensorsSource(source_dir) as store:
+        model = Model({"text": {"config": {}}, "vision": {"config": {}, "target": "text"}})
+        builder = _Qwen4ExpBuilder(model)
+        for leaf, shape in matrices.items():
+            builder.add(names[leaf], store, leaf + ".weight", shape, inputs=(names[leaf] + "_input",))
+        builder.add("vision/layers/0/mlp/fc1_bias", store, fc1 + ".bias", (48,))
+        recipe = Recipe(model)
+        _fp4_local_vision(model, recipe, store)
+        convert(model, recipe, tmp_path / "out.infernix", device="cpu", rows_per_chunk=16)
+        with Artifact(tmp_path / "out.infernix") as artifact:
+            bindings = artifact.directory.bindings
+            policies = {(u["parameter"], u["input"]): u["activation_policy"] for u in artifact.directory.uses}
+            for leaf, (n, k) in matrices.items():
+                name = names[leaf]
+                obj = artifact.object(bindings[name]["object"])
+                assert (obj.format, obj.layout, tuple(obj.shape)) == ("nvfp4_mul", "nvfp4_rg16_v1", (n, k))
+                stored = decode_nvfp4_rg16_words(artifact.read_object(obj.id), obj.shape)
+                codes, scales, multiplier = words[leaf]
+                assert torch.equal(stored["codes"], codes) and torch.equal(stored["scales"], scales)
+                assert stored["multiplier"].view(torch.int32) == multiplier.view(torch.int32)
+                nibbles = torch.stack((codes & 15, codes >> 4), dim=-1).reshape(n, k).long()
+                exact = (e2m1[nibbles] * scales.view(torch.float8_e4m3fn).double().repeat_interleave(16, dim=1)
+                         * float(multiplier))
+                assert torch.equal(dequantize_nvfp4_mul(stored["codes"], stored["scales"], float(stored["multiplier"])),
+                                   exact)
+                assert policies[(name, name + "_input")] == "A16Only"
+                assert verify_rg16(artifact, store, bindings[name], model.parameters[name])
+            kept = artifact.object(bindings["vision/layers/0/mlp/fc1_bias"]["object"])
+            assert kept.format == "bf16" and artifact.read_object(kept.id) == bias.view(torch.int16).numpy().tobytes()
 
 
 # ---------------------------------------------------------------------------- conversion helpers

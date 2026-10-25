@@ -58,8 +58,10 @@ infernix_add_op_test(infernix_offloaded_moe_qwen3_5_122b_test
 infernix_add_op_test(infernix_fp8_row_f32_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_fp8_row_f32.cpp"
   LIBRARIES infernix_ops)
-# The canonical W4A16 projection of Qwen3.5-122B-A10B's nvfp4_rg16_v1 head (GEMV and integer
-# tensor-core routes, FP32 and BF16 outputs) against the CPU engine's exact row sums, bit for bit.
+# The canonical W4A16 projection of an nvfp4_rg16_v1 matrix at every registered shape (Qwen3.5-122B-A10B's
+# head; Qwen3.8-Flash-Next FP4-Local's vision MLP and merger) on the GEMV and integer tensor-core routes,
+# FP32 and BF16 outputs, against the CPU engine's exact row sums bit for bit, and the vision shapes'
+# BF16 outputs against an FP64 oracle over independently decoded weights.
 infernix_add_op_test(infernix_rg16_linear_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_rg16_linear.cu"
   LIBRARIES infernix_ops)
@@ -97,6 +99,14 @@ infernix_add_op_test(infernix_lossless_kv_encode_test
 infernix_add_op_test(infernix_linear_topk_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_linear_topk.cu"
   LIBRARIES infernix_ops)
+
+# Screened vocabulary heads at Qwen3.8-Flash-Next's shapes (q4 proposal head, BF16 and q8 LM heads with
+# their 2-bit screens): screen scores against FP64, rescored rows against projection_fp32's bits, the
+# selection's margin and cap, the same argmax as the full head, column invariance and graph replay.
+infernix_add_op_test(infernix_screened_head_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_screened_head.cpp"
+  LIBRARIES infernix_linear_test_support)
+set_tests_properties(infernix_screened_head_test PROPERTIES TIMEOUT 1800)
 
 infernix_add_op_test(infernix_candidate_selector_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_candidate_selector.cpp"

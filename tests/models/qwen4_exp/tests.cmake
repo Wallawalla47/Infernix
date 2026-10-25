@@ -88,6 +88,12 @@ infernix_add_test(infernix_qwen4_exp_vision_window_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_vision_window.cpp"
   LIBRARIES infernix_model_runtime)
 
+# FP4-Local's nvfp4_rg16_v1 vision MLP and merger at binding, Linear planning and offload staging
+# (host only).
+infernix_add_test(infernix_qwen4_exp_vision_rg16_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_vision_rg16.cpp"
+  LIBRARIES infernix_model_loading)
+
 # The prefix cache's prefill call planner: coverage, grids, exact-tap admission (host only).
 infernix_add_test(infernix_qwen4_exp_call_plan_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_call_plan.cpp"

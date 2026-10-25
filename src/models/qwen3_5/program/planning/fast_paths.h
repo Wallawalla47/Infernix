@@ -69,7 +69,8 @@ struct FastPathConfiguration {
     case FastPath::AdaptiveMtp:
     case FastPath::AdaptiveDFlash:
     case FastPath::IdleWidePrefill:
-    case FastPath::GgmlBf16Prefill: return true;
+    case FastPath::GgmlBf16Prefill:
+    case FastPath::ScreenedLmHead: return true;
     }
     return false;
 }

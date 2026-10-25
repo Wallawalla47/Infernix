@@ -518,6 +518,40 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
             out->weights.proposal = proposal;
         }
     }
+    // The converter's 2-bit screens (screen/*, --screen-heads): optional, bound only for their consumer
+    // (an artifact without them loads as before), and refused cleanly when that consumer is asked for
+    // and the artifact lacks them.
+    if (options.screened_draft_head) {
+        if (!out->config.mtp || !out->weights.proposal) {
+            throw ArtifactError("INFERNIX_TMP_SCREENED_DRAFT_HEAD screens the MTP drafter's proposal head: it needs "
+                                "--spec mtp with --lm-head-draft");
+        }
+        if (!binder.contains("screen/proposal_head")) {
+            throw ArtifactError("INFERNIX_TMP_SCREENED_DRAFT_HEAD needs the proposal head's 2-bit screen "
+                                "(screen/proposal_head): convert the artifact with --proposal --screen-heads");
+        }
+        out->weights.proposal->screen = bindings.parameter(
+            "screen/proposal_head", {out->config.proposal_rows, out->config.text.hidden_size}, {}, QType::Q2_G64_FP16);
+    }
+    if (options.screened_lm_head && options.purpose == EnginePurpose::Generation) {
+        if (!binder.contains("screen/output_head")) {
+            throw ArtifactError("--fast-path screened-lm-head needs the LM head's 2-bit screen (screen/output_head): "
+                                "convert the artifact with --screen-heads");
+        }
+        // The exact rescore covers a BF16 head (recipe A, FP8, FP4-Local) and a row-split q8_g32_fp16 one
+        // (Dense8, recipe C); any other head is refused here rather than at the first screened round.
+        for (const auto& part : bindings.weights.at(out->weights.output_head.index).reference.binding.parts) {
+            const auto& tensor     = reader.directory().tensor(part.object);
+            const QType format     = artifact::parse_format(tensor.format);
+            const QuantLayout kind = artifact::parse_layout(tensor.layout);
+            if (format != QType::BF16 && !(format == QType::Q8_G32_FP16 && kind == QuantLayout::RowSplit)) {
+                throw ArtifactError("--fast-path screened-lm-head rescores a BF16 or row-split q8_g32_fp16 LM head; "
+                                    "this artifact's head is " + tensor.format);
+            }
+        }
+        out->weights.output_head_screen = bindings.parameter(
+            "screen/output_head", {out->config.text.vocab_size, out->config.text.hidden_size}, {}, QType::Q2_G64_FP16);
+    }
     // Every layer's bank runs the arithmetic parse_config chose (bind_moe checked each against it);
     // W4A4 banks read their activation scales.
     if (!out->config.text.moe.a16_experts) {

@@ -116,6 +116,9 @@ struct DFlash2Parameters {
 struct DraftHeadParameters {
     std::optional<LinearParameters> rows; // the proposal head (q4/q8 [rows, H]); empty = text head
     Tensor token_ids;                     // I32 [rows]
+    // The rows' 2-bit screen (q2_g64_fp16 [rows, H]) when bound (INFERNIX_TMP_SCREENED_DRAFT_HEAD): the
+    // drafts then come from ops::screened_head_top.
+    std::optional<Weight> screen;
 };
 
 struct BlockParameters {
@@ -138,6 +141,8 @@ public:
     // Recipe B's 8-bit head (q8_g32_fp16 [V, H], FP32 logits), or a GGUF import's head (ggml blocks,
     // FP32 logits from ops::ggml_linear); output_head is then empty.
     std::optional<LinearParameters> output_head_q8;
+    // output_head's 2-bit screen (q2_g64_fp16 [V, H]) when bound (the screened-lm-head fast path).
+    std::optional<Weight> output_head_screen;
     HyperConnectionParameters final_mixer;
     std::vector<BlockParameters> layers;
     std::optional<MtpParameters> mtp;
