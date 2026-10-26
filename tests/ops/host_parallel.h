@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <exception>
 #include <thread>
@@ -15,7 +16,8 @@ inline std::int64_t host_thread_count() {
 // Calls `body(begin, end)` over contiguous ranges that partition [0, count), on up to `threads`
 // host threads (inline when one suffices), and rethrows the first worker exception. Each index
 // must be evaluated independently of the partition and write only its own outputs, so the result
-// is identical for every thread count.
+// is identical for every thread count. The threads take the ranges (about four per thread) in
+// turn, so uneven ranges, or threads slowed by other processes, leave none of them idle long.
 template <typename Body>
 void parallel_ranges(std::int64_t count, std::int64_t threads, const Body& body) {
     threads = std::min(threads, count);
@@ -23,13 +25,15 @@ void parallel_ranges(std::int64_t count, std::int64_t threads, const Body& body)
         if (count > 0) body(std::int64_t{0}, count);
         return;
     }
+    const std::int64_t ranges = std::min(count, threads * 4);
+    std::atomic<std::int64_t> next{0};
     std::vector<std::thread> workers;
     std::vector<std::exception_ptr> errors(static_cast<std::size_t>(threads));
     workers.reserve(static_cast<std::size_t>(threads));
     for (std::int64_t t = 0; t < threads; ++t) {
         workers.emplace_back([&, t] {
             try {
-                body(count * t / threads, count * (t + 1) / threads);
+                for (std::int64_t r = next++; r < ranges; r = next++) body(count * r / ranges, count * (r + 1) / ranges);
             } catch (...) { errors[static_cast<std::size_t>(t)] = std::current_exception(); }
         });
     }

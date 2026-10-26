@@ -13,7 +13,6 @@ import random
 import struct
 import subprocess
 import sys
-import tempfile
 from fractions import Fraction
 from pathlib import Path
 
@@ -1285,18 +1284,17 @@ def write_cases(path: Path) -> None:
 
 
 def main() -> int:
-    """lossless_ops_oracle.py <family executable> <test name> [case file]: a given case file is written once and
-    reused afterwards (the cases are deterministic)."""
+    """lossless_ops_oracle.py <family executable> <test name> [cache directory]: with a directory, the cases are
+    written there once per version of this file and lossless_cr_oracle.py and reused afterwards (they are
+    deterministic)."""
     command = sys.argv[1:3]  # the family executable and the test name (tests/ops/op_family.h)
-    if len(sys.argv) > 3:
-        path = Path(sys.argv[3])
-        if not path.is_file():
-            write_cases(path)
+    sources = [Path(__file__), Path(cr.__file__)]
+    path, tmp = cr.cached_file(sys.argv[3] if len(sys.argv) > 3 else None, "ops_cases", sources, write_cases)
+    try:
         return subprocess.run([*command, str(path)], check=False).returncode
-    with tempfile.TemporaryDirectory() as tmp:
-        path = Path(tmp) / "ops_cases.bin"
-        write_cases(path)
-        return subprocess.run([*command, str(path)], check=False).returncode
+    finally:
+        if tmp is not None:
+            tmp.cleanup()
 
 
 if __name__ == "__main__":

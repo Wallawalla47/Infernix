@@ -23,12 +23,12 @@ infernix_add_family_op_test(infernix_linear_q56_fp32_scale_test FAMILY linear
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_q56_fp32_scale.cpp"
   LIBRARIES infernix_linear_test_support)
 set_tests_properties(infernix_linear_q56_fp32_scale_test PROPERTIES
-  ENVIRONMENT "INFERNIX_TMP_Q56_FP32_SCALE=0" TIMEOUT 900 RUN_SERIAL TRUE)
+  ENVIRONMENT "INFERNIX_TMP_Q56_FP32_SCALE=0" TIMEOUT 900)
 foreach(q56_test infernix_linear_q56_fp32_scale_test infernix_linear_q5_a16_test
         infernix_linear_q6_a16_test)
   add_test(NAME ${q56_test}_fp32_scale COMMAND ${${q56_test}_COMMAND})
   set_tests_properties(${q56_test}_fp32_scale PROPERTIES
-    ENVIRONMENT "INFERNIX_TMP_Q56_FP32_SCALE=1" SKIP_RETURN_CODE 77 TIMEOUT 900 RUN_SERIAL TRUE)
+    ENVIRONMENT "INFERNIX_TMP_Q56_FP32_SCALE=1" SKIP_RETURN_CODE 77 TIMEOUT 900)
 endforeach()
 
 infernix_add_family_op_test(infernix_linear_q8_a16_test FAMILY linear

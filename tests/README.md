@@ -95,7 +95,18 @@ statistics still drive the normal verdict. Passing tests remain quiet without it
 `infernix_softmax_attention_test` and the causal suite as one entry per KV type
 (`infernix_softmax_attention_<type>_test`, and `infernix_softmax_attention_wide_<type>_test` for
 `--wide-only`), so `ctest -j` runs the KV types concurrently; together the entries run exactly the
-cases of one unsharded invocation.
+cases of one unsharded invocation. `--geometry d256-h24-kv4|d256-h16-kv2|d256-h32-kv2` and
+`--columns LO-HI` keep only the causal cases of that geometry and of calls of LO to HI columns per
+row; a temporary switch's entry uses them to run only the calls its switch reaches.
+
+The lossless route's exact Python oracles (`tests/ops/lossless_cr_oracle.py`, which evaluates on every
+core, and `lossless_ops_oracle.py`) keep their deterministic output in `build/tests/oracle-cache/`, keyed by
+their sources and the Python version, so a tree computes it once per oracle change.
+
+`infernix_offloaded_moe_layer_test --no-idle` runs every layer check except the idle-service latency
+bounds, which `--idle-only` runs: CTest runs the former beside other tests and the latter alone
+(`infernix_offloaded_moe_layer_idle*_test`), since a bound of a few milliseconds holds only with the
+GPU to itself.
 
 `infernix_gdn_replay_fold_test --wide-only` likewise splits into one CTest entry per width and layer
 profile (`infernix_gdn_replay_fold_wide_w<width>_l<layers>_test`, from `--width 33|48|64 --layers

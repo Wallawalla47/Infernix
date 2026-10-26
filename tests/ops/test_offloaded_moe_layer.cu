@@ -39,6 +39,7 @@
 #include <mutex>
 #include <random>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -51,6 +52,12 @@ using infernix::test::cuda_check;
 namespace {
 
 int g_failures = 0;
+
+// The idle-service latency checks (Config::idle) bound a call's time to a few milliseconds, which holds
+// only with the GPU to themselves, so CTest runs them as an entry of their own (--idle-only, run alone)
+// and every other check beside other tests (--no-idle). Without either flag everything runs.
+enum class IdleChecks { kAll, kSkip, kOnly };
+IdleChecks g_idle_checks = IdleChecks::kAll;
 
 // Live hosts get production's bound (kHeartbeatTimeoutNs, 10 s): under a loaded machine a 1 s bound
 // mistook OS scheduling stalls for dead hosts. The silent-host cases wait their whole bound, so they
@@ -503,6 +510,10 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
                                 Config{.slots = 64, .service = nullptr, .idle = 1},
                                 Config{.slots = 64, .service = &service_eight, .idle = 1},
                                 Config{.slots = 64, .service = &service_eight, .idle = 2}}) {
+        if ((g_idle_checks == IdleChecks::kSkip && config.idle > 0) ||
+            (g_idle_checks == IdleChecks::kOnly && config.idle == 0)) {
+            continue;
+        }
         const int slots = config.slots;
         // A fresh dispatch: a fetch call reorders its jobs (fetch-served last).
         infernix::ops::moe_dispatch(routing, experts, dispatch, nullptr, nullptr);
@@ -719,7 +730,7 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
             cuda_check(cudaMemset(d_frame_base + static_cast<std::size_t>(resident) * stride, 0, 3 * stride), "cudaMemset");
         }
     }
-    if (experts == 12) {
+    if (experts == 12 && g_idle_checks != IdleChecks::kOnly) {
         // A CPU channel whose host never answers and whose heartbeat stands still: the wait gives up
         // after heartbeat_timeout_ns and reports it in the error word instead of trapping, and the
         // device stays usable.
@@ -1360,16 +1371,26 @@ INFERNIX_OP_TEST(offloaded_moe_layer) {
         std::printf("SKIP: no usable CUDA device\n");
         return 77;
     }
+    if (argc == 2 && std::string_view(argv[1]) == "--no-idle") {
+        g_idle_checks = IdleChecks::kSkip;
+    } else if (argc == 2 && std::string_view(argv[1]) == "--idle-only") {
+        g_idle_checks = IdleChecks::kOnly;
+    } else if (argc != 1) {
+        std::fprintf(stderr, "usage: infernix_offloaded_moe_layer_test [--no-idle | --idle-only]\n");
+        return 2;
+    }
     try {
-        for (const int entries : {1, 10, 1024, 1025, 40960}) { test_dispatch(512, entries, 100U + entries); }
-        test_dispatch(1024, 1024, 31); // every expert slot of the one-CTA kernel
-        test_dispatch(3, 1000, 37);    // few experts, long runs per expert
-        for (const int columns : {1, 5, 32, 33}) { test_route_dispatch(512, columns, 10, 200U + columns); }
-        test_route_dispatch(512, 64, 16, 233); // 1024 entries past the one-kernel column count
-        test_route_dispatch(9, 3, 3, 239);     // few experts: lanes past E in every selection
-        for (const int columns : {1, 5}) { test_combine_inject(columns, 10, 4, 300U + columns); }
-        test_service_column_bound();
-        test_service_failure_reported();
+        if (g_idle_checks != IdleChecks::kOnly) {
+            for (const int entries : {1, 10, 1024, 1025, 40960}) { test_dispatch(512, entries, 100U + entries); }
+            test_dispatch(1024, 1024, 31); // every expert slot of the one-CTA kernel
+            test_dispatch(3, 1000, 37);    // few experts, long runs per expert
+            for (const int columns : {1, 5, 32, 33}) { test_route_dispatch(512, columns, 10, 200U + columns); }
+            test_route_dispatch(512, 64, 16, 233); // 1024 entries past the one-kernel column count
+            test_route_dispatch(9, 3, 3, 239);     // few experts: lanes past E in every selection
+            for (const int columns : {1, 5}) { test_combine_inject(columns, 10, 4, 300U + columns); }
+            test_service_column_bound();
+            test_service_failure_reported();
+        }
         test_layer(12, 1, 10, 7);  // decode: one column, ten experts
         test_layer(24, 8, 10, 11); // the widest forked call: more jobs than one 3-slot pass
         test_layer(9, 5, 3, 13);   // several columns per expert: several passes per job
@@ -1379,9 +1400,11 @@ INFERNIX_OP_TEST(offloaded_moe_layer) {
         test_layer(400, 64, 10, 23); // more than 256 jobs: the plan ranks in several chunks
         test_layer(512, 512, 10, 29);  // a short prompt's call: ~10 columns per expert, hundreds of narrow jobs
         test_layer(512, 2048, 10, 31); // a wider call: x published from thousands of columns
-        test_tail_skip(48, 1, 10, 7, 401);  // decode: one column, Strata's default rank
-        test_tail_skip(48, 6, 10, 5, 403);  // MTP verification width: an expert skips only if every column ranks it low
-        test_tail_skip(96, 16, 10, 8, 409); // two verify rows: past the fork route, wide experts never skipped
+        if (g_idle_checks != IdleChecks::kOnly) {
+            test_tail_skip(48, 1, 10, 7, 401);  // decode: one column, Strata's default rank
+            test_tail_skip(48, 6, 10, 5, 403);  // MTP verification width: an expert skips only if every column ranks it low
+            test_tail_skip(96, 16, 10, 8, 409); // two verify rows: past the fork route, wide experts never skipped
+        }
         // W4A16 experts (§16.2.1): decode, verification, several columns per expert, many misses, and
         // a short prompt's call (experts of more than eight columns on the narrow kernels). Calls of
         // four columns take the one-column kernels and of five or more the multi-column ones.

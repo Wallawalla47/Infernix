@@ -24,6 +24,7 @@
 #include "core/decode_graph.h"
 #include "core/device.h"
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -136,6 +137,20 @@ constexpr Geometry kGeometries[] = {
     {"d256-h16-kv2", 16, 2},
     {"d256-h32-kv2", 32, 2}, // Qwen3.5-122B-A10B: GQA group 16
 };
+
+// The cases a run selects (--geometry, --columns): those of one geometry and of calls whose width
+// (columns per row) lies in [min_columns, max_columns]. Each case draws its own fixture from its seed,
+// so a selection runs exactly the selected cases of an unselected run.
+struct CaseSelection {
+    std::optional<std::string> geometry;
+    std::int32_t min_columns = 1;
+    std::int32_t max_columns = std::numeric_limits<std::int32_t>::max();
+
+    [[nodiscard]] bool includes(const Geometry& candidate, std::int32_t columns) const {
+        return (!geometry || *geometry == candidate.name) && columns >= min_columns && columns <= max_columns;
+    }
+};
+CaseSelection g_selection;
 
 ops::AttentionHeadGeometry op_geometry(const Geometry& geometry) {
     return {kHeadDim, geometry.q_heads, geometry.kv_heads};
@@ -1935,6 +1950,7 @@ int run_a1_case(DeviceExecutionView execution, const Geometry& geometry, KvCache
                 const AttentionCase& test_case, MappingPattern mapping,
                 std::span<const int> oracle_queries         = {},
                 std::span<const std::uint32_t> graph_limits = {}) {
+    if (!g_selection.includes(geometry, test_case.tokens)) return 0;
     const std::int32_t total       = test_case.base + test_case.tokens;
     const std::int32_t max_context = static_cast<std::int32_t>(
         std::max<std::uint32_t>(static_cast<std::uint32_t>(total + 3), test_case.envelope_max));
@@ -2072,6 +2088,7 @@ int run_a1_case(DeviceExecutionView execution, const Geometry& geometry, KvCache
 int run_a3_case(DeviceExecutionView execution, const Geometry& geometry, KvCacheStorage storage,
                 const AttentionCase& test_case, MappingPattern mapping,
                 std::span<const int> oracle_queries = {}) {
+    if (!g_selection.includes(geometry, test_case.tokens)) return 0;
     const std::int32_t total       = test_case.base + test_case.tokens;
     const std::int32_t max_context = static_cast<std::int32_t>(
         std::max<std::uint32_t>(static_cast<std::uint32_t>(total + 3), test_case.envelope_max));
@@ -2210,6 +2227,7 @@ int verify_invalid_columns_zero(const std::string& label, std::span<const std::u
 int run_batch_case(DeviceExecutionView execution, const Geometry& geometry, KvCacheStorage storage,
                    const BatchAttentionCase& test_case, int envelope_max = 0,
                    std::span<const std::uint32_t> graph_limits = {}) {
+    if (!g_selection.includes(geometry, test_case.width)) return 0;
     const int batch = test_case.contexts.size(), width = test_case.width;
     const int pool_rows = std::max(
         batch, *std::max_element(test_case.table_rows.begin(), test_case.table_rows.end()) + 1);
@@ -3493,6 +3511,7 @@ int run_masked_prefix_invariance_case(DeviceExecutionView execution, const Geome
                                       const std::vector<std::int32_t>& long_valid,
                                       const std::vector<std::int32_t>& short_valid,
                                       std::uint32_t seed) {
+    if (!g_selection.includes(geometry, width)) return 0;
     const int batch = static_cast<int>(contexts.size());
     int maximum     = 1;
     for (const int context : contexts) maximum = std::max(maximum, context + width);
@@ -3644,6 +3663,15 @@ int run_storage_cases(DeviceExecutionView execution, KvCacheStorage storage) {
 }
 
 } // namespace
+
+void select_softmax_attention_cases(std::optional<std::string> geometry, std::int32_t min_columns,
+                                    std::int32_t max_columns) {
+    if (geometry && std::none_of(std::begin(kGeometries), std::end(kGeometries),
+                                 [&](const Geometry& candidate) { return *geometry == candidate.name; }))
+        throw std::invalid_argument("unknown attention geometry " + *geometry);
+    if (min_columns < 1 || max_columns < min_columns) throw std::invalid_argument("invalid --columns range");
+    g_selection = {std::move(geometry), min_columns, max_columns};
+}
 
 int run_softmax_attention_wide_tests(std::optional<KvCacheStorage> selected) {
     if (cuda_unavailable()) {
