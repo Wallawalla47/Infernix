@@ -54,6 +54,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import os
 import subprocess
 import sys
 import time
@@ -292,6 +293,8 @@ def _run_engine(config: dict, step: Step, log) -> int:
     logits = config["logits"] if engine["kind"] == "rows-command" else engine.get("logits", "fp32")
     meta = {"arm": "engine", "engine": engine["name"], "kind": engine["kind"], "protocol": step.protocol,
             "settings": engine.get("settings", ""), "logits": logits}
+    # The engine's own environment (a patched build's switches, e.g. LLAMA_KLD_ROUND_BF16).
+    env = dict(os.environ, **{key: str(value) for key, value in engine.get("env", {}).items()})
     started = time.monotonic()
     if engine["kind"] == "llama-perplexity":
         if "base_chunks" in engine:
@@ -299,7 +302,7 @@ def _run_engine(config: dict, step: Step, log) -> int:
             if not base.exists():
                 llama_kld.head(_base(config), int(engine["base_chunks"]), base)
             meta["chunks"] = int(engine["base_chunks"])
-        result = subprocess.run(step.argv, stdout=log, stderr=subprocess.STDOUT, timeout=step.minutes * 60)
+        result = subprocess.run(step.argv, stdout=log, stderr=subprocess.STDOUT, timeout=step.minutes * 60, env=env)
         if result.returncode != 0:
             return result.returncode
         text = Path(log.name).read_text(encoding="utf-8", errors="replace")
@@ -313,7 +316,7 @@ def _run_engine(config: dict, step: Step, log) -> int:
         scorer = [config["certify"], "llama-rows", "--llama-base", str(_base(config)), "--rows", "-",
                   "--out", str(prefix) + ".rows", "--label", engine["name"], "--chunks", str(config["chunks"]),
                   "--round-logits", "bf16" if config["logits"] == "bf16" else "none"]
-        producer = subprocess.Popen(step.argv, stdout=subprocess.PIPE, stderr=log)
+        producer = subprocess.Popen(step.argv, stdout=subprocess.PIPE, stderr=log, env=env)
         consumer = subprocess.Popen(scorer, stdin=producer.stdout, stdout=log, stderr=log)
         producer.stdout.close()
         try:
