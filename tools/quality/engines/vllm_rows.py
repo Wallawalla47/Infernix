@@ -43,6 +43,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     context, vocab, total, tokens = read_base(args.base)
     chunks = total if args.chunks == 0 else args.chunks
+    # The rows own standard output: vLLM and its libraries log to stdout, so file descriptor 1 (and sys.stdout) go
+    # to stderr and the rows to a private copy of the original descriptor.
+    sys.stdout.flush()
+    out = os.fdopen(os.dup(1), "wb")
+    os.dup2(2, 1)
+    sys.stdout = sys.stderr
 
     import torch
     from vllm import LLM, SamplingParams
@@ -69,7 +75,6 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("could not reach the model's compute_logits")
     params = SamplingParams(max_tokens=1, temperature=0.0, prompt_logprobs=0)
     first = context // 2
-    out = sys.stdout.buffer
     for c in range(chunks):
         captured.clear()
         llm.generate([TokensPrompt(prompt_token_ids=[int(t) for t in tokens[c]])], params, use_tqdm=False)
