@@ -227,6 +227,7 @@ infernix_add_family_op_test(infernix_rmsnorm_rope_test FAMILY elementwise
 
 infernix_add_family_op_test(infernix_context_kv_materialize_test FAMILY attention
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_context_kv_materialize.cpp"
+          "${CMAKE_CURRENT_LIST_DIR}/ring_footprint.cu"
   LIBRARIES infernix_ops)
 
 add_test(NAME infernix_kv_cache_append_nvfp4_test

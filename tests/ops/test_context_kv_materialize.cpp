@@ -6,6 +6,7 @@
 #include "ops/op_tester.h"
 #include "core/decode_graph.h"
 #include "ops/quantized_weight.h"
+#include "ops/ring_footprint.h"
 
 #include <algorithm>
 #include <array>
@@ -224,20 +225,29 @@ void append_key_oracle(const LayerStorage& layer, const float* input, int head, 
     }
 }
 
-// Every layer's K and V rings, read back once per launch for both verifiers.
+// The rings' slot rows (a lane's head's slot: kHeadDim elements), classified on the device once per
+// launch: which of each row's K and V elements left the sentinel. Only these flags and the rows a
+// verifier samples come back to the host.
 struct CacheSnapshot {
-    std::array<std::vector<std::uint16_t>, kMaxLayers> k;
-    std::array<std::vector<std::uint16_t>, kMaxLayers> v;
+    std::array<const void*, kMaxLayers> k{};
+    std::array<const void*, kMaxLayers> v{};
+    std::array<std::vector<std::uint8_t>, kMaxLayers> flags;
 };
+
+constexpr std::int64_t kRingSlotRows = static_cast<std::int64_t>(kPaddedCapacity) * kHeads * kLaneCapacity;
+
+std::int64_t slot_row(int lane, int head, int slot) {
+    return static_cast<std::int64_t>(cache_index(lane, head, slot, 0) / kHeadDim);
+}
 
 CacheSnapshot read_caches(const Fixture& fixture) {
     CacheSnapshot snapshot;
     for (int layer = 0; layer < g_layers; ++layer) {
         const LayerStorage& source = fixture.storage[static_cast<std::size_t>(layer)];
-        snapshot.k[static_cast<std::size_t>(layer)] =
-            from_device<std::uint16_t>(source.cache_k.data(), cache_elements());
-        snapshot.v[static_cast<std::size_t>(layer)] =
-            from_device<std::uint16_t>(source.cache_v.data(), cache_elements());
+        const auto at              = static_cast<std::size_t>(layer);
+        snapshot.k[at]             = source.cache_k.data();
+        snapshot.v[at]             = source.cache_v.data();
+        snapshot.flags[at] = ring_row_flags(source.cache_k.data(), source.cache_v.data(), kHeadDim, kRingSlotRows, kSentinel);
     }
     return snapshot;
 }
@@ -253,39 +263,34 @@ int verify_state_effect(const std::string& label, const CacheSnapshot& snapshot,
         }
     }
 
-    // Each (layer, lane, head) ring row is scanned independently for its first bad element; the
-    // first one found per layer in row order is the element one ascending scan would report.
-    const int kRingRows = g_layers * kLaneCapacity * kHeads;
-    std::vector<int> row_first_bad(kRingRows, -1);
-    parallel_ranges(kRingRows, host_thread_count(), [&](std::int64_t begin, std::int64_t end) {
-        for (auto ring = static_cast<int>(begin); ring < end; ++ring) {
-            const int layer     = ring / (kLaneCapacity * kHeads);
-            const int lane      = ring / kHeads % kLaneCapacity;
-            const int head      = ring % kHeads;
-            const auto& cache_k = snapshot.k[static_cast<std::size_t>(layer)];
-            const auto& cache_v = snapshot.v[static_cast<std::size_t>(layer)];
-            int& first_bad      = row_first_bad[static_cast<std::size_t>(ring)];
-            for (int slot = 0; slot < kPaddedCapacity && first_bad < 0; ++slot) {
-                const bool written = written_slots[static_cast<std::size_t>(lane)].contains(slot);
-                for (int dim = 0; dim < kHeadDim; ++dim) {
-                    const std::size_t index = cache_index(lane, head, slot, dim);
-                    const bool k_changed    = cache_k[index] != kSentinel;
-                    const bool v_changed    = cache_v[index] != kSentinel;
-                    if (k_changed != written || v_changed != written) {
-                        first_bad = static_cast<int>(index);
-                        break;
-                    }
-                }
-            }
-        }
-    });
-
+    // A slot row is right when every K and V element left the sentinel (written) or none did. The
+    // first wrong row per layer, scanning (lane, head) rings and their slots in order, holds the first
+    // wrong element one ascending element scan would report; that row alone is read to name it.
     int failures = 0;
     for (int layer = 0; layer < g_layers; ++layer) {
-        int first_bad = -1;
-        for (int row = 0; row < kLaneCapacity * kHeads && first_bad < 0; ++row) {
-            first_bad =
-                row_first_bad[static_cast<std::size_t>(layer * kLaneCapacity * kHeads + row)];
+        const auto& flags = snapshot.flags[static_cast<std::size_t>(layer)];
+        int first_bad     = -1;
+        for (int ring = 0; ring < kLaneCapacity * kHeads && first_bad < 0; ++ring) {
+            const int lane = ring / kHeads;
+            const int head = ring % kHeads;
+            for (int slot = 0; slot < kPaddedCapacity; ++slot) {
+                const bool written = written_slots[static_cast<std::size_t>(lane)].contains(slot);
+                const std::int64_t row = slot_row(lane, head, slot);
+                const std::uint8_t f   = flags[static_cast<std::size_t>(row)];
+                const bool right = written ? (f & kRingKeyAll) && (f & kRingValueAll)
+                                           : !(f & kRingKeySome) && !(f & kRingValueSome);
+                if (right) continue;
+                const auto keys   = ring_rows(snapshot.k[static_cast<std::size_t>(layer)], kHeadDim, {row});
+                const auto values = ring_rows(snapshot.v[static_cast<std::size_t>(layer)], kHeadDim, {row});
+                for (int dim = 0; dim < kHeadDim && first_bad < 0; ++dim) {
+                    const bool k_changed = keys[static_cast<std::size_t>(dim)] != kSentinel;
+                    const bool v_changed = values[static_cast<std::size_t>(dim)] != kSentinel;
+                    if (k_changed != written || v_changed != written) {
+                        first_bad = static_cast<int>(cache_index(lane, head, slot, dim));
+                    }
+                }
+                break;
+            }
         }
         if (first_bad >= 0) {
             std::cerr << label << " layer=" << layer
@@ -338,11 +343,23 @@ int verify_numeric_samples(const std::string& label, const Fixture& fixture,
             }
         });
 
+    // The sampled slot rows: every sampled head's K row, and the V rows holding value_rows.
+    const auto sample_slot_row = [&](std::size_t sample, int head) {
+        const auto [batch, local] = samples[sample];
+        const int position        = positions[static_cast<std::size_t>(batch * width + local)];
+        return slot_row(state_slots[static_cast<std::size_t>(batch)], head, position & (kCapacity - 1));
+    };
+    std::vector<std::int64_t> key_rows, value_slot_rows;
+    for (std::size_t sample = 0; sample < samples.size(); ++sample) {
+        for (const int head : heads) key_rows.push_back(sample_slot_row(sample, head));
+        for (const int row : value_rows) value_slot_rows.push_back(sample_slot_row(sample, row / kHeadDim));
+    }
+
     int failures = 0;
     for (int layer = 0; layer < g_layers; ++layer) {
         const LayerStorage& source = fixture.storage[static_cast<std::size_t>(layer)];
-        const auto& cache_k_bits   = snapshot.k[static_cast<std::size_t>(layer)];
-        const auto& cache_v_bits   = snapshot.v[static_cast<std::size_t>(layer)];
+        const auto key_bits   = ring_rows(snapshot.k[static_cast<std::size_t>(layer)], kHeadDim, key_rows);
+        const auto value_bits = ring_rows(snapshot.v[static_cast<std::size_t>(layer)], kHeadDim, value_slot_rows);
         std::vector<double> key_got;
         std::vector<double> key_expected;
         std::vector<double> value_got;
@@ -350,34 +367,30 @@ int verify_numeric_samples(const std::string& label, const Fixture& fixture,
         for (std::size_t sample = 0; sample < samples.size(); ++sample) {
             const auto [batch, local] = samples[sample];
             const int column          = batch * width + local;
-            const int position        = positions[static_cast<std::size_t>(column)];
-            const int slot            = position & (kCapacity - 1);
-            const int lane            = state_slots[static_cast<std::size_t>(batch)];
             const float* input = context.data() + static_cast<std::size_t>(column) * g_hidden;
             for (std::size_t head_index = 0; head_index < heads.size(); ++head_index) {
-                const int head = heads[head_index];
                 const std::vector<double>& head_expected =
                     key_oracles[key_oracle_index(layer, sample, head_index)];
+                const std::uint16_t* key_row =
+                    key_bits.data() + (sample * heads.size() + head_index) * static_cast<std::size_t>(kHeadDim);
                 for (int pair = 0; pair < kHeadDim / 2; ++pair) {
                     const int first_dim  = pair;
                     const int second_dim = pair + kHeadDim / 2;
-                    key_got.push_back(
-                        bf16_to_f32(cache_k_bits[cache_index(lane, head, slot, first_dim)]));
+                    key_got.push_back(bf16_to_f32(key_row[first_dim]));
                     key_expected.push_back(head_expected[static_cast<std::size_t>(2 * pair)]);
-                    key_got.push_back(
-                        bf16_to_f32(cache_k_bits[cache_index(lane, head, slot, second_dim)]));
+                    key_got.push_back(bf16_to_f32(key_row[second_dim]));
                     key_expected.push_back(head_expected[static_cast<std::size_t>(2 * pair + 1)]);
                 }
             }
-            for (const int row : value_rows) {
-                const int head          = row / kHeadDim;
-                const int dim           = row - head * kHeadDim;
+            for (std::size_t value_index = 0; value_index < value_rows.size(); ++value_index) {
+                const int row           = value_rows[value_index];
+                const int dim           = row % kHeadDim;
                 const float represented = represented_projection(source.value_logical, row, input);
                 const std::uint16_t expected_bits =
                     quantized_weight::detail::f32_to_f16(represented);
                 value_expected.push_back(quantized_weight::detail::f16_to_f32(expected_bits));
                 value_got.push_back(quantized_weight::detail::f16_to_f32(
-                    cache_v_bits[cache_index(lane, head, slot, dim)]));
+                    value_bits[(sample * value_rows.size() + value_index) * kHeadDim + static_cast<std::size_t>(dim)]));
             }
         }
         failures += verify_reduction(label + " K layer=" + std::to_string(layer), key_got,
