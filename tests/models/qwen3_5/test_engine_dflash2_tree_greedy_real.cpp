@@ -16,16 +16,20 @@
 // drafter, against the target's own greedy choice on the real model.
 //
 // A greedy tree round commits the target's argmax at every position, including positions verified
-// on a side branch whose columns compaction then moved onto the main chain. For every position of
-// a tree-decoded stream this test asks the same Engine for one greedy token from the exact
-// committed prefix (a fresh prefill without speculative state) and scores each disagreement on a
-// CausalScoring Engine. A context built by decode rounds rounds differently from one prefill, so
-// chain decoding disagrees with this oracle too, at low-confidence positions: with the 27B NVIDIA
-// artifact 3.0-3.3 % of the positions for 8- and 16-column chains and 16-column trees over every
-// KV storage, at margins up to 1.25 nats for chains and 2.94 for trees (a position where a fresh
-// decode round of every width and kind picks a third token). A state or compaction error after a
-// side branch would leave the target's choice at most later positions, so the test requires at
-// most 10 % disagreements and no committed token more than kMaxMargin nats below the oracle's.
+// on a side branch whose columns compaction then moved onto the main chain. The oracle is one
+// CausalScoring pass over each prompt and its committed stream (a prefill without speculative
+// state): every position's most probable token, and the committed token's log-probability below
+// it. A context built by decode rounds rounds differently from one prefill, so chain decoding
+// disagrees with this oracle too, at low-confidence positions: with the 27B NVIDIA artifact
+// 1.5-2.7 % of the positions for 8- and 16-column chains and 16-column trees over every KV
+// storage at margins up to 0.86 nats, and with the 35B-A3B artifact 1.0 % for trees and 6.4 %
+// for the block chain at margins up to 1.70 (2026-10-26; one greedy token from a fresh prefill
+// of each committed prefix, the oracle this pass replaced, gave 1.4-3.0 % and 0.94-7.0 % on the
+// same runs; earlier 27B runs reached margins of 2.94 nats at a position where a fresh decode
+// round of every width and kind picks a third token). A state or
+// compaction error after a side branch would leave the target's choice at most later positions,
+// so the test requires at most 10 % disagreements and no committed token more than kMaxMargin
+// nats below the oracle's.
 //
 // A block round (--draft-tokens auto with adaptive-dflash) verifies a width of its proposal its
 // drafts' probabilities choose; a draft copied or aligned wrongly from the block into the round's
@@ -57,14 +61,6 @@ infernix::RequestOptions greedy(std::uint32_t outputs) {
     options.stop.include_model_defaults       = false;
     return options;
 }
-
-struct Disagreement {
-    std::vector<infernix::TokenId> prefix;
-    infernix::TokenId committed = 0;
-    infernix::TokenId oracle    = 0;
-    std::size_t prompt        = 0;
-    std::size_t position      = 0;
-};
 
 } // namespace
 
@@ -150,9 +146,10 @@ int main(int argc, char** argv) {
         const bool tree =
             options.speculative.draft_tree_auto || options.speculative.draft_tree_nodes[0] != 0;
 
-        std::vector<Disagreement> disagreements;
         std::uint64_t rounds = 0, side_rounds = 0, side_drafts = 0, positions = 0, copy_rounds = 0;
         std::vector<std::uint64_t> by_length;
+        std::vector<std::vector<infernix::TokenId>> prompts;
+        std::vector<infernix::GenerationResult> results;
         {
             infernix::Engine engine(options);
             if (ngram_auto) {
@@ -162,40 +159,23 @@ int main(int argc, char** argv) {
                 require(!resolved.ngram_draft_tokens_auto, "the automatic ngram window was not resolved");
             }
             // Every stream is submitted at once; the Engine decodes `streams` of them together.
-            std::vector<std::vector<infernix::TokenId>> prompts;
             std::vector<infernix::GenerationHandle> handles;
             for (const std::string& text : texts) {
                 prompts.push_back(engine.tokenize_text(text));
                 handles.push_back(engine.submit(engine.prepare_tokens(prompts.back()), greedy(outputs)));
             }
-            std::vector<infernix::GenerationResult> results;
             for (infernix::GenerationHandle& handle : handles) { results.push_back(handle.wait()); }
-            for (std::size_t p = 0; p < texts.size(); ++p) {
-                const auto& prompt = prompts[p];
-                const auto& result = results[p];
-                require(result.generated_token_ids.size() == outputs,
-                        "greedy stream stopped before its output budget");
-                rounds += result.speculative.rounds;
-                copy_rounds += result.speculative.ngram_rounds;
-                by_length.resize(std::max(by_length.size(), result.speculative.rounds_by_draft_length.size()));
-                for (std::size_t k = 0; k < result.speculative.rounds_by_draft_length.size(); ++k) {
-                    by_length[k] += result.speculative.rounds_by_draft_length[k];
-                }
-                side_rounds += result.speculative.tree_side_rounds;
-                side_drafts += result.speculative.tree_side_accepted_tokens;
-                auto prefix = prompt;
-                for (std::size_t j = 0; j < outputs; ++j) {
-                    const auto oracle = engine.generate(engine.prepare_tokens(prefix), greedy(1));
-                    require(oracle.generated_token_ids.size() == 1, "oracle produced no token");
-                    const infernix::TokenId committed = result.generated_token_ids[j];
-                    if (oracle.generated_token_ids[0] != committed) {
-                        disagreements.push_back(
-                            {prefix, committed, oracle.generated_token_ids[0], p, j});
-                    }
-                    prefix.push_back(committed);
-                    ++positions;
-                }
+        }
+        for (const infernix::GenerationResult& result : results) {
+            require(result.generated_token_ids.size() == outputs, "greedy stream stopped before its output budget");
+            rounds += result.speculative.rounds;
+            copy_rounds += result.speculative.ngram_rounds;
+            by_length.resize(std::max(by_length.size(), result.speculative.rounds_by_draft_length.size()));
+            for (std::size_t k = 0; k < result.speculative.rounds_by_draft_length.size(); ++k) {
+                by_length[k] += result.speculative.rounds_by_draft_length[k];
             }
+            side_rounds += result.speculative.tree_side_rounds;
+            side_drafts += result.speculative.tree_side_accepted_tokens;
         }
         if (tree) { require(side_rounds != 0, "the greedy streams accepted no side branch"); }
         if (block) {
@@ -207,41 +187,48 @@ int main(int argc, char** argv) {
             require(widths > 1, "the block rounds verified a single width");
         }
 
-        float worst            = 0.0F;
-        std::size_t above_half = 0, above_one = 0;
-        if (!disagreements.empty()) {
+        // The oracle: one scoring pass over each prompt and its committed stream gives every
+        // position's most probable token and the committed token's log-probability.
+        std::size_t disagreements = 0, above_half = 0, above_one = 0;
+        float worst = 0.0F;
+        {
             infernix::EngineOptions scoring;
             scoring.artifact_path = artifact;
             scoring.purpose       = infernix::EnginePurpose::CausalScoring;
             scoring.max_context   = kContext;
             scoring.kv_cache      = kv;
             infernix::Engine scorer(scoring);
-            for (const Disagreement& d : disagreements) {
-                const auto first    = static_cast<std::uint32_t>(d.prefix.size());
-                auto with_committed = d.prefix;
-                with_committed.push_back(d.committed);
-                auto with_oracle = d.prefix;
-                with_oracle.push_back(d.oracle);
-                const float committed = scorer.score_tokens(with_committed, first).logprobs.at(0);
-                const float oracle    = scorer.score_tokens(with_oracle, first).logprobs.at(0);
-                const float margin    = oracle - committed;
-                worst                 = std::max(worst, margin);
-                above_half += margin > 0.5F ? 1U : 0U;
-                above_one += margin > 1.0F ? 1U : 0U;
-                std::cout << "prompt " << d.prompt << " position " << d.position << ": committed "
-                          << d.committed << " (log p " << std::fixed << std::setprecision(4)
-                          << committed << "), oracle " << d.oracle << " (log p " << oracle
-                          << "), margin " << margin << '\n';
+            for (std::size_t p = 0; p < prompts.size(); ++p) {
+                const auto& generated = results[p].generated_token_ids;
+                auto stream           = prompts[p];
+                stream.insert(stream.end(), generated.begin(), generated.end());
+                const auto scores = scorer.score_tokens(stream, static_cast<std::uint32_t>(prompts[p].size()),
+                                                        {.top_k = 1});
+                require(scores.logprobs.size() == outputs && scores.top_ids.size() == outputs,
+                        "scoring returned no score for some position");
+                for (std::size_t j = 0; j < outputs; ++j) {
+                    ++positions;
+                    if (scores.top_ids[j] == generated[j]) continue;
+                    const float margin = scores.top_logprobs[j] - scores.logprobs[j];
+                    ++disagreements;
+                    worst = std::max(worst, margin);
+                    above_half += margin > 0.5F ? 1U : 0U;
+                    above_one += margin > 1.0F ? 1U : 0U;
+                    std::cout << "prompt " << p << " position " << j << ": committed " << generated[j]
+                              << " (log p " << std::fixed << std::setprecision(4) << scores.logprobs[j]
+                              << "), oracle " << scores.top_ids[j] << " (log p " << scores.top_logprobs[j]
+                              << "), margin " << margin << '\n';
+                }
             }
         }
         std::cout << "table=" << table << " K=" << drafts << " positions=" << positions
-                  << " disagreements=" << disagreements.size() << " above_0.5=" << above_half
+                  << " disagreements=" << disagreements << " above_0.5=" << above_half
                   << " above_1=" << above_one << " worst_margin=" << std::fixed
                   << std::setprecision(4) << worst << " rounds=" << rounds
                   << " side_rounds=" << side_rounds << " side_drafts=" << side_drafts
                   << " ngram_rounds=" << copy_rounds << '\n';
         require(worst <= kMaxMargin, "a committed token is far below the target's greedy choice");
-        require(disagreements.size() * 10 <= positions,
+        require(disagreements * 10 <= positions,
                 "the stream left the target's greedy choice at too many positions");
         std::cout << "ok\n";
     } catch (const std::exception& error) {
