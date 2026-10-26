@@ -23,4 +23,11 @@ void ggml_embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStr
  */
 void ple_embed_iq4_nl(const Tensor& rows, Tensor& out, cudaStream_t stream);
 
+/**
+ * The same for a Q8_0 table (a GGUF's or a .basalt pack's rows, verbatim): row_bytes = W / 32 * 34
+ * (an FP16 scale d, then 32 int8 codes q per block) and out[h * W + j, t] = bf16(fp16(d) * q), the
+ * exact product (at most 18 significant bits) rounded once.
+ */
+void ple_embed_q8_0(const Tensor& rows, Tensor& out, cudaStream_t stream);
+
 } // namespace infernix::ops

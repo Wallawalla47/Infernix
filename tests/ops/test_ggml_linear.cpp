@@ -1,4 +1,4 @@
-// ggml_linear, ggml_embedding and ple_embed_iq4_nl against an independent exact oracle
+// ggml_linear, ggml_embedding, ple_embed_iq4_nl and ple_embed_q8_0 against an independent exact oracle
 // (docs/maintainer/qwen3_8-flash-next-design.md §16.2.2).
 //
 // Weights are random block bytes (every byte pattern is a valid encoding once the binary16 scales
@@ -800,11 +800,11 @@ void run_embedding(QType q, int vocab, int hidden, Scales scales, std::mt19937& 
     check(mismatches == 0, label + ": " + std::to_string(mismatches) + " of " + std::to_string(actual.size()) + " outputs differ");
 }
 
-// ple_embed_iq4_nl: rows U8 [row_bytes, heads, T] to out BF16 [heads * W, T], element by element.
-void run_ple(int heads, int width, int columns, Scales scales, std::mt19937& rng) {
-    const std::string label = "ple iq4_nl heads=" + std::to_string(heads) + " W=" + std::to_string(width) +
-                              " T=" + std::to_string(columns);
-    const QType q = QType::GGML_IQ4_NL;
+// ple_embed_iq4_nl and ple_embed_q8_0: rows U8 [row_bytes, heads, T] to out BF16 [heads * W, T], element by
+// element.
+void run_ple(QType q, int heads, int width, int columns, Scales scales, std::mt19937& rng) {
+    const std::string label = std::string(q == QType::GGML_Q8_0 ? "ple q8_0" : "ple iq4_nl") + " heads=" +
+                              std::to_string(heads) + " W=" + std::to_string(width) + " T=" + std::to_string(columns);
     const int elems = static_cast<int>(ggml_block_elems(q)), size = static_cast<int>(ggml_block_bytes(q));
     const int row_bytes = width / elems * size;
     const auto rows = random_blocks(q, heads * columns, width, rng, scales);
@@ -822,7 +822,11 @@ void run_ple(int heads, int width, int columns, Scales scales, std::mt19937& rng
     drows.copy_from_host(rows.data(), rows.size(), 0);
     Tensor trows(drows.p, DType::U8, {row_bytes, heads, columns});
     Tensor tout(dout.p, DType::BF16, {heads * width, columns});
-    ops::ple_embed_iq4_nl(trows, tout, nullptr);
+    if (q == QType::GGML_Q8_0) {
+        ops::ple_embed_q8_0(trows, tout, nullptr);
+    } else {
+        ops::ple_embed_iq4_nl(trows, tout, nullptr);
+    }
     CUDA_CHECK(cudaDeviceSynchronize());
     std::vector<std::uint16_t> actual(expected.size());
     dout.copy_to_host(actual.data(), actual.size() * 2, 0);
@@ -927,16 +931,19 @@ INFERNIX_OP_TEST(ggml_linear) {
         for (const Scales scales : {Scales::Narrow, Scales::Wide, Scales::Wider, Scales::Edge}) {
             run_embedding(QType::GGML_IQ4_XS, 300, 2560, scales, rng);
             run_embedding(QType::GGML_IQ4_XS, 50, 256, scales, rng);
-            run_ple(16, 160, 1, scales, rng);
-            run_ple(16, 160, 37, scales, rng);
-            run_ple(3, 32, 300, scales, rng);
+            for (const QType q : {QType::GGML_IQ4_NL, QType::GGML_Q8_0}) {
+                run_ple(q, 16, 160, 1, scales, rng);
+                run_ple(q, 16, 160, 37, scales, rng);
+                run_ple(q, 3, 32, 300, scales, rng);
+            }
         }
         if (failures != 0) {
             std::cerr << failures << " ggml_linear checks failed\n";
             return 1;
         }
         std::cout << "ggml_linear: every format, K, width and output split bit-equal to the exact oracle, the "
-                     "ggml-bf16-prefill route within its FP32-sum bound; ggml_embedding and ple_embed_iq4_nl element "
+                     "ggml-bf16-prefill route within its FP32-sum bound; ggml_embedding, ple_embed_iq4_nl and "
+                     "ple_embed_q8_0 element "
                      "for element\n";
         return 0;
     } catch (const std::exception& error) {

@@ -116,6 +116,9 @@ INFERNIX_GGML_HD Chunk chunk(const std::uint8_t* b, int part) {
             c.code[j]     = ((q0 >> (2 * j)) & 3) - 1;
             c.code[j + 4] = ((q1 >> (2 * j)) & 3) - 1;
         }
+    } else if constexpr (F == QType::GGML_Q8_0) {
+        c.d = u16_at(b);
+        for (int j = 0; j < 8; ++j) { c.code[j] = static_cast<std::int8_t>(b[2 + 8 * part + j]); }
     } else if constexpr (F == QType::GGML_IQ4_NL) {
         c.d = u16_at(b);
         const std::uint8_t* qs = b + 2 + 8 * (part & 1);

@@ -41,6 +41,9 @@ enum class QType : std::uint16_t {
     // E4M3FN codes with one FP32 multiplier per row (row_scale_v1): ModelOpt's per-tensor FP32
     // weight_scale kept exactly, written into each row of its matrix (tensor-formats.md).
     FP8_E4M3FN_ROW_F32 = 22,
+    // GGUF Q8_0 blocks (an FP16 scale, then 32 int8 codes): the block geometry of Q8_0 PLE n-gram rows
+    // (ops::ple_embed_q8_0), never a stored Weight format; Q8_0 matrices are imported as Q8_G32_FP16.
+    GGML_Q8_0 = 23,
 };
 
 // Whether `format` is a row-scaled FP8 format (row_scale_v1: BF16 or FP32 row multipliers).

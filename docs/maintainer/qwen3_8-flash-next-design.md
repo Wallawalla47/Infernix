@@ -2046,7 +2046,8 @@ tok/s (older build) against 72 aggregate for plain C = 2.
 - The file is its own volume (`*.ninfer.ngram`). It may live on a different NVMe drive from the
   expert banks, which are only read at load.
 - The artifact's `ngram_table` names the row format: `fp8_e4m3fn` (above), `iq4_nl` (the GGUF
-  import, 90 B rows) or `bf16` (Qwen's unquantized table, 320 B rows, 12 per block, 109.2 GB, no
+  import, 90 B rows), `q8_0` (a Q8_0 GGUF's or a .basalt pack's rows verbatim, 170 B, 24 per block;
+  `ops::ple_embed_q8_0` decodes them exactly) or `bf16` (Qwen's unquantized table, 320 B rows, 12 per block, 109.2 GB, no
   scale parameter). FP8 F-A binds `bf16`: `--ngram-reuse` with a BF16 volume checks that sampled
   rows quantize to the checkpoint's FP8 codes by ModelOpt's per-tensor rule. A BF16 volume may also
   replace a quantized table at run time (`resolve_ngram_volume`); nothing replaces a `bf16` table.

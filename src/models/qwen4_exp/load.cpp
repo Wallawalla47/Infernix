@@ -616,7 +616,7 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
         }
     }
     {
-        // The embedding's stored objects: BF16 rows, or a GGUF import's IQ4_XS rows.
+        // The embedding's stored objects: BF16 rows, a GGUF import's IQ4_XS rows, or q8_g32_fp16 rows.
         std::vector<artifact::ObjectHandle> objects;
         for (const auto& part : bindings.weights.at(out->weights.token_embedding.index).reference.binding.parts) {
             if (std::find(objects.begin(), objects.end(), part.object) == objects.end()) { objects.push_back(part.object); }

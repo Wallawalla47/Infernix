@@ -20,8 +20,8 @@ constexpr std::uint32_t kVersion  = 1;
 constexpr std::size_t kHeaderSize = 8 + 4 + 4 + 8 + 4 + 4 + 4 + 8 + 16;
 // An FP8 table's per-tensor scale (BF16 bits) after the fixed fields; 0 when not recorded.
 constexpr std::size_t kScaleOffset = kHeaderSize;
-// The row format (1 FP8, 2 IQ4_NL, 3 BF16, 4 NVFP4; 0 in volumes written before 2026-10-19, whose
-// row size tells their format) and an NVFP4 table's FP32 multiplier (bits).
+// The row format (1 FP8, 2 IQ4_NL, 3 BF16, 4 NVFP4, 5 Q8_0; 0 in volumes written before 2026-10-19,
+// whose row size tells their format) and an NVFP4 table's FP32 multiplier (bits).
 constexpr std::size_t kFormatOffset      = kScaleOffset + 2;
 constexpr std::size_t kNvfp4ScaleOffset  = kFormatOffset + 2;
 constexpr std::size_t kHeaderFieldsBytes = kNvfp4ScaleOffset + 4;
@@ -300,14 +300,15 @@ NgramTableConfig resolve_ngram_volume(const std::filesystem::path& path, const P
         case NgramRowFormat::Iq4Nl: return width % 32 == 0 ? width / 32 * 18 : 0;
         case NgramRowFormat::Bf16: return 2 * width;
         case NgramRowFormat::Nvfp4: return width % 16 == 0 ? width / 2 + width / 16 : 0;
+        case NgramRowFormat::Q8_0: return width % 32 == 0 ? width / 32 * 34 : 0;
         }
         return 0;
     };
     const std::uint16_t tag = read_le<std::uint16_t>(p + kFormatOffset);
     if (tag != 0) {
-        if (tag > 4) { fail("unknown n-gram row format tag " + std::to_string(tag)); }
+        if (tag > 5) { fail("unknown n-gram row format tag " + std::to_string(tag)); }
         constexpr NgramRowFormat kTagged[] = {NgramRowFormat::Fp8E4m3, NgramRowFormat::Iq4Nl, NgramRowFormat::Bf16,
-                                              NgramRowFormat::Nvfp4};
+                                              NgramRowFormat::Nvfp4, NgramRowFormat::Q8_0};
         out.format = kTagged[tag - 1];
         if (out.row_bytes != row_bytes_of(out.format)) {
             fail("n-gram rows of " + std::to_string(out.row_bytes) + " bytes differ from its format's");
@@ -324,7 +325,7 @@ NgramTableConfig resolve_ngram_volume(const std::filesystem::path& path, const P
     // Its own volume (the artifact's format and volume id): the artifact's table and, for FP8 and
     // NVFP4, its scale.
     if (out.format == ple.table.format && out.volume_id == ple.table.volume_id) { return ple.table; }
-    // Another table of this model, in any of the four formats: its own geometry and id, and an FP8
+    // Another table of this model, in any of the five formats: its own geometry and id, and an FP8
     // table's scale or an NVFP4 table's multiplier from its header (a quantization's scale is a
     // property of the volume, not of the artifact).
     out.file_bytes = static_cast<std::uint64_t>(out.header_bytes) + out.blocks * out.block_bytes;

@@ -169,7 +169,7 @@ def main() -> int:
                 report["tensor_mismatches"].append(name)
         if args.ngram is not None:
             table = text["ngram_table"]
-            checked, bad = verify_ngram(qwen4_exp_gguf.Iq4NlTable(store, table["rows"]), args.ngram, table,
+            checked, bad = verify_ngram(qwen4_exp_gguf.GgufNgramTable(store, table["rows"]), args.ngram, table,
                                         args.ngram_rows)
             report["ngram_rows_checked"], report["ngram_row_mismatches"] = checked, bad
         if args.vision_reference is not None:

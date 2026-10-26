@@ -98,10 +98,10 @@ struct QsaConfig {
 // The n-gram table volume written beside the artifact (design §12.2): FP8 E4M3FN rows with one
 // per-tensor scale, a GGUF's IQ4_NL rows (design §12.5), the unquantized table's BF16 rows (an exact
 // conversion bound to a BF16 volume), or NVIDIA FP4-Local's NVFP4 rows (E2M1 codes, then one E4M3FN
-// scale per 16 elements, with one FP32 multiplier for the table; design §12.5). Any volume of the
-// model's table, in any of the four formats, may replace the artifact's at run time
-// (resolve_ngram_volume).
-enum class NgramRowFormat : std::uint8_t { Fp8E4m3, Iq4Nl, Bf16, Nvfp4 };
+// scale per 16 elements, with one FP32 multiplier for the table; design §12.5), or Q8_0 rows (a GGUF's
+// or a .basalt pack's, verbatim: one FP16 scale and 32 int8 codes per block). Any volume of the model's
+// table, in any of the five formats, may replace the artifact's at run time (resolve_ngram_volume).
+enum class NgramRowFormat : std::uint8_t { Fp8E4m3, Iq4Nl, Bf16, Nvfp4, Q8_0 };
 
 struct NgramTableConfig {
     NgramRowFormat format = NgramRowFormat::Fp8E4m3;

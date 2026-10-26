@@ -130,6 +130,9 @@ struct Options {
     // llama-rows: another engine's logits (--rows FILE, or - for standard input) and what produced them (--label).
     std::filesystem::path rows_file;
     std::string label;
+    // --round-logits bf16 (prefill and llama-rows): every evaluated logit rounded to nearest-even BF16 before
+    // it is scored, so engines whose logits are FP32 and BF16 are compared at one precision.
+    bool round_logits = false;
     // The llama-kld arms' CPU threads for the per-row arithmetic (default: half the hardware threads).
     std::uint32_t threads = std::max(1U, std::thread::hardware_concurrency() / 2);
 };
@@ -270,6 +273,10 @@ Options parse(int argc, char** argv) {
             out.rows_file = std::string(value());
         } else if (option == "--label") {
             out.label = std::string(value());
+        } else if (option == "--round-logits") {
+            const std::string_view to = value();
+            if (to != "bf16" && to != "none") { throw std::invalid_argument("--round-logits takes bf16 or none"); }
+            out.round_logits = to == "bf16";
         } else if (option == "--threads") {
             out.threads = std::max(1U, parse_integer<std::uint32_t>(value(), "threads"));
         } else {
@@ -1041,7 +1048,7 @@ int run_llama_prefill(const Options& options) {
     for (std::int32_t c = 0; c < chunks; ++c) {
         const std::vector<std::uint16_t> base_rows = base.next_chunk();
         const std::span<const TokenId> chunk       = header.chunk(static_cast<std::size_t>(c));
-        const infernix::ScoreResult scored =
+        infernix::ScoreResult scored =
             engine.score_tokens(std::vector<TokenId>(chunk.begin(), chunk.end()), 1, infernix::ScoreOptions{.logits_positions = positions});
         if (scored.logits.size() != positions.size() * static_cast<std::size_t>(header.vocab)) {
             throw std::runtime_error("the artifact's vocabulary differs from the base file's " + std::to_string(header.vocab));
@@ -1049,7 +1056,9 @@ int run_llama_prefill(const Options& options) {
         const auto vocab = static_cast<std::size_t>(header.vocab);
         std::vector<llama::Position> scored_rows(positions.size());
         parallel_for(positions.size(), options.threads, [&](std::size_t k) {
-            scored_rows[k] = llama::compare_logits(std::span<const float>(scored.logits.data() + k * vocab, vocab),
+            const std::span<float> row(scored.logits.data() + k * vocab, vocab);
+            if (options.round_logits) { llama::round_to_bf16(row); }
+            scored_rows[k] = llama::compare_logits(row,
                                                    std::span<const std::uint16_t>(base_rows.data() + k * words, words),
                                                    chunk[positions[k] + 1]);
         });
@@ -1064,6 +1073,7 @@ int run_llama_prefill(const Options& options) {
     meta["arm"]           = "llama_prefill";
     meta["chunks_scored"] = chunks;
     meta["kld_definition"] = "full";
+    meta["round_logits"]   = options.round_logits ? "bf16" : "none";
     meta["fast_path_candidates"] = json::array();
     for (const infernix::FastPath path : options.candidates) { meta["fast_path_candidates"].push_back(infernix::fast_path_name(path)); }
     meta["route"]         = options.lossless ? (options.noise_seed != 0 ? "noise_twin" : (options.design ? "design" : "lossless"))
@@ -1092,6 +1102,9 @@ int run_llama_decode(const Options& options) {
     if (options.out.empty()) { throw std::invalid_argument("decode needs --out"); }
     if (options.prefix_reuse) {
         throw std::invalid_argument("the llama-kld decode arm forces each chunk in one request: no --prefix-reuse");
+    }
+    if (options.round_logits) {
+        throw std::invalid_argument("the decode arm reads the engine's own log-probabilities: use --logits-dtype bf16");
     }
     llama::BaseReader base(options.llama_base);
     const llama::BaseHeader& header    = base.header();
@@ -1331,10 +1344,11 @@ int run_llama_rows(const Options& options) {
         if (!*in) { throw std::runtime_error("the rows end in chunk " + std::to_string(c) + " of " + std::to_string(chunks)); }
         std::vector<llama::Position> scored(positions.size());
         parallel_for(positions.size(), options.threads, [&](std::size_t k) {
-            const std::span<const float> row(logits.data() + k * vocab, vocab);
+            const std::span<float> row(logits.data() + k * vocab, vocab);
             if (!std::all_of(row.begin(), row.end(), [](float value) { return std::isfinite(value) || value == -INFINITY; })) {
                 throw std::runtime_error("chunk " + std::to_string(c) + " row " + std::to_string(k) + " holds a NaN or +inf logit");
             }
+            if (options.round_logits) { llama::round_to_bf16(row); }
             scored[k] = llama::compare_logits(row, std::span<const std::uint16_t>(base_rows.data() + k * words, words),
                                               chunk[positions[k] + 1]);
         });
@@ -1348,6 +1362,7 @@ int run_llama_rows(const Options& options) {
     json meta             = provenance(options, nullptr);
     meta["arm"]           = "llama_rows";
     meta["kld_definition"] = "full";
+    meta["round_logits"]   = options.round_logits ? "bf16" : "none";
     meta["label"]         = options.label;
     meta["rows"]          = options.rows_file == "-" ? "-" : std::filesystem::absolute(options.rows_file).string();
     meta["chunks_scored"] = chunks;

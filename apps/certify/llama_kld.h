@@ -97,6 +97,10 @@ struct Position {
     double kld_top   = 0.0;
 };
 
+// Every value rounded to the nearest BF16 (ties to even), kept as binary32: logits at one precision for
+// engines whose heads write FP32 and BF16 (infernix-certify --round-logits bf16).
+void round_to_bf16(std::span<float> values) noexcept;
+
 // From the evaluated run's whole logits row, in llama.cpp's arithmetic.
 [[nodiscard]] Position compare_logits(std::span<const float> logits, std::span<const std::uint16_t> base, TokenId target);
 

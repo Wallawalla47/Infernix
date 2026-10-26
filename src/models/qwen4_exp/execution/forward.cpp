@@ -565,6 +565,8 @@ Tensor Forward::ple_embedding(const PleParameters& p, const ForwardBatch& batch)
         e = work_.alloc(DType::BF16, {dim(config_.ple.embed_dim), T});
         if (format == NgramRowFormat::Iq4Nl) {
             ops::ple_embed_iq4_nl(batch.ngram_rows, e, s);
+        } else if (format == NgramRowFormat::Q8_0) {
+            ops::ple_embed_q8_0(batch.ngram_rows, e, s);
         } else {
             // FP8 rows take their table's BF16 scale, NVFP4 rows their table's FP32 multiplier.
             const Tensor& scale = batch.ngram_scale.data != nullptr ? batch.ngram_scale : p.ngram_scale;

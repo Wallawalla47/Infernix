@@ -255,6 +255,27 @@ void check_bucket() {
     }
 }
 
+// Nearest-even BF16 against the definition: a value exactly between two BF16 neighbours takes the even one.
+void check_bf16_rounding() {
+    const auto bits_of = [](float v) {
+        std::uint32_t b = 0;
+        std::memcpy(&b, &v, sizeof b);
+        return b;
+    };
+    const auto from = [](std::uint32_t b) {
+        float v = 0;
+        std::memcpy(&v, &b, sizeof v);
+        return v;
+    };
+    std::vector<float> v = {from(0x3F808000U), from(0x3F818000U), from(0x3F808001U), from(0xBF807FFFU), 1.0F, -0.0F,
+                            from(0x7F7FFFFFU), -INFINITY};
+    llama::round_to_bf16(v);
+    require(bits_of(v[0]) == 0x3F800000U && bits_of(v[1]) == 0x3F820000U, "halfway values round to the even neighbour");
+    require(bits_of(v[2]) == 0x3F810000U && bits_of(v[3]) == 0xBF800000U, "other values round to the nearest");
+    require(v[4] == 1.0F && bits_of(v[5]) == 0x80000000U && std::isinf(v[6]) && v[7] == -INFINITY,
+            "exact values, signed zero and overflow to infinity");
+}
+
 void check_summary() {
     llama::Summary few;
     for (int i = 0; i < 99; ++i) { few.add(llama::Position{.kld = 0.01, .p_diff = 0, .same_top = true, .nll = 1, .nll_base = 1}); }
@@ -294,6 +315,7 @@ int main() {
         check_file(std::filesystem::temp_directory_path());
         check_positions();
         check_bucket();
+        check_bf16_rounding();
         check_summary();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

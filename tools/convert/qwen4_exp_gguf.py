@@ -47,7 +47,9 @@ from .sources.logical import select_rows, transpose_source
 from .sources.safetensors import SafetensorsSource
 
 NGRAM_TABLE = "per_layer_token_embd.weight"
-IQ4_NL_ROW_FORMAT = "iq4_nl"
+# The n-gram table's GGUF types a volume stores verbatim, by GGUF type id: IQ4_NL (GSQ-RCO's), Q8_0
+# (Unsloth's Q8_0 GGUFs, a .basalt pack's).
+NGRAM_ROW_FORMATS = {20: "iq4_nl", 8: "q8_0"}
 
 
 # ---------------------------------------------------------------------------- expert banks
@@ -346,20 +348,21 @@ def build_model(
         raise ValueError("select text and optional vision and mtp components")
     raw = dict(base.config)
     text = dict(raw.get("text_config", raw))
-    text.pop("ple_embedding_dtype", None)  # the GGUF's table is IQ4_NL, checked below
+    text.pop("ple_embedding_dtype", None)  # the GGUF's table is IQ4_NL or Q8_0, checked below
     if "text_config" in raw:
         raw["text_config"] = text
     else:
         raw = text
     config = qwen4_exp.text_config(raw, mtp="mtp" in selected)
     table = store.tensor(NGRAM_TABLE)
-    if table.ggml_type != 20 or table.row_elems != config["ple_embed_dim"] // (
+    if table.ggml_type not in NGRAM_ROW_FORMATS or table.row_elems != config["ple_embed_dim"] // (
             (config["ngram_size"] - 1) * config["heads_per_ngram"]):
-        raise ValueError(f"{store.path}: {NGRAM_TABLE} must be IQ4_NL rows of one n-gram head")
+        raise ValueError(f"{store.path}: {NGRAM_TABLE} must be IQ4_NL or Q8_0 rows of one n-gram head")
     _metadata_checks(store, config, table.rows)
     config["gdn_output_order"] = "ggml_tiled"
     config["gdn_a"] = "direct"
-    config["ngram_table"] = {"format": IQ4_NL_ROW_FORMAT, **qwen4_exp.ngram_geometry(table.rows, table.row_bytes)}
+    config["ngram_table"] = {"format": NGRAM_ROW_FORMATS[table.ggml_type],
+                             **qwen4_exp.ngram_geometry(table.rows, table.row_bytes)}
     records = {"text": {"config": config}}
     if "vision" in selected:
         if mmproj is None:
@@ -418,14 +421,15 @@ def build_model(
 # ---------------------------------------------------------------------------- n-gram volume
 
 
-class Iq4NlTable:
-    """The PLE n-gram table as the volume stores it: the GGUF's IQ4_NL rows (90 B), verbatim."""
-
-    volume_format = "iq4_nl"
+class GgufNgramTable:
+    """The PLE n-gram table as the volume stores it: the GGUF's IQ4_NL (90 B) or Q8_0 (170 B) rows, verbatim."""
 
     def __init__(self, store: GgufStore, rows: int):
         self.store = store
         t = store.tensor(NGRAM_TABLE)
+        if t.ggml_type not in NGRAM_ROW_FORMATS:
+            raise ValueError(f"{store.path}: {NGRAM_TABLE} is GGUF type {t.ggml_type}, not IQ4_NL or Q8_0")
+        self.volume_format = NGRAM_ROW_FORMATS[t.ggml_type]
         self.row_bytes = t.row_bytes
         self.rows = t.rows
         if self.rows != rows:

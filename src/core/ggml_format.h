@@ -17,7 +17,7 @@
 namespace infernix {
 
 [[nodiscard]] INFERNIX_GGML_FORMAT_HD constexpr bool is_ggml(QType q) noexcept {
-    return q >= QType::GGML_Q2_0 && q <= QType::GGML_IQ4_NL;
+    return (q >= QType::GGML_Q2_0 && q <= QType::GGML_IQ4_NL) || q == QType::GGML_Q8_0;
 }
 
 // Elements per block (the K-axis unit of a row).
@@ -26,6 +26,7 @@ namespace infernix {
     case QType::GGML_Q2_0:
         return 64;
     case QType::GGML_IQ4_NL:
+    case QType::GGML_Q8_0:
         return 32;
     case QType::GGML_Q4_K:
     case QType::GGML_Q5_K:
@@ -46,6 +47,8 @@ namespace infernix {
         return 18;
     case QType::GGML_IQ4_NL:
         return 18;
+    case QType::GGML_Q8_0:
+        return 34;
     case QType::GGML_Q4_K:
         return 144;
     case QType::GGML_Q5_K:

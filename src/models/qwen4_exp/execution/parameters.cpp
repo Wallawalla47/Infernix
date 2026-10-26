@@ -274,9 +274,12 @@ Parameters::Parameters(const Model& source) : model(source) {
     const auto& c = source.config().text;
     const auto& embedding = source.weight(w.token_embedding);
     token_embedding = with_context(embedding.name, [&] { return device_native_weight(embedding.view); });
+    // BF16 rows, a GGUF import's IQ4_XS rows (ops::ggml_embedding), or q8_g32_fp16 rows (a GGUF's or a
+    // .basalt pack's Q8_0 embedding, the same codes and scales; ops::embedding). Every route is exact.
     if (token_embedding.qtype != QType::BF16 &&
-        !(token_embedding.layout == QuantLayout::GgmlRows && token_embedding.qtype == QType::GGML_IQ4_XS)) {
-        throw std::invalid_argument(embedding.name + ": the token embedding must be BF16 or IQ4_XS rows");
+        !(token_embedding.layout == QuantLayout::GgmlRows && token_embedding.qtype == QType::GGML_IQ4_XS) &&
+        !(token_embedding.layout == QuantLayout::RowSplit && token_embedding.qtype == QType::Q8_G32_FP16)) {
+        throw std::invalid_argument(embedding.name + ": the token embedding must be BF16, IQ4_XS or q8_g32_fp16 rows");
     }
     const auto& head = source.weight(w.output_head);
     if (!head.view.parts.empty() && (head.view.parts.front().parent->geometry.format == QType::Q8_G32_FP16 ||

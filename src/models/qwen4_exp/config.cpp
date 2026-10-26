@@ -88,6 +88,11 @@ NgramTableConfig ngram_table(const Json& value, std::uint64_t hash_rows, std::ui
         out.format = NgramRowFormat::Iq4Nl;
         if (head_width % 32) { throw ArtifactError("an IQ4_NL n-gram row must be whole 32-element blocks"); }
         head_width = head_width / 32 * 18;
+    } else if (value.at("format") == "q8_0") {
+        // A GGUF's or a .basalt pack's Q8_0 rows verbatim: blocks of 32 (an fp16 scale and 32 int8 codes).
+        out.format = NgramRowFormat::Q8_0;
+        if (head_width % 32) { throw ArtifactError("a Q8_0 n-gram row must be whole 32-element blocks"); }
+        head_width = head_width / 32 * 34;
     } else if (value.at("format") == "bf16") {
         // The unquantized table's BF16 words (an exact conversion bound to a BF16 volume).
         out.format = NgramRowFormat::Bf16;
@@ -98,7 +103,7 @@ NgramTableConfig ngram_table(const Json& value, std::uint64_t hash_rows, std::ui
         if (head_width % 16) { throw ArtifactError("an NVFP4 n-gram row must be whole 16-element blocks"); }
         head_width = head_width / 2 + head_width / 16;
     } else {
-        throw ArtifactError("n-gram table must hold FP8 E4M3FN, IQ4_NL, BF16 or NVFP4 rows");
+        throw ArtifactError("n-gram table must hold FP8 E4M3FN, IQ4_NL, BF16, NVFP4 or Q8_0 rows");
     }
     out.rows           = wide(value, "rows");
     out.row_bytes      = dimension(value, "row_bytes");

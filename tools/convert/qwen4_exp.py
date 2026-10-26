@@ -780,7 +780,7 @@ NGRAM_SCALE_OFFSET = NGRAM_HEADER.size
 # multiplier (bits; 0 for other formats). Volumes published before stay unchanged.
 NGRAM_FORMAT = struct.Struct("<H")
 NGRAM_FORMAT_OFFSET = NGRAM_SCALE_OFFSET + NGRAM_SCALE.size
-NGRAM_FORMAT_CODES = {"fp8_e4m3fn": 1, "iq4_nl": 2, "bf16": 3, "nvfp4": 4}
+NGRAM_FORMAT_CODES = {"fp8_e4m3fn": 1, "iq4_nl": 2, "bf16": 3, "nvfp4": 4, "q8_0": 5}
 NGRAM_NVFP4_SCALE = struct.Struct("<I")
 NGRAM_NVFP4_SCALE_OFFSET = NGRAM_FORMAT_OFFSET + NGRAM_FORMAT.size
 
@@ -931,8 +931,8 @@ def write_ngram_volume(table: NgramTable, path: Path, volume_id: bytes, *, progr
         NGRAM_MAGIC, NGRAM_VERSION, NGRAM_BLOCK_BYTES, rows, row_bytes, per_block, NGRAM_BLOCK_BYTES,
         geometry["blocks"], volume_id,
     )
-    # The explicit row format; FP8 rows record their scale and NVFP4 rows their multiplier (a BF16 or
-    # IQ4_NL volume's rows are self-contained).
+    # The explicit row format; FP8 rows record their scale and NVFP4 rows their multiplier (a BF16, IQ4_NL
+    # or Q8_0 volume's rows are self-contained).
     format = table.volume_format
     header += NGRAM_SCALE.pack(bf16_bits(table.scale()) if format == "fp8_e4m3fn" else 0)
     header += NGRAM_FORMAT.pack(NGRAM_FORMAT_CODES[format])

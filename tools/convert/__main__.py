@@ -250,14 +250,14 @@ def main(argv=None):
                 ngram_format = qwen4_exp.ngram_volume_format(base, args.ngram_reuse)
             if gguf_store is not None:
                 if ngram_format == "bf16":
-                    raise ValueError("a GGUF import binds its own IQ4_NL volume; give it a BF16 volume at run "
-                                     "time with --ngram-volume")
+                    raise ValueError("a GGUF import binds its own IQ4_NL or Q8_0 volume; give it a BF16 volume at "
+                                     "run time with --ngram-volume")
                 from . import qwen4_exp_gguf
 
                 model = qwen4_exp_gguf.build_model(
                     base, gguf_store, components=components, resource_overrides=overrides, mmproj=mmproj
                 )
-                table_of = lambda: qwen4_exp_gguf.Iq4NlTable(gguf_store, model.config["ngram_table"]["rows"])
+                table_of = lambda: qwen4_exp_gguf.GgufNgramTable(gguf_store, model.config["ngram_table"]["rows"])
             else:
                 model = qwen4_exp.build_model(
                     base, components=components, resource_overrides=overrides, ngram_format=ngram_format

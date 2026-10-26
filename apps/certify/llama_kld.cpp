@@ -116,6 +116,19 @@ float row_log_prob(std::span<const std::uint16_t> row, TokenId token) noexcept {
     return row_scale(row) * static_cast<float>(codes(row)[token]) + row_min_log_prob(row);
 }
 
+void round_to_bf16(std::span<float> values) noexcept {
+    for (float& value : values) {
+        std::uint32_t bits = 0;
+        std::memcpy(&bits, &value, sizeof bits);
+        if ((bits & 0x7FFFFFFFU) > 0x7F800000U) {
+            bits = 0x7FC00000U; // NaN stays NaN
+        } else {
+            bits = ((bits + 0x7FFFU + ((bits >> 16) & 1U)) >> 16) << 16;
+        }
+        std::memcpy(&value, &bits, sizeof bits);
+    }
+}
+
 Position compare_logits(std::span<const float> logits, std::span<const std::uint16_t> base, TokenId target) {
     require_row(base, logits.size());
     if (target < 0 || static_cast<std::size_t>(target) >= logits.size()) { throw std::invalid_argument("target outside the vocabulary"); }

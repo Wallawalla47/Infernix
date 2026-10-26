@@ -32,6 +32,11 @@ inline void decode_block(QType q, const std::uint8_t* b, double* y) {
         for (int j = 0; j < 64; ++j) { y[j] = ((b[2 + j / 4] >> (2 * (j % 4))) & 3) - 1.0; y[j] *= d; }
         break;
     }
+    case QType::GGML_Q8_0: {
+        const double d = f16(u16(b));
+        for (int j = 0; j < 32; ++j) { y[j] = d * static_cast<std::int8_t>(b[2 + j]); }
+        break;
+    }
     case QType::GGML_IQ4_NL: {
         const double d = f16(u16(b));
         for (int j = 0; j < 16; ++j) {
