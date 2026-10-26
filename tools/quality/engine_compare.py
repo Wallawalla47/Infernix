@@ -92,7 +92,7 @@ NOT_EXERCISED = {
     "block-verification": "acts on sampled requests; the measurement decodes greedily",
     "univer-trees": "acts on sampled requests; the measurement decodes greedily",
 }
-MINUTES = {"reference": 120, "twin": 120, "P": 45, "D": 150, "E": 180}
+MINUTES = {"reference": 120, "twin": 120, "P": 45, "D": 240, "E": 180}
 
 
 @dataclass
@@ -121,8 +121,11 @@ def _load_config(path: Path) -> dict:
     config.setdefault("concurrency", 8)
     config.setdefault("route_args", [])
     config.setdefault("spec", [])
+    config.setdefault("arms", "default")
     config.setdefault("paths", "default")
     config.setdefault("budget", 0.25)
+    if config["arms"] not in ("default", "split"):
+        raise ValueError(f"{path}: arms must be default or split")
     config.setdefault("engines", [])
     config.setdefault("decode", True)
     config.setdefault("logits", "bf16")
@@ -203,6 +206,8 @@ def plan(config: dict) -> tuple[list[Step], list[str]]:
     for seed in config["twin_seeds"]:
         steps.append(_arm(config, f"P-twin-s{seed}", "P", ["--lossless", "--noise-seed", str(seed)], "twin"))
         steps[-1].minutes = MINUTES["twin"]
+    if config["arms"] == "default":
+        return _default_plan(config, steps), notes
     steps.append(_arm(config, "P-reproducible-bf16", "P", ["--reproducible", "--kv-dtype", "bf16"], "reproducible"))
     if kv != "bf16":
         steps.append(_arm(config, f"P-reproducible-{kv}", "P", reproducible, "reproducible"))
@@ -256,6 +261,28 @@ def plan(config: dict) -> tuple[list[Step], list[str]]:
     for engine in config["engines"]:
         steps.append(_engine_step(config, engine))
     return steps, notes
+
+
+def _default_plan(config: dict, steps: list[Step]) -> list[Step]:
+    """arms "default": the configuration as shipped, every default fast path on, against the floor: the prompt path,
+    and decoding with the configuration's drafting (no one decodes without it) at one request and at `concurrency`
+    (the batched paths act only with several in flight). No reproducible control and no path-by-path arms."""
+    kv, conc = config["kv"], config["concurrency"]
+    steps.append(_arm(config, f"P-default-{kv}", "P", ["--kv-dtype", kv], "default"))
+    if config["decode"] and config["spec"]:
+        spec = ["--kv-dtype", kv, *config["spec"]]
+        steps.append(_arm(config, f"D-default-{kv}-spec-c1", "D", spec, "default", 1))
+        if not config["decode_cuda_graph"]:
+            # The arms capture rows on eager rounds: the observed form with and without CUDA graphs must agree bit
+            # for bit, so the eager arms measure the graphs' arithmetic.
+            check = spec + ["--observed-only", "--chunks", str(40 if config["chunks"] == 0 else min(40, config["chunks"]))]
+            steps.append(_arm(config, f"D-default-{kv}-spec-c1-graphs", "D", check + ["--cuda-graph"], "graphs", 1,
+                              base=f"D-default-{kv}-spec-c1-eager"))
+            steps.append(_arm(config, f"D-default-{kv}-spec-c1-eager", "D", check, "graphs", 1))
+        steps.append(_arm(config, f"D-default-{kv}-spec-c{conc}", "D", spec, "default", conc))
+    for engine in config["engines"]:
+        steps.append(_engine_step(config, engine))
+    return steps
 
 
 def _engine_step(config: dict, engine: dict) -> Step:
@@ -502,6 +529,24 @@ def report(config: dict, resamples: int = llama_kld.RESAMPLES) -> dict:
             lines.append(f"| {_describe(step, config)} | " + " | ".join(_cell(m, stats[step.id]) for m in llama_kld.METRICS) + " |")
         lines.append("")
     if floor is not None:
+        defaults = [s for s in steps if s.role == "default" and s.id in stats]
+        if defaults:
+            lines += ["## Infernix defaults against the floor", "",
+                      f"Each default arm's statistic divided by the noise twin's (mean of {len(twins)} seeds: mean KLD "
+                      f"{floor['mean_kld']:.6f}, KLD 99.9% {floor['p999_kld']:.6f}, top-1 disagreement "
+                      f"{100 * floor['disagreement']:.3f} %); brackets divide the arm's 95 % interval by the floor.", "",
+                      "| Route | Mean KLD / floor | KLD 99.9% / floor | Top-1 disagreement / floor |", "|---|---|---|---|"]
+            for step in defaults:
+                s = stats[step.id]
+                ratios = {"mean_kld": tuple(s["mean_kld"][k] / floor["mean_kld"] for k in ("value", "low", "high")),
+                          "p999_kld": tuple(s["p999_kld"][k] / floor["p999_kld"] for k in ("value", "low", "high")),
+                          # Disagreement's interval: 1 - agreement's, so its low end is the agreement's high end.
+                          "disagreement": tuple((1 - s["same_top"][k]) / floor["disagreement"]
+                                                for k in ("value", "high", "low"))}
+                out.setdefault("default_ratios", {})[step.id] = ratios
+                lines.append(f"| {_describe(step, config)} | " + " | ".join(
+                    f"{v:.2f}" if np.isnan(lo) else f"{v:.2f} [{lo:.2f}, {hi:.2f}]" for v, lo, hi in ratios.values()) + " |")
+            lines.append("")
         path_steps = [s for s in steps if s.role == "path" and s.id in arms and s.base in arms]
         if path_steps:
             lines += ["## Fast paths, one at a time", "",

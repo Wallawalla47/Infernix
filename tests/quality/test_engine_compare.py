@@ -28,7 +28,7 @@ def _ids(steps):
 
 
 def test_the_static_arms_and_the_reference(tmp_path):
-    config = _config(tmp_path)
+    config = _config(tmp_path, arms="split")
     steps, notes = engine_compare.plan(config)
     assert _ids(steps) == ["reference", "P-twin-s1", "P-twin-s2", "P-reproducible-bf16", "P-reproducible-int8",
                            "P-default-int8", "D-reproducible-int8-c8", "D-reproducible-int8-c1-check", "D-default-int8-c1",
@@ -45,13 +45,13 @@ def test_the_static_arms_and_the_reference(tmp_path):
     assert by_id["D-default-int8-c1"][-2:] == ["--round-logits", "bf16"]
     assert "--no-cuda-graph" not in by_id["D-default-int8-c1"] and "D-default-int8-c1-graphs" not in by_id
     assert any("follow once" in note for note in notes)
-    fp32 = engine_compare.plan(_config(tmp_path, logits="fp32"))[0]
+    fp32 = engine_compare.plan(_config(tmp_path, arms="split", logits="fp32"))[0]
     assert fp32[0].argv[fp32[0].argv.index("--logits-dtype") + 1] == "fp32"
     assert all("--round-logits" not in s.argv and "--logits-dtype" not in s.argv for s in fp32[1:])
 
 
 def test_eager_capture_takes_a_graph_check(tmp_path):
-    steps, _ = engine_compare.plan(_config(tmp_path, decode_cuda_graph=False))
+    steps, _ = engine_compare.plan(_config(tmp_path, arms="split", decode_cuda_graph=False))
     by_id = {s.id: s for s in steps}
     assert "--no-cuda-graph" in by_id["D-default-int8-c1"].argv
     graphs, eager = by_id["D-default-int8-c1-graphs"], by_id["D-default-int8-c1-eager"]
@@ -63,7 +63,7 @@ def test_eager_capture_takes_a_graph_check(tmp_path):
 
 
 def test_paths_follow_the_default_arms(tmp_path):
-    config = _config(tmp_path)
+    config = _config(tmp_path, arms="split")
     _meta(tmp_path, "P-default-int8", load={"fast_paths": ["prompt-pv8", "fp16-gdn-state"]})
     _meta(tmp_path, "D-default-int8-c1", load={"fast_paths": ["prompt-pv8", "batched-decode", "batched-a4-decode",
                                                               "preemption", "fp16-gdn-state"]})
@@ -86,6 +86,42 @@ def test_paths_follow_the_default_arms(tmp_path):
     assert not any("follow once" in note for note in notes)
 
 
+def test_the_default_plan_measures_the_shipped_configuration(tmp_path):
+    # The configuration as shipped against the floor: the prompt path and drafting decode at one request and at the
+    # concurrency; no control, no plain decode, no path-by-path arms, whatever the default arms report.
+    _meta(tmp_path, "P-default-int8", load={"fast_paths": ["prompt-pv8"]})
+    steps, notes = engine_compare.plan(_config(tmp_path))
+    assert _ids(steps) == ["reference", "P-twin-s1", "P-twin-s2", "P-default-int8", "D-default-int8-spec-c1",
+                           "D-default-int8-spec-c8"]
+    by_id = {s.id: s.argv for s in steps}
+    for arm_id in ("D-default-int8-spec-c1", "D-default-int8-spec-c8"):
+        argv = by_id[arm_id]
+        assert argv[argv.index("--spec") + 1] == "mtp" and "--reproducible" not in argv and "--fast-path" not in argv
+    assert by_id["D-default-int8-spec-c8"][by_id["D-default-int8-spec-c8"].index("--concurrency") + 1] == "8"
+    assert notes == []
+    eager = {s.id: s for s in engine_compare.plan(_config(tmp_path, decode_cuda_graph=False))[0]}
+    graphs = eager["D-default-int8-spec-c1-graphs"]
+    assert graphs.base == "D-default-int8-spec-c1-eager" and "--spec" in graphs.argv and "--observed-only" in graphs.argv
+    assert "--no-cuda-graph" in eager["D-default-int8-spec-c1"].argv
+    assert [s.id for s in engine_compare.plan(_config(tmp_path, spec=[]))[0]][-1] == "P-default-int8"
+
+
+def test_the_report_divides_the_defaults_by_the_floor(tmp_path):
+    config = _config(tmp_path, decode=False, spec=[])
+    rng = np.random.default_rng(7)
+    n = 8000
+    _meta(tmp_path, "reference.kld", chunks=40)
+    floor = rng.exponential(2e-3, n)
+    for seed in (1, 2):
+        _arm(tmp_path, f"P-twin-s{seed}", rng.permutation(floor), rng.random(n) > 0.01)
+    _arm(tmp_path, "P-default-int8", 3.0 * floor, rng.random(n) > 0.02)
+    result = engine_compare.report(config, resamples=200)
+    ratios = result["default_ratios"]["P-default-int8"]
+    assert abs(ratios["mean_kld"][0] - 3.0) < 1e-6 and ratios["mean_kld"][1] < 3.0 < ratios["mean_kld"][2]
+    assert 1.5 < ratios["disagreement"][0] < 2.5 and ratios["disagreement"][1] <= ratios["disagreement"][2]
+    assert "Infernix defaults against the floor" in result["markdown"]
+
+
 def _arm(tmp_path, arm_id, kld, same_top, chunks=40, nll_shift=0.0, **meta):
     n = len(kld)
     chunk = np.repeat(np.arange(chunks), n // chunks)
@@ -95,7 +131,7 @@ def _arm(tmp_path, arm_id, kld, same_top, chunks=40, nll_shift=0.0, **meta):
 
 
 def test_the_report_labels_each_path(tmp_path):
-    config = _config(tmp_path, decode=False, spec=[], paths=["prompt-pv8", "fp16-gdn-state", "router-mma"])
+    config = _config(tmp_path, arms="split", decode=False, spec=[], paths=["prompt-pv8", "fp16-gdn-state", "router-mma"])
     rng = np.random.default_rng(5)
     n = 8000
     _meta(tmp_path, "reference.kld", chunks=40)
