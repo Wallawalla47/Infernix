@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from tools.quality.engines import base_file, strata
+from tools.quality.engines import base_file, basalt, strata
 
 
 def test_the_base_header_gives_each_chunk(tmp_path):
@@ -33,6 +33,18 @@ def test_strata_rows_are_read_by_position(tmp_path):
     with pytest.raises(ValueError):
         strata.read_rows(path, 3)
     assert strata.read_rows(tmp_path / "absent.bin", 3) == {}
+
+
+def test_basalt_runs_its_quality_protocol_in_wsl():
+    assert basalt.wsl_path(r"E:\Infernix\x y\b.kld") == "/mnt/e/Infernix/x y/b.kld"
+    assert basalt.wsl_path("/already/linux") == "/already/linux"
+    command = basalt.engine_command("/opt/basalt/bin/basalt", "/mnt/c/p.basalt", "/mnt/d/b.kld", "/mnt/d/w/rows.tsv",
+                                    ["--kv", "int8"], True, "/mnt/d/w/rows.bin")
+    assert command[:4] == ["wsl.exe", "-e", "env", "BASALT_PPL_ROWS=/mnt/d/w/rows.bin"]
+    tail = command[4:]
+    assert tail[:2] == ["/opt/basalt/bin/basalt", "--serve"]
+    assert tail[tail.index("--ppl-base") + 1] == "/mnt/d/b.kld" and tail[-2:] == ["--kv", "int8"]
+    assert tail[tail.index("--spec") + 1] == "5" and tail[tail.index("--max-context") + 1] == "4096"
 
 
 def test_strata_keeps_the_configuration_and_reads_every_token_through_decode():
