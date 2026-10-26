@@ -103,15 +103,25 @@ infernix-serve Ornith-1.5-122B-UNCENSORED-NVFP4-Infernix-00001-of-00003.infernix
   their KV from the expert cache as they grow and give it back when they end.
 - **Speculation (recommended: `--spec mtp --draft-tokens auto`):** two MTP drafts each round, verified
   only when the drafter is confident enough of them to pay for their experts, as for the original
-  Ornith (its speed-up here is being measured). `--spec dflash2` uses the DFlash2 drafter; with `--draft-tokens auto` it decodes
+  Ornith (+18 % decode greedy, +7.5 % at the card's sampling). `--spec dflash2` uses the DFlash2 drafter; with `--draft-tokens auto` it decodes
   without it, as on the original.
 - `--reproducible` runs the bit-exact route, `--lossless` the correctly rounded one.
 
 ## Speed (RTX 5090, i9-13900K, 96 GB DDR5, PCIe 5.0 x8, one request)
 
-Being measured; the figures will be added here. Expect speeds close to the original
-[Ornith-1.5-122B-NVFP4-Infernix](https://huggingface.co/Wallawalla47/Ornith-1.5-122B-NVFP4-Infernix)'s,
-which has the same routed experts.
+INT8 KV, fresh engine each run (empty expert cache), three texts; ranges are across the texts.
+
+| Workload | Speed |
+|---|---|
+| Decode, 1,280-token prompts, greedy: plain / `--spec mtp --draft-tokens auto` | 64-80 / 73-97 tok/s (MTP +18 % median) |
+| The same at the card's sampling (temperature 0.6) | 64-80 / 68-97 tok/s (MTP +7.5 % median) |
+| Prefill, 4K / 32K prompt | 1,700 / 4,530 tok/s |
+
+Measured side by side with the original
+[Ornith-1.5-122B-NVFP4-Infernix](https://huggingface.co/Wallawalla47/Ornith-1.5-122B-NVFP4-Infernix)
+at these settings, prefill is the same (32K +1 %, 4K -0.4 %) and decode differs by less than the
+run-to-run spread (+2.4 % median over two pairs, worst -5 %). The original's card quotes its prefill
+with BF16 KV.
 
 Decode depends on the text, through the share of its experts already in VRAM, because it is bound by
 the bytes of the missing experts. Quality has not been measured beyond the bit-exact comparison above.
