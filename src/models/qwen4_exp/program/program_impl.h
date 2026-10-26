@@ -87,6 +87,7 @@ struct ConstraintPlan {
     std::vector<std::vector<TokenId>> sets;
     std::vector<std::int32_t> steps;
     std::vector<std::vector<TokenId>> observe;
+    bool capture_logits  = false; // TokenConstraint::capture_logits
     std::uint64_t serial = 0; // unique per planned request: a lane's uploaded sets name their plan
 };
 
@@ -5969,6 +5970,8 @@ private:
     // After the round synchronized: the draws of `tokens`, chosen by consecutive columns from
     // `first_column` for the lane's next output steps (none for an unconstrained lane).
     void take_constraint_draws(Lane& lane, std::size_t first_column, std::span<const std::int32_t> tokens);
+    // A capturing column's logits row (TokenConstraint::capture_logits), widened to binary32.
+    [[nodiscard]] std::vector<float> captured_row(std::size_t column) const;
     // Moves the first `accepted` draws of the pending round into the lane's trace.
     static void commit_constraint_draws(Lane& lane, std::size_t accepted);
     // The readout of the lane's prompt from its last prefill call's logits (column 0).
@@ -6037,6 +6040,11 @@ private:
     DeviceBuffer constraint_;
     std::vector<std::int32_t> constraint_host_;
     std::int32_t constraint_columns_ = 0; // the staged round's columns
+    // TokenConstraint::capture_logits: the staged columns whose rows constrain() copies before the mask (1),
+    // and the copied rows (token_domain_ logits per column, in the logits' dtype).
+    std::vector<std::uint8_t> capture_columns_;
+    std::vector<std::byte> capture_rows_;
+    DType capture_dtype_ = DType::FP32;
     std::array<std::uint64_t, kMaximumConcurrency> constraint_serials_{};
     std::uint64_t next_constraint_serial_ = 1;
     PinnedHostBuffer io_host_{1}, host_sampled_{1}, host_configs_{1};

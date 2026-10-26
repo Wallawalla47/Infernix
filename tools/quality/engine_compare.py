@@ -16,9 +16,10 @@ here score against. Arms, on the base's positions (the second half of each chunk
 
   P-*  the prompt path: each chunk in one pass (infernix-certify prefill; llama-perplexity -b n_ctx).
   D-*  the decode path: each chunk's first half prefilled, its scored half forced through decode steps in one
-       request (infernix-certify decode; Basalt's ppl_gate). A decode step observes the reference's 255 most
-       probable tokens and the target; its KL counts the rest of the vocabulary as one bucket (kld_top), which
-       the P arms measure against the full sum.
+       request (infernix-certify decode; Basalt's ppl_gate), each step's whole logits row captured and scored
+       as the P arms score theirs. The Qwen3.5 family captures rows on eager rounds (decode_cuda_graph false),
+       and a pair of check arms (D-*-graphs, D-*-eager) shows the default route's arithmetic is the same with
+       and without CUDA graphs.
   P-twin-sN  the noise twin: the lossless route with each rounding made stochastic (seed N), an ideal
        implementation off by at most one unit in the last place at every rounding: honest rounding's floor.
   *-reproducible-KV  fast paths off; *-default-KV  the product's defaults; *-path-NAME  fast paths off plus that
@@ -124,6 +125,7 @@ def _load_config(path: Path) -> dict:
     config.setdefault("engines", [])
     config.setdefault("decode", True)
     config.setdefault("logits", "bf16")
+    config.setdefault("decode_cuda_graph", True)
     if config["logits"] not in ("bf16", "fp32"):
         raise ValueError(f"{path}: logits must be bf16 or fp32")
     return config
@@ -159,10 +161,14 @@ def _arm(config: dict, step_id: str, protocol: str, args: list[str], role: str, 
         precision = (["--logits-dtype", "bf16"] if role == "twin" else ["--round-logits", "bf16"]) if bf16 else []
         argv = [certify, "prefill", *common, *config["route_args"], *args, *precision]
     else:
-        # The decode arm reads the engine's own log-probabilities: its head writes the precision.
-        precision = ["--logits-dtype", "bf16"] if bf16 else []
+        # The decode arm captures each step's whole row (the Qwen3.5 family on eager rounds: decode_cuda_graph
+        # false) and the scorer rounds it; its --observed-only form reads the head's own log-probabilities.
+        observed = "--observed-only" in args
+        precision = (["--logits-dtype", "bf16"] if observed else ["--round-logits", "bf16"]) if bf16 else []
+        graphs = [] if config["decode_cuda_graph"] or "--cuda-graph" in args else ["--no-cuda-graph"]
+        args = [a for a in args if a != "--cuda-graph"]
         argv = [certify, "decode", *common, *config["route_args"], "--concurrency", str(concurrency or 1), *args,
-                *precision]
+                *graphs, *precision]
     return Step(step_id, role, protocol, argv, MINUTES[protocol], **extra)
 
 
@@ -208,6 +214,13 @@ def plan(config: dict) -> tuple[list[Step], list[str]]:
         steps.append(_arm(config, f"D-reproducible-{kv}-c1-check", "D", reproducible + ["--chunks", str(check)],
                           "invariance", 1, base=f"D-reproducible-{kv}-c{conc}"))
         steps.append(_arm(config, f"D-default-{kv}-c1", "D", ["--kv-dtype", kv], "default", 1))
+        if not config["decode_cuda_graph"]:
+            # The arms capture rows on eager rounds: the observed form with and without CUDA graphs must agree bit
+            # for bit, so the eager arms measure the graphs' arithmetic.
+            check = ["--kv-dtype", kv, "--observed-only", "--chunks", str(40 if config["chunks"] == 0 else min(40, config["chunks"]))]
+            steps.append(_arm(config, f"D-default-{kv}-c1-graphs", "D", check + ["--cuda-graph"], "graphs", 1,
+                              base=f"D-default-{kv}-c1-eager"))
+            steps.append(_arm(config, f"D-default-{kv}-c1-eager", "D", check, "graphs", 1))
         steps.append(_arm(config, f"D-default-{kv}-c{conc}", "D", ["--kv-dtype", kv], "default", conc))
         if config["spec"]:
             steps.append(_arm(config, f"D-reproducible-{kv}-spec-c1", "D", reproducible + config["spec"], "reproducible", 1))
@@ -480,9 +493,6 @@ def report(config: dict, resamples: int = llama_kld.RESAMPLES) -> dict:
             out["arms"][step.id] = {"label": _describe(step, config), "protocol": protocol, "stats": stats[step.id],
                                     "seconds": (_read(config, step.id) or {}).get("seconds")}
             lines.append(f"| {_describe(step, config)} | " + " | ".join(_cell(m, stats[step.id]) for m in llama_kld.METRICS) + " |")
-        if protocol == "D":
-            lines += ["", "Decode-path KLD sums the reference's 255 most probable tokens and the target, the rest of the "
-                      "vocabulary as one bucket: a lower bound of llama.cpp's sum (see the check below)."]
         lines.append("")
     if floor is not None:
         path_steps = [s for s in steps if s.role == "path" and s.id in arms and s.base in arms]
@@ -515,14 +525,12 @@ def report(config: dict, resamples: int = llama_kld.RESAMPLES) -> dict:
             out["checks"].append({"check": "request invariance", "arms": [step.id, step.base], "passed": same})
             lines.append(f"- Request invariance (fast paths off, one request against {step.base.rsplit('-c', 1)[1]} at "
                          f"once, first {np.unique(a.chunk).size} chunks): {'bit-identical' if same else 'DIFFERENT'}.")
-    ratios = [(s, stats[s.id]["mean_kld_top"]["value"] / stats[s.id]["mean_kld"]["value"])
-              for s in steps if s.protocol == "P" and s.id in stats and "mean_kld_top" in stats[s.id]
-              and stats[s.id]["mean_kld"]["value"] > 0]
-    if ratios:
-        low, high = min(r for _, r in ratios), max(r for _, r in ratios)
-        out["checks"].append({"check": "decode KLD form", "ratio_low": low, "ratio_high": high})
-        lines.append(f"- The decode arms' KLD form (255 tokens + bucket) on the prompt arms: {100 * low:.2f}-"
-                     f"{100 * high:.2f} % of llama.cpp's full sum.")
+        if step.role == "graphs" and step.base is not None and step.id in arms and step.base in arms:
+            same = llama_kld.identical(arms[step.id], arms[step.base])
+            out["checks"].append({"check": "cuda graphs", "arms": [step.id, step.base], "passed": same})
+            lines.append(f"- CUDA graphs (the decode arms capture rows on eager rounds): the default route's observed "
+                         f"form with graphs and without, first {np.unique(arms[step.id].chunk).size} chunks: "
+                         f"{'bit-identical' if same else 'DIFFERENT'}.")
     for step in steps:
         meta = _read(config, step.id) if step.role == "engine" else None
         if meta is not None and meta.get("logits") != config["logits"]:

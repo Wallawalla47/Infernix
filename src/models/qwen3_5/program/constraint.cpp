@@ -52,6 +52,16 @@ void ProgramImpl::stage_constraint_columns(std::span<const ConstraintRow> rows,
     }
     bool constrained = false;
     for (const ConstraintRow& row : rows) { constrained = constrained || row.plan != nullptr; }
+    // The columns whose whole rows constrain_round_logits copies (TokenConstraint::capture_logits).
+    logits_capture_.columns.assign(columns, 0);
+    for (std::size_t index = 0; index < rows.size(); ++index) {
+        const ConstraintRow& row = rows[index];
+        if (row.plan == nullptr || !row.plan->capture_logits) { continue; }
+        for (std::uint32_t column = 0; column < width; ++column) {
+            if (static_cast<std::size_t>(row.first_step) + column >= row.plan->step_descriptors.size()) { break; }
+            logits_capture_.columns[index * width + column] = 1;
+        }
+    }
     if (!constrained && constraint_device_columns_ == 0) { return; }
 
     std::vector<std::int32_t>& host = constraint_descriptors_host_;
@@ -152,6 +162,7 @@ ProgramImpl::read_constraint_draws(const RequestConstraintPlan& plan, std::uint3
             draw.observed_logprobs.assign(values, values + plan.observe[step].size());
             draw.top_logprob = values[ops::kTokenObserveTokens];
         }
+        if (plan.capture_logits) { draw.logits = logits_capture_.row(first_column + index); }
         draws.push_back(std::move(draw));
     }
     return draws;

@@ -30,6 +30,7 @@
 //                    --tokens-from BASE) [--design --kv-dtype K] [--logits-dtype fp32|bf16]
 //   infernix-certify prefill   <artifact> --llama-base FILE --out PREFIX [route options | --lossless [--noise-seed N]]
 //   infernix-certify decode    <artifact> --llama-base FILE --out PREFIX [route options] [--concurrency N] [--spec ...]
+//                    [--no-cuda-graph] [--observed-only] [--round-logits bf16]
 //   infernix-certify llama-compare --llama-base FILE --logits OTHER --out PREFIX
 //   infernix-certify llama-rows --llama-base FILE --rows ROWS|- --out PREFIX [--label TEXT] [--chunks N]
 //   [--threads N]: the CPU threads of the per-row arithmetic (default half the hardware threads).
@@ -130,9 +131,13 @@ struct Options {
     // llama-rows: another engine's logits (--rows FILE, or - for standard input) and what produced them (--label).
     std::filesystem::path rows_file;
     std::string label;
-    // --round-logits bf16 (prefill and llama-rows): every evaluated logit rounded to nearest-even BF16 before
+    // --round-logits bf16 (prefill, decode and llama-rows): every evaluated logit rounded to nearest-even BF16 before
     // it is scored, so engines whose logits are FP32 and BF16 are compared at one precision.
     bool round_logits = false;
+    // The llama-kld decode arm: observe 255 tokens and a bucket instead of capturing whole rows, and run
+    // without CUDA graphs (the Qwen3.5 family's row capture needs eager rounds).
+    bool observed_only = false;
+    bool no_cuda_graph = false;
     // The llama-kld arms' CPU threads for the per-row arithmetic (default: half the hardware threads).
     std::uint32_t threads = std::max(1U, std::thread::hardware_concurrency() / 2);
 };
@@ -273,6 +278,10 @@ Options parse(int argc, char** argv) {
             out.rows_file = std::string(value());
         } else if (option == "--label") {
             out.label = std::string(value());
+        } else if (option == "--observed-only") {
+            out.observed_only = true;
+        } else if (option == "--no-cuda-graph") {
+            out.no_cuda_graph = true;
         } else if (option == "--round-logits") {
             const std::string_view to = value();
             if (to != "bf16" && to != "none") { throw std::invalid_argument("--round-logits takes bf16 or none"); }
@@ -1095,16 +1104,18 @@ int run_llama_prefill(const Options& options) {
 // chunk in one request whose prompt is its first half (n_ctx/2 tokens, prefilled), forcing tokens n_ctx/2 ..
 // n_ctx-1 through the decode path, so every scored distribution and the scored half's KV and state come from
 // decode (or verification) steps, as in a generation. The first forced token's distribution is the prompt's
-// and unscored. A step observes the target and the base's 255 most probable tokens; the rest of the KL sum's
-// tokens are one bucket (compare_bucket), so kld is kld_top here: llama.cpp's KL less its unobserved tail,
-// which the prompt arms measure (their kld against their kld_top). --concurrency N runs N chunks at once.
+// and unscored. Each step's whole logits row is captured (TokenConstraint::capture_logits) and scored as the
+// prompt arms score theirs; the Qwen3.5 family copies rows on eager rounds only, so its arms take
+// --no-cuda-graph. --observed-only instead observes the target and the base's 255 most probable tokens, the
+// rest of the KL sum's tokens as one bucket (compare_bucket, a lower bound): it runs with CUDA graphs, so the
+// two forms on one route check that graphs change nothing. --concurrency N runs N chunks at once.
 int run_llama_decode(const Options& options) {
     if (options.out.empty()) { throw std::invalid_argument("decode needs --out"); }
     if (options.prefix_reuse) {
         throw std::invalid_argument("the llama-kld decode arm forces each chunk in one request: no --prefix-reuse");
     }
-    if (options.round_logits) {
-        throw std::invalid_argument("the decode arm reads the engine's own log-probabilities: use --logits-dtype bf16");
+    if (options.round_logits && options.observed_only) {
+        throw std::invalid_argument("--observed-only reads the engine's own log-probabilities: use --logits-dtype bf16");
     }
     llama::BaseReader base(options.llama_base);
     const llama::BaseHeader& header    = base.header();
@@ -1124,6 +1135,7 @@ int run_llama_decode(const Options& options) {
         options.kv_tokens != 0 ? options.kv_tokens : engine_options.max_context * options.concurrency);
     engine_options.max_concurrency    = options.concurrency;
     engine_options.pending_timeout_ms = 3'600'000;
+    engine_options.use_cuda_graph     = !options.no_cuda_graph;
     // The chunks share no prefix: the context cache would only take memory.
     engine_options.context_cache.enabled             = false;
     engine_options.context_cache.host_capacity_bytes = 0;
@@ -1151,10 +1163,14 @@ int run_llama_decode(const Options& options) {
                 std::ifstream in(options.llama_base, std::ios::binary);
                 if (!in) { throw std::runtime_error("cannot read " + options.llama_base.string()); }
                 std::vector<std::uint16_t> block(kBlock * words);
+                std::vector<std::uint16_t> base_rows(options.observed_only ? 0 : rows_per_chunk * words);
                 for (std::size_t c = next++; c < results.size(); c = next++) {
                     const std::span<const TokenId> chunk = header.chunk(c);
-                    std::vector<llama::BucketRow> buckets(rows_per_chunk);
-                    for (std::size_t first = 0; first < rows_per_chunk; first += kBlock) {
+                    std::vector<llama::BucketRow> buckets(options.observed_only ? rows_per_chunk : 0);
+                    for (std::size_t k = 0; !options.observed_only && k < rows_per_chunk; ++k) {
+                        llama::BaseReader::read_row(in, header, c, k, std::span<std::uint16_t>(base_rows.data() + k * words, words));
+                    }
+                    for (std::size_t first = 0; options.observed_only && first < rows_per_chunk; first += kBlock) {
                         const std::size_t count = std::min<std::size_t>(kBlock, rows_per_chunk - first);
                         for (std::size_t k = 0; k < count; ++k) {
                             llama::BaseReader::read_row(in, header, c, first + k,
@@ -1172,10 +1188,11 @@ int run_llama_decode(const Options& options) {
                     request.execution.allow_prefix_reuse      = false;
                     request.stop.include_model_defaults       = false;
                     request.execution.constraint.steps.push_back({chunk[half]});
-                    request.execution.constraint.observe.emplace_back();
+                    request.execution.constraint.capture_logits = !options.observed_only;
+                    if (options.observed_only) { request.execution.constraint.observe.emplace_back(); }
                     for (std::uint32_t k = 0; k < rows_per_chunk; ++k) {
                         request.execution.constraint.steps.push_back({chunk[half + 1 + k]});
-                        request.execution.constraint.observe.push_back(buckets[k].tokens);
+                        if (options.observed_only) { request.execution.constraint.observe.push_back(buckets[k].tokens); }
                     }
                     const infernix::GenerationResult result =
                         engine.submit(engine.prepare_tokens(std::vector<TokenId>(chunk.begin(), chunk.begin() + half), false),
@@ -1187,7 +1204,20 @@ int run_llama_decode(const Options& options) {
                     }
                     ChunkResult& out = results[c];
                     out.positions.resize(rows_per_chunk);
-                    for (std::uint32_t k = 0; k < rows_per_chunk; ++k) {
+                    if (!options.observed_only) {
+                        // Each step's captured row against its base row (step k + 1 forces token half + 1 + k: row k).
+                        parallel_for(rows_per_chunk, lane_threads, [&](std::size_t k) {
+                            std::vector<float> row = result.constrained_draws[k + 1].logits;
+                            if (row.size() != static_cast<std::size_t>(header.vocab)) {
+                                throw std::runtime_error("a decode step captured " + std::to_string(row.size()) +
+                                                         " logits; the base has " + std::to_string(header.vocab));
+                            }
+                            if (options.round_logits) { llama::round_to_bf16(row); }
+                            out.positions[k] = llama::compare_logits(
+                                row, std::span<const std::uint16_t>(base_rows.data() + k * words, words), chunk[half + 1 + k]);
+                        });
+                    }
+                    for (std::uint32_t k = 0; options.observed_only && k < rows_per_chunk; ++k) {
                         const llama::BucketRow& row           = buckets[k];
                         const infernix::ConstrainedDraw& draw = result.constrained_draws[k + 1];
                         if (draw.observed_logprobs.size() != row.tokens.size()) {
@@ -1231,7 +1261,9 @@ int run_llama_decode(const Options& options) {
     json meta                = provenance(options, nullptr);
     meta["arm"]              = "llama_decode";
     meta["chunks_scored"]    = results.size();
-    meta["kld_definition"]   = "observed_bucket";
+    meta["kld_definition"]   = options.observed_only ? "observed_bucket" : "full";
+    meta["round_logits"]     = options.round_logits ? "bf16" : "none";
+    meta["cuda_graphs"]      = !options.no_cuda_graph;
     meta["route"]            = options.reproducible ? "reproducible" : "default";
     meta["fast_path_candidates"] = json::array();
     for (const infernix::FastPath path : options.candidates) { meta["fast_path_candidates"].push_back(infernix::fast_path_name(path)); }

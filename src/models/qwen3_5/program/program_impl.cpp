@@ -223,6 +223,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     }
 
     io = qwen3_5::RoundState(backing, plan.persistent.round);
+    if (io.constraint) { io.constraint->capture = &logits_capture_; }
     if (io.mtp.has_value() != (speculative_backend == SpeculativeBackend::Mtp)) {
         throw std::logic_error("round-state MTP extension does not match the sequence plan");
     }

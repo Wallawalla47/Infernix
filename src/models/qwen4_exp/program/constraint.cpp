@@ -10,7 +10,10 @@
 #include "infernix/ops/top_logprobs.h"
 
 #include <algorithm>
+#include <cstddef>
+#include <cstring>
 #include <iterator>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -60,8 +63,9 @@ std::shared_ptr<const ConstraintPlan> ProgramImpl::compile_constraint(const Toke
             }
         }
     }
-    plan->observe = constraint.observe;
-    plan->serial  = next_constraint_serial_++;
+    plan->observe        = constraint.observe;
+    plan->capture_logits = constraint.capture_logits;
+    plan->serial         = next_constraint_serial_++;
     return plan;
 }
 
@@ -124,6 +128,16 @@ bool ProgramImpl::stage_constraints(std::span<const std::uint32_t> lanes, std::i
         }
     }
     upload_pinned(words + observe_offset(), observe, 4ULL * columns * kObserve, s);
+    // The columns whose whole rows constrain() copies (TokenConstraint::capture_logits).
+    capture_columns_.assign(columns, 0);
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        const Lane& lane = lanes_[lanes[row]];
+        if (!lane.constraint || !lane.constraint->capture_logits) { continue; }
+        const std::size_t first = lane.history.size() - lane.prompt_tokens;
+        for (std::size_t j = 0; j < static_cast<std::size_t>(width) && first + j < lane.constraint->steps.size(); ++j) {
+            capture_columns_[row * static_cast<std::size_t>(width) + j] = 1;
+        }
+    }
     constraint_columns_ = static_cast<std::int32_t>(columns);
     return true;
 }
@@ -146,8 +160,42 @@ void ProgramImpl::constrain(Tensor& logits, Tensor* argmax) {
     const Tensor observe(words + observe_offset(), DType::I32, {static_cast<std::int32_t>(kObserve), columns});
     Tensor observed(words + observe_offset() + constraint_host_.size() * kObserve, DType::FP32,
                     {static_cast<std::int32_t>(kObserved), columns});
+    if (std::find(capture_columns_.begin(), capture_columns_.end(), std::uint8_t{1}) != capture_columns_.end()) {
+        // The capturing columns' public rows, before the mask. Measurement only: the copies wait for the round.
+        // Every caller is a host-launched step after the forward, never a captured graph.
+        const std::size_t element = logits.dtype == DType::FP32 ? 4 : 2;
+        const std::size_t row     = static_cast<std::size_t>(token_domain_) * element;
+        capture_dtype_            = logits.dtype;
+        capture_rows_.resize(static_cast<std::size_t>(columns) * row);
+        for (std::int32_t c = 0; c < columns; ++c) {
+            if (capture_columns_[static_cast<std::size_t>(c)] == 0) { continue; }
+            CUDA_CHECK(cudaMemcpyAsync(capture_rows_.data() + static_cast<std::size_t>(c) * row,
+                                       static_cast<const std::byte*>(logits.data) +
+                                           static_cast<std::size_t>(c) * static_cast<std::size_t>(logits.ne[0]) * element,
+                                       row, cudaMemcpyDeviceToHost, device_.stream));
+        }
+        CUDA_CHECK(cudaStreamSynchronize(device_.stream));
+    }
     ops::constrain_logits(logits, argmax, descriptors, choices, counts, token_domain_, records, &observe, &observed,
                           device_.stream);
+}
+
+std::vector<float> ProgramImpl::captured_row(std::size_t column) const {
+    const auto vocab = static_cast<std::size_t>(token_domain_);
+    if (column >= capture_columns_.size() || capture_columns_[column] == 0) {
+        throw std::logic_error("Qwen4Exp: a capturing step's logits row was not copied");
+    }
+    std::vector<float> out(vocab);
+    if (capture_dtype_ == DType::FP32) {
+        std::memcpy(out.data(), capture_rows_.data() + column * vocab * 4, vocab * 4);
+    } else {
+        const auto* words = reinterpret_cast<const std::uint16_t*>(capture_rows_.data() + column * vocab * 2);
+        for (std::size_t i = 0; i < vocab; ++i) {
+            const std::uint32_t bits = static_cast<std::uint32_t>(words[i]) << 16;
+            std::memcpy(&out[i], &bits, sizeof bits);
+        }
+    }
+    return out;
 }
 
 void ProgramImpl::take_constraint_draws(Lane& lane, std::size_t first_column, std::span<const std::int32_t> tokens) {
@@ -187,6 +235,7 @@ void ProgramImpl::take_constraint_draws(Lane& lane, std::size_t first_column, st
             draw.observed_logprobs.assign(values, values + plan.observe[first + i].size());
             draw.top_logprob = values[kObserve];
         }
+        if (plan.capture_logits) { draw.logits = captured_row(first_column + i); }
         lane.constraint_round.push_back(std::move(draw));
     }
 }

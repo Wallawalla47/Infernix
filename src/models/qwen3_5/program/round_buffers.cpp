@@ -1,7 +1,9 @@
 #include "models/qwen3_5/program/round_buffers.h"
+#include "core/device.h"
 #include "infernix/ops/speculative_tree.h"
 #include "models/load_options.h"
 #include <algorithm>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <type_traits>
@@ -606,6 +608,24 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
     if (layout.block_projected) { block_projected = layout.block_projected->bind(backing); }
 }
 
+std::vector<float> LogitsCapture::row(std::size_t column) const {
+    if (column >= columns.size() || columns[column] == 0) {
+        throw std::logic_error("a capturing step's logits row was not copied");
+    }
+    const auto v = static_cast<std::size_t>(vocab);
+    std::vector<float> out(v);
+    if (dtype == DType::FP32) {
+        std::memcpy(out.data(), rows.data() + column * v * 4, v * 4);
+    } else {
+        const auto* words = reinterpret_cast<const std::uint16_t*>(rows.data() + column * v * 2);
+        for (std::size_t i = 0; i < v; ++i) {
+            const std::uint32_t bits = static_cast<std::uint32_t>(words[i]) << 16;
+            std::memcpy(&out[i], &bits, sizeof bits);
+        }
+    }
+    return out;
+}
+
 void constrain_round_logits(const RoundState& io, const Tensor& logits, const Tensor* argmax,
                             std::int32_t token_domain, cudaStream_t stream) {
     if (!io.constraint) { return; }
@@ -617,6 +637,27 @@ void constrain_round_logits(const RoundState& io, const Tensor& logits, const Te
     }
     const auto count = static_cast<std::int32_t>(columns);
     Tensor matrix(logits.data, logits.dtype, {rows, count});
+    if (LogitsCapture* capture = io.constraint->capture; capture != nullptr && capture->any()) {
+        // The capturing columns' public rows, before the mask (measurement only; the copies wait for the round).
+        cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(stream, &status));
+        if (status != cudaStreamCaptureStatusNone) {
+            throw std::invalid_argument("TokenConstraint::capture_logits needs EngineOptions::use_cuda_graph off");
+        }
+        const std::size_t element = logits.dtype == DType::FP32 ? 4 : 2;
+        const std::size_t row     = static_cast<std::size_t>(token_domain) * element;
+        capture->dtype            = logits.dtype;
+        capture->vocab            = token_domain;
+        capture->rows.resize(static_cast<std::size_t>(count) * row);
+        for (std::int32_t c = 0; c < count && static_cast<std::size_t>(c) < capture->columns.size(); ++c) {
+            if (capture->columns[static_cast<std::size_t>(c)] == 0) { continue; }
+            CUDA_CHECK(cudaMemcpyAsync(capture->rows.data() + static_cast<std::size_t>(c) * row,
+                                       static_cast<const std::byte*>(logits.data) +
+                                           static_cast<std::size_t>(c) * static_cast<std::size_t>(rows) * element,
+                                       row, cudaMemcpyDeviceToHost, stream));
+        }
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
     Tensor descriptors = io.constraint->descriptor_view(count);
     Tensor records     = io.constraint->record_view(count);
     // Observation is always on: its staged lists are -1 for columns nothing observes.

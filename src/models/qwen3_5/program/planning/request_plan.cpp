@@ -115,7 +115,12 @@ RequestBasePlan ProgramImpl::plan_request(PreparedPromptData&& prompt,
             }
         }
     }
-    constraint.observe = options.constraint.observe;
+    constraint.observe        = options.constraint.observe;
+    constraint.capture_logits = options.constraint.capture_logits;
+    if (constraint.capture_logits && use_cuda_graph) {
+        // The rows are copied on eager rounds only (round_buffers.h, LogitsCapture).
+        throw std::invalid_argument("TokenConstraint::capture_logits needs EngineOptions::use_cuda_graph off");
+    }
     if (const auto& rewrite = prompt.identity.rewrite_checkpoint;
         rewrite &&
         (rewrite->recovery_frontier == 0 || rewrite->recovery_frontier > rewrite->frontier ||

@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <vector>
 
 namespace infernix::models::qwen3_5 {
 
@@ -478,7 +479,26 @@ struct DFlashDecodeState {
     [[nodiscard]] DFlashDecodeState narrowed(std::uint32_t k) const;
 };
 
+// TokenConstraint::capture_logits (measurement only): the staged columns whose whole public rows
+// constrain_round_logits copies to the host before the mask, and the copies (in the logits' dtype). Eager
+// rounds only: a captured CUDA graph cannot copy to pageable memory, so a capturing request needs
+// EngineOptions::use_cuda_graph off.
+struct LogitsCapture {
+    std::vector<std::uint8_t> columns; // 1: copy this column's row
+    std::vector<std::byte> rows;
+    DType dtype        = DType::FP32;
+    std::int32_t vocab = 0;
+
+    [[nodiscard]] bool any() const noexcept {
+        return std::find(columns.begin(), columns.end(), std::uint8_t{1}) != columns.end();
+    }
+    // Column `column`'s row widened to binary32.
+    [[nodiscard]] std::vector<float> row(std::size_t column) const;
+};
+
 struct TokenConstraintState {
+    // The program's capture of whole rows (non-owning; null when the program records none).
+    LogitsCapture* capture = nullptr;
     // I32 [kTokenConstraintChoices, lanes * kMaximumConstraintSets]: set s of lane l is column
     // l * kMaximumConstraintSets + s; counts is I32 [lanes * kMaximumConstraintSets].
     Tensor choices;

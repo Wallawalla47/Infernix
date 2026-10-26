@@ -42,11 +42,24 @@ def test_the_static_arms_and_the_reference(tmp_path):
     assert twin[1] == "prefill" and twin[-5:] == ["--lossless", "--noise-seed", "1", "--logits-dtype", "bf16"]
     by_id = {s.id: s.argv for s in steps}
     assert by_id["P-default-int8"][-2:] == ["--round-logits", "bf16"]
-    assert by_id["D-default-int8-c1"][-2:] == ["--logits-dtype", "bf16"]
+    assert by_id["D-default-int8-c1"][-2:] == ["--round-logits", "bf16"]
+    assert "--no-cuda-graph" not in by_id["D-default-int8-c1"] and "D-default-int8-c1-graphs" not in by_id
+    assert any("follow once" in note for note in notes)
     fp32 = engine_compare.plan(_config(tmp_path, logits="fp32"))[0]
     assert fp32[0].argv[fp32[0].argv.index("--logits-dtype") + 1] == "fp32"
     assert all("--round-logits" not in s.argv and "--logits-dtype" not in s.argv for s in fp32[1:])
-    assert any("follow once" in note for note in notes)
+
+
+def test_eager_capture_takes_a_graph_check(tmp_path):
+    steps, _ = engine_compare.plan(_config(tmp_path, decode_cuda_graph=False))
+    by_id = {s.id: s for s in steps}
+    assert "--no-cuda-graph" in by_id["D-default-int8-c1"].argv
+    graphs, eager = by_id["D-default-int8-c1-graphs"], by_id["D-default-int8-c1-eager"]
+    assert "--no-cuda-graph" not in graphs.argv and "--no-cuda-graph" in eager.argv and graphs.base == eager.id
+    for step in (graphs, eager):
+        # The observed form reads the head's own log-probabilities, so the head writes the precision.
+        assert "--observed-only" in step.argv and step.argv[-2:] == ["--logits-dtype", "bf16"]
+        assert step.argv[step.argv.index("--chunks") + 1] == "40"
 
 
 def test_paths_follow_the_default_arms(tmp_path):
@@ -105,8 +118,6 @@ def test_the_report_labels_each_path(tmp_path):
     md = result["markdown"]
     assert "Rounding floor (noise twin, seed 1)" in md and "Infernix default (int8 KV)" in md
     assert "Fast paths, one at a time" in md
-    check = [c for c in result["checks"] if c["check"] == "decode KLD form"]
-    assert check and abs(check[0]["ratio_low"] - 0.95) < 1e-6
 
 
 def test_an_engine_printout_joins_the_table(tmp_path):

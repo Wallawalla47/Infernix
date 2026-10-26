@@ -68,6 +68,7 @@ struct RequestConstraintPlan {
     std::vector<std::vector<TokenId>> sets;
     std::vector<std::int32_t> step_descriptors;
     std::vector<std::vector<TokenId>> observe;
+    bool capture_logits = false; // TokenConstraint::capture_logits
     // Unique per planned request, so a lane's uploaded sets are never mistaken for a later
     // request's.
     std::uint64_t serial = 0;
@@ -607,6 +608,8 @@ public:
     std::size_t constraint_device_columns_ = 0;
     // The host mirror of the device observe lists (staged only for rounds that observe).
     std::vector<std::int32_t> constraint_observe_host_;
+    // TokenConstraint::capture_logits: the staged columns whose rows the round copies, and the copies.
+    qwen3_5::LogitsCapture logits_capture_;
     std::array<std::uint64_t, kMaximumConcurrency> constraint_bound_serials_{};
     std::uint64_t next_constraint_serial_ = 1;
     std::array<RequestControl, kMaximumConcurrency> requests;
