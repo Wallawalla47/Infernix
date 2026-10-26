@@ -40,22 +40,48 @@ def f32_bits(f: float) -> int:
 
 def round_fraction(a: Fraction, prec: int) -> int:
     """Correctly rounded bits of the exact rational a (binary32: prec 24; BF16: prec 8, low 16 bits)."""
-    total = 16 if prec == 8 else 32
-    sign = 1 if a < 0 else 0
-    a = abs(a)
-    if a == 0:
-        return sign << (total - 1)
-    e = a.numerator.bit_length() - a.denominator.bit_length()
-    if Fraction(2) ** e > a:
+    num, den = a.numerator, a.denominator
+    if num == 0:
+        return 0
+    if den & (den - 1) == 0:
+        return round_scaled(num, den.bit_length() - 1, prec)
+    sign = 1 if num < 0 else 0
+    mag = -num if sign else num
+    # floor(log2 a) is e or e - 1 for this e.
+    e = mag.bit_length() - den.bit_length()
+    if (mag << max(0, -e)) < (den << max(0, e)):
         e -= 1
-    while Fraction(2) ** (e + 1) <= a:
-        e += 1
     e = max(e, -126)
-    q = a / Fraction(2) ** (e - prec + 1)
-    n = q.numerator // q.denominator
-    rem = q - n
-    if rem > Fraction(1, 2) or (rem == Fraction(1, 2) and n % 2 == 1):
+    shift = e - prec + 1
+    divisor = den << max(0, shift)
+    n, rem = divmod(mag << max(0, -shift), divisor)
+    if 2 * rem > divisor or (2 * rem == divisor and n % 2 == 1):
         n += 1
+    return pack_rounded(sign, e, n, prec)
+
+
+def round_scaled(value: int, scale: int, prec: int) -> int:
+    """round_fraction(value / 2^scale, prec), in integers."""
+    if value == 0:
+        return 0
+    sign = 1 if value < 0 else 0
+    mag = -value if sign else value
+    e = max(mag.bit_length() - 1 - scale, -126)
+    drop = scale + e - prec + 1
+    if drop <= 0:
+        n = mag << -drop
+    else:
+        n = mag >> drop
+        rem = mag & ((1 << drop) - 1)
+        half = 1 << (drop - 1)
+        if rem > half or (rem == half and n & 1):
+            n += 1
+    return pack_rounded(sign, e, n, prec)
+
+
+def pack_rounded(sign: int, e: int, n: int, prec: int) -> int:
+    """The bits of (-1)^sign n 2^(e - prec + 1), n the significand rounded to prec bits (2^prec when it carried)."""
+    total = 16 if prec == 8 else 32
     if n == 2 ** prec:
         n //= 2
         e += 1
@@ -552,41 +578,92 @@ def conv_slots(x, w, states, src, dst, channels, width, seqs, taps):
     return out, final
 
 
+# The delta rule's oracle computes in integers: a binary32 value v is the integer v 2^149 (its smallest step is
+# 2^-149), so a product of two is exact at 2^298 and sums are exact; each rounding is round_scaled's.
+F32_SCALE = 149
+
+
+def f32_int(bits: int) -> int:
+    """The finite binary32 value of bits, times 2^149."""
+    e = (bits >> 23) & 0xFF
+    m = bits & 0x7FFFFF
+    mag = m if e == 0 else (m | 0x800000) << (e - 1)
+    return -mag if bits >> 31 else mag
+
+
+def f32_round(value: int, scale: int) -> int:
+    """value / 2^scale rounded to binary32, times 2^149."""
+    if value == 0:
+        return 0
+    mag = -value if value < 0 else value
+    e = max(mag.bit_length() - 1 - scale, -126)
+    drop = scale + e - 23
+    if drop <= 0:
+        n = mag << -drop
+    else:
+        n = mag >> drop
+        rem = mag & ((1 << drop) - 1)
+        half = 1 << (drop - 1)
+        if rem > half or (rem == half and n & 1):
+            n += 1
+    if n == 1 << 24:
+        n >>= 1
+        e += 1
+    if e > 127:
+        raise OverflowError("binary32 overflow in the delta rule oracle")
+    n <<= e + 126
+    return -n if value < 0 else n
+
+
+def delta_rule_column(S, qb, kb, vb, g_bits, beta_bits) -> list[int]:
+    """One column of the gated delta rule on the head's state S (S[i][j], f32_int values), in place, from its
+    128 BF16 bits of q, k and v, FP32 bits of g and BF16 bits of beta; returns the column's BF16 output bits."""
+    eps = f32_int(f32_bits(1e-6))
+    scale = f32_int(0x3DB504F3)
+    s2 = 2 * F32_SCALE
+    qv = [f32_int(x << 16) for x in qb]
+    kv = [f32_int(x << 16) for x in kb]
+    rq_in = round_scaled(f32_round(sum(x * x for x in qv), s2) + eps, F32_SCALE, 24)
+    rk_in = round_scaled(f32_round(sum(x * x for x in kv), s2) + eps, F32_SCALE, 24)
+    rq = f32_int(cr.evaluate(cr.RSQRT, float_of(rq_in, 24)))
+    rk = f32_int(cr.evaluate(cr.RSQRT, float_of(rk_in, 24)))
+    qn = [f32_round(f32_round(x * rq, s2) * scale, s2) for x in qv]
+    kn = [f32_round(x * rk, s2) for x in kv]
+    decay = f32_int(cr.evaluate(cr.EXP, float(f32_value(g_bits))))
+    bt = f32_int(beta_bits << 16)
+    for row in S:
+        for j in range(128):
+            row[j] = f32_round(row[j] * decay, s2)
+    out = []
+    for j in range(128):
+        u = f32_round(sum(f32_round(S[i][j] * kn[i], s2) for i in range(128)), F32_SCALE)
+        delta = f32_round(f32_round(f32_int(vb[j] << 16) - u, F32_SCALE) * bt, s2)
+        for i in range(128):
+            S[i][j] = f32_round(S[i][j] + f32_round(kn[i] * delta, s2), F32_SCALE)
+        o = sum(f32_round(S[i][j] * qn[i], s2) for i in range(128))
+        out.append(round_scaled(f32_round(o, F32_SCALE), F32_SCALE, 8))
+    return out
+
+
 def delta_rule_slots(q, k, v, g, beta, hk, hv, width, seqs, states, src, dst):
     """The rule per sequence from its source slot; states FP32 [128 (k), 128 (v), Hv, slots]."""
-    eps = f32_value(f32_bits(1e-6))
-    scale = f32_value(0x3DB504F3)
     out = [0] * (128 * hv * width * seqs)
     final = list(states)
     for b in range(seqs):
         for head in range(hv):
             kh = head // (hv // hk)
             base = (src[b] * hv + head) * 128 * 128
-            S = [[f32_value(states[base + j * 128 + i]) for j in range(128)] for i in range(128)]  # S[i][j]
+            S = [[f32_int(states[base + j * 128 + i]) for j in range(128)] for i in range(128)]  # S[i][j]
             for w_ in range(width):
                 t = b * width + w_
-                qv = [bf16_value(q[(t * hk + kh) * 128 + d]) for d in range(128)]
-                kv = [bf16_value(k[(t * hk + kh) * 128 + d]) for d in range(128)]
-                rq = cr32(cr.RSQRT, f32_of(f32_of(sum((x * x for x in qv), Fraction(0))) + eps))
-                rk = cr32(cr.RSQRT, f32_of(f32_of(sum((x * x for x in kv), Fraction(0))) + eps))
-                qn = [f32_of(f32_of(x * rq) * scale) for x in qv]
-                kn = [f32_of(x * rk) for x in kv]
-                decay = cr32(cr.EXP, f32_value(g[t * hv + head]))
-                bt = bf16_value(beta[t * hv + head])
-                for i in range(128):
-                    for j in range(128):
-                        S[i][j] = f32_of(S[i][j] * decay)
-                for j in range(128):
-                    u = f32_of(sum((f32_of(S[i][j] * kn[i]) for i in range(128)), Fraction(0)))
-                    delta = f32_of(f32_of(bf16_value(v[(t * hv + head) * 128 + j]) - u) * bt)
-                    for i in range(128):
-                        S[i][j] = f32_of(S[i][j] + f32_of(kn[i] * delta))
-                    o = f32_of(sum((f32_of(S[i][j] * qn[i]) for i in range(128)), Fraction(0)))
-                    out[(t * hv + head) * 128 + j] = round_fraction(o, 8)
+                o = (t * hv + head) * 128
+                out[o:o + 128] = delta_rule_column(S, q[(t * hk + kh) * 128:(t * hk + kh + 1) * 128],
+                                                   k[(t * hk + kh) * 128:(t * hk + kh + 1) * 128], v[o:o + 128],
+                                                   g[t * hv + head], beta[t * hv + head])
             dbase = (dst[b] * hv + head) * 128 * 128
             for i in range(128):
                 for j in range(128):
-                    final[dbase + j * 128 + i] = round_fraction(S[i][j], 24)
+                    final[dbase + j * 128 + i] = round_scaled(S[i][j], F32_SCALE, 24)
     return out, final
 
 
@@ -849,31 +926,15 @@ def moe_combine(expert_out, weights, ids, slot_column, shared_out, shared_logits
 
 
 def delta_rule(q, k, v, g, beta, hk, hv, cols):
-    eps = f32_value(f32_bits(1e-6))
-    scale = f32_value(0x3DB504F3)
     out = [0] * (128 * hv * cols)
     for head in range(hv):
         kh = head // (hv // hk)
-        S = [[Fraction(0)] * 128 for _ in range(128)]  # S[i][j]
+        S = [[0] * 128 for _ in range(128)]  # S[i][j]
         for t in range(cols):
-            qv = [bf16_value(q[(t * hk + kh) * 128 + d]) for d in range(128)]
-            kv = [bf16_value(k[(t * hk + kh) * 128 + d]) for d in range(128)]
-            rq = cr32(cr.RSQRT, f32_of(f32_of(sum((x * x for x in qv), Fraction(0))) + eps))
-            rk = cr32(cr.RSQRT, f32_of(f32_of(sum((x * x for x in kv), Fraction(0))) + eps))
-            qn = [f32_of(f32_of(x * rq) * scale) for x in qv]
-            kn = [f32_of(x * rk) for x in kv]
-            decay = cr32(cr.EXP, f32_value(g[t * hv + head]))
-            b = bf16_value(beta[t * hv + head])
-            for i in range(128):
-                for j in range(128):
-                    S[i][j] = f32_of(S[i][j] * decay)
-            for j in range(128):
-                u = f32_of(sum((f32_of(S[i][j] * kn[i]) for i in range(128)), Fraction(0)))
-                delta = f32_of(f32_of(bf16_value(v[(t * hv + head) * 128 + j]) - u) * b)
-                for i in range(128):
-                    S[i][j] = f32_of(S[i][j] + f32_of(kn[i] * delta))
-                o = f32_of(sum((f32_of(S[i][j] * qn[i]) for i in range(128)), Fraction(0)))
-                out[(t * hv + head) * 128 + j] = round_fraction(o, 8)
+            o = (t * hv + head) * 128
+            out[o:o + 128] = delta_rule_column(S, q[(t * hk + kh) * 128:(t * hk + kh + 1) * 128],
+                                               k[(t * hk + kh) * 128:(t * hk + kh + 1) * 128], v[o:o + 128],
+                                               g[t * hv + head], beta[t * hv + head])
     return out
 
 
