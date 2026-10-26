@@ -572,7 +572,9 @@ architecture's (process flags and request fields still override them). It holds 
 `presence_penalty` and `frequency_penalty` [-2,2], and optionally `repetition_penalty` (only 1: the
 sampler has none), plus an optional `source` string. The converter and the runtime refuse a missing,
 unknown or out-of-range value. [ornith-1.5-122b.json](../tools/convert/sampling/ornith-1.5-122b.json)
-is Ornith-1.5-122B's model-card set.
+is Ornith-1.5-122B's model-card set and
+[ornith-1.5-122b-uncensored.json](../tools/convert/sampling/ornith-1.5-122b-uncensored.json)
+dealignai's Ornith-1.5-122B-UNCENSORED-NVFP4's.
 
 The official conversion examples select these maintained templates:
 

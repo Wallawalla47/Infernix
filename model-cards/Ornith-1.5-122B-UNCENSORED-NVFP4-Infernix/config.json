@@ -1,0 +1,11 @@
+{
+  "_comment": "Infernix does not read this file. It lets the Hugging Face Hub count downloads of this repository, which it does through requests for config.json. Give infernix-serve the first part.",
+  "format": "infernix-v3",
+  "engine": "https://github.com/Wallawalla47/Infernix",
+  "artifact": "Ornith-1.5-122B-UNCENSORED-NVFP4-Infernix-00001-of-00003.infernix",
+  "parts": [
+    "Ornith-1.5-122B-UNCENSORED-NVFP4-Infernix-00001-of-00003.infernix",
+    "Ornith-1.5-122B-UNCENSORED-NVFP4-Infernix-00002-of-00003.infernix",
+    "Ornith-1.5-122B-UNCENSORED-NVFP4-Infernix-00003-of-00003.infernix"
+  ]
+}

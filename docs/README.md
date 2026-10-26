@@ -10,7 +10,7 @@ run the CLI or HTTP server.
 | [CLI](cli.md) | text, chat-history, image/video input, output streams, sampling, MTP, and common runtime options |
 | [HTTP serving](serving.md) | OpenAI Responses/Chat Completions, Anthropic Messages, state, streaming, token counting, authentication, and tool calls |
 | [Qwen3.8-Flash-Next](qwen3_8-flash-next.md) | requirements, conversion (recipes A and B, the GSQ-RCO IQ3_S GGUF import), recommended flags, the n-gram table in RAM, measured speed and quality of the offloaded-expert model |
-| [Qwen3.5-122B-A10B](qwen3_5-122b.md) | Ornith-1.5-122B-NVFP4 with offloaded experts (in progress): requirements, conversion and verification, running, measured speed |
+| [Qwen3.5-122B-A10B](qwen3_5-122b.md) | Ornith-1.5-122B-NVFP4 and its UNCENSORED export with offloaded experts (in progress): requirements, conversion and verification, running, measured speed |
 | [Ngram copy proposals](ngram.md) | optional copy acceleration alongside MTP, DFlash or DFlash2 at any concurrency |
 | [Performance](performance.md) | RTX 5090 measurement coverage, per-model serving results, methodology, and publication rules |
 | [Weight conversion](weight-conversion.md) | official recipes, custom formats and sources, conversion methods, optional components and artifact output |

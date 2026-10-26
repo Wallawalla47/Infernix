@@ -1608,7 +1608,8 @@ non-thinking mode; Qwen3.8-Flash-Next uses the same values. Qwen3.6-35B-A3B diff
 thinking presence penalty, which is `1.5`. Frequency penalty is `0` for all registered presets.
 An artifact that carries its checkpoint's recommended presets (the text resource `sampling.json`,
 [weight conversion](weight-conversion.md#resources-files-and-inspection)) uses them instead:
-Ornith-1.5-122B-NVFP4 uses its model card's general set, `1.0/0.95/20/0/1.5`, in both modes.
+Ornith-1.5-122B-NVFP4 uses its model card's general set, `1.0/0.95/20/0/1.5`, in both modes, and
+Ornith-1.5-122B-UNCENSORED-NVFP4 its card's `0.6/0.95/20/0/0`.
 Process flags override registered values, request fields override process flags, and `--greedy`
 finally forces temperature `0`. A request with an output constraint (JSON mode, JSON Schema, GBNF,
 regex or choice) does not take the registered presence and frequency penalties: the constrained

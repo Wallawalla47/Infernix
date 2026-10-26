@@ -586,7 +586,11 @@ Per token at a 32K fresh prompt, on the exact route:
   (a multiplier, unlike NVFP4's `activation_input_divisor`; fused inputs must store bit-equal values).
   The first draft read: `activation_input_divisor = input_scale` (FP32, as NVFP4 A4
   inputs already do) and the `AllowA8` permission. An A8 input with a stored divisor quantizes
-  statically, as NVFP4 A4 inputs with divisors do.
+  statically, as NVFP4 A4 inputs with divisors do. An `AllowA8` input without the role (a per-channel
+  export, ModelOpt `FP8_PER_CHANNEL_PER_TOKEN`: dealignai's Ornith-1.5-122B-UNCENSORED-NVFP4, whose rows
+  each carry their own multiplier) encodes each activation column with its own scale
+  fl32(max |x| / 448) (`Weight::input_scale` 0); a fused parent's inputs are all static (one scale) or
+  all per-token.
 - **Producers and oracle.** The only producer is `import_encoded`. The exact decode oracle is
   registered in C++ and Python, and `verify_artifact` compares codes and multipliers word for word.
 
