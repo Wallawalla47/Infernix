@@ -147,18 +147,13 @@ infernix_add_test(infernix_qwen4_exp_preemption_real_test
   LIBRARIES infernix_engine)
 set_tests_properties(infernix_qwen4_exp_preemption_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
-# Sampled MTP drafts keep the sampler's output distribution and greedy tokens (sampled-mtp-drafts).
-infernix_add_test(infernix_qwen4_exp_sampled_drafts_real_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_sampled_drafts_real.cpp"
+# MTP drafts (one-hot and sampled-mtp-drafts) and a DFlash2 companion drafter (--draft-model) against
+# one plain-decoding reference: the sampler's output distribution, greedy tokens, concurrency and the
+# drafter's ring through a prefix resume.
+infernix_add_test(infernix_qwen4_exp_speculative_sampling_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_speculative_sampling_real.cpp"
   LIBRARIES infernix_engine)
-set_tests_properties(infernix_qwen4_exp_sampled_drafts_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
-
-# A DFlash2 companion drafter (--draft-model): greedy tokens, concurrency, the ring through a prefix
-# resume and the sampler's output distribution.
-infernix_add_test(infernix_qwen4_exp_dflash2_real_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_dflash2_real.cpp"
-  LIBRARIES infernix_engine)
-set_tests_properties(infernix_qwen4_exp_dflash2_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
+set_tests_properties(infernix_qwen4_exp_speculative_sampling_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
 infernix_add_test(infernix_qwen4_exp_decide_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_decide_real.cpp"

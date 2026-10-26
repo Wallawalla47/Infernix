@@ -527,7 +527,7 @@ probable tokens under its sampler and verified by sparse rejection sampling agai
 and its rounds verify every draft (no `--spec-min-p` cut). The output distribution stays the
 sampler's, but a seeded request's text changes, so it cannot be the exact route; greedy requests
 keep the argmax drafts. Its gate is therefore the distribution, not the model-level arms
-(`tests/models/qwen4_exp/test_sampled_drafts_real.cpp`, Dense8, INT8 KV, exact route otherwise):
+(`tests/models/qwen4_exp/test_speculative_sampling_real.cpp`, Dense8, INT8 KV, exact route otherwise):
 2,000 seeded requests x 8 tokens per arm at T 1.0 / top-p 0.95 / top-k 20, two-sample chi-square
 against plain decoding at each position and jointly for the first two tokens (family alpha 1e-3,
 Bonferroni 1.1e-4): sampled drafts least p 0.21 (7,115 rounds, 5,717 of 12,545 drafts accepted),
