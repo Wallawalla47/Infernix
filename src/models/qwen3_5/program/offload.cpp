@@ -69,6 +69,10 @@ ProgramOffload::ProgramOffload(const execution::Parameters& parameters, const Of
 
 ProgramOffload::~ProgramOffload() {
     if (experts_.split_ready != nullptr) { cudaEventDestroy(experts_.split_ready); }
+    for (cudaEvent_t event : experts_.shared_events) {
+        if (event != nullptr) { cudaEventDestroy(event); }
+    }
+    if (experts_.shared_stream != nullptr) { cudaStreamDestroy(experts_.shared_stream); }
 }
 
 void ProgramOffload::start(cudaStream_t compute,
@@ -84,17 +88,28 @@ void ProgramOffload::build_experts() {
     experts_.sources.reserve(parameters_.text.layers.size());
     for (const execution::BlockParameters& block : parameters_.text.layers) {
         const auto& layer = std::get<execution::OffloadedMoeParameters>(block.ffn);
-        const auto& shared = layer.shared_bank->planes;
-        // The shared expert is one more record in the routed bank's layout (design §8.6): always
-        // resident, read in place.
-        if (shared.experts != 1 || shared.record_stride != layer.bank->planes.record_stride ||
-            shared.hidden != layer.bank->planes.hidden || shared.intermediate != layer.bank->planes.intermediate ||
-            shared.device_records == nullptr) {
-            throw std::logic_error("Qwen3.5 offload: the shared expert must be one resident record of the routed geometry");
-        }
         ops::MoeExpertSource source = engine_.source(layer.layer);
-        source.shared_expert        = shared_expert;
-        source.shared_record        = reinterpret_cast<const std::uint8_t*>(shared.device_records);
+        // A dense shared expert runs beside the routed experts (offloaded_moe); the call has no shared job.
+        if (layer.shared_bank != nullptr) {
+            const auto& shared = layer.shared_bank->planes;
+            // The shared expert is one more record in the routed bank's layout (design §8.6): always
+            // resident, read in place.
+            if (shared.experts != 1 || shared.record_stride != layer.bank->planes.record_stride ||
+                shared.hidden != layer.bank->planes.hidden ||
+                shared.intermediate != layer.bank->planes.intermediate || shared.device_records == nullptr) {
+                throw std::logic_error(
+                    "Qwen3.5 offload: the shared expert must be one resident record of the routed geometry");
+            }
+            source.shared_expert = shared_expert;
+            source.shared_record = reinterpret_cast<const std::uint8_t*>(shared.device_records);
+        } else if (!layer.shared) {
+            throw std::logic_error("Qwen3.5 offload: a layer has neither a shared expert bank nor projections");
+        } else if (experts_.shared_stream == nullptr) {
+            CUDA_CHECK(cudaStreamCreateWithFlags(&experts_.shared_stream, cudaStreamNonBlocking));
+            for (cudaEvent_t& event : experts_.shared_events) {
+                CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+            }
+        }
         experts_.sources.push_back(source);
     }
     experts_.tail_skip_rank = engine_.tail_skip_rank();

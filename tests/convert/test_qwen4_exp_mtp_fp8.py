@@ -6,7 +6,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from tools.convert.qwen4_exp import fp8_block_values
+from tools.convert.sources.modelopt import fp8_block_values
 from tools.convert.sources.safetensors import SafetensorsSource
 
 

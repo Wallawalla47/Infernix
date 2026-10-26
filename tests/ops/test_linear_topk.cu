@@ -77,17 +77,19 @@ FixtureWeight make_rowsplit(QType qtype, std::int32_t rows) {
     return result;
 }
 
-FixtureWeight make_fp8() {
+// A row-scaled FP8 head: BF16 row words, or FP32 ones (Qwen3.5-122B-A10B's per-row FP8 head).
+FixtureWeight make_fp8(QType qtype = QType::FP8_E4M3FN_ROW_BF16) {
+    const std::int64_t word          = qtype == QType::FP8_E4M3FN_ROW_F32 ? 4 : 2;
     const std::uint64_t code_bytes   = static_cast<std::uint64_t>(kFullRows) * g_hidden;
     const std::uint64_t scale_offset = align_up(code_bytes, 256);
-    const std::uint64_t scale_bytes  = static_cast<std::uint64_t>(kFullRows) * 2;
+    const std::uint64_t scale_bytes  = static_cast<std::uint64_t>(kFullRows) * word;
     FixtureWeight result{
         DeviceBuffer(static_cast<std::size_t>(scale_offset + scale_bytes)), {}, scale_offset};
     result.payload.fill(0);
     result.weight.payload          = result.payload.p;
     result.weight.payload_bytes    = result.payload.bytes;
     result.weight.high_plane_bytes = 0;
-    result.weight.qtype            = QType::FP8_E4M3FN_ROW_BF16;
+    result.weight.qtype            = qtype;
     result.weight.group_size       = g_hidden;
     result.weight.shape[0]         = kFullRows;
     result.weight.shape[1]         = g_hidden;
@@ -101,10 +103,13 @@ FixtureWeight make_fp8() {
     result.weight.k                = g_hidden;
     result.weight.group            = g_hidden;
     result.weight.layout           = QuantLayout::RowScale;
-    result.weight.scale_dtype      = DType::BF16;
+    result.weight.scale_dtype      = word == 4 ? DType::FP32 : DType::BF16;
     result.weight.scale_ne[0]      = kFullRows;
-    result.weight.scale_nb[0]      = 2;
-    result.weight.scale_nb[1]      = static_cast<std::int64_t>(kFullRows) * 2;
+    result.weight.scale_ne[1]      = 1;
+    result.weight.scale_ne[2]      = 1;
+    result.weight.scale_ne[3]      = 1;
+    result.weight.scale_nb[0]      = word;
+    result.weight.scale_nb[1]      = static_cast<std::int64_t>(kFullRows) * word;
     result.weight.scale_nb[2]      = result.weight.scale_nb[1];
     result.weight.scale_nb[3]      = result.weight.scale_nb[1];
     return result;
@@ -170,6 +175,12 @@ void patch_fp8_row(FixtureWeight& fixture, std::int32_t row, float factor) {
     for (std::int32_t k = 0; k < g_hidden; ++k) { codes[static_cast<std::size_t>(k)] = fp8_code(k); }
     fixture.payload.copy_from_host(codes.data(), codes.size(),
                                    static_cast<std::size_t>(row) * g_hidden);
+    if (fixture.weight.qtype == QType::FP8_E4M3FN_ROW_F32) {
+        fixture.payload.copy_from_host(&factor, sizeof(factor),
+                                       static_cast<std::size_t>(fixture.scale_offset) +
+                                           static_cast<std::size_t>(row) * sizeof(factor));
+        return;
+    }
     const std::uint16_t scale = f32_to_bf16(factor);
     fixture.payload.copy_from_host(&scale, sizeof(scale),
                                    static_cast<std::size_t>(fixture.scale_offset) +
@@ -197,7 +208,8 @@ std::vector<double> base_scores(QType qtype, const std::vector<std::uint16_t>& h
             double sum = 0;
             for (int k = 0; k < g_hidden; ++k) {
                 double weight;
-                if (qtype == QType::FP8_E4M3FN_ROW_BF16) {
+                if (qtype == QType::FP8_E4M3FN_ROW_BF16 || qtype == QType::FP8_E4M3FN_ROW_F32) {
+                    // The factors 1..17 are exact in both row words.
                     weight =
                         quantized_weight::detail::decode_e4m3fn(fp8_code(k)) *
                         static_cast<double>(bf16_to_f32(f32_to_bf16(static_cast<float>(factor))));
@@ -318,7 +330,7 @@ int verify_zero_ties(const FixtureWeight& fixture, const Tensor* id_map,
 int run_full(QType qtype, const char* profile, const DeviceBuffer& hidden,
              const std::vector<double>& base_score) {
     FixtureWeight fixture =
-        qtype == QType::Q8_G32_FP16 ? make_rowsplit(qtype, kFullRows) : make_fp8();
+        qtype == QType::Q8_G32_FP16 ? make_rowsplit(qtype, kFullRows) : make_fp8(qtype);
     for (std::size_t index = 0; index < kFullWinnerRows.size(); ++index) {
         if (qtype == QType::Q8_G32_FP16) {
             patch_rowsplit_row(fixture, qtype, kFullWinnerRows[index], factor_for(index));
@@ -501,6 +513,9 @@ INFERNIX_OP_TEST(linear_topk) {
         DeviceBuffer mid(mid_hidden.size() * sizeof(std::uint16_t));
         mid.copy_from_host(mid_hidden.data(), mid.bytes);
         failures += run_q4(mid, base_scores(QType::Q4_G64_FP16, mid_hidden));
+        // Its per-row FP8 head (dealignai's Ornith-1.5-122B-UNCENSORED-NVFP4: FP32 row multipliers).
+        failures += run_full(QType::FP8_E4M3FN_ROW_F32, "fp8-f32-full H=3072", mid,
+                             base_scores(QType::FP8_E4M3FN_ROW_F32, mid_hidden));
         // Qwen3.8-Flash-Next's heads: the Q8 full head and the Q4 proposal head (--lm-head-draft).
         g_hidden = 2560;
         const std::vector<std::uint16_t> narrow_hidden = make_hidden();

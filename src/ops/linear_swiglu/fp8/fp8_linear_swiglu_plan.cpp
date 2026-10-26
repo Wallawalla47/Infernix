@@ -63,6 +63,11 @@ std::size_t fp8_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy, std:
 void fp8_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& out,
                                 LinearPolicy policy, WorkspaceArena& workspace,
                                 cudaStream_t stream) {
+    if (weight.qtype == QType::FP8_E4M3FN_ROW_F32) {
+        // The 122B shared expert: 16-bit activations under every policy.
+        if (column_invariant(policy)) { return fp8_linear_swiglu_n2048_invariant_launch(x, weight, out, stream); }
+        return fp8_linear_swiglu_n2048_a16_launch(x, weight, out, stream);
+    }
     const Fp8LinearSwiGluRoute route = resolve_route(policy, x.ne[1]);
     if (route == Fp8LinearSwiGluRoute::ColumnInvariantA16) {
         fp8_linear_swiglu_invariant_launch(x, weight, out, stream);

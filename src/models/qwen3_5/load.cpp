@@ -261,7 +261,9 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
             if (streamed) {
                 bank_objects.push_back(data->pending.at(w.experts.index).reference.binding.parts.front().object);
             }
-            shared_objects.push_back(data->pending.at(w.shared_expert.index).reference.binding.parts.front().object);
+            if (w.shared_expert) {
+                shared_objects.push_back(data->pending.at(w.shared_expert->index).reference.binding.parts.front().object);
+            }
         }
     }
     auto bound = loading::resolve_weights(std::move(data->pending), backing);
@@ -283,7 +285,6 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
         for (std::size_t i = 0; i < data->weights.text.layers.size(); ++i) {
             const auto& w = std::get<OffloadedMoeWeights>(data->weights.text.layers[i].ffn);
             const auto& routed = bound.at(w.experts.index);
-            const auto& shared = bound.at(w.shared_expert.index);
             try {
                 if (streamed) {
                     std::vector<float> words = read_scale_tail(bank_objects[i], routed.view);
@@ -297,11 +298,15 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
                         routed.view, moe.num_experts, data->config.text.hidden_size,
                         moe.moe_intermediate_size, routed.name));
                 }
-                std::vector<float> words = read_scale_tail(shared_objects[i], shared.view);
-                shared_banks.push_back(runtime::expert_offload::a16_nvfp4_device_bank(
-                    shared.view, words.data(), 1, data->config.text.hidden_size,
-                    moe.shared_expert_intermediate_size, shared.name));
-                shared_multipliers.push_back(std::move(words));
+                // A dense shared expert (an FP8 checkpoint's) binds as ordinary device projections.
+                if (w.shared_expert) {
+                    const auto& shared = bound.at(w.shared_expert->index);
+                    std::vector<float> words = read_scale_tail(shared_objects[shared_banks.size()], shared.view);
+                    shared_banks.push_back(runtime::expert_offload::a16_nvfp4_device_bank(
+                        shared.view, words.data(), 1, data->config.text.hidden_size,
+                        moe.shared_expert_intermediate_size, shared.name));
+                    shared_multipliers.push_back(std::move(words));
+                }
             } catch (const std::invalid_argument& error) {
                 throw artifact::ArtifactError(error.what());
             }

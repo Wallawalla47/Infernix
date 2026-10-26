@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
+#include <type_traits>
 
 namespace infernix::bench {
 
@@ -105,15 +106,22 @@ static __global__ void fill_row_split_kernel(std::uint8_t* low, std::uint8_t* hi
     }
 }
 
-static __global__ void fill_fp8_weight_kernel(std::uint8_t* codes, __nv_bfloat16* scales,
+// Row words in BF16 (fp8_e4m3fn_row_bf16) or FP32 (fp8_e4m3fn_row_f32).
+template <class Scale>
+static __global__ void fill_fp8_weight_kernel(std::uint8_t* codes, Scale* scales,
                                               std::uint64_t count, int rows, std::uint64_t seed,
                                               float extent) {
     for (auto i = std::uint64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count;
          i += std::uint64_t(gridDim.x) * blockDim.x) {
         codes[i] = __nv_fp8_e4m3(fixture::uniform(i, seed, -224.F, 224.F)).__x;
-        if (i < rows)
-            scales[i] = __float2bfloat16_rn(extent / 224.F *
-                                            fixture::uniform(i, seed ^ 0x51ca1eU, .5F, 1.5F));
+        if (i < rows) {
+            const float scale = extent / 224.F * fixture::uniform(i, seed ^ 0x51ca1eU, .5F, 1.5F);
+            if constexpr (std::is_same_v<Scale, float>) {
+                scales[i] = scale;
+            } else {
+                scales[i] = __float2bfloat16_rn(scale);
+            }
+        }
     }
 }
 
@@ -334,15 +342,17 @@ inline PackedQuantizedWeight make_nvfp4_weight(std::int32_t n, std::int32_t k,
     return result;
 }
 
+// `f32`: fp8_e4m3fn_row_f32 (FP32 row words, a per-token parent: no static input scale).
 inline PackedQuantizedWeight make_fp8_weight(std::int32_t n, std::int32_t k,
-                                             std::uint64_t seed = 0x51U, float extent = 0.05F) {
+                                             std::uint64_t seed = 0x51U, float extent = 0.05F, bool f32 = false) {
     if (n <= 0 || k <= 0) { throw std::invalid_argument("invalid benchmark FP8 weight shape"); }
+    const std::uint64_t word = f32 ? 4 : 2;
     const std::uint64_t code_bytes =
         detail::checked_mul(static_cast<std::uint64_t>(n), static_cast<std::uint64_t>(k),
                             "benchmark FP8 code size overflow");
     const std::uint64_t scale_offset = detail::align_up(code_bytes, 256);
     const std::uint64_t scale_bytes =
-        detail::checked_mul(static_cast<std::uint64_t>(n), 2, "benchmark FP8 scale size overflow");
+        detail::checked_mul(static_cast<std::uint64_t>(n), word, "benchmark FP8 scale size overflow");
     const std::uint64_t payload_bytes =
         detail::checked_add(scale_offset, scale_bytes, "benchmark FP8 payload size overflow");
     if (payload_bytes > std::numeric_limits<std::size_t>::max()) {
@@ -359,11 +369,16 @@ inline PackedQuantizedWeight make_fp8_weight(std::int32_t n, std::int32_t k,
         scale_bytes,
     };
     CUDA_CHECK(cudaMemset(result.storage.p, 0, result.storage.bytes));
-    detail::fill_fp8_weight_kernel<<<detail::launch_grid(code_bytes), 256>>>(
-        static_cast<std::uint8_t*>(result.storage.p),
-        reinterpret_cast<__nv_bfloat16*>(static_cast<std::uint8_t*>(result.storage.p) +
-                                         scale_offset),
-        code_bytes, n, seed, extent);
+    auto* scale_plane = static_cast<std::uint8_t*>(result.storage.p) + scale_offset;
+    if (f32) {
+        detail::fill_fp8_weight_kernel<<<detail::launch_grid(code_bytes), 256>>>(
+            static_cast<std::uint8_t*>(result.storage.p), reinterpret_cast<float*>(scale_plane), code_bytes, n, seed,
+            extent);
+    } else {
+        detail::fill_fp8_weight_kernel<<<detail::launch_grid(code_bytes), 256>>>(
+            static_cast<std::uint8_t*>(result.storage.p), reinterpret_cast<__nv_bfloat16*>(scale_plane), code_bytes,
+            n, seed, extent);
+    }
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -371,9 +386,9 @@ inline PackedQuantizedWeight make_fp8_weight(std::int32_t n, std::int32_t k,
     weight.payload          = result.storage.p;
     weight.payload_bytes    = payload_bytes;
     weight.high_plane_bytes = 0;
-    weight.qtype            = QType::FP8_E4M3FN_ROW_BF16;
+    weight.qtype            = f32 ? QType::FP8_E4M3FN_ROW_F32 : QType::FP8_E4M3FN_ROW_BF16;
     weight.layout           = QuantLayout::RowScale;
-    weight.scale_dtype      = DType::BF16;
+    weight.scale_dtype      = f32 ? DType::FP32 : DType::BF16;
     weight.group_size       = static_cast<std::uint32_t>(k);
     weight.group            = k;
     weight.ndim             = 2;
@@ -387,8 +402,8 @@ inline PackedQuantizedWeight make_fp8_weight(std::int32_t n, std::int32_t k,
     weight.n                = n;
     weight.k                = k;
     weight.scale_ne[0]      = n;
-    weight.scale_nb[0]      = 2;
-    weight.scale_nb[1]      = static_cast<std::int64_t>(n) * 2;
+    weight.scale_nb[0]      = static_cast<std::int64_t>(word);
+    weight.scale_nb[1]      = static_cast<std::int64_t>(n) * static_cast<std::int64_t>(word);
     weight.scale_nb[2]      = weight.scale_nb[1];
     weight.scale_nb[3]      = weight.scale_nb[1];
     return result;

@@ -79,21 +79,27 @@ MoeWeights bind_moe(Bindings& b, const TextConfig& config, const std::string& pr
 
 // The offloaded form (weights.h OffloadedMoeWeights): the routed bank stays in pinned host memory, or
 // in the artifact for the SSD tier (`stream`; the experts' frames in VRAM are the Program's), the
-// shared expert's one-record bank is in device memory.
+// shared expert (a one-record bank, or dense projections) is in device memory.
 OffloadedMoeWeights bind_offloaded_moe(Bindings& b, const TextConfig& config, const std::string& prefix,
                                        bool stream) {
-    const auto& moe  = std::get<MoeConfig>(config.ffn);
-    const auto p     = prefix + "moe/";
-    const auto input = prefix + "ffn_input";
-    const auto h     = config.hidden_size;
+    const auto& moe   = std::get<MoeConfig>(config.ffn);
+    const auto p      = prefix + "moe/";
+    const auto input  = prefix + "ffn_input";
+    const auto h      = config.hidden_size;
+    const auto shared = moe.shared_expert_intermediate_size;
     OffloadedMoeWeights out;
-    out.router        = b.parameter(p + "router", {moe.num_experts, h}, {input});
-    out.shared_score  = b.parameter(p + "shared_score", {1, h}, {input});
-    out.experts       = b.parameter(p + "experts", {moe.num_experts, h, moe.moe_intermediate_size}, {input},
-                                    QType::NVFP4_MUL,
-                                    stream ? artifact::Residency::Streamed : artifact::Residency::HostPinned);
-    out.shared_expert = b.parameter(p + "shared_expert", {1, h, moe.shared_expert_intermediate_size}, {input},
-                                    QType::NVFP4_MUL);
+    out.router       = b.parameter(p + "router", {moe.num_experts, h}, {input});
+    out.shared_score = b.parameter(p + "shared_score", {1, h}, {input});
+    out.experts      = b.parameter(p + "experts", {moe.num_experts, h, moe.moe_intermediate_size}, {input},
+                                   QType::NVFP4_MUL,
+                                   stream ? artifact::Residency::Streamed : artifact::Residency::HostPinned);
+    if (b.binder.reader().directory().bindings.contains(p + "shared_expert")) {
+        out.shared_expert = b.parameter(p + "shared_expert", {1, h, shared}, {input}, QType::NVFP4_MUL);
+    } else {
+        out.shared = DenseWeights{b.parameter(p + "shared/gate", {shared, h}, {input}),
+                                  b.parameter(p + "shared/up", {shared, h}, {input}),
+                                  b.parameter(p + "shared/down", {h, shared}, {p + "shared/product"})};
+    }
     return out;
 }
 

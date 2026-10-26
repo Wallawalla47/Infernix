@@ -67,7 +67,8 @@ void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& valu
  *   [2048,2048,6144,6144].
  * - FP8_E4M3FN_ROW_F32 RowScale [20480,3072] (Qwen3.5-122B-A10B: FP32 row multipliers and one
  *   static activation scale s), with stored row counts [2048,2048,8192,8192]. Its A8 route
- *   encodes x as e4m3_rn_satfinite(fl32(x * fl32(1 / s))); it has no A8 residual route.
+ *   encodes x as e4m3_rn_satfinite(fl32(x * fl32(1 / s))); a per-token parent (Weight::input_scale
+ *   0) takes each column's own s = fl32(max |x| / 448). It has no A8 residual route.
  *
  * The first three ranges are written contiguously to qkv and the final range is written to z.
  * Q8 uses A16 under every policy. Under A16ColumnInvariant a column's outputs do not depend on the

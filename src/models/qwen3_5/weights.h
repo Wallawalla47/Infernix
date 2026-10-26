@@ -60,12 +60,15 @@ struct MoeWeights {
 
 // Routed experts held in pinned host memory as one exact bank per layer (nvfp4_expert_rg16_v1
 // [E, H, I], W4A16) and served through the expert cache (docs/maintainer/qwen3_5-122b-offload-
-// design.md), and the NVFP4 shared expert as a one-record bank in device memory. The artifact
-// decides the form: a block whose `moe/experts` parameter is a bank binds this one.
+// design.md), and the shared expert in device memory: an NVFP4 one as a one-record bank, an FP8 one
+// (dealignai's Ornith-1.5-122B-UNCENSORED-NVFP4) as dense gate/up and down projections. The artifact
+// decides the forms: a block whose `moe/experts` parameter is a bank binds this one, and its
+// `moe/shared_expert` bank or `moe/shared/*` projections the shared expert's.
 struct OffloadedMoeWeights {
     WeightId router, shared_score;
-    WeightId experts;       // host-pinned bank [E, H, I]
-    WeightId shared_expert; // device bank [1, H, I_shared]
+    WeightId experts;                     // host-pinned bank [E, H, I]
+    std::optional<WeightId> shared_expert; // device bank [1, H, I_shared]
+    std::optional<DenseWeights> shared;    // or dense projections
 };
 
 struct BlockWeights {

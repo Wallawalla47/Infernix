@@ -62,6 +62,8 @@ quantized_weight::PackedWeight make_q8_g32_fp16_weight(std::int32_t n, std::int3
 quantized_weight::PackedWeight make_nvfp4_weight(std::int32_t n, std::int32_t k,
                                                  std::uint32_t seed);
 quantized_weight::PackedWeight make_fp8_weight(std::int32_t n, std::int32_t k, std::uint32_t seed);
+// fp8_e4m3fn_row_f32 without a static activation scale (a per-token parent).
+quantized_weight::PackedWeight make_fp8_f32_weight(std::int32_t n, std::int32_t k, std::uint32_t seed);
 quantized_weight::PackedWeight make_mxfp8_weight(std::int32_t n, std::int32_t k, std::uint32_t seed);
 
 void cpu_linear_gemm_fp64(const float* weight, const float* activation, double* output,

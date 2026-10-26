@@ -327,7 +327,8 @@ struct PatternedWeightOptions {
     RowSplitCodePattern row_split_codes  = RowSplitCodePattern::Coordinate;
     float weight_scale_divisor           = 0.0F;
     float input_scale_divisor            = 0.0F;
-    // FP8_E4M3FN_ROW_F32 only: the static activation scale s of its A8 route (Weight::input_scale).
+    // FP8_E4M3FN_ROW_F32 only: the static activation scale s of its A8 route (Weight::input_scale); 0
+    // makes a per-token parent.
     float activation_scale               = 0.0F;
 };
 
@@ -404,7 +405,8 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
                 "quantized-weight fixture: divisors do not belong to FP8 weights");
         }
         const bool f32 = qtype == QType::FP8_E4M3FN_ROW_F32;
-        if (f32 != (options.activation_scale != 0.0F)) {
+        // A row-F32 weight without one is a per-token parent (ModelOpt FP8_PER_CHANNEL_PER_TOKEN).
+        if (!f32 && options.activation_scale != 0.0F) {
             throw std::invalid_argument(
                 "quantized-weight fixture: a static activation scale belongs to FP8 row-F32 weights");
         }

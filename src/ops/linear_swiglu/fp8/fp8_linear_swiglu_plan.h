@@ -32,6 +32,12 @@ void fp8_linear_swiglu_a8_launch(const Tensor& x, const Weight& weight, Tensor& 
 void fp8_linear_swiglu_a8_residual_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                           WorkspaceArena& workspace, cudaStream_t stream);
 
+// Qwen3.5-122B-A10B's FP8 shared expert, fp8_e4m3fn_row_f32 [2048,3072] -> [1024,T]: A16 only (its
+// checkpoint keeps the shared expert's activations 16-bit), and one column-invariant schedule family.
+void fp8_linear_swiglu_n2048_a16_launch(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream);
+void fp8_linear_swiglu_n2048_invariant_launch(const Tensor& x, const Weight& weight, Tensor& out,
+                                              cudaStream_t stream);
+
 void fp8_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& out,
                                 LinearPolicy policy, WorkspaceArena& workspace,
                                 cudaStream_t stream);

@@ -153,6 +153,16 @@ void launch_fp8_a8_quantize(const Tensor& x, const Weight& weight, Fp8A8Workspac
         throw std::invalid_argument("fp8 A8 requires caller workspace");
     }
     if (weight.qtype == QType::FP8_E4M3FN_ROW_F32) {
+        if (weight.input_scale == 0.0F) {
+            // A per-token parent (ModelOpt FP8_PER_CHANNEL_PER_TOKEN, no calibrated scale): each column
+            // takes its own scale, max |x| / 448, as the BF16-scaled row format's A8 route encodes. The
+            // Qwen3.5-122B-A10B's input projections read K 3072, its output projections K 8192.
+            switch (weight.k) {
+            case 3072: launch_quantize_exact<Fp8ActivationGeometry<3072>>(x, workspace, stream); return;
+            case 8192: launch_quantize_exact<Fp8ActivationGeometry<8192>>(x, workspace, stream); return;
+            default: throw std::invalid_argument("fp8 A8 quantize: unsupported per-token K");
+            }
+        }
         if (!(weight.input_scale > 0.0F) || !std::isfinite(weight.input_scale)) {
             throw std::invalid_argument("fp8 A8 quantize: static parent requires its input scale");
         }

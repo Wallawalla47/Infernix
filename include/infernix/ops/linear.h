@@ -137,7 +137,7 @@ enum class LinearRoutes : std::uint8_t {
 
 /**
  * Whether the format writes an FP32 `out` (a vocabulary head's logits): Q6_G64_FP16, Q8_G32_FP16, BF16,
- * FP8_E4M3FN_ROW_BF16 and nvfp4_rg16_v1. The other formats refuse one.
+ * FP8_E4M3FN_ROW_BF16, FP8_E4M3FN_ROW_F32 and nvfp4_rg16_v1. The other formats refuse one.
  */
 [[nodiscard]] bool linear_fp32_output(QType qtype) noexcept;
 
@@ -170,7 +170,8 @@ enum class LinearRoutes : std::uint8_t {
  * `out` is contiguous, non-null, 16-byte-aligned BF16 or FP32 `[N,T]`. FP32 output serves vocabulary
  * heads (BF16 logits tie near-equal tokens): Q6 and Q8 at every registered problem (Q8 problems other
  * than `[248320,5120]` run the runtime-shape schedules), BF16 on its runtime-shape route, FP8
- * `[248320,5120]`, and `nvfp4_rg16_v1`; other formats refuse it. Every logical extent is positive;
+ * `[248320,5120]` and `[248320,3072]` (FP32 row multipliers), and `nvfp4_rg16_v1`; other formats
+ * refuse it. Every logical extent is positive;
  * in particular, `T=0` is invalid rather than a no-op. Dimension zero is stored fastest. The Op has
  * no bias, activation, residual addition, or transpose mode.
  *
@@ -184,7 +185,10 @@ enum class LinearRoutes : std::uint8_t {
  * owns a finite registry of exact physical
  * weight problems and selects its kernel internally; a valid encoding and alignment do not imply
  * arbitrary N/K support. FP8 currently registers `[N,K]` in `{[14336,5120], [16384,5120],
- * [34816,5120], [248320,5120], [5120,6144], [5120,17408]}` at every positive T. The current NVFP4
+ * [34816,5120], [248320,5120], [5120,6144], [5120,17408]}` at every positive T, and with FP32 row
+ * multipliers (FP8_E4M3FN_ROW_F32, Qwen3.5-122B-A10B's per-row FP8 shared expert down and head)
+ * `[3072,1024]` and `[248320,3072]` at every positive T with 16-bit activations under every policy,
+ * each with a column-invariant route. The current NVFP4
  * problems register the five non-vocabulary FP8 geometries and accept every positive T. Q8 also
  * registers `[5120,25600]` at every positive T. BF16 registers the text problems `[14336,5120]`,
  * `[5120,6144]` and `[256,5120]` and the Vision tower problems `[1152,1536]`, `[3456,1152]`,

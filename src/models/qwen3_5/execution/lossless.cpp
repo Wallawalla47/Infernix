@@ -71,7 +71,11 @@ Step design_step(const LosslessDesign& design, const LinearParameters& p) {
     if (!design.active) { return Step::None; }
     if (p.weight.qtype == QType::NVFP4 && ops::allows_a4(p.policy)) { return Step::Nvfp4; }
     if (p.weight.qtype == QType::FP8_E4M3FN_ROW_BF16 && ops::allows_a8(p.policy)) { return Step::Fp8Token; }
-    if (p.weight.qtype == QType::FP8_E4M3FN_ROW_F32 && ops::allows_a8(p.policy)) { return Step::Fp8Static; }
+    // A per-token fp8_e4m3fn_row_f32 parent (no calibrated scale: ModelOpt FP8_PER_CHANNEL_PER_TOKEN)
+    // takes the per-token rule.
+    if (p.weight.qtype == QType::FP8_E4M3FN_ROW_F32 && ops::allows_a8(p.policy)) {
+        return p.weight.input_scale > 0.0F ? Step::Fp8Static : Step::Fp8Token;
+    }
     return Step::None;
 }
 
@@ -390,28 +394,46 @@ void offloaded_moe(A& a, const OffloadedMoeParameters& p, const Tensor& h, Tenso
             streaming->before_experts(p.layer, s);
         }
     }
+    // A dense shared expert (an FP8 checkpoint's) is computed here; a shared expert bank is the
+    // dispatch's last job.
+    const std::int32_t sj = p.shared ? 0 : 1;
+    const std::int32_t Is = p.shared ? p.shared->gate_up.weight.n / 2 : 0;
     for (std::int32_t c0 = 0; c0 < T; c0 += kFfnColumns) {
         const std::int32_t n = std::min(kFfnColumns, T - c0);
         auto scope = a.scope();
         const Tensor hc = h.slice(1, c0, n);
-        // Router logits and the shared expert's gate logit (row E): one encode of hc.
+        // Router logits and the shared expert's gate logit (row E), and a dense shared expert's gate and
+        // up: one encode of hc.
         Tensor logits = alloc(a, DType::BF16, {E + 1, n});
-        shared(a, hc, {{&router, 0, E, &logits, 0}, {&score, 0, 1, &logits, E}}, s);
+        Tensor sg, su, sd;
+        if (p.shared) {
+            sg = alloc(a, DType::BF16, {Is, n});
+            su = alloc(a, DType::BF16, {Is, n});
+            const Weight& gu = p.shared->gate_up.weight;
+            shared(a, hc, {{&router, 0, E, &logits, 0}, {&score, 0, 1, &logits, E}, {&gu, 0, Is, &sg, 0},
+                           {&gu, Is, Is, &su, 0}},
+                   s);
+            if constexpr (kRuns<A>) { ops::lossless_silu_mul(sg, su, sg, s); }
+            sd = alloc(a, DType::BF16, {H, n});
+            linear(a, sg, p.shared->down.weight, 0, H, sd, 0, s);
+        } else {
+            shared(a, hc, {{&router, 0, E, &logits, 0}, {&score, 0, 1, &logits, E}}, s);
+        }
         Tensor weights = alloc(a, DType::FP32, {k, n}), ids = alloc(a, DType::I32, {k, n});
         Tensor gate    = alloc(a, DType::FP32, {n});
-        const std::int32_t entries = (k + 1) * n, max_jobs = std::min(E, k * n) + 1;
-        const DeviceSpan dispatch_bytes = a.alloc_bytes(ops::moe_dispatch_bytes(E + 1, entries));
+        const std::int32_t entries = (k + sj) * n, max_jobs = std::min(E, k * n) + sj;
+        const DeviceSpan dispatch_bytes = a.alloc_bytes(ops::moe_dispatch_bytes(E + sj, entries));
         Tensor outputs = alloc(a, DType::BF16, {H, entries});
         const DeviceSpan expert_ws = a.alloc_bytes(ops::moe_experts_workspace_bytes(
             shape, max_jobs, entries, n, ops::offloaded_moe::ExpertActivation::kA16, ops::offloaded_moe::WideA16::kLossless));
         if constexpr (kRuns<A>) {
             ops::lossless_router(logits, E, k, weights, ids, s);
             ops::MoeRouting routing{ids, weights, gate};
-            ops::MoeDispatch dispatch = ops::carve_moe_dispatch(dispatch_bytes.data, E + 1, entries);
+            ops::MoeDispatch dispatch = ops::carve_moe_dispatch(dispatch_bytes.data, E + sj, entries);
             std::int32_t* route_log   = experts->route_log != nullptr && static_cast<std::size_t>(k) * n <= experts->route_stride
                                             ? experts->route_log + static_cast<std::size_t>(p.layer) * experts->route_stride
                                             : nullptr;
-            ops::moe_dispatch(routing, E, dispatch, route_log, s, /*shared_job=*/true);
+            ops::moe_dispatch(routing, E, dispatch, route_log, s, /*shared_job=*/sj == 1);
             ops::MoeExpertSource source = experts->sources.at(p.layer);
             source.cpu      = ops::MoeCpuChannel{}; // the lossless pass computes every expert on the GPU
             source.wide_a16 = ops::offloaded_moe::WideA16::kLossless;
@@ -423,7 +445,8 @@ void offloaded_moe(A& a, const OffloadedMoeParameters& p, const Tensor& h, Tenso
             ops::moe_experts(hc, dispatch, source, k, max_jobs, expert_ws.data, outputs, s, /*wait_for_cpu=*/false, false);
             // Over the experts in ascending id s = bf16(s + bf16(y_e w_e)), then the gated shared expert, then
             // the residual.
-            const Tensor routed = outputs.slice(1, 0, k * n), shared_out = outputs.slice(1, k * n, n);
+            const Tensor routed = outputs.slice(1, 0, k * n);
+            const Tensor shared_out = p.shared ? sd : outputs.slice(1, k * n, n);
             Tensor xc = x.slice(1, c0, n);
             ops::lossless_moe_combine(routed, weights, ids, Tensor{}, &shared_out, &logits, E, xc, s);
         }

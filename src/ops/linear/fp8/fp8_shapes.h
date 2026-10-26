@@ -49,4 +49,8 @@ extern const Fp8LinearShape kFp8N13312K2560;
 extern const Fp8LinearShape kFp8N2560K6144;
 extern const Fp8LinearShape kFp8N1280K2560;
 extern const Fp8LinearShape kFp8N2560K640;
+// Qwen3.5-122B-A10B fp8_e4m3fn_row_f32 problems (dealignai's Ornith-1.5-122B-UNCENSORED-NVFP4, W8A16):
+// the shared expert's down projection and the vocabulary head.
+extern const Fp8LinearShape kFp8F32N3072K1024;
+extern const Fp8LinearShape kFp8F32N248320K3072;
 } // namespace infernix::ops::detail

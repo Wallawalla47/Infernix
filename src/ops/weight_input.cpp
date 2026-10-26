@@ -1,5 +1,7 @@
 #include "infernix/ops/weight_input.h"
 
+#include "core/temporary_switches.h"
+
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -111,11 +113,14 @@ SingleProjectionWeight single(std::span<const WeightInput> inputs) {
     }
     auto weight = native_weight(view, divisor);
     if (region.parent->geometry.format == QType::FP8_E4M3FN_ROW_F32) {
-        // A static A8 parent's inputs share one activation encoding, so one calibrated scale.
-        float scale = 0;
+        // A static A8 parent's inputs share one activation encoding, so one calibrated scale. A parent
+        // whose inputs carry none (ModelOpt FP8_PER_CHANNEL_PER_TOKEN) encodes each activation column
+        // with its own scale (input_scale 0); a parent may not mix the two.
+        float scale         = 0;
+        bool per_token_input = false;
         for (const auto& input : inputs) {
             if (!input.activation_input_scale) {
-                require(!allows_a8(policy), "static FP8 A8 input requires an activation scale");
+                per_token_input = per_token_input || allows_a8(input.policy);
                 continue;
             }
             require(std::isfinite(*input.activation_input_scale) && *input.activation_input_scale > 0,
@@ -128,7 +133,11 @@ SingleProjectionWeight single(std::span<const WeightInput> inputs) {
                         "fused static FP8 inputs require identical activation scales");
             }
         }
+        require(!(per_token_input && scale != 0), "fused FP8 inputs mix static and per-token activation scales");
         weight.input_scale = scale;
+        // TEMPORARY (INFERNIX_TMP_PER_TOKEN_A16): the per-token A8 prefill's A/B arm at 16-bit activations.
+        static const bool per_token_a16 = temporary_switches::flag("INFERNIX_TMP_PER_TOKEN_A16");
+        if (per_token_input && per_token_a16) { return {weight, LinearPolicy::A16Only}; }
     }
     return {weight, policy};
 }

@@ -7,15 +7,32 @@
 
 namespace infernix::ops::detail {
 namespace {
+// fp8_e4m3fn_row_bf16 problems, and fp8_e4m3fn_row_f32 ones (their kernels read FP32 row words).
 const std::array kShapes{&kFp8N14336K5120, &kFp8N16384K5120, &kFp8N34816K5120, &kFp8N5120K6144,
                          &kFp8N5120K17408,  &kFp8N248320K5120, &kFp8N16384K2560, &kFp8N13312K2560,
                          &kFp8N2560K6144,   &kFp8N1280K2560,   &kFp8N2560K640};
+const std::array kF32Shapes{&kFp8F32N3072K1024, &kFp8F32N248320K3072};
 
-const Fp8LinearShape& resolve_shape(std::int32_t n, std::int32_t k, LinearPolicy policy) {
-    if (!valid_linear_policy(policy)) throw std::invalid_argument("fp8 linear: unsupported policy");
+const Fp8LinearShape* find_shape(QType qtype, std::int32_t n, std::int32_t k) noexcept {
+    if (qtype == QType::FP8_E4M3FN_ROW_F32) {
+        for (const auto* shape : kF32Shapes)
+            if (shape->n == n && shape->k == k) return shape;
+        return nullptr;
+    }
     for (const auto* shape : kShapes)
-        if (shape->n == n && shape->k == k) return *shape;
+        if (shape->n == n && shape->k == k) return shape;
+    return nullptr;
+}
+
+const Fp8LinearShape& resolve_shape(QType qtype, std::int32_t n, std::int32_t k, LinearPolicy policy) {
+    if (!valid_linear_policy(policy)) throw std::invalid_argument("fp8 linear: unsupported policy");
+    if (const auto* shape = find_shape(qtype, n, k)) return *shape;
     throw std::invalid_argument("fp8 linear: unsupported shape");
+}
+
+// The vocabulary heads, the problems that write FP32 logits (A16 and column-invariant routes).
+bool vocabulary_head(const Fp8LinearShape& shape) noexcept {
+    return &shape == &kFp8N248320K5120 || &shape == &kFp8F32N248320K3072;
 }
 
 // The single-term A8 route takes precedence where the policy permits it; the pair route only
@@ -40,17 +57,17 @@ bool uses_f16(const Fp8LinearShape& shape, LinearPolicy policy, LinearRoutes rou
 }
 } // namespace
 
-bool fp8_linear_column_invariant_route(std::int32_t n, std::int32_t k) noexcept {
-    for (const auto* shape : kShapes)
-        if (shape->n == n && shape->k == k) return shape->invariant != nullptr;
-    return false;
+bool fp8_linear_column_invariant_route(QType qtype, std::int32_t n, std::int32_t k) noexcept {
+    const auto* shape = find_shape(qtype, n, k);
+    return shape != nullptr && shape->invariant != nullptr;
 }
 
-std::size_t fp8_linear_workspace_capacity_bytes(std::int32_t n, std::int32_t k, LinearPolicy policy,
-                                                std::int32_t min_tokens, std::int32_t max_tokens) {
+std::size_t fp8_linear_workspace_capacity_bytes(QType qtype, std::int32_t n, std::int32_t k,
+                                                LinearPolicy policy, std::int32_t min_tokens,
+                                                std::int32_t max_tokens) {
     if (min_tokens <= 0 || max_tokens < min_tokens)
         throw std::invalid_argument("fp8 linear workspace: invalid token interval");
-    const auto& shape = resolve_shape(n, k, policy);
+    const auto& shape = resolve_shape(qtype, n, k, policy);
     if (column_invariant(policy) && shape.invariant == nullptr)
         throw std::invalid_argument("fp8 linear: the shape registers no column-invariant route");
     if (column_invariant(policy)) return 0; // one A16 schedule, no route flag applies
@@ -81,10 +98,10 @@ void fp8_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPoli
                   LinearRoutes routes, WorkspaceArena* workspace, cudaStream_t stream) {
     validate_fp8_weight(weight, "fp8 linear");
     if (x.ne[1] <= 0) throw std::invalid_argument("fp8 linear: T must be positive");
-    const auto& shape = resolve_shape(weight.n, weight.k, policy);
-    // FP32 output: the vocabulary head's A16 and column-invariant routes only.
-    if (out.dtype == DType::FP32 && &shape != &kFp8N248320K5120) {
-        throw std::invalid_argument("fp8 linear: FP32 output needs the [248320, 5120] head");
+    const auto& shape = resolve_shape(weight.qtype, weight.n, weight.k, policy);
+    // FP32 output: the vocabulary heads' A16 and column-invariant routes only.
+    if (out.dtype == DType::FP32 && !vocabulary_head(shape)) {
+        throw std::invalid_argument("fp8 linear: FP32 output needs a [248320, 5120] or [248320, 3072] head");
     }
     if (column_invariant(policy)) {
         if (shape.invariant == nullptr)

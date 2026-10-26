@@ -44,18 +44,26 @@ __global__ __launch_bounds__(kThreads) void nvfp4_logits_topk_kernel(const float
 
 } // namespace
 
+void linear_topk_logits_launch(const Tensor& logits, std::int32_t valid_rows, const LinearTopKWorkspace& workspace,
+                               cudaStream_t stream) {
+    if (workspace.rows_per_producer != kThreads || logits.dtype != DType::FP32 ||
+        logits.ne[1] != workspace.columns) {
+        throw std::logic_error("linear_topk logits: workspace does not match the call");
+    }
+    nvfp4_logits_topk_kernel<<<workspace.producer_groups, kThreads, 0, stream>>>(
+        static_cast<const float*>(logits.data), logits.ne[0], valid_rows,
+        static_cast<std::uint64_t*>(workspace.partial_keys.data), workspace.producer_groups, workspace.columns);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void linear_topk_nvfp4_launch(const Tensor& hidden, const Weight& head, std::int32_t valid_rows,
                               const LinearTopKWorkspace& workspace, Tensor& logits, WorkspaceArena& arena,
                               cudaStream_t stream) {
-    if (workspace.rows_per_producer != kThreads || logits.dtype != DType::FP32 || logits.ne[0] != head.n ||
-        logits.ne[1] != hidden.ne[1]) {
+    if (logits.ne[0] != head.n || logits.ne[1] != hidden.ne[1]) {
         throw std::logic_error("linear_topk NVFP4: workspace does not match the call");
     }
     rg16_linear(hidden, head, logits, arena, stream);
-    nvfp4_logits_topk_kernel<<<workspace.producer_groups, kThreads, 0, stream>>>(
-        static_cast<const float*>(logits.data), head.n, valid_rows,
-        static_cast<std::uint64_t*>(workspace.partial_keys.data), workspace.producer_groups, workspace.columns);
-    CUDA_CHECK(cudaGetLastError());
+    linear_topk_logits_launch(logits, valid_rows, workspace, stream);
 }
 
 } // namespace infernix::ops::detail

@@ -2770,11 +2770,13 @@ MoeDispatch carve_moe_dispatch(void* base, std::int32_t experts, std::int32_t en
 
 namespace {
 
-// A column mask covers whole rows of the call's columns and needs the shared job (MoeColumnMask).
+// A column mask covers whole rows of the call's columns (MoeColumnMask); with a shared job, the
+// shared entries of masked columns are dropped too, and without one (a dense shared expert beside the
+// call) only routed entries exist.
 bool masked_call(const MoeColumnMask& mask, int columns, bool shared_job) {
+    (void)shared_job;
     if (mask.valid == nullptr) { return false; }
-    require(mask.width > 0 && columns % mask.width == 0 && shared_job,
-            "a column mask needs whole rows of the call's columns and the shared job");
+    require(mask.width > 0 && columns % mask.width == 0, "a column mask needs whole rows of the call's columns");
     return true;
 }
 

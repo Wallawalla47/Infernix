@@ -14,7 +14,7 @@ import torch
 from tools.artifact.codecs.fp8_row import validate_fp8_row_words
 from tools.artifact.formats import valid_positive_fp32_word
 from .logical import EncodedRows, LogicalSource
-from .modelopt import MXFP8_FORMAT, is_mxfp8_matrix, mxfp8_matrix_source
+from .modelopt import MXFP8_FORMAT, fp8_block_values, is_fp8_block_matrix, is_mxfp8_matrix, mxfp8_matrix_source
 from .safetensors import SafetensorsSource, tensor_source
 
 _E2M1_F64 = torch.tensor(
@@ -249,8 +249,16 @@ def matrix_source(
                 actual = "nvfp4"
             if actual is None and is_mxfp8_matrix(store, prefix, shape):
                 actual = MXFP8_FORMAT  # ModelOpt MXFP8: UE8M0 scales per 32 K elements
+            if actual is None and is_fp8_block_matrix(store, prefix):
+                # Block FP8 (ModelOpt FP8_PB_WO): values only, code x the 128 x 128 tile's FP32 multiplier.
+                resolved = fp8_block_values(store, prefix, shape)
+                return resolved
             if actual is None and store.describe(name).dtype == "F8_E4M3":
-                actual = "fp8_e4m3fn_row_bf16"
+                # Per-row FP32 scales (ModelOpt FP8_PER_CHANNEL_PER_TOKEN) are read exactly; a BF16 or
+                # per-tensor scale takes the BF16 row format, as before.
+                scale = store.describe(prefix + ".weight_scale") if store.has(prefix + ".weight_scale") else None
+                per_row_f32 = scale is not None and scale.dtype == "F32" and prod(scale.shape) == shape[0] > 1
+                actual = "fp8_e4m3fn_row_f32" if per_row_f32 else "fp8_e4m3fn_row_bf16"
             if actual is None:
                 resolved = tensor_source(store, name, shape)
             elif actual == MXFP8_FORMAT:
@@ -278,5 +286,8 @@ def matrix_source(
         encoded,
         lambda: divisor("weight_divisor"),
         lambda: divisor("input_divisor"),
-        (lambda: divisor("input_scale")) if format == "fp8_e4m3fn_row_f32" else None,
+        # A static activation scale only where the matrix stores one (a per-channel export has none).
+        (lambda: divisor("input_scale"))
+        if format == "fp8_e4m3fn_row_f32" and store.has(prefix + ".input_scale")
+        else None,
     )

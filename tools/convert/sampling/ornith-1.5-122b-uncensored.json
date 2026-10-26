@@ -1,0 +1,21 @@
+{
+  "source": "https://huggingface.co/dealignai/Ornith-1.5-122B-UNCENSORED-NVFP4 (revision e6a1c178): the card's recommended sampling, baked into its generation_config.json, one set for both modes (precise coding keeps the same values)",
+  "thinking": {
+    "temperature": 0.6,
+    "top_k": 20,
+    "top_p": 0.95,
+    "min_p": 0.0,
+    "presence_penalty": 0.0,
+    "frequency_penalty": 0.0,
+    "repetition_penalty": 1.0
+  },
+  "non_thinking": {
+    "temperature": 0.6,
+    "top_k": 20,
+    "top_p": 0.95,
+    "min_p": 0.0,
+    "presence_penalty": 0.0,
+    "frequency_penalty": 0.0,
+    "repetition_penalty": 1.0
+  }
+}

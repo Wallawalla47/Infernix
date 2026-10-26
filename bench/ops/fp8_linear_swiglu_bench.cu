@@ -38,6 +38,8 @@ struct Options {
     int warmup   = 5;
     int repeat   = 30;
     bool profile = false;
+    // --shared-122b: Qwen3.5-122B-A10B's per-row FP8 shared expert, fp8_e4m3fn_row_f32 [2048,3072].
+    bool shared_122b = false;
 };
 
 std::vector<std::int32_t> parse_tokens(std::string_view raw) {
@@ -88,9 +90,11 @@ Options parse_options(int argc, char** argv) {
             options.repeat = std::stoi(std::string(next("--repeat value")));
         } else if (argument == "--profile") {
             options.profile = true;
+        } else if (argument == "--shared-122b") {
+            options.shared_122b = true;
         } else if (argument == "--help" || argument == "-h") {
             std::printf("Usage: %s [--policy a16|a8|a8r|invariant] [--t-sweep 1,2,...] [--warmup N] "
-                        "[--repeat N] [--profile]\n",
+                        "[--repeat N] [--profile] [--shared-122b]\n",
                         argv[0]);
             std::exit(0);
         } else {
@@ -121,15 +125,19 @@ int main(int argc, char** argv) {
             std::minmax_element(options.tokens.begin(), options.tokens.end());
         const std::int32_t min_t = *min_it;
         const std::int32_t max_t = *max_it;
+        const std::int32_t kGateUpRows = options.shared_122b ? 2048 : ::kGateUpRows;
+        const std::int32_t kOutputRows = options.shared_122b ? 1024 : ::kOutputRows;
+        const std::int32_t kHidden     = options.shared_122b ? 3072 : ::kHidden;
 
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         bench::L2FlushBuffer flush(kFlushBytes);
         DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_t, 101U);
         DeviceBuffer output(static_cast<std::size_t>(kOutputRows) * max_t * sizeof(std::uint16_t));
-        bench::PackedQuantizedWeight packed  = bench::make_fp8_weight(kGateUpRows, kHidden);
+        bench::PackedQuantizedWeight packed =
+            bench::make_fp8_weight(kGateUpRows, kHidden, 0x51U, 0.05F, options.shared_122b);
         const std::size_t workspace_capacity = ops::linear_swiglu_workspace_capacity_bytes(
-            QType::FP8_E4M3FN_ROW_BF16, kGateUpRows, kHidden, options.policy, min_t, max_t);
+            packed.weight.qtype, kGateUpRows, kHidden, options.policy, min_t, max_t);
         WorkspaceArena workspace(std::max<std::size_t>(workspace_capacity, 256));
 
         const auto launch = [&](std::int32_t tokens, cudaStream_t launch_stream) {

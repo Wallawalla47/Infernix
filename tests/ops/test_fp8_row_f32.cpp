@@ -10,12 +10,21 @@
 //     represents (code * s), so A8 is held to the A16 criterion: what remains is FP32 accumulation and
 //     the output's BF16 rounding. Widths cover every schedule band and the split-K tails.
 //   - Column invariance: under A16ColumnInvariant a column's outputs are the same bits at every width.
+//   - Per-token parents (no static scale; dealignai's Ornith-1.5-122B-UNCENSORED-NVFP4, ModelOpt
+//     FP8_PER_CHANNEL_PER_TOKEN): each column's encoding bit for bit (scale fl32(max |x| / 448), code
+//     e4m3_rn_satfinite(fl32(x * fl32(1 / scale)))), and the three projections' A8 routes against FP64
+//     sums over the values each column's codes represent.
+//   - The per-row FP8 shared expert (linear_swiglu [2048, 3072], linear [3072, 1024]) and vocabulary head
+//     (linear [248320, 3072], BF16 and FP32 logits): under A16ColumnInvariant a column's outputs are the
+//     same bits at every width (their FP64 criteria are test_fp8_a16's and linear_swiglu_fp8's).
 
 #include "ops/op_family.h"
 #include "core/weight.h"
 #include "infernix/ops/attn_input_proj.h"
 #include "infernix/ops/gdn_input_proj.h"
+#include "infernix/ops/linear.h"
 #include "infernix/ops/linear_add.h"
+#include "infernix/ops/linear_swiglu.h"
 #include "ops/common/canonical_math.h"
 #include "ops/linear/fp8/fp8_a8_plan.h"
 
@@ -29,6 +38,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <functional>
+#include <initializer_list>
 #include <iostream>
 #include <random>
 #include <string>
@@ -69,6 +80,27 @@ std::vector<double> oracle(const quantized_weight::PackedWeight& weight, int off
 }
 
 std::vector<double> as_double(const std::vector<float>& x) { return {x.begin(), x.end()}; }
+
+// A per-token column's scale: fl32(max |x| / 448), 0 for an all-zero column.
+float per_token_scale(const std::vector<float>& x, int k, int token) {
+    float maximum = 0.0F;
+    for (int c = 0; c < k; ++c) { maximum = std::max(maximum, std::fabs(x[static_cast<std::size_t>(token) * k + c])); }
+    return maximum > 0.0F ? maximum / 448.0F : 0.0F;
+}
+
+// The values a per-token parent's codes represent ([k][tokens]): code * the column's scale.
+std::vector<double> represented_per_token(const std::vector<float>& x, int k, int tokens) {
+    std::vector<double> out(x.size());
+    for (int t = 0; t < tokens; ++t) {
+        const float scale   = per_token_scale(x, k, t);
+        const float inverse = scale > 0.0F ? 1.0F / scale : 0.0F;
+        for (int c = 0; c < k; ++c) {
+            const std::size_t i = static_cast<std::size_t>(t) * k + c;
+            out[i]              = fp8_static::e4m3_value(fp8_static::code(x[i], inverse)) * static_cast<double>(scale);
+        }
+    }
+    return out;
+}
 
 bool a8(ops::LinearPolicy policy, int tokens, int first_a8 = 17) {
     return policy == ops::LinearPolicy::AllowA8 && tokens >= first_a8;
@@ -119,10 +151,58 @@ int run_quantizer(int k, int tokens) {
     return storage.verify_guards(where);
 }
 
+// A per-token parent's encoding (input_scale 0): every column's scale and codes bit for bit.
+int run_per_token_quantizer(int k, int tokens) {
+    const auto x    = activations(k, tokens, 13U + static_cast<std::uint32_t>(k + tokens));
+    const auto bits = bf16_bits(x);
+    DeviceBuffer input = to_device(bits);
+    const std::size_t bytes = ops::detail::fp8_a8_workspace_capacity_bytes(tokens, k);
+    GuardedDeviceBuffer storage(bytes);
+    DeviceArena arena(DeviceSpan{storage.data(), bytes});
+    const auto workspace = ops::detail::allocate_fp8_a8_workspace(arena, tokens, k);
+    Weight weight{};
+    weight.qtype = QType::FP8_E4M3FN_ROW_F32;
+    weight.n     = 16;
+    weight.k     = k;
+    DeviceContext device;
+    ops::detail::launch_fp8_a8_quantize(Tensor(input.p, DType::BF16, {k, tokens}), weight, workspace, device.stream);
+    cuda_synchronize(device.stream);
+    const auto codes  = from_device<std::uint8_t>(workspace.codes, static_cast<std::size_t>(k) * tokens);
+    const auto scales = from_device<float>(workspace.scales, static_cast<std::size_t>(tokens));
+    std::size_t bad = 0, scale_bad = 0, saturated = 0;
+    for (int t = 0; t < tokens; ++t) {
+        const float scale   = per_token_scale(x, k, t);
+        const float inverse = scale > 0.0F ? 1.0F / scale : 0.0F;
+        scale_bad += std::memcmp(&scales[static_cast<std::size_t>(t)], &scale, 4) != 0;
+        for (int c = 0; c < k; ++c) {
+            const std::size_t i     = static_cast<std::size_t>(t) * k + c;
+            const std::uint8_t want = fp8_static::code(x[i], inverse);
+            bad += codes[i] != want;
+            saturated += (want & 0x7F) == 0x7E ? 1 : 0;
+        }
+    }
+    const std::string where = "per-token A8 encoding K=" + std::to_string(k) + " T=" + std::to_string(tokens);
+    // Each column's largest magnitude takes the top code.
+    if (bad != 0 || scale_bad != 0 || saturated < static_cast<std::size_t>(tokens)) {
+        std::cerr << where << ": " << bad << " codes and " << scale_bad << " scales differ (" << saturated
+                  << " at the top code)\n";
+        return 1;
+    }
+    return storage.verify_guards(where);
+}
+
 // ------------------------------------------------------------------------------ projections
 
+// The values an A8 call's oracle reads: the static rule's, or each column's own scale for a per-token
+// parent, else the BF16 activations themselves.
+std::vector<double> oracle_input(const std::vector<float>& x, int k, int tokens, ops::LinearPolicy policy,
+                                 bool per_token, int first_a8 = 17) {
+    if (!a8(policy, tokens, first_a8)) { return as_double(x); }
+    return per_token ? represented_per_token(x, k, tokens) : represented(x);
+}
+
 int run_attention(DevicePackedWeight& parent, int tokens, ops::LinearPolicy policy,
-                  std::vector<std::uint16_t>* first_column = nullptr) {
+                  std::vector<std::uint16_t>* first_column = nullptr, bool per_token = false) {
     constexpr int kHidden = 3072, kQ = 8192, kKv = 512, kRows = 17408;
     const auto x       = activations(kHidden, tokens, 101U);
     const auto x_bits  = bf16_bits(x);
@@ -137,7 +217,7 @@ int run_attention(DevicePackedWeight& parent, int tokens, ops::LinearPolicy poli
     DeviceContext device;
     ops::attn_input_proj(tx, parent.view(), q, g, k, v, policy, workspace, device.stream);
     cuda_synchronize(device.stream);
-    const auto reference = a8(policy, tokens) ? represented(x) : as_double(x);
+    const auto reference = oracle_input(x, kHidden, tokens, policy, per_token);
     const std::string tag = " " + name(policy) + " T=" + std::to_string(tokens);
     int failures = 0;
     const struct {
@@ -167,7 +247,7 @@ int run_attention(DevicePackedWeight& parent, int tokens, ops::LinearPolicy poli
 }
 
 int run_gdn(DevicePackedWeight& parent, int tokens, ops::LinearPolicy policy,
-            std::vector<std::uint16_t>* first_column = nullptr) {
+            std::vector<std::uint16_t>* first_column = nullptr, bool per_token = false) {
     constexpr int kHidden = 3072, kQkv = 12288, kZ = 8192, kRows = 20480;
     const auto x       = activations(kHidden, tokens, 201U);
     const auto x_bits  = bf16_bits(x);
@@ -181,7 +261,7 @@ int run_gdn(DevicePackedWeight& parent, int tokens, ops::LinearPolicy policy,
     DeviceContext device;
     ops::gdn_input_proj(tx, parent.view(), tqkv, tz, policy, workspace, device.stream);
     cuda_synchronize(device.stream);
-    const auto reference = a8(policy, tokens) ? represented(x) : as_double(x);
+    const auto reference = oracle_input(x, kHidden, tokens, policy, per_token);
     const std::string tag = " " + name(policy) + " T=" + std::to_string(tokens);
     int failures = qkv.verify_guards("gdn qkv" + tag) + z.verify_guards("gdn z" + tag);
     failures += qkv.verify_fully_written("gdn qkv" + tag) + z.verify_fully_written("gdn z" + tag);
@@ -203,7 +283,7 @@ int run_gdn(DevicePackedWeight& parent, int tokens, ops::LinearPolicy policy,
 }
 
 int run_linear_add(DevicePackedWeight& parent, int tokens, ops::LinearPolicy policy,
-                   std::vector<std::uint16_t>* first_column = nullptr) {
+                   std::vector<std::uint16_t>* first_column = nullptr, bool per_token = false) {
     constexpr int kRows = 3072, kK = 8192;
     const auto x       = activations(kK, tokens, 301U);
     const auto x_bits  = bf16_bits(x);
@@ -221,7 +301,7 @@ int run_linear_add(DevicePackedWeight& parent, int tokens, ops::LinearPolicy pol
     DeviceContext device;
     ops::linear_add(tx, parent.view(), to, policy, workspace, device.stream);
     cuda_synchronize(device.stream);
-    const auto reference = a8(policy, tokens) ? represented(x) : as_double(x);
+    const auto reference = oracle_input(x, kK, tokens, policy, per_token);
     auto expected        = oracle(parent.host, 0, kRows, reference, kK, tokens);
     const auto selected  = sampled_rows(kRows, kSamples);
     for (std::size_t r = 0; r < selected.size(); ++r) {
@@ -247,6 +327,44 @@ int run_linear_add(DevicePackedWeight& parent, int tokens, ops::LinearPolicy pol
         }
     }
     return failures + scratch.verify_guards("linear_add" + tag) + parent.verify_preserved("linear_add parent");
+}
+
+// Under A16ColumnInvariant every column of a call of each width in `widths` equals, bit for bit, the
+// same column computed alone: the per-row FP8 shared expert's gate/up (linear_swiglu) and down, and the
+// head with BF16 and FP32 logits. `rows` is the output's row count, `word` its element bytes.
+int run_invariance(const char* label, DevicePackedWeight& parent, int k, int rows, std::size_t word,
+                   std::initializer_list<int> widths,
+                   const std::function<void(const Tensor&, Tensor&, WorkspaceArena&, cudaStream_t)>& call) {
+    const int widest   = std::max(widths);
+    const auto x       = activations(k, widest, 503U + static_cast<std::uint32_t>(rows));
+    DeviceBuffer input = to_device(bf16_bits(x));
+    DeviceBuffer output(static_cast<std::size_t>(rows) * widest * word);
+    WorkspaceArena workspace(std::size_t{1} << 20);
+    DeviceContext device;
+    const auto run = [&](int column, int tokens) {
+        const Tensor tx(static_cast<std::uint16_t*>(input.p) + static_cast<std::size_t>(column) * k, DType::BF16,
+                        {k, tokens});
+        Tensor out(output.p, word == 4 ? DType::FP32 : DType::BF16, {rows, tokens});
+        call(tx, out, workspace, device.stream);
+        cuda_synchronize(device.stream);
+        return from_device<std::uint8_t>(output.p, static_cast<std::size_t>(rows) * tokens * word);
+    };
+    std::vector<std::vector<std::uint8_t>> alone;
+    for (int column = 0; column < widest; ++column) { alone.push_back(run(column, 1)); }
+    int failures = 0;
+    for (const int tokens : widths) {
+        const auto together = run(0, tokens);
+        std::size_t differing = 0;
+        for (int column = 0; column < tokens; ++column) {
+            differing += std::memcmp(together.data() + static_cast<std::size_t>(column) * rows * word,
+                                     alone[static_cast<std::size_t>(column)].data(), rows * word) != 0;
+        }
+        if (differing != 0) {
+            std::cerr << label << " T=" << tokens << ": " << differing << " columns differ from the columns alone\n";
+            ++failures;
+        }
+    }
+    return failures + parent.verify_preserved(label);
 }
 
 } // namespace
@@ -292,6 +410,47 @@ INFERNIX_OP_TEST(fp8_row_f32) {
         }
         std::vector<std::uint16_t> column;
         for (int t : {1, 8, 9, 16, 17, 64, 65, 129}) { failures += run_linear_add(parent, t, P::A16ColumnInvariant, &column); }
+    }
+    // Per-token parents (no static scale): their encoding, then the three projections' A8 routes.
+    for (const int k : {3072, 8192}) {
+        for (const int tokens : {1, 17, 300}) { failures += run_per_token_quantizer(k, tokens); }
+    }
+    {
+        DevicePackedWeight parent(quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_F32, 17408, 3072, 709U));
+        for (int t : {16, 17, 33, 129, 193, 385, 1025}) { failures += run_attention(parent, t, P::AllowA8, nullptr, true); }
+    }
+    {
+        DevicePackedWeight parent(quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_F32, 20480, 3072, 711U));
+        for (int t : {16, 17, 33, 129, 257, 513, 1025}) { failures += run_gdn(parent, t, P::AllowA8, nullptr, true); }
+    }
+    {
+        DevicePackedWeight parent(quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_F32, 3072, 8192, 713U));
+        for (int t : {16, 17, 65, 129, 257, 513, 1025}) { failures += run_linear_add(parent, t, P::AllowA8, nullptr, true); }
+    }
+    // The per-row FP8 shared expert and head under A16ColumnInvariant.
+    const auto widths = {2, 5, 8, 9, 16, 17, 33, 64, 65};
+    {
+        DevicePackedWeight parent(quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_F32, 2048, 3072, 715U));
+        failures += run_invariance("shared gate/up", parent, 3072, 1024, 2, widths,
+                                   [&](const Tensor& x, Tensor& out, WorkspaceArena& ws, cudaStream_t s) {
+                                       ops::linear_swiglu(x, parent.view(), out, P::A16ColumnInvariant, ws, s);
+                                   });
+    }
+    {
+        DevicePackedWeight parent(quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_F32, 3072, 1024, 717U));
+        failures += run_invariance("shared down", parent, 1024, 3072, 2, widths,
+                                   [&](const Tensor& x, Tensor& out, WorkspaceArena& ws, cudaStream_t s) {
+                                       ops::linear(x, parent.view(), out, P::A16ColumnInvariant, ws, s);
+                                   });
+    }
+    {
+        DevicePackedWeight parent(quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_F32, 248320, 3072, 719U));
+        for (const std::size_t word : {std::size_t{2}, std::size_t{4}}) {
+            failures += run_invariance(word == 4 ? "head (FP32 logits)" : "head (BF16 logits)", parent, 3072, 248320, word,
+                                       {2, 8, 9, 33}, [&](const Tensor& x, Tensor& out, WorkspaceArena& ws, cudaStream_t s) {
+                                           ops::linear(x, parent.view(), out, P::A16ColumnInvariant, ws, s);
+                                       });
+        }
     }
     if (failures != 0) {
         std::cerr << failures << " failure(s)\n";

@@ -1,6 +1,9 @@
 #include "models/qwen3_5/execution/offloaded_moe.h"
 
 #include "core/layout.h"
+#include "core/temporary_switches.h"
+#include "infernix/ops/linear.h"
+#include "infernix/ops/linear_swiglu.h"
 #include "infernix/ops/projection_fp32.h"
 #include "infernix/ops/residual_add.h"
 
@@ -14,29 +17,51 @@ namespace {
 
 namespace moe = ops::offloaded_moe;
 
-// The layer's allocations in order (execution and sizing share them).
+// The layer's allocations in order (execution and sizing share them). A shared expert bank is the
+// call's last job (its outputs the last T columns of `outputs`); dense shared projections write
+// `product` and `shared`.
 struct Buffers {
-    Tensor logits, ids, weights, gate, outputs, y;
-    DeviceSpan dispatch, experts;
+    Tensor logits, ids, weights, gate, outputs, product, shared, y;
+    DeviceSpan dispatch, shared_scratch, experts;
 };
 
 template <class A>
 Buffers allocate(A& a, const OffloadedMoeParameters& p, const moe::ExpertShape& shape, std::int32_t T,
                  moe::WideA16 wide_a16) {
     const auto E = static_cast<std::int32_t>(p.experts), K = static_cast<std::int32_t>(p.top_k);
-    const std::int32_t entries  = (K + 1) * T; // the routed entries and the shared job's
-    const std::int32_t max_jobs = std::min(E, K * T) + 1;
+    const std::int32_t shared_job = p.shared ? 0 : 1;
+    const std::int32_t entries    = (K + shared_job) * T; // the routed entries and the shared job's
+    const std::int32_t max_jobs   = std::min(E, K * T) + shared_job;
     Buffers b;
     b.logits   = a.alloc(DType::FP32, {E + 1, T});
     b.ids      = a.alloc(DType::I32, {K, T});
     b.weights  = a.alloc(DType::FP32, {K, T});
     b.gate     = a.alloc(DType::FP32, {T});
-    b.dispatch = a.alloc_bytes(ops::moe_dispatch_bytes(E + 1, entries));
+    b.dispatch = a.alloc_bytes(ops::moe_dispatch_bytes(E + shared_job, entries));
     b.outputs  = a.alloc(DType::BF16, {shape.hidden, entries});
+    if (p.shared) {
+        // Its own buffers, before the experts' workspace: the shared stream reads and writes nothing the
+        // routed experts use before the join.
+        const auto& gu = p.shared->gate_up;
+        const auto& dn = p.shared->down;
+        b.product        = a.alloc(DType::BF16, {gu.weight.n / 2, T});
+        b.shared         = a.alloc(DType::BF16, {shape.hidden, T});
+        // (An arena is never empty: the FP8-row routes take no scratch.)
+        b.shared_scratch = a.alloc_bytes(std::max<std::size_t>(
+            {256, ops::linear_swiglu_workspace_capacity_bytes(gu.weight.qtype, gu.weight.n, gu.weight.k, gu.policy, T, T),
+             ops::linear_workspace_capacity_bytes(dn.weight.qtype, dn.weight.n, dn.weight.k, dn.policy, T, T)}));
+    }
     b.experts  = a.alloc_bytes(
         ops::moe_experts_workspace_bytes(shape, max_jobs, entries, T, moe::ExpertActivation::kA16, wide_a16));
     b.y        = a.alloc(DType::BF16, {shape.hidden, T});
     return b;
+}
+
+// The dense shared expert: silu(gate) * up in one call, then its down projection.
+void dense_shared_expert(const Tensor& hidden, const DenseParameters& shared, Buffers& b, cudaStream_t s) {
+    WorkspaceArena scratch(b.shared_scratch);
+    ops::linear_swiglu(hidden, shared.gate_up.weight, b.product, shared.gate_up.policy, scratch, s);
+    ops::linear(b.product, shared.down.weight, b.shared, shared.down.policy, scratch, s);
 }
 
 // While the host computes the call's misses, the CPU wait warms the next layer's weights into L2 in the
@@ -122,7 +147,10 @@ void offloaded_moe(const Tensor& hidden, const OffloadedMoeParameters& p, Tensor
         ops::projection_fp32(hidden, rows, b.logits, s);
     }
     ops::MoeRouting routing{b.ids, b.weights, b.gate, call.mask};
-    ops::MoeDispatch dispatch = ops::carve_moe_dispatch(b.dispatch.data, E + 1, (K + 1) * T);
+    // A shared expert bank is the call's last job; dense shared projections run beside the call.
+    const bool shared_job     = !p.shared;
+    const std::int32_t sj     = shared_job ? 1 : 0;
+    ops::MoeDispatch dispatch = ops::carve_moe_dispatch(b.dispatch.data, E + sj, (K + sj) * T);
     std::int32_t* route_log   = nullptr;
     if (experts.route_log != nullptr) {
         if (static_cast<std::size_t>(K) * T > experts.route_stride) {
@@ -156,7 +184,7 @@ void offloaded_moe(const Tensor& hidden, const OffloadedMoeParameters& p, Tensor
     runtime::expert_offload::ExpertStream* const streaming =
         call.streamed && experts.stream != nullptr && experts.stream->active() ? experts.stream : nullptr;
     if (streaming != nullptr) {
-        ops::moe_route_dispatch(b.logits, K, routing, dispatch, route_log, s, ops::RouterLogits::kBf16, /*shared_job=*/true);
+        ops::moe_route_dispatch(b.logits, K, routing, dispatch, route_log, s, ops::RouterLogits::kBf16, shared_job);
         if (streaming->gated()) {
             // The layer's routing decides which experts the link copies and which the CPU serves: every
             // narrow miss is offered, capped at the policy's count (Flash-Next §19.3.12).
@@ -200,18 +228,42 @@ void offloaded_moe(const Tensor& hidden, const OffloadedMoeParameters& p, Tensor
         }
     }
 
-    const std::int32_t max_jobs = std::min(E, K * T) + 1;
+    const std::int32_t max_jobs = std::min(E, K * T) + sj;
     source.wide_a16             = experts.wide_a16;
     const bool planned =
         streaming == nullptr && ops::moe_route_dispatch_plan(b.logits, K, routing, dispatch, route_log, hidden, source,
                                                              max_jobs, b.experts.data, b.outputs, s,
-                                                             ops::RouterLogits::kBf16, /*shared_job=*/true);
-    ops::moe_experts(hidden, dispatch, source, K, max_jobs, b.experts.data, b.outputs, s, /*wait_for_cpu=*/true, planned);
+                                                             ops::RouterLogits::kBf16, shared_job);
+    if (shared_job) {
+        ops::moe_experts(hidden, dispatch, source, K, max_jobs, b.experts.data, b.outputs, s, /*wait_for_cpu=*/true,
+                         planned);
+        if (streaming != nullptr && call.release_stream) { streaming->after_experts(p.layer, s); }
+        // y = bf16(sum_i w_i y_i + s y_shared): the routed entries, then the shared job's T columns.
+        const Tensor routed = b.outputs.slice(1, 0, K * T);
+        const Tensor shared = b.outputs.slice(1, K * T, T);
+        ops::moe_combine(routed, routing, shared, b.y, s);
+        ops::residual_add(b.y, residual, s);
+        return;
+    }
+    // The dense shared expert runs on its own stream while the routed experts stage and compute and the
+    // host computes the CPU-served misses; it reads only `hidden` and writes only its own buffers.
+    // TEMPORARY (INFERNIX_TMP_SHARED_SAME_STREAM): the side stream's A/B arm on the compute stream.
+    static const bool same_stream = temporary_switches::flag("INFERNIX_TMP_SHARED_SAME_STREAM");
+    const cudaStream_t shared_s   = experts.shared_stream != nullptr && !same_stream ? experts.shared_stream : s;
+    if (shared_s != s) {
+        CUDA_CHECK(cudaEventRecord(experts.shared_events[0], s));
+        CUDA_CHECK(cudaStreamWaitEvent(shared_s, experts.shared_events[0], 0));
+    }
+    ops::moe_experts(hidden, dispatch, source, K, max_jobs, b.experts.data, b.outputs, s, /*wait_for_cpu=*/false,
+                     planned);
     if (streaming != nullptr && call.release_stream) { streaming->after_experts(p.layer, s); }
-    // y = bf16(sum_i w_i y_i + s y_shared): the routed entries, then the shared job's T columns.
-    const Tensor routed = b.outputs.slice(1, 0, K * T);
-    const Tensor shared = b.outputs.slice(1, K * T, T);
-    ops::moe_combine(routed, routing, shared, b.y, s);
+    dense_shared_expert(hidden, *p.shared, b, shared_s);
+    ops::moe_experts_cpu_wait(hidden, dispatch, source, max_jobs, b.experts.data, b.outputs, s);
+    if (shared_s != s) {
+        CUDA_CHECK(cudaEventRecord(experts.shared_events[1], shared_s));
+        CUDA_CHECK(cudaStreamWaitEvent(s, experts.shared_events[1], 0));
+    }
+    ops::moe_combine(b.outputs, routing, b.shared, b.y, s);
     ops::residual_add(b.y, residual, s);
 }
 

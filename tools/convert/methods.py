@@ -353,7 +353,9 @@ def import_encoded(request: PrepareRequest) -> PreparedMethod:
 
     ``fp8_e4m3fn_row_f32`` keeps ModelOpt's FP32 weight scales exactly; an ``AllowA8`` input records
     the source's static FP32 ``input_scale`` as its ``activation_input_scale``, and inputs fused into
-    one parent must share it (they share one activation encoding). ``nvfp4_mul`` in
+    one parent must share it (they share one activation encoding). A source without one (ModelOpt
+    ``FP8_PER_CHANNEL_PER_TOKEN``) records none: its activations take a scale per column at run time,
+    and a parent may not mix the two. ``nvfp4_mul`` in
     ``nvfp4_rg16_v1`` keeps ModelOpt's FP32 multiplier exactly."""
     if request.target.format not in _IMPORT_FORMATS or len(request.target.shape) != 2:
         raise ValueError("import_encoded requires a known encoded matrix target")
@@ -404,7 +406,12 @@ def import_encoded(request: PrepareRequest) -> PreparedMethod:
                     value = request.auxiliary_overrides[key]
                 elif request.policies[(parameter, input_name)] in ("AllowA8", "AllowA4"):
                     if source.input_scale is None:
-                        raise ValueError(f"{parameter}: AllowA8 needs the source's static input_scale")
+                        # No static scale (ModelOpt FP8_PER_CHANNEL_PER_TOKEN): the engine encodes each
+                        # activation column with its own scale. A parent's inputs share one encoding.
+                        if input_scale not in (None, b"dynamic"):
+                            raise ValueError(f"{parameter}: fused FP8 inputs mix static and per-token scales")
+                        input_scale = b"dynamic"
+                        continue
                     value = AuxiliaryValue.activation_scale(source.input_scale())
                 else:
                     continue

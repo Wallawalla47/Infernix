@@ -36,8 +36,7 @@ void validate_policy(LinearPolicy policy) {
 
 bool linear_swiglu_column_invariant_route(QType qtype, std::int32_t gate_up_rows,
                                           std::int32_t input_rows) noexcept {
-    (void)gate_up_rows;
-    (void)input_rows;
+    if (qtype == QType::FP8_E4M3FN_ROW_F32) { return gate_up_rows == 2048 && input_rows == 3072; }
     return qtype == QType::Q4_G64_FP16 || qtype == QType::NVFP4 ||
            qtype == QType::FP8_E4M3FN_ROW_BF16;
 }
@@ -84,6 +83,8 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
     if (qtype == QType::FP8_E4M3FN_ROW_BF16 && gate_up_rows == 34816 && input_rows == 5120) {
         return detail::fp8_linear_swiglu_workspace_capacity_bytes(policy, min_tokens, max_tokens);
     }
+    // Qwen3.5-122B-A10B's FP8 shared expert: A16 routes, no workspace.
+    if (qtype == QType::FP8_E4M3FN_ROW_F32 && gate_up_rows == 2048 && input_rows == 3072) { return 0; }
     throw std::invalid_argument("linear_swiglu workspace: unsupported weight format");
 }
 
@@ -131,8 +132,12 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
                           (x.ne[0] == 3072 && out.ne[0] == 9216 && gate_up_weight.n == 18432 &&
                            gate_up_weight.k == 3072 && gate_up_weight.padded_shape[0] == 18432 &&
                            gate_up_weight.padded_shape[1] == 3072);
+    // Qwen3.5-122B-A10B's shared expert (fp8_e4m3fn_row_f32, dealignai's Ornith-1.5-122B-UNCENSORED).
+    const bool shared_122b = x.ne[0] == 3072 && out.ne[0] == 1024 && gate_up_weight.n == 2048 &&
+                             gate_up_weight.k == 3072 && gate_up_weight.padded_shape[0] == 2048 &&
+                             gate_up_weight.padded_shape[1] == 3072;
     if (t <= 0 || x.ne[2] != 1 || x.ne[3] != 1 || out.ne[1] != t || out.ne[2] != 1 ||
-        out.ne[3] != 1 || (!large_shape && !q8_shape)) {
+        out.ne[3] != 1 || (!large_shape && !q8_shape && !shared_122b)) {
         throw std::invalid_argument("linear_swiglu: invalid tensor shape");
     }
     if (!x.is_contiguous() || !out.is_contiguous()) {
@@ -163,7 +168,8 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
         gate_up_weight.group_size == 32 && gate_up_weight.group == 32 &&
         gate_up_weight.qhigh == nullptr && gate_up_weight.high_plane_bytes == 0 && common_row_split;
     const bool nvfp4_weight = large_shape && gate_up_weight.qtype == QType::NVFP4;
-    const bool fp8_weight   = large_shape && gate_up_weight.qtype == QType::FP8_E4M3FN_ROW_BF16;
+    const bool fp8_weight   = (large_shape && gate_up_weight.qtype == QType::FP8_E4M3FN_ROW_BF16) ||
+                            (shared_122b && gate_up_weight.qtype == QType::FP8_E4M3FN_ROW_F32);
     if (!q4_weight && !q8_weight && !nvfp4_weight && !fp8_weight) {
         throw std::invalid_argument("linear_swiglu: unsupported weight");
     }

@@ -164,6 +164,7 @@ INFERNIX_OP_TEST(linear_fp32_head) {
                                      HeadCase{"Q8 [248320,5120]", make_q8_g32_fp16_weight, 248320, 5120, 613U, true},
                                      HeadCase{"Q8 [248320,2048]", make_q8_g32_fp16_weight, 248320, 2048, 617U, true},
                                      HeadCase{"FP8 [248320,5120]", make_fp8_weight, 248320, 5120, 619U, true},
+                                     HeadCase{"FP8 row-F32 [248320,3072]", make_fp8_f32_weight, 248320, 3072, 623U, true},
                                      HeadCase{"BF16 [24832,5120]", make_bf16_weight, 24832, 5120, 631U, false}}) {
             failures += run_case(head);
         }

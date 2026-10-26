@@ -147,8 +147,8 @@ std::vector<std::uint16_t> make_activation(const Profile& profile, std::int32_t 
     // Later tokens use exact zeros plus a rotating set of nonzeros. This keeps a full-output,
     // full-formula oracle practical at large registered T boundaries without adopting any
     // production staging or reduction behavior.
-    const bool native_float_weight =
-        profile.qtype == QType::NVFP4 || profile.qtype == QType::FP8_E4M3FN_ROW_BF16;
+    const bool native_float_weight = profile.qtype == QType::NVFP4 || profile.qtype == QType::FP8_E4M3FN_ROW_BF16 ||
+                                     profile.qtype == QType::FP8_E4M3FN_ROW_F32;
     const float dense_scale =
         profile.qtype == QType::Q4_G64_FP16 ? 1.25e-4F : (native_float_weight ? 1.0e-3F : 1.0e-5F);
     for (std::int32_t column = 0; column < profile.input_rows; ++column) {
@@ -310,12 +310,18 @@ void validate_profile(const Profile& profile) {
                        profile.input_rows == 5120 && profile.output_rows == 17408;
     const bool fp8 = profile.qtype == QType::FP8_E4M3FN_ROW_BF16 && profile.gate_up_rows == 34816 &&
                      profile.input_rows == 5120 && profile.output_rows == 17408;
+    // Qwen3.5-122B-A10B's per-row FP8 shared expert (A16 and column-invariant routes only).
+    const bool fp8_122b_shared = profile.qtype == QType::FP8_E4M3FN_ROW_F32 && profile.gate_up_rows == 2048 &&
+                                 profile.input_rows == 3072 && profile.output_rows == 1024;
     if ((!q4 && !q8_companion && !q8_dflash2 && !q8_flash_next_dflash2 && !q8_122b_dflash2 && !q8_flash_next &&
-         !nvfp4 && !fp8) ||
+         !nvfp4 && !fp8 && !fp8_122b_shared) ||
         profile.gate_up_rows != 2 * profile.output_rows) {
         throw std::invalid_argument("linear_swiglu test: profile is not registered");
     }
     const bool invariant = profile.activation_compute == ActivationCompute::A16ColumnInvariant;
+    if (fp8_122b_shared && profile.activation_compute != ActivationCompute::A16 && !invariant) {
+        throw std::invalid_argument("linear_swiglu test: invalid activation-compute profile");
+    }
     // The q4-w4a8 route is the only int8-activation route: Q4 with LinearRoutes::Q4W4A8.
     const bool q4_w4a8 = q4 && ops::has_route(profile.routes, ops::LinearRoutes::Q4W4A8);
     if ((nvfp4 && profile.activation_compute != ActivationCompute::A16 &&
@@ -326,7 +332,7 @@ void validate_profile(const Profile& profile) {
          profile.activation_compute != ActivationCompute::A8Residual && !invariant) ||
         (q4_w4a8 && profile.activation_compute != ActivationCompute::A8Int) ||
         (!nvfp4 && !fp8 && !q4_w4a8 && profile.activation_compute != ActivationCompute::A16 &&
-         !(q4 && invariant)) ||
+         !((q4 || fp8_122b_shared) && invariant)) ||
         (profile.pattern == ActivationPattern::Int8Representable &&
          profile.activation_compute != ActivationCompute::A8Int)) {
         throw std::invalid_argument("linear_swiglu test: invalid activation-compute profile");

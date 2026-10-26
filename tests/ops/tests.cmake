@@ -92,8 +92,9 @@ infernix_add_family_op_test(infernix_offloaded_moe_a4_residual_122b_test FAMILY 
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_a4_residual_122b.cu"
   LIBRARIES infernix_ops)
 set_tests_properties(infernix_offloaded_moe_a4_residual_122b_test PROPERTIES TIMEOUT 900 RUN_SERIAL TRUE)
-# fp8_e4m3fn_row_f32 (Qwen3.5-122B-A10B): the static A8 encoding bit for bit, and the attention, GDN
-# and residual projections against FP64 under A16, static A8 and the column-invariant route.
+# fp8_e4m3fn_row_f32 (Qwen3.5-122B-A10B): the static and per-token A8 encodings bit for bit, the attention,
+# GDN and residual projections against FP64 under A16, static and per-token A8 and the column-invariant
+# route, and the per-row FP8 shared expert's and head's column invariance.
 infernix_add_family_op_test(infernix_fp8_row_f32_test FAMILY projection
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_fp8_row_f32.cpp"
   LIBRARIES infernix_ops)

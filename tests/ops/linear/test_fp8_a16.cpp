@@ -157,6 +157,34 @@ int run_flash_next_fp8_a16() {
     return failures;
 }
 
+// Qwen3.5-122B-A10B's per-row FP8 problems (dealignai's Ornith-1.5-122B-UNCENSORED-NVFP4,
+// fp8_e4m3fn_row_f32 with FP32 row multipliers): the shared expert's down [3072,1024] and the vocabulary
+// head [248320,3072], against the FP64 oracle of the multipliers' exact values at every decode and
+// verification width, the prefill tile boundaries and the column-invariant route, plus their workspace.
+int run_122b_fp8_f32_a16() {
+    int failures       = 0;
+    std::uint32_t seed = 971U;
+    for (const auto& [n, k] : {std::pair{3072, 1024}, std::pair{248320, 3072}}) {
+        std::vector<Invocation> calls;
+        for (int t = 1; t <= 33; ++t) calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only});
+        const bool head = n == 248320;
+        for (int t : {40, 48, 56, 63, 64, 65, 96, 97, 127, 128, 129, 160, 161, 224, 225, 256, 257, 512, 1024})
+            calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only});
+        if (!head) {
+            for (int t : {2049, 4097}) calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only});
+        }
+        for (int t : {1, 2, 5, 8, 9, 16, 17, 33, 40, 65, 129})
+            calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16ColumnInvariant});
+        for (int t : {1, 9, 17, 65})
+            calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true});
+        calls.push_back({1, CallForm::A16Convenience});
+        failures += run_shape("FP8_F32_A16 122B", ActivationCompute::A16, make_fp8_f32_weight,
+                              {n, k, seed++, Comparison::Sampled, true, calls});
+        failures += verify_workspace_envelopes(QType::FP8_E4M3FN_ROW_F32, n, k);
+    }
+    return failures;
+}
+
 // Speculative verification relies on this for one row (design §11.3): an output column is
 // bit-identical whether it is computed alone or beside other columns, up to 8 columns on every
 // Flash-Next shape (its GEMV and SIMT routes reduce a column identically), and to 48 on the shared
@@ -231,7 +259,8 @@ INFERNIX_OP_TEST(linear_fp8_a16) {
         return 77;
     }
     try {
-        const int failures = run_fp8_a16() + run_flash_next_fp8_a16() + fp8_a16_column_invariance();
+        const int failures =
+            run_fp8_a16() + run_flash_next_fp8_a16() + run_122b_fp8_f32_a16() + fp8_a16_column_invariance();
         std::cout << (failures == 0 ? "OK" : "FAIL") << " FP8 A16 Linear\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

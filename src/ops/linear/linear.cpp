@@ -108,6 +108,7 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
         detail::nvfp4_dispatch(x, w, out, policy, workspace, stream);
         return;
     case QType::FP8_E4M3FN_ROW_BF16:
+    case QType::FP8_E4M3FN_ROW_F32:
         detail::fp8_dispatch(x, w, out, policy, routes, workspace, stream);
         return;
     case QType::FP8_E4M3FN_G32_E8M0:
@@ -131,7 +132,8 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
 // The formats a vocabulary head is stored in.
 bool linear_fp32_output(QType qtype) noexcept {
     return qtype == QType::Q6_G64_FP16 || qtype == QType::Q8_G32_FP16 || qtype == QType::BF16 ||
-           qtype == QType::FP8_E4M3FN_ROW_BF16 || qtype == QType::NVFP4_MUL;
+           qtype == QType::FP8_E4M3FN_ROW_BF16 || qtype == QType::FP8_E4M3FN_ROW_F32 ||
+           qtype == QType::NVFP4_MUL;
 }
 
 bool linear_column_invariant_route(QType qtype, std::int32_t output_rows,
@@ -139,9 +141,7 @@ bool linear_column_invariant_route(QType qtype, std::int32_t output_rows,
     if (qtype == QType::Q4_G64_FP16) { return detail::q4_column_invariant_route(output_rows, input_rows); }
     if (qtype == QType::Q6_G64_FP16) { return detail::q6_column_invariant_route(output_rows, input_rows); }
     if (qtype == QType::Q8_G32_FP16) { return detail::q8_column_invariant_route(output_rows, input_rows); }
-    if (qtype == QType::FP8_E4M3FN_ROW_BF16) {
-        return detail::fp8_linear_column_invariant_route(output_rows, input_rows);
-    }
+    if (is_fp8_row(qtype)) { return detail::fp8_linear_column_invariant_route(qtype, output_rows, input_rows); }
     // nvfp4_rg16_v1 sums exactly: every route is column-invariant.
     if (qtype == QType::NVFP4_MUL) { return true; }
     return false;
@@ -192,7 +192,8 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
         return detail::nvfp4_linear_workspace_capacity_bytes(output_rows, input_rows, policy,
                                                              min_tokens, max_tokens);
     case QType::FP8_E4M3FN_ROW_BF16:
-        return detail::fp8_linear_workspace_capacity_bytes(output_rows, input_rows, policy,
+    case QType::FP8_E4M3FN_ROW_F32:
+        return detail::fp8_linear_workspace_capacity_bytes(qtype, output_rows, input_rows, policy,
                                                            min_tokens, max_tokens);
     case QType::FP8_E4M3FN_G32_E8M0:
         return detail::mxfp8_linear_workspace_capacity_bytes(output_rows, input_rows, policy, min_tokens, max_tokens);

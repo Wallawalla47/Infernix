@@ -61,10 +61,12 @@ linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
  *   - Q8_G32_FP16 weight [34816,5120], x [5120,T], out [17408,T];
  *   - Q8_G32_FP16 weight [15360,2560], x [2560,T], out [7680,T] (Qwen3.8-Flash-Next's DFlash2 MLP);
  *   - NVFP4 BlockScaleK16M128x4 weight [34816,5120], x [5120,T], out [17408,T];
- *   - FP8_E4M3FN_ROW_BF16 RowScale weight [34816,5120], x [5120,T], out [17408,T].
+ *   - FP8_E4M3FN_ROW_BF16 RowScale weight [34816,5120], x [5120,T], out [17408,T];
+ *   - FP8_E4M3FN_ROW_F32 RowScale weight [2048,3072], x [3072,T], out [1024,T] (Qwen3.5-122B-A10B's
+ *     per-row FP8 shared expert: 16-bit activations under every policy, with a column-invariant route).
  *   Inputs and output are contiguous BF16. Q4/Q8 scales are FP16, NVFP4 scales are E4M3FN, and
- *   row-scaled FP8 has one BF16 multiplier per gate/up parent row. Gate rows `[0,M)` precede their
- *   matching up rows `[M,2M)` (M = 17408, 7680, 6144 or 640).
+ *   row-scaled FP8 has one BF16 (FP32 for FP8_E4M3FN_ROW_F32) multiplier per gate/up parent row. Gate
+ *   rows `[0,M)` precede their matching up rows `[M,2M)` (M = 17408, 7680, 6144, 1024 or 640).
  *
  * Numeric:
  *   The oracle exact-decodes the registered weight and evaluates `ideal` naively in FP64 from the

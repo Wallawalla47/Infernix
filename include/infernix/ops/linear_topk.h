@@ -27,8 +27,10 @@ namespace infernix::ops {
  *
  * @details For any positive column count `U`, `hidden` is contiguous BF16 `[H,U]` and `head` is
  * Q8_G32_FP16 `[248320,H]` with H = 5120 (Qwen3.8-27B) or 2560 (Qwen3.8-Flash-Next),
- * FP8_E4M3FN_ROW_BF16 `[248320,5120]`, or NVFP4_MUL in nvfp4_rg16_v1 `[248320,3072]`
- * (Qwen3.5-122B-A10B, whose scores are rg16_linear's exact FP32 outputs); `valid_rows` is 248077.
+ * FP8_E4M3FN_ROW_BF16 `[248320,5120]`, NVFP4_MUL in nvfp4_rg16_v1 `[248320,3072]`
+ * (Qwen3.5-122B-A10B, whose scores are rg16_linear's exact FP32 outputs), or FP8_E4M3FN_ROW_F32
+ * `[248320,3072]` (its per-row FP8 head, whose scores are linear's A16 FP32 logits); `valid_rows` is
+ * 248077.
  * For every `t in [0,U)` and valid
  * vocabulary row `v`, the ideal score is
  *

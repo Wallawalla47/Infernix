@@ -1215,7 +1215,8 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     if (options.logits_dtype == LogitsDtype::FP32 && !options.lossless &&
         !ops::linear_fp32_output(parameters.text.output_head.weight.qtype)) {
         throw std::invalid_argument("text/output_head: FP32 logits need a q6_g64_fp16, q8_g32_fp16, bf16, "
-                                    "fp8_e4m3fn_row_bf16 or nvfp4_rg16_v1 head (or --logits-dtype bf16)");
+                                    "fp8_e4m3fn_row_bf16, fp8_e4m3fn_row_f32 or nvfp4_rg16_v1 head (or "
+                                    "--logits-dtype bf16)");
     }
     const std::uint32_t logical_pages = page_count(options.max_context);
     const std::uint32_t minimum_pages = std::max(logical_pages, options.max_concurrency);

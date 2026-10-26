@@ -50,14 +50,16 @@ struct DenseParameters {
 
 // An offloaded MoE layer (weights.h OffloadedMoeWeights; ops/offloaded_sparse_moe.h): the router
 // rows and the shared-expert gate row as BF16 [H, E] and [H, 1] tensors (projection_fp32's form),
-// the Model's routed bank (pinned host memory) and its shared expert's bank (device memory), and the
-// layer's index in the expert cache. The Program supplies each call's mutable expert source (VRAM
-// frames, staging slots, CPU channel). Every expert route is exact W4A16 at every width, so the
-// layer has no compute policy and is column-invariant as it is.
+// the Model's routed bank (pinned host memory) and its shared expert's bank (device memory) or dense
+// projections, and the layer's index in the expert cache. The Program supplies each call's mutable
+// expert source (VRAM frames, staging slots, CPU channel). Every expert route is exact W4A16 at every
+// width, so the routed experts have no compute policy and are column-invariant as they are; dense
+// shared projections carry their own policies (column-invariant on the exact route).
 struct OffloadedMoeParameters {
     Tensor router, shared_score;
     const runtime::expert_offload::ExpertBank* bank        = nullptr;
-    const runtime::expert_offload::ExpertBank* shared_bank = nullptr;
+    const runtime::expert_offload::ExpertBank* shared_bank = nullptr; // or
+    std::optional<DenseParameters> shared;                            // (the dispatch then has no shared job)
     // Device [experts + 1]: the routed experts' multipliers, then the shared expert's (the call's
     // last job, MoeExpertSource::scales). Every route reads these (the lossless one too: W4A16
     // banks store no input scales).

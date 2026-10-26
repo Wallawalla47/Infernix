@@ -32,6 +32,7 @@ from .sources.modelopt import (
     dequantize_fp8_block128,
     fp8_block_matrix_raw,
     fp8_block_matrix_words,
+    fp8_block_values,
     NVFP4_MUL_FORMAT,
     nvfp4_mul_matrix_source,
 )
@@ -274,29 +275,6 @@ def _expert_input_scales(store: SafetensorsSource, prefix: str, experts: int) ->
         return cache[0][begin:end]
 
     return LogicalSource((experts, 3), f"{store.path}:{prefix}*.input_scale", read)
-
-
-def fp8_block_values(store: SafetensorsSource, leaf: str, shape: tuple[int, int]) -> LogicalSource:
-    """The exact values of one block-FP8 matrix ``leaf`` (code x FP32 tile multiplier, binary64).
-
-    NVIDIA stores the MTP routed experts this way, per expert. Each read decodes only the rows it
-    covers, so a recipe's row-chunked quantizer never holds more than one matrix's codes.
-    """
-
-    n, k = shape
-
-    def read(begin: int, end: int) -> torch.Tensor:
-        if begin == end:
-            return torch.empty(0, dtype=torch.float64)
-        first, last = begin // k, -(-end // k)
-        codes, scales = fp8_block_matrix_words(store, leaf, shape)
-        lo, hi = first // 128 * 128, -(-last // 128) * 128
-        rows = dequantize_fp8_block128(codes[lo:min(hi, n)], scales[lo // 128 : -(-min(hi, n) // 128)])
-        flat = rows.reshape(-1)
-        start = begin - lo * k
-        return flat[start : start + end - begin]
-
-    return LogicalSource(shape, f"{store.path}:{leaf}", read)
 
 
 # ---------------------------------------------------------------------------- builder

@@ -55,6 +55,10 @@ struct OffloadedExperts {
     // overlap (all five).
     cudaStream_t side_stream = nullptr;
     std::array<cudaEvent_t, 5> side_events{};
+    // A dense shared expert's stream (null for shared expert banks) and its fork and join events: the
+    // shared expert runs there while the routed experts stage and compute (Qwen4Exp's pattern).
+    cudaStream_t shared_stream = nullptr;
+    std::array<cudaEvent_t, 2> shared_events{};
     // The prefill expert stream (null without one) and the prefill CPU split.
     runtime::expert_offload::ExpertStream* stream      = nullptr;
     const runtime::expert_offload::CpuSplitPolicy* split = nullptr;

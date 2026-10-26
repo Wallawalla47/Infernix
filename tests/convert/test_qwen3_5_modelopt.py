@@ -91,7 +91,7 @@ HEADS, KV, D = 2, 1, 16
 KH, KD, VH, VD, TAPS = 1, 16, 2, 16, 4
 
 
-def _config(*, mtp: bool) -> dict:
+def _config(*, mtp: bool, per_channel: bool = False) -> dict:
     text = {
         "hidden_size": H,
         "vocab_size": VOCAB,
@@ -115,12 +115,16 @@ def _config(*, mtp: bool) -> dict:
     }
     if mtp:
         text["mtp_num_hidden_layers"] = 1
+    # dealignai's Ornith-1.5-122B-UNCENSORED-NVFP4: per-channel FP8 projections, shared experts and
+    # head, block-FP8 MTP experts.
+    layers = ({"lm_head": {"quant_algo": "FP8_PER_CHANNEL_PER_TOKEN"}, "e": {"quant_algo": "W4A16_NVFP4"},
+               "m": {"quant_algo": "FP8_PB_WO"}} if per_channel else
+              {"lm_head": {"quant_algo": "W4A16_NVFP4"}, "a": {"quant_algo": "FP8"}})
     return {
         "architectures": ["Qwen3_5MoeForConditionalGeneration"],
         "text_config": text,
         "quantization_config": {"quant_method": "modelopt", "quant_algo": "MIXED_PRECISION",
-                                "quantized_layers": {"lm_head": {"quant_algo": "W4A16_NVFP4"},
-                                                     "a": {"quant_algo": "FP8"}}},
+                                "quantized_layers": layers},
     }
 
 
@@ -142,15 +146,30 @@ class _Tensors:
 
     def fp8(self, leaf, rows, cols, input_scale):
         self.tensors[leaf + ".weight"] = _fp8_codes(self.generator, (rows, cols)).view(torch.float8_e4m3fn)
+        if input_scale is None:
+            # FP8_PER_CHANNEL_PER_TOKEN: an FP32 scale per row, activations quantized at run time.
+            self.tensors[leaf + ".weight_scale"] = torch.rand((rows,), generator=self.generator) * 1e-3 + 1e-5
+            return
         self.tensors[leaf + ".weight_scale"] = torch.rand((), generator=self.generator) * 1e-3 + 1e-5
         self.tensors[leaf + ".input_scale"] = torch.tensor(input_scale, dtype=torch.float32)
 
+    def fp8_block(self, leaf, rows, cols):
+        """FP8_PB_WO: E4M3FN codes and an FP32 multiplier per 128 x 128 tile."""
+        self.tensors[leaf + ".weight"] = _fp8_codes(self.generator, (rows, cols)).view(torch.float8_e4m3fn)
+        self.tensors[leaf + ".weight_scale_inv"] = (
+            torch.rand((-(-rows // 128), -(-cols // 128)), generator=self.generator) * 1e-3 + 1e-5)
 
-def _tensors(*, mtp: bool, w4a4: bool = False, z_scale: float = 0.05) -> dict[str, torch.Tensor]:
+
+def _tensors(*, mtp: bool, w4a4: bool = False, z_scale: float = 0.05,
+             per_channel: bool = False) -> dict[str, torch.Tensor]:
     t = _Tensors(7)
     t.bf16("model.language_model.embed_tokens.weight", (VOCAB, H))
     t.bf16("model.language_model.norm.weight", (H,))
-    t.nvfp4("lm_head", VOCAB, H)
+    if per_channel:
+        t.fp8("lm_head", VOCAB, H, None)
+    else:
+        t.nvfp4("lm_head", VOCAB, H)
+    scale = (lambda value: None) if per_channel else (lambda value: value)
     for layer, kind in enumerate(("linear_attention", "full_attention")):
         p = f"model.language_model.layers.{layer}."
         t.bf16(p + "input_layernorm.weight", (H,))
@@ -161,14 +180,14 @@ def _tensors(*, mtp: bool, w4a4: bool = False, z_scale: float = 0.05) -> dict[st
                                 ("in_proj_a.weight", (VH, H)), ("in_proj_b.weight", (VH, H)),
                                 ("norm.weight", (VD,))):
                 t.bf16(p + "linear_attn." + name, shape)
-            t.fp8(p + "linear_attn.in_proj_qkv", channels, H, 0.05)
-            t.fp8(p + "linear_attn.in_proj_z", VH * VD, H, z_scale)
-            t.fp8(p + "linear_attn.out_proj", H, VH * VD, 0.007)
+            t.fp8(p + "linear_attn.in_proj_qkv", channels, H, scale(0.05))
+            t.fp8(p + "linear_attn.in_proj_z", VH * VD, H, scale(z_scale))
+            t.fp8(p + "linear_attn.out_proj", H, VH * VD, scale(0.007))
         else:
-            t.fp8(p + "self_attn.q_proj", 2 * HEADS * D, H, 0.14)
-            t.fp8(p + "self_attn.k_proj", KV * D, H, 0.14)
-            t.fp8(p + "self_attn.v_proj", KV * D, H, 0.14)
-            t.fp8(p + "self_attn.o_proj", H, HEADS * D, 0.006)
+            t.fp8(p + "self_attn.q_proj", 2 * HEADS * D, H, scale(0.14))
+            t.fp8(p + "self_attn.k_proj", KV * D, H, scale(0.14))
+            t.fp8(p + "self_attn.v_proj", KV * D, H, scale(0.14))
+            t.fp8(p + "self_attn.o_proj", H, HEADS * D, scale(0.006))
             t.bf16(p + "self_attn.q_norm.weight", (D,))
             t.bf16(p + "self_attn.k_norm.weight", (D,))
         t.bf16(p + "mlp.gate.weight", (E, H))
@@ -177,8 +196,29 @@ def _tensors(*, mtp: bool, w4a4: bool = False, z_scale: float = 0.05) -> dict[st
             for role, rows, cols in (("gate", I, H), ("up", I, H), ("down", H, I)):
                 t.nvfp4(p + f"mlp.experts.{e}.{role}_proj", rows, cols, input_scale=w4a4)
         for role, rows, cols in (("gate", SHARED, H), ("up", SHARED, H), ("down", H, SHARED)):
-            t.nvfp4(p + f"mlp.shared_expert.{role}_proj", rows, cols)
-    if mtp:
+            if per_channel:
+                t.fp8(p + f"mlp.shared_expert.{role}_proj", rows, cols, None)
+            else:
+                t.nvfp4(p + f"mlp.shared_expert.{role}_proj", rows, cols)
+    if mtp and per_channel:
+        # The uncensored export's MTP layer: per-channel FP8 dense projections, block-FP8 experts.
+        m = "mtp.layers.0."
+        t.bf16("mtp.fc.weight", (H, 2 * H))
+        for name in ("pre_fc_norm_embedding", "pre_fc_norm_hidden", "norm"):
+            t.bf16(f"mtp.{name}.weight", (H,))
+        for name, shape in (("input_layernorm.weight", (H,)), ("post_attention_layernorm.weight", (H,)),
+                            ("self_attn.q_norm.weight", (D,)), ("self_attn.k_norm.weight", (D,)),
+                            ("mlp.gate.weight", (E, H)), ("mlp.shared_expert_gate.weight", (1, H))):
+            t.bf16(m + name, shape)
+        for name, rows, cols in (("self_attn.q_proj", 2 * HEADS * D, H), ("self_attn.k_proj", KV * D, H),
+                                 ("self_attn.v_proj", KV * D, H), ("self_attn.o_proj", H, HEADS * D),
+                                 ("mlp.shared_expert.gate_proj", SHARED, H), ("mlp.shared_expert.up_proj", SHARED, H),
+                                 ("mlp.shared_expert.down_proj", H, SHARED)):
+            t.fp8(m + name, rows, cols, None)
+        for e in range(E):
+            for role, rows, cols in (("gate", I, H), ("up", I, H), ("down", H, I)):
+                t.fp8_block(m + f"mlp.experts.{e}.{role}_proj", rows, cols)
+    elif mtp:
         m = "mtp.layers.0."
         t.bf16("mtp.fc.weight", (H, 2 * H))
         for name in ("pre_fc_norm_embedding", "pre_fc_norm_hidden", "norm"):
@@ -198,10 +238,10 @@ def _tensors(*, mtp: bool, w4a4: bool = False, z_scale: float = 0.05) -> dict[st
     return t.tensors
 
 
-def _checkpoint(path, *, mtp=False, **options):
+def _checkpoint(path, *, mtp=False, per_channel=False, **options):
     path.mkdir()
-    (path / "config.json").write_text(json.dumps(_config(mtp=mtp)))
-    save_file(_tensors(mtp=mtp, **options), str(path / "model.safetensors"))
+    (path / "config.json").write_text(json.dumps(_config(mtp=mtp, per_channel=per_channel)))
+    save_file(_tensors(mtp=mtp, per_channel=per_channel, **options), str(path / "model.safetensors"))
     for role, value in {
         "tokenizer.json": {"model": {"vocab": {str(i): i for i in range(6)}}},
         "tokenizer_config.json": {},
@@ -292,6 +332,57 @@ def test_modelopt_moe_checkpoint_converts_bit_exactly(tmp_path):
         assert stored_format("dflash2/candidate_selector/predecessor_codebook") == "bf16"
         assert directory.bindings["dflash2/layers/0/attention/context_key"] == \
             directory.bindings["dflash2/layers/0/attention/key"]
+
+
+def test_per_channel_fp8_export_converts_bit_exactly(tmp_path):
+    """dealignai's Ornith-1.5-122B-UNCENSORED-NVFP4 layout: per-row FP32-scaled FP8 projections without
+    activation scales (A16Only), dense FP8 shared experts beside the expert bank, an FP8 head, and an MTP
+    layer re-quantized from its per-row FP8 projections and block-FP8 experts' exact values."""
+    source = _checkpoint(tmp_path / "source", mtp=True, per_channel=True)
+    out = tmp_path / "out.infernix"
+    with SafetensorsSource(source) as store:
+        model = build_model(store, components=("text", "mtp"))
+        assert "text/layers/1/moe/shared_expert" not in model.parameters
+        assert model.parameters["text/layers/1/moe/shared/gate"].shape == (SHARED, H)
+        # The drafter's sources read the checkpoint's exact values: code x FP32 row scale, code x tile
+        # multiplier (no BF16 rounding of the scales).
+        tensors = _tensors(mtp=True, per_channel=True)
+        leaf = "mtp.layers.0.mlp.experts.1.down_proj"
+        expected = tensors[leaf + ".weight"].double() * float(tensors[leaf + ".weight_scale_inv"][0, 0])
+        assert torch.equal(model.parameters["mtp/layers/0/moe/experts/1/down"].source.values().reshape(H, I),
+                           expected)
+        leaf = "mtp.layers.0.self_attn.o_proj"
+        expected = tensors[leaf + ".weight"].double() * tensors[leaf + ".weight_scale"].double()[:, None]
+        assert torch.equal(model.parameters["mtp/layers/0/attention/output"].source.values().reshape(H, HEADS * D),
+                           expected)
+        recipe = Recipe(model)
+        qwen3_5_moe_nvfp4_modelopt(model, recipe, {"base": store})
+        convert(model, recipe, out, device="cpu", rows_per_chunk=16)
+    assert verify_qwen3_5.main(["--model", str(source), "--artifact", str(out)]) == 0
+    with Artifact(out) as artifact:
+        directory = artifact.directory
+
+        def stored(name):
+            binding = directory.bindings[name]
+            return artifact.object(binding["parts"][0]["object"] if "parts" in binding else binding["object"])
+
+        assert (stored("text/output_head").format, stored("text/output_head").shape) == (F32, (VOCAB, H))
+        # The shared expert's gate and up form one FP8 parent; down its own.
+        assert (stored("text/layers/0/moe/shared/up").format, stored("text/layers/0/moe/shared/up").shape) == \
+            (F32, (2 * SHARED, H))
+        assert stored("text/layers/0/moe/shared/down").format == F32
+        uses = {(u["parameter"], u["input"]): u for u in directory.uses}
+        # The mixers' projections permit 8-bit activations with no static scale (one per column at run
+        # time); the shared expert and head keep 16-bit activations.
+        for key, policy in ((("text/layers/1/attention/query", "text/layers/1/mixer_input"), "AllowA8"),
+                            (("text/layers/0/gdn/z", "text/layers/0/mixer_input"), "AllowA8"),
+                            (("text/layers/1/attention/output", "text/layers/1/attention/gated_output"), "AllowA8"),
+                            (("text/layers/0/moe/shared/gate", "text/layers/0/ffn_input"), "A16Only"),
+                            (("text/output_head", "text/final_hidden"), "A16Only")):
+            assert uses[key]["activation_policy"] == policy and "auxiliaries" not in uses[key]
+        assert stored("mtp/layers/0/moe/experts/0/gate").format == "q4_g64_fp16"
+        assert stored("mtp/layers/0/attention/output").format == "q8_g32_fp16"
+        assert stored("mtp/layers/0/moe/shared/down").format == "q8_g32_fp16"
 
 
 def test_recipe_refuses_activation_scaled_experts(tmp_path):

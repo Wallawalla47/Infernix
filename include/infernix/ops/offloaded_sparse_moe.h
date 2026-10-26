@@ -49,8 +49,8 @@ namespace infernix::ops {
 /// width], read at execution, so a captured call follows it). A masked column (a round's padding past
 /// a row's drafts) routes nowhere: it adds no dispatch entry, routed or shared, so no job, miss or
 /// prefetch, its ids, weights, gate and route-log ids are still the router's, and the combine writes
-/// y = 0 for it. Every live column's bits are those of the unmasked call. Calls with a mask need the
-/// shared job (MoeDispatch::shared_first).
+/// y = 0 for it. Every live column's bits are those of the unmasked call. A call with a mask may have
+/// a shared job (MoeDispatch::shared_first) or not (a dense shared expert computed beside the call).
 struct MoeColumnMask {
     const std::int32_t* valid = nullptr; // null: every column is live
     std::int32_t width        = 0;

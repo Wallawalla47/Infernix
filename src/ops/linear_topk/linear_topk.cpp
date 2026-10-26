@@ -1,6 +1,7 @@
 #include "core/weight.h"
 #include "infernix/ops/linear_topk.h"
 
+#include "infernix/ops/linear.h"
 #include "infernix/ops/rg16_linear.h"
 #include "ops/linear/fp8/fp8_format.h"
 #include "ops/linear_topk/linear_topk_launch.h"
@@ -20,7 +21,15 @@ enum class HeadProfile : std::uint8_t {
     Fp8Full,
     Q4Optimized,
     Nvfp4Full,
+    // Qwen3.5-122B-A10B's per-row FP8 head (dealignai's Ornith-1.5-122B-UNCENSORED-NVFP4): its FP32
+    // logits through linear, then the NVFP4 head's grouped selection.
+    Fp8F32Full,
 };
+
+// The profiles whose logits are materialized before the grouped selection.
+bool materialized(HeadProfile profile) {
+    return profile == HeadProfile::Nvfp4Full || profile == HeadProfile::Fp8F32Full;
+}
 
 bool aligned_to(const void* pointer, std::uintptr_t alignment) {
     return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) == 0;
@@ -38,7 +47,7 @@ bool overlaps(const Tensor& lhs, const Tensor& rhs) {
 }
 
 // The heads' hidden widths: Qwen3.8-27B's (5120; Q8, FP8 and Q4 heads), Qwen3.8-Flash-Next's
-// (2560; Q8 and Q4 heads) and Qwen3.5-122B-A10B's (3072; its NVFP4 head).
+// (2560; Q8 and Q4 heads) and Qwen3.5-122B-A10B's (3072; its NVFP4 and per-row FP8 heads).
 bool registered_hidden(std::int32_t input_rows) {
     return input_rows == detail::kLinearTopKHidden || input_rows == detail::kLinearTopKFlashNextHidden ||
            input_rows == detail::kLinearTopK122BHidden;
@@ -62,6 +71,10 @@ HeadProfile resolve_profile(QType qtype, std::int32_t head_rows, std::int32_t in
         input_rows == detail::kLinearTopK122BHidden) {
         return HeadProfile::Nvfp4Full;
     }
+    if (head_rows == detail::kLinearTopKFullRows && qtype == QType::FP8_E4M3FN_ROW_F32 &&
+        input_rows == detail::kLinearTopK122BHidden) {
+        return HeadProfile::Fp8F32Full;
+    }
     throw std::invalid_argument("linear_topk: unsupported head profile");
 }
 
@@ -72,8 +85,8 @@ struct Plan {
 };
 
 Plan plan_for(HeadProfile profile, int columns) {
-    // The NVFP4 head's producers are 128-row groups of the materialized logits.
-    if (profile == HeadProfile::Nvfp4Full) return {detail::kLinearTopKGroupedRows, 0};
+    // The 122B heads' producers are 128-row groups of the materialized logits.
+    if (materialized(profile)) return {detail::kLinearTopKGroupedRows, 0};
     if (profile == HeadProfile::Q4Optimized) {
         if (columns <= 16) return {16, 0};
         if (columns <= 32) return {64, 32};
@@ -168,6 +181,8 @@ void require_no_weight_overlap(const Weight& head, const Tensor& hidden,
             ? static_cast<std::size_t>(head.n) * (head.k / 64) * sizeof(std::uint16_t)
         : head.qtype == QType::NVFP4_MUL
             ? std::size_t{0}
+        : head.qtype == QType::FP8_E4M3FN_ROW_F32
+            ? static_cast<std::size_t>(head.n) * sizeof(float)
             : static_cast<std::size_t>(head.n) * sizeof(std::uint16_t);
     const Tensor* tensors[]{&hidden,
                             &candidate_ids,
@@ -222,14 +237,20 @@ void execute(const Tensor& hidden, const Weight& head, const Tensor* id_map, Ten
             workspace, head.n, columns, plan.rows, plan.tile, plan.block_k);
         require_scratch_nonoverlap(hidden, ids, scores, id_map, scratch);
         require_no_weight_overlap(head, hidden, ids, scores, id_map, scratch);
-        if (profile == HeadProfile::Nvfp4Full) {
+        if (materialized(profile)) {
             Tensor logits = workspace.alloc(DType::FP32, {head.n, columns}, 256);
             const Tensor* live[]{&hidden, &ids, &scores};
             for (const Tensor* tensor : live) {
                 if (overlaps(*tensor, logits)) { throw std::invalid_argument("linear_topk: workspace overlaps a live tensor"); }
             }
-            detail::linear_topk_nvfp4_launch(x, head, detail::kLinearTopKFullValidRows, scratch, logits, workspace,
-                                             stream);
+            if (profile == HeadProfile::Nvfp4Full) {
+                detail::linear_topk_nvfp4_launch(x, head, detail::kLinearTopKFullValidRows, scratch, logits, workspace,
+                                                 stream);
+            } else {
+                // The head's own A16 route: the scores are the target head's FP32 logits.
+                linear(x, head, logits, LinearPolicy::A16Only, workspace, stream);
+                detail::linear_topk_logits_launch(logits, detail::kLinearTopKFullValidRows, scratch, stream);
+            }
         } else if (profile == HeadProfile::Q8Full)
             detail::linear_topk_q8_launch(x, head, detail::kLinearTopKFullValidRows, scratch,
                                           stream);
@@ -272,6 +293,10 @@ std::size_t linear_topk_workspace_capacity_bytes(QType qtype, std::int32_t head_
         if (profile == HeadProfile::Nvfp4Full) {
             (void)layout.alloc(DType::FP32, {head_rows, columns}, 256);
             (void)layout.alloc_bytes(rg16_linear_workspace_bytes(head_rows, input_rows, columns));
+        } else if (profile == HeadProfile::Fp8F32Full) {
+            (void)layout.alloc(DType::FP32, {head_rows, columns}, 256);
+            (void)layout.alloc_bytes(
+                linear_workspace_capacity_bytes(qtype, head_rows, input_rows, LinearPolicy::A16Only, columns, columns));
         }
     }
     return layout.peak_bytes();
@@ -290,6 +315,8 @@ void linear_topk(const Tensor& hidden, const Weight& head, std::int32_t valid_ro
         require_q8(head);
     } else if (profile == HeadProfile::Nvfp4Full) {
         require_nvfp4(head);
+    } else if (profile == HeadProfile::Fp8F32Full) {
+        (void)detail::validate_fp8_weight(head, "linear_topk FP8 full head");
     } else {
         (void)detail::validate_fp8_weight(head, "linear_topk FP8 full head");
     }

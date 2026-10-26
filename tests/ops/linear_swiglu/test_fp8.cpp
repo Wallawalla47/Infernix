@@ -86,6 +86,17 @@ INFERNIX_OP_TEST(linear_swiglu_fp8) {
             {QType::FP8_E4M3FN_ROW_BF16, 34816, 5120, 17408, 1817U, ActivationCompute::A8Residual},
             std::array{16, 17, 31, 32, 33, 64, 65, 96, 97, 129},
             std::array<std::int32_t, 2>{17, 65});
+        // Qwen3.5-122B-A10B's per-row FP8 shared expert (fp8_e4m3fn_row_f32 [2048, 3072]): every band of
+        // its A16 routes (paired SIMT through 4, sliced-K through 32, MMA beyond) and its column-invariant
+        // route, against the FP64 oracle of the FP32 row multipliers' exact values.
+        failures += run_profile("LinearSwiGLU FP8_F32_A16 122B shared",
+                                {QType::FP8_E4M3FN_ROW_F32, 2048, 3072, 1024, 1821U, ActivationCompute::A16},
+                                std::array{1, 2, 4, 5, 8, 9, 16, 17, 32, 33, 64, 65, 96, 97, 128, 129, 257, 1024},
+                                std::array<std::int32_t, 3>{1, 9, 65});
+        failures += run_profile("LinearSwiGLU FP8_F32_A16 122B shared column-invariant",
+                                {QType::FP8_E4M3FN_ROW_F32, 2048, 3072, 1024, 1823U,
+                                 ActivationCompute::A16ColumnInvariant},
+                                std::array{1, 2, 5, 8, 9, 16, 17, 33, 65, 129});
         std::cout << (failures == 0 ? "OK" : "FAIL") << " LinearSwiGLU FP8 correctness\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

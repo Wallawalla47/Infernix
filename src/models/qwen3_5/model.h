@@ -64,7 +64,8 @@ public:
     // The offloaded MoE layers (weights.h OffloadedMoeWeights), indexed by text layer: each one's
     // routed bank (pinned host memory, or with LoadOptions::stream_experts its layout over records
     // left in the artifact) and its shared expert's bank (device memory). Both are empty when no
-    // layer offloads its experts.
+    // layer offloads its experts; the shared banks are also empty when the shared experts are dense
+    // projections (OffloadedMoeWeights::shared).
     [[nodiscard]] std::span<const runtime::expert_offload::ExpertBank> expert_banks() const noexcept {
         return expert_banks_;
     }
