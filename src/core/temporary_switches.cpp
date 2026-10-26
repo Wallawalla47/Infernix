@@ -185,14 +185,6 @@ constexpr Registration kSwitches[] = {
     // planner's ladder, not the configured chunk (models/qwen3_5/program/offload.cpp wide_bytes; candidates
     // BX-01, Flash-Next's default since its A/B). Same bits (the arena holds intermediates only).
     {"INFERNIX_TMP_PROMPT_SIZED_LOAN", Scope::All, Kind::Flag},
-    // The 122B's per-token fp8_e4m3fn_row_f32 parents (dealignai's Ornith-1.5-122B-UNCENSORED-NVFP4: the
-    // attention and GDN projections, AllowA8 without a static scale): =1 keeps their prefill at 16-bit
-    // activations (ops/weight_input.cpp), the A/B arm against the per-token A8 prefill. Changes prefill bits.
-    {"INFERNIX_TMP_PER_TOKEN_A16", Scope::Qwen3_5, Kind::Flag},
-    // The 122B's dense FP8 shared expert (dealignai's export): =1 runs it on the compute stream after the
-    // routed experts instead of on its own stream beside them (models/qwen3_5/execution/offloaded_moe.cpp),
-    // the side stream's A/B arm. Same bits.
-    {"INFERNIX_TMP_SHARED_SAME_STREAM", Scope::Qwen3_5, Kind::Flag},
     // Flash-Next n-gram volume: a large call's 8 reader threads take its blocks in a scattered (stride
     // permutation) order instead of contiguous ascending ranges (models/qwen4_exp/program/ngram_volume.cpp;
     // candidates BX-04, Basalt edbdde8). Same rows and cache contents.

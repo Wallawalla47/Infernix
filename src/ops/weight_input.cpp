@@ -1,7 +1,5 @@
 #include "infernix/ops/weight_input.h"
 
-#include "core/temporary_switches.h"
-
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -135,9 +133,6 @@ SingleProjectionWeight single(std::span<const WeightInput> inputs) {
         }
         require(!(per_token_input && scale != 0), "fused FP8 inputs mix static and per-token activation scales");
         weight.input_scale = scale;
-        // TEMPORARY (INFERNIX_TMP_PER_TOKEN_A16): the per-token A8 prefill's A/B arm at 16-bit activations.
-        static const bool per_token_a16 = temporary_switches::flag("INFERNIX_TMP_PER_TOKEN_A16");
-        if (per_token_input && per_token_a16) { return {weight, LinearPolicy::A16Only}; }
     }
     return {weight, policy};
 }

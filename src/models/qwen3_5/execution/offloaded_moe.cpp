@@ -1,7 +1,6 @@
 #include "models/qwen3_5/execution/offloaded_moe.h"
 
 #include "core/layout.h"
-#include "core/temporary_switches.h"
 #include "infernix/ops/linear.h"
 #include "infernix/ops/linear_swiglu.h"
 #include "infernix/ops/projection_fp32.h"
@@ -246,10 +245,10 @@ void offloaded_moe(const Tensor& hidden, const OffloadedMoeParameters& p, Tensor
         return;
     }
     // The dense shared expert runs on its own stream while the routed experts stage and compute and the
-    // host computes the CPU-served misses; it reads only `hidden` and writes only its own buffers.
-    // TEMPORARY (INFERNIX_TMP_SHARED_SAME_STREAM): the side stream's A/B arm on the compute stream.
-    static const bool same_stream = temporary_switches::flag("INFERNIX_TMP_SHARED_SAME_STREAM");
-    const cudaStream_t shared_s   = experts.shared_stream != nullptr && !same_stream ? experts.shared_stream : s;
+    // host computes the CPU-served misses; it reads only `hidden` and writes only its own buffers. (Its A/B
+    // against the compute stream, 2026-10-26, one request: decode +0.4 % and prefill 0.0 % for the compute
+    // stream, neither resolved from run-to-run noise.)
+    const cudaStream_t shared_s = experts.shared_stream != nullptr ? experts.shared_stream : s;
     if (shared_s != s) {
         CUDA_CHECK(cudaEventRecord(experts.shared_events[0], s));
         CUDA_CHECK(cudaStreamWaitEvent(shared_s, experts.shared_events[0], 0));
