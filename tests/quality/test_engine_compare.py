@@ -36,8 +36,16 @@ def test_the_static_arms_and_the_reference(tmp_path):
     reference = steps[0].argv
     assert reference[1:3] == ["reference", "model.infernix"] and "--ngram-volume" in reference
     assert reference[reference.index("--chunks") + 1] == "0"
+    assert reference[reference.index("--logits-dtype") + 1] == "bf16"
+    # One logits precision for every arm: the exact routes' heads write it, the others' logits are rounded to it.
     twin = steps[1].argv
-    assert twin[1] == "prefill" and twin[-3:] == ["--lossless", "--noise-seed", "1"]
+    assert twin[1] == "prefill" and twin[-5:] == ["--lossless", "--noise-seed", "1", "--logits-dtype", "bf16"]
+    by_id = {s.id: s.argv for s in steps}
+    assert by_id["P-default-int8"][-2:] == ["--round-logits", "bf16"]
+    assert by_id["D-default-int8-c1"][-2:] == ["--logits-dtype", "bf16"]
+    fp32 = engine_compare.plan(_config(tmp_path, logits="fp32"))[0]
+    assert fp32[0].argv[fp32[0].argv.index("--logits-dtype") + 1] == "fp32"
+    assert all("--round-logits" not in s.argv and "--logits-dtype" not in s.argv for s in fp32[1:])
     assert any("follow once" in note for note in notes)
 
 

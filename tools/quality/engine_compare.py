@@ -123,6 +123,9 @@ def _load_config(path: Path) -> dict:
     config.setdefault("budget", 0.25)
     config.setdefault("engines", [])
     config.setdefault("decode", True)
+    config.setdefault("logits", "bf16")
+    if config["logits"] not in ("bf16", "fp32"):
+        raise ValueError(f"{path}: logits must be bf16 or fp32")
     return config
 
 
@@ -149,10 +152,17 @@ def _arm(config: dict, step_id: str, protocol: str, args: list[str], role: str, 
     common = [config["artifact"], "--llama-base", str(_base(config)), "--out", str(_work(config) / step_id)]
     if "threads" in config:
         common += ["--threads", str(config["threads"])]
+    bf16 = config["logits"] == "bf16"
     if protocol == "P":
-        argv = [certify, "prefill", *common, *config["route_args"], *args]
+        # The exact route's head rounds its exact sums to the precision; every other arm's FP32 logits are
+        # rounded by the scorer, as another engine's are.
+        precision = (["--logits-dtype", "bf16"] if role == "twin" else ["--round-logits", "bf16"]) if bf16 else []
+        argv = [certify, "prefill", *common, *config["route_args"], *args, *precision]
     else:
-        argv = [certify, "decode", *common, *config["route_args"], "--concurrency", str(concurrency or 1), *args]
+        # The decode arm reads the engine's own log-probabilities: its head writes the precision.
+        precision = ["--logits-dtype", "bf16"] if bf16 else []
+        argv = [certify, "decode", *common, *config["route_args"], "--concurrency", str(concurrency or 1), *args,
+                *precision]
     return Step(step_id, role, protocol, argv, MINUTES[protocol], **extra)
 
 
@@ -181,7 +191,7 @@ def plan(config: dict) -> tuple[list[Step], list[str]]:
     steps = [Step("reference", "reference", "ref",
                   [config["certify"], "reference", config["artifact"], "--format", "llama-kld", "--text", config["text"],
                    "--context", str(config["context"]), "--chunks", str(config["chunks"]), "--out", str(_base(config)),
-                   *config["route_args"]],
+                   "--logits-dtype", config["logits"], *config["route_args"]],
                   MINUTES["reference"])]
     for seed in config["twin_seeds"]:
         steps.append(_arm(config, f"P-twin-s{seed}", "P", ["--lossless", "--noise-seed", str(seed)], "twin"))
@@ -264,8 +274,11 @@ def _log(config: dict, record: dict) -> None:
 
 def _run_engine(config: dict, step: Step, log) -> int:
     engine, prefix = step.engine, Path(step.meta["prefix"])
+    # Rows are rounded by the scorer; a tool that scores inside itself (llama-perplexity, Basalt's ppl_gate)
+    # keeps its own logits precision unless its build rounds them (the engine entry's "logits").
+    logits = config["logits"] if engine["kind"] == "rows-command" else engine.get("logits", "fp32")
     meta = {"arm": "engine", "engine": engine["name"], "kind": engine["kind"], "protocol": step.protocol,
-            "settings": engine.get("settings", "")}
+            "settings": engine.get("settings", ""), "logits": logits}
     started = time.monotonic()
     if engine["kind"] == "llama-perplexity":
         if "base_chunks" in engine:
@@ -285,7 +298,8 @@ def _run_engine(config: dict, step: Step, log) -> int:
         meta["printout"] = str(prefix) + ".summary.txt"
     elif engine["kind"] == "rows-command":
         scorer = [config["certify"], "llama-rows", "--llama-base", str(_base(config)), "--rows", "-",
-                  "--out", str(prefix) + ".rows", "--label", engine["name"], "--chunks", str(config["chunks"])]
+                  "--out", str(prefix) + ".rows", "--label", engine["name"], "--chunks", str(config["chunks"]),
+                  "--round-logits", "bf16" if config["logits"] == "bf16" else "none"]
         producer = subprocess.Popen(step.argv, stdout=subprocess.PIPE, stderr=log)
         consumer = subprocess.Popen(scorer, stdin=producer.stdout, stdout=log, stderr=log)
         producer.stdout.close()
@@ -450,7 +464,8 @@ def report(config: dict, resamples: int = llama_kld.RESAMPLES) -> dict:
     lines = [f"# {config['name']}: engines against the exact model", "",
              f"WikiText-2 test, {ref.get('chunks', '?')} chunks of {config['context']} tokens, the second half of each "
              f"scored ({next(iter(arms.values())).kld.size if arms else '?'} positions); the reference is Infernix's "
-             f"lossless route (every operation correctly rounded, FP32 logits, BF16 KV) on `{config['artifact']}`, "
+             f"lossless route (every operation correctly rounded, {config['logits'].upper()} logits, BF16 KV) on "
+             f"`{config['artifact']}`, "
              "as a llama.cpp `--kl-divergence-base` file. Statistics are llama-perplexity's; brackets are 95 % "
              "intervals (a bootstrap over chunks, or llama.cpp's own ±).", ""]
     for protocol, title in (("P", "Prompt path (llama-perplexity -b n_ctx)"),
@@ -508,6 +523,11 @@ def report(config: dict, resamples: int = llama_kld.RESAMPLES) -> dict:
         out["checks"].append({"check": "decode KLD form", "ratio_low": low, "ratio_high": high})
         lines.append(f"- The decode arms' KLD form (255 tokens + bucket) on the prompt arms: {100 * low:.2f}-"
                      f"{100 * high:.2f} % of llama.cpp's full sum.")
+    for step in steps:
+        meta = _read(config, step.id) if step.role == "engine" else None
+        if meta is not None and meta.get("logits") != config["logits"]:
+            lines.append(f"- {step.engine['name']}: scored with its own {meta.get('logits', '?').upper()} logits, not "
+                         f"the comparison's {config['logits'].upper()} (its tool scores inside itself).")
     for note in notes:
         lines.append(f"- {note}")
     out["markdown"] = "\n".join(lines) + "\n"
