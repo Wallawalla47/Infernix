@@ -305,10 +305,11 @@ public:
     EngineOptions normalize(EngineOptions engine_options) {
         bool offloaded_experts = false;
         try {
-            if (runtime::artifact_is_qwen4_exp(engine_options.artifact_path)) {
+            const artifact::Reader reader(engine_options.artifact_path);
+            if (runtime::artifact_is_qwen4_exp(reader)) {
                 architecture = models::Architecture::Qwen4Exp;
             } else {
-                offloaded_experts = runtime::artifact_offloads_experts(engine_options.artifact_path);
+                offloaded_experts = runtime::artifact_offloads_experts(reader);
             }
         } catch (const std::exception&) {}
         runtime::validate_engine_options(engine_options, architecture, offloaded_experts);

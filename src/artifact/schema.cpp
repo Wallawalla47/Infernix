@@ -93,23 +93,54 @@ const Component& Directory::component(std::string_view name) const {
     return found->second;
 }
 
-Json parse_json(std::string_view text, std::string_view label) {
-    std::vector<std::unordered_set<std::string>> member_stack;
-    const auto callback = [&](int, Json::parse_event_t event, Json& parsed) {
-        if (event == Json::parse_event_t::object_start) {
-            member_stack.emplace_back();
-        } else if (event == Json::parse_event_t::key) {
-            const auto& key = parsed.get_ref<const std::string&>();
-            if (!member_stack.back().insert(key).second) {
-                throw ArtifactError(std::string(label) + ": duplicate JSON member " + key);
-            }
-        } else if (event == Json::parse_event_t::object_end) {
-            member_stack.pop_back();
+namespace {
+
+// Refuses a repeated member name in any object, in one pass over the text. A DOM parse keeps only
+// one of the repeated values, so this runs first. (nlohmann's callback parser, which could check
+// during the DOM parse, rescans an object's parent after each object it closes: quadratic in the
+// directory's binding count, 8.8 s for the 35B-A3B artifact's 32,713 bindings.)
+class DuplicateMemberCheck {
+public:
+    explicit DuplicateMemberCheck(std::string_view label) : label_(label) {}
+
+    bool null() { return true; }
+    bool boolean(bool) { return true; }
+    bool number_integer(Json::number_integer_t) { return true; }
+    bool number_unsigned(Json::number_unsigned_t) { return true; }
+    bool number_float(Json::number_float_t, const Json::string_t&) { return true; }
+    bool string(Json::string_t&) { return true; }
+    bool binary(Json::binary_t&) { return true; }
+    bool start_object(std::size_t) {
+        members_.emplace_back();
+        return true;
+    }
+    bool key(Json::string_t& name) {
+        if (!members_.back().insert(name).second) {
+            throw ArtifactError(std::string(label_) + ": duplicate JSON member " + name);
         }
         return true;
-    };
+    }
+    bool end_object() {
+        members_.pop_back();
+        return true;
+    }
+    bool start_array(std::size_t) { return true; }
+    bool end_array() { return true; }
+    // The DOM parse that follows reports a syntax error with its position.
+    bool parse_error(std::size_t, const std::string&, const nlohmann::detail::exception&) { return false; }
+
+private:
+    std::string_view label_;
+    std::vector<std::unordered_set<std::string>> members_;
+};
+
+} // namespace
+
+Json parse_json(std::string_view text, std::string_view label) {
     try {
-        return Json::parse(text.begin(), text.end(), callback);
+        DuplicateMemberCheck check(label);
+        (void)Json::sax_parse(text.begin(), text.end(), &check);
+        return Json::parse(text.begin(), text.end());
     } catch (const Json::exception& error) {
         throw ArtifactError(std::string(label) + ": " + error.what());
     }

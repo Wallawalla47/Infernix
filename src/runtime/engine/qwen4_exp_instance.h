@@ -4,6 +4,7 @@
 // native parameters, the Qwen3.5 frontend it shares the tokenizer and chat template with, and its
 // Program. The Engine drives it with the common EngineCore over the HybridResourceManager.
 
+#include "artifact/reader.h"
 #include "models/qwen4_exp/execution/parameters.h"
 #include "models/qwen4_exp/model.h"
 #include "models/qwen4_exp/program/program.h"
@@ -43,7 +44,7 @@ struct ConstructedQwen4Exp {
 };
 
 // True when the artifact's text component is Qwen4ExpForCausalLM.
-[[nodiscard]] bool artifact_is_qwen4_exp(const std::filesystem::path& artifact);
+[[nodiscard]] bool artifact_is_qwen4_exp(const artifact::Reader& reader);
 
 [[nodiscard]] ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceContext& device);
 

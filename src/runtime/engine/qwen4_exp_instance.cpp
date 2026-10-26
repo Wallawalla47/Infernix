@@ -103,10 +103,7 @@ void validate(const EngineOptions& options) {
 
 } // namespace
 
-bool artifact_is_qwen4_exp(const std::filesystem::path& artifact) {
-    const artifact::Reader reader(artifact);
-    return models::qwen4_exp::is_qwen4_exp(reader);
-}
+bool artifact_is_qwen4_exp(const artifact::Reader& reader) { return models::qwen4_exp::is_qwen4_exp(reader); }
 
 Qwen4ExpInstance::Qwen4ExpInstance(std::unique_ptr<models::qwen4_exp::Model> source, const EngineOptions& options)
     : model(std::move(source)), parameters(*model),

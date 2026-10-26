@@ -6,7 +6,9 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <iostream>
+#include <string>
 
 namespace {
 
@@ -176,6 +178,26 @@ void invalid_directories() {
     bad([](Json& root) { root["components"]["text"]["resources"]["tokenizer.json"] = "q5"; });
     rejects([] { (void)parse_json("{\"a\":{\"x\":1,\"x\":2}}", "duplicate"); },
             "duplicate JSON key accepted");
+    rejects([] { (void)parse_json("{\"x\":[1],\"y\":{},\"x\":2}", "duplicate"); },
+            "duplicate top-level JSON key accepted");
+    rejects([] { (void)parse_json("{\"x\":1,", "truncated"); }, "truncated JSON accepted");
+    {
+        // A name may repeat across objects, only not within one.
+        const Json siblings = parse_json("[{\"x\":1},{\"x\":2,\"y\":{\"x\":3}}]", "siblings");
+        require(siblings[1]["y"]["x"] == 3, "a member name repeated across objects was refused");
+    }
+    {
+        // Linear in the object count: a directory's bindings are siblings (32,713 in the 35B-A3B
+        // artifact), and a quadratic duplicate check took 8.8 s on that one.
+        std::string many = "[";
+        for (int i = 0; i < 100000; ++i) many += (i ? ",{\"id\":" : "{\"id\":") + std::to_string(i) + ",\"parts\":[]}";
+        many += "]";
+        const auto start  = std::chrono::steady_clock::now();
+        const Json parsed = parse_json(many, "many objects");
+        const double seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        require(parsed.size() == 100000 && seconds < 10.0, "100,000 sibling objects did not parse within 10 s");
+    }
     fixture.write();
     {
         std::fstream file(fixture.entry, std::ios::binary | std::ios::in | std::ios::out);

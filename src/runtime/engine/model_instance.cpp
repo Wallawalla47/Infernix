@@ -193,8 +193,7 @@ std::size_t current_free_device_bytes() {
 
 } // namespace
 
-bool artifact_offloads_experts(const std::filesystem::path& artifact) {
-    const artifact::Reader reader(artifact);
+bool artifact_offloads_experts(const artifact::Reader& reader) {
     return reader.directory().bindings.contains("text/layers/0/moe/experts");
 }
 
@@ -434,14 +433,16 @@ ModelInstance::ModelInstance(std::unique_ptr<models::qwen3_5::Model> source,
 ModelInstance::~ModelInstance() = default;
 
 ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) {
-    bool offloaded_experts = false;
-    try {
-        offloaded_experts = artifact_offloads_experts(options.artifact_path);
-    } catch (const std::exception&) {} // an unreadable artifact is reported below, after the option checks
-    validate_engine_options(options, models::Architecture::Qwen3_5, offloaded_experts);
+    // The artifact is opened once; an unreadable one is reported after the option checks.
     const auto start = Clock::now();
     StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
-    artifact::Reader reader(options.artifact_path);
+    std::optional<artifact::Reader> opened;
+    try {
+        opened.emplace(options.artifact_path);
+    } catch (const std::exception&) {}
+    validate_engine_options(options, models::Architecture::Qwen3_5, opened && artifact_offloads_experts(*opened));
+    if (!opened) opened.emplace(options.artifact_path);
+    artifact::Reader& reader = *opened;
     inspect.complete();
     StartupPhaseScope binding(options.startup_observer, StartupPhase::TargetPlan);
     auto plan = models::qwen3_5::plan_load(reader, models::load_options(options, models::Architecture::Qwen3_5));

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "artifact/reader.h"
 #include "models/qwen3_5/model.h"
 #include "models/qwen3_5/execution/parameters.h"
 #include "models/qwen3_5/program/runtime_types.h"
@@ -25,8 +26,8 @@ namespace infernix::runtime {
     bool offloaded_experts = false);
 
 // Whether a Qwen3.5 artifact stores its routed experts as offloaded banks (Qwen3.5-122B-A10B,
-// docs/maintainer/qwen3_5-122b-offload-design.md). Throws when the artifact cannot be read.
-[[nodiscard]] bool artifact_offloads_experts(const std::filesystem::path& artifact);
+// docs/maintainer/qwen3_5-122b-offload-design.md).
+[[nodiscard]] bool artifact_offloads_experts(const artifact::Reader& reader);
 
 struct ModelInstance {
     using ModelContract = models::qwen3_5::RuntimeTypes;
