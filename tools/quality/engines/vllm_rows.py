@@ -73,11 +73,12 @@ def main(argv: list[str] | None = None) -> int:
     for c in range(chunks):
         captured.clear()
         llm.generate([TokensPrompt(prompt_token_ids=[int(t) for t in tokens[c]])], params, use_tqdm=False)
-        # The prompt log-probabilities' calls hold positions 0 .. n_ctx-2 in order (one call of up to 1024 rows here);
-        # the sampled position n_ctx-1 is a one-row call of its own, in either order.
+        # The prompt's multi-row calls hold positions 0 .. n_ctx-1 in order (vLLM 0.32 computes the whole prompt,
+        # the sampled last position included, in one call); a one-row call (a separately sampled position) is not a
+        # prompt row. Row i is position i either way.
         prompt = [t.reshape(-1, t.shape[-1]) for t in captured if t.reshape(-1, t.shape[-1]).shape[0] > 1]
         rows = torch.cat(prompt, dim=0) if prompt else torch.empty(0, 0)
-        if rows.shape[0] != context - 1 or rows.shape[1] < vocab:
+        if rows.shape[0] not in (context - 1, context) or rows.shape[1] < vocab:
             raise SystemExit(f"chunk {c}: captured {tuple(rows.shape)} logits for a {context}-token prompt "
                              f"of a {vocab}-token vocabulary")
         scored = rows[first:context - 1, :vocab].to(torch.float32).numpy()
