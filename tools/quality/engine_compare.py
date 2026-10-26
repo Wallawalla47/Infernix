@@ -269,7 +269,11 @@ def _engine_step(config: dict, engine: dict) -> Step:
         argv = [engine["binary"], "-m", engine["model"], "-c", str(config["context"]),
                 "--kl-divergence-base", str(base), "--kl-divergence", *engine.get("args", [])]
     elif kind == "rows-command":
-        argv = [part.format(base=_base(config), context=config["context"], chunks=config["chunks"]) for part in engine["argv"]]
+        # {base} the reference's path, {base_wsl} the same as WSL sees it (an engine that runs in WSL).
+        from tools.quality.engines.basalt import wsl_path
+
+        argv = [part.format(base=_base(config), base_wsl=wsl_path(_base(config)), context=config["context"],
+                            chunks=config["chunks"]) for part in engine["argv"]]
     elif kind == "positions":
         argv = []
     else:
