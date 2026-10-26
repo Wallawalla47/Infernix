@@ -638,16 +638,17 @@ void constrain_round_logits(const RoundState& io, const Tensor& logits, const Te
     const auto count = static_cast<std::int32_t>(columns);
     Tensor matrix(logits.data, logits.dtype, {rows, count});
     if (LogitsCapture* capture = io.constraint->capture; capture != nullptr && capture->any()) {
-        // The capturing columns' public rows, before the mask (measurement only; the copies wait for the round).
+        // The capturing columns' whole head rows, before the mask, as CausalScoring returns them (padding columns
+        // past the token domain included). Measurement only; the copies wait for the round.
         cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
         CUDA_CHECK(cudaStreamIsCapturing(stream, &status));
         if (status != cudaStreamCaptureStatusNone) {
             throw std::invalid_argument("TokenConstraint::capture_logits needs EngineOptions::use_cuda_graph off");
         }
         const std::size_t element = logits.dtype == DType::FP32 ? 4 : 2;
-        const std::size_t row     = static_cast<std::size_t>(token_domain) * element;
+        const std::size_t row     = static_cast<std::size_t>(rows) * element;
         capture->dtype            = logits.dtype;
-        capture->vocab            = token_domain;
+        capture->vocab            = rows;
         capture->rows.resize(static_cast<std::size_t>(count) * row);
         for (std::int32_t c = 0; c < count && static_cast<std::size_t>(c) < capture->columns.size(); ++c) {
             if (capture->columns[static_cast<std::size_t>(c)] == 0) { continue; }

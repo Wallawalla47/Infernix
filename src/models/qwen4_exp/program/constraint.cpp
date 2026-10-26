@@ -161,11 +161,13 @@ void ProgramImpl::constrain(Tensor& logits, Tensor* argmax) {
     Tensor observed(words + observe_offset() + constraint_host_.size() * kObserve, DType::FP32,
                     {static_cast<std::int32_t>(kObserved), columns});
     if (std::find(capture_columns_.begin(), capture_columns_.end(), std::uint8_t{1}) != capture_columns_.end()) {
-        // The capturing columns' public rows, before the mask. Measurement only: the copies wait for the round.
-        // Every caller is a host-launched step after the forward, never a captured graph.
+        // The capturing columns' whole head rows, before the mask, as CausalScoring returns them (padding columns
+        // past the token domain included). Measurement only: the copies wait for the round. Every caller is a
+        // host-launched step after the forward, never a captured graph.
         const std::size_t element = logits.dtype == DType::FP32 ? 4 : 2;
-        const std::size_t row     = static_cast<std::size_t>(token_domain_) * element;
+        const std::size_t row     = static_cast<std::size_t>(logits.ne[0]) * element;
         capture_dtype_            = logits.dtype;
+        capture_vocab_            = static_cast<std::size_t>(logits.ne[0]);
         capture_rows_.resize(static_cast<std::size_t>(columns) * row);
         for (std::int32_t c = 0; c < columns; ++c) {
             if (capture_columns_[static_cast<std::size_t>(c)] == 0) { continue; }
@@ -181,7 +183,7 @@ void ProgramImpl::constrain(Tensor& logits, Tensor* argmax) {
 }
 
 std::vector<float> ProgramImpl::captured_row(std::size_t column) const {
-    const auto vocab = static_cast<std::size_t>(token_domain_);
+    const std::size_t vocab = capture_vocab_;
     if (column >= capture_columns_.size() || capture_columns_[column] == 0) {
         throw std::logic_error("Qwen4Exp: a capturing step's logits row was not copied");
     }

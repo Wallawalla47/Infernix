@@ -913,8 +913,8 @@ struct TokenConstraint {
     // log-probabilities under the step's whole next-token distribution its ConstrainedDraw
     // reports. Measurement only: observing never changes what a step may produce.
     std::vector<std::vector<TokenId>> observe;
-    // Measurement only: every step's ConstrainedDraw also carries the step's whole logits row (the public token
-    // domain, as the sampler reads them, before the mask). The Qwen3.5 family copies rows on eager rounds only:
+    // Measurement only: every step's ConstrainedDraw also carries the step's whole logits row (the head's full
+    // width, as ScoreResult::logits rows, before the mask). The Qwen3.5 family copies rows on eager rounds only:
     // its Engine needs use_cuda_graph off (the engine comparison's decode arm, infernix-certify).
     bool capture_logits = false;
 
@@ -934,8 +934,8 @@ struct ConstrainedDraw {
     // the logits the sampler reads, before penalties). Empty and 0 otherwise.
     std::vector<float> observed_logprobs;
     float top_logprob = 0.0F;
-    // With TokenConstraint::capture_logits: the step's logits (FP32, or BF16 widened exactly), one per public
-    // token. Empty otherwise.
+    // With TokenConstraint::capture_logits: the step's logits (FP32, or BF16 widened exactly), one per head row
+    // (the scoring vocabulary, padding past the token domain included). Empty otherwise.
     std::vector<float> logits;
 };
 

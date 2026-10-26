@@ -6045,6 +6045,7 @@ private:
     std::vector<std::uint8_t> capture_columns_;
     std::vector<std::byte> capture_rows_;
     DType capture_dtype_ = DType::FP32;
+    std::size_t capture_vocab_ = 0;
     std::array<std::uint64_t, kMaximumConcurrency> constraint_serials_{};
     std::uint64_t next_constraint_serial_ = 1;
     PinnedHostBuffer io_host_{1}, host_sampled_{1}, host_configs_{1};
