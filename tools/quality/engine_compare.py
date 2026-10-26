@@ -2,7 +2,7 @@
 routes and fast paths and for other engines on the same weights.
 
   python -m tools.quality.engine_compare plan CONFIG.json
-  python -m tools.quality.engine_compare run CONFIG.json [--dry-run] [--only ID,...]
+  python -m tools.quality.engine_compare run CONFIG.json [--only ID,...]
   python -m tools.quality.engine_compare report CONFIG.json
 
 One CONFIG describes one weight set at one context: the artifact holding those exact weights, the text, and what
@@ -556,7 +556,6 @@ def main(argv: list[str] | None = None) -> int:
         p = sub.add_parser(name)
         p.add_argument("config", type=Path)
         if name == "run":
-            p.add_argument("--dry-run", action="store_true")
             p.add_argument("--only", help="comma-separated step ids")
         if name == "report":
             p.add_argument("--resamples", type=int, default=llama_kld.RESAMPLES)
