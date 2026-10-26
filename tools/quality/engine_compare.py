@@ -508,7 +508,7 @@ def report(config: dict, resamples: int = llama_kld.RESAMPLES) -> dict:
     floor = _floor(twins) if twins else None
     out = {"name": config["name"], "artifact": config["artifact"], "context": config["context"],
            "reference": ref, "floor": floor, "budget": config["budget"], "arms": {}, "paths": [], "checks": [], "notes": notes}
-    lines = [f"# {config['name']}: engines against the exact model", "",
+    lines = [f"# {config['name']}", "",
              f"WikiText-2 test, {ref.get('chunks', '?')} chunks of {config['context']} tokens, the second half of each "
              f"scored ({next(iter(arms.values())).kld.size if arms else '?'} positions); the reference is Infernix's "
              f"lossless route (every operation correctly rounded, {config['logits'].upper()} logits, BF16 KV) on "
