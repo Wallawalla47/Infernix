@@ -53,6 +53,10 @@ struct DeviceContext {
     // Submits queued work without waiting for it. On a batched driver model (WDDM) a launch can
     // otherwise sit in the command buffer until the next blocking call or launch.
     void flush() const;
+    // Consumes this worker thread's pending CUDA error (the slot cudaGetLastError clears) and
+    // returns it. Unlike synchronize(), it never aborts: the caller decides whether the residue
+    // is recoverable. cudaSuccess when nothing was pending.
+    cudaError_t clear_last_error() const;
 };
 
 // Copies `bytes` from pinned host memory to device memory in stream order, read by the SMs

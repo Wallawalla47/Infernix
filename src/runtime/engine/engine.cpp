@@ -410,6 +410,12 @@ public:
     DeviceContext device;
     std::unique_ptr<runtime::ModelInstance> active;
     std::unique_ptr<runtime::Qwen4ExpInstance> qwen4;
+
+    // The Qwen4Exp program's wide-workspace budget check (nullopt: this program has none).
+    std::optional<models::qwen4_exp::Program::PrefillCapacity> prefill_capacity(std::uint32_t prompt_tokens) const {
+        if (qwen4) { return qwen4->program->prefill_capacity(prompt_tokens); }
+        return std::nullopt;
+    }
     LoadSummary load;
     ModelMetadata model_metadata;
     ModelSamplingDefaults sampling_defaults;
@@ -579,6 +585,13 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
     if (prompt_summary.prompt_tokens > impl_->options.max_context) {
         throw RequestError(ContextLengthDetails{.prompt_tokens = prompt_summary.prompt_tokens,
                                                 .max_context   = impl_->options.max_context});
+    }
+    if (const auto capacity = impl_->prefill_capacity(prompt_summary.prompt_tokens); capacity && !capacity->fits) {
+        throw RequestError(RequestErrorKind::PrefillCapacityInsufficient,
+                           "this prompt's prefill workspace needs " + std::to_string(capacity->demand >> 20) +
+                               " MiB of GPU memory, but only " + std::to_string(capacity->capacity >> 20) +
+                               " MiB are available now (free VRAM plus lendable expert cache); reduce the "
+                               "prompt length or free GPU memory and retry");
     }
     const double prepare_seconds = prompt.impl_->prepare.seconds;
     if (resolved_options.execution.requested_output_tokens == 0) {

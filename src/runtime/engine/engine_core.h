@@ -2292,6 +2292,17 @@ private:
                 }
                 paused_.clear();
                 if (!instance_.program->recover_after_failure()) { return false; }
+                // The failed allocation is still this worker thread's pending CUDA error: the next
+                // request's first CUDA_CHECK(cudaGetLastError()) would abort on it (a previous
+                // request's failure must not take the Engine down). Consume it; a residue that is
+                // not a plain memory shortage is a real device fault the Engine must not ride out.
+                const cudaError_t residue = device_.clear_last_error();
+                if (residue != cudaSuccess && residue != cudaErrorMemoryAllocation) {
+                    publish_diagnostic(diagnostics_, DiagnosticLevel::Error,
+                                       "recovery saw a non-memory CUDA residue (%s); the Engine fails",
+                                       cudaGetErrorName(residue));
+                    return false;
+                }
                 admission_decision_.reset();
                 for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
                     if (slots_[lane] == nullptr) { continue; }

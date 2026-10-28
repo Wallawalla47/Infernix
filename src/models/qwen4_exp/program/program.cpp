@@ -113,6 +113,8 @@ void Program::fail_all_cleanup() noexcept { impl_->release_all(); }
 
 bool Program::recover_after_failure() noexcept { return impl_->recover_after_failure(); }
 
+Program::PrefillCapacity Program::prefill_capacity(std::uint32_t prompt_tokens) const { return impl_->prefill_capacity(prompt_tokens); }
+
 void Program::shutdown_cleanup() noexcept {
     impl_->report_cache_layers();
     impl_->release_all();

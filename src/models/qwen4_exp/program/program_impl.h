@@ -2906,6 +2906,15 @@ public:
         }
     }
 
+    Program::PrefillCapacity prefill_capacity(std::uint32_t prompt_tokens) const {
+        Program::PrefillCapacity out;
+        out.demand   = wide_bytes_for(static_cast<std::int32_t>(prompt_tokens));
+        if (out.demand == 0) { return out; }
+        out.capacity = device_.free_bytes() + (residency_ ? residency_->lendable_bytes() : 0);
+        out.fits     = out.demand <= out.capacity;
+        return out;
+    }
+
     void release_all() noexcept {
         for (std::uint32_t i = 0; i < options_.max_concurrency; ++i) {
             if (lanes_[i].phase != Phase::Free) { release(i); }

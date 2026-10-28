@@ -125,6 +125,11 @@ ApiError request_error_to_api_error(const infernix::RequestError& exception,
         error.status = 400;
         error.code   = "thinking_budget_capacity_insufficient";
         break;
+    case infernix::RequestErrorKind::PrefillCapacityInsufficient:
+        error.param.clear();
+        error.status = 400;
+        error.code   = "prefill_capacity_insufficient";
+        break;
     case infernix::RequestErrorKind::MediaBudgetExceeded:
         error.status = 400;
         error.code   = "media_budget_exceeded";

@@ -628,6 +628,18 @@ public:
     // publishing, lets the prefix cache's transfers land and empties the cache when the failed
     // round may have published into it. False when that fails (the Engine fails everything).
     [[nodiscard]] bool recover_after_failure() noexcept;
+    // This instance's prefill wide-workspace demand (zero when the program uses none) against the
+    // VRAM available for it now (free VRAM plus what the expert cache can lend). `fits` is false
+    // when the demand exceeds the capacity (a fresh allocation would OOM mid-prefill). The
+    // capacity is a best-effort snapshot: work in flight can change it before prefill, and a
+    // failure that slips through is handled as a per-request recoverable error, not an Engine
+    // failure.
+    struct PrefillCapacity {
+        std::size_t demand   = 0;
+        std::size_t capacity = 0;
+        bool fits            = true;
+    };
+    [[nodiscard]] PrefillCapacity prefill_capacity(std::uint32_t prompt_tokens) const;
     // Releases every lane, saves the expert cache's state and then the prefix cache's Host tier
     // when a file is attached.
     void shutdown_cleanup() noexcept;

@@ -1370,6 +1370,7 @@ enum class RequestErrorKind : std::uint8_t {
     QueueTimeout,
     Cancelled,
     Unavailable,
+    PrefillCapacityInsufficient,
 };
 
 enum class RequestErrorSource : std::uint8_t { OutputConstraint, Tools };

@@ -179,6 +179,8 @@ const char* DeviceContext::sync_mode() const {
 
 void DeviceContext::synchronize() const { CUDA_CHECK(cudaStreamSynchronize(stream)); }
 
+cudaError_t DeviceContext::clear_last_error() const { return cudaGetLastError(); }
+
 std::size_t DeviceContext::free_bytes() const {
     std::size_t free  = 0;
     std::size_t total = 0;
