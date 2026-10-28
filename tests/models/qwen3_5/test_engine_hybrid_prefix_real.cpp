@@ -915,7 +915,9 @@ int exercise_coalesce_vision(const char* artifact) {
 // prompt's first token fails after its prefill published blocks and a tap: the request fails alone and
 // the tree holds what it held before. Engine 2 loads the file saved at Engine 1's stop: the clean prompt
 // resumes from it, the failed one resumes from nothing and equals a cache-off run. A request failing in
-// decode (after an output block was published) is withdrawn the same way.
+// decode is withdrawn the same way. The exact route publishes on the chunk grid only, so neither failure
+// publishes a block past the prompt's last grid position (the default route's decode-published blocks are
+// not covered here: its resend would not equal the cache-off run).
 int exercise_nonfinite_withdraw(const char* artifact) {
     const std::filesystem::path file = infernix::test::unique_temp_path("infernix-hybrid-nonfinite-real-test.bin");
     std::error_code ignored;
@@ -966,6 +968,9 @@ int exercise_nonfinite_withdraw(const char* artifact) {
                   << "); " << stats.hybrid_blocks_inserted - before.hybrid_blocks_inserted << " blocks were published\n";
         return false;
     };
+    // Without free-cache-resume a request publishes state only on the prefill-chunk grid and no decode-computed
+    // block (spec §7.9): the 1500-token prompts publish their blocks up to grid position 1024, in both failures.
+    const std::uint64_t grid_blocks = (1500 / kPrefillChunk) * kPrefillChunk / kBlock;
     int failures = 0;
     {
         infernix::Engine engine(options());
@@ -985,8 +990,8 @@ int exercise_nonfinite_withdraw(const char* artifact) {
             std::cerr << "nonfinite: the failing prompt's first token did not fail with non-finite logits\n";
             ++failures;
         }
-        // The prompt's 23 full blocks were published before its first token failed.
-        if (!withdrawn(engine, before, 23)) { ++failures; }
+        // The prompt's grid blocks were published before its first token failed.
+        if (!withdrawn(engine, before, grid_blocks)) { ++failures; }
         std::cout << "nonfinite: after the failure the cache file "
                   << (std::filesystem::exists(file) ? "exists" : "was deleted (a save ran during the request)") << '\n';
     } // the stop saves the Host tier
@@ -1013,9 +1018,8 @@ int exercise_nonfinite_withdraw(const char* artifact) {
             std::cerr << "nonfinite: the clean prompt did not resume from the restored file\n";
             ++failures;
         }
-        // decode: the 60th row fails, 59 tokens past the 1500-token prompt, after block 23
-        // [1472, 1536), which ends in the output, was published. The cache-off reference generates
-        // as many tokens as the run it is compared with.
+        // decode: the 60th row fails, 59 tokens past the 1500-token prompt, after the prompt's grid blocks were
+        // published. The cache-off reference generates as many tokens as the run it is compared with.
         infernix::RequestOptions cache_off_decoding     = greedy(96);
         cache_off_decoding.execution.allow_prefix_reuse = false;
         const std::vector<infernix::TokenId> cold_decoding =
@@ -1026,7 +1030,7 @@ int exercise_nonfinite_withdraw(const char* artifact) {
             std::cerr << "nonfinite: the decode row did not fail with non-finite logits\n";
             ++failures;
         }
-        if (!withdrawn(engine, before, 24)) { ++failures; }
+        if (!withdrawn(engine, before, grid_blocks)) { ++failures; }
         const infernix::GenerationResult again = engine.generate(engine.prepare_tokens(decoding), greedy(96));
         if (again.reused_prompt_tokens != 0 || again.generated_token_ids != cold_decoding) {
             std::cerr << "nonfinite: after the decode failure the prompt reused " << again.reused_prompt_tokens
